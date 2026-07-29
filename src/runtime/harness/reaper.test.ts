@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 
 const reaper = await import('./reaper.js');
 const reg = await import('./approval-registry.js');
-const { createSession, closeEventLog, openEventLog } = await import('./eventlog.js');
+const { createSession, closeEventLog, openEventLog, updateSession } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { listNotifications } = await import('../notifications.js');
 
@@ -60,6 +60,27 @@ test('reapOnce clears session interrupt state when an approval expires', async (
   assert.equal(refreshed.sessionRow.status, 'cancelled');
 });
 
+test('expiring a durable Workspace runner decision does not cancel its Workspace session', async () => {
+  const sessionRow = createSession({ id: 'space-durable-runner-expiry', kind: 'chat' });
+  const row = reg.register({
+    sessionId: sessionRow.id,
+    subject: 'Review exact Workspace runner',
+    tool: 'space_trust_data_runner',
+    ttlMs: 5,
+  });
+  await new Promise((r) => setTimeout(r, 20));
+
+  reaper.reapOnce();
+
+  assert.equal(reg.get(row.approvalId)?.status, 'expired');
+  assert.equal(HarnessSession.load(sessionRow.id)?.sessionRow.status, 'active');
+  const note = listNotifications(50).find((item) =>
+    (item.metadata as { approvalId?: string } | undefined)?.approvalId === row.approvalId);
+  assert.ok(note);
+  assert.doesNotMatch(note.body, /session was cancelled/i);
+  assert.match(note.body, /runner remains blocked|refresh/i);
+});
+
 test('reapOnce posts a user notification per expiry', async () => {
   const session = createSession({ kind: 'chat' });
   const row = reg.register({
@@ -100,6 +121,32 @@ test('reapOnce skips approvals that are still in their TTL window', () => {
   reg.register({ sessionId: session.id, subject: 'still fresh', ttlMs: 60_000 });
   const expired = reaper.reapOnce();
   assert.equal(expired.length, 0);
+});
+
+test('dead-session reap preserves exact Workspace runner decisions but still cancels ordinary orphans', () => {
+  const session = createSession({ kind: 'chat' });
+  const trust = reg.register({
+    sessionId: session.id,
+    subject: 'Review exact Workspace runner',
+    tool: 'space_trust_data_runner',
+    ttlMs: 10 * 60_000,
+  });
+  const ordinary = reg.register({
+    sessionId: session.id,
+    subject: 'Ordinary orphan',
+    tool: 'some_write_tool',
+    ttlMs: 10 * 60_000,
+  });
+  updateSession(session.id, { status: 'cancelled' });
+  openEventLog().prepare(
+    'UPDATE pending_approvals SET requested_at = ? WHERE approval_id IN (?, ?)',
+  ).run('2000-01-01T00:00:00.000Z', trust.approvalId, ordinary.approvalId);
+
+  reaper.reapOnce();
+
+  assert.equal(reg.get(trust.approvalId)?.status, 'pending');
+  assert.equal(reg.get(ordinary.approvalId)?.status, 'resolved');
+  assert.equal(reg.get(ordinary.approvalId)?.resolution, 'cancelled_by_user');
 });
 
 test('startApprovalReaper is idempotent — second start is a no-op', () => {

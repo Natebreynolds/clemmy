@@ -5,9 +5,31 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import {
+  DEFAULT_TEST_TARGETS,
+  isolatedTestArgs,
+} from './run-tests-isolated-args.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const runnerPath = path.join(repoRoot, 'scripts', 'run-tests-isolated.mjs');
+
+test('isolated test runner retains source-only defaults when only reporter options are forwarded', () => {
+  assert.deepEqual(
+    isolatedTestArgs(['--test-reporter=dot']),
+    ['--test', '--test-reporter=dot', ...DEFAULT_TEST_TARGETS],
+  );
+  assert.deepEqual(
+    isolatedTestArgs(['--test-reporter', 'dot']),
+    ['--test', '--test-reporter', 'dot', ...DEFAULT_TEST_TARGETS],
+  );
+});
+
+test('isolated test runner preserves an explicit targeted test without adding the full suite', () => {
+  assert.deepEqual(
+    isolatedTestArgs(['--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts']),
+    ['--test', '--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts'],
+  );
+});
 
 test('isolated test runner disables real local embeddings even when the parent enables them', () => {
   const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-runner-contract-'));

@@ -5,6 +5,7 @@
  * actually happened.
  */
 import { apiGet, apiPost } from './api';
+import type { PendingActionApprovalView } from './types';
 
 export interface PendingActionExecuteResult {
   ok: boolean;
@@ -30,9 +31,23 @@ export const approveExecutePendingAction = (id: string, approvalId?: string | nu
 
 /** The durable record's current truth, for refreshing a card after execution. */
 export const getPendingActionStatus = (id: string) =>
-  apiGet<{ ok: boolean; status: string; resultSummary: string | null }>(
+  apiGet<{
+    ok: boolean;
+    status: string;
+    resultSummary: string | null;
+    pendingAction?: PendingActionApprovalView;
+  }>(
     `/api/console/pending-actions/${encodeURIComponent(id)}`,
   );
+
+/** Standing trust is recipient-scoped send authority. Never offer that control
+ * on a generic external write/deploy merely because it also uses the durable
+ * pending-action substrate. */
+export function canOfferStandingSendTrust(
+  action: Pick<PendingActionApprovalView, 'kind'> | null | undefined,
+): boolean {
+  return action?.kind === 'external_send';
+}
 
 export type PendingActionExecutionPhase =
   | 'running'

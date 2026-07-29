@@ -1,19 +1,26 @@
 /**
- * Workspace data-source executor — runs a declared data source SERVER-SIDE
- * with NO LLM (the token-saving core), then persists the result into the
- * Workspace's data.json. Two source shapes:
- *
- *   - runner script: spaces/<slug>/data/<file> (.mjs/.js/.cjs/.py/.sh) — spawned
- *     with a JSON payload on stdin; must print the dataset as JSON to stdout.
- *   - Composio op: executeComposioTool(slug, args) — credentials resolve
- *     server-side via getPreferredUserId; the view never sees a token.
+ * Workspace data-source executor — runs a PROVABLY READ-ONLY declared Composio
+ * source server-side with no LLM (the token-saving core), then persists the
+ * result into data.json. Installed legacy runner declarations take a one-time,
+ * time-bounded human migration decision bound to their pinned entrypoint hash
+ * and schedule; new/unapproved/drifted entrypoints fail closed before spawn.
  *
  * Used by the on-demand /refresh route and (later) the scheduled daily poll —
  * one execution path for both. Fail-safe: a source error is captured into
  * data.json under _meta so the view can show "couldn't refresh" without the
  * whole Workspace breaking.
  */
-import { existsSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { resolveInSpace, runnerFilenameError, spaceStore, type SpaceDataSource, type SpaceAction } from './store.js';
 import { readData, writeData, appendAudit, type WriteDataResult, type WriteDataError } from './data-store.js';
@@ -27,6 +34,12 @@ import {
   replayWorkflowCallMutationSlot,
   type WorkflowCallMutationSlotInput,
 } from '../execution/workflow-call-receipts.js';
+import {
+  workspaceActionRequiresApproval,
+  workspaceDataSourceSafetyError,
+} from './space-execution-policy.js';
+import { verifySpaceActionApprovalAuthority } from './space-action-authority.js';
+import { authorizeInstalledDataRunner } from './space-data-runner-trust.js';
 
 // Tunable so a heavy data pull can be given more room without a code change.
 const RUNNER_TIMEOUT_MS = (() => {
@@ -42,6 +55,8 @@ export interface RunSourceErr {
   error: string;
   /** Nominal executor proof; never inferred from runner-controlled output. */
   provenNoDispatch?: true;
+  /** Exact human decision that can unlock a legacy compatibility refresh. */
+  pendingApprovalId?: string;
 }
 export type RunSourceResult = RunSourceOk | RunSourceErr;
 
@@ -57,12 +72,24 @@ export interface SpaceActionRunOptions {
 
 type SpaceComposioDispatch = typeof import('../tools/composio-tools.js').dispatchComposioTool;
 let spaceComposioDispatchForTest: SpaceComposioDispatch | null = null;
+type RunnerEntrypointSnapshotHook = (snapshot: {
+  sourcePath: string;
+  snapshotPath: string;
+}) => void;
+let runnerEntrypointSnapshotHookForTest: RunnerEntrypointSnapshotHook | null = null;
 
 /** Focused-test seam at the already-resolved Composio gateway boundary. */
 export function _setSpaceComposioDispatchForTests(
   dispatch: SpaceComposioDispatch | null,
 ): void {
   spaceComposioDispatchForTest = dispatch;
+}
+
+/** Focused race-test seam after approved bytes are frozen but before spawn. */
+export function _setRunnerEntrypointSnapshotHookForTests(
+  hook: RunnerEntrypointSnapshotHook | null,
+): void {
+  runnerEntrypointSnapshotHookForTest = hook;
 }
 
 function spaceActionMutationSlot(
@@ -113,12 +140,109 @@ export function replaySpaceActionMutation(
   };
 }
 
-/** Run a runner script under the workspace data/ dir and return its parsed JSON
- *  (or an error) WITHOUT persisting. Uses the shared sandboxed-script substrate
- *  (scrubbed env / timeout / output-cap / EPIPE guard) — the same executor the
- *  real refresh path (runSpaceDataSource) and the dry-run tool (space_try_runner)
- *  use, so the dry-run is byte-identical to a real pull, minus the write. */
-export async function runScript(slug: string, runner: string, extra?: Record<string, unknown>): Promise<RunSourceResult> {
+type PreparedRunnerEntrypoint =
+  | {
+    ok: true;
+    executionPath: string;
+    cleanup: () => void;
+  }
+  | {
+    ok: false;
+    error: string;
+  };
+
+/**
+ * Freeze the one authority field Clementine can enforce generically: the
+ * approved entrypoint bytes. Reading through one open descriptor prevents a
+ * path replacement from changing which bytes are hashed; writing those bytes
+ * to a random hidden sibling means the interpreter opens the same bytes even
+ * if another process edits the installed runner between verification and
+ * spawn. The sibling preserves extension and directory semantics, so relative
+ * imports and dirname(import.meta.url) keep resolving as installed.
+ *
+ * Helpers, packages, CLIs, local files, auth state, and network services are
+ * deliberately not presented as immutable. They remain live compatibility
+ * dependencies and are disclosed as such on the approval card.
+ */
+function prepareVerifiedRunnerEntrypoint(
+  target: string,
+  runner: string,
+  expectedSha256: string,
+): PreparedRunnerEntrypoint {
+  if (!/^[a-f0-9]{64}$/i.test(expectedSha256)) {
+    return { ok: false, error: 'runner approval is missing a valid entrypoint SHA-256 digest' };
+  }
+
+  let fd: number | null = null;
+  let sourceBytes: Buffer;
+  let sourceMode = 0o400;
+  try {
+    fd = openSync(target, 'r');
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      return { ok: false, error: `runner entrypoint is not a regular file: data/${runner}` };
+    }
+    sourceMode = stat.mode;
+    sourceBytes = readFileSync(fd);
+  } catch (error) {
+    return {
+      ok: false,
+      error: `runner trust could not read the approved entrypoint: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* best-effort descriptor cleanup */ }
+    }
+  }
+
+  const actualSha256 = createHash('sha256').update(sourceBytes).digest('hex');
+  if (actualSha256 !== expectedSha256.toLowerCase()) {
+    return {
+      ok: false,
+      error: `runner entrypoint changed after approval; data/${runner} was not executed`,
+    };
+  }
+
+  const extension = path.extname(runner);
+  const stem = extension ? runner.slice(0, -extension.length) : runner;
+  const snapshotPath = path.join(
+    path.dirname(target),
+    `.clementine-entry-${stem}-${randomUUID()}${extension}`,
+  );
+  try {
+    const ownerMode = (sourceMode & 0o111) !== 0 ? 0o500 : 0o400;
+    writeFileSync(snapshotPath, sourceBytes, { flag: 'wx', mode: ownerMode });
+    chmodSync(snapshotPath, ownerMode);
+    runnerEntrypointSnapshotHookForTest?.({
+      sourcePath: target,
+      snapshotPath,
+    });
+  } catch (error) {
+    try { unlinkSync(snapshotPath); } catch { /* no snapshot or already gone */ }
+    return {
+      ok: false,
+      error: `runner entrypoint could not be frozen before spawn: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  return {
+    ok: true,
+    executionPath: snapshotPath,
+    cleanup: () => {
+      try { unlinkSync(snapshotPath); } catch { /* crash-safe best effort */ }
+    },
+  };
+}
+
+/** Low-level runner executor. Approval-gated callers pass the approved
+ * entrypoint digest so the same verified bytes—not the mutable source path—are
+ * opened by the interpreter. This does not freeze runtime dependencies. */
+export async function runScript(
+  slug: string,
+  runner: string,
+  extra?: Record<string, unknown>,
+  opts: { expectedSha256?: string } = {},
+): Promise<RunSourceResult> {
   const runnerError = runnerFilenameError(runner);
   if (runnerError) return { ok: false, error: runnerError, provenNoDispatch: true };
   let target: string;
@@ -130,44 +254,63 @@ export async function runScript(slug: string, runner: string, extra?: Record<str
   if (!existsSync(target)) {
     return { ok: false, error: `runner script not found: data/${runner}`, provenNoDispatch: true };
   }
-  const augmentedPath = augmentPath(process.env.PATH);
-  const interp = interpreterFor(target, augmentedPath);
-  if (!interp) {
+  const prepared = opts.expectedSha256
+    ? prepareVerifiedRunnerEntrypoint(target, runner, opts.expectedSha256)
+    : {
+      ok: true as const,
+      executionPath: target,
+      cleanup: () => undefined,
+    };
+  if (!prepared.ok) {
     return {
       ok: false,
-      error: `unsupported runner extension for data/${runner} (use .mjs/.js/.cjs/.ts/.py/.sh or an executable)`,
+      error: prepared.error,
       provenNoDispatch: true,
     };
   }
 
-  const spaceDir = resolveInSpace(slug, 'data');
-  const payload = JSON.stringify({ ...(extra ?? {}), slug, runner });
-  const env = scrubbedChildEnv({
-    CLEMENTINE_SPACE_SLUG: slug,
-    ...electronNodeEnv(interp.command, interp.isElectron),
-  });
-  const outcome = await spawnSandboxedScript({
-    command: interp.command, args: interp.args, cwd: spaceDir, env,
-    stdinPayload: payload, timeoutMs: RUNNER_TIMEOUT_MS, maxOutputBytes: RUNNER_MAX_OUTPUT_BYTES,
-  });
-  if (outcome.launchError) {
-    return {
-      ok: false,
-      error: `runner failed to launch: ${outcome.launchError.message}`,
-      provenNoDispatch: true,
-    };
-  }
-  if (outcome.overflowed) return { ok: false, error: `runner output exceeded ${RUNNER_MAX_OUTPUT_BYTES} bytes (print a single JSON document to stdout)` };
-  if (outcome.timedOut) return { ok: false, error: `runner timed out after ${RUNNER_TIMEOUT_MS}ms` };
-  if (outcome.code !== 0) {
-    return { ok: false, error: `runner exited ${outcome.signal ?? outcome.code}: ${[outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join(' | ').slice(0, 2000)}` };
-  }
-  const out = outcome.stdout.trim();
-  if (!out) return { ok: false, error: 'runner produced no output (expected JSON on stdout)' };
   try {
-    return { ok: true, data: JSON.parse(out) };
-  } catch {
-    return { ok: false, error: `runner stdout was not valid JSON: ${out.slice(0, 200)}` };
+    const augmentedPath = augmentPath(process.env.PATH);
+    const interp = interpreterFor(prepared.executionPath, augmentedPath);
+    if (!interp) {
+      return {
+        ok: false,
+        error: `unsupported runner extension for data/${runner} (use .mjs/.js/.cjs/.ts/.py/.sh or an executable)`,
+        provenNoDispatch: true,
+      };
+    }
+
+    const spaceDir = resolveInSpace(slug, 'data');
+    const payload = JSON.stringify({ ...(extra ?? {}), slug, runner });
+    const env = scrubbedChildEnv({
+      CLEMENTINE_SPACE_SLUG: slug,
+      ...electronNodeEnv(interp.command, interp.isElectron),
+    });
+    const outcome = await spawnSandboxedScript({
+      command: interp.command, args: interp.args, cwd: spaceDir, env,
+      stdinPayload: payload, timeoutMs: RUNNER_TIMEOUT_MS, maxOutputBytes: RUNNER_MAX_OUTPUT_BYTES,
+    });
+    if (outcome.launchError) {
+      return {
+        ok: false,
+        error: `runner failed to launch: ${outcome.launchError.message}`,
+        provenNoDispatch: true,
+      };
+    }
+    if (outcome.overflowed) return { ok: false, error: `runner output exceeded ${RUNNER_MAX_OUTPUT_BYTES} bytes (print a single JSON document to stdout)` };
+    if (outcome.timedOut) return { ok: false, error: `runner timed out after ${RUNNER_TIMEOUT_MS}ms` };
+    if (outcome.code !== 0) {
+      return { ok: false, error: `runner exited ${outcome.signal ?? outcome.code}: ${[outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join(' | ').slice(0, 2000)}` };
+    }
+    const out = outcome.stdout.trim();
+    if (!out) return { ok: false, error: 'runner produced no output (expected JSON on stdout)' };
+    try {
+      return { ok: true, data: JSON.parse(out) };
+    } catch {
+      return { ok: false, error: `runner stdout was not valid JSON: ${out.slice(0, 200)}` };
+    }
+  } finally {
+    prepared.cleanup();
   }
 }
 
@@ -225,9 +368,25 @@ async function runSpaceComposio(
 
 /** Run a single declared data source (no persistence). */
 export async function runSpaceDataSource(slug: string, source: SpaceDataSource): Promise<RunSourceResult> {
-  if (source.runner && source.runner.trim()) {
-    return runScript(slug, source.runner.trim());
+  if (source.runner?.trim()) {
+    const trust = authorizeInstalledDataRunner(slug, source);
+    if (trust.state !== 'approved') {
+      return {
+        ok: false,
+        error: trust.error,
+        provenNoDispatch: true,
+        ...(trust.state === 'pending' ? { pendingApprovalId: trust.approvalId } : {}),
+      };
+    }
+    return runScript(
+      slug,
+      source.runner.trim(),
+      undefined,
+      { expectedSha256: trust.runnerSha256 },
+    );
   }
+  const safetyError = workspaceDataSourceSafetyError(source);
+  if (safetyError) return { ok: false, error: safetyError, provenNoDispatch: true };
   if (source.composioSlug && source.composioSlug.trim()) {
     try {
       return await runSpaceComposio(slug, source.composioSlug.trim(), source.composioArgs ?? {});
@@ -246,7 +405,24 @@ export async function runSpaceAction(
   opts: SpaceActionRunOptions = {},
 ): Promise<RunSourceResult> {
   const args = { ...(action.argsTemplate ?? {}), ...(callerArgs ?? {}) };
-  const approvalId = opts.approvalId?.trim() ?? '';
+  const requestedApprovalId = opts.approvalId?.trim() ?? '';
+  const requiresApproval = workspaceActionRequiresApproval(action);
+  const authority = requestedApprovalId
+    ? verifySpaceActionApprovalAuthority({
+      approvalId: requestedApprovalId,
+      slug,
+      action,
+      callerArgs,
+    })
+    : { ok: false, error: 'approval id is missing' };
+  if (requiresApproval && !authority.ok) {
+    return {
+      ok: false,
+      error: `action "${action.id}" requires exact human approval before execution (${authority.error ?? 'authority check failed'}); invoke it through the Workspace action approval path.`,
+      provenNoDispatch: true,
+    };
+  }
+  const approvalId = authority.ok ? authority.approvalId ?? '' : '';
   const mutationSlot = approvalId
     ? spaceActionMutationSlot(slug, action.id, approvalId)
     : undefined;
@@ -262,7 +438,14 @@ export async function runSpaceAction(
     }
   }
   if (action.runner && action.runner.trim()) {
-    if (!mutationSlot) return runScript(slug, action.runner.trim(), { args });
+    const approvedEntrypointSha256 = authority.ok ? authority.runnerSha256 : undefined;
+    if (!mutationSlot || !approvedEntrypointSha256) {
+      return {
+        ok: false,
+        error: `action "${action.id}" requires approval bound to a valid runner entrypoint digest before execution`,
+        provenNoDispatch: true,
+      };
+    }
     try {
       const replay = replaySpaceActionMutation(slug, action, approvalId);
       if (replay.replayed) return replay.result;
@@ -270,7 +453,12 @@ export async function runSpaceAction(
         ...mutationSlot,
         tool: `space-runner:${action.runner.trim()}`,
         args,
-      }, () => runScript(slug, action.runner!.trim(), { args }), {
+      }, () => runScript(
+        slug,
+        action.runner!.trim(),
+        { args },
+        { expectedSha256: approvedEntrypointSha256 },
+      ), {
         classifyFailure: (result) => (
           result.ok
             ? null
@@ -291,6 +479,7 @@ export interface RefreshResult {
   ok: boolean;
   sourceId: string;
   error?: string;
+  pendingApprovalId?: string;
   write?: WriteDataResult | WriteDataError;
 }
 
@@ -362,10 +551,27 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
       meta[source.id] = { refreshedAt: new Date().toISOString(), ok: true };
       results.push({ ok: true, sourceId: source.id });
     } else {
-      meta[source.id] = { refreshedAt: new Date().toISOString(), ok: false, error: run.error };
-      results.push({ ok: false, sourceId: source.id, error: run.error });
+      meta[source.id] = run.pendingApprovalId
+        ? {
+          refreshedAt: new Date().toISOString(),
+          ok: null,
+          status: 'awaiting_approval',
+          approvalId: run.pendingApprovalId,
+        }
+        : { refreshedAt: new Date().toISOString(), ok: false, error: run.error };
+      results.push({
+        ok: false,
+        sourceId: source.id,
+        error: run.error,
+        ...(run.pendingApprovalId ? { pendingApprovalId: run.pendingApprovalId } : {}),
+      });
     }
-    appendAudit(slug, { method: 'REFRESH', path: `/refresh/${source.id}`, outcome: run.ok ? 'ok' : 'error', note: run.ok ? undefined : run.error });
+    appendAudit(slug, {
+      method: 'REFRESH',
+      path: `/refresh/${source.id}`,
+      outcome: run.ok ? 'ok' : run.pendingApprovalId ? 'rejected' : 'error',
+      note: run.ok ? undefined : run.error,
+    });
   }
 
   current._meta = meta;
@@ -373,14 +579,19 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
   const okCount = results.filter((r) => r.ok).length;
   if (write.ok && okCount > 0) spaceStore.update(slug, { lastRefreshedAt: new Date().toISOString() });
   for (const r of results) r.write = write;
-  const failedCount = results.length - okCount;
+  const pendingCount = results.filter((result) => !result.ok && result.pendingApprovalId).length;
+  const failedCount = results.length - okCount - pendingCount;
   recordOperationalEvent({
     source: 'workspace',
-    type: failedCount > 0 ? 'workspace_data_refresh_failed' : 'workspace_data_refresh_completed',
-    severity: failedCount > 0 ? 'error' : 'info',
+    type: failedCount > 0
+      ? 'workspace_data_refresh_failed'
+      : pendingCount > 0
+        ? 'workspace_data_refresh_awaiting_approval'
+        : 'workspace_data_refresh_completed',
+    severity: failedCount > 0 ? 'error' : pendingCount > 0 ? 'warn' : 'info',
     workspaceId: slug,
     actor: 'space-runner',
-    payload: { okCount: results.length - failedCount, failedCount, total: results.length, writeOk: write.ok },
+    payload: { okCount, pendingCount, failedCount, total: results.length, writeOk: write.ok },
   });
   return results;
 }

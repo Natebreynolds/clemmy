@@ -56,6 +56,7 @@ export const WORKSPACE_OPERATIONAL_EVENT_TYPES = [
   'workspace_file_changed',
   'workspace_data_refresh_started',
   'workspace_data_refresh_completed',
+  'workspace_data_refresh_awaiting_approval',
   'workspace_data_refresh_failed',
   'workspace_action_requested',
   'workspace_action_approved',

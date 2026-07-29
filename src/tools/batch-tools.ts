@@ -19,18 +19,81 @@ import {
   type BatchPlan,
 } from '../execution/batch-runner.js';
 import {
+  cancelPendingActionIfQueuedUnlinked,
   claimPendingActionExecution,
   getPendingAction,
+  pendingActionPayloadHash,
   queuePendingAction,
   recordPendingActionResult,
 } from '../runtime/harness/pending-actions.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
+import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 
 const textResult = (text: string) => ({ content: [{ type: 'text' as const, text }] });
 
 type BatchPlanRunner = typeof runBatchPlan;
 let batchPlanRunner: BatchPlanRunner = runBatchPlan;
+
+function currentBatchRequestAttribution(): {
+  sourceUserSeq?: number;
+  runScopeId?: string;
+  callId?: string;
+} {
+  const outputContext = getToolOutputContext();
+  const runContext = harnessRunContextStorage.getStore();
+  const sourceUserSeq = runContext?.sourceUserSeq;
+  return {
+    ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+      ? { sourceUserSeq: sourceUserSeq as number }
+      : {}),
+    ...((outputContext?.runScopeId ?? runContext?.behaviorScopeId)
+      ? { runScopeId: outputContext?.runScopeId ?? runContext?.behaviorScopeId }
+      : {}),
+    ...(outputContext?.callId ? { callId: outputContext.callId } : {}),
+  };
+}
+
+function requestOwnedBatchRetry(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  payloadHash: string;
+  kind: 'external_write' | 'external_send';
+}) {
+  try {
+    const events = listEvents(input.sessionId, {
+      types: ['autonomy_note'],
+      sinceSeq: input.sourceUserSeq,
+    });
+    for (const event of events) {
+      if (
+        event.data.kind !== 'pending_action_queued'
+        || event.data.sourceUserSeq !== input.sourceUserSeq
+        || event.data.payloadHash !== input.payloadHash
+        || event.data.actionKind !== input.kind
+        || event.data.approvalRequired !== true
+        || event.data.autoMaterialize !== true
+        || event.data.toolName !== 'run_batch'
+        || typeof event.data.pendingActionId !== 'string'
+      ) continue;
+      const record = getPendingAction(event.data.pendingActionId);
+      if (
+        record
+        && record.sessionId === input.sessionId
+        && record.toolName === 'run_batch'
+        && record.payloadHash === input.payloadHash
+        && record.kind === input.kind
+      ) return record;
+    }
+  } catch {
+    // The graph edge below remains the only path that can make this batch
+    // executable. If dedupe state is unavailable, its durable write will fail
+    // closed and cancel the newly queued record.
+  }
+  return null;
+}
 
 /** Test seam for proving approval consumption without a live provider call. */
 export function _setBatchPlanRunnerForTests(fn: BatchPlanRunner | null): void {
@@ -163,27 +226,79 @@ export function registerBatchTools(server: McpServer): void {
           const certNote = unverified
             ? `I can't independently verify this batch right now (${cert.reason}) — your approval IS the verification.`
             : `Certification: ${cert.reason || 'allowed'}`;
-          const record = queuePendingAction({
-            title: unverified
-              ? `Review & approve (unverified) — batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 60)}`
-              : `Batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 80)}`,
-            summary: `run_batch plan · ${planForExecution.tool}${planForExecution.composioSlug ? `/${planForExecution.composioSlug}` : ''} · ${planForExecution.items.length} item(s), executed deterministically after approval. ${certNote}${repairNote}`,
-            kind: planForExecution.sideEffect === 'send' || slugIsSend ? 'external_send' : 'external_write',
-            toolName: 'run_batch',
-            payload: planForExecution,
-            targetSummary: `${planForExecution.items.length} item(s): ${planForExecution.items.map((i) => i.id).slice(0, 12).join(', ')}${planForExecution.items.length > 12 ? ' …' : ''}`,
-            preview: JSON.stringify(planForExecution.items[0]?.args ?? {}).slice(0, 400),
-            risk: `Executes ${planForExecution.items.length} ${planForExecution.sideEffect} call(s) with no further review; per-call gates and consecutive-failure halt remain active.`
-              + (unverified ? ' NOTE: automated certification was unavailable — this batch was not machine-verified, so review the payloads before approving.' : ''),
-            rollback: planForExecution.sideEffect === 'send' ? 'Sends are irreversible once delivered.' : 'Depends on the target tool; the ledger lists every executed item.',
+          const kind = planForExecution.sideEffect === 'send' || slugIsSend
+            ? 'external_send' as const
+            : 'external_write' as const;
+          const attribution = currentBatchRequestAttribution();
+          if (!attribution.sourceUserSeq) {
+            return textResult(
+              'run_batch refused this write proposal safely because the active user request could not be durably identified. '
+              + 'No approval or executable batch was created; retry once from the live task so the exact batch can own one approval card.',
+            );
+          }
+          const payloadHash = pendingActionPayloadHash('run_batch', planForExecution);
+          let record = requestOwnedBatchRetry({
             sessionId,
-            createdBy: 'run_batch',
+            sourceUserSeq: attribution.sourceUserSeq,
+            payloadHash,
+            kind,
           });
+          const reused = Boolean(record);
+          if (!record) {
+            record = queuePendingAction({
+              title: unverified
+                ? `Review & approve (unverified) — batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 60)}`
+                : `Batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 80)}`,
+              summary: `run_batch plan · ${planForExecution.tool}${planForExecution.composioSlug ? `/${planForExecution.composioSlug}` : ''} · ${planForExecution.items.length} item(s), executed deterministically after approval. ${certNote}${repairNote}`,
+              kind,
+              toolName: 'run_batch',
+              payload: planForExecution,
+              targetSummary: `${planForExecution.items.length} item(s): ${planForExecution.items.map((i) => i.id).slice(0, 12).join(', ')}${planForExecution.items.length > 12 ? ' …' : ''}`,
+              preview: JSON.stringify(planForExecution.items[0]?.args ?? {}).slice(0, 400),
+              risk: `Executes ${planForExecution.items.length} ${planForExecution.sideEffect} call(s) with no further review; per-call gates and consecutive-failure halt remain active.`
+                + (unverified ? ' NOTE: automated certification was unavailable — this batch was not machine-verified, so review the payloads before approving.' : ''),
+              rollback: planForExecution.sideEffect === 'send' ? 'Sends are irreversible once delivered.' : 'Depends on the target tool; the ledger lists every executed item.',
+              sessionId,
+              createdBy: 'run_batch',
+            });
+            try {
+              appendEvent({
+                sessionId,
+                turn: 0,
+                role: 'Clem',
+                type: 'autonomy_note',
+                data: {
+                  kind: 'pending_action_queued',
+                  pendingActionId: record.id,
+                  toolName: record.toolName,
+                  actionKind: record.kind,
+                  approvalRequired: true,
+                  autoMaterialize: true,
+                  payloadHash: record.payloadHash,
+                  targetSummary: record.targetSummary,
+                  sourceUserSeq: attribution.sourceUserSeq,
+                  ...(attribution.runScopeId ? { runScopeId: attribution.runScopeId } : {}),
+                  ...(attribution.callId ? { callId: attribution.callId } : {}),
+                },
+              });
+            } catch {
+              cancelPendingActionIfQueuedUnlinked(
+                record.id,
+                record.id,
+                'Approval-bound batch was cancelled because its durable request edge could not be recorded.',
+              );
+              return textResult(
+                'run_batch failed safely: the exact batch could not be linked to its one approval card. '
+                + 'Nothing is authorized or executable; retry the proposal once.',
+              );
+            }
+          }
           return textResult(
             (unverified
               ? `I couldn't independently verify this batch (${cert.reason}). Rather than block it, I've queued it for YOUR review — the human is the fallback judge.${repairNote} `
               : `Certified (${cert.reason || 'allowed'}).${repairNote} `)
-            + `Queued for approval as pending action ${record.id} (${planForExecution.items.length} ${planForExecution.sideEffect} item(s)). `
+            + `${reused ? 'Reused the request-owned' : 'Queued for approval as'} pending action ${record.id} (${planForExecution.items.length} ${planForExecution.sideEffect} item(s)). `
+            + 'The harness will surface exactly one approval card for this stored batch. '
             + `Once it is APPROVED, call run_batch action=execute pending_action_id=${record.id}. Do not execute items yourself.`,
           );
         }
@@ -192,6 +307,11 @@ export function registerBatchTools(server: McpServer): void {
           const record = getPendingAction(pending_action_id);
           if (!record) return textResult(`No pending action ${pending_action_id}.`);
           if (record.toolName !== 'run_batch') return textResult(`Pending action ${pending_action_id} is not a run_batch plan.`);
+          if (!record.sessionId || record.sessionId !== sessionId) {
+            return textResult(
+              `Pending action ${pending_action_id} belongs to a different session and was not executed.`,
+            );
+          }
           if (record.status !== 'approved') {
             return textResult(batchExecutionSkipText(pending_action_id, record.status));
           }
@@ -199,7 +319,7 @@ export function registerBatchTools(server: McpServer): void {
           // only on HUMAN consent. A policy-minted approval (YOLO auto-approve,
           // Exhibit A's forgery point) is inert here — the honest path is the
           // approval card, which this refusal names.
-          if (record.kind === 'external_send' && record.approvedBy !== 'human') {
+          if (pendingActionRequiresHumanApproval(record) && record.approvedBy !== 'human') {
             return textResult(
               `Pending action ${pending_action_id} is an irreversible send batch approved by POLICY, not by the user. `
               + 'It requires the user\'s explicit approval card before execution — file it with request_approval '
@@ -214,8 +334,20 @@ export function registerBatchTools(server: McpServer): void {
           // Atomically consume APPROVED immediately before the external loop.
           // Concurrent chat/console/process callers that lose this claim see
           // EXECUTING (or terminal truth) and never start a second batch.
-          const claim = claimPendingActionExecution(record.id, 'run_batch');
+          const claim = claimPendingActionExecution(record.id, 'run_batch', {
+            expectedSessionId: sessionId,
+            requireResolvedHumanCard: pendingActionRequiresHumanApproval(record),
+          });
           if (!claim.claimed || !claim.record || !claim.claimToken) {
+            if (
+              claim.reason === 'payload_integrity_failed'
+              || claim.reason === 'approval_authority_invalid'
+            ) {
+              return textResult(
+                claim.record?.resultSummary
+                ?? `Pending action ${pending_action_id} failed its pre-dispatch authorization integrity check. No batch was started.`,
+              );
+            }
             return textResult(batchExecutionSkipText(
               pending_action_id,
               claim.record?.status,

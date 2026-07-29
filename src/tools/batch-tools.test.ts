@@ -6,7 +6,7 @@
  * approval card, never terminal-block. Asserts a pending approval row exists, the
  * batch was NOT executed, and the response carries no terminal "refused/blocked".
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -21,12 +21,15 @@ import assert from 'node:assert/strict';
 const { registerBatchTools, _setBatchPlanRunnerForTests } = await import('./batch-tools.js');
 const { _setCertifyJudgeForTests } = await import('../execution/batch-runner.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+const { appendEvent, createSession, getSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const {
   getPendingAction,
   listPendingActions,
-  markPendingActionApprovalResolved,
   queuePendingAction,
 } = await import('../runtime/harness/pending-actions.js');
+const { pendingActionApprovalView } = await import('../runtime/harness/pending-action-view.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 
 type ToolResult = { content: Array<{ type: 'text'; text: string }> };
 type Handler = (input: Record<string, unknown>) => Promise<ToolResult>;
@@ -43,6 +46,25 @@ function batchHandler(): Handler {
   return h;
 }
 
+function approveExactPendingAction(
+  record: ReturnType<typeof queuePendingAction>,
+  subject: string,
+): string {
+  if (!getSession(record.sessionId!)) createSession({ id: record.sessionId!, kind: 'chat' });
+  const row = approvalRegistry.register({
+    sessionId: record.sessionId!,
+    subject,
+    tool: 'request_approval',
+    args: {
+      pendingActionId: record.id,
+      pendingAction: pendingActionApprovalView(record),
+    },
+  });
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'test');
+  assert.equal(resolved.ok, true);
+  return row.approvalId;
+}
+
 after(() => {
   _setCertifyJudgeForTests(null);
   _setBatchPlanRunnerForTests(null);
@@ -57,19 +79,39 @@ test('run_batch propose: exhausted judge chain + SEND batch → parks as one app
 
   const handler = batchHandler();
   const sessionId = 'sess-batch-park';
-  const res = await withToolOutputContext({ sessionId }, () => handler({
-    action: 'propose',
-    plan: {
-      tool: 'testmcp__send_message',
-      sideEffect: 'send',
-      objective: 'send three prepared notices to the saved recipients',
-      items: [
-        { id: 'a@example.com', args: JSON.stringify({ to: 'a@example.com', text: 'hi a' }) },
-        { id: 'b@example.com', args: JSON.stringify({ to: 'b@example.com', text: 'hi b' }) },
-        { id: 'c@example.com', args: JSON.stringify({ to: 'c@example.com', text: 'hi c' }) },
-      ],
-    },
-  })) as ToolResult;
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the three prepared notices.' },
+  });
+  const invoke = () => withToolOutputContext(
+    { sessionId, runScopeId: 'batch-proof-run', callId: 'batch-proof-call' },
+    () => withHarnessRunContext(
+      {
+        sessionId,
+        behaviorScopeId: 'batch-proof-run',
+        sourceUserSeq: source.seq,
+        counter: new ToolCallsCounter(100),
+      },
+      () => handler({
+        action: 'propose',
+        plan: {
+          tool: 'testmcp__send_message',
+          sideEffect: 'send',
+          objective: 'send three prepared notices to the saved recipients',
+          items: [
+            { id: 'a@example.com', args: JSON.stringify({ to: 'a@example.com', text: 'hi a' }) },
+            { id: 'b@example.com', args: JSON.stringify({ to: 'b@example.com', text: 'hi b' }) },
+            { id: 'c@example.com', args: JSON.stringify({ to: 'c@example.com', text: 'hi c' }) },
+          ],
+        },
+      }),
+    ),
+  ) as Promise<ToolResult>;
+  const res = await invoke();
 
   const text = res.content[0].text;
   // NOT a terminal block — the payloads are not stranded.
@@ -86,9 +128,82 @@ test('run_batch propose: exhausted judge chain + SEND batch → parks as one app
   assert.equal(pending[0].status, 'queued', 'queued for approval — never auto-executed');
   assert.equal(pending[0].toolName, 'run_batch');
   assert.equal((pending[0].payload as { items: unknown[] }).items.length, 3, 'the exact prepared payloads are pinned in the card');
+  const [edge] = listEvents(sessionId, { types: ['autonomy_note'] }).filter(
+    (event) => event.data.kind === 'pending_action_queued',
+  );
+  assert.ok(edge, 'the direct batch queue emits the graph edge the approval transition consumes');
+  assert.equal(edge.data.sourceUserSeq, source.seq);
+  assert.equal(edge.data.approvalRequired, true, 'reversible and irreversible batch writes use the same one-card edge');
+  assert.equal(edge.data.autoMaterialize, true, 'run_batch proposals do not depend on a model restating an approval question');
+
+  const retry = await invoke();
+  assert.match(retry.content[0].text, /Reused the request-owned pending action/);
+  assert.equal(listPendingActions({ sessionId, status: 'all' }).length, 1, 'same-request retry cannot mint a second batch');
+  assert.equal(
+    listEvents(sessionId, { types: ['autonomy_note'] }).filter(
+      (event) => event.data.kind === 'pending_action_queued',
+    ).length,
+    1,
+    'same-request retry cannot mint a second graph edge',
+  );
+});
+
+test('run_batch propose: a reversible Sheets write still emits an automatic formal approval edge', async () => {
+  _setCertifyJudgeForTests(async () => ({
+    allow: true,
+    reason: 'payloads are exact',
+    concerns: [],
+    judgeUnavailable: false,
+  }));
+  const sessionId = 'sess-batch-reversible-write';
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update these three reviewed Sheet rows.' },
+  });
+  const handler = batchHandler();
+  const res = await withToolOutputContext(
+    { sessionId, runScopeId: 'batch-sheets-run' },
+    () => withHarnessRunContext(
+      {
+        sessionId,
+        behaviorScopeId: 'batch-sheets-run',
+        sourceUserSeq: source.seq,
+        counter: new ToolCallsCounter(100),
+      },
+      () => handler({
+        action: 'propose',
+        plan: {
+          tool: 'composio_execute_tool',
+          composioSlug: 'GOOGLESHEETS_BATCH_UPDATE',
+          sideEffect: 'write',
+          objective: 'update three reviewed rows in the pinned spreadsheet',
+          items: [
+            { id: 'row-1', args: JSON.stringify({ spreadsheet_id: 'sheet-proof', range: 'A1:B1', values: [['a', 1]] }) },
+            { id: 'row-2', args: JSON.stringify({ spreadsheet_id: 'sheet-proof', range: 'A2:B2', values: [['b', 2]] }) },
+            { id: 'row-3', args: JSON.stringify({ spreadsheet_id: 'sheet-proof', range: 'A3:B3', values: [['c', 3]] }) },
+          ],
+        },
+      }),
+    ),
+  ) as ToolResult;
+
+  assert.match(res.content[0].text, /exactly one approval card/);
+  const [record] = listPendingActions({ sessionId, status: 'all' });
+  assert.equal(record.kind, 'external_write');
+  const [edge] = listEvents(sessionId, { types: ['autonomy_note'] }).filter(
+    (event) => event.data.kind === 'pending_action_queued',
+  );
+  assert.ok(edge);
+  assert.equal(edge.data.approvalRequired, true);
+  assert.equal(edge.data.autoMaterialize, true);
 });
 
 test('run_batch execute atomically consumes approval: concurrent calls start one batch and retries stay inert', async () => {
+  createSession({ id: 'sess-batch-concurrent', kind: 'chat' });
   const pending = queuePendingAction({
     title: 'Concurrent approved batch',
     summary: 'prove one approved plan is consumed exactly once',
@@ -103,10 +218,7 @@ test('run_batch execute atomically consumes approval: concurrent calls start one
     sessionId: 'sess-batch-concurrent',
     createdBy: 'test',
   });
-  markPendingActionApprovalResolved(pending.id, 'approved', null, {
-    by: 'policy',
-    evidence: { kind: 'policy', scope: 'test-approved-write' },
-  });
+  approveExactPendingAction(pending, 'approve concurrent batch');
 
   let runCount = 0;
   _setBatchPlanRunnerForTests(async (plan, sessionId) => {
@@ -149,5 +261,111 @@ test('run_batch execute atomically consumes approval: concurrent calls start one
   const retry = await invoke();
   assert.equal(runCount, 1, 'executed retry never starts the runner again');
   assert.match(retry.content[0].text, /already executed|no second batch/i);
+  _setBatchPlanRunnerForTests(null);
+});
+
+test('run_batch refuses a stored plan changed after approval before starting the runner', async () => {
+  const sessionId = 'sess-batch-tamper';
+  createSession({ id: sessionId, kind: 'chat' });
+  const pending = queuePendingAction({
+    title: 'Approved exact batch',
+    summary: 'Only the reviewed record may be written.',
+    kind: 'external_write',
+    toolName: 'run_batch',
+    payload: {
+      tool: 'proof__write_record',
+      sideEffect: 'write',
+      objective: 'write one reviewed record',
+      items: [{ id: 'reviewed', args: { value: 'approved' } }],
+    },
+    sessionId,
+    createdBy: 'test',
+  });
+  approveExactPendingAction(pending, 'approve tamper-proof batch');
+  const file = path.join(TMP_HOME, 'pending-actions', `${pending.id}.json`);
+  const tampered = JSON.parse(readFileSync(file, 'utf8')) as { payload: Record<string, unknown> };
+  tampered.payload = {
+    ...(tampered.payload as Record<string, unknown>),
+    items: [{ id: 'swapped', args: { value: 'changed-after-approval' } }],
+  };
+  writeFileSync(file, JSON.stringify(tampered), 'utf8');
+
+  let runCount = 0;
+  _setBatchPlanRunnerForTests(async () => {
+    runCount += 1;
+    throw new Error('must never run');
+  });
+  const result = await withToolOutputContext(
+    { sessionId },
+    () => batchHandler()({ action: 'execute', pending_action_id: pending.id }),
+  ) as ToolResult;
+
+  assert.equal(runCount, 0, 'tampered approved batch never reaches the runner');
+  assert.match(result.content[0].text, /integrity|payload hash|changed after approval|failed or uncertain|already failed/i);
+  assert.equal(getPendingAction(pending.id)?.status, 'failed');
+  _setBatchPlanRunnerForTests(null);
+});
+
+test('run_batch execute refuses a foreign session without claiming or dispatching the approved batch', async () => {
+  const ownerSessionId = 'sess-batch-owner';
+  const foreignSessionId = 'sess-batch-foreign';
+  createSession({ id: ownerSessionId, kind: 'chat' });
+  createSession({ id: foreignSessionId, kind: 'chat' });
+  const pending = queuePendingAction({
+    title: 'Owner-bound approved batch',
+    summary: 'prove another chat cannot consume this approved plan',
+    kind: 'external_write',
+    toolName: 'run_batch',
+    payload: {
+      tool: 'proof__write_record',
+      sideEffect: 'write',
+      objective: 'write one owner-bound proof record',
+      items: [{ id: 'owner-proof-1', args: { value: 'once' } }],
+    },
+    sessionId: ownerSessionId,
+    createdBy: 'test',
+  });
+  approveExactPendingAction(pending, 'approve owner-bound batch');
+
+  let runCount = 0;
+  const dispatchedSessionIds: string[] = [];
+  _setBatchPlanRunnerForTests(async (plan, sessionId) => {
+    runCount += 1;
+    dispatchedSessionIds.push(sessionId);
+    return {
+      batchId: 'batch-proof-owner',
+      sessionId,
+      tool: plan.tool,
+      sideEffect: plan.sideEffect,
+      objective: plan.objective,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      total: 1,
+      succeeded: 1,
+      failed: 0,
+      halted: false,
+      outcomes: [{ id: 'owner-proof-1', ok: true, attempts: 1, ms: 1 }],
+    };
+  });
+
+  const handler = batchHandler();
+  const foreign = await withToolOutputContext(
+    { sessionId: foreignSessionId },
+    () => handler({ action: 'execute', pending_action_id: pending.id }),
+  ) as ToolResult;
+
+  assert.match(foreign.content[0].text, /different session|was not executed/i);
+  assert.equal(runCount, 0, 'a foreign session must not cross the batch dispatch boundary');
+  assert.equal(getPendingAction(pending.id)?.status, 'approved', 'foreign execution must not consume the owner approval');
+
+  const owner = await withToolOutputContext(
+    { sessionId: ownerSessionId },
+    () => handler({ action: 'execute', pending_action_id: pending.id }),
+  ) as ToolResult;
+
+  assert.match(owner.content[0].text, /batch-proof-owner/);
+  assert.equal(runCount, 1, 'the owning session can still consume the approved batch once');
+  assert.deepEqual(dispatchedSessionIds, [ownerSessionId], 'the ledger and dispatch retain the owner session');
+  assert.equal(getPendingAction(pending.id)?.status, 'executed');
   _setBatchPlanRunnerForTests(null);
 });

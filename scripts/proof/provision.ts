@@ -327,8 +327,12 @@ function createProofRailwayShim(home: string): string {
 
 /** A local-only Composio lane for capability recovery proofs. It begins
  * unauthenticated. Creating $HOME/proof-composio-connected makes `whoami` and
- * `execute` succeed; every execute appends only its slug to a proof-local log. */
-function createProofComposioShim(home: string): void {
+ * `execute` succeed. Every execute keeps the legacy slug-only log and also
+ * appends `<slug> TAB <raw -d argument>` to a proof-local payload log. The
+ * latter is deliberately written by the provider shim, not inferred from
+ * harness telemetry, so an exact-once proof can compare the bytes that actually
+ * crossed the last local dispatch boundary without reaching a real account. */
+export function createProofComposioShim(home: string): void {
   const bin = path.join(home, 'proof-bin');
   mkdirSync(bin, { recursive: true });
   const shim = path.join(bin, process.platform === 'win32' ? 'composio.cmd' : 'composio');
@@ -344,6 +348,7 @@ function createProofComposioShim(home: string): void {
         'if "%1"=="execute" (',
         '  if not exist "%HOME%\\proof-composio-connected" (echo 401 Unauthorized. 1>&2& exit /b 1)',
         '  echo %2>>"%HOME%\\proof-composio-dispatches.log"',
+        '  echo %2	%4>>"%HOME%\\proof-composio-payloads.log"',
         '  if "%2"=="PROOF_SOCIAL_CONTENT_PLAN" (echo {"successful":true,"data":[{"sourceMarker":"SOCIAL_SOURCE:PROOF_ONLY","brand":"Juniper Vale Coffee","handle":"@junipervale","campaign":"Rainy Day Roast","offer":"Complimentary oat-milk upgrade on August 14","hashtag":"#RainyDayRoast"}]}& exit /b 0)',
         '  echo {"successful":true,"data":{"proof":true,"receipt":"proof-cli-1"}}',
         '  exit /b 0',
@@ -356,6 +361,7 @@ function createProofComposioShim(home: string): void {
         '#!/bin/sh',
         'state="${HOME}/proof-composio-connected"',
         'dispatch_log="${HOME}/proof-composio-dispatches.log"',
+        'payload_log="${HOME}/proof-composio-payloads.log"',
         'case "$1" in',
         '  --version) printf "%s\\n" "composio-proof 1.0"; exit 0 ;;',
         '  whoami)',
@@ -366,6 +372,7 @@ function createProofComposioShim(home: string): void {
         '  execute)',
         '    if [ ! -f "$state" ]; then printf "%s\\n" "401 Unauthorized." >&2; exit 1; fi',
         '    printf "%s\\n" "$2" >> "$dispatch_log"',
+        '    printf "%s\\t%s\\n" "$2" "$4" >> "$payload_log"',
         '    if [ "$2" = "PROOF_SOCIAL_CONTENT_PLAN" ]; then',
         '      printf "%s\\n" \'{"successful":true,"data":[{"sourceMarker":"SOCIAL_SOURCE:PROOF_ONLY","brand":"Juniper Vale Coffee","handle":"@junipervale","campaign":"Rainy Day Roast","offer":"Complimentary oat-milk upgrade on August 14","hashtag":"#RainyDayRoast"}]}\'',
         '      exit 0',

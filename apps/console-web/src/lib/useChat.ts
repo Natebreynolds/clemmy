@@ -11,6 +11,7 @@ import {
   type StreamHandle,
 } from './chat';
 import { apiGet, type ApiError } from './api';
+import { getPendingActionStatus } from './pendingActions';
 import { humanToolLabel, salientArgDetail, describeExternalWrite } from './toolLabels';
 import type { ChatPostResult, HarnessEvent, PendingActionApprovalView } from './types';
 
@@ -52,7 +53,13 @@ export interface ChatMessage {
   /** Live, accumulated tool calls + spawned agents for THIS turn — the premium
    *  "watch the team work" strip (vs. a single rolling label). */
   activity?: ActivityItem[];
-  approval?: { subject: string; reason?: string; approvalId?: string | null; pendingAction?: PendingActionApprovalView };
+  approval?: {
+    subject: string;
+    reason?: string;
+    approvalId?: string | null;
+    pendingActionId?: string;
+    pendingAction?: PendingActionApprovalView;
+  };
   planProposalId?: string;
   attachmentNames?: string[];
   /** The durable work item behind a report-back message (background task /
@@ -85,6 +92,8 @@ export function appendLiveApprovalCard(
 ): ChatMessage[] {
   const d = (event.data ?? {}) as Record<string, unknown>;
   const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
+  const pendingActionId = pendingActionIdFromApprovalEvent(d);
+  const pendingAction = pendingActionFromEvent(d.pendingAction);
   const id = `approval-${approvalId ?? event.seq}`;
   if (messages.some((message) => message.id === id
     || (!!approvalId && message.approval?.approvalId === approvalId))) {
@@ -101,7 +110,8 @@ export function appendLiveApprovalCard(
         subject: String(d.subject ?? d.tool ?? 'this action'),
         reason: typeof d.reason === 'string' ? d.reason : undefined,
         approvalId,
-        pendingAction: pendingActionFromEvent(d.pendingAction),
+        ...(pendingActionId ? { pendingActionId } : {}),
+        ...(pendingAction ? { pendingAction } : {}),
       },
     },
   ];
@@ -551,6 +561,58 @@ export function pendingActionFromEvent(value: unknown): PendingActionApprovalVie
   };
 }
 
+/** Slim workflow/background approval events intentionally carry only the
+ * durable pending-action id. Keep it so the console can hydrate the exact
+ * target/risk/payload from the authenticated read endpoint. */
+export function pendingActionIdFromApprovalEvent(
+  data: Record<string, unknown>,
+): string | undefined {
+  const direct = data.pendingActionId ?? data.pending_action_id;
+  if (typeof direct === 'string' && direct.trim()) return direct.trim();
+  const embedded = data.pendingAction;
+  if (embedded && typeof embedded === 'object' && !Array.isArray(embedded)) {
+    const id = (embedded as Record<string, unknown>).id;
+    if (typeof id === 'string' && id.trim()) return id.trim();
+  }
+  let args = data.args;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args) as unknown; } catch { args = null; }
+  }
+  if (args && typeof args === 'object' && !Array.isArray(args)) {
+    const record = args as Record<string, unknown>;
+    const id = record.pendingActionId ?? record.pending_action_id;
+    if (typeof id === 'string' && id.trim()) return id.trim();
+  }
+  return undefined;
+}
+
+/** Apply one durable hydration result to every live/replayed card for the same
+ * action. A crash-repaired stream can contain more than one card referencing
+ * that id; one read must not leave the later card generic merely because the
+ * first card owned the in-flight request. */
+export function mergePendingActionHydration(
+  messages: readonly ChatMessage[],
+  pendingActionId: string,
+  pendingAction: PendingActionApprovalView,
+): ChatMessage[] {
+  let changed = false;
+  const next = messages.map((message) => {
+    if (
+      message.approval?.pendingActionId !== pendingActionId
+      || message.approval.pendingAction
+    ) return message;
+    changed = true;
+    return {
+      ...message,
+      approval: {
+        ...message.approval,
+        pendingAction,
+      },
+    };
+  });
+  return changed ? next : messages as ChatMessage[];
+}
+
 export interface UseChatOptions {
   /** Resume an existing harness session (its turns post back to this id). */
   initialSessionId?: string | null;
@@ -570,10 +632,46 @@ export function useChat(options?: UseChatOptions) {
   const activeRunRef = useRef<ChatPostResult | null>(null);
   const pendingBackgroundRef = useRef<{ assistantId: string } | null>(null);
   const backgroundInFlightRef = useRef(false);
+  const pendingActionHydrationsRef = useRef(new Set<string>());
 
   const patch = useCallback((id: string, fields: Partial<ChatMessage>) => {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...fields } : m)));
   }, []);
+
+  // Workflow/background approval events stay small and reference the durable
+  // action by id. Hydrate those cards asynchronously so live and reopened
+  // conversations show the same exact target, risk, preview, and payload.
+  useEffect(() => {
+    const missingIds = new Set(
+      messages
+        .filter((message) => (
+          message.approval?.pendingActionId
+          && !message.approval.pendingAction
+        ))
+        .map((message) => message.approval!.pendingActionId!),
+    );
+    for (const pendingActionId of missingIds) {
+      if (pendingActionHydrationsRef.current.has(pendingActionId)) continue;
+      pendingActionHydrationsRef.current.add(pendingActionId);
+      void getPendingActionStatus(pendingActionId)
+        .then((snapshot) => {
+          const pendingAction = pendingActionFromEvent(snapshot.pendingAction);
+          if (!pendingAction) return;
+          setMessages((current) => mergePendingActionHydration(
+            current,
+            pendingActionId,
+            pendingAction,
+          ));
+        })
+        .catch(() => {
+          // The next relevant state change may retry; the approval stays
+          // actionable but never invents details when hydration is unavailable.
+        })
+        .finally(() => {
+          pendingActionHydrationsRef.current.delete(pendingActionId);
+        });
+    }
+  }, [messages]);
 
   // ── Idle report-back inbox (v2.3.1) ──────────────────────────────────────
   // THE desktop gap (live, repeatedly): a workflow/background run finishes and
@@ -1060,6 +1158,8 @@ export function inboxAdditionsFromEvents(
       });
     } else if (ev.type === 'approval_requested') {
       const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
+      const pendingActionId = pendingActionIdFromApprovalEvent(d);
+      const pendingAction = pendingActionFromEvent(d.pendingAction);
       additions.push({
         id: `inbox-${ev.seq}`,
         role: 'assistant',
@@ -1069,7 +1169,8 @@ export function inboxAdditionsFromEvents(
           subject: String(d.subject ?? d.tool ?? 'this action'),
           reason: typeof d.reason === 'string' ? d.reason : undefined,
           approvalId,
-          pendingAction: pendingActionFromEvent(d.pendingAction),
+          ...(pendingActionId ? { pendingActionId } : {}),
+          ...(pendingAction ? { pendingAction } : {}),
         },
       });
     }

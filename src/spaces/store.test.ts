@@ -201,6 +201,40 @@ test('buildSpaceHealthSnapshot surfaces failed data-source refresh metadata', ()
   assert.ok(health.issues.some((issue) => /runner produced no output/.test(issue)));
 });
 
+test('buildSpaceHealthSnapshot surfaces pending pinned-entrypoint approval without calling it a refresh failure', () => {
+  const slug = 'health-awaiting-runner-approval';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Health Awaiting Runner Approval',
+    dataSources: [{ id: 'pull', runner: 'refresh.mjs' }],
+  });
+  const viewFile = store.resolveInSpace(slug, 'view/index.html');
+  mkdirSync(path.dirname(viewFile), { recursive: true });
+  writeFileSync(viewFile, '<html>awaiting approval</html>', 'utf-8');
+  const scriptDir = store.resolveInSpace(slug, 'data');
+  mkdirSync(scriptDir, { recursive: true });
+  writeFileSync(path.join(scriptDir, 'refresh.mjs'), 'process.stdout.write("{}")', 'utf-8');
+  data.writeData(slug, {
+    pull: [{ id: 'last-known-good' }],
+    _meta: {
+      pull: {
+        refreshedAt: '2026-06-09T00:01:00.000Z',
+        ok: null,
+        status: 'awaiting_approval',
+        approvalId: 'apr-exact-runner',
+      },
+    },
+  });
+  const rec = store.spaceStore.update(slug, { lastRefreshedAt: '2026-06-09T00:00:00.000Z' })!;
+
+  const health = store.buildSpaceHealthSnapshot(rec, { now: Date.parse('2026-06-09T00:02:00.000Z') });
+
+  assert.equal(health.freshness.state, 'fresh');
+  assert.ok(health.issues.some((issue) =>
+    /data source "pull" is awaiting pinned-entrypoint approval.*apr-exact-runner/.test(issue)));
+  assert.equal(health.issues.some((issue) => /last refresh failed/.test(issue)), false);
+});
+
 test('archive hides from default list; includeArchived shows it; remove deletes dir', () => {
   store.spaceStore.save({ id: 'gone', title: 'Gone' });
   store.spaceStore.archive('gone');

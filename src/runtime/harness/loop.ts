@@ -86,6 +86,11 @@ import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } f
 import * as approvalRegistry from './approval-registry.js';
 import { approvalAuthorityMatchesToolCall, exactApprovalAuthorityMatches } from './approval-authority.js';
 import { pendingActionApprovalViewFromArgs } from './pending-action-view.js';
+import {
+  isQueuedActionApprovalQuestion,
+  materializeQueuedApprovals,
+  queuedApprovalTransitionsForRequest,
+} from './pending-action-transition.js';
 import { actionBus } from '../action-bus.js';
 import { addNotification } from '../notifications.js';
 import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../auth-store.js';
@@ -3457,6 +3462,47 @@ async function runConversationCore(
         },
       });
       decision.nextAction = 'awaiting_user_input';
+    }
+    const queuedApprovalTransitions = queuedApprovalTransitionsForRequest(
+      options.sessionId,
+      activeSourceUserSeq,
+    );
+    const approvalText = decision.reply || decision.summary;
+    const approvalQuestion = isQueuedActionApprovalQuestion(approvalText)
+      || (
+        decision.nextAction === 'awaiting_approval'
+        && !isDirectionSeekingQuestion(approvalText)
+      );
+    const eligibleQueuedApprovalTransitions = queuedApprovalTransitions.filter(
+      (transition) => transition.autoMaterialize || approvalQuestion,
+    );
+    if (eligibleQueuedApprovalTransitions.length > 0 && activeSourceUserSeq) {
+      const materialized = materializeQueuedApprovals(
+        options.sessionId,
+        turnResult.turn,
+        activeSourceUserSeq,
+        eligibleQueuedApprovalTransitions,
+      );
+      for (const item of materialized) {
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'heartbeat',
+          data: {
+            kind: 'pending_action_transition_materialized',
+            pendingActionId: item.transition.record.id,
+            approvalId: item.approval.approvalId,
+            sourceEventSeq: item.transition.eventSeq,
+            autoMaterialize: item.transition.autoMaterialize,
+            message: 'Materialized the exact queued-action approval edge without another model turn.',
+          },
+        });
+      }
+      if (materialized.length > 0) {
+        decision.done = false;
+        decision.nextAction = 'awaiting_approval';
+      }
     }
     // Done-invariant guardrail (Done? node). `done` and `nextAction` are
     // INDEPENDENT schema fields, so the model can emit the contradiction
@@ -8086,6 +8132,22 @@ function structuredOutputRecoveryText(
     ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
 }
 
+/**
+ * Fusion emits synthetic keepalives while its private draft/checker work is
+ * pending so clients can keep showing a live run. They are visibility only:
+ * treating them as semantic model progress lets a wedged Fusion branch evade
+ * the ordinary stream-stall watchdog forever.
+ */
+function isFusionVisibilityHeartbeat(event: unknown): boolean {
+  const ev = event as {
+    type?: unknown;
+    data?: { type?: unknown; event?: { type?: unknown } };
+  };
+  return ev.type === 'raw_model_stream_event'
+    && ev.data?.type === 'model'
+    && ev.data.event?.type === 'debate.keepalive';
+}
+
 const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   type StreamedResultLike = {
     history: AgentInputItem[];
@@ -8173,7 +8235,9 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     const drain = (async () => {
       if (iterable) {
         for await (const event of myResult as unknown as AsyncIterable<unknown>) {
-          lastEventAt = Date.now();
+          // Every real Runner/model/tool event remains activity. Fusion's
+          // synthetic UI heartbeat alone must not extend the liveness window.
+          if (!isFusionVisibilityHeartbeat(event)) lastEventAt = Date.now();
           const ev = event as { type?: string; data?: { type?: string; delta?: string } };
           // Content or tool activity flips us past the pre-content window.
           if (ev.type === 'run_item_stream_event' || (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta')) {

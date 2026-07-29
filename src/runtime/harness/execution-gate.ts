@@ -194,6 +194,19 @@ interface CanonicalExternalAction {
   external: boolean;
 }
 
+export interface CanonicalExternalEffect {
+  /** Canonical provider action after every known transport wrapper is removed. */
+  action?: string;
+  /** Whether the call crosses a provider/external boundary. */
+  external: boolean;
+  /** Whether the canonical action can change external state. */
+  mutating: boolean;
+  /** Whether the canonical action sends/publishes something irreversible. */
+  irreversible: boolean;
+  /** False for an external mutation whose effect vocabulary is not understood. */
+  classificationKnown: boolean;
+}
+
 function decodedArgs(rawArgs: unknown): unknown {
   if (typeof rawArgs !== 'string') return rawArgs;
   const trimmed = rawArgs.trim();
@@ -276,19 +289,36 @@ function documentedReadOnlyExternalAction(action: string): boolean {
 }
 
 /** One shared effect classifier after transport normalization. */
-function canonicalExternalActionIsWrite(action: string | undefined): boolean {
+function canonicalExternalActionWriteClassification(action: string | undefined): {
+  mutating: boolean;
+  classificationKnown: boolean;
+} {
   // A known external carrier with no usable action identity is not provably a
   // read. This is the safety boundary: malformed wrappers and newly introduced
   // mutation verbs cannot bypass execution wrapping.
-  if (!action) return true;
-  const normalized = action.toUpperCase();
-  if (documentedReadOnlyExternalAction(normalized)) return false;
-  for (const pattern of EXEMPT_COMPOSIO_SLUG_PATTERNS) {
-    if (pattern.test(normalized)) return false;
+  if (!action) return { mutating: true, classificationKnown: false };
+  const normalized = action
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toUpperCase();
+  if (documentedReadOnlyExternalAction(normalized)) {
+    return { mutating: false, classificationKnown: true };
   }
-  if (composioSlugIsReadOnly(normalized)) return false;
-  if (isReadOnlyCallAction(normalized)) return false;
-  return true;
+  for (const pattern of EXEMPT_COMPOSIO_SLUG_PATTERNS) {
+    if (pattern.test(normalized)) return { mutating: false, classificationKnown: true };
+  }
+  if (composioSlugIsReadOnly(normalized) || isReadOnlyCallAction(normalized)) {
+    return { mutating: false, classificationKnown: true };
+  }
+  const parts = normalized
+    .split(/[^A-Z0-9]+/)
+    .filter(Boolean);
+  const knownMutation = parts.some((part) => MUTATING_VERBS.has(part))
+    || isIrreversibleSendSlug(action);
+  return { mutating: true, classificationKnown: knownMutation };
+}
+
+function canonicalExternalActionIsWrite(action: string | undefined): boolean {
+  return canonicalExternalActionWriteClassification(action).mutating;
 }
 
 /** THE canonical "is this an irreversible external send" predicate — the one
@@ -323,6 +353,45 @@ export function isMutatingExternalWrite(
   return canonical.external
     ? canonicalExternalActionIsWrite(canonical.action)
     : false;
+}
+
+/**
+ * Canonical external-effect classifier shared by every gate. It unwraps
+ * deferred call_tool, Composio, dynamic cx_ tools, and native MCP namespaces
+ * exactly once, so mutation and irreversibility cannot disagree by transport.
+ */
+export function classifyCanonicalExternalEffect(
+  toolName: string,
+  rawArgs: unknown,
+): CanonicalExternalEffect {
+  if (EXEMPT_TOOL_NAMES.has(mcpToolTail(toolName))) {
+    return {
+      external: false,
+      mutating: false,
+      irreversible: false,
+      classificationKnown: true,
+    };
+  }
+  const canonical = canonicalExternalAction(toolName, rawArgs);
+  if (!canonical.external) {
+    return {
+      external: false,
+      mutating: false,
+      irreversible: false,
+      classificationKnown: true,
+    };
+  }
+  const write = canonicalExternalActionWriteClassification(canonical.action);
+  const irreversible = canonical.action
+    ? isIrreversibleSendSlug(canonical.action)
+    : false;
+  return {
+    ...(canonical.action ? { action: canonical.action } : {}),
+    external: true,
+    mutating: write.mutating,
+    irreversible,
+    classificationKnown: write.classificationKnown || irreversible,
+  };
 }
 
 /**

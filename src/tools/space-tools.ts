@@ -25,7 +25,7 @@ import {
 import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
-import { refreshSpaceData, runScript } from '../spaces/runner.js';
+import { refreshSpaceData } from '../spaces/runner.js';
 import { readData, writeData, listNotes, listAudit, appendNote, appendAudit } from '../spaces/data-store.js';
 import { buildPublishSnapshot } from '../spaces/publish.js';
 import { mismatchHint } from '../shared/edit-mismatch.js';
@@ -78,9 +78,9 @@ function readAgentOwnedFile(
 
 const dataSourceShape = z.object({
   id: z.string().min(1).max(60).describe('Stable id for this data source within the workspace, e.g. "daily_pull".'),
-  runner: z.string().max(120).nullish().describe('Installed filename for a deterministic script (e.g. "refresh.mjs") that prints JSON to stdout. Use runner_path to install a newly-authored script in the same space_save call. Mutually exclusive with composio_slug.'),
-  runner_path: z.string().max(1000).nullish().describe(`Optional source path to the runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
-  composio_slug: z.string().max(120).nullish().describe('A Composio tool slug to call server-side for data (credentials resolve server-side, never in the view). Mutually exclusive with runner.'),
+  runner: z.string().max(120).nullish().describe('Legacy compatibility only: an already-installed source may preserve its runner filename, but new runner data sources are refused. Existing runner entrypoint bytes need a time-bounded pinned-entrypoint approval before refresh; live helpers, packages, CLIs, local files, auth, and network stay outside the digest. Use composio_slug for new sources.'),
+  runner_path: z.string().max(1000).nullish().describe('Legacy compatibility only: may update the file of an existing runner-backed source, which invalidates its prior entrypoint grant and requires a fresh pinned-entrypoint approval. New data-source runner installation is refused.'),
+  composio_slug: z.string().max(120).nullish().describe('A PROVABLY READ-ONLY Composio tool slug (GET/LIST/SEARCH/FETCH/READ) to call server-side for data. Writes, unknown actions, and runners are refused; credentials resolve server-side, never in the view.'),
   composio_args_json: z.string().max(4000).nullish().describe('JSON string of frozen args for composio_slug.'),
   allow_empty: z.boolean().nullish().describe('Set true only when zero rows is an intentional valid product state (for example a brand-new content calendar). The creation smoke will still run, but will not mislabel that expected empty state as broken.'),
   schedule: z.string().max(60).nullish().describe('Optional 5-field cron for an automatic daily/periodic refresh — LIVE: the in-process scheduler runs it server-side (and harvests _reengage from the output). Omit for on-demand only.'),
@@ -299,11 +299,11 @@ export function registerSpaceTools(server: McpServer): void {
       'The view calls same-origin data routes the user opens in the desktop: GET /api/console/spaces/<slug>/data, POST /api/console/spaces/<slug>/notes. It can call any /api endpoint (it inherits the session).',
       'A helper `clem` is auto-injected into every served view. For declared data, PREFER `const data = await clem.data()` and read the exact declared id as `data["<sourceId>"]`; `await clem.refresh(sourceId?)` also returns `{ results, data }`. Legacy placeholders such as `{{tasks}}` are NOT expanded and embedded seeds are static. Existing absolute `/api/console/spaces/<slug>/data` views remain supported through the same scoped RPC bridge. Also available: `await clem.compose(instructions, context)` → a grounded draft; `await clem.action(actionId, args)`; `await clem.note(text, kind?, meta?)`.',
       'APPROVAL CONTRACT: an action that SENDS or writes to an external system takes ONE user approval before it fires — for those `clem.action()` returns {pending:true, approvalId} (it surfaces in the user\'s inbox/board and runs when approved); a read-only action returns {ok:true, result} immediately. Build the view to show a "waiting for approval" state on a pending result — never tell the user it sent until it actually ran.',
-      'Optionally declare data_sources (a deterministic script that prints JSON, or a Composio op) so the workspace can refresh its data server-side without spending tokens. For a new script, write it anywhere inside the Clementine home and pass that file as runner_path in the SAME space_save call; space_save installs it. Do not pre-create or guess the hidden Workspace data/ directory.',
-      'RUNNER CONTRACT (when a data source is a script — .mjs/.js/.ts/.py/.sh): it runs SERVER-SIDE with NO LLM and a SCRUBBED env (PATH/HOME/locale only — NO API keys or daemon secrets). It receives a JSON payload on stdin and MUST print the dataset as JSON to stdout and NOTHING else (a stray console.log/print corrupts the parse). Exit non-zero on failure. Use only language built-ins + (node) global fetch — there is NO node_modules, so no npm imports. It MAY shell out to CLIs on PATH (e.g. `sf`, `gh`), which read their own auth from $HOME. For anything that needs a secret/OAuth, declare a Composio op (composio_slug) instead of a runner. The view reads each source at data["<sourceId>"] from GET /api/console/spaces/<slug>/data.',
-      'PROACTIVE WAKE (optional): a SCHEDULED runner can ping the user when something crosses a threshold — include `_reengage: { fire: true, message: "<what changed>", key: "<stable-condition-id>" }` in its JSON output. The scheduler fires a re-engage when `fire` is true and dedups by `key` (a persistent condition pings ONCE, not every refresh; it can re-fire after the condition clears). Requires reengage_triggers to include "threshold"; omit `_reengage` (or set fire:false) when nothing is notable.',
+      'Optionally declare NEW data_sources as PROVABLY READ-ONLY Composio operations so the workspace can refresh server-side without spending tokens. Only GET/LIST/SEARCH/FETCH/READ-class actions are accepted. Unknown or mutating slugs and new arbitrary runner scripts are refused.',
+      'Compatibility: an already-installed runner-backed data source may retain the same source id + filename. Its first refresh requests one time-bounded human approval bound to the runner entrypoint hash + schedule; entrypoint edits invalidate that grant. Helpers, packages, CLIs, local files, auth state, and network services remain live outside the digest, so this is not a read-only sandbox. Prefer migrating it to read-only Composio. Executable ACTION runners remain per-invocation approval-gated under the same pinned-entrypoint boundary.',
+      'PROACTIVE WAKE (optional): a scheduled read-only source can be paired with threshold re-engagement guidance; the scheduler dedups a persistent condition so it does not ping on every refresh.',
       'OPERATING CONTRACT: persist the Workspace\'s user-owned objective, concrete success criteria, and semantic invariants (things later edits/refreshes must never drift). This is a compact north star, not a procedure or an extra judge. Omit fields on later saves to preserve them.',
-      'Changing a data source (or editing its runner file) auto-refreshes on save and reports the row count, so you can confirm the new data before telling the user it is done.',
+      'Changing a Composio data source auto-refreshes on save and reports the row count. Editing an installed legacy runner requests fresh pinned-entrypoint approval and leaves the Workspace active with its prior dataset until approved.',
       'Returns the workspace URL and a summary. The prior view is snapshotted for one-click revert.',
     ].join('\n'),
     {
@@ -377,6 +377,7 @@ export function registerSpaceTools(server: McpServer): void {
         actions: actList,
         status: existing?.status,
         availableRunnerFiles: new Set(runnerSources.keys()),
+        existingDataSources: existing?.dataSources,
       });
       if (!prep.ok) {
         return textResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${prep.errors.join('\n- ')}`);
@@ -526,13 +527,19 @@ export function registerSpaceTools(server: McpServer): void {
         // Per-source refresh outcome (row counts) so a data edit is never reported
         // "done" while the surface still shows stale rows.
         const failedIds = new Set(smoke.failed.map((f) => f.id));
+        const awaitingApprovalIds = new Set(smoke.awaitingApproval.map((item) => item.id));
         const dataNow = (() => { try { return readData(slug) as Record<string, unknown>; } catch { return {}; } })();
         const refreshed = record.dataSources
-          .filter((s) => !failedIds.has(s.id))
+          .filter((s) => !failedIds.has(s.id) && !awaitingApprovalIds.has(s.id))
           .map((s) => { const n = countRows(dataNow?.[s.id]); return `${s.id} (${n == null ? 'ok' : `${n} row${n === 1 ? '' : 's'}`})`; });
         if (refreshed.length > 0) parts.push(`Data refreshed: ${refreshed.join(', ')}.`);
         if (smoke.failed.length > 0) {
           parts.push(`Creation smoke PARKED this Workspace as PAUSED — fix and re-save:\n- ${smoke.failed.map((f) => `source "${f.id}": ${f.error}`).join('\n- ')}`);
+        }
+        if (smoke.awaitingApproval.length > 0) {
+          parts.push(
+            `Legacy data refresh is waiting for your pinned-entrypoint approval (the Workspace stays active): ${smoke.awaitingApproval.map((item) => `${item.id} · ${item.approvalId}`).join(', ')}.`,
+          );
         }
         if (smoke.actionWarnings.length > 0) parts.push(smoke.actionWarnings.map((w) => `- ${w}`).join('\n'));
         if (parts.length > 0) smokeNote = `\n\n${parts.join('\n\n')}`;
@@ -673,13 +680,27 @@ export function registerSpaceTools(server: McpServer): void {
       const results = await refreshSpaceData(slug, source_id?.trim() || undefined);
       const dataNow = (() => { try { return readData(slug) as Record<string, unknown>; } catch { return {}; } })();
       const lines = results.map((r) => {
+        if (r.pendingApprovalId) {
+          return `- ${r.sourceId}: AWAITING APPROVAL (${r.pendingApprovalId}) — runner not executed; approve it, then call space_refresh once.`;
+        }
         if (!r.ok) return `- ${r.sourceId}: FAILED — ${r.error}`;
         const n = countRows(dataNow?.[r.sourceId]);
         return `- ${r.sourceId}: ok${n == null ? '' : ` (${n} row${n === 1 ? '' : 's'})`}`;
       });
       const anyOk = results.some((r) => r.ok);
       const allOk = results.every((r) => r.ok);
-      return textResult(`${allOk ? 'Refreshed' : anyOk ? 'Partially refreshed' : 'Refresh failed for'} "${slug}":\n${lines.join('\n')}`);
+      const pendingCount = results.filter((r) => r.pendingApprovalId).length;
+      const hardFailureCount = results.filter((r) => !r.ok && !r.pendingApprovalId).length;
+      const heading = allOk
+        ? 'Refreshed'
+        : anyOk
+          ? 'Partially refreshed'
+          : pendingCount > 0 && hardFailureCount === 0
+            ? 'Refresh awaiting approval for'
+            : pendingCount > 0
+              ? 'Refresh incomplete for'
+              : 'Refresh failed for';
+      return textResult(`${heading} "${slug}":\n${lines.join('\n')}`);
     },
   );
 
@@ -828,7 +849,7 @@ export function registerSpaceTools(server: McpServer): void {
     [
       "Make a TARGETED, reversible edit to a Workspace runner's SOURCE — FAST, for changing what/how a runner pulls (a query, a field, a filter, a data source). Use this instead of rewriting the whole file.",
       'Provide runner_path + one or more {find, replace}; each `find` must appear VERBATIM in the current runner — call space_get_runner first to read the exact text. It snapshots the prior source (revert with space_revert_runner) before writing.',
-      'If the runner backs a DATA SOURCE, the data is re-pulled + the new row count reported; if it backs an ACTION, nothing is auto-run (no side effect) — dry-run it with space_try_runner. Reserve write_file + space_save for a full rewrite.',
+      'If the runner backs an installed DATA SOURCE, editing its entrypoint invalidates the prior pinned-entrypoint grant; space_refresh will request one fresh time-bounded approval before the new bytes can run. Helpers, packages, CLIs, local files, auth, and network remain live outside that digest. New data sources must use a provably read-only Composio source. If it backs an ACTION, test it only through the normal Workspace action + approval path. Reserve write_file + space_save for a full rewrite.',
     ].join('\n'),
     {
       slug: z.string().min(2).max(63).describe('The workspace slug.'),
@@ -892,12 +913,14 @@ export function registerSpaceTools(server: McpServer): void {
         try {
           const results = await refreshSpaceData(slug, backedSources[0].id);
           const r = results.find((x) => x.sourceId === backedSources[0].id) ?? results[0];
-          refreshNote = r && r.ok
-            ? `\nRe-pulled data source "${backedSources[0].id}" — the open Workspace auto-refreshes.`
-            : `\n⚠️ Re-pull of "${backedSources[0].id}" FAILED: ${r?.error ?? 'unknown'} (the edit saved; fix it and call space_refresh, or space_revert_runner).`;
+          refreshNote = r?.pendingApprovalId
+            ? `\nThe changed runner was NOT executed. Pinned-entrypoint approval ${r.pendingApprovalId} is waiting; after approval, call space_refresh once to pull the new data.`
+            : r && r.ok
+              ? `\nRe-pulled data source "${backedSources[0].id}" — the open Workspace auto-refreshes.`
+              : `\n⚠️ Re-pull of "${backedSources[0].id}" FAILED: ${r?.error ?? 'unknown'} (the edit saved; fix it and call space_refresh, or space_revert_runner).`;
         } catch (err) { refreshNote = `\n⚠️ Re-pull failed: ${(err as Error).message} (edit saved).`; }
       } else if (backedActions.length > 0) {
-        refreshNote = `\nThis runner backs action "${backedActions[0].label ?? backedActions[0].id}" — not auto-run (no side effect). Dry-run with space_try_runner('${slug}', '${runner}').`;
+        refreshNote = `\nThis runner backs action "${backedActions[0].label ?? backedActions[0].id}" — not auto-run. Invoke the Workspace action normally so its human approval and durable receipt stay intact.`;
       }
       const revertNote = backedUp ? ` Revert with space_revert_runner('${slug}', '${runner}').` : ' (backup unavailable — not reversible.)';
       return textResult(`Applied ${applied} edit${applied === 1 ? '' : 's'} to "data/${runner}".${revertNote}${refreshNote}${detail}`);
@@ -931,7 +954,17 @@ export function registerSpaceTools(server: McpServer): void {
       const backedSources = rec.dataSources.filter((d) => d.runner === runner);
       let refreshNote = '';
       if (backedSources.length > 0) {
-        try { await refreshSpaceData(slug, backedSources[0].id); refreshNote = ` Re-pulled "${backedSources[0].id}".`; } catch { /* ignore */ }
+        try {
+          const results = await refreshSpaceData(slug, backedSources[0].id);
+          const result = results.find((entry) => entry.sourceId === backedSources[0].id) ?? results[0];
+          refreshNote = result?.pendingApprovalId
+              ? ` Restored entrypoint was NOT executed; pinned-entrypoint approval ${result.pendingApprovalId} is waiting.`
+            : result?.ok
+              ? ` Re-pulled "${backedSources[0].id}".`
+              : ` Re-pull failed: ${result?.error ?? 'unknown error'}.`;
+        } catch (error) {
+          refreshNote = ` Re-pull failed: ${error instanceof Error ? error.message : String(error)}.`;
+        }
       }
       return textResult(`Reverted "data/${runner}" to its pre-edit source.${refreshNote}`);
     },
@@ -940,47 +973,53 @@ export function registerSpaceTools(server: McpServer): void {
   server.tool(
     'space_try_runner',
     [
-      'DRY-RUN a data runner you wrote (a .mjs/.js/.ts/.py/.sh under the workspace data/ dir) and SEE its output — WITHOUT persisting. This is the native, sanctioned replacement for running `node data/x.mjs` in the shell or scribbling a /tmp script: it runs the runner through the SAME scrubbed-env executor a real refresh uses, then returns the row count, the column keys, and the first few rows (or the full error). Iterate here until the shape is right.',
-      'When the output looks correct, call space_refresh(slug, source_id) to actually pull + persist it (or space_set_data for a known inline fix). This tool writes NOTHING to data.json.',
+      'STATICALLY inspect a legacy Workspace runner without executing it. Arbitrary scripts can use network access and authenticated CLIs, so there is no truthful generic "dry run": even when data.json is untouched, the script could mutate an external system.',
+      'This tool verifies the file and reports its declared role/provenance. An installed data runner can continue only after space_refresh creates a pinned-entrypoint, time-bounded human approval. That digest does not freeze helpers, packages, CLIs, local files, auth, or network services and does not make arbitrary code read-only; migrate it to a provably read-only Composio source to remove the compatibility grant. Test action runners only through the normal Workspace action approval path.',
     ].join('\n'),
     {
       slug: z.string().min(2).max(63).describe('The workspace slug.'),
       runner_path: z.string().min(1).max(120).describe('Runner filename under the workspace data/ dir, e.g. "refresh.mjs".'),
-      payload_json: z.string().max(4000).nullable().describe('Optional JSON object merged into the stdin payload (test inputs). Omit to run as a scheduled refresh would.'),
+      payload_json: z.string().max(4000).nullable().describe('Legacy compatibility field. It is validated but never executed because this inspection does not spawn the runner.'),
     },
     async ({ slug, runner_path, payload_json }) => {
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
       const rec = spaceStore.get(slug);
       if (!rec) return textResult(`No workspace named "${slug}".`);
       const runner = runner_path.trim();
-      let extra: Record<string, unknown> | undefined;
+      const filenameError = runnerFilenameError(runner);
+      if (filenameError) return textResult(`Error: ${filenameError}`);
       if (payload_json && payload_json.trim()) {
         let parsed: unknown;
         try { parsed = JSON.parse(payload_json); }
         catch (err) { return textResult(`Error: payload_json is not valid JSON: ${(err as Error).message}`); }
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-          return textResult('Error: payload_json must be a JSON object (it is merged into the stdin payload).');
+          return textResult('Error: payload_json must be a JSON object.');
         }
-        extra = parsed as Record<string, unknown>;
       }
-      const run = await runScript(slug, runner, extra);
-      if (!run.ok) {
-        return textResult(`Dry run of data/${runner} FAILED (nothing persisted):\n${run.error}\n\nFix the runner and call space_try_runner again.`);
+      const file = resolveInSpace(slug, path.join('data', runner));
+      if (!existsSync(file)) {
+        return textResult(`Workspace "${slug}" has no runner "data/${runner}".`);
       }
-      const rows = rowCollection(run.data);
-      const bytes = (() => { try { return Buffer.byteLength(JSON.stringify(run.data)); } catch { return 0; } })();
-      const firstRow = rows && rows.length > 0 ? rows[0] : undefined;
-      const keys = firstRow && typeof firstRow === 'object' && !Array.isArray(firstRow)
-        ? Object.keys(firstRow as Record<string, unknown>) : [];
-      const sample = rows ? rows.slice(0, 3) : run.data;
-      const sampleStr = (() => { try { return JSON.stringify(sample, null, 2).slice(0, 3000); } catch { return '(unserializable)'; } })();
-      const shape = rows
-        ? `${rows.length} row${rows.length === 1 ? '' : 's'}${keys.length ? ` · keys: ${keys.join(', ')}` : ''}`
-        : 'a non-array payload (no rows)';
+      let source = '';
+      try { source = readFileSync(file, 'utf-8'); }
+      catch (err) { return textResult(`Error reading "data/${runner}": ${(err as Error).message}`); }
+      const dataSources = rec.dataSources.filter((entry) => entry.runner === runner);
+      const actions = rec.actions.filter((entry) => entry.runner === runner);
+      const provenance = deriveRunnerProvenance(source);
+      const roles = [
+        ...dataSources.map((entry) => `data source "${entry.id}"`),
+        ...actions.map((entry) => `action "${entry.label ?? entry.id}"`),
+      ];
+      const guidance = dataSources.length > 0
+        ? 'This installed legacy data runner is compatibility-gated. space_refresh requests one time-bounded approval bound to its pinned entrypoint hash and schedule; entrypoint edits invalidate that grant. Helpers, packages, CLIs, local files, auth, and network remain live outside the digest. Replace it with a GET/LIST/SEARCH/FETCH/READ Composio action to remove the compatibility exception.'
+        : actions.length > 0
+          ? 'This is an action runner. Test it only by invoking the Workspace action; the normal human-approval path binds its arguments and pinned entrypoint bytes before execution while live dependencies remain outside the digest.'
+          : 'This runner is not declared. Add a provably read-only Composio data source, or declare it as an action that will execute only after human approval.';
       return textResult(
-        `Dry run of data/${runner} OK — ${shape} (${bytes} bytes). NOTHING persisted.\n`
-        + `Sample (first ${rows ? Math.min(3, rows.length) : 1}):\n${sampleStr}\n\n`
-        + `If this is right, call space_refresh('${slug}', '<source_id>') to pull + persist it.`,
+        `Static safety inspection of data/${runner} — DID NOT execute arbitrary runner code.\n`
+        + `Declared role: ${roles.join(', ') || 'none'}.\n`
+        + `Observed provenance: ${provenance.join(' · ') || 'no obvious connector tokens (not proof of safety)'}.\n`
+        + guidance,
       );
     },
   );
@@ -989,7 +1028,7 @@ export function registerSpaceTools(server: McpServer): void {
     'space_set_data',
     [
       'Commit a dataset you ALREADY HAVE IN HAND directly into the workspace under a source id — the sanctioned path for a one-off fix (e.g. correcting one bad row) where you already know the right value. Use this INSTEAD of a /tmp scrub script.',
-      'For the normal case — pulling fresh data — write/edit a runner and use space_refresh. This tool bypasses the runner and is stamped "manual", so a scheduled refresh would later overwrite it; reserve it for fixes and inline results.',
+      'For the normal case, use a provably read-only Composio source and space_refresh. An installed legacy runner may still refresh under its pinned-entrypoint compatibility grant. This tool bypasses either backend and is stamped "manual", so a later scheduled refresh can overwrite it; reserve it for fixes and inline results.',
     ].join('\n'),
     {
       slug: z.string().min(2).max(63).describe('The workspace slug.'),

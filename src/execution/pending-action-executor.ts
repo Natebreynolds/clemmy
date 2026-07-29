@@ -16,6 +16,7 @@ import {
 import { dispatchBatchItemTool } from '../tools/code-mode-tool.js';
 import { ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
+import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 
 export interface ExecuteApprovedResult {
   ok: boolean;
@@ -69,14 +70,26 @@ export function dispatchOutputIndicatesRefusal(text: string): boolean {
 
 function skippedClaimResult(id: string, claim: PendingActionExecutionClaim): ExecuteApprovedResult {
   const status = claim.record?.status;
-  const detail = claim.reason === 'claim_in_progress_or_uncertain' || status === 'executing'
+  const detail = claim.reason === 'payload_integrity_failed' || claim.reason === 'approval_authority_invalid'
+    ? claim.record?.resultSummary
+      ?? `Pending action ${id} failed its pre-dispatch authorization integrity check. No provider call was made.`
+    : claim.reason === 'session_authority_mismatch'
+      ? `Pending action ${id} belongs to a different session and was not executed.`
+      : claim.reason === 'claim_in_progress_or_uncertain' || status === 'executing'
     ? `Pending action ${id} already has an execution claim. It may still be in progress or its outcome may be uncertain — no second dispatch was attempted, and it must not be retried automatically.`
     : status === 'executed'
       ? `Pending action ${id} was already executed — no second dispatch was attempted.`
       : status === 'failed'
         ? `Pending action ${id} already has a failed or uncertain execution result — no automatic retry was attempted.`
         : `Pending action ${id} is ${status ?? 'not available'} — it must be APPROVED before execution.`;
-  return { ok: false, status: 'skipped', resultSummary: detail, record: claim.record };
+  const integrityFailure = claim.reason === 'payload_integrity_failed'
+    || claim.reason === 'approval_authority_invalid';
+  return {
+    ok: false,
+    status: integrityFailure ? 'failed' : 'skipped',
+    resultSummary: detail,
+    record: claim.record,
+  };
 }
 
 export async function executeApprovedPendingActionCall(
@@ -85,12 +98,20 @@ export async function executeApprovedPendingActionCall(
 ): Promise<ExecuteApprovedResult> {
   const record = getPendingAction(id);
   if (!record) return { ok: false, status: 'skipped', resultSummary: `No pending action ${id}.`, record: null };
+  if (!opts.sessionId || !record.sessionId || opts.sessionId !== record.sessionId) {
+    return {
+      ok: false,
+      status: 'skipped',
+      resultSummary: `Pending action ${id} belongs to a different session and was not executed.`,
+      record,
+    };
+  }
   if (record.status !== 'approved') {
     return skippedClaimResult(id, { claimed: false, reason: 'not_approved', record });
   }
   // GRANT INVARIANT I1 (Phase 1): irreversible sends execute only on HUMAN
   // consent — a policy-minted approval is inert at every executor.
-  if (record.kind === 'external_send' && record.approvedBy !== 'human') {
+  if (pendingActionRequiresHumanApproval(record) && record.approvedBy !== 'human') {
     return {
       ok: false,
       status: 'skipped',
@@ -106,7 +127,10 @@ export async function executeApprovedPendingActionCall(
   // chat, and cross-process callers cannot all observe APPROVED and fire.
   let claim: PendingActionExecutionClaim;
   try {
-    claim = claimPendingActionExecution(id, 'pending-action-executor');
+    claim = claimPendingActionExecution(id, 'pending-action-executor', {
+      expectedSessionId: opts.sessionId,
+      requireResolvedHumanCard: pendingActionRequiresHumanApproval(record),
+    });
   } catch {
     // If durable claim storage itself is unavailable, the only safe choice is
     // zero dispatch. Treat the boundary as uncertain instead of throwing or

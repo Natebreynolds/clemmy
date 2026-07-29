@@ -16,6 +16,7 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-too
 const { registerSpaceTools, deriveRunnerProvenance } = await import('./space-tools.js');
 const store = await import('../spaces/store.js');
 const { spaceActionNeedsApproval } = await import('../spaces/space-action-gate.js');
+const approvals = await import('../runtime/harness/approval-registry.js');
 
 type Handler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
 function captureTools(): Record<string, Handler> {
@@ -112,26 +113,22 @@ test('space_save records declared data sources + re-engage contract', async () =
 
 test('space_save refuses a data-backed view that only reads an imaginary window seed', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-imaginary-seed.html');
-  const runnerDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-imaginary-seed.mjs');
   writeFileSync(draft, '<html><script>const data=window.__SPACE_DATA__||{}; render(data.tasks)</script></html>', 'utf-8');
-  writeFileSync(runnerDraft, 'process.stdout.write(JSON.stringify([]))', 'utf-8');
 
   const out = text(await tools.space_save({
     slug: 'imaginary-seed',
     title: 'Imaginary Seed',
     view_path: draft,
-    data_sources: [{ id: 'tasks', runner_path: runnerDraft }],
+    data_sources: [{ id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS' }],
   }));
 
   assert.match(out, /was NOT saved/);
   assert.match(out, /fix these implementation issues now/);
   assert.equal(store.spaceStore.get('imaginary-seed'), undefined);
-  assert.equal(existsSync(store.resolveInSpace('imaginary-seed', 'data/tmp-imaginary-seed.mjs')), false);
 });
 
 test('space_save refuses legacy {{source}} binding before activating a dynamic Workspace', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-legacy-binding.html');
-  const runnerDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-legacy-tasks.mjs');
   writeFileSync(
     draft,
     `<html>
@@ -144,23 +141,20 @@ test('space_save refuses legacy {{source}} binding before activating a dynamic W
     </html>`,
     'utf-8',
   );
-  writeFileSync(runnerDraft, 'process.stdout.write(JSON.stringify([]))', 'utf-8');
-
   const out = text(await tools.space_save({
     slug: 'legacy-binding',
     title: 'Legacy Binding',
     view_path: draft,
-    data_sources: [{ id: 'tasks', runner_path: runnerDraft, allow_empty: true }],
+    data_sources: [{ id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS', allow_empty: true }],
   }));
 
   assert.match(out, /was NOT saved/);
   assert.match(out, /clem\.data\(\)/);
   assert.match(out, /not expanded|legacy/i);
   assert.equal(store.spaceStore.get('legacy-binding'), undefined);
-  assert.equal(existsSync(store.resolveInSpace('legacy-binding', 'data/tmp-legacy-tasks.mjs')), false);
 });
 
-test('space_save installs a newly-authored runner_path in one call', async () => {
+test('space_save refuses a newly-authored opaque data-source runner before installing it', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-one-pass.html');
   const runnerDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-open-tasks.mjs');
   writeFileSync(
@@ -185,29 +179,68 @@ test('space_save installs a newly-authored runner_path in one call', async () =>
     }],
   }));
 
-  assert.match(out, /Created workspace "One Pass"/);
-  const rec = store.spaceStore.get('one-pass');
-  assert.equal(rec?.dataSources[0].runner, 'tmp-open-tasks.mjs');
-  assert.equal(
-    readFileSync(store.resolveInSpace('one-pass', 'data/tmp-open-tasks.mjs'), 'utf-8'),
-    'process.stdout.write(JSON.stringify([]))',
+  assert.match(out, /was NOT saved/);
+  assert.match(out, /opaque runner|provably read-only Composio/i);
+  assert.equal(store.spaceStore.get('one-pass'), undefined);
+  assert.equal(existsSync(store.resolveInSpace('one-pass', 'data/tmp-open-tasks.mjs')), false);
+});
+
+test('space_save preserves an installed runner source and holds its smoke for pinned-entrypoint approval', async () => {
+  const slug = 'legacy-runner-save';
+  const view = store.resolveInSpace(slug, 'view/index.html');
+  const runnerFile = store.resolveInSpace(slug, 'data/pull.mjs');
+  mkdirSync(path.dirname(view), { recursive: true });
+  mkdirSync(path.dirname(runnerFile), { recursive: true });
+  writeFileSync(
+    view,
+    '<html><script>clem.data().then(data => render(data.pull))</script></html>',
+    'utf-8',
   );
-  assert.ok(existsSync(store.resolveInSpace('one-pass', 'data.json')), 'creation smoke runs the staged runner');
+  writeFileSync(runnerFile, 'process.stdout.write(JSON.stringify({rows:[1]}))', 'utf-8');
+  store.spaceStore.save({
+    id: slug,
+    title: 'Legacy runner save',
+    dataSources: [{ id: 'pull', runner: 'pull.mjs', schedule: '0 7 * * *' }],
+  });
+
+  const out = text(await tools.space_save({
+    slug,
+    title: 'Legacy runner save',
+    data_sources: [{
+      id: 'pull',
+      runner: 'pull.mjs',
+      runner_path: null,
+      composio_slug: null,
+      composio_args_json: null,
+      schedule: '0 7 * * *',
+      timezone: null,
+    }],
+  }));
+
+  assert.match(out, /Updated workspace/);
+  assert.match(out, /Legacy runner.*preserved/i);
+  assert.match(out, /waiting for your pinned-entrypoint approval/i);
+  assert.doesNotMatch(out, /Data refreshed:.*pull/i);
+  assert.equal(store.spaceStore.get(slug)?.status, 'active', 'migration wait is not a broken build');
+  assert.equal(store.spaceStore.get(slug)?.dataSources[0]?.runner, 'pull.mjs');
+  assert.equal(
+    approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
+    1,
+  );
+
+  const refreshOut = text(await tools.space_refresh({ slug, source_id: 'pull' }));
+  assert.match(refreshOut, /Refresh awaiting approval for/i);
+  assert.match(refreshOut, /pull: AWAITING APPROVAL/i);
+  assert.doesNotMatch(refreshOut, /FAILED/i);
 });
 
 test('space_save preserves an exact local post-approval action without fake outbound remediation', async () => {
   const slug = 'local-post-approval';
   const viewDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-local-post-approval.html');
-  const dataDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-synthetic-posts.mjs');
   const actionDraft = path.join(process.env.CLEMENTINE_HOME!, 'approve-post.mjs');
   writeFileSync(
     viewDraft,
-    '<html><script>clem.data().then(data => render(data.synthetic_posts)); function approve(id){return clem.action("approve_post", {postId:id})}</script></html>',
-    'utf-8',
-  );
-  writeFileSync(
-    dataDraft,
-    'process.stdout.write(JSON.stringify({posts:[{id:"synthetic-1",title:"Synthetic post"}]}))',
+    '<html><button onclick="approve()">Approve</button><script>function approve(){return clem.action("approve_post", {postId:"synthetic-1"})}</script></html>',
     'utf-8',
   );
   writeFileSync(
@@ -220,11 +253,6 @@ test('space_save preserves an exact local post-approval action without fake outb
     slug,
     title: 'Local Post Approval',
     view_path: viewDraft,
-    data_sources: [{
-      id: 'synthetic_posts',
-      runner_path: dataDraft,
-      allow_empty: false,
-    }],
     actions: [{
       id: 'approve_post',
       label: 'Approve locally',
@@ -235,22 +263,22 @@ test('space_save preserves an exact local post-approval action without fake outb
   }));
 
   assert.match(out, /Created workspace "Local Post Approval"/);
-  assert.doesNotMatch(out, /confirm:true|outside world|recipient/i);
+  assert.match(out, /confirm:true|approval/i);
   const rec = store.spaceStore.get(slug);
   assert.equal(rec?.actions.length, 1, 'the valid local action remains declared');
   assert.equal(rec?.actions[0].id, 'approve_post');
-  assert.notEqual(rec?.actions[0].confirm, true);
-  assert.equal(spaceActionNeedsApproval(rec!.actions[0]), false, 'the local click runs without an external approval card');
+  assert.equal(rec?.actions[0].confirm, true);
+  assert.equal(spaceActionNeedsApproval(rec!.actions[0]), true, 'opaque runner code must take the approval path');
 });
 
-test('space_save preserves a newer installed runner repair over a stale runner_path', async () => {
+test('space_save preserves a newer installed action-runner repair over a stale runner_path', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-newer-runner-view.html');
   const runnerDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-newer-runner.mjs');
   const original = 'process.stdout.write(JSON.stringify([]))';
   const repaired = 'process.stdout.write(JSON.stringify([{title:"kept repair"}]))';
   writeFileSync(
     draft,
-    '<html><script>async function load(){const data=await clem.data();render(data.tasks)}</script></html>',
+    '<html><button onclick="clem.action(\'sync\',{})">Sync</button></html>',
     'utf-8',
   );
   writeFileSync(runnerDraft, original, 'utf-8');
@@ -259,14 +287,14 @@ test('space_save preserves a newer installed runner repair over a stale runner_p
     slug: 'newer-runner-wins',
     title: 'Newer Runner Wins',
     view_path: draft,
-    data_sources: [{
-      id: 'tasks',
+    actions: [{
+      id: 'sync',
+      label: 'Sync',
       runner: null,
       runner_path: runnerDraft,
       composio_slug: null,
-      composio_args_json: null,
-      schedule: null,
-      timezone: null,
+      args_template_json: null,
+      confirm: true,
     }],
   };
   assert.match(text(await tools.space_save(args)), /Created workspace/);
@@ -281,8 +309,6 @@ test('space_save preserves a newer installed runner repair over a stale runner_p
   const out = text(await tools.space_save(args));
   assert.match(out, /Preserved newer edited runner/);
   assert.equal(readFileSync(installed, 'utf-8'), repaired);
-  const data = JSON.parse(readFileSync(store.resolveInSpace('newer-runner-wins', 'data.json'), 'utf-8'));
-  assert.equal(data.tasks[0].title, 'kept repair');
 });
 
 test('space_save rejects conflicting runner sources before installing either', async () => {
@@ -371,7 +397,7 @@ test('space_get surfaces hand-written manifest JSON errors and space_save requir
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-handwrite-fix.html');
   writeFileSync(
     draft,
-    '<html><script>clem.data().then(data => render(data.pull)); function act(){return clem.action("act", {})}</script></html>',
+    '<html><script>function act(){return clem.action("act", {})}</script></html>',
     'utf-8',
   );
   const viewOnly = text(await tools.space_save({ slug, title: 'Handwritten', view_path: draft }));
@@ -382,7 +408,7 @@ test('space_get surfaces hand-written manifest JSON errors and space_save requir
     slug,
     title: 'Handwritten',
     view_path: draft,
-    data_sources: [{ id: 'pull', runner: 'r.mjs', composio_slug: null, composio_args_json: null, schedule: null, timezone: null }],
+    data_sources: [],
     actions: [{ id: 'act', label: 'Act', runner: 'act.mjs', composio_slug: null, args_template_json: '{"scope":"team"}', confirm: null }],
   }));
   assert.match(fixed, /Updated workspace/);
@@ -541,34 +567,38 @@ test('space_edit_view notes when a find hit multiple occurrences', async () => {
   assert.match(res, /ALL 2 occurrences/);
 });
 
-// --- space_try_runner: the no-persist dry-run (replaces shelling `node data/x.mjs`) ---
+// --- space_try_runner: static-only safety inspection (never spawns code) ---
 
-test('space_try_runner runs a runner and returns its shape WITHOUT writing data.json', async () => {
+test('space_try_runner never spawns arbitrary runner code', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-tryrunner.html');
   writeFileSync(draft, '<html>tr</html>', 'utf-8');
   await tools.space_save({ slug: 'tryrunner', title: 'TryRunner', view_path: draft });
   const runnerDir = store.resolveInSpace('tryrunner', 'data');
   mkdirSync(runnerDir, { recursive: true });
   writeFileSync(path.join(runnerDir, 'pull.mjs'),
-    'process.stdout.write(JSON.stringify([{ firm: "Acme", risk: 9 }, { firm: "Globex", risk: 4 }]))', 'utf-8');
+    'import { writeFileSync } from "node:fs"; writeFileSync(new URL("./spawned.txt", import.meta.url), "yes"); process.stdout.write("[]")', 'utf-8');
 
   const res = text(await tools.space_try_runner({ slug: 'tryrunner', runner_path: 'pull.mjs', payload_json: null }));
-  assert.match(res, /Dry run of data\/pull\.mjs OK/);
-  assert.match(res, /2 rows/);
-  assert.match(res, /keys: firm, risk/);
-  assert.match(res, /NOTHING persisted/);
-  assert.match(res, /Acme/); // sample rows included
-  // the crucial invariant: data.json was NOT written by the dry run
+  assert.match(res, /did not execute|static/i);
+  assert.match(res, /arbitrary runner|external/i);
+  assert.equal(existsSync(path.join(runnerDir, 'spawned.txt')), false);
   assert.equal(existsSync(store.resolveInSpace('tryrunner', 'data.json')), false);
 });
 
-test('space_try_runner surfaces a runner failure verbatim (still no persist)', async () => {
+test('space_try_runner gives action runners approval-safe guidance without executing them', async () => {
   const runnerDir = store.resolveInSpace('tryrunner', 'data');
-  writeFileSync(path.join(runnerDir, 'broken.mjs'), 'process.stdout.write("not json at all")', 'utf-8');
-  const res = text(await tools.space_try_runner({ slug: 'tryrunner', runner_path: 'broken.mjs', payload_json: null }));
-  assert.match(res, /FAILED \(nothing persisted\)/);
-  assert.match(res, /not valid JSON/);
-  assert.equal(existsSync(store.resolveInSpace('tryrunner', 'data.json')), false);
+  writeFileSync(
+    path.join(runnerDir, 'act.mjs'),
+    'import { writeFileSync } from "node:fs"; writeFileSync(new URL("./action-ran.txt", import.meta.url), "yes"); process.stdout.write("{}")',
+    'utf-8',
+  );
+  store.spaceStore.update('tryrunner', {
+    actions: [{ id: 'act', runner: 'act.mjs' }],
+  });
+  const res = text(await tools.space_try_runner({ slug: 'tryrunner', runner_path: 'act.mjs', payload_json: null }));
+  assert.match(res, /action/i);
+  assert.match(res, /approval/i);
+  assert.equal(existsSync(path.join(runnerDir, 'action-ran.txt')), false);
 });
 
 // --- space_set_data: the sanctioned inline-commit (replaces /tmp scrub scripts) ---

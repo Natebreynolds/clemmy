@@ -6,16 +6,9 @@
  * initiated may navigate anywhere (including another localhost admin route).
  */
 
-export function isWorkspaceViewUrl(rawUrl: string): boolean {
-  try {
-    const parsed = new URL(rawUrl);
-    const loopback = parsed.protocol === 'http:'
-      && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '[::1]');
-    return loopback && /^\/console\/spaces\/[^/]+\/view(?:\/|$)/i.test(parsed.pathname);
-  } catch {
-    return false;
-  }
-}
+import { isWorkspaceViewUrl } from './workspace-view-url.cjs';
+
+export { isWorkspaceViewUrl };
 
 /**
  * A dashboard renderer gets privileged desktop IPC only when it is on one of

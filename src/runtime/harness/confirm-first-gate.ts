@@ -31,7 +31,11 @@
  * tested in confirm-first-gate.test.ts with no SDK / DB / eventlog.
  */
 import { getRuntimeEnv } from '../../config.js';
-import { isMutatingExternalWrite, looksLikeNativeMcpSend, isIrreversibleSendSlug, IRREVERSIBLE_SEND_VERBS } from './execution-gate.js';
+import {
+  classifyCanonicalExternalEffect,
+  isIrreversibleSendSlug,
+  IRREVERSIBLE_SEND_VERBS,
+} from './execution-gate.js';
 // Re-export so existing importers keep working; the canonical predicate is
 // isIrreversibleSendSlug.
 export { isIrreversibleSendSlug };
@@ -40,27 +44,17 @@ export { isIrreversibleSendSlug };
 export const IRREVERSIBLE_VERBS = IRREVERSIBLE_SEND_VERBS;
 
 export interface ExternalWriteShape {
+  /** Whether the normalized carrier crosses an external boundary. */
+  external: boolean;
   /** Whether this call is a mutating external write at all. */
   mutating: boolean;
   /** Whether the write is irreversible (SEND/PUBLISH). */
   irreversible: boolean;
-  /** Stable key the model fans out on — the Composio slug. Undefined
-   *  when we can't classify (→ gate stays out of the way, fail-open). */
+  /** Stable key the model fans out on — the canonical provider action.
+   *  Unknown external mutations retain their carrier name and fail closed. */
   shapeKey: string | undefined;
-}
-
-function extractToolSlug(rawArgs: unknown): string | undefined {
-  if (!rawArgs) return undefined;
-  if (typeof rawArgs === 'string') {
-    try {
-      return extractToolSlug(JSON.parse(rawArgs) as unknown);
-    } catch {
-      return undefined;
-    }
-  }
-  if (typeof rawArgs !== 'object') return undefined;
-  const slug = (rawArgs as Record<string, unknown>).tool_slug;
-  return typeof slug === 'string' && slug.length > 0 ? slug : undefined;
+  /** False when an unfamiliar external mutation is conservatively classified. */
+  classificationKnown: boolean;
 }
 
 /**
@@ -69,15 +63,14 @@ function extractToolSlug(rawArgs: unknown): string | undefined {
  * what "external write" means, and adds the shape key + irreversibility.
  */
 export function classifyExternalWrite(toolName: string, rawArgs: unknown): ExternalWriteShape {
-  const mutating = isMutatingExternalWrite(toolName, rawArgs);
-  if (!mutating) return { mutating: false, irreversible: false, shapeKey: undefined };
-  const slug = extractToolSlug(rawArgs);
-  // One classifier, everywhere: a send-verb/comm-object slug OR a native-MCP
-  // send-shaped tool name is irreversible.
-  const irreversible = slug ? isIrreversibleSendSlug(slug) : looksLikeNativeMcpSend(toolName);
-  // shapeKey is the slug for composio writes; fall back to the tool name
-  // so non-composio writes (native MCP sends) still batch coherently.
-  return { mutating: true, irreversible, shapeKey: slug ?? toolName };
+  const effect = classifyCanonicalExternalEffect(toolName, rawArgs);
+  return {
+    external: effect.external,
+    mutating: effect.mutating,
+    irreversible: effect.irreversible,
+    shapeKey: effect.mutating ? effect.action ?? toolName : undefined,
+    classificationKnown: effect.classificationKnown,
+  };
 }
 
 export interface InstructionReviewDecision {

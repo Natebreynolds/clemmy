@@ -4,6 +4,7 @@
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { Script } from 'node:vm';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-space-publish-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -52,6 +53,11 @@ test('buildPublishSnapshot: self-contained export — data inlined, _meta stripp
 
   // Static bridge: same window.clem surface, side effects frozen, marked snapshot.
   assert.match(html, /window\.clem=\{slug:"client-seo-board",snapshot:true/, 'static clem bridge injected');
+  assert.ok(
+    html.indexOf('window.clem=') < html.indexOf('clem.data().then'),
+    'published bridge is defined before the authored script executes',
+  );
+  assert.ok(html.indexOf('window.clem=') < html.indexOf('<body>'), 'published bridge starts in <head>, matching live views');
   assert.match(html, /published snapshot/, 'frozen actions explain themselves');
   assert.ok(!html.includes('/api/console/spaces'), 'no live data-plane URLs in the export');
   assert.match(html, /clementine-snapshot/, 'snapshot marker present');
@@ -85,6 +91,64 @@ test('buildPublishSnapshot: refuses archived and missing workspaces', () => {
   assert.equal(res.ok, false);
   assert.match((res as { error: string }).error, /archived/);
   writeFileSync(manifest, JSON.stringify({ ...rec, status: 'active' }), 'utf-8');
+});
+
+test('buildPublishSnapshot: hostile external data cannot break out of the bridge script and hydrates exactly', async () => {
+  const slug = 'script-boundary-board';
+  const dir = path.join(SPACES_DIR, slug);
+  mkdirSync(path.join(dir, 'view'), { recursive: true });
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug, title: 'Script Boundary Board', status: 'active', version: 1,
+    viewEntry: 'view/index.html',
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    dataSources: [{ id: 'external' }], actions: [], revisions: [],
+  }), 'utf-8');
+  writeFileSync(
+    path.join(dir, 'view', 'index.html'),
+    '<!doctype html><html><head><title>Boundary</title></head>'
+      + '<body><script>window.__AUTHORED_SCRIPT_RAN__=true;</script></body></html>',
+    'utf-8',
+  );
+  const hostileRow: Record<string, unknown> = {
+    copy: '</script><script>window.__PUBLISHED_DATA_EXECUTED__=true</script><!--',
+    html: '<img src=x onerror="window.__PUBLISHED_HTML_EXECUTED__=true">',
+    separators: '\u2028\u2029',
+  };
+  Object.defineProperty(hostileRow, '__proto__', {
+    value: { remainsAnOwnDataKey: true },
+    enumerable: true,
+  });
+  const hostile: Record<string, unknown> = { external: [hostileRow] };
+  writeFileSync(path.join(dir, 'data.json'), JSON.stringify(hostile), 'utf-8');
+
+  const result = buildPublishSnapshot(slug);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (!result.ok) return;
+  const html = readFileSync(path.join(result.dir, 'index.html'), 'utf-8');
+
+  assert.equal((html.match(/<script\b/gi) ?? []).length, 2, 'data cannot mint an executable script element');
+  assert.ok(!html.includes('</script><script>window.__PUBLISHED_DATA_EXECUTED__'), 'literal script boundary is absent');
+  assert.match(html, /\\u003c\/script>/, 'HTML-significant less-than signs are escaped in script source');
+
+  const bridgeAt = html.indexOf('window.clem=');
+  const authoredAt = html.indexOf('window.__AUTHORED_SCRIPT_RAN__');
+  assert.ok(bridgeAt >= 0 && bridgeAt < authoredAt, 'published bridge precedes authored JavaScript');
+  const scriptStart = html.lastIndexOf('<script', bridgeAt);
+  const sourceStart = html.indexOf('>', scriptStart) + 1;
+  const sourceEnd = html.indexOf('</script>', bridgeAt);
+  const bridgeSource = html.slice(sourceStart, sourceEnd);
+  const windowObject: Record<string, unknown> = {};
+  new Script(bridgeSource).runInNewContext({ window: windowObject });
+  const clem = windowObject.clem as { data(): Promise<unknown> };
+  const hydrated = await clem.data();
+  assert.equal(JSON.stringify(hydrated), JSON.stringify(hostile), 'snapshot data matches the live JSON document');
+  assert.equal(
+    Object.prototype.hasOwnProperty.call((hydrated as { external: unknown[] }).external[0], '__proto__'),
+    true,
+    'JSON hydration does not reinterpret a nested external data key as an object prototype',
+  );
+  assert.equal(windowObject.__PUBLISHED_DATA_EXECUTED__, undefined);
+  assert.equal(windowObject.__PUBLISHED_HTML_EXECUTED__, undefined);
 });
 
 after(() => {

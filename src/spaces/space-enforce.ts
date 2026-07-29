@@ -20,7 +20,10 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { validateCronExpression } from '../shared/cron.js';
 import { resolveInSpace, runnerFilenameError, type SpaceDataSource, type SpaceAction, type SpaceStatus } from './store.js';
-import { workspaceActionLooksOutbound } from './space-action-semantics.js';
+import {
+  workspaceActionRequiresApproval,
+  workspaceDataSourceSafetyError,
+} from './space-execution-policy.js';
 
 function isValidTimezone(tz: string): boolean {
   try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
@@ -28,6 +31,11 @@ function isValidTimezone(tz: string): boolean {
 
 function hasBackend(x: { runner?: string; composioSlug?: string }): boolean {
   return Boolean((x.runner && x.runner.trim()) || (x.composioSlug && x.composioSlug.trim()));
+}
+
+function runnerDeclarationKey(source: Pick<SpaceDataSource, 'id' | 'runner'>): string | null {
+  const runner = source.runner?.trim();
+  return runner ? `${source.id}\u0000${runner}` : null;
 }
 
 export interface SpaceAutoRepair {
@@ -66,11 +74,11 @@ export function autoRepairSpaceManifest(
 
   const repairedActions = (actions ?? []).map((act) => {
     const a: SpaceAction = { ...act };
-    // A send-like action must confirm before firing (the costliest thing to get
-    // wrong is a send to the wrong person).
-    if (workspaceActionLooksOutbound(a) && a.confirm !== true) {
+    // Keep the manifest/UI hint aligned with the runtime security boundary.
+    // Opaque runner code and every non-proven-read provider action must confirm.
+    if (workspaceActionRequiresApproval(a) && a.confirm !== true) {
       a.confirm = true;
-      repairs.push(`Set confirm:true on action "${a.id}" — it looks like an outbound send, so the view should confirm before firing.`);
+      repairs.push(`Set confirm:true on action "${a.id}" — it is not provably read-only, so it must take the human approval path before execution.`);
     }
     // An action that declares BOTH a runner and a composio slug is ambiguous —
     // keep the Composio op (runSpaceAction prefers it) and drop the runner.
@@ -99,6 +107,7 @@ export function checkSpaceForWrite(
   dataSources: SpaceDataSource[],
   actions: SpaceAction[],
   availableRunnerFiles: ReadonlySet<string> = new Set(),
+  legacyRunnerDeclarations: ReadonlySet<string> = new Set(),
 ): SpaceWriteCheck {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -118,6 +127,17 @@ export function checkSpaceForWrite(
       try { target = resolveInSpace(slug, path.join('data', s.runner.trim())); } catch { /* invalid path */ }
       if ((!target || !existsSync(target)) && !availableRunnerFiles.has(s.runner.trim())) {
         errors.push(`Data source "${s.id}" points at runner "data/${s.runner}" but that file doesn't exist — pass the authored file as runner_path in this space_save call.`);
+      }
+    }
+    const safetyError = workspaceDataSourceSafetyError(s);
+    if (safetyError) {
+      const declaration = runnerDeclarationKey(s);
+      if (declaration && legacyRunnerDeclarations.has(declaration)) {
+        warnings.push(
+          `Legacy runner data source "${s.id}" was preserved. Its runner entrypoint hash and automatic schedule require one human approval before refresh; any later entrypoint or schedule change invalidates that grant. Helpers, packages, CLIs, local files, auth state, and network services remain live outside the digest.`,
+        );
+      } else {
+        errors.push(safetyError);
       }
     }
     if (s.schedule && s.schedule.trim() && !validateCronExpression(s.schedule.trim())) {
@@ -165,8 +185,25 @@ export function prepareSpaceForWrite(input: {
   status?: SpaceStatus;
   /** Runner filenames that space_save already validated and will install atomically. */
   availableRunnerFiles?: ReadonlySet<string>;
+  /**
+   * Existing on-disk declarations are migration-compatible: preserving the
+   * same source id + runner filename is allowed, while runtime exact-hash trust
+   * still gates every spawn. New/swapped runner declarations remain blocked.
+   */
+  existingDataSources?: SpaceDataSource[];
 }): SpaceWritePrep {
   const { dataSources, actions, repairs } = autoRepairSpaceManifest(input.dataSources ?? [], input.actions ?? []);
-  const check = checkSpaceForWrite(input.slug, dataSources, actions, input.availableRunnerFiles);
+  const legacyRunnerDeclarations = new Set(
+    (input.existingDataSources ?? [])
+      .map(runnerDeclarationKey)
+      .filter((key): key is string => key !== null),
+  );
+  const check = checkSpaceForWrite(
+    input.slug,
+    dataSources,
+    actions,
+    input.availableRunnerFiles,
+    legacyRunnerDeclarations,
+  );
   return { dataSources, actions, ok: check.ok, errors: check.errors, warnings: check.warnings, repairs };
 }

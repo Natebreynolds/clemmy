@@ -19,7 +19,9 @@ let annotateShellStderr: typeof import('./computer-tools.js').annotateShellStder
 let annotateSpawnError: typeof import('./computer-tools.js').annotateSpawnError;
 let isProtectedInstalledSkillSourcePath: typeof import('./computer-tools.js').isProtectedInstalledSkillSourcePath;
 let resolveAllowedCwd: typeof import('./computer-tools.js').resolveAllowedCwd;
+let shellMutatesAuthorizationState: typeof import('./computer-tools.js').shellMutatesAuthorizationState;
 let shellWritesInstalledSkillSource: typeof import('./computer-tools.js').shellWritesInstalledSkillSource;
+let writeTargetsAuthorizationState: typeof import('./computer-tools.js').writeTargetsAuthorizationState;
 let WRITE_FILE_MAX_CONTENT_BYTES: number;
 
 before(async () => {
@@ -29,7 +31,9 @@ before(async () => {
     annotateSpawnError,
     isProtectedInstalledSkillSourcePath,
     resolveAllowedCwd,
+    shellMutatesAuthorizationState,
     shellWritesInstalledSkillSource,
+    writeTargetsAuthorizationState,
     WRITE_FILE_MAX_CONTENT_BYTES,
   } = await import('./computer-tools.js'));
 });
@@ -150,6 +154,17 @@ async function invokeWrite(input: { path: string; content: string; mode?: 'creat
   return tool.invoke(
     { context: { sessionId: 'sess-write-test', turn: 0 } },
     JSON.stringify(input),
+    { toolCall: { callId: `call_${Date.now()}` } },
+  );
+}
+
+async function invokeShell(input: { command: string; cwd?: string | null; timeout_ms?: number | null }): Promise<string> {
+  const shell = getComputerTools().find((tool) => tool.name === 'run_shell_command') as unknown as {
+    invoke: (runContext: unknown, input: string, details: unknown) => Promise<string>;
+  };
+  return shell.invoke(
+    { context: { sessionId: 'sess-shell-test', turn: 0 } },
+    JSON.stringify({ cwd: null, timeout_ms: 10_000, ...input }),
     { toolCall: { callId: `call_${Date.now()}` } },
   );
 }
@@ -312,6 +327,61 @@ test('write_file refuses raw writes to typed team-agent and pending-action state
   const out = await invokeWrite({ path: log, content: '{}', mode: null });
   assert.match(out, /Refused raw write to Clementine team communication log/);
   assert.equal(existsSync(log), false);
+});
+
+test('authorization stores reject model-driven writes while read-only inspection stays available', () => {
+  const base = process.env.CLEMENTINE_HOME!;
+  const pendingFile = path.join(base, 'pending-actions', 'pa-proof.json');
+  const harnessDb = path.join(base, 'state', 'harness.db');
+  const mutationReceipt = path.join(
+    base,
+    'Vault',
+    '00-System',
+    'workflows',
+    'proof',
+    'runs',
+    'run-1',
+    'call-mutations',
+    'fingerprint',
+    'receipt.json',
+  );
+  assert.equal(writeTargetsAuthorizationState(pendingFile), true);
+  assert.equal(writeTargetsAuthorizationState(harnessDb), true);
+  assert.equal(writeTargetsAuthorizationState(mutationReceipt), true);
+
+  assert.equal(
+    shellMutatesAuthorizationState(
+      `node -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(pendingFile)}, '{}')`)}`,
+      base,
+    ),
+    true,
+  );
+  assert.equal(
+    shellMutatesAuthorizationState(`sqlite3 ${JSON.stringify(harnessDb)} "UPDATE pending_approvals SET status='resolved'"`, base),
+    true,
+  );
+  assert.equal(
+    shellMutatesAuthorizationState(`cat ${JSON.stringify(pendingFile)}`, base),
+    false,
+    'read-only inspection is not blocked',
+  );
+  assert.equal(
+    shellMutatesAuthorizationState(`sqlite3 ${JSON.stringify(harnessDb)} "SELECT status FROM pending_approvals"`, base),
+    false,
+    'read-only database inspection is not blocked',
+  );
+});
+
+test('run_shell_command hard-denies an interpreter write into pending-action authority', async () => {
+  const target = path.join(process.env.CLEMENTINE_HOME!, 'pending-actions', 'pa-shell-proof.json');
+  mkdirSync(path.dirname(target), { recursive: true });
+  const program = `require('node:fs').writeFileSync(${JSON.stringify(target)}, '{}')`;
+  const output = await invokeShell({ command: `node -e ${JSON.stringify(program)}` });
+  assert.match(
+    output,
+    /cannot mutate Clementine authorization state/i,
+  );
+  assert.equal(existsSync(target), false);
 });
 
 test('installed skill source paths are protected while artifact paths stay writable', () => {

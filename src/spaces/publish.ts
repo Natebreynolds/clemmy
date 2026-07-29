@@ -24,6 +24,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, wri
 import path from 'node:path';
 import { isValidSpaceSlug, resolveInSpace, resolveSpaceDir, spaceStore } from './store.js';
 import { readData, appendAudit } from './data-store.js';
+import { injectWorkspaceBootstrap } from './view-html.js';
 
 export interface PublishSnapshotOk {
   ok: true;
@@ -39,9 +40,23 @@ export type PublishSnapshotResult = PublishSnapshotOk | PublishSnapshotError;
  *  view authored against clem.* renders identically — but data() resolves to
  *  the INLINED dataset and every side-effecting call throws a clear notice. */
 function staticClemBridge(slug: string, datasetJson: string, publishedAt: string): string {
-  const S = JSON.stringify(slug);
-  const T = JSON.stringify(publishedAt);
-  return `<script>(function(){var D=${datasetJson};`
+  const inlineJson = (value: unknown): string => {
+    const json = JSON.stringify(value);
+    if (json === undefined) throw new TypeError('Workspace snapshot value is not JSON-serializable');
+    // HTML parses classic-script contents before JavaScript does. Escaping every
+    // "<" prevents external strings such as "</script><script>…" from ending
+    // this element; the line separators keep the source portable to older JS
+    // parsers. JSON.parse preserves the exact JSON shape (including "__proto__"
+    // as an own key) instead of applying object-literal semantics.
+    return json
+      .replace(/</g, '\\u003c')
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029');
+  };
+  const S = inlineJson(slug);
+  const T = inlineJson(publishedAt);
+  const D = inlineJson(datasetJson);
+  return `<script>(function(){var D=JSON.parse(${D});`
     + `function frozen(name){return async function(){throw new Error('This is a published snapshot of the "'+${S}+'" workspace (exported '+${T}+') — '+name+' is disabled. Open the live workspace in Clementine to act.');};}`
     + `window.clem={slug:${S},snapshot:true,publishedAt:${T},`
     + `data:async function(){return D;},`
@@ -93,7 +108,7 @@ export function buildPublishSnapshot(slug: string): PublishSnapshotResult {
   // Inline the dataset, minus reserved provenance keys (may reference local
   // paths / runner error internals — not for public eyes).
   const raw = readData(slug);
-  const dataset: Record<string, unknown> = {};
+  const dataset = Object.create(null) as Record<string, unknown>;
   const rowsBySource: Record<string, number | null> = {};
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
@@ -118,10 +133,9 @@ export function buildPublishSnapshot(slug: string): PublishSnapshotResult {
     if (/\.html?$/i.test(rel)) {
       const html = readFileSync(src, 'utf-8');
       const marker = `<meta name="clementine-snapshot" content="${publishedAt}">`;
-      const withMarker = html.includes('<head>') ? html.replace('<head>', `<head>${marker}`) : marker + html;
-      const injected = withMarker.includes('</body>')
-        ? withMarker.replace('</body>', `${bridge}</body>`)
-        : withMarker + bridge;
+      // The live route and static export use the same document-start injection
+      // rule: clem exists before any authored inline or external script runs.
+      const injected = injectWorkspaceBootstrap(html, bridge + marker);
       writeFileSync(dst, injected, 'utf-8');
       bytes += Buffer.byteLength(injected);
     } else {

@@ -760,8 +760,12 @@ export class FallbackModel implements Model {
       }
       const { request: req, cleanup } = this.linkAbort(request);
       try {
-        const call = chain[i].getModel().getResponse(req);
-        const result = await this.withFirstByteTimeout(call, isLast, () => cleanup(true));
+        // `getResponse()` resolves only after the complete response, so racing it
+        // against a FIRST-BYTE budget mistakes healthy long reasoning for silence
+        // and duplicates the call on the rescue provider. First-byte fallover is
+        // therefore stream-only, where the first real event is observable below.
+        // Any caller/provider overall deadline remains intact through `req.signal`.
+        const result = await chain[i].getModel().getResponse(req);
         if (!modelResponseHasActionableContent(result)) {
           throw new PreContentStreamEndedError(modelResponseHasActivity(result));
         }

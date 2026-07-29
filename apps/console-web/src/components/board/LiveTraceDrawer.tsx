@@ -31,6 +31,7 @@ import {
   cardTone,
   getBackgroundTaskDetail,
   listReportBackChannels,
+  pendingActionReviewFacts,
   repostBackgroundTaskResult,
   repostBackgroundTaskResultByChannel,
   reviseBackgroundTaskContract,
@@ -265,6 +266,97 @@ function deliveryView(n: BackgroundTaskNotification): { tone: Tone; label: strin
     return { tone: n.deliveryError ? 'warning' : 'success', label: 'delivered', detail };
   }
   return { tone: 'neutral', label: 'sending…', detail: 'Sending…' };
+}
+
+function PendingActionReview({
+  action,
+  busy,
+  onApprove,
+  onReject,
+}: {
+  action: NonNullable<BoardCard['pendingAction']>;
+  busy: BoardButtonIntent | null;
+  onApprove?: () => void;
+  onReject?: () => void;
+}) {
+  const review = pendingActionReviewFacts(action);
+  return (
+    <section className="max-h-[52vh] overflow-y-auto border-b border-warning/40 bg-warning-tint px-5 py-4" aria-label="Exact queued action review">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-warning">
+            <Hand className="h-3.5 w-3.5" aria-hidden />
+            Review exact queued action
+          </div>
+          <p className="mt-1 text-body font-semibold text-fg">{review.title}</p>
+          {review.summary && <p className="mt-0.5 text-small text-muted">{review.summary}</p>}
+        </div>
+        <StatusPill tone="warning">{review.status}</StatusPill>
+      </div>
+
+      <dl className="mt-3 grid gap-3 text-small sm:grid-cols-2">
+        <div>
+          <dt className="text-caption font-semibold text-faint">Execution tool</dt>
+          <dd className="mt-0.5 break-all font-mono text-fg">{review.toolName}</dd>
+        </div>
+        {review.target && (
+          <div>
+            <dt className="text-caption font-semibold text-faint">Target</dt>
+            <dd className="mt-0.5 whitespace-pre-wrap break-words text-fg">{review.target}</dd>
+          </div>
+        )}
+        {review.risk && (
+          <div className="sm:col-span-2">
+            <dt className="text-caption font-semibold text-warning">Risk</dt>
+            <dd className="mt-0.5 whitespace-pre-wrap break-words text-fg">{review.risk}</dd>
+          </div>
+        )}
+        {review.preview && (
+          <div className="sm:col-span-2">
+            <dt className="text-caption font-semibold text-faint">Preview</dt>
+            <dd className="mt-0.5 whitespace-pre-wrap break-words text-fg">{review.preview}</dd>
+          </div>
+        )}
+        {review.rollback && (
+          <div className="sm:col-span-2">
+            <dt className="text-caption font-semibold text-faint">Rollback</dt>
+            <dd className="mt-0.5 whitespace-pre-wrap break-words text-fg">{review.rollback}</dd>
+          </div>
+        )}
+        {review.payloadHash && (
+          <div className="sm:col-span-2">
+            <dt className="text-caption font-semibold text-faint">Payload hash</dt>
+            <dd className="mt-0.5 break-all font-mono text-fg">{review.payloadHash}</dd>
+          </div>
+        )}
+        <div className="sm:col-span-2">
+          <dt className="text-caption font-semibold text-faint">Exact queued payload</dt>
+          <dd>
+            <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-canvas p-3 font-mono text-caption text-muted">
+              {review.payloadText}
+            </pre>
+          </dd>
+        </div>
+      </dl>
+
+      {(onApprove || onReject) && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {onApprove && (
+            <Button size="sm" disabled={busy !== null} onClick={onApprove}>
+              <CheckCircle2 className="h-4 w-4" aria-hidden />
+              {busy === 'approve' ? 'Approving…' : 'Approve & continue'}
+            </Button>
+          )}
+          {onReject && (
+            <Button size="sm" variant="secondary" disabled={busy !== null} onClick={onReject}>
+              <X className="h-4 w-4" aria-hidden />
+              {busy === 'reject' ? 'Rejecting…' : 'Reject'}
+            </Button>
+          )}
+        </div>
+      )}
+    </section>
+  );
 }
 
 export function LiveTraceDrawer({
@@ -602,6 +694,19 @@ export function LiveTraceDrawer({
             <X className="h-4 w-4" />
           </button>
         </header>
+
+        {card.pendingAction && (
+          <PendingActionReview
+            action={card.pendingAction}
+            busy={actionBusy}
+            {...(onAction && card.actions.includes('approve')
+              ? { onApprove: () => { void runCardAction('approve'); } }
+              : {})}
+            {...(onAction && card.actions.includes('reject')
+              ? { onReject: () => { void runCardAction('reject'); } }
+              : {})}
+          />
+        )}
 
         <div className="border-b border-border px-5 py-3">
           <div className="flex flex-wrap items-start justify-between gap-3">

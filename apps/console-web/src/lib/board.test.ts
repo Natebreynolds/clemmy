@@ -7,6 +7,7 @@ import {
   findBoardCardForRun,
   cardTone,
   intentForDrop,
+  pendingActionReviewFacts,
   reconcileOpenBoardCard,
   rejectReason,
   type BoardCard,
@@ -147,6 +148,53 @@ test('the trace drawer offers Stop only for a canonical run with a safe projecte
     'background controls remain in the task cockpit');
   assert.equal(canStopCanonicalRunFromDrawer({ ...canonical, sourceKind: 'approval' }), false,
     'approval controls remain unchanged');
+});
+
+test('Tasks approval review retains exact target, risk, preview, rollback, hash, and payload', () => {
+  const action = {
+    id: 'pa-social-launch',
+    title: 'Publish the approved launch post',
+    summary: 'One reviewed post to the company page.',
+    kind: 'external_send',
+    status: 'approval_requested',
+    toolName: 'SOCIALS_PUBLISH_POST',
+    targetSummary: 'LinkedIn company page',
+    preview: 'Clementine 3.0 launches today.',
+    risk: 'This publishes externally to all page followers.',
+    rollback: 'Delete the post from LinkedIn.',
+    payload: {
+      account: 'company-page',
+      body: 'Clementine 3.0 launches today.',
+    },
+    payloadHash: 'sha256-launch-proof',
+    idempotencyKey: 'social-launch-once',
+    approvalId: 'apr-social',
+    resultSummary: null,
+    createdAt: '2026-07-28T00:00:00.000Z',
+    updatedAt: '2026-07-28T00:00:00.000Z',
+  };
+  const queuedCard = card({
+    id: 'approval:apr-social',
+    sourceKind: 'approval',
+    column: 'needs_you',
+    status: 'awaiting_approval',
+    actions: ['approve', 'reject'],
+    pendingAction: action,
+  });
+
+  assert.equal(queuedCard.pendingAction, action, 'the frontend BoardCard DTO retains the server view');
+  assert.deepEqual(pendingActionReviewFacts(action), {
+    title: action.title,
+    summary: action.summary,
+    status: action.status,
+    toolName: action.toolName,
+    target: action.targetSummary,
+    risk: action.risk,
+    preview: action.preview,
+    rollback: action.rollback,
+    payloadHash: action.payloadHash,
+    payloadText: JSON.stringify(action.payload, null, 2),
+  });
 });
 
 // D (v2.3.0): dragging a waiting card into Running IS the approval gesture

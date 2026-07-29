@@ -12,7 +12,14 @@ import { cn } from '@/lib/cn';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { relativeTime } from '@/lib/inbox';
-import { cardTone, sourceLabel, runQueueRef, type BoardButtonIntent, type BoardCard as BoardCardT } from '@/lib/board';
+import {
+  cardTone,
+  pendingActionReviewFacts,
+  sourceLabel,
+  runQueueRef,
+  type BoardButtonIntent,
+  type BoardCard as BoardCardT,
+} from '@/lib/board';
 import { evidenceChips, blockerSummary } from '@/lib/work-status';
 import { stripInlineMarkdown } from '@/lib/markdown-text';
 import { RunQueue } from './RunQueue';
@@ -74,6 +81,9 @@ export function BoardCard({
   const tone = cardTone(card);
   const draggable = busyIntent === null && card.actions.some((a) => dragActions.has(a));
   const artifacts = artifactsLine(card);
+  const pendingActionReview = card.pendingAction
+    ? pendingActionReviewFacts(card.pendingAction)
+    : null;
 
   const runAction = async (intent: BoardButtonIntent) => {
     if (!onAction || busyIntent !== null) return;
@@ -174,6 +184,33 @@ export function BoardCard({
 
       {card.nextSafeAction && (
         <p className="mt-2 line-clamp-2 text-caption text-faint">{card.nextSafeAction}</p>
+      )}
+
+      {pendingActionReview && (
+        <div className="mt-2 space-y-1 rounded-md border border-warning/30 bg-warning-tint px-2.5 py-2 text-caption">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="font-semibold text-warning">Exact queued action</span>
+            <span className="font-mono text-faint">{pendingActionReview.toolName}</span>
+          </div>
+          {pendingActionReview.target && (
+            <p className="line-clamp-2 break-words text-fg">
+              <span className="font-semibold">Target:</span> {pendingActionReview.target}
+            </p>
+          )}
+          {pendingActionReview.risk && (
+            <p className="line-clamp-3 break-words text-warning">
+              <span className="font-semibold">Risk:</span> {pendingActionReview.risk}
+            </p>
+          )}
+          {pendingActionReview.preview && (
+            <p className="line-clamp-4 whitespace-pre-wrap break-words text-muted">
+              <span className="font-semibold text-fg">Preview:</span> {pendingActionReview.preview}
+            </p>
+          )}
+          {pendingActionReview.payloadHash && (
+            <p className="break-all font-mono text-faint">hash {pendingActionReview.payloadHash}</p>
+          )}
+        </div>
       )}
 
       {card.contentPreview && (card.contentPreview.body || card.contentPreview.imageUrl) && (

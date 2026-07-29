@@ -26,7 +26,12 @@ function queueSendBatch(items: number, kind: 'external_send' | 'external_write' 
     summary: 'test batch',
     kind,
     toolName: 'run_batch',
-    payload: { sideEffect: kind === 'external_send' ? 'send' : 'write', items: Array.from({ length: items }, (_, i) => ({ id: `t-${i}`, args: {} })) },
+    payload: {
+      tool: 'composio_execute_tool',
+      composioSlug: kind === 'external_send' ? 'GMAIL_SEND_EMAIL' : 'GOOGLESHEETS_VALUES_UPDATE',
+      sideEffect: kind === 'external_send' ? 'send' : 'write',
+      items: Array.from({ length: items }, (_, i) => ({ id: `t-${i}`, args: {} })),
+    },
     targetSummary: `${items} item(s)`,
     preview: '{}',
     risk: 'test',
@@ -38,14 +43,62 @@ function queueSendBatch(items: number, kind: 'external_send' | 'external_write' 
 
 test('queued irreversible send requires a human regardless of batch size', async () => {
   const record = queueSendBatch(10);
-  assert.equal(await guard({ subject: 'Send priority-account reactivation emails 1-10', reason: null, destructive: false, pendingActionId: record.id } as never), true);
+  assert.equal(await guard({ subject: 'Send priority-account reactivation emails 1-10', reason: null, destructive: false, pendingActionId: record.id } as never, 'sess-test'), true);
   const single = queueSendBatch(1);
-  assert.equal(await guard({ subject: 'Send one follow-up', reason: null, destructive: false, pendingActionId: single.id } as never), true);
+  assert.equal(await guard({ subject: 'Send one follow-up', reason: null, destructive: false, pendingActionId: single.id } as never, 'sess-test'), true);
 });
 
 test('non-send pending action never blocks YOLO', async () => {
   const record = queueSendBatch(50, 'external_write');
-  assert.equal(await guard({ subject: 'Update 50 sheet rows', reason: null, destructive: false, pendingActionId: record.id } as never), false);
+  assert.equal(await guard({ subject: 'Update 50 sheet rows', reason: null, destructive: false, pendingActionId: record.id } as never, 'sess-test'), false);
+});
+
+test('model-declared external_write cannot weaken a stored irreversible send', async () => {
+  const record = queuePendingAction({
+    title: 'Mislabeled send',
+    summary: 'The stored call is authoritative even when kind is mislabeled.',
+    kind: 'external_write',
+    toolName: 'composio_execute_tool',
+    payload: {
+      tool_slug: 'GMAIL_SEND_EMAIL',
+      arguments: { to: 'proof@example.com', subject: 'Proof', body: 'Exact.' },
+    },
+    sessionId: 'sess-test',
+  });
+  assert.equal(
+    await guard({
+      subject: 'Write the message',
+      reason: null,
+      destructive: false,
+      pendingActionId: record.id,
+    } as never, 'sess-test'),
+    true,
+  );
+});
+
+test('model-declared run_batch write cannot weaken its pinned send slug', async () => {
+  const record = queuePendingAction({
+    title: 'Mislabeled send batch',
+    summary: 'The pinned batch slug is authoritative.',
+    kind: 'external_write',
+    toolName: 'run_batch',
+    payload: {
+      tool: 'composio_execute_tool',
+      composioSlug: 'GMAIL_SEND_EMAIL',
+      sideEffect: 'write',
+      items: [{ id: 'one', args: { to: 'proof@example.com' } }],
+    },
+    sessionId: 'sess-test',
+  });
+  assert.equal(
+    await guard({
+      subject: 'Write one batch',
+      reason: null,
+      destructive: false,
+      pendingActionId: record.id,
+    } as never, 'sess-test'),
+    true,
+  );
 });
 
 test('text fallback: every explicit irreversible action blocks; reversible drafts and writes do not', async () => {

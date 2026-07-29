@@ -446,6 +446,9 @@ export type PendingActionExecutionClaimReason =
   | 'claimed'
   | 'not_found'
   | 'not_approved'
+  | 'session_authority_mismatch'
+  | 'payload_integrity_failed'
+  | 'approval_authority_invalid'
   | 'claim_in_progress_or_uncertain';
 
 export interface PendingActionExecutionClaim {
@@ -455,6 +458,94 @@ export interface PendingActionExecutionClaim {
   /** Opaque one-shot capability held only by the winning executor. It is
    *  required, with the same actor, to finalize EXECUTING. */
   claimToken?: string;
+}
+
+export interface PendingActionExecutionClaimOptions {
+  /** The caller's live session authority. Rechecked inside the same lock as the
+   * approved→executing transition so a changed record cannot cross a TOCTOU gap. */
+  expectedSessionId?: string;
+  /** Irreversible/unknown external writes must be backed by one exact resolved
+   * card whose immutable snapshot matches this record. */
+  requireResolvedHumanCard?: boolean;
+}
+
+function failPendingActionClaimIntegrity(
+  record: PendingActionRecord,
+  actor: string,
+  reason: 'payload_integrity_failed' | 'approval_authority_invalid',
+  detail: string,
+): PendingActionExecutionClaim {
+  const now = new Date().toISOString();
+  record.status = 'failed';
+  record.updatedAt = now;
+  record.resultSummary = `${detail} No provider call was made. This authorization is terminal: recreate the pending action from the intended payload and ask the user to approve the new card before execution.`;
+  record.history = [
+    ...(Array.isArray(record.history) ? record.history : []),
+    {
+      at: now,
+      status: 'failed',
+      note: record.resultSummary,
+      actor: cleanLine(actor, 'pending-action-executor', 120),
+    },
+  ];
+  return {
+    claimed: false,
+    reason,
+    record: writeRecord(record),
+  };
+}
+
+function pinnedPendingActionView(args: Record<string, unknown> | null): Record<string, unknown> | null {
+  const value = args?.pendingAction;
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function verifyResolvedHumanCardAuthority(record: PendingActionRecord): string | null {
+  if (
+    record.approvedBy !== 'human'
+    || record.approvalEvidence?.kind !== 'card'
+    || !record.approvalId
+    || record.approvalEvidence.approvalId !== record.approvalId
+  ) {
+    return 'The action requires an exact human approval card, but its durable consent provenance is missing or inconsistent.';
+  }
+  let row: approvalRegistryForVerify.PendingApprovalRow | undefined;
+  try {
+    row = approvalRegistryForVerify.get(record.approvalId);
+  } catch {
+    return 'The resolved approval card could not be verified at the execution boundary.';
+  }
+  if (
+    !row
+    || row.status !== 'resolved'
+    || row.resolution !== 'approved'
+    || row.approvalId !== record.approvalId
+  ) {
+    return 'The linked approval card is not durably resolved approved.';
+  }
+  if (!record.sessionId || row.sessionId !== record.sessionId) {
+    return 'The linked approval card does not belong to the pending action session.';
+  }
+  const rowPendingActionId = row.args?.pendingActionId ?? row.args?.pending_action_id;
+  const pinned = pinnedPendingActionView(row.args);
+  if (
+    rowPendingActionId !== record.id
+    || pinned?.id !== record.id
+    || pinned.toolName !== record.toolName
+    || pinned.payloadHash !== record.payloadHash
+  ) {
+    return 'The resolved approval card does not pin this pending action id, tool, and payload hash.';
+  }
+  const pinnedHash = pendingActionPayloadHash(String(pinned.toolName), pinned.payload);
+  if (
+    pinnedHash !== pinned.payloadHash
+    || stableStringify(pinned.payload) !== stableStringify(record.payload)
+  ) {
+    return 'The resolved approval card payload snapshot does not match the stored action payload.';
+  }
+  return null;
 }
 
 /**
@@ -467,6 +558,7 @@ export interface PendingActionExecutionClaim {
 export function claimPendingActionExecution(
   id: string,
   actor = 'pending-action-executor',
+  options: PendingActionExecutionClaimOptions = {},
 ): PendingActionExecutionClaim {
   const clean = id.trim();
   if (!clean) return { claimed: false, reason: 'not_found', record: null };
@@ -475,6 +567,36 @@ export function claimPendingActionExecution(
     if (!record) return { claimed: false, reason: 'not_found', record: null } satisfies PendingActionExecutionClaim;
     if (record.status !== 'approved') {
       return { claimed: false, reason: 'not_approved', record } satisfies PendingActionExecutionClaim;
+    }
+    if (
+      options.expectedSessionId !== undefined
+      && (!record.sessionId || record.sessionId !== options.expectedSessionId)
+    ) {
+      return {
+        claimed: false,
+        reason: 'session_authority_mismatch',
+        record,
+      } satisfies PendingActionExecutionClaim;
+    }
+    const recomputedPayloadHash = pendingActionPayloadHash(record.toolName, record.payload);
+    if (recomputedPayloadHash !== record.payloadHash) {
+      return failPendingActionClaimIntegrity(
+        record,
+        actor,
+        'payload_integrity_failed',
+        `Pending action ${record.id} failed its pre-dispatch payload integrity check: the stored tool/payload no longer matches the approved payload hash.`,
+      );
+    }
+    if (options.requireResolvedHumanCard) {
+      const authorityError = verifyResolvedHumanCardAuthority(record);
+      if (authorityError) {
+        return failPendingActionClaimIntegrity(
+          record,
+          actor,
+          'approval_authority_invalid',
+          `Pending action ${record.id} failed its pre-dispatch approval-authority check: ${authorityError}`,
+        );
+      }
     }
     const now = new Date().toISOString();
     const claimedBy = cleanLine(actor, 'pending-action-executor', 120);
@@ -551,6 +673,37 @@ export function linkPendingActionApproval(id: string, approvalId: string): Pendi
     note: `Approval requested: ${approvalId}`,
     actor: 'approval-registry',
   });
+}
+
+/** Collapse a same-request queue race without touching a row that acquired any
+ * approval authority in the meantime. The status+link check and mutation share
+ * the record lock, so a concurrent card can never be cancelled by this cleanup. */
+export function cancelPendingActionIfQueuedUnlinked(
+  id: string,
+  canonicalId: string,
+  reason = `Deduplicated same-request retry; canonical pending action is ${canonicalId}.`,
+): PendingActionRecord | null {
+  const clean = id.trim();
+  if (!clean) return null;
+  const locked = withRecordExecutionLock(clean, () => {
+    const record = getPendingAction(clean);
+    if (!record || record.status !== 'queued' || record.approvalId) return record;
+    const now = new Date().toISOString();
+    record.status = 'cancelled';
+    record.updatedAt = now;
+    record.resultSummary = reason;
+    record.history = [
+      ...(Array.isArray(record.history) ? record.history : []),
+      {
+        at: now,
+        status: 'cancelled',
+        note: record.resultSummary,
+        actor: 'pending-action-graph-transition',
+      },
+    ];
+    return writeRecord(record);
+  });
+  return locked.acquired ? locked.value : getPendingAction(clean);
 }
 
 export function markPendingActionApprovalResolved(

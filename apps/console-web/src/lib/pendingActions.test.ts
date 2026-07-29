@@ -1,10 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  canOfferStandingSendTrust,
   reconcilePendingActionExecutionFailure,
   resolvePendingActionExecutionPresentation,
   type PendingActionExecuteResult,
 } from './pendingActions';
+
+test('standing send trust is offered only for recipient-scoped external sends', () => {
+  assert.equal(canOfferStandingSendTrust({ kind: 'external_send' }), true);
+  assert.equal(canOfferStandingSendTrust({ kind: 'external_write' }), false);
+  assert.equal(canOfferStandingSendTrust({ kind: 'deploy' }), false);
+  assert.equal(canOfferStandingSendTrust(undefined), false);
+});
 
 function skipped(status: string, resultSummary: string | null = null): PendingActionExecuteResult {
   return {

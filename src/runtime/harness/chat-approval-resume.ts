@@ -35,14 +35,107 @@ import pino from 'pino';
 import * as approvalRegistry from './approval-registry.js';
 import { listEvents } from './eventlog.js';
 import { HarnessSession } from './session.js';
+import { getPendingAction } from './pending-actions.js';
+import { pendingActionIdFromArgs } from './pending-action-view.js';
 
 const logger = pino({ name: 'clementine.chat-approval-resume' });
 
 const handledApprovalIds = new Set<string>();
+const activeResumeSessions = new Set<string>();
+const queuedApprovalResumes = new Map<string, {
+  row: approvalRegistry.PendingApprovalRow;
+  dispatch: ChatApprovalResumeDispatch;
+}>();
+const resumeDrainTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const RESUME_DRAIN_DELAY_MS = 25;
 
 export type ChatApprovalResumeDispatch = (sessionId: string, directive: string) => Promise<void>;
 
-export function chatApprovalResumeDirective(subject: string, tool: string): string {
+function scheduleResumeDrain(sessionId: string): void {
+  if (resumeDrainTimers.has(sessionId)) return;
+  const timer = setTimeout(() => {
+    resumeDrainTimers.delete(sessionId);
+    void drainQueuedApprovalResumes(sessionId);
+  }, RESUME_DRAIN_DELAY_MS);
+  timer.unref?.();
+  resumeDrainTimers.set(sessionId, timer);
+}
+
+function enqueueApprovalResume(
+  row: approvalRegistry.PendingApprovalRow,
+  dispatch: ChatApprovalResumeDispatch,
+): void {
+  queuedApprovalResumes.set(row.approvalId, { row, dispatch });
+  scheduleResumeDrain(row.sessionId);
+}
+
+function queuedResumeStillActionable(row: approvalRegistry.PendingApprovalRow): approvalRegistry.PendingApprovalRow | null {
+  const current = approvalRegistry.get(row.approvalId);
+  if (
+    !current
+    || current.status !== 'resolved'
+    || current.resolution !== 'approved'
+    || current.consumedAt
+  ) return null;
+  const pendingActionId = pendingActionIdFromArgs(current.args) ?? undefined;
+  if (!pendingActionId) return current;
+  const pendingAction = getPendingAction(pendingActionId);
+  return pendingAction
+    && pendingAction.sessionId === current.sessionId
+    && pendingAction.approvalId === current.approvalId
+    && pendingAction.status === 'approved'
+    && pendingAction.approvedBy === 'human'
+    ? current
+    : null;
+}
+
+async function drainQueuedApprovalResumes(sessionId: string): Promise<void> {
+  const session = HarnessSession.load(sessionId);
+  if (!session || session.kind !== 'chat') {
+    for (const [approvalId, queued] of queuedApprovalResumes) {
+      if (queued.row.sessionId === sessionId) queuedApprovalResumes.delete(approvalId);
+    }
+    return;
+  }
+  if (activeResumeSessions.has(sessionId) || session.runInFlightSince()) {
+    scheduleResumeDrain(sessionId);
+    return;
+  }
+  const next = [...queuedApprovalResumes.values()]
+    .filter((queued) => queued.row.sessionId === sessionId)
+    .sort((left, right) =>
+      left.row.requestedAt.localeCompare(right.row.requestedAt)
+      || left.row.approvalId.localeCompare(right.row.approvalId))[0];
+  if (!next) return;
+  queuedApprovalResumes.delete(next.row.approvalId);
+  const current = queuedResumeStillActionable(next.row);
+  if (current) await handleResolvedApprovalForChatResume(current, next.dispatch);
+  if ([...queuedApprovalResumes.values()].some((queued) => queued.row.sessionId === sessionId)) {
+    scheduleResumeDrain(sessionId);
+  }
+}
+
+export function chatApprovalResumeDirective(
+  subject: string,
+  tool: string,
+  pendingActionId?: string,
+  pendingActionToolName?: string,
+): string {
+  if (pendingActionId) {
+    if (pendingActionToolName === 'run_batch') {
+      return (
+        `[approval-resume] The user just APPROVED the exact queued batch "${subject}" (${pendingActionId}). `
+        + `Call run_batch once with action="execute" and pending_action_id="${pendingActionId}". `
+        + 'It consumes the stored certified plan and records the per-item ledger. '
+        + 'Do not re-propose it, reconstruct any item, or request another approval. Then report the authoritative ledger.'
+      );
+    }
+    return (
+      `[approval-resume] The user just APPROVED the exact queued action "${subject}" (${pendingActionId}). `
+      + `Call pending_action_execute once with id "${pendingActionId}". It dispatches the byte-identical stored payload and records the provider result. `
+      + 'Do not re-queue it, reconstruct the underlying call, or request another approval. Then report what landed.'
+    );
+  }
   return (
     `[approval-resume] The user just APPROVED the pending action "${subject}" (${tool}). `
     + 'Resume the parked task now: re-run the approved tool call with the exact same arguments — '
@@ -60,17 +153,53 @@ export async function handleResolvedApprovalForChatResume(
   try {
     if (row.resolution !== 'approved') return false;
     if (handledApprovalIds.has(row.approvalId)) return false;
+    const pendingActionId = pendingActionIdFromArgs(row.args) ?? undefined;
+    const pendingAction = pendingActionId ? getPendingAction(pendingActionId) : null;
+    // An exact linked pending-action card is intrinsically resumable. This is
+    // the crash-recovery twin of approval_parked: if the daemon died after
+    // linking the row but before appending that event, approval still executes
+    // only the stored payload instead of resolving into a void.
+    const exactLinkedPendingAction = Boolean(
+      pendingAction
+      && pendingAction.sessionId === row.sessionId
+      && pendingAction.approvalId === row.approvalId
+      && pendingAction.status === 'approved'
+      && pendingAction.approvedBy === 'human',
+    );
     const parked = listEvents(row.sessionId, { types: ['approval_parked'] })
       .some((ev) => (ev.data as { approvalId?: string } | undefined)?.approvalId === row.approvalId);
-    if (!parked) return false;
+    if (!parked && !exactLinkedPendingAction) return false;
     const session = HarnessSession.load(row.sessionId);
     if (!session || session.kind !== 'chat') return false;
-    if (session.runInFlightSince()) return false; // the live run owns this resolution
+    if (activeResumeSessions.has(row.sessionId) || session.runInFlightSince()) {
+      // The current turn may own this resolution; if so its durable consume or
+      // pending-action terminal state makes the queued row inert. Otherwise
+      // (for example a second exact card in one bulk approval) drain it after
+      // the session is free instead of silently losing the user's decision.
+      enqueueApprovalResume(row, dispatch);
+      return false;
+    }
     handledApprovalIds.add(row.approvalId);
+    activeResumeSessions.add(row.sessionId);
     logger.info({ approvalId: row.approvalId, sessionId: row.sessionId, subject: row.subject },
       'parked approval approved — resuming the chat session');
-    await dispatch(row.sessionId, chatApprovalResumeDirective(row.subject, row.tool ?? 'the approved tool'));
-    return true;
+    try {
+      await dispatch(
+        row.sessionId,
+        chatApprovalResumeDirective(
+          row.subject,
+          row.tool ?? 'the approved tool',
+          pendingActionId,
+          pendingAction?.toolName,
+        ),
+      );
+      return true;
+    } finally {
+      activeResumeSessions.delete(row.sessionId);
+      if ([...queuedApprovalResumes.values()].some((queued) => queued.row.sessionId === row.sessionId)) {
+        scheduleResumeDrain(row.sessionId);
+      }
+    }
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err), approvalId: row.approvalId },
       'chat approval resume failed — the approval stays consumable; the user can say "continue"');
@@ -92,5 +221,9 @@ export function startChatApprovalResume(dispatch: ChatApprovalResumeDispatch): v
 /** Test hook: clear the in-process one-shot memory. */
 export function _resetChatApprovalResumeForTest(): void {
   handledApprovalIds.clear();
+  activeResumeSessions.clear();
+  queuedApprovalResumes.clear();
+  for (const timer of resumeDrainTimers.values()) clearTimeout(timer);
+  resumeDrainTimers.clear();
   started = false;
 }

@@ -12,14 +12,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { isolatedTestArgs } from './run-tests-isolated-args.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testHome = mkdtempSync(path.join(os.tmpdir(), 'clementine-test-home-'));
 const tsxBin = path.join(repoRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
 const forwarded = process.argv.slice(2);
-const args = forwarded.length > 0
-  ? ['--test', ...forwarded]
-  : ['--test', 'src/**/*.test.ts', 'apps/**/*.test.ts'];
+const args = isolatedTestArgs(forwarded);
 
 const testEnv = { ...process.env };
 for (const key of [

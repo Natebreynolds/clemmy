@@ -43,6 +43,7 @@ import {
   canonicalExternalWriteActionKey,
   externalWriteSemanticFingerprint,
 } from './external-write-admission.js';
+import { exactApprovalAuthorityMatches } from './approval-authority.js';
 
 /**
  * The tool-choice identifier an approval maps to (Thread 2 — outcome loop).
@@ -360,6 +361,42 @@ function pendingActionIdFromArgs(args: Record<string, unknown> | null): string |
   return typeof direct === 'string' && direct.trim() ? direct.trim() : null;
 }
 
+function ensurePendingActionApprovalLinked(row: PendingApprovalRow): PendingApprovalRow {
+  const pendingActionId = pendingActionIdFromArgs(row.args);
+  if (!pendingActionId) return row;
+  const action = getPendingAction(pendingActionId);
+  if (!action || action.sessionId !== row.sessionId) {
+    throw new Error('approval-registry: pending action does not belong to this session');
+  }
+  linkPendingActionApproval(pendingActionId, row.approvalId);
+  const linked = getPendingAction(pendingActionId);
+  if (
+    !linked
+    || linked.sessionId !== row.sessionId
+    || linked.approvalId !== row.approvalId
+    || !['approval_requested', 'approved'].includes(linked.status)
+  ) {
+    throw new Error('approval-registry: pending action link could not be verified');
+  }
+  return row;
+}
+
+function ensureResumableRowMatchesInput(
+  row: PendingApprovalRow,
+  input: RegisterApprovalInput & { resumeKey: string },
+): PendingApprovalRow {
+  if (!exactApprovalAuthorityMatches(row, {
+    approvalId: '',
+    sessionId: input.sessionId,
+    tool: input.tool ?? null,
+    args: input.args ?? null,
+    resumeKey: input.resumeKey,
+  })) {
+    throw new Error('approval-registry: resume key collision across approval authority');
+  }
+  return ensurePendingActionApprovalLinked(row);
+}
+
 /**
  * Generate a short prefixed approval ID. Format: `apr-xy7q` (4 chars
  * base36 hex-ish, distinct enough for the surface display + tight
@@ -384,6 +421,13 @@ function newApprovalId(): string {
  * point as `approval_requested` event emission.
  */
 export function register(input: RegisterApprovalInput): PendingApprovalRow {
+  const pendingActionId = pendingActionIdFromArgs(input.args ?? null);
+  if (pendingActionId) {
+    const pendingAction = getPendingAction(pendingActionId);
+    if (!pendingAction || pendingAction.sessionId !== input.sessionId) {
+      throw new Error('approval-registry: pending action does not belong to this session');
+    }
+  }
   const db = openEventLog();
   const now = new Date();
   const ttl = input.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
@@ -413,12 +457,15 @@ export function register(input: RegisterApprovalInput): PendingApprovalRow {
       const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?').get(approvalId) as ApprovalSqlRow;
       const publicRow = rowToPublic(row);
       try {
-        const pendingActionId = pendingActionIdFromArgs(publicRow.args);
-        if (pendingActionId) linkPendingActionApproval(pendingActionId, publicRow.approvalId);
-      } catch {
-        // Approval registration is the source of truth; pending-action linkage is best-effort.
+        return ensurePendingActionApprovalLinked(publicRow);
+      } catch (error) {
+        // The row has not been surfaced yet. Compensate so a later retry can
+        // mint/link one usable card instead of inheriting a split-brain row.
+        db.prepare(
+          "DELETE FROM pending_approvals WHERE approval_id = ? AND status = 'pending'",
+        ).run(approvalId);
+        throw error;
       }
-      return publicRow;
     } catch (err) {
       if ((err as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') continue;
       throw err;
@@ -442,7 +489,12 @@ export function registerResumable(
      ORDER BY requested_at DESC, rowid DESC
      LIMIT 1
   `).get(input.resumeKey) as ApprovalSqlRow | undefined;
-  if (existing) return { row: rowToPublic(existing), created: false };
+  if (existing) {
+    return {
+      row: ensureResumableRowMatchesInput(rowToPublic(existing), input),
+      created: false,
+    };
+  }
 
   try {
     return { row: register(input), created: true };
@@ -458,7 +510,10 @@ export function registerResumable(
        LIMIT 1
     `).get(input.resumeKey) as ApprovalSqlRow | undefined;
     if (!raced) throw err;
-    return { row: rowToPublic(raced), created: false };
+    return {
+      row: ensureResumableRowMatchesInput(rowToPublic(raced), input),
+      created: false,
+    };
   }
 }
 

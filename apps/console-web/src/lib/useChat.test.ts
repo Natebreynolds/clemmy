@@ -7,6 +7,7 @@ import {
   createInboxOutcomeCursor,
   createInboxOutcomeDeliveryState,
   inboxOutcomeCursorForSession,
+  mergePendingActionHydration,
   postPendingChatWithRetry,
   reduceActivity,
   retainPendingChatPost,
@@ -64,6 +65,7 @@ test('live approval bursts keep independently addressable cards without overwrit
   const first = ev('approval_requested', {
     approvalId: 'apr-a111',
     subject: 'Create the Airtable record',
+    pendingActionId: 'pa-airtable-1',
   });
   const second = ev('approval_requested', {
     approvalId: 'apr-b222',
@@ -77,7 +79,63 @@ test('live approval bursts keep independently addressable cards without overwrit
     afterSecond.slice(1).map((message) => message.approval?.approvalId),
     ['apr-a111', 'apr-b222'],
   );
+  assert.equal(afterSecond[1].approval?.pendingActionId, 'pa-airtable-1');
   assert.equal(appendLiveApprovalCard(afterSecond, second), afterSecond, 'SSE replay is idempotent');
+});
+
+test('one pending-action read hydrates every slim card sharing the durable action id', () => {
+  const messages = [
+    {
+      id: 'approval-apr-one',
+      role: 'assistant' as const,
+      text: '',
+      status: 'awaiting-approval' as const,
+      approval: {
+        subject: 'Publish the approved launch post',
+        approvalId: 'apr-one',
+        pendingActionId: 'pa-launch',
+      },
+    },
+    {
+      id: 'approval-apr-two',
+      role: 'assistant' as const,
+      text: '',
+      status: 'awaiting-approval' as const,
+      approval: {
+        subject: 'Publish the approved launch post',
+        approvalId: 'apr-two',
+        pendingActionId: 'pa-launch',
+      },
+    },
+  ];
+  const pendingAction = {
+    id: 'pa-launch',
+    title: 'Publish the approved launch post',
+    summary: 'One reviewed post',
+    kind: 'external_send',
+    status: 'approval_requested',
+    toolName: 'SOCIALS_PUBLISH_POST',
+    targetSummary: 'LinkedIn company page',
+    preview: 'Launch day.',
+    risk: 'Publishes externally.',
+    rollback: 'Delete the post.',
+    payload: { body: 'Launch day.' },
+    payloadHash: 'hash-launch',
+    idempotencyKey: 'launch-once',
+    approvalId: 'apr-one',
+    resultSummary: null,
+    createdAt: '2026-07-28T00:00:00.000Z',
+    updatedAt: '2026-07-28T00:00:00.000Z',
+  };
+
+  const hydrated = mergePendingActionHydration(messages, pendingAction.id, pendingAction);
+  assert.equal(hydrated[0].approval?.pendingAction, pendingAction);
+  assert.equal(hydrated[1].approval?.pendingAction, pendingAction);
+  assert.equal(
+    mergePendingActionHydration(hydrated, pendingAction.id, pendingAction),
+    hydrated,
+    'replayed hydration is referentially inert',
+  );
 });
 
 test('conversation completion preserves streamed evidence and only marks explicit output complete', () => {
@@ -628,12 +686,22 @@ test('idle inbox: approval cards and blocking questions surface; pairing survive
   // …batch 2 carries the question + an A2 card; both render.
   const additions = inboxAdditionsFromEvents([
     { seq: 31, turn: 7, type: 'awaiting_user_input', data: { question: 'Which channel should the digest go to?' } },
-    { seq: 32, turn: 0, type: 'approval_requested', data: { subject: 'Post the EOD update', approvalId: 'apr-inbox-1' } },
+    {
+      seq: 32,
+      turn: 0,
+      type: 'approval_requested',
+      data: {
+        subject: 'Post the EOD update',
+        approvalId: 'apr-inbox-1',
+        pendingActionId: 'pa-eod-1',
+      },
+    },
   ], syntheticTurns);
   assert.equal(additions.length, 2);
   assert.equal(additions[0].status, 'awaiting-reply');
   assert.equal(additions[1].status, 'awaiting-approval');
   assert.equal(additions[1].approval?.approvalId, 'apr-inbox-1');
+  assert.equal(additions[1].approval?.pendingActionId, 'pa-eod-1');
 });
 
 test('idle inbox cursor resets sequence and delivery correlation when the session identity changes', () => {

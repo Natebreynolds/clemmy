@@ -46,6 +46,30 @@ test('classifyExternalWrite: tolerates a JSON-string args payload', () => {
   assert.equal(s.shapeKey, 'SALESFORCE_CREATE_RECORD');
 });
 
+test('classifyExternalWrite: nested deferred transports preserve the canonical send effect', () => {
+  const s = classifyExternalWrite('call_tool', {
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({
+      tool_slug: 'GMAIL_SEND_EMAIL',
+      arguments: { to: 'proof@example.com' },
+    }),
+  });
+  assert.equal(s.external, true);
+  assert.equal(s.mutating, true);
+  assert.equal(s.irreversible, true);
+  assert.equal(s.classificationKnown, true);
+  assert.equal(s.shapeKey, 'GMAIL_SEND_EMAIL');
+});
+
+test('classifyExternalWrite: an unfamiliar external mutation is explicit and fail-closed', () => {
+  const s = classifyExternalWrite('mcp__new-provider__opaque_action', {});
+  assert.equal(s.external, true);
+  assert.equal(s.mutating, true);
+  assert.equal(s.irreversible, false);
+  assert.equal(s.classificationKnown, false);
+  assert.equal(s.shapeKey, 'new-provider_opaque_action');
+});
+
 // ─── decideInstructionReview (batch threshold) ────────────────────
 
 test('decideInstructionReview: below threshold → not required, count is 1-based', () => {

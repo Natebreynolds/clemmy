@@ -27,6 +27,37 @@ test('detectNativeMcpSuccess: error / unavailable / approval results are not suc
   assert.equal(detectNativeMcpSuccess('airtable__list_records', 'NOT FOUND: base missing'), null);
 });
 
+test('detectNativeMcpSuccess: structured failure envelopes never poison procedural memory', () => {
+  for (const result of [
+    '{"ok":false,"error":"permission denied"}',
+    '{"success":false,"message":"unauthorized"}',
+    '{"successful":false,"error":{"message":"request refused"}}',
+    '{"isError":true,"content":"authentication required"}',
+  ]) {
+    assert.equal(
+      detectNativeMcpSuccess('airtable__list_records', result),
+      null,
+      `must reject ${result}`,
+    );
+  }
+});
+
+test('detectNativeMcpSuccess: auth, permission, and refusal text never count as success', () => {
+  for (const result of [
+    'Permission denied for this workspace.',
+    'Unauthorized: reconnect the integration.',
+    'Authentication required before calling this tool.',
+    'Tool call refused by harness.',
+    'Access forbidden for this account.',
+  ]) {
+    assert.equal(
+      detectNativeMcpSuccess('airtable__list_records', result),
+      null,
+      `must reject ${result}`,
+    );
+  }
+});
+
 test('detectNativeMcpSuccess: empty inputs are safe', () => {
   assert.equal(detectNativeMcpSuccess(null, 'x'), null);
   assert.equal(detectNativeMcpSuccess('notion__create_page', ''), null);

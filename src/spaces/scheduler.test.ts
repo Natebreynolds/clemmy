@@ -16,6 +16,8 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-sch
 const store = await import('./store.js');
 const data = await import('./data-store.js');
 const sched = await import('./scheduler.js');
+const runner = await import('./runner.js');
+const approvals = await import('../runtime/harness/approval-registry.js');
 
 function writeRunner(slug: string, file: string, body: string) {
   const dir = store.resolveInSpace(slug, 'data');
@@ -27,22 +29,25 @@ test('a due (every-minute) data source fires and persists; dedupes within the mi
   const slug = 'sched-due';
   store.spaceStore.save({
     id: slug, title: 'Due',
-    dataSources: [{ id: 'pull', runner: 'r.mjs', schedule: '* * * * *' }],
+    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '* * * * *' }],
   });
-  writeRunner(slug, 'r.mjs', 'process.stdout.write(JSON.stringify({n:1}))');
+  runner._setSpaceComposioDispatchForTests(async () => ({
+    ok: true as const, result: { n: 1 }, connectionId: 'ca-proof', identity: 'proof@example.test',
+  }));
+  try {
+    const now = new Date('2026-06-08T08:00:00.000Z');
+    const first = await sched.processSpaceSchedules(now);
+    assert.equal(first.fired, 1);
+    assert.deepEqual((data.readData(slug) as any).pull, { n: 1 });
 
-  const now = new Date('2026-06-08T08:00:00.000Z');
-  const first = await sched.processSpaceSchedules(now);
-  assert.equal(first.fired, 1);
-  assert.deepEqual((data.readData(slug) as any).pull, { n: 1 });
-
-  // Same minute again → no double fire (dedup).
-  const second = await sched.processSpaceSchedules(now);
-  assert.equal(second.fired, 0);
-
-  // Archive so this every-minute source doesn't re-fire across the catch-up
-  // window in later tests (they share one CLEMENTINE_HOME + schedule state).
-  store.spaceStore.archive(slug);
+    // Same minute again → no double fire (dedup).
+    const second = await sched.processSpaceSchedules(now);
+    assert.equal(second.fired, 0);
+  } finally {
+    runner._setSpaceComposioDispatchForTests(null);
+    // Archive so this every-minute source doesn't re-fire across later tests.
+    store.spaceStore.archive(slug);
+  }
 });
 
 test('a paused workspace is skipped by the scheduler', async () => {
@@ -50,9 +55,8 @@ test('a paused workspace is skipped by the scheduler', async () => {
   store.spaceStore.save({
     id: slug, title: 'Paused',
     status: 'paused',
-    dataSources: [{ id: 'pull', runner: 'r.mjs', schedule: '* * * * *' }],
+    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '* * * * *' }],
   });
-  writeRunner(slug, 'r.mjs', 'process.stdout.write(JSON.stringify({n:9}))');
   const res = await sched.processSpaceSchedules(new Date('2026-06-08T09:00:00.000Z'));
   // evaluated counts only active spaces' scheduled sources; paused contributes 0.
   assert.equal(res.fired, 0);
@@ -61,61 +65,103 @@ test('a paused workspace is skipped by the scheduler', async () => {
 
 test('a data source with no schedule never fires', async () => {
   const slug = 'sched-none';
-  store.spaceStore.save({ id: slug, title: 'None', dataSources: [{ id: 'pull', runner: 'r.mjs' }] });
-  writeRunner(slug, 'r.mjs', 'process.stdout.write(JSON.stringify({n:0}))');
+  store.spaceStore.save({ id: slug, title: 'None', dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }] });
   const res = await sched.processSpaceSchedules(new Date('2026-06-08T10:00:00.000Z'));
   assert.equal(res.fired, 0);
   assert.deepEqual(data.readData(slug), {});
 });
 
-test('E2: a runner _reengage signal fires a threshold re-engage once, dedupes, and re-fires after it clears', async () => {
+test('a due installed legacy runner requests one decision without counting as a scheduler error', async () => {
+  const slug = 'sched-legacy-trust';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Legacy schedule',
+    dataSources: [{ id: 'pull', runner: 'pull.mjs', schedule: '* * * * *' }],
+  });
+  writeRunner(
+    slug,
+    'pull.mjs',
+    `import { writeFileSync } from 'node:fs';
+writeFileSync(new URL('./must-not-run.txt', import.meta.url), 'no');
+process.stdout.write('{}');`,
+  );
+
+  const res = await sched.processSpaceSchedules(new Date('2026-06-08T10:00:00.000Z'));
+  assert.equal(res.fired, 0);
+  assert.equal(res.errors, 0);
+  assert.equal(res.awaitingApproval, 1);
+  assert.equal(
+    approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
+    1,
+  );
+  assert.equal(
+    (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/must-not-run.txt')),
+    false,
+  );
+  store.spaceStore.archive(slug);
+});
+
+test('E2: a read-only source _reengage signal fires once, dedupes, and re-fires after it clears', async () => {
   const slug = 'sched-rg';
   store.spaceStore.save({
     id: slug, title: 'Reengage',
-    dataSources: [{ id: 'pull', runner: 'r.mjs', schedule: '* * * * *' }],
+    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '* * * * *' }],
     reengage: { triggers: ['threshold'] },
   });
-  const emit = (re: string) => writeRunner(slug, 'r.mjs', `process.stdout.write(JSON.stringify({rows:[{a:1}],_reengage:${re}}))`);
+  let current: Record<string, unknown> = { rows: [{ a: 1 }] };
+  const emit = (re: string) => { current = { rows: [{ a: 1 }], _reengage: JSON.parse(re) }; };
   const fires = () => data.listAudit(slug).filter((a) => a.path === '/reengage/threshold').length;
+  runner._setSpaceComposioDispatchForTests(async () => ({
+    ok: true as const, result: current, connectionId: 'ca-proof', identity: 'proof@example.test',
+  }));
 
-  // T1: condition A crosses → fires once. (1-minute catch-up windows step by step.)
-  emit('{"fire":true,"key":"cold-A","message":"3 deals cold"}');
-  await sched.processSpaceSchedules(new Date('2026-06-08T10:01:00.000Z'));
-  assert.equal(fires(), 1);
+  try {
+    // T1: condition A crosses → fires once. (1-minute catch-up windows step by step.)
+    emit('{"fire":true,"key":"cold-A","message":"3 deals cold"}');
+    await sched.processSpaceSchedules(new Date('2026-06-08T10:01:00.000Z'));
+    assert.equal(fires(), 1);
 
-  // T2: same condition (key A) persists → deduped, no new fire.
-  await sched.processSpaceSchedules(new Date('2026-06-08T10:02:00.000Z'));
-  assert.equal(fires(), 1);
+    // T2: same condition (key A) persists → deduped, no new fire.
+    await sched.processSpaceSchedules(new Date('2026-06-08T10:02:00.000Z'));
+    assert.equal(fires(), 1);
 
-  // T3: a NEW condition (key B) → fires again.
-  emit('{"fire":true,"key":"cold-B","message":"5 deals cold"}');
-  await sched.processSpaceSchedules(new Date('2026-06-08T10:03:00.000Z'));
-  assert.equal(fires(), 2);
+    // T3: a NEW condition (key B) → fires again.
+    emit('{"fire":true,"key":"cold-B","message":"5 deals cold"}');
+    await sched.processSpaceSchedules(new Date('2026-06-08T10:03:00.000Z'));
+    assert.equal(fires(), 2);
 
-  // T4: condition clears (fire:false) → no re-engage, dedup reset.
-  emit('{"fire":false}');
-  await sched.processSpaceSchedules(new Date('2026-06-08T10:04:00.000Z'));
-  assert.equal(fires(), 2);
+    // T4: condition clears (fire:false) → no re-engage, dedup reset.
+    emit('{"fire":false}');
+    await sched.processSpaceSchedules(new Date('2026-06-08T10:04:00.000Z'));
+    assert.equal(fires(), 2);
 
-  // T5: condition A returns → re-fires (the cleared dedup allows it).
-  emit('{"fire":true,"key":"cold-A","message":"back cold"}');
-  await sched.processSpaceSchedules(new Date('2026-06-08T10:05:00.000Z'));
-  assert.equal(fires(), 3);
-
-  store.spaceStore.archive(slug);
+    // T5: condition A returns → re-fires (the cleared dedup allows it).
+    emit('{"fire":true,"key":"cold-A","message":"back cold"}');
+    await sched.processSpaceSchedules(new Date('2026-06-08T10:05:00.000Z'));
+    assert.equal(fires(), 3);
+  } finally {
+    runner._setSpaceComposioDispatchForTests(null);
+    store.spaceStore.archive(slug);
+  }
 });
 
 test('E2: a source with no _reengage signal never fires a re-engage', async () => {
   const slug = 'sched-norg';
   store.spaceStore.save({
     id: slug, title: 'NoRe',
-    dataSources: [{ id: 'pull', runner: 'r.mjs', schedule: '* * * * *' }],
+    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '* * * * *' }],
     reengage: { triggers: ['threshold'] },
   });
-  writeRunner(slug, 'r.mjs', 'process.stdout.write(JSON.stringify({rows:[{a:1}]}))');
-  await sched.processSpaceSchedules(new Date('2026-06-08T10:06:00.000Z'));
-  assert.equal(data.listAudit(slug).filter((a) => a.path === '/reengage/threshold').length, 0);
-  store.spaceStore.archive(slug);
+  runner._setSpaceComposioDispatchForTests(async () => ({
+    ok: true as const, result: { rows: [{ a: 1 }] }, connectionId: 'ca-proof', identity: 'proof@example.test',
+  }));
+  try {
+    await sched.processSpaceSchedules(new Date('2026-06-08T10:06:00.000Z'));
+    assert.equal(data.listAudit(slug).filter((a) => a.path === '/reengage/threshold').length, 0);
+  } finally {
+    runner._setSpaceComposioDispatchForTests(null);
+    store.spaceStore.archive(slug);
+  }
 });
 
 test('paused-build auto-retry: a transiently-failing source reactivates the workspace; budget caps + spacing hold', async () => {
@@ -125,16 +171,15 @@ test('paused-build auto-retry: a transiently-failing source reactivates the work
   const slug = 'retry-paused';
   store.spaceStore.save({
     id: slug, title: 'Retry Me',
-    dataSources: [{ id: 'pull', runner: 'flaky.mjs' }],
+    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }],
   });
-  // Runner fails while a flag file exists (the "transient outage"), then succeeds.
-  const flag = path.join(process.env.CLEMENTINE_HOME!, 'outage.flag');
-  writeFileSync(flag, 'down', 'utf-8');
-  writeRunner(slug, 'flaky.mjs', `
-import { existsSync } from 'node:fs';
-if (existsSync(${JSON.stringify(flag)})) { console.error('api down'); process.exit(1); }
-process.stdout.write(JSON.stringify({ rows: [1, 2] }));
-`);
+  let outage = true;
+  runner._setSpaceComposioDispatchForTests(async () => {
+    if (outage) throw new Error('api down');
+    return {
+      ok: true as const, result: { rows: [1, 2] }, connectionId: 'ca-proof', identity: 'proof@example.test',
+    };
+  });
   store.spaceStore.update(slug, { status: 'paused' });
 
   // Too fresh (< 5 min since pause) → not touched.
@@ -154,8 +199,7 @@ process.stdout.write(JSON.stringify({ rows: [1, 2] }));
   assert.equal(spaced.examined, 0, '15-min spacing between attempts');
 
   // Outage clears; attempt 2 → data pulls, workspace REACTIVATES.
-  const { rmSync: rm } = await import('node:fs');
-  rm(flag, { force: true });
+  outage = false;
   const now2 = new Date(now1.getTime() + 16 * 60_000);
   const second = await sched.retryPausedSpaces(now2);
   assert.equal(second.reactivated, 1);
@@ -165,6 +209,7 @@ process.stdout.write(JSON.stringify({ rows: [1, 2] }));
   // Reactivated → nothing left to retry.
   const done = await sched.retryPausedSpaces(new Date(now2.getTime() + 20 * 60_000));
   assert.equal(done.examined, 0);
+  runner._setSpaceComposioDispatchForTests(null);
   store.spaceStore.archive(slug);
 });
 

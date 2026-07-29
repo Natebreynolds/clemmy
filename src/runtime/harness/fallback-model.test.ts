@@ -132,6 +132,35 @@ test('getResponse: overload on primary falls back to the next brain', async () =
   }, 'the response carries truthful winner metadata for outer route accounting');
 });
 
+test('getResponse: a caller-configured overall abort remains bounded and never dispatches a rescue', async () => {
+  const controller = new AbortController();
+  let rescueCalls = 0;
+  const primary = model({
+    getResponse: async (request: any) => new Promise<ModelResponse>((_resolve, reject) => {
+      request.signal.addEventListener('abort', () => reject(new Error('aborted by overall deadline')), { once: true });
+    }),
+  });
+  const rescue = model({
+    getResponse: async () => {
+      rescueCalls += 1;
+      return resp('unexpected rescue');
+    },
+  });
+  const overallDeadline = setTimeout(() => controller.abort(), 10);
+  try {
+    await assert.rejects(
+      () => withModelFallback(
+        [target('primary', primary), target('rescue', rescue)],
+        { firstByteTimeoutMs: 1 },
+      ).getResponse({ ...req(), signal: controller.signal } as never),
+      /overall deadline/,
+    );
+  } finally {
+    clearTimeout(overallDeadline);
+  }
+  assert.equal(rescueCalls, 0, 'caller cancellation is authoritative and never starts a duplicate provider call');
+});
+
 test('getResponse: a NON-overload error (400) does NOT fall back — it throws', async () => {
   let sonnetCalls = 0;
   const opus = model({ getResponse: async () => { throw { statusCode: 400, message: 'bad' }; } });

@@ -16,11 +16,19 @@ import {
   bindDiscordHarnessSession,
   handleHarnessCancel,
   isChannelSessionAwaitingApproval,
+  remainingApprovalDisplayState,
   requestBoundChannelRunStop,
   tryHandleHarnessApprovalReply,
   type DiscordHarnessTransport,
 } from './discord-harness.js';
-import { buildSlackHarnessTransport, handleSlackHarnessMessage, slackHarnessConversationId, toSlackMrkdwn } from './slack-harness.js';
+import {
+  approvalBlocksForState,
+  buildSlackHarnessTransport,
+  handleSlackHarnessMessage,
+  slackHarnessConversationId,
+  toSlackMrkdwn,
+} from './slack-harness.js';
+import { pendingActionIdFromArgs } from '../runtime/harness/pending-action-view.js';
 import { ClementineAssistant } from '../assistant/core.js';
 import { claimInbound, completeInbound } from './inbox-store.js';
 import type { ApprovalResolutionResult } from '../types.js';
@@ -417,6 +425,43 @@ async function settleSlackApprovalCard(
   } catch { /* the decision is durable even if the old Slack card cannot update */ }
 }
 
+async function refreshSlackApprovalSiblings(
+  client: WebClient,
+  channelId: string,
+  messageTs: string | undefined,
+  row: approvalRegistry.PendingApprovalRow,
+  decision: 'approved' | 'rejected' | 'already-resolved',
+): Promise<boolean> {
+  const state = remainingApprovalDisplayState(
+    row.sessionId,
+    row.approvalId,
+    decision,
+  );
+  if (!state) return false;
+  if (!channelId || !messageTs) return true;
+  const body = toSlackMrkdwn(state.summary) || 'Approval decision recorded.';
+  const controls = approvalBlocksForState(state) ?? [];
+  const blocks: KnownBlock[] = [
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: body.slice(0, 3000) },
+    },
+    ...controls,
+  ];
+  try {
+    await client.chat.update({
+      channel: channelId,
+      ts: messageTs,
+      text: body,
+      blocks,
+    });
+  } catch {
+    // The durable Inbox remains authoritative if the old Slack card cannot
+    // be refreshed.
+  }
+  return true;
+}
+
 function workflowNameForApproval(row: approvalRegistry.PendingApprovalRow): string | null {
   const context = approvalContextForRow(row);
   return context.workflowName?.trim() || null;
@@ -770,7 +815,72 @@ async function handleSlackAction(opts: {
     if (targetId.startsWith('apr-')) {
       const row = originalRow;
       if (row && row.status !== 'pending') {
+        if (await refreshSlackApprovalSiblings(
+          opts.client,
+          opts.channelId,
+          opts.messageTs,
+          row,
+          'already-resolved',
+        )) {
+          await opts.respondEphemeral(`Approval \`${targetId}\` was already ${row.status}; the remaining independent approvals are still actionable.`);
+          return;
+        }
         await opts.respondEphemeral(`Approval \`${targetId}\` was already ${row.status}.`);
+        return;
+      }
+      if (
+        row
+        && pendingActionIdFromArgs(row.args)
+        && !approvalRegistry.isExpired(row)
+      ) {
+        // Exact queued actions already own a durable parked graph edge. Resolve
+        // only the clicked authority; the global resume listener serializes
+        // execution without a second channel-specific model turn.
+        const result = approvalRegistry.resolve(
+          row.approvalId,
+          approved ? 'approved' : 'rejected',
+          'slack-user',
+        );
+        if (!result.ok) {
+          const current = result.row ?? approvalRegistry.get(row.approvalId);
+          if (current) {
+            await refreshSlackApprovalSiblings(
+              opts.client,
+              opts.channelId,
+              opts.messageTs,
+              current,
+              'already-resolved',
+            );
+          }
+          await opts.respondEphemeral(
+            result.reason === 'not_found'
+              ? `Approval \`${targetId}\` was not found.`
+              : `Approval \`${targetId}\` was already ${current?.status ?? 'resolved'}.`,
+          );
+          return;
+        }
+        const siblingsRemain = await refreshSlackApprovalSiblings(
+          opts.client,
+          opts.channelId,
+          opts.messageTs,
+          result.row ?? row,
+          approved ? 'approved' : 'rejected',
+        );
+        if (!siblingsRemain) {
+          await settleSlackApprovalCard(
+            opts.client,
+            opts.channelId,
+            opts.messageTs,
+            approved
+              ? '✅ *Approved*\nThe exact action is authorized; Clementine is resuming.'
+              : '⏭️ *Skipped*\nThe exact action was declined. No external action was performed.',
+          );
+        }
+        await opts.respondEphemeral(
+          approved
+            ? `Approved \`${targetId}\`. The exact queued action is authorized and Clementine is resuming.`
+            : `Rejected \`${targetId}\`. No external action was performed.`,
+        );
         return;
       }
       const transport = buildSlackHarnessTransport({ client: opts.client, channel: opts.channelId, threadTs: opts.threadTs ?? opts.messageTs });

@@ -35,6 +35,7 @@ test('operational event taxonomy includes release-critical graph and routing eve
 
 test('operational event taxonomy includes workspace and transaction visibility', () => {
   for (const type of [
+    'workspace_data_refresh_awaiting_approval',
     'workspace_data_refresh_failed',
     'workspace_action_executed',
     'workspace_memory_consolidated',

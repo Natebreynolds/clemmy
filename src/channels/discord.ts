@@ -16,6 +16,7 @@ import {
   TextInputStyle,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
+  type InteractionUpdateOptions,
   type ModalSubmitInteraction,
   Partials,
   type Message,
@@ -49,16 +50,19 @@ import {
   DISCORD_REQUIRE_MENTION,
 } from '../config.js';
 import {
+  approvalComponentsForState,
   bindDiscordHarnessSession,
   getBoundDiscordHarnessSessionId,
   handleDiscordHarnessMessage,
   handleHarnessSessions,
+  remainingApprovalDisplayState,
   resolveActiveDiscordHarnessRuns,
   resolveBoundChannelRunAttempt,
   runDiscordHarnessConversation,
   type DiscordHarnessTransport,
   tryHandleHarnessApprovalReply,
 } from './discord-harness.js';
+import { pendingActionIdFromArgs } from '../runtime/harness/pending-action-view.js';
 import { ClementineAssistant } from '../assistant/core.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
@@ -2398,6 +2402,41 @@ async function collapseApprovalCard(
   }
 }
 
+/**
+ * Keep sibling authorities visible after one decision. Returns true whenever
+ * the registry still has actionable rows for the same session, even if the
+ * best-effort Discord edit fails (the decision itself is already durable).
+ */
+async function refreshDiscordApprovalSiblings(
+  interaction: ButtonInteraction,
+  row: approvalRegistry.PendingApprovalRow,
+  decision: 'approved' | 'rejected' | 'already-resolved',
+): Promise<boolean> {
+  const state = remainingApprovalDisplayState(
+    row.sessionId,
+    row.approvalId,
+    decision,
+  );
+  if (!state) return false;
+  const components = approvalComponentsForState(state) ?? [];
+  try {
+    await interaction.update({
+      content: state.summary.slice(0, 1900),
+      components: components as InteractionUpdateOptions['components'],
+    });
+  } catch (err) {
+    try {
+      await interaction.reply({
+        content: `Decision recorded, but I could not refresh the remaining approval buttons: ${err instanceof Error ? err.message : 'unknown error'}. Open Clementine → Inbox to review them.`,
+        ephemeral: true,
+      });
+    } catch {
+      // The decision is durable and the Inbox remains authoritative.
+    }
+  }
+  return true;
+}
+
 async function handleButtonInteraction(interaction: ButtonInteraction, assistant: ClementineAssistant): Promise<void> {
   if (!interaction.customId.startsWith(`${DISCORD_CUSTOM_ID_PREFIX}:`)) {
     return;
@@ -2448,6 +2487,9 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         if (row && row.status !== 'pending') {
           const ageMs = Date.now() - new Date(row.resolvedAt ?? row.requestedAt).getTime();
           const ageLabel = formatRelativeAgo(ageMs);
+          if (await refreshDiscordApprovalSiblings(interaction, row, 'already-resolved')) {
+            return;
+          }
           // v0.5.21.2 — collapse the stale card (drop buttons + add
           // status footer) so the same card can't be re-clicked into
           // the same confusing "already resolved" state. The user's
@@ -2458,6 +2500,51 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
             interaction,
             'already-resolved',
             `was already ${row.status} ${ageLabel}${row.resolver ? ` by ${row.resolver}` : ''}`,
+          );
+          return;
+        }
+        if (
+          row
+          && pendingActionIdFromArgs(row.args)
+          && !approvalRegistry.isExpired(row)
+        ) {
+          // Exact pending-action cards are durable graph authorities, not a
+          // live SDK prompt. Resolve the one selected id and let the global
+          // parked-approval listener serialize its resume. Sending this
+          // through runDiscordHarnessResume would both start an extra model
+          // turn and settle sibling buttons that still require decisions.
+          const result = approvalRegistry.resolve(
+            row.approvalId,
+            approved ? 'approved' : 'rejected',
+            'discord-user',
+          );
+          if (!result.ok) {
+            const current = result.row ?? approvalRegistry.get(row.approvalId);
+            if (current && await refreshDiscordApprovalSiblings(interaction, current, 'already-resolved')) {
+              return;
+            }
+            await collapseApprovalCard(
+              interaction,
+              'already-resolved',
+              result.reason === 'not_found'
+                ? 'approval was not found'
+                : `approval was already ${current?.status ?? 'resolved'}`,
+            );
+            return;
+          }
+          if (await refreshDiscordApprovalSiblings(
+            interaction,
+            result.row ?? row,
+            approved ? 'approved' : 'rejected',
+          )) {
+            return;
+          }
+          await collapseApprovalCard(
+            interaction,
+            approved ? 'approved' : 'rejected',
+            approved
+              ? 'exact action authorized; Clementine is resuming'
+              : 'exact action declined; no external action was performed',
           );
           return;
         }

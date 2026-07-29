@@ -59,7 +59,9 @@ function sectionBlock(body: string): KnownBlock {
  * Block Kit sibling of approvalComponentsForState (discord-harness.ts): emit
  * Approve / Edit / Reject buttons for a pending approval, reusing the SAME
  * `clementine:<action>:<id>` action_id convention so the Slack action handler
- * routes them through the identical approval path as Discord's buttons.
+ * routes them through the identical approval path as Discord's buttons. Exact
+ * queued-action cards omit Edit because their approval binds an immutable
+ * payload; ordinary approvals remain editable.
  */
 export function approvalBlocksForState(state: DisplayState): KnownBlock[] | null {
   const ids = state.pendingApprovalIds && state.pendingApprovalIds.length > 0
@@ -68,17 +70,40 @@ export function approvalBlocksForState(state: DisplayState): KnownBlock[] | null
       ? [state.pendingApprovalId]
       : [];
   if (ids.length === 0) return null;
+  if (ids.length > 1) {
+    // Keep each human decision bound to one approval id. A former "Approve
+    // all" label encoded only ids[0], settled the whole Slack card, and left
+    // siblings pending. Five rows matches Discord's inline-control ceiling;
+    // overflow remains reviewable in the Inbox.
+    return ids.slice(0, 5).map((id, index) => ({
+      type: 'actions',
+      block_id: `clementine:approval:${id}`,
+      elements: [
+        {
+          type: 'button',
+          style: 'primary',
+          text: { type: 'plain_text', text: `Approve ${index + 1}` },
+          action_id: `clementine:approve:${id}`,
+          value: id,
+        },
+        {
+          type: 'button',
+          style: 'danger',
+          text: { type: 'plain_text', text: `Reject ${index + 1}` },
+          action_id: `clementine:reject:${id}`,
+          value: id,
+        },
+      ],
+    }));
+  }
   const id = ids[0];
-  const count = ids.length;
-  const approveLabel = count > 1 ? `Approve all ${count}` : 'Approve';
-  const rejectLabel = count > 1 ? `Reject all ${count}` : 'Reject';
   const elements: Button[] = [
-    { type: 'button', style: 'primary', text: { type: 'plain_text', text: approveLabel }, action_id: `clementine:approve:${id}`, value: id },
+    { type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Approve' }, action_id: `clementine:approve:${id}`, value: id },
   ];
-  if (count === 1) {
+  if (state.pendingApprovalEditable !== false) {
     elements.push({ type: 'button', text: { type: 'plain_text', text: 'Edit' }, action_id: `clementine:edit:${id}`, value: id });
   }
-  elements.push({ type: 'button', style: 'danger', text: { type: 'plain_text', text: rejectLabel }, action_id: `clementine:reject:${id}`, value: id });
+  elements.push({ type: 'button', style: 'danger', text: { type: 'plain_text', text: 'Reject' }, action_id: `clementine:reject:${id}`, value: id });
   return [{ type: 'actions', block_id: `clementine:approval:${id}`, elements }];
 }
 

@@ -1,17 +1,21 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { appendEvent } from '../runtime/harness/eventlog.js';
+import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import {
   PENDING_ACTION_KINDS,
   PENDING_ACTION_STATUSES,
+  cancelPendingActionIfQueuedUnlinked,
   formatPendingAction,
   getPendingAction,
   listPendingActions,
   parsePendingActionPayloadJson,
+  pendingActionPayloadHash,
   queuePendingAction,
   recordPendingActionResult,
   type PendingActionKind,
+  type PendingActionRecord,
   type PendingActionStatus,
 } from '../runtime/harness/pending-actions.js';
 import { textResult } from './shared.js';
@@ -21,18 +25,62 @@ import {
   isRecipientIntegrityGateEnabled,
   RecipientSetIntegrityError,
 } from '../runtime/harness/recipient-integrity-gate.js';
+import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 
 const statusEnum = z.enum(PENDING_ACTION_STATUSES);
 const kindEnum = z.enum(PENDING_ACTION_KINDS);
 
-function currentSessionId(explicit?: string | null): string | null {
-  const clean = explicit?.trim();
-  if (clean) return clean;
-  return getToolOutputContext()?.sessionId ?? null;
+function normalizeSessionId(value?: string | null): string | null {
+  const clean = value?.trim();
+  if (!clean || /^(?:null|undefined)$/i.test(clean)) return null;
+  return clean;
 }
 
-function maybeLog(sessionId: string | null, type: 'queued' | 'result', data: Record<string, unknown>): void {
-  if (!sessionId) return;
+/**
+ * Mutation ownership comes only from the harness context. A model must never
+ * choose which session owns a queued or executed write.
+ */
+function ownedSessionId(): string | null {
+  return normalizeSessionId(getToolOutputContext()?.sessionId);
+}
+
+/**
+ * Listing is a read/filter operation, so an explicit filter remains useful.
+ * Fall back to the active session only when no valid filter was supplied.
+ */
+function filteredSessionId(explicit?: string | null): string | null {
+  return normalizeSessionId(explicit)
+    ?? normalizeSessionId(getToolOutputContext()?.sessionId);
+}
+
+function currentRequestAttribution(): {
+  sourceUserSeq?: number;
+  runScopeId?: string;
+  callId?: string;
+} {
+  const outputContext = getToolOutputContext();
+  const runContext = harnessRunContextStorage.getStore();
+  const sourceUserSeq = runContext?.sourceUserSeq;
+  return {
+    ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+      ? { sourceUserSeq: sourceUserSeq as number }
+      : {}),
+    ...((outputContext?.runScopeId ?? runContext?.behaviorScopeId)
+      ? { runScopeId: outputContext?.runScopeId ?? runContext?.behaviorScopeId }
+      : {}),
+    ...(outputContext?.callId ? { callId: outputContext.callId } : {}),
+  };
+}
+
+function activeContextOwns(record: { sessionId: string | null }): boolean {
+  const context = getToolOutputContext();
+  if (!context) return true;
+  const sessionId = normalizeSessionId(context.sessionId);
+  return Boolean(sessionId && record.sessionId === sessionId);
+}
+
+function maybeLog(sessionId: string | null, type: 'queued' | 'result', data: Record<string, unknown>): boolean {
+  if (!sessionId) return false;
   try {
     appendEvent({
       sessionId,
@@ -41,9 +89,65 @@ function maybeLog(sessionId: string | null, type: 'queued' | 'result', data: Rec
       type: 'autonomy_note',
       data: { kind: `pending_action_${type}`, ...data },
     });
+    return true;
   } catch {
-    // Pending action state is the source of truth; event-log mirroring is best-effort.
+    return false;
   }
+}
+
+function requestOwnedQueueRetry(input: {
+  sessionId: string | null;
+  sourceUserSeq?: number;
+  payloadHash: string;
+  kind: PendingActionKind;
+  approvalRequired: boolean;
+}): PendingActionRecord | null {
+  if (!input.sessionId || !input.sourceUserSeq) return null;
+  try {
+    const events = listEvents(input.sessionId, {
+      types: ['autonomy_note'],
+      sinceSeq: input.sourceUserSeq,
+    });
+    for (const event of events) {
+      if (
+        event.data.kind !== 'pending_action_queued'
+        || event.data.sourceUserSeq !== input.sourceUserSeq
+        || event.data.payloadHash !== input.payloadHash
+        || event.data.actionKind !== input.kind
+        || event.data.approvalRequired !== input.approvalRequired
+        || typeof event.data.pendingActionId !== 'string'
+      ) continue;
+      const record = getPendingAction(event.data.pendingActionId);
+      if (
+        record
+        && record.sessionId === input.sessionId
+        && record.payloadHash === input.payloadHash
+        && record.kind === input.kind
+      ) return record;
+    }
+  } catch {
+    // Dedupe uncertainty must not make a new write safer. The graph transition
+    // independently collapses same-request races before it can mint a card.
+  }
+  return null;
+}
+
+function queuedActionNextStep(record: PendingActionRecord, approvalRequired: boolean): string {
+  if (record.status === 'approval_requested') {
+    return 'This exact request already has its one formal approval card. Do not queue or request another; wait for the user decision.';
+  }
+  if (record.status === 'approved') {
+    return 'This exact queued action is approved. Call pending_action_execute once with this id; do not reconstruct the underlying call.';
+  }
+  if (record.status === 'executing' || record.status === 'executed') {
+    return `This exact request is already ${record.status}. Do not dispatch or queue it again; report the durable result.`;
+  }
+  if (['rejected', 'expired', 'cancelled', 'failed'].includes(record.status)) {
+    return `This exact request is already ${record.status}. Do not retry or create a replacement from this same request; explain the status.`;
+  }
+  return approvalRequired
+    ? 'REQUIRED NEXT EDGE: end this turn with one concise question naming the external action (for example, "Should I send it?"). The harness will materialize the single formal approval card from this request-owned record; do not search for or create another approval tool call. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
+    : 'Next step: ask the user whether to execute this queued action. If it requires a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.';
 }
 
 export function registerPendingActionTools(server: McpServer): void {
@@ -52,7 +156,7 @@ export function registerPendingActionTools(server: McpServer): void {
     [
       'Queue a fully prepared action payload before an irreversible external write/send/deploy or other approval-bound execution.',
       'This tool DOES NOT execute anything. Use it after you have gathered the facts, selected the exact tool, and built the exact payload.',
-      'For an approval-bound action, call request_approval({pendingActionId:<id>, ...}) once immediately after queueing; do not add a separate prose confirmation first.',
+      'For an approval-bound action, end the turn with one concise execution/approval question. The harness turns this exact queued record into the single formal card.',
       'After approval, call pending_action_execute with this id; it dispatches the exact queued payload once and records the outcome.',
     ].join(' '),
     {
@@ -65,7 +169,6 @@ export function registerPendingActionTools(server: McpServer): void {
       preview: z.string().max(8000).optional().describe('Human-reviewable content preview: email body, rows to update, command, deploy target, etc.'),
       risk: z.string().max(1000).optional().describe('Main risk/blast radius in plain language.'),
       rollback: z.string().max(1000).optional().describe('Undo/rollback note if available.'),
-      sessionId: z.string().optional().describe('Optional session id. Defaults to the current harness session.'),
       createdBy: z.string().max(120).optional(),
     },
     async (input) => {
@@ -75,8 +178,20 @@ export function registerPendingActionTools(server: McpServer): void {
       } catch (err) {
         return textResult(`pending_action_queue failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-      const sessionId = currentSessionId(input.sessionId);
+      const sessionId = ownedSessionId();
+      if (getToolOutputContext() && !sessionId) {
+        return textResult('pending_action_queue refused: the active harness context has no authoritative session owner.');
+      }
       const shape = classifyExternalWrite(input.toolName, payload);
+      const kind = input.kind as PendingActionKind;
+      const needsFormalApproval = pendingActionRequiresHumanApproval({
+        kind,
+        toolName: input.toolName,
+        payload,
+      });
+      if (needsFormalApproval && !sessionId) {
+        return textResult('pending_action_queue refused: an approval-bound action requires an authoritative harness session.');
+      }
       if (sessionId && shape.mutating && shape.irreversible && isRecipientIntegrityGateEnabled()) {
         const recipientResult = evaluateRecipientSetIntegrity(sessionId, payload);
         if (recipientResult.action === 'block') {
@@ -100,32 +215,53 @@ export function registerPendingActionTools(server: McpServer): void {
           return textResult(`pending_action_queue refused by harness: ${error.message}`);
         }
       }
-      const record = queuePendingAction({
-        title: input.title,
-        summary: input.summary,
-        kind: input.kind as PendingActionKind,
-        toolName: input.toolName,
-        payload,
-        targetSummary: input.targetSummary,
-        preview: input.preview,
-        risk: input.risk,
-        rollback: input.rollback,
+      const attribution = currentRequestAttribution();
+      const payloadHash = pendingActionPayloadHash(input.toolName, payload);
+      let record = requestOwnedQueueRetry({
         sessionId,
-        createdBy: input.createdBy ?? 'clementine',
+        sourceUserSeq: attribution.sourceUserSeq,
+        payloadHash,
+        kind,
+        approvalRequired: needsFormalApproval,
       });
-      maybeLog(sessionId, 'queued', {
-        pendingActionId: record.id,
-        toolName: record.toolName,
-        kind: record.kind,
-        payloadHash: record.payloadHash,
-        targetSummary: record.targetSummary,
-      });
-      const needsFormalApproval = input.kind === 'external_send' || (shape.mutating && shape.irreversible);
-      const nextStep = needsFormalApproval
-        ? 'REQUIRED NEXT TOOL: call request_approval ONCE now with pendingActionId set to this id and include a concise preview. Do not stop at a separate prose confirmation; the approval card is the single user confirmation. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
-        : 'Next step: ask the user whether to execute this queued action. If it requires a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.';
+      const reused = Boolean(record);
+      if (!record) {
+        record = queuePendingAction({
+          title: input.title,
+          summary: input.summary,
+          kind,
+          toolName: input.toolName,
+          payload,
+          targetSummary: input.targetSummary,
+          preview: input.preview,
+          risk: input.risk,
+          rollback: input.rollback,
+          sessionId,
+          createdBy: input.createdBy ?? 'clementine',
+        });
+        const edgePersisted = maybeLog(sessionId, 'queued', {
+          pendingActionId: record.id,
+          toolName: record.toolName,
+          actionKind: record.kind,
+          approvalRequired: needsFormalApproval,
+          payloadHash: record.payloadHash,
+          targetSummary: record.targetSummary,
+          ...attribution,
+        });
+        if (needsFormalApproval && !edgePersisted) {
+          cancelPendingActionIfQueuedUnlinked(
+            record.id,
+            record.id,
+            'Approval-bound queue was cancelled because its durable request edge could not be recorded.',
+          );
+          return textResult(
+            'pending_action_queue failed safely: the approval-bound payload was not accepted because its durable request edge could not be recorded. Nothing is authorized or executable; retry the queue once.',
+          );
+        }
+      }
+      const nextStep = queuedActionNextStep(record, needsFormalApproval);
       return textResult([
-        `Pending action queued: ${record.id}`,
+        `Pending action ${reused ? 'reused' : 'queued'}: ${record.id}`,
         nextStep,
         '',
         formatPendingAction(record, { verbose: true }),
@@ -144,7 +280,7 @@ export function registerPendingActionTools(server: McpServer): void {
     async ({ status, sessionId, limit }) => {
       const records = listPendingActions({
         status: (status ?? 'all') as PendingActionStatus | 'all',
-        sessionId: currentSessionId(sessionId),
+        sessionId: filteredSessionId(sessionId),
         limit,
       });
       if (records.length === 0) return textResult('No pending actions match.');
@@ -160,7 +296,7 @@ export function registerPendingActionTools(server: McpServer): void {
     },
     async ({ id }) => {
       const record = getPendingAction(id);
-      if (!record) return textResult(`No pending action found with id ${id}.`);
+      if (!record || !activeContextOwns(record)) return textResult(`No pending action found with id ${id}.`);
       return textResult(`${formatPendingAction(record, { verbose: true })}\n\nPayload:\n${JSON.stringify(record.payload, null, 2)}`);
     },
   );
@@ -175,12 +311,15 @@ export function registerPendingActionTools(server: McpServer): void {
     ].join(' '),
     {
       id: z.string().min(1),
-      sessionId: z.string().optional(),
     },
-    async ({ id, sessionId }) => {
+    async ({ id }) => {
       const { executeApprovedPendingActionCall } = await import('../execution/pending-action-executor.js');
-      const result = await executeApprovedPendingActionCall(id, { sessionId: currentSessionId(sessionId) ?? undefined });
-      maybeLog(currentSessionId(sessionId), 'result', { pendingActionId: id, status: result.status });
+      const ownerSessionId = ownedSessionId();
+      if (!ownerSessionId) {
+        return textResult('pending_action_execute refused: the active harness context has no authoritative session owner.');
+      }
+      const result = await executeApprovedPendingActionCall(id, { sessionId: ownerSessionId });
+      maybeLog(ownerSessionId, 'result', { pendingActionId: id, status: result.status });
       return textResult(result.resultSummary);
     },
   );
@@ -194,6 +333,8 @@ export function registerPendingActionTools(server: McpServer): void {
       resultSummary: z.string().min(1).max(4000),
     },
     async ({ id, status, resultSummary }) => {
+      const current = getPendingAction(id);
+      if (!current || !activeContextOwns(current)) return textResult(`No pending action found with id ${id}.`);
       const updated = recordPendingActionResult(id, status, resultSummary);
       if (!updated) return textResult(`No pending action found with id ${id}.`);
       maybeLog(updated.sessionId, 'result', {

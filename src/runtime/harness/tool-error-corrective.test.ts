@@ -78,6 +78,7 @@ test('detectStructuredToolFailure: fires on a parseable error envelope, ignores 
   assert.equal(detectStructuredToolFailure('{"successful":false,"error":"404 not found"}').failed, true);
   assert.equal(detectStructuredToolFailure('{"error":{"message":"bad field"}}').failed, true);
   assert.equal(detectStructuredToolFailure('{"success":false}').failed, true);
+  assert.equal(detectStructuredToolFailure('{"ok":false}').failed, true);
   // notFound is derived from the summary.
   assert.equal(detectStructuredToolFailure('{"error":"no such record"}').notFound, true);
   // Success / explicit-success-wins / prose must NOT be flagged.

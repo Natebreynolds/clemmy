@@ -20,10 +20,11 @@ import {
   parseHarnessCommand,
   toDiscordMarkdown,
   __test__,
+  type DisplayState,
 } from './discord-harness.js';
 import type { PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 
-function freshState() {
+function freshState(): DisplayState {
   return { summary: '', status: 'starting', done: false, toolsCalled: [], toolCount: 0 };
 }
 
@@ -154,15 +155,56 @@ test('approval buttons render for a single pending approval', () => {
   assert.equal(rows[0].components[2].label, 'Reject');
 });
 
-test('approval buttons collapse sibling approvals into one batch action', () => {
+test('exact pending-action approval hides Edit and surfaces target, risk, and preview', () => {
+  const s = freshState();
+  applyEventToState(event('approval_requested', {
+    subject: 'send the reviewed launch update',
+    tool: 'request_approval',
+    approvalId: 'apr-exact',
+    pendingActionId: 'pa-exact',
+    pendingAction: {
+      id: 'pa-exact',
+      title: 'Send the reviewed launch update',
+      summary: 'One exact reviewed send.',
+      kind: 'external_send',
+      status: 'approval_requested',
+      toolName: 'composio_execute_tool',
+      targetSummary: 'launch@example.com',
+      preview: 'Subject: Clementine 3.0 is ready',
+      risk: 'Sending cannot be undone.',
+      rollback: 'No rollback after delivery.',
+      payload: { tool_slug: 'GMAIL_SEND_EMAIL' },
+      payloadHash: 'hash-exact',
+      idempotencyKey: 'idem-exact',
+      approvalId: 'apr-exact',
+      resultSummary: null,
+      createdAt: '2026-07-28T12:00:00.000Z',
+      updatedAt: '2026-07-28T12:00:00.000Z',
+    },
+  }), s);
+
+  const rows = __test__.approvalComponentsForState(s) as Array<{ components: Array<{ label: string; custom_id: string }> }>;
+  assert.deepEqual(rows[0].components.map((button) => button.label), ['Approve', 'Reject']);
+  assert.equal(s.pendingApprovalEditable, false);
+  assert.match(s.summary, /Target:.*launch@example\.com/);
+  assert.match(s.summary, /Risk:.*cannot be undone/);
+  assert.match(s.summary, /Preview:.*Clementine 3\.0 is ready/);
+  assert.doesNotMatch(s.summary, /\*\*Edit\*\*/);
+});
+
+test('sibling approval buttons preserve one exact control per action', () => {
   const s = freshState();
   applyEventToState(event('approval_requested', { subject: 'draft one', tool: 'composio_execute_tool', approvalId: 'apr-1111' }), s);
   applyEventToState(event('approval_requested', { subject: 'draft two', tool: 'composio_execute_tool', approvalId: 'apr-2222' }), s);
   const rows = __test__.approvalComponentsForState(s) as Array<{ components: Array<{ label: string; custom_id: string }> }>;
+  assert.equal(rows.length, 2);
   assert.equal(rows[0].components.length, 2);
-  assert.equal(rows[0].components[0].label, 'Approve all 2');
+  assert.equal(rows[0].components[0].label, 'Approve 1');
   assert.equal(rows[0].components[0].custom_id, 'clementine:approve:apr-1111');
-  assert.equal(rows[0].components[1].label, 'Reject all 2');
+  assert.equal(rows[0].components[1].custom_id, 'clementine:reject:apr-1111');
+  assert.equal(rows[1].components[0].label, 'Approve 2');
+  assert.equal(rows[1].components[0].custom_id, 'clementine:approve:apr-2222');
+  assert.equal(rows[1].components[1].custom_id, 'clementine:reject:apr-2222');
 });
 
 test('approval picker gives each ambiguous global approval explicit buttons', () => {

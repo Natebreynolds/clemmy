@@ -90,13 +90,16 @@ const GOLDEN = {
   // 2026-07-27 schema-on-demand: Claude's provider-specific rubric teaches its
   // bounded tool_search → call_tool path without leaking that transport into
   // the shared Codex/BYO rubric.
-  instructions: { len: 35384, sha16: '2f61cf2192bbaac8' },
-  native: { len: 34487, sha16: 'bcdd4c3da1aed9d2' },
-  claudeBrain: { len: 6230, sha16: 'f43b0d42f91fb9ef' },
+  // 2026-07-28 deterministic approval graph: every flagship lane now queues
+  // the exact payload, asks once, and lets the runtime link the formal card;
+  // approval resumes the exact single-call or batch executor without rebuild.
+  instructions: { len: 35355, sha16: 'f808a65aea7b57ac' },
+  native: { len: 34458, sha16: '515e7faf1e1c207c' },
+  claudeBrain: { len: 6192, sha16: '49f5f52806aba5fd' },
   // 2026-07-27 live efficiency proof: execution_create already guards against
   // a duplicate active lane, so the lean rubric no longer makes the model dump
   // every user's old executions before opening/reusing the current one.
-  lean: { len: 9771, sha16: 'dfde474429efbdb9' },
+  lean: { len: 9737, sha16: 'a77e2bbd3461e2dc' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

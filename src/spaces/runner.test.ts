@@ -11,7 +11,15 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +29,8 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-runner-te
 const runner = await import('./runner.js');
 const store = await import('./store.js');
 const dataStore = await import('./data-store.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const eventlog = await import('../runtime/harness/eventlog.js');
 
 function writeRunner(slug: string, file: string, body: string, exec = false): void {
   const dir = store.resolveInSpace(slug, 'data');
@@ -58,7 +68,7 @@ test('node (.mjs) runner: ELECTRON_RUN_AS_NODE set, PATH augmented, secrets scru
   // A daemon secret present at spawn time MUST NOT reach agent-authored code.
   process.env.SPACE_TEST_SECRET = 'leak-canary';
   try {
-    const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: 'echo.mjs' });
+    const res = await runner.runScript(slug, 'echo.mjs');
     assert.equal(res.ok, true, res.ok ? '' : (res as { error: string }).error);
     const d = (res as { data: Record<string, unknown> }).data;
     assert.equal(d.electron, '1', 'ELECTRON_RUN_AS_NODE must be 1 for a node runner');
@@ -93,7 +103,7 @@ test('runner stdin identity cannot be overridden by dry-run payload extras', asy
 test('shell (.sh) runner: works and does NOT get ELECTRON_RUN_AS_NODE', async () => {
   const slug = 'env-sh';
   writeRunner(slug, 'echo.sh', `#!/bin/bash\nprintf '{"electron":"%s","slug":"%s"}' "\${ELECTRON_RUN_AS_NODE:-}" "$CLEMENTINE_SPACE_SLUG"\n`);
-  const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: 'echo.sh' });
+  const res = await runner.runScript(slug, 'echo.sh');
   assert.equal(res.ok, true, res.ok ? '' : (res as { error: string }).error);
   const d = (res as { data: Record<string, unknown> }).data;
   assert.equal(d.electron, '', 'ELECTRON_RUN_AS_NODE must NOT be set for a shell runner');
@@ -103,7 +113,7 @@ test('shell (.sh) runner: works and does NOT get ELECTRON_RUN_AS_NODE', async ()
 test('python (.py) runner: resolves python3 on the augmented PATH and yields JSON', { skip: !hasPython }, async () => {
   const slug = 'env-py';
   writeRunner(slug, 'echo.py', `import json,os\nprint(json.dumps({"slug": os.environ.get("CLEMENTINE_SPACE_SLUG"), "rows": [1,2]}))\n`);
-  const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: 'echo.py' });
+  const res = await runner.runScript(slug, 'echo.py');
   assert.equal(res.ok, true, res.ok ? '' : (res as { error: string }).error);
   const d = (res as { data: Record<string, unknown> }).data;
   assert.equal(d.slug, slug);
@@ -113,7 +123,7 @@ test('python (.py) runner: resolves python3 on the augmented PATH and yields JSO
 test('runner that prints non-JSON → clear error (not a crash)', async () => {
   const slug = 'bad-json';
   writeRunner(slug, 'r.mjs', `process.stdout.write('not json at all');`);
-  const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: 'r.mjs' });
+  const res = await runner.runScript(slug, 'r.mjs');
   assert.equal(res.ok, false);
   assert.match((res as { error: string }).error, /not valid JSON/);
 });
@@ -135,38 +145,437 @@ test('refreshSpaceData refuses malformed hand-written manifest JSON before runni
   assert.match(res[0].error ?? '', /composio_args_json is not valid JSON/);
 });
 
-test('refreshSpaceData serializes same-space refreshes so concurrent sources do not clobber data.json', async () => {
+test('runtime refuses mutating and unknown Composio data sources before provider dispatch', async () => {
+  let dispatches = 0;
+  runner._setSpaceComposioDispatchForTests(async (toolSlug, _args) => {
+    dispatches += 1;
+    return {
+      ok: true as const,
+      result: { toolSlug },
+      connectionId: 'ca-proof',
+      identity: 'proof@example.test',
+    };
+  });
+  try {
+    for (const composioSlug of [
+      'GOOGLESHEETS_UPDATE_SPREADSHEET',
+      'GMAIL_MARK_AS_READ',
+      'ACME_DO_THING',
+    ]) {
+      const res = await runner.runSpaceDataSource('runtime-source-policy', {
+        id: 'pull',
+        composioSlug,
+      });
+      assert.equal(res.ok, false, `${composioSlug} must fail closed`);
+      assert.match(res.ok ? '' : res.error, /provably read-only/i);
+    }
+    assert.equal(dispatches, 0, 'unsafe refresh declarations never cross the provider boundary');
+
+    const read = await runner.runSpaceDataSource('runtime-source-policy', {
+      id: 'events',
+      composioSlug: 'GOOGLECALENDAR_LIST_EVENTS',
+    });
+    assert.equal(read.ok, true, read.ok ? '' : read.error);
+    assert.equal(dispatches, 1, 'a proven read still refreshes normally');
+  } finally {
+    runner._setSpaceComposioDispatchForTests(null);
+  }
+});
+
+test('runtime refuses opaque runner-backed data sources before spawning', async () => {
+  const slug = 'runner-data-source-disabled';
+  writeRunner(
+    slug,
+    'pull.mjs',
+    `import { writeFileSync } from 'node:fs';
+writeFileSync(new URL('./spawned.txt', import.meta.url), 'yes');
+process.stdout.write('[]');`,
+  );
+
+  const res = await runner.runSpaceDataSource(slug, {
+    id: 'pull',
+    runner: 'pull.mjs',
+  });
+
+  assert.equal(res.ok, false);
+  assert.match(res.ok ? '' : res.error, /opaque runner|read-only Composio/i);
+  assert.equal(
+    (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/spawned.txt')),
+    false,
+  );
+});
+
+test('an installed legacy data runner requests one pinned-entrypoint trust card, then runs only after approval', async () => {
+  const slug = 'legacy-runner-trust';
+  const source = {
+    id: 'pull',
+    runner: 'pull.mjs',
+    schedule: '0 7 * * *',
+    timezone: 'America/Los_Angeles',
+  };
+  writeRunner(slug, 'pull.mjs', 'process.stdout.write(JSON.stringify({version:1}));');
+  store.spaceStore.save({
+    id: slug,
+    title: 'Legacy runner trust',
+    dataSources: [source],
+  });
+
+  const first = await runner.runSpaceDataSource(slug, source);
+  assert.equal(first.ok, false);
+  assert.match(first.ok ? '' : first.error, /one-time approval|awaiting.*approval/i);
+  const cards = approvalRegistry.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  });
+  assert.equal(cards.length, 1, 'first compatibility refresh mints one decision');
+  assert.equal(cards[0]?.tool, 'space_trust_data_runner');
+  assert.equal(cards[0]?.args?.spaceSlug, slug);
+  assert.equal(cards[0]?.args?.sourceId, source.id);
+  assert.equal(cards[0]?.args?.runner, source.runner);
+  assert.match(String(cards[0]?.args?.runnerSha256 ?? ''), /^[a-f0-9]{64}$/);
+  assert.match(cards[0]?.subject ?? '', /pinned entrypoint/i);
+  assert.match(String(cards[0]?.args?.reason ?? ''), /helpers.*packages.*CLIs.*local files.*auth.*network/i);
+  assert.match(String(cards[0]?.args?.reason ?? ''), /not.*read-only sandbox/i);
+  assert.doesNotMatch(String(cards[0]?.args?.reason ?? ''), /this exact local code/i);
+  assert.deepEqual(cards[0]?.args?.schedulePolicy, {
+    schedule: source.schedule,
+    timezone: source.timezone,
+  });
+
+  const duplicate = await runner.runSpaceDataSource(slug, source);
+  assert.equal(duplicate.ok, false);
+  assert.equal(
+    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
+    1,
+    'retries and scheduler ticks converge on the same pending card',
+  );
+
+  const resolved = approvalRegistry.resolve(cards[0]!.approvalId, 'approved', 'runner-trust-test');
+  assert.equal(resolved.ok, true);
+  const approved = await runner.runSpaceDataSource(slug, source);
+  assert.deepEqual(approved, { ok: true, data: { version: 1 } });
+});
+
+test('verified runner execution snapshots approved entry bytes before spawn and cleans the snapshot', async () => {
+  const slug = 'verified-entrypoint-snapshot';
+  const file = 'pull.mjs';
+  const approvedSource = [
+    "import { readFileSync } from 'node:fs';",
+    "const helper = JSON.parse(readFileSync(new URL('./live-helper.json', import.meta.url), 'utf8'));",
+    "process.stdout.write(JSON.stringify({ entry: 'approved', helper }));",
+  ].join('\n');
+  writeRunner(slug, file, approvedSource);
+  writeFileSync(
+    store.resolveInSpace(slug, 'data/live-helper.json'),
+    JSON.stringify({ version: 1 }),
+    'utf-8',
+  );
+  const target = store.resolveInSpace(slug, `data/${file}`);
+  const expectedSha256 = createHash('sha256').update(readFileSync(target)).digest('hex');
+  let snapshotPath = '';
+
+  runner._setRunnerEntrypointSnapshotHookForTests((snapshot) => {
+    snapshotPath = snapshot.snapshotPath;
+    assert.equal(path.dirname(snapshot.sourcePath), path.dirname(snapshot.snapshotPath));
+    assert.equal(path.extname(snapshot.snapshotPath), '.mjs');
+    assert.equal(readFileSync(snapshot.snapshotPath, 'utf-8'), approvedSource);
+    writeFileSync(
+      snapshot.sourcePath,
+      "process.stdout.write(JSON.stringify({ entry: 'unapproved' }));",
+      'utf-8',
+    );
+    writeFileSync(
+      store.resolveInSpace(slug, 'data/live-helper.json'),
+      JSON.stringify({ version: 2 }),
+      'utf-8',
+    );
+  });
+  try {
+    const result = await runner.runScript(slug, file, undefined, { expectedSha256 });
+    assert.deepEqual(result, {
+      ok: true,
+      data: {
+        entry: 'approved',
+        helper: { version: 2 },
+      },
+    }, 'the pinned entrypoint executes while explicitly live sibling data remains live');
+  } finally {
+    runner._setRunnerEntrypointSnapshotHookForTests(null);
+  }
+
+  assert.match(snapshotPath, /\.clementine-entry-/);
+  assert.equal(existsSync(snapshotPath), false, 'ephemeral approved-entry snapshot is removed after success');
+});
+
+test('verified runner snapshots are cleaned after a non-zero runner exit', async () => {
+  const slug = 'verified-entrypoint-cleanup-failure';
+  const file = 'pull.mjs';
+  writeRunner(slug, file, "process.stderr.write('expected failure'); process.exit(7);");
+  const target = store.resolveInSpace(slug, `data/${file}`);
+  const expectedSha256 = createHash('sha256').update(readFileSync(target)).digest('hex');
+  let snapshotPath = '';
+  runner._setRunnerEntrypointSnapshotHookForTests((snapshot) => {
+    snapshotPath = snapshot.snapshotPath;
+  });
+  try {
+    const result = await runner.runScript(slug, file, undefined, { expectedSha256 });
+    assert.equal(result.ok, false);
+    assert.match(result.ok ? '' : result.error, /exited 7/);
+  } finally {
+    runner._setRunnerEntrypointSnapshotHookForTests(null);
+  }
+  assert.ok(snapshotPath);
+  assert.equal(existsSync(snapshotPath), false, 'ephemeral approved-entry snapshot is removed after failure');
+});
+
+test('runner-trust approval and rejection immediately leave a truthful no-execution stale-state note', async () => {
+  for (const resolution of ['approved', 'rejected'] as const) {
+    const slug = `legacy-runner-trust-note-${resolution}`;
+    const source = { id: 'pull', runner: 'pull.mjs' };
+    writeRunner(
+      slug,
+      'pull.mjs',
+      `import { writeFileSync } from 'node:fs';
+writeFileSync(new URL('./decision-spawned.txt', import.meta.url), 'yes');
+process.stdout.write('{}');`,
+    );
+    store.spaceStore.save({
+      id: slug,
+      title: `Legacy runner trust note ${resolution}`,
+      dataSources: [source],
+    });
+
+    const refresh = await runner.refreshSpaceData(slug, source.id);
+    assert.match(refresh[0]?.pendingApprovalId ?? '', /^apr-/);
+    const approvalId = refresh[0]!.pendingApprovalId!;
+    assert.equal(approvalRegistry.resolve(approvalId, resolution, 'runner-trust-note-test').ok, true);
+
+    const current = dataStore.readData(slug) as {
+      _meta?: { pull?: { status?: string; approvalId?: string } };
+    };
+    assert.equal(current._meta?.pull?.status, 'awaiting_approval');
+    assert.equal(current._meta?.pull?.approvalId, approvalId);
+    assert.equal(
+      (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/decision-spawned.txt')),
+      false,
+      'a trust decision projects status but never auto-runs the runner',
+    );
+    const note = dataStore.listNotes(slug).find((item) => item.meta?.approvalId === approvalId);
+    assert.ok(note);
+    assert.equal(note.meta?.status, resolution);
+    assert.equal(note.meta?.staleDataStatus, true);
+    assert.match(note.text, /no refresh was run automatically/i);
+    assert.match(note.text, /may continue to show.*awaiting/i);
+  }
+});
+
+test('an unreaped expired runner-trust card renews cleanly without executing the runner', async () => {
+  const slug = 'legacy-runner-trust-expired';
+  const source = { id: 'pull', runner: 'pull.mjs' };
+  writeRunner(
+    slug,
+    'pull.mjs',
+    `import { writeFileSync } from 'node:fs';
+writeFileSync(new URL('./expired-card-spawned.txt', import.meta.url), 'yes');
+process.stdout.write('{}');`,
+  );
+  store.spaceStore.save({
+    id: slug,
+    title: 'Legacy runner trust expired',
+    dataSources: [source],
+  });
+
+  await runner.runSpaceDataSource(slug, source);
+  const firstCard = approvalRegistry.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  })[0];
+  assert.ok(firstCard);
+  eventlog.openEventLog().prepare(
+    'UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?',
+  ).run('2000-01-01T00:00:00.000Z', firstCard.approvalId);
+
+  const renewed = await runner.runSpaceDataSource(slug, source);
+  assert.equal(renewed.ok, false);
+  assert.equal(
+    (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/expired-card-spawned.txt')),
+    false,
+    'an expired decision never executes opaque code',
+  );
+  const pending = approvalRegistry.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  });
+  assert.equal(pending.length, 1);
+  assert.notEqual(pending[0]?.approvalId, firstCard.approvalId);
+  assert.equal(
+    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'any' })
+      .find((row) => row.approvalId === firstCard.approvalId)?.status,
+    'expired',
+  );
+});
+
+test('editing a trusted runner entrypoint or its automatic schedule invalidates the pinned grant before spawn', async () => {
+  const slug = 'legacy-runner-trust-drift';
+  const source = {
+    id: 'pull',
+    runner: 'pull.mjs',
+    schedule: '0 7 * * *',
+    timezone: 'America/Los_Angeles',
+  };
+  writeRunner(slug, 'pull.mjs', 'process.stdout.write(JSON.stringify({version:1}));');
+  store.spaceStore.save({
+    id: slug,
+    title: 'Legacy runner trust drift',
+    dataSources: [source],
+  });
+
+  await runner.runSpaceDataSource(slug, source);
+  const firstCard = approvalRegistry.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  })[0];
+  assert.ok(firstCard);
+  assert.equal(approvalRegistry.resolve(firstCard.approvalId, 'approved', 'runner-trust-test').ok, true);
+  assert.equal((await runner.runSpaceDataSource(slug, source)).ok, true);
+
+  writeRunner(
+    slug,
+    'pull.mjs',
+    `import { writeFileSync } from 'node:fs';
+writeFileSync(new URL('./unapproved-spawn.txt', import.meta.url), 'yes');
+process.stdout.write(JSON.stringify({version:2}));`,
+  );
+  const codeDrift = await runner.runSpaceDataSource(slug, source);
+  assert.equal(codeDrift.ok, false);
+  assert.match(codeDrift.ok ? '' : codeDrift.error, /approval/i);
+  assert.equal(
+    (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/unapproved-spawn.txt')),
+    false,
+    'changed entrypoint bytes never inherit the old durable grant',
+  );
+
+  const codeCard = approvalRegistry.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  })[0];
+  assert.ok(codeCard);
+  assert.notEqual(codeCard.approvalId, firstCard.approvalId);
+  assert.notEqual(codeCard.args?.runnerSha256, firstCard.args?.runnerSha256);
+  assert.equal(approvalRegistry.resolve(codeCard.approvalId, 'approved', 'runner-trust-test').ok, true);
+
+  const changedSchedule = { ...source, schedule: '*/5 * * * *' };
+  store.spaceStore.update(slug, { dataSources: [changedSchedule] });
+  const scheduleDrift = await runner.runSpaceDataSource(slug, changedSchedule);
+  assert.equal(scheduleDrift.ok, false);
+  const pending = approvalRegistry.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  });
+  assert.equal(pending.length, 1, 'schedule drift gets one fresh exact decision');
+  assert.deepEqual(pending[0]?.args?.schedulePolicy, {
+    schedule: changedSchedule.schedule,
+    timezone: changedSchedule.timezone,
+  });
+});
+
+test('runner-backed actions cannot execute without approval authority', async () => {
+  const slug = 'runner-action-needs-approval';
+  writeRunner(
+    slug,
+    'act.mjs',
+    `import { writeFileSync } from 'node:fs';
+writeFileSync(new URL('./dispatched.txt', import.meta.url), 'yes');
+process.stdout.write(JSON.stringify({ok:true}));`,
+  );
+
+  const res = await runner.runSpaceAction(
+    slug,
+    { id: 'refresh-looking-name', label: 'Refresh rows', runner: 'act.mjs' },
+    {},
+  );
+
+  assert.equal(res.ok, false);
+  assert.match(res.ok ? '' : res.error, /approval/i);
+  assert.equal(
+    (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/dispatched.txt')),
+    false,
+    'an opaque runner is never launched on the immediate path',
+  );
+});
+
+test('mutating and unknown Composio actions cannot bypass approval through the runner API', async () => {
+  let dispatches = 0;
+  runner._setSpaceComposioDispatchForTests(async (toolSlug, _args) => {
+    dispatches += 1;
+    return {
+      ok: true as const,
+      result: { toolSlug },
+      connectionId: 'ca-proof',
+      identity: 'proof@example.test',
+    };
+  });
+  try {
+    for (const composioSlug of ['GMAIL_SEND_EMAIL', 'ACME_DO_THING']) {
+      const res = await runner.runSpaceAction(
+        'runtime-action-policy',
+        { id: 'act', composioSlug },
+        {},
+      );
+      assert.equal(res.ok, false, `${composioSlug} must require approval`);
+      assert.match(res.ok ? '' : res.error, /approval/i);
+    }
+    assert.equal(dispatches, 0);
+
+    const read = await runner.runSpaceAction(
+      'runtime-action-policy',
+      { id: 'list', composioSlug: 'GOOGLECALENDAR_LIST_EVENTS' },
+      {},
+    );
+    assert.equal(read.ok, true, read.ok ? '' : read.error);
+    assert.equal(dispatches, 1);
+  } finally {
+    runner._setSpaceComposioDispatchForTests(null);
+  }
+});
+
+test('refreshSpaceData serializes same-space read-only Composio refreshes so concurrent sources do not clobber data.json', async () => {
   const slug = 'refresh-serial';
   store.spaceStore.save({
     id: slug,
     title: 'Refresh Serial',
     dataSources: [
-      { id: 'alpha', runner: 'alpha.mjs' },
-      { id: 'beta', runner: 'beta.mjs' },
+      { id: 'alpha', composioSlug: 'SALESFORCE_GET_ALPHA' },
+      { id: 'beta', composioSlug: 'SALESFORCE_GET_BETA' },
     ],
   });
-  writeRunner(slug, 'alpha.mjs', `
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    process.stdout.write(JSON.stringify({rows:[{id:"alpha"}]}));
-  `);
-  writeRunner(slug, 'beta.mjs', `
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    process.stdout.write(JSON.stringify({rows:[{id:"beta"}]}));
-  `);
+  runner._setSpaceComposioDispatchForTests(async (toolSlug) => {
+    await new Promise((resolve) => setTimeout(resolve, toolSlug.endsWith('ALPHA') ? 80 : 20));
+    const id = toolSlug.endsWith('ALPHA') ? 'alpha' : 'beta';
+    return {
+      ok: true as const,
+      result: { rows: [{ id }] },
+      connectionId: 'ca-proof',
+      identity: 'proof@example.test',
+    };
+  });
+  try {
+    const [alpha, beta] = await Promise.all([
+      runner.refreshSpaceData(slug, 'alpha'),
+      runner.refreshSpaceData(slug, 'beta'),
+    ]);
 
-  const [alpha, beta] = await Promise.all([
-    runner.refreshSpaceData(slug, 'alpha'),
-    runner.refreshSpaceData(slug, 'beta'),
-  ]);
-
-  assert.equal(alpha[0].ok, true, alpha[0].error ?? '');
-  assert.equal(beta[0].ok, true, beta[0].error ?? '');
-  const data = dataStore.readData(slug) as Record<string, unknown>;
-  assert.deepEqual(data.alpha, { rows: [{ id: 'alpha' }] });
-  assert.deepEqual(data.beta, { rows: [{ id: 'beta' }] });
-  assert.equal((data._meta as Record<string, { ok?: boolean }>).alpha.ok, true);
-  assert.equal((data._meta as Record<string, { ok?: boolean }>).beta.ok, true);
-  runner._resetSpaceRefreshQueuesForTest();
+    assert.equal(alpha[0].ok, true, alpha[0].error ?? '');
+    assert.equal(beta[0].ok, true, beta[0].error ?? '');
+    const data = dataStore.readData(slug) as Record<string, unknown>;
+    assert.deepEqual(data.alpha, { rows: [{ id: 'alpha' }] });
+    assert.deepEqual(data.beta, { rows: [{ id: 'beta' }] });
+    assert.equal((data._meta as Record<string, { ok?: boolean }>).alpha.ok, true);
+    assert.equal((data._meta as Record<string, { ok?: boolean }>).beta.ok, true);
+  } finally {
+    runner._setSpaceComposioDispatchForTests(null);
+    runner._resetSpaceRefreshQueuesForTest();
+  }
 });
 
 test('refreshSpaceData does not advance lastRefreshedAt when every source fails', async () => {
@@ -179,6 +588,16 @@ test('refreshSpaceData does not advance lastRefreshedAt when every source fails'
   });
   store.spaceStore.update(slug, { lastRefreshedAt: oldSuccess });
   writeRunner(slug, 'bad.mjs', `process.stderr.write('source broke'); process.exit(2);`);
+  await runner.runSpaceDataSource(slug, store.spaceStore.get(slug)!.dataSources[0]);
+  const approval = approvalRegistry.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  })[0];
+  assert.ok(approval);
+  assert.equal(
+    approvalRegistry.resolve(approval.approvalId, 'approved', 'runner-failure-test').ok,
+    true,
+  );
 
   const res = await runner.refreshSpaceData(slug);
 
@@ -192,7 +611,7 @@ test('refreshSpaceData does not advance lastRefreshedAt when every source fails'
 test('runner that prints nothing (exit 0) → "produced no output"', async () => {
   const slug = 'no-output';
   writeRunner(slug, 'r.mjs', `process.exit(0);`);
-  const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: 'r.mjs' });
+  const res = await runner.runScript(slug, 'r.mjs');
   assert.equal(res.ok, false);
   assert.match((res as { error: string }).error, /produced no output/);
 });
@@ -200,7 +619,7 @@ test('runner that prints nothing (exit 0) → "produced no output"', async () =>
 test('runner that exits non-zero → surfaces stderr', async () => {
   const slug = 'nonzero';
   writeRunner(slug, 'r.mjs', `process.stderr.write('boom happened'); process.exit(3);`);
-  const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: 'r.mjs' });
+  const res = await runner.runScript(slug, 'r.mjs');
   assert.equal(res.ok, false);
   assert.match((res as { error: string }).error, /exited 3/);
   assert.match((res as { error: string }).error, /boom happened/);
@@ -209,7 +628,7 @@ test('runner that exits non-zero → surfaces stderr', async () => {
 test('unsupported extension → actionable error', async () => {
   const slug = 'bad-ext';
   writeRunner(slug, 'data.txt', `whatever`);
-  const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: 'data.txt' });
+  const res = await runner.runScript(slug, 'data.txt');
   assert.equal(res.ok, false);
   assert.match((res as { error: string }).error, /unsupported runner extension/);
 });
@@ -220,7 +639,7 @@ test('runner path traversal is refused even if the target file exists inside the
   mkdirSync(viewDir, { recursive: true });
   writeFileSync(path.join(viewDir, 'evil.mjs'), `process.stdout.write(JSON.stringify({ran:true}));`, 'utf-8');
 
-  const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: '../view/evil.mjs' });
+  const res = await runner.runScript(slug, '../view/evil.mjs');
 
   assert.equal(res.ok, false);
   assert.match((res as { error: string }).error, /runner must be a filename under data\//);

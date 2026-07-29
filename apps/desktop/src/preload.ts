@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import { isWorkspaceViewUrl } from './workspace-navigation-policy.js';
+import { isWorkspaceViewUrl } from './workspace-view-url.cjs';
 
 /**
  * Preload script — bridges a narrow, typed API onto window.clemmy in

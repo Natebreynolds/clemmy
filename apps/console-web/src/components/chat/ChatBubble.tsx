@@ -9,6 +9,7 @@ import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import {
   approveExecutePendingAction,
+  canOfferStandingSendTrust,
   getPendingActionStatus,
   reconcilePendingActionExecutionFailure,
   resolvePendingActionExecutionPresentation,
@@ -299,12 +300,14 @@ export function ChatBubble({
                   <div>Tool: <span className="font-mono">{pendingAction.toolName}</span></div>
                   {pendingAction.targetSummary && <div>Target: {pendingAction.targetSummary}</div>}
                   {pendingAction.preview && <div className="whitespace-pre-wrap">Preview: {pendingAction.preview}</div>}
+                  {pendingAction.risk && <div className="whitespace-pre-wrap text-warning">Risk: {pendingAction.risk}</div>}
+                  {pendingAction.rollback && <div className="whitespace-pre-wrap">Rollback: {pendingAction.rollback}</div>}
                   {pendingAction.payloadHash && <div>Payload hash: <span className="font-mono">{pendingAction.payloadHash}</span></div>}
                 </div>
               )}
               {message.approval?.reason && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
               {pendingAction && <PayloadPreview value={pendingAction.payload} />}
-              {pendingAction && !resolved && (
+              {canOfferStandingSendTrust(pendingAction) && !resolved && (
                 <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-caption text-muted">
                   <input
                     type="checkbox"

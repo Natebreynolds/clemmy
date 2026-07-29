@@ -18,19 +18,14 @@
  * Classification reuses the SAME `classifyExternalWrite` the rest of the
  * harness uses, so a Space send gates identically to an agent send.
  *
- * Kill-switch: `CLEMMY_SPACE_ACTION_APPROVAL` — default ON (the safe behavior).
- * Set to off/0/false/no to restore instant execution while debugging.
+ * There is deliberately no release-time bypass: alternate callers and stale
+ * debug configuration must not turn an approval-required action into a write.
  */
-import { getRuntimeEnv } from '../config.js';
-import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
-import path from 'node:path';
-import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
 import {
-  listPending, onApprovalResolved, register, type PendingApprovalRow,
+  listPending, onApprovalResolved, registerResumable, type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
 import { getSession, createSession } from '../runtime/harness/eventlog.js';
-import { resolveInSpace, spaceStore, type SpaceAction, type SpaceRecord } from './store.js';
+import { spaceStore, type SpaceAction, type SpaceRecord } from './store.js';
 import { appendNote, appendAudit, listAudit, listNotes } from './data-store.js';
 import {
   replaySpaceActionMutation,
@@ -38,17 +33,24 @@ import {
   SPACE_ACTION_MUTATION_WORKFLOW_SLUG,
 } from './runner.js';
 import { workspaceActionLooksOutbound } from './space-action-semantics.js';
+import {
+  SPACE_ACTION_APPROVAL_TOOL,
+  workspaceActionRequiresApproval,
+} from './space-execution-policy.js';
+import {
+  actionApprovalSnapshot,
+  actionApprovalSnapshotsEqual,
+  actionFromApprovalSnapshot,
+  parseActionApprovalSnapshot,
+  spaceActionApprovalResumeKey,
+} from './space-action-authority.js';
 
 /** Synthetic tool name stamped on the approval row so the resolve listener can
  *  recognise a Space-action approval (and tell it apart from agent tool calls). */
-export const SPACE_ACTION_TOOL = 'space_execute_action';
+export const SPACE_ACTION_TOOL = SPACE_ACTION_APPROVAL_TOOL;
 export { SPACE_ACTION_MUTATION_WORKFLOW_SLUG };
 const SPACE_ACTION_EXECUTION_VERSION = 1;
-
-export function spaceActionApprovalEnabled(): boolean {
-  const raw = (getRuntimeEnv('CLEMMY_SPACE_ACTION_APPROVAL', 'on') ?? 'on').trim().toLowerCase();
-  return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no');
-}
+const RUNNER_ACTION_SCOPE_REASON = 'This approval covers a pinned entrypoint: only the runner entrypoint bytes are frozen. Helpers, packages, CLIs, local files, auth state, and network services remain live and outside the digest; arbitrary runner code is not a read-only sandbox.';
 
 /**
  * Does this action mutate an external system (→ needs one approval)?
@@ -61,15 +63,7 @@ export function spaceActionApprovalEnabled(): boolean {
  *    external-write boundary without broadening the existing approval policy.
  */
 export function spaceActionNeedsApproval(action: SpaceAction): boolean {
-  if (action.confirm === true) return true;
-  if (action.composioSlug && action.composioSlug.trim()) {
-    try {
-      return classifyExternalWrite('composio_execute_tool', { tool_slug: action.composioSlug.trim() }).mutating;
-    } catch {
-      return false; // can't classify → don't block (fail-open, matches the harness)
-    }
-  }
-  return workspaceActionLooksOutbound(action);
+  return workspaceActionRequiresApproval(action);
 }
 
 /** A short human preview of what the action will do, for the approval card. */
@@ -83,84 +77,6 @@ function actionPreview(action: SpaceAction, callerArgs: Record<string, unknown>)
   const subject = pick(['subject', 'title', 'summary']);
   const bits = [recipient ? `to ${recipient}` : '', subject ? `“${subject}”` : ''].filter(Boolean).join(' ');
   return bits || action.composioSlug || action.runner || action.id;
-}
-
-interface ActionApprovalSnapshot {
-  id: string;
-  label: string | null;
-  composioSlug: string | null;
-  runner: string | null;
-  argsTemplate: Record<string, unknown> | null;
-  confirm: boolean;
-  runnerSha256: string | null;
-}
-
-function asObj(v: unknown): Record<string, unknown> | null {
-  return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : null;
-}
-
-function stableClone(v: unknown): unknown {
-  if (Array.isArray(v)) return v.map(stableClone);
-  const obj = asObj(v);
-  if (!obj) return v;
-  const out: Record<string, unknown> = {};
-  for (const key of Object.keys(obj).sort()) out[key] = stableClone(obj[key]);
-  return out;
-}
-
-function runnerSha256(slug: string, runner: string | undefined): string | null {
-  const name = runner?.trim();
-  if (!name) return null;
-  try {
-    const file = resolveInSpace(slug, path.join('data', name));
-    if (!existsSync(file)) return null;
-    return createHash('sha256').update(readFileSync(file)).digest('hex');
-  } catch {
-    return null;
-  }
-}
-
-function actionSnapshot(rec: SpaceRecord, action: SpaceAction): ActionApprovalSnapshot {
-  return {
-    id: action.id,
-    label: action.label ?? null,
-    composioSlug: action.composioSlug ?? null,
-    runner: action.runner ?? null,
-    argsTemplate: asObj(action.argsTemplate) ? stableClone(action.argsTemplate) as Record<string, unknown> : null,
-    confirm: action.confirm === true,
-    runnerSha256: runnerSha256(rec.id, action.runner),
-  };
-}
-
-function parseActionSnapshot(v: unknown): ActionApprovalSnapshot | null {
-  const obj = asObj(v);
-  if (!obj || typeof obj.id !== 'string') return null;
-  const argsTemplate = obj.argsTemplate === null || obj.argsTemplate === undefined
-    ? null
-    : asObj(obj.argsTemplate);
-  return {
-    id: obj.id,
-    label: typeof obj.label === 'string' ? obj.label : null,
-    composioSlug: typeof obj.composioSlug === 'string' ? obj.composioSlug : null,
-    runner: typeof obj.runner === 'string' ? obj.runner : null,
-    argsTemplate: argsTemplate ? stableClone(argsTemplate) as Record<string, unknown> : null,
-    confirm: obj.confirm === true,
-    runnerSha256: typeof obj.runnerSha256 === 'string' ? obj.runnerSha256 : null,
-  };
-}
-
-function snapshotsEqual(a: ActionApprovalSnapshot, b: ActionApprovalSnapshot): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
-}
-
-function actionFromSnapshot(snapshot: ActionApprovalSnapshot): SpaceAction {
-  const action: SpaceAction = { id: snapshot.id };
-  if (snapshot.label) action.label = snapshot.label;
-  if (snapshot.composioSlug) action.composioSlug = snapshot.composioSlug;
-  if (snapshot.runner) action.runner = snapshot.runner;
-  if (snapshot.argsTemplate) action.argsTemplate = snapshot.argsTemplate;
-  if (snapshot.confirm) action.confirm = true;
-  return action;
 }
 
 function projectApprovedAction(
@@ -275,27 +191,42 @@ export function enqueueSpaceActionApproval(
 ): EnqueueResult {
   const verb = workspaceActionLooksOutbound(action) ? 'Send' : 'Run';
   const subject = `${verb} “${action.label ?? action.id}” in workspace “${rec.title}”`;
-  const row = register({
-    sessionId: ensureSpaceSession(rec),
+  const sessionId = ensureSpaceSession(rec);
+  const args = {
+    spaceSlug: rec.id,
+    actionId: action.id,
+    callerArgs,
+    composioSlug: action.composioSlug ?? null,
+    spaceActionExecutionVersion: SPACE_ACTION_EXECUTION_VERSION,
+    actionSnapshot: actionApprovalSnapshot(rec, action),
+    ...(action.runner?.trim() ? { reason: RUNNER_ACTION_SCOPE_REASON } : {}),
+    preview: actionPreview(action, callerArgs),
+  };
+  const registered = registerResumable({
+    sessionId,
     subject,
     tool: SPACE_ACTION_TOOL,
-    args: {
-      spaceSlug: rec.id,
-      actionId: action.id,
-      callerArgs,
-      composioSlug: action.composioSlug ?? null,
-      spaceActionExecutionVersion: SPACE_ACTION_EXECUTION_VERSION,
-      actionSnapshot: actionSnapshot(rec, action),
-      preview: actionPreview(action, callerArgs),
-    },
+    args,
+    resumeKey: spaceActionApprovalResumeKey({
+      sessionId,
+      tool: SPACE_ACTION_TOOL,
+      args,
+    }),
   });
-  appendAudit(rec.id, { method: 'ACTION_PENDING', path: `/action/${action.id}`, outcome: 'ok', note: row.approvalId });
-  appendNote(rec.id, {
-    text: `“${action.label ?? action.id}” is awaiting your approval (${row.approvalId}).`,
-    kind: 'action',
-    meta: { actionId: action.id, approvalId: row.approvalId, status: 'pending' },
-  });
-  return { approvalId: row.approvalId, subject };
+  if (registered.created) {
+    appendAudit(rec.id, {
+      method: 'ACTION_PENDING',
+      path: `/action/${action.id}`,
+      outcome: 'ok',
+      note: registered.row.approvalId,
+    });
+    appendNote(rec.id, {
+      text: `“${action.label ?? action.id}” is awaiting your approval (${registered.row.approvalId}).`,
+      kind: 'action',
+      meta: { actionId: action.id, approvalId: registered.row.approvalId, status: 'pending' },
+    });
+  }
+  return { approvalId: registered.row.approvalId, subject };
 }
 
 /** Execute one resolved-approved action. A durable receipt is replayed before
@@ -313,7 +244,7 @@ async function executeApprovedSpaceActionOnce(row: PendingApprovalRow): Promise<
   const callerArgs = (args.callerArgs && typeof args.callerArgs === 'object')
     ? args.callerArgs as Record<string, unknown> : {};
   if (!slug || !actionId) return;
-  const approvedSnapshot = parseActionSnapshot(args.actionSnapshot);
+  const approvedSnapshot = parseActionApprovalSnapshot(args.actionSnapshot);
   const label = approvedSnapshot?.label ?? actionId;
   if (!approvedSnapshot) {
     recordApprovedActionNotRun(
@@ -325,7 +256,7 @@ async function executeApprovedSpaceActionOnce(row: PendingApprovalRow): Promise<
     );
     return;
   }
-  const approvedAction = actionFromSnapshot(approvedSnapshot);
+  const approvedAction = actionFromApprovalSnapshot(approvedSnapshot);
   try {
     const replay = replaySpaceActionMutation(slug, approvedAction, row.approvalId);
     if (replay.replayed) {
@@ -363,7 +294,7 @@ async function executeApprovedSpaceActionOnce(row: PendingApprovalRow): Promise<
     recordApprovedActionNotRun(slug, label, actionId, row.approvalId, 'action no longer exists in the workspace.');
     return;
   }
-  if (!snapshotsEqual(actionSnapshot(rec, action), approvedSnapshot)) {
+  if (!actionApprovalSnapshotsEqual(actionApprovalSnapshot(rec, action), approvedSnapshot)) {
     recordApprovedActionNotRun(
       slug,
       label,

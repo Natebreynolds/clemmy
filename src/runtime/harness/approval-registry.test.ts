@@ -178,6 +178,32 @@ test('register/resolve mirror pendingActionId status into the pending-action que
   assert.equal(pending.getPendingAction(action.id)?.status, 'approved');
 });
 
+test('register cannot link a pending action owned by another session', () => {
+  const owner = createSession({ kind: 'chat' });
+  const attacker = createSession({ kind: 'chat' });
+  const action = pending.queuePendingAction({
+    title: 'Owner-only send',
+    summary: 'This exact payload belongs to the owner session.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'owner@example.com' } },
+    sessionId: owner.id,
+  });
+
+  assert.throws(
+    () => reg.register({
+      sessionId: attacker.id,
+      subject: 'Forged cross-session card',
+      tool: 'request_approval',
+      args: { pendingActionId: action.id },
+    }),
+    /does not belong to this session/,
+  );
+  assert.equal(pending.getPendingAction(action.id)?.status, 'queued');
+  assert.equal(pending.getPendingAction(action.id)?.approvalId, null);
+  assert.equal(reg.listPending({ sessionId: attacker.id, status: 'pending' }).length, 0);
+});
+
 test('resolve reports not_found for unknown ids', () => {
   const result = reg.resolve('apr-xxxx', 'approved', 'whoever');
   assert.equal(result.ok, false);
@@ -251,6 +277,36 @@ test('resumable approval registration dedupes and an approved grant is claimed e
 
   const replay = reg.claimResumableApproval(input.resumeKey);
   assert.equal(replay.state, 'consumed', 'the exact approved payload cannot reuse the grant twice');
+});
+
+test('resumable approval refuses a same-key row whose nested payload authority differs', () => {
+  const session = createSession({ kind: 'workflow' });
+  const first = reg.registerResumable({
+    sessionId: session.id,
+    subject: 'Send exact message?',
+    tool: 'composio_execute_tool',
+    args: {
+      tool_slug: 'GMAIL_SEND_EMAIL',
+      arguments: { to: 'first@example.com', body: 'exact first body' },
+    },
+    resumeKey: 'resume-collision-proof',
+  });
+  assert.throws(
+    () => reg.registerResumable({
+      sessionId: session.id,
+      subject: 'Send different message?',
+      tool: 'composio_execute_tool',
+      args: {
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: { to: 'second@example.com', body: 'different body' },
+      },
+      resumeKey: 'resume-collision-proof',
+    }),
+    /resume key collision across approval authority/,
+  );
+  const [remaining] = reg.listPending({ sessionId: session.id });
+  assert.equal(remaining.approvalId, first.row.approvalId);
+  assert.deepEqual(remaining.args, first.row.args, 'the original authority is never rewritten');
 });
 
 test('claimApprovedUnconsumedForSession: one-shot session claim for replay-supported tools only', () => {

@@ -93,7 +93,13 @@ function prune(map: Record<string, string>, nowMs: number): Record<string, strin
   return out;
 }
 
-export interface SpaceFireResult { evaluated: number; fired: number; errors: number }
+export interface SpaceFireResult {
+  evaluated: number;
+  fired: number;
+  errors: number;
+  /** Due legacy sources held for a pinned-entrypoint decision, not runtime errors. */
+  awaitingApproval: number;
+}
 
 /**
  * Evaluate every active Workspace's scheduled data sources against the wall
@@ -107,6 +113,7 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
   let evaluated = 0;
   let fired = 0;
   let errors = 0;
+  let awaitingApproval = 0;
 
   for (const space of spaceStore.list()) {
     if (space.status !== 'active') continue;
@@ -122,7 +129,8 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
         try {
           const results = await refreshSpaceData(space.id, ds.id);
           if (results.some((r) => !r.ok)) {
-            errors += 1;
+            if (results.some((r) => !r.ok && !r.pendingApprovalId)) errors += 1;
+            else awaitingApproval += 1;
           } else {
             fired += 1;
             // E2: harvest a proactive re-engage signal, deduped by condition key
@@ -154,7 +162,7 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
   state.lastEvaluatedAtMs = now.getTime();
   state.lastRunByMinute = prune(lastRun, now.getTime());
   saveState(state);
-  return { evaluated, fired, errors };
+  return { evaluated, fired, errors, awaitingApproval };
 }
 
 // ── Paused-build auto-retry ───────────────────────────────────────────────────

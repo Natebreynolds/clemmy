@@ -518,6 +518,20 @@ function sourceFailureFromMeta(meta: Record<string, unknown>, sourceId: string):
   };
 }
 
+function sourcePendingApprovalFromMeta(
+  meta: Record<string, unknown>,
+  sourceId: string,
+): { approvalId?: string; refreshedAt?: string } | null {
+  const entry = meta[sourceId];
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const rec = entry as Record<string, unknown>;
+  if (rec.ok !== null || rec.status !== 'awaiting_approval') return null;
+  return {
+    approvalId: typeof rec.approvalId === 'string' && rec.approvalId.trim() ? rec.approvalId.trim() : undefined,
+    refreshedAt: typeof rec.refreshedAt === 'string' && rec.refreshedAt.trim() ? rec.refreshedAt.trim() : undefined,
+  };
+}
+
 export function buildSpaceHealthSnapshot(
   record: SpaceRecord,
   opts: { now?: number; staleAfterMs?: number } = {},
@@ -554,6 +568,13 @@ export function buildSpaceHealthSnapshot(
 
   const dataMeta = readDataMeta(record);
   for (const source of record.dataSources) {
+    const pending = sourcePendingApprovalFromMeta(dataMeta, source.id);
+    if (pending) {
+      const when = pending.refreshedAt ? ` since ${pending.refreshedAt}` : '';
+      const approval = pending.approvalId ? ` (${pending.approvalId})` : '';
+      issues.push(`data source "${source.id}" is awaiting pinned-entrypoint approval${when}${approval}`);
+      continue;
+    }
     const failure = sourceFailureFromMeta(dataMeta, source.id);
     if (!failure) continue;
     const when = failure.refreshedAt ? ` at ${failure.refreshedAt}` : '';

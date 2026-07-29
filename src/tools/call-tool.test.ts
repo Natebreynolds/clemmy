@@ -166,7 +166,16 @@ test('unknown deferred arguments are rejected instead of silently stripped befor
   assert.match(out.detail, /Unrecognized keys?:.*description.*dataSources|Unrecognized keys?:.*dataSources.*description/i);
   assert.ok(out.schema && typeof out.schema === 'object');
   assert.match(out.guidance, /clem\.data\(\)/, 'the correction includes the selected tool contract, not only its arguments');
-  assert.match(out.guidance, /MUST print the dataset as JSON to stdout/, 'runner semantics are available on direct stale-schema calls');
+  assert.match(
+    out.guidance,
+    /new arbitrary runner scripts are refused/i,
+    'the direct stale-schema correction refuses unsafe new data-source runners',
+  );
+  assert.match(
+    out.guidance,
+    /Executable ACTION runners remain per-invocation approval-gated under the same pinned-entrypoint boundary/i,
+    'the direct stale-schema correction carries the exact current action-runner contract',
+  );
   assert.ok(!getHotSet('sess-stale-workspace-schema').includes('space_save'), 'unknown fields must prevent dispatch and promotion');
 });
 

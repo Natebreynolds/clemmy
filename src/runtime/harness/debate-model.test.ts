@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
@@ -26,7 +26,9 @@ const {
   verifyJudgeAvailable,
   resolveBoundaryJudge,
   resolveBoundaryJudgeHedge,
+  readRecentDebateTraces,
 } = await import('./debate-model.js');
+const { withModelFallback } = await import('./fallback-model.js');
 const { getDebateCheckerModel } = await import('../../config.js');
 
 // Codex logged in, Claude NOT (a non-oat01 token blocks the host-keychain fallback
@@ -416,12 +418,56 @@ test('getStreamedResponse: slow drafting emits keep-alive frames (no committed c
 
 // --- helpers ----------------------------------------------------------------
 
-test('buildJudgeRequest: preserves tools/modelSettings, appends both drafts to system', () => {
-  const r = req({ tools: [{ name: 't' }], modelSettings: { temperature: 0.3 } });
-  const jr = buildJudgeRequest(r, msg('DRAFT-A'), msg('DRAFT-B')) as any;
-  assert.deepEqual(jr.tools, [{ name: 't' }], 'tools preserved');
-  assert.equal(jr.modelSettings.temperature, 0.3, 'modelSettings preserved');
-  assert.match(jr.systemInstructions, /BASE/, 'original system kept');
+test('buildJudgeRequest: isolates a redacted synthesis packet from the executor transport', () => {
+  const signal = new AbortController().signal;
+  const r = req({
+    input: [
+      {
+        role: 'user',
+        content: 'Reconcile deployment resource deploy-ordinary-42. OPENAI_API_KEY=sk-judge-user-secret-123456',
+      },
+      {
+        type: 'function_call_result',
+        name: 'railway',
+        output: {
+          resource_id: 'deploy-ordinary-42',
+          OPENAI_API_KEY: 'sk-judge-tool-secret-123456',
+        },
+      },
+      { role: 'system', content: 'Goal deploy-ordinary-42. Authorization: Bearer judge-system-secret-123456' },
+    ],
+    systemInstructions: 'FULL EXECUTOR HARNESS COMPOSIO_API_KEY=sk-judge-harness-secret-123456',
+    tools: [{ name: 't', description: 'secret sk-judge-tool-schema-123456' }],
+    handoffs: [{ name: 'h' }],
+    previousResponseId: 'executor-response-secret',
+    conversationId: 'executor-conversation-secret',
+    prompt: { id: 'executor-prompt-secret' },
+    signal,
+    modelSettings: {
+      temperature: 0.3,
+      providerData: {
+        headers: { Authorization: 'Bearer judge-provider-secret-123456' },
+        apiKey: 'sk-judge-provider-key-123456',
+      },
+    },
+  });
+  const jr = buildJudgeRequest(
+    r,
+    msg('DRAFT-A deploy-ordinary-42. Bearer judge-draft-a-secret-123456'),
+    msg('DRAFT-B deploy-ordinary-42. COMPOSIO_API_KEY=sk-judge-draft-b-secret-123456'),
+  ) as any;
+  const serialized = JSON.stringify(jr);
+  assert.deepEqual(jr.tools, [], 'executor tool schemas never cross into the judge lane');
+  assert.deepEqual(jr.handoffs, [], 'executor handoffs never cross into the judge lane');
+  assert.equal(jr.modelSettings.temperature, 0.3, 'safe generic model settings survive');
+  assert.equal(jr.signal, signal, 'caller cancellation remains authoritative');
+  assert.equal(jr.previousResponseId, undefined, 'executor response identity is not inherited');
+  assert.equal(jr.conversationId, undefined, 'executor conversation identity is not inherited');
+  assert.equal(jr.prompt, undefined, 'executor prompt-template identity is not inherited');
+  assert.doesNotMatch(serialized, /judge-(?:user|tool|system|harness|provider|draft)[-a-z0-9]*/i);
+  assert.doesNotMatch(serialized, /FULL EXECUTOR HARNESS/);
+  assert.match(serialized, /\[REDACTED\]/, 'known credentials are replaced before crossing providers');
+  assert.match(serialized, /deploy-ordinary-42/, 'ordinary evidence and resource ids survive');
   assert.match(jr.systemInstructions, /DRAFT-A/);
   assert.match(jr.systemInstructions, /DRAFT-B/);
 });
@@ -505,6 +551,123 @@ test('buildVerifyRequest: isolates a bounded evidence packet and strips the exec
   assert.match(vr.input, /DRAFT/, 'the draft is included in the verifier packet');
   assert.match(vr.input, /https:\/\/example\.test/, 'recent tool evidence is included');
   assert.ok(vr.input.length < 20_000, 'huge runtime context is bounded');
+});
+
+test('buildVerifyRequest: redacts credentials and drops executor conversation/provider identity', () => {
+  const signal = new AbortController().signal;
+  const r = req({
+    input: [
+      {
+        role: 'user',
+        content: 'Check resource sheet-ordinary-91 with OPENAI_API_KEY=sk-verify-user-secret-123456.',
+      },
+      {
+        type: 'function_call_result',
+        name: 'sheets',
+        output: {
+          resource_id: 'sheet-ordinary-91',
+          refresh_token: 'verify-refresh-secret-123456',
+          detail: 'Authorization: Bearer verify-tool-bearer-123456',
+        },
+      },
+      { role: 'system', content: 'Goal sheet-ordinary-91. DISCORD_BOT_TOKEN=verify-system-secret-123456' },
+    ],
+    systemInstructions: 'FULL EXECUTOR HARNESS sk-verify-harness-secret-123456',
+    tools: [{ name: 't', description: 'sk-verify-tool-schema-123456' }],
+    handoffs: [{ name: 'h' }],
+    previousResponseId: 'verify-response-secret',
+    conversationId: 'verify-conversation-secret',
+    prompt: { id: 'verify-prompt-secret' },
+    signal,
+    modelSettings: {
+      temperature: 0.2,
+      providerData: {
+        headers: { Authorization: 'Bearer verify-provider-secret-123456' },
+        apiKey: 'sk-verify-provider-key-123456',
+      },
+    },
+  });
+  const vr = buildVerifyRequest(
+    r,
+    msg('Resource sheet-ordinary-91 is ready. Bearer verify-draft-secret-123456'),
+  ) as any;
+  const serialized = JSON.stringify(vr);
+
+  assert.equal(vr.signal, signal, 'caller cancellation remains authoritative');
+  assert.equal(vr.previousResponseId, undefined);
+  assert.equal(vr.conversationId, undefined);
+  assert.equal(vr.prompt, undefined);
+  assert.deepEqual(vr.tools, []);
+  assert.deepEqual(vr.handoffs, []);
+  assert.equal(vr.modelSettings.temperature, 0.2, 'safe generic model settings survive');
+  assert.doesNotMatch(serialized, /verify-(?:user|refresh|tool|system|harness|provider|draft|response|conversation|prompt)[-a-z0-9]*/i);
+  assert.doesNotMatch(serialized, /FULL EXECUTOR HARNESS/);
+  assert.match(serialized, /\[REDACTED\]/);
+  assert.match(serialized, /sheet-ordinary-91/, 'ordinary evidence and ids remain available to the checker');
+});
+
+test('fusion trace excerpts redact credentials for VERIFY and legacy DEBATE', async () => {
+  const tracePath = path.join(process.env.CLEMENTINE_HOME as string, 'state', 'debate-traces.jsonl');
+  await withEnv(
+    { NODE_ENV: undefined, CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' },
+    async () => {
+      const b = brains({
+        passthrough: model({
+          getResponse: async () => msg(
+            'VERIFY-TRACE-ID-91 resource-id-91 OPENAI_API_KEY=sk-verify-trace-secret-123456',
+          ),
+        }),
+        judge: model({
+          getResponse: async () => msg('{"verdict":"accept","issues":[],"corrected":null}'),
+        }),
+      });
+      await dm(b).getResponse(req());
+    },
+  );
+  const persistedAfterVerify = readFileSync(tracePath, 'utf8')
+    .split('\n')
+    .find((line) => line.includes('VERIFY-TRACE-ID-91'));
+  assert.ok(persistedAfterVerify, 'VERIFY trace row was persisted');
+  const verifySerialized = persistedAfterVerify;
+  assert.doesNotMatch(verifySerialized, /sk-verify-trace-secret-123456/);
+  assert.match(verifySerialized, /\[REDACTED\]/);
+  assert.match(verifySerialized, /resource-id-91/);
+
+  await withEnv(
+    { NODE_ENV: undefined, CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'debate' },
+    async () => {
+      const b = brains({
+        draftA: model({
+          getResponse: async () => msg(
+            'DEBATE-TRACE-ID-92 resource-id-92 OPENAI_API_KEY=sk-debate-trace-a-123456',
+          ),
+        }),
+        draftB: model({
+          getResponse: async () => msg(
+            'DEBATE-TRACE-ID-92 resource-id-92 Bearer debate-trace-b-secret-123456',
+          ),
+        }),
+        judge: model({
+          getResponse: async () => msg(
+            'DEBATE-TRACE-ID-92 resource-id-92 COMPOSIO_API_KEY=sk-debate-trace-final-123456',
+          ),
+        }),
+      });
+      await dm(b).getResponse(req());
+    },
+  );
+  const persistedAfterDebate = readFileSync(tracePath, 'utf8')
+    .split('\n')
+    .find((line) => line.includes('DEBATE-TRACE-ID-92'));
+  assert.ok(persistedAfterDebate, 'legacy DEBATE trace row was persisted');
+  const debateSerialized = persistedAfterDebate;
+  assert.doesNotMatch(debateSerialized, /sk-debate-trace-(?:a|final)-123456|debate-trace-b-secret-123456/);
+  assert.match(debateSerialized, /\[REDACTED\]/);
+  assert.match(debateSerialized, /resource-id-92/);
+
+  const consoleRows = readRecentDebateTraces(20);
+  assert.ok(consoleRows.some((row) => JSON.stringify(row).includes('VERIFY-TRACE-ID-91')));
+  assert.ok(consoleRows.some((row) => JSON.stringify(row).includes('DEBATE-TRACE-ID-92')));
 });
 
 test('getDebateCheckerModel: defaults to Sonnet (fast, low-contention checker); env overrides', () => {
@@ -731,6 +894,59 @@ test('getStreamedResponse: judge failure AFTER content rethrows (cannot duplicat
   });
 });
 
+test('legacy DEBATE routes tool-bearing turns executor-first and preserves the executable edge unchanged', async () => {
+  await withEnv(
+    { CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'debate' },
+    async () => {
+      const executableDraft = {
+        output: [{
+          type: 'function_call',
+          name: 'send_email',
+          callId: 'call-preserve-1',
+          arguments: '{"to":"user@example.test"}',
+        }],
+        usage: {},
+      } as unknown as ModelResponse;
+      let executorCalls = 0;
+      let draftCalls = 0;
+      let judgeCalls = 0;
+      const b = brains({
+        passthrough: model({
+          getResponse: async () => {
+            executorCalls += 1;
+            return executableDraft;
+          },
+        }),
+        draftA: model({
+          getResponse: async () => {
+            draftCalls += 1;
+            return msg('should not draft A');
+          },
+        }),
+        draftB: model({
+          getResponse: async () => {
+            draftCalls += 1;
+            return msg('should not draft B');
+          },
+        }),
+        judge: model({
+          getResponse: async () => {
+            judgeCalls += 1;
+            return msg('should not reconcile');
+          },
+        }),
+      });
+
+      const response = await dm(b).getResponse(req({ tools: [{ name: 'send_email' }] }));
+
+      assert.equal(response, executableDraft, 'the active executor tool call survives byte-for-byte');
+      assert.equal(executorCalls, 1);
+      assert.equal(draftCalls, 0, 'parallel authoring is skipped on an executable graph edge');
+      assert.equal(judgeCalls, 0, 'a tool-less judge is never asked to recreate the executable edge');
+    },
+  );
+});
+
 // --- 'verify' strategy: Codex drives (executor=passthrough), Claude checks (judge) ---
 
 test('verify strategy: executor authors once, checker returns a typed correction', async () => {
@@ -753,6 +969,43 @@ test('verify strategy: executor authors once, checker returns a typed correction
     assert.equal(executorCalls, 1, 'executor drafted exactly once (2 calls total, not 3)');
     assert.match(checkerSawDraft, /CODEX-DRAFT/, 'checker received the executor draft');
     assert.match(checkerSawDraft, /Return only the JSON verdict object/);
+  });
+});
+
+test('verify strategy: a delayed healthy executor is not mistaken for first-byte silence', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let primaryCalls = 0;
+    let rescueCalls = 0;
+    const primary = model({
+      getResponse: async () => {
+        primaryCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return msg('HEALTHY-PRIMARY-DRAFT');
+      },
+    });
+    const rescue = model({
+      getResponse: async () => {
+        rescueCalls += 1;
+        return msg('UNEXPECTED-RESCUE-DRAFT');
+      },
+    });
+    const routedExecutor = withModelFallback(
+      [
+        { label: 'healthy-primary', getModel: () => primary },
+        { label: 'rescue', getModel: () => rescue },
+      ],
+      { firstByteTimeoutMs: 10 },
+    );
+    const b = brains({
+      passthrough: routedExecutor,
+      judge: model({ getResponse: async () => msg('{"verdict":"accept","issues":[],"corrected":null}') }),
+    });
+
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+
+    assert.equal(primaryCalls, 1);
+    assert.equal(rescueCalls, 0, 'first-byte timing applies to streams, not total getResponse latency');
+    assert.ok(evs.some((event) => event.type === 'output_text_delta' && event.delta === 'HEALTHY-PRIMARY-DRAFT'));
   });
 });
 
@@ -1091,12 +1344,10 @@ test('verifyJudgeAvailable reflects the GLM-brain + Codex-judge pairing', async 
 });
 
 
-// Transport-capability degrade (live 2026-07-24, the "judge text failed"
-// Discord incident): high-stakes fusion drafted a TOOL-BEARING turn on a
-// text-only claude transport and the run died twice. A tool-bearing debate
-// turn degrades to the VERIFY shape (executor drafts, tools:[] checker
-// refines); tool-less turns still full-debate.
-test('debate degrades to verify for tool-bearing turns when claude drafts may be text-only', async () => {
+// Tool-bearing turns have one author (the active executor). This also subsumes
+// the live 2026-07-24 text-only-Claude transport failure: DEBATE never fans an
+// executable edge out to independent drafters, while tool-less prose still can.
+test('debate uses executor-first verify for tool-bearing turns and full debate for tool-less prose', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
     let draftACalls = 0;
     let judgeSystem = '';
@@ -1105,9 +1356,8 @@ test('debate degrades to verify for tool-bearing turns when claude drafts may be
       draftA: model({ getResponse: async () => { draftACalls += 1; return msg('CLAUDE-DRAFT'); } }),
       judge: model({ getResponse: async (r: any) => { judgeSystem = r.systemInstructions; return msg('REFINED FINAL with plenty of substantive user-facing content here'); } }),
     });
-    (b as DebateBrains).claudeDraftMayBeTextOnly = true;
     const res = await dm(b).getResponse(req({ tools: [{ name: 'run_shell_command' }] }));
-    assert.equal(draftACalls, 0, 'the text-only claude draft is never dispatched with tools');
+    assert.equal(draftACalls, 0, 'parallel drafters are never dispatched with tools');
     assert.match(judgeSystem, /VERIFY|DRAFT/i, 'the checker ran the verify shape');
     assert.match((res.output[0] as any).content, /REFINED FINAL|EXECUTOR-DRAFT/);
 
@@ -1115,7 +1365,6 @@ test('debate degrades to verify for tool-bearing turns when claude drafts may be
     const b2 = brains({
       draftA: model({ getResponse: async () => { draftACalls += 1; return msg('CLAUDE-DRAFT'); } }),
     });
-    (b2 as DebateBrains).claudeDraftMayBeTextOnly = true;
     await dm(b2).getResponse(req());
     assert.equal(draftACalls, 1, 'tool-less turns still full-debate');
   });

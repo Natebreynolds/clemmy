@@ -38,6 +38,19 @@ const DEFAULT_TICK_MS = 60_000; // sweep once a minute
 
 let activeInterval: NodeJS.Timeout | null = null;
 
+// These decisions are intentionally owned by durable product state rather than
+// a paused SDK turn. The Workspace runner gate revalidates the installed
+// source, entry-file hash, and schedule before every spawn, and its own TTL is
+// still enforced by pass 1. A terminal chat session therefore does not make
+// this exact decision orphaned.
+const DURABLE_PRODUCT_APPROVAL_TOOLS = new Set([
+  'space_trust_data_runner',
+]);
+
+function hasDurableProductOwner(row: Pick<approvalRegistry.PendingApprovalRow, 'tool'>): boolean {
+  return !!row.tool && DURABLE_PRODUCT_APPROVAL_TOOLS.has(row.tool);
+}
+
 interface StartOptions {
   /** Sweep cadence; defaults to 60s. */
   tickMs?: number;
@@ -118,6 +131,8 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
   try {
     const stillPending = approvalRegistry.listPending({ status: 'pending' });
     for (const row of stillPending) {
+      if (hasDurableProductOwner(row)) continue;
+
       // Guard 1: skip freshly-registered approvals.
       const requestedAtMs = Date.parse(row.requestedAt);
       if (Number.isFinite(requestedAtMs) && now - requestedAtMs < MIN_APPROVAL_AGE_MS) continue;
@@ -163,35 +178,39 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
   }
 
   for (const row of expired) {
-    // Clear the SDK interrupt state so the next user message in this
-    // session starts a fresh turn instead of trying to resume the
-    // long-dead pause.
-    try {
-      const session = HarnessSession.load(row.sessionId);
-      if (session) {
-        session.clearInterruptState();
-        session.markStatus('cancelled');
-      }
-    } catch (err) {
-      logger.warn(
-        { err: err instanceof Error ? err.message : err, sessionId: row.sessionId },
-        'reaper failed to clear interrupt state',
-      );
-      // Reports-back (P1): don't let a failed cleanup stay invisible. If
-      // the interrupt state couldn't be cleared, the session may be wedged
-      // — tell the user instead of leaving a ghost pause only in the logs.
+    const durableProductApproval = hasDurableProductOwner(row);
+    if (!durableProductApproval) {
+      // Clear the SDK interrupt state so the next user message in this
+      // session starts a fresh turn instead of trying to resume the
+      // long-dead pause. Durable product-owned decisions have no SDK
+      // interrupt and must not cancel their Workspace chat/session.
       try {
-        addNotification({
-          id: `interrupt-clear-failed-${row.approvalId}-${randomUUID().slice(0, 8)}`,
-          kind: 'system',
-          title: 'Session cleanup failed after approval expired',
-          body: `The expired approval on **${row.subject}** could not be cleared from its session, which may leave it stuck. If that session stops responding, restart the daemon.`,
-          createdAt: new Date().toISOString(),
-          read: false,
-          metadata: { approvalId: row.approvalId, sessionId: row.sessionId },
-        });
-      } catch {
-        /* best-effort — the warning above is still in the logs */
+        const session = HarnessSession.load(row.sessionId);
+        if (session) {
+          session.clearInterruptState();
+          session.markStatus('cancelled');
+        }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : err, sessionId: row.sessionId },
+          'reaper failed to clear interrupt state',
+        );
+        // Reports-back (P1): don't let a failed cleanup stay invisible. If
+        // the interrupt state couldn't be cleared, the session may be wedged
+        // — tell the user instead of leaving a ghost pause only in the logs.
+        try {
+          addNotification({
+            id: `interrupt-clear-failed-${row.approvalId}-${randomUUID().slice(0, 8)}`,
+            kind: 'system',
+            title: 'Session cleanup failed after approval expired',
+            body: `The expired approval on **${row.subject}** could not be cleared from its session, which may leave it stuck. If that session stops responding, restart the daemon.`,
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: { approvalId: row.approvalId, sessionId: row.sessionId },
+          });
+        } catch {
+          /* best-effort — the warning above is still in the logs */
+        }
       }
     }
 
@@ -203,7 +222,9 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
         id: `approval-expired-${row.approvalId}-${randomUUID().slice(0, 8)}`,
         kind: 'system',
         title: 'Approval expired',
-        body: `The approval on **${row.subject}** expired without a reply. The session was cancelled. Re-ask and I'll redo it.`,
+        body: durableProductApproval
+          ? `The approval on **${row.subject}** expired without a reply. The Workspace session remains available, but the runner remains blocked. Refresh it again to request a new exact decision.`
+          : `The approval on **${row.subject}** expired without a reply. The session was cancelled. Re-ask and I'll redo it.`,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: {

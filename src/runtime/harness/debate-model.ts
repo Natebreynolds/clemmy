@@ -26,7 +26,7 @@
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, getDebateCheckerModel, getByoBackendConfig, judgeChoice, MODELS } from '../../config.js';
-import { ClaudeModelProvider, claudeHarnessModelSupportsTools } from './claude-model.js';
+import { ClaudeModelProvider } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
 import { resolveByoProviderForModel, resolveEffectiveProviderForModel } from './byo-providers.js';
@@ -51,6 +51,7 @@ import {
 export { debateBrainsAvailable, judgeCrossFamilyEnabled, chooseBoundaryJudgeFamily };
 import { harnessRunContextStorage } from './brackets.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
+import { redactSensitiveText, redactSensitiveValue } from '../security.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -77,8 +78,9 @@ export function isDebateModeEnabled(): boolean {
 // without a circular import); re-exported here for existing consumers.
 export { judgeChoice };
 
-/** Keep-alive cadence for the silent drafting window (ms). Well under the 75s
- *  pre-content stall ceiling, so a pathologically slow draft can't be abandoned. */
+/** Visibility-only keep-alive cadence for the silent drafting window (ms).
+ * These frames keep clients visibly live but intentionally do not extend the
+ * outer loop's semantic-progress watchdog. */
 function heartbeatMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_HEARTBEAT_MS', '10000') ?? '10000', 10);
   return Number.isFinite(raw) && raw >= 0 ? raw : 10000;
@@ -366,12 +368,6 @@ export interface DebateBrains {
   draftB: Model;
   /** Reconciles the two drafts into the final answer. */
   judge: Model;
-  /** True when the DEBATE-strategy drafts include a Claude model whose harness
-   *  transport may be text-only (headless). The wrapper degrades tool-bearing
-   *  turns to the VERIFY shape (checker is tools:[]) instead of letting a
-   *  draft crash on the transport (live 2026-07-24: kimi brain + high-stakes
-   *  fusion drafted Claude WITH tools on headless — run died twice). */
-  claudeDraftMayBeTextOnly?: boolean;
 }
 
 export interface DebateOptions {
@@ -446,7 +442,10 @@ export class DebateModel implements Model {
     if (!shouldDebate(request)) return this.brains.passthrough.getResponse(request);
     if (
       fusionStrategy() === 'verify'
-      || (this.brains.claudeDraftMayBeTextOnly === true && requestNeedsNativeTools(request))
+      // A legacy tool-bearing debate cannot safely ask a tool-less isolated
+      // judge to recreate an executable edge. Route it executor-first through
+      // VERIFY; tool-call drafts already bypass the checker byte-for-byte.
+      || requestNeedsNativeTools(request)
     ) return this.verifyResponse(request);
     if (!this.spendFusionSlot()) return this.brains.passthrough.getResponse(request);
     const { a, b } = await this.draftBoth(request);
@@ -497,11 +496,10 @@ export class DebateModel implements Model {
 
     if (
       fusionStrategy() === 'verify'
-      // Transport-capability degrade (live 2026-07-24): a tool-bearing turn
-      // must never draft on a text-only Claude transport — run the VERIFY
-      // shape instead (executor drafts, tool-less checker refines). Same
-      // second opinion, zero crash surface.
-      || (this.brains.claudeDraftMayBeTextOnly === true && requestNeedsNativeTools(request))
+      // An executable graph edge has one author: the active executor. Besides
+      // avoiding text-only Claude transport failures, this prevents a tool-less
+      // isolated judge from replacing a valid function call with prose.
+      || requestNeedsNativeTools(request)
     ) {
       // verify claims its slot AFTER drafting (only for a user-facing answer).
       yield* this.verifyStreamed(request);
@@ -1140,7 +1138,6 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
   // PROVIDER so it carries the overload fallback chain Opus -> Sonnet -> Codex.
   if (!haveClaude || !haveCodex) return null;
   const claude: Model = new ClaudeModelProvider().getModel();
-  const claudeDraftMayBeTextOnly = !claudeHarnessModelSupportsTools();
   const codex: Model = new CodexModelProvider().getModel();
   // The judge comes from the role→model registry (a UI/chat binding wins; else the
   // provider-derived default), dispatched by its provider so the role snapshot and
@@ -1154,7 +1151,6 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
     draftA: claude,
     draftB: codex,
     judge,
-    claudeDraftMayBeTextOnly,
   };
 }
 
@@ -1170,11 +1166,8 @@ const JUDGE_PREAMBLE = [
   'If the drafts agree, confirm and tighten. If they conflict, decide on the',
   'merits and say nothing about the disagreement. Do NOT mention this debate, the',
   'other model, or that drafts existed — speak directly to the user as one voice.',
-  'IMPORTANT: if EITHER draft proposes a local-state or side-effecting tool call',
-  '(focus_get / focus_set / focus_update / focus_clear, memory_remember, or any',
-  'execution_* call), PRESERVE that call in your response unless you have a',
-  "concrete reason to drop it — only the deciding brain's tool calls actually",
-  'execute, so dropping one silently loses focus hygiene or a learned fact.',
+  'Executable tool-bearing turns are handled by the executor-first path and are',
+  'outside this synthesis node. Do not invent tool calls or operational state.',
 ].join(' ');
 
 /** Disable extended thinking on a checker/judge request. The fusion checker
@@ -1203,16 +1196,61 @@ function withThinkingDisabled(request: ModelRequest): ModelRequest {
   } as ModelRequest;
 }
 
-/** Build the judge's request: the original request UNCHANGED (tools, modelSettings,
- *  outputType/handoffs all preserved so structured output + tool use still work),
- *  with the two drafts appended to the system instructions as text. Augmenting the
- *  instruction string (not the input items) keeps it shape-safe across providers.
- *
- *  INVARIANT: request.input MUST be preserved verbatim — it carries the harness's
- *  per-turn `role:system` items injected by callModelInputFilter (the
- *  [AGENT CONTEXT PACKET] with the focus line, the memory primer, and the goal
- *  block). The `...request` spread preserves them; do NOT rebuild the judge's
- *  input or the judge loses its focus / memory / goal context. */
+const SAFE_CROSS_PROVIDER_MODEL_SETTINGS = [
+  'temperature',
+  'topP',
+  'frequencyPenalty',
+  'presencePenalty',
+  'truncation',
+  'maxTokens',
+  'store',
+  'reasoning',
+  'text',
+] as const;
+
+/**
+ * A checker/judge is a distinct provider boundary, not a continuation of the
+ * executor transport. Preserve only generic generation controls; providerData,
+ * retry callbacks, cache identity, and tool choice stay with the executor.
+ */
+function crossProviderModelSettings(request: ModelRequest): Record<string, unknown> {
+  const source = ((request as { modelSettings?: Record<string, unknown> }).modelSettings ?? {}) as Record<string, unknown>;
+  const safe: Record<string, unknown> = {};
+  for (const key of SAFE_CROSS_PROVIDER_MODEL_SETTINGS) {
+    if (source[key] !== undefined) safe[key] = redactSensitiveValue(source[key]);
+  }
+  return safe;
+}
+
+function isolatedCrossProviderRequest(
+  request: ModelRequest,
+  fields: {
+    input: string;
+    systemInstructions: string;
+    outputType: ModelRequest['outputType'];
+    modelSettings: Record<string, unknown>;
+  },
+): ModelRequest {
+  const source = request as {
+    signal?: AbortSignal;
+    tracing?: ModelRequest['tracing'];
+  };
+  return withThinkingDisabled({
+    input: fields.input,
+    systemInstructions: fields.systemInstructions,
+    modelSettings: fields.modelSettings,
+    tools: [],
+    toolsExplicitlyProvided: true,
+    handoffs: [],
+    outputType: fields.outputType,
+    tracing: source.tracing ?? false,
+    ...(source.signal ? { signal: source.signal } : {}),
+  } as ModelRequest);
+}
+
+/** Build a bounded, isolated judge request. The judge gets the latest ask,
+ * recent redacted runtime evidence, and two redacted drafts—not the executor's
+ * provider conversation identity, prompt template, tool graph, or credentials. */
 // Position-bias mitigation. An LLM judge favors whichever draft is presented
 // first (~⅓ of comparative verdicts flip on re-order). draftA is ALWAYS Claude
 // and draftB ALWAYS Codex (resolveDebateBrains), so a FIXED presentation order is
@@ -1226,26 +1264,35 @@ export function setJudgeOrderCoinForTest(fn: (() => boolean) | null): void {
 }
 
 export function buildJudgeRequest(request: ModelRequest, a: ModelResponse, b: ModelResponse): ModelRequest {
-  const base = ((request as { systemInstructions?: string }).systemInstructions ?? '').toString();
   // Present in a randomized order so the verdict isn't biased toward the model
   // that is always drafted first (Claude). Content is identical either way.
   const swap = judgeOrderCoin();
   const first = swap ? b : a;
   const second = swap ? a : b;
   const block = [
-    base,
-    '',
     '=== TWO-MODEL DEBATE — RECONCILE THE DRAFTS BELOW ===',
     JUDGE_PREAMBLE,
     '',
     '--- DRAFT A ---',
-    summarizeOutput(first.output) || '(empty)',
+    clipMiddle(
+      redactSensitiveText(summarizeOutput(first.output) || '(empty)'),
+      FUSION_CONTEXT_CHARS,
+    ),
     '',
     '--- DRAFT B ---',
-    summarizeOutput(second.output) || '(empty)',
+    clipMiddle(
+      redactSensitiveText(summarizeOutput(second.output) || '(empty)'),
+      FUSION_CONTEXT_CHARS,
+    ),
     '=== END DEBATE DRAFTS ===',
   ].join('\n');
-  return withThinkingDisabled({ ...request, systemInstructions: block } as ModelRequest);
+  const requestOutput = (request as { outputType?: ModelRequest['outputType'] }).outputType;
+  return isolatedCrossProviderRequest(request, {
+    input: buildFusionEvidencePacket(request),
+    systemInstructions: block,
+    modelSettings: crossProviderModelSettings(request),
+    outputType: requestOutput ? redactSensitiveValue(requestOutput) : 'text',
+  });
 }
 
 const VERIFY_PREAMBLE = [
@@ -1295,8 +1342,8 @@ const VERIFY_OUTPUT_TYPE: Exclude<ModelRequest['outputType'], 'text'> = {
   },
 };
 
-const VERIFY_CONTEXT_CHARS = 12_000;
-const VERIFY_ITEM_CHARS = 2_400;
+const FUSION_CONTEXT_CHARS = 12_000;
+const FUSION_ITEM_CHARS = 2_400;
 
 function verifyMaxTokens(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_FUSION_CHECKER_MAX_TOKENS', '1800') ?? '1800', 10);
@@ -1324,12 +1371,15 @@ function renderVerifyEvidenceItem(item: unknown): string {
   if (type === 'function_call_result' || type === 'tool_result' || role === 'tool') {
     const name = typeof it.name === 'string' && it.name ? ` ${it.name}` : '';
     const value = it.output ?? it.result ?? it.content;
-    return `TOOL RESULT${name}:\n${clipMiddle(stableStringify(value), VERIFY_ITEM_CHARS)}`;
+    // Redact the complete value before clipping. Clipping first could bisect a
+    // credential prefix and leave an otherwise-detectable secret suffix behind.
+    const redacted = stableStringify(redactSensitiveValue(value));
+    return `TOOL RESULT${name}:\n${clipMiddle(redacted, FUSION_ITEM_CHARS)}`;
   }
   if (role === 'system') {
     const text = extractItemText(item).trim();
     if (!text) return '';
-    return `RUNTIME CONTEXT:\n${clipMiddle(text, VERIFY_ITEM_CHARS)}`;
+    return `RUNTIME CONTEXT:\n${clipMiddle(redactSensitiveText(text), FUSION_ITEM_CHARS)}`;
   }
   return '';
 }
@@ -1338,7 +1388,7 @@ function renderVerifyEvidenceItem(item: unknown): string {
  * implementation copied the whole harness prompt and conversation into a second
  * author, which both choked the model and invited it to reinterpret graph state.
  * This packet keeps only the latest ask plus recent system/tool evidence. */
-function compactVerifyEvidence(request: ModelRequest): string {
+function compactFusionEvidence(request: ModelRequest): string {
   const input = (request as { input?: unknown }).input;
   if (!Array.isArray(input)) return '(No separate runtime evidence was surfaced.)';
   const selected: string[] = [];
@@ -1360,7 +1410,20 @@ function compactVerifyEvidence(request: ModelRequest): string {
     if (isSystem) systemContexts += 1;
   }
   if (selected.length === 0) return '(No separate runtime evidence was surfaced.)';
-  return clipMiddle(selected.reverse().join('\n\n'), VERIFY_CONTEXT_CHARS);
+  return clipMiddle(selected.reverse().join('\n\n'), FUSION_CONTEXT_CHARS);
+}
+
+function buildFusionEvidencePacket(request: ModelRequest): string {
+  return [
+    'USER REQUEST:',
+    clipMiddle(
+      redactSensitiveText(renderLatestUserText(request).trim() || '(No plain-text user request was surfaced.)'),
+      4_000,
+    ),
+    '',
+    'AVAILABLE RUNTIME EVIDENCE:',
+    compactFusionEvidence(request),
+  ].join('\n');
 }
 
 /** Build the isolated verifier-node request. It intentionally does NOT inherit
@@ -1368,36 +1431,28 @@ function compactVerifyEvidence(request: ModelRequest): string {
  * tool choice. The checker sees a compact evidence packet and emits a typed
  * verdict that Clementine can reject before any checker text reaches the user. */
 export function buildVerifyRequest(request: ModelRequest, draft: ModelResponse): ModelRequest {
-  const requestSettings = {
-    ...(((request as { modelSettings?: Record<string, unknown> }).modelSettings ?? {}) as Record<string, unknown>),
-  };
-  delete requestSettings.toolChoice;
-  delete requestSettings.parallelToolCalls;
+  const requestSettings = crossProviderModelSettings(request);
   const configuredMax = verifyMaxTokens();
   const inheritedMax = typeof requestSettings.maxTokens === 'number' ? requestSettings.maxTokens : configuredMax;
   requestSettings.maxTokens = Math.min(inheritedMax, configuredMax);
 
   const input = [
-    'USER REQUEST:',
-    clipMiddle(renderLatestUserText(request).trim() || '(No plain-text user request was surfaced.)', 4_000),
-    '',
-    'AVAILABLE RUNTIME EVIDENCE:',
-    compactVerifyEvidence(request),
+    buildFusionEvidencePacket(request),
     '',
     'CLEMENTINE DRAFT:',
-    clipMiddle(userFacingDraftText(draft.output) || '(empty)', VERIFY_CONTEXT_CHARS),
+    clipMiddle(
+      redactSensitiveText(userFacingDraftText(draft.output) || '(empty)'),
+      FUSION_CONTEXT_CHARS,
+    ),
     '',
     'Return only the JSON verdict object.',
   ].join('\n');
-  return withThinkingDisabled({
-    ...request,
+  return isolatedCrossProviderRequest(request, {
     input,
     systemInstructions: VERIFY_PREAMBLE,
     modelSettings: requestSettings,
     outputType: VERIFY_OUTPUT_TYPE,
-    tools: [],
-    handoffs: [],
-  } as ModelRequest);
+  });
 }
 
 type VerifyOutcome =
@@ -1666,9 +1721,9 @@ function safeArgs(args: unknown): string {
 // ---------------------------------------------------------------------------
 
 /** Yield benign keep-alive frames (codex's `model` pass-through shape) until the
- *  drafts settle, so the loop's stall watchdog sees activity. These reset the
- *  watchdog but are NOT counted as committed content (only output_text_delta is),
- *  so retry-safety downstream is preserved. */
+ * drafts settle so clients retain live-run visibility. The outer loop
+ * intentionally does not count these synthetic frames as semantic progress;
+ * genuinely stalled drafts must still reach the ordinary stream watchdog. */
 export async function* heartbeatsUntil(
   done: Promise<unknown>,
   intervalMs: number,
@@ -1919,7 +1974,10 @@ async function* forwardWithDoneBackstop(stream: AsyncIterable<StreamEvent>): Asy
 
 const TRACE_CAP = 1600;
 function capText(s: string): string {
-  return s.length > TRACE_CAP ? `${s.slice(0, TRACE_CAP)}…(+${s.length - TRACE_CAP} chars)` : s;
+  const redacted = redactSensitiveText(s);
+  return redacted.length > TRACE_CAP
+    ? `${redacted.slice(0, TRACE_CAP)}…(+${redacted.length - TRACE_CAP} chars)`
+    : redacted;
 }
 
 /** Lexical divergence between the two drafts: 0 = identical wording, 1 = disjoint.
@@ -1949,7 +2007,12 @@ const TRACE_MAX_BYTES = 2_000_000;
 const TRACE_KEEP_LINES = 400;
 function recordDebateTrace(rec: Record<string, unknown>): void {
   if (process.env.NODE_ENV === 'test') return;
-  const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+  // Defense in depth: individual excerpts are redacted before clipping above,
+  // then the complete record is recursively scrubbed so checker issues and any
+  // future trace field cannot accidentally persist a credential.
+  const safeRec = redactSensitiveValue(rec) as Record<string, unknown>;
+  const rawSessionId = harnessRunContextStorage.getStore()?.sessionId;
+  const sessionId = rawSessionId ? redactSensitiveText(rawSessionId) : undefined;
   // Mirror the fusion judge/checker outcome into the operational store so the
   // dashboard sees the otherwise-invisible reconciliation turn (a judge_verdict
   // for every debate/verify pass). Best-effort — never affects the turn.
@@ -1960,11 +2023,11 @@ function recordDebateTrace(rec: Record<string, unknown>): void {
       sessionId,
       actor: 'fusion',
       payload: {
-        judge: rec.path === 'verify' ? 'verify_checker' : 'debate',
-        ...(typeof rec.judge === 'string' ? { judgeModel: rec.judge } : {}),
-        outcome: typeof rec.outcome === 'string' ? rec.outcome : 'reconciled',
-        ...(typeof rec.divergence === 'number' ? { divergence: rec.divergence } : {}),
-        ...(typeof rec.n === 'number' ? { n: rec.n } : {}),
+        judge: safeRec.path === 'verify' ? 'verify_checker' : 'debate',
+        ...(typeof safeRec.judge === 'string' ? { judgeModel: safeRec.judge } : {}),
+        outcome: typeof safeRec.outcome === 'string' ? safeRec.outcome : 'reconciled',
+        ...(typeof safeRec.divergence === 'number' ? { divergence: safeRec.divergence } : {}),
+        ...(typeof safeRec.n === 'number' ? { n: safeRec.n } : {}),
       },
     });
   } catch {
@@ -1975,15 +2038,15 @@ function recordDebateTrace(rec: Record<string, unknown>): void {
   // attributable at this seam and is omitted (the scorer tolerates missing
   // fields). Fail-open.
   try {
-    const judgeModel = typeof rec.judge === 'string' && rec.judge ? rec.judge : resolveRoleModel('judge').modelId;
-    const outcome = typeof rec.outcome === 'string' ? rec.outcome : 'reconciled';
+    const judgeModel = typeof safeRec.judge === 'string' && safeRec.judge ? safeRec.judge : resolveRoleModel('judge').modelId;
+    const outcome = typeof safeRec.outcome === 'string' ? safeRec.outcome : 'reconciled';
     const decisionId = recordModelRouteDecision({
       sessionId,
       role: 'judge',
       resolvedModel: judgeModel,
       provider: resolveEffectiveProviderForModel(judgeModel),
       source: 'default',
-      reason: { seam: rec.path === 'verify' ? 'verify_checker' : 'debate', outcome },
+      reason: { seam: safeRec.path === 'verify' ? 'verify_checker' : 'debate', outcome },
     });
     recordModelRouteOutcome({
       decisionId,
@@ -1995,7 +2058,7 @@ function recordDebateTrace(rec: Record<string, unknown>): void {
   try {
     const p = debateTracePath();
     mkdirSync(path.dirname(p), { recursive: true });
-    appendFileSync(p, `${JSON.stringify({ ts: new Date().toISOString(), ...(sessionId ? { sessionId } : {}), ...rec })}\n`);
+    appendFileSync(p, `${JSON.stringify({ ts: new Date().toISOString(), ...(sessionId ? { sessionId } : {}), ...safeRec })}\n`);
     // Bound the file: when it crosses the cap, keep the last N rows. Stops
     // unbounded growth and keeps readRecentDebateTraces' whole-file read cheap.
     try {
@@ -2021,7 +2084,11 @@ export function readRecentDebateTraces(limit = 40): Array<Record<string, unknown
     const n = Math.min(Math.max(1, Math.floor(limit)), 500);
     const out: Array<Record<string, unknown>> = [];
     for (const l of lines.slice(-n)) {
-      try { out.push(JSON.parse(l)); } catch { /* skip a partial/corrupt line */ }
+      try {
+        // Older installations may already have pre-redaction excerpt rows.
+        // Never surface those raw through the console after upgrading.
+        out.push(redactSensitiveValue(JSON.parse(l)) as Record<string, unknown>);
+      } catch { /* skip a partial/corrupt line */ }
     }
     return out.reverse();
   } catch {
@@ -2069,11 +2136,11 @@ export function getFusionHealthSnapshot(limit = 100): FusionHealthSnapshot {
 }
 
 function errText(err: unknown): string {
-  if (err instanceof Error) return err.message;
+  if (err instanceof Error) return redactSensitiveText(err.message);
   try {
-    return JSON.stringify(err);
+    return redactSensitiveText(JSON.stringify(redactSensitiveValue(err)));
   } catch {
-    return String(err);
+    return redactSensitiveText(String(err));
   }
 }
 

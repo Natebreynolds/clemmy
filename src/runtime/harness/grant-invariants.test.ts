@@ -22,6 +22,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { queuePendingAction, markPendingActionApprovalResolved, getPendingAction } = await import('./pending-actions.js');
+const { pendingActionApprovalView } = await import('./pending-action-view.js');
 const { executeApprovedPendingActionCall } = await import('../../execution/pending-action-executor.js');
 const { shouldRunObjectiveJudge } = await import('./objective-judge.js');
 const { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
@@ -52,6 +53,7 @@ test('EXHIBIT A replay: a POLICY-approved irreversible send is inert at every ex
 
   let dispatched = 0;
   const result = await executeApprovedPendingActionCall(record.id, {
+    sessionId: 'sess-grant',
     dispatch: async () => { dispatched += 1; return 'sent'; },
   });
   assert.equal(result.ok, false, 'policy consent must not execute an irreversible send');
@@ -64,8 +66,16 @@ test('I1 counterpart: a HUMAN card decision arms the same action', async () => {
   // B4 (2026-07-20): the human claim is VERIFIED against the registry — this
   // test now mints a REAL approved card (a fabricated id is refuted to policy).
   const registryMod = await import('./approval-registry.js');
-  const cardSess = createSession({ kind: 'chat' });
-  const card = registryMod.register({ sessionId: cardSess.id, subject: 'send', tool: 'composio_execute_tool', args: {} });
+  const cardSess = createSession({ id: 'sess-grant', kind: 'chat' });
+  const card = registryMod.register({
+    sessionId: cardSess.id,
+    subject: 'send',
+    tool: 'request_approval',
+    args: {
+      pendingActionId: record.id,
+      pendingAction: pendingActionApprovalView(record),
+    },
+  });
   registryMod.resolve(card.approvalId, 'approved', 'test');
   markPendingActionApprovalResolved(record.id, 'approved', card.approvalId);
   const after = getPendingAction(record.id);
@@ -74,6 +84,7 @@ test('I1 counterpart: a HUMAN card decision arms the same action', async () => {
 
   let dispatched = 0;
   const result = await executeApprovedPendingActionCall(record.id, {
+    sessionId: 'sess-grant',
     dispatch: async () => { dispatched += 1; return 'sent'; },
   });
   assert.equal(result.ok, true, 'human consent executes');

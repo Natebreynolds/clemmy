@@ -18,6 +18,8 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-rou
 const express = (await import('express')).default;
 const { registerSpaceRoutes } = await import('./space-routes.js');
 const store = await import('../spaces/store.js');
+const spaceRunner = await import('../spaces/runner.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 
 let server: Server;
 let base = '';
@@ -297,21 +299,27 @@ test('notes append + list', async () => {
   assert.equal(list.body.notes[0].kind, 'call');
 });
 
-test('refresh runs a deterministic runner server-side and persists its JSON', async () => {
+test('refresh runs a provably read-only Composio source and persists its JSON', async () => {
   const slug = 'refresh-rt';
-  store.spaceStore.save({ id: slug, title: 'Refresh RT', dataSources: [{ id: 'pull', runner: 'refresh.mjs' }] });
-  const scriptDir = store.resolveInSpace(slug, 'data');
-  mkdirSync(scriptDir, { recursive: true });
-  writeFileSync(path.join(scriptDir, 'refresh.mjs'), 'process.stdout.write(JSON.stringify({rows:[{name:"Acme",amount:1000}]}))', 'utf-8');
-
-  const ref = await j(await fetch(`${base}/api/console/spaces/${slug}/refresh`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sourceId: 'pull' }),
+  store.spaceStore.save({ id: slug, title: 'Refresh RT', dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }] });
+  spaceRunner._setSpaceComposioDispatchForTests(async () => ({
+    ok: true as const,
+    result: { rows: [{ name: 'Acme', amount: 1000 }] },
+    connectionId: 'ca-proof',
+    identity: 'proof@example.test',
   }));
-  assert.equal(ref.status, 200);
-  assert.equal(ref.body.results[0].ok, true);
-  // Persisted under the source id, with a _meta marker.
-  assert.deepEqual(ref.body.data.pull, { rows: [{ name: 'Acme', amount: 1000 }] });
-  assert.equal(ref.body.data._meta.pull.ok, true);
+  try {
+    const ref = await j(await fetch(`${base}/api/console/spaces/${slug}/refresh`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sourceId: 'pull' }),
+    }));
+    assert.equal(ref.status, 200);
+    assert.equal(ref.body.results[0].ok, true);
+    // Persisted under the source id, with a _meta marker.
+    assert.deepEqual(ref.body.data.pull, { rows: [{ name: 'Acme', amount: 1000 }] });
+    assert.equal(ref.body.data._meta.pull.ok, true);
+  } finally {
+    spaceRunner._setSpaceComposioDispatchForTests(null);
+  }
 });
 
 test('refresh surfaces a runner error without breaking the workspace', async () => {
@@ -320,6 +328,19 @@ test('refresh surfaces a runner error without breaking the workspace', async () 
   const scriptDir = store.resolveInSpace(slug, 'data');
   mkdirSync(scriptDir, { recursive: true });
   writeFileSync(path.join(scriptDir, 'bad.mjs'), 'process.exit(2)', 'utf-8');
+  const pending = await j(await fetch(`${base}/api/console/spaces/${slug}/refresh`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sourceId: 'bad' }),
+  }));
+  assert.equal(pending.status, 200);
+  assert.equal(pending.body.results[0].ok, false);
+  assert.equal(pending.body.data._meta.bad.status, 'awaiting_approval');
+  const approval = approvalRegistry.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  })[0];
+  assert.ok(approval);
+  assert.equal(approvalRegistry.resolve(approval.approvalId, 'approved', 'space-route-test').ok, true);
+
   const ref = await j(await fetch(`${base}/api/console/spaces/${slug}/refresh`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sourceId: 'bad' }),
   }));
@@ -345,33 +366,37 @@ test('paused workspace rejects data writes (423) but still serves the view', asy
   assert.equal(view.status, 200); // read-only cached view still serves
 });
 
-test('action route runs a READ-class action immediately, merges args, records a note', async () => {
+test('action route runs a proven READ-class Composio action immediately, merges args, records a note', async () => {
   const slug = 'action-rt';
   store.spaceStore.save({
     id: slug, title: 'Action RT',
-    // "Refresh list" is read-class (not a send, no confirm) → fires instantly
-    // even with the E1 approval gate on (the default).
-    actions: [{ id: 'refresh-list', label: 'Refresh list', runner: 'act.mjs', argsTemplate: { scope: 'team' } }],
+    actions: [{
+      id: 'refresh-list',
+      label: 'Refresh list',
+      composioSlug: 'SALESFORCE_GET_CONTACTS',
+      argsTemplate: { scope: 'team' },
+    }],
   });
-  const scriptDir = store.resolveInSpace(slug, 'data');
-  mkdirSync(scriptDir, { recursive: true });
-  // Echo the merged args back so the test can assert the template+caller merge.
-  writeFileSync(path.join(scriptDir, 'act.mjs'),
-    'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s);process.stdout.write(JSON.stringify({sent:p.args}))})',
-    'utf-8');
-
-  const res = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ actionId: 'refresh-list', args: { limit: 10 } }),
+  spaceRunner._setSpaceComposioDispatchForTests(async (_toolSlug, args) => ({
+    ok: true as const,
+    result: { received: args },
+    connectionId: 'ca-proof',
+    identity: 'proof@example.test',
   }));
-  assert.equal(res.status, 200);
-  assert.equal(res.body.ok, true);
-  // template (scope) merged under caller args (limit).
-  assert.deepEqual(res.body.result.sent, { scope: 'team', limit: 10 });
+  try {
+    const res = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ actionId: 'refresh-list', args: { limit: 10 } }),
+    }));
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true);
+    assert.deepEqual(res.body.result.received, { scope: 'team', limit: 10 });
 
-  // The action is recorded as a note so the dock's Clem has context.
-  const notes = await j(await fetch(`${base}/api/console/spaces/${slug}/notes`));
-  assert.ok(notes.body.notes.some((n: any) => n.kind === 'action' && /Refresh list/.test(n.text)));
+    const notes = await j(await fetch(`${base}/api/console/spaces/${slug}/notes`));
+    assert.ok(notes.body.notes.some((n: any) => n.kind === 'action' && /Refresh list/.test(n.text)));
+  } finally {
+    spaceRunner._setSpaceComposioDispatchForTests(null);
+  }
 });
 
 test('action route refuses a workspace with malformed hand-written action JSON', async () => {
@@ -442,7 +467,7 @@ test('E1: confirm:true forces the gate even for a non-send runner action', async
   assert.equal(res.body.pending, true);
 });
 
-test('E1: kill-switch off restores instant execution for a send action', async () => {
+test('E1: stale kill-switch configuration cannot bypass action approval', async () => {
   const prev = process.env.CLEMMY_SPACE_ACTION_APPROVAL;
   process.env.CLEMMY_SPACE_ACTION_APPROVAL = 'off';
   try {
@@ -460,8 +485,9 @@ test('E1: kill-switch off restores instant execution for a send action', async (
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ actionId: 'send', args: { to: 'lead@acme' } }),
     }));
-    assert.equal(res.status, 200);
-    assert.deepEqual(res.body.result.sent, { from: 'me@co', to: 'lead@acme' });
+    assert.equal(res.status, 202);
+    assert.equal(res.body.pending, true);
+    assert.match(res.body.approvalId, /^apr-/);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_SPACE_ACTION_APPROVAL;
     else process.env.CLEMMY_SPACE_ACTION_APPROVAL = prev;

@@ -45,6 +45,7 @@ export function toolkitSlugForTool(toolSlug: string): string {
 export interface SpaceSmokeResult {
   ran: boolean;
   failed: { id: string; error: string }[];
+  awaitingApproval: { id: string; approvalId: string }[];
   empty: string[];
   actionWarnings: string[];
 }
@@ -56,9 +57,10 @@ export interface SpaceSmokeResult {
  */
 export async function runSpaceCreationSmoke(slug: string): Promise<SpaceSmokeResult> {
   const rec = spaceStore.get(slug);
-  if (!rec) return { ran: false, failed: [], empty: [], actionWarnings: [] };
+  if (!rec) return { ran: false, failed: [], awaitingApproval: [], empty: [], actionWarnings: [] };
 
   const failed: { id: string; error: string }[] = [];
+  const awaitingApproval: { id: string; approvalId: string }[] = [];
   const empty: string[] = [];
   const actionWarnings: string[] = [];
 
@@ -71,7 +73,14 @@ export async function runSpaceCreationSmoke(slug: string): Promise<SpaceSmokeRes
       continue;
     }
     const r = results[0];
-    if (!r || !r.ok) { failed.push({ id: source.id, error: r?.error ?? 'unknown error' }); continue; }
+    if (!r || !r.ok) {
+      if (r?.pendingApprovalId) {
+        awaitingApproval.push({ id: source.id, approvalId: r.pendingApprovalId });
+      } else {
+        failed.push({ id: source.id, error: r?.error ?? 'unknown error' });
+      }
+      continue;
+    }
     const data = readData(slug);
     const val = data && typeof data === 'object' ? (data as Record<string, unknown>)[source.id] : undefined;
     if (looksEmpty(val) && source.allowEmpty !== true) empty.push(source.id);
@@ -117,5 +126,5 @@ export async function runSpaceCreationSmoke(slug: string): Promise<SpaceSmokeRes
     }
   }
 
-  return { ran: true, failed, empty, actionWarnings };
+  return { ran: true, failed, awaitingApproval, empty, actionWarnings };
 }

@@ -126,6 +126,11 @@ import {
   buildProspectiveIntentionContext,
   prospectiveCaptureDirective,
 } from '../prospective-intentions.js';
+import {
+  isQueuedActionApprovalQuestion,
+  materializeQueuedApprovals,
+  queuedApprovalTransitionsForRequest,
+} from './pending-action-transition.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
@@ -1864,17 +1869,65 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   let completionIndependentlyVerified = false;
   let artifactVerificationPending: RunArtifact[] = [];
   let logicalRunScopeId: string | undefined;
+  let graphApprovalId: string | undefined;
   let result: ClaudeAgentSdkRunResult;
   try {
     result = await runWithSalvage({ prompt: request.message, ...runOptions });
     logicalRunScopeId = result.artifactRunScopeId;
-    const resultIsAwaitingInput = (): boolean => result.stoppedReason === 'awaiting-input';
+    const resultIsAwaitingInput = (): boolean =>
+      result.stoppedReason === 'awaiting-input' || result.stoppedReason === 'pending-approval';
 
     // Phase 1.3: ONE shared budget across all post-result corrective continuations
     // (narration, reasoning-leak, judge) so they can't compound into 4-5 full-context
     // re-runs of a single turn. Healthy turns spend 0.
     let continuationsUsed = 0;
     const continuationBudget = maxTurnContinuations();
+
+    // Queue + an explicit execution question is already a complete graph
+    // state. Reconcile after every result merge so a narration/judge/max-turn
+    // continuation cannot strand or duplicate the queued action.
+    const reconcileQueuedApprovalEdge = (): boolean => {
+      const approvalQuestion = isQueuedActionApprovalQuestion(result.text);
+      const transitions = queuedApprovalTransitionsForRequest(sessionId, userInputEvent.seq)
+        .filter((transition) => transition.autoMaterialize || approvalQuestion);
+      if (transitions.length === 0) return false;
+      const materialized = materializeQueuedApprovals(
+        sessionId,
+        0,
+        userInputEvent.seq,
+        transitions,
+      );
+      if (materialized.length > 0) {
+        graphApprovalId ??= materialized[0].approval.approvalId;
+        result = {
+          ...result,
+          limitHit: false,
+          selfStopped: false,
+          stoppedReason: 'pending-approval',
+        };
+        for (const item of materialized) {
+          try {
+            appendEvent({
+              sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'heartbeat',
+              data: {
+                kind: 'pending_action_transition_materialized',
+                pendingActionId: item.transition.record.id,
+                approvalId: item.approval.approvalId,
+                sourceEventSeq: item.transition.eventSeq,
+                autoMaterialize: item.transition.autoMaterialize,
+                message: 'Materialized the exact queued-action approval edge without another model turn.',
+              },
+            });
+          } catch { /* transition state is already durable */ }
+        }
+        return true;
+      }
+      return false;
+    };
+    reconcileQueuedApprovalEdge();
 
     // Narrate-instead-of-call backstop (defense-in-depth; the lean rubric prevents
     // most of it). If the brain made NO real tool calls but its text reproduces the
@@ -1888,7 +1941,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         ...cleanContinuationRunOptions(),
       });
       continuationsUsed += 1; // a continuation was spent (a parse stumble → null still cost a query())
-      if (retry) result = mergeClaudeRunEvidence(result, retry);
+      if (retry) {
+        result = mergeClaudeRunEvidence(result, retry);
+        reconcileQueuedApprovalEdge();
+      }
     }
 
     // Reasoning-leak backstop (defense-in-depth; the trusted-memory framing prevents
@@ -1906,7 +1962,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         ...cleanContinuationRunOptions(),
       });
       continuationsUsed += 1;
-      if (retry) result = mergeClaudeRunEvidence(result, retry);
+      if (retry) {
+        result = mergeClaudeRunEvidence(result, retry);
+        reconcileQueuedApprovalEdge();
+      }
     }
 
     // Objective-completion judge (parity with the harness loop): on an authoring
@@ -2037,6 +2096,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         continuationsUsed += 1;
         if (!contResult) break; // parse stumble on a continuation → keep the prior good result
         result = mergeClaudeRunEvidence(result, contResult);
+        if (reconcileQueuedApprovalEdge()) break;
         if (contResult.limitHit) break;
       }
     }
@@ -2127,6 +2187,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         if (!cont) break; // a parse stumble on a continuation → keep the prior partial
         continuationLedger = [...continuationLedger, ...(cont.toolCallLedger ?? [])];
         result = mergeClaudeRunEvidence(result, cont);
+        if (reconcileQueuedApprovalEdge()) break;
         try {
           appendEvent({ sessionId, turn: 0, role: 'system', type: 'sdk_auto_continue', data: { attempt: autoContinues, stillLimited: Boolean(cont.limitHit) } });
         } catch { /* telemetry best-effort */ }
@@ -2330,6 +2391,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       ? (budgetWindowExhausted() ? 'token-budget' : 'max-turns-with-grace')
       : 'success');
   const awaitingInput = stoppedReason === 'awaiting-input';
+  const awaitingApproval = stoppedReason === 'pending-approval';
   // Report-back / observability parity (gap analysis): the harness loop emits
   // conversation_completed + runtime.completed on a clean terminal so the Tasks
   // board, report-back, and watchdog see the run. The Agent SDK lane runs its
@@ -2386,11 +2448,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           ? 'awaiting_continue'
           : awaitingInput
             ? 'awaiting_user_input'
-            : 'claude_agent_sdk_brain',
+            : awaitingApproval
+              ? 'awaiting_approval'
+              : 'claude_agent_sdk_brain',
         summary: text.slice(0, 400),
         reply: text,
         ...(logicalRunScopeId ? { artifactRunScopeId: logicalRunScopeId } : {}),
         ...(awaitingInput ? { awaitingUser: true } : {}),
+        ...(awaitingApproval && graphApprovalId ? { pendingApprovalId: graphApprovalId } : {}),
         ...(artifactVerificationPending.length > 0
           ? {
               artifactVerification: {
@@ -2518,6 +2583,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   return {
     text,
     sessionId,
+    ...(awaitingApproval && graphApprovalId ? { pendingApprovalId: graphApprovalId } : {}),
     stoppedReason,
     turnsUsed: result.toolUses.length > 0 ? result.toolUses.length : 1,
     raw: {

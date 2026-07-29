@@ -25,11 +25,11 @@ import {
 import { refreshSpaceData, runSpaceAction } from '../spaces/runner.js';
 import { composeForSpace } from '../spaces/compose.js';
 import {
-  spaceActionApprovalEnabled, spaceActionNeedsApproval,
-  enqueueSpaceActionApproval, initSpaceActionApprovals,
+  spaceActionNeedsApproval, enqueueSpaceActionApproval, initSpaceActionApprovals,
 } from '../spaces/space-action-gate.js';
 import { reengageSpace } from '../spaces/reengage.js';
 import { buildPublishSnapshot } from '../spaces/publish.js';
+import { injectWorkspaceBootstrap } from '../spaces/view-html.js';
 import { availableStarterRecipes } from '../spaces/starter-recipes.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
 
@@ -145,20 +145,6 @@ window.clem=Object.freeze({slug:S,data:function(){return rpc('data',{});},refres
 })();</script>`;
 };
 
-/** Insert a snippet as early as possible so `window.clem` is defined before any
- *  authored <script> executes. Prefers just inside <head>; falls back to just
- *  inside <html>, then after <!doctype>, else prepends. Case-insensitive, first
- *  match wins. Keeps the bridge ahead of a top-of-body author script — the whole
- *  point (see serveView). */
-function injectAtDocumentStart(html: string, snippet: string): string {
-  const m = /<head[^>]*>/i.exec(html) ?? /<html[^>]*>/i.exec(html) ?? /<!doctype[^>]*>/i.exec(html);
-  if (m) {
-    const at = m.index + m[0].length;
-    return html.slice(0, at) + snippet + html.slice(at);
-  }
-  return snippet + html;
-}
-
 function isLoopback(req: Request): boolean {
   const addr = req.socket?.remoteAddress ?? '';
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1' || addr === '';
@@ -227,7 +213,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       // the surface renders empty on first load. That ordering bug forced
       // hand-rolled `waitForClem` polls in authored views.) The bridge touches
       // no DOM, so <head> is safe.
-      res.send(injectAtDocumentStart(html, CLEM_VIEW_BRIDGE(slug)));
+      res.send(injectWorkspaceBootstrap(html, CLEM_VIEW_BRIDGE(slug)));
       return;
     }
     res.send(readFileSync(target));
@@ -472,8 +458,9 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     const callerArgs = (req.body?.args && typeof req.body.args === 'object') ? req.body.args as Record<string, unknown> : {};
     // E1 — an action that MUTATES an external system (a send, a CRM write) takes
     // ONE approval (surfaced in the inbox/board) before it fires; READ-class
-    // actions run instantly. Kill-switch: CLEMMY_SPACE_ACTION_APPROVAL.
-    if (spaceActionApprovalEnabled() && spaceActionNeedsApproval(action)) {
+    // actions run instantly. The runtime boundary repeats this check, so an
+    // alternate caller or stale debug configuration cannot bypass approval.
+    if (spaceActionNeedsApproval(action)) {
       try {
         const { approvalId, subject } = enqueueSpaceActionApproval(rec, action, callerArgs);
         res.status(202).json({ pending: true, approvalId, subject });

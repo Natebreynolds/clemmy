@@ -78,6 +78,7 @@ import {
   terminalToolShouldHalt,
 } from '../runtime/harness/terminal-tool.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -473,27 +474,57 @@ const DIRECT_EMAIL_ACTION_TEXT_RE = /(?:^|[.!?]\s+|\b(?:please|to|will|should|mu
  * Anchor on the queued payload when available; fall back to explicit action
  * wording for legacy callers that have not queued a payload yet.
  */
-export const _requestApprovalRequiresHumanForTests = (args: RequestApprovalArgs): Promise<boolean> => requestApprovalRequiresHuman(args);
+export const _requestApprovalRequiresHumanForTests = (
+  args: RequestApprovalArgs,
+  sessionId?: string,
+): Promise<boolean> => requestApprovalRequiresHuman(
+  args,
+  sessionId ? { context: { sessionId } } : undefined,
+);
 
-async function requestApprovalRequiresHuman(args: RequestApprovalArgs): Promise<boolean> {
-  if (args.destructive) return true;
+async function pendingActionForActiveSession(
+  args: RequestApprovalArgs,
+  runContext: unknown,
+) {
   const id = args.pendingActionId?.trim();
-  if (id) {
-    try {
-      const { getPendingAction } = await import('../runtime/harness/pending-actions.js');
-      const { isIrreversibleSendSlug } = await import('../runtime/harness/confirm-first-gate.js');
-      const record = getPendingAction(id);
-      if (record) {
-        // Send-ness anchors on BOTH the queue kind AND the plan's own slug —
-        // the kind derives from the MODEL-declared sideEffect, so a send batch
-        // the model labeled 'write' must not slip the gate (adversarial-review
-        // blocker, 2026-07-09).
-        const payload = record.payload as { items?: unknown[]; composioSlug?: string } | undefined;
-        const slugIrreversible = typeof payload?.composioSlug === 'string'
-          && isIrreversibleSendSlug(payload.composioSlug);
-        return record.kind === 'external_send' || slugIrreversible;
-      }
-    } catch { return true; /* fail-closed on the safety path */ }
+  if (!id) return { state: 'none' as const };
+  const sessionId = extractSessionId(runContext)?.trim();
+  if (!sessionId) {
+    return {
+      state: 'refused' as const,
+      id,
+      reason: 'the active run has no authoritative session owner',
+    };
+  }
+  try {
+    const { getPendingAction } = await import('../runtime/harness/pending-actions.js');
+    const record = getPendingAction(id);
+    if (!record || !record.sessionId || record.sessionId !== sessionId) {
+      return {
+        state: 'refused' as const,
+        id,
+        reason: 'the queued action does not belong to this session',
+      };
+    }
+    return { state: 'owned' as const, id, sessionId, record };
+  } catch {
+    return {
+      state: 'refused' as const,
+      id,
+      reason: 'the queued action ownership could not be verified',
+    };
+  }
+}
+
+async function requestApprovalRequiresHuman(
+  args: RequestApprovalArgs,
+  runContext?: unknown,
+): Promise<boolean> {
+  if (args.destructive) return true;
+  const pendingAction = await pendingActionForActiveSession(args, runContext);
+  if (pendingAction.state === 'refused') return true;
+  if (pendingAction.state === 'owned') {
+    return pendingActionRequiresHumanApproval(pendingAction.record);
   }
   const text = `${args.subject} ${args.reason ?? ''}`;
   return IRREVERSIBLE_ACTION_TEXT_RE.test(text) || DIRECT_EMAIL_ACTION_TEXT_RE.test(text);
@@ -539,30 +570,31 @@ function inferApprovedComposioSlugs(args: RequestApprovalArgs): string[] {
   return [];
 }
 
-async function pendingActionApprovedSlugs(args: RequestApprovalArgs): Promise<string[]> {
-  const id = args.pendingActionId?.trim();
-  if (!id) return [];
-  try {
-    const { getPendingAction } = await import('../runtime/harness/pending-actions.js');
-    const record = getPendingAction(id);
-    const payload = record?.payload as { composioSlug?: string; tool_slug?: string } | undefined;
-    const slug = payload?.composioSlug ?? payload?.tool_slug;
-    return typeof slug === 'string' && slug.trim() ? [slug.trim()] : [];
-  } catch {
-    return [];
-  }
+async function pendingActionApprovedSlugs(
+  args: RequestApprovalArgs,
+  runContext: unknown,
+): Promise<string[]> {
+  const pendingAction = await pendingActionForActiveSession(args, runContext);
+  if (pendingAction.state !== 'owned') return [];
+  const payload = pendingAction.record.payload as { composioSlug?: string; tool_slug?: string } | undefined;
+  const slug = payload?.composioSlug ?? payload?.tool_slug;
+  return typeof slug === 'string' && slug.trim() ? [slug.trim()] : [];
 }
 
 async function openRequestApprovalScope(args: RequestApprovalArgs, runContext: unknown): Promise<string[]> {
   if (args.destructive) return [];
   const sessionId = extractSessionId(runContext);
   if (!sessionId) return [];
+  const pendingAction = await pendingActionForActiveSession(args, runContext);
+  if (pendingAction.state === 'refused') return [];
   // Approve-once-then-run: a HUMAN approval of a queued action IS the reviewed
   // plan — open the scope for the plan's own slug so the confirm-first gate
   // doesn't re-refuse the approved batch at the threshold (adversarial review,
   // 2026-07-09). The text-inference fallback keeps the old draft-batch shape.
-  const fromPendingAction = await pendingActionApprovedSlugs(args);
-  const allowedComposioSlugs = fromPendingAction.length > 0 ? fromPendingAction : inferApprovedComposioSlugs(args);
+  const fromPendingAction = await pendingActionApprovedSlugs(args, runContext);
+  const allowedComposioSlugs = pendingAction.state === 'owned'
+    ? fromPendingAction
+    : inferApprovedComposioSlugs(args);
   if (allowedComposioSlugs.length === 0) return [];
   openPlanScope({
     sessionId,
@@ -574,41 +606,51 @@ async function openRequestApprovalScope(args: RequestApprovalArgs, runContext: u
   return allowedComposioSlugs;
 }
 
-async function pendingActionExecutionInstructions(args: RequestApprovalArgs): Promise<string> {
-  const pendingActionId = args.pendingActionId?.trim();
-  if (!pendingActionId) return '';
-  try {
-    const { getPendingAction } = await import('../runtime/harness/pending-actions.js');
-    const record = getPendingAction(pendingActionId);
-    if (!record) {
-      return ` Queued action ${pendingActionId} is approved, but the queue record could not be read; do not reconstruct it from memory.`;
-    }
-    if (record.status !== 'approved') {
-      return ` Queued action ${record.id} is not recorded as approved; do not execute or reconstruct it.`;
-    }
-    return [
-      ` Queued action ${record.id} is approved.`,
-      `Execute ONLY the exact queued payload for ${record.toolName} (payload hash ${record.payloadHash}); do not reconstruct it from memory.`,
-      `Call pending_action_execute with id ${record.id}; it dispatches the byte-identical stored payload and records the result. Do NOT call pending_action_get followed by the underlying tool, which would create a second approval boundary and invite reconstruction drift.`,
-    ].join(' ');
-  } catch {
-    // Approval is authoritative; pending-action status mirroring is best-effort.
-    return '';
+async function pendingActionExecutionInstructions(
+  args: RequestApprovalArgs,
+  runContext: unknown,
+): Promise<string> {
+  const pendingAction = await pendingActionForActiveSession(args, runContext);
+  if (pendingAction.state === 'none') return '';
+  if (pendingAction.state === 'refused') {
+    return ` Queued action ${pendingAction.id} was refused because ${pendingAction.reason}; do not execute or reconstruct it.`;
   }
+  const { record } = pendingAction;
+  if (record.status !== 'approved') {
+    return ` Queued action ${record.id} is not recorded as approved; do not execute or reconstruct it.`;
+  }
+  if (record.toolName === 'run_batch') {
+    return [
+      ` Queued batch ${record.id} is approved.`,
+      `Execute ONLY its server-stored certified plan (payload hash ${record.payloadHash}); do not reconstruct any item from memory.`,
+      `Call run_batch with action="execute" and pending_action_id="${record.id}" exactly once. Do NOT call pending_action_execute or re-propose the batch.`,
+    ].join(' ');
+  }
+  return [
+    ` Queued action ${record.id} is approved.`,
+    `Execute ONLY the exact queued payload for ${record.toolName} (payload hash ${record.payloadHash}); do not reconstruct it from memory.`,
+    `Call pending_action_execute with id ${record.id}; it dispatches the byte-identical stored payload and records the result. Do NOT call pending_action_get followed by the underlying tool, which would create a second approval boundary and invite reconstruction drift.`,
+  ].join(' ');
 }
 
-async function markPendingActionPolicyApprovedFromRequest(args: RequestApprovalArgs): Promise<string> {
-  const pendingActionId = args.pendingActionId?.trim();
-  if (!pendingActionId) return '';
+async function markPendingActionPolicyApprovedFromRequest(
+  args: RequestApprovalArgs,
+  runContext: unknown,
+): Promise<string> {
+  const pendingAction = await pendingActionForActiveSession(args, runContext);
+  if (pendingAction.state === 'none') return '';
+  if (pendingAction.state === 'refused') {
+    return ` Queued action ${pendingAction.id} was refused because ${pendingAction.reason}; its approval state was not changed.`;
+  }
   try {
     const { markPendingActionApprovalResolved } = await import('../runtime/harness/pending-actions.js');
     // Only the two true auto-approval branches call this helper. A resumed human
     // card has already been recorded by approval-registry and must remain human.
-    markPendingActionApprovalResolved(pendingActionId, 'approved', null, {
+    markPendingActionApprovalResolved(pendingAction.record.id, 'approved', null, {
       by: 'policy',
       evidence: { kind: 'policy', scope: loadProactivityPolicy().autoApproveScope },
     });
-    return pendingActionExecutionInstructions(args);
+    return pendingActionExecutionInstructions(args, runContext);
   } catch {
     return '';
   }
@@ -627,30 +669,34 @@ export function buildRequestApprovalTool() {
     // memory" + destructive:false, the runtime guard turns it into a
     // no-op so the user doesn't see a phantom approval prompt and the
     // orchestrator can keep moving.
-    needsApproval: async (_ctx, input) => {
+    needsApproval: async (ctx, input) => {
       const args = input as RequestApprovalArgs;
       // Send-batch check FIRST: a queued external_send whose subject happens
       // to read like a local save ("save these emails to memory then send")
       // must never ride the local-save shortcut past the gate (adversarial-
       // review blocker, 2026-07-09).
-      if (await requestApprovalRequiresHuman(args)) return true;
+      if (await requestApprovalRequiresHuman(args, ctx)) return true;
       if (isLocalSaveApproval(args)) return false;
       if (isYoloAutoApprovalPolicy()) return false;
       return true;
     },
     execute: async (args, runContext) => {
-      const requiresHuman = await requestApprovalRequiresHuman(args);
+      const pendingAction = await pendingActionForActiveSession(args, runContext);
+      if (pendingAction.state === 'refused') {
+        return `Refused queued action ${pendingAction.id}: ${pendingAction.reason}. Its approval state was not changed and no tool scope was opened.`;
+      }
+      const requiresHuman = await requestApprovalRequiresHuman(args, runContext);
       if (!requiresHuman && isLocalSaveApproval(args)) {
-        const pendingActionText = await markPendingActionPolicyApprovedFromRequest(args);
+        const pendingActionText = await markPendingActionPolicyApprovedFromRequest(args, runContext);
         return `Auto-approved (local save — no external mutation): ${args.subject}. Proceed with the save and report back what landed.${pendingActionText}`;
       }
       if (!requiresHuman && isYoloAutoApprovalPolicy()) {
-        const pendingActionText = await markPendingActionPolicyApprovedFromRequest(args);
+        const pendingActionText = await markPendingActionPolicyApprovedFromRequest(args, runContext);
         return `Auto-approved by YOLO mode: ${args.subject}. Proceed with the action you described.${pendingActionText}`;
       }
       // Human approval was persisted by approval-registry before the SDK resumed
       // this tool. Read that linked action without rewriting its provenance.
-      const pendingActionText = await pendingActionExecutionInstructions(args);
+      const pendingActionText = await pendingActionExecutionInstructions(args, runContext);
       const scopedSlugs = await openRequestApprovalScope(args, runContext);
       const scopeText = scopedSlugs.length > 0
         ? ` Approved scope opened for ${scopedSlugs.join(', ')} in this session, so matching concrete tool calls should not ask again.`

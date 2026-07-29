@@ -161,6 +161,7 @@ export function detectStructuredToolFailure(text: string): { failed: boolean; su
     r.isError === true
     || r.successful === false
     || r.success === false
+    || r.ok === false
     || (errStr.length > 0 && !explicitSuccess);
   if (!failed) return none;
   const message = typeof r.message === 'string' ? r.message : '';
@@ -172,4 +173,3 @@ export function detectStructuredToolFailure(text: string): { failed: boolean; su
 export function mcpErrorCorrectiveEnabled(): boolean {
   return (process.env.CLEMMY_MCP_ERROR_CORRECTIVE ?? 'on').toLowerCase() !== 'off';
 }
-

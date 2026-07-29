@@ -385,6 +385,7 @@ import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJ
 import { getJudgeMetricsSnapshot } from '../runtime/harness/judge-family.js';
 import { summarizeApprovalAction, extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import {
+  pendingActionApprovalView,
   pendingActionApprovalViewFromArgs,
   type PendingActionApprovalView,
 } from '../runtime/harness/pending-action-view.js';
@@ -10911,7 +10912,15 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const record = getPendingAction(req.params.id);
     if (!record) { res.status(404).json({ ok: false, reason: 'pending action not found' }); return; }
-    res.json({ ok: true, status: record.status, resultSummary: record.resultSummary });
+    // Read-only hydration for slim workflow/background approval events. The
+    // execution endpoint still re-verifies the exact card/action/session
+    // backlinks; returning this view grants no authority.
+    res.json({
+      ok: true,
+      status: record.status,
+      resultSummary: record.resultSummary,
+      pendingAction: pendingActionApprovalView(record),
+    });
   });
 
   app.post('/api/console/pending-actions/:id/approve-execute', async (req, res) => {

@@ -32,7 +32,7 @@ const {
   getPendingAction,
 } = await import('../runtime/harness/pending-actions.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
-const { createSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const { createSession, listEvents, openEventLog } = await import('../runtime/harness/eventlog.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { listSendTrustGrants } = await import('../agents/plan-scope.js');
 
@@ -189,20 +189,43 @@ test('approve-execute requires the registry payload backlink and matching sessio
 
     const actionSession = createSession({ kind: 'chat' }).id;
     const cardSession = createSession({ kind: 'chat' }).id;
-    const mismatched = linkedRunBatch('Session mismatch', {
-      actionSessionId: actionSession,
-      cardSessionId: cardSession,
+    const mismatchedRecord = queuePendingAction({
+      title: 'Session mismatch',
+      summary: 'legacy forged cross-session row',
+      kind: 'external_send',
+      toolName: 'run_batch',
+      payload: {
+        tool: 'composio_execute_tool',
+        items: [{ tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'approval-test@example.test' } }],
+      },
+      sessionId: actionSession,
     });
-    const sessionBefore = getPendingAction(mismatched.record.id);
-    const sessionRes = await fetch(`${h.url}/api/console/pending-actions/${mismatched.record.id}/approve-execute`, {
+    const mismatchedApprovalId = 'apr-sms1';
+    const now = new Date();
+    openEventLog().prepare(`
+      INSERT INTO pending_approvals
+        (approval_id, session_id, requested_at, expires_at, subject, tool, args_json, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+    `).run(
+      mismatchedApprovalId,
+      cardSession,
+      now.toISOString(),
+      new Date(now.getTime() + 60_000).toISOString(),
+      'Session mismatch',
+      'run_batch',
+      JSON.stringify({ pendingActionId: mismatchedRecord.id }),
+    );
+    linkPendingActionApproval(mismatchedRecord.id, mismatchedApprovalId);
+    const sessionBefore = getPendingAction(mismatchedRecord.id);
+    const sessionRes = await fetch(`${h.url}/api/console/pending-actions/${mismatchedRecord.id}/approve-execute`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ approvalId: mismatched.card.approvalId }),
+      body: JSON.stringify({ approvalId: mismatchedApprovalId }),
     });
     assert.equal(sessionRes.status, 409);
     assert.match((await sessionRes.json() as { reason: string }).reason, /different session/i);
-    assert.equal(getPendingAction(mismatched.record.id)?.status, sessionBefore?.status);
-    assert.equal(approvalRegistry.get(mismatched.card.approvalId)?.status, 'pending');
+    assert.equal(getPendingAction(mismatchedRecord.id)?.status, sessionBefore?.status);
+    assert.equal(approvalRegistry.get(mismatchedApprovalId)?.status, 'pending');
   } finally {
     await h.close();
   }
@@ -472,7 +495,13 @@ test('approve-execute rejects a not-yet-approved action without an exact card, n
 test('GET pending-actions/:id returns the durable record truth; 404 when missing', async () => {
   const record = queuePendingAction({
     title: 'Send email', summary: 'queued', kind: 'external_send',
-    toolName: 'composio_execute_tool', payload: {}, sessionId: 'sess-u3',
+    toolName: 'composio_execute_tool',
+    payload: { to: 'launch@example.test', subject: 'Launch' },
+    targetSummary: 'launch@example.test',
+    preview: 'Subject: Launch',
+    risk: 'Sends one external email.',
+    rollback: 'Cannot unsend.',
+    sessionId: 'sess-u3',
   });
   markPendingActionApprovalResolved(record.id, 'rejected', null);
 
@@ -480,8 +509,32 @@ test('GET pending-actions/:id returns the durable record truth; 404 when missing
   try {
     const ok = await fetch(`${h.url}/api/console/pending-actions/${record.id}`);
     assert.equal(ok.status, 200);
-    const body = await ok.json() as { ok: boolean; status: string; resultSummary: string | null };
+    const body = await ok.json() as {
+      ok: boolean;
+      status: string;
+      resultSummary: string | null;
+      pendingAction: {
+        id: string;
+        title: string;
+        toolName: string;
+        targetSummary: string;
+        preview: string;
+        risk: string;
+        rollback: string;
+        payload: unknown;
+        payloadHash: string;
+      };
+    };
     assert.equal(body.status, 'rejected', 'reads the current durable status');
+    assert.equal(body.pendingAction.id, record.id);
+    assert.equal(body.pendingAction.title, record.title);
+    assert.equal(body.pendingAction.toolName, record.toolName);
+    assert.equal(body.pendingAction.targetSummary, record.targetSummary);
+    assert.equal(body.pendingAction.preview, record.preview);
+    assert.equal(body.pendingAction.risk, record.risk);
+    assert.equal(body.pendingAction.rollback, record.rollback);
+    assert.deepEqual(body.pendingAction.payload, record.payload);
+    assert.equal(body.pendingAction.payloadHash, record.payloadHash);
 
     const missing = await fetch(`${h.url}/api/console/pending-actions/pa-does-not-exist`);
     assert.equal(missing.status, 404);

@@ -59,6 +59,8 @@ const {
   closeProspectiveIntentionsDbForTest,
   upsertProspectiveIntention,
 } = await import('../prospective-intentions.js');
+const pendingActions = await import('./pending-actions.js');
+const approvalRegistry = await import('./approval-registry.js');
 
 beforeEach(() => {
   resetEventLog();
@@ -2536,6 +2538,298 @@ test('respondViaClaudeAgentSdkBrain persists a material plain-text clarification
   const completed = listEvents('brain-plain-material-ask', { types: ['conversation_completed'] }).at(-1);
   assert.equal(completed?.data.reason, 'awaiting_user_input');
   assert.equal(completed?.data.awaitingUser, true);
+});
+
+test('Claude brain materializes one exact queued-action card without another model turn', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = 'brain-queued-approval-edge';
+  let calls = 0;
+  let pendingActionId = '';
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    assert.ok(options.sourceUserSeq);
+    const record = pendingActions.queuePendingAction({
+      title: 'Send the reviewed proof',
+      summary: 'Send one exact request-owned email after human approval.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: { to: 'proof@example.com', subject: 'Proof', body: 'Exact payload.' },
+      },
+      targetSummary: 'proof@example.com',
+      sessionId,
+    });
+    pendingActionId = record.id;
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'Clem',
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        pendingActionId: record.id,
+        actionKind: record.kind,
+        approvalRequired: true,
+        sourceUserSeq: options.sourceUserSeq,
+        payloadHash: record.payloadHash,
+      },
+    });
+    return {
+      text: 'The exact email is queued. Would you like me to send it?',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: ['mcp__clementine-local__pending_action_queue'],
+      successfulToolUses: ['pending_action_queue'],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Queue this exact email and ask whether I want it sent.',
+    sessionId,
+  });
+
+  assert.equal(calls, 1, 'the graph transition spends no corrective model call');
+  assert.equal(response.stoppedReason, 'pending-approval');
+  assert.ok(response.pendingApprovalId);
+  const rows = approvalRegistry.listPending({ sessionId, status: 'pending' });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].approvalId, response.pendingApprovalId);
+  assert.equal(rows[0].tool, 'request_approval');
+  assert.equal(rows[0].args?.pendingActionId, pendingActionId);
+  assert.equal(pendingActions.getPendingAction(pendingActionId)?.status, 'approval_requested');
+  assert.equal(listEvents(sessionId, { types: ['approval_requested'] }).length, 1);
+  assert.equal(listEvents(sessionId, { types: ['approval_parked'] }).length, 1);
+  assert.equal(listEvents(sessionId, { types: ['awaiting_user_input'] }).length, 0);
+  assert.equal(
+    listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)?.data.reason,
+    'awaiting_approval',
+  );
+});
+
+test('Claude brain materializes one card per distinct request-owned payload and collapses an exact retry', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = 'brain-multi-queued-approval-edge';
+  let calls = 0;
+  let calendarId = '';
+  let calendarRetryId = '';
+  let airtableId = '';
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    assert.ok(options.sourceUserSeq);
+    const calendarInput = {
+      title: 'Create launch review calendar event',
+      summary: 'Create the exact reviewed launch event.',
+      kind: 'external_write' as const,
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'GOOGLECALENDAR_CREATE_EVENT',
+        arguments: { title: 'Launch review', start: '2026-08-01T09:00:00-07:00' },
+      },
+      sessionId,
+    };
+    const calendar = pendingActions.queuePendingAction(calendarInput);
+    const calendarRetry = pendingActions.queuePendingAction({
+      ...calendarInput,
+      title: 'Retry create launch review calendar event',
+    });
+    const airtable = pendingActions.queuePendingAction({
+      title: 'Create launch review Airtable record',
+      summary: 'Create the exact reviewed launch record.',
+      kind: 'external_write',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'AIRTABLE_CREATE_RECORD',
+        arguments: { table: 'Content Calendar', title: 'Launch review', status: 'Planned' },
+      },
+      sessionId,
+    });
+    calendarId = calendar.id;
+    calendarRetryId = calendarRetry.id;
+    airtableId = airtable.id;
+    for (const record of [calendar, calendarRetry, airtable]) {
+      appendEvent({
+        sessionId,
+        turn: 0,
+        role: 'Clem',
+        type: 'autonomy_note',
+        data: {
+          kind: 'pending_action_queued',
+          pendingActionId: record.id,
+          actionKind: record.kind,
+          approvalRequired: true,
+          sourceUserSeq: options.sourceUserSeq,
+          payloadHash: record.payloadHash,
+          autoMaterialize: true,
+        },
+      });
+    }
+    return {
+      text: 'Calendar and Airtable batch proposals are queued for approval.',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: ['mcp__clementine-local__pending_action_queue'],
+      successfulToolUses: ['pending_action_queue'],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Add the launch review to Calendar and Airtable.',
+    sessionId,
+  });
+
+  assert.equal(calls, 1, 'auto-materialized plural graph transitions spend no corrective model call');
+  assert.equal(response.stoppedReason, 'pending-approval');
+  const rows = approvalRegistry.listPending({ sessionId, status: 'pending' });
+  assert.equal(rows.length, 2);
+  assert.ok(rows.some((row) => row.approvalId === response.pendingApprovalId));
+  assert.deepEqual(
+    new Set(rows.map((row) => row.args?.pendingActionId)),
+    new Set([calendarId, airtableId]),
+  );
+  assert.equal(pendingActions.getPendingAction(calendarId)?.status, 'approval_requested');
+  assert.equal(pendingActions.getPendingAction(calendarRetryId)?.status, 'cancelled');
+  assert.equal(pendingActions.getPendingAction(airtableId)?.status, 'approval_requested');
+  assert.equal(listEvents(sessionId, { types: ['approval_requested'] }).length, 2);
+  assert.equal(listEvents(sessionId, { types: ['approval_parked'] }).length, 2);
+  assert.equal(
+    listEvents(sessionId, { types: ['heartbeat'] })
+      .filter((event) => event.data.kind === 'pending_action_transition_materialized').length,
+    2,
+  );
+  assert.equal(listEvents(sessionId, { types: ['awaiting_user_input'] }).length, 0);
+  assert.equal(
+    listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)?.data.reason,
+    'awaiting_approval',
+  );
+});
+
+test('Claude brain reconciles a queued approval edge created by a corrective continuation', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = 'brain-queued-approval-after-continuation';
+  let calls = 0;
+  let pendingActionId = '';
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        text: 'Tool call: pending_action_queue {"title":"Send proof"}',
+        sessionId: 'sdk-session',
+        model: 'claude-sonnet-5',
+        toolUses: [],
+      };
+    }
+    assert.ok(options.sourceUserSeq);
+    const record = pendingActions.queuePendingAction({
+      title: 'Send the reviewed continuation proof',
+      summary: 'Send one exact request-owned email after human approval.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: { to: 'proof@example.com', subject: 'Proof', body: 'Exact continuation payload.' },
+      },
+      sessionId,
+    });
+    pendingActionId = record.id;
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'Clem',
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        pendingActionId: record.id,
+        toolName: record.toolName,
+        actionKind: record.kind,
+        approvalRequired: true,
+        sourceUserSeq: options.sourceUserSeq,
+        payloadHash: record.payloadHash,
+      },
+    });
+    return {
+      text: 'The exact email is queued. Should I send it?',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: ['mcp__clementine-local__pending_action_queue'],
+      successfulToolUses: ['pending_action_queue'],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Queue this exact email and ask whether I want it sent.',
+    sessionId,
+  });
+
+  assert.equal(calls, 2, 'the existing narration repair is the only continuation spent');
+  assert.equal(response.stoppedReason, 'pending-approval');
+  assert.ok(response.pendingApprovalId);
+  assert.equal(approvalRegistry.listPending({ sessionId, status: 'pending' }).length, 1);
+  assert.equal(pendingActions.getPendingAction(pendingActionId)?.approvalId, response.pendingApprovalId);
+  assert.equal(listEvents(sessionId, { types: ['approval_requested'] }).length, 1);
+  assert.equal(listEvents(sessionId, { types: ['approval_parked'] }).length, 1);
+  assert.equal(listEvents(sessionId, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+test('Claude brain keeps a premature queued payload inert while asking for missing account scope', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = 'brain-queued-missing-scope';
+  let pendingActionId = '';
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    assert.ok(options.sourceUserSeq);
+    const record = pendingActions.queuePendingAction({
+      title: 'Premature send',
+      summary: 'The account is not resolved yet.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: { to: 'guessed@example.com', subject: 'Guess', body: 'Must stay inert.' },
+      },
+      sessionId,
+    });
+    pendingActionId = record.id;
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'Clem',
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        pendingActionId: record.id,
+        toolName: record.toolName,
+        actionKind: record.kind,
+        approvalRequired: true,
+        sourceUserSeq: options.sourceUserSeq,
+        payloadHash: record.payloadHash,
+      },
+    });
+    return {
+      text: 'Which account should I use to send it?',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: ['mcp__clementine-local__pending_action_queue'],
+      successfulToolUses: ['pending_action_queue'],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Prepare the message, but I have two accounts.',
+    sessionId,
+  });
+
+  assert.equal(response.stoppedReason, 'awaiting-input');
+  assert.equal(pendingActions.getPendingAction(pendingActionId)?.status, 'queued');
+  assert.equal(approvalRegistry.listPending({ sessionId, status: 'pending' }).length, 0);
+  assert.equal(listEvents(sessionId, { types: ['approval_requested'] }).length, 0);
 });
 
 test('respondViaClaudeAgentSdkBrain local_authoring mode exposes curated local authoring tools but not broad execution', async () => {

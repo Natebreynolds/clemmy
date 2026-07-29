@@ -87,6 +87,7 @@ const { getPlanScope } = await import('../../agents/plan-scope.js');
 const { rememberFact } = await import('../../memory/facts.js');
 const { recordStepResult, takeStepResult, clearStepResult } = await import('../../tools/step-result-tool.js');
 const artifactLedger = await import('./artifact-ledger.js');
+const { getPendingAction, queuePendingAction } = await import('./pending-actions.js');
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
 const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
 
@@ -3740,6 +3741,417 @@ test('runConversation: stops with awaiting_user_input when the orchestrator asks
   });
   assert.equal(result.status, 'awaiting_user_input');
   assert.equal(result.steps, 1);
+});
+
+test('runConversation: a queued approval-bound question materializes one linked card without another model turn', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let calls = 0;
+  let pendingActionId = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    if (calls === 1) {
+      const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+      const record = queuePendingAction({
+        title: 'Proof send',
+        summary: 'Queue one exact external send before approval.',
+        kind: 'external_send',
+        toolName: 'composio_execute_tool',
+        payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+        targetSummary: 'proof@example.com',
+        sessionId: sess.id,
+      });
+      pendingActionId = record.id;
+      appendEvent({
+        sessionId: sess.id,
+        turn: 0,
+        role: 'Clem',
+        type: 'autonomy_note',
+        data: {
+          kind: 'pending_action_queued',
+          pendingActionId,
+          actionKind: 'external_send',
+          approvalRequired: true,
+          sourceUserSeq: source.seq,
+          payloadHash: record.payloadHash,
+        },
+      });
+      assert.ok(source.seq > 0);
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: 'The exact send is queued. Should I proceed?',
+          reply: 'The exact send is queued. Should I proceed?',
+          done: false,
+          nextAction: 'awaiting_user_input',
+          reason: null,
+        },
+      } as never;
+    }
+    throw new Error('the graph edge must not spend another model turn');
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Queue this email and ask whether I want it sent.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_approval');
+  assert.equal(calls, 1);
+  assert.equal(
+    listEvents(sess.id, { types: ['heartbeat'] })
+      .filter((event) => event.data.kind === 'pending_action_transition_materialized').length,
+    1,
+  );
+  const approvals = listEvents(sess.id, { types: ['approval_requested'] });
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].data.tool, 'request_approval');
+  assert.equal((approvals[0].data.args as { pendingActionId?: string }).pendingActionId, pendingActionId);
+  assert.equal(getPendingAction(pendingActionId)?.status, 'approval_requested');
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' }).length, 1);
+  assert.equal(listEvents(sess.id, { types: ['approval_parked'] }).length, 1);
+});
+
+test('runConversation: one request materializes distinct queued payloads and collapses an exact retry in one model turn', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let calls = 0;
+  let calendarId = '';
+  let calendarRetryId = '';
+  let airtableId = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+    const calendarInput = {
+      title: 'Create launch review calendar event',
+      summary: 'Create the exact reviewed launch event.',
+      kind: 'external_write' as const,
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'GOOGLECALENDAR_CREATE_EVENT',
+        arguments: { title: 'Launch review', start: '2026-08-01T09:00:00-07:00' },
+      },
+      sessionId: sess.id,
+    };
+    const calendar = queuePendingAction(calendarInput);
+    const calendarRetry = queuePendingAction({
+      ...calendarInput,
+      title: 'Retry create launch review calendar event',
+    });
+    const airtable = queuePendingAction({
+      title: 'Create launch review Airtable record',
+      summary: 'Create the exact reviewed launch record.',
+      kind: 'external_write',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'AIRTABLE_CREATE_RECORD',
+        arguments: { table: 'Content Calendar', title: 'Launch review', status: 'Planned' },
+      },
+      sessionId: sess.id,
+    });
+    calendarId = calendar.id;
+    calendarRetryId = calendarRetry.id;
+    airtableId = airtable.id;
+    for (const record of [calendar, calendarRetry, airtable]) {
+      appendEvent({
+        sessionId: sess.id,
+        turn: 0,
+        role: 'Clem',
+        type: 'autonomy_note',
+        data: {
+          kind: 'pending_action_queued',
+          pendingActionId: record.id,
+          actionKind: record.kind,
+          approvalRequired: true,
+          sourceUserSeq: source.seq,
+          payloadHash: record.payloadHash,
+        },
+      });
+    }
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Both exact actions are queued. Should I proceed?',
+        reply: 'Both exact actions are queued. Should I proceed?',
+        done: false,
+        nextAction: 'awaiting_user_input',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Add the launch review to Calendar and Airtable.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_approval');
+  assert.equal(calls, 1, 'all distinct approval edges materialize without another model turn');
+  assert.equal(
+    listEvents(sess.id, { types: ['heartbeat'] })
+      .filter((event) => event.data.kind === 'pending_action_transition_materialized').length,
+    2,
+  );
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 2);
+  assert.equal(listEvents(sess.id, { types: ['approval_parked'] }).length, 2);
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' }).length, 2);
+  assert.equal(getPendingAction(calendarId)?.status, 'approval_requested');
+  assert.equal(getPendingAction(calendarRetryId)?.status, 'cancelled');
+  assert.equal(getPendingAction(airtableId)?.status, 'approval_requested');
+  const linkedIds = new Set(
+    approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' })
+      .map((row) => row.args?.pendingActionId),
+  );
+  assert.deepEqual(linkedIds, new Set([calendarId, airtableId]));
+});
+
+test('runConversation: a missing-scope question keeps a prematurely queued payload inert', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let pendingActionId = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+    const record = queuePendingAction({
+      title: 'Premature account send',
+      summary: 'The sending account is not resolved yet.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'guessed@example.com' } },
+      sessionId: sess.id,
+    });
+    pendingActionId = record.id;
+    appendEvent({
+      sessionId: sess.id,
+      turn: 0,
+      role: 'Clem',
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        pendingActionId,
+        toolName: record.toolName,
+        actionKind: record.kind,
+        approvalRequired: true,
+        sourceUserSeq: source.seq,
+        payloadHash: record.payloadHash,
+      },
+    });
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Which account should I use to send it?',
+        reply: 'Which account should I use to send it?',
+        done: false,
+        nextAction: 'awaiting_user_input',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Prepare this message, but I have two sending accounts.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(getPendingAction(pendingActionId)?.status, 'queued');
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' }).length, 0);
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 0);
+});
+
+test('runConversation: a declarative queue-only completion does not mint an approval card', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let calls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+    const record = queuePendingAction({
+      title: 'Queue-only proof send',
+      summary: 'Prepare this exact send but do not request approval yet.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+      targetSummary: 'proof@example.com',
+      sessionId: sess.id,
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn: 0,
+      role: 'Clem',
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        pendingActionId: record.id,
+        actionKind: 'external_send',
+        approvalRequired: true,
+        sourceUserSeq: source.seq,
+        payloadHash: record.payloadHash,
+      },
+    });
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Queued exactly for later review. I did not request approval or execute it.',
+        reply: 'Queued exactly for later review. I did not request approval or execute it.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Queue the exact send.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(calls, 1);
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' }).length, 0);
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 0);
+});
+
+test('runConversation: an explicit propose-to-approval edge auto-materializes without magic closing words', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let calls = 0;
+  let pendingActionId = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+    const record = queuePendingAction({
+      title: 'Approve launch batch',
+      summary: 'Execute the exact proposed launch batch.',
+      kind: 'external_write',
+      toolName: 'run_batch',
+      payload: { action: 'execute', batchId: 'batch-proof-auto' },
+      sessionId: sess.id,
+    });
+    pendingActionId = record.id;
+    appendEvent({
+      sessionId: sess.id,
+      turn: 0,
+      role: 'Clem',
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        pendingActionId: record.id,
+        actionKind: record.kind,
+        approvalRequired: true,
+        sourceUserSeq: source.seq,
+        payloadHash: record.payloadHash,
+        autoMaterialize: true,
+      },
+    });
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'The exact launch batch proposal is ready for approval.',
+        reply: 'The exact launch batch proposal is ready for approval.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Prepare the launch batch for approval.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_approval');
+  assert.equal(calls, 1);
+  assert.equal(getPendingAction(pendingActionId)?.status, 'approval_requested');
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' }).length, 1);
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 1);
+  assert.equal(
+    listEvents(sess.id, { types: ['heartbeat'] })
+      .filter((event) => event.data.kind === 'pending_action_transition_materialized'
+        && event.data.autoMaterialize === true).length,
+    1,
+  );
+});
+
+test('runConversation: an older request cannot claim a later request queued action', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let laterActionId = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const laterUser = appendEvent({
+      sessionId: sess.id,
+      turn: 2,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'A newer independent request.' },
+    });
+    const record = queuePendingAction({
+      title: 'Later request send',
+      summary: 'This belongs only to the newer user request.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'later@example.com' } },
+      sessionId: sess.id,
+    });
+    laterActionId = record.id;
+    appendEvent({
+      sessionId: sess.id,
+      turn: 0,
+      role: 'Clem',
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        pendingActionId: record.id,
+        actionKind: 'external_send',
+        approvalRequired: true,
+        sourceUserSeq: laterUser.seq,
+        payloadHash: record.payloadHash,
+      },
+    });
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Should I execute it?',
+        reply: 'Should I execute it?',
+        done: false,
+        nextAction: 'awaiting_user_input',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Original request A.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(getPendingAction(laterActionId)?.status, 'queued');
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' }).length, 0);
 });
 
 test('runConversation: propagates SDK-level awaiting_approval status from runTurn', async () => {

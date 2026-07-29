@@ -67,6 +67,11 @@ import {
   extractNamedResource,
 } from '../memory/focus.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import {
+  pendingActionApprovalViewFromArgs,
+  pendingActionIdFromArgs,
+  type PendingActionApprovalView,
+} from '../runtime/harness/pending-action-view.js';
 import { listPlanProposals, approvePlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
@@ -1511,6 +1516,11 @@ export interface DisplayState {
   // Cleared on approval_resolved / awaiting_user_input / completion.
   pendingApprovalId?: string;
   pendingApprovalIds?: string[];
+  // Exact queued-action cards approve one immutable payload. Editing those
+  // args would break the approval authority binding, so the UI hides Edit.
+  // Undefined preserves the legacy editable behavior for ordinary approvals
+  // until the registry row has been hydrated.
+  pendingApprovalEditable?: boolean;
   // Wall-clock when the turn started, in ms. Set on the first
   // turn_started event. renderBody uses this to show an elapsed-time
   // counter so the user can tell "still working at 4m 12s" vs
@@ -1633,21 +1643,41 @@ async function maybeRouteParkedBackgroundReply(input: {
  * the existing button interaction handler in discord.ts resolves the
  * apr-xxxx id and triggers `runDiscordHarnessResume`.
  */
-function approvalComponentsForState(state: DisplayState): unknown[] | null {
+export function approvalComponentsForState(state: DisplayState): unknown[] | null {
   const ids = state.pendingApprovalIds && state.pendingApprovalIds.length > 0
     ? state.pendingApprovalIds
     : state.pendingApprovalId
       ? [state.pendingApprovalId]
       : [];
   if (ids.length === 0) return null;
+  if (ids.length > 1) {
+    // Discord permits at most five action rows. Preserve exact authority per
+    // sibling instead of presenting a false "Approve all" control whose custom
+    // id can carry only one approval. The summary names the same numbered rows
+    // and gives explicit typed commands for any overflow.
+    return ids.slice(0, 5).map((id, index) => ({
+      type: 1,
+      components: [
+        {
+          type: 2,
+          style: 3,
+          label: `Approve ${index + 1}`,
+          custom_id: `clementine:approve:${id}`,
+        },
+        {
+          type: 2,
+          style: 4,
+          label: `Reject ${index + 1}`,
+          custom_id: `clementine:reject:${id}`,
+        },
+      ],
+    }));
+  }
   const id = ids[0];
-  const count = ids.length;
-  const approveLabel = count > 1 ? `Approve all ${count}` : 'Approve';
-  const rejectLabel = count > 1 ? `Reject all ${count}` : 'Reject';
   const buttons: Array<Record<string, unknown>> = [
-    { type: 2 /* Button */, style: 3 /* Success */, label: approveLabel, custom_id: `clementine:approve:${id}` },
+    { type: 2 /* Button */, style: 3 /* Success */, label: 'Approve', custom_id: `clementine:approve:${id}` },
   ];
-  if (count === 1) {
+  if (state.pendingApprovalEditable !== false) {
     buttons.push(
       // Edit opens a Discord modal pre-filled with the tool's args
       // JSON. User can change time, recipient, content, etc. before
@@ -1655,7 +1685,7 @@ function approvalComponentsForState(state: DisplayState): unknown[] | null {
       { type: 2, style: 1 /* Primary */, label: 'Edit', custom_id: `clementine:edit:${id}` },
     );
   }
-  buttons.push({ type: 2, style: 4 /* Danger */, label: rejectLabel, custom_id: `clementine:reject:${id}` });
+  buttons.push({ type: 2, style: 4 /* Danger */, label: 'Reject', custom_id: `clementine:reject:${id}` });
   return [
     {
       type: 1, // ActionRow
@@ -1688,6 +1718,18 @@ function describeRecipient(value: unknown): string {
   return trimDiscordText(email || name, 110);
 }
 
+function pendingActionDetail(view: Partial<PendingActionApprovalView> | undefined): string {
+  if (!view) return '';
+  const target = typeof view.targetSummary === 'string' ? trimDiscordText(view.targetSummary, 160) : '';
+  const risk = typeof view.risk === 'string' ? trimDiscordText(view.risk, 220) : '';
+  const preview = typeof view.preview === 'string' ? trimDiscordText(view.preview, 320) : '';
+  return [
+    target ? `**Target:** ${target}` : '',
+    risk ? `**Risk:** ${risk}` : '',
+    preview ? `**Preview:** ${preview}` : '',
+  ].filter(Boolean).join('\n');
+}
+
 function approvalRowDetail(row: approvalRegistry.PendingApprovalRow): string {
   const args = row.args ?? {};
   if (row.tool === 'composio_execute_tool') {
@@ -1705,6 +1747,8 @@ function approvalRowDetail(row: approvalRegistry.PendingApprovalRow): string {
     return slug;
   }
   if (row.tool === 'request_approval') {
+    const pendingDetail = pendingActionDetail(pendingActionApprovalViewFromArgs(args));
+    if (pendingDetail) return pendingDetail;
     const reason = typeof args.reason === 'string' ? trimDiscordText(args.reason, 140) : '';
     const preview = args.preview && typeof args.preview === 'object' ? args.preview as { count?: unknown } : null;
     const count = typeof preview?.count === 'number' ? `${preview.count} item${preview.count === 1 ? '' : 's'}` : '';
@@ -1715,6 +1759,62 @@ function approvalRowDetail(row: approvalRegistry.PendingApprovalRow): string {
     return objective;
   }
   return previewToolCall(row.tool || 'approval', row.args);
+}
+
+/**
+ * Rebuild the shared channel card after one exact decision. A channel message
+ * may carry several independent approval ids; resolving one must not make the
+ * remaining authorities disappear. The registry, rather than the old message,
+ * is the source of truth for what is still actionable.
+ */
+export function remainingApprovalDisplayState(
+  sessionId: string,
+  decidedApprovalId: string,
+  decision: 'approved' | 'rejected' | 'already-resolved',
+): DisplayState | null {
+  const rows = approvalRegistry
+    .listPending({ sessionId, status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row));
+  if (rows.length === 0) return null;
+
+  const pendingApprovalIds = rows.map((row) => row.approvalId);
+  const soleExactPendingAction = rows.length === 1
+    ? pendingActionIdFromArgs(rows[0].args ?? null)
+    : null;
+  const decisionLabel = decision === 'approved'
+    ? 'Approved'
+    : decision === 'rejected'
+      ? 'Rejected'
+      : 'Already resolved';
+  const decisionEmoji = decision === 'approved'
+    ? '✅'
+    : decision === 'rejected'
+      ? '❌'
+      : 'ℹ️';
+  const lines = [
+    `${decisionEmoji} **${decisionLabel}** \`${decidedApprovalId}\`.`,
+    '',
+    `${rows.length} independent action${rows.length === 1 ? '' : 's'} still need${rows.length === 1 ? 's' : ''} your decision:`,
+  ];
+  for (const [index, row] of rows.slice(0, 5).entries()) {
+    const detail = approvalRowDetail(row);
+    lines.push(`${index + 1}. ${row.subject}${detail ? ` — ${detail}` : ''} (\`${row.approvalId}\`)`);
+  }
+  if (rows.length > 5) {
+    lines.push(`+${rows.length - 5} more — open Clementine → Inbox to review them individually.`);
+  }
+  lines.push('', 'Each numbered button applies only to its matching action.');
+
+  return {
+    summary: lines.join('\n'),
+    status: 'awaiting independent approvals',
+    done: true,
+    toolsCalled: [],
+    toolCount: 0,
+    pendingApprovalId: pendingApprovalIds[0],
+    pendingApprovalIds,
+    pendingApprovalEditable: rows.length === 1 && !soleExactPendingAction,
+  };
 }
 
 async function refreshPendingApprovalDisplay(state: DisplayState, sessionId: string): Promise<void> {
@@ -1729,21 +1829,34 @@ async function refreshPendingApprovalDisplay(state: DisplayState, sessionId: str
   if (rows.length === 0) return;
   state.pendingApprovalIds = rows.map((row) => row.approvalId);
   state.pendingApprovalId = state.pendingApprovalIds[0];
+  const exactPendingActionId = rows.length === 1
+    ? pendingActionIdFromArgs(rows[0].args ?? null)
+    : null;
+  state.pendingApprovalEditable = rows.length === 1 && !exactPendingActionId;
   const lines: string[] = [];
   if (rows.length === 1) {
     const row = rows[0];
     lines.push(`Approval required: ${row.subject}`);
     const detail = approvalRowDetail(row);
     if (detail) lines.push('', detail);
-    lines.push('', `Tap **Approve**, **Edit**, or **Reject** below — or type \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\`.`);
+    const actions = state.pendingApprovalEditable
+      ? '**Approve**, **Edit**, or **Reject**'
+      : '**Approve** or **Reject**';
+    lines.push('', `Tap ${actions} below — or type \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\`.`);
   } else {
     lines.push(`Approval required for ${rows.length} actions:`);
-    for (const row of rows.slice(0, 5)) {
+    for (const [index, row] of rows.slice(0, 5).entries()) {
       const detail = approvalRowDetail(row);
-      lines.push(`• ${row.subject}${detail ? ` — ${detail}` : ''}`);
+      lines.push(`${index + 1}. ${row.subject}${detail ? ` — ${detail}` : ''} (\`${row.approvalId}\`)`);
     }
     if (rows.length > 5) lines.push(`• +${rows.length - 5} more`);
-    lines.push('', `Tap **Approve all ${rows.length}** or **Reject all ${rows.length}** below. Buttons apply to this paused batch.`);
+    lines.push(
+      '',
+      `Use the numbered **Approve** / **Reject** buttons below for the first ${Math.min(rows.length, 5)} action${Math.min(rows.length, 5) === 1 ? '' : 's'}. Each button applies only to its matching action.`,
+    );
+    if (rows.length > 5) {
+      lines.push('Open Clementine → Inbox to review the remaining actions individually.');
+    }
   }
   state.summary = lines.join('\n');
 }
@@ -3133,6 +3246,18 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
     case 'approval_requested': {
       const subject = String(data.subject ?? data.tool ?? 'action');
       const approvalId = typeof data.approvalId === 'string' ? data.approvalId : null;
+      const pendingActionArgs = typeof data.pendingActionId === 'string'
+        ? { pendingActionId: data.pendingActionId }
+        : data.args;
+      const pendingAction = data.pendingAction && typeof data.pendingAction === 'object'
+        ? data.pendingAction as Partial<PendingActionApprovalView>
+        : pendingActionApprovalViewFromArgs(pendingActionArgs);
+      const exactPendingActionId = pendingActionIdFromArgs(pendingActionArgs)
+        ?? (
+          typeof pendingAction?.id === 'string' && pendingAction.id.trim()
+            ? pendingAction.id.trim()
+            : null
+        );
       // Stash the approval id so the next flush attaches Approve/Reject
       // buttons (rendered server-side by the Discord transport via the
       // standard buildApprovalActions helper). Text fallback stays in
@@ -3143,6 +3268,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
         if (!ids.includes(approvalId)) ids.push(approvalId);
         state.pendingApprovalIds = ids;
         state.pendingApprovalId = ids[0] ?? approvalId;
+        if (ids.length === 1) state.pendingApprovalEditable = !exactPendingActionId;
       }
 
       // Resource-fingerprint warning: if the approval's args mention a
@@ -3159,10 +3285,15 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
         }
       } catch { /* graceful */ }
 
+      const detail = pendingActionDetail(pendingAction);
       const replyHint = approvalId
         ? `Tap **Approve** or **Reject** below — or type \`approve ${approvalId}\` / \`reject ${approvalId}\` if you prefer.`
         : 'Tap a button below — or reply **approve** / **reject**.';
-      state.summary = `Approval required: ${subject}${mismatchWarning}\n\n${replyHint}`;
+      state.summary = [
+        `Approval required: ${subject}${mismatchWarning}`,
+        detail,
+        replyHint,
+      ].filter(Boolean).join('\n\n');
       state.status = 'approval required';
       state.done = true;
       return;
@@ -3173,6 +3304,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       // Buttons are no longer relevant; clear so the next flush drops them.
       state.pendingApprovalId = undefined;
       state.pendingApprovalIds = undefined;
+      state.pendingApprovalEditable = undefined;
       return;
     }
     case 'condenser_applied': {

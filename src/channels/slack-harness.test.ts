@@ -51,12 +51,33 @@ test('approvalBlocksForState: single approval → approve/edit/reject', () => {
   assert.deepEqual(ids, ['clementine:approve:apr-1', 'clementine:edit:apr-1', 'clementine:reject:apr-1']);
 });
 
-test('approvalBlocksForState: multiple approvals → approve-all/reject-all, no edit', () => {
+test('approvalBlocksForState: exact pending-action approval omits Edit', () => {
+  const blocks = approvalBlocksForState(state({
+    pendingApprovalId: 'apr-exact',
+    pendingApprovalEditable: false,
+  }));
+  assert.ok(blocks);
+  const elements = (blocks![0] as { elements: Array<{ action_id: string }> }).elements;
+  assert.deepEqual(
+    elements.map((element) => element.action_id),
+    ['clementine:approve:apr-exact', 'clementine:reject:apr-exact'],
+  );
+});
+
+test('approvalBlocksForState: multiple approvals keep exact per-action controls', () => {
   const blocks = approvalBlocksForState(state({ pendingApprovalIds: ['apr-1', 'apr-2', 'apr-3'] }));
-  const elements = (blocks![0] as { elements: Array<{ action_id: string; text: { text: string } }> }).elements;
-  assert.equal(elements.length, 2, 'no Edit button for batch approvals');
-  assert.ok(elements[0].text.text.includes('Approve all 3'));
-  assert.ok(elements[1].text.text.includes('Reject all 3'));
+  assert.equal(blocks?.length, 3);
+  const rows = blocks as Array<{ elements: Array<{ action_id: string; text: { text: string } }> }>;
+  assert.deepEqual(
+    rows.map((row) => row.elements.map((element) => element.action_id)),
+    [
+      ['clementine:approve:apr-1', 'clementine:reject:apr-1'],
+      ['clementine:approve:apr-2', 'clementine:reject:apr-2'],
+      ['clementine:approve:apr-3', 'clementine:reject:apr-3'],
+    ],
+  );
+  assert.equal(rows[0].elements[0].text.text, 'Approve 1');
+  assert.equal(rows[2].elements[1].text.text, 'Reject 3');
 });
 
 test('buildSlackHarnessTransport: posts a placeholder then live-edits via update', async () => {

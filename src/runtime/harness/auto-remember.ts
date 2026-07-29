@@ -25,6 +25,7 @@
  */
 import { getActiveObjective } from '../../memory/focus.js';
 import { peekToolChoice, rememberToolChoice } from '../../memory/tool-choice-store.js';
+import { classifyToolError, detectStructuredToolFailure } from './tool-error-corrective.js';
 
 function recallFromSuccessEnabled(): boolean {
   return (process.env.CLEMMY_SCOPE_FROM_RECALL ?? 'on').toLowerCase() !== 'off';
@@ -44,8 +45,11 @@ export function detectNativeMcpSuccess(
   const text = (resultStr ?? '').trim();
   if (!name || !text) return null;
   if (!name.includes('__') || name.startsWith('cx_')) return null;
+  if (detectStructuredToolFailure(text).failed) return null;
   if (/^\s*(⚠️|error:)/i.test(text)) return null;
   const head = firstLine(text);
+  if (classifyToolError(head) === 'permission_denied') return null;
+  if (/\b(?:not\s+authenticated|authentication\s+(?:required|failed)|authorization\s+(?:required|failed)|(?:request|tool\s+call|operation)\s+refused)\b/i.test(head)) return null;
   if (/server_unavailable|approval_blocked|not[\s_]?found|\bfailed\b/i.test(head)) return null;
   return { identifier: name };
 }

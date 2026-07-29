@@ -16,6 +16,7 @@ process.env.CLEMMY_MODEL_STREAM_STALL_MS = '300';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Runner } from '@openai/agents';
+import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 
 const { __defaultRunRunner } = await import('./loop.js');
 const { isTransientStepError } = await import('../../execution/transient-error.js');
@@ -47,6 +48,112 @@ function makeStreamResult(opts: { events?: number; gapMs?: number; hang?: boolea
 const runnerFor = (result: unknown): Runner =>
   ({ run: async () => result } as unknown as Runner);
 
+function completedMessage(text: string): ModelResponse {
+  return {
+    output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }],
+    usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+  } as unknown as ModelResponse;
+}
+
+function neverSettlingModel(onAbort: () => void): Model {
+  const waitForAbort = (request: ModelRequest): Promise<never> => new Promise((_resolve, reject) => {
+    const signal = (request as { signal?: AbortSignal }).signal;
+    const aborted = () => {
+      onAbort();
+      reject(new Error('fusion model request aborted'));
+    };
+    if (signal?.aborted) aborted();
+    else signal?.addEventListener('abort', aborted, { once: true });
+  });
+  return {
+    getResponse: (request) => waitForAbort(request),
+    getStreamedResponse: async function* (request) {
+      await waitForAbort(request);
+    },
+  } as Model;
+}
+
+function runnerForModelStream(
+  stream: (signal: AbortSignal) => AsyncIterable<unknown>,
+): {
+  runner: Runner;
+  forceStop: () => void;
+  cancelCalls: () => number;
+} {
+  let activeStop: () => void = () => {};
+  let cancellationCalls = 0;
+  const runner = {
+    run: async () => {
+      const controller = new AbortController();
+      let complete!: () => void;
+      const completed = new Promise<void>((resolve) => { complete = resolve; });
+      let stopped = false;
+      activeStop = () => {
+        if (stopped) return;
+        stopped = true;
+        controller.abort();
+        complete();
+      };
+      return {
+        history: [],
+        lastResponseId: 'fusion-stall',
+        finalOutput: { ok: true },
+        rawResponses: [],
+        completed,
+        cancel: () => {
+          cancellationCalls += 1;
+          activeStop();
+        },
+        async *[Symbol.asyncIterator]() {
+          try {
+            for await (const data of stream(controller.signal)) {
+              yield { type: 'raw_model_stream_event', data };
+            }
+          } finally {
+            complete();
+          }
+        },
+      };
+    },
+  } as unknown as Runner;
+  return {
+    runner,
+    forceStop: () => activeStop(),
+    cancelCalls: () => cancellationCalls,
+  };
+}
+
+async function expectFusionPreContentStall(
+  rig: ReturnType<typeof runnerForModelStream>,
+): Promise<void> {
+  let safetyTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await assert.rejects(
+      Promise.race([
+        __defaultRunRunner(
+          rig.runner,
+          {} as never,
+          [],
+          { disablePreContentRetry: true } as never,
+        ),
+        new Promise<never>((_resolve, reject) => {
+          safetyTimer = setTimeout(() => {
+            rig.forceStop();
+            reject(new Error('fusion watchdog regression safety timeout'));
+          }, 1_500);
+        }),
+      ]),
+      (err: unknown) => err instanceof Error
+        && /timed out/.test(err.message)
+        && !/regression safety/.test(err.message),
+    );
+  } finally {
+    if (safetyTimer) clearTimeout(safetyTimer);
+    rig.forceStop();
+  }
+  assert.equal(rig.cancelCalls(), 1, 'the watchdog attempted to cancel the stuck fused model stream');
+}
+
 test('a stream that never emits is aborted with a transient timeout error', async () => {
   const result = makeStreamResult({ events: 0, hang: true });
   const started = Date.now();
@@ -70,6 +177,31 @@ test('steady events keep the turn alive even when each gap is near the threshold
   // but the timer resets per event — must complete, not stall.
   const result = makeStreamResult({ events: 6, gapMs: 200 });
   const out = await __defaultRunRunner(runnerFor(result), {} as never, [], {} as never);
+  assert.deepEqual(out.finalOutput, { ok: true });
+});
+
+test('genuine tool activity keeps the watchdog alive', async () => {
+  let resolveCompleted!: () => void;
+  const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
+  const result = {
+    history: [],
+    lastResponseId: 'resp_tool_activity',
+    finalOutput: { ok: true },
+    rawResponses: [],
+    completed,
+    async *[Symbol.asyncIterator]() {
+      // Total duration exceeds the 300ms watchdog, but each real Runner tool
+      // event is semantic progress and must refresh its liveness clock.
+      for (let i = 0; i < 5; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        yield { type: 'run_item_stream_event', item: { type: 'tool_call_item', id: `tool-${i}` } };
+      }
+      resolveCompleted();
+    },
+  };
+
+  const out = await __defaultRunRunner(runnerFor(result), {} as never, [], {} as never);
+
   assert.deepEqual(out.finalOutput, { ok: true });
 });
 
@@ -110,6 +242,82 @@ test('buffered private reasoning keeps the watchdog alive without entering Runne
   );
   assert.deepEqual(out.finalOutput, { ok: true });
   assert.equal(typeof context.privateModelActivityAt, 'number');
+});
+
+test('Fusion VERIFY visibility heartbeats do not keep a never-settling executor alive', async () => {
+  const previousMode = process.env.CLEMMY_DEBATE_MODE;
+  const previousStrategy = process.env.CLEMMY_FUSION_STRATEGY;
+  process.env.CLEMMY_DEBATE_MODE = 'all';
+  process.env.CLEMMY_FUSION_STRATEGY = 'verify';
+  try {
+    const { DebateModel } = await import('./debate-model.js');
+    let executorAborts = 0;
+    const executor = neverSettlingModel(() => { executorAborts += 1; });
+    const checker = {
+      getResponse: async () => completedMessage('{"verdict":"accept","issues":[],"corrected":null}'),
+      getStreamedResponse: async function* () {},
+    } as Model;
+    const fused = new DebateModel(
+      { passthrough: executor, draftA: executor, draftB: executor, judge: checker },
+      { heartbeatMs: 50 },
+    );
+    const rig = runnerForModelStream((signal) => fused.getStreamedResponse({
+      input: 'verify this',
+      modelSettings: {},
+      tools: [],
+      handoffs: [],
+      signal,
+    } as unknown as ModelRequest));
+
+    await expectFusionPreContentStall(rig);
+
+    assert.equal(executorAborts, 1, 'the stuck VERIFY executor received cancellation');
+  } finally {
+    if (previousMode === undefined) delete process.env.CLEMMY_DEBATE_MODE;
+    else process.env.CLEMMY_DEBATE_MODE = previousMode;
+    if (previousStrategy === undefined) delete process.env.CLEMMY_FUSION_STRATEGY;
+    else process.env.CLEMMY_FUSION_STRATEGY = previousStrategy;
+  }
+});
+
+test('Fusion DEBATE visibility heartbeats do not keep two never-settling drafts alive', async () => {
+  const previousMode = process.env.CLEMMY_DEBATE_MODE;
+  const previousStrategy = process.env.CLEMMY_FUSION_STRATEGY;
+  process.env.CLEMMY_DEBATE_MODE = 'all';
+  process.env.CLEMMY_FUSION_STRATEGY = 'debate';
+  try {
+    const { DebateModel } = await import('./debate-model.js');
+    let draftAAborts = 0;
+    let draftBAborts = 0;
+    const draftA = neverSettlingModel(() => { draftAAborts += 1; });
+    const draftB = neverSettlingModel(() => { draftBAborts += 1; });
+    const passthrough = neverSettlingModel(() => {});
+    const judge = {
+      getResponse: async () => completedMessage('unused'),
+      getStreamedResponse: async function* () {},
+    } as Model;
+    const fused = new DebateModel(
+      { passthrough, draftA, draftB, judge },
+      { heartbeatMs: 50 },
+    );
+    const rig = runnerForModelStream((signal) => fused.getStreamedResponse({
+      input: 'debate this',
+      modelSettings: {},
+      tools: [],
+      handoffs: [],
+      signal,
+    } as unknown as ModelRequest));
+
+    await expectFusionPreContentStall(rig);
+
+    assert.equal(draftAAborts, 1, 'draft A received cancellation');
+    assert.equal(draftBAborts, 1, 'draft B received cancellation');
+  } finally {
+    if (previousMode === undefined) delete process.env.CLEMMY_DEBATE_MODE;
+    else process.env.CLEMMY_DEBATE_MODE = previousMode;
+    if (previousStrategy === undefined) delete process.env.CLEMMY_FUSION_STRATEGY;
+    else process.env.CLEMMY_FUSION_STRATEGY = previousStrategy;
+  }
 });
 
 test('a PRE-CONTENT stall is retried and self-heals when the retry streams (Claude tool-turn hang)', async () => {

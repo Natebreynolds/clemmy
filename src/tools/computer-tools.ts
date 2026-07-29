@@ -479,11 +479,53 @@ export function writeTargetsProtectedOwnStore(resolvedPath: string): boolean {
   return name === 'memory.db' || name === 'harness.db' || name === 'secrets-vault.json';
 }
 
-function assertOwnStoresProtected(command: string): void {
+/** Durable authority is never writable through model-authored filesystem
+ * primitives. This is narrower than "all Clementine state": it protects the
+ * approval graph/event DB and exact-once mutation receipts while leaving
+ * ordinary workspace artifacts writable and authority files readable. */
+export function writeTargetsAuthorizationState(resolvedPath: string): boolean {
+  const target = path.resolve(resolvedPath);
+  const protectedRoots = [
+    path.resolve(PENDING_ACTIONS_DIR),
+    path.resolve(BASE_DIR, 'state'),
+    path.resolve(BASE_DIR, 'audit'),
+  ];
+  if (protectedRoots.some((root) => isInside(root, target))) return true;
+
+  const rel = path.relative(path.resolve(BASE_DIR), target);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  const segments = rel.split(path.sep);
+  return segments.includes('call-mutations') || segments.includes('.trigger-receipts');
+}
+
+const AUTHORIZATION_STATE_REFERENCE =
+  /(?:^|[/\\\s"'=])(?:pending-actions|call-mutations|\.trigger-receipts)(?:[/\\\s"'=]|$)|\bharness\.db\b|(?:^|[/\\])(?:state|audit)(?:[/\\]|$)/i;
+const AUTHORIZATION_STATE_MUTATION =
+  /(?:^|[\s;&|])(?:rm|rmdir|unlink|trash|mv|cp|install|touch|mkdir|truncate|chmod|chown|chgrp|ln|dd)\b|(?:^|[^<])>{1,2}\s*|\|\s*tee\b|\b(?:writeFileSync|appendFileSync|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|mkdirSync|writeFile|appendFile|createWriteStream)\s*\(|\bopen\s*\([^)]*,\s*['"][wax+][^'"]*['"]|\b(?:update|delete\s+from|insert\s+into|replace\s+into|drop\s+table|alter\s+table|create\s+table|truncate)\b/i;
+
+/** Pure shell-side twin of writeTargetsAuthorizationState. It recognizes both
+ * direct shell file verbs/redirection and common interpreter/database write
+ * APIs. Read-only cat/SELECT inspection remains legal. */
+export function shellMutatesAuthorizationState(rawCommand: unknown, cwdInput?: string): boolean {
+  if (typeof rawCommand !== 'string') return false;
+  const command = rawCommand.trim();
+  if (!command || !AUTHORIZATION_STATE_MUTATION.test(command)) return false;
+  const cwd = path.resolve(expandHome(cwdInput || BASE_DIR));
+  return writeTargetsAuthorizationState(cwd) || AUTHORIZATION_STATE_REFERENCE.test(command);
+}
+
+function assertOwnStoresProtected(command: string, cwd: string): void {
   if (shellDestroysOwnStores(command)) {
     throw new Error(
       "Command denied: it would delete or destroy Clementine's own data stores (memory, event log, audit ledger, secrets, workflow definitions, or their backups). "
       + 'These are protected from shell-level destruction. For storage hygiene use the built-in maintenance/self-heal paths, or ask the user to remove files manually.',
+    );
+  }
+  if (shellMutatesAuthorizationState(command, cwd)) {
+    throw new Error(
+      'Command denied: model-authored shell commands cannot mutate Clementine authorization state '
+      + '(pending actions, approval/event data, audit authority, or exact-once mutation receipts). '
+      + 'Use the purpose-built approval, pending-action, workflow, or settings tools instead. Read-only inspection remains available.',
     );
   }
 }
@@ -868,7 +910,7 @@ export function shellOutputLooksInteractive(exitCode: number, stdout: string, st
 
 function runCommand(command: string, cwd: string, timeoutMs: number): Promise<ShellCommandResult> {
   assertCommandAllowed(command);
-  assertOwnStoresProtected(command);
+  assertOwnStoresProtected(command, cwd);
   const stubMessage = developerToolStubBlockMessage(command);
   const externalMutation = classifyShellNetworkMutation(command).isNetworkMutation;
   if (stubMessage) {
@@ -1197,6 +1239,9 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       }
       const teamNotice = typedClementineStateWriteNotice(filePath);
       if (teamNotice) return teamNotice;
+      if (writeTargetsAuthorizationState(filePath)) {
+        return `Refused to write ${filePath}: Clementine authorization state cannot be mutated through write_file. Use the purpose-built approval, pending-action, workflow, or settings tools instead.`;
+      }
       // The explicit `append` flag wins over `mode`: true → append (create if
       // absent), false → overwrite (start a fresh chunked file). null → use `mode`.
       const mode = input.append === true ? 'append'

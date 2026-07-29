@@ -11,6 +11,7 @@ import { apiGet, apiPost } from './api';
 import { humanStatusLabel } from './work-status';
 import type { Tone } from '@/components/ui/StatusPill';
 import type { RunEnvironmentDetail } from './run-environment';
+import type { PendingActionApprovalView } from './types';
 
 export type BoardColumnId = 'queued' | 'running' | 'needs_you' | 'done';
 export type BoardSourceKind = 'background' | 'run' | 'execution' | 'workflow' | 'approval';
@@ -59,6 +60,9 @@ export interface BoardCard {
   approvalId?: string;
   nextSafeAction?: string;
   contentPreview?: ApprovalContentPreview;
+  /** Exact durable action behind an approval card. This is display-only;
+   * the action route still validates the card/action/session backlink. */
+  pendingAction?: PendingActionApprovalView;
   artifactSummary?: BoardArtifactSummary;
   failureSummary?: BoardFailureSummary;
   /** A finished/parked background task idle past the stale threshold (>7d). */
@@ -80,6 +84,46 @@ export interface BoardCard {
     workflowSlug?: string;
     needsAttention?: boolean;
     outcomeSnapshot?: TaskOutcomeSnapshot;
+  };
+}
+
+/** One normalized review model shared by the compact Tasks card and its full
+ * drawer. Keeping this projection pure makes it regression-testable: neither
+ * surface may accidentally drop the target/risk/preview/hash that the server
+ * supplied for the exact queued payload. */
+export function pendingActionReviewFacts(action: PendingActionApprovalView): {
+  title: string;
+  summary: string;
+  status: string;
+  toolName: string;
+  target: string;
+  risk: string;
+  preview: string;
+  rollback: string;
+  payloadHash: string;
+  payloadText: string;
+} {
+  let payloadText = '—';
+  if (typeof action.payload === 'string') {
+    payloadText = action.payload || '—';
+  } else {
+    try {
+      payloadText = JSON.stringify(action.payload, null, 2) || '—';
+    } catch {
+      payloadText = '[Payload could not be rendered]';
+    }
+  }
+  return {
+    title: action.title,
+    summary: action.summary,
+    status: action.status,
+    toolName: action.toolName,
+    target: action.targetSummary,
+    risk: action.risk,
+    preview: action.preview,
+    rollback: action.rollback,
+    payloadHash: action.payloadHash,
+    payloadText,
   };
 }
 

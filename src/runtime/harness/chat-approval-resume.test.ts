@@ -15,8 +15,17 @@ mkdirSync(path.join(TMP, 'state'), { recursive: true });
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { createSession, appendEvent } = await import('./eventlog.js');
+const {
+  appendEvent,
+  createSession,
+  listEvents,
+  openEventLog,
+} = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
+const {
+  markPendingActionApprovalResolved,
+  queuePendingAction,
+} = await import('./pending-actions.js');
 const { HarnessSession } = await import('./session.js');
 const {
   handleResolvedApprovalForChatResume,
@@ -88,6 +97,190 @@ test('wired end-to-end: startChatApprovalResume fires through the registry hook'
   // The hook dispatches on a microtask; give it a beat.
   await new Promise((r) => setTimeout(r, 50));
   assert.deepEqual(dispatched, [sess.id]);
+});
+
+test('sibling approvals resolved while the first resume is in flight are drained serially', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const first = parkApproval(sess.id, 'proof_first');
+  const second = parkApproval(sess.id, 'proof_second');
+  const directives: string[] = [];
+  let releaseFirst!: () => void;
+  const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+
+  const dispatch = async (sessionId: string, directive: string) => {
+    directives.push(directive);
+    const live = HarnessSession.load(sessionId)!;
+    live.setRunInFlight();
+    if (directives.length === 1) await firstHeld;
+    live.clearRunInFlight();
+  };
+
+  const resolvedAt = new Date().toISOString();
+  openEventLog().prepare(`
+    UPDATE pending_approvals
+       SET status = 'resolved',
+           resolution = 'approved',
+           resolver = 'bulk-test',
+           resolved_at = ?
+     WHERE approval_id IN (?, ?)
+  `).run(resolvedAt, first.approvalId, second.approvalId);
+  const firstResolved = approvalRegistry.get(first.approvalId)!;
+  const secondResolved = approvalRegistry.get(second.approvalId)!;
+  const firstResume = handleResolvedApprovalForChatResume(firstResolved, dispatch);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(
+    await handleResolvedApprovalForChatResume(secondResolved, dispatch),
+    false,
+    'the sibling is queued while the first resume owns the session',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(directives.length, 1, 'the second approval does not double-drive the live session');
+
+  releaseFirst();
+  await firstResume;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(directives.length, 2, 'the approved sibling is resumed after the first turn releases the session');
+  assert.match(directives[0], /proof_first/);
+  assert.match(directives[1], /proof_second/);
+});
+
+test('a parked pending-action card resumes through exact queued execution, not a reconstructed approval call', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const action = queuePendingAction({
+    title: 'Send the reviewed proof',
+    summary: 'Send one exact reviewed payload.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+    sessionId: sess.id,
+  });
+  const row = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'Send the reviewed proof',
+    tool: 'request_approval',
+    args: { pendingActionId: action.id },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'system',
+    type: 'approval_parked',
+    data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id },
+  });
+  const resolvedRow: approvalRegistry.PendingApprovalRow = {
+    ...row,
+    status: 'resolved',
+    resolution: 'approved',
+    resolver: 'test',
+    resolvedAt: new Date().toISOString(),
+  };
+  const directives: string[] = [];
+
+  assert.equal(
+    await handleResolvedApprovalForChatResume(
+      resolvedRow,
+      async (_sessionId, directive) => { directives.push(directive); },
+    ),
+    true,
+  );
+  assert.equal(directives.length, 1);
+  assert.match(directives[0], /pending_action_execute once/);
+  assert.match(directives[0], new RegExp(action.id));
+  assert.doesNotMatch(directives[0], /re-run the approved tool call/i);
+});
+
+test('an exact linked pending-action card resumes even if a crash lost approval_parked', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const action = queuePendingAction({
+    title: 'Crash-window send',
+    summary: 'The exact linked card survives a missing park event.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+    sessionId: sess.id,
+  });
+  const row = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: action.title,
+    tool: 'request_approval',
+    args: { pendingActionId: action.id },
+  });
+  const resolvedAt = new Date().toISOString();
+  openEventLog().prepare(`
+    UPDATE pending_approvals
+       SET status = 'resolved',
+           resolution = 'approved',
+           resolver = 'crash-recovery-test',
+           resolved_at = ?
+     WHERE approval_id = ?
+  `).run(resolvedAt, row.approvalId);
+  markPendingActionApprovalResolved(action.id, 'approved', row.approvalId);
+  const resolved = approvalRegistry.get(row.approvalId)!;
+  assert.equal(listEvents(sess.id, { types: ['approval_parked'] }).length, 0);
+
+  const directives: string[] = [];
+  assert.equal(
+    await handleResolvedApprovalForChatResume(
+      resolved,
+      async (_sessionId, directive) => { directives.push(directive); },
+    ),
+    true,
+  );
+  assert.equal(directives.length, 1);
+  assert.match(directives[0], new RegExp(action.id));
+  assert.match(directives[0], /pending_action_execute once/);
+});
+
+test('an approved run_batch card resumes through its deterministic batch executor', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const action = queuePendingAction({
+    title: 'Update the reviewed rows',
+    summary: 'Run the exact certified batch after one approval.',
+    kind: 'external_write',
+    toolName: 'run_batch',
+    payload: {
+      tool: 'composio_execute_tool',
+      composioSlug: 'GOOGLESHEETS_BATCH_UPDATE',
+      sideEffect: 'write',
+      objective: 'update the exact reviewed rows',
+      items: [{ id: 'row-1', args: { spreadsheet_id: 'sheet-proof', range: 'A1' } }],
+    },
+    sessionId: sess.id,
+  });
+  const row = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: action.title,
+    tool: 'request_approval',
+    args: { pendingActionId: action.id },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'system',
+    type: 'approval_parked',
+    data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id },
+  });
+  const resolvedRow: approvalRegistry.PendingApprovalRow = {
+    ...row,
+    status: 'resolved',
+    resolution: 'approved',
+    resolver: 'test',
+    resolvedAt: new Date().toISOString(),
+  };
+  const directives: string[] = [];
+
+  assert.equal(
+    await handleResolvedApprovalForChatResume(
+      resolvedRow,
+      async (_sessionId, directive) => { directives.push(directive); },
+    ),
+    true,
+  );
+  assert.equal(directives.length, 1);
+  assert.match(directives[0], /Call run_batch once/);
+  assert.match(directives[0], /action="execute"/);
+  assert.match(directives[0], new RegExp(action.id));
+  assert.doesNotMatch(directives[0], /pending_action_execute/);
 });
 
 test('a dispatch failure is swallowed (the grant stays consumable for a manual continue)', async () => {

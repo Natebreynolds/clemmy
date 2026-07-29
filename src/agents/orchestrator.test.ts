@@ -1029,6 +1029,49 @@ test('request_approval execute carries auto-approval reason when the action was 
   assert.equal(events.length, 0);
 });
 
+test('request_approval cannot auto-approve a reversible pending action owned by another session', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'strict' });
+  const owner = createSession({ kind: 'chat' });
+  const foreign = createSession({ kind: 'chat' });
+  const action = pendingActions.queuePendingAction({
+    title: 'Create queued draft',
+    summary: 'Create one reversible Outlook draft.',
+    kind: 'external_write',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: 'Proof' } },
+    sessionId: owner.id,
+  });
+  const args = {
+    // This wording previously activated the local-save shortcut after the
+    // foreign payload made requestApprovalRequiresHuman return false.
+    subject: 'Save this draft rule to memory',
+    reason: 'Store the prepared draft for later.',
+    destructive: false,
+    preview: null,
+    pendingActionId: action.id,
+  };
+  const tool = buildRequestApprovalTool();
+  const needsApproval = tool.needsApproval as unknown as (
+    ctx: unknown,
+    input: typeof args,
+  ) => Promise<boolean>;
+
+  assert.equal(
+    await needsApproval({ context: { sessionId: foreign.id } }, args),
+    true,
+    'a foreign pending action must fail closed before the local-save shortcut',
+  );
+  const result = await invokeFunctionTool(tool, args, { sessionId: foreign.id, turn: 1 });
+  assert.match(result, /different session|does not belong|refused/i);
+  assert.equal(
+    pendingActions.getPendingAction(action.id)?.status,
+    'queued',
+    'foreign-session invocation must not mutate approval state',
+  );
+  assert.equal(getPlanScope(foreign.id), null, 'foreign payload must not open a tool scope');
+});
+
 test('request_approval human resume preserves linked pending-action provenance', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -1103,7 +1146,7 @@ test('request_approval mints policy provenance only on a true YOLO auto-approval
       summary: 'Create one reversible Outlook draft.',
       kind: 'external_write',
       toolName: 'composio_execute_tool',
-      payload: { composioSlug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: 'Proof' } },
+      payload: { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: 'Proof' } },
       sessionId: sess.id,
     });
     const args = {
@@ -1115,7 +1158,11 @@ test('request_approval mints policy provenance only on a true YOLO auto-approval
     };
     const tool = buildRequestApprovalTool();
     const needsApproval = tool.needsApproval as unknown as (ctx: unknown, input: typeof args) => Promise<boolean>;
-    assert.equal(await needsApproval({}, args), false, 'YOLO should auto-approve this reversible write');
+    assert.equal(
+      await needsApproval({ context: { sessionId: sess.id } }, args),
+      false,
+      'YOLO should auto-approve this reversible write in its owning session',
+    );
 
     const result = await invokeFunctionTool(tool, args, { sessionId: sess.id, turn: 3 });
     assert.match(result, /Auto-approved by YOLO mode/);

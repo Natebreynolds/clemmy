@@ -277,21 +277,22 @@ test('human approval provenance cannot be downgraded by later policy bookkeeping
 });
 
 test('policy-approved preclaim action can attach a real card and upgrade to human without moving status backwards', async () => {
+  const { createSession } = await import('./eventlog.js');
+  const registryMod = await import('./approval-registry.js');
+  const sess = createSession({ kind: 'chat' });
   const record = pending.queuePendingAction({
     title: 'Human upgrade',
     summary: 'A policy decision is inert until a real card approves this send.',
     kind: 'external_send',
     toolName: 'composio_execute_tool',
     payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+    sessionId: sess.id,
   });
   pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
     by: 'policy',
     evidence: { kind: 'policy', scope: 'auto' },
   });
 
-  const { createSession } = await import('./eventlog.js');
-  const registryMod = await import('./approval-registry.js');
-  const sess = createSession({ kind: 'chat' });
   const card = registryMod.register({
     sessionId: sess.id,
     subject: 'upgrade send consent',

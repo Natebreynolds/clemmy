@@ -24,10 +24,9 @@ function writeRunner(slug: string, file: string) {
 }
 
 test('clean thin space passes untouched (no repairs, no errors)', () => {
-  writeRunner('clean', 'r.mjs');
   const prep = enforce.prepareSpaceForWrite({
     slug: 'clean',
-    dataSources: [{ id: 'pull', runner: 'r.mjs' }],
+    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }],
     actions: [],
   });
   assert.equal(prep.ok, true);
@@ -46,7 +45,7 @@ test('auto-repair coerces confirm:true on a send-like action', () => {
   assert.match(prep.repairs.join(' '), /confirm:true/);
 });
 
-test('auto-repair leaves a local post-approval action ungated', () => {
+test('auto-repair marks every opaque runner action as approval-required', () => {
   writeRunner('local-approval', 'approve-post.mjs');
   const prep = enforce.prepareSpaceForWrite({
     slug: 'local-approval',
@@ -60,15 +59,14 @@ test('auto-repair leaves a local post-approval action ungated', () => {
     }],
   });
   assert.equal(prep.ok, true);
-  assert.equal(prep.actions[0].confirm, false);
-  assert.equal(prep.repairs.some((repair) => /confirm:true/.test(repair)), false);
+  assert.equal(prep.actions[0].confirm, true);
+  assert.equal(prep.repairs.some((repair) => /confirm:true/.test(repair)), true);
 });
 
 test('auto-repair drops a bad timezone (keeps the source)', () => {
-  writeRunner('tz', 'r.mjs');
   const prep = enforce.prepareSpaceForWrite({
     slug: 'tz',
-    dataSources: [{ id: 'pull', runner: 'r.mjs', schedule: '0 7 * * *', timezone: 'Mars/Phobos' }],
+    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '0 7 * * *', timezone: 'Mars/Phobos' }],
     actions: [],
   });
   assert.equal(prep.ok, true);
@@ -100,6 +98,32 @@ test('auto-repair drops a redundant data-source runner when both backends are de
   assert.match(prep.repairs.join(' '), /Data source "pull".*dropped the runner/);
 });
 
+test('Composio data sources must be provably read-only at authoring time', () => {
+  const read = enforce.prepareSpaceForWrite({
+    slug: 'read-source',
+    dataSources: [{ id: 'events', composioSlug: 'GOOGLECALENDAR_LIST_EVENTS' }],
+    actions: [],
+  });
+  assert.equal(read.ok, true, read.errors.join('\n'));
+
+  for (const composioSlug of [
+    'GOOGLESHEETS_UPDATE_SPREADSHEET',
+    'GMAIL_MARK_AS_READ',
+    'ACME_DO_THING',
+  ]) {
+    const unsafe = enforce.prepareSpaceForWrite({
+      slug: 'unsafe-source',
+      dataSources: [{ id: 'pull', composioSlug }],
+      actions: [],
+    });
+    assert.equal(unsafe.ok, false, `${composioSlug} must not become an automatic refresh`);
+    assert.match(
+      unsafe.errors.join(' '),
+      /Data source "pull".*provably read-only.*action/i,
+    );
+  }
+});
+
 test('ERROR: source with no backend blocks the save', () => {
   const prep = enforce.prepareSpaceForWrite({
     slug: 'nob', dataSources: [{ id: 'pull' }], actions: [],
@@ -116,15 +140,65 @@ test('ERROR: runner file that is not on disk blocks the save', () => {
   assert.match(prep.errors.join(' '), /doesn.t exist/);
 });
 
-test('a validated runner_path staging set satisfies the pre-install existence gate', () => {
+test('an opaque data-source runner is rejected even when its staged file exists', () => {
   const prep = enforce.prepareSpaceForWrite({
     slug: 'staged',
     dataSources: [{ id: 'pull', runner: 'new.mjs' }],
     actions: [],
     availableRunnerFiles: new Set(['new.mjs']),
   });
-  assert.equal(prep.ok, true);
-  assert.equal(prep.errors.length, 0);
+  assert.equal(prep.ok, false);
+  assert.match(prep.errors.join(' '), /opaque runner|read-only Composio/i);
+});
+
+test('an installed runner declaration survives metadata/view saves but remains approval-gated at runtime', () => {
+  writeRunner('legacy-preserved', 'pull.mjs');
+  const existingDataSources = [{
+    id: 'pull',
+    runner: 'pull.mjs',
+    schedule: '0 7 * * *',
+    timezone: 'America/Los_Angeles',
+  }];
+  const prep = enforce.prepareSpaceForWrite({
+    slug: 'legacy-preserved',
+    dataSources: existingDataSources,
+    existingDataSources,
+    actions: [],
+  });
+
+  assert.equal(prep.ok, true, prep.errors.join('\n'));
+  assert.deepEqual(prep.dataSources, existingDataSources);
+  assert.match(
+    prep.warnings.join(' '),
+    /legacy runner.*preserved.*entrypoint hash.*approval.*helpers.*outside the digest/i,
+  );
+});
+
+test('legacy compatibility cannot introduce a new runner source or swap its runner filename', () => {
+  writeRunner('legacy-narrow', 'old.mjs');
+  writeRunner('legacy-narrow', 'new.mjs');
+  const existingDataSources = [{ id: 'pull', runner: 'old.mjs' }];
+
+  const added = enforce.prepareSpaceForWrite({
+    slug: 'legacy-narrow',
+    dataSources: [
+      ...existingDataSources,
+      { id: 'new-source', runner: 'new.mjs' },
+    ],
+    existingDataSources,
+    actions: [],
+  });
+  assert.equal(added.ok, false);
+  assert.match(added.errors.join(' '), /new-source.*opaque runner|new-source.*read-only Composio/i);
+
+  const swapped = enforce.prepareSpaceForWrite({
+    slug: 'legacy-narrow',
+    dataSources: [{ id: 'pull', runner: 'new.mjs' }],
+    existingDataSources,
+    actions: [],
+  });
+  assert.equal(swapped.ok, false);
+  assert.match(swapped.errors.join(' '), /pull.*opaque runner|pull.*read-only Composio/i);
 });
 
 test('ERROR: runner declarations must be filenames under data/, not paths', () => {
@@ -144,9 +218,8 @@ test('ERROR: runner declarations must be filenames under data/, not paths', () =
 });
 
 test('ERROR: invalid cron on a scheduled source blocks the save', () => {
-  writeRunner('badcron', 'r.mjs');
   const prep = enforce.prepareSpaceForWrite({
-    slug: 'badcron', dataSources: [{ id: 'pull', runner: 'r.mjs', schedule: 'every morning' }], actions: [],
+    slug: 'badcron', dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: 'every morning' }], actions: [],
   });
   assert.equal(prep.ok, false);
   assert.match(prep.errors.join(' '), /invalid schedule/);
