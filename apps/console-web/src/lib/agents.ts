@@ -67,6 +67,9 @@ export interface Delegation {
   expectedOutput: string;
   status: 'pending' | 'in_progress' | 'completed';
   result?: string;
+  /** How the result is grounded. 'model_prose' = the model's own text with no
+   *  independent evidence — the UI must not present it as verified work. */
+  resultEvidence?: 'model_prose';
   /** Who actually recorded the result — not assumed to be the assignee. */
   completedBy?: string;
   /** Set when Clementine closed work that was queued for someone else. */
@@ -85,10 +88,14 @@ export interface AgentComms { messages: TeamMessage[]; delegations: Delegation[]
  */
 export function describeDelegationOutcome(delegation: Delegation): string | null {
   if (delegation.status !== 'completed') return null;
+  // Evidence provenance travels with attribution: today every delegation
+  // result is the model's own prose, and the line says so rather than letting
+  // "Completed" read as independently verified work.
+  const evidence = delegation.resultEvidence === 'model_prose' ? ' · model prose, unverified' : '';
   const actor = delegation.completedBy;
-  if (!actor) return 'Completed';
-  if (delegation.onBehalfOf) return `Completed by Clementine, on behalf of ${delegation.onBehalfOf}`;
-  return `Completed by ${actor}`;
+  if (!actor) return `Completed${evidence}`;
+  if (delegation.onBehalfOf) return `Completed by Clementine, on behalf of ${delegation.onBehalfOf}${evidence}`;
+  return `Completed by ${actor}${evidence}`;
 }
 
 export interface AgentRunEvent {

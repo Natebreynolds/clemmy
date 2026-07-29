@@ -52,3 +52,17 @@ test('a legacy record with no attribution does not invent one', () => {
   assert.equal(line, 'Completed');
   assert.doesNotMatch(line ?? '', /by/);
 });
+
+test('a model-prose result is labeled, never presented as verified work', () => {
+  const line = describeDelegationOutcome(delegation({
+    status: 'completed',
+    completedBy: 'analyst',
+    resultEvidence: 'model_prose',
+  }));
+  assert.equal(line, 'Completed by analyst · model prose, unverified');
+});
+
+test('a record without evidence provenance gains no invented label', () => {
+  const line = describeDelegationOutcome(delegation({ status: 'completed', completedBy: 'analyst' }));
+  assert.doesNotMatch(line ?? '', /prose|unverified/, 'legacy records make no claim either way');
+});
