@@ -18,7 +18,15 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -403,20 +411,25 @@ test('reapRunEventDir removes the run event-log directory — P0-2', () => {
   appendWorkflowEvent('reapme', 'rid', { kind: 'run_started' });
   const dir = path.join(WORKFLOWS_DIR, 'reapme', 'runs', 'rid');
   assert.ok(existsSync(dir), 'event dir exists after an event');
-  reapRunEventDir('reapme', 'rid');
+  assert.equal(reapRunEventDir('reapme', 'rid'), true);
   assert.ok(!existsSync(dir), 'event dir removed after reap');
 });
 
-test('reapRunEventDir preserves structured mutation receipts while removing best-effort events', () => {
+test('reapRunEventDir preserves only structured mutation receipts while removing workspace and best-effort state', () => {
   appendWorkflowEvent('reap-receipts', 'rid', { kind: 'step_started', stepId: 'write' });
   const dir = path.join(WORKFLOWS_DIR, 'reap-receipts', 'runs', 'rid');
   const receiptDir = path.join(dir, 'call-mutations', 'fingerprint');
+  const workspaceDir = path.join(dir, 'workspace', 'artifacts');
   mkdirSync(receiptDir, { recursive: true });
+  mkdirSync(workspaceDir, { recursive: true });
   writeFileSync(path.join(receiptDir, 'intent.json'), '{}', 'utf-8');
+  writeFileSync(path.join(workspaceDir, 'large-output.json'), 'x'.repeat(40_000), 'utf-8');
 
-  reapRunEventDir('reap-receipts', 'rid');
+  assert.equal(reapRunEventDir('reap-receipts', 'rid'), true);
   assert.equal(existsSync(path.join(dir, 'events.jsonl')), false);
+  assert.equal(existsSync(path.join(dir, 'workspace')), false);
   assert.equal(existsSync(path.join(receiptDir, 'intent.json')), true);
+  assert.deepEqual(readdirSync(dir), ['call-mutations']);
 });
 
 test('listPendingRuns excludes runs with terminal queue-record status', () => {

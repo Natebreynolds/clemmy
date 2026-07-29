@@ -169,6 +169,28 @@ test('workers receive stable isolated tracker scopes while retaining parent sess
   });
 });
 
+test('Claude SDK workers inherit the parent physical dispatch lease', async () => {
+  let captured: any;
+  setClaudeAgentSdkWorkerRunForTest(async (options) => {
+    captured = options;
+    return { text: 'done', toolUses: [] };
+  });
+  const dispatchLease = {
+    sessionId: 'sess-parent-lease',
+    scopeId: 'sess-parent-lease::provider',
+    leaseId: 'lease-parent',
+  };
+  await runClaudeAgentSdkWorker(
+    researchPacket,
+    'claude-opus-4-8',
+    'sess-parent-lease',
+    77,
+    undefined,
+    dispatchLease,
+  );
+  assert.equal(captured.dispatchLease, dispatchLease);
+});
+
 test('guard OFF: byte-identical rollback — friendly text verbatim + base cap regardless of intent', async () => {
   await withThrashGuard('off', async () => {
     let captured: any;

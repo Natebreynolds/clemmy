@@ -95,6 +95,47 @@ export interface WorkflowGraphPatchResult {
   warnings: string[];
 }
 
+/**
+ * Release-v3 authority carried by a model-added prompt node.
+ *
+ * Neither tool is work authority: `workflow_step_result` is the structural
+ * return channel, and `workspace_artifact_query` is confined to the owning
+ * run workspace by the ephemeral graph-step agent. This exact pair must never
+ * be replaced with `*` or treated as an empty/inherited allowlist.
+ */
+export const WORKFLOW_GRAPH_RESULT_ONLY_TOOL = 'workflow_step_result';
+export const WORKFLOW_GRAPH_CONTEXT_QUERY_TOOL = 'workspace_artifact_query';
+export const WORKFLOW_GRAPH_ALLOWED_TOOLS = [
+  WORKFLOW_GRAPH_RESULT_ONLY_TOOL,
+  WORKFLOW_GRAPH_CONTEXT_QUERY_TOOL,
+] as const;
+export const WORKFLOW_GRAPH_ADDITIVE_NODE_MODE = 'additive_read_only_v3';
+const WORKFLOW_GRAPH_DYNAMIC_NODE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const WORKFLOW_GRAPH_RESERVED_DYNAMIC_NODE_IDS = new Set([
+  '__synthesis__',
+  '__proto__',
+  'prototype',
+  'constructor',
+]);
+
+/**
+ * Validate an id that may become a runtime-created step/session/object key.
+ * Kept beside the graph model so both mutation admission and persisted-snapshot
+ * execution enforce the same rule.
+ */
+export function workflowGraphDynamicNodeIdError(nodeId: unknown): string | null {
+  if (typeof nodeId !== 'string') {
+    return 'Dynamic node id must be a string.';
+  }
+  if (WORKFLOW_GRAPH_RESERVED_DYNAMIC_NODE_IDS.has(nodeId.toLowerCase())) {
+    return `Dynamic node id "${nodeId}" is reserved by the workflow runtime.`;
+  }
+  if (!WORKFLOW_GRAPH_DYNAMIC_NODE_ID_RE.test(nodeId)) {
+    return `Dynamic node id "${nodeId}" must match ${WORKFLOW_GRAPH_DYNAMIC_NODE_ID_RE} (1-64 safe identifier characters).`;
+  }
+  return null;
+}
+
 export function workflowGraphEdgeId(
   source: string,
   target: string,

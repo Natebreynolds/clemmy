@@ -241,6 +241,9 @@ export interface AssistantRequest {
   /** Tool names to hide from the model for this single call. See
    *  RunRequest.excludeToolNames for the contract. */
   excludeToolNames?: string[];
+  /** Exact local harness tool authority for this call. An explicitly empty
+   * list means decision-only: no local or external tools may be exposed. */
+  allowedToolNames?: string[];
 }
 
 export interface AssistantResponse {
@@ -404,6 +407,13 @@ export interface ExecutionRecord {
     createdAt: string;
     updatedAt: string;
     result?: string;
+    /** How the reported result is grounded. Model prose is a work product,
+     * not independent proof of an external outcome. */
+    resultEvidence?: 'model_prose';
+    /** Actual actor that recorded the completion. */
+    completedBy?: string;
+    /** Assignee represented by another actor, when applicable. */
+    onBehalfOf?: string;
   }>;
   activity?: Array<{
     id: string;

@@ -22,7 +22,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-force-graph-3d": "^1.29.1",
-    "react-router-dom": "^7.1.1",
+    "react-router-dom": "^7.18.2",
     "tailwind-merge": "^2.5.5",
     "three": "^0.184.0"
   },

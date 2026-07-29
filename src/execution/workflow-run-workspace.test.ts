@@ -86,15 +86,21 @@ test('recordStepOutput persists every step as an inspectable work product', () =
   recordStepOutput({ workflowName: wf, runId: run, stepId: 'draft', output: 'a tailored email body', nowIso: NOW });
   const manifest = readWorkspaceManifest(wf, run).filter((m) => m.tool === 'step-output');
   assert.deepEqual(manifest.map((m) => m.agent), ['pull', 'draft']);
-  assert.deepEqual(manifest.map((m) => m.path), ['artifacts/step-pull.json', 'artifacts/step-draft.json']);
+  assert.match(manifest[0].path, /^artifacts\/step-pull-[a-f0-9]{64}\.json$/);
+  assert.match(manifest[1].path, /^artifacts\/step-draft-[a-f0-9]{64}\.json$/);
+  assert.match(manifest[0].sha256 ?? '', /^[a-f0-9]{64}$/);
   assert.match(manifest[0].summary, /"prospects" has 3 items/);
   // The file holds the full work product.
-  const full = readFileSync(path.join(runWorkspaceDir(wf, run), 'artifacts/step-pull.json'), 'utf-8');
+  const full = readFileSync(path.join(runWorkspaceDir(wf, run), manifest[0].path), 'utf-8');
   assert.match(full, /prospects/);
 });
 
 test('stepOutputArtifactRelPath matches the persisted step output location', () => {
   assert.equal(stepOutputArtifactRelPath('fetch accounts'), 'artifacts/step-fetch-accounts.json');
+  assert.equal(
+    stepOutputArtifactRelPath('fetch accounts', 'a'.repeat(64)),
+    `artifacts/step-fetch-accounts-${'a'.repeat(64)}.json`,
+  );
 });
 
 test('summarizeToolOutput describes shape without dumping content', () => {

@@ -134,7 +134,7 @@ export function findStalledRuns(
       if (ageMs >= opts.queuedStallMs) {
         out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'queued_not_draining' });
       }
-    } else if (status === 'running') {
+    } else if (status === 'running' || status === 'finalizing') {
       // Silent-running detection (turn-stall fix layer 3, 2026-06-11): a
       // 'running' run whose step sessions have emitted NOTHING for a long
       // window is wedged, not working — two live incidents sat invisible
@@ -455,10 +455,10 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
     }
   }
 
-  // Populate lastActivityAt for running runs from the harness event log —
+  // Populate lastActivityAt for running/finalizing runs from the harness event log —
   // a run's step sessions are 'workflow:<runId>:<stepId>'.
   for (const run of runs) {
-    if ((run.status ?? 'queued') !== 'running') continue;
+    if (run.status !== 'running' && run.status !== 'finalizing') continue;
     try {
       run.lastActivityAt = latestEventAtForSessionPrefix(`workflow:${run.id}:`) ?? run.lastActivityAt;
     } catch { /* watchdog must never throw on a read */ }

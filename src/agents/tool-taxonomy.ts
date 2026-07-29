@@ -152,6 +152,9 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'space_refresh',
   'space_try_runner',
   'space_set_data',
+  // Creates/reuses the action's exact durable approval card only. The existing
+  // Workspace action gate owns any later external dispatch after resolution.
+  'space_action_prepare',
   'space_publish',
   // Team-agent coordination writes are Clementine-local state: durable agent
   // definitions, local request/delegation queues, and the local comms log. They

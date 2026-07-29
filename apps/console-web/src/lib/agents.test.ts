@@ -59,7 +59,8 @@ test('a model-prose result is labeled, never presented as verified work', () => 
     completedBy: 'analyst',
     resultEvidence: 'model_prose',
   }));
-  assert.equal(line, 'Completed by analyst · model prose, unverified');
+  assert.equal(line, 'Reported by analyst · verification required');
+  assert.doesNotMatch(line, /completed/i);
 });
 
 test('a record without evidence provenance gains no invented label', () => {

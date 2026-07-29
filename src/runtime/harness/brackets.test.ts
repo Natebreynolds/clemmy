@@ -45,6 +45,7 @@ const {
   startGate,
   mintJudgeFailApproval,
   OrphanedWriteRetryError,
+  _setBeforeSharedWriteAdmissionForTests,
 } = await import('./brackets.js');
 const { classifyTurnPreflight, recordTurnPreflightDecision } = await import('./turn-control.js');
 
@@ -147,6 +148,103 @@ test('wrapToolForHarness: default-ON wraps the tool; =off returns it unchanged',
   } finally {
     if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev;
+  }
+});
+
+test('revoke-before-admission leaves zero reservation and zero invoke for shell and generic writes', async () => {
+  const saved: Record<string, string | undefined> = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  const leases = await import('./dispatch-lease.js');
+
+  const runCase = async (
+    kind: 'shell' | 'generic',
+  ): Promise<void> => {
+    resetEventLog();
+    const session = createSession({ kind: 'chat' });
+    const lease = leases.activateDispatchLease({
+      sessionId: session.id,
+      scopeId: `${session.id}::${kind}`,
+    });
+    let invoked = 0;
+    let release!: () => void;
+    let reached!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const atAdmission = new Promise<void>((resolve) => { reached = resolve; });
+    _setBeforeSharedWriteAdmissionForTests(async (seenKind) => {
+      if (seenKind !== kind) return;
+      reached();
+      await hold;
+    });
+    const wrapped = kind === 'shell'
+      ? wrapToolForHarness({
+          name: 'run_shell_command',
+          execute: async () => { invoked += 1; return 'posted'; },
+        })
+      : wrapToolForHarness({
+          name: 'composio_execute_tool',
+          execute: async () => { invoked += 1; return 'sent'; },
+        });
+    const input = kind === 'shell'
+      ? {
+          command: 'curl -X POST https://api.example.test/messages -d \'{"body":"hello"}\'',
+        }
+      : {
+          tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+          arguments: JSON.stringify({
+            to_email: 'reverse-order@example.test',
+            subject: 'hello',
+            body: 'hello',
+          }),
+        };
+    const pending = withHarnessRunContext(
+      {
+        sessionId: session.id,
+        behaviorScopeId: `${session.id}::turn`,
+        counter: new ToolCallsCounter(10),
+        dispatchLease: lease,
+      },
+      () => wrapped.execute!(input),
+    );
+    await atAdmission;
+    // Simulate recovery winning the durable generation race after optional
+    // async gates but before this write owns admission.
+    leases.revokeDispatchLease(lease);
+    release();
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof leases.StaleDispatchLeaseError,
+    );
+    assert.equal(invoked, 0, `${kind}: provider/local invoke never starts`);
+    assert.equal(
+      listEvents(session.id, { types: ['external_write'] }).length,
+      0,
+      `${kind}: no stale pre-dispatch reservation is appended`,
+    );
+  };
+
+  try {
+    await runCase('shell');
+    await runCase('generic');
+  } finally {
+    _setBeforeSharedWriteAdmissionForTests(null);
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 

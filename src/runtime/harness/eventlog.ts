@@ -1056,6 +1056,56 @@ const MIGRATIONS: EventLogMigration[] = [
       }
     },
   },
+  {
+    // Physical model attempts are cancelable transports, not dispatch
+    // authority. A provider can acknowledge cancel and still deliver a late
+    // tool call after a retry/recovery has begun. Keep one durable generation
+    // per execution scope so every process (including the Claude local-MCP
+    // child) can reject work from a superseded generation before bookkeeping
+    // or provider dispatch.
+    version: 15,
+    sql: `
+      CREATE TABLE IF NOT EXISTS run_dispatch_leases (
+        scope_id       TEXT PRIMARY KEY,
+        session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        lease_id       TEXT NOT NULL,
+        run_attempt_id TEXT REFERENCES run_attempts(attempt_id) ON DELETE CASCADE,
+        activated_at   TEXT NOT NULL,
+        revoked_at     TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_run_dispatch_leases_session
+        ON run_dispatch_leases(session_id, revoked_at);
+    `,
+  },
+  {
+    // Internal provider retries own a child generation rather than borrowing
+    // the caller's shared lease. Persist the exact parent so a parent revoke
+    // invalidates every query child across in-process and stdio MCP transports.
+    version: 16,
+    sql: '',
+    backfill: (db) => {
+      const table = db.prepare(`
+        SELECT 1 AS present
+          FROM sqlite_master
+         WHERE type = 'table' AND name = 'run_dispatch_leases'
+      `).get() as { present: number } | undefined;
+      if (!table) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(run_dispatch_leases)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.has('parent_scope_id')) {
+        db.exec('ALTER TABLE run_dispatch_leases ADD COLUMN parent_scope_id TEXT');
+      }
+      if (!columns.has('parent_lease_id')) {
+        db.exec('ALTER TABLE run_dispatch_leases ADD COLUMN parent_lease_id TEXT');
+      }
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_run_dispatch_leases_parent
+          ON run_dispatch_leases(parent_scope_id, parent_lease_id)
+      `);
+    },
+  },
 ];
 
 function runMigrations(db: Database.Database): void {

@@ -124,11 +124,14 @@ export async function runDoctor(): Promise<number> {
     .filter(Boolean);
   if (v2Agents.includes('clementine')) {
     passRow('AUTONOMY_V2_AGENTS', v2Agents.join(', '));
-    if (!getOpenAiApiKey()) {
-      warnRow('AUTONOMY_V2_RUNTIME', 'OpenAI Agents SDK autonomy needs OPENAI_API_KEY; Codex OAuth chat still works');
-    }
+    passRow(
+      'AUTONOMY_V2_RUNTIME',
+      getOpenAiApiKey()
+        ? 'Selected-brain decision runtime enabled; raw OpenAI SDK fallback is also available'
+        : 'Selected-brain decision runtime enabled; no raw SDK fallback configured',
+    );
   } else {
-    warnRow('AUTONOMY_V2_AGENTS', 'clementine is not on the OpenAI Agents SDK v2 loop');
+    warnRow('AUTONOMY_V2_AGENTS', 'clementine is not on the durable decision-runtime loop');
   }
 
   // Connected apps

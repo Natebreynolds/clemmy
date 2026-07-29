@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { query as claudeQuery } from '@anthropic-ai/claude-agent-sdk';
 import type {
   CanUseTool,
@@ -69,6 +70,13 @@ import {
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
 import { createClementineMcpServer, listClementineMcpToolNames } from '../../tools/mcp-server.js';
+import {
+  activateDispatchLease,
+  assertDispatchLeaseCurrent,
+  revokeDispatchLeaseBeforeRecovery,
+  serializeDispatchLease,
+  type DispatchLeaseRef,
+} from './dispatch-lease.js';
 import {
   isTerminalToolName,
   terminalToolShouldHalt,
@@ -472,6 +480,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
     runScopeId?: string;
     sourceUserSeq?: number;
     mcpToolScope?: McpToolScope | null;
+    dispatchLease?: DispatchLeaseRef;
   },
   loading?: { alwaysLoadTools?: string[]; deferUnlistedTools?: boolean; deferredTools?: string[] },
 ): Record<string, McpServerConfig> {
@@ -481,10 +490,11 @@ export function buildClaudeAgentSdkLocalMcpServers(
   // MCP surface, each run through the full harness gate chain (see
   // gated-mutating-tools.ts). Set only for the agentic brain/worker profiles —
   // a read-only run leaves it off so those tools never appear.
-  // mcpToolAllowlist (JIT tool-RAG): when non-empty, the server advertises ONLY
-  // those tools — fewer schemas sent to the model = fewer input tokens. Absent →
-  // every tool registers (byte-identical to before).
+  // mcpToolAllowlist (JIT tool-RAG): when present, the server advertises ONLY
+  // those tools — fewer schemas sent to the model = fewer input tokens. Absent
+  // means every tool registers; an explicit [] means no local MCP server.
   const allowlist = (mcpToolAllowlist ?? []).map((t) => t.trim()).filter(Boolean);
+  if (mcpToolAllowlist !== undefined && allowlist.length === 0) return {};
   if (claudeSdkInProcessMcpEnabled()) {
     return {
       'clementine-local': {
@@ -495,6 +505,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
           runScopeId: attribution?.runScopeId,
           sourceUserSeq: attribution?.sourceUserSeq,
           mcpToolScope: attribution?.mcpToolScope,
+          dispatchLease: attribution?.dispatchLease,
           gatedMutations,
           allowedTools: allowlist,
           alwaysLoadTools: loading?.alwaysLoadTools,
@@ -515,6 +526,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
       : {}),
     ...(attribution?.mcpToolScope !== undefined
       ? { CLEMENTINE_MCP_TOOL_SCOPE_JSON: JSON.stringify(attribution.mcpToolScope) }
+      : {}),
+    ...(attribution?.dispatchLease
+      ? { CLEMENTINE_MCP_DISPATCH_LEASE_JSON: serializeDispatchLease(attribution.dispatchLease) as string }
       : {}),
     ...(gatedMutations ? { CLEMENTINE_MCP_GATED_MUTATIONS: 'on' } : {}),
     ...(allowlist.length > 0 ? { CLEMENTINE_MCP_ALLOWED_TOOLS: allowlist.join(',') } : {}),
@@ -1163,6 +1177,9 @@ export interface ClaudeAgentSdkRunOptions {
   /** Exact accepted user event owned by this run attempt. Turn preflight uses
    * this instead of session-global latest-user state. */
   sourceUserSeq?: number;
+  /** Physical SDK query generation. Local MCP (in-process or stdio) and native
+   * canUseTool both enforce it before dispatch. */
+  dispatchLease?: DispatchLeaseRef;
   /** Durable artifact root. Unlike trackerScopeId, this may intentionally span
    * a manual continue/restart/fallback while guardrail counters start fresh. */
   artifactRunScopeId?: string;
@@ -1781,7 +1798,23 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   //    opted in (its recovery skeleton needs run_tool_program — workers/steps
   //    lack it). Local gated tools already ride the full ladder via
   //    wrapToolForHarness; local reads ride the ambient counter. No double-count.
-  const canUseTool: CanUseTool = (async (toolName, input, opts) => {
+  const buildCanUseTool = (
+    dispatchLease: DispatchLeaseRef | undefined,
+  ): CanUseTool => (async (toolName, input, opts) => {
+    const staleLeaseDenial = (): PermissionResult | null => {
+      try {
+        assertDispatchLeaseCurrent(dispatchLease);
+        return null;
+      } catch (err) {
+        return {
+          behavior: 'deny',
+          interrupt: true,
+          message: err instanceof Error ? err.message : 'This provider attempt is no longer authoritative.',
+        } as PermissionResult;
+      }
+    };
+    const staleAtEntry = staleLeaseDenial();
+    if (staleAtEntry) return staleAtEntry;
     const kill = killGateVerdict(
       options.sessionId,
       options.sourceUserSeq ? { sourceUserSeq: options.sourceUserSeq } : undefined,
@@ -1947,6 +1980,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           const permission = await ceilingGated(toolName, input, opts);
           if (permission?.behavior !== 'allow') return permission;
 
+          // Approval/judges may have waited while another brain recovered.
+          // Re-check before claims/reservations/provider admission.
+          const staleAfterPermission = staleLeaseDenial();
+          if (staleAfterPermission) return staleAfterPermission;
+
           if (artifactAdmission) {
             if (providerCallId) nativeArtifactClaims.set(providerCallId, artifactAdmission);
             else markClaimedArtifactUncertain(artifactAdmission.artifactId);
@@ -1955,6 +1993,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             const duplicateDenial = await withExternalWriteAdmissionLock(
               externalWriteAdmissionKey(options.sessionId as string),
               async (): Promise<PermissionResult | null> => {
+                const staleBeforeReservation = staleLeaseDenial();
+                if (staleBeforeReservation) return staleBeforeReservation;
                 if (irreversibleNativeWrite) {
                   const denial = nativeExternalWriteDuplicateDenial(
                     options.sessionId as string,
@@ -1983,6 +2023,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               },
             );
             if (duplicateDenial) return duplicateDenial;
+          }
+          // A native write that reached this point has a durable pre-dispatch
+          // reservation, which is the recovery interlock. Reads/local calls
+          // have no such ledger, so close their final async window here.
+          if (!pendingNativeWrite) {
+            const staleBeforeDispatch = staleLeaseDenial();
+            if (staleBeforeDispatch) return staleBeforeDispatch;
           }
           admittedForDispatch = true;
           return permission;
@@ -2022,16 +2069,24 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // authority surface stays same-turn reachable through the generic dispatcher,
   // whose INNER call uses the existing schema validation and harness gates.
   const localUniverse = [...new Set(
-    (options.localMcpToolUniverse?.length ? options.localMcpToolUniverse : allowed)
+    (options.localMcpToolUniverse !== undefined ? options.localMcpToolUniverse : allowed)
       .map((name) => name.trim())
       .filter(Boolean),
   )];
+  const explicitEmptyMcpAllowlist =
+    options.mcpToolAllowlist !== undefined
+    && options.mcpToolAllowlist.map((name) => name.trim()).filter(Boolean).length === 0;
   const useLocalSchemaOnDemand = Boolean(
     agentic
     && claudeToolSearchEnabled()
-    && localUniverse.length > 0,
+    && localUniverse.length > 0
+    && !explicitEmptyMcpAllowlist,
   );
-  let localMcpToolAllowlist = options.mcpToolAllowlist ?? (agentic ? undefined : allowed);
+  let localMcpToolAllowlist = options.mcpToolAllowlist !== undefined
+    ? options.mcpToolAllowlist
+    : agentic
+      ? undefined
+      : allowed;
   let localMcpLoading: {
     alwaysLoadTools?: string[];
     deferUnlistedTools?: boolean;
@@ -2039,7 +2094,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   } | undefined;
   if (useLocalSchemaOnDemand) {
     const universeSet = new Set(localUniverse);
-    const requestedFirstClass = options.mcpToolAllowlist?.length
+    const requestedFirstClass = options.mcpToolAllowlist !== undefined
       ? new Set(options.mcpToolAllowlist.filter((name) => universeSet.has(name)))
       : resolveHotSet(options.sessionId, options.prompt, { allowedNames: universeSet });
     for (const name of options.requiredLocalMcpTools ?? []) {
@@ -2065,6 +2120,30 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     }
   }
   const runScopeId = trackerScopeId;
+  const nativeMcpServers = agentic
+    ? buildScopedNativeMcpServers(options.nativeMcpScopeInput, {
+        mode: options.nativeMcpScopeMode,
+        ...(options.nativeMcpToolScope !== undefined
+          ? { scope: options.nativeMcpToolScope }
+          : {}),
+      })
+    : {};
+  const buildMcpServersForDispatchLease = (
+    dispatchLease: DispatchLeaseRef | undefined,
+  ): Record<string, McpServerConfig> => ({
+    ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, localMcpToolAllowlist, {
+      workflowRunId: options.workflowRunId,
+      workflowName: options.workflowName,
+      stepId: options.stepId,
+      runScopeId,
+      sourceUserSeq: options.sourceUserSeq,
+      mcpToolScope: options.nativeMcpToolScope,
+      dispatchLease,
+    }, localMcpLoading),
+    // Native external MCP servers (scoped by intent), ONLY in agentic mode —
+    // the per-query canUseTool closure below carries this query generation.
+    ...nativeMcpServers,
+  });
   const sdkOptions: ClaudeAgentOptions = {
     env,
     ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
@@ -2074,32 +2153,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     settingSources: [],
     skills: [],
     tools: [],
-    mcpServers: {
-      ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, localMcpToolAllowlist, {
-        workflowRunId: options.workflowRunId,
-        workflowName: options.workflowName,
-        stepId: options.stepId,
-        runScopeId,
-        sourceUserSeq: options.sourceUserSeq,
-        mcpToolScope: options.nativeMcpToolScope,
-      }, localMcpLoading),
-      // Native external MCP servers (scoped by intent), ONLY in agentic mode — the
-      // canUseTool gate then covers every native call. Gives the Claude brain parity
-      // with the Codex lane instead of being blind to native MCPs.
-      ...(agentic
-        ? buildScopedNativeMcpServers(options.nativeMcpScopeInput, {
-            mode: options.nativeMcpScopeMode,
-            ...(options.nativeMcpToolScope !== undefined
-              ? { scope: options.nativeMcpToolScope }
-              : {}),
-          })
-        : {}),
-    },
+    // Rebuilt per physical query below so its local MCP handlers capture that
+    // query's immutable child generation. The base object is never dispatched.
+    mcpServers: {},
     // Keep SDK preapproval empty for both modes. Non-agentic runs use the local
     // MCP allowlist above to advertise only read/local schemas, then the same
     // canUseTool path enforces the deny-only allowlist and loop ceilings.
     allowedTools: sdkPreapprovedToolsForMode(allowed, agentic),
-    canUseTool,
+    canUseTool: buildCanUseTool(options.dispatchLease),
     permissionMode: 'default',
     maxTurns: options.maxTurns ?? 3,
     // Flip ON only when a delta sink is provided (chat surfaces). Worker/workflow
@@ -2199,6 +2260,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const seenTopLevelToolCallIds = new Set<string>();
   const seenTopLevelToolReturnIds = new Set<string>();
   const seenReturnedToolCallIds = new Set<string>();
+  // One unique child scope per SDK invocation, with a new generation for each
+  // query()/internal retry. The caller's lease remains shared authority owned
+  // by the brain/workflow/worker wrapper; this function revokes only children.
+  const internalQueryScopeId = options.dispatchLease
+    ? `${options.dispatchLease.scopeId}::sdk-query:${randomUUID()}`
+    : undefined;
   for (let attempt = 0; ; attempt++) {
     result = null;
     init = null;
@@ -2226,6 +2293,40 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     let lastHeartbeatAt = startedAt;
     const toolById = new Map<string, { name: string; input: unknown }>();
     let stream: Query | undefined;
+    const queryDispatchLease = options.dispatchLease && internalQueryScopeId
+      ? activateDispatchLease({
+          sessionId: options.dispatchLease.sessionId,
+          scopeId: internalQueryScopeId,
+          runAttemptId: options.dispatchLease.runAttemptId,
+          parentLease: options.dispatchLease,
+        })
+      : options.dispatchLease;
+    const querySdkOptions: ClaudeAgentOptions = {
+      ...sdkOptions,
+      mcpServers: buildMcpServersForDispatchLease(queryDispatchLease),
+      canUseTool: buildCanUseTool(queryDispatchLease),
+    };
+    let queryDispatchRevoked = false;
+    let queryClosed = false;
+    const revokeQueryDispatch = async (): Promise<void> => {
+      // With no caller lease this is the legacy/out-of-band path and there is
+      // no child authority to own. Never revoke a borrowed shared parent.
+      if (!queryDispatchLease || queryDispatchLease === options.dispatchLease || queryDispatchRevoked) return;
+      await revokeDispatchLeaseBeforeRecovery(queryDispatchLease);
+      queryDispatchRevoked = true;
+    };
+    const interruptQuery = async (): Promise<void> => {
+      // Authority is stale INSIDE interrupt(), not merely after it returns.
+      await revokeQueryDispatch();
+      try { await stream?.interrupt?.(); } catch { /* best-effort */ }
+    };
+    const closeQuery = async (): Promise<void> => {
+      if (queryClosed) return;
+      // Authority is stale INSIDE close(), before backoff or another query.
+      await revokeQueryDispatch();
+      queryClosed = true;
+      try { stream?.close?.(); } catch { /* ignore */ }
+    };
     try {
       if (effectiveShouldCancel && await effectiveShouldCancel()) {
         throw new AgentRuntimeCancelledError('Run cancelled by caller.');
@@ -2233,7 +2334,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       // Tests inject queryImpl for SDK behavior coverage. A forgotten seam must
       // fail locally before the real Claude subprocess can inherit Keychain auth.
       if (queryImpl === claudeQuery) assertLiveModelTransportAllowed('Claude Agent SDK');
-      stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
+      stream = queryImpl({ prompt: effectivePrompt, options: querySdkOptions }) as Query;
       const iterator = (stream as AsyncIterable<SDKMessage>)[Symbol.asyncIterator]();
       while (true) {
         const heartbeatIntervalMs = Math.max(1, options.livenessHeartbeatMs ?? 60_000);
@@ -2244,7 +2345,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           heartbeatIntervalMs,
           async () => {
             if (effectiveShouldCancel && await effectiveShouldCancel()) {
-              try { await stream?.interrupt?.(); } catch { /* best-effort */ }
+              await interruptQuery();
               throw new AgentRuntimeCancelledError('Run cancelled by caller.');
             }
             const now = Date.now();
@@ -2273,7 +2374,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             ) {
               ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
               ceilingState.stoppedKind = 'wallclock';
-              try { await stream?.interrupt?.(); } catch { /* best-effort */ }
+              await interruptQuery();
               return 'stop';
             }
             return 'continue';
@@ -2292,7 +2393,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           }
         }
         if (effectiveShouldCancel && await effectiveShouldCancel()) {
-          try { await stream?.interrupt?.(); } catch { /* best-effort */ }
+          await interruptQuery();
           throw new AgentRuntimeCancelledError('Run cancelled by caller.');
         }
         // TURN-CONTROL SPINE: liveness heartbeats. The harness loop emits
@@ -2329,7 +2430,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         ) {
           ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
           ceilingState.stoppedKind = 'wallclock';
-          try { await stream?.interrupt?.(); } catch { /* best-effort; finally closes */ }
+          await interruptQuery();
           break;
         }
         const nextInit = extractInit(message);
@@ -2514,13 +2615,16 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             if (!terminalToolShouldHalt(source.name, tr.output)) continue;
             terminalToolReply = renderTerminalToolReply(source.name, source.input, tr.output);
             terminalToolReason = terminalToolStoppedReason(source.name);
-            try { await stream?.interrupt?.(); } catch { /* best-effort */ }
+            await interruptQuery();
             break;
           }
         }
         if (terminalToolReply) break;
         result = extractResult(message) ?? result;
       }
+      // The provider iterator has ended; no further tool callback belongs to
+      // this query even while result/orphan bookkeeping below is still running.
+      await revokeQueryDispatch();
       const required = requiredLocalMcpTools(options);
       if (options.sessionId && nativeArtifactClaims.size > 0) {
         for (const [callId, claim] of nativeArtifactClaims) {
@@ -2543,6 +2647,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         });
       }
     } catch (err) {
+      // A thrown iterator/startup path loses authority before any catch-side
+      // settlement, close(), backoff, or retry work.
+      await revokeQueryDispatch();
       if (options.sessionId && nativeArtifactClaims.size > 0) {
         for (const [callId, claim] of nativeArtifactClaims) {
           try { markClaimedArtifactUncertain(claim.artifactId, callId); } catch { /* pending claim remains fail-closed */ }
@@ -2581,7 +2688,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           && !localMcpSurfaceInitialized(err.availableTools)
           && attempt < maxRetries
         ) {
-          try { stream?.close?.(); } catch { /* ignore */ }
+          await closeQuery();
           emitToolSurfaceRetryEvent(options, err, attempt, maxRetries);
           await sleep(toolSurfaceBackoffMs(attempt));
           continue;
@@ -2596,7 +2703,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         const committed = toolUses.length > 0 || streamedAny;
         // Safe first-byte retry: nothing committed yet and budget remains.
         if (!committed && attempt < maxOverloadRetries()) {
-          try { stream?.close?.(); } catch { /* ignore */ }
+          await closeQuery();
           await sleep(overloadBackoffMs(attempt));
           continue;
         }
@@ -2617,7 +2724,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         throw err;
       }
     } finally {
-      try { stream?.close?.(); } catch { /* ignore */ }
+      await closeQuery();
     }
     // A self-imposed stop (ceiling/wall-clock) that ended the stream WITHOUT a
     // throw (e.g. the SDK honored the interrupt cleanly) still routes to limitHit.

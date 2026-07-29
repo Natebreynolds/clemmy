@@ -11,6 +11,11 @@ import {
   COMPOSIO_EXECUTE_TOOL_PARAMS,
 } from './composio-tools.js';
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
+import {
+  assertDispatchLeaseCurrent,
+  parseDispatchLease,
+  type DispatchLeaseRef,
+} from '../runtime/harness/dispatch-lease.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { toolCallCorrelationFingerprint } from '../runtime/harness/tool-correlation.js';
@@ -117,6 +122,7 @@ export interface RegisterGatedMutatingToolsOptions {
   sessionId?: string;
   runScopeId?: string;
   sourceUserSeq?: number;
+  dispatchLease?: DispatchLeaseRef;
 }
 
 /**
@@ -135,6 +141,8 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
     const value = Number.parseInt(process.env.CLEMENTINE_MCP_SOURCE_USER_SEQ ?? '', 10);
     return Number.isSafeInteger(value) && value > 0 ? value : undefined;
   })();
+  const dispatchLease = opts.dispatchLease
+    ?? parseDispatchLease(process.env.CLEMENTINE_MCP_DISPATCH_LEASE_JSON);
 
   const byName = new Map<string, InvokableTool>();
   for (const t of [...getComputerTools(), ...getComposioRuntimeTools()] as InvokableTool[]) {
@@ -151,6 +159,7 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
       realTool.description ?? name,
       shape,
       async (rawInput: Record<string, unknown>) => {
+        assertDispatchLeaseCurrent(dispatchLease);
         const counter = new ToolCallsCounter(PER_CALL_COUNTER_LIMIT);
         const callId = `mcp-${randomUUID()}`;
         // Compute this from the original full MCP payload before previewArgs
@@ -204,6 +213,10 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
             counter,
             behaviorScopeId: runScopeId,
             ...(sourceUserSeq ? { sourceUserSeq } : {}),
+            ...(dispatchLease ? {
+              dispatchLease,
+              runAttemptId: dispatchLease.runAttemptId,
+            } : {}),
           }, () =>
             wrapped.invoke!(runContext, JSON.stringify(input ?? {}), details),
           );

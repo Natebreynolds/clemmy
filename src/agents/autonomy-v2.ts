@@ -3,33 +3,31 @@ import { z } from 'zod';
 import pino from 'pino';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { getOpenAiApiKey, getRuntimeEnv, MODELS } from '../config.js';
-import { getCoreTools } from '../tools/registry.js';
-import { getOrCreateConfiguredMcpServers } from '../runtime/mcp-servers.js';
+import { getActiveAuthMode, getOpenAiApiKey, getRuntimeEnv, MODELS } from '../config.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import { renderOpenCheckInsForAgent } from './check-ins.js';
-import { getProposalFeedback, renderProposalFeedback } from './proposal-feedback.js';
-import { buildPlannerTool } from './planner.js';
-import { loadSkill } from '../memory/skill-store.js';
 import {
-  buildAgentCommsTools,
-  commsInstructionBlock,
   deliverTeamCommsToInboxes,
   logCommsDelivery,
   peerCommsEnabled,
   resetCommsCycle,
 } from './agent-comms.js';
-import { buildAgentDelegationTools, claimDelegationFor, completeDelegationFor, renderOpenDelegations } from './agent-delegations.js';
+import {
+  claimDelegationTransitionFor,
+  completeDelegationTransitionFor,
+  isValidDelegationId,
+  renderOpenDelegations,
+} from './agent-delegations.js';
 import { DELEGATIONS_DIR as DELEGATIONS_DIR_FOR_WAKE } from '../tools/shared.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { addNotification } from '../runtime/notifications.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { listEvents } from '../runtime/harness/eventlog.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
-import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENT_INBOX_DIR,
@@ -51,59 +49,18 @@ import {
 } from './run-tracking.js';
 
 /**
- * SDK-native autonomy loop (Phase 1).
+ * Durable autonomy loop.
  *
- * This module is intentionally parallel to src/agents/autonomy.ts. The
- * v1 loop in that file is hand-rolled: builds a string prompt, JSON-
- * parses the response with three fallback strategies, and dispatches
- * through a hardcoded switch over 10 action types. It works, but it has
- * known failure modes (silent inbox loss on parse error, sequential
- * agent execution, no validation, no observability).
+ * When Clementine's selected-brain runtime is available, autonomy uses it.
+ * A compatible raw OpenAI SDK credential is a no-assistant fallback only.
+ * Both lanes are decision-only: the model returns a strict, closed JSON action
+ * list and this module validates and executes those actions with the acting
+ * agent slug bound in code. Neither lane grants direct local, MCP, or handoff
+ * authority to the model.
  *
- * Phase 1 replaces the LLM-facing core with proper SDK primitives:
- *
- *   - `Agent` from `@openai/agents` with `outputType` set to a Zod
- *     schema. The OpenAI structured outputs API enforces the shape on
- *     the server — JSON parse failures drop to ~zero.
- *   - Lifecycle hooks (`agent_start` / `agent_end` / `agent_tool_*`)
- *     wired straight into the run-events store. Every cycle is fully
- *     inspectable in the dashboard and via the new
- *     agent_runs_recent / agent_run_get MCP tools.
- *   - MCP tools (`getCoreTools()` + discovered servers) are the action
- *     surface. The agent can call any tool that's registered today;
- *     new actions = new tools, no code change in this file.
- *   - Per-agent execution wrapped in `Promise.allSettled` with a hard
- *     timeout so a single slow agent cannot stall the daemon tick.
- *
- * Phase 1 still produces a structured AgentDecision that we execute
- * via the existing executeAgentActions switch (imported from v1) — the
- * disk-file team-comms / delegation flow remains intact, this is a
- * pure upgrade of the LLM-facing core. Phase 2 will replace the
- * delegation action with native handoffs and migrate more actions to
- * tool calls.
- *
- *
- * REQUIREMENTS
- * ------------
- * - `OPENAI_API_KEY` must be set. Structured outputs are not available
- *   over the codex CLI bridge; codex_oauth users stay on v1 for now.
- * - Opt-in via env var `AUTONOMY_V2_AGENTS=clementine,researcher`
- *   (comma-separated slugs). Empty / unset → v2 is a no-op.
- *
- *
- * DAEMON INTEGRATION (recommended follow-up patch to runner.ts)
- * --------------------------------------------------------------
- *
- *   import { processAgentAutonomyV2 } from '../agents/autonomy-v2.js';
- *
- *   // ...inside startDaemon while-loop, alongside processAgentAutonomy:
- *   await processAgentAutonomyV2();
- *
- * The v1 loop also runs. Each agent appears in only one engine because
- * v2 owns the slugs listed in AUTONOMY_V2_AGENTS, and after a v2 cycle
- * marks `lastRunAt`, v1 will see the cadence as not-yet-due and skip.
- * For inbox-triggered wakes overlap is possible during the first tick
- * of opt-in — accept the duplicate processing on transition.
+ * Opt in with `AUTONOMY_V2_AGENTS=clementine,researcher`. Empty or unset is a
+ * no-op. Per-agent single-flight ownership, cancellation, and bounded retry
+ * backoff keep daemon ticks from overlapping or hammering a degraded provider.
  */
 
 const logger = pino({ name: 'clementine-next.agents.v2' });
@@ -121,21 +78,12 @@ function readOptInSlugs(): Set<string> {
   );
 }
 
-// -------- Decision schema --------
-//
-// Phase 2: actions are NO LONGER a structured array. The agent calls
-// real tools during its run (notify_user, task_add, goal_upsert,
-// memory_remember, etc.) and the SDK orchestrates those tool calls
-// natively. The decision output is metadata only — what did you do,
-// what are you on the hook for next time, when should you wake again.
-//
-// This collapses the v1 "return action JSON → switch executes it"
-// pattern to the SDK's native "agent calls tools, runner orchestrates"
-// pattern. The tool surface IS the action vocabulary; adding a new
-// autonomy action = registering a new MCP tool.
+// -------- Decision metadata schema --------
+// Actions are sanitized separately because both model lanes return the same
+// closed action vocabulary and code, not the model runtime, owns execution.
 
 export const AgentDecisionSchema = z.object({
-  summary: z.string().describe('Brief explanation of what you did and why this cycle. Mention which tools you called.'),
+  summary: z.string().describe('Brief explanation of what was decided or completed in this cycle.'),
   commitments: z.array(z.string()).max(8).describe('What you commit to follow up on next cycle. Concrete and dated when possible.'),
   followUpMinutes: z.number().int().min(5).max(1440).optional().describe('When to wake again, in minutes. Omit to use the agent default cadence.'),
 });
@@ -320,6 +268,24 @@ function isDelegationWakeDue(agent: TeamAgentRecord, state: AgentStateRecord): b
  *  provider, short enough that transient weather never costs a full cadence. */
 const CYCLE_FAILURE_RETRY_MS = 90_000;
 
+function buildCycleFailureState(
+  state: AgentStateRecord,
+  slug: string,
+  message: string,
+  nowMs = Date.now(),
+): AgentStateRecord {
+  return {
+    ...state,
+    slug,
+    engine: 'v2',
+    lastRunAt: new Date(nowMs).toISOString(),
+    lastError: message,
+    nextWakeAt: new Date(nowMs + CYCLE_FAILURE_RETRY_MS).toISOString(),
+  };
+}
+
+export const _testOnly_buildCycleFailureState = buildCycleFailureState;
+
 function isCadenceDue(agent: TeamAgentRecord, state: AgentStateRecord): boolean {
   if (!agent.proactive) return false;
   if (state.nextWakeAt && new Date(state.nextWakeAt).getTime() > Date.now()) return false;
@@ -391,9 +357,8 @@ function buildAgentInput(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], s
  *          only, balanced = act on clear signals, hands_on = drive
  *          things forward proactively.
  *
- *   allowed action categories — gates entire tool families. Don't try
- *          a Composio call if allowComposioActions=false; the call will
- *          fail and waste a turn.
+ *   allowed action categories — context for what downstream governed work may
+ *          be proposed. This decision lane itself never receives those tools.
  *
  *   checkInMinutes — informs a reasonable followUpMinutes default when
  *          the agent doesn't have a specific reason to wake sooner.
@@ -417,18 +382,19 @@ export function buildPolicyText(policy: ProactivityPolicy): string {
 
   const lines = [
     'Operating policy:',
+    '- This cycle is decision-only. These policy flags do not grant direct local, connected-app, or handoff tools.',
     `- ${modeGuidance[policy.mode]}`,
     `- Default check-in cadence: ${policy.checkInMinutes} minute(s). Use this for followUpMinutes when you have no better reason.`,
   ];
   if (allowedCategories.length > 0) {
-    lines.push(`- Allowed action categories: ${allowedCategories.join(', ')}.`);
+    lines.push(`- Policy permits these categories in a separately governed execution path: ${allowedCategories.join(', ')}.`);
   }
   if (blockedCategories.length > 0) {
-    lines.push(`- Blocked: ${blockedCategories.join(', ')}. Do not attempt tools in these categories — they will fail.`);
+    lines.push(`- Blocked: ${blockedCategories.join(', ')}. Do not propose work in these categories — it will fail downstream policy.`);
   }
   lines.push(policy.requireWorkflowApprovalForExecution
-    ? '- Execution gate: Executor/Deployer handoffs require an active tracked execution. If the work is not tracked yet, ask the user to promote/approve it as a long-running task.'
-    : '- Execution gate: disabled. Executor/Deployer handoffs may run without a tracked execution.');
+    ? '- Downstream execution gate: executor/deployer work requires an active tracked execution.'
+    : '- Downstream execution gate: tracked-execution approval is disabled by policy.');
   return lines.join('\n');
 }
 
@@ -488,88 +454,6 @@ export function chooseFollowUpMinutes(
   return Math.max(base * 3, 15);
 }
 
-/**
- * Slice 4 — inject the SKILL.md body of every skill bound to this agent,
- * the same way a workflow step does for `usesSkill`. A specialist boots
- * knowing its craft instead of rediscovering it via skill_read each cycle.
- * Missing skills are noted (not silently dropped) so a stale binding is
- * visible. Returns '' when no skills are bound (no prompt growth).
- */
-function renderBoundSkills(agent: TeamAgentRecord): string {
-  const names = agent.skills ?? [];
-  if (names.length === 0) return '';
-  const blocks: string[] = [];
-  for (const name of names) {
-    const skill = loadSkill(name);
-    if (skill) blocks.push(`### Skill: ${name}\n${skill.body.trim()}`);
-    else blocks.push(`### Skill: ${name}\n(not installed — ask the user to install it or remove it from your skills.)`);
-  }
-  return ['Your skills (follow these as binding procedures when the task matches):', ...blocks].join('\n\n');
-}
-
-/** Slice 4 — list the workflows this agent owns so it reaches for them via
- *  `workflow_run` instead of redoing the work ad-hoc. Returns '' when none. */
-function renderOwnedWorkflows(agent: TeamAgentRecord): string {
-  const names = agent.workflows ?? [];
-  if (names.length === 0) return '';
-  return [
-    'Workflows you own — prefer `workflow_run` with the exact name when the task matches one:',
-    ...names.map((n) => `- ${n}`),
-  ].join('\n');
-}
-
-function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolicy): string {
-  const orchestrator = isOrchestratorSlug(agent.slug);
-  const proposalFeedbackBlock = renderProposalFeedback(getProposalFeedback({ windowDays: 30 }));
-  return [
-    `You are ${agent.name} (${agent.slug}), an autonomous agent inside Clementine.`,
-    agent.role ? `Role: ${agent.role}` : '',
-    agent.description ? `Mission: ${agent.description}` : '',
-    agent.project ? `Bound project: ${agent.project}` : '',
-    `Personality and operating guidance:\n${agent.personality}`,
-    // Slice 4: bound skills + owned workflows. Data-driven — empty by
-    // default, so agents without bindings are unchanged.
-    renderBoundSkills(agent),
-    renderOwnedWorkflows(agent),
-    'You are proactive. If goals or tasks have stagnated, take initiative.',
-    orchestrator ? [
-      'You are the orchestrator. Specialized sub-agents are available via handoff:',
-      '- Researcher: read-only information gatherer. Hand off when you need facts from memory, files, the workspace, or session history before deciding. It cannot mutate state.',
-      '- Writer: drafts docs, reports, summaries, emails/messages, and handoff notes. It drafts but does not send or deploy.',
-      '- Reviewer: read-only auditor. Hand off (a) before risky execution, deployment, or user-facing delivery, AND (b) after a multi-step mutation completes (multiple writes, command sequence, workflow that changed state) before declaring done. Reviewer reads what changed and confirms or flags. Skip the post-write Reviewer pass only for trivial single-file edits or read-only work.',
-      '- Executor: does concrete work (tasks, executions, file writes, shell commands, notifications).',
-      '- Deployer: handles release, deployment, CI, environment, and CLI-driven shipping work.',
-      policy.requireWorkflowApprovalForExecution
-        ? 'Workflow approval gate: Executor and Deployer handoffs are only available when an active tracked execution exists for this session. If no active execution is listed but the work needs execution, ask the user to promote/approve it as a long-running tracked task instead of silently handing off.'
-        : 'Workflow approval gate is disabled by policy: Executor and Deployer handoffs may be used whenever the work is concrete and appropriate.',
-      'When to hand off vs. act directly: simple single-step actions you can take yourself. Multi-step work, especially when it involves both information gathering AND mutation, benefits from a handoff so the sub-agent stays focused.',
-      'When handing off, give the sub-agent a clear, scoped objective. They return when their part is done — you can then hand off again, finish, or take a final action yourself.',
-    ].join('\n') : '',
-    [
-      'How to act:',
-      '- Use tools directly to take action this cycle. Do NOT describe actions in your output — execute them.',
-      '- If you have active executions, your primary job each cycle is to ADVANCE them. Call `execution_update_step` after making progress; `execution_complete` when success criteria are met. Compound progress across cycles instead of starting over.',
-      '- `notify_user` for meaningful updates the user should see, but does NOT need to respond to.',
-      '- `ask_user_question` ONLY when you genuinely cannot proceed without information the user has and you do not. Never re-ask something already open — open check-ins are listed in your input.',
-      '- `execution_mark_blocked` when something external blocks you. If a user answer would unblock it, ALSO call `ask_user_question` with the contextExecutionId so the cycle resumes when they answer.',
-      '- `task_add` / `task_update` to manage the tasks file. `goal_upsert` to create a goal (omit id) or log progress / change status on one (pass its id).',
-      '- `memory_remember` for durable preferences, project context, or standing feedback that should carry across sessions.',
-      '- `memory_recall_all` to look across memory before deciding; use `memory_recall` only for a vault-only lookup.',
-      '- `propose_check_in_template` when you notice a recurring rhythm in the user\'s work (weekly deploys, daily standups, monthly reviews) or a condition that should trigger a future nudge. DO NOT auto-install — the user approves from Settings → Proactive Check-Ins. Always include a clear `rationale` referencing the specific pattern you observed.',
-      '- `draft_plan` BEFORE you act on complex multi-step work — it returns a structured plan (objective, steps, risks, needsUserInput, recommendsTrackedExecution) without mutating anything. Skip it for trivial actions.',
-      '- `share_plan` after `draft_plan` when the plan is executable, moderate, and safe/local/read-only but the user should still see the working approach. It does not ask for approval; continue after sharing it.',
-      '- `surface_plan` after `draft_plan` only when the plan is executable and significant/large or recommendsTrackedExecution. If needsUserInput is non-empty, ask that clarification first; incomplete plans are not approvable. Skip surface_plan when the plan is trivial/moderate and unambiguous — share the plan if useful, then execute it.',
-      '- If there\'s nothing useful to do this cycle, take no action and say so in your summary.',
-      '- If you receive an inbox item of type `check_in_answered`, the user just answered a question you previously asked. Pick up where you left off and use the answer to make progress.',
-    ].join('\n'),
-    peerCommsEnabled()
-      ? commsInstructionBlock(agent.slug)
-      : 'Peer messaging (messages, requests, replies) is not available this cycle — surface the intent in your summary so the user can act. Work delegated TO you is separate and always actionable: it appears in your input with its id.',
-    proposalFeedbackBlock,
-    'Output: return only `summary`, `commitments`, and optional `followUpMinutes`. Be specific and brief.',
-  ].filter(Boolean).join('\n\n');
-}
-
 // -------- Agent cache --------
 // Building an Agent is cheap, but caching avoids per-tick churn and
 // gives us a stable EventEmitter to attach hooks to per slug.
@@ -586,10 +470,8 @@ const agentCache = new Map<string, AgentCacheEntry>();
 let runner: Runner | null = null;
 
 /**
- * Drop every cached autonomy agent. Called when the MCP server config
- * changes (dashboard add/edit/delete) so the next cycle constructs a
- * fresh agent against the new namespace shim instead of holding the
- * old one.
+ * Drop every cached fallback agent. Configuration changes call this so the
+ * next raw-SDK fallback cycle reconstructs its decision-only model wrapper.
  */
 export function clearAutonomyAgentCache(): void {
   agentCache.clear();
@@ -712,40 +594,16 @@ async function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): Pro
     return cached.agent;
   }
 
-  // Include the Planner-as-tool so autonomy cycles can think before
-  // they act, exactly like the chat path. The Planner is read-only so
-  // it always passes policy filters.
-  // Peer-comms tools are bound to THIS agent's slug (correct attribution
-  // in the shared daemon). Gated default-off → tool set is unchanged.
-  const commsTools = peerCommsEnabled() ? buildAgentCommsTools(record.slug) : [];
-  // Delegation tools are slug-bound too, and always present: a delegation only
-  // exists because someone explicitly assigned it, so letting the assignee
-  // finish it is the assigned-work path working — not a new autonomy category.
-  const delegationTools = buildAgentDelegationTools(record.slug);
-  const allTools = [...getCoreTools(), buildPlannerTool(), ...commsTools, ...delegationTools];
-  const tools = filterToolsByPolicy(allTools, policy);
-
-  // Orchestrator agents get handoffs configured so they can delegate
-  // focused work to specialized sub-agents (researcher, executor) via
-  // the SDK's native handoff flow — no disk polling, all in one run.
-  // The primary `clementine` agent is the orchestrator by default;
-  // other slugs can opt in via AUTONOMY_ORCHESTRATOR_SLUGS env var.
-  const handoffs = isOrchestratorSlug(record.slug)
-    ? await defaultOrchestratorHandoffs({
-      requireWorkflowApprovalForExecution: policy.requireWorkflowApprovalForExecution,
-    })
-    : undefined;
-
   const agent: AutonomyAgent = new Agent<RuntimeContextValue>({
     name: record.name,
-    instructions: buildAgentInstructions(record, policy),
+    instructions: [
+      'You are a durable team-agent decision engine.',
+      'You have no direct tools or handoffs in this lane.',
+      'Return only the strict JSON decision requested in the input.',
+      'Never invent a delegation id or claim an external effect you did not perform in this reply.',
+    ].join(' '),
     model: record.model ?? MODELS.fast,
-    tools,
-    handoffs,
-    // Single namespace-shimmed MCP server — flattens every configured
-    // server's tools under `<server>__<tool>` names so duplicate-name
-    // collisions across installs cannot throw at agent construction.
-    mcpServers: [getOrCreateConfiguredMcpServers()],
+    ...rawSdkDecisionOnlySurface(),
   });
 
   // Per-tool lifecycle hooks. Resolve the active runId via WeakMap so
@@ -756,6 +614,14 @@ async function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): Pro
   agentCache.set(record.slug, { record, policyFingerprint: polFp, agent });
   return agent;
 }
+
+function rawSdkDecisionOnlySurface(): { tools: []; mcpServers: [] } {
+  return { tools: [], mcpServers: [] };
+}
+
+/** Release contract: the no-assistant SDK fallback has the same closed,
+ * code-executed action surface as the selected-brain runtime lane. */
+export const _testOnly_rawSdkDecisionOnlySurface = rawSdkDecisionOnlySurface;
 
 /** Safe JSON parse for tool argument strings. Returns the parsed value
  *  when possible, otherwise the original string (useful when the tool
@@ -866,13 +732,14 @@ async function assertAutonomyDecisionGuardrails(decision: AgentDecisionV2): Prom
 
 // -------- Main cycle --------
 //
-// Phase 2 removed executeDecisionActions — the SDK Runner now executes
-// tool calls during agent.run(), and those tool calls ARE the actions.
-// The cycle records the metadata (summary, commitments, follow-up)
-// into agent state. The runs.json store captures the tool-call timeline
-// (when wired via per-tool hooks in Phase 1.5).
+// Both model lanes return the same JSON contract. Actions are sanitized and
+// executed below; only after every requested transition succeeds do we consume
+// inbox inputs and record the cycle as successful.
 
-async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string }> {
+async function runAgentCycleV2(
+  record: TeamAgentRecord,
+  signal?: AbortSignal,
+): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string }> {
   const state = loadAgentState(record.slug);
   const inboxItems = loadInbox(record.slug).filter((item) => item.status === 'pending').slice(0, MAX_INBOX_PER_CYCLE);
   const wakeReasons = [
@@ -903,22 +770,33 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
   addRunEvent(runId, policyEvent);
 
   const agent = await getAgent(record, policy);
-  const input = buildAgentInput(record, inboxItems, state, policy);
+  const input = buildRuntimeCyclePrompt(record, buildAgentInput(record, inboxItems, state, policy));
   currentRunIdByAgent.set(agent, runId);
 
   try {
     const result = await getRunner().run(agent, input, {
       context: { sessionId: `agent:${record.slug}`, userId: record.slug, channel: 'agent' },
       maxTurns: 8,
+      signal,
     });
+    if (signal?.aborted) throw new Error('cycle_aborted: caller wait budget expired');
 
+    const parsed = parseDecisionJson(result.finalOutput) as Record<string, unknown> | null;
     const decision = sanitizeAgentDecisionOutput(result.finalOutput);
     if (!decision) {
       throw new Error('Agent run completed but produced no usable decision output.');
     }
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('cycle_prose_only: reply was not the JSON decision contract');
+    }
     await assertAutonomyDecisionGuardrails(decision);
 
-    recordAutonomyResponse(runId, JSON.stringify(decision));
+    const actions = sanitizeRuntimeCycleActions(parsed.actions);
+    const actionOutcomes = executeRuntimeCycleActions(record.slug, actions);
+    assertRuntimeActionsSucceeded(actionOutcomes);
+    assertWakeMadeProgress(wakeReasons, actionOutcomes);
+
+    recordAutonomyResponse(runId, JSON.stringify({ ...decision, actions }));
     recordAutonomyDecision(runId, {
       summary: decision.summary,
       commitments: decision.commitments,
@@ -948,19 +826,14 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
         : undefined,
     });
 
-    finishAutonomyRun(runId, [decision.summary]);
+    const outcomes = actionOutcomes.map((outcome) => outcome.message);
+    finishAutonomyRun(runId, [decision.summary, ...outcomes]);
 
-    return { runId, success: true, outcomes: [decision.summary] };
+    return { runId, success: true, outcomes: [decision.summary, ...outcomes] };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.error({ err: error, agent: record.slug }, 'autonomy-v2 cycle failed');
-    saveAgentState({
-      ...state,
-      slug: record.slug,
-      engine: 'v2',
-      lastRunAt: new Date().toISOString(),
-      lastError: message,
-    });
+    saveAgentState(buildCycleFailureState(state, record.slug, message));
     finishAutonomyRun(runId, [], message);
     return { runId, success: false, outcomes: [], error: message };
   } finally {
@@ -970,9 +843,17 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+  onTimeout?: () => void,
+): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    const timer = setTimeout(() => {
+      try { onTimeout?.(); } catch { /* timeout still rejects */ }
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
     promise.then((value) => { clearTimeout(timer); resolve(value); }, (err) => { clearTimeout(timer); reject(err); });
   });
 }
@@ -1010,6 +891,44 @@ export interface AutonomyV2RunSummary {
 const RUNTIME_CYCLE_TIMEOUT_MS = 180_000;
 const MAX_RUNTIME_ACTIONS = 5;
 
+/**
+ * Physical cycle ownership, independent of the caller's wait budget.
+ *
+ * A Promise.race timeout only stops the caller from waiting; it does not stop
+ * the model/tool loop underneath. Keep the slug claimed until that underlying
+ * work actually settles so a later daemon tick cannot start an overlapping
+ * cycle against the same inbox/delegations.
+ */
+interface ClaimedCycle<T> {
+  started: true;
+  promise: Promise<T>;
+  abort: () => void;
+}
+
+const cyclesInFlight = new Map<string, { promise: Promise<unknown>; abort: () => void }>();
+
+function claimCycle<T>(
+  slug: string,
+  start: (signal: AbortSignal) => Promise<T>,
+): ClaimedCycle<T> | { started: false; promise: Promise<unknown> } {
+  const existing = cyclesInFlight.get(slug);
+  if (existing) return { started: false, promise: existing.promise };
+
+  const controller = new AbortController();
+  const promise = start(controller.signal);
+  const claimed = { promise, abort: () => controller.abort() };
+  cyclesInFlight.set(slug, claimed);
+  void promise.then(
+    () => {
+      if (cyclesInFlight.get(slug) === claimed) cyclesInFlight.delete(slug);
+    },
+    () => {
+      if (cyclesInFlight.get(slug) === claimed) cyclesInFlight.delete(slug);
+    },
+  );
+  return { started: true, promise, abort: claimed.abort };
+}
+
 export interface RuntimeCycleAction {
   type: 'claim_delegation' | 'complete_delegation' | 'notify_user';
   delegationId?: string;
@@ -1030,11 +949,13 @@ export function sanitizeRuntimeCycleActions(value: unknown): RuntimeCycleAction[
     const type = obj.type;
     if (type === 'claim_delegation') {
       const delegationId = cleanDecisionString(obj.delegationId ?? obj.delegation_id, 64);
-      if (delegationId) out.push({ type, delegationId });
+      if (delegationId && isValidDelegationId(delegationId)) out.push({ type, delegationId });
     } else if (type === 'complete_delegation') {
       const delegationId = cleanDecisionString(obj.delegationId ?? obj.delegation_id, 64);
       const result = cleanDecisionString(obj.result, 4000);
-      if (delegationId && result) out.push({ type, delegationId, result });
+      if (delegationId && isValidDelegationId(delegationId) && result) {
+        out.push({ type, delegationId, result });
+      }
     } else if (type === 'notify_user') {
       const title = cleanDecisionString(obj.title, 140);
       const body = cleanDecisionString(obj.body, 1000);
@@ -1060,15 +981,25 @@ function buildRuntimeCyclePrompt(record: TeamAgentRecord, input: string): string
   ].join('\n');
 }
 
-/** Execute the closed action vocabulary deterministically, slug bound in code. */
-function executeRuntimeCycleActions(slug: string, actions: RuntimeCycleAction[]): string[] {
-  const outcomes: string[] = [];
+interface RuntimeActionOutcome {
+  actionType: RuntimeCycleAction['type'];
+  ok: boolean;
+  message: string;
+}
+
+/** Execute the closed action vocabulary deterministically, slug bound in code.
+ * Failures remain structured so the cycle cannot mistake a denial string for
+ * successful work and consume its triggering inputs. */
+function executeRuntimeCycleActions(slug: string, actions: RuntimeCycleAction[]): RuntimeActionOutcome[] {
+  const outcomes: RuntimeActionOutcome[] = [];
   for (const action of actions) {
     try {
       if (action.type === 'claim_delegation' && action.delegationId) {
-        outcomes.push(claimDelegationFor(slug, action.delegationId));
+        const result = claimDelegationTransitionFor(slug, action.delegationId);
+        outcomes.push({ actionType: action.type, ...result });
       } else if (action.type === 'complete_delegation' && action.delegationId && action.result) {
-        outcomes.push(completeDelegationFor(slug, action.delegationId, action.result, 'model_prose'));
+        const result = completeDelegationTransitionFor(slug, action.delegationId, action.result, 'model_prose');
+        outcomes.push({ actionType: action.type, ...result });
       } else if (action.type === 'notify_user' && action.title) {
         addNotification({
           id: `${Date.now()}-agent-${slug}-${randomSuffix()}`,
@@ -1079,13 +1010,31 @@ function executeRuntimeCycleActions(slug: string, actions: RuntimeCycleAction[])
           read: false,
           metadata: { agentSlug: slug },
         });
-        outcomes.push(`Notified user: ${action.title}`);
+        outcomes.push({ actionType: action.type, ok: true, message: `Notified user: ${action.title}` });
       }
     } catch (err) {
-      outcomes.push(`Action ${action.type} failed: ${err instanceof Error ? err.message : String(err)}`);
+      outcomes.push({
+        actionType: action.type,
+        ok: false,
+        message: `Action ${action.type} failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
     }
   }
   return outcomes;
+}
+
+function assertRuntimeActionsSucceeded(outcomes: RuntimeActionOutcome[]): void {
+  const failures = outcomes.filter((outcome) => !outcome.ok);
+  if (failures.length === 0) return;
+  throw new Error(`cycle_action_failed: ${failures.map((failure) => failure.message).join(' | ')}`);
+}
+
+function assertWakeMadeProgress(wakeReasons: string[], outcomes: RuntimeActionOutcome[]): void {
+  if (!wakeReasons.includes('delegation')) return;
+  if (outcomes.some((outcome) => outcome.ok)) return;
+  throw new Error(
+    'cycle_no_progress: delegation wake requires a successful delegation transition or an explicit user notification',
+  );
 }
 
 function randomSuffix(): string {
@@ -1095,6 +1044,7 @@ function randomSuffix(): string {
 async function runAgentCycleViaRuntime(
   assistant: ClementineAssistant,
   record: TeamAgentRecord,
+  signal?: AbortSignal,
 ): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string }> {
   const state = loadAgentState(record.slug);
   const inboxItems = loadInbox(record.slug).filter((item) => item.status === 'pending').slice(0, MAX_INBOX_PER_CYCLE);
@@ -1122,6 +1072,12 @@ async function runAgentCycleViaRuntime(
       channel: 'cron' as const,
       message: buildRuntimeCyclePrompt(record, input),
       maxWallClockMs: RUNTIME_CYCLE_TIMEOUT_MS,
+      shouldCancel: () => Boolean(signal?.aborted),
+      // This lane is decision-only. The model returns a closed JSON action
+      // vocabulary; code executes those actions with the agent slug bound.
+      // An explicit empty allowlist prevents the generic cron harness from
+      // granting unrelated local or external tool authority mid-turn.
+      allowedToolNames: [],
       // The harness surface exposes the registry team tools, which attribute
       // the actor from the PROCESS-GLOBAL agent slug — in the shared daemon a
       // cycle using them records the work as 'clementine' (proven live: the
@@ -1187,9 +1143,13 @@ async function runAgentCycleViaRuntime(
       throw new Error('cycle_prose_only: reply was not the JSON decision contract');
     }
     await assertAutonomyDecisionGuardrails(decision);
+    if (signal?.aborted) throw new Error('cycle_aborted: caller wait budget expired');
 
     const actions = sanitizeRuntimeCycleActions(parsed?.actions);
-    const outcomes = executeRuntimeCycleActions(record.slug, actions);
+    const actionOutcomes = executeRuntimeCycleActions(record.slug, actions);
+    assertRuntimeActionsSucceeded(actionOutcomes);
+    assertWakeMadeProgress(wakeReasons, actionOutcomes);
+    const outcomes = actionOutcomes.map((outcome) => outcome.message);
 
     recordAutonomyResponse(runId, JSON.stringify({ ...decision, actions }));
     recordAutonomyDecision(runId, {
@@ -1218,15 +1178,7 @@ async function runAgentCycleViaRuntime(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.error({ err: error, agent: record.slug }, 'autonomy runtime cycle failed');
-    saveAgentState({
-      ...state,
-      slug: record.slug,
-      engine: 'v2',
-      lastRunAt: new Date().toISOString(),
-      lastError: message,
-      // Bounded retry: transient provider weather must not cost a full cadence.
-      nextWakeAt: new Date(Date.now() + CYCLE_FAILURE_RETRY_MS).toISOString(),
-    });
+    saveAgentState(buildCycleFailureState(state, record.slug, message));
     finishAutonomyRun(runId, [], message);
     return { runId, success: false, outcomes: [], error: message };
   }
@@ -1252,11 +1204,27 @@ function warnAutonomyEngineUnavailableOnce(optIn: Set<string>): void {
   logger.warn(
     {
       optedInAgents: [...optIn].sort(),
-      reason: 'no_openai_api_key',
-      remedy: 'Autonomy cycles need a raw OPENAI_API_KEY. OAuth-only installs (Claude/Codex OAuth) cannot run them.',
+      reason: 'selected_brain_runtime_unavailable',
+      remedy: 'Pass the configured Clementine assistant runtime so autonomy follows the selected Claude, Codex, or BYO brain.',
     },
-    'agent autonomy is configured but cannot run — opted-in agents will not wake',
+    'agent autonomy is configured but the selected brain runtime is unavailable — opted-in agents will not wake',
   );
+}
+
+/**
+ * A raw OpenAI key may be configured only for voice/embeddings while the user
+ * has selected Claude OAuth, Codex OAuth, or a BYO brain. Its mere presence is
+ * not authority to reroute autonomous work (and billing) through OpenAI.
+ */
+export function shouldUseOpenAiSdkAutonomy(assistantPresent = false): boolean {
+  if (assistantPresent) return false;
+  if (!getOpenAiApiKey()) return false;
+  if (getActiveAuthMode() !== 'api_key') return false;
+  try {
+    return resolveRoleModel('brain').provider === 'codex';
+  } catch {
+    return false;
+  }
 }
 
 export async function processAgentAutonomyV2(assistant?: ClementineAssistant): Promise<AutonomyV2RunSummary> {
@@ -1274,7 +1242,7 @@ export async function processAgentAutonomyV2(assistant?: ClementineAssistant): P
   // cycles through the assistant's brain runtime instead — the same primitive
   // the execution controller and cron already use — so autonomy works on
   // Claude OAuth and Codex OAuth, the shipped defaults.
-  if (!getOpenAiApiKey()) {
+  if (!shouldUseOpenAiSdkAutonomy(Boolean(assistant))) {
     if (!assistant) {
       // No key AND no runtime handle: nothing can run. Say so once rather
       // than returning quietly every tick.
@@ -1286,8 +1254,19 @@ export async function processAgentAutonomyV2(assistant?: ClementineAssistant): P
     // Sequential on purpose: runtime turns are heavier than SDK cycles, and
     // serializing them keeps one slow agent from stacking brain-lane load.
     for (const rec of records) {
+      const claimed = claimCycle(rec.slug, (signal) => runAgentCycleViaRuntime(assistant, rec, signal));
+      if (!claimed.started) {
+        summary.attempted++;
+        summary.skipped++;
+        continue;
+      }
       try {
-        const result = await withTimeout(runAgentCycleViaRuntime(assistant, rec), RUNTIME_CYCLE_TIMEOUT_MS + 15_000, `agent ${rec.slug}`);
+        const result = await withTimeout(
+          claimed.promise,
+          RUNTIME_CYCLE_TIMEOUT_MS + 15_000,
+          `agent ${rec.slug}`,
+          claimed.abort,
+        );
         summary.attempted++;
         if (!result.runId) summary.skipped++;
         else if (result.success) summary.succeeded++;
@@ -1316,16 +1295,24 @@ export async function processAgentAutonomyV2(assistant?: ClementineAssistant): P
     return summary;
   }
 
-  const results = await Promise.allSettled(
-    records.map((rec) => withTimeout(runAgentCycleV2(rec), PER_AGENT_TIMEOUT_MS, `agent ${rec.slug}`)),
-  );
+  const claimedCycles = records.map((rec) => {
+    const claimed = claimCycle(rec.slug, (signal) => runAgentCycleV2(rec, signal));
+    if (!claimed.started) {
+      return Promise.resolve({ kind: 'skipped_in_flight' as const });
+    }
+    return withTimeout(claimed.promise, PER_AGENT_TIMEOUT_MS, `agent ${rec.slug}`, claimed.abort)
+      .then((result) => ({ kind: 'result' as const, result }));
+  });
+  const results = await Promise.allSettled(claimedCycles);
 
   for (const result of results) {
     summary.attempted++;
     if (result.status === 'fulfilled') {
-      if (!result.value.runId) {
+      if (result.value.kind === 'skipped_in_flight') {
         summary.skipped++;
-      } else if (result.value.success) {
+      } else if (!result.value.result.runId) {
+        summary.skipped++;
+      } else if (result.value.result.success) {
         summary.succeeded++;
       } else {
         summary.failed++;

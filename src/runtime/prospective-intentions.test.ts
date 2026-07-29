@@ -252,6 +252,7 @@ test('reconciliation cancels removed source definitions but preserves terminal h
 });
 
 test('model context is relevance-scoped, session-aware, and bounded', () => {
+  const beforeEitherReminderIsDue = new Date('2026-07-28T12:00:00.000Z');
   prospective.upsertProspectiveIntention({
     ...timerDefinition('deploy-reminder', '2026-07-29T17:00:00.000Z', 'Check the Railway deployment'),
     sessionId: 'sess-deploy',
@@ -264,12 +265,14 @@ test('model context is relevance-scoped, session-aware, and bounded', () => {
   const unrelated = prospective.buildProspectiveIntentionContext({
     query: 'Explain how CSS grid works',
     sessionId: 'sess-other',
+    now: beforeEitherReminderIsDue,
   });
   assert.equal(unrelated.text, '', 'global commitments must not tax unrelated turns');
 
   const unrelatedSameSession = prospective.buildProspectiveIntentionContext({
     query: 'Explain how CSS grid works',
     sessionId: 'sess-deploy',
+    now: beforeEitherReminderIsDue,
   });
   assert.equal(
     unrelatedSameSession.text,
@@ -281,6 +284,7 @@ test('model context is relevance-scoped, session-aware, and bounded', () => {
     query: 'What is next with the deployment?',
     sessionId: 'sess-deploy',
     maxChars: 900,
+    now: beforeEitherReminderIsDue,
   });
   assert.match(scoped.text, /Railway deployment/);
   assert.doesNotMatch(scoped.text, /dentist/i);
@@ -289,6 +293,7 @@ test('model context is relevance-scoped, session-aware, and bounded', () => {
   const overview = prospective.buildProspectiveIntentionContext({
     query: 'What reminders and upcoming commitments do I have?',
     maxChars: 1_400,
+    now: beforeEitherReminderIsDue,
   });
   assert.match(overview.text, /Railway deployment/);
   assert.match(overview.text, /dentist/i);

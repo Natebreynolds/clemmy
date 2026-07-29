@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -186,6 +186,16 @@ export function loadWorkflowGraphSnapshotByRunId(
   return row ? rowToSnapshot(row) : null;
 }
 
+/** Run records and their graph snapshots share the same retention lifecycle. */
+export function deleteWorkflowGraphSnapshotByRunId(
+  runId: string,
+  db: Database.Database = openWorkflowGraphDb(),
+): boolean {
+  db.exec(WORKFLOW_GRAPH_SCHEMA_SQL);
+  const result = db.prepare('DELETE FROM workflow_graphs WHERE run_id = ?').run(runId);
+  return result.changes > 0;
+}
+
 function insertGraphNodes(db: Database.Database, snapshotId: string, nodes: WorkflowGraphNode[]): void {
   const insert = db.prepare(`
     INSERT INTO workflow_graph_nodes (
@@ -294,5 +304,8 @@ function ensureStateDir(): void {
 }
 
 function hashEdgeId(edgeId: string): string {
-  return Buffer.from(edgeId).toString('base64url').slice(0, 48) || randomUUID();
+  // Edge ids commonly share a long descriptive source prefix. Truncating a
+  // base64 encoding therefore made distinct fan-out edges collide in the row
+  // primary key and silently prevented the runner from persisting any graph.
+  return createHash('sha256').update(edgeId).digest('hex');
 }

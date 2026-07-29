@@ -500,10 +500,107 @@ test('F3: a workflow step that hits its turn budget WITH progress auto-continues
   assert.notEqual((result.output as { blocked?: boolean }).blocked, true);
 });
 
-test('F3: cancellation during SDK auto-continue is re-thrown, never converted to prior partial output', async () => {
+test('workflow SDK continuations rotate physical leases and revoke the winner on completion', async () => {
+  const eventlog = await import('./eventlog.js');
+  const leases = await import('./dispatch-lease.js');
+  const session = eventlog.createSession({ kind: 'workflow' });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: 'wf-lease-run' });
+  const seen: NonNullable<Parameters<typeof leases.isDispatchLeaseCurrent>[0]>[] = [];
   let calls = 0;
-  setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
     calls += 1;
+    assert.ok(options.dispatchLease, 'production workflow attempt installs a physical dispatch lease');
+    assert.equal(leases.isDispatchLeaseCurrent(options.dispatchLease), true);
+    if (seen[0]) assert.equal(leases.isDispatchLeaseCurrent(seen[0]), false, 'continuation starts only after prior revoke');
+    seen.push(options.dispatchLease);
+    if (calls === 1) {
+      return {
+        text: 'partial',
+        sessionId: 'sdk-step',
+        model: 'claude-sonnet-5',
+        toolUses: ['mcp__clementine-local__read_file'],
+        limitHit: true,
+      };
+    }
+    return {
+      text: '{"status":"completed","output":{"ok":true}}',
+      structuredOutput: { status: 'completed', output: { ok: true } },
+      sessionId: 'sdk-step',
+      model: 'claude-sonnet-5',
+      toolUses: [],
+      limitHit: false,
+    };
+  });
+
+  try {
+    const result = await runClaudeAgentSdkWorkflowStep({
+      step,
+      workflowName: 'WF Lease',
+      prompt: 'finish the step',
+      modelId: 'claude-sonnet-5',
+      sessionId: session.id,
+      runAttemptId: attempt.attemptId,
+      fullLane: true,
+    });
+    assert.deepEqual(result.output, { ok: true });
+    assert.equal(calls, 2);
+    assert.notEqual(seen[0].leaseId, seen[1].leaseId);
+    assert.equal(leases.isDispatchLeaseCurrent(seen[1]), false, 'successful return revoked the final query');
+  } finally {
+    eventlog.finishRunAttempt(attempt, 'completed');
+  }
+});
+
+test('workflow SDK approval park revokes dispatch before returning control to the runner', async () => {
+  const eventlog = await import('./eventlog.js');
+  const leases = await import('./dispatch-lease.js');
+  const session = eventlog.createSession({ kind: 'workflow' });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: 'wf-park-lease-run' });
+  let captured: Parameters<typeof leases.isDispatchLeaseCurrent>[0];
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+    captured = options.dispatchLease;
+    assert.equal(leases.isDispatchLeaseCurrent(captured), true);
+    throw new sdkMod.ClaudeAgentSdkApprovalBoundaryError({
+      approvalId: 'apr-workflow-lease',
+      sessionId: session.id,
+      tool: 'composio_execute_tool',
+      args: { tool_slug: 'GMAIL_SEND_EMAIL' },
+      state: 'pending',
+    });
+  });
+
+  try {
+    await assert.rejects(
+      () => runClaudeAgentSdkWorkflowStep({
+        step,
+        workflowName: 'WF Lease',
+        prompt: 'send the approved message',
+        modelId: 'claude-sonnet-5',
+        sessionId: session.id,
+        runAttemptId: attempt.attemptId,
+        fullLane: true,
+        parkApprovals: true,
+      }),
+      (err: unknown) => err instanceof sdkMod.ClaudeAgentSdkApprovalBoundaryError,
+    );
+    assert.ok(captured);
+    assert.equal(leases.isDispatchLeaseCurrent(captured), false);
+  } finally {
+    eventlog.finishRunAttempt(attempt, 'interrupted');
+  }
+});
+
+test('F3: cancellation during SDK auto-continue is re-thrown, never converted to prior partial output', async () => {
+  const eventlog = await import('./eventlog.js');
+  const leases = await import('./dispatch-lease.js');
+  const session = eventlog.createSession({ kind: 'workflow' });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: 'wf-cancel-lease-run' });
+  let calls = 0;
+  const seen: NonNullable<Parameters<typeof leases.isDispatchLeaseCurrent>[0]>[] = [];
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+    calls += 1;
+    assert.ok(options.dispatchLease);
+    seen.push(options.dispatchLease);
     if (calls === 1) {
       return {
         text: 'partial progress',
@@ -522,12 +619,16 @@ test('F3: cancellation during SDK auto-continue is re-thrown, never converted to
       workflowName: 'WF',
       prompt: 'continue a long step',
       modelId: 'claude-sonnet-5',
+      sessionId: session.id,
+      runAttemptId: attempt.attemptId,
       sourceUserSeq: 88,
       shouldCancel: () => true,
     }),
     (err: unknown) => err instanceof AgentRuntimeCancelledError,
   );
   assert.equal(calls, 2, 'the stop lands on the first continuation and is not retried/swallowed');
+  assert.equal(seen.every((lease) => !leases.isDispatchLeaseCurrent(lease)), true);
+  eventlog.finishRunAttempt(attempt, 'cancelled');
 });
 
 test('F3: a step limit-hit with NO tool progress still BLOCKS (anti-loop)', async () => {

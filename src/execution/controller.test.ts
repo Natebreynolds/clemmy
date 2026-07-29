@@ -77,24 +77,28 @@ function assistantWithResponses(responses: string[]) {
 }
 
 test('controller mark_completed is rejected when the completion judge finds no evidence', async () => {
-  const execution = createExecution();
+  const execution = createExecution({
+    title: 'Evaluate the report',
+    objective: 'Evaluate whether the report addresses the stated risks.',
+    startedFromMessage: 'evaluate the report',
+  });
   let judgeCalls = 0;
   _setExecutionCompletionJudgeForTests(async (objective, evidence) => {
     judgeCalls += 1;
-    assert.match(objective, /Send the finished report/);
-    assert.match(evidence, /send the report next/i);
-    return { done: false, reason: 'no sent-message receipt or report artifact' };
+    assert.match(objective, /Evaluate whether the report/);
+    assert.match(evidence, /review the report next/i);
+    return { done: false, reason: 'no evaluation findings were provided' };
   });
 
   const { assistant } = assistantWithResponses([
     JSON.stringify({
       summary: 'promised completion',
-      actions: [{ type: 'mark_completed', summary: "I'll send the report next." }],
+      actions: [{ type: 'mark_completed', summary: "I'll review the report next." }],
     }),
     JSON.stringify({
       summary: 'Completion gap remains open.',
       status: 'active',
-      nextStep: 'Produce the send receipt and report artifact.',
+      nextStep: 'Produce the evaluation findings.',
       nextReviewMinutes: 30,
     }),
   ]);
@@ -111,7 +115,23 @@ test('controller mark_completed is rejected when the completion judge finds no e
 });
 
 test('controller mark_completed closes the execution when the completion judge passes', async () => {
-  const execution = createExecution();
+  const sessionId = `sess-controller-confirmed-${Math.random().toString(36).slice(2, 8)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'confirmed controller write' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the finished report.' },
+  });
+  const execution = createExecution({ sessionId, sourceUserSeq: source.seq });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-confirmed', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['customer@example.com'] },
+  });
   _setExecutionCompletionJudgeForTests(async () => ({ done: true, reason: 'receipt and artifact present' }));
   const { assistant } = assistantWithResponses([
     JSON.stringify({
@@ -240,22 +260,26 @@ test('controller queue_workflow writes through the shared workflow queue', async
 
 test('synthesis-driven completed status is rejected when judge validation fails', async () => {
   const store = new ExecutionStore();
-  const execution = createExecution();
+  const execution = createExecution({
+    title: 'Evaluate the report',
+    objective: 'Evaluate whether the report addresses the stated risks.',
+    startedFromMessage: 'evaluate the report',
+  });
   store.addActivity({
     executionId: execution.id,
     key: 'task:t1:completed',
     type: 'task_completed',
-    message: 'Task t1 completed, but no send receipt was produced.',
+    message: 'Task t1 completed, but no evaluation findings were produced.',
   });
   let judgeCalls = 0;
   _setExecutionCompletionJudgeForTests(async () => {
     judgeCalls += 1;
-    return { done: false, reason: 'the final receipt is missing' };
+    return { done: false, reason: 'the evaluation findings are missing' };
   });
 
   const { assistant } = assistantWithResponses([
     JSON.stringify({
-      summary: "I'll send the final receipt next.",
+      summary: "I'll produce the evaluation findings next.",
       status: 'completed',
       nextReviewMinutes: 30,
     }),

@@ -76,6 +76,8 @@ const {
   createSession,
   appendEvent,
   writeToolOutput,
+  beginRunAttempt,
+  finishRunAttempt,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, drainOrphanedToolCompletions, recipientGroundingNote } = await import('./loop.js');
@@ -3751,6 +3753,74 @@ test('runConversationFromResume: completed decision with empty reply is retried 
   const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
   assert.equal(completed.data.summary, 'Approved - continuing with the next step.');
   assert.doesNotMatch(String(completed.data.summary), /marked the turn complete|Internal log|Resumed approval/);
+});
+
+test('runConversationFromResume retains one outer attempt through the approved state and continuations', async () => {
+  resetEventLog();
+  const previousBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const agent = new Agent({ name: 'ResumeAttemptIdentityTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-attempt-identity' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'workflow-step-attempt-identity' });
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool',
+    callId: 'c1',
+    argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+  }]));
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'one exact action',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'X', arguments: '{}' },
+  });
+  const observedAttemptIds: Array<string | undefined> = [];
+  let calls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    observedAttemptIds.push(harnessRunContextStorage.getStore()?.runAttemptId);
+    calls += 1;
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: calls === 1
+        ? {
+            done: false,
+            nextAction: 'awaiting_handoff_result',
+            reply: 'Approved — continuing.',
+            summary: 'Approval resumed.',
+            reason: null,
+          }
+        : {
+            done: true,
+            nextAction: 'completed',
+            reply: 'The approved action and follow-up are complete.',
+            summary: 'Completed after approval.',
+            reason: null,
+          },
+    };
+  };
+
+  try {
+    const result = await runConversationFromResume({
+      agent,
+      sessionId: sess.id,
+      runAttemptId: attempt.attemptId,
+      decision: 'approve',
+      resolver: 'unit-test',
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.deepEqual(
+      observedAttemptIds,
+      [attempt.attemptId, attempt.attemptId],
+      'the resumed SDK state and its synthetic continuation retain the same outer attempt',
+    );
+  } finally {
+    finishRunAttempt(attempt, 'completed');
+    if (previousBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = previousBrackets;
+  }
 });
 
 test('honest-completion: RESUME path judges promise-shaped final replies before banking completion', async () => {

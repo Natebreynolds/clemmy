@@ -30,6 +30,12 @@ import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { recentExecutionToolEvidence } from './completion-evidence.js';
+import { isValidDelegationId } from '../agents/agent-delegations.js';
+import {
+  objectiveRequiresFreshExternalWrite,
+  objectiveRequiresMutatingEvidence,
+  type FreshExternalWriteEvidenceStatus,
+} from '../runtime/harness/tool-evidence.js';
 
 const logger = pino({ name: 'clementine-next.execution-controller' });
 
@@ -87,6 +93,9 @@ interface DelegationRecord {
   expectedOutput: string;
   status: 'pending' | 'in_progress' | 'completed';
   result?: string;
+  resultEvidence?: 'model_prose';
+  completedBy?: string;
+  onBehalfOf?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -166,6 +175,212 @@ async function validateExecutionCompletion(
   });
 }
 
+function delegationCriterionIsCognitive(
+  task: string,
+  expectedOutput: string,
+  result: string | undefined,
+  step?: PlanStep,
+): boolean {
+  if (!result?.trim()) return false;
+  const criterion = [
+    task,
+    expectedOutput,
+    step?.text ?? '',
+    step?.verify ?? '',
+  ].filter(Boolean).join('\n');
+  return !objectiveRequiresMutatingEvidence(criterion)
+    && !objectiveRequiresFreshExternalWrite(criterion);
+}
+
+type ExternalActionRequirement =
+  | 'email:send'
+  | 'email:reply'
+  | 'email:forward'
+  | 'message:send'
+  | 'call:outbound'
+  | 'calendar:write'
+  | 'social:publish'
+  | 'sheet:write'
+  | 'crm:write'
+  | 'notion:write'
+  | 'code-host:write'
+  | 'deploy'
+  | 'dispatch:send';
+
+function requiredExternalActionRequirements(text: string): ExternalActionRequirement[] {
+  const normalized = text.toLowerCase();
+  const requirements = new Set<ExternalActionRequirement>();
+  if (/\b(?:email|e-mail|gmail|outlook|mail)\b/.test(normalized)) {
+    if (/\bforward\b/.test(normalized)) requirements.add('email:forward');
+    else if (/\breply|respond\b/.test(normalized)) requirements.add('email:reply');
+    else requirements.add('email:send');
+  }
+  if (/\b(?:slack|teams|sms|dm)\b/.test(normalized)) requirements.add('message:send');
+  if (/\bcall\b/.test(normalized)) requirements.add('call:outbound');
+  if (/\b(?:calendar|appointment|meeting|event)\b/.test(normalized)) requirements.add('calendar:write');
+  if (/\b(?:publish|social|tweet|post)\b/.test(normalized)) requirements.add('social:publish');
+  if (/\b(?:sheet|spreadsheet|excel|airtable)\b/.test(normalized)) requirements.add('sheet:write');
+  if (/\b(?:salesforce|crm)\b/.test(normalized)) requirements.add('crm:write');
+  if (/\bnotion\b/.test(normalized)) requirements.add('notion:write');
+  if (/\b(?:github|gitlab|pull request|\\bpr\\b|issue|repository|repo)\b/.test(normalized)) {
+    requirements.add('code-host:write');
+  }
+  if (/\b(?:deploy|deployment|netlify|vercel|railway)\b/.test(normalized)) requirements.add('deploy');
+  const hasDispatchRequirement = [...requirements].some((requirement) =>
+    requirement.startsWith('email:')
+    || requirement === 'message:send'
+    || requirement === 'call:outbound'
+  );
+  if (
+    !hasDispatchRequirement
+    && /\b(?:send|forward|message|notify|invite)\b/.test(normalized)
+  ) {
+    requirements.add('dispatch:send');
+  }
+  return [...requirements];
+}
+
+function externalActionKeyMatches(
+  requirement: ExternalActionRequirement,
+  actionKey: string,
+): boolean {
+  const key = actionKey.toLowerCase();
+  switch (requirement) {
+    case 'email:send': return key === 'email:send' || key === 'email:send_draft';
+    case 'email:reply': return key === 'email:reply';
+    case 'email:forward': return key === 'email:forward';
+    case 'message:send': return key === 'message:send';
+    case 'call:outbound': return key === 'call:outbound';
+    case 'calendar:write': return /^(?:calendar|meeting):/.test(key);
+    case 'social:publish': return key === 'social:publish';
+    case 'sheet:write': return /(?:sheet|spreadsheet|excel|airtable)/.test(key);
+    case 'crm:write': return /\b(?:salesforce|crm)\b/.test(key);
+    case 'notion:write': return /\bnotion\b/.test(key);
+    case 'code-host:write': return /\b(?:github|gitlab|pull|repo|issue)\b/.test(key);
+    case 'deploy': return /\b(?:deploy|deployment|netlify|vercel|railway|publish)\b/.test(key);
+    case 'dispatch:send':
+      return /^(?:email:(?:send|send_draft|reply|forward)|message:send|invite:send|call:outbound)$/.test(key);
+  }
+}
+
+function externalRequirementsSatisfied(
+  requirements: ExternalActionRequirement[],
+  confirmedActionKeys: string[],
+): boolean {
+  return requirements.length > 0
+    && requirements.every((requirement) =>
+      confirmedActionKeys.some((actionKey) => externalActionKeyMatches(requirement, actionKey))
+    );
+}
+
+/**
+ * Deterministic completion boundary shared by synthesis and direct controller
+ * actions. A model judge may assess fuzzy objective quality, but it cannot
+ * overrule unfinished plan state or treat a delegate's own prose as
+ * independent verification.
+ */
+function deterministicCompletionPrecheck(
+  execution: ExecutionRecord,
+  plan?: PlanRecord,
+  externalWriteStatus: FreshExternalWriteEvidenceStatus = 'missing',
+  confirmedExternalActionKeys: string[] = [],
+): GoalValidationResult | null {
+  const perCriterion: NonNullable<GoalValidationResult['perCriterion']> = [];
+  const objectiveText = [execution.objective, execution.successCriteria ?? ''].filter(Boolean).join('\n');
+  const requiresExternalWrite = objectiveRequiresFreshExternalWrite(objectiveText);
+  const objectiveExternalRequirements = requiredExternalActionRequirements(objectiveText);
+  const toolEvidence = recentExecutionToolEvidence(execution);
+
+  for (const step of plan?.steps ?? []) {
+    perCriterion.push({
+      criterion: step.verify || step.text,
+      pass: step.status === 'done',
+      method: 'deterministic',
+      detail: `plan step is ${step.status}`,
+    });
+  }
+
+  if (requiresExternalWrite) {
+    const correlated = externalWriteStatus === 'confirmed'
+      && externalRequirementsSatisfied(objectiveExternalRequirements, confirmedExternalActionKeys);
+    perCriterion.push({
+      criterion: 'Fresh external-write receipt for this execution',
+      pass: correlated,
+      method: 'deterministic',
+      detail: correlated
+        ? `fresh external action coverage confirmed: ${objectiveExternalRequirements.join(', ')}`
+        : externalWriteStatus === 'confirmed'
+          ? `confirmed writes do not cover required action families: ${objectiveExternalRequirements.join(', ') || 'unclassified external action'}`
+        : `fresh external-write evidence is ${externalWriteStatus}`,
+    });
+  }
+
+  for (const binding of execution.delegationBindings ?? []) {
+    const boundStep = binding.planStepId
+      ? plan?.steps.find((step) => step.id === binding.planStepId)
+      : undefined;
+    const cognitiveDeliverable = delegationCriterionIsCognitive(
+      binding.task,
+      binding.expectedOutput,
+      binding.result,
+      boundStep,
+    );
+    const bindingCriterion = [
+      binding.task,
+      binding.expectedOutput,
+      boundStep?.text ?? '',
+      boundStep?.verify ?? '',
+    ].filter(Boolean).join('\n');
+    const bindingExternalRequirements = requiredExternalActionRequirements(bindingCriterion);
+    const correlatedExternalEvidence = externalWriteStatus === 'confirmed'
+      && externalRequirementsSatisfied(bindingExternalRequirements, confirmedExternalActionKeys);
+    const explicitlyLinkedToolEvidence = toolEvidence.includes(binding.delegationId);
+    const independentlyGrounded = cognitiveDeliverable
+      || (objectiveRequiresFreshExternalWrite(bindingCriterion)
+        ? correlatedExternalEvidence
+        : objectiveRequiresMutatingEvidence(bindingCriterion)
+          ? explicitlyLinkedToolEvidence
+          : true);
+    const verified = binding.status === 'completed'
+      && (
+        (binding.resultEvidence !== undefined && binding.resultEvidence !== 'model_prose')
+        || independentlyGrounded
+      );
+    perCriterion.push({
+      criterion: `Verify delegation ${binding.delegationId} from ${binding.toAgent}`,
+      pass: verified,
+      method: 'deterministic',
+      detail: binding.status !== 'completed'
+        ? `delegation is ${binding.status}`
+        : cognitiveDeliverable
+          ? 'reported prose is itself the non-mutating cognitive deliverable; objective acceptance is still judged'
+          : correlatedExternalEvidence
+            ? `reported world effect is covered by matching external action evidence: ${bindingExternalRequirements.join(', ')}`
+            : explicitlyLinkedToolEvidence
+              ? 'reported mutation has a tool receipt explicitly linked by delegation id'
+              : binding.resultEvidence === 'model_prose' || !binding.resultEvidence
+                ? 'delegation result is reported model prose; unrelated execution-wide evidence does not verify it'
+                : `delegation evidence is ${binding.resultEvidence}`,
+    });
+  }
+
+  const failed = perCriterion.filter((criterion) => !criterion.pass);
+  if (failed.length === 0) return null;
+  const criteriaMet = perCriterion.length - failed.length;
+  return {
+    pass: false,
+    advice: failed.some((criterion) => /external-write/i.test(criterion.criterion))
+      ? 'produce and verify the fresh external write required by this execution before closing it'
+      : failed.some((criterion) => /delegation/i.test(criterion.criterion))
+        ? 'verify the reported delegation result and finish any remaining work before closing the execution'
+      : `complete or verify the remaining plan step${failed.length === 1 ? '' : 's'} before closing the execution`,
+    perCriterion,
+    successRatePercent: Math.round((criteriaMet / Math.max(1, perCriterion.length)) * 100),
+    criteriaMet,
+    criteriaTotal: perCriterion.length,
+  };
+}
+
 function rejectExecutionCompletion(
   store: ExecutionStore,
   execution: ExecutionRecord,
@@ -201,8 +416,13 @@ function rejectExecutionCompletion(
   return updatedExecution;
 }
 
-function delegationFilePath(toAgent: string, id: string): string {
-  return path.join(DELEGATIONS_DIR, toAgent, `${id}.json`);
+function delegationFilePath(toAgent: string, id: string): string | null {
+  if (!isValidDelegationId(toAgent) || !isValidDelegationId(id)) return null;
+  const root = path.resolve(DELEGATIONS_DIR);
+  const queue = path.resolve(root, toAgent);
+  if (path.dirname(queue) !== root) return null;
+  const candidate = path.resolve(queue, `${id}.json`);
+  return path.dirname(candidate) === queue ? candidate : null;
 }
 
 function refreshExecutionContinuity(sessionId: string): void {
@@ -241,14 +461,16 @@ function loadWorkflowSummaries(): WorkflowSummary[] {
 }
 
 function readDelegationById(id: string): DelegationRecord | null {
-  if (!existsSync(DELEGATIONS_DIR)) return null;
+  if (!isValidDelegationId(id) || !existsSync(DELEGATIONS_DIR)) return null;
   for (const slug of readdirSync(DELEGATIONS_DIR)) {
     const filePath = delegationFilePath(slug, id);
-    if (!existsSync(filePath)) continue;
+    if (!filePath || !existsSync(filePath)) continue;
     try {
-      return JSON.parse(readFileSync(filePath, 'utf-8')) as DelegationRecord;
+      const record = JSON.parse(readFileSync(filePath, 'utf-8')) as DelegationRecord;
+      if (record.id !== id || record.toAgent !== slug) continue;
+      return record;
     } catch {
-      return null;
+      continue;
     }
   }
   return null;
@@ -259,6 +481,7 @@ function loadWorkflowRunStatus(runId: string): 'queued' | 'running' | 'completed
   if (!existsSync(filePath)) return 'error';
   try {
     const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as { status?: string };
+    if (parsed.status === 'finalizing') return 'running';
     return parsed.status === 'running' || parsed.status === 'completed' || parsed.status === 'error' ? parsed.status : 'queued';
   } catch {
     return 'error';
@@ -493,11 +716,11 @@ function syncWorkflowBindings(store: ExecutionStore, execution: ExecutionRecord)
 function syncDelegationBindings(store: ExecutionStore, plans: PlanStore, execution: ExecutionRecord, plan?: PlanRecord): {
   execution: ExecutionRecord;
   plan?: PlanRecord;
-  completedDelegations: Array<{ id: string; result?: string }>;
+  delegationReports: Array<{ id: string; result?: string }>;
 } {
   let changed = false;
   let nextPlan = plan;
-  const completedDelegations: Array<{ id: string; result?: string }> = [];
+  const delegationReports: Array<{ id: string; result?: string }> = [];
   const activity: Array<{
     key: string;
     type: NonNullable<ExecutionRecord['activity']>[number]['type'];
@@ -507,20 +730,56 @@ function syncDelegationBindings(store: ExecutionStore, plans: PlanStore, executi
   const updatedBindings = (execution.delegationBindings ?? []).map((binding) => {
     const record = readDelegationById(binding.delegationId);
     if (!record) return binding;
-    if (record.status === binding.status && record.result === binding.result) return binding;
+    const resultEvidence = record.resultEvidence ?? (record.status === 'completed' ? 'model_prose' : undefined);
+    const completedBy = record.completedBy?.trim() || (record.status === 'completed' ? binding.toAgent : undefined);
+    const onBehalfOf = record.onBehalfOf?.trim();
+    if (
+      record.status === binding.status
+      && record.result === binding.result
+      && resultEvidence === binding.resultEvidence
+      && completedBy === binding.completedBy
+      && onBehalfOf === binding.onBehalfOf
+    ) return binding;
     changed = true;
     if (record.status === 'completed') {
-      completedDelegations.push({ id: record.id, result: record.result });
+      delegationReports.push({ id: record.id, result: record.result });
+      const verified = resultEvidence !== undefined && resultEvidence !== 'model_prose';
+      const boundStep = binding.planStepId
+        ? nextPlan?.steps.find((step) => step.id === binding.planStepId)
+        : undefined;
+      const cognitiveDeliverable = delegationCriterionIsCognitive(
+        record.task,
+        record.expectedOutput,
+        record.result,
+        boundStep,
+      );
+      const actorLabel = onBehalfOf
+        ? `${completedBy} reported delegated work on behalf of ${onBehalfOf}`
+        : `${completedBy} reported delegated work`;
       activity.push({
         key: `delegation:${record.id}:completed`,
         type: 'delegation_completed',
         message: clean(
-          `${binding.toAgent} completed delegated work.${record.result ? ` ${record.result}` : ''}`,
+          verified
+            ? `${actorLabel} with verified evidence.${record.result ? ` ${record.result}` : ''}`
+            : `${actorLabel}; verification required.${record.result ? ` ${record.result}` : ''}`,
           500,
         ),
-        metadata: { delegationId: record.id, toAgent: binding.toAgent, result: record.result },
+        metadata: {
+          delegationId: record.id,
+          toAgent: binding.toAgent,
+          result: record.result,
+          completedBy,
+          ...(onBehalfOf ? { onBehalfOf } : {}),
+          resultEvidence,
+          verificationRequired: !verified,
+        },
       });
-      if (nextPlan && binding.planStepId) {
+      // A durable completion row is transport, not proof. Today delegated
+      // completions carry model prose only, so retain the result for synthesis
+      // but do not silently satisfy a bound plan step. A later evidence-aware
+      // controller/task transition can advance the step.
+      if (nextPlan && binding.planStepId && (verified || cognitiveDeliverable)) {
         nextPlan = plans.updateStep(nextPlan.id, binding.planStepId, 'done') ?? nextPlan;
       }
     }
@@ -529,27 +788,37 @@ function syncDelegationBindings(store: ExecutionStore, plans: PlanStore, executi
       status: record.status,
       updatedAt: record.updatedAt,
       result: record.result,
+      resultEvidence,
+      completedBy,
+      onBehalfOf,
     };
   });
 
   if (!changed) {
-    return { execution, plan: nextPlan, completedDelegations };
+    return { execution, plan: nextPlan, delegationReports };
   }
 
   let updatedExecution = store.update(execution.id, {
     delegationBindings: updatedBindings,
-    nextReviewAt: plusMinutes(completedDelegations.length > 0 ? 1 : 30),
+    nextReviewAt: plusMinutes(delegationReports.length > 0 ? 1 : 30),
   }) ?? execution;
-  if (completedDelegations.length > 0) {
+  if (delegationReports.length > 0) {
     updatedExecution = store.update(updatedExecution.id, {
-      lastAssistantSummary: clean(completedDelegations.map((item) => item.result || `Delegation ${item.id} completed.`).join(' | '), 400),
+      lastAssistantSummary: clean(
+        delegationReports
+          .map((item) => item.result
+            ? `Delegation ${item.id} reported (verification required): ${item.result}`
+            : `Delegation ${item.id} reported a result; verification required.`)
+          .join(' | '),
+        400,
+      ),
     }) ?? updatedExecution;
   }
   for (const item of activity) {
     updatedExecution = appendExecutionActivity(store, updatedExecution, item);
   }
   const syncedExecution = nextPlan ? store.syncWithPlan(updatedExecution.id, nextPlan) ?? updatedExecution : updatedExecution;
-  return { execution: syncedExecution, plan: nextPlan, completedDelegations };
+  return { execution: syncedExecution, plan: nextPlan, delegationReports };
 }
 
 function syncTaskBindings(store: ExecutionStore, plans: PlanStore, execution: ExecutionRecord, plan?: PlanRecord): {
@@ -618,7 +887,16 @@ function hasPendingTaskForStep(execution: ExecutionRecord, stepId?: string): boo
 }
 
 function hasPendingDelegationForStep(execution: ExecutionRecord, stepId?: string): boolean {
-  return Boolean((execution.delegationBindings ?? []).some((binding) => binding.planStepId === stepId && binding.status !== 'completed'));
+  return Boolean((execution.delegationBindings ?? []).some((binding) =>
+    binding.planStepId === stepId
+    && (
+      binding.status !== 'completed'
+      // Keep an unverified reported result attached to the current step so the
+      // controller can inspect/verify it instead of dispatching a duplicate.
+      || binding.resultEvidence === 'model_prose'
+      || (binding.status === 'completed' && !binding.resultEvidence)
+    )
+  ));
 }
 
 function hasPendingTaskDescription(execution: ExecutionRecord, description: string): boolean {
@@ -782,6 +1060,10 @@ function delegateExecutionStep(
     updatedAt: new Date().toISOString(),
   };
   const filePath = delegationFilePath(toAgent, record.id);
+  if (!filePath) {
+    logger.warn({ executionId: execution.id, toAgent }, 'Refused delegation with an unsafe queue owner or id');
+    return execution;
+  }
   ensureDir(path.dirname(filePath));
   writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf-8');
   logger.info({ executionId: execution.id, delegationId: record.id, toAgent }, 'Execution controller delegated step');
@@ -915,6 +1197,15 @@ async function applySynthesisDecision(
     if (writeTruth?.status === 'failed' || writeTruth?.status === 'ambiguous') {
       return writeTruth.execution;
     }
+    const deterministicBlock = deterministicCompletionPrecheck(
+      writeTruth?.execution ?? execution,
+      plan,
+      writeTruth?.status,
+      writeTruth?.confirmedActionKeys,
+    );
+    if (deterministicBlock) {
+      return rejectExecutionCompletion(store, execution, decision.summary, deterministicBlock, 'synthesis');
+    }
     const validation = await validateExecutionCompletion(execution, plan, decision.summary);
     if (!validation.pass) {
       return rejectExecutionCompletion(store, execution, decision.summary, validation, 'synthesis');
@@ -1031,7 +1322,14 @@ function buildControllerPrompt(execution: ExecutionRecord, plan: PlanRecord | un
     .map((binding) => `- ${binding.workflow} (${binding.runId}) | ${binding.status}`)
     .join('\n') || 'none';
   const delegationBindings = (execution.delegationBindings ?? [])
-    .map((binding) => `- ${binding.toAgent} (${binding.delegationId}) | ${binding.status} | ${binding.task}${binding.result ? ` | result: ${binding.result}` : ''}`)
+    .map((binding) => [
+      `- ${binding.toAgent} (${binding.delegationId}) | ${binding.status}`,
+      binding.resultEvidence ? `evidence=${binding.resultEvidence}` : '',
+      binding.completedBy ? `completedBy=${binding.completedBy}` : '',
+      binding.onBehalfOf ? `onBehalfOf=${binding.onBehalfOf}` : '',
+      binding.task,
+      binding.result ? `result: ${binding.result}` : '',
+    ].filter(Boolean).join(' | '))
     .join('\n') || 'none';
   const workflows = loadWorkflowSummaries()
     .filter((workflow) => workflow.enabled)
@@ -1073,6 +1371,7 @@ function buildControllerPrompt(execution: ExecutionRecord, plan: PlanRecord | un
     '- Use create_task when the next action should become a concrete tracked task.',
     '- Use queue_workflow only if the workflow exists by exact name.',
     '- Use delegate only if the target agent exists by exact slug and is a genuinely better owner for the step.',
+    '- A completed delegation labeled evidence=model_prose is a reported work product, not independent proof of an external effect. Inspect it and create the smallest verification task when the objective requires external truth.',
     '- Use mark_blocked when progress genuinely cannot continue without outside input or a missing dependency.',
     '- Use mark_completed only when the objective is satisfied.',
     '- Keep actions to 0-2 items.',
@@ -1238,6 +1537,22 @@ async function advanceExecution(assistant: ClementineAssistant, execution: Execu
           const writeTruth = store.reconcileExternalWriteTruth(currentExecution.id);
           if (writeTruth?.status === 'failed' || writeTruth?.status === 'ambiguous') {
             currentExecution = writeTruth.execution;
+            break;
+          }
+          const deterministicBlock = deterministicCompletionPrecheck(
+            writeTruth?.execution ?? currentExecution,
+            plan,
+            writeTruth?.status,
+            writeTruth?.confirmedActionKeys,
+          );
+          if (deterministicBlock) {
+            currentExecution = rejectExecutionCompletion(
+              store,
+              currentExecution,
+              summary,
+              deterministicBlock,
+              'controller',
+            );
             break;
           }
           const validation = await validateExecutionCompletion(currentExecution, plan, summary);

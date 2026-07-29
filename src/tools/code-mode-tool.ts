@@ -561,6 +561,8 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
   | 'defaultTimeoutMs'
   | 'turnRecallRunIds'
   | 'mcpToolScope'
+  | 'dispatchLease'
+  | 'runAttemptId'
 >> {
   const parent = harnessRunContextStorage.getStore();
   if (!parent || parent.sessionId !== sessionId) return {};
@@ -573,6 +575,8 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
     ...(parent.guardrailScopeId ? { guardrailScopeId: parent.guardrailScopeId } : {}),
     ...(parent.suppressBackgroundOffer ? { suppressBackgroundOffer: true } : {}),
     ...(parent.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
+    ...(parent.dispatchLease ? { dispatchLease: parent.dispatchLease } : {}),
+    ...(parent.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
     // recallBudget is deliberately NOT inherited (live 2026-07-24): the budget
     // protects the MODEL's context window, but a program-internal recall never
     // enters model context — only the program's clipped output does. Inheriting

@@ -97,7 +97,7 @@ test('decideToolApproval: task_hygiene is local bookkeeping and does not ask', (
 
 test('decideToolApproval: workspace authoring tools are local bookkeeping and do not ask', () => {
   setScope('strict');
-  for (const toolName of ['space_save', 'space_refresh', 'space_try_runner', 'space_edit_view', 'space_set_data']) {
+  for (const toolName of ['space_save', 'space_refresh', 'space_try_runner', 'space_edit_view', 'space_set_data', 'space_action_prepare']) {
     const decision = decideToolApproval({ toolName });
     assert.equal(decision.needsApproval, false, toolName);
     assert.equal(decision.reason, 'read-always-auto', toolName);

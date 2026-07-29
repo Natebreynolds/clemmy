@@ -463,6 +463,7 @@ export async function respondViaHarness(
     const agent = await buildAgentImpl({
       userInput: request.message,
       sessionId,
+      allowedToolNames: request.allowedToolNames,
       excludeToolNames: request.excludeToolNames,
       // Only surfaces flagged honorModel forward request.model (workflow steps);
       // every other surface keeps the harness's configured model (byte-identical).
@@ -482,6 +483,7 @@ export async function respondViaHarness(
       ? buildChatFalloverWiring({
           userInput: request.message,
           sessionId,
+          allowedToolNames: request.allowedToolNames,
           excludeToolNames: request.excludeToolNames,
           allowToolJit: true,
           buildAgent: buildAgentImpl,
@@ -519,6 +521,7 @@ export async function respondViaHarness(
       sessionId,
       input: request.message,
       sourceUserSeq: sourceUserEvent.seq,
+      runAttemptId: requestAttempt.attemptId,
       maxWallClockMs: request.maxWallClockMs,
       maxRunTokens: request.maxRunTokens,
       runTokenBaseline: request.runTokenBaseline,
@@ -679,7 +682,7 @@ export async function respondPreferHarness(
   legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
 ): Promise<AssistantResponse> {
   if (!harnessSurfaceEnabled(surface)) {
-    if (legacyRespondFallbackEnabled()) {
+    if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, reason: 'surface_disabled' }, 'explicit legacy respond fallback engaged');
       return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
     }
@@ -696,7 +699,7 @@ export async function respondPreferHarness(
   // caller's tool surface or bypass the harness. buildOrchestratorAgent does the
   // actual filtering for enforceable names.
   if (!harnessCanEnforceExcludes(request.excludeToolNames)) {
-    if (legacyRespondFallbackEnabled()) {
+    if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, excludeToolNames: request.excludeToolNames, reason: 'non_filterable_excludes' }, 'explicit legacy respond fallback engaged');
       return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
     }
@@ -715,7 +718,7 @@ export async function respondPreferHarness(
     auth = { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }
   if (!auth.ok) {
-    if (legacyRespondFallbackEnabled()) {
+    if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, reason: 'harness_auth_unavailable', authReason: auth.reason }, 'explicit legacy respond fallback engaged');
       return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
     }
@@ -979,9 +982,10 @@ type BuiltAgent = Awaited<ReturnType<typeof buildOrchestratorAgent>>;
 export function buildChatFalloverWiring(opts: {
   userInput: string;
   sessionId: string;
+  allowedToolNames?: string[];
   excludeToolNames?: string[];
   allowToolJit?: boolean;
-  buildAgent: (o: { userInput?: string; sessionId: string; excludeToolNames?: string[]; model?: string; allowToolJit?: boolean }) => Promise<BuiltAgent>;
+  buildAgent: (o: { userInput?: string; sessionId: string; allowedToolNames?: string[]; excludeToolNames?: string[]; model?: string; allowToolJit?: boolean }) => Promise<BuiltAgent>;
 }): { falloverModelIds?: string[]; rebuildAgentForBrain?: (modelId: string) => Promise<BuiltAgent> } {
   if (!chatBrainFalloverEnabled()) return {};
   try {
@@ -994,6 +998,7 @@ export function buildChatFalloverWiring(opts: {
       rebuildAgentForBrain: (modelId: string) => opts.buildAgent({
         userInput: opts.userInput,
         sessionId: opts.sessionId,
+        allowedToolNames: opts.allowedToolNames,
         excludeToolNames: opts.excludeToolNames,
         model: modelId,
         allowToolJit: opts.allowToolJit ?? true,

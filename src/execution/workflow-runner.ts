@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
@@ -63,15 +63,19 @@ import { loadSkill } from '../memory/skill-store.js';
 import {
   anchorRunGoal,
   offloadContextValue,
+  readItemOutputArtifact,
   readReduceDigest,
+  readStepOutputArtifact,
+  readStepOutputArtifactForValue,
+  recordItemOutput,
   recordReduceDigest,
   recordStepOutput,
   reduceDigestArtifactRelPath,
   runWorkspaceDir,
   runWorkspaceOffloadEnabled,
-  stepOutputArtifactRelPath,
   summarizeToolOutput,
   writeWorkspaceCheckerReport,
+  type StepOutputArtifactReference,
 } from './workflow-run-workspace.js';
 import { reduceShardMembers, reduceShardSize, reduceTierEnabled, shardFingerprint } from '../runtime/harness/fanout-reduce.js';
 import { resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
@@ -82,11 +86,13 @@ import { checkerReportFromVerdict } from './workflow-run-checker.js';
 import { compactWorkflowGoalEvidence, countNonEmptyLines } from './workflow-goal-evidence.js';
 import {
   appendWorkflowEvent,
+  appendWorkflowEventDurably,
   computeResumeState,
   listPendingRuns,
   readWorkflowEvents,
   type WorkflowEvent,
   type AttemptRecord,
+  type ResumeState,
   listWorkflowRunIds,
 } from './workflow-events.js';
 import { sumUsageTokensForSource, sumUsageTokensForRun } from '../runtime/usage-log.js';
@@ -223,9 +229,21 @@ import {
   renderWorkflowPatternHint,
 } from '../memory/workflow-pattern-store.js';
 import { workflowCodeRevisionFingerprint } from './workflow-code-certification.js';
-import { compileWorkflowStepsToGraph } from './workflow-graph.js';
+import {
+  compileWorkflowStepsToGraph,
+  validateWorkflowGraph,
+  WORKFLOW_GRAPH_ALLOWED_TOOLS,
+  WORKFLOW_GRAPH_ADDITIVE_NODE_MODE,
+  workflowGraphDynamicNodeIdError,
+  type WorkflowGraphDefinition,
+  type WorkflowGraphNode,
+} from './workflow-graph.js';
 import { resolveWorkflowReadiness } from './workflow-readiness.js';
-import { persistWorkflowGraphSnapshot } from './workflow-graph-store.js';
+import {
+  loadWorkflowGraphSnapshotByRunId,
+  persistWorkflowGraphSnapshot,
+} from './workflow-graph-store.js';
+import { reconcileWorkflowGraphPatchTelemetry } from './workflow-graph-reshape.js';
 import {
   claudeAgentSdkWorkflowStepEnabled,
   runClaudeAgentSdkWorkflowStep,
@@ -242,15 +260,49 @@ const logger = pino({ name: 'clementine-next.workflow-runner' });
 let buildWorkflowOrchestratorAgentImpl: typeof buildOrchestratorAgent = buildOrchestratorAgent;
 let runWorkflowConversationImpl: typeof runConversation = runConversation;
 let resumeWorkflowConversationImpl: typeof runConversationFromResume = runConversationFromResume;
+let configureWorkflowHarnessRuntimeImpl: typeof configureHarnessRuntime = configureHarnessRuntime;
+let beforeWorkflowGraphFinalizationForTests: ((input: {
+  workflowName: string;
+  runId: string;
+}) => void | Promise<void>) | null = null;
+let afterStepArtifactPersistForTests: ((input: {
+  workflowName: string;
+  runId: string;
+  stepId: string;
+  artifact: StepOutputArtifactReference;
+}) => void) | null = null;
 
 export function _setWorkflowHarnessLoopImplsForTests(input: {
   buildAgent?: typeof buildOrchestratorAgent;
   runConversation?: typeof runConversation;
   runConversationFromResume?: typeof runConversationFromResume;
+  configureRuntime?: typeof configureHarnessRuntime;
 } = {}): void {
   buildWorkflowOrchestratorAgentImpl = input.buildAgent ?? buildOrchestratorAgent;
   runWorkflowConversationImpl = input.runConversation ?? runConversation;
   resumeWorkflowConversationImpl = input.runConversationFromResume ?? runConversationFromResume;
+  configureWorkflowHarnessRuntimeImpl = input.configureRuntime ?? configureHarnessRuntime;
+}
+
+/** Deterministic race seam: production leaves this null. Tests can admit a
+ * graph patch after the scheduler's final refresh but before finalization. */
+export function _setBeforeWorkflowGraphFinalizationForTests(
+  fn: ((input: { workflowName: string; runId: string }) => void | Promise<void>) | null,
+): void {
+  beforeWorkflowGraphFinalizationForTests = fn;
+}
+
+/** Deterministic crash-window seam. Production leaves this null. A test can
+ * throw after the exact artifact is durable but before completion publication. */
+export function _setAfterStepArtifactPersistForTests(
+  fn: ((input: {
+    workflowName: string;
+    runId: string;
+    stepId: string;
+    artifact: StepOutputArtifactReference;
+  }) => void) | null,
+): void {
+  afterStepArtifactPersistForTests = fn;
 }
 
 /**
@@ -625,6 +677,12 @@ export interface QueuedRunRecord {
    * has the idempotent passive outcome turn. */
   reportBack?: WorkflowRunReportBackEnvelope;
   reportBackRetry?: WorkflowRunReportBackRetryState;
+  /**
+   * Terminal graph barrier. `finalizing` is a recoverable non-terminal state:
+   * reshape admission is closed, while a daemon restart may resume the run and
+   * reclaim the barrier before publishing terminal truth.
+   */
+  workflowGraphFinalizingFingerprint?: string;
 }
 
 /**
@@ -1436,12 +1494,25 @@ export function renderCallArgs(args: Record<string, unknown> | undefined, inputs
  *  and typed blocks as chat/Space) — a workflow exact-call can never dispatch
  *  under an ambiguous or non-compliant account. Args are rendered against
  *  inputs/upstream/(item). */
+let workflowCallNodeOverrideForTests:
+  | ((step: WorkflowStepInput, ctx: StepExecutionContext, item?: unknown) => Promise<unknown>)
+  | undefined;
+
+export function _setWorkflowCallNodeForTests(
+  override?: (step: WorkflowStepInput, ctx: StepExecutionContext, item?: unknown) => Promise<unknown>,
+): void {
+  workflowCallNodeOverrideForTests = override;
+}
+
 async function executeWorkflowCallNode(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
   item?: unknown,
   mutationItemKey?: string,
 ): Promise<unknown> {
+  if (workflowCallNodeOverrideForTests) {
+    return workflowCallNodeOverrideForTests(step, ctx, item);
+  }
   const call = step.call!;
   const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item, resolveWorkflowStepProjectContext(step, ctx.workflow));
   const durableReplay = replayWorkflowCallMutationSlot({
@@ -1803,6 +1874,10 @@ interface StepExecutionContext {
   /** Exact deterministic-code bundle admitted with this run. Older queued
    * records omit it and retain their legacy behavior. */
   admittedCodeRevision?: string;
+  /** Probe-based loopUntil attempts validate their external exit condition
+   * before publishing completion. The plain-step finalizer captures the exact
+   * output/meta here; the loop publishes it only after the probe passes. */
+  deferStepCompletion?: (output: unknown, meta?: Record<string, unknown>) => void;
 }
 
 function assertAdmittedWorkflowCodeRevision(ctx: Pick<
@@ -1992,6 +2067,9 @@ const WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS = parseInt(
 );
 
 function workflowHarnessEnabled(step: WorkflowStepInput): boolean {
+  // Graph-added nodes must never fall through to the legacy assistant.respond
+  // lane: that lane has no exact result-only tool-surface lock.
+  if (isGraphRuntimeWorkflowStep(step)) return true;
   if ((step as unknown as { useHarness?: boolean }).useHarness === false) return false;
   return process.env.WORKFLOW_USE_HARNESS !== 'off';
 }
@@ -2135,6 +2213,9 @@ function workflowStepUsesFullClaudeLane(step: WorkflowStepInput): boolean {
 }
 
 function workflowAutoApprovalTools(workflow: WorkflowDefinition, step: WorkflowStepInput): string[] {
+  if (isGraphRuntimeWorkflowStep(step)) {
+    return [...WORKFLOW_GRAPH_ALLOWED_TOOLS];
+  }
   if (step.allowedTools && step.allowedTools.length > 0) {
     return step.allowedTools;
   }
@@ -2391,7 +2472,35 @@ export const workflowRunnerInternalsForTest = {
   workflowHarnessRouteMarker,
   isWorkflowRunCancelled,
   sampleStepAttemptMetrics,
+  hydrateCompletedOutputArtifacts,
+  runStepVerifiedAttempt,
+  boundedStepOutputsForRunRecord,
+  graphContextForRun,
 };
+
+function graphContextForRun(
+  workflowName: string,
+  runId: string,
+): { workflowName: string; runId: string; allowedArtifactPaths: string[] } {
+  const owner = loadWorkflowGraphSnapshotByRunId(runId)?.workflowName ?? workflowName;
+  const resume = computeResumeState(owner, runId);
+  const allowedArtifactPaths = new Set(
+    Array.from(
+      resume.completedStepArtifacts.values(),
+      (reference) => reference.path,
+    ),
+  );
+  for (const itemReferences of resume.completedItemArtifacts.values()) {
+    for (const reference of itemReferences.values()) {
+      allowedArtifactPaths.add(reference.path);
+    }
+  }
+  return {
+    workflowName: owner,
+    runId,
+    allowedArtifactPaths: Array.from(allowedArtifactPaths),
+  };
+}
 
 async function runStepViaHarness(
   step: WorkflowStepInput,
@@ -2415,12 +2524,28 @@ async function runStepViaHarness(
   // model provider is registered lazily — without this, the first
   // model call inside runConversation fails with "Missing credentials.
   // Please pass an `apiKey`".
-  const auth = await configureHarnessRuntime();
+  const auth = await configureWorkflowHarnessRuntimeImpl();
   if (!auth.ok) {
     throw new Error(
       `Codex auth not configured for workflow step "${step.id}": ${auth.reason ?? 'unknown'}`,
     );
   }
+  // `workflowName` is the human display name at existing call sites, while
+  // durable run workspaces and definitions are keyed by slug. Resolve that
+  // storage identity once so large-context refs, model pins, and run history
+  // all point at the same owning workflow (live bug: "Live Graph Resume" was
+  // writing a second workspace beside `live-graph-resume`).
+  const workflowStorageName = (() => {
+    try {
+      const graphOwner = loadWorkflowGraphSnapshotByRunId(workflowRunId)?.workflowName;
+      if (graphOwner) return graphOwner;
+    } catch { /* legacy/no-graph fallback below */ }
+    try {
+      return listWorkflows().find((entry) => entry.data.name === workflowName)?.name ?? workflowName;
+    } catch {
+      return workflowName;
+    }
+  })();
   // Per-step harness sessions must be stable across daemon restarts.
   // If the prior process parked on approval, reusing the same session
   // is what prevents a second approval from being minted for the same
@@ -2456,7 +2581,7 @@ async function runStepViaHarness(
     // Definition lookup for the workflow-level model pins (owner ask,
     // 2026-07-24). Best-effort: unreadable definition reverts to defaults.
     const workflowDefForPin = ((): WorkflowDefinition | undefined => {
-      try { return readWorkflow(workflowName)?.data; } catch { return undefined; }
+      try { return readWorkflow(workflowStorageName)?.data; } catch { return undefined; }
     })();
     const workflowWorkerPin = workflowDefForPin?.models?.worker?.trim();
     if (workflowWorkerPin) {
@@ -2474,7 +2599,7 @@ async function runStepViaHarness(
     const graduatedSends = (() => {
       try {
         if (!isUnattendedScheduledRun(workflowRunId) || stepSideEffectClass(step) !== 'send') return [];
-        const priorSessions = listWorkflowRunIds(workflowName, 50)
+        const priorSessions = listWorkflowRunIds(workflowStorageName, 50)
           .filter((runId) => runId !== workflowRunId)
           .map((runId) => `workflow:${runId}:${step.id}`);
         return approvedSendSlugsForSessions(priorSessions).filter((slug) => isIrreversibleSendSlug(slug));
@@ -2551,8 +2676,8 @@ async function runStepViaHarness(
     // as a structured block AFTER the prose (never replacing it). This is
     // authoritative data the step can use even if a template token typo
     // dropped a value from the prose — it cannot be falsely starved.
-    const message = useWorkflowStepAgent() && stepContext
-      ? `${proseMessage}\n\n${renderStepContextBlock(stepContext, { workflowName, runId: workflowRunId })}`
+    const message = (isGraphRuntimeWorkflowStep(step) || useWorkflowStepAgent()) && stepContext
+      ? `${proseMessage}\n\n${renderStepContextBlock(stepContext, { workflowName: workflowStorageName, runId: workflowRunId })}`
       : proseMessage;
     const sourceUserEvent = recordRunAttemptUserInput(stepAttempt, {
       turn: 1,
@@ -2587,7 +2712,12 @@ async function runStepViaHarness(
         });
       } catch { /* trace is best-effort */ }
     };
-    if (stepModel && claudeAgentSdkWorkflowStepEnabled(stepModel) && workflowStepCanRunOnClaudeAgentSdk(step)) {
+    if (
+      !isGraphRuntimeWorkflowStep(step)
+      && stepModel
+      && claudeAgentSdkWorkflowStepEnabled(stepModel)
+      && workflowStepCanRunOnClaudeAgentSdk(step)
+    ) {
       const fullLane = workflowStepUsesFullClaudeLane(step);
       // Approved-payload replay (2026-07-21): a re-admitted parked step re-runs
       // the model, which RE-COMPOSES its payload — the exact-payload resume key
@@ -2615,6 +2745,7 @@ async function runStepViaHarness(
           // requirement, not a mutating-tool capability.
           sessionId: realSessionId,
           sourceUserSeq: sourceUserEvent.seq,
+          runAttemptId: stepAttempt.attemptId,
           // The one-per-run watcher performs the durable file reads. The SDK
           // calls this hook at every stream message, so keep this hot path an
           // in-memory point read instead of hammering the filesystem.
@@ -2685,7 +2816,7 @@ async function runStepViaHarness(
     }
     const route = workflowHarnessRoute(step, stepModel);
     appendWorkerRoute(workflowHarnessRouteMarker(step, stepModel, modelRoute.trace));
-    const scopedWorkflowStepAgent = useWorkflowStepAgent();
+    const scopedWorkflowStepAgent = isGraphRuntimeWorkflowStep(step) || useWorkflowStepAgent();
     const workflowMcpToolScope = scopedWorkflowStepAgent
       ? workflowStepExternalMcpScopeForLock(step.allowedTools)
       : undefined;
@@ -2694,6 +2825,12 @@ async function runStepViaHarness(
           userInput: message,
           sessionId: realSessionId,
           lockTools: step.allowedTools,
+          resultOnlyTools: isGraphRuntimeWorkflowStep(step),
+          ...(isGraphRuntimeWorkflowStep(step)
+            ? {
+                graphContext: graphContextForRun(workflowName, workflowRunId),
+              }
+            : {}),
           model: stepModel,
           mcpToolScope: workflowMcpToolScope,
         })
@@ -2712,6 +2849,7 @@ async function runStepViaHarness(
         sessionId: realSessionId,
         input: message,
         sourceUserSeq: sourceUserEvent.seq,
+        runAttemptId: stepAttempt.attemptId,
         mcpToolScope: workflowMcpToolScope,
         reuseRecordedUserInput: true,
         // P2-10: bound the step on the harness path too. The legacy path passes
@@ -2816,6 +2954,7 @@ async function runStepViaHarness(
       result = await resumeWorkflowConversationImpl({
         agent,
         sessionId: realSessionId,
+        runAttemptId: stepAttempt.attemptId,
         decision,
         resolver: 'workflow-runner',
       });
@@ -3453,15 +3592,13 @@ async function executeStepVerified(
     // emits workflow_node_blocked, not _completed.
     const errText = `Optional step "${step.id}" produced no data: ${reason.slice(0, 400)}`;
     const gap = { gap: true, ok: false, error: errText, reason: errText };
-    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-      kind: 'step_completed',
+    persistAndPublishStepCompletion({
+      workflowSlug: ctx.workflowSlug,
+      runId: ctx.runId,
       stepId: step.id,
       output: gap,
       meta: { softFailed: true, optional: true, blocked: true, error: reason.slice(0, 500) },
     });
-    try {
-      recordStepOutput({ workflowName: ctx.workflowSlug, runId: ctx.runId, stepId: step.id, output: gap, nowIso: new Date().toISOString() });
-    } catch { /* best-effort */ }
     logger.warn({ stepId: step.id, reason: reason.slice(0, 200) }, 'optional workflow step failed — continuing with a declared gap');
     return gap;
   }
@@ -3562,8 +3699,11 @@ async function runStepVerifiedAttempt(
   // Transient-retry wraps EXECUTION only. Verification is deterministic and
   // never transient-retried. Park/cancel signals propagate immediately (they
   // are not "retryable").
-  const runOnce = (attemptStep: WorkflowStepInput): Promise<unknown> =>
-    runWithStepRetry(() => executeStep(attemptStep, ctx), {
+  const runOnce = (
+    attemptStep: WorkflowStepInput,
+    attemptContext: StepExecutionContext = ctx,
+  ): Promise<unknown> =>
+    runWithStepRetry(() => executeStep(attemptStep, attemptContext), {
       budget,
       backoffBaseMs: RETRY_BACKOFF_BASE_MS,
       isRetryable: (err) =>
@@ -3603,7 +3743,15 @@ async function runStepVerifiedAttempt(
   const runAttempt = !stepHasLoopProbe(step)
     ? runOnce
     : async (attemptStep: WorkflowStepInput): Promise<unknown> => {
-      const output = await runOnce(attemptStep);
+      let deferredCompletion:
+        | { output: unknown; meta?: Record<string, unknown> }
+        | undefined;
+      const output = await runOnce(attemptStep, {
+        ...ctx,
+        deferStepCompletion: (capturedOutput, capturedMeta) => {
+          deferredCompletion = { output: capturedOutput, meta: capturedMeta };
+        },
+      });
       const probe = step.loopUntil!.probe!;
       assertAdmittedWorkflowCodeRevision(ctx);
       const probeOutput = await runDeterministicWorkflowStep(probe.runner, {
@@ -3625,6 +3773,21 @@ async function runStepVerifiedAttempt(
             'output_contract',
           );
         }
+        if (!deferredCompletion) {
+          throw new Error(
+            `Step "${step.id}" passed its loop probe without a deferred completion payload.`,
+          );
+        }
+        // The external exit condition is the commit boundary. A failed probe
+        // owns no step_completed event, so a daemon restart can never skip an
+        // unfinished poll/re-pursuit loop.
+        persistAndPublishStepCompletion({
+          workflowSlug: ctx.workflowSlug,
+          runId: ctx.runId,
+          stepId: step.id,
+          output: deferredCompletion.output,
+          meta: deferredCompletion.meta,
+        });
         return output;
       };
   const recordAttempts = attemptRecordsEnabled();
@@ -3748,12 +3911,181 @@ export class WorkflowContractViolationError extends Error {
 // isBlockedStepOutput moved to step-output-verify.ts (one truth for both gates).
 export { coerceOutputForContract } from './step-output-verify.js';
 
+function persistAndPublishStepCompletion(input: {
+  workflowSlug: string;
+  runId: string;
+  stepId: string;
+  output: unknown;
+  meta?: Record<string, unknown>;
+}): void {
+  const producedAt = new Date().toISOString();
+  const persisted = recordStepOutput({
+    workflowName: input.workflowSlug,
+    runId: input.runId,
+    stepId: input.stepId,
+    output: input.output,
+    nowIso: producedAt,
+  });
+  if (!persisted.sha256) {
+    throw new Error(`Step "${input.stepId}" output artifact was persisted without a SHA-256 reference.`);
+  }
+  const artifact: StepOutputArtifactReference = {
+    path: persisted.path,
+    sha256: persisted.sha256,
+    bytes: persisted.bytes,
+    producedAt: persisted.producedAt,
+  };
+  afterStepArtifactPersistForTests?.({
+    workflowName: input.workflowSlug,
+    runId: input.runId,
+    stepId: input.stepId,
+    artifact,
+  });
+  appendWorkflowEventDurably(input.workflowSlug, input.runId, {
+    kind: 'step_completed',
+    stepId: input.stepId,
+    output: input.output,
+    meta: {
+      ...(input.meta ?? {}),
+      stepOutputArtifact: artifact,
+    },
+  });
+}
+
+function persistAndPublishItemCompletion(input: {
+  workflowSlug: string;
+  runId: string;
+  stepId: string;
+  itemKey: string;
+  output: unknown;
+  meta?: Record<string, unknown>;
+}): void {
+  const producedAt = new Date().toISOString();
+  const persisted = recordItemOutput({
+    workflowName: input.workflowSlug,
+    runId: input.runId,
+    stepId: input.stepId,
+    itemKey: input.itemKey,
+    output: input.output,
+    nowIso: producedAt,
+  });
+  if (!persisted.sha256) {
+    throw new Error(
+      `Item "${input.stepId}/${input.itemKey}" output artifact was persisted without a SHA-256 reference.`,
+    );
+  }
+  appendWorkflowEventDurably(input.workflowSlug, input.runId, {
+    kind: 'item_completed',
+    stepId: input.stepId,
+    itemKey: input.itemKey,
+    output: input.output,
+    meta: {
+      ...(input.meta ?? {}),
+      itemOutputArtifact: {
+        path: persisted.path,
+        sha256: persisted.sha256,
+        bytes: persisted.bytes,
+        producedAt: persisted.producedAt,
+      },
+    },
+  });
+}
+
+function journalValueLooksCompacted(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return /\[…truncated \d+ bytes…\]\s*$/.test(value);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  return keys.length === 2
+    && keys[0] === 'preview'
+    && keys[1] === 'truncated'
+    && (value as { truncated?: unknown }).truncated === true
+    && typeof (value as { preview?: unknown }).preview === 'string';
+}
+
+/**
+ * Replace compact journal previews with the exact immutable bytes owned by each
+ * completion event. Completion authority still comes from events.jsonl; this
+ * only hydrates the value used by downstream execution, retry seeding, and the
+ * terminal report. Legacy events without an artifact reference retain their
+ * historical inline value.
+ */
+function hydrateCompletedOutputArtifacts(
+  resume: ResumeState,
+  workflowSlug: string,
+  runId: string,
+): ResumeState {
+  for (const [stepId, reference] of resume.completedStepArtifacts) {
+    const artifact = readStepOutputArtifact({
+      workflowName: workflowSlug,
+      runId,
+      stepId,
+      reference,
+    });
+    if (!artifact.found || !artifact.verified) {
+      throw new Error(
+        `Completed step "${stepId}" has an unreadable exact output artifact; refusing to use a compact preview. `
+        + `${artifact.error ?? 'The referenced artifact is missing.'}`,
+      );
+    }
+    resume.completedSteps.set(stepId, artifact.value);
+  }
+  for (const [stepId, value] of resume.completedSteps) {
+    if (
+      !resume.completedStepArtifacts.has(stepId)
+      && journalValueLooksCompacted(value)
+    ) {
+      throw new Error(
+        `Legacy completion for step "${stepId}" contains only a truncated journal preview and no exact artifact reference. `
+        + 'Refusing to treat partial bytes as completed work.',
+      );
+    }
+  }
+  for (const [stepId, itemReferences] of resume.completedItemArtifacts) {
+    let completedItems = resume.completedItems.get(stepId);
+    if (!completedItems) {
+      completedItems = new Map();
+      resume.completedItems.set(stepId, completedItems);
+    }
+    for (const [itemKey, reference] of itemReferences) {
+      const artifact = readItemOutputArtifact({
+        workflowName: workflowSlug,
+        runId,
+        stepId,
+        itemKey,
+        reference,
+      });
+      if (!artifact.found || !artifact.verified) {
+        throw new Error(
+          `Completed item "${stepId}/${itemKey}" has an unreadable exact output artifact; refusing to use a compact preview. `
+          + `${artifact.error ?? 'The referenced artifact is missing.'}`,
+        );
+      }
+      completedItems.set(itemKey, artifact.value);
+    }
+  }
+  for (const [stepId, completedItems] of resume.completedItems) {
+    const references = resume.completedItemArtifacts.get(stepId);
+    for (const [itemKey, value] of completedItems) {
+      if (!references?.has(itemKey) && journalValueLooksCompacted(value)) {
+        throw new Error(
+          `Legacy completion for item "${stepId}/${itemKey}" contains only a truncated journal preview and no exact artifact reference. `
+          + 'Refusing to aggregate partial bytes as completed work.',
+        );
+      }
+    }
+  }
+  return resume;
+}
+
 export function finalizeStepOutput(
   workflowSlug: string,
   runId: string,
   step: WorkflowStepInput,
   output: unknown,
   meta?: Record<string, unknown>,
+  publishCompletion = true,
 ): unknown {
   // Bind a JSON-text output to the declared contract shape BEFORE verifying, so
   // a step that emitted the right keys as text (not a structured object) passes
@@ -3807,22 +4139,49 @@ export function finalizeStepOutput(
       );
     }
   }
-  appendWorkflowEvent(workflowSlug, runId, {
-    kind: 'step_completed',
-    stepId: step.id,
-    output: bound,
-    // Tag a blocked-but-finalized step so telemetry emits workflow_node_blocked
-    // instead of workflow_node_completed — a block is NOT a success (it was
-    // counting as one, overstating reliability on the engine's central concept).
-    ...(meta || isBlockedOutput ? { meta: { ...(meta ?? {}), ...(isBlockedOutput ? { blocked: true } : {}) } } : {}),
-  });
-  // Persist the step's work product to the shared run workspace so the manifest
-  // is a complete, inspectable record of the run — what the live window shows
-  // and a checker agent reads. Best-effort: never blocks a completed step.
-  try {
-    recordStepOutput({ workflowName: workflowSlug, runId, stepId: step.id, output: bound, nowIso: new Date().toISOString() });
-  } catch { /* best-effort */ }
+  // Artifact first, completion journal second. If the process dies between
+  // these writes, restart sees an unreferenced artifact and safely re-runs the
+  // step. Once step_completed exists, its exact hash-verified bytes are already
+  // durable and cannot be replaced by a later pursuit.
+  if (publishCompletion) {
+    persistAndPublishStepCompletion({
+      workflowSlug,
+      runId,
+      stepId: step.id,
+      output: bound,
+      // Tag a blocked-but-finalized step so telemetry emits workflow_node_blocked
+      // instead of workflow_node_completed — a block is NOT a success.
+      ...(meta || isBlockedOutput
+        ? { meta: { ...(meta ?? {}), ...(isBlockedOutput ? { blocked: true } : {}) } }
+        : {}),
+    });
+  }
   return bound;
+}
+
+function finalizeOrDeferStepOutput(
+  ctx: StepExecutionContext,
+  step: WorkflowStepInput,
+  output: unknown,
+  meta?: Record<string, unknown>,
+): unknown {
+  const finalized = finalizeStepOutput(
+    ctx.workflowSlug,
+    ctx.runId,
+    step,
+    output,
+    meta,
+    !ctx.deferStepCompletion,
+  );
+  if (ctx.deferStepCompletion) {
+    ctx.deferStepCompletion(
+      finalized,
+      isBlockedStepOutput(finalized)
+        ? { ...(meta ?? {}), blocked: true }
+        : meta,
+    );
+  }
+  return finalized;
 }
 
 function collectStringLeaves(value: unknown, into: string[] = [], depth = 0): string[] {
@@ -4122,7 +4481,7 @@ export async function executeStep(
       });
       throw err;
     }
-    return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, callOutput, {
+    return finalizeOrDeferStepOutput(ctx, step, callOutput, {
       mode: 'call',
       tool: step.call.tool,
     });
@@ -4247,8 +4606,9 @@ export async function executeStep(
           if (stepSideEffectClass(step) !== 'read'
             && itemSendAlreadyFired(ctx.runId, step.id, key)) {
             const skipNote = '[skipped on resume — a prior external mutation for this item already fired; not repeated to avoid a duplicate. Verify it landed.]';
-            appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-              kind: 'item_completed',
+            persistAndPublishItemCompletion({
+              workflowSlug: ctx.workflowSlug,
+              runId: ctx.runId,
               stepId: step.id,
               itemKey: key,
               output: skipNote,
@@ -4378,8 +4738,9 @@ export async function executeStep(
             // Move 3: the Claude SDK lane's pure-text output skips runConversation's
             // content grounding — verify its figures per item (detection-only).
             if (itemLane === 'claude_sdk') await deferAdvisory(ctx, noteStepOutputGroundingAdvisory(step, itemSessionId, output, ctx, key));
-            appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-              kind: 'item_completed',
+            persistAndPublishItemCompletion({
+              workflowSlug: ctx.workflowSlug,
+              runId: ctx.runId,
               stepId: step.id,
               itemKey: key,
               output,
@@ -4640,9 +5001,10 @@ export async function executeStep(
     }
   }
 
-  const finalized = finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, output, {
+  const completionMeta = {
     modelRoute: workflowModelRouteMeta(stepRoute),
-  });
+  };
+  const finalized = finalizeOrDeferStepOutput(ctx, step, output, completionMeta);
   noteInferredOutputContractAdvisory(step, finalized, ctx);
   return finalized;
 }
@@ -5095,9 +5457,17 @@ function stepOutputArtifactRefForPrompt(
     return null;
   }
 
-  const workspacePath = stepOutputArtifactRelPath(stepId);
-  const absolutePath = path.join(runWorkspaceDir(opts.workflowName, opts.runId), workspacePath);
-  if (existsSync(absolutePath)) {
+  const artifact = readStepOutputArtifactForValue({
+    workflowName: opts.workflowName,
+    runId: opts.runId,
+    stepId,
+    value,
+  });
+  const workspacePath = artifact.verified ? artifact.path : undefined;
+  const absolutePath = workspacePath
+    ? path.join(runWorkspaceDir(opts.workflowName, opts.runId), workspacePath)
+    : null;
+  if (workspacePath && absolutePath && existsSync(absolutePath)) {
     // Stage 3: when a shard-reduced digest exists for this step, inline it so
     // the consumer (synthesis especially) reads real compressed content
     // instead of flying blind on a shape summary + path. Bounded; the exact
@@ -5544,7 +5914,11 @@ export function seedFailedItemRetryRun(
     }
   }
 
-  const source = computeResumeState(workflowSlug, fromRunId);
+  const source = hydrateCompletedOutputArtifacts(
+    computeResumeState(workflowSlug, fromRunId),
+    workflowSlug,
+    fromRunId,
+  );
   if (!source.completedSteps.has(retryStep.forEach)) {
     throw new Error(
       `Cannot retry failed items for "${stepId}" because source run "${fromRunId}" did not complete upstream step "${retryStep.forEach}".`,
@@ -5555,8 +5929,9 @@ export function seedFailedItemRetryRun(
   let inheritedSteps = 0;
   for (const [completedStepId, output] of source.completedSteps) {
     if (affectedSteps.has(completedStepId)) continue;
-    appendWorkflowEvent(workflowSlug, runId, {
-      kind: 'step_completed',
+    persistAndPublishStepCompletion({
+      workflowSlug,
+      runId,
       stepId: completedStepId,
       output,
       meta: { inheritedFromRunId: fromRunId, retryFailedItemsOnly: true },
@@ -5568,8 +5943,9 @@ export function seedFailedItemRetryRun(
   let inheritedItems = 0;
   for (const [itemKey, output] of source.completedItems.get(stepId) ?? new Map<string, unknown>()) {
     if (failedSet.has(itemKey)) continue;
-    appendWorkflowEvent(workflowSlug, runId, {
-      kind: 'item_completed',
+    persistAndPublishItemCompletion({
+      workflowSlug,
+      runId,
       stepId,
       itemKey,
       output,
@@ -5583,8 +5959,9 @@ export function seedFailedItemRetryRun(
     for (const itemKey of failedSet) {
       if (!itemSendAlreadyFired(fromRunId, stepId, itemKey)) continue;
       const skipNote = '[skipped on failed-item retry — a prior external mutation for this item already fired; not repeated to avoid a duplicate. Verify it landed.]';
-      appendWorkflowEvent(workflowSlug, runId, {
-        kind: 'item_completed',
+      persistAndPublishItemCompletion({
+        workflowSlug,
+        runId,
         stepId,
         itemKey,
         output: skipNote,
@@ -5725,6 +6102,291 @@ export function shouldHaltResumeForSideEffect(
   return null;
 }
 
+type GraphRuntimeWorkflowStep = WorkflowStepInput & {
+  /** In-memory only. Never authored or serialized into SKILL.md. */
+  __graphRuntimeAdded?: true;
+};
+
+function isGraphRuntimeWorkflowStep(step: WorkflowStepInput): step is GraphRuntimeWorkflowStep {
+  return (step as GraphRuntimeWorkflowStep).__graphRuntimeAdded === true;
+}
+
+export interface MaterializedWorkflowGraphSteps {
+  ok: boolean;
+  steps: WorkflowStepInput[];
+  errors: string[];
+}
+
+function graphAddedNodeSafetyErrors(node: WorkflowGraphNode): string[] {
+  const errors: string[] = [];
+  const idError = workflowGraphDynamicNodeIdError(node.id);
+  if (idError) errors.push(idError);
+  if (node.type !== 'step') {
+    errors.push(`Graph-added node "${node.id}" is type "${node.type}", but this release executes prompt steps only.`);
+  }
+  if (!node.prompt?.trim()) {
+    errors.push(`Graph-added node "${node.id}" has no executable prompt.`);
+  }
+  if (node.stepId && node.stepId !== node.id) {
+    errors.push(`Graph-added node "${node.id}" has mismatched stepId "${node.stepId}".`);
+  }
+  if (node.sideEffect && node.sideEffect !== 'read') {
+    errors.push(`Graph-added node "${node.id}" requests ${node.sideEffect} authority; only read-only nodes can execute.`);
+  }
+  if (node.deterministic) {
+    errors.push(`Graph-added node "${node.id}" requests script execution, which is outside the release-v3 graph contract.`);
+  }
+  if (node.forEach) {
+    errors.push(`Graph-added node "${node.id}" requests fan-out, which is outside the release-v3 graph contract.`);
+  }
+  if (node.usesSkill) {
+    errors.push(`Graph-added node "${node.id}" requests skill authority, which is outside the release-v3 graph contract.`);
+  }
+  if (node.loopUntil || node.loopSafe) {
+    errors.push(`Graph-added node "${node.id}" requests loop authority, which is outside the release-v3 graph contract.`);
+  }
+  const allowed = node.allowedTools ?? [];
+  if (
+    allowed.length > 0
+    && allowed.some(
+      (toolName) => !WORKFLOW_GRAPH_ALLOWED_TOOLS.includes(
+        toolName as (typeof WORKFLOW_GRAPH_ALLOWED_TOOLS)[number],
+      ),
+    )
+  ) {
+    errors.push(
+      `Graph-added node "${node.id}" requests work or wildcard authority; only ${WORKFLOW_GRAPH_ALLOWED_TOOLS.join(' and ')} are permitted.`,
+    );
+  }
+  const runtimeMode = node.config?.runtimeMode;
+  if (runtimeMode !== undefined && runtimeMode !== WORKFLOW_GRAPH_ADDITIVE_NODE_MODE) {
+    errors.push(`Graph-added node "${node.id}" declares unsupported runtime mode "${String(runtimeMode)}".`);
+  }
+  const toolAuthority = node.config?.toolAuthority;
+  if (toolAuthority !== undefined && toolAuthority !== 'result_only') {
+    errors.push(`Graph-added node "${node.id}" declares unsupported tool authority "${String(toolAuthority)}".`);
+  }
+  return errors;
+}
+
+/**
+ * Materialize a persisted graph's additive nodes into executable workflow
+ * steps. Authored steps remain canonical; the graph may only add safe prompt
+ * nodes and dependency edges whose target is one of those nodes.
+ */
+export function materializeWorkflowGraphSteps(
+  authoredSteps: WorkflowStepInput[],
+  graph: WorkflowGraphDefinition,
+): MaterializedWorkflowGraphSteps {
+  const errors = [...validateWorkflowGraph(graph).errors];
+  const authoredById = new Map(authoredSteps.map((step) => [step.id, step]));
+  const graphById = new Map(graph.nodes.map((node) => [node.id, node]));
+  const addedNodes = graph.nodes.filter((node) => !authoredById.has(node.id));
+  const addedIds = new Set(addedNodes.map((node) => node.id));
+  const base = compileWorkflowStepsToGraph(authoredSteps);
+  const baseNodeById = new Map(base.nodes.map((node) => [node.id, node]));
+
+  for (const authored of authoredSteps) {
+    const liveNode = graphById.get(authored.id);
+    if (!liveNode) {
+      errors.push(`Persisted graph removed authored node "${authored.id}"; release-v3 graphs are additive only.`);
+    } else if (JSON.stringify(liveNode) !== JSON.stringify(baseNodeById.get(authored.id))) {
+      errors.push(`Persisted graph altered authored node "${authored.id}"; authored execution authority is immutable.`);
+    }
+  }
+  for (const node of addedNodes) errors.push(...graphAddedNodeSafetyErrors(node));
+
+  const liveEdgeById = new Map(graph.edges.map((edge) => [edge.id, edge]));
+  const baseEdgeIds = new Set(base.edges.map((edge) => edge.id));
+  for (const baseEdge of base.edges) {
+    const live = liveEdgeById.get(baseEdge.id);
+    if (!live) {
+      errors.push(`Persisted graph removed authored edge "${baseEdge.id}"; release-v3 graphs are additive only.`);
+      continue;
+    }
+    if (
+      live.disabled
+      || live.source !== baseEdge.source
+      || live.target !== baseEdge.target
+      || live.type !== baseEdge.type
+    ) {
+      errors.push(`Persisted graph altered authored edge "${baseEdge.id}"; edge mutation is not executable in release v3.`);
+    }
+  }
+  for (const edge of graph.edges) {
+    if (baseEdgeIds.has(edge.id)) continue;
+    if (edge.disabled) {
+      errors.push(`Graph-added edge "${edge.id}" is disabled; release-v3 edges are additive and enabled.`);
+    }
+    if (edge.type !== 'dependency') {
+      errors.push(`Graph-added edge "${edge.id}" is type "${edge.type}"; dependency edges are the only executable type.`);
+    }
+    if (!addedIds.has(edge.target)) {
+      errors.push(`Graph-added edge "${edge.id}" targets authored node "${edge.target}"; authored topology is immutable.`);
+    }
+  }
+
+  if (errors.length > 0) {
+    return { ok: false, steps: authoredSteps, errors: [...new Set(errors)] };
+  }
+
+  const dynamicSteps = addedNodes.map((node): WorkflowStepInput => {
+    const dependsOn = graph.edges
+      .filter((edge) => !edge.disabled && edge.type === 'dependency' && edge.target === node.id)
+      .map((edge) => edge.source);
+    return {
+      id: node.id,
+      prompt: node.prompt!.trim(),
+      ...(dependsOn.length > 0 ? { dependsOn: [...new Set(dependsOn)] } : {}),
+      ...(node.model ? { model: node.model } : {}),
+      ...(node.intent ? { intent: node.intent } : {}),
+      ...(node.tier !== undefined ? { tier: node.tier } : {}),
+      ...(node.maxTurns !== undefined ? { maxTurns: node.maxTurns } : {}),
+      ...(node.inputs ? { inputs: node.inputs } : {}),
+      ...(node.output ? { output: node.output } : {}),
+      ...(node.retryBudget !== undefined ? { retryBudget: node.retryBudget } : {}),
+      sideEffect: 'read',
+      allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS],
+      useHarness: true,
+      __graphRuntimeAdded: true,
+    } as GraphRuntimeWorkflowStep;
+  });
+  return { ok: true, steps: [...authoredSteps, ...dynamicSteps], errors: [] };
+}
+
+interface LiveWorkflowExecutionPlan {
+  steps: WorkflowStepInput[];
+  graph: WorkflowGraphDefinition | null;
+  graphFingerprint: string | null;
+}
+
+/**
+ * A resumed run can deterministically normalize its admitted definition before
+ * execution (for example, adding an inferred output contract). Its persisted
+ * graph may already contain live additive nodes from an earlier daemon pass.
+ * Recompile only the authored portion and carry those dynamic additions
+ * forward; otherwise the safety check correctly sees the repaired authored
+ * node as a forbidden graph rewrite and the run can never resume.
+ */
+function rebasePersistedGraphAfterPreRunRepair(input: {
+  workflowSlug: string;
+  runId: string;
+  beforeSteps: WorkflowStepInput[];
+  afterSteps: WorkflowStepInput[];
+}): boolean {
+  const snapshot = loadWorkflowGraphSnapshotByRunId(input.runId);
+  if (!snapshot) return false;
+  if (snapshot.workflowName !== input.workflowSlug) {
+    throw new Error(
+      `Cannot rebase workflow graph for run "${input.runId}": graph owner `
+      + `"${snapshot.workflowName}" does not match "${input.workflowSlug}".`,
+    );
+  }
+
+  const previousBase = compileWorkflowStepsToGraph(input.beforeSteps);
+  const previousAuthoredNodeIds = new Set(previousBase.nodes.map((node) => node.id));
+  const previousAuthoredEdgeIds = new Set(previousBase.edges.map((edge) => edge.id));
+  const dynamicNodes = snapshot.graph.nodes
+    .filter((node) => !previousAuthoredNodeIds.has(node.id));
+  const dynamicEdges = snapshot.graph.edges
+    .filter((edge) => !previousAuthoredEdgeIds.has(edge.id));
+  const repairedBase = compileWorkflowStepsToGraph(input.afterSteps, {
+    id: snapshot.graph.id,
+    name: snapshot.graph.name,
+    version: snapshot.graph.version,
+    metadata: snapshot.graph.metadata,
+  });
+  const candidate: WorkflowGraphDefinition = {
+    ...snapshot.graph,
+    nodes: [...repairedBase.nodes, ...dynamicNodes],
+    edges: [...repairedBase.edges, ...dynamicEdges],
+  };
+  const validation = validateWorkflowGraph(candidate);
+  if (!validation.ok) {
+    throw new Error(
+      `Cannot safely rebase repaired workflow graph for run "${input.runId}": `
+      + validation.errors.join('; '),
+    );
+  }
+  candidate.entryNodeIds = validation.entryNodeIds;
+  persistWorkflowGraphSnapshot({
+    workflowName: input.workflowSlug,
+    runId: input.runId,
+    graph: candidate,
+  });
+  return true;
+}
+
+function workflowGraphFingerprint(graph: WorkflowGraphDefinition | null): string | null {
+  if (!graph) return null;
+  return createHash('sha256').update(JSON.stringify(graph)).digest('hex');
+}
+
+type WorkflowGraphFinalizationClaim = 'claimed' | 'graph_advanced' | 'inactive';
+
+/**
+ * Close reshape admission before any terminal-only judges, requeues, learning,
+ * notifications, or publication run. The graph fingerprint comparison and the
+ * `running -> finalizing` transition share the same run-record lock used by
+ * reshape admission. A patch that wins first leaves the run `running`; the next
+ * drain (including after restart) executes the newly materialized node. A claim
+ * that wins first makes reshape fail closed because `finalizing` is not active.
+ */
+function claimWorkflowGraphFinalization(input: {
+  filePath: string;
+  workflowName: string;
+  runId: string;
+  expectedFingerprint: string | null;
+}): WorkflowGraphFinalizationClaim {
+  return withWorkflowRunRecordLock(input.filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(input.filePath);
+    if (!current || current.id !== input.runId || isTerminalRunRecord(current)) return 'inactive';
+    if (current.status !== 'running' && current.status !== 'finalizing') return 'inactive';
+
+    const snapshot = loadWorkflowGraphSnapshotByRunId(input.runId);
+    if (snapshot && snapshot.workflowName !== input.workflowName) {
+      throw new Error(
+        `Persisted workflow graph ownership mismatch for run "${input.runId}": expected "${input.workflowName}", found "${snapshot.workflowName}".`,
+      );
+    }
+    const actualFingerprint = workflowGraphFingerprint(snapshot?.graph ?? null);
+    if (actualFingerprint !== input.expectedFingerprint) return 'graph_advanced';
+
+    writeWorkflowRunRecordDurablyUnlocked(input.filePath, {
+      ...current,
+      status: 'finalizing',
+      workflowGraphFinalizingFingerprint: input.expectedFingerprint ?? 'no_graph',
+    });
+    return 'claimed';
+  });
+}
+
+function loadLiveWorkflowExecutionPlan(
+  authoredSteps: WorkflowStepInput[],
+  workflowSlug: string,
+  runId: string,
+): LiveWorkflowExecutionPlan {
+  const snapshot = loadWorkflowGraphSnapshotByRunId(runId);
+  if (!snapshot) return { steps: authoredSteps, graph: null, graphFingerprint: null };
+  if (snapshot.workflowName !== workflowSlug) {
+    throw new Error(
+      `Persisted workflow graph ownership mismatch for run "${runId}": expected "${workflowSlug}", found "${snapshot.workflowName}".`,
+    );
+  }
+  reconcileWorkflowGraphPatchTelemetry(snapshot);
+  const materialized = materializeWorkflowGraphSteps(authoredSteps, snapshot.graph);
+  if (!materialized.ok) {
+    throw new Error(
+      `Persisted workflow graph for run "${runId}" is not executable under the additive read-only release contract: ${materialized.errors.join('; ')}`,
+    );
+  }
+  return {
+    steps: materialized.steps,
+    graph: snapshot.graph,
+    graphFingerprint: workflowGraphFingerprint(snapshot.graph),
+  };
+}
+
 async function executeWorkflow(
   workflow: WorkflowDefinition,
   workflowSlug: string,
@@ -5739,8 +6401,35 @@ async function executeWorkflow(
   mutationContractSnapshot?: unknown,
   capabilityResume?: WorkflowCapabilityBlockState,
   admittedCodeRevision?: string,
-): Promise<{ finalOutput: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>; qualityAdvisories: WorkflowQualityAdvisory[] }> {
-  const resume = computeResumeState(workflowSlug, runId);
+): Promise<{
+  finalOutput: string;
+  forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>;
+  qualityAdvisories: WorkflowQualityAdvisory[];
+  executionSteps: WorkflowStepInput[];
+  graphFingerprint: string | null;
+}> {
+  // Completion authorization comes from events.jsonl, while exact bytes come
+  // from the event-owned immutable artifact. Missing/corrupt referenced bytes
+  // are a hard durability error rather than silent compact-preview starvation.
+  const resume = hydrateCompletedOutputArtifacts(
+    computeResumeState(workflowSlug, runId),
+    workflowSlug,
+    runId,
+  );
+  let liveExecutionPlan = loadLiveWorkflowExecutionPlan(workflow.steps, workflowSlug, runId);
+  let allExecutionSteps = liveExecutionPlan.steps;
+  let executionWorkflow: WorkflowDefinition = {
+    ...workflow,
+    steps: allExecutionSteps,
+  };
+  const refreshLiveExecutionPlan = (): void => {
+    liveExecutionPlan = loadLiveWorkflowExecutionPlan(workflow.steps, workflowSlug, runId);
+    allExecutionSteps = liveExecutionPlan.steps;
+    executionWorkflow = {
+      ...workflow,
+      steps: allExecutionSteps,
+    };
+  };
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
@@ -5778,7 +6467,7 @@ async function executeWorkflow(
   // a human confirms before any re-run. (See shouldHaltResumeForSideEffect for
   // the exemptions: approval-gated steps and the targeted single-step re-run.)
   const inFlightStep = resume.inFlightStepId
-    ? workflow.steps.find((step) => step.id === resume.inFlightStepId)
+    ? allExecutionSteps.find((step) => step.id === resume.inFlightStepId)
     : undefined;
   const claimedExternalWrite = inFlightStep
     ? stepExternalWriteAlreadyClaimed(runId, inFlightStep.id)
@@ -5789,7 +6478,7 @@ async function executeWorkflow(
     ? mutationContractSnapshot
     : undefined;
   const durableMutationProtocolStepIds = new Set<string>();
-  for (const step of workflow.steps) {
+  for (const step of allExecutionSteps) {
     if (step.forEach || workflowStepMutationReceiptContract(step) !== 'structured_call_receipt') continue;
     if (
       sourceUsesMutationReceiptProtocol
@@ -5844,7 +6533,7 @@ async function executeWorkflow(
     provenNoDispatchStepIds.add(capabilityResume.stepId);
   }
   const resumeHalt = shouldHaltResumeForSideEffect(
-    workflow,
+    executionWorkflow,
     resume,
     targetStepId,
     {
@@ -5894,9 +6583,9 @@ async function executeWorkflow(
   // references in the prompt resolve to empty strings — the user is
   // explicitly asking to see this step in isolation. Synthesis is
   // skipped too; the step output is the final output.
-  const steps = targetStepId
-    ? workflow.steps.filter((s) => s.id === targetStepId)
-    : workflow.steps;
+  let steps = targetStepId
+    ? allExecutionSteps.filter((step) => step.id === targetStepId)
+    : allExecutionSteps;
 
   if (targetStepId) {
     const step = steps[0];
@@ -5914,7 +6603,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
+        workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -5951,7 +6640,14 @@ async function executeWorkflow(
         });
       } catch { /* the advisory must never fail a run */ }
     };
-    while (completedStepIds.size < steps.length) {
+    while (true) {
+      // Re-read the persisted graph at every scheduling boundary. A prompt
+      // node added by the batch that just finished therefore joins this same
+      // run; after a daemon restart the first pass materializes it identically.
+      refreshLiveExecutionPlan();
+      steps = allExecutionSteps;
+      if (steps.every((step) => completedStepIds.has(step.id))) break;
+
       // Give already-resolved watcher promises one microtask turn to publish
       // into the mailbox. This never waits for judge I/O: a slow check simply
       // remains in flight while the next graph batch starts.
@@ -5987,8 +6683,9 @@ async function executeWorkflow(
       for (const skipped of dependencySkips) {
         stepOutputs[skipped.stepId] = skipped.output;
         completedStepIds.add(skipped.stepId);
-        appendWorkflowEvent(workflowSlug, runId, {
-          kind: 'step_completed',
+        persistAndPublishStepCompletion({
+          workflowSlug,
+          runId,
           stepId: skipped.stepId,
           output: skipped.output,
           meta: {
@@ -5999,12 +6696,14 @@ async function executeWorkflow(
           },
         });
       }
-      if (completedStepIds.size >= steps.length) break;
+      if (steps.every((step) => completedStepIds.has(step.id))) continue;
       // Readiness comes from the graph (workflow-readiness.ts), so the
       // persisted/patched graph is what decides execution order rather than
       // only observing it. A definition that cannot progress surfaces as a
       // named stall instead of an exception thrown from inside the loop.
-      const readiness = resolveWorkflowReadiness(steps, completedStepIds);
+      const readiness = resolveWorkflowReadiness(steps, completedStepIds, {
+        graph: liveExecutionPlan.graph,
+      });
       if (readiness.structurallyStalled) {
         throw new Error(`Workflow dependency graph is blocked or cyclic: ${readiness.stalledDetail ?? 'no step can proceed'}`);
       }
@@ -6024,7 +6723,7 @@ async function executeWorkflow(
         throwIfWorkflowRunCancelled(runId);
         const completedItems = resume.completedItems.get(step.id) ?? new Map();
         const output = await executeStepVerified(step, {
-          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
+          workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
           ...(watcherSteer ? { watcherSteer } : {}),
         });
         return { step, output };
@@ -6077,7 +6776,7 @@ async function executeWorkflow(
       // Fail-open + silent when on-track/unsure; bounded checks and steers.
       if (
         watcherEnabled
-        && completedStepIds.size < steps.length
+        && steps.some((step) => !completedStepIds.has(step.id))
         && !watcherMailbox.inFlight
         && watcherInjections < MAX_WATCHER_INJECTIONS
         && watcherChecks < MAX_WATCHER_CHECKS
@@ -6121,7 +6820,7 @@ async function executeWorkflow(
       kind: 'step_started',
       stepId: '__synthesis__',
     });
-    const stepOutputsAsText = formatStepOutputs(workflow.steps, stepOutputs, { workflowName: workflowSlug, runId });
+    const stepOutputsAsText = formatStepOutputs(steps, stepOutputs, { workflowName: workflowSlug, runId });
     const synthesisPrompt = renderTemplate(workflow.synthesis.prompt, inputs, stepOutputs, undefined, resolveWorkflowStepProjectContext({}, workflow));
     const synthesisStep: WorkflowStepInput = {
       id: '__synthesis__',
@@ -6235,7 +6934,7 @@ async function executeWorkflow(
       : synthesisOutput != null
         ? JSON.stringify(synthesisOutput, null, 2)
         : '';
-    finalOutput = synthesisText || formatStepOutputs(workflow.steps, stepOutputs, { workflowName: workflowSlug, runId });
+    finalOutput = synthesisText || formatStepOutputs(steps, stepOutputs, { workflowName: workflowSlug, runId });
     throwIfWorkflowRunCancelled(runId);
     finalizeStepOutput(workflowSlug, runId, synthesisStep, finalOutput);
   } else {
@@ -6249,7 +6948,7 @@ async function executeWorkflow(
         },
       });
     }
-    finalOutput = formatStepOutputs(workflow.steps, stepOutputs, { workflowName: workflowSlug, runId });
+    finalOutput = formatStepOutputs(steps, stepOutputs, { workflowName: workflowSlug, runId });
   }
 
   // Join the deferred detection-only advisory judges (skill-execution,
@@ -6260,13 +6959,36 @@ async function executeWorkflow(
 
   // Record string-coerced step outputs on the run record for the
   // dashboard's recent-runs display (which expects strings).
-  return { finalOutput, forEachFailures, qualityAdvisories };
+  return {
+    finalOutput,
+    forEachFailures,
+    qualityAdvisories,
+    executionSteps: steps,
+    graphFingerprint: liveExecutionPlan.graphFingerprint,
+  };
 }
 
 function stringifyOutputs(stepOutputs: Record<string, unknown>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(stepOutputs)) {
-    out[k] = typeof v === 'string' ? v : JSON.stringify(v);
+    out[k] = typeof v === 'string' ? v : (JSON.stringify(v) ?? String(v));
+  }
+  return out;
+}
+
+function boundedStepOutputsForRunRecord(
+  stepOutputs: Record<string, unknown>,
+  opts: StepContextRenderOptions,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [stepId, value] of Object.entries(stepOutputs)) {
+    const projection = stepOutputValueForPrompt(stepId, value, opts);
+    const rendered = typeof projection === 'string'
+      ? projection
+      : (JSON.stringify(projection) ?? String(projection));
+    out[stepId] = rendered.length <= 12_000
+      ? rendered
+      : `${rendered.slice(0, 11_900)}\n...[bounded run-record projection; query the referenced workspace artifact for exact data]`;
   }
   return out;
 }
@@ -6609,7 +7331,7 @@ function serializedContextLength(value: unknown): number {
 
 function clipForContext(value: unknown): unknown {
   let json: string;
-  try { json = JSON.stringify(value); } catch { return '[unserializable]'; }
+  try { json = JSON.stringify(value) ?? String(value); } catch { return '[unserializable]'; }
   if (json.length <= STEP_CONTEXT_VALUE_CLIP) return value;
   // Head+tail preview of the SERIALIZED value (not a bare placeholder): a
   // downstream step keyed on a big upstream output (50 enriched records, a
@@ -6658,7 +7380,11 @@ function renderStepContextBlock(
 ): string {
   const payload: Record<string, unknown> = {
     input: Object.fromEntries(Object.entries(ctx.values).map(([k, v]) => [k, contextValueForPrompt(v, `input.${k}`, opts)])),
-    upstream: Object.fromEntries(Object.entries(ctx.upstream).map(([k, v]) => [k, contextValueForPrompt(v, `upstream.${k}`, opts)])),
+    upstream: Object.fromEntries(Object.entries(ctx.upstream).map(([k, v]) => [
+      k,
+      stepOutputArtifactRefForPrompt(k, v, opts)
+        ?? contextValueForPrompt(v, `upstream.${k}`, opts),
+    ])),
   };
   if (ctx.project !== undefined) payload.project = ctx.project;
   if (ctx.item !== undefined) payload.item = contextValueForPrompt(ctx.item, 'item', opts);
@@ -6790,12 +7516,19 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
     if (run.status === 'cancelled' && !run.notifiedAt) {
       notifyCancelledRunOnce(filePath, run);
     }
-    // Pick up queued runs and runs marked as running but never
-    // completed (resume after daemon restart). Also pick up a FRESH dry_run /
-    // creation_test request — but not one already finished.
+    // Pick up queued/running runs and a run that crashed after claiming the
+    // graph-finalization barrier. `finalizing` is deliberately resumable: the
+    // runner rechecks durable graph state before terminal truth is republished.
+    // Also pick up a FRESH dry_run / creation_test request — but not one already
+    // finished.
     if (run.status === 'dry_run' || run.status === 'creation_test') {
       if (run.finishedAt) continue;
-    } else if (run.status && run.status !== 'queued' && run.status !== 'running') {
+    } else if (
+      run.status
+      && run.status !== 'queued'
+      && run.status !== 'running'
+      && run.status !== 'finalizing'
+    ) {
       continue;
     }
     if (inFlightRunIds.has(run.id)) continue; // already draining in another slot
@@ -7680,11 +8413,19 @@ async function processOneRunFile(
       const prep = prepareWorkflowForWrite(workflow.data);
       if (prep.ok && prep.repairs.length > 0) {
         let repairAuthorized = false;
+        let graphRebased = false;
         withWorkflowRunRecordLock(filePath, () => {
           const authoritative = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
           if (!authoritative || isTerminalRunRecord(authoritative)) return;
           repairAuthorized = true;
+          const beforeRepairSteps = workflow.data.steps;
           workflow.data = prep.def;
+          graphRebased = rebasePersistedGraphAfterPreRunRepair({
+            workflowSlug: workflow.name,
+            runId: run.id,
+            beforeSteps: beforeRepairSteps,
+            afterSteps: prep.def.steps,
+          });
           // A snapshotted run may normalize its own admitted definition, but it
           // must never overwrite a newer workflow edit. Legacy runs keep the
           // prior best-effort persistence behavior for compatibility.
@@ -7700,6 +8441,7 @@ async function processOneRunFile(
                 repairs: prep.repairs.slice(0, 8),
                 definitionSource: definitionResolution.definitionSource,
                 persistedToWorkflow: definitionResolution.definitionSource === 'legacy_current',
+                graphRebased,
               },
             });
           } catch { /* best-effort */ }
@@ -7810,7 +8552,7 @@ async function processOneRunFile(
       return;
     }
 
-    const isResume = run.status === 'running';
+    const isResume = run.status === 'running' || run.status === 'finalizing';
     let runningRecord = writeRunRecord(filePath, {
       ...run,
       status: 'running',
@@ -7917,7 +8659,13 @@ async function processOneRunFile(
           itemKeys: run.retryFailedItemKeys,
         });
       }
-      const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(
+      const {
+        finalOutput,
+        forEachFailures,
+        qualityAdvisories,
+        executionSteps,
+        graphFingerprint,
+      } = await executeWorkflow(
         workflow.data,
         workflow.name,
         run.id,
@@ -7932,16 +8680,54 @@ async function processOneRunFile(
         capabilityResumeAuthority,
         definitionResolution.snapshot?.codeRevision,
       );
+      if (beforeWorkflowGraphFinalizationForTests) {
+        await beforeWorkflowGraphFinalizationForTests({
+          workflowName: workflow.name,
+          runId: run.id,
+        });
+      }
+      const graphFinalizationClaim = claimWorkflowGraphFinalization({
+        filePath,
+        workflowName: workflow.name,
+        runId: run.id,
+        expectedFingerprint: graphFingerprint,
+      });
+      if (graphFinalizationClaim !== 'claimed') {
+        if (graphFinalizationClaim === 'graph_advanced') {
+          // The patch already carries proposed/applied telemetry. This advisory
+          // makes the non-terminal handshake explicit in the run journal.
+          try {
+            appendWorkflowEvent(workflow.name, run.id, {
+              kind: 'step_advisory',
+              stepId: 'run',
+              meta: { reason: 'workflow_graph_advanced_before_terminal' },
+            });
+          } catch { /* restart-safe run state is authoritative */ }
+        }
+        return;
+      }
       throwIfWorkflowRunCancelled(run.id);
-      const resume = computeResumeState(workflow.name, run.id);
+      const executionWorkflowData: WorkflowDefinition = {
+        ...workflow.data,
+        steps: executionSteps,
+      };
+      const resume = hydrateCompletedOutputArtifacts(
+        computeResumeState(workflow.name, run.id),
+        workflow.name,
+        run.id,
+      );
       const rawStepOutputs = Object.fromEntries(resume.completedSteps);
       const stepOutputs = stringifyOutputs(rawStepOutputs);
+      const runRecordStepOutputs = boundedStepOutputsForRunRecord(
+        rawStepOutputs,
+        { workflowName: workflow.name, runId: run.id },
+      );
 
       // Self-heal: a step that returned {blocked:true} ran cleanly but
       // could not finish its job. Today that still marks "completed" and
       // dumps raw JSON. Detect it, diagnose the root cause, and offer a
       // fix — instead of silently reporting a misleading success.
-      const blockedSteps = detectBlockedSteps(stepOutputs, workflow.data.steps.map((s) => s.id));
+      const blockedSteps = detectBlockedSteps(stepOutputs, executionSteps.map((step) => step.id));
 
       // Wave 2.1 (substance gap): a read step that produced NO data while a
       // downstream step depends on it — the canonical "forEach over an empty
@@ -7957,7 +8743,7 @@ async function processOneRunFile(
       // RAW outputs (stepOutputs above is stringified → "[]"/"{}" read as non-empty).
       const emptyDeliverableReads = run.targetStepId
         ? []
-        : (() => { try { return detectEmptyDeliverableReads(workflow.data.steps, rawStepOutputs); } catch { return []; } })();
+        : (() => { try { return detectEmptyDeliverableReads(executionSteps, rawStepOutputs); } catch { return []; } })();
       for (const er of emptyDeliverableReads) {
         try {
           appendWorkflowEvent(workflow.name, run.id, {
@@ -7981,7 +8767,7 @@ async function processOneRunFile(
       // actually succeeded. Skipped for partial single-step re-runs and runs
       // with no deliverable; fully fail-open.
       const baseSuccessBody = renderSuccessBody({
-        steps: workflow.data.steps,
+        steps: executionSteps,
         stepOutputs,
         finalOutput,
         hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
@@ -8112,6 +8898,8 @@ async function processOneRunFile(
           verdict: goalVerdict,
           maxAttempts: runGoal.maxAttempts,
           priorRepursuits: run.goalAttempt ?? 0,
+          // A fresh re-pursuit receives the authored definition and a freshly
+          // compiled graph; run-local additive nodes do not cross run lineage.
           unsafeStepId: runUnsafeToRepursue(workflow.data.steps, new Set(resume.completedSteps.keys())),
           chronicallyFailing: shouldStopAutoHeal(workflow.name),
         });
@@ -8188,7 +8976,10 @@ async function processOneRunFile(
       // prompt; diagnosing it would auto-propose a bogus prompt rewrite. Such
       // steps still mark the run needs-attention (reports-back), just without a
       // fix offer.
-      const diagnosableBlocks = blockedSteps.filter((b) => b.kind === 'blocked');
+      const authoredStepIds = new Set(workflow.data.steps.map((step) => step.id));
+      const diagnosableBlocks = blockedSteps.filter(
+        (block) => block.kind === 'blocked' && authoredStepIds.has(block.stepId),
+      );
       let diagnosis: WorkflowDiagnosis | null = null;
       let proposedFix: ProposedFix | null = null;
       if (diagnosableBlocks.length > 0 && selfHealEnabled()) {
@@ -8203,13 +8994,13 @@ async function processOneRunFile(
           if (remembered) priorFix = { fixKind: remembered.fixKind, fixDescription: remembered.fixDescription, fixJson: JSON.stringify(remembered.fix) };
         } catch { /* recall is best-effort */ }
         diagnosis = await diagnoseWorkflowBlock({
-          workflow: workflow.data,
+          workflow: executionWorkflowData,
           blockedSteps: diagnosableBlocks,
           // The step's blocked reason usually carries the real tool error.
           toolErrors: diagnosableBlocks.map((b) => b.reason),
           // RSH-4: upstream reads that produced nothing but feed a downstream
           // step — so the Doctor can re-root a symptom block onto its real cause.
-          upstreamEmptyProducers: detectEmptyDeliverableReads(workflow.data.steps, rawStepOutputs),
+          upstreamEmptyProducers: detectEmptyDeliverableReads(executionSteps, rawStepOutputs),
           priorFix,
         });
         if (diagnosis) {
@@ -8262,7 +9053,7 @@ async function processOneRunFile(
           if ((run.selfHealAttempt ?? 0) > 0) {
             try { confirmPendingFix(run.id, new Date().toISOString()); } catch { /* best-effort */ }
           }
-          const stepSessionIds = (workflow.data.steps ?? []).map((s) => `workflow:${run.id}:${s.id}`);
+          const stepSessionIds = executionSteps.map((step) => `workflow:${run.id}:${step.id}`);
           const learningManifests = stepSessionIds.flatMap((sessionId) => {
             try { return summarizeWorkManifests(sessionId); } catch { return []; }
           });
@@ -8310,7 +9101,7 @@ async function processOneRunFile(
           if (!run.targetStepId && patternLearningDecision.receipt) {
             try {
               recordSuccessfulWorkflowPattern({
-                workflow: workflow.data,
+                workflow: executionWorkflowData,
                 workflowSlug: workflow.name,
                 runId: run.id,
                 finalOutput,
@@ -8318,13 +9109,20 @@ async function processOneRunFile(
               });
             } catch { /* pattern learning never affects the run */ }
             try {
+              // Contract tightening edits SKILL.md. Run-local graph nodes are
+              // deliberately excluded because they do not survive this run.
               tightenWorkflowContractsFromCleanRun(workflow.name, workflow.data, stepOutputs, run.id);
             } catch (err) {
               logger.warn({ workflow: workflow.name, err: err instanceof Error ? err.message : String(err) }, 'clean-run contract tightening skipped');
             }
           }
         } else if (needsAttention && !run.targetStepId) {
-          try { recordFailedWorkflowPattern({ workflow: workflow.data, workflowSlug: workflow.name }); } catch { /* best-effort */ }
+          try {
+            recordFailedWorkflowPattern({
+              workflow: executionWorkflowData,
+              workflowSlug: workflow.name,
+            });
+          } catch { /* best-effort */ }
         }
       };
       const autoHealPaused = needsAttention && prospectiveConsecutiveFailures >= escalateThreshold();
@@ -8337,7 +9135,7 @@ async function processOneRunFile(
         ...run,
         status: hasForEachFailures ? 'completed_with_errors' : 'completed',
         finishedAt: new Date().toISOString(),
-        stepOutputs,
+        stepOutputs: runRecordStepOutputs,
         output: finalOutput,
         ...(needsAttention
           ? { needsAttention: true, blockedSteps, proposedFixId: proposedFix?.id ?? null }
@@ -8423,6 +9221,8 @@ async function processOneRunFile(
         const healed = (healReverted || autoHealPaused) ? null : await tryAutoHealAndRequeue({
           run,
           workflowSlug: workflow.name,
+          // Auto-heal rewrites the durable authored definition. A run-local
+          // additive node may surface needs-attention but is never persisted.
           steps: workflow.data.steps,
           diagnosis,
           proposedFix,
@@ -8493,12 +9293,12 @@ async function processOneRunFile(
       // appended to the human body ONLY when concrete artifacts exist — and a run
       // that produced artifacts is by definition NOT a routine no-op, so this can
       // never break the quiet-day no-op silencing.
-      const runArtifacts = summarizeRunArtifacts(workflow.data.steps, rawStepOutputs);
+      const runArtifacts = summarizeRunArtifacts(executionSteps, rawStepOutputs);
       const succeededBecause = (runGoal && goalDecision?.action === 'satisfied')
         ? `goal met${typeof goalVerdict?.successRatePercent === 'number' ? ` (${goalVerdict.successRatePercent}%, ${goalVerdict.criteriaMet ?? '?'}/${goalVerdict.criteriaTotal ?? '?'} criteria)` : ''}`
         : (targetVerdict?.judged && targetVerdict.reached)
           ? 'reached the workflow target'
-          : `completed ${workflow.data.steps.length} step${workflow.data.steps.length === 1 ? '' : 's'}`;
+          : `completed ${executionSteps.length} step${executionSteps.length === 1 ? '' : 's'}`;
       const producedItems = [
         runArtifacts.counts.length ? runArtifacts.counts.join(', ') : '',
         ...runArtifacts.files,

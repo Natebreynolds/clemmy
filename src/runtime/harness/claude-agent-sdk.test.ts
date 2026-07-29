@@ -16,6 +16,7 @@ const eventlog = await import('./eventlog.js');
 const artifactLedger = await import('./artifact-ledger.js');
 const toolEconomy = await import('./tool-economy.js');
 const capabilityHealth = await import('./capability-health.js');
+const dispatchLease = await import('./dispatch-lease.js');
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
 const { formatAutoResolvedAskUserQuestionOutput } = await import('./terminal-tool.js');
 const {
@@ -1023,6 +1024,14 @@ test('buildClaudeAgentSdkLocalMcpServers exposes the local Clementine MCP in-pro
   assert.ok(local.instance, 'in-process MCP server instance should be present');
 });
 
+test('buildClaudeAgentSdkLocalMcpServers preserves an explicit empty authority boundary', () => {
+  assert.deepEqual(
+    buildClaudeAgentSdkLocalMcpServers('brain-session-decision-only', true, []),
+    {},
+    '[] means zero local MCP tools; only undefined may select the default surface',
+  );
+});
+
 test('buildClaudeAgentSdkLocalMcpServers marks only the selected local tools always-load for native deferral', () => {
   const servers = buildClaudeAgentSdkLocalMcpServers(
     'brain-session-deferred',
@@ -1046,7 +1055,14 @@ test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine M
       'brain-session-1',
       false,
       undefined,
-      { sourceUserSeq: 123 },
+      {
+        sourceUserSeq: 123,
+        dispatchLease: {
+          sessionId: 'brain-session-1',
+          scopeId: 'brain-session-1::sdk',
+          leaseId: 'lease-123',
+        },
+      },
     );
     const local = servers['clementine-local'] as any;
     assert.equal(local.type, 'stdio');
@@ -1055,6 +1071,14 @@ test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine M
     assert.equal(local.env.CLEMENTINE_HOME, TMP_HOME);
     assert.equal(local.env.CLEMENTINE_MCP_SESSION_ID, 'brain-session-1');
     assert.equal(local.env.CLEMENTINE_MCP_SOURCE_USER_SEQ, '123');
+    assert.deepEqual(
+      JSON.parse(local.env.CLEMENTINE_MCP_DISPATCH_LEASE_JSON),
+      {
+        sessionId: 'brain-session-1',
+        scopeId: 'brain-session-1::sdk',
+        leaseId: 'lease-123',
+      },
+    );
     assert.ok(Array.isArray(local.args));
     assert.ok(local.args.some((arg: string) => arg.includes('mcp-server')));
 
@@ -1766,6 +1790,47 @@ test('agentic SDK runs leave allowedTools empty so canUseTool is the permission 
   assert.deepEqual(verdict.updatedInput, { path: '/tmp/example.txt' });
 });
 
+test('Claude native canUseTool interrupts a superseded physical attempt', async () => {
+  const {
+    activateDispatchLease,
+    revokeDispatchLease,
+  } = await import('./dispatch-lease.js');
+  const session = eventlog.createSession({ kind: 'chat' });
+  const dispatchLease = activateDispatchLease({
+    sessionId: session.id,
+    scopeId: `${session.id}::sdk`,
+  });
+  const capture: { call?: any } = {};
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    capture.call = params;
+    return successQuery('ok');
+  }) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Read a file safely.',
+    sessionId: session.id,
+    modelId: 'claude-sonnet-4-6',
+    agentic: true,
+    dispatchLease,
+    allowedLocalMcpTools: ['read_file'],
+  });
+
+  const canUse = capture.call.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
+  revokeDispatchLease(dispatchLease);
+  const verdict = await canUse(
+    'mcp__clementine-local__read_file',
+    { path: '/tmp/example.txt' },
+    {
+      signal: new AbortController().signal,
+      toolUseID: 'toolu_stale_read',
+      requestId: 'req_stale_read',
+    },
+  );
+  assert.equal(verdict.behavior, 'deny');
+  assert.equal(verdict.interrupt, true);
+  assert.match(verdict.message, /no longer authoritative/i);
+});
+
 // Brain continuity: a Claude Agent SDK turn must feed its tool returns into the
 // SAME reflection pipeline the Codex loop uses, so Clementine learns from Claude
 // turns instead of going amnesiac. The Agent SDK runs its tool loop outside the
@@ -2016,6 +2081,144 @@ test('overload at first byte is retried and then succeeds (no tools ran yet)', a
   const r = await runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' });
   assert.equal(calls, 2, 'retried once');
   assert.equal(r.text, 'recovered');
+});
+
+test('internal query retries rotate subordinate leases before close/backoff and preserve the parent', async () => {
+  const priorInProcess = process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
+  process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP = 'off';
+  const session = eventlog.createSession({ kind: 'chat' });
+  const runAttempt = eventlog.beginRunAttempt(session.id, { runId: 'sdk-query-child-retry' });
+  const parent = dispatchLease.activateDispatchLease({
+    sessionId: session.id,
+    scopeId: `${session.id}::outer-sdk`,
+    runAttemptId: runAttempt.attemptId,
+  });
+  const queryLeases: dispatchLease.DispatchLeaseRef[] = [];
+  const currentInsideClose: boolean[] = [];
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    calls += 1;
+    const local = params.options.mcpServers['clementine-local'];
+    const child = dispatchLease.parseDispatchLease(
+      local?.env?.CLEMENTINE_MCP_DISPATCH_LEASE_JSON,
+    ) as dispatchLease.DispatchLeaseRef;
+    queryLeases.push(child);
+    const generator = calls === 1
+      ? (async function* () {
+          throw new Error('Claude Code returned an error result: API Error: 529 Overloaded');
+        })()
+      : (async function* () {
+          yield initOnlyMessage();
+          yield successResultMessage('recovered under child generation two');
+        })();
+    return Object.assign(generator, {
+      close() {
+        currentInsideClose.push(dispatchLease.isDispatchLeaseCurrent(child));
+      },
+      interrupt: async () => {},
+      setPermissionMode: async () => {},
+      setModel: async () => {},
+      setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
+      streamInput: async () => {},
+      stopTask: async () => false,
+      backgroundTasks: async () => false,
+    }) as Query;
+  }) as any);
+
+  try {
+    const result = await runClaudeAgentSdk({
+      prompt: 'recover once',
+      sessionId: session.id,
+      modelId: 'claude-sonnet-4-6',
+      dispatchLease: parent,
+    });
+    assert.equal(result.text, 'recovered under child generation two');
+    assert.equal(calls, 2);
+    assert.equal(new Set(queryLeases.map((lease) => lease.leaseId)).size, 2);
+    assert.ok(queryLeases.every(
+      (lease) =>
+        lease.parentScopeId === parent.scopeId
+        && lease.parentLeaseId === parent.leaseId,
+    ));
+    assert.deepEqual(
+      currentInsideClose,
+      [false, false],
+      'each generation is stale inside close(), including before internal retry backoff',
+    );
+    assert.equal(
+      dispatchLease.isDispatchLeaseCurrent(parent),
+      true,
+      'a healthy SDK worker/query return never revokes borrowed parent authority',
+    );
+  } finally {
+    dispatchLease.revokeDispatchLease(parent);
+    eventlog.finishRunAttempt(runAttempt, 'completed');
+    if (priorInProcess === undefined) delete process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
+    else process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP = priorInProcess;
+  }
+});
+
+test('wall-clock interrupt observes its query child already stale', async () => {
+  const priorInProcess = process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
+  process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP = 'off';
+  const session = eventlog.createSession({ kind: 'chat' });
+  const runAttempt = eventlog.beginRunAttempt(session.id, { runId: 'sdk-query-child-interrupt' });
+  const parent = dispatchLease.activateDispatchLease({
+    sessionId: session.id,
+    scopeId: `${session.id}::outer-sdk`,
+    runAttemptId: runAttempt.attemptId,
+  });
+  let currentInsideInterrupt: boolean | undefined;
+  let currentInsideClose: boolean | undefined;
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    const local = params.options.mcpServers['clementine-local'];
+    const child = dispatchLease.parseDispatchLease(
+      local?.env?.CLEMENTINE_MCP_DISPATCH_LEASE_JSON,
+    ) as dispatchLease.DispatchLeaseRef;
+    let yieldedInit = false;
+    return {
+      [Symbol.asyncIterator]() { return this; },
+      async next() {
+        if (!yieldedInit) {
+          yieldedInit = true;
+          return { done: false, value: initOnlyMessage() };
+        }
+        return new Promise<IteratorResult<SDKMessage>>(() => {});
+      },
+      async interrupt() {
+        currentInsideInterrupt = dispatchLease.isDispatchLeaseCurrent(child);
+      },
+      close() {
+        currentInsideClose = dispatchLease.isDispatchLeaseCurrent(child);
+      },
+      setPermissionMode: async () => {},
+      setModel: async () => {},
+      setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
+      streamInput: async () => {},
+      stopTask: async () => false,
+      backgroundTasks: async () => false,
+    } as unknown as Query;
+  }) as any);
+
+  try {
+    const result = await runClaudeAgentSdk({
+      prompt: 'stop at wall clock',
+      sessionId: session.id,
+      modelId: 'claude-sonnet-4-6',
+      dispatchLease: parent,
+      maxWallClockMs: 25,
+      livenessHeartbeatMs: 5,
+    });
+    assert.equal(result.limitHit, true);
+    assert.equal(currentInsideInterrupt, false);
+    assert.equal(currentInsideClose, false);
+    assert.equal(dispatchLease.isDispatchLeaseCurrent(parent), true);
+  } finally {
+    dispatchLease.revokeDispatchLease(parent);
+    eventlog.finishRunAttempt(runAttempt, 'completed');
+    if (priorInProcess === undefined) delete process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
+    else process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP = priorInProcess;
+  }
 });
 
 test('synchronous overload during query startup is retried before surfacing', async () => {
@@ -2485,12 +2688,14 @@ test('Phase 3: turnContext rides the USER turn (not the cached system append) so
   assert.doesNotMatch(capture.call.options.systemPrompt.append, /Current State|## Now/);
 });
 
-test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confirm-first approval does NOT self-abort the turn', async () => {
+test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confirm-first approval does NOT self-abort the turn', async (t) => {
   const prevPoll = process.env.CLEMMY_APPROVAL_POLL_MS;
   process.env.CLEMMY_APPROVAL_POLL_MS = '10'; // fast poll so the test resolves quickly
   const approvalRegistry = await import('./approval-registry.js');
   const { createSession, getSession } = await import('./eventlog.js');
   const sid = 'sdk-approval-wallclock';
+  let logicalNow = Date.now();
+  t.mock.method(Date, 'now', () => logicalNow);
   try {
     if (!getSession(sid)) createSession({ id: sid, kind: 'chat', title: 'approval wallclock' });
     setClaudeAgentSdkQueryForTest(((p: any) => {
@@ -2498,15 +2703,16 @@ test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confir
       return stubsFor((async function* () {
         yield initOnlyMessage();
         // A behaviorally mutating shell command registers an approval and
-        // AWAITS a human. Resolve it well after the active-work wall clock.
-        // That delay is spent INSIDE canUseTool → pausedMs, so it must NOT count
-        // toward the turn budget.
+        // AWAITS a human. Advance logical time well past the active-work wall
+        // clock immediately before resolving. Scheduler contention remains real,
+        // but cannot consume the assertion's logical budget.
         const callP = canUse('mcp__clementine-local__run_shell_command', { command: 'git push origin main' }, { signal: new AbortController().signal });
         setTimeout(() => {
+          logicalNow += 1_200;
           for (const row of approvalRegistry.listPending({ sessionId: sid })) {
             approvalRegistry.resolve(row.approvalId, 'approved', 'test');
           }
-        }, 1_200);
+        }, 25);
         await callP;
         yield successResultMessage('finished after the slow approval');
       })());
@@ -2517,11 +2723,8 @@ test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confir
       sessionId: sid,
       modelId: 'claude-sonnet-4-6',
       agentic: true,
-      // Leave enough headroom for module/event-loop scheduling when this file
-      // runs alongside the other heavy SDK suites. The former 40ms budget could
-      // expire on unrelated CPU contention before approval waiting dominated,
-      // producing a false release-gate failure. The 1.2s wait remains far above
-      // this budget, so a regression that counts paused time still fails.
+      // Logical approval time exceeds this budget. A regression that counts the
+      // paused interval still fails without relying on wall-clock scheduling.
       maxWallClockMs: 500,
       // Force the silent-iterator ticker to inspect the wall clock repeatedly
       // while canUseTool is still waiting. The regression used to pass only
@@ -2531,7 +2734,7 @@ test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confir
     });
 
     // WITHOUT the pausedMs exclusion this would limitHit (1.2s > 500ms). WITH it,
-    // wall - pausedMs remains below 500ms and the turn completes after approval.
+    // logical wall - pausedMs remains below 500ms and the turn completes.
     assert.notEqual(r.limitHit, true, 'a long approval wait must not trip the wall clock');
     assert.match(r.text, /finished after the slow approval/);
   } finally {
@@ -2627,9 +2830,9 @@ test('silent SDK waits emit rate-limited visible heartbeats before the wall-cloc
     // DETERMINISTIC MARGINS (sweep-flake fix 2026-07-23): the wall-clock
     // starts BEFORE the SDK setup work, so setup time (variable under load)
     // eats the window before the tick loop even starts — the original
-    // 24ms/6ms was a coin flip (failed 8/9 solo). 1000ms/100ms leaves ≥800ms
-    // of tick headroom even after slow setup: the ≥2 liveness bound needs
-    // only 200ms of ticking; the ≤11 bound is the rate limit
+    // 24ms/6ms was a coin flip (failed 8/9 solo). The tick emits before it
+    // checks the wall-clock stop, so even a first timer delayed past 1000ms
+    // guarantees one visible heartbeat. The ≤11 bound is the rate limit
     // (wallClock/cadence + 1) — a mis-rate-limited loop would blow past it.
     maxWallClockMs: 1_000,
     livenessHeartbeatMs: 100,
@@ -2637,7 +2840,7 @@ test('silent SDK waits emit rate-limited visible heartbeats before the wall-cloc
   assert.equal(r.limitHit, true);
   const beats = eventlog.listEvents(sid, { types: ['heartbeat'] })
     .filter((event) => event.data.kind === 'progress_check_in');
-  assert.ok(beats.length >= 2, 'the user/operator sees progress while iterator.next() is silent');
+  assert.ok(beats.length >= 1, 'the user/operator sees progress while iterator.next() is silent');
   assert.ok(beats.length <= 11, 'ticks stay rate-limited to the configured cadence');
   assert.ok(beats.every((event) => event.data.transport === 'claude_agent_sdk'));
   assert.equal(closed, 1);

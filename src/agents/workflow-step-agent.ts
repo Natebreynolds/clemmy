@@ -1,5 +1,8 @@
-import { Agent } from '@openai/agents';
+import { Agent, tool } from '@openai/agents';
 import type { Tool, ToolUseBehavior } from '@openai/agents';
+import { realpathSync } from 'node:fs';
+import path from 'node:path';
+import { z } from 'zod';
 import { MODELS } from '../config.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
@@ -21,6 +24,8 @@ import { buildCallTool } from '../tools/call-tool.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import { peekStepResult } from '../tools/step-result-tool.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
+import { runWorkspaceDir } from '../execution/workflow-run-workspace.js';
+import { queryWorkspaceArtifact } from '../tools/workspace-artifact-tools.js';
 
 import { harnessInputGuardrails, harnessOutputGuardrails } from '../runtime/harness/guardrails.js';
 
@@ -259,22 +264,101 @@ export interface BuildWorkflowStepAgentOptions {
    *  the agent's tool list is pruned to that family + the structural baseline,
    *  so a bound step can't drift onto composio. Omit / `['*']` → full surface. */
   lockTools?: string[] | null;
+  /**
+   * Runtime-added graph prompts are intentionally graph-restricted. This is
+   * stronger than an empty allowedTools array (which means "inherit the full
+   * surface") and stronger than the normal structural baseline: only the
+   * result channel and optional run-confined artifact query are exposed.
+   */
+  resultOnlyTools?: boolean;
+  /** Exact run workspace boundary and event-owned artifact allowlist for a
+   * graph-added node's one read helper. */
+  graphContext?: {
+    workflowName: string;
+    runId: string;
+    allowedArtifactPaths: string[];
+  };
   /** Per-step model override (the intent-routed worker model). Omit ⇒ the
    *  primary brain tier, byte-identical to before. The registered
    *  RouterModelProvider dispatches the id to its provider (Codex/Claude/BYO). */
   model?: string;
 }
 
+function pathIsInside(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+/**
+ * One narrowly-scoped reader for graph-added nodes. Large upstream values are
+ * represented as run-workspace refs; this tool can page those exact JSON rows
+ * without granting general filesystem, memory, notification, or MCP access.
+ */
+function buildGraphContextQueryTool(
+  context: NonNullable<BuildWorkflowStepAgentOptions['graphContext']>,
+): Tool<RuntimeContextValue> {
+  const allowedRelativePaths = new Set(
+    context.allowedArtifactPaths.map((entry) => path.normalize(entry)),
+  );
+  return tool({
+    name: 'workspace_artifact_query',
+    description: 'Query exact JSON/JSONL rows from this workflow run workspace only. Use the path supplied in STEP CONTEXT when an upstream value is offloaded.',
+    parameters: z.object({
+      path: z.string().min(1),
+      json_path: z.string().optional(),
+      fields: z.array(z.string()).optional(),
+      filter_field: z.string().optional(),
+      filter_contains: z.string().optional(),
+      filter_equals: z.string().optional(),
+      offset: z.number().int().min(0).optional(),
+      limit: z.number().int().min(1).max(200).optional(),
+      max_chars: z.number().int().min(100).max(50_000).optional(),
+    }),
+    execute: async (input) => {
+      try {
+        const root = realpathSync(runWorkspaceDir(context.workflowName, context.runId));
+        const candidate = path.isAbsolute(input.path)
+          ? input.path
+          : path.join(root, input.path);
+        const resolved = realpathSync(candidate);
+        if (!pathIsInside(root, resolved)) {
+          return `Refused: graph context reads are limited to this run workspace (${root}).`;
+        }
+        const workspaceRelative = path.normalize(path.relative(root, resolved));
+        if (!allowedRelativePaths.has(workspaceRelative)) {
+          return 'Refused: this artifact is not owned by a completed event in the active workflow run.';
+        }
+        const result = queryWorkspaceArtifact({ ...input, path: resolved });
+        return result.length <= 50_000
+          ? result
+          : `${result.slice(0, 50_000)}\n...[clipped; narrow the query or increase offset]`;
+      } catch (error) {
+        return `Graph context query failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    },
+  }) as Tool<RuntimeContextValue>;
+}
+
 export async function buildWorkflowStepAgent(
   options: BuildWorkflowStepAgentOptions = {},
 ): Promise<Agent<RuntimeContextValue, any>> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  const lockedTools = lockToolsForStep(
+  let lockedTools = lockToolsForStep(
     filterToolsForStep(all),
     options.lockTools,
   ) as Tool<RuntimeContextValue>[];
-  const surfaceLocked = stepAllowedToolsLock(options.lockTools);
-  const externalMcpScope = workflowStepExternalMcpScopeForLock(options.lockTools, options.mcpToolScope);
+  if (options.resultOnlyTools) {
+    const resultTool = lockedTools.find((toolRef) =>
+      (toolRef as { name?: string }).name === 'workflow_step_result');
+    lockedTools = [
+      ...(resultTool ? [resultTool] : []),
+      ...(options.graphContext ? [buildGraphContextQueryTool(options.graphContext)] : []),
+    ];
+  }
+  const surfaceLocked = options.resultOnlyTools || stepAllowedToolsLock(options.lockTools);
+  const externalMcpScope = options.resultOnlyTools
+    ? null
+    : workflowStepExternalMcpScopeForLock(options.lockTools, options.mcpToolScope);
 
   // Workflow steps now have the same schema-on-demand escape hatch as chat:
   // a tiny structural/acquisition kernel stays first-class; every other local
@@ -337,7 +421,15 @@ export async function buildWorkflowStepAgent(
   const learnedRecall = (!surfaceLocked && options.userInput)
     ? renderToolChoicesForContext(8, undefined, options.userInput)
     : '';
-  const staticInstructions = [STEP_INSTRUCTIONS, catalogBlock].filter(Boolean).join('\n\n');
+  const staticInstructions = [
+    STEP_INSTRUCTIONS,
+    ...(options.resultOnlyTools
+      ? [
+          'This is a graph-added read-only prompt node. You have no work tools, external MCP servers, general file access, notification authority, or wildcard authority. For an offloaded upstream value, workspace_artifact_query can page exact JSON rows from this run workspace only. Reason over the supplied prompt and step context, then return the result through workflow_step_result.',
+        ]
+      : []),
+    catalogBlock,
+  ].filter(Boolean).join('\n\n');
   const baseInstructions = harnessInstructions(staticInstructions, { includeRememberedToolChoices: false });
   const instructions = learnedRecall
     ? () => `${baseInstructions()}\n\n${learnedRecall}`

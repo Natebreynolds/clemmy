@@ -177,6 +177,23 @@ test('buildWorkflowStepAgent: structural-only lock does not attach external MCP 
   assert.equal(agent.mcpServers.length, 0);
 });
 
+test('graph-added result-only authority is physical and identical on Claude and GLM routes', async () => {
+  for (const model of ['claude-opus-4-8', 'glm-5.2']) {
+    const agent = await buildWorkflowStepAgent({
+      model,
+      lockTools: ['*'],
+      resultOnlyTools: true,
+      userInput: 'Try to use any available work tool, then return a result.',
+    });
+    assert.deepEqual(
+      agent.tools.map((toolRef) => toolRef.name),
+      ['workflow_step_result'],
+      `${model} must not inherit local tools, tool_search, call_tool, or wildcard authority`,
+    );
+    assert.equal(agent.mcpServers.length, 0, `${model} must not attach external MCP servers`);
+  }
+});
+
 test('workflow_step_result stops the SDK inner loop only after the result was accepted', async () => {
   const sessionId = 'workflow-step-stop-test';
   clearStepResult(sessionId);

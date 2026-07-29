@@ -23,7 +23,7 @@ export function workspaceSlugFromSessionId(sessionId: string): string | null {
 export const WORKSPACE_DOCK_TOOLS = [
   'space_get', 'space_get_view', 'space_list', 'space_edit_view', 'space_save', 'space_refresh',
   'space_get_runner', 'space_edit_runner', 'space_revert_runner', 'space_try_runner', 'space_set_data',
-  'space_history', 'space_diff', 'space_publish',
+  'space_history', 'space_diff', 'space_action_prepare', 'space_publish',
 ] as const;
 
 /**
@@ -59,7 +59,7 @@ export function buildWorkspaceContextPrimer(slug: string): string | null {
     `[workspace-context] Live Workspace: "${rec.title}" (slug: ${slug}). This is an ongoing collaboration about the surface, not a one-shot background job. Current sources: ${ds}. Current actions: ${acts}.`,
     `[workspace-contract — user-owned outcome, not a rigid procedure]\n${contract}\nPreserve this north star across view, data, actions, fan-out, and later edits. The model chooses the method; ask only when a material product choice is genuinely unresolved.`,
     `Operate through Workspace tools, never shell/file-system paths. NEVER write the Workspace HTML to a sandbox or scratch copy. Read manifest/data with space_get('${slug}'). For a view change, read the exact region with space_get_view('${slug}', '<nearby text>') then make a targeted space_edit_view('${slug}', [{find, replace}]). For a legacy data/query change, inspect statically with space_try_runner('${slug}', '<runner>'), edit the runner entrypoint with space_edit_runner, then call space_refresh('${slug}')—changed entrypoint bytes need a fresh pinned-entrypoint approval before execution; helpers, packages, CLIs, local files, auth state, and network remain live. Use a provably read-only Composio source for new data pulls. Use write_file + space_save only for a new/full rewrite or contract/source/action changes.`,
-    `Ground completion in the real tool result: a saved view is not proof that a data pull worked, and an empty/failed pull is not success. Exact dataset history is available on demand: use space_history('${slug}') for observation facts and space_diff('${slug}', '<source id>') for bounded changes. Never infer a delta from the current snapshot or semantic memory; if the diff reports insufficient history, say so. Workspace edits are versioned and reversible. If a schema is deferred, use tool_search then call_tool; report a missing capability only after that real dispatch says it is unavailable.`,
+    `Ground completion in the real tool result: a saved view is not proof that a data pull worked, and an empty/failed pull is not success. Exact dataset history is available on demand: use space_history('${slug}') for observation facts and space_diff('${slug}', '<source id>') for bounded changes. Never infer a delta from the current snapshot or semantic memory; if the diff reports insufficient history, say so. space_action_prepare queues approval, never execution. Workspace edits are versioned and reversible. If a schema is deferred, use tool_search then call_tool; report a missing capability only after that real dispatch says it is unavailable.`,
     `Reply like a colleague: lead with the user-visible outcome, then any honest blocker or open product choice. Keep slugs, file paths, evidence plumbing, and step narration internal. Never answer only "done", and never tell the user to refresh—the open surface updates itself.`,
   ].join('\n\n');
 }

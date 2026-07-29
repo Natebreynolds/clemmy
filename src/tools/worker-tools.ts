@@ -595,7 +595,14 @@ export function registerWorkerTools(server: McpServer): void {
         // of the module graph — mirrors code-mode-tool's runtime imports).
         assertWorkerMayStart();
         const result: { text: string; model?: string } = route.claudeLane
-          ? await runClaudeAgentSdkWorker(input, workerModel, sessionId, sourceUserSeq, mcpToolScope)
+          ? await runClaudeAgentSdkWorker(
+              input,
+              workerModel,
+              sessionId,
+              sourceUserSeq,
+              mcpToolScope,
+              harnessRunContextStorage.getStore()?.dispatchLease,
+            )
           : await (async () => {
               const { runCrossProviderWorker } = await import('../agents/sub-agents.js');
               return runCrossProviderWorker(input, workerModel, sessionId, sourceUserSeq, mcpToolScope);

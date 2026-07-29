@@ -7,11 +7,9 @@ test('flat model-facing operations map to real graph operations', () => {
   const { operations, errors } = toGraphOperations([
     { op: 'add_node', node_id: 'analyze-b', label: 'second branch', prompt: 'analyze the rest', side_effect: 'read' },
     { op: 'add_edge', source: 'pull', target: 'analyze-b' },
-    { op: 'disable_edge', edge_id: 'dependency:pull->analyze', reason: 'source rate-limited' },
-    { op: 'enable_edge', edge_id: 'dependency:pull->analyze' },
   ] as never);
   assert.deepEqual(errors, []);
-  assert.equal(operations.length, 4);
+  assert.equal(operations.length, 2);
 
   const added = operations[0] as { op: 'add_node'; node: Record<string, unknown> };
   assert.equal(added.node.id, 'analyze-b');
@@ -21,10 +19,25 @@ test('flat model-facing operations map to real graph operations', () => {
 
   const edge = operations[1] as { op: 'add_edge'; edge: { id: string; source: string; target: string } };
   assert.equal(edge.edge.id, 'dependency:pull->analyze-b', 'edge id matches the compiler convention');
+});
 
-  const disabled = operations[2] as { op: 'disable_edge'; edgeId: string; reason?: string };
-  assert.equal(disabled.edgeId, 'dependency:pull->analyze');
-  assert.equal(disabled.reason, 'source rate-limited');
+test('edge rewrite requests reach the graph boundary for an audited not-supported refusal', () => {
+  const { operations, errors } = toGraphOperations([
+    { op: 'disable_edge', edge_id: 'dependency:pull->analyze', reason: 'source rate-limited' },
+    { op: 'enable_edge', edge_id: 'dependency:pull->analyze' },
+  ] as never);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(operations, [
+    {
+      op: 'disable_edge',
+      edgeId: 'dependency:pull->analyze',
+      reason: 'source rate-limited',
+    },
+    {
+      op: 'enable_edge',
+      edgeId: 'dependency:pull->analyze',
+    },
+  ]);
 });
 
 test('incomplete operations are refused with the exact position and missing field', () => {

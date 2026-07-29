@@ -77,7 +77,7 @@ test('WORKSPACE_DOCK_TOOLS lists the tools a dock turn needs to edit', () => {
   assert.deepEqual([...WORKSPACE_DOCK_TOOLS], [
     'space_get', 'space_get_view', 'space_list', 'space_edit_view', 'space_save', 'space_refresh',
     'space_get_runner', 'space_edit_runner', 'space_revert_runner', 'space_try_runner', 'space_set_data',
-    'space_history', 'space_diff', 'space_publish',
+    'space_history', 'space_diff', 'space_action_prepare', 'space_publish',
   ]);
 });
 
@@ -89,12 +89,13 @@ test('WORKSPACE_DOCK_HOT_TOOLS is a strict common-operation subset', () => {
 
 test('the Claude tool profiles EXPOSE the space tools (the keystone fix)', () => {
   const full = sdk.defaultClaudeAgentSdkAllowedLocalTools('full');
-  for (const t of ['space_get', 'space_get_view', 'space_get_runner', 'space_list', 'space_history', 'space_diff', 'space_edit_view', 'space_edit_runner', 'space_revert_runner', 'space_save', 'space_refresh', 'space_try_runner', 'space_set_data', 'space_publish']) {
+  for (const t of ['space_get', 'space_get_view', 'space_get_runner', 'space_list', 'space_history', 'space_diff', 'space_edit_view', 'space_edit_runner', 'space_revert_runner', 'space_save', 'space_refresh', 'space_try_runner', 'space_set_data', 'space_action_prepare', 'space_publish']) {
     assert.ok(full.includes(t), `full profile missing ${t}`);
   }
   const authoring = sdk.defaultClaudeAgentSdkAllowedLocalTools('local_authoring');
   assert.ok(authoring.includes('space_save') && authoring.includes('space_edit_view'));
   assert.ok(authoring.includes('space_try_runner') && authoring.includes('space_set_data'));
+  assert.ok(authoring.includes('space_action_prepare'));
   // read-only gets the reads (incl. space_get_view, the view-HTML reader) but NOT
   // the writes/executors (space_save/edit/try_runner/set_data).
   const ro = sdk.defaultClaudeAgentSdkAllowedLocalTools('read_only');
@@ -102,4 +103,5 @@ test('the Claude tool profiles EXPOSE the space tools (the keystone fix)', () =>
   assert.ok(ro.includes('space_history') && ro.includes('space_diff'));
   assert.ok(!ro.includes('space_save') && !ro.includes('space_edit_view'));
   assert.ok(!ro.includes('space_try_runner') && !ro.includes('space_set_data'));
+  assert.ok(!ro.includes('space_action_prepare'));
 });

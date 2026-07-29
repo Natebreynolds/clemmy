@@ -10,6 +10,11 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 const { createClementineMcpServer } = await import('./mcp-server.js');
 const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
+const {
+  activateDispatchLease,
+  revokeDispatchLease,
+  StaleDispatchLeaseError,
+} = await import('../runtime/harness/dispatch-lease.js');
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -107,4 +112,39 @@ test('in-process MCP handlers inherit the exact SDK source turn', async () => {
   }>;
   const result = await registered.source_authority_probe.handler({});
   assert.deepEqual(JSON.parse(result.content[0].text), { sourceUserSeq: 91 });
+});
+
+test('in-process MCP refuses a superseded SDK attempt before entering its handler', async () => {
+  const session = createSession({ kind: 'chat' });
+  const dispatchLease = activateDispatchLease({
+    sessionId: session.id,
+    scopeId: `${session.id}::sdk`,
+  });
+  const server = createClementineMcpServer({
+    sessionId: session.id,
+    dispatchLease,
+    allowedTools: ['lease_probe'],
+  });
+  let handlerCalls = 0;
+  server.tool(
+    'lease_probe',
+    'test-only dispatch lease probe',
+    {},
+    async () => {
+      handlerCalls += 1;
+      return { content: [{ type: 'text' as const, text: 'ok' }] };
+    },
+  );
+  const registered = (server as any)._registeredTools as Record<string, {
+    handler: (input: Record<string, unknown>) => Promise<unknown>;
+  }>;
+
+  await registered.lease_probe.handler({});
+  assert.equal(handlerCalls, 1);
+  revokeDispatchLease(dispatchLease);
+  await assert.rejects(
+    registered.lease_probe.handler({}),
+    (err: unknown) => err instanceof StaleDispatchLeaseError,
+  );
+  assert.equal(handlerCalls, 1, 'stale call was rejected before handler bookkeeping/work');
 });

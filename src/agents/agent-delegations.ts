@@ -56,21 +56,49 @@ interface DelegationRecord {
   updatedAt: string;
 }
 
-function agentDir(slug: string): string {
-  return path.join(DELEGATIONS_DIR, slug);
+export interface DelegationTransitionResult {
+  ok: boolean;
+  message: string;
 }
 
-function filePath(slug: string, id: string): string {
-  return path.join(agentDir(slug), `${id}.json`);
+const DELEGATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+/** IDs cross a model boundary before reaching the filesystem. Keep them to
+ * the same compact filename alphabet used by every in-product producer. */
+export function isValidDelegationId(id: string): boolean {
+  return DELEGATION_ID_PATTERN.test(id);
+}
+
+function agentDir(slug: string): string | null {
+  if (!DELEGATION_ID_PATTERN.test(slug)) return null;
+  const root = path.resolve(DELEGATIONS_DIR);
+  const candidate = path.resolve(root, slug);
+  return path.dirname(candidate) === root ? candidate : null;
+}
+
+function filePath(slug: string, id: string): string | null {
+  if (!isValidDelegationId(id)) return null;
+  const dir = agentDir(slug);
+  if (!dir) return null;
+  const candidate = path.resolve(dir, `${id}.json`);
+  return path.dirname(candidate) === dir ? candidate : null;
 }
 
 function readOwn(slug: string): DelegationRecord[] {
+  const dir = agentDir(slug);
+  if (!dir) return [];
   try {
-    return readdirSync(agentDir(slug))
+    return readdirSync(dir)
       .filter((file) => file.endsWith('.json'))
       .map((file) => {
-        try { return JSON.parse(readFileSync(path.join(agentDir(slug), file), 'utf-8')) as DelegationRecord; }
-        catch { return null; }
+        const id = file.slice(0, -'.json'.length);
+        if (!isValidDelegationId(id)) return null;
+        try {
+          const record = JSON.parse(readFileSync(path.join(dir, file), 'utf-8')) as DelegationRecord;
+          return record.id === id && record.toAgent === slug ? record : null;
+        } catch {
+          return null;
+        }
       })
       .filter((record): record is DelegationRecord => record !== null);
   } catch {
@@ -80,13 +108,22 @@ function readOwn(slug: string): DelegationRecord[] {
 
 function readOne(slug: string, id: string): DelegationRecord | null {
   const file = filePath(slug, id);
-  if (!existsSync(file)) return null;
-  try { return JSON.parse(readFileSync(file, 'utf-8')) as DelegationRecord; }
-  catch { return null; }
+  if (!file || !existsSync(file)) return null;
+  try {
+    const record = JSON.parse(readFileSync(file, 'utf-8')) as DelegationRecord;
+    return record.id === id && record.toAgent === slug ? record : null;
+  } catch {
+    return null;
+  }
 }
 
 function write(slug: string, record: DelegationRecord): void {
-  writeFileSync(filePath(slug, record.id), JSON.stringify(record, null, 2), 'utf-8');
+  if (record.toAgent !== slug) {
+    throw new Error('delegation record owner does not match its queue');
+  }
+  const file = filePath(slug, record.id);
+  if (!file) throw new Error('invalid delegation queue or id');
+  writeFileSync(file, JSON.stringify(record, null, 2), 'utf-8');
 }
 
 function leaseHeld(record: DelegationRecord, now: number): boolean {
@@ -120,16 +157,33 @@ export function renderOpenDelegations(slug: string): string {
  * scoped to the agent's own queue, so another agent's work is not merely
  * refused — it is unreachable.
  */
-export function claimDelegationFor(agentSlug: string, delegationId: string): string {
+export function claimDelegationTransitionFor(
+  agentSlug: string,
+  delegationId: string,
+): DelegationTransitionResult {
   const record = readOne(agentSlug, delegationId);
-  if (!record) return `Delegation ${delegationId} is not assigned to you (not in your queue).`;
-  if (record.status === 'completed') return `Delegation ${delegationId} is already completed.`;
+  if (!record) {
+    return {
+      ok: false,
+      message: `Delegation ${delegationId} is not assigned to you (invalid id or not in your queue).`,
+    };
+  }
+  if (record.status === 'completed') {
+    return { ok: true, message: `Delegation ${delegationId} is already completed.` };
+  }
   if (leaseHeld(record, Date.now())) {
-    return `Delegation ${delegationId} is already in progress (claimed ${record.claimedAt}). Continue it rather than starting over.`;
+    return {
+      ok: true,
+      message: `Delegation ${delegationId} is already in progress (claimed ${record.claimedAt}). Continue it rather than starting over.`,
+    };
   }
   const now = new Date().toISOString();
   write(agentSlug, { ...record, status: 'in_progress', claimedBy: agentSlug, claimedAt: now, updatedAt: now });
-  return `Claimed delegation ${delegationId}: ${record.task}`;
+  return { ok: true, message: `Claimed delegation ${delegationId}: ${record.task}` };
+}
+
+export function claimDelegationFor(agentSlug: string, delegationId: string): string {
+  return claimDelegationTransitionFor(agentSlug, delegationId).message;
 }
 
 /**
@@ -137,23 +191,40 @@ export function claimDelegationFor(agentSlug: string, delegationId: string): str
  * completion transition, so the first result is authoritative — a repeat
  * reports instead of rewriting history.
  */
-export function completeDelegationFor(
+export function completeDelegationTransitionFor(
   agentSlug: string,
   delegationId: string,
   result: string,
   evidence: 'model_prose' = 'model_prose',
-): string {
+): DelegationTransitionResult {
   const record = readOne(agentSlug, delegationId);
-  if (!record) return `Delegation ${delegationId} is not assigned to you (not in your queue).`;
+  if (!record) {
+    return {
+      ok: false,
+      message: `Delegation ${delegationId} is not assigned to you (invalid id or not in your queue).`,
+    };
+  }
   if (record.status === 'completed') {
-    return `Delegation ${delegationId} is already completed. Recorded result: ${record.result ?? '(none)'}`;
+    return {
+      ok: true,
+      message: `Delegation ${delegationId} is already completed. Recorded result: ${record.result ?? '(none)'}`,
+    };
   }
   const now = new Date().toISOString();
   // Provenance is written, never inferred: today every delegation completion
   // is the model's own prose, and the record says so outright rather than
   // letting a consumer read it as independently verified work.
   write(agentSlug, { ...record, status: 'completed', result, resultEvidence: evidence, completedBy: agentSlug, updatedAt: now });
-  return `Completed delegation ${delegationId} for ${record.fromAgent}.`;
+  return { ok: true, message: `Reported delegation ${delegationId} result for ${record.fromAgent}; verification required.` };
+}
+
+export function completeDelegationFor(
+  agentSlug: string,
+  delegationId: string,
+  result: string,
+  evidence: 'model_prose' = 'model_prose',
+): string {
+  return completeDelegationTransitionFor(agentSlug, delegationId, result, evidence).message;
 }
 
 /**

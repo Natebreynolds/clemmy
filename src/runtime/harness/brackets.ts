@@ -126,6 +126,11 @@ import {
   type ArtifactIntent,
 } from './artifact-ledger.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
+import {
+  assertDispatchLeaseCurrent,
+  StaleDispatchLeaseError,
+  type DispatchLeaseRef,
+} from './dispatch-lease.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -929,6 +934,13 @@ export class RecallBudget {
 export interface HarnessRunContext {
   sessionId: string;
   counter: ToolCallsCounter;
+  /** Exact physical provider/Runner generation allowed to dispatch tools.
+   * Transport cancellation is best-effort; this durable lease is checked at
+   * tool entry and again immediately before provider/local execution. */
+  dispatchLease?: DispatchLeaseRef;
+  /** Outer durable request attempt, when one exists. Used to invalidate a
+   * child-process lease once the request reaches a terminal state. */
+  runAttemptId?: string;
   /** Exact external MCP authority for this run. `undefined` preserves legacy
    * callers; `null` is an explicit no-external-tools boundary. Nested carriers
    * must inherit this field so a remembered/guessed namespaced tool cannot
@@ -1857,6 +1869,16 @@ function creditRecallFromToolResult(
 // read prior<threshold in the await gap and none trip the batch floor — the
 // exact 10-email incident on the worker lane. This chains the gate's critical
 // section per session so each send sees the prior's append.
+let beforeSharedWriteAdmissionForTests:
+  | ((kind: 'shell' | 'generic') => void | Promise<void>)
+  | null = null;
+
+export function _setBeforeSharedWriteAdmissionForTests(
+  hook: ((kind: 'shell' | 'generic') => void | Promise<void>) | null,
+): void {
+  beforeSharedWriteAdmissionForTests = hook;
+}
+
 export function wrapToolForHarness<T extends WrappableTool>(
   tool: T,
   options: WrapToolOptions = {},
@@ -1916,6 +1938,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
   ): Promise<string | undefined> => {
     const ctx = harnessRunContextStorage.getStore();
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
+    // 0. Physical-attempt authority. This must precede counters, artifact
+    // claims, write reservations, and every other bookkeeping side effect.
+    assertDispatchLeaseCurrent(ctx.dispatchLease);
     // 1. Kill check
     assertNotKilled(
       ctx.sessionId,
@@ -2711,9 +2736,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
         : '';
       const mutation = command ? classifyShellNetworkMutation(command) : { isNetworkMutation: false as const };
       if (mutation.isNetworkMutation && mutation.shapeKey) {
+        await beforeSharedWriteAdmissionForTests?.('shell');
         await withExternalWriteAdmissionLock(
           externalWriteAdmissionKey(ctx.sessionId),
           async () => {
+            // FIRST operation under the durable admission lock. Recovery may
+            // revoke while optional judges run before this callback; a stale
+            // attempt must not consume consent, reserve, or invoke.
+            assertDispatchLeaseCurrent(ctx.dispatchLease);
             const correlationFingerprint = toolCallCorrelationFingerprint(tool.name, parsedInput);
             const duplicateTargets = extractDuplicateIdentityKeys(command);
             const ledgerTargets = Array.from(new Set([
@@ -2777,9 +2807,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
       const sessionRow = getSession(ctx.sessionId);
       const shape = classifyExternalWrite(tool.name, parsedInput);
       if (shape.mutating && shape.shapeKey) {
+        await beforeSharedWriteAdmissionForTests?.('generic');
         await withExternalWriteAdmissionLock(
           externalWriteAdmissionKey(ctx.sessionId),
           async () => {
+            // FIRST operation under the durable admission lock. This is the
+            // reverse-order half of revoke-vs-reserve serialization.
+            assertDispatchLeaseCurrent(ctx.dispatchLease);
             const actionKey = canonicalExternalWriteActionKey(tool.name, shape.shapeKey);
             const correlationFingerprint = toolCallCorrelationFingerprint(tool.name, parsedInput);
             const semanticFingerprint = externalWriteSemanticFingerprint(actionKey, parsedInput);
@@ -2916,6 +2950,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         err instanceof ConfirmFirstRequiredError
         || err instanceof DuplicateExternalWriteError
         || err instanceof ExternalWriteReservationError
+        || err instanceof StaleDispatchLeaseError
       ) throw err;
       throw new ExternalWriteReservationError(tool.name, err);
     }
@@ -3157,6 +3192,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // propagate — these SHOULD abort the run.
         throw err;
       }
+      // Gates above may await judges/approval/storage while a recovery rotates
+      // the physical attempt. Re-check at the final pre-dispatch edge.
+      try {
+        assertDispatchLeaseCurrent(ctx?.dispatchLease);
+      } catch (err) {
+        releaseUndispatchedArtifact(artifact.dispatch);
+        throw err;
+      }
       const invokeOnce = () => {
         // S3 abort-on-timeout: a per-invocation controller whose signal rides the
         // ALS into the tool's fetch layer (Composio merges it via AbortSignal.any).
@@ -3337,6 +3380,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // throw aborted the run purely because the tool used `execute` not `invoke`).
       const soft = softToolError(err);
       if (soft !== null) return soft;
+      throw err;
+    }
+    // Mirror the invoke path's final pre-dispatch generation check. A claim
+    // acquired by this call is still proven undispatched and can be released.
+    try {
+      assertDispatchLeaseCurrent(ctx?.dispatchLease);
+    } catch (err) {
+      releaseUndispatchedArtifact(artifact.dispatch);
       throw err;
     }
     let result: unknown;

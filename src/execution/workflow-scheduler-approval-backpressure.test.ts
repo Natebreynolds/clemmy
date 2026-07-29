@@ -23,12 +23,13 @@ function run(id: string, workflow: string, status: string): void {
 test('scheduled approval backpressure counts a parked run separately from executable queue work', () => {
   run('parked-1', 'daily-standup-email', 'parked');
   run('queued-1', 'daily-standup-email', 'queued');
+  run('finalizing-1', 'daily-standup-email', 'finalizing');
   run('done-1', 'daily-standup-email', 'completed');
   run('other-1', 'another-workflow', 'parked');
 
   assert.deepEqual(
     workflowSchedulerInternalsForTest.countActiveRunsFor('daily-standup-email'),
-    { pending: 1, parked: 1 },
+    { pending: 2, parked: 1 },
   );
 });
 

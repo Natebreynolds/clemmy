@@ -14,6 +14,10 @@ import {
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
 import { externalMcpScopeForAllowedToolLock } from '../../agents/external-mcp-scope-lock.js';
+import {
+  activateDispatchLease,
+  revokeDispatchLeaseBeforeRecovery,
+} from './dispatch-lease.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
@@ -244,6 +248,8 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   /** Exact accepted child-step user event. Keeps kill/preflight authority on
    * this physical attempt even if the stable workflow session is reused. */
   sourceUserSeq?: number;
+  /** Exact workflow child attempt that owns this physical SDK dispatch. */
+  runAttemptId?: string;
   /** Durable workflow-run cancellation (dashboard or generic Tasks board). */
   shouldCancel?: () => boolean | Promise<boolean>;
   /** Tool-capable gated lane (read + write/send through the harness gate chain)
@@ -321,9 +327,31 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     maxTurns: maxTurns(args.step, fullLane),
     outputSchema: claudeWorkflowStepOutputSchema(),
   };
+  const sdkDispatchScopeId = args.sessionId && args.runAttemptId
+    ? `${args.sessionId}::workflow-step:${args.runAttemptId}:${args.step.id}:sdk-dispatch`
+    : undefined;
+  const runPhysicalSdkAttempt = async (
+    options: ClaudeAgentSdkRunOptions,
+  ): Promise<ClaudeAgentSdkRunResult> => {
+    if (!args.sessionId || !args.runAttemptId || !sdkDispatchScopeId) {
+      return runClaudeAgentSdkImpl(options);
+    }
+    const dispatchLease = activateDispatchLease({
+      sessionId: args.sessionId,
+      scopeId: sdkDispatchScopeId,
+      runAttemptId: args.runAttemptId,
+    });
+    try {
+      return await runClaudeAgentSdkImpl({ ...options, dispatchLease });
+    } finally {
+      // Approval parking, cancellation, model failure, and healthy completion
+      // all revoke before control returns to the workflow runner/recovery.
+      await revokeDispatchLeaseBeforeRecovery(dispatchLease);
+    }
+  };
   let result: ClaudeAgentSdkRunResult;
   try {
-    result = await runClaudeAgentSdkImpl({ prompt: args.prompt, ...stepRunOptions });
+    result = await runPhysicalSdkAttempt({ prompt: args.prompt, ...stepRunOptions });
     // F3 — auto-continue past the per-query turn budget on a forward-progressing step
     // instead of BLOCKING it (parity with the chat brain's F1). A heavy / multi-item
     // step must not halt just because it hit the per-query turn cap while still making
@@ -343,7 +371,7 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
       ) {
         let cont: ClaudeAgentSdkRunResult;
         try {
-          cont = await runClaudeAgentSdkImpl({
+          cont = await runPhysicalSdkAttempt({
             // Re-include the step's ORIGINAL instructions (which carry any skill body
             // prepended by applySkillToPrompt) — the stateless SDK lane would otherwise
             // lose the skill procedure on the continuation and hand-roll the deliverable.

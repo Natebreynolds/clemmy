@@ -85,6 +85,7 @@ const {
   isWorkflowStepStructuralResultError,
   isWorkflowStepBrainFalloverEligible,
   _setWorkflowHarnessLoopImplsForTests,
+  _setWorkflowCallNodeForTests,
   publishWorkflowRunTerminalForTest,
   emitParkedApprovalCardToOriginChat,
   resolveWorkflowDefinitionForRun,
@@ -137,7 +138,17 @@ test('blocked workflow nodes propagate through dependents without cancelling ind
   assert.equal(skips.some((skip) => skip.stepId === 'independent'), false);
 });
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
-const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
+const {
+  readWorkflowEvents,
+  appendWorkflowEvent,
+  appendWorkflowEventDurably,
+  computeResumeState,
+} = await import('./workflow-events.js');
+const {
+  readStepOutputArtifact,
+  recordItemOutput,
+  recordStepOutput,
+} = await import('./workflow-run-workspace.js');
 const { clearStepWatermark, readSeenItemKeys } = await import('./workflow-watermark-store.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const {
@@ -154,6 +165,7 @@ const { AgentRuntimeCancelledError } = await import('../runtime/provider.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { readWorkflowRunRecord } = await import('./workflow-run-record.js');
 const { createWorkflowRunDefinitionSnapshot } = await import('./workflow-run-definition.js');
 
@@ -1453,7 +1465,11 @@ test('final synthesis and goal evidence render large completed outputs as querya
 
   assert.match(rendered, /__clementine_context_ref/);
   assert.match(rendered, /workspace_artifact_query/);
-  assert.match(rendered, /artifacts\/step-fetch_accounts\.json/);
+  assert.match(
+    rendered,
+    /artifacts\/step-fetch_accounts-[a-f0-9]{64}\.json/,
+    'completion context points at the immutable content-addressed artifact',
+  );
   assert.doesNotMatch(rendered, new RegExp(lastNeedle), 'large tail data should stay in the artifact during synthesis');
 
   const pathMatch = rendered.match(/"path": "([^"]+)"/);
@@ -1466,6 +1482,67 @@ test('final synthesis and goal evidence render large completed outputs as querya
   assert.match(evidence, /Artifact:/);
   assert.match(evidence, /Preview:/);
   assert.doesNotMatch(evidence, new RegExp(lastNeedle), 'goal evidence stays bounded and points to the artifact');
+});
+
+test('downstream context selects the event-authorized artifact, never a later orphan', () => {
+  const workflowName = 'authorized-artifact-workflow';
+  const runId = 'authorized-artifact-run';
+  const step = { id: 'source', prompt: 'Produce source rows.' } as never;
+  const authorized = {
+    rows: Array.from({ length: 380 }, (_, index) => ({
+      index,
+      value: `${'a'.repeat(90)}${index === 379 ? 'AUTHORIZED-TAIL' : index}`,
+    })),
+  };
+  const orphan = {
+    rows: Array.from({ length: 380 }, (_, index) => ({
+      index,
+      value: `${'b'.repeat(90)}${index === 379 ? 'ORPHAN-TAIL' : index}`,
+    })),
+  };
+  finalizeStepOutput(workflowName, runId, step, authorized);
+  recordStepOutput({
+    workflowName,
+    runId,
+    stepId: 'source',
+    output: orphan,
+    nowIso: new Date().toISOString(),
+  });
+
+  const rendered = workflowRunnerInternalsForTest.formatStepOutputs(
+    [step],
+    { source: authorized },
+    { workflowName, runId },
+  );
+  const pathMatch = rendered.match(/"path": "([^"]+)"/);
+  assert.ok(pathMatch?.[1]);
+  const selected = readFileSync(pathMatch[1], 'utf-8');
+  assert.match(selected, /AUTHORIZED-TAIL/);
+  assert.doesNotMatch(selected, /ORPHAN-TAIL/);
+});
+
+test('terminal run projection stays bounded while exact large outputs remain artifact-backed', () => {
+  const workflowName = 'bounded-terminal-workflow';
+  const runId = 'bounded-terminal-run';
+  const output = {
+    rows: Array.from({ length: 1_200 }, (_, index) => ({
+      index,
+      value: `${'z'.repeat(120)}${index === 1_199 ? 'TERMINAL-EXACT-TAIL' : index}`,
+    })),
+  };
+  finalizeStepOutput(
+    workflowName,
+    runId,
+    { id: 'large', prompt: 'Produce a large exact result.' } as never,
+    output,
+  );
+  const projection = workflowRunnerInternalsForTest.boundedStepOutputsForRunRecord(
+    { large: output },
+    { workflowName, runId },
+  );
+  assert.ok(Buffer.byteLength(JSON.stringify(projection), 'utf-8') < 20_000);
+  assert.match(projection.large, /__clementine_context_ref/);
+  assert.doesNotMatch(projection.large, /TERMINAL-EXACT-TAIL/);
 });
 
 test('goal evidence preserves line count and scalar metadata after wide arrays', () => {
@@ -2084,6 +2161,136 @@ test('Tasks-board stop releases a standard workflow step waiting in-place on app
   }
 });
 
+test('standard workflow approval resume retains the exact step attempt identity', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  const prev = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
+    WORKFLOW_APPROVAL_PARKING: process.env.WORKFLOW_APPROVAL_PARKING,
+    WORKFLOW_STEP_AGENT: process.env.WORKFLOW_STEP_AGENT,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
+  };
+  const runId = `wf-standard-attempt-resume-${Date.now()}`;
+  const sessionId = `workflow:${runId}:approval_identity`;
+  let approvalId = '';
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  let initialOptions: {
+    sessionId: string;
+    sourceUserSeq?: number;
+    runAttemptId?: string;
+  } | undefined;
+  let resumeOptions: {
+    sessionId: string;
+    runAttemptId?: string;
+  } | undefined;
+  try {
+    const stateDir = path.join(tmp, 'state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      path.join(stateDir, 'auth.json'),
+      JSON.stringify({ codexOauth: { accessToken: 'codex-standard-attempt-test-token', refreshToken: 'refresh' } }),
+      'utf-8',
+    );
+    process.env.AUTH_MODE = 'codex_oauth';
+    process.env.WORKFLOW_USE_HARNESS = 'on';
+    process.env.WORKFLOW_APPROVAL_PARKING = 'off';
+    process.env.WORKFLOW_STEP_AGENT = 'off';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'off';
+    _setWorkflowHarnessLoopImplsForTests({
+      buildAgent: (async () => ({})) as never,
+      runConversation: (async (options: {
+        sessionId: string;
+        sourceUserSeq?: number;
+        runAttemptId?: string;
+      }) => {
+        initialOptions = options;
+        const row = approvalRegistry.register({
+          sessionId: options.sessionId,
+          subject: 'Approve the exact workflow action?',
+          tool: 'composio_execute_tool',
+          ttlMs: 60_000,
+        });
+        approvalId = row.approvalId;
+        entered();
+        return {
+          sessionId: options.sessionId,
+          status: 'awaiting_approval',
+          steps: 1,
+          lastTurn: 1,
+        };
+      }) as never,
+      runConversationFromResume: (async (options: {
+        sessionId: string;
+        runAttemptId?: string;
+      }) => {
+        resumeOptions = options;
+        return {
+          sessionId: options.sessionId,
+          status: 'completed',
+          steps: 1,
+          lastTurn: 2,
+          lastDecision: {
+            summary: 'Approved workflow action completed.',
+            reply: 'The approved workflow action is complete.',
+            done: true,
+            nextAction: 'completed',
+          },
+        };
+      }) as never,
+    });
+    const step = {
+      id: 'approval_identity',
+      prompt: 'Complete the exact approved workflow action.',
+      model: 'gpt-5.4',
+      sideEffect: 'read' as const,
+    };
+    const ctx = {
+      workflow: {
+        name: 'Standard Attempt Identity',
+        description: 'test',
+        enabled: true,
+        steps: [step],
+        trigger: { manual: true },
+      },
+      workflowSlug: 'standard-attempt-identity',
+      runId,
+      inputs: {},
+      stepOutputs: {},
+      assistant: { respond: async () => { throw new Error('legacy assistant should not run'); } },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+
+    const running = executeStep(step, ctx);
+    await enteredPromise;
+    const activeAttempt = getLatestRunAttempt(sessionId);
+    assert.ok(activeAttempt?.attemptId);
+    assert.equal(initialOptions?.sourceUserSeq, activeAttempt?.sourceUserSeq);
+    assert.equal(initialOptions?.runAttemptId, activeAttempt?.attemptId);
+
+    approvalRegistry.resolve(approvalId, 'approved', 'unit-test-human');
+    await running;
+
+    assert.equal(
+      resumeOptions?.runAttemptId,
+      activeAttempt?.attemptId,
+      'approval resume remains owned by the same durable workflow step attempt',
+    );
+    assert.equal(getLatestRunAttempt(sessionId)?.status, 'completed');
+  } finally {
+    if (approvalId) approvalRegistry.resolve(approvalId, 'cancelled_by_user', 'test-cleanup');
+    _setWorkflowHarnessLoopImplsForTests();
+    resetHarnessRuntimeConfig();
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test('workflow Claude-routed step marks its harness session failed when the SDK throws', async () => {
   resetEventLog();
   resetHarnessRuntimeConfig();
@@ -2543,6 +2750,134 @@ test('forEach batching resumes after already-completed items and drains remainin
   }
 });
 
+test('forEach restart hydrates an exact >32KB completed item before draining its pending sibling', async () => {
+  const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  const workflowSlug = 'foreach-exact-item-resume';
+  const runId = 'foreach-exact-item-run';
+  const exactItem = {
+    body: `${'x'.repeat(40_000)}EXACT-ITEM-TAIL-AFTER-RESTART`,
+  };
+  try {
+    const persisted = recordItemOutput({
+      workflowName: workflowSlug,
+      runId,
+      stepId: 'fanout',
+      itemKey: 'a',
+      output: exactItem,
+      nowIso: new Date().toISOString(),
+    });
+    assert.ok(persisted.sha256);
+    appendWorkflowEventDurably(workflowSlug, runId, {
+      kind: 'item_completed',
+      stepId: 'fanout',
+      itemKey: 'a',
+      output: exactItem,
+      meta: {
+        itemOutputArtifact: {
+          path: persisted.path,
+          sha256: persisted.sha256,
+          bytes: persisted.bytes,
+          producedAt: persisted.producedAt,
+        },
+      },
+    });
+
+    const compact = computeResumeState(workflowSlug, runId);
+    assert.equal(
+      (compact.completedItems.get('fanout')?.get('a') as { truncated?: boolean }).truncated,
+      true,
+      'the item journal remains compact',
+    );
+    const resumed = workflowRunnerInternalsForTest.hydrateCompletedOutputArtifacts(
+      compact,
+      workflowSlug,
+      runId,
+    );
+    assert.match(
+      JSON.stringify(resumed.completedItems.get('fanout')?.get('a')),
+      /EXACT-ITEM-TAIL-AFTER-RESTART/,
+    );
+    assert.ok(
+      workflowRunnerInternalsForTest
+        .graphContextForRun(workflowSlug, runId)
+        .allowedArtifactPaths.includes(persisted.path),
+      'a graph-added node can query the exact event-owned item artifact directly',
+    );
+
+    let modelCalls = 0;
+    const ctx = {
+      workflow: { name: 'Exact Item Resume', steps: [] },
+      workflowSlug,
+      runId,
+      inputs: {},
+      stepOutputs: { pull: ['a', 'b'] },
+      assistant: {
+        respond: async () => {
+          modelCalls += 1;
+          return { text: 'done-b' };
+        },
+      },
+      completedItems: resumed.completedItems.get('fanout') ?? new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+    const output = await executeStep(
+      { id: 'fanout', prompt: 'Process item.', forEach: 'pull', useHarness: false } as never,
+      ctx,
+    ) as Array<{ itemKey: string; output: unknown }>;
+
+    assert.equal(modelCalls, 1, 'only the pending sibling executes after restart');
+    assert.match(JSON.stringify(output.find((item) => item.itemKey === 'a')?.output), /EXACT-ITEM-TAIL-AFTER-RESTART/);
+  } finally {
+    restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
+  }
+});
+
+test('missing or malformed item artifact authority fails closed instead of replaying partial work', () => {
+  const workflowSlug = 'foreach-corrupt-item-ref';
+  appendWorkflowEventDurably(workflowSlug, 'missing-ref', {
+    kind: 'item_completed',
+    stepId: 'fanout',
+    itemKey: 'a',
+    output: { truncated: true, preview: 'partial' },
+    meta: {
+      itemOutputArtifact: {
+        path: 'artifacts/does-not-exist.json',
+        sha256: 'a'.repeat(64),
+        bytes: 7,
+        producedAt: new Date().toISOString(),
+      },
+    },
+  });
+  assert.throws(
+    () => workflowRunnerInternalsForTest.hydrateCompletedOutputArtifacts(
+      computeResumeState(workflowSlug, 'missing-ref'),
+      workflowSlug,
+      'missing-ref',
+    ),
+    /unreadable exact output artifact/,
+  );
+
+  appendWorkflowEvent(workflowSlug, 'malformed-ref', {
+    kind: 'item_completed',
+    stepId: 'fanout',
+    itemKey: 'a',
+    output: 'partial',
+    meta: { itemOutputArtifact: { path: '../escape.json' } },
+  });
+  assert.throws(
+    () => computeResumeState(workflowSlug, 'malformed-ref'),
+    /malformed itemOutputArtifact reference/,
+  );
+});
+
 test('forEach batching attributes item failures to their original keys across windows', async () => {
   const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
@@ -2665,7 +3000,19 @@ test('failed-item retry seeding inherits upstream + completed items but not stal
       { id: 'summarize', prompt: 'Summarize all processed records.', dependsOn: ['blast'] },
     ],
   } as never;
-  appendWorkflowEvent('retry-seed-test', 'source-run', { kind: 'step_completed', stepId: 'pull', output: ['a', 'b', 'c'] });
+  const exactPull = [
+    'a',
+    'b',
+    'c',
+    ...Array.from({ length: 400 }, (_, index) =>
+      `${'x'.repeat(90)}${index === 399 ? 'EXACT-RETRY-SEED-TAIL' : index}`),
+  ];
+  finalizeStepOutput(
+    'retry-seed-test',
+    'source-run',
+    { id: 'pull', prompt: 'Pull records.' },
+    exactPull,
+  );
   appendWorkflowEvent('retry-seed-test', 'source-run', { kind: 'item_completed', stepId: 'blast', itemKey: 'a', output: 'done-a' });
   appendWorkflowEvent('retry-seed-test', 'source-run', { kind: 'item_failed', stepId: 'blast', itemKey: 'b', error: 'temporary b failure' });
   appendWorkflowEvent('retry-seed-test', 'source-run', { kind: 'item_completed', stepId: 'blast', itemKey: 'c', output: 'done-c' });
@@ -2687,7 +3034,25 @@ test('failed-item retry seeding inherits upstream + completed items but not stal
 
   assert.deepEqual(seeded, { inheritedSteps: 1, inheritedItems: 2, sentSkips: 0 });
   const state = computeResumeState('retry-seed-test', 'retry-run');
-  assert.equal(state.completedSteps.get('pull')?.toString(), 'a,b,c');
+  assert.equal(
+    (state.completedSteps.get('pull') as { truncated?: boolean }).truncated,
+    true,
+    'the retry journal remains compact',
+  );
+  const inheritedReference = state.completedStepArtifacts.get('pull');
+  assert.ok(inheritedReference, 'the inherited completion owns a new exact artifact');
+  const inheritedExact = readStepOutputArtifact({
+    workflowName: 'retry-seed-test',
+    runId: 'retry-run',
+    stepId: 'pull',
+    reference: inheritedReference,
+  });
+  assert.equal(inheritedExact.verified, true);
+  assert.match(
+    JSON.stringify(inheritedExact.value),
+    /EXACT-RETRY-SEED-TAIL/,
+    'failed-item retry seeding never inherits the truncated journal preview',
+  );
   assert.equal(state.completedSteps.has('blast'), false, 'retry step reruns with failed item pending');
   assert.equal(state.completedSteps.has('summarize'), false, 'downstream summary must recompute after retry');
   assert.deepEqual(Array.from(state.completedItems.get('blast')?.keys() ?? []), ['a', 'c']);
@@ -2695,6 +3060,123 @@ test('failed-item retry seeding inherits upstream + completed items but not stal
     .find((ev) => ev.kind === 'step_advisory' && ev.meta?.reason === 'failed_item_retry_seeded');
   assert.equal(seededEvent?.meta?.inheritedSteps, 1);
   assert.equal(seededEvent?.meta?.inheritedItems, 2);
+});
+
+test('a failed external loop probe never publishes provisional step completion', async () => {
+  const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  const workflowSlug = 'deferred-probe-completion';
+  const runId = 'probe-failed-before-commit';
+  const scriptsDir = path.join(WORKFLOWS_DIR, workflowSlug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'probe.mjs'),
+    'console.log(JSON.stringify({ pending: true }));\n',
+    'utf-8',
+  );
+  const step = {
+    id: 'poll_export',
+    prompt: 'Start or inspect the export.',
+    sideEffect: 'read',
+    useHarness: false,
+    loopUntil: {
+      maxAttempts: 1,
+      probe: { runner: 'probe.mjs' },
+      until: { type: 'object', required_keys: ['done'] },
+    },
+  };
+  const ctx = {
+    workflow: {
+      name: 'Deferred Probe Completion',
+      description: '',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [step],
+    },
+    workflowSlug,
+    runId,
+    inputs: {},
+    stepOutputs: {},
+    assistant: { respond: async () => ({ text: 'candidate output before probe' }) },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
+  try {
+    await assert.rejects(
+      () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
+      /loop probe did not satisfy/,
+    );
+    const events = readWorkflowEvents(workflowSlug, runId);
+    assert.equal(
+      events.some((event) => event.kind === 'step_completed' && event.stepId === step.id),
+      false,
+      'an unsatisfied external exit condition owns no completion authority',
+    );
+    assert.equal(computeResumeState(workflowSlug, runId).completedSteps.has(step.id), false);
+  } finally {
+    restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
+  }
+});
+
+test('a read-only structured call also defers completion until its external loop probe passes', async () => {
+  const workflowSlug = 'deferred-call-probe-completion';
+  const runId = 'call-probe-failed-before-commit';
+  const scriptsDir = path.join(WORKFLOWS_DIR, workflowSlug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'probe.mjs'),
+    'console.log(JSON.stringify({ pending: true }));\n',
+    'utf-8',
+  );
+  const step = {
+    id: 'poll_sheet_export',
+    prompt: 'Read the export state.',
+    sideEffect: 'read',
+    call: { tool: 'GOOGLESHEETS_GET_VALUES', args: { spreadsheet_id: 'sheet-test' } },
+    loopUntil: {
+      maxAttempts: 1,
+      probe: { runner: 'probe.mjs' },
+      until: { type: 'object', required_keys: ['done'] },
+    },
+  };
+  const ctx = {
+    workflow: {
+      name: 'Deferred Call Probe Completion',
+      description: '',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [step],
+    },
+    workflowSlug,
+    runId,
+    inputs: {},
+    stepOutputs: {},
+    assistant: { respond: async () => ({ text: 'unused' }) },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
+  _setWorkflowCallNodeForTests(async () => ({ exportId: 'exp-1', status: 'pending' }));
+  try {
+    await assert.rejects(
+      () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
+      /loop probe did not satisfy/,
+    );
+    assert.equal(
+      readWorkflowEvents(workflowSlug, runId)
+        .some((event) => event.kind === 'step_completed' && event.stepId === step.id),
+      false,
+    );
+  } finally {
+    _setWorkflowCallNodeForTests();
+  }
 });
 
 test('workflow conversion: a plain step routes through the GATED harness loop when CLEMMY_HARNESS_WORKFLOW=on (not the legacy core)', async () => {

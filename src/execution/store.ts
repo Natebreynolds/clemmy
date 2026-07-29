@@ -22,6 +22,10 @@ import {
   freshExternalWriteEvidenceStatus,
   type FreshExternalWriteEvidenceStatus,
 } from '../runtime/harness/tool-evidence.js';
+import {
+  canonicalExternalWriteActionKey,
+  uncompensatedExternalWriteEvents,
+} from '../runtime/harness/external-write-admission.js';
 
 const STATE_DIR = path.join(BASE_DIR, 'state');
 const EXECUTIONS_FILE = path.join(STATE_DIR, 'executions.json');
@@ -65,7 +69,28 @@ function clean(value: string, maxChars = 220): string {
 
 export interface ExecutionExternalWriteTruth {
   status: FreshExternalWriteEvidenceStatus;
+  /** Provider-neutral action families for confirmed, request-owned writes.
+   * Completion callers use these to prevent an unrelated write from proving a
+   * different delegated world effect. */
+  confirmedActionKeys: string[];
   execution: ExecutionRecord;
+}
+
+function externalWriteActionKey(event: EventRow): string {
+  const data = event.data && typeof event.data === 'object' && !Array.isArray(event.data)
+    ? event.data as Record<string, unknown>
+    : {};
+  const explicit = typeof data.actionKey === 'string' ? data.actionKey.trim().toLowerCase() : '';
+  if (explicit.includes(':')) return explicit;
+  const toolName = typeof data.toolName === 'string'
+    ? data.toolName
+    : typeof data.tool === 'string' ? data.tool : undefined;
+  const shapeKey = typeof data.shapeKey === 'string'
+    ? data.shapeKey
+    : typeof data.slug === 'string'
+      ? data.slug
+      : explicit || undefined;
+  return canonicalExternalWriteActionKey(toolName, shapeKey);
 }
 
 function executionSourceUserSeqs(execution: ExecutionRecord): number[] {
@@ -82,10 +107,11 @@ function executionExternalWriteStatus(
 ): {
   status: FreshExternalWriteEvidenceStatus;
   latestNegativeSeq?: number;
+  confirmedActionKeys: string[];
 } {
   const sourceUserSeqs = executionSourceUserSeqs(execution);
   if (sourceUserSeqs.length === 0) {
-    return { status: 'missing' };
+    return { status: 'missing', confirmedActionKeys: [] };
   }
   const firstSourceUserSeq = sourceUserSeqs[0] as number;
   const acceptedSources = new Set(sourceUserSeqs);
@@ -124,6 +150,13 @@ function executionExternalWriteStatus(
       return precedingUserSeq !== undefined && acceptedSources.has(precedingUserSeq);
     });
     const status = freshExternalWriteEvidenceStatus(events, sourceUserSeqs);
+    const confirmedActionKeys = status === 'confirmed'
+      ? [...new Set(
+          uncompensatedExternalWriteEvents(events)
+            .filter((event) => event.type === 'external_write')
+            .map(externalWriteActionKey),
+        )]
+      : [];
     const latestNegativeSeq = events
       .filter((event) =>
         event.type === 'external_write_failed'
@@ -133,11 +166,11 @@ function executionExternalWriteStatus(
         (latest, event) => latest === undefined || event.seq > latest ? event.seq : latest,
         undefined,
       );
-    return { status, latestNegativeSeq };
+    return { status, latestNegativeSeq, confirmedActionKeys };
   } catch {
     // Event storage is best-effort for legacy/non-harness executions. Missing
     // evidence must not invent a blocker for work that never performed a write.
-    return { status: 'missing' };
+    return { status: 'missing', confirmedActionKeys: [] };
   }
 }
 
@@ -601,7 +634,11 @@ export class ExecutionStore {
       ) || changed;
     }
     if (changed) saveExecutions(executions);
-    return { status: evidence.status, execution };
+    return {
+      status: evidence.status,
+      confirmedActionKeys: evidence.confirmedActionKeys,
+      execution,
+    };
   }
 
   listDue(now = new Date(), limit = 20): ExecutionRecord[] {

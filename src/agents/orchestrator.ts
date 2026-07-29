@@ -161,6 +161,12 @@ export interface BuildOrchestratorAgentOptions {
    */
   excludeToolNames?: string[];
   /**
+   * Exact local harness tool authority for this call. Unlike an absent value,
+   * an empty array is meaningful and produces a decision-only agent with no
+   * local tools and no external MCP attachment.
+   */
+  allowedToolNames?: string[];
+  /**
    * Per-call model override. When provided, the agent runs on this model instead
    * of the role-registry brain default — needed so workflow-step lanes that
    * route grunt-work to a cheaper worker model (forEach fan-out) can ride the
@@ -1010,15 +1016,22 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const priorUserInputs = options.sessionId
     ? recentPriorUserInputsForScope(options.sessionId, options.userInput)
     : [];
-  const mcpToolScope = options.mcpToolScope ?? (
-    options.sessionId
-      ? resolveMcpToolScopeWithRecall({
-          userInput: options.userInput,
-          priorUserInputs,
-          pinnedCalendarLabels: pinnedCalendarRuleLabels(),
-        })
-      : resolveMcpToolScope({ userInput: options.userInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() })
-  );
+  const mcpToolScope = options.allowedToolNames !== undefined
+    ? {
+        reason: 'explicit local tool allowlist; external MCP authority denied',
+        allowedServerSlugs: [],
+        toolPatterns: [],
+        maxTools: 0,
+      }
+    : options.mcpToolScope ?? (
+        options.sessionId
+          ? resolveMcpToolScopeWithRecall({
+              userInput: options.userInput,
+              priorUserInputs,
+              pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+            })
+          : resolveMcpToolScope({ userInput: options.userInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() })
+      );
   // T1: thread the current input so the fail-open MCP surface can rank the
   // user's connected tools by semantic relevance (run-start only; ignored by
   // keyword family scopes). Respects a caller-provided queryText.
@@ -1339,6 +1352,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         counter,
         ...(parent?.sourceUserSeq ? { sourceUserSeq: parent.sourceUserSeq } : {}),
         ...(parent?.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
+        ...(parent?.dispatchLease ? { dispatchLease: parent.dispatchLease } : {}),
+        ...(parent?.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
         ...(workerThrashGuardEnabled()
           ? { guardrailScopeId: `${sessionId}::wkr:${Date.now()}-${(workerBudgetScopeSeq = (workerBudgetScopeSeq + 1) % 1_000_000)}` }
           : {}),
@@ -1714,6 +1729,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             sessionId,
             sourceUserSeq,
             harnessRunContextStorage.getStore()?.mcpToolScope,
+            harnessRunContextStorage.getStore()?.dispatchLease,
           );
           appendWorkerRoute({
             ...(route.trace ?? {
@@ -2116,6 +2132,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     surface: 'orchestrator',
     lane: options.allowToolJit === true ? 'chat' : 'execution',
     tools: assembledTools.map((toolRef) => toolRef as Tool<RuntimeContextValue>),
+    allowedToolNames: options.allowedToolNames,
     excludeToolNames: options.excludeToolNames,
     reason: 'orchestrator local harness tools',
   });

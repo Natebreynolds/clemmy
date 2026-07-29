@@ -19,7 +19,7 @@
  *   2. A claim is a LEASE, not a lock. A cycle that dies mid-work must not
  *      strand the delegation forever.
  */
-import { test, before, beforeEach } from 'node:test';
+import { test, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -34,6 +34,8 @@ type Mod = typeof import('./agent-delegations.js');
 let buildAgentDelegationTools: Mod['buildAgentDelegationTools'];
 let renderOpenDelegations: Mod['renderOpenDelegations'];
 let DELEGATION_CLAIM_LEASE_MS: Mod['DELEGATION_CLAIM_LEASE_MS'];
+let setBridgeImplsForTests: typeof import('../runtime/harness/respond-bridge.js')['_setBridgeImplsForTests'];
+let resetEventLog: typeof import('../runtime/harness/eventlog.js')['resetEventLog'];
 
 const DELEGATIONS = () => path.join(process.env.CLEMENTINE_HOME!, 'delegations');
 
@@ -73,10 +75,24 @@ async function run(slug: string, name: string, args: Record<string, unknown>): P
 before(async () => {
   ({ buildAgentDelegationTools, renderOpenDelegations, DELEGATION_CLAIM_LEASE_MS } =
     await import('./agent-delegations.js'));
+  ({ _setBridgeImplsForTests: setBridgeImplsForTests } =
+    await import('../runtime/harness/respond-bridge.js'));
+  ({ resetEventLog } = await import('../runtime/harness/eventlog.js'));
 });
 
 beforeEach(() => {
   rmSync(DELEGATIONS(), { recursive: true, force: true });
+  resetEventLog();
+  setBridgeImplsForTests({});
+  process.env.AUTH_MODE = 'api_key';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'off';
+  process.env.CLEMMY_HARNESS_CRON = 'on';
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+});
+
+after(() => {
+  setBridgeImplsForTests({});
+  rmSync(tmpHome, { recursive: true, force: true });
 });
 
 test('a woken agent can see the work assigned to it, and only that work', () => {
@@ -159,6 +175,44 @@ test('CONTENTION: agent B cannot complete agent A-s delegation in the same proce
   const refused = await run('builder', 'delegation_complete', { delegation_id: 'd2', result: 'not mine' });
   assert.match(refused, /not assigned/i);
   assert.equal(read('analyst', 'd2').status, 'pending', 'the refusal must not mutate state');
+});
+
+test('PATH SAFETY: a delegation id cannot traverse into another agent queue', async () => {
+  seed('builder', 'cross-queue');
+  const refused = await run('analyst', 'delegation_claim', {
+    delegation_id: '../builder/cross-queue',
+  });
+  assert.match(refused, /not assigned|invalid/i);
+  assert.equal(
+    read('builder', 'cross-queue').status,
+    'pending',
+    'a model-supplied id must never resolve outside the bound queue directory',
+  );
+});
+
+test('OWNERSHIP: malformed records in an agent directory are neither rendered nor mutable', async () => {
+  seed('analyst', 'spoofed-owner', { toAgent: 'builder' });
+  assert.doesNotMatch(
+    renderOpenDelegations('analyst'),
+    /spoofed-owner/,
+    'directory placement alone does not establish record ownership',
+  );
+  const refused = await run('analyst', 'delegation_claim', { delegation_id: 'spoofed-owner' });
+  assert.match(refused, /not assigned|invalid/i);
+  assert.equal(read('analyst', 'spoofed-owner').status, 'pending');
+
+  seed('analyst', 'filename-id', { id: 'different-record-id' });
+  assert.doesNotMatch(
+    renderOpenDelegations('analyst'),
+    /different-record-id|filename-id/,
+    'the durable id must agree with the containing filename',
+  );
+  const idRefused = await run('analyst', 'delegation_complete', {
+    delegation_id: 'filename-id',
+    result: 'must not land',
+  });
+  assert.match(idRefused, /not assigned|invalid/i);
+  assert.equal(read('analyst', 'filename-id').status, 'pending');
 });
 
 test('exactly-once: a completed delegation is not silently rewritten', async () => {
@@ -264,22 +318,77 @@ test('a configured-but-keyless autonomy pass does no work and does not throw', a
 // and assert the delegated work actually completes with correct attribution.
 
 // The engine routes cycles through respondPreferHarness('cron', …) — the same
-// gated path cron jobs use. Tests kill that surface and enable the explicit
-// legacy fallback so the fake assistant.respond below serves the turn without
-// spinning the full harness loop.
-process.env.CLEMMY_HARNESS_CRON = 'off';
-process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+// gated path cron jobs use. Stub that harness at its construction/run seams:
+// explicit decision-only authority must never rely on the wider break-glass
+// legacy assistant fallback.
+interface HarnessStubReply {
+  text: string;
+  stoppedReason?: 'success' | 'pending-approval' | 'error';
+}
 
-function fakeAssistant(responses: string[]): { assistant: unknown; prompts: string[] } {
+function fakeHarnessAssistant(responses: HarnessStubReply[]): {
+  assistant: unknown;
+  prompts: string[];
+  authority: Array<string[] | undefined>;
+  legacyCalls: () => number;
+} {
   const prompts: string[] = [];
+  const authority: Array<string[] | undefined> = [];
+  let legacyCallCount = 0;
+  setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async (options: { allowedToolNames?: string[] }) => {
+      authority.push(options.allowedToolNames);
+      return {};
+    }) as never,
+    runConversation: (async (options: { sessionId: string; input: string }) => {
+      prompts.push(options.input);
+      const response = responses.shift();
+      if (!response) throw new Error('unexpected harness conversation call');
+      const stoppedReason = response.stoppedReason ?? 'success';
+      const lastDecision = {
+        summary: response.text,
+        reply: response.text,
+        done: stoppedReason === 'success',
+        nextAction: stoppedReason === 'pending-approval' ? 'awaiting_approval' : 'completed',
+        reason: null,
+      };
+      if (stoppedReason === 'pending-approval') {
+        return {
+          sessionId: options.sessionId,
+          status: 'awaiting_approval',
+          steps: 1,
+          lastTurn: 1,
+          lastDecision,
+        };
+      }
+      if (stoppedReason === 'error') {
+        return {
+          sessionId: options.sessionId,
+          status: 'failed',
+          steps: 1,
+          lastTurn: 1,
+          lastDecision,
+          error: response.text,
+        };
+      }
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision,
+      };
+    }) as never,
+  });
   return {
     prompts,
+    authority,
+    legacyCalls: () => legacyCallCount,
     assistant: {
-      async respond(request: { message: string; sessionId?: string }) {
-        prompts.push(request.message);
-        const text = responses.shift();
-        if (text === undefined) throw new Error('unexpected respond call');
-        return { text, sessionId: request.sessionId ?? 'agent:test' };
+      async respond() {
+        legacyCallCount += 1;
+        throw new Error('explicit decision-only authority must not use legacy assistant.respond');
       },
       getRuntime() {
         return { async run() { throw new Error('runtime.run must not be used — it is the codex-native lane'); } };
@@ -322,7 +431,8 @@ test('RUNTIME ENGINE: a keyless cycle completes delegated work through the brain
       { type: 'complete_delegation', delegationId: 'rt1', result: 'Risks: freeze writes, backfill, cut over.' },
     ],
   });
-  const { assistant, prompts } = fakeAssistant([decision]);
+  const harness = fakeHarnessAssistant([{ text: decision }]);
+  const { assistant, prompts } = harness;
 
   const prevAgents = process.env.AUTONOMY_V2_AGENTS;
   const prevKey = process.env.OPENAI_API_KEY;
@@ -332,6 +442,8 @@ test('RUNTIME ENGINE: a keyless cycle completes delegated work through the brain
     const summary = await mod.processAgentAutonomyV2(assistant as never);
     assert.equal(summary.attempted, 1);
     assert.equal(summary.succeeded, 1, 'the cycle must succeed through the runtime');
+    assert.equal(harness.legacyCalls(), 0, 'the harness, not break-glass legacy fallback, serves the cycle');
+    assert.deepEqual(harness.authority, [[]], 'the runtime binds decision-only authority at harness construction');
   } finally {
     if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
     else process.env.AUTONOMY_V2_AGENTS = prevAgents;
@@ -355,6 +467,7 @@ test('RUNTIME ENGINE: malformed actions are dropped, never guessed at', async ()
     { type: 'complete_delegation', delegationId: 'x' },            // missing result
     { type: 'claim_delegation' },                                   // missing id
     { type: 'delete_everything', delegationId: 'x' },               // unknown verb
+    { type: 'claim_delegation', delegationId: '../builder/secret' }, // path traversal
     { type: 'notify_user', title: 'ok', body: 'fine' },             // valid
     'garbage',
   ]);
@@ -367,7 +480,10 @@ test('RUNTIME ENGINE: a prose-only reply fails the cycle instead of inventing ac
   seedTeamAgent('rt-flake');
   seed('rt-flake', 'rt2');
 
-  const { assistant } = fakeAssistant(['I looked around and everything seems fine!']);
+  const harness = fakeHarnessAssistant([
+    { text: 'I looked around and everything seems fine!' },
+  ]);
+  const { assistant } = harness;
   const prevAgents = process.env.AUTONOMY_V2_AGENTS;
   const prevKey = process.env.OPENAI_API_KEY;
   process.env.AUTONOMY_V2_AGENTS = 'rt-flake';
@@ -379,11 +495,14 @@ test('RUNTIME ENGINE: a prose-only reply fails the cycle instead of inventing ac
     // success while the delegated work sat untouched. Prose is not a decision.
     assert.equal(summary.attempted, 1);
     assert.equal(summary.failed, 1, 'prose-only replies are not successful cycles');
+    assert.equal(harness.legacyCalls(), 0);
+    assert.deepEqual(harness.authority, [[]], 'the prose-producing turn stays decision-only');
   } finally {
     if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
     else process.env.AUTONOMY_V2_AGENTS = prevAgents;
     if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey;
   }
+  assert.equal(harness.prompts.length, 1, 'prose is rejected directly instead of being treated as a decision');
   assert.equal(read('rt-flake', 'rt2').status, 'pending', 'no action was invented from prose');
 });
 
@@ -410,14 +529,11 @@ test('HONESTY: a parked/blocked turn is never a successful cycle and consumes no
   seedTeamAgent('rt-parked');
   seed('rt-parked', 'rp1');
 
-  const prompts: string[] = [];
-  const assistant = {
-    async respond(request: { message: string; sessionId?: string }) {
-      prompts.push(request.message);
-      return { text: 'I need approval before continuing.', sessionId: request.sessionId ?? 'x', stoppedReason: 'pending-approval' };
-    },
-    getRuntime() { return { async run() { throw new Error('unused'); } }; },
-  };
+  const harness = fakeHarnessAssistant([{
+    text: 'I need approval before continuing.',
+    stoppedReason: 'pending-approval',
+  }]);
+  const { assistant } = harness;
 
   const prevAgents = process.env.AUTONOMY_V2_AGENTS;
   const prevKey = process.env.OPENAI_API_KEY;
@@ -427,6 +543,8 @@ test('HONESTY: a parked/blocked turn is never a successful cycle and consumes no
     const summary = await mod.processAgentAutonomyV2(assistant as never);
     assert.equal(summary.succeeded, 0, 'a parked turn must not count as success');
     assert.equal(summary.failed, 1, 'it is recorded truthfully as not-completed');
+    assert.equal(harness.legacyCalls(), 0);
+    assert.deepEqual(harness.authority, [[]]);
   } finally {
     if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
     else process.env.AUTONOMY_V2_AGENTS = prevAgents;
@@ -439,18 +557,19 @@ test('HONESTY: an error turn is not a successful cycle', async () => {
   const mod = await import('./autonomy-v2.js');
   seedTeamAgent('rt-err');
   seed('rt-err', 're1');
-  const assistant = {
-    async respond(request: { sessionId?: string }) {
-      return { text: 'runtime exploded', sessionId: request.sessionId ?? 'x', stoppedReason: 'error' };
-    },
-    getRuntime() { return { async run() { throw new Error('unused'); } }; },
-  };
+  const harness = fakeHarnessAssistant([{
+    text: 'runtime exploded',
+    stoppedReason: 'error',
+  }]);
+  const { assistant } = harness;
   const prevAgents = process.env.AUTONOMY_V2_AGENTS;
   process.env.AUTONOMY_V2_AGENTS = 'rt-err';
   try {
     const summary = await mod.processAgentAutonomyV2(assistant as never);
     assert.equal(summary.succeeded, 0);
     assert.equal(summary.failed, 1);
+    assert.equal(harness.legacyCalls(), 0);
+    assert.deepEqual(harness.authority, [[]]);
   } finally {
     if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
     else process.env.AUTONOMY_V2_AGENTS = prevAgents;
@@ -483,20 +602,16 @@ test('WAKE: open delegated work wakes the agent, paced by backoff', async () => 
     commitments: [],
     actions: [{ type: 'complete_delegation', delegationId: 'w9', result: 'Done: a, b, c.' }],
   });
-  const prompts: string[] = [];
-  const assistant = {
-    async respond(request: { message: string; sessionId?: string }) {
-      prompts.push(request.message);
-      return { text: decision, sessionId: request.sessionId ?? 'x' };
-    },
-    getRuntime() { return { async run() { throw new Error('unused'); } }; },
-  };
+  const harness = fakeHarnessAssistant([{ text: decision }]);
+  const { assistant } = harness;
 
   const prevAgents = process.env.AUTONOMY_V2_AGENTS;
   process.env.AUTONOMY_V2_AGENTS = 'rt-wake';
   try {
     const summary = await mod.processAgentAutonomyV2(assistant as never);
     assert.equal(summary.succeeded, 1, 'the delegation itself must wake the agent');
+    assert.equal(harness.legacyCalls(), 0);
+    assert.deepEqual(harness.authority, [[]]);
   } finally {
     if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
     else process.env.AUTONOMY_V2_AGENTS = prevAgents;

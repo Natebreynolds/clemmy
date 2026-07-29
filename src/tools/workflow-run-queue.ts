@@ -592,7 +592,7 @@ export function findDuplicateQueuedWorkflowRun(
         retryFailedItemKeys?: unknown;
       };
       const status = typeof parsed.status === 'string' ? parsed.status : 'queued';
-      if (status !== 'queued' && status !== 'running') continue;
+      if (status !== 'queued' && status !== 'running' && status !== 'finalizing') continue;
       if (parsed.workflow !== workflowName) continue;
       // A requeue-from-run must never see its own SOURCE run as the duplicate
       // (the source is still status:'running' on disk when a goal re-pursuit

@@ -556,7 +556,7 @@ export function bindChatDiscussedToolkits(
   return bindDiscussedToolkitsIntoSteps(steps, toolkitsDiscussedInChat(sessionId));
 }
 
-const ACTIVE_RUN_STATUSES = new Set(['queued', 'running', 'parked']);
+const ACTIVE_RUN_STATUSES = new Set(['queued', 'running', 'finalizing', 'parked']);
 
 function formatRunAge(iso?: string): string {
   if (!iso) return '';
@@ -572,7 +572,7 @@ function formatRunAge(iso?: string): string {
 
 /**
  * Render a compact overview of workflow runs for chat recall ("what's running?"):
- * every in-flight (queued/running/parked) or needs-attention run, plus the few
+ * every in-flight (queued/running/finalizing/parked) or needs-attention run, plus the few
  * most-recent finished ones. Reads the run-record files directly — token-cheap.
  */
 export function renderWorkflowRunsOverview(limit = 15): string {

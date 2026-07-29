@@ -22,8 +22,19 @@ process.env.HOME = tmp;
 // Prove the flag is gone: even explicitly OFF, verification must still run.
 process.env.WORKFLOW_CONTRACT_OUTPUT = 'off';
 
-const { finalizeStepOutput } = await import('./workflow-runner.js');
-const { readWorkflowEvents } = await import('./workflow-events.js');
+const {
+  finalizeStepOutput,
+  _setAfterStepArtifactPersistForTests,
+} = await import('./workflow-runner.js');
+const { computeResumeState, readWorkflowEvents } = await import('./workflow-events.js');
+const {
+  readStepOutputArtifact,
+  readWorkspaceManifest,
+} = await import('./workflow-run-workspace.js');
+
+test.afterEach(() => {
+  _setAfterStepArtifactPersistForTests(null);
+});
 
 const WF = 'finalize-test-wf';
 let n = 0;
@@ -92,4 +103,51 @@ test('synthesis-shape step with url_present contract + no URL → fails the fina
     /failed its contract/,
   );
   assert.ok(kinds(run).includes('step_failed'));
+});
+
+test('artifact-first completion survives the crash window without authorizing truncated data', () => {
+  const run = nextRun();
+  const step = { id: 'large-source', prompt: 'produce exact rows' };
+  const marker = 'ROW-BEYOND-EVENT-PREVIEW-MUST-SURVIVE';
+  const output = {
+    rows: Array.from({ length: 500 }, (_, index) => ({
+      index,
+      value: `${'x'.repeat(90)}${index === 499 ? marker : ''}`,
+    })),
+  };
+
+  _setAfterStepArtifactPersistForTests(() => {
+    throw new Error('simulated process death after artifact fsync');
+  });
+  assert.throws(
+    () => finalizeStepOutput(WF, run, step, output),
+    /simulated process death/,
+  );
+
+  assert.equal(
+    computeResumeState(WF, run).completedSteps.has(step.id),
+    false,
+    'an orphan artifact is never completion authority',
+  );
+  const orphan = readWorkspaceManifest(WF, run)
+    .find((entry) => entry.tool === 'step-output' && entry.agent === step.id);
+  assert.ok(orphan?.sha256, 'the exact content-addressed artifact was durable before the crash');
+
+  _setAfterStepArtifactPersistForTests(null);
+  finalizeStepOutput(WF, run, step, output);
+
+  const resume = computeResumeState(WF, run);
+  const reference = resume.completedStepArtifacts.get(step.id);
+  assert.ok(reference, 'step_completed owns one exact artifact reference');
+  const journalOutput = resume.completedSteps.get(step.id) as { truncated?: boolean };
+  assert.equal(journalOutput.truncated, true, 'the event journal remains compact');
+
+  const exact = readStepOutputArtifact({
+    workflowName: WF,
+    runId: run,
+    stepId: step.id,
+    reference,
+  });
+  assert.equal(exact.verified, true);
+  assert.match(JSON.stringify(exact.value), new RegExp(marker));
 });

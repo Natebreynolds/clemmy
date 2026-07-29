@@ -68,7 +68,7 @@ writeFileSync(
 // did the work.
 writeFileSync(
   path.join(DELEGATIONS_DIR, 'researcher', 'd2.json'),
-  JSON.stringify({ id: 'd2', fromAgent: 'clementine', toAgent: 'researcher', task: 'summarize risks', expectedOutput: 'a list', status: 'completed', result: 'Three risks: a, b, c', completedBy: 'clementine', onBehalfOf: 'researcher', createdAt: '2026-06-22T09:00:00.000Z', updatedAt: '2026-06-22T10:00:00.000Z' }),
+  JSON.stringify({ id: 'd2', fromAgent: 'clementine', toAgent: 'researcher', task: 'summarize risks', expectedOutput: 'a list', status: 'completed', result: 'Three risks: a, b, c', resultEvidence: 'model_prose', completedBy: 'clementine', onBehalfOf: 'researcher', createdAt: '2026-06-22T09:00:00.000Z', updatedAt: '2026-06-22T10:00:00.000Z' }),
   'utf-8',
 );
 
@@ -314,7 +314,7 @@ test('GET /api/console/agents/comms carries delegation result and attribution', 
   try {
     const body = await (await fetch(`${h.url}/api/console/agents/comms`)).json() as {
       delegations: Array<{
-        id: string; status: string; result?: string; completedBy?: string; onBehalfOf?: string;
+        id: string; status: string; result?: string; resultEvidence?: string; completedBy?: string; onBehalfOf?: string;
       }>;
     };
     const done = body.delegations.find((d) => d.id === 'd2');
@@ -323,6 +323,7 @@ test('GET /api/console/agents/comms carries delegation result and attribution', 
     assert.equal(done.result, 'Three risks: a, b, c', 'the payoff the user actually wants to read');
     assert.equal(done.completedBy, 'clementine', 'who really produced it');
     assert.equal(done.onBehalfOf, 'researcher', 'and whose queue it came from');
+    assert.equal(done.resultEvidence, 'model_prose', 'evidence provenance reaches the UI');
 
     const open = body.delegations.find((d) => d.id === 'd1');
     assert.equal(open?.completedBy, undefined, 'an open delegation invents no author');

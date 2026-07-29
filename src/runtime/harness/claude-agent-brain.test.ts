@@ -1238,7 +1238,7 @@ test('Workspace dock: schema-on-demand loads the common edit kernel and defers s
   for (const common of ['space_get', 'space_get_view', 'space_edit_view']) {
     assert.ok(captured.mcpToolAllowlist.includes(common), `${common} stays first-class in a dock`);
   }
-  for (const specialized of ['space_get_runner', 'space_edit_runner', 'space_try_runner', 'space_history', 'space_diff', 'space_publish', 'space_save']) {
+  for (const specialized of ['space_get_runner', 'space_edit_runner', 'space_try_runner', 'space_history', 'space_diff', 'space_action_prepare', 'space_publish', 'space_save']) {
     assert.ok(captured.allowedLocalMcpTools.includes(specialized), `${specialized} remains permitted`);
     assert.ok(captured.localMcpToolUniverse.includes(specialized), `${specialized} remains call_tool-reachable`);
     assert.equal(captured.mcpToolAllowlist.includes(specialized), false, `${specialized} schema is deferred until needed`);

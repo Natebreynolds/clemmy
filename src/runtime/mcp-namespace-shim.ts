@@ -54,6 +54,7 @@ import {
   toolFailureCorrective,
 } from './harness/tool-error-corrective.js';
 import { creditMatchingRecall, isTransientFailure } from '../memory/procedural-recall-link.js';
+import { assertDispatchLeaseCurrent } from './harness/dispatch-lease.js';
 
 // Bound MCP startup below the SDK's default (~60s), but leave enough
 // room for `npx`/`uvx` based servers on fresh machines. 5s/8s was too
@@ -1041,6 +1042,11 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     },
 
     async callTool(toolName: string, args: Record<string, unknown> | null): Promise<CallToolResultContent> {
+      const entryRunContext = harnessRunContextStorage.getStore();
+      // A stale provider frame must not even rebuild routing or emit tool
+      // bookkeeping. Native MCP calls bypass wrapToolForHarness, so this is
+      // their first physical-attempt authority boundary.
+      assertDispatchLeaseCurrent(entryRunContext?.dispatchLease);
       // Ensure we have a routing map. The SDK always calls listTools()
       // before callTool() on a given run, but be defensive.
       if (!cachedToolToServer) {
@@ -1424,6 +1430,11 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       });
       let preRecordedWrite = false;
       const reserveWrite = async (): Promise<void> => {
+        // This runs inside the shared write-admission lock. If recovery won the
+        // race and revoked first, no reservation or provider call can occur. If
+        // this reservation wins first, the durable in-flight ledger prevents
+        // recovery from blindly replaying while the provider call is admitted.
+        assertDispatchLeaseCurrent(activeRunContext?.dispatchLease);
         // Earlier model judges intentionally run outside this critical section.
         // Every transport shares this short read-ledger → reserve-write lock;
         // provider dispatch begins only after it is released.
@@ -1477,6 +1488,13 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         await reserveWrite();
       }
       try {
+        // Reads have no reservation ledger, so close the async-gate window at
+        // the final dispatch edge. Writes deliberately rely on the pre-dispatch
+        // reservation above once admitted (a post-reservation denial would
+        // create a false orphan).
+        if (!preRecordedWrite) {
+          assertDispatchLeaseCurrent(activeRunContext?.dispatchLease);
+        }
         // Forward to the underlying server with the ORIGINAL tool name.
         const rawResult = await server.callTool(parsed.toolName, args);
         const normalized = normalizeMcpCallResult(toolName, rawResult);

@@ -83,9 +83,12 @@ test('running_silent: a running run with NO step activity past the window is fla
     { id: 'alive', workflow: 'wf', status: 'running', createdAt: iso(60 * 60_000), lastActivityAt: iso(60_000) },
     // no events at all (lastActivityAt absent) → age from createdAt
     { id: 'never-started', workflow: 'wf', status: 'running', createdAt: iso(20 * 60_000) },
+    // finalization can include model judges and must retain the same liveness net
+    { id: 'finalizing-wedged', workflow: 'wf', status: 'finalizing', createdAt: iso(60 * 60_000), lastActivityAt: iso(30 * 60_000) },
+    { id: 'finalizing-alive', workflow: 'wf', status: 'finalizing', createdAt: iso(60 * 60_000), lastActivityAt: iso(60_000) },
   ];
   const stalled = findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN, runningSilentStallMs: 10 * 60_000 });
-  assert.deepEqual(stalled.map((r) => r.id).sort(), ['never-started', 'wedged']);
+  assert.deepEqual(stalled.map((r) => r.id).sort(), ['finalizing-wedged', 'never-started', 'wedged']);
   assert.ok(stalled.every((r) => r.reason === 'running_silent'));
 });
 

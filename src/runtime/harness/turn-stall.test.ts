@@ -384,6 +384,120 @@ test('a superseded (stalled) attempt does NOT stream its late tokens into the li
   assert.deepEqual(chunks, ['GOOD'], "the superseded attempt's late STALE token must be suppressed");
 });
 
+test('an authoritative normal attempt can mutate exactly once through the dispatch lease', async () => {
+  const {
+    ToolCallsCounter,
+    withHarnessRunContext,
+    wrapToolForHarness,
+  } = await import('./brackets.js');
+  const { createSession } = await import('./eventlog.js');
+  const session = createSession({ kind: 'chat' });
+  const writes: string[] = [];
+  const wrapped = wrapToolForHarness({
+    name: 'space_save',
+    execute: async (input: unknown) => {
+      writes.push(String((input as { writer?: unknown }).writer ?? 'unknown'));
+      return 'saved';
+    },
+  }, { timeoutMs: 1_000 });
+  const healthy = {
+    history: [], lastResponseId: 'healthy', finalOutput: { ok: true }, rawResponses: [],
+    completed: Promise.resolve(),
+    async *[Symbol.asyncIterator]() {
+      await wrapped.execute!({ writer: 'authoritative-attempt' });
+      yield { type: 'raw_model_stream_event', data: { type: 'output_text_delta', delta: 'done' } };
+    },
+  };
+
+  const out = await withHarnessRunContext(
+    {
+      sessionId: session.id,
+      behaviorScopeId: `${session.id}::turn:normal`,
+      counter: new ToolCallsCounter(10),
+    },
+    () => __defaultRunRunner(runnerFor(healthy), {} as never, [], {} as never),
+  );
+
+  assert.deepEqual(out.finalOutput, { ok: true });
+  assert.deepEqual(writes, ['authoritative-attempt']);
+});
+
+test('a superseded pre-content attempt cannot mutate after the recovery attempt starts', async () => {
+  // The stream guard above protects only user-visible text. A cancelled provider
+  // can still finish a late tool call after the retry has started, so the tool
+  // boundary must reject work owned by the superseded attempt. This reproduces
+  // the live GLM workspace race without a network dependency: cancel() is
+  // observed, the recovery attempt saves first, then the abandoned attempt
+  // reaches the real harness wrapper with a second space_save.
+  const {
+    ToolCallsCounter,
+    withHarnessRunContext,
+    wrapToolForHarness,
+  } = await import('./brackets.js');
+  const { createSession } = await import('./eventlog.js');
+  const session = createSession({ kind: 'chat' });
+  const writes: string[] = [];
+  let cancelCalls = 0;
+  let releaseRetry!: () => void;
+  let settleStale!: () => void;
+  const retryStarted = new Promise<void>((resolve) => { releaseRetry = resolve; });
+  const staleSettled = new Promise<void>((resolve) => { settleStale = resolve; });
+  const wrapped = wrapToolForHarness({
+    name: 'space_save',
+    execute: async (input: unknown) => {
+      writes.push(String((input as { writer?: unknown }).writer ?? 'unknown'));
+      return 'saved';
+    },
+  }, { timeoutMs: 1_000 });
+
+  const stale = {
+    history: [], lastResponseId: 'stale', finalOutput: { ok: false }, rawResponses: [],
+    completed: Promise.resolve(),
+    cancel: () => { cancelCalls += 1; },
+    async *[Symbol.asyncIterator]() {
+      await retryStarted;
+      try {
+        await wrapped.execute!({ writer: 'stale-attempt' });
+        yield { type: 'run_item_stream_event', item: { type: 'tool_call_item' } };
+      } catch {
+        // A dispatch-lease refusal is the expected fixed behavior. The stale
+        // drain is detached, so expose settlement through staleSettled below.
+      } finally {
+        settleStale();
+      }
+    },
+  };
+  const live = {
+    history: [], lastResponseId: 'live', finalOutput: { ok: true }, rawResponses: [],
+    completed: Promise.resolve(),
+    async *[Symbol.asyncIterator]() {
+      releaseRetry();
+      await wrapped.execute!({ writer: 'recovery-attempt' });
+      yield { type: 'raw_model_stream_event', data: { type: 'output_text_delta', delta: 'done' } };
+    },
+  };
+  let call = 0;
+  const runner = { run: async () => (call++ === 0 ? stale : live) } as unknown as Runner;
+  const out = await withHarnessRunContext(
+    {
+      sessionId: session.id,
+      behaviorScopeId: `${session.id}::turn:1`,
+      counter: new ToolCallsCounter(10),
+    },
+    () => __defaultRunRunner(runner, {} as never, [], {} as never),
+  );
+  await staleSettled;
+
+  assert.deepEqual(out.finalOutput, { ok: true }, 'the recovery attempt remains authoritative');
+  assert.equal(call, 2, 'the stalled turn is retried exactly once');
+  assert.equal(cancelCalls, 1, 'the stale stream received the best-effort transport cancel');
+  assert.deepEqual(
+    writes,
+    ['recovery-attempt'],
+    'the superseded attempt must be fenced before its late mutation executes',
+  );
+});
+
 test('a pre-content stall that NEVER recovers still fails after exhausting retries', async () => {
   // Both attempts wedge → after the one retry, surface the transient stall.
   const wedged = () => makeStreamResult({ events: 0, hang: true });
@@ -421,4 +535,81 @@ test('G4 (2026-07-20): a kill lands MID-STREAM on a tool-less turn — no waitin
   );
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 4_000, `kill honored mid-stream in ~1 poll tick, not at the turn boundary (took ${elapsed}ms)`);
+});
+
+test('a killed attempt is fenced before transport cancel can release a late mutation', async () => {
+  const {
+    ToolCallsCounter,
+    withHarnessRunContext,
+    wrapToolForHarness,
+  } = await import('./brackets.js');
+  const { createSession, requestKill } = await import('./eventlog.js');
+  const session = createSession({ kind: 'chat' });
+  const writes: string[] = [];
+  let cancelCalls = 0;
+  let releaseCancel!: () => void;
+  let signalStarted!: () => void;
+  let signalSettled!: () => void;
+  const cancelled = new Promise<void>((resolve) => { releaseCancel = resolve; });
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  const settled = new Promise<void>((resolve) => { signalSettled = resolve; });
+  const wrapped = wrapToolForHarness({
+    name: 'space_save',
+    execute: async () => {
+      writes.push('late-after-kill');
+      return 'saved';
+    },
+  }, { timeoutMs: 1_000 });
+  const stale = {
+    history: [], lastResponseId: 'killed', finalOutput: { ok: false }, rawResponses: [],
+    completed: Promise.resolve(),
+    cancel: () => {
+      cancelCalls += 1;
+      releaseCancel();
+    },
+    async *[Symbol.asyncIterator]() {
+      signalStarted();
+      let wasCancelled = false;
+      while (!wasCancelled) {
+        wasCancelled = await Promise.race([
+          cancelled.then(() => true),
+          new Promise<false>((resolve) => setTimeout(() => resolve(false), 100)),
+        ]);
+        if (!wasCancelled) {
+          yield { type: 'raw_model_stream_event', data: { type: 'output_text_delta', delta: '.' } };
+        }
+      }
+      try {
+        await wrapped.execute!({});
+      } catch {
+        // The kill path must revoke before invoking cancel(), so this is the
+        // expected stale-generation refusal.
+      } finally {
+        signalSettled();
+      }
+    },
+  };
+  const task = withHarnessRunContext(
+    {
+      sessionId: session.id,
+      behaviorScopeId: `${session.id}::turn:kill`,
+      counter: new ToolCallsCounter(10),
+    },
+    () => __defaultRunRunner(
+      runnerFor(stale),
+      {} as never,
+      [],
+      { context: { sessionId: session.id } } as never,
+    ),
+  );
+  await started;
+  requestKill(session.id, 'user hit stop');
+  await assert.rejects(
+    task,
+    (err: unknown) => err instanceof Error && err.name === 'KillRequested',
+  );
+  await settled;
+
+  assert.equal(cancelCalls, 1);
+  assert.deepEqual(writes, [], 'cancel-released stale work never reaches the local mutation');
 });

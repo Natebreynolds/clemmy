@@ -15,6 +15,7 @@ import {
   withHarnessRunContext,
   ToolCallsCounter,
   defaultToolCallsPerTurn,
+  harnessRunContextStorage,
   workerThrashGuardEnabled,
   type WrappableTool,
 } from '../runtime/harness/brackets.js';
@@ -301,6 +302,7 @@ export async function runCrossProviderWorker(
   const counter = new ToolCallsCounter(Math.max(defaultToolCallsPerTurn(), maxTurns * 4));
   const scopeId = `${sessionId}::sdkx:${Date.now()}-${(crossWorkerScopeSeq = (crossWorkerScopeSeq + 1) % 1_000_000)}`;
   const runner = new Runner({ workflowName: 'clementine-sdk-brain-cross-worker', groupId: sessionId });
+  const parentHarnessContext = harnessRunContextStorage.getStore();
   try {
     const result = await withHarnessRunContext(
       {
@@ -309,6 +311,12 @@ export async function runCrossProviderWorker(
         mcpToolScope: effectiveMcpToolScope,
         ...(guard ? { guardrailScopeId: scopeId } : {}),
         ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
+        ...(parentHarnessContext?.sessionId === sessionId && parentHarnessContext.dispatchLease
+          ? { dispatchLease: parentHarnessContext.dispatchLease }
+          : {}),
+        ...(parentHarnessContext?.sessionId === sessionId && parentHarnessContext.runAttemptId
+          ? { runAttemptId: parentHarnessContext.runAttemptId }
+          : {}),
       },
       () =>
         runner.run(worker, buildWorkerJobPrompt(input), {

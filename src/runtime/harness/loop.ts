@@ -1,5 +1,6 @@
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
+import { randomUUID } from 'node:crypto';
 import { HarnessSession } from './session.js';
 import { markRunInFlight } from './restart-recovery.js';
 import { uncompensatedExternalWriteEvents } from './external-write-admission.js';
@@ -113,6 +114,13 @@ import { isUserFacingSession } from '../../execution/scope.js';
 import { primeTurnRecallVector, recordFactImpression, searchFactsByText } from '../../memory/facts.js';
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
+import {
+  activateDispatchLease,
+  captureDispatchRecoveryLedgerBaseline,
+  checkDispatchRecoveryLedger,
+  revokeDispatchLeaseBeforeRecovery,
+  type DispatchLeaseRef,
+} from './dispatch-lease.js';
 import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
@@ -1200,6 +1208,9 @@ export interface RunTurnOptions {
   reuseRecordedUserInput?: boolean;
   /** Exact accepted source event owned by this logical user request. */
   sourceUserSeq?: number;
+  /** Durable outer request attempt. Internal provider retries remain children
+   * of this identity and lose authority when it reaches a terminal state. */
+  runAttemptId?: string;
   /** W1a: when true, a TRANSIENT model/codex error returns `infraTransientKind`
    *  WITHOUT writing the infra-recovery ask, so runConversation can attempt
    *  cross-brain fallover first. Off (default) = today's behavior verbatim. */
@@ -1330,6 +1341,9 @@ export interface RunConversationOptions {
   reuseRecordedUserInput?: boolean;
   /** Exact accepted source event owned by this logical user request. */
   sourceUserSeq?: number;
+  /** Durable outer request attempt, forwarded through every continuation and
+   * cross-brain retry. */
+  runAttemptId?: string;
   /**
    * W1a chat step-boundary brain fallover. When BOTH are provided, a turn that
    * fails on a TRANSIENT model/codex error (and has NOT written externally this
@@ -2556,6 +2570,7 @@ async function runConversationCore(
       // The entire self-continuation/fallover chain remains authorized by the
       // same accepted user event; a synthetic prompt never becomes authority.
       sourceUserSeq: activeSourceUserSeq,
+      runAttemptId: options.runAttemptId,
       maxTurns,
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
@@ -5910,6 +5925,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           sessionId: options.sessionId,
           counter: toolCounter,
           sourceUserSeq,
+          ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
           behaviorScopeId: `${options.sessionId}::turn:${turn}`,
           recallBudget,
           suppressBackgroundOffer: options.suppressBackgroundOffer,
@@ -6034,6 +6050,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 export interface ResumePendingApprovalOptions {
   agent: Agent<any, any>;
   sessionId: string;
+  /** Durable outer request attempt. The resumed SDK state must retain the
+   * same authority as the workflow/chat turn that originally parked it. */
+  runAttemptId?: string;
   /** Exact durable card the human acted on. When supplied, only the SDK
    * interruption whose tool and full payload match this row may inherit the
    * decision; every sibling interruption remains pending. */
@@ -6431,6 +6450,7 @@ export async function resumePendingApproval(
           resumeCtx = {
             sessionId: options.sessionId,
             counter: toolCounter,
+            ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
             ...(resumeAgentScopeBinding.bound ? { mcpToolScope: resumeAgentScopeBinding.scope } : {}),
             ...(resumeSourceUserSeq ? { sourceUserSeq: resumeSourceUserSeq } : {}),
           };
@@ -6575,6 +6595,9 @@ export async function resumePendingApproval(
 export async function runConversationFromResume(opts: {
   agent: Agent<any, any>;
   sessionId: string;
+  /** Durable outer request attempt, retained across the resumed SDK state and
+   * every synthetic continuation that follows it. */
+  runAttemptId?: string;
   approvalId?: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
   /** Required when decision === 'approve_with_edits'. JSON-encoded args. */
@@ -6602,6 +6625,7 @@ export async function runConversationFromResume(opts: {
 async function runConversationFromResumeCore(opts: {
   agent: Agent<any, any>;
   sessionId: string;
+  runAttemptId?: string;
   approvalId?: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
   modifiedArgs?: string;
@@ -6664,6 +6688,7 @@ async function runConversationFromResumeCore(opts: {
   const firstResult = await resumePendingApproval({
     agent: opts.agent,
     sessionId: opts.sessionId,
+    runAttemptId: opts.runAttemptId,
     approvalId: opts.approvalId,
     decision: opts.decision,
     modifiedArgs: opts.modifiedArgs,
@@ -7102,6 +7127,7 @@ async function runConversationFromResumeCore(opts: {
       // Resume continuations are always harness-synthetic, never a user message.
       suppressMemoryCapture: true,
       sourceUserSeq: activeSourceUserSeq,
+      runAttemptId: opts.runAttemptId,
       maxTurns,
       toolCallsPerTurn,
       makeRunner: opts.makeRunner,
@@ -8284,9 +8310,42 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   // "importportance" on a recovered heavy turn). Gating onChunk on this id —
   // and capturing `result` per attempt — keeps a superseded stream silent.
   let activeAttempt = 0;
+  const parentHarnessContext = harnessRunContextStorage.getStore();
+  // One scope per defaultRunRunner invocation, with a new generation for each
+  // internal pre-content retry. A unique child scope avoids unrelated parallel
+  // workers under the same turn rotating one another.
+  const runnerDispatchScopeId = parentHarnessContext
+    ? `${parentHarnessContext.dispatchLease?.scopeId
+      ?? parentHarnessContext.behaviorScopeId
+      ?? parentHarnessContext.sessionId}::runner:${randomUUID()}`
+    : undefined;
   for (let attempt = 0; ; attempt += 1) {
     activeAttempt = attempt;
-    result = await run(agent, items, { ...opts, stream: true });
+    const dispatchLease: DispatchLeaseRef | undefined =
+      parentHarnessContext && runnerDispatchScopeId && getSession(parentHarnessContext.sessionId)
+        ? activateDispatchLease({
+            sessionId: parentHarnessContext.sessionId,
+            scopeId: runnerDispatchScopeId,
+            runAttemptId: parentHarnessContext.runAttemptId,
+          })
+        : undefined;
+    const dispatchRecoveryBaseline = dispatchLease
+      ? captureDispatchRecoveryLedgerBaseline(dispatchLease.sessionId)
+      : undefined;
+    const physicalAttemptContext = parentHarnessContext && dispatchLease
+      ? { ...parentHarnessContext, dispatchLease }
+      : parentHarnessContext;
+    try {
+      result = physicalAttemptContext
+        ? await withHarnessRunContext(
+            physicalAttemptContext,
+            () => run(agent, items, { ...opts, stream: true }),
+          )
+        : await run(agent, items, { ...opts, stream: true });
+    } catch (err) {
+      await revokeDispatchLeaseBeforeRecovery(dispatchLease);
+      throw err;
+    }
     const myResult = result;
     const myAttempt = attempt;
     const iterable = Symbol.asyncIterator in (myResult as unknown as Record<symbol, unknown>);
@@ -8312,7 +8371,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
       } catch { /* advisory telemetry must never break the stream */ }
       console.warn(`[harness] content chanting detected (advisory): a ${trip.chunk.length}-char chunk repeated ${trip.repeats}x`);
     };
-    const drain = (async () => {
+    const drainWork = async (): Promise<void> => {
       if (iterable) {
         for await (const event of myResult as unknown as AsyncIterable<unknown>) {
           // Every real Runner/model/tool event remains activity. Fusion's
@@ -8338,7 +8397,10 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
         }
       }
       await myResult.completed;
-    })();
+    };
+    const drain = physicalAttemptContext
+      ? withHarnessRunContext(physicalAttemptContext, drainWork) as Promise<void>
+      : drainWork();
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     const watchdog = new Promise<never>((_, reject) => {
       if (!iterable || streamMs <= 0) return; // mocks / kill-switch: no watchdog
@@ -8351,14 +8413,24 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
         // a private activity timestamp in the run context instead; count that as
         // liveness without counting it as committed content. If reasoning stops,
         // the ordinary first-byte window still expires from its final timestamp.
-        const privateActivityAt = harnessRunContextStorage.getStore()?.privateModelActivityAt ?? 0;
+        const privateActivityAt =
+          physicalAttemptContext?.privateModelActivityAt
+          ?? harnessRunContextStorage.getStore()?.privateModelActivityAt
+          ?? 0;
         const observedActivityAt = Math.max(lastEventAt, privateActivityAt);
         if (Date.now() - observedActivityAt > win) {
           if (stallTimer) clearInterval(stallTimer);
-          // Best-effort: release the underlying stream so the dangling
-          // request doesn't pin sockets after we abandon the turn.
-          try { (myResult as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
-          reject(new ModelStreamStalledError(Math.round(win / 1000), !yieldedContent));
+          // Revoke authority BEFORE transport cancellation or recovery. A late
+          // cancel callback/tool frame can now only observe the stale lease.
+          void revokeDispatchLeaseBeforeRecovery(dispatchLease).then(
+            () => {
+              // Best-effort: release the underlying stream so the dangling
+              // request doesn't pin sockets after we abandon the turn.
+              try { (myResult as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
+              reject(new ModelStreamStalledError(Math.round(win / 1000), !yieldedContent));
+            },
+            reject,
+          );
         }
       }, tickMs);
       // Deliberately NOT unref'd: while a turn is in flight the watchdog IS
@@ -8384,8 +8456,13 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
           const target = getActiveRunAttempt(killSessionId) ?? undefined;
           if (isKillRequested(killSessionId, target)) {
             if (killTimer) clearInterval(killTimer);
-            try { (myResult as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
-            reject(new KillRequested(killSessionId));
+            void revokeDispatchLeaseBeforeRecovery(dispatchLease).then(
+              () => {
+                try { (myResult as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
+                reject(new KillRequested(killSessionId));
+              },
+              reject,
+            );
           }
         } catch { /* kill poll is best-effort */ }
       }, 1000);
@@ -8396,12 +8473,37 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     }).catch(() => { /* surfaced via race */ });
     try {
       await Promise.race([drain, watchdog, killWatch]);
+      await revokeDispatchLeaseBeforeRecovery(dispatchLease);
       recoveryStreamText = attemptStreamText;
       break; // turn drained successfully
     } catch (err) {
+      // Exact-generation revoke is idempotent. It must finish before any retry
+      // can acquire the next generation.
+      await revokeDispatchLeaseBeforeRecovery(dispatchLease);
       // A pre-content stall is retryable: nothing streamed, so no tool ran and
       // no partial reply reached the user — re-run cleanly before giving up.
       if (err instanceof ModelStreamStalledError && err.preContent && attempt < maxStallRetries) {
+        const recoveryCheck = dispatchLease
+          ? checkDispatchRecoveryLedger(dispatchLease.sessionId, dispatchRecoveryBaseline)
+          : { safeToReplay: true as const, evidence: [] };
+        if (!recoveryCheck.safeToReplay) {
+          try {
+            appendEvent({
+              sessionId: dispatchLease!.sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'guardrail_tripped',
+              data: {
+                kind: 'physical_attempt_retry_blocked',
+                reason: recoveryCheck.reason,
+                recordedExternalWrites: recoveryCheck.evidence.filter(
+                  (event) => event.type === 'external_write',
+                ).length,
+              },
+            });
+          } catch { /* recovery remains fail-closed without telemetry */ }
+          throw err;
+        }
         console.warn(`[harness] model stream stalled pre-content after ${err.seconds}s — retrying (attempt ${attempt + 1}/${maxStallRetries})`);
         continue;
       }

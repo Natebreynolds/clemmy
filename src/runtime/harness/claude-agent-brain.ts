@@ -132,6 +132,13 @@ import {
   queuedApprovalTransitionShouldMaterialize,
   queuedApprovalTransitionsForRequest,
 } from './pending-action-transition.js';
+import {
+  activateDispatchLease,
+  captureDispatchRecoveryLedgerBaseline,
+  checkDispatchRecoveryLedger,
+  revokeDispatchLeaseBeforeRecovery,
+  type DispatchRecoveryLedgerCheck,
+} from './dispatch-lease.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
@@ -509,6 +516,7 @@ function toolPolicyForRequest(request: AssistantRequest, mode: ClaudeAgentBrainM
     surface: 'claude_agent_sdk_brain',
     lane: mode,
     toolNames: defaultClaudeAgentSdkAllowedLocalTools(toolProfileForMode(mode)),
+    allowedToolNames: request.allowedToolNames,
     excludeToolNames: request.excludeToolNames,
     reason: 'claude-agent-sdk allowed local MCP tools',
   });
@@ -524,9 +532,10 @@ export function claudeAgentSdkAdvertisedToolUniverse(
   mode: ClaudeAgentBrainMode,
   fastAllowNames: readonly string[],
   excludeNames: readonly string[] = [],
+  explicitAuthority = false,
 ): string[] {
   const excluded = new Set(excludeNames);
-  const names = mode === 'full'
+  const names = mode === 'full' && !explicitAuthority
     // The MCP server directly registers most capabilities. Four computer reads
     // (workspace_roots/list_files/read_file/git_status) are implemented only as
     // local-runtime tools, but the schema-on-demand call_tool bridge can invoke
@@ -1471,12 +1480,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // definitions never enter provider accounting. This is an acquisition
   // mechanism, not permission pruning. If disabled, fall back to the legacy
   // semantic JIT behavior byte-for-byte.
+  const explicitToolAuthority = request.allowedToolNames !== undefined;
   const fullToolPolicy = toolPolicyForRequest(request, mode);
   const fullAllowed = fullToolPolicy.names;
   const advertisedUniverse = claudeAgentSdkAdvertisedToolUniverse(
     mode,
     fullAllowed,
     request.excludeToolNames,
+    explicitToolAuthority,
   );
   try {
     appendEvent({
@@ -1490,10 +1501,18 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   const jitDecision = resolveToolJitDecision({ allowLane: true, sessionId });
   let jitAllowed = fullAllowed;
   let jitAdvertised = advertisedUniverse;
-  let mcpToolAllowlist: string[] | undefined;
+  // `undefined` means the normal/default surface; an explicit empty array is a
+  // real zero-authority boundary and must survive every layer unchanged.
+  let mcpToolAllowlist: string[] | undefined = explicitToolAuthority
+    ? [...advertisedUniverse]
+    : undefined;
   let jitDropped = 0;
   let jitReason = jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
-  const schemaOnDemandAcquisition = mode === 'full' && claudeToolSearchEnabled();
+  // The acquisition bridge itself is extra authority. Exact per-call
+  // allowlists therefore remain first-class and never gain tool_search or
+  // call_tool implicitly.
+  const schemaOnDemandAcquisition =
+    mode === 'full' && !explicitToolAuthority && claudeToolSearchEnabled();
   const priorBrainInputs = recentPriorBrainInputs(sessionId, request.message);
   const jitQuery = [request.message, ...priorBrainInputs]
     .filter((s) => s.trim().length > 0)
@@ -1613,7 +1632,13 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // Keep the Claude-native external MCP surface observable with the same event
   // contract as the Codex lane. This is also the auditable proof that an
   // explicit local-only boundary resolved to zero external authority.
-  const nativeMcpScope: McpToolScope = mode === 'full'
+  const nativeMcpScope: McpToolScope = explicitToolAuthority
+    ? {
+        reason: 'Explicit local tool allowlist; native external MCP authority denied',
+        allowedServerSlugs: [],
+        maxTools: 0,
+      }
+    : mode === 'full'
     ? resolveMcpToolScopeWithRecall({
         userInput: turnObjective,
         priorUserInputs: priorBrainInputs,
@@ -1676,7 +1701,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     turnContext,
     allowedLocalMcpTools: jitAllowed,
     mcpToolAllowlist,
-    localMcpToolUniverse: schemaOnDemandAcquisition ? advertisedUniverse : undefined,
+    localMcpToolUniverse: explicitToolAuthority
+      ? [...advertisedUniverse]
+      : schemaOnDemandAcquisition
+        ? advertisedUniverse
+        : undefined,
     agentic: mode === 'full',
     // Mount the read-fanout block on native external MCP: the orchestrator brain
     // is the ONE lane with run_tool_program (the recovery), so serial native-MCP
@@ -1688,9 +1717,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // silently). If the local server didn't attach, these sentinels are absent
     // from the SDK init → typed ClaudeAgentSdkToolSurfaceError → the bridge's
     // cross-brain fallover completes the turn on Codex instead of a blind run.
-    requiredLocalMcpTools: schemaOnDemandAcquisition
-      ? ['memory_recall_all', 'tool_search', 'call_tool']
-      : ['memory_recall_all'],
+    requiredLocalMcpTools: explicitToolAuthority
+      ? []
+      : schemaOnDemandAcquisition
+        ? ['memory_recall_all', 'tool_search', 'call_tool']
+        : ['memory_recall_all'],
     // Scope the native external MCP servers to THIS turn's intent (the user's message)
     // so the Claude brain reaches native capabilities (dataforseo, browsermcp, …) like
     // the Codex lane, without attaching all of them.
@@ -1775,9 +1806,48 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // separate process), so the fan-out slice of this ceiling is enforced via
   // the eventlog, not shared memory. No-op when unlimited/off.
   recordRunTokenWindow({ sessionId, baseline: budgetBaseline, ceiling: budgetCeiling, warned: new Set() });
+  const sdkDispatchScopeId = `${attemptTrackerScopeId}::sdk-dispatch`;
+  const physicalRecoveryChecks = new WeakMap<object, DispatchRecoveryLedgerCheck>();
+  const recoveryCheckFor = (err: unknown): DispatchRecoveryLedgerCheck | undefined =>
+    typeof err === 'object' && err !== null
+      ? physicalRecoveryChecks.get(err)
+      : undefined;
+  const physicalAttemptMayReplay = (err: unknown): boolean =>
+    recoveryCheckFor(err)?.safeToReplay === true;
+  const runSdkPhysicalAttempt = async (
+    opts: Parameters<typeof runClaudeAgentSdkImpl>[0],
+  ): Promise<ClaudeAgentSdkRunResult> => {
+    const recoveryBaseline = captureDispatchRecoveryLedgerBaseline(sessionId);
+    const dispatchLease = activateDispatchLease({
+      sessionId,
+      scopeId: sdkDispatchScopeId,
+      runAttemptId: attempt.attemptId,
+    });
+    let revokedAfterFailure = false;
+    try {
+      return await runClaudeAgentSdkImpl({ ...opts, dispatchLease });
+    } catch (err) {
+      await revokeDispatchLeaseBeforeRecovery(dispatchLease);
+      revokedAfterFailure = true;
+      if (typeof err === 'object' && err !== null) {
+        physicalRecoveryChecks.set(
+          err,
+          checkDispatchRecoveryLedger(sessionId, recoveryBaseline),
+        );
+      }
+      throw err;
+    } finally {
+      // The exact-generation revoke is idempotent. On failure the catch above
+      // performs it before binding the replay check; healthy completion still
+      // closes authority before any continuation can begin.
+      if (!revokedAfterFailure) {
+        await revokeDispatchLeaseBeforeRecovery(dispatchLease);
+      }
+    }
+  };
   const runWithSalvage = async (opts: Parameters<typeof runClaudeAgentSdkImpl>[0]): Promise<ClaudeAgentSdkRunResult> => {
     try {
-      return await runClaudeAgentSdkImpl(opts);
+      return await runSdkPhysicalAttempt(opts);
     } catch (err) {
       // P4: a COMMITTED provider overload (the model hit 429/529 AFTER side effects
       // landed, 21-min-in) used to dead-end as a raw "overloaded" error. If writes
@@ -1817,8 +1887,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             return salvagedOverflow;
           }
         }
+        if (!physicalAttemptMayReplay(err)) throw err;
         try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'claude_sdk_overflow_retry', reason: 'context_overflow_reduced_retry' } }); } catch { /* best-effort */ }
-        return await runClaudeAgentSdkImpl({
+        return await runSdkPhysicalAttempt({
           ...opts,
           priorTurns: opts.priorTurns?.slice(-2),
           turnContext: stripRecallFromTurnContext(opts.turnContext),
@@ -1831,8 +1902,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         return salvaged;
       }
       // Nothing committed yet — safe to retry once.
+      if (!physicalAttemptMayReplay(err)) throw err;
       try {
-        return await runClaudeAgentSdkImpl(opts);
+        return await runSdkPhysicalAttempt(opts);
       } catch (err2) {
         if (isClaudeSdkUnparseableToolCall(err2)) {
           const s2 = salvageCommittedResult(sessionId, salvageSinceSeq); // the retry may have committed before failing
@@ -1847,7 +1919,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // rather than turning a finished turn into a failure. Returns null ⇒ keep prior.
   const runContinuation = async (opts: Parameters<typeof runClaudeAgentSdkImpl>[0]): Promise<ClaudeAgentSdkRunResult | null> => {
     try {
-      return await runClaudeAgentSdkImpl(opts);
+      return await runSdkPhysicalAttempt(opts);
     } catch (err) {
       if (claudeSdkSalvageEnabled() && isClaudeSdkUnparseableToolCall(err)) return null;
       throw err;

@@ -49,6 +49,11 @@ import type { PluginTool } from '../plugins/types.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
+import {
+  assertDispatchLeaseCurrent,
+  parseDispatchLease,
+  type DispatchLeaseRef,
+} from '../runtime/harness/dispatch-lease.js';
 
 // Counter cap for the ambient harness run context. Most tools wrapped here are
 // reads that never touch the counter; the gated mutating tools set their OWN
@@ -74,6 +79,9 @@ export interface ClementineMcpServerOptions {
   /** Exact parent external-MCP authority carried through the Claude SDK's
    * in-process or stdio local-MCP transport into nested tools/workers. */
   mcpToolScope?: McpToolScope | null;
+  /** Physical SDK attempt allowed to enter local tool handlers. Serialized
+   * through env when this server runs as a stdio child. */
+  dispatchLease?: DispatchLeaseRef;
   gatedMutations?: boolean;
   allowedTools?: string[];
   /** Tools that must remain first-class when the client supports MCP tool
@@ -108,33 +116,44 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
     return Number.isSafeInteger(value) && value > 0 ? value : undefined;
   })();
   const mcpToolScope = resolvedMcpToolScope(opts);
+  const dispatchLease = opts.dispatchLease
+    ?? parseDispatchLease(process.env.CLEMENTINE_MCP_DISPATCH_LEASE_JSON);
   const originalTool = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
     const last = args.length - 1;
     const handler = args[last];
     if (toolName && typeof handler === 'function') {
-      args[last] = async (...handlerArgs: any[]) => withToolOutputContext(
-        { sessionId, runScopeId, toolName, ...(workflowRunId ? { workflowRunId } : {}), ...(workflowName ? { workflowName } : {}), ...(stepId ? { stepId } : {}) },
-        // Also establish the harness run context so tools that read it for the
-        // active session (execution_create / execution_* / plan / goal, etc.)
-        // resolve CLEMENTINE_MCP_SESSION_ID instead of failing with "requires a
-        // harness session context". Without this, the Agent SDK lane deadlocks:
-        // the execution-wrap gate demands an execution lane before an outbound
-        // send, but execution_create could not see the session to open one.
-        // The gated mutating tools nest their own inner context (with the real
-        // per-call counter), so this is a safe outer fallback for everything else.
-        () => withHarnessRunContext(
-          {
-            sessionId,
-            behaviorScopeId: runScopeId,
-            counter: new ToolCallsCounter(AMBIENT_COUNTER_LIMIT),
-            ...(sourceUserSeq ? { sourceUserSeq } : {}),
-            ...(mcpToolScope !== undefined ? { mcpToolScope } : {}),
-          },
-          () => handler(...handlerArgs),
-        ),
-      );
+      args[last] = async (...handlerArgs: any[]) => {
+        // Reject before tool-output context, counters, audit mirrors, or the
+        // handler itself can observe a superseded SDK query.
+        assertDispatchLeaseCurrent(dispatchLease);
+        return withToolOutputContext(
+          { sessionId, runScopeId, toolName, ...(workflowRunId ? { workflowRunId } : {}), ...(workflowName ? { workflowName } : {}), ...(stepId ? { stepId } : {}) },
+          // Also establish the harness run context so tools that read it for the
+          // active session (execution_create / execution_* / plan / goal, etc.)
+          // resolve CLEMENTINE_MCP_SESSION_ID instead of failing with "requires a
+          // harness session context". Without this, the Agent SDK lane deadlocks:
+          // the execution-wrap gate demands an execution lane before an outbound
+          // send, but execution_create could not see the session to open one.
+          // The gated mutating tools nest their own inner context (with the real
+          // per-call counter), so this is a safe outer fallback for everything else.
+          () => withHarnessRunContext(
+            {
+              sessionId,
+              behaviorScopeId: runScopeId,
+              counter: new ToolCallsCounter(AMBIENT_COUNTER_LIMIT),
+              ...(sourceUserSeq ? { sourceUserSeq } : {}),
+              ...(mcpToolScope !== undefined ? { mcpToolScope } : {}),
+              ...(dispatchLease ? {
+                dispatchLease,
+                runAttemptId: dispatchLease.runAttemptId,
+              } : {}),
+            },
+            () => handler(...handlerArgs),
+          ),
+        );
+      };
     }
     return originalTool(...args);
   };
@@ -287,6 +306,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
     sessionId: opts.sessionId,
     runScopeId: opts.runScopeId,
     sourceUserSeq: opts.sourceUserSeq,
+    dispatchLease: opts.dispatchLease,
   });
 
   // Code Mode (Lane C) — expose run_tool_program on the Claude SDK lane too, so

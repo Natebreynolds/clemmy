@@ -162,6 +162,20 @@ test('queueWorkflowRun: writes a queued run and dedupes identical inputs', () =>
   assert.equal(runFiles().length, 1);
 });
 
+test('queueWorkflowRun: finalizing remains active and cannot be queued twice', () => {
+  const first = queueWorkflowRun('audit-brief', { url: 'https://finalizing.example' });
+  assert.equal(first.status, 'queued');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${first.id}.json`);
+  const record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({ ...record, status: 'finalizing' }), 'utf-8');
+
+  const duplicate = queueWorkflowRun('audit-brief', { url: 'https://finalizing.example' });
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(duplicate.id, first.id);
+  assert.match(duplicate.message, /already finalizing/i);
+  assert.equal(runFiles().length, 1, 'the terminal-judge window must not duplicate external effects');
+});
+
 test('every resolvable queue lane pins the exact content-hashed workflow definition', () => {
   writeAuditWorkflow(false);
   const queued = [
@@ -256,6 +270,11 @@ test('queueWorkflowRun: a paused creator cannot enter a replacement lock generat
         HOME: TMP_HOME,
         CLEM_QUEUE_MODULE_URL: moduleUrl,
         CLEM_QUEUE_RESULT: result,
+        // This test deliberately pauses a lock creator while replacing its
+        // directory generation. Keep that pause outside the production 10s
+        // acquisition deadline so scheduler load cannot turn fail-closed into
+        // a false assertion failure.
+        CLEMENTINE_TEST_DEDUPE_LOCK_TIMEOUT_MS: '120000',
         ...extraEnv,
       },
       stdio: ['ignore', 'pipe', 'pipe'],

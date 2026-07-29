@@ -1,8 +1,24 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from 'node:fs';
 import path from 'node:path';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import type { WorkflowStepInput } from '../memory/workflow-store.js';
+import type {
+  ItemOutputArtifactReference,
+  StepOutputArtifactReference,
+} from './workflow-run-workspace.js';
 import { isOperationalEventType, recordOperationalEvent, type OperationalEventSeverity, type OperationalEventSource, type OperationalEventType } from '../runtime/operational-telemetry.js';
 
 /**
@@ -126,15 +142,26 @@ function runDir(workflowName: string, runId: string): string {
  * critical structured-call receipts. Those receipts are intentionally retained
  * beyond the seven-day UI/run-record window for duplicate prevention, manual
  * verification, and audit. */
-export function reapRunEventDir(workflowName: string, runId: string): void {
+export function reapRunEventDir(workflowName: string, runId: string): boolean {
   const dir = runDir(workflowName, runId);
   try {
+    if (!existsSync(dir)) return true;
     if (existsSync(path.join(dir, 'call-mutations'))) {
-      rmSync(path.join(dir, 'events.jsonl'), { force: true });
-      return;
+      // Structured mutation receipts outlive the UI/run-record window for
+      // duplicate prevention. Preserve only that ledger: exact output
+      // artifacts, events, checkpoints, and every other run-local sibling are
+      // retention-bound and must not grow forever beside it.
+      for (const entry of readdirSync(dir)) {
+        if (entry === 'call-mutations') continue;
+        rmSync(path.join(dir, entry), { recursive: true, force: true });
+      }
+      return true;
     }
     rmSync(dir, { recursive: true, force: true });
-  } catch { /* best-effort */ }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function eventsPath(workflowName: string, runId: string): string {
@@ -145,6 +172,21 @@ function ensureRunDir(workflowName: string, runId: string): string {
   const dir = runDir(workflowName, runId);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function fsyncDirectoryBestEffort(dir: string): void {
+  let fd: number | null = null;
+  try {
+    fd = openSync(dir, 'r');
+    fsyncSync(fd);
+  } catch {
+    // Windows cannot open directory handles this way; file fsync remains the
+    // cross-platform durability floor.
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+  }
 }
 
 /**
@@ -169,6 +211,14 @@ function compactPayload(value: unknown): unknown {
   return { truncated: true, preview: json.slice(0, MAX_PAYLOAD_BYTES - 64) };
 }
 
+function completeWorkflowEvent(event: Omit<WorkflowEvent, 't'>): WorkflowEvent {
+  return {
+    t: new Date().toISOString(),
+    ...event,
+    output: compactPayload(event.output),
+  };
+}
+
 /**
  * Append one event to a run's events.jsonl. Creates the directory on
  * first write. Never throws — durability layer must not break the
@@ -181,11 +231,7 @@ export function appendWorkflowEvent(
   runId: string,
   event: Omit<WorkflowEvent, 't'>,
 ): WorkflowEvent {
-  const full: WorkflowEvent = {
-    t: new Date().toISOString(),
-    ...event,
-    output: compactPayload(event.output),
-  };
+  const full = completeWorkflowEvent(event);
   try {
     ensureRunDir(workflowName, runId);
     appendFileSync(eventsPath(workflowName, runId), JSON.stringify(full) + '\n', 'utf-8');
@@ -194,6 +240,32 @@ export function appendWorkflowEvent(
     // mirror to stderr so the daemon's supervisor.log captures the
     // event when the per-run log is unwritable.
   }
+  mirrorWorkflowOperationalEvent(workflowName, runId, full);
+  return full;
+}
+
+/**
+ * Correctness-critical event publication. Unlike the general telemetry path,
+ * this append fsyncs and throws on failure. Callers use it only after the exact
+ * referenced work product is already durable, making `artifact -> event` a
+ * one-way commit protocol: an orphan artifact is harmless, while a completion
+ * event can never point at bytes that were merely buffered.
+ */
+export function appendWorkflowEventDurably(
+  workflowName: string,
+  runId: string,
+  event: Omit<WorkflowEvent, 't'>,
+): WorkflowEvent {
+  const full = completeWorkflowEvent(event);
+  const dir = ensureRunDir(workflowName, runId);
+  const fd = openSync(eventsPath(workflowName, runId), 'a');
+  try {
+    writeSync(fd, JSON.stringify(full) + '\n', undefined, 'utf-8');
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  fsyncDirectoryBestEffort(dir);
   mirrorWorkflowOperationalEvent(workflowName, runId, full);
   return full;
 }
@@ -370,8 +442,12 @@ export function listFinalFailedItems(
 export interface ResumeState {
   /** Completed step IDs → recorded output. */
   completedSteps: Map<string, unknown>;
+  /** Exact immutable artifact references committed by step_completed. */
+  completedStepArtifacts: Map<string, StepOutputArtifactReference>;
   /** Per-step Set of itemKeys that succeeded in forEach iterations. */
   completedItems: Map<string, Map<string, unknown>>;
+  /** Exact immutable artifact references committed by item_completed. */
+  completedItemArtifacts: Map<string, Map<string, ItemOutputArtifactReference>>;
   /** Every step whose latest lifecycle is started/failed but not completed.
    *  Graph batches run concurrently, so crash recovery must retain the whole
    *  set rather than whichever step_started event happened to land last. */
@@ -396,10 +472,44 @@ export interface ResumeState {
   terminal: boolean;
 }
 
+function outputArtifactReferenceFromMeta(
+  meta: Record<string, unknown> | undefined,
+  key: 'stepOutputArtifact' | 'itemOutputArtifact',
+  owner: string,
+): StepOutputArtifactReference | null {
+  if (!meta || !Object.prototype.hasOwnProperty.call(meta, key)) return null;
+  const raw = meta[key];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`${owner} carries a malformed ${key} reference.`);
+  }
+  const candidate = raw as Record<string, unknown>;
+  if (
+    typeof candidate.path !== 'string'
+    || path.isAbsolute(candidate.path)
+    || typeof candidate.sha256 !== 'string'
+    || !/^[a-f0-9]{64}$/.test(candidate.sha256)
+    || typeof candidate.bytes !== 'number'
+    || !Number.isSafeInteger(candidate.bytes)
+    || candidate.bytes < 0
+    || typeof candidate.producedAt !== 'string'
+    || !Number.isFinite(Date.parse(candidate.producedAt))
+  ) {
+    throw new Error(`${owner} carries a malformed ${key} reference.`);
+  }
+  return {
+    path: candidate.path,
+    sha256: candidate.sha256,
+    bytes: candidate.bytes,
+    producedAt: candidate.producedAt,
+  };
+}
+
 export function computeResumeState(workflowName: string, runId: string): ResumeState {
   const events = readWorkflowEvents(workflowName, runId);
   const completedSteps = new Map<string, unknown>();
+  const completedStepArtifacts = new Map<string, StepOutputArtifactReference>();
   const completedItems = new Map<string, Map<string, unknown>>();
+  const completedItemArtifacts = new Map<string, Map<string, ItemOutputArtifactReference>>();
   const failedSteps = new Set<string>();
   const inFlightStepIds = new Set<string>();
   let inFlightStepId: string | undefined;
@@ -430,6 +540,13 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
         ? []
         : ev.output;
       completedSteps.set(ev.stepId, output);
+      const artifact = outputArtifactReferenceFromMeta(
+        ev.meta,
+        'stepOutputArtifact',
+        `Step completion "${ev.stepId}"`,
+      );
+      if (artifact) completedStepArtifacts.set(ev.stepId, artifact);
+      else completedStepArtifacts.delete(ev.stepId);
       failedSteps.delete(ev.stepId);
       inFlightStepIds.delete(ev.stepId);
       if (inFlightStepId === ev.stepId) {
@@ -440,10 +557,32 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
       let inner = completedItems.get(ev.stepId);
       if (!inner) { inner = new Map(); completedItems.set(ev.stepId, inner); }
       inner.set(ev.itemKey, ev.output);
+      let artifactInner = completedItemArtifacts.get(ev.stepId);
+      if (!artifactInner) {
+        artifactInner = new Map();
+        completedItemArtifacts.set(ev.stepId, artifactInner);
+      }
+      const artifact = outputArtifactReferenceFromMeta(
+        ev.meta,
+        'itemOutputArtifact',
+        `Item completion "${ev.stepId}/${ev.itemKey}"`,
+      );
+      if (artifact) artifactInner.set(ev.itemKey, artifact);
+      else artifactInner.delete(ev.itemKey);
     }
   }
 
-  return { completedSteps, completedItems, failedSteps, inFlightStepIds, inFlightStepId, lastEventAt, terminal };
+  return {
+    completedSteps,
+    completedStepArtifacts,
+    completedItems,
+    completedItemArtifacts,
+    failedSteps,
+    inFlightStepIds,
+    inFlightStepId,
+    lastEventAt,
+    terminal,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────

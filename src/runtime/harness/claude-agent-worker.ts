@@ -7,6 +7,7 @@ import {
   type ClaudeAgentSdkRunOptions,
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
+import type { DispatchLeaseRef } from './dispatch-lease.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
   externalMcpScopeFromResolvedTools,
@@ -95,6 +96,7 @@ export async function runClaudeAgentSdkWorker(
   sessionId?: string,
   sourceUserSeq?: number,
   parentMcpToolScope?: McpToolScope | null,
+  dispatchLease?: DispatchLeaseRef,
 ): Promise<ClaudeAgentSdkWorkerResult> {
   // Agentic only with the PARENT session id — the gates + plan-scope + execution
   // lane aggregate across the worker fan-out via the shared session (one batch
@@ -136,6 +138,7 @@ export async function runClaudeAgentSdkWorker(
     // the full grind ladder per worker (and survives resume), while sessionId
     // continues to own kill, approval, execution, and event records.
     trackerScopeId,
+    ...(dispatchLease ? { dispatchLease } : {}),
     ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
   });
   // Cap-visibility: on a turn-cap the SDK returns limitHit:true + FRIENDLY "say

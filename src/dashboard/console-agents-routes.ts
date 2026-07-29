@@ -86,6 +86,7 @@ interface DelegationRecord {
   expectedOutput: string;
   status: 'pending' | 'in_progress' | 'completed';
   result?: string;
+  resultEvidence?: 'model_prose';
   completedBy?: string;
   onBehalfOf?: string;
   createdAt: string;

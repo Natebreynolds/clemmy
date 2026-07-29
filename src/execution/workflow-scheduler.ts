@@ -4,6 +4,11 @@ import pino from 'pino';
 import { CRON_RUNS_DIR, WORKFLOW_RUNS_DIR, ensureDir } from '../tools/shared.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { reapRunEventDir } from './workflow-events.js';
+import {
+  deleteWorkflowGraphSnapshotByRunId,
+  loadWorkflowGraphSnapshotByRunId,
+} from './workflow-graph-store.js';
+import { resolveWorkflowRunDefinitionSnapshot } from './workflow-run-definition.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
@@ -377,14 +382,14 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
   return result;
 }
 
-/** Max queued+running run records per workflow before the scheduler
+/** Max queued+running/finalizing run records per workflow before the scheduler
  *  backs off. Three feels right: it absorbs short bursts of slow runs
  *  without letting a single misbehaving cron carpet the disk. */
 const MAX_PENDING_PER_WORKFLOW = 3;
 
 /** Walk WORKFLOW_RUNS_DIR once and split active work into executable
- *  queued/running records versus approval-parked records. A parked run is not
- *  part of the concurrency queue, but it IS schedule backpressure. */
+ *  queued/running/finalizing records versus approval-parked records. A parked
+ *  run is not part of the concurrency queue, but it IS schedule backpressure. */
 function countActiveRunsFor(workflowName: string): { pending: number; parked: number } {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return { pending: 0, parked: 0 };
   let files: string[];
@@ -404,7 +409,12 @@ function countActiveRunsFor(workflowName: string): { pending: number; parked: nu
       };
       if (raw.workflow !== workflowName) continue;
       if (raw.status === 'parked') parked += 1;
-      else if (!raw.status || raw.status === 'queued' || raw.status === 'running') pending += 1;
+      else if (
+        !raw.status
+        || raw.status === 'queued'
+        || raw.status === 'running'
+        || raw.status === 'finalizing'
+      ) pending += 1;
     } catch {
       // Unreadable record — ignore. The reaper will sweep it eventually.
     }
@@ -524,6 +534,7 @@ interface ReapableWorkflowRunRecord extends WorkflowRunReportBackRecord {
   status?: string;
   finishedAt?: string;
   workflow?: string;
+  workflowDefinitionSnapshot?: unknown;
 }
 
 let beforeRunRecordReapLockForTests: ((filePath: string) => void) | undefined;
@@ -556,6 +567,29 @@ function hasOutstandingWorkflowRunReportBack(record: ReapableWorkflowRunRecord):
   }
 }
 
+/** Resolve the storage owner before deleting any of the evidence that can tell
+ * us that owner. New runs have both a graph owner and an immutable admitted
+ * definition; the current workflow catalog is only a legacy fallback for
+ * display-name run records. */
+function canonicalWorkflowSlugForReap(
+  record: ReapableWorkflowRunRecord,
+  runId: string,
+): string | null {
+  const graphOwner = loadWorkflowGraphSnapshotByRunId(runId)?.workflowName.trim();
+  if (graphOwner) return graphOwner;
+
+  const admitted = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
+  if (admitted.status === 'valid') return admitted.snapshot.workflowSlug;
+  if (admitted.status === 'invalid') return null;
+
+  const reference = record.workflow?.trim();
+  if (!reference) return null;
+  const current = listWorkflows().find(
+    (entry) => entry.name === reference || entry.data.name === reference,
+  );
+  return current?.name ?? reference;
+}
+
 export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return { scanned: 0, deleted: 0 };
   let files: string[];
@@ -583,11 +617,16 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
         const ageRef = Number.isFinite(finishedMs) ? finishedMs : statSync(full).mtimeMs;
         if (ageRef >= cutoffMs) return false;
 
+        const runId = file.replace(/\.json$/, '');
+        const workflowSlug = canonicalWorkflowSlugForReap(raw, runId);
+        if (!workflowSlug) return false;
+
+        // Clean subordinate state before unlinking the sole run ownership
+        // record. Any cleanup failure leaves that record reachable for a later
+        // retry instead of stranding graph/events under a lost display name.
+        if (!reapRunEventDir(workflowSlug, runId)) return false;
+        deleteWorkflowGraphSnapshotByRunId(runId);
         unlinkSync(full);
-        // Keep the event ledger deletion in the same critical section. A report
-        // writer can therefore never recreate the record after its events were
-        // reaped as a consequence of an unlocked interleaving.
-        if (raw.workflow) reapRunEventDir(raw.workflow, file.replace(/\.json$/, ''));
         return true;
       });
       if (reaped) deleted += 1;

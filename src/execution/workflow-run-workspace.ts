@@ -22,7 +22,23 @@
  * Pure filesystem I/O — no LLM — so the whole thing is deterministically
  * testable. This is app-side (runner) code, so Date is available here.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, statSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
 import path from 'node:path';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 
@@ -45,7 +61,20 @@ export interface WorkspaceArtifact {
   bytes: number;
   summary: string;
   producedAt: string;
+  /** Present for correctness-critical artifacts referenced by the event log. */
+  sha256?: string;
 }
+
+/** Exact immutable work-product reference carried by a step_completed event. */
+export interface StepOutputArtifactReference {
+  path: string;
+  sha256: string;
+  bytes: number;
+  producedAt: string;
+}
+
+/** Exact immutable work-product reference carried by an item_completed event. */
+export type ItemOutputArtifactReference = StepOutputArtifactReference;
 
 export interface ToolOffloadResult {
   offloaded: boolean;
@@ -135,6 +164,57 @@ function recordArtifact(workflowName: string, runId: string, entry: WorkspaceArt
   appendFileSync(manifestPath(workflowName, runId), JSON.stringify(entry) + '\n', 'utf-8');
 }
 
+function recordArtifactDurably(workflowName: string, runId: string, entry: WorkspaceArtifact): void {
+  const fd = openSync(manifestPath(workflowName, runId), 'a');
+  try {
+    writeSync(fd, JSON.stringify(entry) + '\n', undefined, 'utf-8');
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function fsyncDirectoryBestEffort(dir: string): void {
+  // Directory fsync makes the preceding rename durable on macOS/Linux. Windows
+  // does not permit opening a directory this way, so file fsync remains the
+  // cross-platform durability floor.
+  let fd: number | null = null;
+  try {
+    fd = openSync(dir, 'r');
+    fsyncSync(fd);
+  } catch {
+    // Best effort across platforms.
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+  }
+}
+
+function writeFileAtomicallyAndDurably(filePath: string, content: string): void {
+  const dir = path.dirname(filePath);
+  const temporary = path.join(
+    dir,
+    `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let fd: number | null = null;
+  try {
+    fd = openSync(temporary, 'wx');
+    writeSync(fd, content, undefined, 'utf-8');
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(temporary, filePath);
+    fsyncDirectoryBestEffort(dir);
+  } catch (error) {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+    try { unlinkSync(temporary); } catch { /* best effort */ }
+    throw error;
+  }
+}
+
 /**
  * Offload a tool result to the shared workspace when it's large enough to hurt
  * the context. Returns a handback describing where it went + a summary; when the
@@ -199,8 +279,21 @@ function nextArtifactIndex(workflowName: string, runId: string): number {
   return readWorkspaceManifest(workflowName, runId).length + 1;
 }
 
-export function stepOutputArtifactRelPath(stepId: string): string {
-  return path.join('artifacts', `step-${safeSegment(stepId, 'step')}.json`);
+export function stepOutputArtifactRelPath(stepId: string, sha256?: string): string {
+  const contentSuffix = sha256 ? `-${sha256}` : '';
+  return path.join('artifacts', `step-${safeSegment(stepId, 'step')}${contentSuffix}.json`);
+}
+
+export function itemOutputArtifactRelPath(
+  stepId: string,
+  itemKey: string,
+  sha256: string,
+): string {
+  const itemIdentity = createHash('sha256').update(itemKey).digest('hex').slice(0, 24);
+  return path.join(
+    'artifacts',
+    `item-${safeSegment(stepId, 'step')}-${itemIdentity}-${sha256}.json`,
+  );
 }
 
 function safeStringify(value: unknown): string {
@@ -211,12 +304,49 @@ function safeStringify(value: unknown): string {
   }
 }
 
+function recordCompletedOutputArtifact(args: {
+  workflowName: string;
+  runId: string;
+  artifactPath: (sha256: string) => string;
+  tool: 'step-output' | 'item-output';
+  agent: string;
+  output: unknown;
+  nowIso: string;
+}): WorkspaceArtifact {
+  ensureRunWorkspace(args.workflowName, args.runId);
+  const serialized = safeStringify(args.output);
+  const sha256 = createHash('sha256').update(serialized).digest('hex');
+  const rel = args.artifactPath(sha256);
+  const entry: WorkspaceArtifact = {
+    path: rel,
+    tool: args.tool,
+    agent: args.agent,
+    bytes: Buffer.byteLength(serialized, 'utf-8'),
+    summary: summarizeToolOutput(args.output),
+    producedAt: args.nowIso,
+    sha256,
+  };
+  const absolutePath = path.join(runWorkspaceDir(args.workflowName, args.runId), rel);
+  if (!existsSync(absolutePath)) {
+    writeFileAtomicallyAndDurably(absolutePath, serialized);
+  } else {
+    // A same-content retry naturally addresses the same path. Verify it before
+    // allowing an event to trust this inode.
+    const existing = readFileSync(absolutePath, 'utf-8');
+    const existingHash = createHash('sha256').update(existing).digest('hex');
+    if (existingHash !== sha256) {
+      throw new Error(`Output artifact hash collision/corruption at ${rel}.`);
+    }
+  }
+  recordArtifactDurably(args.workflowName, args.runId, entry);
+  return entry;
+}
+
 /**
- * Persist a completed step's output as a durable workspace artifact — the
- * "work product" of that step. ALWAYS writes the file + a manifest entry (even
- * small outputs), so the manifest is a complete, inspectable record of the run
- * that the live window and a checker agent read. Overwrites the file on
- * re-pursuit (latest work wins); the manifest keeps the history.
+ * Persist a completed step's output as a durable workspace artifact. The file
+ * is content-addressed, fsynced, and atomically renamed before its manifest
+ * entry is fsynced. A later step_completed event can therefore reference one
+ * exact immutable payload without racing a different re-pursuit result.
  */
 export function recordStepOutput(args: {
   workflowName: string;
@@ -225,20 +355,204 @@ export function recordStepOutput(args: {
   output: unknown;
   nowIso: string;
 }): WorkspaceArtifact {
-  ensureRunWorkspace(args.workflowName, args.runId);
-  const rel = stepOutputArtifactRelPath(args.stepId);
-  const serialized = safeStringify(args.output);
-  const entry: WorkspaceArtifact = {
-    path: rel,
+  return recordCompletedOutputArtifact({
+    workflowName: args.workflowName,
+    runId: args.runId,
+    artifactPath: (sha256) => stepOutputArtifactRelPath(args.stepId, sha256),
     tool: 'step-output',
     agent: args.stepId,
-    bytes: Buffer.byteLength(serialized, 'utf-8'),
-    summary: summarizeToolOutput(args.output),
-    producedAt: args.nowIso,
-  };
-  writeFileSync(path.join(runWorkspaceDir(args.workflowName, args.runId), rel), serialized, 'utf-8');
-  recordArtifact(args.workflowName, args.runId, entry);
-  return entry;
+    output: args.output,
+    nowIso: args.nowIso,
+  });
+}
+
+/** Persist one completed forEach item's exact output before publishing it. */
+export function recordItemOutput(args: {
+  workflowName: string;
+  runId: string;
+  stepId: string;
+  itemKey: string;
+  output: unknown;
+  nowIso: string;
+}): WorkspaceArtifact {
+  return recordCompletedOutputArtifact({
+    workflowName: args.workflowName,
+    runId: args.runId,
+    artifactPath: (sha256) => itemOutputArtifactRelPath(args.stepId, args.itemKey, sha256),
+    tool: 'item-output',
+    agent: `${args.stepId}:${args.itemKey}`,
+    output: args.output,
+    nowIso: args.nowIso,
+  });
+}
+
+type ArtifactReadResult = {
+  found: boolean;
+  verified: boolean;
+  value?: unknown;
+  producedAt?: string;
+  path?: string;
+  bytes?: number;
+  sha256?: string;
+  error?: string;
+};
+
+function readCompletedOutputArtifact(args: {
+  workflowName: string;
+  runId: string;
+  tool: 'step-output' | 'item-output';
+  agent: string;
+  reference?: StepOutputArtifactReference;
+}): ArtifactReadResult {
+  const manifestEntry: WorkspaceArtifact | undefined = args.reference
+    ? {
+        path: args.reference.path,
+        tool: args.tool,
+        agent: args.agent,
+        bytes: args.reference.bytes,
+        summary: '',
+        producedAt: args.reference.producedAt,
+        sha256: args.reference.sha256,
+      }
+    : readWorkspaceManifest(args.workflowName, args.runId)
+        .filter((entry) => entry.tool === args.tool && entry.agent === args.agent)
+        .at(-1);
+  if (!manifestEntry) return { found: false, verified: false };
+  try {
+    const root = realpathSync(runWorkspaceDir(args.workflowName, args.runId));
+    if (path.isAbsolute(manifestEntry.path)) {
+      return { found: false, verified: false, error: 'Artifact reference must be workspace-relative.' };
+    }
+    const candidate = path.resolve(root, manifestEntry.path);
+    const relative = path.relative(root, candidate);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      return { found: false, verified: false, error: 'Artifact reference escapes the owning run workspace.' };
+    }
+    const resolved = realpathSync(candidate);
+    const resolvedRelative = path.relative(root, resolved);
+    if (resolvedRelative.startsWith('..') || path.isAbsolute(resolvedRelative)) {
+      return { found: false, verified: false, error: 'Artifact symlink escapes the owning run workspace.' };
+    }
+    const raw = readFileSync(resolved, 'utf-8');
+    const bytes = Buffer.byteLength(raw, 'utf-8');
+    const sha256 = createHash('sha256').update(raw).digest('hex');
+    if (args.reference) {
+      if (bytes !== args.reference.bytes) {
+        return {
+          found: true,
+          verified: false,
+          path: manifestEntry.path,
+          bytes,
+          sha256,
+          error: `Artifact byte length mismatch: expected ${args.reference.bytes}, got ${bytes}.`,
+        };
+      }
+      if (sha256 !== args.reference.sha256) {
+        return {
+          found: true,
+          verified: false,
+          path: manifestEntry.path,
+          bytes,
+          sha256,
+          error: 'Artifact SHA-256 mismatch.',
+        };
+      }
+    } else if (manifestEntry.sha256 && sha256 !== manifestEntry.sha256) {
+      return {
+        found: true,
+        verified: false,
+        path: manifestEntry.path,
+        bytes,
+        sha256,
+        error: 'Artifact SHA-256 does not match its manifest entry.',
+      };
+    }
+    const common = {
+      found: true,
+      verified: true,
+      producedAt: manifestEntry.producedAt,
+      path: manifestEntry.path,
+      bytes,
+      sha256,
+    };
+    if (raw === 'undefined') {
+      return { ...common, value: undefined };
+    }
+    try {
+      return { ...common, value: JSON.parse(raw) as unknown };
+    } catch {
+      return { ...common, value: raw };
+    }
+  } catch (error) {
+    return {
+      found: false,
+      verified: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Read the exact durable work product for a completed step. The event journal
+ * remains the authority that a step completed; this artifact only restores the
+ * payload when the journal intentionally compacted it.
+ */
+export function readStepOutputArtifact(args: {
+  workflowName: string;
+  runId: string;
+  stepId: string;
+  /** When supplied, only this exact event-owned artifact may be read. */
+  reference?: StepOutputArtifactReference;
+}): ArtifactReadResult {
+  return readCompletedOutputArtifact({
+    workflowName: args.workflowName,
+    runId: args.runId,
+    tool: 'step-output',
+    agent: args.stepId,
+    reference: args.reference,
+  });
+}
+
+/** Read the event-owned exact work product for one completed forEach item. */
+export function readItemOutputArtifact(args: {
+  workflowName: string;
+  runId: string;
+  stepId: string;
+  itemKey: string;
+  reference?: ItemOutputArtifactReference;
+}): ArtifactReadResult {
+  return readCompletedOutputArtifact({
+    workflowName: args.workflowName,
+    runId: args.runId,
+    tool: 'item-output',
+    agent: `${args.stepId}:${args.itemKey}`,
+    reference: args.reference,
+  });
+}
+
+/**
+ * Resolve the artifact matching this exact in-memory value. This never selects
+ * a later orphan manifest entry from an interrupted re-pursuit.
+ */
+export function readStepOutputArtifactForValue(args: {
+  workflowName: string;
+  runId: string;
+  stepId: string;
+  value: unknown;
+}): ArtifactReadResult {
+  const serialized = safeStringify(args.value);
+  const sha256 = createHash('sha256').update(serialized).digest('hex');
+  return readStepOutputArtifact({
+    workflowName: args.workflowName,
+    runId: args.runId,
+    stepId: args.stepId,
+    reference: {
+      path: stepOutputArtifactRelPath(args.stepId, sha256),
+      sha256,
+      bytes: Buffer.byteLength(serialized, 'utf-8'),
+      producedAt: new Date(0).toISOString(),
+    },
+  });
 }
 
 export function runWorkspaceOffloadEnabled(): boolean {

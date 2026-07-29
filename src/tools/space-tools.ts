@@ -42,6 +42,10 @@ import {
   getWorkspaceHistoryAvailability,
   listWorkspaceObservationHistory,
 } from '../spaces/workspace-observation-query.js';
+import {
+  enqueueSpaceActionApproval,
+  spaceActionNeedsApproval,
+} from '../spaces/space-action-gate.js';
 import { redactSensitiveText } from '../runtime/security.js';
 
 // Re-exported for back-compat (space-tools.test.ts imports it from here); the
@@ -659,6 +663,84 @@ export function registerSpaceTools(server: McpServer): void {
         `${verb} workspace "${record.title}" (${slug}) — status ${record.status}. Open it at /workspaces/${slug} in the desktop.${dsNote}`
         + `${contractNote} The view is versioned (v${record.version}) — prior versions are revertible.${advisories}${smokeNote}${gapQuestions}`,
       );
+    },
+  );
+
+  server.tool(
+    'space_action_prepare',
+    [
+      'Prepare ONE action already declared in a Workspace for the user to approve.',
+      'This tool never dispatches the action. It only creates/reuses the same exact approval card used by the Workspace button; execution remains owned by the existing Workspace approval + receipt path.',
+      'The approval is bound to the exact Workspace, declared action manifest, runner digest when applicable, and caller arguments. You cannot supply or override a Composio slug, runner, or wildcard authority here.',
+      'Use only after Workspace evidence supports the proposed action and the user asked you to take or prepare it. Report it as waiting for approval — never as executed.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('Exact existing Workspace slug.'),
+      action_id: z.string().min(1).max(120).describe('Exact id of an action already declared in that Workspace.'),
+      args_json: z.string().max(20_000).nullish().describe('Optional JSON object of caller-supplied arguments for this one action. Omit for {}. The declared action template remains authoritative.'),
+    },
+    async ({ slug, action_id, args_json }) => {
+      if (!isValidSpaceSlug(slug)) {
+        return textResult(`Error: "${slug}" is not a valid workspace slug.`);
+      }
+      const rec = spaceStore.get(slug);
+      if (!rec) {
+        return textResult(`No workspace named "${slug}".`);
+      }
+      if (rec.status !== 'active') {
+        return textResult(
+          `Workspace "${slug}" is ${rec.status}; action "${action_id}" was not prepared or run.`,
+        );
+      }
+      if (rec.manifestErrors && rec.manifestErrors.length > 0) {
+        return textResult(
+          `Workspace "${slug}" has an invalid manifest; action "${action_id}" was not prepared or run. `
+          + `Fix it with space_save first:\n- ${rec.manifestErrors.join('\n- ')}`,
+        );
+      }
+      const action = rec.actions.find((candidate) => candidate.id === action_id);
+      if (!action) {
+        return textResult(
+          `Workspace "${slug}" has no declared action "${action_id}". Nothing was prepared or run.`,
+        );
+      }
+      if (!spaceActionNeedsApproval(action)) {
+        return textResult(
+          `Workspace action "${action_id}" is read-only and does not use the approval-gated action path. `
+          + 'Nothing was prepared or run; use the Workspace control for this read-only action.',
+        );
+      }
+
+      let callerArgs: Record<string, unknown> = {};
+      if (args_json != null && args_json.trim()) {
+        try {
+          const parsed = JSON.parse(args_json) as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return textResult('Error: args_json must be one JSON object. Nothing was prepared or run.');
+          }
+          callerArgs = parsed as Record<string, unknown>;
+        } catch (err) {
+          return textResult(
+            `Error: args_json is not valid JSON: ${(err as Error).message}. Nothing was prepared or run.`,
+          );
+        }
+      }
+
+      try {
+        const prepared = enqueueSpaceActionApproval(rec, action, callerArgs);
+        return textResult(
+          `Prepared "${action.label ?? action.id}" in workspace "${rec.title}" for user approval `
+          + `(${prepared.approvalId}). It was not run or dispatched. The approval is bound to this `
+          + 'Workspace, declared action, current action manifest, and exact caller arguments. '
+          + 'Report it as waiting for approval, not completed.',
+        );
+      } catch (err) {
+        return textResult(
+          `Action "${action_id}" was not prepared or run: ${redactSensitiveText(
+            err instanceof Error ? err.message : String(err),
+          )}`,
+        );
+      }
     },
   );
 

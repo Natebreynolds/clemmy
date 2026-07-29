@@ -2,9 +2,10 @@
  * `workflow_reshape` — the model's structural verb for work already running.
  *
  * `workflow_update` replaces an entire step list at authoring time. This is its
- * surgical, mid-run counterpart: widen a bottleneck into parallel branches,
- * withhold a route whose source went dark, or restore one when it recovers,
- * without disturbing a single completed result.
+ * surgical, mid-run counterpart. Release v3 can add read-only prompt nodes
+ * whose only tools are their result channel and a run-scoped exact-artifact
+ * query, plus dependency edges into those nodes, without disturbing completed
+ * results. Topology rewrites and dynamic effect authority remain later-train.
  *
  * Discoverable rather than first-class: it stays out of the always-loaded
  * schema kernel and is acquired through tool_search/call_tool like any other
@@ -74,6 +75,9 @@ export function parseOperationsJson(raw: string): { inputs: OperationInput[]; er
 export function toGraphOperations(inputs: OperationInput[]): { operations: WorkflowGraphPatchOperation[]; errors: string[] } {
   const operations: WorkflowGraphPatchOperation[] = [];
   const errors: string[] = [];
+  // disable/enable are recognized so the locked graph boundary can emit an
+  // audited proposed -> rejected trail. Recognition here is not admission:
+  // reshapeWorkflowGraph refuses both under the release-v3 contract.
   const VALID_OPS = new Set(['add_node', 'add_edge', 'disable_edge', 'enable_edge']);
   inputs.forEach((input, index) => {
     const at = `operation ${index + 1} (${input.op ?? 'missing op'})`;
@@ -109,10 +113,19 @@ export function toGraphOperations(inputs: OperationInput[]): { operations: Workf
       });
       return;
     }
-    if (!input.edge_id) { errors.push(`${at}: edge_id is required.`); return; }
-    operations.push(input.op === 'disable_edge'
-      ? { op: 'disable_edge', edgeId: input.edge_id, ...(input.reason ? { reason: input.reason } : {}) }
-      : { op: 'enable_edge', edgeId: input.edge_id });
+    if (input.op === 'disable_edge') {
+      if (!input.edge_id) { errors.push(`${at}: edge_id is required.`); return; }
+      operations.push({
+        op: 'disable_edge',
+        edgeId: input.edge_id,
+        ...(input.reason ? { reason: input.reason } : {}),
+      });
+      return;
+    }
+    if (input.op === 'enable_edge') {
+      if (!input.edge_id) { errors.push(`${at}: edge_id is required.`); return; }
+      operations.push({ op: 'enable_edge', edgeId: input.edge_id });
+    }
   });
   return { operations, errors };
 }
@@ -122,30 +135,34 @@ export function registerWorkflowReshapeTools(server: McpServer): void {
     'workflow_reshape',
     [
       'Change the SHAPE of a workflow run that is already in flight — the mid-run counterpart to workflow_update (which replaces a whole definition at authoring time). ',
-      'Use it when reality diverges from the plan: split a bottleneck node into parallel branches, add a follow-up branch, withhold a route whose source is rate-limited or dark (disable_edge), or restore one when it recovers (enable_edge). ',
+      'This release supports one safe additive shape: add a read-only prompt node, then optionally add dependency edges whose target is that new node. ',
+      'Graph-added nodes have no work-tool or wildcard authority; they can reason over prior step outputs, page exact offloaded data only inside this run workspace, and return a result. Dynamic writes, sends, scripts, fan-out, edge disabling, and edge restoring are refused. ',
       'action "inspect" returns the live graph — node ids, edge ids, and which nodes are irreversible one-way doors — so operations reference real ids. Inspect before reshaping. ',
-      'Completed work is immutable: a reshape redirects what happens NEXT and can never edit or remove a node whose result is recorded. ',
-      'A reshape that would let work run without waiting for an approval-gated send is refused, as is a new send node without requires_approval. ',
+      'The runtime derives completed and in-flight nodes from the durable run journal; caller hints cannot weaken those boundaries. ',
       'Refusals name the exact problem so the next attempt can correct it.',
     ].join(''),
     {
       workflow: z.string().min(1).describe('Workflow name (slug) that owns the run.'),
       run_id: z.string().min(1).describe('The in-flight run to reshape.'),
       action: z.enum(['inspect', 'apply']).describe('"inspect" reads the live graph; "apply" performs the reshape.'),
-      reason: z.string().nullish().describe('For "apply": one plain sentence on why the shape must change. Surfaced to the user.'),
-      operations_json: z.string().nullish().describe('For "apply": a JSON ARRAY string of operations. Each entry: {"op":"add_node","node_id":"analyze-b","label":"second branch","prompt":"...","side_effect":"read"} | {"op":"add_edge","source":"pull","target":"analyze-b"} | {"op":"disable_edge","edge_id":"dependency:a->b","reason":"source is dark"} | {"op":"enable_edge","edge_id":"dependency:a->b"}. Only op and its own required keys are needed; omit the rest.'),
-      completed_node_ids_json: z.string().nullish().describe('Optional JSON array string of already-finished node ids; their structure is protected.'),
+      reason: z.string().max(500).nullish().describe('For "apply": one plain sentence on why the shape must change. Required and surfaced to the user.'),
+      operations_json: z.string().nullish().describe('For "apply": a JSON ARRAY string of operations. Each entry: {"op":"add_node","node_id":"analyze-b","label":"second branch","prompt":"...","side_effect":"read"} | {"op":"add_edge","source":"pull","target":"analyze-b"}. New nodes must include a prompt and may only be read-only.'),
     },
-    async ({ workflow, run_id, action, reason, operations_json, completed_node_ids_json }) => {
+    async ({ workflow, run_id, action, reason, operations_json }) => {
       try {
         if (action === 'inspect') {
-          const graph = loadLiveWorkflowGraph(run_id);
+          const graph = loadLiveWorkflowGraph(run_id, workflow);
           if (!graph) return textResult(`No live graph is stored for run "${run_id}".`);
           return textResult(JSON.stringify({
             nodes: graph.nodes.map((node) => ({ id: node.id, label: node.label, sideEffect: node.sideEffect, requiresApproval: node.requiresApproval })),
             edges: graph.edges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target, disabled: edge.disabled === true })),
             irreversibleBoundaries: irreversibleBoundaries(graph),
           }, null, 2));
+        }
+
+        const normalizedReason = reason?.trim();
+        if (!normalizedReason) {
+          return textResult('Refused: "apply" requires one plain-sentence reason explaining why this active run needs a new branch.');
         }
 
         const parsedOps = parseOperationsJson(operations_json ?? '');
@@ -155,19 +172,10 @@ export function registerWorkflowReshapeTools(server: McpServer): void {
         const mapped = toGraphOperations(parsedOps.inputs);
         if (mapped.errors.length > 0) return textResult(`Refused: ${mapped.errors.join(' ')}`);
 
-        let completedNodeIds: string[] = [];
-        if (completed_node_ids_json?.trim()) {
-          try {
-            const parsed = JSON.parse(completed_node_ids_json) as unknown;
-            if (Array.isArray(parsed)) completedNodeIds = parsed.map((id) => String(id));
-          } catch { /* an unreadable hint must never block a valid reshape */ }
-        }
-
         const result = reshapeWorkflowGraph({
           workflowName: workflow,
           runId: run_id,
-          completedNodeIds,
-          patch: { operations: mapped.operations, reason: reason ?? undefined },
+          patch: { operations: mapped.operations, reason: normalizedReason },
         });
 
         if (!result.ok) {

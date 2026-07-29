@@ -278,6 +278,14 @@ test('every registry name is unique', () => {
   assert.deepEqual(dupes, [], `duplicate registry entries: ${dupes.join(', ')}`);
 });
 
+test('workflow_reshape registry copy pins the shipped additive read-only contract', () => {
+  const declaration = TOOL_REGISTRY.find((entry) => entry.name === 'workflow_reshape');
+  assert.equal(
+    declaration?.description,
+    'Add read-only prompt nodes with only a result channel and run-scoped artifact query, plus dependency edges into those nodes, on an active workflow run. Dynamic writes/sends, scripts, fan-out, and edge disable/enable are not supported; completed and in-flight targets are immutable.',
+  );
+});
+
 test('KNOWN_UNREGISTERED_BLOCKLIST is exactly the F1 names absent from the registry', () => {
   const registryNames = new Set(TOOL_REGISTRY.map((d) => d.name));
   const absent = new Set([...WORKFLOW_STEP_BLOCKED_TOOL_NAMES].filter((n) => !registryNames.has(n)));

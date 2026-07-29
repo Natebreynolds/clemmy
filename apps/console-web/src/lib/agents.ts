@@ -88,14 +88,17 @@ export interface AgentComms { messages: TeamMessage[]; delegations: Delegation[]
  */
 export function describeDelegationOutcome(delegation: Delegation): string | null {
   if (delegation.status !== 'completed') return null;
-  // Evidence provenance travels with attribution: today every delegation
-  // result is the model's own prose, and the line says so rather than letting
-  // "Completed" read as independently verified work.
-  const evidence = delegation.resultEvidence === 'model_prose' ? ' · model prose, unverified' : '';
   const actor = delegation.completedBy;
-  if (!actor) return `Completed${evidence}`;
-  if (delegation.onBehalfOf) return `Completed by Clementine, on behalf of ${delegation.onBehalfOf}${evidence}`;
-  return `Completed by ${actor}${evidence}`;
+  if (delegation.resultEvidence === 'model_prose') {
+    if (!actor) return 'Result reported · verification required';
+    if (delegation.onBehalfOf) {
+      return `Reported by Clementine, on behalf of ${delegation.onBehalfOf} · verification required`;
+    }
+    return `Reported by ${actor} · verification required`;
+  }
+  if (!actor) return 'Completed';
+  if (delegation.onBehalfOf) return `Completed by Clementine, on behalf of ${delegation.onBehalfOf}`;
+  return `Completed by ${actor}`;
 }
 
 

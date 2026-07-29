@@ -4368,7 +4368,12 @@ export function registerConsoleRoutes(
         });
       }
       for (const run of runRecords) {
-        if (run.status !== 'queued' && run.status !== 'running' && run.status !== 'parked') continue;
+        if (
+          run.status !== 'queued'
+          && run.status !== 'running'
+          && run.status !== 'finalizing'
+          && run.status !== 'parked'
+        ) continue;
         if (activeByRunId.has(run.id)) continue;
         activeByRunId.set(run.id, {
           workflowName: run.workflow,
