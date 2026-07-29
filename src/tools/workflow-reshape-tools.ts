@@ -17,28 +17,74 @@ import { reshapeWorkflowGraph, loadLiveWorkflowGraph } from '../execution/workfl
 import { irreversibleBoundaries } from '../execution/workflow-graph-boundaries.js';
 import type { WorkflowGraphPatchOperation } from '../execution/workflow-graph.js';
 
-const OperationSchema = z.object({
-  op: z.enum(['add_node', 'add_edge', 'disable_edge', 'enable_edge']),
-  node_id: z.string().nullish().describe('For add_node: the new node id. Also the step id it executes as.'),
-  label: z.string().nullish().describe('For add_node: a short human label for the reshape feed.'),
-  prompt: z.string().nullish().describe('For add_node: what this branch should do.'),
-  side_effect: z.enum(['read', 'write', 'send']).nullish().describe('For add_node. A "send" node MUST also set requires_approval.'),
-  requires_approval: z.boolean().nullish(),
-  source: z.string().nullish().describe('For add_edge: the node that must finish first.'),
-  target: z.string().nullish().describe('For add_edge: the node that waits.'),
-  edge_id: z.string().nullish().describe('For disable_edge/enable_edge: the exact edge id from the current graph.'),
-  reason: z.string().nullish().describe('For disable_edge: why this route is being withheld.'),
-});
+/**
+ * Operations arrive as a JSON array STRING, matching this codebase's
+ * convention for nested payloads on the deferred transport (call_tool's
+ * args_json, workflow_state's values, composio_args_json).
+ *
+ * This is not cosmetic. A nested array-of-objects with optional fields is
+ * hostile to the strict schema transport: the model must supply every
+ * nullable key, and omitted nested optionals fail validation. Live pass^k
+ * caught exactly that — one run in three fumbled operations.0.label /
+ * .prompt / .side_effect and the reshape silently never happened. A JSON
+ * string has one shape the model cannot get partially wrong, and parse
+ * errors become readable guidance instead of schema noise.
+ */
+export interface OperationInput {
+  op?: string;
+  node_id?: string;
+  label?: string;
+  prompt?: string;
+  side_effect?: string;
+  requires_approval?: boolean;
+  source?: string;
+  target?: string;
+  edge_id?: string;
+  reason?: string;
+}
 
-type OperationInput = z.infer<typeof OperationSchema>;
+/** Parse the operations payload. Returns typed errors, never throws. */
+export function parseOperationsJson(raw: string): { inputs: OperationInput[]; errors: string[] } {
+  const text = (raw ?? '').trim();
+  if (!text) return { inputs: [], errors: ['operations_json is required — pass a JSON array of operations.'] };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { inputs: [], errors: ['operations_json is not valid JSON. Pass a JSON ARRAY string, e.g. [{"op":"add_node","node_id":"analyze-b"}].'] };
+  }
+  if (!Array.isArray(parsed)) {
+    return { inputs: [], errors: ['operations_json must be a JSON ARRAY of operations.'] };
+  }
+  const inputs: OperationInput[] = [];
+  const errors: string[] = [];
+  parsed.forEach((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      errors.push(`operation ${index + 1}: each entry must be an object.`);
+      return;
+    }
+    inputs.push(entry as OperationInput);
+  });
+  return { inputs, errors };
+}
+
 
 /** Translate the flat model-facing shape into graph operations. Kept pure and
  *  exported so the mapping is testable without a live graph. */
 export function toGraphOperations(inputs: OperationInput[]): { operations: WorkflowGraphPatchOperation[]; errors: string[] } {
   const operations: WorkflowGraphPatchOperation[] = [];
   const errors: string[] = [];
+  const VALID_OPS = new Set(['add_node', 'add_edge', 'disable_edge', 'enable_edge']);
   inputs.forEach((input, index) => {
-    const at = `operation ${index + 1} (${input.op})`;
+    const at = `operation ${index + 1} (${input.op ?? 'missing op'})`;
+    if (!input.op || !VALID_OPS.has(input.op)) {
+      errors.push(`${at}: op must be one of add_node, add_edge, disable_edge, enable_edge.`);
+      return;
+    }
+    if (input.side_effect && !['read', 'write', 'send'].includes(input.side_effect)) {
+      errors.push(`${at}: side_effect must be read, write, or send.`);
+      return;
+    }
     if (input.op === 'add_node') {
       if (!input.node_id) { errors.push(`${at}: node_id is required.`); return; }
       operations.push({
@@ -49,7 +95,7 @@ export function toGraphOperations(inputs: OperationInput[]): { operations: Workf
           stepId: input.node_id,
           ...(input.label ? { label: input.label } : {}),
           ...(input.prompt ? { prompt: input.prompt } : {}),
-          ...(input.side_effect ? { sideEffect: input.side_effect } : {}),
+          ...(input.side_effect ? { sideEffect: input.side_effect as 'read' | 'write' | 'send' } : {}),
           ...(input.requires_approval == null ? {} : { requiresApproval: input.requires_approval }),
         },
       });
@@ -87,10 +133,10 @@ export function registerWorkflowReshapeTools(server: McpServer): void {
       run_id: z.string().min(1).describe('The in-flight run to reshape.'),
       action: z.enum(['inspect', 'apply']).describe('"inspect" reads the live graph; "apply" performs the reshape.'),
       reason: z.string().nullish().describe('For "apply": one plain sentence on why the shape must change. Surfaced to the user.'),
-      operations: z.array(OperationSchema).nullish().describe('For "apply": the structural changes.'),
-      completed_node_ids: z.array(z.string()).nullish().describe('Nodes already finished; their structure is protected.'),
+      operations_json: z.string().nullish().describe('For "apply": a JSON ARRAY string of operations. Each entry: {"op":"add_node","node_id":"analyze-b","label":"second branch","prompt":"...","side_effect":"read"} | {"op":"add_edge","source":"pull","target":"analyze-b"} | {"op":"disable_edge","edge_id":"dependency:a->b","reason":"source is dark"} | {"op":"enable_edge","edge_id":"dependency:a->b"}. Only op and its own required keys are needed; omit the rest.'),
+      completed_node_ids_json: z.string().nullish().describe('Optional JSON array string of already-finished node ids; their structure is protected.'),
     },
-    async ({ workflow, run_id, action, reason, operations, completed_node_ids }) => {
+    async ({ workflow, run_id, action, reason, operations_json, completed_node_ids_json }) => {
       try {
         if (action === 'inspect') {
           const graph = loadLiveWorkflowGraph(run_id);
@@ -102,16 +148,25 @@ export function registerWorkflowReshapeTools(server: McpServer): void {
           }, null, 2));
         }
 
-        const list = operations ?? [];
-        if (list.length === 0) return textResult('Refused: "apply" needs at least one operation. Call action "inspect" first to see real node and edge ids.');
+        const parsedOps = parseOperationsJson(operations_json ?? '');
+        if (parsedOps.errors.length > 0) return textResult(`Refused: ${parsedOps.errors.join(' ')} Call action "inspect" first to see real node and edge ids.`);
+        if (parsedOps.inputs.length === 0) return textResult('Refused: "apply" needs at least one operation. Call action "inspect" first to see real node and edge ids.');
 
-        const mapped = toGraphOperations(list);
+        const mapped = toGraphOperations(parsedOps.inputs);
         if (mapped.errors.length > 0) return textResult(`Refused: ${mapped.errors.join(' ')}`);
+
+        let completedNodeIds: string[] = [];
+        if (completed_node_ids_json?.trim()) {
+          try {
+            const parsed = JSON.parse(completed_node_ids_json) as unknown;
+            if (Array.isArray(parsed)) completedNodeIds = parsed.map((id) => String(id));
+          } catch { /* an unreadable hint must never block a valid reshape */ }
+        }
 
         const result = reshapeWorkflowGraph({
           workflowName: workflow,
           runId: run_id,
-          completedNodeIds: completed_node_ids ?? [],
+          completedNodeIds,
           patch: { operations: mapped.operations, reason: reason ?? undefined },
         });
 
