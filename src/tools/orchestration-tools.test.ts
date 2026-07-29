@@ -205,7 +205,7 @@ test('workflow_create accepts an inputs SCHEMA as a JSON string and persists it'
   assert.deepEqual(entry!.data.inputs, { url: { type: 'string', description: 'Site to audit' } });
 });
 
-test('workflow_create/update tool schemas accept step input contracts for codification', () => {
+test('workflow_create/update tool schemas accept contracts and explain structured-call output paths', () => {
   const step = {
     id: 'pull',
     prompt: 'Fetch the domain rank overview.',
@@ -221,6 +221,19 @@ test('workflow_create/update tool schemas accept step input contracts for codifi
   assert.ok(updateSchema?.steps?.parse, 'workflow_update steps schema registered');
   assert.doesNotThrow(() => createSchema.steps.parse([step]));
   assert.doesNotThrow(() => updateSchema.steps.parse([step]));
+
+  const callDescription = (schema: typeof createSchema) =>
+    ((schema?.steps as unknown as {
+      def?: {
+        innerType?: {
+          element?: { shape?: { call?: { description?: string } } };
+        };
+      };
+    })?.def?.innerType?.element?.shape?.call?.description ?? '');
+  assert.match(callDescription(createSchema), /successful, data/);
+  assert.match(callDescription(createSchema), /data\.records/);
+  assert.match(callDescription(updateSchema), /successful, data/);
+  assert.match(callDescription(updateSchema), /data\.records/);
 });
 
 test('workflow_create saves authored step input contracts as direct call nodes when codifiable', async () => {
