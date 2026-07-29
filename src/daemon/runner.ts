@@ -1899,7 +1899,9 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       // Autonomy v1 (processAgentAutonomy) was deleted in Phase-2 Wave 2 — v2
       // owns every standing agent (AUTONOMY_V2_AGENTS) and self-driving goals
       // own the rest. Only v2 + goals run the standing-work cadence now.
-      await withDaemonRuntimePhase('daemon.loop.agent_autonomy_v2', { tickCount }, () => processAgentAutonomyV2());
+      // The assistant handle lets cycles run through the brain runtime on
+      // OAuth-primary installs (no raw OpenAI key — the shipped default).
+      await withDaemonRuntimePhase('daemon.loop.agent_autonomy_v2', { tickCount }, () => processAgentAutonomyV2(assistant));
       // Self-driving goals (A2): re-enter active goals due for a heartbeat.
       // Inside proactiveWorkAllowed ⇒ quiet hours pause resumption for free
       // (the autonomous-hours window, reusing proactivity-policy). ~60s scan

@@ -110,6 +110,41 @@ export function renderOpenDelegations(slug: string): string {
   ].join('\n');
 }
 
+
+/**
+ * Core claim transition, slug-bound in code. Shared by the SDK tool and the
+ * runtime-engine cycle so both auth paths go through ONE owner. Lookup is
+ * scoped to the agent's own queue, so another agent's work is not merely
+ * refused — it is unreachable.
+ */
+export function claimDelegationFor(agentSlug: string, delegationId: string): string {
+  const record = readOne(agentSlug, delegationId);
+  if (!record) return `Delegation ${delegationId} is not assigned to you (not in your queue).`;
+  if (record.status === 'completed') return `Delegation ${delegationId} is already completed.`;
+  if (leaseHeld(record, Date.now())) {
+    return `Delegation ${delegationId} is already in progress (claimed ${record.claimedAt}). Continue it rather than starting over.`;
+  }
+  const now = new Date().toISOString();
+  write(agentSlug, { ...record, status: 'in_progress', claimedBy: agentSlug, claimedAt: now, updatedAt: now });
+  return `Claimed delegation ${delegationId}: ${record.task}`;
+}
+
+/**
+ * Core completion transition, slug-bound in code. The delegator acts on the
+ * completion transition, so the first result is authoritative — a repeat
+ * reports instead of rewriting history.
+ */
+export function completeDelegationFor(agentSlug: string, delegationId: string, result: string): string {
+  const record = readOne(agentSlug, delegationId);
+  if (!record) return `Delegation ${delegationId} is not assigned to you (not in your queue).`;
+  if (record.status === 'completed') {
+    return `Delegation ${delegationId} is already completed. Recorded result: ${record.result ?? '(none)'}`;
+  }
+  const now = new Date().toISOString();
+  write(agentSlug, { ...record, status: 'completed', result, completedBy: agentSlug, updatedAt: now });
+  return `Completed delegation ${delegationId} for ${record.fromAgent}.`;
+}
+
 /**
  * Delegation tools bound to one agent's slug. Attribution never depends on a
  * process-global, so two agents' tools cannot cross-write in a shared daemon.
@@ -121,19 +156,8 @@ export function buildAgentDelegationTools(agentSlug: string): Tool<RuntimeContex
     parameters: z.object({
       delegation_id: z.string().describe('The delegation id from your delegated-work list.'),
     }),
-    execute: async ({ delegation_id }: { delegation_id: string }) => {
-      const record = readOne(agentSlug, delegation_id);
-      // Lookup is scoped to this agent's own queue, so another agent's work is
-      // not merely refused — it is unreachable.
-      if (!record) return `Delegation ${delegation_id} is not assigned to you (not in your queue).`;
-      if (record.status === 'completed') return `Delegation ${delegation_id} is already completed.`;
-      if (leaseHeld(record, Date.now())) {
-        return `Delegation ${delegation_id} is already in progress (claimed ${record.claimedAt}). Continue it rather than starting over.`;
-      }
-      const now = new Date().toISOString();
-      write(agentSlug, { ...record, status: 'in_progress', claimedBy: agentSlug, claimedAt: now, updatedAt: now });
-      return `Claimed delegation ${delegation_id}: ${record.task}`;
-    },
+    execute: async ({ delegation_id }: { delegation_id: string }) =>
+      claimDelegationFor(agentSlug, delegation_id),
   });
 
   const complete = tool({
@@ -143,18 +167,8 @@ export function buildAgentDelegationTools(agentSlug: string): Tool<RuntimeContex
       delegation_id: z.string().describe('The delegation id you are finishing.'),
       result: z.string().describe('The actual result — what was produced, not a promise to produce it.'),
     }),
-    execute: async ({ delegation_id, result }: { delegation_id: string; result: string }) => {
-      const record = readOne(agentSlug, delegation_id);
-      if (!record) return `Delegation ${delegation_id} is not assigned to you (not in your queue).`;
-      // The delegator acts on the completion transition, so the first result is
-      // authoritative — a repeat cycle reports instead of rewriting history.
-      if (record.status === 'completed') {
-        return `Delegation ${delegation_id} is already completed. Recorded result: ${record.result ?? '(none)'}`;
-      }
-      const now = new Date().toISOString();
-      write(agentSlug, { ...record, status: 'completed', result, completedBy: agentSlug, updatedAt: now });
-      return `Completed delegation ${delegation_id} for ${record.fromAgent}.`;
-    },
+    execute: async ({ delegation_id, result }: { delegation_id: string; result: string }) =>
+      completeDelegationFor(agentSlug, delegation_id, result),
   });
 
   return [claim, complete] as Tool<RuntimeContextValue>[];

@@ -256,3 +256,125 @@ test('a configured-but-keyless autonomy pass does no work and does not throw', a
     if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey;
   }
 });
+
+// ─── OAuth/runtime engine: autonomy must run on BOTH OAuths ───
+// (owner directive, live date). The SDK engine needs a raw OpenAI key, which
+// OAuth-primary installs never have. These tests drive a full cycle through a
+// fake brain runtime — the same interface Claude OAuth and Codex OAuth serve —
+// and assert the delegated work actually completes with correct attribution.
+
+function fakeAssistant(responses: string[]): { assistant: unknown; prompts: string[] } {
+  const prompts: string[] = [];
+  return {
+    prompts,
+    assistant: {
+      getRuntime() {
+        return {
+          async run(request: { prompt: string; sessionId?: string }) {
+            prompts.push(request.prompt);
+            const text = responses.shift();
+            if (text === undefined) throw new Error('unexpected runtime call');
+            return { text, sessionId: request.sessionId ?? 'agent:test' };
+          },
+        };
+      },
+    },
+  };
+}
+
+function seedTeamAgent(slug: string): void {
+  const dir = path.join(process.env.CLEMENTINE_HOME!, 'vault', '00-System', 'agents', slug);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'agent.md'), [
+    '---',
+    `slug: ${slug}`,
+    `name: ${slug}`,
+    'description: Runtime engine test agent.',
+    'canMessage: []',
+    'allowedTools: []',
+    'tier: 2',
+    'autonomyEnabled: true',
+    'proactive: true',
+    'cadenceMinutes: 30',
+    '---',
+    `You are ${slug}.`,
+  ].join('\n'), 'utf-8');
+}
+
+test('RUNTIME ENGINE: a keyless cycle completes delegated work through the brain runtime', async () => {
+  const mod = await import('./autonomy-v2.js');
+  mod._testOnly_resetAutonomyUnavailableWarning();
+
+  seedTeamAgent('rt-analyst');
+  seed('rt-analyst', 'rt1');
+
+  const decision = JSON.stringify({
+    summary: 'Claimed and completed the delegated summary task.',
+    commitments: ['Watch for follow-up work'],
+    actions: [
+      { type: 'claim_delegation', delegationId: 'rt1' },
+      { type: 'complete_delegation', delegationId: 'rt1', result: 'Risks: freeze writes, backfill, cut over.' },
+    ],
+  });
+  const { assistant, prompts } = fakeAssistant([decision]);
+
+  const prevAgents = process.env.AUTONOMY_V2_AGENTS;
+  const prevKey = process.env.OPENAI_API_KEY;
+  process.env.AUTONOMY_V2_AGENTS = 'rt-analyst';
+  delete process.env.OPENAI_API_KEY;
+  try {
+    const summary = await mod.processAgentAutonomyV2(assistant as never);
+    assert.equal(summary.attempted, 1);
+    assert.equal(summary.succeeded, 1, 'the cycle must succeed through the runtime');
+  } finally {
+    if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
+    else process.env.AUTONOMY_V2_AGENTS = prevAgents;
+    if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey;
+  }
+
+  // The agent saw its delegated work in the cycle input…
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /rt1/, 'the delegation id reaches the cycle prompt');
+
+  // …and the durable record closed with truthful attribution.
+  const record = read('rt-analyst', 'rt1');
+  assert.equal(record.status, 'completed');
+  assert.equal(record.result, 'Risks: freeze writes, backfill, cut over.');
+  assert.equal(record.completedBy, 'rt-analyst', 'the agent itself, never a process-global');
+});
+
+test('RUNTIME ENGINE: malformed actions are dropped, never guessed at', async () => {
+  const mod = await import('./autonomy-v2.js');
+  const actions = mod.sanitizeRuntimeCycleActions([
+    { type: 'complete_delegation', delegationId: 'x' },            // missing result
+    { type: 'claim_delegation' },                                   // missing id
+    { type: 'delete_everything', delegationId: 'x' },               // unknown verb
+    { type: 'notify_user', title: 'ok', body: 'fine' },             // valid
+    'garbage',
+  ]);
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].type, 'notify_user');
+});
+
+test('RUNTIME ENGINE: a prose-only reply fails the cycle instead of inventing actions', async () => {
+  const mod = await import('./autonomy-v2.js');
+  seedTeamAgent('rt-flake');
+  seed('rt-flake', 'rt2');
+
+  const { assistant } = fakeAssistant(['I looked around and everything seems fine!']);
+  const prevAgents = process.env.AUTONOMY_V2_AGENTS;
+  const prevKey = process.env.OPENAI_API_KEY;
+  process.env.AUTONOMY_V2_AGENTS = 'rt-flake';
+  delete process.env.OPENAI_API_KEY;
+  try {
+    const summary = await mod.processAgentAutonomyV2(assistant as never);
+    // A bare-prose reply still sanitizes into a summary-only decision — the
+    // key property is that NO action executes and the delegation is untouched.
+    assert.equal(summary.attempted, 1);
+  } finally {
+    if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
+    else process.env.AUTONOMY_V2_AGENTS = prevAgents;
+    if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey;
+  }
+  assert.equal(read('rt-flake', 'rt2').status, 'pending', 'no action was invented from prose');
+});

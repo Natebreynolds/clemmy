@@ -21,8 +21,10 @@ import {
   peerCommsEnabled,
   resetCommsCycle,
 } from './agent-comms.js';
-import { buildAgentDelegationTools, renderOpenDelegations } from './agent-delegations.js';
+import { buildAgentDelegationTools, claimDelegationFor, completeDelegationFor, renderOpenDelegations } from './agent-delegations.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
+import { addNotification } from '../runtime/notifications.js';
+import type { ClementineAssistant } from '../assistant/core.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
 import type { RuntimeContextValue } from '../types.js';
@@ -953,6 +955,174 @@ export interface AutonomyV2RunSummary {
  * inbox `processed` flag and `lastRunAt` cadence check.
  */
 
+
+// -------- OAuth/runtime cycle engine --------
+//
+// The SDK engine above is built on `@openai/agents` and therefore needs a raw
+// OpenAI API key — a credential this product otherwise uses only for voice and
+// embeddings. OAuth-primary installs (Claude OAuth, Codex OAuth — the shipped
+// default) never have one, so opted-in agents were permanently inert there.
+//
+// This engine runs the SAME cycle through the assistant's brain runtime — the
+// canonical primitive the execution controller, cron, and proactive briefs
+// already drive autonomous turns through — so it works on every auth mode the
+// product supports. The decision comes back as strict JSON; a small, closed
+// action vocabulary is executed deterministically in code with the agent's
+// slug bound at the call site (never a process-global), reusing the exact
+// transition functions the SDK tools call. One owner, two entry points.
+
+const RUNTIME_CYCLE_TIMEOUT_MS = 180_000;
+const MAX_RUNTIME_ACTIONS = 5;
+
+export interface RuntimeCycleAction {
+  type: 'claim_delegation' | 'complete_delegation' | 'notify_user';
+  delegationId?: string;
+  result?: string;
+  title?: string;
+  body?: string;
+}
+
+/** Strict, clamped parse of the runtime engine's action list. Unknown types
+ *  and malformed entries are dropped, never guessed at. */
+export function sanitizeRuntimeCycleActions(value: unknown): RuntimeCycleAction[] {
+  if (!Array.isArray(value)) return [];
+  const out: RuntimeCycleAction[] = [];
+  for (const raw of value) {
+    if (out.length >= MAX_RUNTIME_ACTIONS) break;
+    if (!raw || typeof raw !== 'object') continue;
+    const obj = raw as Record<string, unknown>;
+    const type = obj.type;
+    if (type === 'claim_delegation') {
+      const delegationId = cleanDecisionString(obj.delegationId ?? obj.delegation_id, 64);
+      if (delegationId) out.push({ type, delegationId });
+    } else if (type === 'complete_delegation') {
+      const delegationId = cleanDecisionString(obj.delegationId ?? obj.delegation_id, 64);
+      const result = cleanDecisionString(obj.result, 4000);
+      if (delegationId && result) out.push({ type, delegationId, result });
+    } else if (type === 'notify_user') {
+      const title = cleanDecisionString(obj.title, 140);
+      const body = cleanDecisionString(obj.body, 1000);
+      if (title) out.push({ type, title, body });
+    }
+  }
+  return out;
+}
+
+function buildRuntimeCyclePrompt(record: TeamAgentRecord, input: string): string {
+  return [
+    `You are ${record.name} (${record.slug}), a durable team agent, on a scheduled working cycle. ${record.description ?? ''}`,
+    '',
+    input,
+    '',
+    'Decide what to do this cycle and reply with STRICT JSON only — no prose before or after:',
+    '{"summary": string, "commitments": string[], "followUpMinutes"?: number, "actions": Action[]}',
+    'Action is one of:',
+    '  {"type":"claim_delegation","delegationId":string}   — claim a task delegated to you before working on it',
+    '  {"type":"complete_delegation","delegationId":string,"result":string} — result must be the ACTUAL work product, not a promise',
+    '  {"type":"notify_user","title":string,"body":string} — only for something the user should see',
+    'Rules: act only on delegations listed in your input. If a delegated task is small enough to finish now, do the work and complete it with the real result in this reply. If nothing needs doing, return an empty actions array and say so in summary.',
+  ].join('\n');
+}
+
+/** Execute the closed action vocabulary deterministically, slug bound in code. */
+function executeRuntimeCycleActions(slug: string, actions: RuntimeCycleAction[]): string[] {
+  const outcomes: string[] = [];
+  for (const action of actions) {
+    try {
+      if (action.type === 'claim_delegation' && action.delegationId) {
+        outcomes.push(claimDelegationFor(slug, action.delegationId));
+      } else if (action.type === 'complete_delegation' && action.delegationId && action.result) {
+        outcomes.push(completeDelegationFor(slug, action.delegationId, action.result));
+      } else if (action.type === 'notify_user' && action.title) {
+        addNotification({
+          id: `${Date.now()}-agent-${slug}-${randomSuffix()}`,
+          kind: 'system',
+          title: action.title,
+          body: action.body ?? '',
+          createdAt: new Date().toISOString(),
+          read: false,
+          metadata: { agentSlug: slug },
+        });
+        outcomes.push(`Notified user: ${action.title}`);
+      }
+    } catch (err) {
+      outcomes.push(`Action ${action.type} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return outcomes;
+}
+
+function randomSuffix(): string {
+  return Math.random().toString(36).slice(2, 8);
+}
+
+async function runAgentCycleViaRuntime(
+  assistant: ClementineAssistant,
+  record: TeamAgentRecord,
+): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string }> {
+  const state = loadAgentState(record.slug);
+  const inboxItems = loadInbox(record.slug).filter((item) => item.status === 'pending').slice(0, MAX_INBOX_PER_CYCLE);
+  const wakeReasons = [
+    ...(inboxItems.length > 0 ? ['inbox'] : []),
+    ...(isCadenceDue(record, state) ? ['cadence'] : []),
+  ];
+  if (wakeReasons.length === 0) return { runId: '', success: true, outcomes: [] };
+
+  const runId = startAutonomyRun(record, wakeReasons, inboxItems.length);
+  const policySnapshot = getProactivityPolicySnapshot();
+  addRunEvent(runId, buildPolicyEvent(policySnapshot));
+
+  try {
+    const input = buildAgentInput(record, inboxItems, state, policySnapshot.policy);
+    const run = await assistant.getRuntime().run({
+      prompt: buildRuntimeCyclePrompt(record, input),
+      sessionId: `agent:${record.slug}`,
+      userId: record.slug,
+      channel: 'agent',
+      maxWallClockMs: RUNTIME_CYCLE_TIMEOUT_MS,
+    });
+
+    const parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
+    const decision = sanitizeAgentDecisionOutput(run.text);
+    if (!decision) throw new Error('Agent cycle completed but produced no usable decision output.');
+    await assertAutonomyDecisionGuardrails(decision);
+
+    const actions = sanitizeRuntimeCycleActions(parsed?.actions);
+    const outcomes = executeRuntimeCycleActions(record.slug, actions);
+
+    recordAutonomyResponse(runId, JSON.stringify({ ...decision, actions }));
+    recordAutonomyDecision(runId, {
+      summary: decision.summary,
+      commitments: decision.commitments,
+      followUpMinutes: decision.followUpMinutes,
+    });
+    markInboxProcessed(record.slug, inboxItems.map((item) => item.id));
+
+    const activeExecs = activeExecutionCountForSession(`agent:${record.slug}`);
+    const effectiveFollowUp = chooseFollowUpMinutes(decision.followUpMinutes, activeExecs, policySnapshot.policy);
+    saveAgentState({
+      slug: record.slug,
+      engine: 'v2',
+      lastRunAt: new Date().toISOString(),
+      lastWakeAt: new Date().toISOString(),
+      lastWakeReasons: wakeReasons,
+      lastSummary: decision.summary,
+      commitments: decision.commitments.slice(0, 8),
+      nextWakeAt: effectiveFollowUp
+        ? new Date(Date.now() + effectiveFollowUp * 60_000).toISOString()
+        : undefined,
+    });
+    finishAutonomyRun(runId, [decision.summary, ...outcomes]);
+    return { runId, success: true, outcomes: [decision.summary, ...outcomes] };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error({ err: error, agent: record.slug }, 'autonomy runtime cycle failed');
+    saveAgentState({ ...state, slug: record.slug, engine: 'v2', lastRunAt: new Date().toISOString(), lastError: message });
+    finishAutonomyRun(runId, [], message);
+    return { runId, success: false, outcomes: [], error: message };
+  }
+}
+
 /**
  * One-shot warning for the configured-but-inert case. Bounded to a single
  * emission per process so a 15s daemon tick cannot turn it into a log storm.
@@ -980,24 +1150,45 @@ function warnAutonomyEngineUnavailableOnce(optIn: Set<string>): void {
   );
 }
 
-export async function processAgentAutonomyV2(): Promise<AutonomyV2RunSummary> {
+export async function processAgentAutonomyV2(assistant?: ClementineAssistant): Promise<AutonomyV2RunSummary> {
   const start = Date.now();
   const summary: AutonomyV2RunSummary = { attempted: 0, succeeded: 0, failed: 0, skipped: 0, durationMs: 0 };
 
   const optIn = readOptInSlugs();
-
-  if (!getOpenAiApiKey()) {
-    // Silent no-op is the trap: a user who set AUTONOMY_V2_AGENTS has opted
-    // agents in and will reasonably assume they run. This engine is built on
-    // the OpenAI Agents SDK and needs a raw OpenAI key, which OAuth-only
-    // installs (Claude / Codex OAuth, BYO third-party providers) do not have.
-    // Say so once per process rather than returning quietly every tick.
-    if (optIn.size > 0) warnAutonomyEngineUnavailableOnce(optIn);
+  if (optIn.size === 0) {
     summary.durationMs = Date.now() - start;
     return summary;
   }
 
-  if (optIn.size === 0) {
+  // Engine selection. The SDK engine needs a raw OpenAI API key (a credential
+  // this product otherwise uses only for voice/embeddings). Without one, run
+  // cycles through the assistant's brain runtime instead — the same primitive
+  // the execution controller and cron already use — so autonomy works on
+  // Claude OAuth and Codex OAuth, the shipped defaults.
+  if (!getOpenAiApiKey()) {
+    if (!assistant) {
+      // No key AND no runtime handle: nothing can run. Say so once rather
+      // than returning quietly every tick.
+      warnAutonomyEngineUnavailableOnce(optIn);
+      summary.durationMs = Date.now() - start;
+      return summary;
+    }
+    const records = loadTeamAgents().filter((rec) => optIn.has(rec.slug) && rec.autonomyEnabled !== false);
+    // Sequential on purpose: runtime turns are heavier than SDK cycles, and
+    // serializing them keeps one slow agent from stacking brain-lane load.
+    for (const rec of records) {
+      try {
+        const result = await withTimeout(runAgentCycleViaRuntime(assistant, rec), RUNTIME_CYCLE_TIMEOUT_MS + 15_000, `agent ${rec.slug}`);
+        summary.attempted++;
+        if (!result.runId) summary.skipped++;
+        else if (result.success) summary.succeeded++;
+        else summary.failed++;
+      } catch (err) {
+        summary.attempted++;
+        summary.failed++;
+        logger.warn({ err, agent: rec.slug }, 'autonomy runtime cycle rejected');
+      }
+    }
     summary.durationMs = Date.now() - start;
     return summary;
   }
