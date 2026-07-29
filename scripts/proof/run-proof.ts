@@ -46,6 +46,7 @@ import { capabilityReconnectResume } from './scenarios/capability-reconnect-resu
 import { fusionBoundedVerifier } from './scenarios/fusion-bounded-verifier.js';
 import { schemaOnDemand } from './scenarios/schema-on-demand.js';
 import { cleanTurnIsolation } from './scenarios/clean-turn-isolation.js';
+import { graphReshapeLive } from './scenarios/graph-reshape-live.js';
 import { socialStudioLifecycle } from './scenarios/social-studio-lifecycle.js';
 import { pendingActionExactOnce } from './scenarios/pending-action-exact-once.js';
 import { bookkeepingReceiptExactOnce } from './scenarios/bookkeeping-receipt-exact-once.js';
@@ -72,6 +73,7 @@ const DEFAULT_SCENARIOS: ScenarioDef[] = [
   capabilityReconnectResume,
   schemaOnDemand,
   cleanTurnIsolation,
+  graphReshapeLive,
 ];
 const SCENARIO_CATALOG: ScenarioDef[] = [
   ...DEFAULT_SCENARIOS,
