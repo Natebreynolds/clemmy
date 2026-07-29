@@ -612,6 +612,11 @@ export function registerTeamTools(server: McpServer): void {
               `Task: ${delegation.task}`,
               `Expected Output: ${delegation.expectedOutput}`,
               delegation.result ? `Result: ${delegation.result}` : '',
+              // Say who produced the result, so a later turn never reports a
+              // teammate as having done work the primary agent did.
+              delegation.completedBy
+                ? `Completed by: ${delegation.completedBy}${delegation.onBehalfOf ? ` (on behalf of ${delegation.onBehalfOf})` : ''}`
+                : '',
             ].filter(Boolean).join('\n'),
           );
         }
