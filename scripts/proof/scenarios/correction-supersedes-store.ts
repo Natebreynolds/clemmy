@@ -55,10 +55,24 @@ export const correctionSupersedesStore: ScenarioDef = {
       }
     } catch { /* surfaced below */ }
 
+    let activeCorrected = -1;
+    try {
+      const db = new Database(path.join(daemon.home, 'state', 'memory.db'), { readonly: true });
+      activeCorrected = (db.prepare(`
+        SELECT COUNT(*) AS count FROM consolidated_facts
+        WHERE active = 1 AND lower(content) LIKE ?
+      `).get(`%${CORRECTED.toLowerCase()}%`) as { count: number }).count;
+      db.close();
+    } catch { /* surfaced below */ }
+
     const checks: Check[] = [{
       name: 'stale belief is retired OR tracked for retirement',
       pass: staleOnlyActive === 0 || queuedPairs > 0,
       detail: `stale-only active facts: ${staleOnlyActive}; pending-conflict queue entries: ${queuedPairs}`,
+    }, {
+      name: 'the correction consolidated to exactly one active fact',
+      pass: activeCorrected === 1,
+      detail: `active facts containing the correction: ${activeCorrected}`,
     }];
 
     return { checks, latency: [{ wallMs: 0, ttftMs: null }], sessionId: session, metrics: { turns: 2, staleOnlyActive, queuedPairs } };

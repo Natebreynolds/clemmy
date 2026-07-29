@@ -1074,16 +1074,31 @@ async function runAgentCycleViaRuntime(
 
   try {
     const input = buildAgentInput(record, inboxItems, state, policySnapshot.policy);
-    const run = await assistant.getRuntime().run({
+    // Mirror the execution controller's proven decision shape exactly:
+    // explicit JSON-only instructions plus one retry with a harder nudge.
+    // Without instructions the runtime returned EMPTY text on both OAuth
+    // brains (live, 2026-07-29) and the cycle failed with "no usable
+    // decision output".
+    const baseRequest = {
+      instructions: 'You are a strict internal agent-cycle decider. Return the decision as JSON only — no prose, no code fences.',
+      model: MODELS.fast,
       prompt: buildRuntimeCyclePrompt(record, input),
       sessionId: `agent:${record.slug}`,
       userId: record.slug,
       channel: 'agent',
       maxWallClockMs: RUNTIME_CYCLE_TIMEOUT_MS,
-    });
-
-    const parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
-    const decision = sanitizeAgentDecisionOutput(run.text);
+    };
+    let run = await assistant.getRuntime().run(baseRequest);
+    let parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
+    let decision = sanitizeAgentDecisionOutput(run.text);
+    if (!decision) {
+      run = await assistant.getRuntime().run({
+        ...baseRequest,
+        prompt: `${baseRequest.prompt}\n\nYour previous reply was not parseable JSON. Reply with ONLY the JSON object described above.`,
+      });
+      parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
+      decision = sanitizeAgentDecisionOutput(run.text);
+    }
     if (!decision) throw new Error('Agent cycle completed but produced no usable decision output.');
     await assertAutonomyDecisionGuardrails(decision);
 
