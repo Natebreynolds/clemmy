@@ -24,8 +24,10 @@ interface TeamMessageRecord {
   toAgent: string;
   content: string;
   timestamp: string;
-  protocol: 'message' | 'request' | 'response';
+  protocol: 'message' | 'request' | 'response' | 'delegation_result';
   requestId?: string;
+  delegationId?: string;
+  onBehalfOf?: string;
   respondedAt?: string;
 }
 
@@ -37,6 +39,10 @@ interface DelegationRecord {
   expectedOutput: string;
   status: 'pending' | 'in_progress' | 'completed';
   result?: string;
+  /** Who actually recorded the result — never assumed to be the assignee. */
+  completedBy?: string;
+  /** Set when the primary agent closed work queued for someone else. */
+  onBehalfOf?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -486,6 +492,101 @@ export function registerTeamTools(server: McpServer): void {
       ensureDir(path.dirname(filePath));
       writeFileSync(filePath, JSON.stringify(delegation, null, 2), 'utf-8');
       return textResult(`Task delegated to ${to_agent}. Delegation ID: ${delegation.id}`);
+    },
+  );
+
+  // Delegation mirrors the request primitive: queue (delegate_task) →
+  // discover (delegation_inbox) → finish (complete_delegation). Without the
+  // last two the execution controller polls for a 'completed' status that
+  // nothing could ever write, so a delegated plan step parks forever.
+  server.tool(
+    'delegation_inbox',
+    'List delegated tasks assigned to the current team agent and still open.',
+    {},
+    async () => {
+      const slug = currentAgentSlug();
+      const dirPath = path.join(DELEGATIONS_DIR, slug);
+      if (!existsSync(dirPath)) return textResult('No delegated tasks.');
+
+      const open = readdirSync(dirPath)
+        .filter((file) => file.endsWith('.json'))
+        .map((file) => {
+          try { return JSON.parse(readFileSync(path.join(dirPath, file), 'utf-8')) as DelegationRecord; }
+          catch { return null; }
+        })
+        .filter((record): record is DelegationRecord => record !== null && record.status !== 'completed');
+
+      if (open.length === 0) return textResult('No delegated tasks.');
+
+      return textResult(
+        open
+          .map((record) => `- [${record.status.toUpperCase()}] ${record.id} from ${record.fromAgent}: ${record.task} | expected: ${record.expectedOutput}`)
+          .join('\n'),
+      );
+    },
+  );
+
+  server.tool(
+    'complete_delegation',
+    'Finish a delegated task assigned to the current team agent by recording its result.',
+    {
+      delegation_id: z.string().min(1),
+      result: z.string().min(1),
+    },
+    async ({ delegation_id, result }) => {
+      if (!existsSync(DELEGATIONS_DIR)) return textResult(`Delegation not found: ${delegation_id}`);
+
+      for (const slug of readdirSync(DELEGATIONS_DIR)) {
+        const filePath = delegationFilePath(slug, delegation_id);
+        if (!existsSync(filePath)) continue;
+
+        const delegation = JSON.parse(readFileSync(filePath, 'utf-8')) as DelegationRecord;
+        const actor = currentAgentSlug();
+        // The assignee closes its own work. The primary agent may also close
+        // it — in the shared daemon every agent runs in one process, so a
+        // delegate cannot always assert its own identity, and without this the
+        // execution controller waits on a status nothing can write. A peer,
+        // however, never closes work it was not given.
+        const onBehalfOf = delegation.toAgent === actor ? undefined : delegation.toAgent;
+        if (onBehalfOf && !isPrimaryAgent()) {
+          return textResult(`Delegation ${delegation_id} is not assigned to ${actor}.`);
+        }
+        // The delegator acts on the completion transition, so the first
+        // result is authoritative — a re-run reports instead of rewriting.
+        if (delegation.status === 'completed') {
+          return textResult(`Delegation ${delegation_id} is already completed. Recorded result: ${delegation.result ?? '(none)'}`);
+        }
+
+        const completedAt = new Date().toISOString();
+        writeFileSync(
+          filePath,
+          JSON.stringify(
+            { ...delegation, status: 'completed', result, completedBy: actor, onBehalfOf, updatedAt: completedAt },
+            null,
+            2,
+          ),
+          'utf-8',
+        );
+        appendTeamComms({
+          id: randomBytes(4).toString('hex'),
+          fromAgent: actor,
+          toAgent: delegation.fromAgent,
+          content: result,
+          timestamp: completedAt,
+          protocol: 'delegation_result',
+          delegationId: delegation_id,
+          onBehalfOf,
+          respondedAt: completedAt,
+        });
+
+        return textResult(
+          onBehalfOf
+            ? `Completed delegation ${delegation_id} on behalf of ${onBehalfOf}.`
+            : `Completed delegation ${delegation_id} for ${delegation.fromAgent}.`,
+        );
+      }
+
+      return textResult(`Delegation not found: ${delegation_id}`);
     },
   );
 

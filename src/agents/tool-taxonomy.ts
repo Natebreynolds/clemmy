@@ -265,6 +265,7 @@ const ALWAYS_READ = new Set<string>([
   'team_list',
   'team_pending_requests',
   'check_delegation',
+  'delegation_inbox',
   // Pending-action inspection is a pure local read.
   'pending_action_list',
   'pending_action_get',
