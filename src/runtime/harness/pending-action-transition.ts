@@ -41,6 +41,16 @@ const CONTEXT_BOUND_PROCEED_QUESTION_RE =
 const APPROVE_OR_STOP_DECISION_RE =
   /\bapprove\s+to\s+proceed\s+or\s+(?:tell\s+me\s+to\s+)?stop\b/i;
 
+function lastSentencePeriodBoundary(text: string): number {
+  let cursor = text.lastIndexOf('.');
+  while (cursor >= 0) {
+    const next = text[cursor + 1];
+    if (next === undefined || /\s/u.test(next)) return cursor;
+    cursor = text.lastIndexOf('.', cursor - 1);
+  }
+  return -1;
+}
+
 /**
  * Narrow queue→card intent. Generic material questions keep the action inert:
  * "Which account should I use to send it?" is not execution authorization.
@@ -52,7 +62,10 @@ export function isQueuedActionApprovalQuestion(reply?: string | null): boolean {
   const questionEnd = tail.lastIndexOf('?');
   const beforeQuestion = tail.slice(0, questionEnd);
   const questionStart = Math.max(
-    beforeQuestion.lastIndexOf('.'),
+    // A dot inside a target such as proof@example.com or example.com/path is
+    // not a sentence boundary. Only a period followed by whitespace/end may
+    // delimit the final authorization question.
+    lastSentencePeriodBoundary(beforeQuestion),
     beforeQuestion.lastIndexOf('!'),
     beforeQuestion.lastIndexOf('?'),
     beforeQuestion.lastIndexOf('\n'),

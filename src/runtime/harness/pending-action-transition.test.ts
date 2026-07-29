@@ -110,6 +110,7 @@ test('approval-edge question detection distinguishes authorization from missing 
     'Would you like me to proceed?',
     'Ready to send 12 emails — approve to proceed or tell me to stop?',
     'Can I go ahead?',
+    'Queued (id `pa-ms5wk9wy-8a0722`) — the formal approval card is now open. Do you approve executing this send to proof@example.com?',
   ]) {
     assert.equal(isQueuedActionApprovalQuestion(positive), true, positive);
   }
