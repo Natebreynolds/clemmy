@@ -8,6 +8,7 @@ import type {
   Options as ClaudeAgentOptions,
   PermissionResult,
   Query,
+  SDKAPIRetryMessage,
   SDKMessage,
   SDKResultMessage,
   SDKSystemMessage,
@@ -125,14 +126,13 @@ export function setClaudeAgentSdkReflectionForTest(fn: ReflectFn | null): void {
 }
 
 // -------- In-lane provider-overload retry (first-byte-safe) --------
-// The Claude Code SDK has no retry/fallover of its own: a 529 Overloaded / 5xx
-// from `query()` throws "Claude Code returned an error result: API Error: …"
-// terminally. This made an Anthropic overload dead-end EVERY raw-SDK caller
-// (workflow steps, chat brain, run_worker) — none of which pass through
-// RouterModelProvider's withModelFallback. We retry the WHOLE query with backoff,
-// but ONLY when it's safe: no tool executed and nothing streamed to the user yet,
-// so a re-run can't double-act or duplicate visible output. A mid-run overload
-// (after tools) is left to the CALLER's step/turn-boundary cross-provider switch.
+// Older Claude Code SDKs did not retry/fall over on 529/5xx, so a transient
+// provider error dead-ended every raw-SDK caller. Current SDKs retry internally
+// and expose `system/api_retry` frames. Keep the WHOLE-query retry only for
+// startup/legacy errors that did not already consume the SDK's retry budget.
+// Replaying an SDK-exhausted query here turned one ~200s outage into ~600s.
+// Every outer retry remains pre-commit only: no tool executed and no text was
+// streamed, so it cannot double-act or duplicate visible output.
 
 /**
  * Thrown when the Claude SDK lane gives up on a provider overload/5xx (after
@@ -1509,6 +1509,29 @@ function extractInit(message: SDKMessage): SDKSystemMessage | null {
     : null;
 }
 
+function extractApiRetry(message: SDKMessage): SDKAPIRetryMessage | null {
+  return message.type === 'system' && (message as { subtype?: unknown }).subtype === 'api_retry'
+    ? (message as SDKAPIRetryMessage)
+    : null;
+}
+
+function modelActivityKind(message: SDKMessage): string | null {
+  if (message.type === 'assistant') return 'assistant';
+  if (message.type === 'stream_event') return 'stream';
+  if (message.type === 'tool_progress') return 'tool_progress';
+  if (
+    message.type === 'result'
+    && message.subtype === 'success'
+    && typeof message.result === 'string'
+    && message.result.trim().length > 0
+  ) return 'result';
+  if (
+    message.type === 'system'
+    && (message as { subtype?: unknown }).subtype === 'thinking_tokens'
+  ) return 'thinking';
+  return null;
+}
+
 function numeric(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
@@ -2273,6 +2296,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     successfulToolUses = [];
     toolCallLedger.length = 0;
     firstByteMs = null;
+    let firstModelActivityMs: number | null = null;
     lastAssistantText = '';
     streamedText = '';
     streamedAny = false;
@@ -2291,6 +2315,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     ceilingState.permissionPauseStartedAt = null;
     const startedAt = Date.now();
     let lastHeartbeatAt = startedAt;
+    let sawSdkApiRetry = false;
     const toolById = new Map<string, { name: string; input: unknown }>();
     let stream: Query | undefined;
     const queryDispatchLease = options.dispatchLease && internalQueryScopeId
@@ -2382,6 +2407,47 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         );
         if (next.done) break;
         const message = next.value;
+        const apiRetry = extractApiRetry(message);
+        if (apiRetry) {
+          sawSdkApiRetry = true;
+          if (options.sessionId) {
+            try {
+              appendEvent({
+                sessionId: options.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'sdk_api_retry',
+                data: {
+                  attempt: apiRetry.attempt,
+                  maxRetries: apiRetry.max_retries,
+                  retryDelayMs: apiRetry.retry_delay_ms,
+                  errorStatus: apiRetry.error_status,
+                  error: String(apiRetry.error).slice(0, 120),
+                  outerAttempt: attempt,
+                },
+              });
+            } catch { /* retry telemetry must never affect provider recovery */ }
+          }
+        }
+        const activityKind = modelActivityKind(message);
+        if (activityKind && firstModelActivityMs === null) {
+          firstModelActivityMs = Date.now() - startedAt;
+          if (options.sessionId) {
+            try {
+              appendEvent({
+                sessionId: options.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'sdk_first_model_activity',
+                data: {
+                  firstModelActivityMs,
+                  kind: activityKind,
+                  outerAttempt: attempt,
+                },
+              });
+            } catch { /* model-activity telemetry must never affect execution */ }
+          }
+        }
         if (firstByteMs === null) {
           firstByteMs = Date.now() - startedAt;
           // Eventlog copy of the usage-log timing so TTFT is scoreable per
@@ -2701,8 +2767,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         throw new ClaudeSdkCapacityExhaustedError(msg, toolUses.length > 0 || streamedAny);
       } else if (isProviderOverloadMessage(msg)) {
         const committed = toolUses.length > 0 || streamedAny;
-        // Safe first-byte retry: nothing committed yet and budget remains.
-        if (!committed && attempt < maxOverloadRetries()) {
+        // Safe legacy/startup retry: nothing committed, budget remains, and
+        // this physical query did not already consume the modern SDK's own
+        // structured retry cycle.
+        if (!committed && !sawSdkApiRetry && attempt < maxOverloadRetries()) {
           await closeQuery();
           await sleep(overloadBackoffMs(attempt));
           continue;

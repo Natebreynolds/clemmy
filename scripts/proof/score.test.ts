@@ -71,6 +71,8 @@ function buildFixtureHome(): string {
 
   ev('turn_started', {}, 0);
   ev('turn_memory_primer', { injectedBytes: 512 }, 100);
+  ev('sdk_first_byte', { firstByteMs: 250 }, 200);
+  ev('sdk_first_model_activity', { firstModelActivityMs: 1_750, kind: 'assistant' }, 1_750);
   ev('tool_called', { tool: 'run_worker', callId: 'c1' }, 2_000);
   ev('tool_called', { tool: 'run_worker', callId: 'c2' }, 2_500);
   ev('tool_called', {
@@ -183,6 +185,7 @@ test('sessionMetrics computes counts, TTFT, and latency from the fixture', () =>
     // First model ACTION is the tool call at +2s (the primer at +100ms is
     // harness prep and must not count as TTFT).
     assert.equal(m.latency[0].ttftMs, 2_000);
+    assert.equal(m.firstByteMs, 1_750, 'SDK proof TTFT prefers model activity over child init');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

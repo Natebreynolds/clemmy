@@ -7,7 +7,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { Query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import type { Query, SDKAPIRetryMessage, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
 const mod = await import('./claude-agent-sdk.js');
 const usageLog = await import('../usage-log.js');
@@ -2026,6 +2026,39 @@ function stubsFor(gen: AsyncGenerator<SDKMessage>): Query {
 function throwingQuery(msg: string): Query {
   return stubsFor((async function* () { throw new Error(msg); })());
 }
+function sdkRetryThenThrowQuery(msg: string): Query {
+  return stubsFor((async function* () {
+    yield {
+      type: 'system',
+      subtype: 'init',
+      model: 'claude-sonnet-5',
+      session_id: 's',
+      uuid: 'i',
+      apiKeySource: 'none',
+      claude_code_version: '2.1.220',
+      cwd: process.cwd(),
+      tools: [],
+      mcp_servers: [],
+      permissionMode: 'dontAsk',
+      slash_commands: [],
+      output_style: 'default',
+      skills: [],
+      plugins: [],
+    } as any;
+    yield {
+      type: 'system',
+      subtype: 'api_retry',
+      attempt: 3,
+      max_retries: 3,
+      retry_delay_ms: 8_000,
+      error_status: 500,
+      error: 'server_error',
+      uuid: 'retry-1',
+      session_id: 's',
+    } satisfies SDKAPIRetryMessage;
+    throw new Error(msg);
+  })());
+}
 function successQuery(text: string): Query {
   return stubsFor((async function* () {
     yield { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 's', uuid: 'i', apiKeySource: 'none', claude_code_version: '2', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'dontAsk', slash_commands: [], output_style: 'default', skills: [], plugins: [] } as any;
@@ -2081,6 +2114,90 @@ test('overload at first byte is retried and then succeeds (no tools ran yet)', a
   const r = await runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' });
   assert.equal(calls, 2, 'retried once');
   assert.equal(r.text, 'recovered');
+});
+
+test('an SDK-exhausted API retry is observed once and never replayed by the outer legacy retry', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  let calls = 0;
+  let caught: { name?: string; committed?: boolean } | null = null;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    calls += 1;
+    return sdkRetryThenThrowQuery('Claude Code returned an error result: API Error: 500 Internal Server Error');
+  }) as any);
+
+  await assert.rejects(
+    runClaudeAgentSdk({
+      prompt: 'What is my project access code?',
+      sessionId: session.id,
+      modelId: 'claude-sonnet-5',
+    }),
+    (err: unknown) => {
+      caught = err as { name?: string; committed?: boolean };
+      return caught.name === 'ClaudeSdkProviderOverloadError';
+    },
+  );
+
+  assert.equal(calls, 1, 'the SDK already spent its retry budget, so the outer query is not replayed');
+  assert.equal(caught?.committed, false, 'the existing cross-brain fallback may safely own the replay');
+  const retries = eventlog.listEvents(session.id, { types: ['sdk_api_retry'] });
+  assert.equal(retries.length, 1);
+  assert.deepEqual(retries[0]?.data, {
+    attempt: 3,
+    maxRetries: 3,
+    retryDelayMs: 8_000,
+    errorStatus: 500,
+    error: 'server_error',
+    outerAttempt: 0,
+  });
+  assert.equal(
+    eventlog.listEvents(session.id, { types: ['sdk_first_model_activity'] }).length,
+    0,
+    'SDK init/retry control frames are not model activity',
+  );
+});
+
+test('a legacy outer retry stops when its next physical query reports an SDK-owned retry', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    calls += 1;
+    return calls === 1
+      ? throwingQuery('Claude Code returned an error result: API Error: 529 Overloaded')
+      : sdkRetryThenThrowQuery('Claude Code returned an error result: API Error: 500 Internal Server Error');
+  }) as any);
+
+  await assert.rejects(
+    runClaudeAgentSdk({
+      prompt: 'Recover this turn.',
+      sessionId: session.id,
+      modelId: 'claude-sonnet-5',
+    }),
+    (err: unknown) => (err as { name?: string; committed?: boolean }).name === 'ClaudeSdkProviderOverloadError'
+      && (err as { committed?: boolean }).committed === false,
+  );
+
+  assert.equal(calls, 2, 'one legacy retry is allowed, then the SDK-owned cycle stops outer replay');
+  const retries = eventlog.listEvents(session.id, { types: ['sdk_api_retry'] });
+  assert.equal(retries.length, 1);
+  assert.equal(retries[0]?.data.outerAttempt, 1);
+});
+
+test('first model activity is measured separately from SDK process initialization', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  setClaudeAgentSdkQueryForTest(((_p: any) => successQuery('recalled')) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'What is my project access code?',
+    sessionId: session.id,
+    modelId: 'claude-sonnet-5',
+  });
+
+  const initialized = eventlog.listEvents(session.id, { types: ['sdk_first_byte'] });
+  const activity = eventlog.listEvents(session.id, { types: ['sdk_first_model_activity'] });
+  assert.equal(initialized.length, 1);
+  assert.equal(activity.length, 1);
+  assert.equal(activity[0]?.data.kind, 'result');
+  assert.equal(typeof activity[0]?.data.firstModelActivityMs, 'number');
 });
 
 test('internal query retries rotate subordinate leases before close/backoff and preserve the parent', async () => {

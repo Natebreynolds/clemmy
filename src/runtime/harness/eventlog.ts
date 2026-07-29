@@ -123,10 +123,18 @@ export const EVENT_TYPES = [
   // SDK local-MCP startup guard retried because the required local tool surface
   // was empty or no init message arrived before the startup budget.
   'sdk_tool_surface_retry',
-  // Spawn→first-stream-byte latency for one SDK query (WS5-L2). The usage log
-  // has it too; this copy makes TTFT scoreable from the eventlog (proof
-  // harness, speculative-routing acceptance telemetry).
+  // The modern Claude Agent SDK reported an internal provider retry. This is
+  // observational only, but it prevents the legacy outer retry layer from
+  // replaying an already-exhausted physical query.
+  'sdk_api_retry',
+  // Spawn→first SDK frame latency for one query. In current Claude SDKs this is
+  // normally the child-process init frame, not model TTFT; retained for
+  // compatibility with existing telemetry consumers.
   'sdk_first_byte',
+  // Spawn→first genuine model/provider activity after SDK initialization
+  // (assistant/stream/thinking/tool-progress/result). This is the truthful
+  // user-wait metric; init and api_retry control frames do not satisfy it.
+  'sdk_first_model_activity',
   // Per-turn prompt-prefix cache-hit ratio on the default brain lane — makes the
   // freeze-stable-prefix cache lever scoreable from the eventlog (2026-07-09).
   'sdk_cache',

@@ -59,9 +59,9 @@ export interface SessionMetrics {
   limitExceededEvents: number;
   primerInjectedBytes: number | null;
   latency: TurnLatency[];
-  /** Spawn→first-stream-byte of the session's FIRST SDK query (sdk_first_byte
-   *  event) — the TTFT stand-in on the SDK lane, whose sessions carry no
-   *  turn_started/tool timing for the turn-based ttft above. */
+  /** Spawn→first real model activity for the session's first SDK query.
+   * Falls back to the legacy sdk_first_byte/process-init metric only for proof
+   * homes produced before sdk_first_model_activity existed. */
   firstByteMs: number | null;
 }
 
@@ -87,6 +87,7 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
   let guardrailsTripped = 0;
   let externalWrites = 0;
   const sdkFirstBytes: number[] = [];
+  const sdkFirstModelActivities: number[] = [];
   let autoContinues = 0;
   let workerResults = 0;
   let workerFailures = 0;
@@ -143,6 +144,15 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
         } catch { /* ignore malformed */ }
         break;
       }
+      case 'sdk_first_model_activity': {
+        try {
+          const data = JSON.parse(ev.data_json) as { firstModelActivityMs?: number };
+          if (typeof data.firstModelActivityMs === 'number') {
+            sdkFirstModelActivities.push(data.firstModelActivityMs);
+          }
+        } catch { /* ignore malformed */ }
+        break;
+      }
       case 'guardrail_tripped': guardrailsTripped += 1; break;
       case 'external_write': externalWrites += 1; break;
       case 'sdk_auto_continue': autoContinues += 1; break;
@@ -184,7 +194,7 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
     limitExceededEvents,
     primerInjectedBytes,
     latency,
-    firstByteMs: sdkFirstBytes.length > 0 ? sdkFirstBytes[0] : null,
+    firstByteMs: sdkFirstModelActivities[0] ?? sdkFirstBytes[0] ?? null,
   };
 }
 
