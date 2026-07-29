@@ -45,6 +45,9 @@ interface DelegationRecord {
   expectedOutput: string;
   status: 'pending' | 'in_progress' | 'completed';
   result?: string;
+  /** How the result is grounded. 'model_prose' = the model's own text with no
+   *  independent evidence — consumers must not present it as verified work. */
+  resultEvidence?: 'model_prose';
   completedBy?: string;
   onBehalfOf?: string;
   claimedBy?: string;
@@ -134,14 +137,22 @@ export function claimDelegationFor(agentSlug: string, delegationId: string): str
  * completion transition, so the first result is authoritative — a repeat
  * reports instead of rewriting history.
  */
-export function completeDelegationFor(agentSlug: string, delegationId: string, result: string): string {
+export function completeDelegationFor(
+  agentSlug: string,
+  delegationId: string,
+  result: string,
+  evidence: 'model_prose' = 'model_prose',
+): string {
   const record = readOne(agentSlug, delegationId);
   if (!record) return `Delegation ${delegationId} is not assigned to you (not in your queue).`;
   if (record.status === 'completed') {
     return `Delegation ${delegationId} is already completed. Recorded result: ${record.result ?? '(none)'}`;
   }
   const now = new Date().toISOString();
-  write(agentSlug, { ...record, status: 'completed', result, completedBy: agentSlug, updatedAt: now });
+  // Provenance is written, never inferred: today every delegation completion
+  // is the model's own prose, and the record says so outright rather than
+  // letting a consumer read it as independently verified work.
+  write(agentSlug, { ...record, status: 'completed', result, resultEvidence: evidence, completedBy: agentSlug, updatedAt: now });
   return `Completed delegation ${delegationId} for ${record.fromAgent}.`;
 }
 

@@ -400,3 +400,66 @@ test('an out-of-range wake preference is clamped, never voids the decision', asy
   const high = mod.sanitizeAgentDecisionOutput(JSON.stringify({ summary: 's', commitments: [], followUpMinutes: 99999 }));
   assert.equal(high?.followUpMinutes, 1440, 'clamped to the ceiling');
 });
+
+// ─── Validator repairs (owner's second agent, live date) ───
+
+test('HONESTY: a parked/blocked turn is never a successful cycle and consumes nothing', async () => {
+  const mod = await import('./autonomy-v2.js');
+  seedTeamAgent('rt-parked');
+  seed('rt-parked', 'rp1');
+
+  const prompts: string[] = [];
+  const assistant = {
+    async respond(request: { message: string; sessionId?: string }) {
+      prompts.push(request.message);
+      return { text: 'I need approval before continuing.', sessionId: request.sessionId ?? 'x', stoppedReason: 'pending-approval' };
+    },
+    getRuntime() { return { async run() { throw new Error('unused'); } }; },
+  };
+
+  const prevAgents = process.env.AUTONOMY_V2_AGENTS;
+  const prevKey = process.env.OPENAI_API_KEY;
+  process.env.AUTONOMY_V2_AGENTS = 'rt-parked';
+  delete process.env.OPENAI_API_KEY;
+  try {
+    const summary = await mod.processAgentAutonomyV2(assistant as never);
+    assert.equal(summary.succeeded, 0, 'a parked turn must not count as success');
+    assert.equal(summary.failed, 1, 'it is recorded truthfully as not-completed');
+  } finally {
+    if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
+    else process.env.AUTONOMY_V2_AGENTS = prevAgents;
+    if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey;
+  }
+  assert.equal(read('rt-parked', 'rp1').status, 'pending', 'the delegation is untouched for retry');
+});
+
+test('HONESTY: an error turn is not a successful cycle', async () => {
+  const mod = await import('./autonomy-v2.js');
+  seedTeamAgent('rt-err');
+  seed('rt-err', 're1');
+  const assistant = {
+    async respond(request: { sessionId?: string }) {
+      return { text: 'runtime exploded', sessionId: request.sessionId ?? 'x', stoppedReason: 'error' };
+    },
+    getRuntime() { return { async run() { throw new Error('unused'); } }; },
+  };
+  const prevAgents = process.env.AUTONOMY_V2_AGENTS;
+  process.env.AUTONOMY_V2_AGENTS = 'rt-err';
+  try {
+    const summary = await mod.processAgentAutonomyV2(assistant as never);
+    assert.equal(summary.succeeded, 0);
+    assert.equal(summary.failed, 1);
+  } finally {
+    if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
+    else process.env.AUTONOMY_V2_AGENTS = prevAgents;
+  }
+  assert.equal(read('rt-err', 're1').status, 'pending');
+});
+
+test('PROVENANCE: a completed delegation says its result is model prose', async () => {
+  const mod = await import('./agent-delegations.js');
+  seed('rt-prov', 'pv1');
+  mod.completeDelegationFor('rt-prov', 'pv1', 'Three risks: a, b, c');
+  const record = read('rt-prov', 'pv1');
+  assert.equal(record.resultEvidence, 'model_prose', 'the record never implies independent verification');
+});

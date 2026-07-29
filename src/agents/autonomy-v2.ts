@@ -1043,7 +1043,7 @@ function executeRuntimeCycleActions(slug: string, actions: RuntimeCycleAction[])
       if (action.type === 'claim_delegation' && action.delegationId) {
         outcomes.push(claimDelegationFor(slug, action.delegationId));
       } else if (action.type === 'complete_delegation' && action.delegationId && action.result) {
-        outcomes.push(completeDelegationFor(slug, action.delegationId, action.result));
+        outcomes.push(completeDelegationFor(slug, action.delegationId, action.result, 'model_prose'));
       } else if (action.type === 'notify_user' && action.title) {
         addNotification({
           id: `${Date.now()}-agent-${slug}-${randomSuffix()}`,
@@ -1106,6 +1106,15 @@ async function runAgentCycleViaRuntime(
       excludeToolNames: ['complete_delegation', 'delegation_inbox', 'check_delegation', 'delegate_task', 'team_reply', 'team_request', 'team_message'],
     };
     let run = await respondPreferHarness('cron', baseRequest, (req) => assistant.respond(req));
+    // A turn that parked, errored, or hit a budget is NOT a completed cycle —
+    // treating it as one would consume inbox items and advance the wake state
+    // on the strength of an apology (the exact ungrounded-success class this
+    // release removes). Surface the truthful state and leave the inputs intact
+    // so the next cycle retries them. (validator feedback, live date)
+    const terminalOk = (reason: string | undefined): boolean => reason === undefined || reason === 'success';
+    if (!terminalOk(run.stoppedReason)) {
+      throw new Error(`cycle_not_terminal:${run.stoppedReason}`);
+    }
     let parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
     let decision = sanitizeAgentDecisionOutput(run.text);
     if (!decision) {
@@ -1113,6 +1122,9 @@ async function runAgentCycleViaRuntime(
         ...baseRequest,
         message: `${baseRequest.message}\n\nYour previous reply was not parseable JSON. Reply with ONLY the JSON object described above.`,
       }, (req) => assistant.respond(req));
+      if (!terminalOk(run.stoppedReason)) {
+        throw new Error(`cycle_not_terminal:${run.stoppedReason}`);
+      }
       parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
       decision = sanitizeAgentDecisionOutput(run.text);
     }

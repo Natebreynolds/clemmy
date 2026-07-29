@@ -39,6 +39,7 @@ interface DelegationRecord {
   expectedOutput: string;
   status: 'pending' | 'in_progress' | 'completed';
   result?: string;
+  resultEvidence?: 'model_prose';
   /** Who actually recorded the result — never assumed to be the assignee. */
   completedBy?: string;
   /** Set when the primary agent closed work queued for someone else. */
@@ -561,7 +562,10 @@ export function registerTeamTools(server: McpServer): void {
         writeFileSync(
           filePath,
           JSON.stringify(
-            { ...delegation, status: 'completed', result, completedBy: actor, onBehalfOf, updatedAt: completedAt },
+            // resultEvidence: every completion today is model prose — the
+            // record states that outright so no consumer reads it as
+            // independently verified work.
+            { ...delegation, status: 'completed', result, resultEvidence: 'model_prose', completedBy: actor, onBehalfOf, updatedAt: completedAt },
             null,
             2,
           ),
@@ -616,6 +620,9 @@ export function registerTeamTools(server: McpServer): void {
               // teammate as having done work the primary agent did.
               delegation.completedBy
                 ? `Completed by: ${delegation.completedBy}${delegation.onBehalfOf ? ` (on behalf of ${delegation.onBehalfOf})` : ''}`
+                : '',
+              delegation.resultEvidence === 'model_prose'
+                ? 'Evidence: model prose only (not independently verified)'
                 : '',
             ].filter(Boolean).join('\n'),
           );
