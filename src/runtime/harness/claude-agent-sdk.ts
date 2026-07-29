@@ -1516,7 +1516,13 @@ function extractApiRetry(message: SDKMessage): SDKAPIRetryMessage | null {
 }
 
 function modelActivityKind(message: SDKMessage): string | null {
-  if (message.type === 'assistant') return 'assistant';
+  if (
+    message.type === 'assistant'
+    && (
+      extractAssistantText(message).trim().length > 0
+      || extractToolUseIds(message).length > 0
+    )
+  ) return 'assistant';
   if (message.type === 'stream_event') return 'stream';
   if (message.type === 'tool_progress') return 'tool_progress';
   if (

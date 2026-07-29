@@ -2056,6 +2056,14 @@ function sdkRetryThenThrowQuery(msg: string): Query {
       uuid: 'retry-1',
       session_id: 's',
     } satisfies SDKAPIRetryMessage;
+    yield {
+      type: 'assistant',
+      session_id: 's',
+      uuid: 'assistant-error',
+      parent_tool_use_id: null,
+      error: 'server_error',
+      message: { content: [] },
+    } as any;
     throw new Error(msg);
   })());
 }
