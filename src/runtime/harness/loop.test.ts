@@ -4027,7 +4027,69 @@ test('runConversation: a declarative queue-only completion does not mint an appr
   assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 0);
 });
 
-test('runConversation: an explicit propose-to-approval edge auto-materializes without magic closing words', async () => {
+test('runConversation: a typed queue-only edge stays inert even when closing prose asks to execute', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let pendingActionId = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+    const record = queuePendingAction({
+      title: 'Stage launch send',
+      summary: 'Store the launch send for a later review turn.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: JSON.stringify({ to: 'proof@example.com', body: 'Staged only.' }),
+        connected_account_id: null,
+      },
+      sessionId: sess.id,
+    });
+    pendingActionId = record.id;
+    appendEvent({
+      sessionId: sess.id,
+      turn: 0,
+      role: 'Clem',
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        pendingActionId: record.id,
+        actionKind: record.kind,
+        approvalRequired: true,
+        approvalIntent: 'queue_only',
+        autoMaterialize: false,
+        sourceUserSeq: source.seq,
+        payloadHash: record.payloadHash,
+      },
+    });
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'The staged email is ready. Should I execute it?',
+        reply: 'The staged email is ready. Should I execute it?',
+        done: false,
+        nextAction: 'awaiting_user_input',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Stage this exact launch send only.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(getPendingAction(pendingActionId)?.status, 'queued');
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' }).length, 0);
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 0);
+});
+
+test('runConversation: a typed propose-to-approval edge auto-materializes without magic closing words', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   let calls = 0;
@@ -4056,15 +4118,15 @@ test('runConversation: an explicit propose-to-approval edge auto-materializes wi
         approvalRequired: true,
         sourceUserSeq: source.seq,
         payloadHash: record.payloadHash,
-        autoMaterialize: true,
+        approvalIntent: 'request_now',
       },
     });
     return {
       history: items,
       lastResponseId: undefined,
       finalOutput: {
-        summary: 'The exact launch batch proposal is ready for approval.',
-        reply: 'The exact launch batch proposal is ready for approval.',
+        summary: 'Queued — nothing was sent. **Should I execute it and send to proof@example.com?**',
+        reply: 'Queued — nothing was sent. **Should I execute it and send to proof@example.com?**',
         done: true,
         nextAction: 'completed',
         reason: null,
@@ -4088,7 +4150,7 @@ test('runConversation: an explicit propose-to-approval edge auto-materializes wi
   assert.equal(
     listEvents(sess.id, { types: ['heartbeat'] })
       .filter((event) => event.data.kind === 'pending_action_transition_materialized'
-        && event.data.autoMaterialize === true).length,
+        && event.data.approvalIntent === 'request_now').length,
     1,
   );
 });

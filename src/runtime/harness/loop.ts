@@ -89,6 +89,7 @@ import { pendingActionApprovalViewFromArgs } from './pending-action-view.js';
 import {
   isQueuedActionApprovalQuestion,
   materializeQueuedApprovals,
+  queuedApprovalTransitionShouldMaterialize,
   queuedApprovalTransitionsForRequest,
 } from './pending-action-transition.js';
 import { actionBus } from '../action-bus.js';
@@ -3474,7 +3475,10 @@ async function runConversationCore(
         && !isDirectionSeekingQuestion(approvalText)
       );
     const eligibleQueuedApprovalTransitions = queuedApprovalTransitions.filter(
-      (transition) => transition.autoMaterialize || approvalQuestion,
+      (transition) => queuedApprovalTransitionShouldMaterialize(
+        transition,
+        approvalQuestion,
+      ),
     );
     if (eligibleQueuedApprovalTransitions.length > 0 && activeSourceUserSeq) {
       const materialized = materializeQueuedApprovals(
@@ -3494,6 +3498,7 @@ async function runConversationCore(
             pendingActionId: item.transition.record.id,
             approvalId: item.approval.approvalId,
             sourceEventSeq: item.transition.eventSeq,
+            approvalIntent: item.transition.approvalIntent,
             autoMaterialize: item.transition.autoMaterialize,
             message: 'Materialized the exact queued-action approval edge without another model turn.',
           },

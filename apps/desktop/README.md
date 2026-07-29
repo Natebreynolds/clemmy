@@ -114,7 +114,7 @@ npm --prefix apps/desktop run package:mac:unsigned
 npm --prefix apps/desktop run package:win
 ```
 
-macOS production artifacts are signed, notarized, and stapled by the release flow. Windows artifacts may be unsigned unless the Windows signing secrets are configured. Do not place signing identities, account emails, certificate fingerprints, passwords, or encoded certificates in this repository.
+macOS production artifacts are signed, notarized, and stapled by the release flow. Production Windows artifacts must be Authenticode-signed, and the release workflow fails closed when the signing secrets are unavailable; only private manual candidates may be unsigned. Do not place signing identities, account emails, certificate fingerprints, passwords, or encoded certificates in this repository.
 
 See the [desktop release guide](../../docs/guides/desktop-releases.md) for the supported local and GitHub Actions release workflow.
 

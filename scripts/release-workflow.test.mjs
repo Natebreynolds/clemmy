@@ -41,6 +41,8 @@ const desktopReleaseGuideText = readFileSync(
   new URL('../docs/guides/desktop-releases.md', import.meta.url),
   'utf-8',
 );
+const rootReadmeText = readFileSync(new URL('../README.md', import.meta.url), 'utf-8');
+const desktopReadmeText = readFileSync(new URL('../apps/desktop/README.md', import.meta.url), 'utf-8');
 const v3ReleaseNotesPath = new URL('../docs/releases/v3.0.0.md', import.meta.url);
 
 function runScripts(job) {
@@ -187,13 +189,18 @@ test('production Windows verifies Authenticode after packaging while private can
   assert.ok(signatureIndex < uploadIndex, 'unsigned production artifacts must never upload');
 });
 
-test('release guide matches fail-closed Windows production signing and the explicit mac-only exception', () => {
+test('public release docs match fail-closed Windows production signing and the explicit mac-only exception', () => {
   assert.match(desktopReleaseGuideText, /WINDOWS_CSC_LINK/);
   assert.match(desktopReleaseGuideText, /WINDOWS_CSC_KEY_PASSWORD/);
   assert.match(desktopReleaseGuideText, /private manual.*unsigned/is);
   assert.match(desktopReleaseGuideText, /production.*required/is);
   assert.match(desktopReleaseGuideText, /\[mac-only\]/);
   assert.doesNotMatch(desktopReleaseGuideText, /Windows certificate\s+secrets remain optional/i);
+  for (const readme of [rootReadmeText, desktopReadmeText]) {
+    assert.match(readme, /production.*fail(?:s)? closed/is);
+    assert.match(readme, /private manual candidates may be unsigned/is);
+    assert.doesNotMatch(readme, /Windows artifacts may be unsigned unless/i);
+  }
 });
 
 test('v3.0.0 publishes curated major-release notes and other versions retain generated-note fallback', () => {

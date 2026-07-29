@@ -2573,12 +2573,14 @@ test('Claude brain materializes one exact queued-action card without another mod
         pendingActionId: record.id,
         actionKind: record.kind,
         approvalRequired: true,
+        approvalIntent: 'request_now',
+        autoMaterialize: true,
         sourceUserSeq: options.sourceUserSeq,
         payloadHash: record.payloadHash,
       },
     });
     return {
-      text: 'The exact email is queued. Would you like me to send it?',
+      text: 'Queued (id shown in the card). Should I go ahead and execute it?',
       sessionId: 'sdk-session',
       model: 'claude-sonnet-5',
       toolUses: ['mcp__clementine-local__pending_action_queue'],

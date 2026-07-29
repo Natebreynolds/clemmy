@@ -1,11 +1,14 @@
 import { before, beforeEach, after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/clemmy-test-pending-action-recipient-integrity';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
-const { registerPendingActionTools } = await import('./pending-action-tools.js');
+const {
+  canonicalizePendingActionCall,
+  registerPendingActionTools,
+} = await import('./pending-action-tools.js');
 const { appendEvent, createSession, listEvents, resetEventLog, writeToolOutput } = await import('../runtime/harness/eventlog.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
@@ -17,6 +20,10 @@ const {
   queuePendingAction,
   recordPendingActionResult,
 } = await import('../runtime/harness/pending-actions.js');
+const {
+  queuedApprovalTransitionShouldMaterialize,
+  queuedApprovalTransitionsForRequest,
+} = await import('../runtime/harness/pending-action-transition.js');
 
 function handlerFor(name: string): (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }> {
   const handlers = new Map<string, (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>>();
@@ -115,6 +122,152 @@ test('pending_action_queue accepts the exact source-backed recipient set', async
   assert.equal(listPendingActions({ sessionId: session.id }).length, 1);
 });
 
+test('pending_action_queue canonicalizes both Composio spellings and promotes one exact queue-only record', async () => {
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Stage this exact email, then make it ready for my approval.' },
+  });
+  const args = {
+    recipient_email: 'owner@example.com',
+    subject: 'Canonical proof',
+    body: 'One immutable payload.',
+  };
+  const invoke = (input: Record<string, unknown>) => withToolOutputContext(
+    { sessionId: session.id, runScopeId: 'canonical-run', callId: `call-${String(input.approvalIntent)}` },
+    () => withHarnessRunContext(
+      {
+        sessionId: session.id,
+        sourceUserSeq: source.seq,
+        behaviorScopeId: 'canonical-run',
+        counter: new ToolCallsCounter(10),
+      },
+      () => handlerFor('pending_action_queue')(input),
+    ),
+  );
+
+  const staged = await invoke({
+    title: 'Canonical email',
+    summary: 'Stage the exact canonical email without opening a card yet.',
+    kind: 'external_send',
+    toolName: 'GMAIL_SEND_EMAIL',
+    payloadJson: JSON.stringify(args),
+    approvalIntent: 'queue_only',
+  });
+  assert.match(staged.content[0].text, /QUEUE-ONLY EDGE RECORDED/);
+
+  const promoted = await invoke({
+    title: 'Canonical email',
+    summary: 'Open the one exact canonical email approval card now.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payloadJson: JSON.stringify({
+      tool_slug: 'GMAIL_SEND_EMAIL',
+      arguments: args,
+    }),
+    approvalIntent: 'request_now',
+  });
+  assert.match(promoted.content[0].text, /Pending action reused/);
+  assert.match(promoted.content[0].text, /GRAPH EDGE RECORDED/);
+
+  const records = listPendingActions({ sessionId: session.id });
+  assert.equal(records.length, 1, 'canonical raw/gateway spellings dedupe');
+  assert.equal(records[0].toolName, 'composio_execute_tool');
+  assert.deepEqual(records[0].payload, {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: JSON.stringify(args),
+    connected_account_id: null,
+  });
+  const edges = listEvents(session.id, { types: ['autonomy_note'] })
+    .filter((event) => event.data.kind === 'pending_action_queued');
+  assert.deepEqual(edges.map((event) => event.data.approvalIntent), ['queue_only', 'request_now']);
+  const [transition] = queuedApprovalTransitionsForRequest(session.id, source.seq);
+  assert.equal(transition?.approvalIntent, 'request_now', 'promotion is monotonic');
+  assert.equal(queuedApprovalTransitionShouldMaterialize(transition!, false), true);
+
+  const refusedDowngrade = await invoke({
+    title: 'Canonical email',
+    summary: 'A stale retry must not downgrade the existing approval edge.',
+    kind: 'external_send',
+    toolName: 'GMAIL_SEND_EMAIL',
+    payloadJson: JSON.stringify(args),
+    approvalIntent: 'queue_only',
+  });
+  assert.match(refusedDowngrade.content[0].text, /GRAPH EDGE RECORDED/);
+  assert.doesNotMatch(refusedDowngrade.content[0].text, /QUEUE-ONLY EDGE RECORDED/);
+  assert.equal(
+    queuedApprovalTransitionsForRequest(session.id, source.seq)[0]?.approvalIntent,
+    'request_now',
+    'request_now cannot be downgraded by a stale retry',
+  );
+});
+
+test('pending-action canonicalization never rewrites local or custom tool identities as Composio', () => {
+  const dynamicToolsDir = `${TEST_HOME}/tools`;
+  mkdirSync(dynamicToolsDir, { recursive: true });
+  writeFileSync(`${dynamicToolsDir}/SEND_INVOICE.sh`, '#!/bin/sh\n', 'utf8');
+  for (const toolName of [
+    'space_publish',
+    'space_save',
+    'request_approval',
+    'run_worker',
+    'custom_write_record',
+    'SEND_INVOICE',
+  ]) {
+    const payload = { proof: toolName };
+    assert.deepEqual(
+      canonicalizePendingActionCall(toolName, payload),
+      { toolName, payload },
+      toolName,
+    );
+  }
+
+  assert.deepEqual(
+    canonicalizePendingActionCall('GMAIL_SEND_EMAIL', { to: 'proof@example.com' }),
+    {
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: JSON.stringify({ to: 'proof@example.com' }),
+        connected_account_id: null,
+      },
+    },
+  );
+  assert.throws(
+    () => canonicalizePendingActionCall('composio_execute_tool', {
+      tool_slug: 'space_publish',
+      arguments: {},
+    }),
+    /concrete Composio action slug/,
+  );
+});
+
+test('pending_action_queue rejects malformed Composio transport before creating an action', async () => {
+  const session = createSession({ kind: 'chat' });
+  const response = await withToolOutputContext({ sessionId: session.id }, () =>
+    handlerFor('pending_action_queue')({
+      title: 'Malformed gateway',
+      summary: 'This invalid transport must not reach an approval card.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payloadJson: JSON.stringify({
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: '[1,2,3]',
+      }),
+      approvalIntent: 'request_now',
+    }));
+  assert.match(response.content[0].text, /arguments must be a valid JSON-object string or a plain object/);
+  assert.equal(listPendingActions({ sessionId: session.id }).length, 0);
+  assert.equal(
+    listEvents(session.id, { types: ['autonomy_note'] })
+      .filter((event) => event.data.kind === 'pending_action_queued').length,
+    0,
+  );
+});
+
 test('pending_action_queue keeps a reversible local action on the lighter conversational path', async () => {
   const session = createSession({ kind: 'chat' });
   const response = await withToolOutputContext({ sessionId: session.id }, () =>
@@ -170,6 +323,15 @@ test('pending_action_queue keeps ambient session ownership over model-supplied n
 
 test('pending_action_queue exposes no model-controlled session field and refuses unowned approval actions', async () => {
   assert.equal(Object.hasOwn(schemaFor('pending_action_queue'), 'sessionId'), false);
+  assert.equal(Object.hasOwn(schemaFor('pending_action_queue'), 'approvalIntent'), true);
+  const approvalIntentSchema = schemaFor('pending_action_queue').approvalIntent as {
+    safeParse(value: unknown): { success: boolean };
+  };
+  assert.equal(
+    approvalIntentSchema.safeParse(undefined).success,
+    true,
+    'pre-3.0 queue callers may omit the typed edge and use the legacy bridge',
+  );
   assert.equal(Object.hasOwn(schemaFor('pending_action_execute'), 'sessionId'), false);
   for (const [index, sessionId] of ['null', ' NULL ', 'undefined'].entries()) {
     const response = await handlerFor('pending_action_queue')({

@@ -129,6 +129,7 @@ import {
 import {
   isQueuedActionApprovalQuestion,
   materializeQueuedApprovals,
+  queuedApprovalTransitionShouldMaterialize,
   queuedApprovalTransitionsForRequest,
 } from './pending-action-transition.js';
 
@@ -1889,7 +1890,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     const reconcileQueuedApprovalEdge = (): boolean => {
       const approvalQuestion = isQueuedActionApprovalQuestion(result.text);
       const transitions = queuedApprovalTransitionsForRequest(sessionId, userInputEvent.seq)
-        .filter((transition) => transition.autoMaterialize || approvalQuestion);
+        .filter((transition) => queuedApprovalTransitionShouldMaterialize(
+          transition,
+          approvalQuestion,
+        ));
       if (transitions.length === 0) return false;
       const materialized = materializeQueuedApprovals(
         sessionId,
@@ -1917,6 +1921,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
                 pendingActionId: item.transition.record.id,
                 approvalId: item.approval.approvalId,
                 sourceEventSeq: item.transition.eventSeq,
+                approvalIntent: item.transition.approvalIntent,
                 autoMaterialize: item.transition.autoMaterialize,
                 message: 'Materialized the exact queued-action approval edge without another model turn.',
               },

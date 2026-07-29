@@ -54,7 +54,7 @@ export interface ExactProviderPayloadResult {
   slugDispatchCount: number;
 }
 
-interface PendingActionFile {
+export interface PendingActionFile {
   id: string;
   status: string;
   kind: string;
@@ -67,10 +67,23 @@ interface PendingActionFile {
   resultSummary?: string | null;
 }
 
-interface ExpectedEmail {
+export interface ExpectedEmail {
   to: string;
   subject: string;
   body: string;
+}
+
+export interface ProofGraphEvent {
+  seq: number;
+  type: string;
+  data: Record<string, unknown>;
+}
+
+export interface PendingActionRequestGraph {
+  sourceUserSeq: number | null;
+  pendingActionIds: string[];
+  edgeCount: number;
+  typedRequestNowEdgeCount: number;
 }
 
 interface ApprovalAuditRow {
@@ -179,14 +192,125 @@ function readPendingActions(home: string): PendingActionFile[] {
   }
 }
 
+/**
+ * Correlate a proof request to queued actions through the same durable
+ * sourceUserSeq edge the runtime uses. Payload vocabulary is deliberately not
+ * part of identity: a provider-valid recipient alias must not make the scorer
+ * lose the action, its approval card, and every downstream observation.
+ */
+export function correlatePendingActionRequest(
+  events: ProofGraphEvent[],
+  requestText: string,
+  afterUserSeq = 0,
+): PendingActionRequestGraph {
+  const source = events
+    .filter((event) => (
+      event.type === 'user_input_received'
+      && event.seq > afterUserSeq
+      && event.data.synthetic !== true
+      && event.data.text === requestText
+    ))
+    .sort((a, b) => b.seq - a.seq)[0];
+  if (!source) {
+    return {
+      sourceUserSeq: null,
+      pendingActionIds: [],
+      edgeCount: 0,
+      typedRequestNowEdgeCount: 0,
+    };
+  }
+  const edges = events.filter((event) => (
+    event.type === 'autonomy_note'
+    && event.seq > source.seq
+    && event.data.kind === 'pending_action_queued'
+    && event.data.sourceUserSeq === source.seq
+    && typeof event.data.pendingActionId === 'string'
+    && event.data.pendingActionId.trim().length > 0
+  ));
+  return {
+    sourceUserSeq: source.seq,
+    pendingActionIds: [...new Set(
+      edges.map((event) => String(event.data.pendingActionId).trim()),
+    )],
+    edgeCount: edges.length,
+    typedRequestNowEdgeCount: edges.filter((event) => (
+      event.data.approvalIntent === 'request_now'
+      && event.data.autoMaterialize === true
+    )).length,
+  };
+}
+
+function sessionGraphEvents(home: string, sessionId: string): ProofGraphEvent[] {
+  const db = openHarnessDb(home);
+  try {
+    const rows = db.prepare(
+      `SELECT seq, type, data_json
+         FROM events
+        WHERE session_id = ?
+          AND type IN ('user_input_received', 'autonomy_note')
+        ORDER BY seq ASC`,
+    ).all(sessionId) as Array<{ seq: number; type: string; data_json: string }>;
+    return rows.flatMap((row) => {
+      try {
+        const data = JSON.parse(row.data_json) as unknown;
+        const record = asRecord(data);
+        return record ? [{ seq: row.seq, type: row.type, data: record }] : [];
+      } catch {
+        return [];
+      }
+    });
+  } finally {
+    db.close();
+  }
+}
+
+function requestGraph(
+  home: string,
+  sessionId: string,
+  requestText: string,
+  afterUserSeq = 0,
+): PendingActionRequestGraph {
+  try {
+    return correlatePendingActionRequest(
+      sessionGraphEvents(home, sessionId),
+      requestText,
+      afterUserSeq,
+    );
+  } catch {
+    return {
+      sourceUserSeq: null,
+      pendingActionIds: [],
+      edgeCount: 0,
+      typedRequestNowEdgeCount: 0,
+    };
+  }
+}
+
+function actionsForGraph(
+  home: string,
+  graph: PendingActionRequestGraph,
+): PendingActionFile[] {
+  const byId = new Map(readPendingActions(home).map((action) => [action.id, action]));
+  return graph.pendingActionIds.flatMap((id) => {
+    const action = byId.get(id);
+    return action ? [action] : [];
+  });
+}
+
 function pendingActionInnerArgs(action: PendingActionFile | null): {
   raw: string | null;
   parsed: Record<string, unknown> | null;
   slug: string | null;
 } {
   const outer = asRecord(action?.payload);
-  const slug = typeof outer?.tool_slug === 'string' ? outer.tool_slug : null;
-  const value = outer?.arguments;
+  const wrapped = action?.toolName === 'composio_execute_tool';
+  const direct = action?.toolName === TOOL_SLUG;
+  const slug = wrapped && typeof outer?.tool_slug === 'string'
+    ? outer.tool_slug
+    : direct
+      ? TOOL_SLUG
+      : null;
+  const value = wrapped ? outer?.arguments : direct ? outer : null;
   if (typeof value === 'string') {
     try {
       return { raw: value, parsed: asRecord(JSON.parse(value)), slug };
@@ -204,25 +328,39 @@ function pendingActionInnerArgs(action: PendingActionFile | null): {
   };
 }
 
-function actionMatchesEmail(action: PendingActionFile, expected: ExpectedEmail): boolean {
-  const inner = pendingActionInnerArgs(action);
-  return inner.slug === TOOL_SLUG
-    && inner.parsed?.to === expected.to
-    && inner.parsed.subject === expected.subject
-    && inner.parsed.body === expected.body;
-}
+const EMAIL_RECIPIENT_KEYS = ['to', 'recipient_email'] as const;
 
-function exactEmailShape(action: PendingActionFile | null, expected: ExpectedEmail): boolean {
-  if (!action || action.toolName !== 'composio_execute_tool' || action.kind !== 'external_send') return false;
+/** Exact semantic email shape, independent of transport representation. */
+export function exactEmailShape(action: PendingActionFile | null, expected: ExpectedEmail): boolean {
+  if (!action || action.kind !== 'external_send') return false;
   const inner = pendingActionInnerArgs(action);
   if (inner.slug !== TOOL_SLUG || !inner.raw || !inner.parsed) return false;
-  return Object.keys(inner.parsed).sort().join(',') === 'body,subject,to'
-    && inner.parsed.to === expected.to
+  const recipientKeys = EMAIL_RECIPIENT_KEYS.filter((key) => Object.hasOwn(inner.parsed!, key));
+  if (recipientKeys.length !== 1) return false;
+  const recipientKey = recipientKeys[0];
+  return Object.keys(inner.parsed).sort().join(',')
+      === ['body', 'subject', recipientKey].sort().join(',')
+    && inner.parsed[recipientKey] === expected.to
     && inner.parsed.subject === expected.subject
     && inner.parsed.body === expected.body;
 }
 
-function naturalSendPrompt(expected: ExpectedEmail): string {
+/**
+ * Canonical provider transport is scored independently from semantic shape so
+ * a transport defect remains visible without erasing the request/card graph.
+ */
+export function canonicalComposioEmailTransport(action: PendingActionFile | null): boolean {
+  if (!action || action.toolName !== 'composio_execute_tool') return false;
+  const outer = asRecord(action.payload);
+  if (outer?.tool_slug !== TOOL_SLUG || typeof outer.arguments !== 'string') return false;
+  try {
+    return asRecord(JSON.parse(outer.arguments)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+export function naturalSendPrompt(expected: ExpectedEmail): string {
   return [
     'Please send this exact email through my connected Gmail account now.',
     `The connected integration already selected the ${TOOL_SLUG} action, so use that action rather than searching for a different one.`,
@@ -337,12 +475,12 @@ export const pendingActionExactOnce: ScenarioDef = {
     const rejectedEmail: ExpectedEmail = {
       to: `proof+reject-${nonce}@example.com`,
       subject: `Proof reject ${nonce}`,
-      body: `Reject path ${nonce}: this proof payload must never reach the provider shim.`,
+      body: `Rejection fixture ${nonce}.`,
     };
     const approvedEmail: ExpectedEmail = {
       to: `proof+approve-${nonce}@example.com`,
       subject: `Proof exact once ${nonce}`,
-      body: `Approve path ${nonce}: this proof payload must reach the provider shim exactly once.`,
+      body: `Approval fixture ${nonce}.`,
     };
     const checks: Check[] = [];
     const startedAt = Date.now();
@@ -359,9 +497,10 @@ export const pendingActionExactOnce: ScenarioDef = {
     const providerBaseline = proofProviderObservations(daemon.home).length;
     const slugBaseline = proofProviderSlugs(daemon.home).length;
 
-    const rejectTurn = await daemon.chat(naturalSendPrompt(rejectedEmail), sessionId, 420_000);
-    const rejectActions = readPendingActions(daemon.home)
-      .filter((action) => action.sessionId === sessionId && actionMatchesEmail(action, rejectedEmail));
+    const rejectPrompt = naturalSendPrompt(rejectedEmail);
+    const rejectTurn = await daemon.chat(rejectPrompt, sessionId, 420_000);
+    const rejectGraph = requestGraph(daemon.home, sessionId, rejectPrompt);
+    const rejectActions = actionsForGraph(daemon.home, rejectGraph);
     const rejectedQueued = rejectActions[0] ?? null;
     const rejectCardId = rejectedQueued?.approvalId ?? rejectTurn.pendingApprovalId ?? '';
     const rejectCardsBefore = approvalAudits(daemon.home, sessionId)
@@ -373,8 +512,22 @@ export const pendingActionExactOnce: ScenarioDef = {
     checks.push(narrationCheck(rejectTurn.text));
     checks.push({
       name: 'natural reject request queued one exact action',
-      pass: rejectActions.length === 1 && exactEmailShape(rejectedQueued, rejectedEmail),
-      detail: `matches=${rejectActions.length}; ${actionDetail(rejectedQueued)}; payload=${JSON.stringify(rejectedQueued?.payload ?? null)}`,
+      pass: rejectGraph.sourceUserSeq != null
+        && rejectGraph.edgeCount === 1
+        && rejectGraph.typedRequestNowEdgeCount === 1
+        && rejectGraph.pendingActionIds.length === 1
+        && rejectActions.length === 1
+        && rejectedQueued?.sessionId === sessionId
+        && exactEmailShape(rejectedQueued, rejectedEmail),
+      detail: `sourceUserSeq=${rejectGraph.sourceUserSeq}; edges=${rejectGraph.edgeCount}; ids=${JSON.stringify(rejectGraph.pendingActionIds)}; actions=${rejectActions.length}; ${actionDetail(rejectedQueued)}; payload=${JSON.stringify(rejectedQueued?.payload ?? null)}`,
+    });
+    checks.push({
+      name: 'reject action retained canonical Composio transport',
+      pass: canonicalComposioEmailTransport(rejectedQueued),
+      detail: JSON.stringify({
+        toolName: rejectedQueued?.toolName ?? null,
+        payload: rejectedQueued?.payload ?? null,
+      }),
     });
     checks.push({
       name: 'reject request opened one exact formal card',
@@ -437,14 +590,21 @@ export const pendingActionExactOnce: ScenarioDef = {
       }),
     });
 
+    const approvePrompt = `New, separate request after the rejected one:\n${naturalSendPrompt(approvedEmail)}`;
     const approveTurn = await daemon.chat(
-      `New, separate request after the rejected one:\n${naturalSendPrompt(approvedEmail)}`,
+      approvePrompt,
       sessionId,
       420_000,
     );
+    const approveGraph = requestGraph(
+      daemon.home,
+      sessionId,
+      approvePrompt,
+      rejectGraph.sourceUserSeq ?? 0,
+    );
+    const approvedMatches = actionsForGraph(daemon.home, approveGraph);
     const allSessionActions = readPendingActions(daemon.home)
       .filter((action) => action.sessionId === sessionId);
-    const approvedMatches = allSessionActions.filter((action) => actionMatchesEmail(action, approvedEmail));
     const approvedQueued = approvedMatches[0] ?? null;
     const approveCardId = approvedQueued?.approvalId ?? approveTurn.pendingApprovalId ?? '';
     const cardsBeforeApprove = approvalAudits(daemon.home, sessionId)
@@ -456,11 +616,24 @@ export const pendingActionExactOnce: ScenarioDef = {
     checks.push(narrationCheck(approveTurn.text));
     checks.push({
       name: 'fresh request queued one new exact action',
-      pass: approvedMatches.length === 1
+      pass: approveGraph.sourceUserSeq != null
+        && approveGraph.edgeCount === 1
+        && approveGraph.typedRequestNowEdgeCount === 1
+        && approveGraph.pendingActionIds.length === 1
+        && approvedMatches.length === 1
         && exactEmailShape(approvedQueued, approvedEmail)
+        && approvedQueued?.sessionId === sessionId
         && approvedQueued?.id !== rejectedQueued?.id
         && allSessionActions.length === 2,
-      detail: `approve matches=${approvedMatches.length}; session actions=${allSessionActions.length}; ${actionDetail(approvedQueued)}`,
+      detail: `sourceUserSeq=${approveGraph.sourceUserSeq}; edges=${approveGraph.edgeCount}; ids=${JSON.stringify(approveGraph.pendingActionIds)}; approve actions=${approvedMatches.length}; session actions=${allSessionActions.length}; ${actionDetail(approvedQueued)}`,
+    });
+    checks.push({
+      name: 'fresh action retained canonical Composio transport',
+      pass: canonicalComposioEmailTransport(approvedQueued),
+      detail: JSON.stringify({
+        toolName: approvedQueued?.toolName ?? null,
+        payload: approvedQueued?.payload ?? null,
+      }),
     });
     checks.push({
       name: 'fresh request opened one new formal card',

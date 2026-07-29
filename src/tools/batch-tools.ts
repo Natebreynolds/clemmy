@@ -273,6 +273,7 @@ export function registerBatchTools(server: McpServer): void {
                   toolName: record.toolName,
                   actionKind: record.kind,
                   approvalRequired: true,
+                  approvalIntent: 'request_now',
                   autoMaterialize: true,
                   payloadHash: record.payloadHash,
                   targetSummary: record.targetSummary,

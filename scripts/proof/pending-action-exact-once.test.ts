@@ -11,9 +11,16 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  canonicalComposioEmailTransport,
+  correlatePendingActionRequest,
+  exactEmailShape,
   exactProviderPayloadObservation,
+  naturalSendPrompt,
   parseProofComposioPayloadLog,
+  type PendingActionFile,
+  type ProofGraphEvent,
 } from './scenarios/pending-action-exact-once.js';
+import { replyOffersFinalExecuteGate } from './scenarios/pending-action-gate.js';
 import { createProofComposioShim } from './provision.js';
 
 test('proof Composio payload log preserves the exact provider argument bytes', () => {
@@ -51,6 +58,145 @@ test('exact provider observation requires one byte-identical dispatch', () => {
   ]);
   assert.equal(duplicate.pass, false);
   assert.equal(duplicate.exactCount, 2);
+});
+
+test('proof correlates queued actions by the durable sourceUserSeq edge, not payload vocabulary', () => {
+  const request = 'Send the exact fixture email.';
+  const events: ProofGraphEvent[] = [
+    { seq: 3, type: 'user_input_received', data: { text: 'Older request.' } },
+    {
+      seq: 5,
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        sourceUserSeq: 3,
+        pendingActionId: 'pa-older',
+      },
+    },
+    { seq: 8, type: 'user_input_received', data: { text: request } },
+    {
+      seq: 11,
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        sourceUserSeq: 8,
+        pendingActionId: 'pa-request-owned',
+        payloadHash: 'hash-with-recipient_email-alias',
+        approvalIntent: 'request_now',
+        autoMaterialize: true,
+      },
+    },
+    {
+      seq: 12,
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        sourceUserSeq: 3,
+        pendingActionId: 'pa-unrelated-late-edge',
+      },
+    },
+    { seq: 13, type: 'user_input_received', data: { text: '[approval-resume] synthetic', synthetic: true } },
+  ];
+
+  assert.deepEqual(correlatePendingActionRequest(events, request), {
+    sourceUserSeq: 8,
+    pendingActionIds: ['pa-request-owned'],
+    edgeCount: 1,
+    typedRequestNowEdgeCount: 1,
+  });
+  assert.deepEqual(correlatePendingActionRequest(events, 'Missing request.'), {
+    sourceUserSeq: null,
+    pendingActionIds: [],
+    edgeCount: 0,
+    typedRequestNowEdgeCount: 0,
+  });
+});
+
+function pendingEmailAction(
+  toolName: string,
+  payload: unknown,
+): PendingActionFile {
+  return {
+    id: 'pa-proof',
+    status: 'approval_requested',
+    kind: 'external_send',
+    toolName,
+    sessionId: 'proof-session',
+    approvalId: 'apr-proof',
+    payloadHash: 'hash-proof',
+    payload,
+  };
+}
+
+test('semantic email shape accepts the provider recipient alias while canonical transport is scored separately', () => {
+  const expected = {
+    to: 'proof+alias@example.com',
+    subject: 'Alias proof',
+    body: 'Neutral fixture body.',
+  };
+  const canonical = pendingEmailAction('composio_execute_tool', {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: JSON.stringify({
+      recipient_email: expected.to,
+      subject: expected.subject,
+      body: expected.body,
+    }),
+  });
+  assert.equal(exactEmailShape(canonical, expected), true);
+  assert.equal(canonicalComposioEmailTransport(canonical), true);
+
+  const directButSemanticallyExact = pendingEmailAction('GMAIL_SEND_EMAIL', {
+    to: expected.to,
+    subject: expected.subject,
+    body: expected.body,
+  });
+  assert.equal(exactEmailShape(directButSemanticallyExact, expected), true);
+  assert.equal(
+    canonicalComposioEmailTransport(directButSemanticallyExact),
+    false,
+    'transport failure must not erase the request-owned semantic action',
+  );
+
+  const extraField = pendingEmailAction('composio_execute_tool', {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: JSON.stringify({
+      recipient_email: expected.to,
+      subject: expected.subject,
+      body: expected.body,
+      cc: 'extra@example.com',
+    }),
+  });
+  assert.equal(exactEmailShape(extraField, expected), false, 'exact shape rejects extra fields');
+
+  const ambiguousRecipient = pendingEmailAction('composio_execute_tool', {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: JSON.stringify({
+      to: expected.to,
+      recipient_email: expected.to,
+      subject: expected.subject,
+      body: expected.body,
+    }),
+  });
+  assert.equal(exactEmailShape(ambiguousRecipient, expected), false, 'exact shape requires one recipient key');
+});
+
+test('proof prompt keeps a neutral fixture body exact', () => {
+  const prompt = naturalSendPrompt({
+    to: 'fixture@example.com',
+    subject: 'Fixture subject',
+    body: 'Neutral fixture body.',
+  });
+  assert.match(prompt, /Body: Neutral fixture body\./);
+  assert.doesNotMatch(prompt, /must (?:never )?reach|provider shim/i);
+});
+
+test('final execute-gate prose does not need to predict the materialized approval id', () => {
+  const reply = 'The exact email action is queued but not sent. Do you want me to execute it?';
+  assert.equal(reply.includes('apr-'), false);
+  assert.equal(replyOffersFinalExecuteGate(reply), true);
+  assert.equal(replyOffersFinalExecuteGate('The exact email action is queued for later.'), false);
+  assert.equal(replyOffersFinalExecuteGate('I could not send it. What should I do next?'), false);
+  assert.equal(replyOffersFinalExecuteGate('The send is blocked. Which account should I use?'), false);
 });
 
 test('proof-local Composio shim records the raw provider argument and keeps the legacy slug log', {

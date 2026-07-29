@@ -26,9 +26,131 @@ import {
   RecipientSetIntegrityError,
 } from '../runtime/harness/recipient-integrity-gate.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
+import { isDirectComposioActionSlug } from '../execution/workflow-direct-call.js';
+import { TOOL_REGISTRY } from './tool-registry.js';
+import { listDynamicToolNames } from './dynamic-tools.js';
 
 const statusEnum = z.enum(PENDING_ACTION_STATUSES);
 const kindEnum = z.enum(PENDING_ACTION_KINDS);
+const approvalIntentEnum = z.enum(['request_now', 'queue_only']);
+const BUILT_IN_TOOL_NAMES = new Set(TOOL_REGISTRY.map((tool) => tool.name));
+
+export type PendingActionApprovalIntent = z.infer<typeof approvalIntentEnum>;
+
+interface CanonicalPendingActionCall {
+  toolName: string;
+  payload: unknown;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isWrappedComposioActionSlug(value: string): boolean {
+  return !BUILT_IN_TOOL_NAMES.has(value) && isDirectComposioActionSlug(value);
+}
+
+/**
+ * A bare tool name is ambiguous with local/custom tools, so only Composio's
+ * canonical SCREAMING_SNAKE action form may use the convenience spelling.
+ * Lowercase or custom identifiers must keep their original executor; an
+ * explicit composio_execute_tool wrapper remains available for provider slugs.
+ */
+function isBareComposioActionSlug(value: string): boolean {
+  return /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(value)
+    && !listDynamicToolNames().includes(value)
+    && isWrappedComposioActionSlug(value);
+}
+
+/**
+ * Normalize the two model-facing Composio spellings into the one executable
+ * broker call stored in the immutable approval snapshot. A card must never be
+ * minted for a payload that the approved executor cannot invoke.
+ */
+export function canonicalizePendingActionCall(
+  toolNameInput: string,
+  payloadInput: unknown,
+): CanonicalPendingActionCall {
+  const toolName = toolNameInput.trim();
+  if (toolName === 'composio_execute_tool') {
+    if (!isPlainRecord(payloadInput)) {
+      throw new Error(
+        'composio_execute_tool payloadJson must be an object with tool_slug and arguments.',
+      );
+    }
+    const allowed = new Set(['tool_slug', 'arguments', 'connected_account_id']);
+    const unexpected = Object.keys(payloadInput).filter((key) => !allowed.has(key));
+    if (unexpected.length > 0) {
+      throw new Error(
+        `composio_execute_tool payloadJson contains unsupported transport field(s): ${unexpected.join(', ')}. `
+        + 'Put action fields inside arguments.',
+      );
+    }
+    const slug = typeof payloadInput.tool_slug === 'string'
+      ? payloadInput.tool_slug.trim()
+      : '';
+    if (!slug || !isWrappedComposioActionSlug(slug)) {
+      throw new Error(
+        'composio_execute_tool payloadJson requires a concrete Composio action slug in tool_slug.',
+      );
+    }
+    let argumentsJson: string;
+    if (typeof payloadInput.arguments === 'string') {
+      try {
+        const parsed = JSON.parse(payloadInput.arguments) as unknown;
+        if (!isPlainRecord(parsed)) throw new Error('not an object');
+      } catch {
+        throw new Error(
+          'composio_execute_tool arguments must be a valid JSON-object string or a plain object.',
+        );
+      }
+      // Preserve already-canonical provider bytes exactly.
+      argumentsJson = payloadInput.arguments;
+    } else if (isPlainRecord(payloadInput.arguments)) {
+      argumentsJson = JSON.stringify(payloadInput.arguments);
+    } else {
+      throw new Error(
+        'composio_execute_tool arguments must be a valid JSON-object string or a plain object.',
+      );
+    }
+    const rawConnection = payloadInput.connected_account_id;
+    if (
+      rawConnection !== undefined
+      && rawConnection !== null
+      && (typeof rawConnection !== 'string' || !rawConnection.trim())
+    ) {
+      throw new Error('composio_execute_tool connected_account_id must be a non-empty string or null.');
+    }
+    return {
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: slug,
+        arguments: argumentsJson,
+        connected_account_id: typeof rawConnection === 'string'
+          ? rawConnection.trim()
+          : null,
+      },
+    };
+  }
+
+  if (isBareComposioActionSlug(toolName)) {
+    if (!isPlainRecord(payloadInput)) {
+      throw new Error(
+        `Direct Composio action ${toolName} requires a plain JSON-object payload.`,
+      );
+    }
+    return {
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: toolName,
+        arguments: JSON.stringify(payloadInput),
+        connected_account_id: null,
+      },
+    };
+  }
+
+  return { toolName, payload: payloadInput };
+}
 
 function normalizeSessionId(value?: string | null): string | null {
   const clean = value?.trim();
@@ -132,7 +254,39 @@ function requestOwnedQueueRetry(input: {
   return null;
 }
 
-function queuedActionNextStep(record: PendingActionRecord, approvalRequired: boolean): string {
+function requestOwnedApprovalIntentState(input: {
+  sessionId: string | null;
+  sourceUserSeq?: number;
+  pendingActionId: string;
+  payloadHash: string;
+}): PendingActionApprovalIntent | 'legacy' | 'missing' {
+  if (!input.sessionId || !input.sourceUserSeq) return 'missing';
+  try {
+    const matching = listEvents(input.sessionId, {
+      types: ['autonomy_note'],
+      sinceSeq: input.sourceUserSeq,
+    }).filter((event) => (
+      event.data.kind === 'pending_action_queued'
+      && event.data.sourceUserSeq === input.sourceUserSeq
+      && event.data.pendingActionId === input.pendingActionId
+      && event.data.payloadHash === input.payloadHash
+    ));
+    if (matching.some((event) => (
+      event.data.approvalIntent === 'request_now'
+      || event.data.autoMaterialize === true
+    ))) return 'request_now';
+    if (matching.some((event) => event.data.approvalIntent === 'queue_only')) return 'queue_only';
+    return matching.length > 0 ? 'legacy' : 'missing';
+  } catch {
+    return 'missing';
+  }
+}
+
+function queuedActionNextStep(
+  record: PendingActionRecord,
+  approvalRequired: boolean,
+  approvalIntent?: PendingActionApprovalIntent,
+): string {
   if (record.status === 'approval_requested') {
     return 'This exact request already has its one formal approval card. Do not queue or request another; wait for the user decision.';
   }
@@ -145,8 +299,12 @@ function queuedActionNextStep(record: PendingActionRecord, approvalRequired: boo
   if (['rejected', 'expired', 'cancelled', 'failed'].includes(record.status)) {
     return `This exact request is already ${record.status}. Do not retry or create a replacement from this same request; explain the status.`;
   }
-  return approvalRequired
-    ? 'REQUIRED NEXT EDGE: end this turn with one concise question naming the external action (for example, "Should I send it?"). The harness will materialize the single formal approval card from this request-owned record; do not search for or create another approval tool call. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
+  return approvalRequired && approvalIntent === 'request_now'
+    ? 'GRAPH EDGE RECORDED: the harness will open the single formal approval card from this request-owned record now, independent of your closing prose. Do not search for or create another approval tool call. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
+    : approvalRequired && approvalIntent === 'queue_only'
+      ? 'QUEUE-ONLY EDGE RECORDED: this action is stored without opening an approval card. Do not ask the user to execute it in this turn. A later explicit request can promote the same exact payload to one formal card.'
+      : approvalRequired
+        ? 'REQUIRED NEXT EDGE: end this turn with one concise question naming the external action (for example, "Should I send it?"). The harness will materialize the single formal approval card from this request-owned record; do not search for or create another approval tool call. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
     : 'Next step: ask the user whether to execute this queued action. If it requires a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.';
 }
 
@@ -156,7 +314,7 @@ export function registerPendingActionTools(server: McpServer): void {
     [
       'Queue a fully prepared action payload before an irreversible external write/send/deploy or other approval-bound execution.',
       'This tool DOES NOT execute anything. Use it after you have gathered the facts, selected the exact tool, and built the exact payload.',
-      'For an approval-bound action, end the turn with one concise execution/approval question. The harness turns this exact queued record into the single formal card.',
+      'State the graph edge with approvalIntent: request_now opens the one exact formal card this turn; queue_only stores it without a card. Use queue_only when the user explicitly asked to stage only, and do not queue at all while required scope is unresolved.',
       'After approval, call pending_action_execute with this id; it dispatches the exact queued payload once and records the outcome.',
     ].join(' '),
     {
@@ -165,6 +323,7 @@ export function registerPendingActionTools(server: McpServer): void {
       kind: kindEnum.describe('The action class. external_send/external_write/deployment are approval-bound in normal operation.'),
       toolName: z.string().min(1).max(160).describe('The exact tool to call after approval, e.g. composio_execute_tool or run_shell_command.'),
       payloadJson: z.string().min(2).max(100000).describe('Exact JSON payload for the execution tool. Use the tool schema shape, not prose.'),
+      approvalIntent: approvalIntentEnum.optional().describe('request_now = exact payload is complete and the graph should open its one formal card now; queue_only = store it without opening a card this turn. Optional only for pre-3.0 callers, which retain the narrow legacy prose bridge.'),
       targetSummary: z.string().max(1000).optional().describe('Human-readable destination/recipient/resource.'),
       preview: z.string().max(8000).optional().describe('Human-reviewable content preview: email body, rows to update, command, deploy target, etc.'),
       risk: z.string().max(1000).optional().describe('Main risk/blast radius in plain language.'),
@@ -172,21 +331,29 @@ export function registerPendingActionTools(server: McpServer): void {
       createdBy: z.string().max(120).optional(),
     },
     async (input) => {
-      let payload: unknown;
+      let parsedPayload: unknown;
       try {
-        payload = parsePendingActionPayloadJson(input.payloadJson);
+        parsedPayload = parsePendingActionPayloadJson(input.payloadJson);
       } catch (err) {
         return textResult(`pending_action_queue failed: ${err instanceof Error ? err.message : String(err)}`);
       }
+      let canonical: CanonicalPendingActionCall;
+      try {
+        canonical = canonicalizePendingActionCall(input.toolName, parsedPayload);
+      } catch (err) {
+        return textResult(`pending_action_queue refused: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const { toolName, payload } = canonical;
+      const approvalIntent = input.approvalIntent as PendingActionApprovalIntent | undefined;
       const sessionId = ownedSessionId();
       if (getToolOutputContext() && !sessionId) {
         return textResult('pending_action_queue refused: the active harness context has no authoritative session owner.');
       }
-      const shape = classifyExternalWrite(input.toolName, payload);
+      const shape = classifyExternalWrite(toolName, payload);
       const kind = input.kind as PendingActionKind;
       const needsFormalApproval = pendingActionRequiresHumanApproval({
         kind,
-        toolName: input.toolName,
+        toolName,
         payload,
       });
       if (needsFormalApproval && !sessionId) {
@@ -195,7 +362,7 @@ export function registerPendingActionTools(server: McpServer): void {
       if (sessionId && shape.mutating && shape.irreversible && isRecipientIntegrityGateEnabled()) {
         const recipientResult = evaluateRecipientSetIntegrity(sessionId, payload);
         if (recipientResult.action === 'block') {
-          const error = new RecipientSetIntegrityError({ toolName: input.toolName, result: recipientResult });
+          const error = new RecipientSetIntegrityError({ toolName, result: recipientResult });
           try {
             appendEvent({
               sessionId,
@@ -205,7 +372,7 @@ export function registerPendingActionTools(server: McpServer): void {
               data: {
                 kind: 'recipient_set_integrity_blocked',
                 phase: 'pending_action_queue',
-                toolName: input.toolName,
+                toolName,
                 recipients: recipientResult.recipients,
                 unsupportedRecipients: recipientResult.unsupportedRecipients ?? [],
                 reason: recipientResult.reason,
@@ -216,7 +383,7 @@ export function registerPendingActionTools(server: McpServer): void {
         }
       }
       const attribution = currentRequestAttribution();
-      const payloadHash = pendingActionPayloadHash(input.toolName, payload);
+      const payloadHash = pendingActionPayloadHash(toolName, payload);
       let record = requestOwnedQueueRetry({
         sessionId,
         sourceUserSeq: attribution.sourceUserSeq,
@@ -230,7 +397,7 @@ export function registerPendingActionTools(server: McpServer): void {
           title: input.title,
           summary: input.summary,
           kind,
-          toolName: input.toolName,
+          toolName,
           payload,
           targetSummary: input.targetSummary,
           preview: input.preview,
@@ -244,6 +411,10 @@ export function registerPendingActionTools(server: McpServer): void {
           toolName: record.toolName,
           actionKind: record.kind,
           approvalRequired: needsFormalApproval,
+          ...(approvalIntent ? {
+            approvalIntent,
+            autoMaterialize: approvalIntent === 'request_now',
+          } : {}),
           payloadHash: record.payloadHash,
           targetSummary: record.targetSummary,
           ...attribution,
@@ -258,8 +429,52 @@ export function registerPendingActionTools(server: McpServer): void {
             'pending_action_queue failed safely: the approval-bound payload was not accepted because its durable request edge could not be recorded. Nothing is authorized or executable; retry the queue once.',
           );
         }
+      } else if (approvalIntent && attribution.sourceUserSeq) {
+        const currentIntent = requestOwnedApprovalIntentState({
+          sessionId,
+          sourceUserSeq: attribution.sourceUserSeq,
+          pendingActionId: record.id,
+          payloadHash: record.payloadHash,
+        });
+        const shouldPromote = approvalIntent === 'request_now'
+          && currentIntent !== 'request_now';
+        const shouldRecordQueueOnly = approvalIntent === 'queue_only'
+          && currentIntent !== 'request_now'
+          && currentIntent !== 'queue_only';
+        if (
+          (shouldPromote || shouldRecordQueueOnly)
+          && !maybeLog(sessionId, 'queued', {
+            pendingActionId: record.id,
+            toolName: record.toolName,
+            actionKind: record.kind,
+            approvalRequired: needsFormalApproval,
+            approvalIntent,
+            autoMaterialize: approvalIntent === 'request_now',
+            payloadHash: record.payloadHash,
+            targetSummary: record.targetSummary,
+            ...attribution,
+          })
+        ) {
+          return textResult(
+            'pending_action_queue failed safely: the existing payload remains inert because its updated approval graph edge could not be recorded. Retry once.',
+          );
+        }
       }
-      const nextStep = queuedActionNextStep(record, needsFormalApproval);
+      const persistedIntent = requestOwnedApprovalIntentState({
+        sessionId,
+        sourceUserSeq: attribution.sourceUserSeq,
+        pendingActionId: record.id,
+        payloadHash: record.payloadHash,
+      });
+      const effectiveApprovalIntent = persistedIntent === 'request_now'
+        || persistedIntent === 'queue_only'
+        ? persistedIntent
+        : approvalIntent;
+      const nextStep = queuedActionNextStep(
+        record,
+        needsFormalApproval,
+        effectiveApprovalIntent,
+      );
       return textResult([
         `Pending action ${reused ? 'reused' : 'queued'}: ${record.id}`,
         nextStep,

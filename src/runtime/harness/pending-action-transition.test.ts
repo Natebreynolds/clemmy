@@ -30,6 +30,7 @@ const {
 const {
   isQueuedActionApprovalQuestion,
   materializeQueuedApprovals,
+  queuedApprovalTransitionShouldMaterialize,
   queuedApprovalTransitionsForRequest,
 } = await import('./pending-action-transition.js');
 const {
@@ -51,7 +52,7 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-function queueRequestOwnedSend() {
+function queueRequestOwnedSend(approvalIntent?: 'request_now' | 'queue_only') {
   const session = createSession({ kind: 'chat', channel: 'discord' });
   const source = appendEvent({
     sessionId: session.id,
@@ -89,6 +90,10 @@ function queueRequestOwnedSend() {
       sourceUserSeq: source.seq,
       runScopeId: 'proof-run',
       callId: 'proof-queue',
+      ...(approvalIntent ? {
+        approvalIntent,
+        autoMaterialize: approvalIntent === 'request_now',
+      } : {}),
     },
   });
   return { session, source, record };
@@ -125,6 +130,33 @@ test('approval-edge question detection distinguishes authorization from missing 
   ]) {
     assert.equal(isQueuedActionApprovalQuestion(negative), false, negative);
   }
+});
+
+test('typed approval intent owns the graph edge while old events retain narrow compatibility', () => {
+  const requestNow = queueRequestOwnedSend('request_now');
+  const [requestTransition] = queuedApprovalTransitionsForRequest(
+    requestNow.session.id,
+    requestNow.source.seq,
+  );
+  assert.equal(requestTransition?.approvalIntent, 'request_now');
+  assert.equal(queuedApprovalTransitionShouldMaterialize(requestTransition!, false), true);
+
+  const queueOnly = queueRequestOwnedSend('queue_only');
+  const [queueTransition] = queuedApprovalTransitionsForRequest(
+    queueOnly.session.id,
+    queueOnly.source.seq,
+  );
+  assert.equal(queueTransition?.approvalIntent, 'queue_only');
+  assert.equal(queuedApprovalTransitionShouldMaterialize(queueTransition!, true), false);
+
+  const legacy = queueRequestOwnedSend();
+  const [legacyTransition] = queuedApprovalTransitionsForRequest(
+    legacy.session.id,
+    legacy.source.seq,
+  );
+  assert.equal(legacyTransition?.approvalIntent, 'legacy');
+  assert.equal(queuedApprovalTransitionShouldMaterialize(legacyTransition!, false), false);
+  assert.equal(queuedApprovalTransitionShouldMaterialize(legacyTransition!, true), true);
 });
 
 test('queue -> one card -> approve -> resume -> exact payload dispatches once', async () => {
@@ -378,9 +410,11 @@ test('one request gets one card per distinct payload hash and collapses same-pay
   assert.equal(calendarTransition?.record.id, calendar.id, 'first exact Calendar record is canonical');
   assert.deepEqual(calendarTransition?.duplicateRecordIds, [calendarRetry.id]);
   assert.equal(calendarTransition?.autoMaterialize, true, 'same-hash edge metadata survives dedupe');
+  assert.equal(calendarTransition?.approvalIntent, 'request_now');
   assert.equal(airtableTransition?.record.id, airtable.id);
   assert.deepEqual(airtableTransition?.duplicateRecordIds, []);
   assert.equal(airtableTransition?.autoMaterialize, false);
+  assert.equal(airtableTransition?.approvalIntent, 'legacy');
 
   const materialized = materializeQueuedApprovals(
     session.id,

@@ -16,6 +16,11 @@ export interface QueuedApprovalTransition {
   eventSeq: number;
   record: PendingActionRecord;
   duplicateRecordIds: string[];
+  /**
+   * New queue calls state the graph edge explicitly. `legacy` is reserved for
+   * pre-3.0 events and keeps the narrow prose classifier as an upgrade bridge.
+   */
+  approvalIntent: 'request_now' | 'queue_only' | 'legacy';
   /** Explicit propose→approval primitives (currently run_batch) can request
    * deterministic card materialization without depending on closing prose. */
   autoMaterialize: boolean;
@@ -61,6 +66,19 @@ export function isQueuedActionApprovalQuestion(reply?: string | null): boolean {
     || EXPLICIT_APPROVAL_DECISION_RE.test(question)
     || CONTEXT_BOUND_PROCEED_QUESTION_RE.test(question)
     || explicitApproveOrStop;
+}
+
+/**
+ * A new typed graph edge always wins over narration. Only old events that lack
+ * the edge may consult the compatibility prose signal.
+ */
+export function queuedApprovalTransitionShouldMaterialize(
+  transition: QueuedApprovalTransition,
+  legacyApprovalSignal: boolean,
+): boolean {
+  if (transition.approvalIntent === 'request_now') return true;
+  if (transition.approvalIntent === 'queue_only') return false;
+  return legacyApprovalSignal;
 }
 
 function exactPendingApprovalRow(
@@ -148,7 +166,18 @@ export function queuedApprovalTransitionsForRequest(
         eventSeq: canonical.event.seq,
         record: canonical.record,
         duplicateRecordIds,
-        autoMaterialize: valid.some(({ event }) => event.data.autoMaterialize === true),
+        approvalIntent: valid.some(({ event }) => (
+          event.data.approvalIntent === 'request_now'
+          || event.data.autoMaterialize === true
+        ))
+          ? 'request_now'
+          : valid.some(({ event }) => event.data.approvalIntent === 'queue_only')
+            ? 'queue_only'
+            : 'legacy',
+        autoMaterialize: valid.some(({ event }) => (
+          event.data.approvalIntent === 'request_now'
+          || event.data.autoMaterialize === true
+        )),
       });
     }
     return transitions.sort((a, b) => a.eventSeq - b.eventSeq);

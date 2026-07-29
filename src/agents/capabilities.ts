@@ -265,6 +265,7 @@ function runProbe(command: string, args: string[]): Promise<{ stdout: string; st
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
+    let settled = false;
     const child = spawn(command, args, {
       env: process.env,
       // Tight timeout — a probe shouldn't take more than 4s.
@@ -273,9 +274,16 @@ function runProbe(command: string, args: string[]): Promise<{ stdout: string; st
     child.stdout?.on('data', (d: Buffer) => { stdout += d.toString('utf-8'); });
     child.stderr?.on('data', (d: Buffer) => { stderr += d.toString('utf-8'); });
     child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
       resolve({ stdout, stderr: stderr || err.message, code: -1 });
     });
-    child.on('exit', (code) => {
+    // `exit` may fire before stdout/stderr finish draining. Resolve on `close`
+    // so a successful probe never becomes "available, version unknown" under
+    // concurrent load merely because its final output chunk arrived late.
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
       resolve({ stdout, stderr, code });
     });
   });

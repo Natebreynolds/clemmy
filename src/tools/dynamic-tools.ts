@@ -7,12 +7,31 @@ import { BASE_DIR } from '../config.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 import { textResult } from './shared.js';
 
+function dynamicToolName(file: string): string {
+  return file.replace(/\.(sh|py)$/, '').replace(/[^a-z0-9_]/gi, '_');
+}
+
+/** Fresh synchronous inventory so approval routing never mistakes a manually
+ * installed custom tool for a provider action merely because its name is
+ * SCREAMING_SNAKE. */
+export function listDynamicToolNames(): string[] {
+  const toolsDir = path.join(BASE_DIR, 'tools');
+  if (!existsSync(toolsDir)) return [];
+  try {
+    return readdirSync(toolsDir)
+      .filter((entry) => entry.endsWith('.sh') || entry.endsWith('.py'))
+      .map(dynamicToolName);
+  } catch {
+    return [];
+  }
+}
+
 export function registerDynamicTools(server: McpServer): void {
   const toolsDir = path.join(BASE_DIR, 'tools');
   if (!existsSync(toolsDir)) return;
 
   for (const file of readdirSync(toolsDir).filter((entry) => entry.endsWith('.sh') || entry.endsWith('.py'))) {
-    const toolName = file.replace(/\.(sh|py)$/, '').replace(/[^a-z0-9_]/gi, '_');
+    const toolName = dynamicToolName(file);
     const filePath = path.join(toolsDir, file);
     const metaPath = `${filePath}.meta.json`;
 

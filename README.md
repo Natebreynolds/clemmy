@@ -234,7 +234,7 @@ Additional harness evaluations, smoke tests, and surface-specific guidance are l
 | Platform | Status |
 | --- | --- |
 | macOS | Primary desktop target. Release workflow produces signed and notarized DMG and ZIP artifacts for Apple Silicon and Intel. Native meeting capture and notch features live here. |
-| Windows | Release CI builds an NSIS installer on normal version tags. It may be unsigned unless Windows signing credentials are configured, and macOS-native features are not available. Check each release for current parity. |
+| Windows | Production version tags build an Authenticode-signed NSIS installer and fail closed when Windows signing credentials are unavailable. Private manual candidates may be unsigned. macOS-native features are not available. |
 | Linux | No supported desktop artifact is published. Running the daemon from source remains a developer path. |
 
 ## Contributing and support

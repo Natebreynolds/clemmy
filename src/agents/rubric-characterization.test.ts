@@ -93,13 +93,13 @@ const GOLDEN = {
   // 2026-07-28 deterministic approval graph: every flagship lane now queues
   // the exact payload, asks once, and lets the runtime link the formal card;
   // approval resumes the exact single-call or batch executor without rebuild.
-  instructions: { len: 35355, sha16: 'f808a65aea7b57ac' },
-  native: { len: 34458, sha16: '515e7faf1e1c207c' },
-  claudeBrain: { len: 6192, sha16: '49f5f52806aba5fd' },
+  instructions: { len: 35419, sha16: '544f580e7e54a4dc' },
+  native: { len: 34522, sha16: '8389d9195c9267a4' },
+  claudeBrain: { len: 6291, sha16: '38e852a3e070644c' },
   // 2026-07-27 live efficiency proof: execution_create already guards against
   // a duplicate active lane, so the lean rubric no longer makes the model dump
   // every user's old executions before opening/reusing the current one.
-  lean: { len: 9737, sha16: 'a77e2bbd3461e2dc' },
+  lean: { len: 9836, sha16: '05458612e51fe869' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
