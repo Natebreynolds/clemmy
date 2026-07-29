@@ -22,7 +22,7 @@ const PROMPT = [
   '- payloadJson: {"tool_slug":"GMAIL_SEND_EMAIL","arguments":{"to":"proof@example.com","subject":"Proof pending action","body":"This is a fictional proof payload only."}}',
   '- preview: To proof@example.com; Subject Proof pending action; Body This is a fictional proof payload only.',
   '',
-  'After queueing it, reply with the pending action id and ask whether I want you to execute it. Do not merely describe the queue; create it.',
+  'After queueing it, follow Clementine’s normal single-approval flow for that exact pending action. Do not stop at a prose-only question and do not merely describe the queue; create the one actionable approval card.',
 ].join('\n');
 
 interface PendingActionFile {
