@@ -45,7 +45,7 @@ jobs:
 
     steps:
       - name: Checkout exact source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -178,7 +178,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -310,7 +310,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -420,7 +420,7 @@ jobs:
 
     steps:
       - name: Checkout tags
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
