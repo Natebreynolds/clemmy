@@ -188,10 +188,19 @@ export function sanitizeAgentDecisionOutput(value: unknown): AgentDecisionV2 | n
     : typeof rawFollowUp === 'string'
       ? Number.parseInt(rawFollowUp, 10)
       : undefined;
+  // CLAMP the wake preference instead of letting an out-of-range value void
+  // the whole decision. Live failure class (2026-07-29): the model returned a
+  // perfect decision with followUpMinutes: 3; the schema floor is 5, safeParse
+  // failed, and the cycle discarded the decision — actions included — as
+  // "no usable output". A bad wake preference is a detail to bound, never a
+  // reason to drop completed reasoning.
+  const clampedFollowUp = Number.isFinite(followUp)
+    ? Math.min(1440, Math.max(5, followUp as number))
+    : undefined;
   const candidate: AgentDecisionV2 = {
     summary: cleanDecisionString(obj.summary ?? obj.message ?? obj.result ?? obj.report, 1200),
     commitments: cleanStringArray(obj.commitments ?? obj.followUps ?? obj.follow_ups, 8),
-    ...(Number.isFinite(followUp) ? { followUpMinutes: followUp } : {}),
+    ...(clampedFollowUp !== undefined ? { followUpMinutes: clampedFollowUp } : {}),
   };
   const checked = AgentDecisionSchema.safeParse(candidate);
   return checked.success ? checked.data : null;

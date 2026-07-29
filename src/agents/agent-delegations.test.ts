@@ -384,3 +384,19 @@ test('RUNTIME ENGINE: a prose-only reply fails the cycle instead of inventing ac
   }
   assert.equal(read('rt-flake', 'rt2').status, 'pending', 'no action was invented from prose');
 });
+
+test('an out-of-range wake preference is clamped, never voids the decision', async () => {
+  const mod = await import('./autonomy-v2.js');
+  // Live failure class: a PERFECT decision with followUpMinutes below the
+  // schema floor was nulled wholesale, actions included, failing the cycle.
+  const d = mod.sanitizeAgentDecisionOutput(JSON.stringify({
+    summary: 'Completed the delegated task.',
+    commitments: [],
+    followUpMinutes: 3,
+    actions: [{ type: 'complete_delegation', delegationId: 'x', result: 'done' }],
+  }));
+  assert.ok(d, 'the decision must survive');
+  assert.equal(d.followUpMinutes, 5, 'clamped to the floor, not discarded');
+  const high = mod.sanitizeAgentDecisionOutput(JSON.stringify({ summary: 's', commitments: [], followUpMinutes: 99999 }));
+  assert.equal(high?.followUpMinutes, 1440, 'clamped to the ceiling');
+});
