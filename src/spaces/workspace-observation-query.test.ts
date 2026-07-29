@@ -378,7 +378,10 @@ test('diff previews redact credential-shaped values even under a generic field n
         url: 'https://user:old-password@example.test/path?api_key=old-query-secret',
         env: 'OPENAI_API_KEY=sk-oldcanary1234567890abcdef',
         credentials: 'PASSWORD=old-password-canary',
-        pem: '-----BEGIN PRIVATE KEY-----\nOLD-PRIVATE-CANARY\n-----END PRIVATE KEY-----',
+        // The `...` marks this as a placeholder body for the public-hygiene
+        // check, which otherwise flags any PEM block as key material. The
+        // canary substring the assertion below greps for is unchanged.
+        pem: '-----BEGIN PRIVATE KEY-----\nOLD-PRIVATE-CANARY...\n-----END PRIVATE KEY-----',
         'OPENAI_API_KEY=sk-pathcanary1234567890abcdef': 'old',
         rows: [{ id: 'OPENAI_API_KEY=sk-entitycanary1234567890abcdef', state: 'old' }],
       },
@@ -393,7 +396,7 @@ test('diff previews redact credential-shaped values even under a generic field n
         url: 'https://user:new-password@example.test/path?api_key=new-query-secret',
         env: 'OPENAI_API_KEY=sk-newcanary1234567890abcdef',
         credentials: 'PASSWORD=new-password-canary',
-        pem: '-----BEGIN PRIVATE KEY-----\nNEW-PRIVATE-CANARY\n-----END PRIVATE KEY-----',
+        pem: '-----BEGIN PRIVATE KEY-----\nNEW-PRIVATE-CANARY...\n-----END PRIVATE KEY-----',
         'OPENAI_API_KEY=sk-pathcanary1234567890abcdef': 'new',
         rows: [{ id: 'OPENAI_API_KEY=sk-entitycanary1234567890abcdef', state: 'new' }],
       },
