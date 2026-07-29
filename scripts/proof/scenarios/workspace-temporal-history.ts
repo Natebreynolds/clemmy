@@ -61,6 +61,18 @@ export const TEMPORAL_SNAPSHOT_BEFORE = {
   currency: 'USD',
 } as const;
 
+/**
+ * Drop the reserved `_meta` provenance key so a committed snapshot can be
+ * compared against what the caller actually sent. `_meta` is maintained by the
+ * runner, is rejected as a source id by the store, and is stripped on publish.
+ */
+function withoutReservedMeta(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const { _meta, ...sources } = value as Record<string, unknown>;
+  void _meta;
+  return sources;
+}
+
 export const TEMPORAL_SNAPSHOT_AFTER = {
   report: 'Proof campaign watch',
   accounts: [
@@ -503,8 +515,13 @@ export const workspaceTemporalHistory: ScenarioDef = {
       },
       {
         name: 'current projection survived restart exactly',
+        // `_meta` is a reserved runner-provenance key the store maintains
+        // alongside the committed sources (see spaces/store.ts + publish.ts);
+        // it is never one of them. Compare the source keys exactly, the same
+        // way space-smoke.ts filters it, instead of expecting the committed
+        // snapshot to contain provenance the caller never sent.
         pass: isRecord(dataAfterRestart.json)
-          && isDeepStrictEqual(dataAfterRestart.json.data, TEMPORAL_SNAPSHOT_AFTER),
+          && isDeepStrictEqual(withoutReservedMeta(dataAfterRestart.json.data), TEMPORAL_SNAPSHOT_AFTER),
         detail: JSON.stringify(dataAfterRestart.json).slice(0, 1_000),
       },
       {
