@@ -587,6 +587,9 @@ function getRunner(): Runner {
 }
 
 export const _testOnly_buildRunnerConfig = buildRunnerConfig;
+/** Exposed so the delegation wiring (assigned work reaches the cycle input) is
+ *  pinned by a test rather than only by typecheck. */
+export const _testOnly_buildAgentInput = buildAgentInput;
 
 function recordHash(record: TeamAgentRecord): string {
   return JSON.stringify({

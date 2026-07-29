@@ -181,3 +181,40 @@ test('a missing delegation is reported rather than silently dropped', async () =
   assert.match(await run('analyst', 'delegation_claim', { delegation_id: 'nope' }), /not assigned to you/i);
   assert.match(await run('analyst', 'delegation_complete', { delegation_id: 'nope', result: 'x' }), /not assigned to you/i);
 });
+
+// ─── Wiring: assigned work must actually reach the cycle input ───
+// The tools above are useless if a woken agent never sees what it was given.
+// This pins the one line in autonomy-v2 that puts it there.
+
+test('WIRING: delegated work reaches the agent cycle input', async () => {
+  const { _testOnly_buildAgentInput } = await import('./autonomy-v2.js');
+  seed('analyst', 'w1');
+
+  const record = {
+    slug: 'analyst',
+    name: 'Analyst',
+    description: 'Test analyst.',
+    canMessage: [],
+    allowedTools: [],
+    tier: 2,
+  } as unknown as Parameters<typeof _testOnly_buildAgentInput>[0];
+
+  const input = _testOnly_buildAgentInput(record, [], { slug: 'analyst' });
+  assert.match(input, /w1/, 'the agent must see the delegation id it needs to claim');
+  assert.match(input, /Do the thing w1/, 'and the task itself');
+});
+
+test('WIRING: an agent with no delegated work gains no empty section', async () => {
+  const { _testOnly_buildAgentInput } = await import('./autonomy-v2.js');
+  const record = {
+    slug: 'idle-agent',
+    name: 'Idle',
+    description: 'Test idle agent.',
+    canMessage: [],
+    allowedTools: [],
+    tier: 2,
+  } as unknown as Parameters<typeof _testOnly_buildAgentInput>[0];
+
+  const input = _testOnly_buildAgentInput(record, [], { slug: 'idle-agent' });
+  assert.doesNotMatch(input, /delegated to you/i, 'quiet agents pay no prompt cost');
+});
