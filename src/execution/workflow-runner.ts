@@ -224,6 +224,7 @@ import {
 } from '../memory/workflow-pattern-store.js';
 import { workflowCodeRevisionFingerprint } from './workflow-code-certification.js';
 import { compileWorkflowStepsToGraph } from './workflow-graph.js';
+import { resolveWorkflowReadiness } from './workflow-readiness.js';
 import { persistWorkflowGraphSnapshot } from './workflow-graph-store.js';
 import {
   claudeAgentSdkWorkflowStepEnabled,
@@ -5629,12 +5630,14 @@ function reachableResumeFrontier(
   completedSteps: Map<string, unknown>,
 ): Set<string> {
   const completedIds = new Set(completedSteps.keys());
-  try {
-    const batches = planWorkflowExecutionBatches(steps, completedIds);
-    return new Set((batches[0] ?? []).map((step) => step.id));
-  } catch {
+  const readiness = resolveWorkflowReadiness(steps, completedIds);
+  // A definition that cannot progress keeps the conservative frontier (every
+  // remaining step) rather than an empty one — the resume guard must not read
+  // an unprogressable graph as "nothing left to protect".
+  if (readiness.structurallyStalled) {
     return new Set(steps.filter((step) => !completedIds.has(step.id)).map((step) => step.id));
   }
+  return new Set(readiness.readyStepIds);
 }
 
 export function shouldHaltResumeForSideEffect(
@@ -5997,7 +6000,16 @@ async function executeWorkflow(
         });
       }
       if (completedStepIds.size >= steps.length) break;
-      const readyBatch = planWorkflowExecutionBatches(steps, completedStepIds)[0] ?? [];
+      // Readiness comes from the graph (workflow-readiness.ts), so the
+      // persisted/patched graph is what decides execution order rather than
+      // only observing it. A definition that cannot progress surfaces as a
+      // named stall instead of an exception thrown from inside the loop.
+      const readiness = resolveWorkflowReadiness(steps, completedStepIds);
+      if (readiness.structurallyStalled) {
+        throw new Error(`Workflow dependency graph is blocked or cyclic: ${readiness.stalledDetail ?? 'no step can proceed'}`);
+      }
+      const readyIds = new Set(readiness.readyStepIds);
+      const readyBatch = steps.filter((step) => readyIds.has(step.id));
       const concurrencyCap = Math.max(1, RUNNER_CONCURRENCY);
       const batch = readyBatch.slice(0, concurrencyCap);
       appendWorkflowNodeReadyBatch(workflowSlug, runId, readyBatch, batch, executionRound, concurrencyCap);
@@ -7272,7 +7284,8 @@ export async function runCreationTest(
   const completed = new Set<string>();
   let guard = 0;
   while (completed.size < steps.length && guard++ < steps.length + 2) {
-    const batch = planWorkflowExecutionBatches(steps, completed)[0] ?? [];
+    const readyIds = new Set(resolveWorkflowReadiness(steps, completed).readyStepIds);
+    const batch = steps.filter((step) => readyIds.has(step.id));
     if (batch.length === 0) break;
     for (const step of batch) {
       throwIfWorkflowRunCancelled(runId);
