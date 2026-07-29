@@ -1,3 +1,4 @@
+import { irreversibleBoundaryViolations } from './workflow-graph-boundaries.js';
 import type {
   WorkflowStepInput,
   WorkflowStepInputBinding,
@@ -272,6 +273,13 @@ export function applyWorkflowGraphPatch(
   const validation = validateWorkflowGraph(next);
   if (!validation.ok) {
     return { ok: false, graph, errors: validation.errors, warnings: validation.warnings };
+  }
+
+  // One-way doors are enforced here, inside apply, so no caller can reshape a
+  // running graph around an approval gate by skipping a separate check.
+  const boundaryViolations = irreversibleBoundaryViolations(graph, next);
+  if (boundaryViolations.length > 0) {
+    return { ok: false, graph, errors: boundaryViolations, warnings: validation.warnings };
   }
 
   next.entryNodeIds = computeEntryNodeIds(next.nodes, next.edges);
