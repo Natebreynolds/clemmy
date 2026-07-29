@@ -1504,15 +1504,6 @@ export function _setWorkflowCallNodeForTests(
   workflowCallNodeOverrideForTests = override;
 }
 
-function workflowCallOutputPayload(result: unknown): unknown {
-  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
-  const envelope = result as Record<string, unknown>;
-  return envelope.successful === true
-    && Object.prototype.hasOwnProperty.call(envelope, 'data')
-    ? envelope.data
-    : result;
-}
-
 async function executeWorkflowCallNode(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
@@ -1520,7 +1511,7 @@ async function executeWorkflowCallNode(
   mutationItemKey?: string,
 ): Promise<unknown> {
   if (workflowCallNodeOverrideForTests) {
-    return workflowCallOutputPayload(await workflowCallNodeOverrideForTests(step, ctx, item));
+    return workflowCallNodeOverrideForTests(step, ctx, item);
   }
   const call = step.call!;
   const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item, resolveWorkflowStepProjectContext(step, ctx.workflow));
@@ -1530,7 +1521,7 @@ async function executeWorkflowCallNode(
     stepId: step.id,
     ...(mutationItemKey ? { itemKey: mutationItemKey } : {}),
   });
-  if (durableReplay.replayed) return workflowCallOutputPayload(durableReplay.result);
+  if (durableReplay.replayed) return durableReplay.result;
   const {
     composioDispatchErrorProvesNoCommit,
     composioFailureProvesNoCommit,
@@ -1600,7 +1591,7 @@ async function executeWorkflowCallNode(
     }
     throw new Error(`composio dispatch blocked (${outcome.reason}): ${outcome.message}`);
   }
-  return workflowCallOutputPayload(outcome.result);
+  return outcome.result;
 }
 
 interface DeterministicStepPayload {

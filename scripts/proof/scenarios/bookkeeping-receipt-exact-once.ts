@@ -668,9 +668,9 @@ export const bookkeepingReceiptExactOnce: ScenarioDef = {
             },
             output: {
               type: 'object',
-              required_keys: ['values'],
-              non_empty: ['values'],
-              min_items: { values: 2 },
+              required_keys: ['successful', 'data'],
+              non_empty: ['data.values'],
+              min_items: { 'data.values': 2 },
               description: 'Provider readback must contain the header and exactly persisted receipt evidence.',
             },
           },
@@ -908,6 +908,18 @@ export const bookkeepingReceiptExactOnce: ScenarioDef = {
       });
 
       const events = approvedRunId ? workflowEvents(daemon, workflowSlug, approvedRunId) : [];
+      const readbackCompletedEvents = events.filter(
+        (event) => event.kind === 'step_completed' && event.stepId === READBACK_STEP_ID,
+      );
+      checks.push({
+        name: 'durable readback completion carried the exact header and receipt row',
+        pass: readbackCompletedEvents.length === 1
+          && bookkeepingReadbackMatches(readbackCompletedEvents[0]?.output, row),
+        detail: JSON.stringify({
+          count: readbackCompletedEvents.length,
+          output: readbackCompletedEvents[0]?.output ?? null,
+        }),
+      });
       const appendCompletedIndexes = events
         .map((event, index) => ({ event, index }))
         .filter(({ event }) => event.kind === 'step_completed' && event.stepId === APPEND_STEP_ID)

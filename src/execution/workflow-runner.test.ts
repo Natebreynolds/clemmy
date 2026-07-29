@@ -3179,10 +3179,15 @@ test('a read-only structured call also defers completion until its external loop
   }
 });
 
-test('a structured Composio call validates and publishes provider data, not its transport envelope', async () => {
+test('a structured Composio call preserves its legacy envelope while validating nested provider data', async () => {
   const workflowSlug = 'call-output-envelope';
   const runId = 'call-output-envelope-run';
   const rows = [['fingerprint'], ['receipt-1']];
+  const providerResult = {
+    successful: true,
+    data: { rows },
+    logId: 'log-proof-readback-1',
+  };
   const step = {
     id: 'readback',
     prompt: 'Read the rows back.',
@@ -3190,9 +3195,9 @@ test('a structured Composio call validates and publishes provider data, not its 
     call: { tool: 'GOOGLESHEETS_VALUES_GET', args: { spreadsheet_id: 'sheet-test' } },
     output: {
       type: 'object',
-      required_keys: ['rows'],
-      non_empty: ['rows'],
-      min_items: { rows: 1 },
+      required_keys: ['successful', 'data', 'logId'],
+      non_empty: ['data.rows'],
+      min_items: { 'data.rows': 1 },
     },
   };
   const ctx = {
@@ -3213,16 +3218,18 @@ test('a structured Composio call validates and publishes provider data, not its 
     qualityAdvisories: [],
   } as unknown as Parameters<typeof executeStep>[1];
 
-  _setWorkflowCallNodeForTests(async () => ({
-    successful: true,
-    data: { rows },
-  }));
+  _setWorkflowCallNodeForTests(async () => providerResult);
   try {
     const result = await executeStep(step as never, ctx);
-    assert.deepEqual(result, { rows });
+    assert.deepEqual(result, providerResult);
+    assert.deepEqual(
+      (result as typeof providerResult).data.rows,
+      rows,
+      'existing {{steps.readback.output.data.rows}} bindings remain valid',
+    );
     const completion = readWorkflowEvents(workflowSlug, runId)
       .find((event) => event.kind === 'step_completed' && event.stepId === step.id);
-    assert.deepEqual(completion?.output, { rows });
+    assert.deepEqual(completion?.output, providerResult);
   } finally {
     _setWorkflowCallNodeForTests();
   }
