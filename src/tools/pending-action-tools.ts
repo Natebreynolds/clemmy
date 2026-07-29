@@ -120,11 +120,14 @@ export function registerPendingActionTools(server: McpServer): void {
         payloadHash: record.payloadHash,
         targetSummary: record.targetSummary,
       });
+      const nextStep = shape.mutating && shape.irreversible
+        ? 'Next step: call request_approval ONCE now with pendingActionId set to this id and include a concise preview. Do not stop at a separate prose confirmation; the approval card is the single user confirmation. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
+        : 'Next step: ask the user whether to execute this queued action. If it requires a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.';
       return textResult([
         `Pending action queued: ${record.id}`,
         formatPendingAction(record, { verbose: true }),
         '',
-        'Next step: ask the user whether to execute this queued action. For a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.',
+        nextStep,
       ].join('\n'));
     },
   );

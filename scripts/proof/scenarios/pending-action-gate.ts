@@ -1,8 +1,8 @@
 /**
  * Scenario 10 — pending-action-gate: the brain prepares an exact external-write
- * payload, queues it locally, and returns "ready to execute?" without touching an
- * external service. This pins the UX target: do all prep, ask once at the final
- * boundary, execute later from the queued payload.
+ * payload, queues it locally, and opens one linked approval card without touching
+ * an external service. This pins the UX target: do all prep, ask exactly once at
+ * the final boundary, execute later from the queued payload.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
@@ -33,7 +33,20 @@ interface PendingActionFile {
   toolName?: string;
   targetSummary?: string;
   payloadHash?: string;
+  approvalId?: string | null;
   payload?: { tool_slug?: string; arguments?: { to?: string; subject?: string; body?: string } };
+}
+
+interface ApprovalAuditRow {
+  approval_id: string;
+  session_id: string;
+  status: string;
+  args_json: string | null;
+}
+
+interface ApprovalEventData {
+  approvalId?: string;
+  pendingAction?: { id?: string; approvalId?: string | null };
 }
 
 function readPendingActions(home: string): PendingActionFile[] {
@@ -63,10 +76,40 @@ export const pendingActionGate: ScenarioDef = {
       ?? actions.find((item) => item.toolName === 'composio_execute_tool');
 
     let metrics = null;
+    let approval: ApprovalAuditRow | null = null;
+    let approvalCount = 0;
+    let approvalArgs: { pendingActionId?: string } | null = null;
+    let approvalEvent: ApprovalEventData | null = null;
+    let approvalEventCount = 0;
     try {
       const db = openHarnessDb(daemon.home);
-      metrics = sessionMetrics(db, turn.sessionId);
-      db.close();
+      try {
+        metrics = sessionMetrics(db, turn.sessionId);
+        const approvals = db.prepare(
+          `SELECT approval_id, session_id, status, args_json
+             FROM pending_approvals
+            WHERE session_id = ?
+            ORDER BY requested_at DESC`,
+        ).all(turn.sessionId) as ApprovalAuditRow[];
+        approval = approvals[0] ?? null;
+        approvalCount = approvals.length;
+        if (approval?.args_json) {
+          try { approvalArgs = JSON.parse(approval.args_json) as { pendingActionId?: string }; } catch { /* fail closed below */ }
+        }
+        const events = db.prepare(
+          `SELECT data_json
+             FROM events
+            WHERE session_id = ? AND type = 'approval_requested'
+            ORDER BY seq DESC`,
+        ).all(turn.sessionId) as Array<{ data_json?: string }>;
+        const event = events[0];
+        approvalEventCount = events.length;
+        if (event?.data_json) {
+          try { approvalEvent = JSON.parse(event.data_json) as ApprovalEventData; } catch { /* fail closed below */ }
+        }
+      } finally {
+        db.close();
+      }
     } catch { /* checks below surface missing metrics */ }
     const toolCalls = metrics?.toolCalls ?? {};
 
@@ -76,9 +119,33 @@ export const pendingActionGate: ScenarioDef = {
     checks.push(narrationCheck(turn.text));
     checks.push(stormCheck(daemon.log()));
     checks.push({
-      name: 'pending action persisted',
-      pass: Boolean(action?.id && action.status === 'queued'),
-      detail: action ? JSON.stringify({ id: action.id, status: action.status, toolName: action.toolName }) : `actions=${JSON.stringify(actions)}`,
+      name: 'pending action opened one formal approval gate',
+      pass: Boolean(
+        action?.id
+        && action.status === 'approval_requested'
+        && action.approvalId
+        && approvalCount === 1
+        && approval?.approval_id === action.approvalId
+        && approval.session_id === turn.sessionId
+        && approval.status === 'pending'
+        && approvalArgs?.pendingActionId === action.id
+        && approvalEventCount === 1
+        && approvalEvent?.approvalId === action.approvalId
+        && approvalEvent.pendingAction?.id === action.id
+        && approvalEvent.pendingAction.approvalId === action.approvalId
+        && turn.pendingApprovalId === action.approvalId
+      ),
+      detail: JSON.stringify({
+        action: action ? { id: action.id, status: action.status, approvalId: action.approvalId } : null,
+        approval: approval ? {
+          count: approvalCount,
+          id: approval.approval_id,
+          status: approval.status,
+          pendingActionId: approvalArgs?.pendingActionId,
+        } : null,
+        event: approvalEvent ? { count: approvalEventCount, ...approvalEvent } : null,
+        responseApprovalId: turn.pendingApprovalId,
+      }),
     });
     checks.push({
       name: 'exact external payload retained',
@@ -104,7 +171,8 @@ export const pendingActionGate: ScenarioDef = {
     });
     checks.push({
       name: 'reply offers final execute gate',
-      pass: Boolean(action?.id && turn.text.includes(action.id)) && /\b(execute|send|ready|approve)\b/i.test(turn.text),
+      pass: Boolean(action?.approvalId && turn.text.includes(action.approvalId))
+        && /\b(execute|send|approve|reject)\b/i.test(turn.text),
       detail: turn.text.slice(0, 260),
     });
 

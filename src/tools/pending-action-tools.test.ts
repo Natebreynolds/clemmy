@@ -95,6 +95,8 @@ test('pending_action_queue accepts the exact source-backed recipient set', async
   });
 
   assert.match(response.content[0].text, /Pending action queued/);
+  assert.match(response.content[0].text, /call request_approval ONCE now/);
+  assert.match(response.content[0].text, /approval card is the single user confirmation/);
   assert.match(response.content[0].text, /pending_action_execute/);
   assert.equal(listPendingActions({ sessionId: session.id }).length, 1);
 });
