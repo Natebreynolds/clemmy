@@ -30,6 +30,7 @@ import { fanoutMultiItem } from './scenarios/fanout-multi-item.js';
 import { continuityRecall } from './scenarios/continuity-recall.js';
 import { correctionSticks } from './scenarios/correction-sticks.js';
 import { agentAutonomyLive } from './scenarios/agent-autonomy-live.js';
+import { correctionSupersedesStore } from './scenarios/correction-supersedes-store.js';
 import { longToolSelfCorrect } from './scenarios/long-tool-self-correct.js';
 import { approvalParkResume } from './scenarios/approval-park-resume.js';
 import { cronReportBack } from './scenarios/cron-report-back.js';
@@ -88,6 +89,7 @@ const SCENARIO_CATALOG: ScenarioDef[] = [
   pendingActionExactOnce,
   bookkeepingReceiptExactOnce,
   workspaceTemporalHistory,
+  correctionSupersedesStore,
 ];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 
