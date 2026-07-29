@@ -179,10 +179,28 @@ export const teamDelegationRoundtrip: ScenarioDef = {
         : 'assignee closed it — attribution to the agent is accurate',
     });
 
+    // No delegation may be left dangling. A model that re-does work after an
+    // honest budget stop creates more than one — that is acceptable for local
+    // state, but every one of them must still reach a terminal status rather
+    // than sitting open forever, which is the original defect this scenario
+    // exists to catch.
+    const open = delegations.filter((record) => record.status !== 'completed');
     checks.push({
-      name: 'report includes the delegation id and final status',
-      pass: Boolean(completed?.id && reportText.includes(completed.id)) && /complete/i.test(reportText),
-      detail: `${continued ? '(after continuation) ' : ''}${reportText.slice(0, 260)}`,
+      name: 'no delegation left open',
+      pass: open.length === 0,
+      detail: `created=${delegations.length} open=${open.length} ${JSON.stringify(open.map((d) => d.id))}`,
+    });
+
+    // The report must name a delegation that genuinely completed — not
+    // necessarily the first one on disk, since a continuation may have
+    // produced a second.
+    const reported = delegations.find(
+      (record) => record.status === 'completed' && record.id && reportText.includes(record.id),
+    );
+    checks.push({
+      name: 'report names a real completed delegation',
+      pass: Boolean(reported) && /complete/i.test(reportText),
+      detail: `${continued ? '(after continuation) ' : ''}reported=${reported?.id ?? 'none'} of ${JSON.stringify(delegations.map((d) => d.id))}; ${reportText.slice(0, 200)}`,
     });
 
     return {
