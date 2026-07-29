@@ -15,6 +15,7 @@ import { registerSkillTools } from './skill-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerModelRoleTools } from './model-role-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
+import { registerWorkflowReshapeTools } from './workflow-reshape-tools.js';
 import { registerSpaceTools } from './space-tools.js';
 import { registerDynamicTools } from './dynamic-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
@@ -254,6 +255,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerToolChoiceTools(server);
   registerModelRoleTools(server);
   registerWorkflowScheduleTools(server);
+  registerWorkflowReshapeTools(server);
   registerSpaceTools(server);
   registerBrowserHarnessTools(server);
   registerMcpStatusTools(server);
