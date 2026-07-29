@@ -68,7 +68,14 @@ export const correctionSticks: ScenarioDef = {
         WHERE active = 1 AND lower(content) LIKE ?
       `).get(`%${needle.toLowerCase()}%`) as { count: number }).count;
       activeCorrected = countActive(CORRECTED);
-      activeStale = countActive(STALE);
+      // Count only facts that ASSERT the stale value without the correction
+      // beside it. A correction naturally quotes the value it retires
+      // ("X is stale, don't use it"), and that mention is not a stale belief —
+      // counting it would make the check unfalsifiable in the wrong direction.
+      activeStale = (memoryDb.prepare(`
+        SELECT COUNT(*) AS count FROM consolidated_facts
+        WHERE active = 1 AND lower(content) LIKE ? AND lower(content) NOT LIKE ?
+      `).get(`%${STALE.toLowerCase()}%`, `%${CORRECTED.toLowerCase()}%`) as { count: number }).count;
       memoryDb.close();
     } catch { /* surfaced by the checks below */ }
 
@@ -98,9 +105,9 @@ export const correctionSticks: ScenarioDef = {
       detail: `active facts containing the correction: ${activeCorrected}`,
     });
     checks.push({
-      name: 'the stale fact is not left active alongside it',
+      name: 'no stale-only belief is left active beside the correction',
       pass: activeStale === 0,
-      detail: `active facts still containing the superseded value: ${activeStale}`,
+      detail: `active facts asserting the superseded value without the correction: ${activeStale}`,
     });
     checks.push({
       name: 'the correction did not duplicate into competing facts',
