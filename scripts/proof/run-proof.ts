@@ -28,6 +28,7 @@ import {
 } from './score.js';
 import { fanoutMultiItem } from './scenarios/fanout-multi-item.js';
 import { continuityRecall } from './scenarios/continuity-recall.js';
+import { correctionSticks } from './scenarios/correction-sticks.js';
 import { longToolSelfCorrect } from './scenarios/long-tool-self-correct.js';
 import { approvalParkResume } from './scenarios/approval-park-resume.js';
 import { cronReportBack } from './scenarios/cron-report-back.js';
@@ -57,6 +58,7 @@ import type { BrainKind, FusionProofMode, ProofReport, ScenarioDef, ScenarioOutc
 const DEFAULT_SCENARIOS: ScenarioDef[] = [
   fanoutMultiItem,
   continuityRecall,
+  correctionSticks,
   completeSetRecall,
   longToolSelfCorrect,
   approvalParkResume,
