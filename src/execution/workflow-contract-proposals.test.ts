@@ -140,6 +140,28 @@ test('preserves exact object-literal return keys without inventing generic field
   assert.deepEqual(output?.verify, { url_present: ['sheetUrl'] });
 });
 
+test('does not invent prose-derived output keys for a structured provider call', () => {
+  const proposal = proposeWorkflowContractUpgrades(wf({
+    description: 'Read a provider row back after a write.',
+    steps: [
+      {
+        id: 'readback',
+        prompt: 'Read the provider row back before this workflow can complete.',
+        call: {
+          tool: 'GOOGLESHEETS_VALUES_GET',
+          args: { spreadsheet_id: 'sheet-1', range: 'Receipts!A:L' },
+        },
+      },
+    ],
+  }));
+
+  assert.deepEqual(
+    proposal.proposedStepOutputs,
+    [],
+    'provider response fields must come from an explicit/schema-derived contract, never nouns in the prompt',
+  );
+});
+
 test('renders a reviewable non-mutating proposal report', () => {
   const proposal = proposeWorkflowContractUpgrades(wf({
     synthesis: { prompt: 'Return the live audit URL.' },

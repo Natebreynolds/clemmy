@@ -461,6 +461,7 @@ function proposeStepOutput(step: WorkflowStepInput): WorkflowContractStepOutputP
   if (hasOutputContract(step)) return null;
   if (step.forEach) return null;
   if (step.deterministic) return null;
+  if (step.call) return null;
   const prompt = step.prompt ?? '';
   if (!stepLooksContractWorthy(prompt)) return null;
 

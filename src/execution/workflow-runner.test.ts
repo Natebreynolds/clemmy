@@ -3179,6 +3179,55 @@ test('a read-only structured call also defers completion until its external loop
   }
 });
 
+test('a structured Composio call validates and publishes provider data, not its transport envelope', async () => {
+  const workflowSlug = 'call-output-envelope';
+  const runId = 'call-output-envelope-run';
+  const rows = [['fingerprint'], ['receipt-1']];
+  const step = {
+    id: 'readback',
+    prompt: 'Read the rows back.',
+    sideEffect: 'read',
+    call: { tool: 'GOOGLESHEETS_VALUES_GET', args: { spreadsheet_id: 'sheet-test' } },
+    output: {
+      type: 'object',
+      required_keys: ['rows'],
+      non_empty: ['rows'],
+      min_items: { rows: 1 },
+    },
+  };
+  const ctx = {
+    workflow: {
+      name: 'Call Output Envelope',
+      description: '',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [step],
+    },
+    workflowSlug,
+    runId,
+    inputs: {},
+    stepOutputs: {},
+    assistant: { respond: async () => ({ text: 'unused' }) },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
+
+  _setWorkflowCallNodeForTests(async () => ({
+    successful: true,
+    data: { rows },
+  }));
+  try {
+    const result = await executeStep(step as never, ctx);
+    assert.deepEqual(result, { rows });
+    const completion = readWorkflowEvents(workflowSlug, runId)
+      .find((event) => event.kind === 'step_completed' && event.stepId === step.id);
+    assert.deepEqual(completion?.output, { rows });
+  } finally {
+    _setWorkflowCallNodeForTests();
+  }
+});
+
 test('workflow conversion: a plain step routes through the GATED harness loop when CLEMMY_HARNESS_WORKFLOW=on (not the legacy core)', async () => {
   // Proves the staged workflow-step conversion (respondPreferHarness on the
   // default-off `workflow` surface) actually rides the harness when flipped on,

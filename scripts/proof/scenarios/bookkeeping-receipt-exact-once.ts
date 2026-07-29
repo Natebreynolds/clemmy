@@ -666,6 +666,13 @@ export const bookkeepingReceiptExactOnce: ScenarioDef = {
                 range,
               },
             },
+            output: {
+              type: 'object',
+              required_keys: ['values'],
+              non_empty: ['values'],
+              min_items: { values: 2 },
+              description: 'Provider readback must contain the header and exactly persisted receipt evidence.',
+            },
           },
         ],
       });
@@ -978,24 +985,10 @@ export const bookkeepingReceiptExactOnce: ScenarioDef = {
         checks,
         latency: [
           {
-            wallMs: ambiguousTurn.wallMs,
-            ttftMs: correctionMetrics?.latency[0]?.ttftMs
-              ?? correctionMetrics?.firstByteMs
-              ?? null,
-          },
-          {
-            wallMs: correctionTurn.wallMs,
-            ttftMs: correctionMetrics?.latency[1]?.ttftMs ?? null,
-          },
-          {
             wallMs: recallTurn.wallMs,
             ttftMs: recallMetrics?.latency[0]?.ttftMs
               ?? recallMetrics?.firstByteMs
               ?? null,
-          },
-          {
-            wallMs: Date.now() - startedAt - ambiguousTurn.wallMs - correctionTurn.wallMs - recallTurn.wallMs,
-            ttftMs: null,
           },
         ],
         sessionId: recallSession,
@@ -1011,6 +1004,11 @@ export const bookkeepingReceiptExactOnce: ScenarioDef = {
           mutationCommits: ledger.commits,
           needsInputBoundary:
             'manual run 1 asks; manual run 2 supplies explicit correction because workflows lack a first-class resumable needs_input node',
+          ambiguousTurnWallMs: ambiguousTurn.wallMs,
+          correctionTurnWallMs: correctionTurn.wallMs,
+          recallTurnWallMs: recallTurn.wallMs,
+          workflowLifecycleWallMs:
+            Date.now() - startedAt - ambiguousTurn.wallMs - correctionTurn.wallMs - recallTurn.wallMs,
           tokensUsed:
             (correctionMetrics?.tokensUsed ?? 0)
             + (recallMetrics?.tokensUsed ?? 0),
