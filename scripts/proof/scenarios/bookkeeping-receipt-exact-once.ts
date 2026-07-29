@@ -32,6 +32,7 @@ import type {
   DaemonHandle,
   ScenarioDef,
 } from '../types.js';
+import { PROOF_CLIENT_COMPLETION_TIMEOUT_MS } from '../timeouts.js';
 
 export const BOOKKEEPING_APPEND_TOOL = 'GOOGLESHEETS_SPREADSHEETS_VALUES_APPEND';
 export const BOOKKEEPING_READ_TOOL = 'GOOGLESHEETS_VALUES_GET';
@@ -837,7 +838,7 @@ export const bookkeepingReceiptExactOnce: ScenarioDef = {
             workflowName,
             approvedRunId,
             (run) => Boolean(run.status && NORMAL_TERMINAL_RUN_STATUSES.has(run.status)),
-            600_000,
+            PROOF_CLIENT_COMPLETION_TIMEOUT_MS,
           )
         : null;
       const finalObservations = providerObservations(daemon.home).slice(providerBaseline);

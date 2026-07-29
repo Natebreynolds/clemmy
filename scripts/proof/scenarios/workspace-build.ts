@@ -10,6 +10,7 @@
  */
 import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
+import { PROOF_CLIENT_COMPLETION_TIMEOUT_MS } from '../timeouts.js';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -45,7 +46,7 @@ export const workspaceBuild: ScenarioDef = {
       const turn = await daemon.chat(
         workspaceBuildPrompt(),
         sessionId,
-        600_000,
+        PROOF_CLIENT_COMPLETION_TIMEOUT_MS,
       );
 
       const checks: Check[] = [];

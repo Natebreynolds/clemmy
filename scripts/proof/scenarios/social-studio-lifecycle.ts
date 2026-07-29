@@ -24,6 +24,7 @@ import {
   stormCheck,
 } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
+import { PROOF_CLIENT_COMPLETION_TIMEOUT_MS } from '../timeouts.js';
 
 const SLUG = 'proof-social-studio';
 const SOURCE_ID = 'content-plan';
@@ -286,7 +287,7 @@ export const socialStudioLifecycle: ScenarioDef = {
         'Build and validate it in this turn. Do not ask a question first and do not invoke the action.',
       ].join('\n'),
       sessionId,
-      600_000,
+      PROOF_CLIENT_COMPLETION_TIMEOUT_MS,
     );
 
     checks.push({ name: 'workspace build returned HTTP 200', pass: buildTurn.httpStatus === 200, detail: `status ${buildTurn.httpStatus}` });

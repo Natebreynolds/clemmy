@@ -48,6 +48,10 @@ const { TOOL_JIT_CORE } = await import('./tool-jit.js');
 const { RunContext, Usage } = await import('@openai/agents');
 const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
 const { summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
+const {
+  markByoModelNotServed,
+  clearByoNotServedForTest,
+} = await import('../runtime/harness/byo-providers.js');
 
 async function renderAgentInstructions(agent: { instructions?: unknown }): Promise<string> {
   const instr = agent.instructions;
@@ -769,6 +773,117 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       'only the original two batch workers ran',
     );
   } finally {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('run_worker route and result telemetry use the effective post-repair BYO model', async () => {
+  resetEventLog();
+  clearByoNotServedForTest();
+  const session = createSession({ kind: 'chat', title: 'run_worker repaired route truth' });
+  const prev: Record<string, string | undefined> = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE,
+    BYO_MODEL_BASE_URL: process.env.BYO_MODEL_BASE_URL,
+    BYO_MODEL_API_KEY: process.env.BYO_MODEL_API_KEY,
+    BYO_MODEL_ID: process.env.BYO_MODEL_ID,
+    OPENAI_MODEL_WORKER: process.env.OPENAI_MODEL_WORKER,
+    CLEMMY_MODEL_ROLES_REGISTRY: process.env.CLEMMY_MODEL_ROLES_REGISTRY,
+    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
+    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
+  };
+  const requestedModels: Array<string | undefined> = [];
+  try {
+    process.env.AUTH_MODE = 'api_key';
+    process.env.MODEL_ROUTING_MODE = 'all_in';
+    process.env.BYO_MODEL_BASE_URL = 'https://api.example.test';
+    process.env.BYO_MODEL_API_KEY = 'k';
+    process.env.BYO_MODEL_ID = 'glm-5.2';
+    process.env.OPENAI_MODEL_WORKER = 'gpt-5.4';
+    process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
+    process.env.CLEMMY_MODEL_ROLES = '';
+    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
+    markByoModelNotServed('gpt-5.4');
+
+    const stubModel: import('@openai/agents').Model = {
+      async getResponse() {
+        return {
+          output: [{
+            type: 'message',
+            id: 'msg_worker_repaired',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: 'worker finished after route repair', providerData: {} }],
+          }],
+          usage: new Usage(),
+          responseId: 'resp_worker_repaired',
+        } as unknown as import('@openai/agents').ModelResponse;
+      },
+      async *getStreamedResponse() {
+        throw new Error('not used in this test');
+      },
+    };
+    const stubProvider: import('@openai/agents').ModelProvider = {
+      getModel(modelName?: string) {
+        requestedModels.push(modelName);
+        return stubModel;
+      },
+    };
+
+    const agent = await buildOrchestratorAgent();
+    const runWorker = (agent.tools ?? []).find((tool) => (tool as { name?: string }).name === 'run_worker') as {
+      invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
+    } | undefined;
+    assert.ok(runWorker);
+
+    const packet = {
+      objective: 'Produce one fictional SEO note.',
+      item: 'Auric & Vale Law',
+      resolvedTools: 'none needed',
+      context: 'This is fictional.',
+      instructions: 'Return one concise sentence.',
+      expectedOutput: 'One sentence or ERROR: <reason>.',
+      intent: 'research',
+      workManifest: {
+        id: 'repaired-worker-route',
+        contractVersion: '1',
+        phase: 'snapshot',
+        mode: 'declare',
+        phases: [{ id: 'snapshot' }],
+      },
+    };
+    const input = JSON.stringify(packet);
+    const result = await runWorker.invoke(
+      new RunContext({ sessionId: session.id }),
+      input,
+      {
+        parentRunConfig: { modelProvider: stubProvider },
+        toolCall: { name: 'run_worker', callId: 'call_worker_repaired', arguments: input },
+      },
+    );
+
+    assert.equal(result, 'worker finished after route repair');
+    assert.deepEqual(requestedModels, ['glm-5.2']);
+
+    const started = listEvents(session.id, { types: ['worker_started'] });
+    assert.equal((started[0]?.data as { model?: string }).model, 'glm-5.2');
+    assert.equal((started[0]?.data as { provider?: string }).provider, 'byo');
+
+    const routed = listEvents(session.id, { types: ['worker_model_routed'] });
+    assert.equal(routed.length, 1);
+    assert.equal((routed[0].data as { modelId?: string }).modelId, 'glm-5.2');
+    assert.equal((routed[0].data as { provider?: string }).provider, 'byo');
+    assert.equal((routed[0].data as { transport?: string }).transport, 'openai_agents_harness');
+
+    const results = listEvents(session.id, { types: ['worker_result'] });
+    assert.equal(results.length, 1);
+    assert.equal((results[0].data as { ok?: boolean }).ok, true);
+    assert.equal((results[0].data as { model?: string }).model, 'glm-5.2');
+  } finally {
+    clearByoNotServedForTest();
     for (const [key, value] of Object.entries(prev)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

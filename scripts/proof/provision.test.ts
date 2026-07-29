@@ -25,6 +25,7 @@ const ENV_KEYS = [
   'BYO_PROVIDER_DEEPSEEK_API_KEY',
   'CLAUDE_MODEL',
   'OPENAI_MODEL_PRIMARY',
+  'OPENAI_MODEL_WORKER',
   'CLEMMY_MODEL_ROLES',
   'CLEMMY_MODEL_ROLES_REGISTRY',
   'CLEMMY_DEBATE_JUDGE',
@@ -76,6 +77,11 @@ test('glm proof plan copies BYO_PROVIDERS and per-provider key slots', () => {
   assert.deepEqual(plan.expectedWorker, {
     modelId: 'deepseek-chat', provider: 'byo', source: 'role-binding',
   });
+  assert.equal(
+    plan.env.OPENAI_MODEL_WORKER,
+    'glm-5.2',
+    'the legacy fallback stays on the default BYO provider; the durable named-provider binding wins separately',
+  );
   assert.deepEqual(plan.expectedFusionChecker, {
     modelId: 'deepseek-chat', provider: 'byo', source: 'role-binding',
   });
@@ -84,6 +90,38 @@ test('glm proof plan copies BYO_PROVIDERS and per-provider key slots', () => {
     false,
     'the isolated matrix removes only global brain bindings',
   );
+});
+
+test('glm proof ignores an inactive Codex worker binding and pins the all-in BYO worker', () => {
+  const priorRoles = process.env.CLEMMY_MODEL_ROLES;
+  const priorWorker = process.env.OPENAI_MODEL_WORKER;
+  process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+    { role: 'worker', modelId: 'gpt-5.6-luna', scope: 'durable', source: 'settings' },
+    { role: 'judge', modelId: 'deepseek-chat', scope: 'durable', source: 'settings' },
+  ]);
+  process.env.OPENAI_MODEL_WORKER = 'gpt-5.4';
+  try {
+    const plan = planBrain('glm');
+    assert.deepEqual(plan.expectedWorker, {
+      modelId: 'glm-5.2', provider: 'byo', source: 'provider-slot',
+    });
+    assert.equal(
+      plan.env.OPENAI_MODEL_WORKER,
+      'glm-5.2',
+      'the isolated daemon must not cold-probe the stale Codex slot on the BYO endpoint',
+    );
+    assert.equal(
+      (JSON.parse(plan.env.CLEMMY_MODEL_ROLES) as Array<{ role: string; modelId: string }>)
+        .some((binding) => binding.role === 'worker' && binding.modelId === 'gpt-5.6-luna'),
+      true,
+      'proof provisioning does not mutate durable role bindings; all-in merely leaves this one inactive',
+    );
+  } finally {
+    if (priorRoles === undefined) delete process.env.CLEMMY_MODEL_ROLES;
+    else process.env.CLEMMY_MODEL_ROLES = priorRoles;
+    if (priorWorker === undefined) delete process.env.OPENAI_MODEL_WORKER;
+    else process.env.OPENAI_MODEL_WORKER = priorWorker;
+  }
 });
 
 test('codex proof copies non-secret role selection while pinning the exact configured brain slot', () => {

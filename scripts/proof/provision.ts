@@ -32,6 +32,7 @@ import type {
   ProofModelProvider,
   TurnResult,
 } from './types.js';
+import { PROOF_CLIENT_COMPLETION_TIMEOUT_MS } from './timeouts.js';
 import { seedIsolatedClaudeAccess } from '../lib/isolated-claude-auth.js';
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
@@ -143,7 +144,25 @@ function roleExpectations(kind: BrainKind, env: Record<string, string>): {
         : '';
   const brain = expectation(env, brainSlot, 'provider-slot');
   const workerBinding = roleModel(env, 'worker');
-  const worker = expectation(env, workerBinding || brainSlot, workerBinding ? 'role-binding' : 'provider-slot');
+  // The GLM matrix deliberately runs in all-in mode. A saved Codex/Claude
+  // worker binding is inactive under that product contract, so expecting it
+  // here makes the proof impossible by construction and can also leave a stale
+  // OPENAI_MODEL_WORKER id probing the BYO endpoint. Preserve active BYO
+  // bindings (including named-provider workers); otherwise follow the selected
+  // BYO brain exactly.
+  const allInWorkerSlot = kind === 'glm'
+    ? env.BYO_MODEL_ID || brainSlot
+    : brainSlot;
+  const activeWorkerBinding = kind === 'glm'
+    && workerBinding
+    && providerFor(workerBinding, env) !== 'byo'
+    ? undefined
+    : workerBinding;
+  const worker = expectation(
+    env,
+    activeWorkerBinding || allInWorkerSlot,
+    activeWorkerBinding ? 'role-binding' : 'provider-slot',
+  );
   const judgeBinding = roleModel(env, 'judge');
   const judgeSlot = kind === 'glm'
     ? env.BYO_MODEL_JUDGE_ID || env.BYO_MODEL_ID || ''
@@ -240,7 +259,16 @@ export function planBrain(kind: BrainKind): BrainPlan {
       skipReason: 'no BYO_MODEL_ID (or BYO_BRAIN_MODEL_ID) configured in the real home',
     };
   }
-  const env = { ...selectionEnv, BYO_MODEL_ID: byoModel };
+  const env = {
+    ...selectionEnv,
+    BYO_MODEL_ID: byoModel,
+    // Pin the legacy fallback slot to the default BYO primary. An explicit
+    // durable BYO worker binding still wins independently; copying that binding
+    // into this legacy slot would make both the default and named providers
+    // claim the same id. This prevents a stale built-in id from spending one
+    // failed worker wave without manufacturing a provider-identity collision.
+    OPENAI_MODEL_WORKER: selectionEnv.BYO_MODEL_ID || byoModel,
+  };
   for (const key of [
     'BYO_MODEL_API_KEY', 'ZHIPU_API_KEY', 'GLM_API_KEY', 'OPENROUTER_API_KEY',
   ]) {
@@ -601,7 +629,11 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
   const baseUrl = `http://127.0.0.1:${port}`;
   const headers = { authorization: `Bearer ${secret}`, 'content-type': 'application/json' };
 
-  const chat = async (message: string, sessionId: string, timeoutMs = 600_000): Promise<TurnResult> => {
+  const chat = async (
+    message: string,
+    sessionId: string,
+    timeoutMs = PROOF_CLIENT_COMPLETION_TIMEOUT_MS,
+  ): Promise<TurnResult> => {
     const started = Date.now();
     // Node fetch (undici) kills any response whose HEADERS take >300s by
     // default — a real workspace-build/long-agent turn legitimately runs past

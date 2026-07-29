@@ -1783,7 +1783,24 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           }
         }
       }
-      if (route.trace) appendWorkerRoute(route.trace);
+      // The role trace describes the model originally selected; repair/bench
+      // logic above may have changed what will actually cross the provider
+      // boundary. Persist the effective route, while retaining the selection
+      // source/intent fields for diagnosis. A successful repaired GLM worker
+      // must never be recorded as the stale gpt-* id that first triggered the
+      // provider rejection.
+      appendWorkerRoute({
+        ...(route.trace ?? {
+          seam: 'chat',
+          attemptedIntent: input.intent ?? null,
+          matchedIntent: null,
+          item: input.item,
+          source: 'default',
+        }),
+        modelId: workerModel,
+        provider: workerProvider,
+        transport: 'openai_agents_harness',
+      });
       // Dispatch with the REPAIRED model id — cloning with route.model (or the
       // build-time default) bypassed repairByoRoutedModelId, so telemetry showed
       // the repair while the actual provider call still 400'd (live 2026-07-22,
@@ -1800,12 +1817,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       try {
         assertWorkerMayStart();
         const output = await invokeWorkerWithOwnBudget(nestedWorkerTool, runContext, JSON.stringify(input), details, resolveWorkerMaxTurns(input.intent, workerMaxTurns));
-        recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), route.model ?? workerModel);
-        appendWorkerResultFromOutput(output, { model: route.model ?? workerModel, toolUses: [] });
+        recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), workerModel);
+        appendWorkerResultFromOutput(output, { model: workerModel, toolUses: [] });
         return await reduceReturn(output);
       } catch (err) {
-        appendWorkerResult({ item: input.item, ok: false, model: route.model ?? workerModel, toolUses: [], reason: workerResultReason(err) });
-        recordWorkerSubagent(`ERROR: ${workerResultReason(err)}`, route.model ?? workerModel);
+        appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err) });
+        recordWorkerSubagent(`ERROR: ${workerResultReason(err)}`, workerModel);
         // Infra-shaped failure (credentials/auth/provider config): every sibling
         // dies identically — return an actionable envelope instead of a raw
         // throw so the model stops fanning out, finishes inline, and TELLS the

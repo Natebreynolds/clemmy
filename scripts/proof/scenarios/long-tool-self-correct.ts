@@ -6,6 +6,7 @@
  */
 import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
+import { PROOF_CLIENT_COMPLETION_TIMEOUT_MS } from '../timeouts.js';
 
 const MARKER = 'MARKER-XYZ-42';
 
@@ -18,7 +19,7 @@ export const longToolSelfCorrect: ScenarioDef = {
       `Run this exact local shell command and then report its output verbatim: sleep 70 && echo ${MARKER}. `
       + 'It intentionally takes over a minute — wait for it, do not give up, do not ask me anything.',
       sessionId,
-      600_000,
+      PROOF_CLIENT_COMPLETION_TIMEOUT_MS,
     );
 
     const checks: Check[] = [];

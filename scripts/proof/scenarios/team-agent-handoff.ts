@@ -9,6 +9,7 @@ import path from 'node:path';
 
 import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
+import { PROOF_CLIENT_COMPLETION_TIMEOUT_MS } from '../timeouts.js';
 
 const RESEARCHER = 'proof-researcher';
 const BUILDER = 'proof-builder';
@@ -90,7 +91,7 @@ export const teamAgentHandoff: ScenarioDef = {
   summary: 'create 2 agents → queue request + delegation → report IDs',
   async run(daemon: DaemonHandle) {
     const sessionId = `proof-team-${Date.now().toString(36)}`;
-    const turn = await daemon.chat(PROMPT, sessionId, 600_000);
+    const turn = await daemon.chat(PROMPT, sessionId, PROOF_CLIENT_COMPLETION_TIMEOUT_MS);
 
     const researcherPath = agentPath(daemon.home, RESEARCHER);
     const builderPath = agentPath(daemon.home, BUILDER);

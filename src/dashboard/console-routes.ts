@@ -12974,6 +12974,16 @@ export function registerConsoleRoutes(
           removeEnvKey('BYO_BRAIN_MODEL_ID');
           delete process.env.BYO_BRAIN_MODEL_ID;
         }
+        // Keep the legacy worker slot aligned with the all-in BYO backend,
+        // matching the older model-backend route. Durable worker bindings stay
+        // untouched: an active BYO binding still wins, while an inactive
+        // subscription-family binding continues to be reported as inactive.
+        // Without this sync, switching brains through the newer picker could
+        // leave gpt-* here and spend a whole failed fan-out wave probing a
+        // single-family BYO endpoint before the runtime self-healed.
+        const allInWorkerModel = getByoBackendConfig().primaryId;
+        updateEnvKey('OPENAI_MODEL_WORKER', allInWorkerModel);
+        process.env.OPENAI_MODEL_WORKER = allInWorkerModel;
         updateEnvKey('MODEL_ROUTING_MODE', 'all_in');
         process.env.MODEL_ROUTING_MODE = 'all_in';
       } else {
