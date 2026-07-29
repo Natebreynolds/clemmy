@@ -1150,6 +1150,16 @@ async function runAgentCycleViaRuntime(
       } catch { /* fall through to the explicit failure below */ }
     }
     if (!decision) throw new Error('Agent cycle completed but produced no usable decision output.');
+    // The sanitizer's prose fallback exists for the SDK engine, where the
+    // structure is enforced server-side. For runtime cycles it is a hole: a
+    // mid-turn recovery narration ("Recovered successfully...") was accepted
+    // as a summary-only decision and scored a successful cycle while the
+    // delegated work sat untouched (live, codex, validator class). A cycle
+    // decision must come from parsed JSON or the cycle fails and its inputs
+    // stay intact for retry.
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('cycle_prose_only: reply was not the JSON decision contract');
+    }
     await assertAutonomyDecisionGuardrails(decision);
 
     const actions = sanitizeRuntimeCycleActions(parsed?.actions);

@@ -374,9 +374,11 @@ test('RUNTIME ENGINE: a prose-only reply fails the cycle instead of inventing ac
   delete process.env.OPENAI_API_KEY;
   try {
     const summary = await mod.processAgentAutonomyV2(assistant as never);
-    // A bare-prose reply still sanitizes into a summary-only decision — the
-    // key property is that NO action executes and the delegation is untouched.
+    // A bare-prose reply must FAIL the cycle outright: live, a mid-turn
+    // recovery narration was accepted as a summary-only decision and scored
+    // success while the delegated work sat untouched. Prose is not a decision.
     assert.equal(summary.attempted, 1);
+    assert.equal(summary.failed, 1, 'prose-only replies are not successful cycles');
   } finally {
     if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
     else process.env.AUTONOMY_V2_AGENTS = prevAgents;
