@@ -36,6 +36,7 @@ import { converseFirst } from './scenarios/converse-first.js';
 import { clarifyThenExecute } from './scenarios/clarify-then-execute.js';
 import { workspaceBuild } from './scenarios/workspace-build.js';
 import { teamAgentHandoff } from './scenarios/team-agent-handoff.js';
+import { teamDelegationRoundtrip } from './scenarios/team-delegation-roundtrip.js';
 import { pendingActionGate } from './scenarios/pending-action-gate.js';
 import { completeSetRecall } from './scenarios/complete-set-recall.js';
 import { longHorizonManifest } from './scenarios/long-horizon-manifest.js';
@@ -65,6 +66,7 @@ const DEFAULT_SCENARIOS: ScenarioDef[] = [
   clarifyThenExecute,
   workspaceBuild,
   teamAgentHandoff,
+  teamDelegationRoundtrip,
   pendingActionGate,
   longHorizonManifest,
   backgroundSteerInFlight,
