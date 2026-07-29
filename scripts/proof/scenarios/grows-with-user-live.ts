@@ -77,10 +77,17 @@ export const growsWithUserLive: ScenarioDef = {
       pass: /harborline/i.test(autoAfter),
       detail: autoAfter ? autoAfter.slice(0, 240) : 'no AUTO section content',
     });
+    // Whitespace-insensitive on the boundary: on the FIRST regeneration the
+    // marker is inserted into a file that had none, and the composer's
+    // newline joining around it is formatting, not content. The invariant is
+    // "curated CONTENT preserved verbatim" — live forensics confirmed the
+    // composer honors it while a byte-compare false-failed on the trailing
+    // newline delta (both brains, identically).
+    const curatedPreserved = curatedAfter.trimEnd() === curatedBefore.trimEnd();
     checks.push({
       name: 'growth never touches the user-owned curated half',
-      pass: curatedAfter === curatedBefore,
-      detail: curatedAfter === curatedBefore ? 'curated section byte-identical' : 'CURATED SECTION CHANGED',
+      pass: curatedPreserved,
+      detail: curatedPreserved ? 'curated content preserved verbatim' : 'CURATED CONTENT CHANGED',
     });
 
     return {
