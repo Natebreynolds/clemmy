@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { getRuntimeEnv } from '../config.js';
 import pino from 'pino';
 import { CRON_RUNS_DIR, WORKFLOW_RUNS_DIR, ensureDir } from '../tools/shared.js';
 import { listWorkflows } from '../memory/workflow-store.js';
@@ -207,9 +208,33 @@ interface ScheduledFireResult {
  * Daemon entry point. Idempotent within a minute. Safe to call every
  * 15s — only the first match per workflow per minute writes a run.
  */
+/**
+ * How many CATCH-UP workflows (a missed window, not the live minute) may fire
+ * in one tick. Per-workflow collapse already reduces N missed occurrences to
+ * one run; this is the cross-workflow limit that was missing.
+ *
+ * Shipped incident (v3.0.0, live): three heavy schedules (7:30, 8:00, 9:00)
+ * were all missed while the app was closed. On boot each collapsed correctly to
+ * one run — and then all three fired in the SAME tick. With
+ * CLEMENTINE_WORKFLOW_RUN_CONCURRENCY=3 they ran simultaneously, the daemon was
+ * SIGKILLed under the combined load, restarted into the same backlog, and
+ * repeated: downtime produced more downtime.
+ *
+ * A catch-up is by definition not urgent — its window already passed. Firing
+ * one per tick leaves the rest QUEUED and still eligible on the next tick
+ * (~15s), so a long absence drains in order instead of stampeding. Live-minute
+ * fires are never throttled. Override: CLEMENTINE_WORKFLOW_CATCHUP_PER_TICK.
+ */
+export function maxCatchupFiresPerTick(): number {
+  const raw = parseInt(getRuntimeEnv('CLEMENTINE_WORKFLOW_CATCHUP_PER_TICK', '1') || '1', 10);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 10) : 1;
+}
+
 export async function processWorkflowSchedules(now: Date = new Date()): Promise<ScheduledFireResult> {
   const result: ScheduledFireResult = { fired: [], deduped: [] };
   const minuteKey = currentMinuteKey(now);
+  // Budget for missed-window fires this tick; live-minute fires never spend it.
+  let catchupBudget = maxCatchupFiresPerTick();
 
   let workflows;
   try {
@@ -326,10 +351,28 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       continue;
     }
 
+    // Cross-workflow catch-up stagger. A fire whose matched minute is not the
+    // CURRENT minute is a missed window; those queue behind the tick budget
+    // instead of stampeding. Crucially we do NOT stamp lastRunByMinute here, so
+    // the occurrence stays eligible and fires on a later tick — queued, not lost.
+    const isCatchupFire = latestKey !== minuteKey;
+    if (isCatchupFire && catchupBudget <= 0) {
+      result.deduped.push(wf.name);
+      recordOperationalEvent({
+        source: 'workflow',
+        type: 'workflow_trigger_deduped',
+        severity: 'info',
+        actor: 'workflow-scheduler',
+        payload: { workflowName: wf.name, schedule, reason: 'catchup_staggered', matchedMinute: latestKey },
+      });
+      continue;
+    }
+
     try {
       // A long-missed window collapses to ONE catch-up run (not N), so a
       // daily 8am report fires once after a closed-overnight laptop reopens.
       const runId = enqueueScheduledRun(wf.name);
+      if (isCatchupFire) catchupBudget -= 1;
       state.lastRunByMinute[dedupeKey] = latestKey;
       result.fired.push(wf.name);
       recordOperationalEvent({
