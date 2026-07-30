@@ -466,7 +466,7 @@ const DOCTOR_INSTRUCTIONS = [
   '- A connection/auth error (ComposioToolExecutionError about auth, expired/invalid connection, 401/403): kind=reconnect_service, service=<the service>. Do NOT pretend an edit fixes an auth problem. autoApplicable=false.',
   '- A required run input was missing/empty: kind=adjust_input. autoApplicable=false.',
   '- The step RAN but its output FAILED its declared output contract because the step did NOT actually produce the deliverable — it claimed "produced a brief" but returned no real URL/file, or returned a summary instead of the artifact: kind=edit_step. Rewrite the step prompt to EXPLICITLY produce the declared shape and return the REAL artifact (the actual created URL / saved file path), not a bare claim. The newStepPrompt MUST keep the same declared output contract. autoApplicable=true.',
-  '- The step RAN and produced VALID, real data, but its declared output contract is itself WRONG — it requires a key the real data legitimately does not always carry (e.g. requires "phone" but this record has none), demands a min_items count higher than a legitimate result (7 items when 7 is a real, complete answer), or fixes a type/shape the data never actually matches: kind=edit_contract. Provide newOutputContractJson = the CORRECTED contract (loosen only what false-fails legitimate data). Do NOT loosen a contract to hide a genuinely empty or garbage output — that is a real failure, not a contract bug. When in doubt between edit_step and edit_contract, prefer edit_step (fix the work, not the check). autoApplicable=true.',
+  '- The step RAN and produced VALID, real data, but its declared output contract is itself WRONG — it requires a key the real data legitimately does not always carry (e.g. requires "phone" but this record has none), demands a min_items count higher than a legitimate result (7 items when 7 is a real, complete answer), or fixes a type/shape the data never actually matches: kind=edit_contract. Provide newOutputContractJson = the CORRECTED contract (loosen only what false-fails legitimate data). Do NOT loosen a contract to hide a genuinely empty or garbage output — that is a real failure, not a contract bug. One distinction matters here: for a RECURRING (schedule-triggered) monitor/scan, a quiet period with zero new items is often a correct, complete answer — a minimum-items floor that fails such a run is a contract bug (require the key and shape, not a floor), whereas for a one-shot deliverable workflow an empty result usually means the work itself failed. Judge which case this is from the run evidence and the trigger context you are given. When in doubt between edit_step and edit_contract, prefer edit_step (fix the work, not the check). autoApplicable=true.',
   '- The step failed because a declared INPUT BINDING is wrong — it points at a source that does not exist (a step id or input name that is not there), or a required input has no value and needs a sensible default: kind=edit_input. Provide newInputsJson = the corrected input map for the step. Only reference inputs/steps that ACTUALLY EXIST in this workflow (you are given the steps). If the input genuinely needs a value only the human can supply (an API key, a person to email), use kind=adjust_input (autoApplicable=false) instead. autoApplicable=true when the binding fix references an existing source.',
   '- The step failed because its allowed-tools SURFACE is too narrow — the error says a tool it needs is not available/exposed, AND that tool is a real one the step should be allowed to call: kind=edit_binding. Provide newAllowedToolsJson = the corrected surface (the existing tools PLUS the one it needs). NOTE: if the fix is to call a DIFFERENT tool or correct a tool NAME written in the prompt, that is kind=edit_step (rewrite the prompt), not edit_binding — edit_binding only widens/corrects the allow-list. autoApplicable=true.',
   '- If the step is a codified direct call that used to be an LLM/model step (the step has codifiedFrom metadata), and the direct call itself is brittle/wrong or fails its contract while the original model step could adapt: kind=uncodify_step. Leave all new* JSON fields null. autoApplicable=true ONLY when codifiedFrom exists.',
@@ -644,6 +644,21 @@ export async function judgeHealCrossFamily(
   }
 }
 
+/**
+ * One line of trigger context for the Doctor. A recurring scan finding zero
+ * new items on a quiet period is often a correct outcome; without knowing the
+ * workflow recurs, the Doctor cannot weigh that possibility and its own
+ * "never loosen a contract for empty output" guardrail steers it away from
+ * the right edit_contract fix. Information only — the model judges.
+ */
+export function workflowTriggerContextLine(workflow: WorkflowDefinition): string {
+  const schedule = workflow.trigger?.schedule?.trim();
+  if (!schedule) return '';
+  const tz = workflow.trigger?.timezone?.trim();
+  return `Trigger: RECURRING — runs on schedule "${schedule}"${tz ? ` (${tz})` : ''}. `
+    + 'It will run again on its own; a quiet period with zero new items can be a legitimate, complete result for a scan step.';
+}
+
 export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<WorkflowDiagnosis | null> {
   // RSH-4: re-root onto an upstream empty producer when the first blocked step
   // only inherited its failure.
@@ -667,6 +682,7 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
   const prompt = [
     `Workflow: ${input.workflow.name}`,
     `Workflow description: ${input.workflow.description ?? '(none)'}`,
+    workflowTriggerContextLine(input.workflow),
     `Blocked step id: ${primary.stepId}`,
     `Blocked reason (from the step): ${primary.reason}`,
     input.toolErrors && input.toolErrors.length

@@ -177,6 +177,44 @@ test('renders a reviewable non-mutating proposal report', () => {
   assert.match(report, /url_present: \["url"\]/);
 });
 
+test('advises when a recurring schedule carries a minimum-items floor', () => {
+  // Live class (platform-49 Slack review, 2026-07-30): a daily scan authored
+  // with min_items ≥ 1 reports a legitimately quiet day as a failed run. The
+  // advisory informs the authoring model; it never blocks the write.
+  const scanStep = {
+    id: 'main',
+    prompt: 'Daily scrape of the channel; classify requests into the tracker sheet.',
+    output: {
+      type: 'object' as const,
+      required_keys: ['url', 'leads'],
+      non_empty: ['leads'],
+      min_items: { leads: 1 },
+    },
+  };
+  const scheduled = wf({
+    trigger: { manual: true, schedule: '0 8 * * *', timezone: 'America/Los_Angeles' },
+    steps: [scanStep],
+  });
+  const warnings = workflowAuthoringAdvisories(scheduled);
+  assert.equal(warnings.filter((w) => /quiet period/i.test(w)).length, 1);
+  assert.match(warnings[0], /"main"/);
+  assert.match(warnings[0], /leads/);
+  assert.match(warnings[0], /keep the floor only if/i, 'must read as a consideration, not a rule');
+
+  // Manual one-shot: demanding items is normal — stay quiet.
+  assert.equal(
+    workflowAuthoringAdvisories(wf({ steps: [scanStep] })).filter((w) => /quiet period/i.test(w)).length,
+    0,
+  );
+
+  // The author explicitly demanded a count — that intent wins, stay quiet.
+  const explicit = wf({
+    trigger: { manual: true, schedule: '0 8 * * *' },
+    steps: [{ ...scanStep, prompt: 'Return at least 3 drafts for the daily digest.' }],
+  });
+  assert.equal(workflowAuthoringAdvisories(explicit).filter((w) => /quiet period/i.test(w)).length, 0);
+});
+
 test('advises when live research has an identity-only output contract', () => {
   const warnings = workflowAuthoringAdvisories(wf({
     steps: [

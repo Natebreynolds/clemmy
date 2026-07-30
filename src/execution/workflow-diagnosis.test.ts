@@ -39,8 +39,39 @@ const {
   detectProseSelfReportedFailure,
   diagnoseWorkflowBlock,
   prependRootCauseBlock,
+  workflowTriggerContextLine,
   _testOnly_sanitizeWorkflowDiagnosisOutput,
 } = mod;
+
+test('the Doctor is told a workflow recurs, so quiet-period emptiness is judgeable', () => {
+  // Live class (platform-49 Slack review, 2026-07-30): without trigger context
+  // the Doctor cannot distinguish "a daily scan found nothing today" (a
+  // legitimate result choked by a min_items floor → edit_contract) from "a
+  // one-shot build produced nothing" (a real failure). Context, not a rule —
+  // the model still judges from run evidence.
+  const line = workflowTriggerContextLine({
+    name: 'daily-scan',
+    description: 'scan',
+    enabled: true,
+    trigger: { manual: true, schedule: '0 8 * * *', timezone: 'America/Los_Angeles' },
+    steps: [],
+  });
+  assert.match(line, /RECURRING/);
+  assert.match(line, /0 8 \* \* \*/);
+  assert.match(line, /America\/Los_Angeles/);
+  assert.match(line, /legitimate/i);
+
+  // Non-scheduled workflows contribute nothing — the prompt stays clean.
+  assert.equal(workflowTriggerContextLine({
+    name: 'one-shot', description: 'x', enabled: true, trigger: { manual: true }, steps: [],
+  }), '');
+
+  // The line is actually wired into the Doctor's prompt, and the instructions
+  // teach the recurring-vs-one-shot distinction it enables.
+  const source = fs.readFileSync(new URL('./workflow-diagnosis.ts', import.meta.url), 'utf-8');
+  assert.match(source, /workflowTriggerContextLine\(input\.workflow\),/);
+  assert.match(source, /RECURRING \(schedule-triggered\) monitor\/scan/);
+});
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 
 test('deepSelfReportedFailure: finds a failure nested below the top level; null on healthy data', () => {

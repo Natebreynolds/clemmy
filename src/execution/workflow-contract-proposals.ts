@@ -279,9 +279,37 @@ export function hardenWeakLiveResearchOutputContract(
   });
 }
 
+const EXPLICIT_MINIMUM_RE = /\b(?:exactly|at\s+least)\s+(?:\d{1,4}|one|two|three|four|five|six|seven|eight|nine|ten)\b/i;
+
+/**
+ * A schedule-triggered scan can legitimately find zero new items on a quiet
+ * period, so a min_items floor turns a correct empty run into a reported
+ * failure. Advisory only — the authoring model (or the user) decides whether
+ * every run truly must produce items (an explicit "at least N" in the prompt
+ * is taken as that intent and stays quiet).
+ */
+function recurringMinimumItemsAdvisory(
+  workflow: WorkflowDefinition,
+  step: WorkflowStepInput,
+): string | null {
+  if (!workflow.trigger?.schedule) return null;
+  const floors = Object.entries(step.output?.min_items ?? {}).filter(([, min]) => min >= 1);
+  if (floors.length === 0) return null;
+  if (EXPLICIT_MINIMUM_RE.test(step.prompt ?? '')) return null;
+  const keys = floors.map(([key]) => key || '(root)').join(', ');
+  return (
+    `Step "${step.id}" runs on a recurring schedule but its contract requires at least one item at ${keys}. `
+    + 'A scan can legitimately find nothing on a quiet period, and that floor would report the run as failed. '
+    + 'If an empty period is a valid outcome, require the key and shape instead of a minimum; keep the floor only if every run truly must produce items.'
+  );
+}
+
 export function workflowAuthoringAdvisories(workflow: WorkflowDefinition): string[] {
   const warnings: string[] = [];
   for (const step of workflow.steps ?? []) {
+    const recurringFloor = recurringMinimumItemsAdvisory(workflow, step);
+    if (recurringFloor) warnings.push(recurringFloor);
+
     if (unattendedComposioWriteNeedsBinding(workflow, step)) {
       warnings.push(
         `Step "${step.id}" is an unattended external write through composio_execute_tool, but its prompt names no concrete mutation slug and the step cannot call composio_search_tools. Pin a proven TOOLKIT_ACTION slug plus its argument shape, or allow bounded discovery, so the run reaches the write with an executable action.`,
