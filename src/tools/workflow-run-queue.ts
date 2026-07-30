@@ -857,6 +857,11 @@ export interface QueueWorkflowRunOptions {
    *  (the source is still status:'running' on disk during a mid-completion
    *  re-pursuit queue, and must not count as "already queued"). */
   excludeRunId?: string;
+  /** Scheduler catch-up admission (v3.0.1 stampede family): marks a run born
+   *  from a MISSED schedule window. While one of these is still executable the
+   *  scheduler holds further catch-up admissions, so a post-downtime backlog
+   *  drains at run-completion pace instead of piling into the drain lane. */
+  catchupFire?: boolean;
   /** Durable lineage for whole-run requeues, so dashboards can compare attempts
    *  without inferring ancestry from timestamps or matching inputs. */
   requeuedFromRunId?: string;
@@ -1075,6 +1080,7 @@ function queueWorkflowRunUnlocked(
     workflow: name,
     inputs: normalizedInputs,
     status: 'queued',
+    ...(opts?.catchupFire ? { catchupFire: true } : {}),
     mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
     ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
     createdAt,

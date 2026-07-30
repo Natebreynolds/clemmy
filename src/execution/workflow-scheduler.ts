@@ -234,7 +234,11 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
   const result: ScheduledFireResult = { fired: [], deduped: [] };
   const minuteKey = currentMinuteKey(now);
   // Budget for missed-window fires this tick; live-minute fires never spend it.
-  let catchupBudget = maxCatchupFiresPerTick();
+  // A still-executable catch-up run zeroes this tick's budget: admission-time
+  // staggering alone re-converges into concurrent heavy runs (see
+  // hasExecutableCatchupRun). Held occurrences park the watermark below, so
+  // nothing is lost while the in-flight run finishes.
+  let catchupBudget = hasExecutableCatchupRun() ? 0 : maxCatchupFiresPerTick();
   // Earliest occurrence HELD by the stagger this pass. The end-of-pass
   // watermark must not advance beyond it, or the held occurrence falls out of
   // the next tick's window and is silently dropped instead of queued.
@@ -385,7 +389,7 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
     try {
       // A long-missed window collapses to ONE catch-up run (not N), so a
       // daily 8am report fires once after a closed-overnight laptop reopens.
-      const runId = enqueueScheduledRun(wf.name);
+      const runId = enqueueScheduledRun(wf.name, isCatchupFire);
       if (isCatchupFire) catchupBudget -= 1;
       state.lastRunByMinute[dedupeKey] = latestKey;
       result.fired.push(wf.name);
@@ -488,6 +492,43 @@ function countActiveRunsFor(workflowName: string): { pending: number; parked: nu
   return { pending, parked };
 }
 
+/** True while any catch-up-born run is still EXECUTABLE (queued/running/
+ *  finalizing). Enqueue-time staggering alone only spaces admissions by one
+ *  tick (~15s) — heavy runs take minutes, so three staggered admissions still
+ *  become three CONCURRENT runs and re-create the incident load. Serializing
+ *  on completion makes the backlog drain at run-completion pace: one heavy
+ *  catch-up at a time. Parked runs do not hold the gate (an approval can sit
+ *  for days; the catch-up window is capped at 24h), and a crashed run is
+ *  released by the stale-run reaper.
+ */
+function hasExecutableCatchupRun(): boolean {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return false;
+  let files: string[];
+  try {
+    files = readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json'));
+  } catch {
+    return false;
+  }
+  for (const file of files) {
+    try {
+      const raw = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as {
+        catchupFire?: boolean;
+        status?: string;
+      };
+      if (raw.catchupFire !== true) continue;
+      if (
+        !raw.status
+        || raw.status === 'queued'
+        || raw.status === 'running'
+        || raw.status === 'finalizing'
+      ) return true;
+    } catch {
+      // Unreadable record — ignore. The reaper will sweep it eventually.
+    }
+  }
+  return false;
+}
+
 /** Daily-bucketed system notification so the user knows their schedule
  *  is firing faster than the workflow can finish. We import lazily to
  *  avoid a runtime cycle (notifications → maintenance → scheduler). */
@@ -564,11 +605,12 @@ function emitCatchupNotice(workflowName: string, missed: number, firedMinuteKey:
 
 /** Queues the scheduled run record and returns its id (so the caller can correlate a
  *  workflow_trigger_fired telemetry event to the run it enqueued). */
-function enqueueScheduledRun(workflowName: string): string {
+function enqueueScheduledRun(workflowName: string, catchupFire = false): string {
   const queued = queueWorkflowRun(workflowName, {}, {
     source: 'schedule',
     idPrefix: 'sched',
     dedupe: false,
+    ...(catchupFire ? { catchupFire: true } : {}),
   });
   if (!queued.id) throw new Error(queued.message || `Scheduled workflow "${workflowName}" did not return a run id.`);
   return queued.id;
