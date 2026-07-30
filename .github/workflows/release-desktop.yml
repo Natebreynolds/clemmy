@@ -119,6 +119,31 @@ jobs:
           echo "candidate=false" >> "$GITHUB_OUTPUT"
           echo "mac_only=$mac_only" >> "$GITHUB_OUTPUT"
 
+      # A production tag without [mac-only] will build Windows, and the Windows
+      # job fails closed without signing secrets — so surface that here, before
+      # the expensive gates and the 35-minute macOS build, not after them.
+      - name: Fail fast on missing Windows signing secrets
+        if: steps.release-metadata.outputs.candidate == 'false' && steps.release-metadata.outputs.mac_only != 'true'
+        shell: bash
+        env:
+          WINDOWS_CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          WINDOWS_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for name in WINDOWS_CSC_LINK WINDOWS_CSC_KEY_PASSWORD; do
+            value="${!name-}"
+            if [[ -z "$value" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::This production tag builds Windows, but the Windows signing secrets are missing: ${missing[*]}. Configure them, or retag with [mac-only] in the tagged commit message to skip Windows intentionally."
+            exit 1
+          fi
+          echo "Windows signing secrets present for the production Windows build."
+
       - name: Setup Node
         uses: actions/setup-node@v6
         with:

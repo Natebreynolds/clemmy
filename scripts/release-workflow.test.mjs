@@ -159,6 +159,50 @@ test('Windows production builds fail closed without signing secrets while privat
   assert.match(metadataScript, /mac_only=\$mac_only.*GITHUB_OUTPUT/);
 });
 
+test('preflight fails fast when a production tag builds Windows without signing secrets', () => {
+  const preflight = workflow.jobs?.preflight;
+  const steps = preflight?.steps ?? [];
+  const failFast = steps.find(
+    (step) => step?.name === 'Fail fast on missing Windows signing secrets',
+  );
+  assert.ok(failFast, 'preflight must surface missing Windows secrets before the expensive gates');
+
+  const condition = String(failFast?.if ?? '');
+  assert.match(condition, /outputs\.candidate == 'false'/);
+  assert.match(condition, /outputs\.mac_only != 'true'/);
+  assert.equal(failFast?.env?.WINDOWS_CSC_LINK, '${{ secrets.WINDOWS_CSC_LINK }}');
+  assert.equal(
+    failFast?.env?.WINDOWS_CSC_KEY_PASSWORD,
+    '${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}',
+  );
+
+  const script = String(failFast?.run ?? '');
+  assert.match(script, /\[mac-only\]/, 'the error must name the intentional skip escape hatch');
+
+  const unsignedProduction = runBash(script, {});
+  assert.equal(unsignedProduction.status, 1);
+  assert.match(
+    `${unsignedProduction.stdout}\n${unsignedProduction.stderr}`,
+    /WINDOWS_CSC_LINK.*WINDOWS_CSC_KEY_PASSWORD/,
+  );
+
+  const partiallySigned = runBash(script, { WINDOWS_CSC_LINK: 'private-certificate' });
+  assert.equal(partiallySigned.status, 1);
+  assert.match(`${partiallySigned.stdout}\n${partiallySigned.stderr}`, /WINDOWS_CSC_KEY_PASSWORD/);
+
+  const fullySigned = runBash(script, {
+    WINDOWS_CSC_LINK: 'private-certificate',
+    WINDOWS_CSC_KEY_PASSWORD: 'private-password',
+  });
+  assert.equal(fullySigned.status, 0, fullySigned.stderr);
+
+  const failFastIndex = steps.indexOf(failFast);
+  const metadataIndex = steps.findIndex((step) => step?.id === 'release-metadata');
+  const installIndex = steps.findIndex((step) => step?.name === 'Install dependencies');
+  assert.ok(metadataIndex < failFastIndex, 'the check needs the computed mac_only output');
+  assert.ok(failFastIndex < installIndex, 'the check must run before dependency install and the gate suite');
+});
+
 test('production Windows verifies Authenticode after packaging while private candidates remain unsigned-compatible', () => {
   const windowsJob = workflow.jobs?.['release-windows'];
   const signatureStep = (windowsJob?.steps ?? []).find(
