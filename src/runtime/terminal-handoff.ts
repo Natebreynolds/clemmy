@@ -115,15 +115,21 @@ export async function openTerminalAuthSession(catalogId: string): Promise<Termin
     '-e', `tell application "Terminal" to do script "${escaped}"`,
   ]);
   if (!result.ok) {
-    // -1743 is the TCC automation denial; name the fix instead of a bare error.
+    // -1743 = TCC automation denial; -1712 = AppleEvent timeout, which in
+    // practice means the "allow Clementine to control Terminal" dialog is
+    // sitting unanswered (observed live on first use). Name the fix for
+    // each instead of a bare error.
     const denied = /-1743|not authoriz/i.test(result.stderr);
+    const timedOut = /-1712|timed out/i.test(result.stderr);
     logger.warn({ cli: catalogId, stderr: result.stderr.slice(0, 400) }, 'terminal hand-off failed');
     return {
       ok: false,
       command,
       message: denied
         ? `macOS blocked Clementine from controlling Terminal. Allow it under System Settings → Privacy & Security → Automation → Clementine → Terminal, then try again — or run \`${command}\` yourself.`
-        : `Could not open Terminal automatically. Run \`${command}\` in your own terminal instead.`,
+        : timedOut
+          ? `macOS is waiting for permission — look for a dialog asking to allow Clementine to control Terminal, click Allow, then try again. (The Terminal window may also have opened late; check before re-running.) Fallback: run \`${command}\` yourself.`
+          : `Could not open Terminal automatically. Run \`${command}\` in your own terminal instead.`,
     };
   }
   watchForSignIn(entry.id);

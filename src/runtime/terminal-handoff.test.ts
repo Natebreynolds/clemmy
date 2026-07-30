@@ -75,3 +75,12 @@ test('a generic osascript failure falls back to the manual command', async () =>
   assert.equal(result.ok, false);
   assert.match(result.message, /Run `.+` in your own terminal/);
 });
+
+test('an unanswered permission dialog (-1712 AppleEvent timeout, observed live) points at the waiting prompt', async () => {
+  const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
+  _testOnly_setOsaExec(async () => ({ ok: false, stderr: '71:120: execution error: Terminal got an error: AppleEvent timed out. (-1712)' }));
+  const result = await openTerminalAuthSession(interactive.id);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /waiting for permission|click Allow/i);
+  assert.ok(result.message.includes(interactive.authCommand!), 'the manual command remains the fallback');
+});
