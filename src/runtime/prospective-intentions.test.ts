@@ -419,10 +419,10 @@ test('status and source filters are applied before limits, and counts include te
 });
 
 test('capture directive fires only for concrete future commitments', () => {
-  assert.match(
-    prospective.prospectiveCaptureDirective('Remind me tomorrow to review the proposal') ?? '',
-    /Persist it/,
-  );
+  const reminderDirective = prospective.prospectiveCaptureDirective('Remind me tomorrow to review the proposal') ?? '';
+  assert.match(reminderDirective, /Persist it/);
+  assert.match(reminderDirective, /set_timer/);
+  assert.match(reminderDirective, /task_add TODO does not fire/);
   assert.match(
     prospective.prospectiveCaptureDirective('Keep an eye on the inbox and tell me if Acme replies') ?? '',
     /future cue/,

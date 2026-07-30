@@ -126,6 +126,7 @@ writeFileSync(
 
 const {
   buildAgentContextPacket,
+  projectCommandsLineForInput,
   detectMultiItemIntent,
   detectMultiItemIntentFromConversation,
   fanoutDirectiveLine,
@@ -137,6 +138,7 @@ const {
   closeProspectiveIntentionsDbForTest,
   upsertProspectiveIntention,
 } = await import('../prospective-intentions.js');
+const awaitedShared = await import('../../tools/shared.js');
 
 test.after(() => {
   closeProspectiveIntentionsDbForTest();
@@ -916,4 +918,45 @@ test('context packet states provider-access facts: no raw key -> OAuth-lane-only
     if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
     if (prevByo === undefined) delete process.env.BYO_PROVIDERS; else process.env.BYO_PROVIDERS = prevByo;
   }
+});
+
+test('project commands: a matching ask surfaces the project_run route; unrelated asks pay no tax', (t) => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), 'clemmy-packet-projects-'));
+  const project = path.join(workspace, 'proposal-builder');
+  mkdirSync(path.join(project, '.claude', 'commands'), { recursive: true });
+  writeFileSync(path.join(project, 'package.json'), '{"name":"proposal-builder"}', 'utf-8');
+  writeFileSync(path.join(project, '.claude', 'commands', 'seo-audit.md'), '# audit', 'utf-8');
+  const shared = awaitedShared;
+  shared.updateEnvKey('WORKSPACE_DIRS', workspace);
+  shared.clearWorkspaceProjectCache();
+  t.after(() => {
+    shared.updateEnvKey('WORKSPACE_DIRS', '');
+    shared.clearWorkspaceProjectCache();
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  const matched = buildAgentContextPacket(
+    'build me an seo audit for acme.com',
+    { enabled: true, hitCount: 0, injected: false },
+  );
+  assert.equal(matched.projectCommands.length, 1, 'the /seo-audit command should rank for an SEO-audit ask');
+  assert.match(matched.projectCommands[0].name, /seo-audit in proposal-builder/);
+  assert.match(matched.projectCommands[0].description, /project_run/);
+
+  const unrelated = buildAgentContextPacket(
+    'What is the capital of France?',
+    { enabled: true, hitCount: 0, injected: false },
+  );
+  assert.equal(unrelated.projectCommands.length, 0, 'unrelated turns must not carry project-command noise');
+
+  // Lane-parity export: the Claude brain builds its context piecewise and
+  // does NOT consume the packet — live 07-30 it hand-rolled an in-loop audit
+  // because the route block only existed packet-side. The line export must
+  // carry the same block (and the same silence on unrelated turns).
+  const line = projectCommandsLineForInput('build me an seo audit for acme.com');
+  assert.ok(line, 'parity export returns the block for a matching ask');
+  assert.match(line!, /seo-audit in proposal-builder/);
+  assert.match(line!, /project_run/);
+  assert.match(line!, /Do NOT rebuild the deliverable by hand/);
+  assert.equal(projectCommandsLineForInput('What is the capital of France?'), null);
 });

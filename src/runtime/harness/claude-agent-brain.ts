@@ -66,7 +66,7 @@ import {
 import { resolveWriteEvidence } from './work-report.js';
 import { gatherSessionSkills } from './skill-execution.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../../memory/skill-store.js';
-import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput } from './context-packet.js';
+import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput, projectCommandsLineForInput } from './context-packet.js';
 import { looksLikeToolCallShape, looksLikeToolCallShapeStreaming } from './tool-narration-shapes.js';
 import { createReplyStreamExtractor } from './reply-stream.js';
 import { markRunInFlight } from './restart-recovery.js';
@@ -1136,6 +1136,11 @@ async function buildClaudeAgentBrainTurnContext(
   // isn't repeated. Bounded to a couple of lines; empty for most turns.
   let pitfalls = '';
   try { pitfalls = knownPitfallLineForInput(request.message ?? '') ?? ''; } catch { pitfalls = ''; }
+  // Project-command deliverable routes (parity with the context packet — this
+  // lane doesn't consume the packet): when the ask matches a local project's
+  // own slash command, steer to project_run instead of an in-loop rebuild.
+  let projectRoutes = '';
+  try { projectRoutes = projectCommandsLineForInput(request.message ?? '') ?? ''; } catch { projectRoutes = ''; }
   let harnessHealth = '';
   try { harnessHealth = renderHarnessCapabilityHealthForContext({ limit: 3 }); } catch { harnessHealth = ''; }
   // CONVERGENCE: carry the user's answer forward and forbid re-asking the
@@ -1160,6 +1165,7 @@ async function buildClaudeAgentBrainTurnContext(
       fanoutDirective,
       confirmBeat,
       pitfalls,
+      projectRoutes,
     ].filter(Boolean).join('\n\n'),
     memoryPrimer,
   };

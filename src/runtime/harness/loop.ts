@@ -7604,6 +7604,19 @@ export interface OrphanedToolReport {
   directive: string;
 }
 
+/**
+ * A non-destructive view of completed stranded tools. The caller must first
+ * durably retain `reports`, then call `acknowledge`. Passing a subset lets a
+ * restarted outbox acknowledge only the exact logical calls it owns, without
+ * consuming newer completions from the same session.
+ */
+export interface OrphanedToolCompletionClaim {
+  reports: OrphanedToolReport[];
+  sourceCallIds: string[];
+  expiredCallIds: string[];
+  acknowledge: (logicalCallIds?: readonly string[]) => void;
+}
+
 /** One-line result summary for the report directive — a run_batch's ledger counts
  *  or a plain tool_returned preview. */
 function summarizeOrphanCompletion(toolName: string, returnedData: unknown, batchData: unknown): string {
@@ -7631,19 +7644,25 @@ function buildOrphanReportDirective(toolName: string, resultSummary: string): st
 }
 
 /**
- * Reunify completed stranded tools into report directives. For each registered
- * `orphaned_tool_inflight` not yet reported: if the tool has since completed (a
- * `tool_returned` for its callId, or — for run_batch — a `batch_completed` after
- * it), emit `orphaned_tool_reported` (dedup) and return a report directive. An
- * orphan whose tool never completes within ORPHAN_TOOL_MAX_AGE_MS is dropped
- * (marked reported with expired:true) so it can't linger. Idempotent: a second
- * drain returns nothing for an already-reported orphan. The daemon/next-turn poke
- * fires a report turn (runConversation) per returned directive.
+ * Inspect completed stranded tools without consuming their source evidence.
+ * `acknowledge` is idempotent and writes the existing
+ * `orphaned_tool_reported` marker only after the caller has durably accepted
+ * ownership. This closes the crash gap between event-log discovery and the
+ * report outbox.
  */
-export function drainOrphanedToolCompletions(sessionId: string): OrphanedToolReport[] {
+export function claimOrphanedToolCompletions(sessionId: string): OrphanedToolCompletionClaim {
   const reports: OrphanedToolReport[] = [];
+  const sourceCallIds: string[] = [];
+  const expiredCallIds: string[] = [];
   let events: EventRow[];
-  try { events = listEvents(sessionId); } catch { return reports; }
+  try { events = listEvents(sessionId); } catch {
+    return {
+      reports,
+      sourceCallIds,
+      expiredCallIds,
+      acknowledge: () => {},
+    };
+  }
   const pairs = pairTransportMirrorToolCalls(events);
   const reported = new Set(
     events.filter((e) => e.type === 'orphaned_tool_reported')
@@ -7697,34 +7716,69 @@ export function drainOrphanedToolCompletions(sessionId: string): OrphanedToolRep
       ? events.filter((e) => e.type === 'batch_completed' && Date.parse(e.createdAt) >= atMs).slice(-1)[0]
       : undefined;
     if (returnedEvent || batchDone) {
-      for (const marker of group.markers) {
-        safeAppend({
-          sessionId,
-          turn: marker.turn,
-          role: 'system',
-          type: 'orphaned_tool_reported',
-          data: { callId: marker.callId, logicalCallId: group.logicalCallId, toolName: marker.toolName },
-        });
-        reported.add(marker.callId);
-      }
       const summary = summarizeOrphanCompletion(orphan.toolName, returnedEvent?.data, batchDone?.data);
       reports.push({ callId: group.logicalCallId, toolName: orphan.toolName, directive: buildOrphanReportDirective(orphan.toolName, summary) });
+      sourceCallIds.push(group.logicalCallId);
       continue;
     }
     if (Number.isFinite(atMs) && Date.now() - atMs > ORPHAN_TOOL_MAX_AGE_MS) {
-      for (const marker of group.markers) {
-        safeAppend({
-          sessionId,
-          turn: marker.turn,
-          role: 'system',
-          type: 'orphaned_tool_reported',
-          data: { callId: marker.callId, logicalCallId: group.logicalCallId, toolName: marker.toolName, expired: true },
-        });
-        reported.add(marker.callId);
-      }
+      expiredCallIds.push(group.logicalCallId);
     }
   }
-  return reports;
+
+  return {
+    reports,
+    sourceCallIds,
+    expiredCallIds,
+    acknowledge: (logicalCallIds = [...sourceCallIds, ...expiredCallIds]) => {
+      const selected = new Set(logicalCallIds);
+      if (selected.size === 0) return;
+      // Re-read at acknowledgement time so a retry after a partial write or a
+      // concurrent acknowledgement never appends a second marker.
+      const currentReported = new Set(
+        listEvents(sessionId, { types: ['orphaned_tool_reported'] })
+          .map((event) => String((event.data as { callId?: unknown } | undefined)?.callId ?? '')),
+      );
+      for (const group of groups.values()) {
+        if (!selected.has(group.logicalCallId)) continue;
+        const mirrorCallId = pairs.canonicalToMirrorCallId.get(group.logicalCallId);
+        const linkedCallIds = new Set([
+          group.logicalCallId,
+          ...(mirrorCallId ? [mirrorCallId] : []),
+          ...group.markers.map((marker) => marker.callId),
+        ]);
+        if ([...linkedCallIds].some((callId) => currentReported.has(callId))) continue;
+        const expired = expiredCallIds.includes(group.logicalCallId);
+        for (const marker of group.markers) {
+          appendEvent({
+            sessionId,
+            turn: marker.turn,
+            role: 'system',
+            type: 'orphaned_tool_reported',
+            data: {
+              callId: marker.callId,
+              logicalCallId: group.logicalCallId,
+              toolName: marker.toolName,
+              ...(expired ? { expired: true } : {}),
+            },
+          });
+          currentReported.add(marker.callId);
+        }
+      }
+    },
+  };
+}
+
+/**
+ * Legacy consuming facade. New production handoffs should use
+ * `claimOrphanedToolCompletions`, durably store the reports, then acknowledge.
+ * Keeping this export avoids changing direct callers that already own their
+ * own durability boundary.
+ */
+export function drainOrphanedToolCompletions(sessionId: string): OrphanedToolReport[] {
+  const claim = claimOrphanedToolCompletions(sessionId);
+  claim.acknowledge();
+  return claim.reports;
 }
 
 /** Record the self-heal in the trace (attempt is 1-based). Emitted by the loop

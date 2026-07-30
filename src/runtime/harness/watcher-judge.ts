@@ -33,6 +33,21 @@ export function watcherJudgeEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WATCHER_JUDGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
+/**
+ * Workflow nodes already have durable outputs, dependency barriers, terminal
+ * goal proof, and effect-specific gates. A cadence-based model reviewer after
+ * every few completed nodes adds cost and can steer healthy work at an
+ * arbitrary (non-semantic) boundary, so the workflow mount is opt-in until it
+ * can be triggered only at meaningful merge/risk boundaries.
+ *
+ * The global watcher kill-switch still wins. This separate knob intentionally
+ * leaves the existing long interactive-turn watcher behavior unchanged.
+ */
+export function workflowWatcherJudgeEnabled(): boolean {
+  if (!watcherJudgeEnabled()) return false;
+  return (getRuntimeEnv('CLEMMY_WORKFLOW_WATCHER_JUDGE', 'off') ?? 'off').trim().toLowerCase() === 'on';
+}
+
 /** Tool calls between trajectory checks. Low enough to catch drift before it
  *  compounds, high enough that a focused run sees at most a few checks. */
 export function watcherCheckIntervalTools(): number {

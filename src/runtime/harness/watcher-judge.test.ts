@@ -16,6 +16,7 @@ import {
   WATCHER_JUDGE_SYSTEM_PROMPT,
   watcherCheckIntervalTools,
   watcherJudgeEnabled,
+  workflowWatcherJudgeEnabled,
 } from './watcher-judge.js';
 
 const baseGate = {
@@ -95,22 +96,29 @@ test('prompt: renders goal, declared criteria, tool evidence, and the latest not
   assert.match(p, /Drafting the remaining three/);
 });
 
-test('knobs: default on, interval defaults to 12 and rejects sub-2 overrides', () => {
+test('knobs: chat defaults on, workflow mount defaults off, and the global kill-switch wins', () => {
   const prevOn = process.env.CLEMMY_WATCHER_JUDGE;
+  const prevWorkflowOn = process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE;
   const prevInt = process.env.CLEMMY_WATCHER_INTERVAL_TOOLS;
   try {
     delete process.env.CLEMMY_WATCHER_JUDGE;
+    delete process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE;
     delete process.env.CLEMMY_WATCHER_INTERVAL_TOOLS;
     assert.equal(watcherJudgeEnabled(), true);
+    assert.equal(workflowWatcherJudgeEnabled(), false);
+    process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE = 'on';
+    assert.equal(workflowWatcherJudgeEnabled(), true);
     assert.equal(watcherCheckIntervalTools(), 12);
     process.env.CLEMMY_WATCHER_JUDGE = 'off';
     assert.equal(watcherJudgeEnabled(), false);
+    assert.equal(workflowWatcherJudgeEnabled(), false);
     process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '1';
     assert.equal(watcherCheckIntervalTools(), 12, 'sub-2 interval rejected');
     process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '4';
     assert.equal(watcherCheckIntervalTools(), 4);
   } finally {
     if (prevOn === undefined) delete process.env.CLEMMY_WATCHER_JUDGE; else process.env.CLEMMY_WATCHER_JUDGE = prevOn;
+    if (prevWorkflowOn === undefined) delete process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE; else process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE = prevWorkflowOn;
     if (prevInt === undefined) delete process.env.CLEMMY_WATCHER_INTERVAL_TOOLS; else process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = prevInt;
   }
 });

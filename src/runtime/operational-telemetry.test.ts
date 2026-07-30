@@ -22,6 +22,7 @@ test('operational event taxonomy includes release-critical graph and routing eve
     'workflow_graph_patch_applied',
     'workflow_checkpoint_created',
     'workflow_trigger_fired',
+    'workflow_catchup_held',
   ]) {
     assert.ok(WORKFLOW_OPERATIONAL_EVENT_TYPES.includes(type as never), `missing ${type}`);
     assert.ok(isOperationalEventType(type));

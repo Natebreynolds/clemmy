@@ -109,6 +109,11 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'task_add',
   'task_update',
   'task_hygiene',
+  // A reminder explicitly requested in the current turn is a reversible local
+  // commitment record. Its eventual effect is only a Clementine notification,
+  // so asking for a second approval would add friction without protecting an
+  // external system.
+  'set_timer',
   'goal_upsert',
   // Current focus — local SQLite attention pointer. Pure local writes,
   // no external surface. Pausing for approval on these would force the

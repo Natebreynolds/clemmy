@@ -211,6 +211,34 @@ export function withFileLockSync<T>(filePath: string, work: () => T): T {
   }
 }
 
+/**
+ * Fail-closed synchronous lock for durable commitments. Unlike the hot-path
+ * best-effort variant above, this never runs the mutation without ownership:
+ * a timeout is surfaced so callers can retry without risking a lost update.
+ */
+export function withFileLockSyncStrict<T>(filePath: string, work: () => T): T {
+  const startedAt = Date.now();
+  let locked = tryAcquireFileLock(filePath);
+  while (!locked) {
+    if (Date.now() - startedAt > LOCK_MAX_WAIT_MS) {
+      throw new BoundaryError({
+        kind: 'state.write_failed',
+        retryable: true,
+        userMessage: `Couldn't get a write lock on ${path.basename(filePath)} — another process may be stuck. Try again.`,
+        operatorMessage: `withFileLockSyncStrict timeout after ${LOCK_MAX_WAIT_MS}ms on ${filePath}`,
+        context: { filePath, waitedMs: Date.now() - startedAt },
+      });
+    }
+    sleepSync(LOCK_RETRY_MS);
+    locked = tryAcquireFileLock(filePath);
+  }
+  try {
+    return work();
+  } finally {
+    releaseFileLock(filePath);
+  }
+}
+
 // -------------------------------------------------------- atomicJsonMutate
 
 /**

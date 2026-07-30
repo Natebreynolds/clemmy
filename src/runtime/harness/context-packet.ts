@@ -7,6 +7,7 @@ import {
   skillEligibleForAutomaticRecall,
 } from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
+import { listWorkspaceProjects } from '../../tools/shared.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
 import { pinnedCalendarRuleLabels } from './constraint-guard.js';
@@ -80,6 +81,9 @@ export interface AgentContextPacket {
   };
   skills: RankedContextCandidate[];
   workflows: RankedContextCandidate[];
+  /** Local project slash commands (proposal-builder's /seo-audit, …) whose
+   *  names match the request — the project_run route to the REAL deliverable. */
+  projectCommands: RankedContextCandidate[];
   toolScope: McpToolScope;
   mcp: Array<Pick<MCPServerHealthSnapshot, 'slug' | 'state' | 'toolCount' | 'failureCount' | 'lastError'>>;
   healthWarnings: string[];
@@ -389,6 +393,67 @@ function rankWorkflows(input: string): RankedContextCandidate[] {
   }
 }
 
+const PROJECT_COMMANDS_INSTRUCTION = 'The user\'s local project already produces this deliverable with its own slash command, skills, and connected data. Offer to run it via project_run (one approval, runs in the background, you poll status and deliver the produced files). Do NOT rebuild the deliverable by hand in-loop when a matching project command exists.';
+
+/** Project slash commands as deliverable routes. When the ask matches a
+ *  command a project already implements (its own skills, MCP creds, and
+ *  templates behind it), the honest answer is to DRIVE that project via
+ *  project_run — an in-loop rebuild produces a lookalike, not the real
+ *  deliverable. Matching is deliberately strict (two token hits or an
+ *  explicit name) so unrelated turns pay zero prompt tax. */
+function rankProjectCommands(input: string): RankedContextCandidate[] {
+  const queryTokens = tokens(input);
+  if (queryTokens.length === 0) return [];
+  try {
+    const candidates: Array<RankedContextCandidate & { matchCount: number }> = [];
+    for (const project of listWorkspaceProjects()) {
+      for (const command of project.capabilities?.commands ?? []) {
+        const { score, matched } = candidateScore(queryTokens, [
+          { text: command.replace(/[-:]/g, ' '), weight: 6 },
+          { text: project.name.replace(/[-]/g, ' '), weight: 3 },
+          { text: project.description, weight: 2 },
+        ]);
+        if (score <= 0) continue;
+        candidates.push({
+          name: `/${command} in ${project.name}`,
+          description: `project_run {"action":"start","project":"${project.name}","prompt":"/${command} <args>"} — runs the project's own command via the user's CLI.`,
+          score,
+          reason: matched.length > 0 ? `matched ${matched.join(', ')}` : '',
+          matchCount: matched.length,
+        });
+      }
+    }
+    return candidates
+      .filter((candidate) => candidate.score >= 8 && (
+        candidate.matchCount >= 2 || explicitlyNamesCandidate(input, candidate.name)
+      ))
+      .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+      .slice(0, MAX_CANDIDATES)
+      .map(({ matchCount: _matchCount, ...candidate }) => candidate);
+  } catch {
+    return [];
+  }
+}
+
+/** Lane-parity export (same contract as knownPitfallLineForInput): the
+ *  project-commands deliverable-route block for a raw user input, for lanes
+ *  that do not consume the context packet (the Claude brain builds its turn
+ *  context piecewise — live 07-30: an "seo audit" ask on the Claude brain
+ *  got a hand-rolled in-loop audit because this section never reached it). */
+export function projectCommandsLineForInput(input: string): string | null {
+  try {
+    const candidates = rankProjectCommands(input);
+    if (candidates.length === 0) return null;
+    return renderCandidates(
+      'Project commands (the real deliverable route)',
+      candidates,
+      PROJECT_COMMANDS_INSTRUCTION,
+    ).join('\n');
+  } catch {
+    return null;
+  }
+}
+
 function existingBaseDir(): string {
   let cursor = BASE_DIR;
   while (cursor && cursor !== path.dirname(cursor)) {
@@ -537,6 +602,7 @@ export function buildAgentContextPacket(
   const constrainedWorkflowNode = opts?.sessionKind === 'workflow';
   const skills = constrainedWorkflowNode ? [] : rankSkills(input);
   const workflows = constrainedWorkflowNode ? [] : rankWorkflows(input);
+  const projectCommands = constrainedWorkflowNode ? [] : rankProjectCommands(input);
   const toolScope = summarizeToolScope(input);
   const mcp = lightenQa || constrainedWorkflowNode ? [] : mcpHealth();
   const healthWarnings = [
@@ -646,6 +712,7 @@ export function buildAgentContextPacket(
     // this turn will likely use — surfaced BEFORE acting so a known mistake
     // isn't repeated (they used to be reachable only via skill_read).
     pitfallsForSkills(skills.map((s) => s.name)),
+    ...renderCandidates('Project commands (the real deliverable route)', projectCommands, PROJECT_COMMANDS_INSTRUCTION),
     ...renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. If the user asks to RUN/start/kick off something by name — even a loose one ("run my email flow", "kick off the prospect routine") — call workflow_run with their exact phrasing: the resolver matches it to the right saved workflow (or asks which) and confirms before anything runs, then it executes in the background and reports back here. Do NOT auto-run a workflow the user did not ask to run; for a task that merely resembles a saved workflow, do it directly and offer to save it as a workflow afterward.'),
     healthWarnings.length > 0 ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}` : 'Health warnings: none.',
     agentSystem.text,
@@ -667,6 +734,7 @@ export function buildAgentContextPacket(
     },
     skills,
     workflows,
+    projectCommands,
     toolScope,
     mcp,
     healthWarnings,

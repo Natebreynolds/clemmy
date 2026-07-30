@@ -80,7 +80,7 @@ const {
   finishRunAttempt,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded, harnessRunContextStorage } = await import('./brackets.js');
@@ -6810,6 +6810,85 @@ test('orphaned tool: the sweep driver fires ONE report turn per completed orphan
   assert.match(fired[0].directive, /3\/3 succeeded/);
   // Idempotent across ticks: a second sweep fires nothing.
   assert.equal(sweepOrphanedToolReports({ now: () => Date.now(), recentSessionIds: () => [sess], drain: (id) => drainOrphanedToolCompletions(id), fire: () => { throw new Error('should not fire'); } }).fired, 0);
+});
+
+test('orphaned tool: production claim is acknowledged only after durable outbox handoff', async () => {
+  resetEventLog();
+  const {
+    _testOnly_createOrphanReportCoordinator,
+    sweepOrphanedToolReports,
+  } = await import('../../execution/orphan-tool-reports.js');
+  const makeCompletedOrphan = (sessionId: string, callId: string): void => {
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'Clem',
+      type: 'tool_called',
+      data: { tool: 'run_batch', callId, arguments: '{}' },
+    });
+    recordOrphanedToolInFlight(sessionId, 1);
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'system',
+      type: 'batch_completed',
+      data: { batchId: `batch-${callId}`, total: 2, succeeded: 2, failed: 0 },
+    });
+  };
+
+  const failedSession = createSession({ kind: 'chat' }).id;
+  makeCompletedOrphan(failedSession, 'claim-failed-outbox');
+  const blockedParent = path.join(mkdtempSync(path.join(os.tmpdir(), 'clem-orphan-claim-fail-')), 'file');
+  writeFileSync(blockedParent, 'not a directory');
+  const failedCoordinator = _testOnly_createOrphanReportCoordinator(
+    1,
+    path.join(blockedParent, 'outbox.json'),
+  );
+  const failed = sweepOrphanedToolReports({
+    now: () => Date.now(),
+    recentSessionIds: () => [failedSession],
+    claim: (sessionId) => claimOrphanedToolCompletions(sessionId),
+    fire: () => {
+      throw new Error('an unpersisted claim must never launch');
+    },
+  }, failedCoordinator);
+  assert.equal(failed.fired, 0);
+  assert.equal(
+    listEvents(failedSession, { types: ['orphaned_tool_reported'] }).length,
+    0,
+    'an outbox failure leaves source evidence unacknowledged',
+  );
+  assert.equal(
+    claimOrphanedToolCompletions(failedSession).reports.length,
+    1,
+    'the exact completion remains claimable after the failed handoff',
+  );
+
+  const successSession = createSession({ kind: 'chat' }).id;
+  makeCompletedOrphan(successSession, 'claim-success');
+  const outboxPath = path.join(
+    mkdtempSync(path.join(os.tmpdir(), 'clem-orphan-claim-success-')),
+    'state',
+    'outbox.json',
+  );
+  const successCoordinator = _testOnly_createOrphanReportCoordinator(1, outboxPath);
+  let fireCount = 0;
+  const success = sweepOrphanedToolReports({
+    now: () => Date.now(),
+    recentSessionIds: () => [successSession],
+    claim: (sessionId) => claimOrphanedToolCompletions(sessionId),
+    fire: async () => { fireCount += 1; },
+  }, successCoordinator);
+  assert.equal(success.fired, 1);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(fireCount, 1);
+  assert.equal(
+    listEvents(successSession, { types: ['orphaned_tool_reported'] }).length,
+    1,
+    'a successful durable handoff acknowledges the source exactly once',
+  );
+  assert.equal(claimOrphanedToolCompletions(successSession).reports.length, 0);
 });
 
 // ─── Ask-first contract regression fixtures ─────────────────────────────────

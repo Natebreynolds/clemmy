@@ -93,6 +93,10 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   // approved conversational act (cli_setup's contract), never a side effect
   // of a workflow step grinding through its prompt.
   'cli_setup',
+  // Guest harness runs: spawning a full agent in the user's project is a
+  // user-approved conversational act (project_run's contract) — and letting
+  // a deterministic step launch open-ended agents is unbounded fan-out.
+  'project_run',
   // Background-task lifecycle belongs to the origin conversation. A child
   // workflow step must not revise the contract of a sibling/parent run.
   'background_task_revise',

@@ -37,6 +37,7 @@ const {
   markNotificationsReadByApprovalId,
   markNotificationsReadByQuestionId,
   isDeliveryJobStale,
+  _failNextNotificationDeliveryQueueWriteForTest,
 } = await import('./notifications.js');
 
 const NOTIFICATIONS_FILE = path.join(TMP_HOME, 'state', 'notifications.json');
@@ -87,6 +88,29 @@ test('addNotification: subsequent writes preserve prior items', () => {
   const items = listNotifications(50);
   const ids = items.map((it) => it.id).sort();
   assert.ok(ids.includes('n1') && ids.includes('n2'), `expected n1 and n2 in ${ids.join(',')}`);
+});
+
+test('addNotification: a stable-ID retry repairs a delivery job lost after the notification write', () => {
+  const notification = makeNotification('partial-queue-write');
+  rmSync(DELIVERY_FILE, { force: true });
+  _failNextNotificationDeliveryQueueWriteForTest();
+
+  assert.throws(
+    () => addNotification(notification),
+    'the forced queue-path failure must surface after notifications.json lands',
+  );
+  assert.ok(
+    listNotifications(50).some((item) => item.id === notification.id),
+    'the notification half of the partial write should be durable',
+  );
+
+  addNotification(notification);
+  const queue = JSON.parse(readFileSync(DELIVERY_FILE, 'utf-8')) as Array<{ notificationId: string }>;
+  assert.equal(
+    queue.filter((job) => job.notificationId === notification.id).length,
+    1,
+    'retry reconciles exactly one outbound delivery job',
+  );
 });
 
 test('loadNotifications: corrupted JSON is quarantined and surfaced via actionBus', () => {

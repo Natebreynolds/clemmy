@@ -185,7 +185,7 @@ export function registerVaultTools(server: McpServer): void {
 
   server.tool(
     'task_add',
-    "Add a SINGLE one-shot task to the user's TODO list. Use ONLY for one-time todos like \"remind me to call Bob tomorrow\" or \"add to my list: review the Q3 plan\". DO NOT use for recurring or scheduled work (\"daily\", \"every Monday\", \"at 6pm\", \"weekly\", \"every hour\") — for those, call workflow_create + workflow_schedule instead (workflows actually fire on a cron; tasks just sit in the list). The handler rejects descriptions that contain recurring language to prevent misroutes.",
+    "Add a SINGLE passive item to the user's TODO list, such as \"add to my list: review the Q3 plan\". This tool NEVER fires or sends a notification. For \"remind/notify me at 10 PM tonight\" use set_timer; for recurring or later scheduled work use workflow_create + workflow_schedule.",
     {
       description: z.string().min(1),
       priority: z.enum(['high', 'medium', 'low']).optional(),
@@ -193,17 +193,23 @@ export function registerVaultTools(server: McpServer): void {
       project: z.string().optional(),
     },
     async ({ description, priority, due_date, project }) => {
-      // Tier-2 architectural guard: task_add is one-shot. If the model
-      // tried to use it for recurring/scheduled work (the lunar-audit-style
-      // task-tool miscall regression where Clementine called task_add for a
-      // "daily at 6pm" request), refuse with a message that names the
-      // correct tools so the model self-corrects in one retry.
-      // Only match unambiguously recurring language. The earlier draft
-      // included `at\s+\d{1,2}\s*(am|pm)` which false-positived on
-      // common one-shot reminders like "remind me at 3pm tomorrow" —
-      // a perfectly valid task_add use case. Time-of-day alone is NOT
-      // a recurrence signal; recurrence is signaled by cadence words
-      // (daily/weekly/...) or quantifiers (every X, each X).
+      // TASKS.md stores passive work and its reader reduces due timestamps to a
+      // calendar date. Accepting an exact time here is therefore misleading:
+      // it cannot wake the daemon or notify the user. Refuse it at the tool
+      // boundary so a reminder request self-corrects to the firing capability.
+      const hasReminderIntent = /\breminder\b|\b(?:remind|notify|alert|ping|nudge|tell)\s+(?:me|us)\b|\blet\s+(?:me|us)\s+know\b/i.test(description);
+      const hasExactDueTime = typeof due_date === 'string'
+        && (/[T ]\d{1,2}:\d{2}(?::\d{2})?/.test(due_date) || /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(due_date));
+      if (hasReminderIntent || hasExactDueTime) {
+        return textResult(
+          'task_add refused: this looks like a reminder, but task_add would create only a passive TODO and would not notify the user. '
+          + 'For a one-time reminder within 24 hours, call set_timer with fire_at (an ISO timestamp with an explicit offset). '
+          + 'For later or recurring work, use workflow_create + workflow_schedule.',
+        );
+      }
+
+      // Recurring commitments belong to the workflow scheduler, not a passive
+      // one-shot task record.
       const RECURRING_PATTERN = /\b(daily|weekly|monthly|hourly|every\s+(day|week|month|hour|morning|afternoon|evening|night|weekday|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|each\s+(day|week|month|hour|morning|afternoon|evening|night|weekday|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|recurring|repeats?|on\s+a\s+schedule)\b/i;
       const match = description.match(RECURRING_PATTERN);
       if (match) {
@@ -230,7 +236,7 @@ export function registerVaultTools(server: McpServer): void {
       body = `${body.slice(0, insertAt)}\n${taskLine}${body.slice(insertAt)}`;
       writeFileSync(TASKS_FILE, body, 'utf-8');
 
-      return textResult(`Added task {${taskId}}: ${description}`);
+      return textResult(`Added passive TODO {${taskId}}: ${description}. No reminder notification was scheduled.`);
     },
   );
 
