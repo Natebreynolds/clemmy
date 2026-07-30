@@ -136,6 +136,130 @@ export function listRecentDeliverables(limit = 30): DeliverableHit[] {
   }
 }
 
+export interface DeliveredGroup {
+  /** Stable key (representative row id). */
+  id: number;
+  createdAt: string;
+  /** Humanized name of the WORK, never a tool slug or bare filename. */
+  title: string;
+  /** The ask that produced it (representative why). */
+  why: string;
+  lane: string | null;
+  sessionId: string | null;
+  /** Best openable link among members, when one exists. */
+  url?: string;
+  /** Representative local file (prefers documents over scripts/data). */
+  filePath?: string;
+  fileStillExists?: boolean;
+  /** How many artifacts this piece of work produced. */
+  artifactCount: number;
+  /** True when the group is a re-runnable ask (guest/local produced work). */
+  rerunnable: boolean;
+}
+
+const SCRIPT_OR_DATA_RE = /\.(mjs|cjs|js|ts|json|map|lock)$/i;
+const DOCUMENT_RE = /\.(html?|pdf|docx?|md|csv|xlsx?|pptx?|png|jpe?g)$/i;
+
+function humanizeExternalTitle(row: DeliverableRecord): string {
+  const slug = row.title.trim();
+  if (/^GOOGLESHEETS?_/i.test(slug)) return 'Google Sheet updated';
+  if (/^(GMAIL|OUTLOOK)_/i.test(slug)) return slug.toLowerCase().includes('draft') ? 'Email drafted' : 'Email sent';
+  const shell = slug.match(/^shell:(.+)$/i);
+  if (shell) return `${shell[1].trim()} run`;
+  if (/^[A-Z][A-Z0-9]+(_[A-Z0-9]+)+$/.test(slug)) {
+    // Any other TOOL_SLUG: first token as the service name, verb-ish tail.
+    const service = slug.split('_')[0].toLowerCase();
+    return `${service.charAt(0).toUpperCase()}${service.slice(1)} updated`;
+  }
+  return slug || 'External update';
+}
+
+/** A `workflow-slug::step` machine ask reads as "workflow workflow-slug". */
+function humanizeWhy(why: string): string {
+  const m = why.trim().match(/^([a-z0-9][a-z0-9-]{2,})::[a-z0-9_-]+$/i);
+  return m ? `workflow ${m[1]}` : why;
+}
+
+function groupTitle(rep: DeliverableRecord, members: DeliverableRecord[]): string {
+  if (rep.kind === 'file') {
+    const parts = rep.target.split('/').filter(Boolean);
+    const base = parts.pop() ?? rep.target;
+    // "myatt-bell-brief · index.html" reads as the work; a bare index.html
+    // does not (three of them side by side on the live shelf). Skip generic
+    // structural dirs (research/view/dist/…) so the name that survives is the
+    // one a human would use for the project.
+    let parent = parts.pop();
+    while (parent && /^(users|home|tmp|desktop|documents|research|view|views|dist|build|out|public|src|output)$/i.test(parent)) {
+      parent = parts.pop();
+    }
+    const name = parent ? `${parent} · ${base}` : base;
+    return name.length > 64 ? `${name.slice(0, 61)}…` : name;
+  }
+  if (rep.kind === 'url') {
+    try {
+      const u = new URL(rep.target);
+      if (u.hostname.includes('docs.google.com')) return 'Google Sheet';
+      return u.hostname.replace(/^www\./, '');
+    } catch { return rep.target.slice(0, 64); }
+  }
+  const human = humanizeExternalTitle(rep);
+  // Several external writes in one piece of work stay ONE card.
+  return members.length > 1 && rep.kind !== 'file' ? human : human;
+}
+
+/**
+ * The Delivered shelf's real unit: a piece of FINISHED WORK, not an artifact.
+ * Raw rows are per-file / per-external-call (the tee writes one row per sheet
+ * call — the live shelf showed six GOOGLESHEETS_* slug cards from one edit).
+ * Groups collapse rows by originating session (fallback: target), pick a
+ * document-shaped representative over scripts/data, humanize tool slugs, and
+ * mark which groups are re-runnable asks.
+ */
+export function listDeliveredGroups(limit = 12): DeliveredGroup[] {
+  try {
+    const rows = listRecentDeliverables(100);
+    const byKey = new Map<string, DeliverableRecord[]>();
+    for (const row of rows) {
+      // One piece of work = one card. Guest-run files carry no sessionId but
+      // share their producing ask verbatim — the ask is the work's identity
+      // (live: one /build-brief run rendered as three sibling file cards).
+      const key = row.sessionId?.trim() || (row.why.trim() ? `why:${row.why.trim()}` : `target:${row.target}`);
+      const bucket = byKey.get(key);
+      if (bucket) bucket.push(row);
+      else byKey.set(key, [row]);
+    }
+    const groups: DeliveredGroup[] = [];
+    for (const members of byKey.values()) {
+      // Representative: url > primary document (html/pdf beat notes/data —
+      // the brief's face is index.html, not its research homepage.md) > any
+      // document > any file > external write.
+      const url = members.find((m) => m.kind === 'url' || m.target.startsWith('http'));
+      const docs = members.filter((m) => m.kind === 'file' && DOCUMENT_RE.test(m.target) && !SCRIPT_OR_DATA_RE.test(m.target));
+      const doc = docs.find((m) => /\.(html?|pdf)$/i.test(m.target)) ?? docs[0];
+      const anyFile = members.find((m) => m.kind === 'file');
+      const rep = doc ?? url ?? anyFile ?? members[0];
+      const file = doc ?? (rep.kind === 'file' ? rep : undefined);
+      const lane = rep.lane;
+      groups.push({
+        id: rep.id,
+        createdAt: members[0].createdAt, // newest member leads
+        title: groupTitle(rep, members),
+        why: humanizeWhy(rep.why),
+        lane,
+        sessionId: rep.sessionId,
+        ...(url ? { url: url.target } : {}),
+        ...(file ? { filePath: file.target, fileStillExists: existsSync(file.target) } : {}),
+        artifactCount: members.length,
+        rerunnable: lane === 'guest' || lane === 'local',
+      });
+    }
+    groups.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return groups.slice(0, Math.max(1, Math.min(limit, 50)));
+  } catch {
+    return [];
+  }
+}
+
 export function searchDeliverables(query: string, limit = 6): DeliverableHit[] {
   try {
     const qTokens = new Set(tokensOf(query));

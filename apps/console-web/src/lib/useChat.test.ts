@@ -741,3 +741,38 @@ test('idle inbox cursor preserves batch-split delivery state inside the same ses
   assert.equal(reset.seq, 0);
   assert.deepEqual(reset.deliveries, []);
 });
+
+test('a delivered rescue completion is a SUCCESS, never "Didn\'t finish"', () => {
+  // Live 2026-07-30 (first turn on v3.2.0): the stall judge rescued a good
+  // reply and completed with reason 'stall_judge_delivered' + delivered:true —
+  // the client's failure regex matched the substring 'stall' and branded the
+  // judged-good answer with a red "Didn't finish".
+  const rescued = terminalCompletionPresentation(
+    { reason: 'stall_judge_delivered', delivered: true, reply: 'I will run the build brief; I just need the URL.' },
+    '',
+  );
+  assert.equal(rescued.status, 'complete');
+  assert.match(rescued.text, /build brief/);
+
+  // The authoritative flag alone is enough, whatever the reason says.
+  const flagged = terminalCompletionPresentation(
+    { reason: 'stalled_then_recovered', delivered: true, reply: 'The sheet is updated with all eight reps.' },
+    '',
+  );
+  assert.equal(flagged.status, 'complete');
+
+  // Even a placeholder-only delivered reply never contradicts the server
+  // with a failure banner.
+  const placeholder = terminalCompletionPresentation(
+    { reason: 'stall_judge_delivered', delivered: true, reply: 'done.' },
+    '',
+  );
+  assert.equal(placeholder.status, 'complete');
+
+  // A real failure without the flag still fails.
+  const realFail = terminalCompletionPresentation(
+    { reason: 'stalled', reply: 'partial work' },
+    '',
+  );
+  assert.equal(realFail.status, 'failed');
+});

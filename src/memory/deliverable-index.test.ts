@@ -221,3 +221,35 @@ test('Delivered shelf read: newest first, limit honored, missing files flagged n
   assert.equal(ghostRow.stillExists, false, 'flagged as moved, never silently dropped');
   assert.equal(listRecentDeliverables(1).length, 1, 'limit honored');
 });
+
+test('Delivered groups: one card per piece of WORK, humanized — never a tool slug or sibling-file flood', async () => {
+  const { listDeliveredGroups } = await import('./deliverable-index.js');
+  // Six per-call sheet writes from one workspace session (the live flood).
+  for (let i = 0; i < 6; i++) {
+    recordDeliverable({
+      kind: 'external_doc', target: `sheet-range-${i}`, title: 'GOOGLESHEETS_FORMAT_CELL',
+      why: 'poll every 2 hours during business hours', sessionId: 'space-shelf-group-test', lane: 'external',
+    });
+  }
+  // One guest run, three sibling files sharing the producing ask, no session.
+  const why = 'Produced by "/build-brief https://example-firm.test" in proposal-builder via project_run (claude)';
+  const brief = path.join(TMP_HOME, 'example-brief', 'index.html');
+  writeFileSync(path.join(TMP_HOME, 'example-brief-note.md'), 'x');
+  recordDeliverable({ kind: 'file', target: path.join(TMP_HOME, 'example-brief', 'research', 'homepage.md'), why, lane: 'guest' });
+  recordDeliverable({ kind: 'file', target: brief, why, lane: 'guest' });
+  recordDeliverable({ kind: 'file', target: path.join(TMP_HOME, 'example-brief', 'research', 'contact.md'), why, lane: 'guest' });
+
+  const groups = listDeliveredGroups(50);
+  const sheetGroups = groups.filter((g) => g.sessionId === 'space-shelf-group-test');
+  assert.equal(sheetGroups.length, 1, 'six per-call rows collapse into one card');
+  assert.equal(sheetGroups[0].title, 'Google Sheet updated', 'tool slugs never surface as titles');
+  assert.equal(sheetGroups[0].artifactCount, 6);
+  assert.equal(sheetGroups[0].rerunnable, false, 'an external side effect is not a re-runnable ask');
+
+  const briefGroups = groups.filter((g) => g.why === why);
+  assert.equal(briefGroups.length, 1, 'sibling files of one run collapse into one card');
+  assert.equal(briefGroups[0].artifactCount, 3);
+  assert.match(briefGroups[0].title, /example-brief · index\.html/, 'the html deliverable is the face, research/ climbs to the project dir');
+  assert.equal(briefGroups[0].rerunnable, true, 'a guest-run ask can be run again');
+  assert.equal(briefGroups[0].filePath, brief);
+});

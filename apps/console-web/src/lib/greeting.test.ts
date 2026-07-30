@@ -23,3 +23,12 @@ test('greetingName prefers the chosen casual name, then first name, never a hard
   assert.equal(greetingName(null), '');
   assert.equal(greetingName({ displayName: '   ' }), '');
 });
+
+test('placeholder identities never become a greeting name', () => {
+  // Live catch (dev console, 2026-07-30): an unset profile serialized as
+  // "the user" and the home screen said "Good afternoon, the".
+  assert.equal(greetingName({ name: 'the user' }), '');
+  assert.equal(greetingName({ displayName: 'The User' }), '');
+  assert.equal(greetingName({ preferredName: 'user' }), '');
+  assert.equal(timeGreeting(14, greetingName({ name: 'the user' })), 'Good afternoon');
+});

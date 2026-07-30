@@ -1,4 +1,4 @@
-import { apiGet } from './api';
+import { apiGet, apiPost } from './api';
 
 export type FocusStatus = 'active' | 'paused' | 'completed' | 'abandoned';
 export type FocusWorkMode = 'explore' | 'decide' | 'execute' | 'monitor';
@@ -62,6 +62,14 @@ export interface FocusSnapshot {
 
 export const listFocusSnapshot = () =>
   apiGet<FocusSnapshot>('/api/console/focus');
+
+/** "Still current" — clears the Check-context pill by extending confirm_after. */
+export const confirmFocus = (id: number) =>
+  apiPost<{ focus: FocusView }>(`/api/console/focus/${id}/confirm`);
+
+/** "Done with this" — resolves the focus (completed by default). */
+export const clearFocus = (id: number, resolution: 'completed' | 'abandoned' = 'completed') =>
+  apiPost<{ focus: FocusView }>(`/api/console/focus/${id}/clear`, { resolution });
 
 /**
  * Whether the workstate carries structured collaboration detail — the lists,

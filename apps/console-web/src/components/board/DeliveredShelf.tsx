@@ -5,33 +5,31 @@
  * restarts (born from the 2026-07-30 incident where a finished brief sat on
  * disk while the chat claimed she gave up).
  *
- * Each card carries the two affordances that make completed work ALIVE:
- * "Ask Clem" (chat with this deliverable as the subject) and "Run again"
- * (re-invoke the stored producing route — Clem confirms inputs herself, and
- * every effect gate still applies).
+ * The unit is a PIECE OF WORK, grouped server-side — the first render showed
+ * six GOOGLESHEETS_* slug cards from one edit and three bare index.htmls from
+ * one brief, which is exactly the noise this surface exists to prevent.
  */
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Copy, ExternalLink, FileText, Globe, MessageCircle, Package, RotateCw, Table2 } from 'lucide-react';
+import { Copy, ExternalLink, FileText, Globe, MessageCircle, RotateCw, Table2 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
-import { listDelivered, type DeliveredItem } from '@/lib/delivered';
+import { listDelivered, type DeliveredGroup } from '@/lib/delivered';
 
-function kindIcon(item: DeliveredItem) {
-  const target = item.target.toLowerCase();
-  if (item.kind === 'url' || target.startsWith('http')) {
-    return target.includes('docs.google.com/spreadsheets') ? Table2 : Globe;
-  }
-  if (item.kind === 'file') return FileText;
-  return Package;
+function groupIcon(group: DeliveredGroup) {
+  if (group.url?.includes('docs.google.com/spreadsheets')) return Table2;
+  if (group.url) return Globe;
+  if (group.filePath) return FileText;
+  return Table2;
 }
 
-function displayTitle(item: DeliveredItem): string {
-  if (item.title.trim()) return item.title;
-  const tail = item.target.split('/').filter(Boolean).pop() ?? item.target;
-  return tail.length > 60 ? `${tail.slice(0, 57)}…` : tail;
-}
+const LANE_LABEL: Record<string, string> = {
+  guest: 'CLI project',
+  local: 'built locally',
+  workflow: 'workflow',
+  external: 'connected app',
+};
 
 function relativeTime(iso: string): string {
   const ms = Date.now() - Date.parse(iso);
@@ -45,91 +43,89 @@ function relativeTime(iso: string): string {
 
 export function DeliveredShelf() {
   const navigate = useNavigate();
-  const delivered = usePoll(['delivered'], () => listDelivered(30), 30000);
+  const delivered = usePoll(['delivered'], () => listDelivered(12), 30000);
   const [copiedId, setCopiedId] = useState<number | null>(null);
-  const items = delivered.data ?? [];
-  if (delivered.isLoading || items.length === 0) return null;
+  const groups = delivered.data ?? [];
+  if (delivered.isLoading || groups.length === 0) return null;
 
-  const askClem = (item: DeliveredItem) => {
+  const askClem = (g: DeliveredGroup) => {
     navigate(`/chat?prompt=${encodeURIComponent(
-      `About the ${displayTitle(item)} you delivered (${item.target}): `,
+      `About "${g.title}" you delivered${g.filePath ? ` (${g.filePath})` : g.url ? ` (${g.url})` : ''}: `,
     )}`);
   };
-  const runAgain = (item: DeliveredItem) => {
+  const runAgain = (g: DeliveredGroup) => {
     navigate(`/chat?prompt=${encodeURIComponent(
-      `I want to run the same work again that produced "${displayTitle(item)}" (${item.why.slice(0, 300)}). `
+      `I want to run the same work again that produced "${g.title}" (original ask: ${g.why.slice(0, 280)}). `
       + 'Confirm the inputs with me first if anything should change, then run it.',
     )}`);
   };
-  const copyPath = (item: DeliveredItem) => {
-    void navigator.clipboard?.writeText(item.target);
-    setCopiedId(item.id);
-    setTimeout(() => setCopiedId((current) => (current === item.id ? null : current)), 1500);
+  const copyPath = (g: DeliveredGroup) => {
+    if (!g.filePath) return;
+    void navigator.clipboard?.writeText(g.filePath);
+    setCopiedId(g.id);
+    setTimeout(() => setCopiedId((current) => (current === g.id ? null : current)), 1500);
   };
 
   return (
-    <section aria-label="Delivered" className="mt-6">
-      <div className="mb-2 flex items-center gap-2">
+    <section aria-label="Delivered" className="mt-8">
+      <div className="mb-3 flex items-baseline gap-2">
         <h3 className="text-h3 text-fg">Delivered</h3>
-        <StatusPill tone="neutral">{items.length}</StatusPill>
         <span className="text-caption text-muted">Finished work — it never gets lost from here.</span>
       </div>
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {items.map((item) => {
-          const Icon = kindIcon(item);
-          const isUrl = item.kind === 'url' || item.target.startsWith('http');
+        {groups.map((g) => {
+          const Icon = groupIcon(g);
           return (
-            <Card key={item.id} className="flex flex-col gap-2 p-4">
-              <div className="flex items-start gap-2">
-                <Icon className="mt-0.5 h-4 w-4 shrink-0 text-primary" aria-hidden />
+            <Card key={g.id} className="flex flex-col gap-2.5 p-4">
+              <div className="flex items-start gap-2.5">
+                <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-md bg-primary-tint text-primary">
+                  <Icon className="h-4 w-4" aria-hidden />
+                </span>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-body font-semibold text-fg" title={item.target}>{displayTitle(item)}</p>
-                  <p className="mt-0.5 line-clamp-2 text-caption text-muted" title={item.why}>{item.why}</p>
+                  <p className="truncate text-body font-semibold text-fg" title={g.filePath ?? g.url ?? g.title}>{g.title}</p>
+                  <p className="mt-0.5 line-clamp-2 text-caption text-muted" title={g.why}>“{g.why}”</p>
                 </div>
               </div>
-              <div className="flex flex-wrap items-center gap-2">
-                {item.lane && <StatusPill tone="neutral">{item.lane}</StatusPill>}
-                {item.kind === 'file' && item.stillExists === false && (
-                  <StatusPill tone="warning">file moved</StatusPill>
-                )}
-                <span className="text-caption text-faint">{relativeTime(item.createdAt)}</span>
-                <span className="flex-1" />
-                {isUrl ? (
+              <div className="flex items-center gap-2 text-caption text-faint">
+                {g.lane && <span>{LANE_LABEL[g.lane] ?? g.lane}</span>}
+                {g.artifactCount > 1 && <span>· {g.artifactCount} artifacts</span>}
+                <span>· {relativeTime(g.createdAt)}</span>
+                {g.filePath && g.fileStillExists === false && <StatusPill tone="warning">file moved</StatusPill>}
+              </div>
+              <div className="flex items-center gap-1.5 border-t border-border pt-2">
+                {g.url ? (
                   <a
-                    className="inline-flex items-center gap-1 text-caption text-muted hover:text-fg"
-                    href={item.target}
-                    target="_blank"
-                    rel="noreferrer"
-                    title="Open"
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-primary hover:bg-primary-tint"
+                    href={g.url} target="_blank" rel="noreferrer"
                   >
                     <ExternalLink className="h-3.5 w-3.5" aria-hidden /> Open
                   </a>
-                ) : (
+                ) : g.filePath ? (
                   <button
                     type="button"
-                    className="inline-flex items-center gap-1 text-caption text-muted hover:text-fg"
-                    onClick={() => copyPath(item)}
-                    title={item.target}
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-primary hover:bg-primary-tint"
+                    onClick={() => copyPath(g)}
+                    title={g.filePath}
                   >
-                    <Copy className="h-3.5 w-3.5" aria-hidden /> {copiedId === item.id ? 'Copied' : 'Copy path'}
+                    <Copy className="h-3.5 w-3.5" aria-hidden /> {copiedId === g.id ? 'Copied' : 'Copy path'}
                   </button>
-                )}
+                ) : null}
                 <button
                   type="button"
-                  className="inline-flex items-center gap-1 text-caption text-muted hover:text-fg"
-                  onClick={() => askClem(item)}
-                  title="Open chat about this deliverable"
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption text-muted hover:bg-subtle hover:text-fg"
+                  onClick={() => askClem(g)}
                 >
                   <MessageCircle className="h-3.5 w-3.5" aria-hidden /> Ask Clem
                 </button>
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-1 text-caption text-muted hover:text-fg"
-                  onClick={() => runAgain(item)}
-                  title="Ask Clem to run the producing route again"
-                >
-                  <RotateCw className="h-3.5 w-3.5" aria-hidden /> Run again
-                </button>
+                {g.rerunnable && (
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption text-muted hover:bg-subtle hover:text-fg"
+                    onClick={() => runAgain(g)}
+                  >
+                    <RotateCw className="h-3.5 w-3.5" aria-hidden /> Run again
+                  </button>
+                )}
               </div>
             </Card>
           );

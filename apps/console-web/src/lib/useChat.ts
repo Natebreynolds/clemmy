@@ -174,7 +174,13 @@ export function terminalCompletionPresentation(
   const awaitingUser = currentStatus === 'awaiting-reply'
     || /awaiting_(?:user(?:_(?:input|reply))?|input|reply)|needs_user_(?:input|reply)/.test(reasonKey);
   const stopped = awaitingContinue || /cancelled|canceled|aborted|stopped/.test(reasonKey);
-  const failed = /fail|error|abandon|stall|exhaust|invalid|blocked|unavailable|timed?_?out|no_structured/.test(reasonKey);
+  // `delivered: true` is the server's authoritative success flag. A rescue
+  // path like reason 'stall_judge_delivered' is a SUCCESS with provenance —
+  // the substring 'stall' branded a judged-good reply with a red "Didn't
+  // finish" (live 2026-07-30, first turn on v3.2.0).
+  const judgedDelivered = data.delivered === true || /delivered/.test(reasonKey);
+  const failed = !judgedDelivered
+    && /fail|error|abandon|stall|exhaust|invalid|blocked|unavailable|timed?_?out|no_structured/.test(reasonKey);
 
   if (text) {
     const status: MessageStatus = awaitingUser ? 'awaiting-reply' : stopped ? 'stopped' : failed ? 'failed' : 'complete';
@@ -200,6 +206,11 @@ export function terminalCompletionPresentation(
       status: 'stopped',
       progress: undefined,
     };
+  }
+  // Delivered-but-unrenderable (e.g. a placeholder-only reply): the server
+  // vouched for the delivery — never contradict it with a failure banner.
+  if (judgedDelivered && !stopped) {
+    return { text: 'Done — the full reply is in the activity above.', status: 'complete', progress: undefined };
   }
   return { text: EMPTY_COMPLETION_ERROR, status: stopped ? 'stopped' : 'failed', progress: undefined };
 }

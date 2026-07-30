@@ -58,6 +58,7 @@ import {
   activateFocus as activateFocusRow,
   parkFocus as parkFocusRow,
   clearFocus as clearFocusRow,
+  touchFocus as touchFocusRow,
   checkResourceMatchesFocus,
   extractResourceIdFromApprovalArgs,
 } from '../memory/focus.js';
@@ -6663,9 +6664,9 @@ export function registerConsoleRoutes(
   app.get('/api/console/delivered', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { listRecentDeliverables } = await import('../memory/deliverable-index.js');
-      const limitRaw = Number.parseInt(String(req.query.limit ?? '30'), 10);
-      res.json({ items: listRecentDeliverables(Number.isFinite(limitRaw) ? limitRaw : 30) });
+      const { listDeliveredGroups } = await import('../memory/deliverable-index.js');
+      const limitRaw = Number.parseInt(String(req.query.limit ?? '12'), 10);
+      res.json({ groups: listDeliveredGroups(Number.isFinite(limitRaw) ? limitRaw : 12) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -12444,6 +12445,21 @@ export function registerConsoleRoutes(
     if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
     const row = activateFocusRow(id);
     if (!row) { res.status(404).json({ error: 'focus not found or not parked' }); return; }
+    res.json({ focus: row });
+  });
+
+  /**
+   * "Still current" — answers the Check-context nudge. Bumps last_touched_at
+   * and extends confirm_after, so the Working Together card's warning pill
+   * clears instead of asking a question the UI gave no way to answer
+   * (live complaint 2026-07-30).
+   */
+  app.post('/api/console/focus/:id/confirm', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    const row = touchFocusRow(id);
+    if (!row) { res.status(404).json({ error: 'focus not found' }); return; }
     res.json({ focus: row });
   });
 

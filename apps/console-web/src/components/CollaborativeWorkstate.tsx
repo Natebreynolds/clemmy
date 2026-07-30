@@ -11,7 +11,11 @@ import { Link } from 'react-router-dom';
 import { StatusPill, type Tone } from './ui/StatusPill';
 import { cn } from '@/lib/cn';
 import { stripInlineMarkdown } from '@/lib/markdown-text';
+import { useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import {
+  clearFocus,
+  confirmFocus,
   focusActionHref,
   hasWorkstateDetails,
   shouldShowWorkstate,
@@ -69,11 +73,23 @@ export function CollaborativeWorkstate({
   compact?: boolean;
   className?: string;
 }) {
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState(false);
   const focus = snapshot?.active;
   // A bare title+summary card is an echo of the last chat message — render
   // only when there is structured detail or a context check to answer.
   if (!focus || !shouldShowWorkstate(snapshot)) return null;
   const state = focus.workstate;
+  const resolveCheck = (action: 'confirm' | 'done') => {
+    if (busy) return;
+    setBusy(true);
+    void (action === 'confirm' ? confirmFocus(focus.id) : clearFocus(focus.id, 'completed'))
+      .finally(() => {
+        setBusy(false);
+        // The snapshot rides several polls (command-center, focus) — refresh all.
+        void qc.invalidateQueries();
+      });
+  };
   const hasDetails = hasWorkstateDetails(state);
   const itemLimit = compact ? 2 : 8;
   const mode = state?.mode;
@@ -95,6 +111,28 @@ export function CollaborativeWorkstate({
             <p className="text-caption font-semibold uppercase tracking-wide text-muted">Working together</p>
             {mode && <StatusPill tone={MODE_TONE[mode]}>{MODE_LABEL[mode]}</StatusPill>}
             {snapshot?.needsConfirm && <StatusPill tone="warning">Check context</StatusPill>}
+            {/* A context check must be ANSWERABLE where it is asked — the pill
+                alone shipped as a question with no reply box (live 2026-07-30). */}
+            {snapshot?.needsConfirm && (
+              <span className="ml-auto flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => resolveCheck('confirm')}
+                  className="rounded-md border border-border px-2 py-0.5 text-caption font-medium text-fg hover:border-primary/40 hover:text-primary disabled:opacity-50"
+                >
+                  Still current
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => resolveCheck('done')}
+                  className="rounded-md border border-border px-2 py-0.5 text-caption text-muted hover:text-fg disabled:opacity-50"
+                >
+                  Done with this
+                </button>
+              </span>
+            )}
           </div>
           {/* Title/summary are model-authored and sometimes arrive as markdown —
               strip to calm plain text and clamp; the structured sections below

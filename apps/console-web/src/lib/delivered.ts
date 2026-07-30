@@ -1,20 +1,22 @@
 import { apiGet } from './api';
 
-/** A finished piece of work from the durable deliverable index — what it is,
- *  where it lives, and the ask + route that produced it. */
-export interface DeliveredItem {
+/** A piece of FINISHED WORK from the durable deliverable index — grouped
+ *  server-side (one card per work session, not per artifact/tool call). */
+export interface DeliveredGroup {
   id: number;
   createdAt: string;
-  kind: string;
-  target: string;
+  /** Humanized name of the work — never a tool slug or bare filename. */
   title: string;
-  /** The producing ask + route — powers "Ask Clem about this" and "Run again". */
+  /** The ask that produced it. */
   why: string;
-  sessionId: string | null;
   lane: string | null;
-  /** kind='file' only: false when the recorded path no longer exists. */
-  stillExists?: boolean;
+  sessionId: string | null;
+  url?: string;
+  filePath?: string;
+  fileStillExists?: boolean;
+  artifactCount: number;
+  rerunnable: boolean;
 }
 
-export const listDelivered = (limit = 30) =>
-  apiGet<{ items: DeliveredItem[] }>(`/api/console/delivered?limit=${limit}`).then((r) => r.items);
+export const listDelivered = (limit = 12) =>
+  apiGet<{ groups: DeliveredGroup[] }>(`/api/console/delivered?limit=${limit}`).then((r) => r.groups);
