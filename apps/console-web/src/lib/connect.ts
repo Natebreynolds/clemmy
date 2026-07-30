@@ -350,6 +350,9 @@ export const authCatalogCli = (id: string) =>
 /** Paste-your-own install command (validated server-side against the install allowlist). */
 export const runInstallCommand = (command: string, saveAs?: string) =>
   apiPost<{ job: InstallJob }>('/api/console/install-commands', { command, ...(saveAs ? { saveAs } : {}) });
+/** Interactive logins: open the user's Terminal with the login command running. */
+export const openTerminalAuth = (id: string) =>
+  apiPost<{ ok: boolean; command: string; message: string }>(`/api/console/cli-catalog/${encodeURIComponent(id)}/terminal-auth`);
 
 // ─── Browser harness (browser-use) — drive the user's real Chrome ────────
 export interface BrowserHarnessPrereq { name: string; available: boolean; path?: string; version?: string }

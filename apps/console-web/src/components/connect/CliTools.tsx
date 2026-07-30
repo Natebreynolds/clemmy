@@ -9,7 +9,7 @@ import {
   getClis, getSavedClis, saveCli, removeSavedCli, probeCli,
   getManagedClis, startManagedCliJob, getManagedCliJob,
   getCliCatalog, installCatalogCli, forgetCatalogCli, getInstallJob,
-  authCatalogCli, runInstallCommand,
+  authCatalogCli, runInstallCommand, openTerminalAuth,
   type ManagedCliStatus, type ManagedCliKind, type ManagedCliAction,
   type CatalogEntry, type ConnectedCli, type CliHealth,
 } from '@/lib/connect';
@@ -112,14 +112,32 @@ function ManagedCard({ label, command, icon: Icon, status, busy, loading, onRun 
 // for ANY CLI — known catalog tools get the exact command, others get a guess
 // the user can correct. (Auth is interactive/browser-based, so we hand over
 // the command rather than run it blindly; Clem can also run it on request.)
-function AuthReveal({ command, authCommand, authDocsUrl }: { command: string; authCommand?: string; authDocsUrl?: string }) {
+function AuthReveal({ command, authCommand, authDocsUrl, catalogId }: { command: string; authCommand?: string; authDocsUrl?: string; catalogId?: string }) {
   const [cmd, setCmd] = useState(authCommand || `${command} login`);
   const [copied, setCopied] = useState(false);
+  const [terminalMsg, setTerminalMsg] = useState('');
+  const [opening, setOpening] = useState(false);
   const copy = async () => { try { await navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* ignore */ } };
   const docs = authDocsUrl || `https://www.google.com/search?q=${encodeURIComponent(`${command} CLI login authenticate`)}`;
+  const openTerminal = async () => {
+    if (!catalogId) return;
+    setOpening(true); setTerminalMsg('');
+    try { const r = await openTerminalAuth(catalogId); setTerminalMsg(r.message); }
+    catch (e) { setTerminalMsg((e as Error).message); }
+    finally { setOpening(false); }
+  };
   return (
     <div className="mt-2 rounded-md border border-border bg-subtle p-2.5">
-      <div className="mb-1 text-caption text-muted">Sign in / re-auth — run this in your terminal{authCommand ? '' : ' (edit if the command differs)'}:</div>
+      {catalogId && (
+        <div className="mb-2 flex items-center gap-2">
+          <Button size="sm" disabled={opening} onClick={() => void openTerminal()}>
+            {opening ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Terminal className="h-3.5 w-3.5" aria-hidden />} Open in Terminal
+          </Button>
+          <span className="text-caption text-faint">runs the sign-in for you — just finish the prompts</span>
+        </div>
+      )}
+      {terminalMsg && <p className="mb-2 text-caption text-muted">{terminalMsg}</p>}
+      <div className="mb-1 text-caption text-muted">Or run it yourself{authCommand ? '' : ' (edit if the command differs)'}:</div>
       <div className="flex items-center gap-2">
         <input value={cmd} onChange={(e) => setCmd(e.target.value)} aria-label="Login command"
           className="min-w-0 flex-1 rounded bg-canvas px-2 py-1 font-mono text-caption text-fg outline-none focus:ring-1 focus:ring-primary" />
@@ -249,7 +267,7 @@ function CatalogTools() {
                   {busy === `forget:${c.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <X className="h-3.5 w-3.5" aria-hidden />}
                 </Button>
               </div>
-              {reveal === c.id && <AuthReveal command={c.command} authCommand={c.authCommand} authDocsUrl={c.authDocsUrl} />}
+              {reveal === c.id && <AuthReveal command={c.command} authCommand={c.authCommand} authDocsUrl={c.authDocsUrl} catalogId={c.id} />}
             </Card>
           ))}
         </div>
@@ -332,7 +350,7 @@ function CatalogTools() {
                       : <Button size="sm" variant="secondary" onClick={() => setReveal(reveal === e.id ? null : e.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign in</Button>)
                   : <Button size="sm" disabled={busy === `install:${e.id}`} onClick={() => install(e.id)}>{busy === `install:${e.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install</Button>}
               </div>
-              {reveal === e.id && <AuthReveal command={e.command} authCommand={e.authCommand} authDocsUrl={e.authDocsUrl} />}
+              {reveal === e.id && <AuthReveal command={e.command} authCommand={e.authCommand} authDocsUrl={e.authDocsUrl} catalogId={e.id} />}
             </Card>
           ))}
 

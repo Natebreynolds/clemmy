@@ -33,6 +33,7 @@ async function call(args: Record<string, unknown>): Promise<string> {
 }
 
 const { _testOnly_setProbeExec } = await import('../integrations/cli-catalog/auth-health.js');
+const { _testOnly_setOsaExec, _testOnly_stopSignInWatchers } = await import('../runtime/terminal-handoff.js');
 
 before(async () => {
   const { registerCliSetupTools } = await import('./cli-setup-tools.js');
@@ -41,6 +42,8 @@ before(async () => {
 
 afterEach(() => {
   _testOnly_setProbeExec();
+  _testOnly_setOsaExec();
+  _testOnly_stopSignInWatchers();
 });
 
 test('status never spawns a real probe (injected exec) and names the fix calls', async () => {
@@ -72,13 +75,26 @@ test('sudo and multi-command forms are refused', async () => {
   }
 });
 
-test('auth on a non-headless catalog CLI returns the hand-over text and starts NO job', async () => {
+test('auth on a non-headless CLI opens the Terminal hand-off (stubbed) and starts NO background job', async () => {
   const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
   const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
+  const scripts: string[] = [];
+  _testOnly_setOsaExec(async (args) => { scripts.push(args.join(' ')); return { ok: true, stderr: '' }; });
   const out = await call({ action: 'auth', catalogId: interactive.id });
-  assert.match(out, /interactive sign-in|only the user can complete/i);
+  assert.match(out, /Terminal window just opened|Opened Terminal/i);
+  assert.ok(out.includes(interactive.authCommand!), 'the exact login command is named for the user');
+  assert.equal(scripts.length, 1, 'exactly one Terminal hand-off');
+  assert.ok(scripts[0].includes(interactive.authCommand!), 'the Terminal runs the catalog command');
+  assert.doesNotMatch(out, /Job [a-z0-9-]+;/, 'no background job may start for an interactive login');
+});
+
+test('when the Terminal hand-off is unavailable, auth falls back to the manual hand-over text', async () => {
+  const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
+  const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
+  _testOnly_setOsaExec(async () => ({ ok: false, stderr: 'no window server' }));
+  const out = await call({ action: 'auth', catalogId: interactive.id });
+  assert.match(out, /interactive sign-in that only the user can complete/i);
   assert.ok(out.includes(interactive.authCommand!), 'the exact login command is relayed');
-  assert.doesNotMatch(out, /Job [a-z]/, 'no background job may start for an interactive login');
 });
 
 test('auth on an unknown id fails closed', async () => {

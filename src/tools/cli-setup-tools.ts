@@ -14,8 +14,9 @@ import { textResult } from './shared.js';
  *     (allowlist: npm -g / brew / uv tool / pipx / pip --user /
  *     git clone https — no sudo, no metacharacters)
  *   - auth: startCatalogAuthJob for verified-headless catalog entries;
- *     interactive logins are handed to the user as the exact command,
- *     NEVER spawned (stdin is ignored — they would hang).
+ *     interactive logins open the user's Terminal with the login already
+ *     running (terminal-handoff.ts) — the daemon itself NEVER spawns
+ *     them (its runner has no TTY; they would hang).
  *
  * Conversational contract: offer → one approval → execute → report the
  * job id and watch it with job_status.
@@ -30,7 +31,7 @@ export function registerCliSetupTools(server: McpServer): void {
       'Install or re-authenticate a local CLI for the user, via the approved runners. Actions:',
       '- status: auth/install state of every CLI the user has connected or saved (their roster).',
       '- install: install a CLI. Pass catalogId (preferred — e.g. "railway", "github") OR a raw command, which must match the install allowlist (npm install -g / brew install / uv tool install / pipx install / pip install --user / git clone https).',
-      '- auth: sign a catalog CLI in again. Browser-based flows run as a background job; interactive logins return the exact command for the USER to run — relay it, never run it yourself.',
+      '- auth: sign a catalog CLI in again. Browser-based flows run as a background job; interactive logins open the user\'s Terminal with the login already running (tell them to finish the prompts there). Never run a login through run_shell_command yourself.',
       '- job_status: check a previously started install/auth job by id.',
       'Ask the user before install/auth (one approval covers the whole fix); status and job_status are read-only.',
     ].join('\n'),
@@ -119,11 +120,20 @@ async function authAction(catalogId: string | undefined): Promise<ReturnType<typ
   const entry = findCatalogEntry(catalogId.trim());
   if (!entry) return textResult(`Unknown catalog CLI "${catalogId}". Use cli_setup status for known ids.`);
   if (!entry.authHeadless || !entry.authCommand) {
-    // Interactive login — hand over, never spawn (stdin is ignored; it
-    // would hang as a zombie until the job timeout).
+    // Interactive login — the daemon's job runner has no TTY, so we hand
+    // the flow to a REAL Terminal window the user owns: open it with the
+    // login already running, then watch the auth probe for the flip.
+    const { openTerminalAuthSession } = await import('../runtime/terminal-handoff.js');
+    const handoff = await openTerminalAuthSession(entry.id);
+    if (handoff.ok) {
+      return textResult([
+        `${handoff.message}`,
+        `Tell the user: a Terminal window just opened running \`${handoff.command}\` — finish the prompts there.`,
+        'You will see parked work resume automatically once the sign-in lands; no need to poll.',
+      ].join('\n'));
+    }
     return textResult([
-      `${entry.name} needs an interactive sign-in that only the user can complete.`,
-      `Tell the user to run this in their terminal: ${entry.authCommand ?? `${entry.command} login`}`,
+      `${entry.name} needs an interactive sign-in that only the user can complete, and the Terminal hand-off was not available: ${handoff.message}`,
       `Docs: ${entry.authDocsUrl}`,
       'They can also do this from Connect → Command-line tools.',
     ].join('\n'));
