@@ -553,18 +553,7 @@ export async function getWorkflowRunEvents(name: string, runId: string, limit = 
 }
 
 export async function listRecentRuns(limit = 20): Promise<{ runs: RunSummary[] }> {
-  // The dashboard exposes recent runs via /api/runs which webhook.ts
-  // serves alongside /api/console/*. Fall back to console/executions
-  // if /api/runs is missing on older daemons.
-  try {
-    return await api<{ runs: RunSummary[] }>(`/api/runs?limit=${limit}`);
-  } catch (err) {
-    if ((err as ApiError).status === 404) {
-      const fallback = await api<{ executions: RunSummary[] }>(`/api/console/executions?limit=${limit}`);
-      return { runs: fallback.executions ?? [] };
-    }
-    throw err;
-  }
+  return api<{ runs: RunSummary[] }>(`/m/api/runs?limit=${limit}`);
 }
 
 // ─── memory graph (the constellation) ─

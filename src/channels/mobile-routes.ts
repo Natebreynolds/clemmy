@@ -400,6 +400,13 @@ export interface MobileRouterDeps {
    *  that exercise only the auth surface can omit this and the send
    *  endpoint will return 503. */
   assistant?: ClementineAssistant;
+  /**
+   * Recent activity runs (chats + workflows), injected from webhook.ts so
+   * the phone's Activity tab shows the SAME list as the desktop dashboard's
+   * /api/runs. Tests that exercise only the auth surface can omit this and
+   * the endpoint will return 503.
+   */
+  listRecentRuns?: (limit: number) => unknown[];
   /** Test seam — override the state dir for fixtures. */
   stateDir?: string;
   /** Test seam — override secure-cookie behavior. */
@@ -1692,6 +1699,24 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const { buildMemoryNeighborhood } = await import('../dashboard/memory-graph.js');
       const { openMemoryDb } = await import('../memory/db.js');
       res.json(buildMemoryNeighborhood(openMemoryDb(), nodeId, req.query.depth === '2' ? 2 : 1));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * The Activity tab's feed. Delegates to the same collector as the desktop
+   * dashboard's /api/runs — the phone door only serves /m/*, so this is the
+   * mobile-reachable spelling of that list, not a second implementation.
+   */
+  router.get('/api/runs', requireMobileSession, (req, res) => {
+    if (!deps.listRecentRuns) {
+      res.status(503).json({ error: 'UNAVAILABLE' });
+      return;
+    }
+    const limit = clampInt(req.query.limit, 20, 1, 50);
+    try {
+      res.json({ runs: deps.listRecentRuns(limit) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

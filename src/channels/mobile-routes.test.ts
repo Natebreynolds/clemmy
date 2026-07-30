@@ -52,7 +52,7 @@ interface Harness {
 
 let harnessCounter = 0;
 
-async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean; assistant?: Parameters<typeof createMobileRouter>[0]['assistant'] }): Promise<Harness> {
+async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean; assistant?: Parameters<typeof createMobileRouter>[0]['assistant']; listRecentRuns?: Parameters<typeof createMobileRouter>[0]['listRecentRuns'] }): Promise<Harness> {
   const stateDir = path.join(TMP_ROOT, `case-${++harnessCounter}`);
   const app = express();
   app.use(express.json());
@@ -64,6 +64,7 @@ async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean; as
       cookieSecure: opts?.cookieSecure,
       isAdminAuthorized: () => admin,
       assistant: opts?.assistant,
+      listRecentRuns: opts?.listRecentRuns,
     }),
   );
   const server: Server = await new Promise((resolve) => {
@@ -1169,5 +1170,44 @@ test('memory graph, neighborhood, and reminders routes serve the mobile surfaces
 
     const anon = await fetch(`${h.url}/m/api/reminders`);
     assert.equal(anon.status, 401, 'reminders require the device session');
+  } finally { await h.close(); }
+});
+
+test('the Activity feed rides the mobile door: /m/api/runs serves the injected collector', async () => {
+  // Regression pin: the Activity tab used to call /api/runs, which the
+  // direct-app ingress 404s (it serves /m/* only) — the tab was dead on
+  // every phone door. The mobile spelling must exist and be session-gated.
+  const h = await startHarness({
+    listRecentRuns: (limit) => [
+      {
+        id: 'run-1',
+        sessionId: 'sess-1',
+        title: 'Draft the follow-up email',
+        status: 'completed',
+        createdAt: '2026-07-30T10:00:00.000Z',
+        updatedAt: '2026-07-30T10:05:00.000Z',
+      },
+    ].slice(0, limit),
+  });
+  try {
+    const anon = await fetch(`${h.url}/m/api/runs`);
+    assert.equal(anon.status, 401, 'the runs feed requires the device session');
+
+    const cookie = await loginMobile(h);
+    const res = await fetch(`${h.url}/m/api/runs`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { runs: Array<{ id: string; status: string }> };
+    assert.equal(body.runs.length, 1);
+    assert.equal(body.runs[0].id, 'run-1');
+    assert.equal(body.runs[0].status, 'completed');
+  } finally { await h.close(); }
+});
+
+test('/m/api/runs degrades to 503 when no collector is injected (auth-only harnesses)', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h);
+    const res = await fetch(`${h.url}/m/api/runs`, { headers: { cookie } });
+    assert.equal(res.status, 503);
   } finally { await h.close(); }
 });

@@ -881,6 +881,40 @@ function deriveDashboardSessionToken(webhookSecret: string): string {
     .digest('base64url');
 }
 
+/**
+ * The one activity-run list. Serves the desktop dashboard's /api/runs AND
+ * the phone's /m/api/runs so both surfaces show the same recent work —
+ * a run visible on one door must be visible on the other.
+ */
+function collectRecentActivityRuns(limit: number) {
+  const resolvedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(120, limit)) : 30;
+  const legacyRuns = listRuns(Math.max(resolvedLimit, 40));
+  const harnessRuns = harnessListSessions({ limit: Math.max(30, Math.min(120, resolvedLimit * 2)) })
+    .filter(isActivityVisibleHarnessSession)
+    .map(harnessSessionAsActivityRun);
+  // Dedup: a chat can produce BOTH a harness session (sess-…) and a legacy
+  // run record sharing the same sessionId. Prefer the harness session (it
+  // carries the richer event timeline) and drop the duplicate legacy row so
+  // the same conversation never shows twice in the inbox.
+  const harnessSessionIds = new Set(harnessRuns.map((run) => run.sessionId || run.id));
+  const dedupedLegacy = legacyRuns.filter((run) => !harnessSessionIds.has(run.sessionId));
+  // Workflow runs queued via the API exist only as workflows/runs/<id>.json
+  // until the runner starts them (which upserts a legacy run with the SAME
+  // id). Surface those file records so a queued/orphaned workflow run is
+  // visible in the inbox too — deduped by id against runs already collected.
+  const knownIds = new Set([...harnessRuns, ...dedupedLegacy].map((run) => run.id));
+  const workflowFileRuns = readWorkflowRuns(Math.max(resolvedLimit, 40))
+    .filter((rec) => typeof rec.id === 'string' && !knownIds.has(rec.id as string))
+    .map((rec) => workflowRunRecordAsActivityRun(rec, rec.id as string));
+  return [...harnessRuns, ...dedupedLegacy, ...workflowFileRuns]
+    .sort((left, right) =>
+      String(right.updatedAt || right.completedAt || right.createdAt || '')
+        .localeCompare(String(left.updatedAt || left.completedAt || left.createdAt || '')),
+    )
+    .slice(0, resolvedLimit)
+    .map(compactActivityRunListRow);
+}
+
 export const __test__ = {
   cancelTrackedRun,
   chooseArtifactProjectionScope,
@@ -1804,7 +1838,11 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   registerSpaceRoutes(app, isAuthorized);
   const consoleSpaServed = consoleNext && registerConsoleSpaRoutes(app, isAuthorized);
   registerConsoleRoutes(app, isAuthorized, assistant, { serveLegacyAtRoot: !consoleSpaServed });
-  app.use('/m', createMobileRouter({ isAdminAuthorized: isAuthorized, assistant }));
+  app.use('/m', createMobileRouter({
+    isAdminAuthorized: isAuthorized,
+    assistant,
+    listRecentRuns: collectRecentActivityRuns,
+  }));
 
   app.get('/dashboard', (req, res) => {
     if (!isAuthorized(req)) {
@@ -2510,32 +2548,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   app.get('/api/runs', requireAuth, (req, res) => {
     const limit = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 30;
     const resolvedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(120, limit)) : 30;
-    const legacyRuns = listRuns(Math.max(resolvedLimit, 40));
-    const harnessRuns = harnessListSessions({ limit: Math.max(30, Math.min(120, resolvedLimit * 2)) })
-      .filter(isActivityVisibleHarnessSession)
-      .map(harnessSessionAsActivityRun);
-    // Dedup: a chat can produce BOTH a harness session (sess-…) and a legacy
-    // run record sharing the same sessionId. Prefer the harness session (it
-    // carries the richer event timeline) and drop the duplicate legacy row so
-    // the same conversation never shows twice in the inbox.
-    const harnessSessionIds = new Set(harnessRuns.map((run) => run.sessionId || run.id));
-    const dedupedLegacy = legacyRuns.filter((run) => !harnessSessionIds.has(run.sessionId));
-    // Workflow runs queued via the API exist only as workflows/runs/<id>.json
-    // until the runner starts them (which upserts a legacy run with the SAME
-    // id). Surface those file records so a queued/orphaned workflow run is
-    // visible in the inbox too — deduped by id against runs already collected.
-    const knownIds = new Set([...harnessRuns, ...dedupedLegacy].map((run) => run.id));
-    const workflowFileRuns = readWorkflowRuns(Math.max(resolvedLimit, 40))
-      .filter((rec) => typeof rec.id === 'string' && !knownIds.has(rec.id as string))
-      .map((rec) => workflowRunRecordAsActivityRun(rec, rec.id as string));
-    const runs = [...harnessRuns, ...dedupedLegacy, ...workflowFileRuns]
-      .sort((left, right) =>
-        String(right.updatedAt || right.completedAt || right.createdAt || '')
-          .localeCompare(String(left.updatedAt || left.completedAt || left.createdAt || '')),
-      )
-      .slice(0, resolvedLimit)
-      .map(compactActivityRunListRow);
-    res.json({ runs });
+    res.json({ runs: collectRecentActivityRuns(resolvedLimit) });
   });
 
   app.get('/api/runs/:id', requireAuth, (req, res) => {
