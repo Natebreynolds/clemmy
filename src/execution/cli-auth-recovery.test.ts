@@ -27,7 +27,11 @@ const {
   detectBlockedOnCli,
 } = await import('./background-tasks.js');
 const { recordConnectedCli, findCatalogEntry } = await import('../integrations/cli-catalog/catalog.js');
-const { getCliHealth, invalidateCliHealth, _testOnly_setProbeExec } = await import('../integrations/cli-catalog/auth-health.js');
+const { getCliHealth, invalidateCliHealth, _testOnly_setProbeExec, _testOnly_setCommandResolver } = await import('../integrations/cli-catalog/auth-health.js');
+// Installed-ness resolves against the REAL PATH before any probe runs, so these
+// transition tests would only pass where the CLI happens to be installed (green
+// on a dev laptop, red on the Linux release runner). Resolve hermetically.
+_testOnly_setCommandResolver((command: string) => ({ skipped: false as const, command, path: process.execPath }));
 const { registerCliAuthRecoverySweep } = await import('./cli-auth-recovery.js');
 
 // The roster: railway is connected (catalog entry with a probe).

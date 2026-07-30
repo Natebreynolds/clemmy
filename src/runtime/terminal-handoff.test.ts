@@ -28,7 +28,15 @@ afterEach(() => {
   _testOnly_stopSignInWatchers();
 });
 
-test('the command comes ONLY from the catalog — callers pass an id, and the spawned script carries the exact authCommand', async () => {
+// The hand-off is macOS-only BY DESIGN (terminal-handoff.ts: "the product ships
+// mac-only") — off darwin it returns the "run it yourself" fallback instead of
+// driving Terminal. The tests below assert the macOS path, so they must not run
+// on the Linux release-preflight runner.
+const macOnly = {
+  skip: process.platform !== 'darwin' ? 'Terminal hand-off drives Terminal.app; macOS-only by design' : false,
+} as const;
+
+test('the command comes ONLY from the catalog — callers pass an id, and the spawned script carries the exact authCommand', macOnly, async () => {
   const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
   const calls: string[][] = [];
   _testOnly_setOsaExec(async (args) => { calls.push(args); return { ok: true, stderr: '' }; });
@@ -59,7 +67,7 @@ test('AppleScript escaping neutralizes quotes and backslashes', () => {
   );
 });
 
-test('a TCC automation denial names the System Settings fix instead of a bare error', async () => {
+test('a TCC automation denial names the System Settings fix instead of a bare error', macOnly, async () => {
   const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
   _testOnly_setOsaExec(async () => ({ ok: false, stderr: 'execution error: Not authorized to send Apple events to Terminal. (-1743)' }));
   const result = await openTerminalAuthSession(interactive.id);
@@ -68,7 +76,7 @@ test('a TCC automation denial names the System Settings fix instead of a bare er
   assert.ok(result.message.includes(interactive.authCommand!), 'the manual command remains the fallback');
 });
 
-test('a generic osascript failure falls back to the manual command', async () => {
+test('a generic osascript failure falls back to the manual command', macOnly, async () => {
   const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
   _testOnly_setOsaExec(async () => ({ ok: false, stderr: 'osascript: command failed' }));
   const result = await openTerminalAuthSession(interactive.id);
@@ -76,7 +84,7 @@ test('a generic osascript failure falls back to the manual command', async () =>
   assert.match(result.message, /Run `.+` in your own terminal/);
 });
 
-test('an unanswered permission dialog (-1712 AppleEvent timeout, observed live) points at the waiting prompt', async () => {
+test('an unanswered permission dialog (-1712 AppleEvent timeout, observed live) points at the waiting prompt', macOnly, async () => {
   const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
   _testOnly_setOsaExec(async () => ({ ok: false, stderr: '71:120: execution error: Terminal got an error: AppleEvent timed out. (-1712)' }));
   const result = await openTerminalAuthSession(interactive.id);

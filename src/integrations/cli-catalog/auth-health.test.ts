@@ -19,6 +19,7 @@ const {
   classifyProbeOutput,
   stripAnsi,
   _testOnly_setProbeExec,
+  _testOnly_setCommandResolver,
   _testOnly_stopCliHealthSweep,
 } = await import('./auth-health.js');
 const { CLI_CATALOG } = await import('./catalog.js');
@@ -26,8 +27,17 @@ const { validateInstallCommand } = await import('../browser-harness.js');
 
 afterEach(() => {
   _testOnly_setProbeExec();
+  _testOnly_setCommandResolver();
   _testOnly_stopCliHealthSweep();
 });
+
+/** Installed-ness resolves against the REAL PATH before any probe runs, so the
+ *  transition tests below would only pass on a machine that happens to have the
+ *  CLI installed (green on a dev laptop, red on the Linux release runner).
+ *  Stub resolution so they exercise the transition engine hermetically. */
+function stubInstalled(): void {
+  _testOnly_setCommandResolver((command: string) => ({ skipped: false as const, command, path: process.execPath }));
+}
 
 // ─── Catalog contract pins ──────────────────────────────────────────
 
@@ -123,6 +133,7 @@ test('a timed-out or silently-failing probe is error, never ok and never signed_
 
 test('signed_out→ok fires the recovered event exactly once; ok→ok never fires', async () => {
   const { getCliHealth, onCliAuthRecovered, invalidateCliHealth } = await import('./auth-health.js');
+  stubInstalled();
   const { recordConnectedCli, findCatalogEntry } = await import('./catalog.js');
   recordConnectedCli(findCatalogEntry('railway')!);
 
@@ -150,6 +161,7 @@ test('signed_out→ok fires the recovered event exactly once; ok→ok never fire
 
 test('the 45s memo prevents repeat probes inside the TTL; force busts it', async () => {
   const { getCliHealth, invalidateCliHealth } = await import('./auth-health.js');
+  stubInstalled();
   invalidateCliHealth();
   let probes = 0;
   _testOnly_setProbeExec(async () => {

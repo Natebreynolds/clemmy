@@ -145,6 +145,16 @@ export function _testOnly_setProbeExec(fn?: ProbeExec): void {
   execImpl = fn ?? realExec;
 }
 
+type CommandResolver = typeof findSafeCliCommand;
+let resolveCommandImpl: CommandResolver = findSafeCliCommand;
+/** Test seam for INSTALLED-ness. Resolution hits the real PATH before any
+ *  probe runs, so a transition test could only pass on a machine that happened
+ *  to have that CLI installed — green on a dev laptop, red on a CI runner.
+ *  Mirrors _testOnly_setProbeExec; pass undefined to restore the real lookup. */
+export function _testOnly_setCommandResolver(fn?: CommandResolver): void {
+  resolveCommandImpl = fn ?? findSafeCliCommand;
+}
+
 /** Pure classification — pinned by the truth-table test.
  *  Order matters: the signed-out pattern outranks exit code because some
  *  CLIs report signed-out states with exit 0 (gcloud prints `[]`). */
@@ -253,7 +263,7 @@ async function probeHealth(item: RosterItem): Promise<CliHealth> {
   if (delegated) return delegated;
 
   const checkedAt = new Date().toISOString();
-  const safe = findSafeCliCommand(item.command);
+  const safe = resolveCommandImpl(item.command);
   if (!safe || safe.skipped || !safe.path) {
     // Not on PATH, or resolvable only to a binary the safety seam refuses
     // to execute (CLT stub, MDM tool) — treat both as not-probeable.

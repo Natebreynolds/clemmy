@@ -139,8 +139,14 @@ test('claude run: parses stream-json into events + final message, collects chang
 
 test('codex run: final message read from the -o last-message file', async (t) => {
   const project = makeProject();
+  // Resolution happens BEFORE the spawn seam, against the real PATH — so
+  // without this stub the test only passes on a machine that has codex
+  // installed (green on a dev Mac, red on a CI runner). Stub the resolver so
+  // the test exercises the codex ARG/last-message contract hermetically.
+  setGuestHarnessBinaryResolverForTest(() => process.execPath);
   t.after(() => {
     rmSync(project, { recursive: true, force: true });
+    setGuestHarnessBinaryResolverForTest(null);
     setGuestHarnessSpawnForTest(null);
   });
 

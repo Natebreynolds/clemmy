@@ -32,7 +32,16 @@ async function call(args: Record<string, unknown>): Promise<string> {
   return result.content.map((part) => part.text ?? '').join('\n');
 }
 
-const { _testOnly_setProbeExec } = await import('../integrations/cli-catalog/auth-health.js');
+const { _testOnly_setProbeExec, _testOnly_setCommandResolver } = await import('../integrations/cli-catalog/auth-health.js');
+// Installed-ness resolves against the REAL PATH before any probe runs, so a
+// status test would only probe on a machine that has the CLI installed (green
+// on a dev laptop, red on the Linux release runner). Resolve hermetically.
+_testOnly_setCommandResolver((command: string) => ({ skipped: false as const, command, path: process.execPath }));
+// The Terminal hand-off drives Terminal.app and is macOS-only BY DESIGN; off
+// darwin it returns the "run it yourself" fallback instead.
+const macOnly = {
+  skip: process.platform !== 'darwin' ? 'Terminal hand-off is macOS-only by design' : false,
+} as const;
 const { _testOnly_setOsaExec, _testOnly_stopSignInWatchers } = await import('../runtime/terminal-handoff.js');
 
 before(async () => {
@@ -75,7 +84,7 @@ test('sudo and multi-command forms are refused', async () => {
   }
 });
 
-test('auth on a non-headless CLI opens the Terminal hand-off (stubbed) and starts NO background job', async () => {
+test('auth on a non-headless CLI opens the Terminal hand-off (stubbed) and starts NO background job', macOnly, async () => {
   const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
   const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
   const scripts: string[] = [];
