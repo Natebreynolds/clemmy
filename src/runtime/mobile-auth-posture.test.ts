@@ -41,7 +41,7 @@ test('a stock daemon has sound posture with no PIN configured', () => {
   // credential, so requiring a PIN would add a setup step without adding
   // security. This is what makes one-tap setup possible.
   withEnv(
-    { CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY: undefined, CLEMENTINE_MOBILE_INGRESS: undefined },
+    { CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY: undefined },
     () => {
       const posture = mobileAuthPosture({ stateDir: path.join(TMP_ROOT, 'empty') });
       assert.equal(posture.ok, true);
@@ -61,29 +61,9 @@ test('disabling device binding is a BLOCKING gap', () => {
   });
 });
 
-test('disabling the private ingress is a BLOCKING gap', () => {
-  withEnv({ CLEMENTINE_MOBILE_INGRESS: 'shared' }, () => {
-    const posture = mobileAuthPosture({ stateDir: path.join(TMP_ROOT, 'empty') });
-    assert.equal(posture.ok, false, 'a shared listener makes rate limits spoofable again');
-    const gap = posture.gaps.find((g) => g.code === 'INGRESS_SPLIT_DISABLED');
-    assert.ok(gap);
-    assert.equal(gap!.blocking, true);
-  });
-});
-
-test('gaps are reported together rather than one at a time', () => {
-  withEnv(
-    { CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY: 'false', CLEMENTINE_MOBILE_INGRESS: 'shared' },
-    () => {
-      const posture = mobileAuthPosture({ stateDir: path.join(TMP_ROOT, 'empty') });
-      assert.equal(posture.gaps.filter((g) => g.blocking).length, 2);
-    },
-  );
-});
-
 test('every gap message says what to do about it', () => {
   withEnv(
-    { CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY: 'false', CLEMENTINE_MOBILE_INGRESS: 'shared' },
+    { CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY: 'false' },
     () => {
       for (const gap of mobileAuthPosture({ stateDir: path.join(TMP_ROOT, 'empty') }).gaps) {
         assert.ok(gap.message.length > 40, `${gap.code} needs an actionable message`);

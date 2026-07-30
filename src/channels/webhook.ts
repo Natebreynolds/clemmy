@@ -54,10 +54,9 @@ import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/con
 import { registerSpaceRoutes } from '../dashboard/space-routes.js';
 import { createMobileRouter } from './mobile-routes.js';
 import { defaultDenyAuthGate } from './auth-policy.js';
-import { readMobileAccess, setMobileAccessIngress } from '../runtime/mobile-access-state.js';
 import {
   classifyIngress,
-  restrictTunnelIngressToMobile,
+  restrictDirectAppIngressToMobile,
   startIngressListeners,
 } from '../runtime/mobile-ingress.js';
 import {
@@ -556,44 +555,6 @@ function latestHarnessEvent(
     if (predicate(events[index])) return events[index];
   }
   return undefined;
-}
-
-function isConfiguredMobileHost(req: express.Request): boolean {
-  const host = normalizeHostHeader(req.headers.host);
-  if (!host) return false;
-  const mobileHost = readMobileAccess().tunnel?.hostname?.trim().toLowerCase() ?? '';
-  return Boolean(mobileHost && host === mobileHost);
-}
-
-function requireMobileSurfaceForMobileHost(
-  req: express.Request,
-  res: express.Response,
-  next: express.NextFunction,
-): void {
-  if (!isConfiguredMobileHost(req)) {
-    next();
-    return;
-  }
-  if (req.path === '/m' || req.path.startsWith('/m/')) {
-    next();
-    return;
-  }
-  res.status(404).type('text/plain').send('Not found');
-}
-
-async function autoStartMobileTunnelIfConfigured(): Promise<void> {
-  const access = readMobileAccess();
-  // Quick tunnels are no longer excluded: they now run detached and survive
-  // restarts, so a restarted daemon adopts the live one instead of orphaning it
-  // and handing the phone a dead hostname.
-  if (!access.autoStart || !access.tunnel) return;
-  const { startTunnel, adoptOrStartQuickTunnel } = await import('../integrations/mobile-access.js');
-  const result = access.tunnel.mode === 'quick'
-    ? await adoptOrStartQuickTunnel()
-    : await startTunnel();
-  if (!result.ok) {
-    logger.warn({ error: result.error }, 'Mobile custom-domain tunnel auto-start failed');
-  }
 }
 
 function effectiveHarnessStatus(
@@ -1227,13 +1188,11 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     next();
   });
   // Order matters. Reject unknown Hosts before anything reads them, classify
-  // which door the request came through, then restrict tunnel traffic to the
-  // mobile surface by socket. requireMobileSurfaceForMobileHost stays mounted
-  // behind that as a redundant Host-based check.
+  // which door the request came through, then restrict direct-app traffic to
+  // the mobile surface by socket.
   app.use(hostAllowlistMiddleware);
   app.use(classifyIngress);
-  app.use(restrictTunnelIngressToMobile);
-  app.use(requireMobileSurfaceForMobileHost);
+  app.use(restrictDirectAppIngressToMobile);
   // Default-deny runs BEFORE any body parser. Two routes mount raw parsers with
   // 30mb and 50mb limits as route middleware, which previously executed ahead of
   // their own inline auth check — so an unauthenticated caller could make the
@@ -2914,15 +2873,4 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const { startBonjourAdvertisement } = await import('../runtime/mobile-bonjour.js');
     startBonjourAdvertisement({ port: listeners.directAppPort, fingerprint: directAppFingerprint });
   }
-
-  // Publish the private port BEFORE the tunnel auto-start reads it, or the
-  // tunnel would be pointed at the shared listener and land in tunnel-legacy.
-  if (listeners.tunnelPort !== null) {
-    await setMobileAccessIngress({ port: listeners.tunnelPort, pid: process.pid })
-      .catch((err) => logger.warn({ err }, 'Failed to publish mobile ingress port'));
-  }
-
-  void autoStartMobileTunnelIfConfigured().catch((err) => {
-    logger.warn({ err }, 'Mobile custom-domain tunnel auto-start failed');
-  });
 }

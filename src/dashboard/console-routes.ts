@@ -163,19 +163,10 @@ import {
   startBrowserHarnessInstall,
 } from '../integrations/browser-harness.js';
 import {
-  cancelLogin as mobileCancelLogin,
-  configureTunnel as mobileConfigureTunnel,
-  fetchAvailableTunnels as mobileListTunnels,
   generateQrSvg as mobileGenerateQrSvg,
-  getInstallJob as getMobileInstallJob,
   getMobileAccessStatusPayload,
   MobileQrNotReadyError,
   rotatePin as mobileRotatePin,
-  startInstallJob as startMobileInstallJob,
-  startLogin as startMobileLogin,
-  startQuickTunnel as startMobileQuickTunnel,
-  startTunnel as startMobileTunnel,
-  stopTunnel as stopMobileTunnel,
 } from '../integrations/mobile-access.js';
 import {
   revokeAllSessions as revokeAllMobileSessions,
@@ -6658,12 +6649,11 @@ export function registerConsoleRoutes(
     }
   });
 
-  // ─── Mobile Access (PWA companion + Cloudflare Tunnel) ───────────
+  // ─── Mobile Access (pinned-TLS direct-app door) ──────────────────
   //
   // GETs are auth-checked but read-only and return JSON. Mutating POSTs
-  // (install, login, configure, start/stop tunnel, rotate PIN) are
-  // gated by isAuthorized — the Bearer/cookie that lets you reach the
-  // console at all is sufficient to drive the wizard.
+  // (rotate PIN, revoke sessions) are gated by isAuthorized — the
+  // Bearer/cookie that lets you reach the console at all is sufficient.
 
   app.get('/api/console/mobile-access/status', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
@@ -6671,87 +6661,6 @@ export function registerConsoleRoutes(
       res.json(await getMobileAccessStatusPayload());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.post('/api/console/mobile-access/install', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
-      const job = await startMobileInstallJob();
-      res.json({ job });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.get('/api/console/mobile-access/install/:id', (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const job = getMobileInstallJob(req.params.id);
-    if (!job) { res.status(404).json({ error: 'install job not found' }); return; }
-    res.json({ job });
-  });
-
-  app.post('/api/console/mobile-access/login', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
-      res.json({ login: await startMobileLogin() });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.post('/api/console/mobile-access/login/cancel', (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    mobileCancelLogin();
-    res.json({ ok: true });
-  });
-
-  app.get('/api/console/mobile-access/tunnels', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
-      res.json({ tunnels: await mobileListTunnels() });
-    } catch (err) {
-      // Most common: not logged in. Return 200 + empty so the UI can
-      // render a "log in first" hint instead of throwing.
-      res.json({ tunnels: [], error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.post('/api/console/mobile-access/configure', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const tunnelName = typeof req.body?.tunnelName === 'string' ? req.body.tunnelName.trim() : '';
-    const hostname = typeof req.body?.hostname === 'string' ? req.body.hostname.trim() : '';
-    if (!tunnelName || !hostname) {
-      res.status(400).json({ error: 'tunnelName and hostname are required' });
-      return;
-    }
-    try {
-      const record = await mobileConfigureTunnel({ tunnelName, hostname });
-      res.json({ ok: true, state: record });
-    } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.post('/api/console/mobile-access/tunnel/start', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
-      const result = await startMobileTunnel();
-      if (!result.ok) { res.status(400).json(result); return; }
-      res.json(result);
-    } catch (err) {
-      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.post('/api/console/mobile-access/quick/start', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
-      const result = await startMobileQuickTunnel();
-      if (!result.ok) { res.status(400).json(result); return; }
-      res.json(result);
-    } catch (err) {
-      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -6765,15 +6674,6 @@ export function registerConsoleRoutes(
       const { ensureMobileAccess } = await import('../integrations/mobile-setup.js');
       const result = await ensureMobileAccess();
       res.status(result.ok ? 200 : 400).json(result);
-    } catch (err) {
-      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.post('/api/console/mobile-access/tunnel/stop', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
-      res.json(await stopMobileTunnel());
     } catch (err) {
       res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -6811,23 +6711,10 @@ export function registerConsoleRoutes(
     res.json({ ok: true, removed });
   });
 
-  app.post('/api/console/mobile-access/access-ack', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const enabled = req.body?.enabled === true;
-    try {
-      const { setMobileAccessAccessAck } = await import('../runtime/mobile-access-state.js');
-      const record = await setMobileAccessAccessAck({ enabled });
-      res.json({ ok: true, cloudflareAccess: record.cloudflareAccess ?? null });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
   app.get('/api/console/mobile-access/qr', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const hostname = typeof req.query.hostname === 'string' ? req.query.hostname : undefined;
     try {
-      const result = await mobileGenerateQrSvg(hostname);
+      const result = await mobileGenerateQrSvg();
       res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('X-Target-Url', result.targetUrl);

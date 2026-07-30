@@ -90,19 +90,12 @@ Memory
   memory status       Show SQLite vault index and fact counts
   memory reindex      Rebuild the SQLite vault index
 
-Mobile (PWA companion)
-  mobile status                    Show PIN + sessions + tunnel summary
+Mobile (Clem app companion)
+  mobile status                    Show PIN + sessions summary
+  mobile setup                     Check the direct-app door + render setup state
   mobile set-pin                   Set / rotate the mobile login PIN
   mobile sessions                  List active mobile sessions
   mobile revoke-all                Invalidate every active mobile session
-  mobile tunnel detect             Locate cloudflared + record version
-  mobile tunnel install            brew install cloudflared (macOS)
-  mobile tunnel login              Open browser to authorize cloudflared
-  mobile tunnel list               List tunnels on the connected CF account
-  mobile tunnel create <name>      Create a named tunnel
-  mobile tunnel route <tn> <host>  Point hostname at a tunnel
-  mobile tunnel start              Run the configured tunnel (foreground)
-  mobile tunnel info               Show saved mobile-access state
 
 Harness (0.3, local smoke test)
   harness run "<prompt>"     Run one turn through the Orchestrator + loop

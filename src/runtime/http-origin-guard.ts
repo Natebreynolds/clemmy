@@ -9,12 +9,7 @@
  * is satisfied because the *name* never changed. Those requests reach the daemon
  * carrying `Host: evil.example`.
  *
- * Previously the only Host check was requireMobileSurfaceForMobileHost, which
- * asks "is this the configured tunnel hostname?" — an allowlist of exactly one
- * name, used to *restrict* that name to /m/*. Any other Host, including a
- * rebound attacker name, fell straight through to the full /api/* surface.
- *
- * So we invert it: unknown *names* are rejected outright with 421.
+ * Unknown *names* are rejected outright with 421.
  *
  * IP literals are deliberately allowed. Rebinding fundamentally requires a
  * hostname — it works by changing what a name resolves to. A page cannot cause
@@ -26,7 +21,6 @@
 import net from 'node:net';
 import type { Request, Response, NextFunction } from 'express';
 import { WEBHOOK_HOST } from '../config.js';
-import { readMobileAccess } from './mobile-access-state.js';
 
 /**
  * Lowercases a Host header and strips the port and any IPv6 brackets.
@@ -54,32 +48,20 @@ function extraAllowedHosts(): string[] {
     .filter(Boolean);
 }
 
-/**
- * Builds the allowlist fresh on every call.
- *
- * Deliberately uncached: a quick tunnel gets a NEW hostname every time
- * cloudflared restarts, and a cached set would 421 the user's own phone the
- * moment the tunnel rotated. The read is a small JSON file behind the
- * mobile-access state module, not a network call.
- */
-export function buildAllowedHostNames(opts?: { hostname?: string | null }): Set<string> {
+/** Builds the allowlist fresh on every call — env-driven entries stay live. */
+export function buildAllowedHostNames(): Set<string> {
   const allowed = new Set<string>(LOOPBACK_NAMES);
   const configured = normalizeHostHeader(WEBHOOK_HOST);
   if (configured && !net.isIP(configured) && configured !== '0.0.0.0') allowed.add(configured);
-  const tunnelHost = opts?.hostname === undefined
-    ? readMobileAccess().tunnel?.hostname
-    : opts.hostname;
-  const normalizedTunnel = normalizeHostHeader(tunnelHost);
-  if (normalizedTunnel) allowed.add(normalizedTunnel);
   for (const extra of extraAllowedHosts()) allowed.add(extra);
   return allowed;
 }
 
-export function isAllowedHost(host: string, opts?: { hostname?: string | null }): boolean {
+export function isAllowedHost(host: string): boolean {
   if (!host) return false;
   // IP literals cannot be a rebinding vector — see the module header.
   if (net.isIP(host) !== 0) return true;
-  return buildAllowedHostNames(opts).has(host);
+  return buildAllowedHostNames().has(host);
 }
 
 /**

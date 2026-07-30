@@ -50,7 +50,6 @@ const {
   isAllowedHost,
   normalizeHostHeader,
 } = await import('./http-origin-guard.js');
-const { setMobileAccessTunnel } = await import('./mobile-access-state.js');
 
 async function startApp(): Promise<{ port: number; close: () => Promise<void> }> {
   const app = express();
@@ -98,31 +97,13 @@ test('loopback and IP-literal Hosts are allowed', async () => {
   }
 });
 
-test('the configured tunnel hostname is allowed, and a hostname change is picked up live', async () => {
-  const stateDir = path.join(TMP_ROOT, 'rotate');
-  // Quick tunnels get a NEW hostname on every restart, so a cached allowlist
-  // would 421 the user's own phone the moment the tunnel rotated.
-  await setMobileAccessTunnel(
-    { id: 't1', name: 'quick', hostname: 'first.trycloudflare.com', mode: 'quick' },
-    { stateDir },
-  );
-  assert.equal(isAllowedHost('first.trycloudflare.com', { hostname: 'first.trycloudflare.com' }), true);
-
-  await setMobileAccessTunnel(
-    { id: 't2', name: 'quick', hostname: 'second.trycloudflare.com', mode: 'quick' },
-    { stateDir },
-  );
-  assert.equal(isAllowedHost('second.trycloudflare.com', { hostname: 'second.trycloudflare.com' }), true);
-  assert.equal(isAllowedHost('first.trycloudflare.com', { hostname: 'second.trycloudflare.com' }), false);
-});
-
 test('CLEMENTINE_EXTRA_ALLOWED_HOSTS widens the allowlist', () => {
   const prior = process.env.CLEMENTINE_EXTRA_ALLOWED_HOSTS;
   process.env.CLEMENTINE_EXTRA_ALLOWED_HOSTS = 'my-box.lan, other.example';
   try {
-    assert.equal(isAllowedHost('my-box.lan', { hostname: null }), true);
-    assert.equal(isAllowedHost('other.example', { hostname: null }), true);
-    assert.equal(isAllowedHost('evil.example', { hostname: null }), false);
+    assert.equal(isAllowedHost('my-box.lan'), true);
+    assert.equal(isAllowedHost('other.example'), true);
+    assert.equal(isAllowedHost('evil.example'), false);
   } finally {
     if (prior === undefined) delete process.env.CLEMENTINE_EXTRA_ALLOWED_HOSTS;
     else process.env.CLEMENTINE_EXTRA_ALLOWED_HOSTS = prior;
