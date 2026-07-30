@@ -13,7 +13,10 @@ import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-const LANES = ['loop.ts', 'claude-agent-brain.ts', 'plan-first.ts'];
+// Paths relative to this dir (src/runtime/harness). assistant/core.ts is the
+// daemon/Discord/Slack/mobile lane — it once called auto-credit directly and so
+// silently dropped correction detection, the exact two-lane drift this guards.
+const LANES = ['loop.ts', 'claude-agent-brain.ts', 'plan-first.ts', '../../assistant/core.ts'];
 
 // Every brain lane must route its post-turn work through the ONE shared seam,
 // so a new post-turn behavior wires in a single place and can never be dropped
@@ -22,7 +25,7 @@ for (const lane of LANES) {
   test(`${lane} runs post-turn hooks via the shared spine`, () => {
     const src = readFileSync(path.join(here, lane), 'utf8');
     assert.match(src, /runPostTurnHooks\(/, `${lane} must call the shared runPostTurnHooks seam`);
-    assert.match(src, /from '\.\/post-turn\.js'/, `${lane} must import the shared post-turn spine`);
+    assert.match(src, /from '[^']*post-turn\.js'/, `${lane} must import the shared post-turn spine`);
   });
 }
 

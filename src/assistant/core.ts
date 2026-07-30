@@ -3,7 +3,7 @@ import { MODELS } from '../config.js';
 import { analyzeExecutionIntent, buildExecutionPromptBlock, parseExecutionResponse } from '../execution/intake.js';
 import { ExecutionStore } from '../execution/store.js';
 import { assemblePromptContextAsync } from '../memory/context.js';
-import { autoCreditRecallRuns } from '../memory/recall-auto-credit.js';
+import { runPostTurnHooks } from '../runtime/harness/post-turn.js';
 import { refreshSessionBrief } from '../memory/session-briefs.js';
 import { SessionStore } from '../memory/session-store.js';
 import type { AssistantRequest, AssistantResponse, RunResult } from '../types.js';
@@ -276,15 +276,20 @@ export class ClementineAssistant {
       result = { ...result, text: ASSISTANT_PAUSED_PLACEHOLDER, stoppedReason: result.stoppedReason ?? 'error' };
     }
 
-    // Post-reply memory credit for this lane's primer recall run (code-level
-    // replacement for the never-called memory_mark_used prompt rule).
+    // Full post-turn spine for this lane (daemon / Discord / Slack / mobile):
+    // correction detection + auto-credit + auto-focus, via the ONE shared seam.
+    // This lane previously called auto-credit directly and so silently dropped
+    // correction detection — a user correcting Clem here could never teach her.
     try {
-      autoCreditRecallRuns({
+      runPostTurnHooks({
+        sessionId: request.sessionId,
+        turn: 0,
+        userInput: request.message,
         recallIds: [recallId],
         replyText: result.text,
         queryText: request.message,
       });
-    } catch { /* crediting is bookkeeping; it must never break the reply */ }
+    } catch { /* post-turn hooks are bookkeeping; they must never break the reply */ }
 
     if (executionPrompt && executionIntent) {
       const parsed = parseExecutionResponse(result.text);
