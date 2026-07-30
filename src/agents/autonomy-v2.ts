@@ -1,4 +1,5 @@
 import { Agent, Runner, setDefaultOpenAIKey, setTracingExportApiKey } from '@openai/agents';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import pino from 'pino';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -40,7 +41,7 @@ import {
   type TeamAgentRecord,
 } from '../tools/shared.js';
 import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
-import { addRunEvent, finishRun } from '../runtime/run-events.js';
+import { addRunEvent, createRunId, finishRun } from '../runtime/run-events.js';
 import {
   finishAutonomyRun,
   recordAutonomyDecision,
@@ -185,6 +186,14 @@ interface AgentStateRecord {
   commitments?: string[];
   nextWakeAt?: string;
   lastError?: string;
+  /** Fingerprint of the complete pending inbox present during the last failed
+   *  cycle. Backoff suppresses only that set; a new request remains due. */
+  failedInboxFingerprint?: string;
+  /** Set when the last cycle stopped WAITING ON THE HUMAN (approval card or a
+   *  question) rather than failing. Distinguishes "parked" from "broken" so the
+   *  failure backoff never re-runs a turn that is sitting in the user's inbox. */
+  parkedReason?: string;
+  parkedAt?: string;
   engine?: 'v1' | 'v2';
 }
 
@@ -268,11 +277,75 @@ function isDelegationWakeDue(agent: TeamAgentRecord, state: AgentStateRecord): b
  *  provider, short enough that transient weather never costs a full cadence. */
 const CYCLE_FAILURE_RETRY_MS = 90_000;
 
+/**
+ * Stop reasons that mean "this cycle is WAITING ON THE HUMAN", not "this cycle
+ * broke". A turn that parked for an approval card or asked the user a question
+ * did its job — the work is sitting in the user's inbox. Retrying it on the
+ * failure backoff re-runs the same turn every 90s and re-trips the same card,
+ * which is noise for the user and burned tokens for us. Park instead: hold the
+ * agent until the human acts, leaving the inbox items intact so the resumed
+ * cycle still sees them.
+ */
+const CYCLE_PARKED_REASONS: ReadonlySet<string> = new Set([
+  'pending-approval',
+  'awaiting-input',
+  'awaits-user-material',
+]);
+
+function isParkedCycleReason(reason: string | undefined): boolean {
+  return typeof reason === 'string' && CYCLE_PARKED_REASONS.has(reason);
+}
+
+/** Thrown when a cycle stops because it needs the human. Carries the reason so
+ *  the caller parks (waits) instead of applying the failure retry backoff. */
+export class AutonomyCycleParked extends Error {
+  readonly reason: string;
+
+  constructor(reason: string) {
+    super(`cycle_parked:${reason}`);
+    this.name = 'AutonomyCycleParked';
+    this.reason = reason;
+  }
+}
+
+/**
+ * A parked cycle waits for the human rather than retrying on a clock. No
+ * nextWakeAt is set: the agent's normal cadence/inbox wake rules resume it once
+ * the user has acted, and lastError is cleared because waiting is not an error.
+ */
+function buildCycleParkedState(
+  state: AgentStateRecord,
+  reason: string,
+  nowMs = Date.now(),
+): AgentStateRecord {
+  const next: AgentStateRecord = {
+    ...state,
+    engine: 'v2',
+    lastRunAt: new Date(nowMs).toISOString(),
+    parkedReason: reason,
+    parkedAt: new Date(nowMs).toISOString(),
+  };
+  delete next.lastError;
+  delete next.nextWakeAt;
+  delete next.failedInboxFingerprint;
+  return next;
+}
+
+export const _testOnly_buildCycleParkedState = buildCycleParkedState;
+export const _testOnly_isParkedCycleReason = isParkedCycleReason;
+
+function inboxFingerprint(ids: readonly string[]): string {
+  return createHash('sha256')
+    .update([...new Set(ids)].sort().join('\u0000'))
+    .digest('hex');
+}
+
 function buildCycleFailureState(
   state: AgentStateRecord,
   slug: string,
   message: string,
   nowMs = Date.now(),
+  failedInboxIds: string[] = [],
 ): AgentStateRecord {
   return {
     ...state,
@@ -280,11 +353,39 @@ function buildCycleFailureState(
     engine: 'v2',
     lastRunAt: new Date(nowMs).toISOString(),
     lastError: message,
+    failedInboxFingerprint: inboxFingerprint(failedInboxIds),
     nextWakeAt: new Date(nowMs + CYCLE_FAILURE_RETRY_MS).toISOString(),
   };
 }
 
 export const _testOnly_buildCycleFailureState = buildCycleFailureState;
+
+/**
+ * Inbox work normally bypasses cadence so a newly delivered request is
+ * responsive. A failed cycle is the exception: the same pending item remains
+ * in the inbox, so ignoring its recorded retry time would hammer the provider
+ * on every daemon tick. Successful follow-up schedules intentionally do not
+ * suppress new inbox work.
+ */
+function isInboxWakeDue(
+  pendingInboxIds: readonly string[],
+  state: Pick<AgentStateRecord, 'lastError' | 'nextWakeAt' | 'failedInboxFingerprint'>,
+  nowMs = Date.now(),
+): boolean {
+  if (pendingInboxIds.length === 0) return false;
+  if (!state.lastError || !state.nextWakeAt) return true;
+  // Legacy state has no failed-id snapshot; preserve its one bounded backoff.
+  // New state can distinguish the same failed work from a newly arrived
+  // request, which should wake immediately.
+  if (
+    typeof state.failedInboxFingerprint === 'string'
+    && state.failedInboxFingerprint !== inboxFingerprint(pendingInboxIds)
+  ) return true;
+  const nextWakeAtMs = Date.parse(state.nextWakeAt);
+  return !Number.isFinite(nextWakeAtMs) || nextWakeAtMs <= nowMs;
+}
+
+export const _testOnly_isInboxWakeDue = isInboxWakeDue;
 
 function isCadenceDue(agent: TeamAgentRecord, state: AgentStateRecord): boolean {
   if (!agent.proactive) return false;
@@ -615,6 +716,14 @@ async function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): Pro
   return agent;
 }
 
+/** Narrow test seam for a preflight model-construction failure. Production
+ * always uses getAgent; tests can prove that setup failures still close the
+ * durable run and persist the same inbox-scoped retry state as run failures. */
+let sdkAgentBuilderImpl: typeof getAgent | undefined;
+export const _testOnly_setSdkAgentBuilder = (fn?: typeof getAgent): void => {
+  sdkAgentBuilderImpl = fn;
+};
+
 function rawSdkDecisionOnlySurface(): { tools: []; mcpServers: [] } {
   return { tools: [], mcpServers: [] };
 }
@@ -739,11 +848,12 @@ async function assertAutonomyDecisionGuardrails(decision: AgentDecisionV2): Prom
 async function runAgentCycleV2(
   record: TeamAgentRecord,
   signal?: AbortSignal,
-): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string }> {
+): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string; parked?: boolean; parkedReason?: string }> {
   const state = loadAgentState(record.slug);
-  const inboxItems = loadInbox(record.slug).filter((item) => item.status === 'pending').slice(0, MAX_INBOX_PER_CYCLE);
+  const pendingInboxItems = loadInbox(record.slug).filter((item) => item.status === 'pending');
+  const inboxItems = pendingInboxItems.slice(0, MAX_INBOX_PER_CYCLE);
   const wakeReasons = [
-    ...(inboxItems.length > 0 ? ['inbox'] : []),
+    ...(isInboxWakeDue(pendingInboxItems.map((item) => item.id), state) ? ['inbox'] : []),
     ...(isCadenceDue(record, state) ? ['cadence'] : []),
     ...(isDelegationWakeDue(record, state) ? ['delegation'] : []),
   ];
@@ -751,29 +861,33 @@ async function runAgentCycleV2(
     return { runId: '', success: true, outcomes: [] };
   }
 
-  const runId = startAutonomyRun(record, wakeReasons, inboxItems.length);
-
-  // Fresh per-cycle peer-message budget (gated; no-op when disabled).
-  if (peerCommsEnabled()) resetCommsCycle(record.slug);
-
-  // Read policy once per cycle so the agent build, the input text, and
-  // the recorded snapshot all use the same view. Avoids the agent's
-  // tools and the policy text disagreeing if the user toggles a setting
-  // mid-cycle.
-  const policySnapshot = getProactivityPolicySnapshot();
-  const policy = policySnapshot.policy;
-
-  // Capture the policy snapshot as a run event so the dashboard / audit
-  // can answer "what was the agent operating under during this cycle?"
-  // months later.
-  const policyEvent = buildPolicyEvent(policySnapshot);
-  addRunEvent(runId, policyEvent);
-
-  const agent = await getAgent(record, policy);
-  const input = buildRuntimeCyclePrompt(record, buildAgentInput(record, inboxItems, state, policy));
-  currentRunIdByAgent.set(agent, runId);
-
+  // Reserve the id before setup so even a start/model-construction failure can
+  // close the same observable run instead of escaping as an untracked reject.
+  const runId = createRunId();
+  let agent: AutonomyAgent | undefined;
   try {
+    startAutonomyRun(record, wakeReasons, inboxItems.length, { id: runId });
+
+    // Fresh per-cycle peer-message budget (gated; no-op when disabled).
+    if (peerCommsEnabled()) resetCommsCycle(record.slug);
+
+    // Read policy once per cycle so the agent build, the input text, and
+    // the recorded snapshot all use the same view. Avoids the agent's
+    // tools and the policy text disagreeing if the user toggles a setting
+    // mid-cycle.
+    const policySnapshot = getProactivityPolicySnapshot();
+    const policy = policySnapshot.policy;
+
+    // Capture the policy snapshot as a run event so the dashboard / audit
+    // can answer "what was the agent operating under during this cycle?"
+    // months later.
+    const policyEvent = buildPolicyEvent(policySnapshot);
+    addRunEvent(runId, policyEvent);
+
+    agent = await (sdkAgentBuilderImpl ?? getAgent)(record, policy);
+    const input = buildRuntimeCyclePrompt(record, buildAgentInput(record, inboxItems, state, policy));
+    currentRunIdByAgent.set(agent, runId);
+
     const result = await getRunner().run(agent, input, {
       context: { sessionId: `agent:${record.slug}`, userId: record.slug, channel: 'agent' },
       maxTurns: 8,
@@ -833,13 +947,19 @@ async function runAgentCycleV2(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.error({ err: error, agent: record.slug }, 'autonomy-v2 cycle failed');
-    saveAgentState(buildCycleFailureState(state, record.slug, message));
+    saveAgentState(buildCycleFailureState(
+      state,
+      record.slug,
+      message,
+      Date.now(),
+      pendingInboxItems.map((item) => item.id),
+    ));
     finishAutonomyRun(runId, [], message);
     return { runId, success: false, outcomes: [], error: message };
   } finally {
     // Always release the WeakMap binding so a stale runId can't leak
     // into a future cycle if hooks fire after the run resolves.
-    currentRunIdByAgent.delete(agent);
+    if (agent) currentRunIdByAgent.delete(agent);
   }
 }
 
@@ -867,7 +987,7 @@ export interface AutonomyV2RunSummary {
 }
 
 /**
- * Run a single v2 autonomy pass over all opted-in agents in parallel.
+ * Run a single v2 autonomy pass over opted-in agents.
  * Safe to call repeatedly; idempotent within a cycle thanks to the
  * inbox `processed` flag and `lastRunAt` cadence check.
  */
@@ -905,7 +1025,31 @@ interface ClaimedCycle<T> {
   abort: () => void;
 }
 
-const cyclesInFlight = new Map<string, { promise: Promise<unknown>; abort: () => void }>();
+interface InFlightAutonomyCycle {
+  promise: Promise<unknown>;
+  abort: () => void;
+  /** Infinity while the caller still owns the turn. After a timeout, the
+   *  provider gets a short cancellation grace period before this stale claim
+   *  stops blocking unrelated agents. The original slug remains claimed until
+   *  physical settlement, so its own inbox can never run concurrently. */
+  globalHoldUntilMs: number;
+}
+
+const AUTONOMY_ABORT_SETTLEMENT_GRACE_MS = 30_000;
+export const _testOnly_autonomyAbortSettlementGraceMs = AUTONOMY_ABORT_SETTLEMENT_GRACE_MS;
+
+let autonomyCoordinatorNow = (): number => Date.now();
+export function _testOnly_setAutonomyCoordinatorNow(now?: () => number): void {
+  autonomyCoordinatorNow = now ?? (() => Date.now());
+}
+
+const cyclesInFlight = new Map<string, InFlightAutonomyCycle>();
+
+/** Await physical provider settlement during isolated timeout tests. Production
+ *  scheduling never calls this; it observes the same map without blocking. */
+export async function _testOnly_waitForAutonomyLaneIdle(): Promise<void> {
+  await Promise.allSettled([...cyclesInFlight.values()].map((claim) => claim.promise));
+}
 
 function claimCycle<T>(
   slug: string,
@@ -916,7 +1060,11 @@ function claimCycle<T>(
 
   const controller = new AbortController();
   const promise = start(controller.signal);
-  const claimed = { promise, abort: () => controller.abort() };
+  const claimed: InFlightAutonomyCycle = {
+    promise,
+    abort: () => controller.abort(),
+    globalHoldUntilMs: Number.POSITIVE_INFINITY,
+  };
   cyclesInFlight.set(slug, claimed);
   void promise.then(
     () => {
@@ -927,6 +1075,12 @@ function claimCycle<T>(
     },
   );
   return { started: true, promise, abort: claimed.abort };
+}
+
+function beginAutonomyAbortSettlementGrace(slug: string): void {
+  const claimed = cyclesInFlight.get(slug);
+  if (!claimed) return;
+  claimed.globalHoldUntilMs = autonomyCoordinatorNow() + AUTONOMY_ABORT_SETTLEMENT_GRACE_MS;
 }
 
 export interface RuntimeCycleAction {
@@ -1050,25 +1204,37 @@ export const _testOnly_setRuntimeCycleImpl = (fn?: typeof runAgentCycleViaRuntim
   runtimeCycleImpl = fn;
 };
 
+/** SDK counterpart to the runtime seam. It lets the bounded admission policy
+ *  be proven without an API key or a live provider. */
+let sdkCycleImpl: typeof runAgentCycleV2 | undefined;
+export const _testOnly_setSdkCycleImpl = (fn?: typeof runAgentCycleV2): void => {
+  sdkCycleImpl = fn;
+};
+
 async function runAgentCycleViaRuntime(
   assistant: ClementineAssistant,
   record: TeamAgentRecord,
   signal?: AbortSignal,
-): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string }> {
+): Promise<{ runId: string; success: boolean; outcomes: string[]; error?: string; parked?: boolean; parkedReason?: string }> {
   const state = loadAgentState(record.slug);
-  const inboxItems = loadInbox(record.slug).filter((item) => item.status === 'pending').slice(0, MAX_INBOX_PER_CYCLE);
+  const pendingInboxItems = loadInbox(record.slug).filter((item) => item.status === 'pending');
+  const inboxItems = pendingInboxItems.slice(0, MAX_INBOX_PER_CYCLE);
   const wakeReasons = [
-    ...(inboxItems.length > 0 ? ['inbox'] : []),
+    ...(isInboxWakeDue(pendingInboxItems.map((item) => item.id), state) ? ['inbox'] : []),
     ...(isCadenceDue(record, state) ? ['cadence'] : []),
     ...(isDelegationWakeDue(record, state) ? ['delegation'] : []),
   ];
   if (wakeReasons.length === 0) return { runId: '', success: true, outcomes: [] };
 
-  const runId = startAutonomyRun(record, wakeReasons, inboxItems.length);
-  const policySnapshot = getProactivityPolicySnapshot();
-  addRunEvent(runId, buildPolicyEvent(policySnapshot));
-
+  // Keep runtime setup under the same failure transition as its provider turn.
+  // A malformed policy/run store must retain the triggering inbox and pace its
+  // retry just like a model-construction or transport failure.
+  const runId = createRunId();
   try {
+    startAutonomyRun(record, wakeReasons, inboxItems.length, { id: runId });
+    const policySnapshot = getProactivityPolicySnapshot();
+    addRunEvent(runId, buildPolicyEvent(policySnapshot));
+
     const input = buildAgentInput(record, inboxItems, state, policySnapshot.policy);
     // Run the cycle exactly the way cron runs jobs: respondPreferHarness on the
     // 'cron' surface routes through the gated harness loop with whatever brain
@@ -1108,6 +1274,7 @@ async function runAgentCycleViaRuntime(
     // so the next cycle retries them. (validator feedback, live date)
     const terminalOk = (reason: string | undefined): boolean => reason === undefined || reason === 'success';
     if (!terminalOk(run.stoppedReason)) {
+      if (isParkedCycleReason(run.stoppedReason)) throw new AutonomyCycleParked(run.stoppedReason as string);
       throw new Error(`cycle_not_terminal:${run.stoppedReason}`);
     }
     let parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
@@ -1118,6 +1285,7 @@ async function runAgentCycleViaRuntime(
         message: `${baseRequest.message}\n\nYour previous reply was not parseable JSON. Reply with ONLY the JSON object described above.`,
       }, (req) => assistant.respond(req));
       if (!terminalOk(run.stoppedReason)) {
+        if (isParkedCycleReason(run.stoppedReason)) throw new AutonomyCycleParked(run.stoppedReason as string);
         throw new Error(`cycle_not_terminal:${run.stoppedReason}`);
       }
       parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
@@ -1190,8 +1358,23 @@ async function runAgentCycleViaRuntime(
     return { runId, success: true, outcomes: [decision.summary, ...outcomes] };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    // WAITING ON THE HUMAN is not a failure. Park (no retry clock, no lastError)
+    // so the approval card sitting in the user's inbox is answered once, instead
+    // of the same turn re-running every 90s and minting a duplicate card.
+    if (error instanceof AutonomyCycleParked) {
+      logger.info({ agent: record.slug, reason: error.reason }, 'autonomy cycle parked waiting on the user');
+      saveAgentState(buildCycleParkedState(state, error.reason));
+      finishAutonomyRun(runId, [`Waiting on you (${error.reason}).`]);
+      return { runId, success: false, outcomes: [], parked: true, parkedReason: error.reason };
+    }
     logger.error({ err: error, agent: record.slug }, 'autonomy runtime cycle failed');
-    saveAgentState(buildCycleFailureState(state, record.slug, message));
+    saveAgentState(buildCycleFailureState(
+      state,
+      record.slug,
+      message,
+      Date.now(),
+      pendingInboxItems.map((item) => item.id),
+    ));
     finishAutonomyRun(runId, [], message);
     return { runId, success: false, outcomes: [], error: message };
   }
@@ -1240,6 +1423,112 @@ export function shouldUseOpenAiSdkAutonomy(assistantPresent = false): boolean {
   }
 }
 
+type AutonomyCycleResult = Awaited<ReturnType<typeof runAgentCycleV2>>;
+type AutonomyCycleStarter = (
+  record: TeamAgentRecord,
+  signal: AbortSignal,
+) => Promise<AutonomyCycleResult>;
+
+/**
+ * The slug admitted most recently is enough durable-in-process state for fair
+ * round-robin service. Due-ness remains owned by each cycle implementation;
+ * no-op scans do not move the cursor or consume the one-turn tick budget.
+ */
+let lastAdmittedAgentSlug: string | undefined;
+
+export function _testOnly_resetAutonomyAdmissionCursor(): void {
+  lastAdmittedAgentSlug = undefined;
+}
+
+function recordsInAdmissionOrder(records: TeamAgentRecord[]): TeamAgentRecord[] {
+  if (!lastAdmittedAgentSlug || records.length < 2) return records;
+  const lastIndex = records.findIndex((record) => record.slug === lastAdmittedAgentSlug);
+  if (lastIndex < 0) return records;
+  const nextIndex = (lastIndex + 1) % records.length;
+  return [...records.slice(nextIndex), ...records.slice(0, nextIndex)];
+}
+
+/**
+ * Scan no-ops freely, but admit at most one actual brain cycle. This single
+ * policy serves both selected-brain runtime and SDK fallback so a restart with
+ * many due agents cannot fan out an unbounded Promise.all on either lane.
+ */
+async function runBoundedAutonomyPass(
+  records: TeamAgentRecord[],
+  startCycle: AutonomyCycleStarter,
+  timeoutMs: number,
+  summary: AutonomyV2RunSummary,
+  rejectionMessage: string,
+): Promise<void> {
+  // Let already-settled claims run their deletion handler before inspecting
+  // the physical lane. This keeps a synchronously released test/provider
+  // promise from imposing an extra tick while still holding genuinely active
+  // work.
+  await Promise.resolve();
+
+  // A timeout releases only the caller's wait budget. Give the underlying
+  // provider a bounded grace period to observe cancellation before admitting
+  // another heavy turn. A provider that ignores abort forever must not freeze
+  // every other agent forever: after the grace period only its own slug stays
+  // claimed, preserving per-agent state safety while round-robin service
+  // continues for unrelated agents.
+  const physicalClaims = [...cyclesInFlight.values()];
+  if (physicalClaims.some((claim) =>
+    claim.globalHoldUntilMs > autonomyCoordinatorNow())) {
+    summary.attempted++;
+    summary.skipped++;
+    return;
+  }
+  // One quarantined provider may coexist with one fresh recovery attempt.
+  // If that second provider also ignores abort, open the circuit instead of
+  // accumulating an unbounded set of zombie network/model calls.
+  if (physicalClaims.length >= 2) {
+    summary.attempted++;
+    summary.skipped++;
+    return;
+  }
+
+  for (const record of recordsInAdmissionOrder(records)) {
+    const claimed = claimCycle(record.slug, (signal) => startCycle(record, signal));
+    if (!claimed.started) {
+      summary.attempted++;
+      summary.skipped++;
+      continue;
+    }
+
+    try {
+      const result = await withTimeout(
+        claimed.promise,
+        timeoutMs,
+        `agent ${record.slug}`,
+        claimed.abort,
+      );
+      summary.attempted++;
+      if (!result.runId) {
+        summary.skipped++;
+        continue;
+      }
+
+      lastAdmittedAgentSlug = record.slug;
+      if (result.success) summary.succeeded++;
+      else summary.failed++;
+    } catch (err) {
+      // A rejected or timed-out claimed cycle may already have consumed a
+      // provider turn, so it owns this invocation's one-turn budget.
+      // If it is still physically in flight, this was the wrapper timeout:
+      // start a bounded global cancellation grace. Ordinary rejections have
+      // already removed their claim in the promise settlement microtask.
+      beginAutonomyAbortSettlementGrace(record.slug);
+      summary.attempted++;
+      summary.failed++;
+      lastAdmittedAgentSlug = record.slug;
+      logger.warn({ err, agent: record.slug }, rejectionMessage);
+    }
+
+    break;
+  }
+}
+
 export async function processAgentAutonomyV2(assistant?: ClementineAssistant): Promise<AutonomyV2RunSummary> {
   const start = Date.now();
   const summary: AutonomyV2RunSummary = { attempted: 0, succeeded: 0, failed: 0, skipped: 0, durationMs: 0 };
@@ -1255,7 +1544,10 @@ export async function processAgentAutonomyV2(assistant?: ClementineAssistant): P
   // cycles through the assistant's brain runtime instead — the same primitive
   // the execution controller and cron already use — so autonomy works on
   // Claude OAuth and Codex OAuth, the shipped defaults.
-  if (!shouldUseOpenAiSdkAutonomy(Boolean(assistant))) {
+  const useSdkEngine = sdkCycleImpl !== undefined
+    || sdkAgentBuilderImpl !== undefined
+    || shouldUseOpenAiSdkAutonomy(Boolean(assistant));
+  if (!useSdkEngine) {
     if (!assistant) {
       // No key AND no runtime handle: nothing can run. Say so once rather
       // than returning quietly every tick.
@@ -1264,41 +1556,13 @@ export async function processAgentAutonomyV2(assistant?: ClementineAssistant): P
       return summary;
     }
     const records = loadTeamAgents().filter((rec) => optIn.has(rec.slug) && rec.autonomyEnabled !== false);
-    // Sequential on purpose: runtime turns are heavier than SDK cycles, and
-    // serializing them keeps one slow agent from stacking brain-lane load.
-    // AND at most ONE fired cycle per tick (v3.0.1 stampede family): after
-    // downtime every agent's cadence is due at once, and N sequential brain
-    // turns inside one awaited phase starve the daemon loop — workflow
-    // scheduling, briefs, and the watchdog wait for the SUM of them. Holding
-    // is free here: a held agent stamps nothing, stays due, and runs next
-    // tick (~15s later) — a non-event against a 30-minute cadence.
-    for (const rec of records) {
-      const claimed = claimCycle(rec.slug, (signal) => (runtimeCycleImpl ?? runAgentCycleViaRuntime)(assistant, rec, signal));
-      if (!claimed.started) {
-        summary.attempted++;
-        summary.skipped++;
-        continue;
-      }
-      let firedBrainTurn = false;
-      try {
-        const result = await withTimeout(
-          claimed.promise,
-          RUNTIME_CYCLE_TIMEOUT_MS + 15_000,
-          `agent ${rec.slug}`,
-          claimed.abort,
-        );
-        summary.attempted++;
-        if (!result.runId) summary.skipped++;
-        else if (result.success) { summary.succeeded++; firedBrainTurn = true; }
-        else { summary.failed++; firedBrainTurn = true; }
-      } catch (err) {
-        summary.attempted++;
-        summary.failed++;
-        firedBrainTurn = true; // a rejected cycle still consumed the tick's brain budget
-        logger.warn({ err, agent: rec.slug }, 'autonomy runtime cycle rejected');
-      }
-      if (firedBrainTurn) break; // one real cycle per tick; the rest stay due
-    }
+    await runBoundedAutonomyPass(
+      records,
+      (record, signal) => (runtimeCycleImpl ?? runAgentCycleViaRuntime)(assistant, record, signal),
+      RUNTIME_CYCLE_TIMEOUT_MS + 15_000,
+      summary,
+      'autonomy runtime cycle rejected',
+    );
     summary.durationMs = Date.now() - start;
     return summary;
   }
@@ -1317,33 +1581,13 @@ export async function processAgentAutonomyV2(assistant?: ClementineAssistant): P
     return summary;
   }
 
-  const claimedCycles = records.map((rec) => {
-    const claimed = claimCycle(rec.slug, (signal) => runAgentCycleV2(rec, signal));
-    if (!claimed.started) {
-      return Promise.resolve({ kind: 'skipped_in_flight' as const });
-    }
-    return withTimeout(claimed.promise, PER_AGENT_TIMEOUT_MS, `agent ${rec.slug}`, claimed.abort)
-      .then((result) => ({ kind: 'result' as const, result }));
-  });
-  const results = await Promise.allSettled(claimedCycles);
-
-  for (const result of results) {
-    summary.attempted++;
-    if (result.status === 'fulfilled') {
-      if (result.value.kind === 'skipped_in_flight') {
-        summary.skipped++;
-      } else if (!result.value.result.runId) {
-        summary.skipped++;
-      } else if (result.value.result.success) {
-        summary.succeeded++;
-      } else {
-        summary.failed++;
-      }
-    } else {
-      summary.failed++;
-      logger.warn({ err: result.reason }, 'autonomy-v2 cycle rejected');
-    }
-  }
+  await runBoundedAutonomyPass(
+    records,
+    (record, signal) => (sdkCycleImpl ?? runAgentCycleV2)(record, signal),
+    PER_AGENT_TIMEOUT_MS,
+    summary,
+    'autonomy-v2 cycle rejected',
+  );
 
   summary.durationMs = Date.now() - start;
   return summary;
