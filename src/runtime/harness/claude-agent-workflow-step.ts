@@ -362,22 +362,35 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
       // just re-loops — the exact thrash the ceiling exists to prevent).
       const autoStart = Date.now();
       let autos = 0;
+      // A step that burned its ENTIRE budget without a single tool call is a
+      // reasoning/narration burn (the failure the chat brain catches with
+      // looksLikeReasoningLeak), not forward progress. Rather than dead-end it
+      // to needs-attention — a hard STOP, the opposite of long-running — give it
+      // exactly ONE action-forcing nudge to convert thinking into a tool call.
+      // Bounded to a single shot so a genuinely stuck step still blocks honestly
+      // instead of looping the budget forever.
+      let zeroToolNudges = 0;
       while (
         result.limitHit
         && !result.selfStopped // a continuation that anti-thrash loop-STOPPED must NOT be re-run
-        && result.toolUses.length > 0
         && autos < maxWorkflowStepAutoContinues()
         && (Date.now() - autoStart) < workflowStepAutoContinueWallMs()
       ) {
+        const madeToolProgress = result.toolUses.length > 0;
+        if (!madeToolProgress) {
+          if (zeroToolNudges >= 1) break; // one shot at converting a reasoning burn
+          zeroToolNudges += 1;
+        }
         let cont: ClaudeAgentSdkRunResult;
         try {
           cont = await runPhysicalSdkAttempt({
             // Re-include the step's ORIGINAL instructions (which carry any skill body
             // prepended by applySkillToPrompt) — the stateless SDK lane would otherwise
             // lose the skill procedure on the continuation and hand-roll the deliverable.
-            prompt:
-              `You hit the per-turn tool budget but this step is NOT finished. The step's ORIGINAL instructions (INCLUDING any skill procedure) — KEEP FOLLOWING them:\n\n${args.prompt.slice(0, 12000)}\n\n---\nYour progress so far:\n${(result.text || '').trim().slice(0, 1200)}\n\n`
-              + `Continue and FINISH the step — do NOT redo completed work. When done, call workflow_step_result exactly once.`,
+            prompt: madeToolProgress
+              ? `You hit the per-turn tool budget but this step is NOT finished. The step's ORIGINAL instructions (INCLUDING any skill procedure) — KEEP FOLLOWING them:\n\n${args.prompt.slice(0, 12000)}\n\n---\nYour progress so far:\n${(result.text || '').trim().slice(0, 1200)}\n\n`
+                + `Continue and FINISH the step — do NOT redo completed work. When done, call workflow_step_result exactly once.`
+              : `This step used its ENTIRE turn budget without taking a single action — you reasoned or explained but never called a tool. Do NOT keep thinking out loud. The step's ORIGINAL instructions (INCLUDING any skill procedure):\n\n${args.prompt.slice(0, 12000)}\n\n---\nTake the concrete action NOW: call the tool that does the work, or — only if the work is genuinely already complete — call workflow_step_result exactly once. Act, do not narrate.`,
             ...stepRunOptions,
           });
         } catch (err) {

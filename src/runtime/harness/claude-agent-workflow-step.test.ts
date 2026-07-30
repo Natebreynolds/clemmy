@@ -160,6 +160,78 @@ test('auto-continue HALTS when a continuation anti-thrash loop-stops (no thrash 
   assert.match((result.output as any).reason, /loop/i, 'the honest anti-thrash reason is surfaced, not the generic budget message');
 });
 
+test('a reasoning-burn step (budget spent, ZERO tool calls) gets ONE action-forcing continuation, then blocks if still empty', async () => {
+  // Regression: before this, the auto-continue loop required toolUses.length > 0,
+  // so a step that spent its whole budget thinking without acting dead-ended
+  // straight to needs-attention — a hard STOP, the opposite of long-running.
+  let calls = 0;
+  const prompts: string[] = [];
+  setClaudeAgentSdkWorkflowStepRunForTest(async (opts: any) => {
+    calls += 1;
+    prompts.push(String(opts?.prompt ?? ''));
+    return {
+      text: 'let me think about how to approach this...',
+      sessionId: 'sdk-workflow-session',
+      model: 'claude-sonnet-4-6',
+      toolUses: [], // pure reasoning burn — never acted
+      usage: { input_tokens: 1, output_tokens: 1 },
+      limitHit: true,
+      selfStopped: false,
+    } as any;
+  });
+
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step,
+    workflowName: 'Report Workflow',
+    prompt: 'Workflow: Report Workflow\nStep: design_report\n\nDesign the report.',
+    modelId: 'claude-sonnet-4-6',
+  });
+
+  assert.equal(calls, 2, 'initial run + EXACTLY ONE zero-tool continuation — not zero (dead-end) and not a budget-looping cascade');
+  assert.match(prompts[1], /without taking a single action|Act, do not narrate/, 'the continuation FORCES action, not a generic "keep going"');
+  assert.equal((result.output as any).blocked, true, 'still-empty after the one nudge blocks honestly for self-heal to re-queue');
+});
+
+test('a reasoning-burn step that ACTS on the nudge converges instead of blocking', async () => {
+  let calls = 0;
+  setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        text: 'thinking...',
+        sessionId: 'sdk-workflow-session',
+        model: 'claude-sonnet-4-6',
+        toolUses: [],
+        usage: { input_tokens: 1, output_tokens: 1 },
+        limitHit: true,
+        selfStopped: false,
+      } as any;
+    }
+    // The nudge converted thinking into action and finished cleanly.
+    return {
+      text: 'done',
+      sessionId: 'sdk-workflow-session',
+      model: 'claude-sonnet-4-6',
+      toolUses: ['mcp__clementine-local__composio_execute_tool'],
+      usage: { input_tokens: 1, output_tokens: 1 },
+      limitHit: false,
+      selfStopped: false,
+      structured: true,
+      output: { report: 'ok' },
+    } as any;
+  });
+
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step,
+    workflowName: 'Report Workflow',
+    prompt: 'Design the report.',
+    modelId: 'claude-sonnet-4-6',
+  });
+
+  assert.equal(calls, 2, 'the nudge ran exactly once and the step converged');
+  assert.notEqual((result.output as any)?.blocked, true, 'a step that acted on the nudge is NOT dead-ended');
+});
+
 test('renderClaudeAgentWorkflowStepSystemAppend full lane permits gated execution tools (no read-only boundary)', () => {
   const prompt = renderClaudeAgentWorkflowStepSystemAppend({ workflowName: 'Report Workflow', step, fullLane: true });
   assert.doesNotMatch(prompt, /READ-ONLY\/local-context/);
@@ -631,12 +703,16 @@ test('F3: cancellation during SDK auto-continue is re-thrown, never converted to
   eventlog.finishRunAttempt(attempt, 'cancelled');
 });
 
-test('F3: a step limit-hit with NO tool progress still BLOCKS (anti-loop)', async () => {
+test('F3: a limit-hit step with NO tool progress gets ONE action-forcing nudge, then BLOCKS (bounded — never loops the budget)', async () => {
+  // Evolved from "block immediately" to "one action-forcing nudge, then block":
+  // a reasoning burn dead-ending straight to needs-attention is a hard STOP,
+  // against the long-running directive. The nudge is capped at one shot, so the
+  // anti-loop invariant (no cascade) is preserved — asserted by calls === 2.
   let calls = 0;
   setClaudeAgentSdkWorkflowStepRunForTest(async () => { calls += 1; return { text: 'stuck', sessionId: 's', toolUses: [], limitHit: true }; });
   const result = await runClaudeAgentSdkWorkflowStep({ step, workflowName: 'WF', prompt: 'x', modelId: 'claude-sonnet-5', fullLane: true });
-  assert.equal(calls, 1, 'no auto-continue without tool progress');
-  assert.equal((result.output as { blocked?: boolean }).blocked, true, 'blocks honestly on the turn budget');
+  assert.equal(calls, 2, 'exactly one action-forcing nudge to convert a reasoning burn, then STOP re-running (bounded, no loop)');
+  assert.equal((result.output as { blocked?: boolean }).blocked, true, 'still-empty after the one nudge blocks honestly for self-heal');
 });
 
 test('F3: kill-switch off ⇒ blocks on the turn budget (prior behavior)', async () => {
