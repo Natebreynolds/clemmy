@@ -235,6 +235,10 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
   const minuteKey = currentMinuteKey(now);
   // Budget for missed-window fires this tick; live-minute fires never spend it.
   let catchupBudget = maxCatchupFiresPerTick();
+  // Earliest occurrence HELD by the stagger this pass. The end-of-pass
+  // watermark must not advance beyond it, or the held occurrence falls out of
+  // the next tick's window and is silently dropped instead of queued.
+  let heldEarliestMs: number | undefined;
 
   let workflows;
   try {
@@ -264,7 +268,13 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
     for (const m of window) {
       if (!cronMatches(schedule, m, wf.trigger?.timezone)) continue;
       const k = currentMinuteKey(m);
-      if (state.lastRunByMinute[dedupeKey] !== k) matchedKeys.push(k);
+      // Strictly newer than the last fired occurrence. Minute keys are
+      // zero-padded (lexical order == time order), and the catch-up stagger
+      // below can REWIND the evaluation window to keep held occurrences
+      // eligible — so equality alone is not enough: a rewound window must
+      // never re-fire an occurrence at or before one already handled.
+      const lastFired = state.lastRunByMinute[dedupeKey];
+      if (lastFired === undefined || k > lastFired) matchedKeys.push(k);
     }
     if (matchedKeys.length === 0) {
       // Telemetry parity: if NOW matched but we already fired it this minute,
@@ -357,6 +367,10 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
     // the occurrence stays eligible and fires on a later tick — queued, not lost.
     const isCatchupFire = latestKey !== minuteKey;
     if (isCatchupFire && catchupBudget <= 0) {
+      const heldMs = Date.parse(`${latestKey}:00`);
+      if (Number.isFinite(heldMs) && (heldEarliestMs === undefined || heldMs < heldEarliestMs)) {
+        heldEarliestMs = heldMs;
+      }
       result.deduped.push(wf.name);
       recordOperationalEvent({
         source: 'workflow',
@@ -420,7 +434,16 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
   }
 
   // Always advance the evaluation pointer so the next tick's window is correct.
-  state.lastEvaluatedAtMs = minuteFloor(now.getTime());
+  // Hold-aware watermark (fixes a defect in the first version of the
+  // stagger): advancing unconditionally to `now` dropped every held
+  // occurrence out of the next window — the stampede became silent loss.
+  // Parking the watermark just before the earliest held minute keeps it
+  // eligible; the strictly-newer dedupe above makes the rewound window safe
+  // for workflows that already fired. Each tick fires at least one catch-up,
+  // so the watermark strictly advances and the backlog drains.
+  state.lastEvaluatedAtMs = heldEarliestMs !== undefined
+    ? Math.min(minuteFloor(now.getTime()), heldEarliestMs - 60_000)
+    : minuteFloor(now.getTime());
   saveScheduleState(state);
   return result;
 }
