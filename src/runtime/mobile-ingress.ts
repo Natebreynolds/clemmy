@@ -8,11 +8,22 @@
  * unforgeable from the outside and degrades to a plain fact about which fd
  * accepted the connection.
  *
- * Two classifications:
+ * Three classifications:
  *   'loopback'   — the main listener. Full surface.
  *   'direct-app' — arrived on the pinned-TLS listener the iOS app connects
  *                  to directly. Restricted to /m/* by socket. The socket peer
  *                  IS the client, so the real IP needs no forwarding header.
+ *   'relay'      — arrived through the daemon's own outbound relay tunnel
+ *                  (mobile-relay.ts pipes end-to-end-TLS bytes into a
+ *                  loopback-only listener). Restricted to /m/* like the
+ *                  direct door, and pairing is additionally refused: the
+ *                  pairing QR is a LAN ceremony. The socket peer is NOT the
+ *                  client here — the real client IP is restored from the
+ *                  relay's OPEN frame via the stream-peer registry below,
+ *                  which is trustworthy because the relay is our code,
+ *                  authenticated by its pinned certificate. That trust is
+ *                  only about rate-limit identity, never about content: the
+ *                  phone's TLS still terminates HERE, on the Mac's cert.
  */
 import http from 'node:http';
 import https from 'node:https';
@@ -21,7 +32,7 @@ import pino from 'pino';
 
 const logger = pino({ name: 'clementine-next.mobile-ingress' });
 
-export type ClemIngress = 'loopback' | 'direct-app';
+export type ClemIngress = 'loopback' | 'direct-app' | 'relay';
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -39,6 +50,34 @@ declare global {
  * or header can collide with it.
  */
 const DIRECT_APP_SOCKET = Symbol('clem.directAppSocket');
+const RELAY_SOCKET = Symbol('clem.relaySocket');
+const RELAY_CLIENT_IP = Symbol('clem.relayClientIp');
+
+// ─── relay stream-peer registry ─────────────────────────────────────
+//
+// The relay client (mobile-relay.ts) opens one loopback connection to the
+// relay listener per phone stream. TLS bytes pass through untouched, so the
+// real client IP cannot ride a header — instead the client registers
+// "my outbound socket's local port → the IP the relay observed", and the
+// listener reads it back via the connection's remotePort. Both ends live in
+// this process; the map never crosses a trust boundary.
+
+const relayStreamPeers = new Map<number, string>();
+
+export function registerRelayStreamPeer(localPort: number, clientIp: string): void {
+  relayStreamPeers.set(localPort, clientIp);
+}
+
+export function unregisterRelayStreamPeer(localPort: number): void {
+  relayStreamPeers.delete(localPort);
+}
+
+/** The relay-observed client IP for a relay-ingress request, if known. */
+export function relayClientIp(req: Request): string | undefined {
+  const raw = req as unknown as Record<symbol, unknown>;
+  const ip = raw[RELAY_CLIENT_IP];
+  return typeof ip === 'string' && ip.length > 0 ? ip : undefined;
+}
 
 export interface DirectAppListenerOptions {
   /** 0 = kernel-assigned; the bound port is reported in `directAppPort`. */
@@ -68,6 +107,11 @@ export function classifyIngress(req: Request, _res: Response, next: NextFunction
     next();
     return;
   }
+  if (raw[RELAY_SOCKET] === true) {
+    req.clemIngress = 'relay';
+    next();
+    return;
+  }
   req.clemIngress = 'loopback';
   next();
 }
@@ -77,15 +121,23 @@ export function classifyIngress(req: Request, _res: Response, next: NextFunction
  * from which socket accepted the connection, which a caller cannot influence.
  */
 export function restrictDirectAppIngressToMobile(req: Request, res: Response, next: NextFunction): void {
-  if (req.clemIngress !== 'direct-app') {
+  if (req.clemIngress !== 'direct-app' && req.clemIngress !== 'relay') {
     next();
     return;
   }
-  if (req.path === '/m' || req.path.startsWith('/m/')) {
-    next();
+  const onMobileSurface = req.path === '/m' || req.path.startsWith('/m/');
+  if (!onMobileSurface) {
+    res.status(404).type('text/plain').send('Not found');
     return;
   }
-  res.status(404).type('text/plain').send('Not found');
+  // Pairing is a LAN ceremony: the QR is displayed on the user's own screen
+  // and scanned in the same room. Consuming a pairing token from across the
+  // internet is never legitimate, so the relay door refuses it outright.
+  if (req.clemIngress === 'relay' && req.path === '/m/auth/pair') {
+    res.status(404).type('text/plain').send('Not found');
+    return;
+  }
+  next();
 }
 
 /**
@@ -166,6 +218,43 @@ export async function startIngressListeners(
         ),
       );
     },
+  };
+}
+
+/**
+ * The loopback listener the relay client pipes phone streams into. Same TLS
+ * identity as the direct-app door — the phone's pinned handshake terminates
+ * here, so through the relay it is still talking to the Mac's certificate.
+ * Bound strictly to 127.0.0.1 with a kernel-assigned port; nothing on the
+ * LAN can reach it, and anything arriving here is classified 'relay'.
+ */
+export async function startRelayInternalListener(
+  app: Express,
+  opts: { keyPem: string; certPem: string },
+): Promise<{ port: number; close(): Promise<void> }> {
+  const server = await new Promise<https.Server>((resolve, reject) => {
+    const s = https.createServer({ key: opts.keyPem, cert: opts.certPem }, (req, res) => {
+      const raw = req as unknown as Record<symbol, unknown>;
+      raw[RELAY_SOCKET] = true;
+      const remotePort = req.socket.remotePort;
+      if (typeof remotePort === 'number') {
+        const ip = relayStreamPeers.get(remotePort);
+        if (ip) raw[RELAY_CLIENT_IP] = ip;
+      }
+      app(req as never, res as never);
+    });
+    s.once('error', reject);
+    s.listen(0, '127.0.0.1', () => {
+      s.removeListener('error', reject);
+      resolve(s);
+    });
+  });
+  const addr = server.address();
+  const port = addr && typeof addr === 'object' ? addr.port : 0;
+  logger.info({ port }, 'Relay internal listener bound (loopback only)');
+  return {
+    port,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
 

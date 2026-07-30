@@ -40,6 +40,7 @@
  */
 import { runConversation } from './loop.js';
 import { buildOrchestratorAgent } from '../../agents/orchestrator.js';
+import { executionLaneToolSearchEnabled } from '../../agents/tool-catalog.js';
 import { configureHarnessRuntime } from './codex-client.js';
 import {
   appendEvent,
@@ -468,11 +469,16 @@ export async function respondViaHarness(
       // Only surfaces flagged honorModel forward request.model (workflow steps);
       // every other surface keeps the harness's configured model (byte-identical).
       ...(modelForRun ? { model: modelForRun } : {}),
-      // Phase 1 Tool-RAG: JIT tool loading is allowed ONLY on interactive chat
-      // lanes (a user is present turn-by-turn). Execution surfaces (cron /
-      // background / workflow) have no user and can't recover a dropped built-in
-      // tool, so they keep the full surface. Still default-off via CLEMMY_TOOL_JIT.
-      allowToolJit: config.kind === 'chat',
+      // Schema-on-demand lane admission. Chat always qualifies. Execution
+      // surfaces (cron / background / workflow) qualify only while the
+      // deferred tool-search surface is globally ON — recovery there is the
+      // model calling tool_search → call_tool, which needs no user in the
+      // loop. When tool-search is off, execution lanes stay on the FULL
+      // surface: the legacy JIT pruner has no catalog recovery and must
+      // never run on an unattended lane. Kill-switch:
+      // CLEMMY_EXECUTION_TOOL_SEARCH=off (execution lanes only).
+      allowToolJit: config.kind === 'chat'
+        || (config.kind === 'execution' && executionLaneToolSearchEnabled()),
     });
     // W1a — chat step-boundary brain fallover. On a CHAT surface, hand
     // runConversation the ordered next-brain

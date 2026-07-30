@@ -1,0 +1,14 @@
+{
+  "name": "clementine-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SNI-routed TLS-passthrough relay for off-LAN Clementine mobile access. Zero dependencies.",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

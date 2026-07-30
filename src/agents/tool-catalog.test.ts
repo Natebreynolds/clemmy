@@ -16,6 +16,7 @@ const {
   allRegistryNames,
   resolveHotSet,
   rankCatalog,
+  executionLaneToolSearchEnabled,
 } = await import('./tool-catalog.js');
 const { recordToolHit, getHotSet, _resetHotSetForTest } = await import('./tool-hotset.js');
 const { TOOL_REGISTRY } = await import('../tools/tool-registry.js');
@@ -119,4 +120,33 @@ test('rankCatalog ranks an on-topic tool above an unrelated one', async () => {
 test('rankCatalog returns all entries and never throws on empty query', async () => {
   const ranked = await rankCatalog('');
   assert.equal(ranked.length, TOOL_REGISTRY.length);
+});
+
+// ── execution-lane schema-on-demand admission ─────────────────────────────────
+
+test('execution lanes get the deferred surface only while global tool-search is ON', () => {
+  const priorExec = process.env.CLEMMY_EXECUTION_TOOL_SEARCH;
+  const priorGlobal = process.env.CLEMMY_CODEX_TOOL_SEARCH;
+  try {
+    // Default: both on → execution lanes admitted to schema-on-demand.
+    delete process.env.CLEMMY_EXECUTION_TOOL_SEARCH;
+    delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
+    assert.equal(executionLaneToolSearchEnabled(), true, 'default admits execution lanes');
+
+    // Execution kill-switch: full surface on execution lanes, chat untouched.
+    process.env.CLEMMY_EXECUTION_TOOL_SEARCH = 'off';
+    assert.equal(executionLaneToolSearchEnabled(), false, 'execution kill-switch stands the lane down');
+
+    // Global tool-search off ⇒ execution lanes MUST fall back to the full
+    // surface (never the legacy JIT pruner — pruning without catalog recovery
+    // would strand a dropped tool on an unattended run).
+    delete process.env.CLEMMY_EXECUTION_TOOL_SEARCH;
+    process.env.CLEMMY_CODEX_TOOL_SEARCH = 'off';
+    assert.equal(executionLaneToolSearchEnabled(), false, 'no catalog ⇒ no admission ⇒ full surface');
+  } finally {
+    if (priorExec === undefined) delete process.env.CLEMMY_EXECUTION_TOOL_SEARCH;
+    else process.env.CLEMMY_EXECUTION_TOOL_SEARCH = priorExec;
+    if (priorGlobal === undefined) delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
+    else process.env.CLEMMY_CODEX_TOOL_SEARCH = priorGlobal;
+  }
 });

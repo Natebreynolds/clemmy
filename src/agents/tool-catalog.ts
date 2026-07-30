@@ -237,11 +237,28 @@ export function codexToolSearchEnabled(): boolean {
   return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
 }
 
+/** Extends the schema-on-demand surface to the autonomous respond lanes
+ *  (cron / background / workflow). The original lane gate assumed an
+ *  autonomous lane "can't recover a dropped built-in" — but recovery is the
+ *  MODEL calling tool_search → call_tool, which needs no user in the loop,
+ *  and the worker / workflow-step lanes have relied on exactly that path
+ *  since the deferred surface shipped. Requires the global surface to be on:
+ *  when tool-search is off entirely, execution lanes keep the FULL first-class
+ *  surface (the legacy JIT pruner must never run there — pruning without the
+ *  catalog really would strand a dropped tool). Kill-switch:
+ *  CLEMMY_EXECUTION_TOOL_SEARCH=off restores the full surface on execution
+ *  lanes only, leaving chat untouched. */
+export function executionLaneToolSearchEnabled(): boolean {
+  const v = (getRuntimeEnv('CLEMMY_EXECUTION_TOOL_SEARCH', 'on') || 'on').trim().toLowerCase();
+  if (v === 'off' || v === '0' || v === 'false' || v === 'no') return false;
+  return codexToolSearchEnabled();
+}
+
 /**
  * The single source of truth for "does the schema-on-demand surface run this turn?".
- * Always respects the lane gate (interactive chat only) — an autonomous lane can't
- * recover a catalog-only tool via call_tool the way a conversational turn can, so
- * it keeps the full first-class surface. (The per-session A/B that guarded the
+ * Lane admission comes from the caller (`allowLane`): interactive chat always
+ * qualifies; the autonomous respond lanes qualify via
+ * executionLaneToolSearchEnabled(). (The per-session A/B that guarded the
  * v1.3.0 default flip was retired 2026-07-16 after the flip shipped and held.)
  */
 export function resolveToolSearchDecision(opts: { allowLane: boolean; sessionId?: string | null }): ToolSearchDecision {

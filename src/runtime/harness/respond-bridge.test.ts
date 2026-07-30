@@ -148,6 +148,44 @@ test('workflow surface: default ON + honorModel forwards step.model on the gated
   assert.equal(capturedModel, 'gpt-5.4-mini', 'honorModel surface forwards step.model');
 });
 
+test('execution lanes are admitted to schema-on-demand, with both kill-switches honored', async () => {
+  let capturedJit: boolean | undefined;
+  const recordingBuilder = (async (opts: { allowToolJit?: boolean }) => { capturedJit = opts.allowToolJit; return FAKE_AGENT; }) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: fakeRun({ status: 'completed' }) });
+  const priorExec = process.env.CLEMMY_EXECUTION_TOOL_SEARCH;
+  const priorGlobal = process.env.CLEMMY_CODEX_TOOL_SEARCH;
+  try {
+    // Default: cron (execution kind) rides the deferred tool-search surface.
+    delete process.env.CLEMMY_EXECUTION_TOOL_SEARCH;
+    delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
+    await respondPreferHarness('cron', { message: 'job', sessionId: 'cron-jit-1' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+    assert.equal(capturedJit, true, 'execution lane admitted by default');
+
+    // Execution kill-switch: cron falls back to the full first-class surface.
+    process.env.CLEMMY_EXECUTION_TOOL_SEARCH = 'off';
+    await respondPreferHarness('cron', { message: 'job', sessionId: 'cron-jit-2' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+    assert.equal(capturedJit, false, 'execution kill-switch restores the full surface');
+
+    // Global tool-search off: execution must NOT be admitted (no catalog
+    // recovery ⇒ the legacy JIT pruner must never run unattended).
+    delete process.env.CLEMMY_EXECUTION_TOOL_SEARCH;
+    process.env.CLEMMY_CODEX_TOOL_SEARCH = 'off';
+    await respondPreferHarness('cron', { message: 'job', sessionId: 'cron-jit-3' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+    assert.equal(capturedJit, false, 'no global catalog ⇒ full surface on execution lanes');
+
+    // Chat lanes are admitted regardless of the execution flag.
+    process.env.CLEMMY_EXECUTION_TOOL_SEARCH = 'off';
+    delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
+    await respondPreferHarness('dashboard', { message: 'hi', sessionId: 'chat-jit-1' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+    assert.equal(capturedJit, true, 'chat admission is independent of the execution flag');
+  } finally {
+    if (priorExec === undefined) delete process.env.CLEMMY_EXECUTION_TOOL_SEARCH;
+    else process.env.CLEMMY_EXECUTION_TOOL_SEARCH = priorExec;
+    if (priorGlobal === undefined) delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
+    else process.env.CLEMMY_CODEX_TOOL_SEARCH = priorGlobal;
+  }
+});
+
 test('non-honorModel surface ignores request.model (cron/gateway byte-identical)', async () => {
   let capturedModel: string | undefined = 'unset';
   const recordingBuilder = (async (opts: { model?: string }) => { capturedModel = opts.model; return FAKE_AGENT; }) as never;

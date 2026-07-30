@@ -1930,13 +1930,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
 
   // Phase 1 Tool-RAG: retrieve only the built-in discovery tools this turn plausibly
   // needs (CORE + semantic top-K). Structural tools (planner/approval/question/worker)
-  // are ALWAYS kept (added below). Gated to INTERACTIVE chat lanes only
-  // (options.allowToolJit) — autonomous lanes can't recover a dropped built-in (no
-  // mid-run acquisition yet) and have no user. The decision is the global flag OR, when
-  // the live A/B is on, the session's deterministic arm (control = full surface, jit =
-  // reduced) — so both arms are attributable. Off / no-query / no-embeddings / no-signal
-  // → full surface (byte-identical). The ranking query folds in recent prior-turn texts
-  // so bare follow-ups inherit intent. Never throws into construction.
+  // are ALWAYS kept (added below). Lane admission (options.allowToolJit) covers
+  // interactive chat always, and the autonomous respond lanes when the deferred
+  // tool-search surface is on (recovery there is the model calling
+  // tool_search → call_tool — no user needed). The legacy JIT pruner below still
+  // runs ONLY when tool-search is inactive, which by construction only happens on
+  // chat lanes — an unattended lane never gets pruning without catalog recovery.
+  // Off / no-query / no-embeddings / no-signal → full surface (byte-identical).
+  // The ranking query folds in recent prior-turn texts so bare follow-ups inherit
+  // intent. Never throws into construction.
   // Resolved EARLY so JIT can stand down when the deferred surface governs: with
   // tool-search active, first-class = structural + hot set and everything else is
   // catalog-reachable — JIT's semantic top-K over the same tools is pure waste
