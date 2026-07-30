@@ -11,9 +11,11 @@ import {
   listWorkspaceProjects,
   textResult,
 } from './shared.js';
-import { readTimers, writeTimers } from '../runtime/timers.js';
+import { appendTimer, resolveTimerFireAt, type TimerEntry } from '../runtime/timers.js';
 import { timerProspectiveDefinition } from '../runtime/prospective-adapters.js';
 import { upsertProspectiveIntention } from '../runtime/prospective-intentions.js';
+import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
 
 // Timer store moved to src/runtime/timers.ts (2026-07-20): set_timer used to be
 // WRITE-ONLY — no consumer ever fired what this tool wrote, so every reminder
@@ -40,6 +42,68 @@ function readPlistValue(plistPath: string, key: string): string | null {
   if (result.status !== 0) return null;
   const value = result.stdout.trim();
   return value || null;
+}
+
+function reminderOriginMetadata(): TimerEntry['metadata'] | undefined {
+  const originSessionId = getToolOutputContext()?.sessionId?.trim();
+  if (!originSessionId) return undefined;
+
+  const base: NonNullable<TimerEntry['metadata']> = { originSessionId };
+  try {
+    const session = getHarnessSession(originSessionId);
+    if (!session) return base;
+    const metadata = session.metadata ?? {};
+    const channelLabel = String(session.channel ?? '').trim().toLowerCase();
+    const metadataSource = String(metadata.source ?? '').trim().toLowerCase();
+    const isDiscord = channelLabel === 'discord'
+      || channelLabel.startsWith('discord:')
+      || metadataSource === 'discord'
+      || metadataSource.startsWith('discord-');
+    const isSlack = channelLabel === 'slack'
+      || channelLabel.startsWith('slack:')
+      || metadataSource === 'slack'
+      || metadataSource.startsWith('slack-');
+    const channelId = typeof metadata.channelId === 'string' && metadata.channelId.trim()
+      ? metadata.channelId.trim()
+      : '';
+    const userId = session.userId?.trim()
+      || (typeof metadata.userId === 'string' ? metadata.userId.trim() : '');
+
+    if (isDiscord) {
+      const discordChannelId = typeof metadata.discordChannelId === 'string' && metadata.discordChannelId.trim()
+        ? metadata.discordChannelId.trim()
+        : channelId;
+      if (discordChannelId) return { ...base, discordChannelId };
+      const discordUserId = typeof metadata.discordUserId === 'string' && metadata.discordUserId.trim()
+        ? metadata.discordUserId.trim()
+        : userId;
+      return discordUserId ? { ...base, discordUserId } : base;
+    }
+
+    if (isSlack) {
+      const rawConversation = typeof metadata.slackChannelId === 'string' && metadata.slackChannelId.trim()
+        ? metadata.slackChannelId.trim()
+        : channelId;
+      if (rawConversation) {
+        const [slackChannelId, ...threadParts] = rawConversation.split(':');
+        const slackThreadTs = typeof metadata.slackThreadTs === 'string' && metadata.slackThreadTs.trim()
+          ? metadata.slackThreadTs.trim()
+          : threadParts.join(':');
+        return {
+          ...base,
+          slackChannelId,
+          ...(slackThreadTs ? { slackThreadTs } : {}),
+        };
+      }
+      const slackUserId = typeof metadata.slackUserId === 'string' && metadata.slackUserId.trim()
+        ? metadata.slackUserId.trim()
+        : userId;
+      return slackUserId ? { ...base, slackUserId } : base;
+    }
+  } catch {
+    // The durable timer remains valid even if origin lookup is unavailable.
+  }
+  return base;
 }
 
 function desktopBundleCandidates(): string[] {
@@ -82,30 +146,38 @@ export function registerAdminTools(server: McpServer): void {
 
   server.tool(
     'set_timer',
-    'Set a short-term reminder. Use this instead of cron for reminders under 24 hours.',
+    'Set a one-time reminder notification within the next 24 hours. Use minutes for a relative reminder, or fire_at for an exact wall-clock time such as "10 PM tonight". This tool actually fires; task_add only creates a passive TODO.',
     {
-      minutes: z.number().min(1).max(1440),
+      minutes: z.number().min(1).max(1440).optional()
+        .describe('Relative delay in minutes. Provide this OR fire_at, never both.'),
+      fire_at: z.string().optional()
+        .describe('Exact ISO 8601 timestamp with an explicit UTC offset, within 24 hours. Example: 2026-07-30T22:00:00-07:00. Provide this OR minutes.'),
       message: z.string().min(1),
     },
-    async ({ minutes, message }) => {
+    async ({ minutes, fire_at, message }) => {
       const now = Date.now();
-      const fireAt = now + minutes * 60 * 1000;
-      const timers = readTimers();
+      const resolved = resolveTimerFireAt({ minutes, fireAt: fire_at }, now);
+      if (!resolved.ok) {
+        return textResult(`set_timer refused: ${resolved.error} No reminder was scheduled.`);
+      }
       const timer = {
         id: `timer-${randomBytes(4).toString('hex')}`,
         message,
-        fireAt,
+        fireAt: resolved.fireAt,
         createdAt: now,
+        metadata: reminderOriginMetadata(),
       };
-      timers.push(timer);
-      writeTimers(timers);
+      appendTimer(timer);
       // Materialize the future commitment immediately. The timer file remains
       // execution-authoritative; a control-plane indexing failure must never
       // make the proven reminder path fail.
       try { upsertProspectiveIntention(timerProspectiveDefinition(timer)); }
       catch { /* daemon reconciliation repairs the index on its next tick */ }
 
-      return textResult(`Timer set for ${minutes} minute${minutes === 1 ? '' : 's'} from now: "${message}" — it will fire as a notification (late-but-never-lost if the app is closed or the Mac sleeps).`);
+      return textResult(
+        `Reminder scheduled (${timer.id}) for ${resolved.confirmationTarget}: "${message}" — `
+        + 'it will fire as a notification (late-but-never-lost if the app is closed or the Mac sleeps).',
+      );
     },
   );
 

@@ -217,7 +217,22 @@ function loadDeliveryQueue(): NotificationDeliveryJob[] {
   }));
 }
 
+let failNextDeliveryQueueWriteForTest: Error | null = null;
+
+/** Test-only fault injection for the notifications.json → delivery-queue
+ * partial-write boundary. Never called by production code. */
+export function _failNextNotificationDeliveryQueueWriteForTest(
+  error: Error = new Error('forced notification delivery queue write failure'),
+): void {
+  failNextDeliveryQueueWriteForTest = error;
+}
+
 function saveDeliveryQueue(items: NotificationDeliveryJob[]): void {
+  if (failNextDeliveryQueueWriteForTest) {
+    const error = failNextDeliveryQueueWriteForTest;
+    failNextDeliveryQueueWriteForTest = null;
+    throw error;
+  }
   atomicWriteJson(DELIVERY_QUEUE_FILE, items);
 }
 
@@ -251,6 +266,48 @@ function isDuplicateApprovalNotification(existing: NotificationRecord, next: Not
     existing.body === next.body;
 }
 
+function isTerminalOriginChatPushEligible(item: NotificationRecord): boolean {
+  return item.metadata?.reportBackTargetType === 'origin_chat'
+    && item.metadata?.terminalReportBack === true
+    && (process.env.CLEMMY_REPORTBACK_PUSH ?? 'on').toLowerCase() !== 'off'
+    && listNotificationDestinations().some((entry) => entry.enabled && entry.type === 'web_push');
+}
+
+function shouldQueueNotificationDelivery(item: NotificationRecord): boolean {
+  if (item.silent) return false;
+  const isOriginChatReport = item.metadata?.reportBackTargetType === 'origin_chat';
+  return !isOriginChatReport || isTerminalOriginChatPushEligible(item);
+}
+
+/**
+ * Reconcile the second half of notification persistence. A crash or disk
+ * failure can land notifications.json before its delivery-queue write; a
+ * stable-ID retry must repair that missing job instead of treating the
+ * notification record alone as proof that outbound delivery was queued.
+ */
+function ensureNotificationDeliveryQueued(item: NotificationRecord): void {
+  if (!shouldQueueNotificationDelivery(item)) return;
+  const isOriginChatReport = item.metadata?.reportBackTargetType === 'origin_chat';
+  if (item.deliveredAt && !isOriginChatReport) return;
+  if (
+    isOriginChatReport
+    && item.deliveredDestinations?.some((destination) => destination !== 'origin-chat')
+  ) return;
+
+  const queue = loadDeliveryQueue();
+  if (queue.some((job) => job.notificationId === item.id)) return;
+  queue.push({
+    notificationId: item.id,
+    queuedAt: new Date().toISOString(),
+    completedDestinationIds: [],
+    failedDestinationIds: [],
+    attemptCountByDestination: {},
+    nextAttemptAtByDestination: {},
+    lastErrorByDestination: {},
+  });
+  saveDeliveryQueue(queue);
+}
+
 export function listNotifications(limit = 20): NotificationRecord[] {
   const items = loadNotifications();
   const compacted = pruneNotifications(items);
@@ -271,7 +328,11 @@ export function addNotification(item: NotificationRecord): void {
   // recomputed gap values — confusing duplicate reports of the same
   // outage. Content-dedup (proactive briefs, approvals) stays as a
   // secondary safety net for kinds that don't bother setting a stable id.
-  if (item.id && items.some((existing) => existing.id === item.id)) {
+  const existingWithId = item.id
+    ? items.find((existing) => existing.id === item.id)
+    : undefined;
+  if (existingWithId) {
+    ensureNotificationDeliveryQueued(existingWithId);
     return;
   }
   if (items.some((existing) =>
@@ -308,29 +369,12 @@ export function addNotification(item: NotificationRecord): void {
   // with the web_push device on success. Only enqueue when push is enabled AND a
   // web_push device actually exists, so a no-device task stays transcript-only
   // (no perpetually-deferred "no destinations" job). Kill-switch CLEMMY_REPORTBACK_PUSH.
-  const terminalPushEligible = isOriginChatReport
-    && item.metadata?.terminalReportBack === true
-    && (process.env.CLEMMY_REPORTBACK_PUSH ?? 'on').toLowerCase() !== 'off'
-    && listNotificationDestinations().some((entry) => entry.enabled && entry.type === 'web_push');
-
   // Silent notifications are dashboard-only: skip the delivery queue so
   // we don't fan out lifecycle pings (queued / started / heartbeat /
   // tool-progress) to Discord and other external destinations. They
   // still land in notifications.json so the Activity panel sees them,
   // and the actionBus emit below still fires for live dashboard updates.
-  if (!item.silent && (!isOriginChatReport || terminalPushEligible)) {
-    const queue = loadDeliveryQueue();
-    queue.push({
-      notificationId: item.id,
-      queuedAt: new Date().toISOString(),
-      completedDestinationIds: [],
-      failedDestinationIds: [],
-      attemptCountByDestination: {},
-      nextAttemptAtByDestination: {},
-      lastErrorByDestination: {},
-    });
-    saveDeliveryQueue(queue);
-  }
+  ensureNotificationDeliveryQueued(item);
 
   actionBus.emit({ kind: 'notification.created', notification: item });
 }

@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -134,4 +134,75 @@ test('task_hygiene is exposed as a dry-run cleanup tool for workflows', async ()
   const result = await handler({});
   assert.match(result.content[0].text, /Task ledger hygiene \(dry-run\)/);
   assert.match(result.content[0].text, /Repaired:/);
+});
+
+test('task_add cannot masquerade an exact-time reminder as a passive TODO', async () => {
+  seedTaskList();
+  const handler = registeredToolHandlers().get('task_add');
+  assert.ok(handler, 'task_add should be registered');
+
+  const result = await handler({
+    description: 'Authenticate Railway and finish the deployment',
+    due_date: '2026-07-30T22:00:00-07:00',
+  });
+
+  assert.match(result.content[0].text, /task_add refused/i);
+  assert.match(result.content[0].text, /set_timer/);
+  assert.doesNotMatch(
+    readFileSync(TASKS_FILE, 'utf-8'),
+    /Authenticate Railway and finish the deployment/,
+    'a rejected reminder creates no passive task record',
+  );
+});
+
+test('task_add rejects reminder intent even when the model hides the time in the description', async () => {
+  seedTaskList();
+  const handler = registeredToolHandlers().get('task_add');
+  assert.ok(handler, 'task_add should be registered');
+
+  const result = await handler({
+    description: 'Remind me at 10 PM tonight to authenticate Railway',
+    due_date: '2026-07-30',
+  });
+
+  assert.match(result.content[0].text, /task_add refused/i);
+  assert.match(result.content[0].text, /set_timer/);
+  assert.doesNotMatch(
+    readFileSync(TASKS_FILE, 'utf-8'),
+    /authenticate Railway/,
+    'a reminder hidden in the description creates no passive task record',
+  );
+});
+
+test('task_add rejects a normalized reminder noun with a date-only due value', async () => {
+  seedTaskList();
+  const handler = registeredToolHandlers().get('task_add');
+  assert.ok(handler, 'task_add should be registered');
+
+  const result = await handler({
+    description: 'Reminder: authenticate Railway at 10 PM tonight',
+    due_date: '2026-07-30',
+  });
+
+  assert.match(result.content[0].text, /task_add refused/i);
+  assert.match(result.content[0].text, /set_timer/);
+  assert.doesNotMatch(
+    readFileSync(TASKS_FILE, 'utf-8'),
+    /authenticate Railway/,
+    'normalized reminder wording creates no passive task record',
+  );
+});
+
+test('task_add reports passive TODOs honestly', async () => {
+  seedTaskList();
+  const handler = registeredToolHandlers().get('task_add');
+  assert.ok(handler, 'task_add should be registered');
+
+  const result = await handler({
+    description: 'Review the Q3 plan',
+    due_date: '2026-08-01',
+  });
+
+  assert.match(result.content[0].text, /Added passive TODO/);
+  assert.match(result.content[0].text, /No reminder notification was scheduled/);
 });

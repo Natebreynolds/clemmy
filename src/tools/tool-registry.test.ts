@@ -117,6 +117,10 @@ test('orchestrator discovery surface: critical members present, non-orchestrator
     'composio_execute_tool', 'memory_forget', 'memory_pin', 'space_save', 'workflow_create',
     'workflow_from_session', 'goal_upsert', 'run_batch', 'run_tool_program', 'recall_tool_result',
     'tool_output_query', 'workspace_artifact_query', 'focus_get', 'browser_harness_run', 'pending_action_queue', 'tool_search',
+    // Incident 2026-07-24: GPT-5.6 Sol searched for a one-time reminder,
+    // could not see set_timer on the orchestrator surface, wrote a TODO instead,
+    // and then falsely claimed a notification had been scheduled.
+    'set_timer',
   ]) {
     assert.ok(surface.has(n), `orchestrator discovery surface must include ${n}`);
   }
@@ -141,7 +145,7 @@ test('SDK local-authoring ⊇ read-only + its authoring members', () => {
   const ro = asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS);
   const auth = asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS);
   for (const n of ro) assert.ok(auth.has(n), `authoring must be a superset of read-only (missing ${n})`);
-  for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'pending_action_execute', 'set_model_role', 'focus_get', 'focus_set', 'focus_update']) {
+  for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'pending_action_execute', 'set_model_role', 'focus_get', 'focus_set', 'focus_update', 'set_timer']) {
     assert.ok(auth.has(n), `authoring must include ${n}`);
   }
 });
@@ -150,7 +154,7 @@ test('SDK full (brain) ⊇ authoring + execution + brain-only fan-out', () => {
   const auth = asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS);
   const full = asSet(CLAUDE_AGENT_SDK_FULL_TOOLS);
   for (const n of auth) assert.ok(full.has(n), `full must be a superset of authoring (missing ${n})`);
-  for (const n of ['run_worker', 'run_batch', 'write_file', 'run_shell_command', 'composio_execute_tool', 'execution_create', 'notify_user']) {
+  for (const n of ['run_worker', 'run_batch', 'write_file', 'run_shell_command', 'composio_execute_tool', 'execution_create', 'notify_user', 'set_timer']) {
     assert.ok(full.has(n), `full must include ${n}`);
   }
 });
