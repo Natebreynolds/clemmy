@@ -4,6 +4,8 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, Sparkles, X } from 'lucide-react';
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
+import { getContext } from '@/lib/memory';
+import { greetingName, timeGreeting } from '@/lib/greeting';
 import { dismissInboxItem } from '@/lib/inbox';
 import { chatApprovalReply, useChat } from '@/lib/useChat';
 import type { CommandCenter, CommandCenterItem } from '@/lib/types';
@@ -13,13 +15,6 @@ import { ChatBubble } from '@/components/chat/ChatBubble';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { cn } from '@/lib/cn';
-
-function timeGreeting(): string {
-  const h = new Date().getHours();
-  if (h < 12) return 'Good morning';
-  if (h < 18) return 'Good afternoon';
-  return 'Good evening';
-}
 
 const SUGGESTIONS = [
   "What's on my plate today?",
@@ -109,6 +104,9 @@ function AttentionStrip({ needsYou, workingNow, onDismiss }: { needsYou: Command
 export function Chat() {
   const qc = useQueryClient();
   const cc = usePoll(['command-center'], () => apiGet<CommandCenter>('/api/console/home/command-center'), 6000);
+  // The profile changes rarely; a slow poll keeps the greeting personal
+  // without adding chatter to the fast command-center loop.
+  const userContext = usePoll(['user-context'], getContext, 300000);
   const dismissCard = async (item: CommandCenterItem) => {
     if (!item.dismissKind || !item.dismissId) return;
     try { await dismissInboxItem(item.dismissKind, item.dismissId); } finally {
@@ -177,7 +175,7 @@ export function Chat() {
       <div className="mx-auto flex h-full w-full max-w-3xl flex-col justify-center px-8 py-8">
         <div className="mb-6 text-center">
           <DogMark size={56} className="mx-auto mb-4" />
-          <h2 className="text-display text-fg">{timeGreeting()}</h2>
+          <h2 className="text-display text-fg">{timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile))}</h2>
           <p className="mt-1 text-body-lg text-muted">
             {cc.data?.presence?.awayMessage ?? "I'm here. Ask me anything, or tap Talk."}
           </p>
