@@ -164,7 +164,7 @@ input, textarea { font: inherit; }
   min-height: 0;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
-  padding: 4px 16px calc(var(--dock-height) + 24px + env(safe-area-inset-bottom));
+  padding: 4px 16px max(calc(var(--dock-height) + 50px), calc(var(--dock-height) + 38px + env(safe-area-inset-bottom)));
   max-width: 720px;
   width: 100%;
   margin: 0 auto;
@@ -197,7 +197,9 @@ input, textarea { font: inherit; }
   position: fixed;
   left: 50%;
   transform: translateX(-50%);
-  bottom: calc(10px + env(safe-area-inset-bottom));
+  /* Clear of the home indicator even when the shell reports a zero inset:
+     max() floors the lift at 26px, and a real inset adds 14px on top of it. */
+  bottom: max(26px, calc(env(safe-area-inset-bottom) + 14px));
   z-index: 40;
   display: flex;
   gap: 2px;
