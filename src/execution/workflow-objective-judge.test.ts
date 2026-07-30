@@ -267,6 +267,28 @@ test('judgeWorkflowTarget: FAILS OPEN when the judge throws (never breaks a good
   });
   assert.equal(v.reached, true);
   assert.equal(v.judged, false, 'fail-open path is recorded as not-judged for telemetry');
+  assert.equal(v.unavailable, true, 'an infra failure is marked unavailable — distinct from a deliberate skip');
+});
+
+test('judgeWorkflowTarget: deliberate skips are NOT marked unavailable', async () => {
+  // Partial run: judged=false is a deliberate skip, not an outage.
+  const partial = await judgeWorkflowTarget({
+    workflow: wf(),
+    inputs: {},
+    finalOutput: 'step output',
+    isPartialRun: true,
+    judgeFn: async () => { throw new Error('must not be called'); },
+  });
+  assert.equal(partial.judged, false);
+  assert.equal(partial.unavailable, undefined, 'a deliberate skip never claims the judge was down');
+  // No deliverable: same — skip, not outage.
+  const empty = await judgeWorkflowTarget({
+    workflow: wf(),
+    inputs: {},
+    finalOutput: '',
+    judgeFn: async () => { throw new Error('must not be called'); },
+  });
+  assert.equal(empty.unavailable, undefined);
 });
 
 // ── truncation-artifact guard (the Outlook-brief false-flag) ──────────────

@@ -1944,7 +1944,7 @@ function applyWorkflowOriginLineage(ctx: Pick<StepExecutionContext, 'originSessi
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract' | 'synthesis_degraded';
+  kind: 'skill_not_executed' | 'target_missed' | 'target_unverified' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract' | 'synthesis_degraded';
   note: string;
 }
 
@@ -1963,6 +1963,7 @@ export function workflowAdvisoryRequiresAttention(
       // as clean success.
       return true;
     case 'goal_validation_unavailable':
+    case 'target_unverified':
       // A dead judge is not proof the deliverable is bad. It is still delivered
       // loudly as a quality advisory, but it does not count as a workflow
       // failure or trigger chronic-failure accounting by itself.
@@ -9122,6 +9123,19 @@ async function processOneRunFile(
           appendWorkflowEvent(workflow.name, run.id, {
             kind: 'verdict_recorded',
             meta: { door: 'workflow_target', pass: targetVerdict.reached, reason: targetVerdict.gap.slice(0, 400) },
+          });
+        }
+        // A judge OUTAGE on a legacy (no declared goal) run means NOTHING
+        // verified the deliverable — neither contract criteria (none declared)
+        // nor the target judge. Fail-open still accepts the run; say so
+        // honestly as an informational advisory instead of silent clean
+        // success. Never attention-requiring: an infra blip must not flip a
+        // good run to blocked.
+        if (targetVerdict && !targetVerdict.judged && targetVerdict.unavailable) {
+          qualityAdvisories.push({
+            stepId: '(workflow target)',
+            kind: 'target_unverified',
+            note: `completed unverified: this run has no declared goal contract and the target judge was unavailable (${targetVerdict.gap}).`,
           });
         }
         if (targetVerdict && targetVerdict.judged && !targetVerdict.reached) {

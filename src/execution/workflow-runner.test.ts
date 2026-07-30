@@ -1033,6 +1033,10 @@ test('workflowAdvisoryRequiresAttention: confident quality misses are not clean 
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'ungrounded_output' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'inferred_output_contract' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'goal_validation_unavailable' }), false);
+  // Tier-1 item 3: a judge OUTAGE on a legacy run is reported honestly as
+  // "completed unverified" — but an infra blip must NEVER flip a good run to
+  // blocked, so the advisory is informational by construction.
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'target_unverified' }), false);
   // T1.2: a degraded synthesis rollup is a presentation loss, not a failed run —
   // every step already completed and verified.
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'synthesis_degraded' }), false);

@@ -34,6 +34,12 @@ export interface WorkflowTargetVerdict {
   gap: string;
   /** False when the judge was deliberately skipped (no target/deliverable, or a partial run). */
   judged: boolean;
+  /**
+   * True only when the judge was WANTED but infra failed (timeout/error) —
+   * distinct from a deliberate skip. Fail-open still accepts the run; this
+   * flag lets the caller say honestly that nothing verified it.
+   */
+  unavailable?: boolean;
 }
 
 const MAX_OBJECTIVE_CHARS = 2000;
@@ -241,7 +247,7 @@ export async function judgeWorkflowTarget(
   try {
     const verdict = await withJudgeTimeout(judge(objectivePrompt, deliverable));
     if (!verdict) {
-      return { reached: true, judged: false, gap: 'target judge timed out — accepting completion' };
+      return { reached: true, judged: false, unavailable: true, gap: 'target judge timed out — accepting completion' };
     }
     // A truncation-shaped gap on a deliverable WE windowed for length is a
     // self-inflicted artifact, never a real target miss — fall open so it can
@@ -252,6 +258,6 @@ export async function judgeWorkflowTarget(
     }
     return { reached: verdict.done, judged: true, gap: verdict.reason };
   } catch {
-    return { reached: true, judged: false, gap: 'target judge unavailable — accepting completion' };
+    return { reached: true, judged: false, unavailable: true, gap: 'target judge unavailable — accepting completion' };
   }
 }
