@@ -1,3 +1,4 @@
+import type { JSX } from 'preact';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { getAuthStatus, logout, pairDevice, type AuthStatus } from './lib/api';
 import { Login } from './screens/Login';
@@ -97,32 +98,88 @@ export function App() {
   return (
     <>
       <header class="app-header">
-        <h1>Clementine</h1>
+        <h1><img class="brand-mark" src="/m/clemmy.png" alt="" width="26" height="26" />Clementine</h1>
         <div class="meta">
+          <span class="conn-pill" title="Connected directly to your Mac — end-to-end encrypted">Direct</span>
           <button
-            class="btn btn-ghost"
-            style="padding: 4px 10px; font-size: 10px; max-width: none; width: auto;"
+            class="icon-btn"
+            aria-label="Sign out"
             onClick={async () => { await logout(); await refreshAuth(); }}
           >
-            Sign out
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
+            </svg>
           </button>
         </div>
       </header>
       <main class="app-main">
-        <PushPrompt />
-        {tab === 'inbox' ? <Inbox />
-          : tab === 'chats' ? <Chats />
-          : tab === 'workflows' ? <Workflows />
-          : tab === 'memory' ? <Memory />
-          : <Activity />}
+        <div class="screen-enter" key={tab}>
+          <PushPrompt />
+          {tab === 'inbox' ? <Inbox />
+            : tab === 'chats' ? <Chats />
+            : tab === 'workflows' ? <Workflows />
+            : tab === 'memory' ? <Memory />
+            : <Activity />}
+        </div>
       </main>
-      <nav class="section-tab-bar">
-        <button class={tab === 'inbox' ? 'active' : ''} onClick={() => setTab('inbox')}>Inbox</button>
-        <button class={tab === 'chats' ? 'active' : ''} onClick={() => setTab('chats')}>Chats</button>
-        <button class={tab === 'workflows' ? 'active' : ''} onClick={() => setTab('workflows')}>Flows</button>
-        <button class={tab === 'memory' ? 'active' : ''} onClick={() => setTab('memory')}>Memory</button>
-        <button class={tab === 'activity' ? 'active' : ''} onClick={() => setTab('activity')}>Activity</button>
+      <nav class="section-tab-bar" aria-label="Sections">
+        {TABS.map((t) => (
+          <button key={t.id} class={tab === t.id ? 'active' : ''} onClick={() => setTab(t.id)} aria-label={t.label}>
+            {t.icon}
+            {t.label}
+          </button>
+        ))}
       </nav>
     </>
   );
 }
+
+const stroke = { fill: 'none', stroke: 'currentColor', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' } as const;
+
+const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
+  {
+    id: 'inbox',
+    label: 'Inbox',
+    icon: (
+      <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+        <path d="M22 12h-6l-2 3h-4l-2-3H2" /><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'chats',
+    label: 'Chats',
+    icon: (
+      <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'workflows',
+    label: 'Flows',
+    icon: (
+      <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+      </svg>
+    ),
+  },
+  {
+    id: 'memory',
+    label: 'Memory',
+    icon: (
+      <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+        <path d="M12 3a4 4 0 0 0-4 4 4 4 0 0 0-3 6.5 4 4 0 0 0 3 6.5h.5" /><path d="M12 3a4 4 0 0 1 4 4 4 4 0 0 1 3 6.5 4 4 0 0 1-3 6.5h-.5" /><path d="M12 3v17" />
+      </svg>
+    ),
+  },
+  {
+    id: 'activity',
+    label: 'Activity',
+    icon: (
+      <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+      </svg>
+    ),
+  },
+];
