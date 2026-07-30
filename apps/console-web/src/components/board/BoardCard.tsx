@@ -14,9 +14,11 @@ import { Button } from '@/components/ui/Button';
 import { relativeTime } from '@/lib/inbox';
 import {
   cardTone,
+  isWorkflowCatchupCard,
   pendingActionReviewFacts,
   sourceLabel,
   runQueueRef,
+  workflowCatchupReadinessFacts,
   type BoardButtonIntent,
   type BoardCard as BoardCardT,
 } from '@/lib/board';
@@ -58,7 +60,9 @@ function failureReasonIsRedundant(card: BoardCardT): boolean {
 }
 
 function continueIntent(card: BoardCardT): BoardButtonIntent {
-  return card.sourceKind === 'background' || card.sourceKind === 'execution' ? 'resume' : 'resume_safe';
+  return card.sourceKind === 'background' || card.sourceKind === 'execution' || card.sourceKind === 'schedule'
+    ? 'resume'
+    : 'resume_safe';
 }
 
 export function BoardCard({
@@ -84,6 +88,8 @@ export function BoardCard({
   const pendingActionReview = card.pendingAction
     ? pendingActionReviewFacts(card.pendingAction)
     : null;
+  const isCatchup = isWorkflowCatchupCard(card);
+  const catchupReadiness = workflowCatchupReadinessFacts(card);
 
   const runAction = async (intent: BoardButtonIntent) => {
     if (!onAction || busyIntent !== null) return;
@@ -186,6 +192,16 @@ export function BoardCard({
         <p className="mt-2 line-clamp-2 text-caption text-faint">{card.nextSafeAction}</p>
       )}
 
+      {isCatchup && catchupReadiness.blocked && (
+        <div className="mt-2 rounded-sm bg-warning-tint px-2 py-1.5">
+          <p className="text-caption font-semibold text-warning">Needs connection/fix before Resume</p>
+          <p className="mt-0.5 line-clamp-2 text-caption text-fg">
+            {catchupReadiness.blockerMessages[0]
+              ?? `${catchupReadiness.blockerCount || 1} required dependency is not ready.`}
+          </p>
+        </div>
+      )}
+
       {pendingActionReview && (
         <div className="mt-2 space-y-1 rounded-md border border-warning/30 bg-warning-tint px-2.5 py-2 text-caption">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -245,7 +261,33 @@ export function BoardCard({
             : tone.label}
         </StatusPill>
         <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
-          {onAction && card.primaryAction === 'approve' && (
+          {onAction && isCatchup && (
+            <>
+              <Button
+                size="sm"
+                disabled={busyIntent !== null}
+                title={catchupReadiness.blocked ? 'Resume rechecks these dependencies now.' : undefined}
+                onClick={(e) => { e.stopPropagation(); void runAction('resume'); }}
+                onPointerDown={(e) => e.stopPropagation()}
+                className="h-7 px-2 text-caption"
+              >
+                <Play className="h-3.5 w-3.5" aria-hidden />
+                {busyIntent === 'resume' ? 'Resuming…' : 'Resume run'}
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={busyIntent !== null}
+                onClick={(e) => { e.stopPropagation(); void runAction('skip'); }}
+                onPointerDown={(e) => e.stopPropagation()}
+                className="h-7 px-2 text-caption"
+              >
+                <X className="h-3.5 w-3.5" aria-hidden />
+                {busyIntent === 'skip' ? 'Skipping…' : 'Skip run'}
+              </Button>
+            </>
+          )}
+          {onAction && !isCatchup && card.primaryAction === 'approve' && (
             <>
               <Button
                 size="sm"
@@ -270,7 +312,7 @@ export function BoardCard({
               </Button>
             </>
           )}
-          {onAction && card.primaryAction === 'retry_failed_items' && (
+          {onAction && !isCatchup && card.primaryAction === 'retry_failed_items' && (
             <Button
               size="sm"
               disabled={busyIntent !== null}
@@ -281,7 +323,7 @@ export function BoardCard({
               <RotateCcw className="h-3.5 w-3.5" aria-hidden /> Retry
             </Button>
           )}
-          {onAction && card.primaryAction === 'continue' && (
+          {onAction && !isCatchup && card.primaryAction === 'continue' && (
             <Button
               size="sm"
               disabled={busyIntent !== null}
@@ -292,7 +334,7 @@ export function BoardCard({
               <Play className="h-3.5 w-3.5" aria-hidden /> Continue
             </Button>
           )}
-          {card.primaryAction === 'open_result' && (
+          {!isCatchup && card.primaryAction === 'open_result' && (
             <Button
               size="sm"
               variant="secondary"
@@ -318,7 +360,7 @@ export function BoardCard({
             onPointerDown={(e) => e.stopPropagation()}
             className="text-caption font-semibold text-faint transition-colors hover:text-primary hover:underline"
           >
-            View trace
+            {isCatchup ? 'Review' : 'View trace'}
           </button>
         </div>
       </div>

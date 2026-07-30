@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -35,6 +35,7 @@ const { fireWorkflowSystemEvent } = await import('../execution/workflow-trigger-
 const { CRON_TRIGGERS_DIR, WORKFLOW_RUNS_DIR, updateEnvKey, clearWorkspaceProjectCache } = await import('../tools/shared.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
+const { queueWorkflowRun } = await import('../tools/workflow-run-queue.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { queuePendingAction } = await import('../runtime/harness/pending-actions.js');
 const {
@@ -165,6 +166,193 @@ test('GET /api/console/board normalizes every background-task status into the ri
     assert.equal(byId.get(awaitingContinue.id)?.primaryAction, 'continue');
     assert.equal(byId.get(awaitingInput.id)?.primaryAction, 'none');
     assert.match(byId.get(awaitingInput.id)?.nextSafeAction ?? '', /originating chat/i);
+  } finally {
+    await h.close();
+  }
+});
+
+test('held workflow catch-ups appear in Needs You and Resume/Skip act on the exact unstarted occurrence', async () => {
+  const workflowSlug = 'board-held-catchup';
+  const workflowName = 'Board held catch-up';
+  const scheduledAtMs = Date.parse('2026-07-28T15:00:00.000Z');
+  writeWorkflow(workflowSlug, {
+    name: workflowName,
+    description: 'Tasks-board catch-up decision proof',
+    enabled: true,
+    trigger: { schedule: '0 8 * * *' },
+    steps: [{ id: 'read', prompt: 'Read the current summary.', sideEffect: 'read' }],
+  });
+  const queueHeld = (missedCount: number, occurrenceMs: number) => queueWorkflowRun(
+    workflowName,
+    {},
+    {
+      source: 'schedule',
+      catchupFire: true,
+      catchupOccurrenceAtMs: occurrenceMs - (missedCount - 1) * 24 * 60 * 60 * 1000,
+      holdForCatchupDecision: true,
+      workflowSlug,
+      catchupFirstDueAtMs: occurrenceMs - (missedCount - 1) * 24 * 60 * 60 * 1000,
+      catchupMissedCount: missedCount,
+      triggerReceiptId: `workflow-schedule:v1:${workflowSlug}:${occurrenceMs}`,
+    },
+  );
+  const skippedHeld = queueHeld(3, scheduledAtMs);
+  const resumedHeld = queueHeld(1, scheduledAtMs + 60_000);
+  assert.equal(skippedHeld.status, 'held');
+  assert.equal(resumedHeld.status, 'held');
+  assert.ok(skippedHeld.id);
+  assert.ok(resumedHeld.id);
+  const skippedRunId = skippedHeld.id!;
+  const resumedRunId = resumedHeld.id!;
+
+  const authorized = { v: true };
+  const h = await boot(authorized);
+  try {
+    const boardResponse = await fetch(`${h.url}/api/console/board`);
+    assert.equal(boardResponse.status, 200);
+    const board = await boardResponse.json() as { cards: BoardCard[] };
+    const skippedCard = board.cards.find((card) => card.id === `catchup:${skippedRunId}`);
+    assert.ok(skippedCard, 'held occurrence has a dedicated Tasks card');
+    assert.equal(skippedCard!.sourceKind, 'schedule');
+    assert.equal(skippedCard!.column, 'needs_you');
+    assert.equal(skippedCard!.status, 'awaiting_catchup_decision');
+    assert.deepEqual(skippedCard!.actions, ['resume', 'cancel', 'skip']);
+    assert.equal(skippedCard!.raw?.runId, skippedRunId);
+    assert.equal(skippedCard!.raw?.workflowSlug, workflowSlug);
+    assert.equal(skippedCard!.raw?.missedCount, 3);
+    assert.equal((skippedCard!.raw?.readiness as { ok?: unknown } | undefined)?.ok, true);
+    assert.match(skippedCard!.nextSafeAction ?? '', /Future scheduled runs stay enabled/);
+
+    authorized.v = false;
+    const denied = await fetch(
+      `${h.url}/api/console/board/workflow-catchups/${workflowSlug}/${skippedRunId}/skip`,
+      { method: 'POST' },
+    );
+    assert.equal(denied.status, 401, 'catch-up decisions use the console auth boundary');
+    authorized.v = true;
+
+    const mismatch = await fetch(
+      `${h.url}/api/console/board/workflow-catchups/not-this-workflow/${resumedRunId}/resume`,
+      { method: 'POST' },
+    );
+    assert.equal(mismatch.status, 409, 'a stale/mismatched card cannot decide another workflow occurrence');
+
+    const skipped = await fetch(
+      `${h.url}/api/console/board/workflow-catchups/${workflowSlug}/${skippedRunId}/skip`,
+      { method: 'POST' },
+    );
+    assert.equal(skipped.status, 200);
+    const skippedBody = await skipped.json() as { ok: boolean; status: string; message: string };
+    assert.equal(skippedBody.ok, true);
+    assert.equal(skippedBody.status, 'skipped');
+    const skippedRecord = JSON.parse(
+      readFileSync(path.join(WORKFLOW_RUNS_DIR, `${skippedRunId}.json`), 'utf-8'),
+    ) as Record<string, unknown>;
+    assert.equal(skippedRecord.status, 'cancelled');
+    assert.equal(skippedRecord.catchupDisposition, 'skipped');
+    assert.equal(
+      existsSync(path.join(WORKFLOWS_DIR, workflowSlug, 'runs', skippedRunId, 'events.jsonl')),
+      false,
+      'Skip emitted no workflow execution events',
+    );
+
+    const resumed = await fetch(
+      `${h.url}/api/console/board/workflow-catchups/${workflowSlug}/${resumedRunId}/resume`,
+      { method: 'POST' },
+    );
+    assert.equal(resumed.status, 200);
+    const resumedBody = await resumed.json() as { ok: boolean; status: string };
+    assert.equal(resumedBody.ok, true);
+    assert.equal(resumedBody.status, 'resumed');
+    const resumedRecord = JSON.parse(
+      readFileSync(path.join(WORKFLOW_RUNS_DIR, `${resumedRunId}.json`), 'utf-8'),
+    ) as Record<string, unknown>;
+    assert.equal(resumedRecord.status, 'queued');
+    assert.equal(resumedRecord.catchupDisposition, 'resumed');
+
+    const refreshed = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: BoardCard[] };
+    assert.equal(
+      refreshed.cards.some((card) => card.sourceKind === 'schedule'
+        && (card.raw?.runId === skippedRunId || card.raw?.runId === resumedRunId)),
+      false,
+      'resolved decisions leave the held recovery board immediately',
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test('a held catch-up exposes readiness blockers and remains skippable when Resume is blocked', async () => {
+  const workflowSlug = 'board-blocked-catchup';
+  const workflowName = 'Board blocked catch-up';
+  const scheduledAtMs = Date.parse('2026-07-28T16:00:00.000Z');
+  writeWorkflow(workflowSlug, {
+    name: workflowName,
+    description: 'A held run whose admitted script is unavailable.',
+    enabled: true,
+    trigger: { schedule: '0 9 * * *' },
+    steps: [{
+      id: 'merge',
+      prompt: 'Merge the report.',
+      deterministic: { runner: 'missing-merge.py' },
+    }],
+  });
+  const held = queueWorkflowRun(workflowName, {}, {
+    source: 'schedule',
+    catchupFire: true,
+    catchupOccurrenceAtMs: scheduledAtMs,
+    holdForCatchupDecision: true,
+    workflowSlug,
+    catchupFirstDueAtMs: scheduledAtMs,
+    catchupMissedCount: 1,
+    triggerReceiptId: `workflow-schedule:v1:${workflowSlug}:${scheduledAtMs}`,
+  });
+  assert.equal(held.status, 'held');
+  assert.equal(held.readiness?.ok, false);
+  assert.ok(held.id);
+
+  const h = await boot();
+  try {
+    const board = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: BoardCard[] };
+    const card = board.cards.find((candidate) => candidate.raw?.runId === held.id);
+    assert.ok(card, 'blocked held occurrence stays visible in Needs You');
+    const readiness = card!.raw?.readiness as {
+      ok?: boolean;
+      blockers?: Array<{ name?: string; reason?: string }>;
+    } | undefined;
+    assert.equal(readiness?.ok, false);
+    assert.equal(readiness?.blockers?.length, 1);
+    assert.equal(readiness?.blockers?.[0]?.name, 'missing-merge.py');
+    assert.match(readiness?.blockers?.[0]?.reason ?? '', /script.*missing/i);
+    assert.ok(card!.actions.includes('skip'), 'a readiness blocker never removes Skip');
+
+    const blocked = await fetch(
+      `${h.url}/api/console/board/workflow-catchups/${workflowSlug}/${held.id}/resume`,
+      { method: 'POST' },
+    );
+    assert.equal(blocked.status, 409);
+    const blockedBody = await blocked.json() as {
+      ok: boolean;
+      status: string;
+      readiness?: { blockers?: unknown[] };
+    };
+    assert.equal(blockedBody.ok, false);
+    assert.equal(blockedBody.status, 'blocked_readiness');
+    assert.equal(blockedBody.readiness?.blockers?.length, 1);
+    const stillHeld = JSON.parse(
+      readFileSync(path.join(WORKFLOW_RUNS_DIR, `${held.id}.json`), 'utf-8'),
+    ) as Record<string, unknown>;
+    assert.equal(stillHeld.status, 'awaiting_catchup_decision');
+    assert.equal(stillHeld.catchupDisposition, 'held');
+
+    const skipped = await fetch(
+      `${h.url}/api/console/board/workflow-catchups/${workflowSlug}/${held.id}/skip`,
+      { method: 'POST' },
+    );
+    assert.equal(skipped.status, 200);
+    const skippedBody = await skipped.json() as { ok: boolean; status: string };
+    assert.equal(skippedBody.ok, true);
+    assert.equal(skippedBody.status, 'skipped');
   } finally {
     await h.close();
   }
@@ -2986,5 +3174,71 @@ test('GET /api/console/board collapses a tracked execution that belongs to a bac
     );
   } finally {
     await h.close();
+  }
+});
+
+test('guest CLI runs surface as board cards with a working kill endpoint and drawer feed', async () => {
+  const { setGuestHarnessSpawnForTest, setGuestHarnessBinaryResolverForTest } = await import('../execution/guest-harness.js');
+  const { startGuestRun, getGuestRun } = await import('../execution/guest-run-jobs.js');
+  const { EventEmitter } = await import('node:events');
+  const os = await import('node:os');
+  const { mkdtempSync, mkdirSync: mkdir } = await import('node:fs');
+
+  const workspace = mkdtempSync(path.join(os.tmpdir(), 'clemmy-board-guest-ws-'));
+  const projectDir = path.join(workspace, 'guest-fixture');
+  mkdir(projectDir, { recursive: true });
+  writeFileSync(path.join(projectDir, 'package.json'), '{"name":"guest-fixture"}');
+  updateEnvKey('WORKSPACE_DIRS', workspace);
+  clearWorkspaceProjectCache();
+
+  const child = new EventEmitter() as any;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  let sigtermed = false;
+  child.kill = () => { sigtermed = true; };
+  setGuestHarnessBinaryResolverForTest(() => process.execPath);
+  setGuestHarnessSpawnForTest((() => child) as any);
+
+  const h = await boot();
+  try {
+    const job = startGuestRun({ harness: 'claude', project: 'guest-fixture', prompt: '/seo-audit example.com' });
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'WebFetch', input: {} }] } })}\n`));
+
+    const board = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: BoardCard[] };
+    const card = board.cards.find((c) => c.id === `guest:${job.id}`);
+    assert.ok(card, 'a running guest run gets a board card');
+    assert.equal(card!.sourceKind, 'guest');
+    assert.equal(card!.column, 'running');
+    assert.deepEqual(card!.actions, ['cancel']);
+    assert.equal(card!.cancelEndpoint, `/api/console/guest-runs/${encodeURIComponent(job.id)}/kill`);
+    assert.equal(card!.raw.guestRunId, job.id);
+
+    // Drawer feed: the per-run endpoint serves the narration tail.
+    const feed = await (await fetch(`${h.url}/api/console/guest-runs/${job.id}`)).json() as { events: string[]; status: string };
+    assert.equal(feed.status, 'running');
+    assert.ok(feed.events.some((e) => e.includes('WebFetch')), 'events tail includes the tool narration');
+
+    // Kill from the board: endpoint signals the child; once it exits the
+    // card lands in done as killed with no cancel affordance left.
+    const killRes = await fetch(`${h.url}/api/console/guest-runs/${job.id}/kill`, { method: 'POST' });
+    assert.equal(killRes.status, 200);
+    assert.equal(sigtermed, true, 'kill endpoint reaches the child process');
+    child.emit('close', 143);
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    assert.equal(getGuestRun(job.id)?.status, 'killed');
+
+    const after = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: BoardCard[] };
+    const doneCard = after.cards.find((c) => c.id === `guest:${job.id}`);
+    assert.ok(doneCard, 'the finished guest run stays visible in done');
+    assert.equal(doneCard!.column, 'done');
+    assert.equal(doneCard!.status, 'killed');
+    assert.deepEqual(doneCard!.actions, []);
+  } finally {
+    await h.close();
+    setGuestHarnessSpawnForTest(null);
+    setGuestHarnessBinaryResolverForTest(null);
+    updateEnvKey('WORKSPACE_DIRS', '');
+    clearWorkspaceProjectCache();
+    rmSync(workspace, { recursive: true, force: true });
   }
 });

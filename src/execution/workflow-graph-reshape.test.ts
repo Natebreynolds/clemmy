@@ -14,12 +14,23 @@ import path from 'node:path';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-reshape-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
-const { reshapeWorkflowGraph, loadLiveWorkflowGraph } = await import('./workflow-graph-reshape.js');
+const {
+  reshapeWorkflowGraph,
+  loadLiveWorkflowGraph,
+  WORKFLOW_RESHAPE_MAX_OPERATIONS_PER_PATCH,
+  WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_PATCH,
+  WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_RUN,
+  WORKFLOW_RESHAPE_MAX_PROMPT_BYTES_PER_NODE,
+  WORKFLOW_RESHAPE_MAX_TOTAL_ADDED_PROMPT_BYTES_PER_RUN,
+} = await import('./workflow-graph-reshape.js');
 const {
   loadWorkflowGraphSnapshotByRunId,
   persistWorkflowGraphSnapshot,
 } = await import('./workflow-graph-store.js');
-const { compileWorkflowStepsToGraph } = await import('./workflow-graph.js');
+const {
+  compileWorkflowStepsToGraph,
+  WORKFLOW_GRAPH_ADDITIVE_NODE_MODE,
+} = await import('./workflow-graph.js');
 const { appendWorkflowEvent, readWorkflowEvents } = await import('./workflow-events.js');
 const { resolveWorkflowReadiness } = await import('./workflow-readiness.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
@@ -63,6 +74,23 @@ function seed(runId: string, status: 'running' | 'completed' = 'running'): void 
   writeRunRecord(runId, status);
 }
 
+function seedWithDynamicPrompts(runId: string, prompts: string[]): void {
+  const graph = compileWorkflowStepsToGraph(steps, { id: `${WF}:${runId}` });
+  graph.nodes.push(...prompts.map((prompt, index) => ({
+    id: `existing_dynamic_${index}`,
+    type: 'step' as const,
+    stepId: `existing_dynamic_${index}`,
+    prompt,
+    sideEffect: 'read' as const,
+    config: {
+      runtimeMode: WORKFLOW_GRAPH_ADDITIVE_NODE_MODE,
+      toolAuthority: 'result_only',
+    },
+  })));
+  persistWorkflowGraphSnapshot({ workflowName: WF, runId, graph });
+  writeRunRecord(runId);
+}
+
 test('a reshape is durable, changes what runs next, and is recorded as applied', () => {
   const runId = 'run-widen';
   seed(runId);
@@ -99,6 +127,183 @@ test('a reshape is durable, changes what runs next, and is recorded as applied',
   assert.ok(kinds.includes('workflow_graph_patch_applied'));
   const appliedEvent = readWorkflowEvents(WF, runId).find((e) => e.kind === 'workflow_graph_patch_applied');
   assert.match(String(appliedEvent?.meta?.reason ?? ''), /rate-limited/);
+});
+
+test('reshape admission bounds operations and new branches per patch', () => {
+  assert.equal(typeof WORKFLOW_RESHAPE_MAX_OPERATIONS_PER_PATCH, 'number');
+  assert.equal(typeof WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_PATCH, 'number');
+  assert.ok(
+    WORKFLOW_RESHAPE_MAX_OPERATIONS_PER_PATCH > WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_PATCH,
+    'the operation budget must leave room for dependency edges',
+  );
+
+  const operationRunId = 'run-operation-admission-cap';
+  seed(operationRunId);
+  const tooManyOperations = reshapeWorkflowGraph({
+    workflowName: WF,
+    runId: operationRunId,
+    patch: {
+      reason: 'Exercise the deterministic patch operation ceiling.',
+      operations: Array.from(
+        { length: WORKFLOW_RESHAPE_MAX_OPERATIONS_PER_PATCH + 1 },
+        (_, index) => ({
+          op: 'add_node' as const,
+          node: {
+            id: `operation_cap_${index}`,
+            type: 'step' as const,
+            prompt: 'read one bounded source',
+            sideEffect: 'read' as const,
+          },
+        }),
+      ),
+    },
+  });
+  assert.equal(tooManyOperations.ok, false);
+  assert.match(
+    tooManyOperations.errors.join(' '),
+    new RegExp(`at most ${WORKFLOW_RESHAPE_MAX_OPERATIONS_PER_PATCH} operations`, 'i'),
+  );
+  assert.equal(loadLiveWorkflowGraph(operationRunId)?.nodes.length, steps.length);
+
+  const nodeRunId = 'run-node-per-patch-admission-cap';
+  seed(nodeRunId);
+  const tooManyNodes = reshapeWorkflowGraph({
+    workflowName: WF,
+    runId: nodeRunId,
+    patch: {
+      reason: 'Exercise the deterministic branch ceiling for one patch.',
+      operations: Array.from(
+        { length: WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_PATCH + 1 },
+        (_, index) => ({
+          op: 'add_node' as const,
+          node: {
+            id: `node_cap_${index}`,
+            type: 'step' as const,
+            prompt: 'read one bounded source',
+            sideEffect: 'read' as const,
+          },
+        }),
+      ),
+    },
+  });
+  assert.equal(tooManyNodes.ok, false);
+  assert.match(
+    tooManyNodes.errors.join(' '),
+    new RegExp(`at most ${WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_PATCH} new nodes`, 'i'),
+  );
+  assert.equal(loadLiveWorkflowGraph(nodeRunId)?.nodes.length, steps.length);
+});
+
+test('repeated reshapes cannot grow one run past its dynamic-node budget', () => {
+  assert.equal(typeof WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_RUN, 'number');
+  const runId = 'run-total-dynamic-node-cap';
+  seedWithDynamicPrompts(
+    runId,
+    Array.from({ length: WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_RUN }, () => 'bounded read'),
+  );
+
+  const result = reshapeWorkflowGraph({
+    workflowName: WF,
+    runId,
+    patch: {
+      reason: 'Exercise the cumulative dynamic branch ceiling.',
+      operations: [{
+        op: 'add_node',
+        node: {
+          id: 'one_dynamic_node_too_many',
+          type: 'step',
+          prompt: 'read one more source',
+          sideEffect: 'read',
+        },
+      }],
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(
+    result.errors.join(' '),
+    new RegExp(`at most ${WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_RUN} graph-added nodes`, 'i'),
+  );
+  assert.equal(
+    loadLiveWorkflowGraph(runId)?.nodes.some((node) => node.id === 'one_dynamic_node_too_many'),
+    false,
+  );
+});
+
+test('reshape prompt budgets use UTF-8 bytes per node and cumulatively per run', () => {
+  assert.equal(typeof WORKFLOW_RESHAPE_MAX_PROMPT_BYTES_PER_NODE, 'number');
+  assert.equal(typeof WORKFLOW_RESHAPE_MAX_TOTAL_ADDED_PROMPT_BYTES_PER_RUN, 'number');
+
+  const perNodeRunId = 'run-prompt-node-byte-cap';
+  seed(perNodeRunId);
+  const multibytePrompt = 'é'.repeat(
+    Math.floor(WORKFLOW_RESHAPE_MAX_PROMPT_BYTES_PER_NODE / 2) + 1,
+  );
+  assert.ok(
+    Buffer.byteLength(multibytePrompt, 'utf-8') > WORKFLOW_RESHAPE_MAX_PROMPT_BYTES_PER_NODE,
+  );
+  const oversizedNode = reshapeWorkflowGraph({
+    workflowName: WF,
+    runId: perNodeRunId,
+    patch: {
+      reason: 'Exercise the per-node UTF-8 prompt ceiling.',
+      operations: [{
+        op: 'add_node',
+        node: {
+          id: 'oversized_prompt',
+          type: 'step',
+          prompt: multibytePrompt,
+          sideEffect: 'read',
+        },
+      }],
+    },
+  });
+  assert.equal(oversizedNode.ok, false);
+  assert.match(
+    oversizedNode.errors.join(' '),
+    new RegExp(`prompt.*at most ${WORKFLOW_RESHAPE_MAX_PROMPT_BYTES_PER_NODE} UTF-8 bytes`, 'i'),
+  );
+
+  const totalRunId = 'run-total-prompt-byte-cap';
+  const existingPromptBytes = WORKFLOW_RESHAPE_MAX_TOTAL_ADDED_PROMPT_BYTES_PER_RUN - 1;
+  const existingPrompts: string[] = [];
+  let remaining = existingPromptBytes;
+  while (remaining > 0) {
+    const bytes = Math.min(remaining, WORKFLOW_RESHAPE_MAX_PROMPT_BYTES_PER_NODE);
+    existingPrompts.push('x'.repeat(bytes));
+    remaining -= bytes;
+  }
+  assert.ok(existingPrompts.length < WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_RUN);
+  seedWithDynamicPrompts(totalRunId, existingPrompts);
+
+  const oversizedRun = reshapeWorkflowGraph({
+    workflowName: WF,
+    runId: totalRunId,
+    patch: {
+      reason: 'Exercise the cumulative prompt ceiling.',
+      operations: [{
+        op: 'add_node',
+        node: {
+          id: 'prompt_total_overflow',
+          type: 'step',
+          prompt: 'ok',
+          sideEffect: 'read',
+        },
+      }],
+    },
+  });
+  assert.equal(oversizedRun.ok, false);
+  assert.match(
+    oversizedRun.errors.join(' '),
+    new RegExp(
+      `graph-added prompts.*at most ${WORKFLOW_RESHAPE_MAX_TOTAL_ADDED_PROMPT_BYTES_PER_RUN} UTF-8 bytes per run`,
+      'i',
+    ),
+  );
+  assert.equal(
+    loadLiveWorkflowGraph(totalRunId)?.nodes.some((node) => node.id === 'prompt_total_overflow'),
+    false,
+  );
 });
 
 test('display-name callers resolve to the canonical graph-owner slug', () => {

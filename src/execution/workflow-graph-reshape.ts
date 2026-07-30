@@ -65,6 +65,19 @@ export interface ReshapeWorkflowGraphResult {
   appliedOperations: number;
 }
 
+/**
+ * Deterministic resource admission for model-owned graph additions.
+ *
+ * These are execution-shape budgets, not quality judgments: they bound how
+ * much concurrency and prompt material one active run can acquire while still
+ * leaving enough room for a useful fan-out and its dependency edges.
+ */
+export const WORKFLOW_RESHAPE_MAX_OPERATIONS_PER_PATCH = 24;
+export const WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_PATCH = 6;
+export const WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_RUN = 24;
+export const WORKFLOW_RESHAPE_MAX_PROMPT_BYTES_PER_NODE = 4 * 1024;
+export const WORKFLOW_RESHAPE_MAX_TOTAL_ADDED_PROMPT_BYTES_PER_RUN = 32 * 1024;
+
 interface ReshapeRunRecord {
   id?: string;
   workflow?: string;
@@ -182,11 +195,55 @@ function admitReleasePatch(
 ): ReleasePatchAdmission {
   const operations = patch.operations ?? [];
   const errors: string[] = [];
+  const addedNodes = operations
+    .filter((operation): operation is Extract<WorkflowGraphPatchOperation, { op: 'add_node' }> =>
+      operation.op === 'add_node');
+  const existingAddedNodes = current.nodes.filter(
+    (node) => node.config?.runtimeMode === WORKFLOW_GRAPH_ADDITIVE_NODE_MODE,
+  );
+  const existingPromptBytes = existingAddedNodes.reduce(
+    (total, node) => total + Buffer.byteLength(node.prompt?.trim() ?? '', 'utf-8'),
+    0,
+  );
+  const proposedPromptBytes = addedNodes.reduce(
+    (total, operation) => total + Buffer.byteLength(operation.node.prompt?.trim() ?? '', 'utf-8'),
+    0,
+  );
+
+  if (operations.length > WORKFLOW_RESHAPE_MAX_OPERATIONS_PER_PATCH) {
+    errors.push(
+      `A reshape patch may contain at most ${WORKFLOW_RESHAPE_MAX_OPERATIONS_PER_PATCH} operations; received ${operations.length}. Split the new structure into smaller patches.`,
+    );
+  }
+  if (addedNodes.length > WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_PATCH) {
+    errors.push(
+      `A reshape patch may add at most ${WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_PATCH} new nodes; received ${addedNodes.length}.`,
+    );
+  }
+  if (existingAddedNodes.length + addedNodes.length > WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_RUN) {
+    errors.push(
+      `An active run may contain at most ${WORKFLOW_RESHAPE_MAX_ADDED_NODES_PER_RUN} graph-added nodes; this patch would bring the run to ${existingAddedNodes.length + addedNodes.length}.`,
+    );
+  }
+  for (const operation of addedNodes) {
+    const promptBytes = Buffer.byteLength(operation.node.prompt?.trim() ?? '', 'utf-8');
+    if (promptBytes > WORKFLOW_RESHAPE_MAX_PROMPT_BYTES_PER_NODE) {
+      errors.push(
+        `Dynamic node "${operation.node.id}" prompt must be at most ${WORKFLOW_RESHAPE_MAX_PROMPT_BYTES_PER_NODE} UTF-8 bytes; received ${promptBytes} bytes. Put large context in the run workspace and query it instead.`,
+      );
+    }
+  }
+  if (
+    existingPromptBytes + proposedPromptBytes
+    > WORKFLOW_RESHAPE_MAX_TOTAL_ADDED_PROMPT_BYTES_PER_RUN
+  ) {
+    errors.push(
+      `Graph-added prompts may total at most ${WORKFLOW_RESHAPE_MAX_TOTAL_ADDED_PROMPT_BYTES_PER_RUN} UTF-8 bytes per run; this patch would bring the run to ${existingPromptBytes + proposedPromptBytes} bytes. Put source material in the run workspace instead.`,
+    );
+  }
+
   const addedNodeIds = new Set(
-    operations
-      .filter((operation): operation is Extract<WorkflowGraphPatchOperation, { op: 'add_node' }> =>
-        operation.op === 'add_node')
-      .map((operation) => operation.node.id),
+    addedNodes.map((operation) => operation.node.id),
   );
   const canonicalNodeIds = new Set([
     ...current.nodes.map((node) => node.id),

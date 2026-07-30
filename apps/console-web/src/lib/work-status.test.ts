@@ -11,6 +11,7 @@ test('raw harness statuses never leak verbatim', () => {
   assert.equal(humanStatusLabel('parked'), 'Waiting for your approval');
   assert.equal(humanStatusLabel('awaiting_capability'), 'Waiting for a connection');
   assert.equal(humanStatusLabel('interrupted'), 'Interrupted — resumable');
+  assert.equal(humanStatusLabel('awaiting_catchup_decision'), 'Missed schedule');
   assert.equal(humanStatusLabel('step: publish_approved_post'), 'Working');
   // Unknown states are prettified, never underscored.
   assert.equal(humanStatusLabel('some_future_state'), 'Some future state');

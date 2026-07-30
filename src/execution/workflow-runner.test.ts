@@ -4724,6 +4724,8 @@ test('workflow watcher: drift at a step boundary records a steer advisory with t
   }), 'utf-8');
 
   const digestsSeen: Array<{ summary: string; count: number }> = [];
+  const previousWorkflowWatcher = process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE;
+  process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE = 'on';
   setWatcher(async (input) => {
     digestsSeen.push({ summary: input.toolCallSummary, count: input.toolCallCount });
     return { onTrack: false, miss: 'the enrichment ignored the stated goal', steer: 'Re-anchor on the goal before the final step.' };
@@ -4732,6 +4734,8 @@ test('workflow watcher: drift at a step boundary records a steer advisory with t
     await processWorkflowRuns({} as never);
   } finally {
     setWatcher(async () => ({ onTrack: true, miss: '', steer: '' }));
+    if (previousWorkflowWatcher === undefined) delete process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE;
+    else process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE = previousWorkflowWatcher;
   }
 
   // Cadence: default interval 2 over 3 sequential steps → exactly ONE check

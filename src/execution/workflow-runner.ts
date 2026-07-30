@@ -38,6 +38,7 @@ import {
   type ComposioGatewayBlockReason,
 } from '../tools/composio-tools.js';
 import { runBoundedPool } from './bounded-pool.js';
+import { resolveWorkflowRunConcurrency } from './workflow-run-concurrency.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
 import { addRunEvent, startRun, finishRun, getRun } from '../runtime/run-events.js';
@@ -176,7 +177,7 @@ import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtim
 import { buildWorkflowObjective, deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import {
   runWatcherJudge,
-  watcherJudgeEnabled,
+  workflowWatcherJudgeEnabled,
   watcherWorkflowIntervalSteps,
   MAX_WATCHER_INJECTIONS,
   MAX_WATCHER_CHECKS,
@@ -357,7 +358,7 @@ export function shouldSilenceCompletionEcho(opts: {
 const RUNNER_CONCURRENCY = parseInt(process.env.CLEMENTINE_WORKFLOW_CONCURRENCY ?? '5', 10);
 
 // Anti-choke batch size for a single forEach fan-out. The run drain is
-// single-slot by default (runDrainConcurrency = 1), so one forEach over an
+// single-slot by default (resolveWorkflowRunConcurrency = 1), so one forEach over an
 // unbounded upstream array (e.g. 10k scraped rows) still needs visible,
 // resumable progress. This bounds each window without turning the cap into a
 // hard ceiling: every pending item is attempted before the step completes.
@@ -560,6 +561,24 @@ export interface QueuedRunRecord {
   workflow: string;
   inputs?: Record<string, string>;
   status?: string;
+  /** A run descended from a missed scheduled occurrence. Execution admission
+   *  permits at most one such lineage at a time. */
+  catchupFire?: boolean;
+  /** Root occurrence age, preserved across every requeue for fair admission. */
+  catchupOccurrenceAtMs?: number;
+  /** User-owned stale-occurrence decision. Only `resumed` is executable;
+   * `held` remains outside the drain until Resume/Skip wins the record lock. */
+  catchupDisposition?: 'held' | 'resumed' | 'skipped';
+  /** Stable workflow entry identity and collapsed-window evidence for the
+   * recovery card. These are durable metadata, never model instructions. */
+  workflowSlug?: string;
+  catchupFirstDueAtMs?: number;
+  catchupScheduledAtMs?: number;
+  catchupMissedCount?: number;
+  catchupDecidedAt?: string;
+  /** Occurrence-stable scheduler receipt and requeue lineage. */
+  triggerReceiptId?: string;
+  requeuedFromRunId?: string;
   createdAt?: string;
   startedAt?: string;
   finishedAt?: string;
@@ -2463,6 +2482,8 @@ export const workflowRunnerInternalsForTest = {
     hasCompletedUpstreamMutation(steps, blockedStepId, completedStepIds),
   hasUngatedIrreversibleAction,
   tryAutoHealAndRequeue,
+  renderSelfHealRequeuedStatus,
+  renderSelfHealRequeueFailedStatus,
   selfHealAutoMaxAttempts,
   resolveWorkflowStepModel,
   workflowStepCanRunOnClaudeAgentSdk,
@@ -6439,7 +6460,7 @@ async function executeWorkflow(
 
   // WATCHER (workflow mount) state — see the step-boundary check below.
   // Disabled for partial single-step TRY runs (no full trajectory to judge).
-  const watcherEnabled = watcherJudgeEnabled() && !targetStepId;
+  const watcherEnabled = workflowWatcherJudgeEnabled() && !targetStepId;
   const WATCHER_STEP_INTERVAL = watcherWorkflowIntervalSteps();
   const workflowWatcherFn = workflowWatcherOverride ?? runWatcherJudge;
   const watcherObjective = buildWorkflowObjective(workflow, inputs);
@@ -7289,27 +7310,182 @@ export function reapResolvedParkedRuns(): void {
 // concurrent slots (or two overlapping drain passes). Module-scoped so
 // it persists across passes.
 const inFlightRunIds = new Set<string>();
+// Catch-ups are globally single-flight at the point where work can actually
+// execute. Parked/capability-blocked records never enter the eligible set, so
+// they release this slot; once resumed as `running`, they must win admission
+// again. Keep this separate from inFlightRunIds so ordinary runs may consume
+// the remaining bounded-pool capacity.
+const inFlightCatchupRunIds = new Set<string>();
+
+type WorkflowDrainCandidate = { file: string; filePath: string; run: QueuedRunRecord };
+
+function catchupAdmissionAge(run: QueuedRunRecord): number {
+  if (Number.isFinite(run.catchupOccurrenceAtMs)) return run.catchupOccurrenceAtMs!;
+  const createdAtMs = Date.parse(run.createdAt ?? '');
+  return Number.isFinite(createdAtMs) ? createdAtMs : 0;
+}
+
+interface LegacyScheduledCatchupIdentity {
+  workflowSlug: string;
+  scheduledAtMs: number;
+}
+
+function legacyScheduledCatchupIdentity(run: QueuedRunRecord): LegacyScheduledCatchupIdentity | null {
+  if (
+    run.status !== 'queued'
+    || run.catchupFire !== true
+    || run.catchupDisposition !== undefined
+    || run.source !== 'schedule'
+    || typeof run.triggerReceiptId !== 'string'
+  ) return null;
+  const match = /^workflow-schedule:v1:([^:]+):(\d+)$/.exec(run.triggerReceiptId);
+  if (!match) return null;
+  const scheduledAtMs = Number(match[2]);
+  if (!Number.isSafeInteger(scheduledAtMs) || scheduledAtMs < 0) return null;
+  return { workflowSlug: match[1], scheduledAtMs };
+}
+
+/** Conservative v3.0.x bridge. Only the original, provably-unstarted
+ * scheduler record may become held. A requeue descendant, a run with any
+ * execution projection, or a record with a run-local artifact directory is
+ * left alone because work may already have crossed an effect boundary. */
+export function _testOnly_isLegacyScheduledCatchupSafeToHold(
+  run: QueuedRunRecord,
+  runArtifactsExist = false,
+): boolean {
+  if (!legacyScheduledCatchupIdentity(run) || runArtifactsExist) return false;
+  return (
+    run.startedAt === undefined
+    && run.finishedAt === undefined
+    && run.cancelledAt === undefined
+    && run.requeuedFromRunId === undefined
+    && run.retryFailedItemsFromRunId === undefined
+    && run.targetStepId === undefined
+    && run.selfHealAttempt === undefined
+    && run.goalAttempt === undefined
+    && run.stepOutputs === undefined
+    && run.output === undefined
+    && run.mutationContractSnapshot === undefined
+    && run.parked === undefined
+    && run.capabilityBlock === undefined
+    && run.workflowGraphFinalizingFingerprint === undefined
+    && run.reportBack === undefined
+  );
+}
+
+function legacyCatchupRunArtifactsExist(identity: LegacyScheduledCatchupIdentity, runId: string): boolean {
+  return existsSync(path.join(WORKFLOWS_DIR, identity.workflowSlug, 'runs', runId));
+}
+
+/** Atomically freezes an upgrade-era queued catch-up before it can enter the
+ * execution pool. Returns the authoritative post-lock record. */
+function migrateLegacyScheduledCatchupToHold(
+  filePath: string,
+  snapshot: QueuedRunRecord,
+): QueuedRunRecord {
+  const identity = legacyScheduledCatchupIdentity(snapshot);
+  if (
+    !identity
+    || !_testOnly_isLegacyScheduledCatchupSafeToHold(
+      snapshot,
+      legacyCatchupRunArtifactsExist(identity, snapshot.id),
+    )
+  ) return snapshot;
+
+  const result = withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    if (!current) return snapshot;
+    const currentIdentity = legacyScheduledCatchupIdentity(current);
+    if (
+      !currentIdentity
+      || !_testOnly_isLegacyScheduledCatchupSafeToHold(
+        current,
+        legacyCatchupRunArtifactsExist(currentIdentity, current.id),
+      )
+    ) return current;
+    const firstDueAtMs = Number.isFinite(current.catchupOccurrenceAtMs)
+      ? Math.floor(current.catchupOccurrenceAtMs!)
+      : currentIdentity.scheduledAtMs;
+    const held: QueuedRunRecord = {
+      ...current,
+      status: 'awaiting_catchup_decision',
+      catchupDisposition: 'held',
+      workflowSlug: currentIdentity.workflowSlug,
+      catchupFirstDueAtMs: firstDueAtMs,
+      catchupScheduledAtMs: currentIdentity.scheduledAtMs,
+      catchupMissedCount: 1,
+    };
+    writeWorkflowRunRecordDurablyUnlocked(filePath, held);
+    return held;
+  });
+  if (result.catchupDisposition === 'held') {
+    try {
+      addNotification({
+        id: `system-workflow-catchup-held-${result.id}`,
+        kind: 'system',
+        title: `Missed workflow waiting: "${result.workflow}"`,
+        body:
+          `"${result.workflow}" was queued by an older Clementine version after a missed schedule. `
+          + 'It is now paused before execution; no workflow steps have run. Open Tasks to review it, then Resume or Skip.',
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: {
+          errorCategory: 'workflow_schedule_catchup_held',
+          workflow: result.workflow,
+          workflowRunId: result.id,
+          runId: result.id,
+          catchupHeld: true,
+          legacyMigration: true,
+        },
+      });
+    } catch { /* the durable Tasks card remains authoritative */ }
+  }
+  return result;
+}
+
+/** Focused proof seam for the one-time legacy migration. */
+export const _testOnly_migrateLegacyScheduledCatchupToHold = migrateLegacyScheduledCatchupToHold;
+
+function selectWorkflowDrainCandidates<T extends { run: QueuedRunRecord }>(
+  eligible: T[],
+  catchupSlotOccupied = inFlightCatchupRunIds.size > 0,
+): T[] {
+  // Defense in depth: production status filtering already excludes held runs,
+  // but the admission selector itself must never let malformed/stale callers
+  // count a held decision as executable concurrency.
+  const executable = eligible.filter((item) =>
+    item.run.status !== 'awaiting_catchup_decision'
+    && item.run.catchupDisposition !== 'held');
+  if (catchupSlotOccupied) return executable.filter((item) => item.run.catchupFire !== true);
+  const oldestCatchup = executable
+    .filter((item) => item.run.catchupFire === true)
+    .sort((a, b) =>
+      catchupAdmissionAge(a.run) - catchupAdmissionAge(b.run)
+      || a.run.id.localeCompare(b.run.id))[0];
+  if (!oldestCatchup) return executable;
+  return executable.filter((item) =>
+    item.run.catchupFire !== true || item.run.id === oldestCatchup.run.id);
+}
+
+/** Direct deterministic proof seam; the production drain uses the same
+ * selector immediately before entering its bounded execution pool. */
+export function _testOnly_selectWorkflowDrainCandidates(
+  runs: QueuedRunRecord[],
+  catchupSlotOccupied = false,
+): QueuedRunRecord[] {
+  return selectWorkflowDrainCandidates(
+    runs.map((run) => ({ run })),
+    catchupSlotOccupied,
+  ).map((item) => item.run);
+}
 
 // How many queued runs may execute at once. Read at call time so it's
 // runtime-configurable and testable. Default 1 = today's sequential
 // behavior (forward-only: no behavior change until explicitly raised);
 // set CLEMENTINE_WORKFLOW_RUN_CONCURRENCY=3 (etc.) to let independent
 // runs progress in parallel once you've soaked it.
-const MAX_RUN_DRAIN_CONCURRENCY = 4;
 /** Test seam for the clamp — the ceiling is a safety property, so it is pinned. */
-export const _testOnly_runDrainConcurrency = (): number => runDrainConcurrency();
-function runDrainConcurrency(): number {
-  const raw = parseInt(getRuntimeEnv('CLEMENTINE_WORKFLOW_RUN_CONCURRENCY', '1') || '1', 10);
-  if (!Number.isFinite(raw) || raw <= 0) return 1;
-  // Upper clamp (v3.0.1 incident): this knob had NO ceiling, so any positive
-  // value was honored on the heaviest resource in the product. A machine that
-  // exhausts itself gets its daemon SIGKILLed, restarts into the same backlog,
-  // and repeats — the failure is self-reinforcing, so the ceiling is a safety
-  // property rather than a preference. Concurrent workflow runs each carry a
-  // model lane plus tool subprocesses; beyond a handful the wall-clock win is
-  // gone and only the crash risk remains.
-  return Math.min(raw, MAX_RUN_DRAIN_CONCURRENCY);
-}
+export const _testOnly_runDrainConcurrency = (): number => resolveWorkflowRunConcurrency();
 
 // Flag-gate for the constrained, structured-output step agent. Default
 // OFF so this lands dark (no behavior change) until verified + soaked;
@@ -7467,6 +7643,14 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
       dashboardNotified = terminalDashboardNotificationRunIdsFrom(notifications);
     } catch { /* best-effort: a bad notification log must not block the cancel notify */ }
     let notificationPersisted = reported.has(run.id) || dashboardNotified.has(run.id);
+    const skippedHeldCatchup = run.catchupDisposition === 'skipped';
+    const skipReasonAlreadyProvesNoExecution = typeof run.error === 'string'
+      && /\b(?:before (?:any )?workflow step|no workflow steps? (?:ran|were run)|before execution)\b/i.test(run.error);
+    const terminalDetail = skippedHeldCatchup
+      ? skipReasonAlreadyProvesNoExecution
+        ? run.error!
+        : `${run.error || 'You skipped this missed workflow occurrence.'} No workflow steps ran.`
+      : run.error || 'This workflow run was cancelled.';
     if (shouldNotifyCancelledRun(run, Date.now(), reported)) {
       addNotification({
         // Stable id → addNotification id-dedup makes this at-most-once even if
@@ -7474,11 +7658,18 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
         // card for the same run.
         id: `workflow-${run.id}-cancelled`,
         kind: 'workflow',
-        title: `Workflow cancelled: ${run.workflow}`,
-        body: run.error || 'This workflow run was cancelled.',
+        title: skippedHeldCatchup
+          ? `Missed workflow skipped: ${run.workflow}`
+          : `Workflow cancelled: ${run.workflow}`,
+        body: terminalDetail,
         createdAt: new Date().toISOString(),
         read: false,
-        metadata: { workflow: run.workflow, runId: run.id, status: 'cancelled' },
+        metadata: {
+          workflow: run.workflow,
+          runId: run.id,
+          status: skippedHeldCatchup ? 'skipped' : 'cancelled',
+          ...(skippedHeldCatchup ? { catchupSkipped: true } : {}),
+        },
       });
       notificationPersisted = true;
       // A chat-fired run's cancellation re-enters the origin chat too —
@@ -7491,7 +7682,7 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
         recordAndAttemptWorkflowRunReportBack(filePath, {
           workflowName: run.workflow,
           outcome: 'failed',
-          detail: run.error || 'This workflow run was cancelled.',
+          detail: terminalDetail,
         });
       }
     }
@@ -7505,11 +7696,27 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
 
 async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
   const workflows = listWorkflows();
-  const eligible: Array<{ file: string; filePath: string; run: QueuedRunRecord }> = [];
+  const eligible: WorkflowDrainCandidate[] = [];
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     let run = readRunRecord(filePath);
     if (!run) continue;
+    // One-time upgrade bridge: legacy versions wrote a missed schedule
+    // directly as queued. Freeze only a pristine original scheduler record,
+    // under the same lock as every other run transition, before eligibility is
+    // considered. If durability fails, fail closed for this tick rather than
+    // executing stale work the user has not chosen to resume.
+    if (legacyScheduledCatchupIdentity(run)) {
+      try {
+        run = migrateLegacyScheduledCatchupToHold(filePath, run);
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err), runId: run.id },
+          'Could not durably hold legacy scheduled catch-up; execution remains closed',
+        );
+        continue;
+      }
+    }
     // A terminal outcome is a durable delivery intent, not a one-shot side
     // effect. Retry failed origins and late observer sidecars every drain tick;
     // duplicate turns acknowledge successfully without being appended again.
@@ -7546,16 +7753,20 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
     eligible.push({ file, filePath, run });
   }
   if (eligible.length === 0) return;
+  const admitted = selectWorkflowDrainCandidates(eligible);
+  if (admitted.length === 0) return;
 
   await runBoundedPool(
-    eligible,
-    runDrainConcurrency(),
+    admitted,
+    resolveWorkflowRunConcurrency(),
     async (item) => {
       if (inFlightRunIds.has(item.run.id)) return;
       inFlightRunIds.add(item.run.id);
+      if (item.run.catchupFire === true) inFlightCatchupRunIds.add(item.run.id);
       try {
         await processOneRunFile(item.file, item.filePath, item.run, workflows, assistant);
       } finally {
+        inFlightCatchupRunIds.delete(item.run.id);
         inFlightRunIds.delete(item.run.id);
       }
     },
@@ -7621,6 +7832,31 @@ function hasUngatedIrreversibleAction(steps: WorkflowStepInput[]): boolean {
 }
 
 interface AutoHealOutcome { attempt: number; max: number; stepId: string; message: string; }
+
+/**
+ * Neutral status lines for the self-heal notification / report-back body.
+ *
+ * These are DATA the daemon surfaces about an automatic action taken in
+ * post-run processing — there is no model in the loop at heal time to author a
+ * reply, so the text must NOT ventriloquize Clem's first-person voice. It states
+ * the facts (which step, which fix, which attempt) and leaves the authored voice
+ * to the fresh run's own report-back when it finishes. First-person scaffolding
+ * ("I auto-applied…", "It's running…") is the forbidden shape here.
+ */
+function renderSelfHealRequeuedStatus(
+  fix: { stepId: string; description: string },
+  attempt: number,
+  max: number,
+): string {
+  return `Auto-applied a fix to blocked step "${fix.stepId}" (${fix.description}) and re-queued the workflow — attempt ${attempt} of ${max}, now running in the background. It will report back here when it finishes.`;
+}
+
+function renderSelfHealRequeueFailedStatus(
+  fix: { stepId: string; description: string },
+  reason: string,
+): string {
+  return `Auto-applied a fix to step "${fix.stepId}" (${fix.description}), but the automatic re-run did not start: ${reason}`;
+}
 
 /**
  * Decide + perform an automatic heal for a run that just completed with a
@@ -7739,7 +7975,7 @@ async function tryAutoHealAndRequeue(args: {
   if (requeued.status !== 'queued' && requeued.status !== 'duplicate') {
     // Fix is applied but we couldn't re-queue — report it so it's never silent.
     logger.warn({ runId: run.id, status: requeued.status, reason: requeued.message }, 'self-heal: applied fix but could not re-queue; surfacing for manual re-run');
-    return { attempt, max, stepId: fix.stepId, message: `I auto-applied a fix to step "${fix.stepId}" (${fix.description}), but couldn't re-run automatically: ${requeued.message}` };
+    return { attempt, max, stepId: fix.stepId, message: renderSelfHealRequeueFailedStatus(fix, requeued.message) };
   }
   // RSH-5: remember this fix as PENDING, keyed by the healed re-run. If that run
   // completes clean the fix is PROMOTED to the confirmed store (it stuck); if it
@@ -7761,7 +7997,7 @@ async function tryAutoHealAndRequeue(args: {
     attempt,
     max,
     stepId: fix.stepId,
-    message: `Step "${fix.stepId}" blocked, so I auto-applied a fix (${fix.description}) and re-ran the workflow — attempt ${attempt} of ${max}. It's running in the background and will report back here when it finishes.`,
+    message: renderSelfHealRequeuedStatus(fix, attempt, max),
   };
 }
 
