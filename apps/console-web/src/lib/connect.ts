@@ -281,7 +281,7 @@ export const setMcpCredential = (name: string, key: string, value: string) =>
   apiPost(`/api/console/mcp-servers/${encodeURIComponent(name)}/credential`, { key, value });
 export const getClis = () => apiGet<{ clis?: CliRow[]; cliCount?: number; detectedCount?: number }>('/api/console/clis');
 // User-saved CLIs the user explicitly told Clementine they use.
-export const getSavedClis = () => apiGet<{ saved: string[] }>('/api/console/clis/saved');
+export const getSavedClis = () => apiGet<{ saved: string[]; health?: Record<string, CliHealth> }>('/api/console/clis/saved');
 export const saveCli = (command: string) => apiPost<{ saved: string[] }>('/api/console/clis/saved', { command });
 export const removeSavedCli = (command: string) =>
   api<{ saved: string[] }>(`/api/console/clis/saved?command=${encodeURIComponent(command)}`, { method: 'DELETE' });
@@ -318,12 +318,23 @@ export const getManagedCliJob = (id: string) =>
 export interface CatalogEntry {
   id: string; name: string; command: string; vendor: string; description: string; tags: string[];
   installCommand: string; installSource: string; authDocsUrl: string; authCommand?: string; homepage?: string;
+  authHeadless?: boolean;
   installed?: boolean; resolvedPath?: string; score?: number;
 }
 export interface ConnectedCli {
   id: string; command: string; vendor: string; name: string; installedAt: string; authDocsUrl: string; authCommand?: string;
+  authHeadless?: boolean;
 }
-export interface CatalogResp { query: string; results: CatalogEntry[]; connected: Record<string, ConnectedCli>; autoPromoted: string[] }
+/** Persisted auth-health snapshot for a roster CLI (id = catalog id or `saved:<command>`). */
+export interface CliHealth {
+  id: string; command: string; installed: boolean;
+  authStatus: 'ok' | 'signed_out' | 'unknown' | 'error';
+  username?: string; checkedAt: string;
+}
+export interface CatalogResp {
+  query: string; results: CatalogEntry[]; connected: Record<string, ConnectedCli>; autoPromoted: string[];
+  health?: Record<string, CliHealth>;
+}
 export interface InstallJob { id: string; title: string; status: 'running' | 'succeeded' | 'failed'; output: string; exitCode?: number | null }
 
 export const getCliCatalog = (q?: string) =>
@@ -333,6 +344,12 @@ export const installCatalogCli = (id: string) =>
 export const forgetCatalogCli = (id: string) => apiPost<{ ok: boolean }>('/api/console/cli-catalog/forget', { id });
 export const reconnectCatalogCli = (id: string) => apiPost('/api/console/cli-catalog/reconnect', { id });
 export const getInstallJob = (id: string) => apiGet<{ job: InstallJob }>(`/api/console/install-jobs/${encodeURIComponent(id)}`);
+/** One-click sign-in for a verified-headless catalog CLI; poll via getManagedCliJob. */
+export const authCatalogCli = (id: string) =>
+  apiPost<{ job: ManagedCliJob }>(`/api/console/cli-catalog/${encodeURIComponent(id)}/auth`);
+/** Paste-your-own install command (validated server-side against the install allowlist). */
+export const runInstallCommand = (command: string, saveAs?: string) =>
+  apiPost<{ job: InstallJob }>('/api/console/install-commands', { command, ...(saveAs ? { saveAs } : {}) });
 
 // ─── Browser harness (browser-use) — drive the user's real Chrome ────────
 export interface BrowserHarnessPrereq { name: string; available: boolean; path?: string; version?: string }

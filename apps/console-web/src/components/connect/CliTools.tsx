@@ -9,8 +9,9 @@ import {
   getClis, getSavedClis, saveCli, removeSavedCli, probeCli,
   getManagedClis, startManagedCliJob, getManagedCliJob,
   getCliCatalog, installCatalogCli, forgetCatalogCli, getInstallJob,
+  authCatalogCli, runInstallCommand,
   type ManagedCliStatus, type ManagedCliKind, type ManagedCliAction,
-  type CatalogEntry, type ConnectedCli,
+  type CatalogEntry, type ConnectedCli, type CliHealth,
 } from '@/lib/connect';
 
 const BARE = /^[A-Za-z0-9._+-]{1,60}$/;
@@ -129,6 +130,18 @@ function AuthReveal({ command, authCommand, authDocsUrl }: { command: string; au
   );
 }
 
+/** Auth pill for a roster CLI from the persisted health snapshot. `unknown`
+ *  renders nothing — absence of a probe must not read as a problem. */
+function HealthPill({ health }: { health?: CliHealth }) {
+  if (!health || !health.installed) return null;
+  if (health.authStatus === 'ok') {
+    return <StatusPill tone="success">{health.username ? health.username : 'Signed in'}</StatusPill>;
+  }
+  if (health.authStatus === 'signed_out') return <StatusPill tone="warning">Signed out</StatusPill>;
+  if (health.authStatus === 'error') return <StatusPill tone="danger">Auth check failed</StatusPill>;
+  return null;
+}
+
 // ─── CLI catalog (install + connect) + free-form saved tools ──────────
 function CatalogTools() {
   const qc = useQueryClient();
@@ -146,6 +159,13 @@ function CatalogTools() {
   const [error, setError] = useState('');
   const [reveal, setReveal] = useState<string | null>(null);
   const [installJobId, setInstallJobId] = useState<string | null>(null);
+  const [authJobId, setAuthJobId] = useState<string | null>(null);
+
+  const healthMap = catalog.data?.health ?? {};
+  const healthFor = (idOrCommand: string): CliHealth | undefined =>
+    healthMap[idOrCommand]
+    ?? healthMap[`saved:${idOrCommand}`]
+    ?? Object.values(healthMap).find((h) => h.command === idOrCommand);
 
   const q = query.trim();
   const searchQ = useQuery({ queryKey: ['cli-catalog', q], queryFn: () => getCliCatalog(q), enabled: q.length > 0 });
@@ -178,6 +198,26 @@ function CatalogTools() {
     }
   }, [installJob?.status, qc]);
 
+  const authJobQ = useQuery({
+    queryKey: ['catalog-auth-job', authJobId],
+    queryFn: () => getManagedCliJob(authJobId!),
+    enabled: Boolean(authJobId),
+    refetchInterval: (qq) => (qq.state.data?.job?.status === 'running' ? 1500 : false),
+  });
+  const authJob = authJobQ.data?.job;
+  useEffect(() => {
+    if (authJob && authJob.status !== 'running') {
+      void qc.invalidateQueries({ queryKey: ['cli-catalog'] });
+      setBusy(null);
+    }
+  }, [authJob?.status, qc]);
+
+  const signIn = async (id: string) => {
+    setBusy(`auth:${id}`); setError('');
+    try { const { job } = await authCatalogCli(id); setAuthJobId(job.id); }
+    catch (e) { setBusy(null); setError((e as Error).message); }
+  };
+
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['cli-catalog'] }); void qc.invalidateQueries({ queryKey: ['clis-saved'] }); };
   const install = async (id: string) => {
     setBusy(`install:${id}`); setError('');
@@ -201,7 +241,10 @@ function CatalogTools() {
                   <span className="text-body font-medium text-fg">{c.name}</span>
                   <span className="ml-2 font-mono text-caption text-faint">{c.command}</span>
                 </div>
-                <Button size="sm" variant="ghost" onClick={() => setReveal(reveal === c.id ? null : c.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Re-auth</Button>
+                <HealthPill health={healthFor(c.id)} />
+                {c.authHeadless
+                  ? <Button size="sm" variant={healthFor(c.id)?.authStatus === 'signed_out' ? 'primary' : 'ghost'} disabled={busy === `auth:${c.id}`} onClick={() => signIn(c.id)}>{busy === `auth:${c.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} {healthFor(c.id)?.authStatus === 'signed_out' ? 'Sign in' : 'Re-auth'}</Button>
+                  : <Button size="sm" variant="ghost" onClick={() => setReveal(reveal === c.id ? null : c.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Re-auth</Button>}
                 <Button size="sm" variant="ghost" aria-label={`Forget ${c.name}`} title="Disconnect" disabled={busy === `forget:${c.id}`} onClick={() => forget(c.id)}>
                   {busy === `forget:${c.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <X className="h-3.5 w-3.5" aria-hidden />}
                 </Button>
@@ -220,6 +263,7 @@ function CatalogTools() {
               <div className="flex items-center gap-3">
                 <Terminal className="h-4 w-4 shrink-0 text-primary" aria-hidden />
                 <span className="min-w-0 flex-1 truncate font-mono text-small text-fg">{name}</span>
+                <HealthPill health={healthFor(name)} />
                 <Button size="sm" variant="ghost" onClick={() => setReveal(reveal === `saved:${name}` ? null : `saved:${name}`)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Re-auth</Button>
                 <Button size="sm" variant="ghost" aria-label={`Remove ${name}`} title="Remove" disabled={busy === `save:${name}`} onClick={() => unsave(name)}>
                   {busy === `save:${name}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <X className="h-3.5 w-3.5" aria-hidden />}
@@ -228,6 +272,18 @@ function CatalogTools() {
               {reveal === `saved:${name}` && <AuthReveal command={name} />}
             </Card>
           ))}
+        </div>
+      )}
+
+      {/* Sign-in job output */}
+      {authJob && (
+        <div className="mb-3 rounded-md border border-border bg-subtle p-3">
+          <div className="mb-1 flex items-center gap-2 text-small">
+            {authJob.status === 'running' ? <Loader2 className="h-4 w-4 animate-spin text-primary" aria-hidden /> : authJob.status === 'succeeded' ? <Check className="h-4 w-4 text-success" aria-hidden /> : <X className="h-4 w-4 text-danger" aria-hidden />}
+            <span className="font-medium text-fg">{authJob.title}</span><span className="text-faint">· {authJob.status}</span>
+            {authJob.status === 'running' && <span className="text-caption text-faint">— a browser window should open; finish signing in there</span>}
+          </div>
+          {authJob.output && <pre className="max-h-40 overflow-auto whitespace-pre-wrap font-mono text-caption text-muted">{authJob.output}</pre>}
         </div>
       )}
 
@@ -269,8 +325,11 @@ function CatalogTools() {
                   <div className="flex items-center gap-2"><span className="text-body font-medium text-fg">{e.name}</span><span className="font-mono text-caption text-faint">{e.command}</span></div>
                   <div className="truncate text-caption text-muted">{e.description}</div>
                 </div>
+                <HealthPill health={healthFor(e.id)} />
                 {e.installed
-                  ? <Button size="sm" variant="secondary" onClick={() => setReveal(reveal === e.id ? null : e.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign in</Button>
+                  ? (e.authHeadless
+                      ? <Button size="sm" variant="secondary" disabled={busy === `auth:${e.id}`} onClick={() => signIn(e.id)}>{busy === `auth:${e.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Sign in</Button>
+                      : <Button size="sm" variant="secondary" onClick={() => setReveal(reveal === e.id ? null : e.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign in</Button>)
                   : <Button size="sm" disabled={busy === `install:${e.id}`} onClick={() => install(e.id)}>{busy === `install:${e.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install</Button>}
               </div>
               {reveal === e.id && <AuthReveal command={e.command} authCommand={e.authCommand} authDocsUrl={e.authDocsUrl} />}
@@ -302,6 +361,76 @@ function CatalogTools() {
           {catResults.length === 0 && pathResults.length === 0 && !(isBare && !exactKnown) && (searchQ.isFetching ? <Card className="p-4 text-body text-muted">Searching…</Card> : <Card className="p-4 text-body text-muted">No tool matches “{q}”.</Card>)}
         </div>
       )}
+
+      <CustomInstall onJob={(id) => { setInstallJobId(id); setBusy('install:custom'); }} />
     </>
+  );
+}
+
+/** Paste-your-own install command. Validated SERVER-SIDE against the same
+ *  allowlist as catalog installs (npm -g / brew / uv tool / pipx / pip
+ *  --user / git clone https — no sudo, no pipes); "remember" saves the
+ *  binary name to the roster once the install succeeds. */
+function CustomInstall({ onJob }: { onJob: (jobId: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [command, setCommand] = useState('');
+  const [remember, setRemember] = useState(true);
+  const [saveAs, setSaveAs] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  const guessedName = (() => {
+    const words = command.trim().split(/\s+/);
+    const last = words[words.length - 1] ?? '';
+    const bare = last.split('/').pop()?.replace(/^@[^/]+\//, '') ?? '';
+    return BARE.test(bare) ? bare : '';
+  })();
+
+  const submit = async () => {
+    setSubmitting(true); setError('');
+    try {
+      const name = remember ? (saveAs.trim() || guessedName) : '';
+      const { job } = await runInstallCommand(command.trim(), name || undefined);
+      onJob(job.id);
+      setCommand(''); setSaveAs(''); setOpen(false);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <button type="button" onClick={() => setOpen(true)}
+        className="mt-3 cursor-pointer text-small text-muted underline-offset-2 hover:text-fg hover:underline">
+        Have an install command? Paste it and Clementine runs it safely.
+      </button>
+    );
+  }
+  return (
+    <Card className="mt-3 p-3.5">
+      <div className="mb-2 text-small font-medium text-fg">Paste an install command</div>
+      <div className="mb-2 flex items-center gap-2">
+        <input value={command} onChange={(e) => { setCommand(e.target.value); setError(''); }}
+          placeholder="npm install -g some-cli   ·   brew install some-tool" aria-label="Install command"
+          className="min-w-0 flex-1 rounded border border-border bg-canvas px-2.5 py-1.5 font-mono text-caption text-fg outline-none focus:ring-1 focus:ring-primary" />
+        <Button size="sm" disabled={!command.trim() || submitting} onClick={() => void submit()}>
+          {submitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => { setOpen(false); setError(''); }} aria-label="Close"><X className="h-3.5 w-3.5" aria-hidden /></Button>
+      </div>
+      <label className="flex items-center gap-2 text-caption text-muted">
+        <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+        Remember this CLI for Clementine
+        {remember && (
+          <input value={saveAs} onChange={(e) => setSaveAs(e.target.value)} placeholder={guessedName || 'binary name'}
+            aria-label="CLI name to remember"
+            className="w-32 rounded border border-border bg-canvas px-2 py-0.5 font-mono text-caption text-fg outline-none focus:ring-1 focus:ring-primary" />
+        )}
+      </label>
+      <p className="mt-1.5 text-caption text-faint">Allowed forms: npm install -g · brew install · uv tool install · pipx install · pip install --user · git clone https. Anything else is refused.</p>
+      {error && <p className="mt-1.5 text-caption text-danger">{error}</p>}
+    </Card>
   );
 }
