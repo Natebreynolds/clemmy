@@ -30,6 +30,7 @@
  */
 import net from 'node:net';
 import tls from 'node:tls';
+import { Duplex } from 'node:stream';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
@@ -216,8 +217,29 @@ export function startRelay(opts) {
     log.info(`relay: tunnel registered for ${pairId}`);
   }
 
-  function handleTunnelLeg(rawSocket) {
-    const tlsSocket = new tls.TLSSocket(rawSocket, {
+  /**
+   * Wraps a raw socket in a duplex that replays already-sniffed bytes first.
+   * Necessary because tls.TLSSocket over a net.Socket reads the kernel handle
+   * directly — bytes consumed while parsing SNI (and merely unshift()ed back
+   * into the JS stream buffer) would be invisible to the handshake.
+   */
+  function replayedSocket(rawSocket, buffered) {
+    const duplex = new Duplex({
+      read() { rawSocket.resume(); },
+      write(chunk, _enc, cb) { rawSocket.write(chunk, cb); },
+      final(cb) { rawSocket.end(); cb(); },
+      destroy(err, cb) { rawSocket.destroy(); cb(err); },
+    });
+    if (buffered.length) duplex.push(buffered);
+    rawSocket.on('data', (chunk) => { if (!duplex.push(chunk)) rawSocket.pause(); });
+    rawSocket.on('end', () => duplex.push(null));
+    rawSocket.on('error', (err) => duplex.destroy(err));
+    rawSocket.on('close', () => duplex.destroy());
+    return duplex;
+  }
+
+  function handleTunnelLeg(rawSocket, buffered) {
+    const tlsSocket = new tls.TLSSocket(replayedSocket(rawSocket, buffered), {
       isServer: true,
       secureContext: tls.createSecureContext({ key: tlsKeyPem, cert: tlsCertPem }),
     });
@@ -264,7 +286,8 @@ export function startRelay(opts) {
     }
     const streamId = tunnel.nextStreamId++;
     tunnel.streams.set(streamId, rawSocket);
-    const ip = rawSocket.remoteAddress ?? '';
+    // Normalize IPv4-mapped IPv6 so rate-limit buckets are stable per host.
+    const ip = (rawSocket.remoteAddress ?? '').replace(/^::ffff:/i, '');
     tunnel.socket.write(encodeFrame(FRAME.OPEN, streamId, JSON.stringify({ ip })));
     // Replay the ClientHello bytes we consumed while sniffing SNI, then pipe.
     if (buffered.length) tunnel.socket.write(encodeFrame(FRAME.DATA, streamId, buffered));
@@ -299,9 +322,7 @@ export function startRelay(opts) {
       }
       const label = parsed.sni.slice(0, -(base.length + 1));
       if (label === 'tunnel') {
-        // Give the TLS server the full ClientHello back before terminating.
-        socket.unshift(buffered);
-        handleTunnelLeg(socket);
+        handleTunnelLeg(socket, buffered);
       } else if (PAIR_ID_RE.test(label)) {
         handlePhoneLeg(socket, label, buffered);
       } else {

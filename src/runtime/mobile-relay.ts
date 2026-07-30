@@ -52,7 +52,7 @@ export function encodeFrame(type: number, streamId: number, payload: Buffer | st
 }
 
 export function frameReader(): (chunk: Buffer) => RelayFrame[] {
-  let buffered = Buffer.alloc(0);
+  let buffered: Buffer = Buffer.alloc(0);
   return (chunk: Buffer): RelayFrame[] => {
     buffered = buffered.length ? Buffer.concat([buffered, chunk]) : chunk;
     const frames: RelayFrame[] = [];

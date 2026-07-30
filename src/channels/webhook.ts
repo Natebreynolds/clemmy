@@ -2885,5 +2885,30 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     // QR-baked address still works until the IP rotates.
     const { startBonjourAdvertisement } = await import('../runtime/mobile-bonjour.js');
     startBonjourAdvertisement({ port: listeners.directAppPort, fingerprint: directAppFingerprint });
+
+    // Off-LAN reach: when a relay is configured, dial out and keep a tunnel
+    // registered. Best-effort like Bonjour — no relay means LAN-only, never
+    // a boot failure.
+    try {
+      const { relayConfigFromEnv, ensureRelayAuthToken, relayPairId, startMobileRelayClient } =
+        await import('../runtime/mobile-relay.js');
+      const relayConfig = relayConfigFromEnv();
+      if (relayConfig && directApp) {
+        const { startRelayInternalListener } = await import('../runtime/mobile-ingress.js');
+        const relayListener = await startRelayInternalListener(app, {
+          keyPem: directApp.keyPem,
+          certPem: directApp.certPem,
+        });
+        startMobileRelayClient({
+          config: relayConfig,
+          pairId: relayPairId(directApp.certPem),
+          authToken: ensureRelayAuthToken(),
+          localPort: relayListener.port,
+        });
+        logger.info({ relay: relayConfig.url, base: relayConfig.baseDomain }, 'Mobile relay tunnel starting');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Mobile relay unavailable; phone access stays LAN-only');
+    }
   }
 }

@@ -59,6 +59,7 @@ import {
 } from '../runtime/notifications.js';
 import { getVapidPublicKey } from '../runtime/web-push-keys.js';
 import { deviceKeyRequired } from '../runtime/mobile-device-policy.js';
+import { relayClientIp } from '../runtime/mobile-ingress.js';
 import { markPushSubscribed } from '../runtime/mobile-sessions.js';
 import {
   getSession as harnessGetSession,
@@ -461,11 +462,18 @@ function readSessionCookie(req: express.Request): string {
 }
 
 function clientIp(req: express.Request): string {
-  // The socket peer IS the client on every door we serve (loopback, or the
-  // pinned-TLS direct-app listener). Forwarding headers (CF-Connecting-IP,
-  // X-Forwarded-For) are never trusted: we never sit behind a proxy we
-  // control that sets them, so they were only ever a spoofing surface that
-  // would let a caller mint fresh rate-limit buckets per request.
+  // The socket peer IS the client on the loopback and pinned-TLS direct-app
+  // doors. On the relay door every stream arrives from 127.0.0.1, so the
+  // relay-observed client IP is restored via the in-process stream-peer
+  // registry (mobile-ingress.ts) — without it every remote caller would
+  // share one rate-limit bucket and one attacker could lock out the owner.
+  // Forwarding HEADERS (CF-Connecting-IP, X-Forwarded-For) remain untrusted
+  // everywhere: they were only ever a spoofing surface that would let a
+  // caller mint fresh rate-limit buckets per request.
+  if (req.clemIngress === 'relay') {
+    const restored = relayClientIp(req);
+    if (restored) return restored;
+  }
   return req.socket.remoteAddress || req.ip || 'unknown';
 }
 

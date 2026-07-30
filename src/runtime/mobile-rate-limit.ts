@@ -31,10 +31,13 @@
  *   'proof' — Device-proof verification failures. A client failing this many
  *             signature checks is broken or hostile, not unlucky.
  *
- * Note that the IP a bucket is keyed on is only trustworthy because ingress
- * classification decides when CF-Connecting-IP may be believed — see
- * mobile-ingress.ts. Without that, any caller could rotate the header and mint a
- * fresh bucket per request, making every budget here unenforceable.
+ * Note that the IP a bucket is keyed on is only trustworthy because it never
+ * comes from a client-controlled header: on the loopback and direct-app doors
+ * the socket peer IS the client, and on the relay door the IP is restored
+ * from the relay's authenticated OPEN frame via the in-process stream-peer
+ * registry (mobile-ingress.ts). If a spoofable header were believed instead,
+ * any caller could rotate it and mint a fresh bucket per request, making
+ * every budget here unenforceable.
  */
 
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
