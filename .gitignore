@@ -125,3 +125,13 @@ proof-report.json
 # Local demo/scratch outputs — never release content
 output/
 *.clemplug
+
+# Ad-hoc run output at the repo root (research briefs, scraped rows, generated
+# pages). These are REAL client/work deliverables produced by live runs — they
+# stay on disk for the user but must never enter the repo.
+/chunk*.json
+/chatgpt_ads_rows.json
+/*-research*.md
+/pi-law-firms-comparison.md
+/harbor-vine-index.html
+/artifacts/
