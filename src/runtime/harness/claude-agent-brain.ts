@@ -10,6 +10,7 @@ import {
 } from '../../spaces/workspace-context.js';
 import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
+import { stableContextGeneration } from '../stable-context-generation.js';
 import { isUnparseableToolCallError } from '../../execution/transient-error.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import {
@@ -797,14 +798,16 @@ export function frameTrustedMemory(persistentContext: string): string {
 // Re-rendering it every turn meant a single reflection-written fact changed the
 // block and busted the whole prompt-prefix cache (measured ~28% hit rate). We
 // snapshot it PER SESSION so the system append stays byte-stable across turns.
-// This remains opt-in until every explicit memory/profile/connection mutation
-// shares a production invalidation generation; otherwise Claude can carry stale
-// preferences and capabilities for the rest of a live session.
-const stableMemorySnapshots = new Map<string, string>();
+// Default ON since every explicit mutation surface (memory tools, console
+// memory/profile routes, hygiene approvals, skill installs) bumps the shared
+// stableContextGeneration — an explicit edit re-renders on the next turn, while
+// automatic reflection churn stays deferred (that deferral is the whole point).
+// Kill-switch: CLEMMY_BRAIN_STABLE_SNAPSHOT=off.
+const stableMemorySnapshots = new Map<string, { generation: number; text: string }>();
 const STABLE_SNAPSHOT_MAX = 256;
 
 function stableSnapshotEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_STABLE_SNAPSHOT', 'off') ?? 'off').trim());
+  return !/^(0|false|off|no)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_STABLE_SNAPSHOT', 'on') ?? 'on').trim());
 }
 
 /** Invalidate a session's frozen stable-memory snapshot so the next turn
@@ -826,15 +829,18 @@ function renderStableMemoryFrozen(request: AssistantRequest): string {
   });
   const key = request.sessionId?.trim();
   if (!key || !stableSnapshotEnabled()) return render();
+  const generation = stableContextGeneration();
   const cached = stableMemorySnapshots.get(key);
-  if (cached !== undefined) return cached;
+  // A stale generation means an EXPLICIT memory/profile/skill mutation landed
+  // since this snapshot froze — re-render so the edit is visible this session.
+  if (cached !== undefined && cached.generation === generation) return cached.text;
   const fresh = render();
   // Bounded FIFO eviction so long-lived daemons don't leak snapshots.
-  if (stableMemorySnapshots.size >= STABLE_SNAPSHOT_MAX) {
+  if (stableMemorySnapshots.size >= STABLE_SNAPSHOT_MAX && !stableMemorySnapshots.has(key)) {
     const oldest = stableMemorySnapshots.keys().next().value;
     if (oldest !== undefined) stableMemorySnapshots.delete(oldest);
   }
-  stableMemorySnapshots.set(key, fresh);
+  stableMemorySnapshots.set(key, { generation, text: fresh });
   return fresh;
 }
 

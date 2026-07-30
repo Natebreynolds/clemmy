@@ -31,6 +31,7 @@ import { openMemoryDb } from '../memory/db.js';
 import { deleteFact, getFact, updateFact } from '../memory/facts.js';
 import { isSelfReferentialTool } from '../memory/reflection.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
+import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 
 const DEFAULT_CAP = 25;
 const MAX_CAP = 100;
@@ -119,6 +120,7 @@ export function approveDuplicateMerges(
       continue;
     }
     if (deleteFact(dropId)) {
+      bumpStableContextGeneration();
       result.ids.push(dropId);
       result.applied += 1;
       actedPairs.push({ keepId, dropId });
@@ -192,6 +194,7 @@ export function liftRecallGaps(
     }
     const updated = updateFact(row.id, { importance: Math.min(10, row.imp + 1) });
     if (updated) {
+      bumpStableContextGeneration();
       result.ids.push(row.id);
       result.applied += 1;
       priorImportance[row.id] = row.imp;
@@ -262,6 +265,7 @@ export function retireInternalNoise(
       continue;
     }
     if (deleteFact(row.id)) {
+      bumpStableContextGeneration();
       acted += 1;
       result.ids.push(row.id);
       result.applied += 1;

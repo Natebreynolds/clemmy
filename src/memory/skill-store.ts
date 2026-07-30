@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
+import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 import {
   isValidLearningReceipt,
   type LearningReceipt,
@@ -344,6 +345,9 @@ export function installSkillFromDir(
   });
   const skill = loadSkill(installName);
   if (!skill) throw new Error(`Skill installed but failed to load: ${installName}`);
+  // Skill Discovery rides the STABLE context partition — surface the new
+  // skill to frozen prefix snapshots this session, not next session.
+  bumpStableContextGeneration();
   return skill;
 }
 

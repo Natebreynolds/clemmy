@@ -190,6 +190,7 @@ import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
 import { classifyTool } from '../agents/tool-taxonomy.js';
 import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
+import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
 import { getSavedClis, addSavedCli, removeSavedCli } from '../runtime/saved-clis.js';
 import {
@@ -3452,6 +3453,7 @@ export function registerConsoleRoutes(
     if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
     try {
       const ok = forgetFact(id);
+      if (ok) bumpStableContextGeneration();
       res.json({ ok });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -3471,6 +3473,7 @@ export function registerConsoleRoutes(
     if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
     try {
       const ok = reactivateFact(id);
+      if (ok) bumpStableContextGeneration();
       res.json({ ok });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -3608,6 +3611,7 @@ export function registerConsoleRoutes(
       const existing = getFact(id);
       if (!existing) { res.status(404).json({ error: `no fact #${id}` }); return; }
       const ok = setFactPinned(id, pinned);
+      if (ok) bumpStableContextGeneration();
       res.json({ ok, pinned });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -7352,6 +7356,7 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const updated = saveUserProfile(req.body ?? {});
+      bumpStableContextGeneration();
       res.json({ profile: updated });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

@@ -54,12 +54,24 @@ test('renderLearnedBlocks returns section-wrapped Remembered Tool Choices + Rece
   assert.equal(typeof recentlyLearned, 'string', 'recently-learned is always a string (may be empty), never throws');
 });
 
-test('tiered OFF (default): dynamic blocks inline in instructions; turn-context tail empty', () => {
+test('tiered is DEFAULT ON: the cached prefix stays lean and the tail carries the turn context', () => {
   delete process.env.CLEMMY_TIERED_CONTEXT;
   const out = buildAssistantInstructions(ctx, 'dashboard', 'action', 'send an outlook email');
   assert.match(out, /Core Personality/, 'SOUL present');
-  assert.match(out, /Persistent Facts|Data Landscape|Connected Tools/, 'dynamic/legacy blocks inline when off');
-  assert.equal(buildTurnContextBlock(ctx, 'action', 'send an outlook email'), '', 'no turn-context tail when off');
+  assert.doesNotMatch(out, /## Now/, 'the minute-resolution Now line must NOT bust the cached prefix by default');
+  assert.notEqual(buildTurnContextBlock(ctx, 'action', 'send an outlook email'), '', 'turn-context tail present by default');
+});
+
+test('tiered kill-switch OFF: dynamic blocks inline in instructions; turn-context tail empty', () => {
+  process.env.CLEMMY_TIERED_CONTEXT = 'off';
+  try {
+    const out = buildAssistantInstructions(ctx, 'dashboard', 'action', 'send an outlook email');
+    assert.match(out, /Core Personality/, 'SOUL present');
+    assert.match(out, /Persistent Facts|Data Landscape|Connected Tools/, 'dynamic/legacy blocks inline when off');
+    assert.equal(buildTurnContextBlock(ctx, 'action', 'send an outlook email'), '', 'no turn-context tail when off');
+  } finally {
+    delete process.env.CLEMMY_TIERED_CONTEXT;
+  }
 });
 
 test('tiered ON: Constitution (voice+reasoning+SOUL) stays in instructions; dynamic context moves to the tail', () => {
@@ -105,9 +117,14 @@ test('tiered prompt keeps skill discovery stable and injects only query-relevant
     delete process.env.CLEMMY_TIERED_CONTEXT;
   }
 
-  const legacy = buildAssistantInstructions(ctx, 'dashboard', 'action', 'Create a Google Doc about a firm.');
-  assert.equal((legacy.match(/## Relevant Skills/g) ?? []).length, 1, 'legacy unsplit prompt injects one relevant-skill menu');
-  assert.equal(buildTurnContextBlock(ctx, 'action', 'Create a Google Doc about a firm.'), '', 'legacy path has no second turn-context injection');
+  process.env.CLEMMY_TIERED_CONTEXT = 'off';
+  try {
+    const legacy = buildAssistantInstructions(ctx, 'dashboard', 'action', 'Create a Google Doc about a firm.');
+    assert.equal((legacy.match(/## Relevant Skills/g) ?? []).length, 1, 'legacy unsplit prompt injects one relevant-skill menu');
+    assert.equal(buildTurnContextBlock(ctx, 'action', 'Create a Google Doc about a firm.'), '', 'legacy path has no second turn-context injection');
+  } finally {
+    delete process.env.CLEMMY_TIERED_CONTEXT;
+  }
 });
 
 test('renderFactsForInstructions mode split: pinned vs scored vs all', () => {
@@ -131,20 +148,25 @@ test('renderFactsForInstructions mode split: pinned vs scored vs all', () => {
 });
 
 test('CANON-SELFASM: chat instructions carry the Now/date block (legacy mode)', () => {
-  delete process.env.CLEMMY_TIERED_CONTEXT;
-  const out = buildAssistantInstructions(ctx, 'dashboard', 'action', 'what should I do today');
-  assert.match(out, /## Now/, 'chat now carries the Now block (was harness-only — chat did date math against the training cutoff)');
-  assert.match(out, /Today is \d{4}-\d{2}-\d{2}/, 'the real current date is injected');
+  process.env.CLEMMY_TIERED_CONTEXT = 'off';
+  try {
+    const out = buildAssistantInstructions(ctx, 'dashboard', 'action', 'what should I do today');
+    assert.match(out, /## Now/, 'chat now carries the Now block (was harness-only — chat did date math against the training cutoff)');
+    assert.match(out, /Today is \d{4}-\d{2}-\d{2}/, 'the real current date is injected');
+  } finally {
+    delete process.env.CLEMMY_TIERED_CONTEXT;
+  }
 });
 
 test('CANON-SELFASM: the kill-switch removes the parity blocks', () => {
   const prev = process.env.CLEMMY_CHAT_CONTEXT_PARITY;
-  delete process.env.CLEMMY_TIERED_CONTEXT;
+  process.env.CLEMMY_TIERED_CONTEXT = 'off';
   try {
     process.env.CLEMMY_CHAT_CONTEXT_PARITY = 'off';
     const out = buildAssistantInstructions(ctx, 'dashboard', 'action', 'what should I do today');
     assert.doesNotMatch(out, /## Now/, 'flag off → no Now block (exact prior behavior)');
   } finally {
+    delete process.env.CLEMMY_TIERED_CONTEXT;
     if (prev === undefined) delete process.env.CLEMMY_CHAT_CONTEXT_PARITY;
     else process.env.CLEMMY_CHAT_CONTEXT_PARITY = prev;
   }

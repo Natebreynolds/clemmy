@@ -23,6 +23,7 @@ import { addFactEntityLinks, recordGroundedEntityRelationship, type EntityRelati
 import { getFactEvidence, syncMemoryPolicyForFact } from '../memory/temporal-memory.js';
 import { compileWordMatcher } from '../memory/word-match.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 import { listEvents, recentToolOutputs } from '../runtime/harness/eventlog.js';
 
 /** Register a recall run with the active turn so the post-turn auto-credit
@@ -727,6 +728,10 @@ export function registerMemoryTools(server: McpServer): void {
           factId: outcome.factId,
           content,
         });
+        // An explicit remember changes the STABLE memory block — invalidate
+        // frozen prefix snapshots so the change is visible this session.
+        // (Reflection/auto-capture writes deliberately do not bump.)
+        if (outcome.action !== 'ignore') bumpStableContextGeneration();
         const verb = outcome.action === 'supersede'
           ? 'Superseded the prior fact with'
           : outcome.action === 'reinforce'
@@ -962,6 +967,7 @@ export function registerMemoryTools(server: McpServer): void {
       const review = reviewForgetRequest(fact, hard === true);
       if (!review.allow) return textResult(`Refused: ${review.reason}`);
       const ok = forgetFact(id, { hard });
+      if (ok) bumpStableContextGeneration();
       if (ok && fact.kind === 'constraint') notifyStandingRuleChange('forgotten', fact);
       return textResult(ok ? `Forgot fact #${id}${hard ? ' (hard delete)' : ''}.` : `No fact found with id ${id}.`);
     },
@@ -975,6 +981,7 @@ export function registerMemoryTools(server: McpServer): void {
     },
     async ({ id }) => {
       const ok = reactivateFact(id);
+      if (ok) bumpStableContextGeneration();
       const fact = ok ? getFact(id) : null;
       return textResult(
         ok
@@ -996,6 +1003,7 @@ export function registerMemoryTools(server: McpServer): void {
       const fact = getFact(id);
       if (!fact) return textResult(`No fact found with id ${id}.`);
       const ok = setFactPinned(id, want);
+      if (ok) bumpStableContextGeneration();
       // Unpinning removes a standing instruction's always-applied protection —
       // surface every such change to the user (pinning a constraint too, so
       // rule lifecycle is fully visible).

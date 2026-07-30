@@ -9,6 +9,7 @@ import { test, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 
 const brain = await import('./claude-agent-brain.js');
+const { bumpStableContextGeneration } = await import('../stable-context-generation.js');
 const {
   claudeAgentSdkBrainMode,
   claudeAgentSdkBrainEnabled,
@@ -618,32 +619,41 @@ test('Claude brain keeps the installed catalog out of the stable prompt and inje
   }
 });
 
-test('stable memory freezing is opt-in and supports explicit invalidation', () => {
+test('stable memory freezing is DEFAULT ON, defers churn, and honors the invalidation generation', () => {
   process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on'; // the freeze applies only on the split (cacheable-prefix) path
-  process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT = 'on';
+  delete process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT; // default path under test
   const sid = 'brain-freeze-A';
   invalidateStableMemorySnapshot(); // clean slate
   // First render seeds this session's snapshot (before the vault edit).
   const first = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
-  // A mid-session vault edit changes what the STABLE block WOULD render.
+  // A DIRECT store write (the reflection/auto-capture path — no generation
+  // bump) changes what the STABLE block WOULD render.
   saveUserProfile({ role: 'MARKER_ROLE_XYZZY' });
-  // Same session → byte-identical (frozen); the new role never enters the cached prefix.
+  // Same session → byte-identical (frozen); automatic churn stays deferred and
+  // never busts the cached prefix. This is the snapshot's whole point.
   const second = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
-  assert.equal(second, first, 'frozen snapshot: same session ignores the mid-session edit');
+  assert.equal(second, first, 'default-on freeze: same session defers the churn write');
   assert.doesNotMatch(second, /MARKER_ROLE_XYZZY/);
   // A DIFFERENT session renders live — proves the edit really does surface (so its
   // absence above is the freeze, not a non-rendering field).
   const fresh = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: 'brain-freeze-B' }, 'read_only');
   assert.match(fresh, /MARKER_ROLE_XYZZY/, 'a fresh session renders the current vault state');
-  // Explicit invalidation re-renders the frozen session.
-  invalidateStableMemorySnapshot(sid);
+  // An EXPLICIT mutation bumps the shared generation (memory tools / console
+  // routes / skill installs call this) — every frozen session re-renders.
+  bumpStableContextGeneration();
   const third = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
-  assert.match(third, /MARKER_ROLE_XYZZY/, 'invalidation re-renders the stable block');
-  // Default/off → live render every turn (no freeze).
-  delete process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT;
+  assert.match(third, /MARKER_ROLE_XYZZY/, 'a generation bump re-renders the stable block');
+  // Per-session invalidation still works (tests + targeted callers).
   saveUserProfile({ role: 'MARKER_ROLE_SECOND' });
+  invalidateStableMemorySnapshot(sid);
+  const fourth = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
+  assert.match(fourth, /MARKER_ROLE_SECOND/, 'explicit invalidation re-renders the stable block');
+  // Kill-switch off → live render every turn (no freeze).
+  process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT = 'off';
+  saveUserProfile({ role: 'MARKER_ROLE_THIRD' });
   const live = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
-  assert.match(live, /MARKER_ROLE_SECOND/, 'default renders the vault live');
+  assert.match(live, /MARKER_ROLE_THIRD/, 'kill-switch renders the vault live');
+  delete process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT;
   invalidateStableMemorySnapshot();
 });
 

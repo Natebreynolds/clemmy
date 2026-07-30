@@ -212,13 +212,17 @@ export function renderActionDisciplineDirective(intent?: MessageIntent, message 
  * the cached `instructions` prefix, and the DYNAMIC per-turn blocks (facts,
  * tool-choices, working-memory, …) move to the per-turn input tail via
  * buildTurnContextBlock — so the prefix caches and the model isn't waded
- * through ~8K of re-sent, mostly-irrelevant context every turn. Default OFF →
- * byte-identical legacy prompt until validated. CLEMMY_TIERED_CONTEXT=on enables.
+ * through ~8K of re-sent, mostly-irrelevant context every turn. Default ON:
+ * the tiered assembly is validated (instructions-learned suite exercises both
+ * tiers + the casual-turn pointer), and the legacy path put a minute-resolution
+ * "Now" line at byte 0 of the instructions — busting the prompt-prefix cache
+ * every turn. Kill-switch: CLEMMY_TIERED_CONTEXT=off restores the legacy
+ * interleaved prompt byte-identically.
  */
 export function tieredContextEnabled(): boolean {
   // getRuntimeEnv (not process.env) so the documented ~/.clementine-next/.env
   // path flips it too, matching the sibling scopeGateEnabled flag in this file.
-  return (getRuntimeEnv('CLEMMY_TIERED_CONTEXT', 'off') ?? 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('CLEMMY_TIERED_CONTEXT', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 // CANON-SELFASM kill-switch (default ON). The chat assembler historically
