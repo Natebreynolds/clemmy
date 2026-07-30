@@ -34,6 +34,9 @@
 	<array>
 		<string>_clemmy._tcp</string>
 	</array>
+	<!-- Only standard TLS — skips the export-compliance question on every upload. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<!-- Scoped to local networking only. The connection is still TLS: the
