@@ -11,6 +11,13 @@ export function stripInlineMarkdown(text: string): string {
   out = out.replace(/```[a-z]*\n?/gi, '').replace(/`([^`]*)`/g, '$1');
   // Links/images: keep the human label, drop the URL.
   out = out.replace(/!?\[([^\]]*)\]\(([^)]*)\)/g, (_m, label: string) => label || '');
+  // Truncated previews can also cut a link in half — the server clamps titles
+  // by raw character count, so `[label](https://…` can arrive with no closing
+  // paren, which the pair-regex above can never match. Keep the human label,
+  // drop the dangling syntax; in a one-line surface the fragment is always
+  // noise, never content.
+  out = out.replace(/!?\[([^\]]*)\]\([^)]*$/, (_m, label: string) => label || '');
+  out = out.replace(/!?\[([^\]]*)$/, (_m, label: string) => label || '');
   // Bold / italics / strikethrough markers.
   out = out.replace(/(\*\*|__)(.*?)\1/g, '$2');
   out = out.replace(/(^|[\s(])(\*|_)([^*_]+)\2(?=[\s).,;:!?]|$)/g, '$1$3');
