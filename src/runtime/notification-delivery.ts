@@ -245,6 +245,33 @@ export async function deliverNotificationToDestination(
     return;
   }
 
+  if (destination.type === 'apns') {
+    if (!destination.apnsDeviceToken) {
+      throw new Error('APNs destination is missing a device token.');
+    }
+    const { sendApnsAlert, isApnsTokenGone, isApnsConfigured } = await import('./apns.js');
+    if (!isApnsConfigured()) {
+      // Registration is accepted before the signing key exists so pushes
+      // start the moment it lands; until then this leg reports honestly
+      // instead of retrying into a wall.
+      throw new Error('APNs is not configured yet (no signing key). See state/apns.json.');
+    }
+    const content = buildWebPushPayload(notification);
+    const result = await sendApnsAlert({
+      deviceToken: destination.apnsDeviceToken,
+      title: content.title,
+      body: content.body,
+      url: content.url,
+    });
+    if (result.ok) return;
+    if (isApnsTokenGone(result)) {
+      const { removeApnsDestinationByToken } = await import('./notifications.js');
+      removeApnsDestinationByToken(destination.apnsDeviceToken);
+      throw new Error(`APNs token gone (${result.reason ?? result.status}); destination removed.`);
+    }
+    throw new Error(`APNs delivery failed: HTTP ${result.status}${result.reason ? ` ${result.reason}` : ''}`);
+  }
+
   if (destination.type === 'discord_user') {
     if (!destination.userId) {
       throw new Error('Discord user destination is missing userId.');

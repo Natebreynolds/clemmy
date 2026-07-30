@@ -15,8 +15,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -180,4 +182,112 @@ test('a failed main bind rejects and leaves no listeners behind', async () => {
     }),
     /Refusing LAN webhook bind/,
   );
+});
+
+// ─── direct-app door (pinned TLS for the iOS app) ───────────────────
+
+async function startWithDirectApp() {
+  const { ensureMobileTlsIdentity } = await import('./mobile-tls.js');
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-direct-tls-'));
+  const identity = ensureMobileTlsIdentity({ stateDir });
+
+  const app = express();
+  app.use(classifyIngress);
+  app.use(restrictTunnelIngressToMobile);
+  const report = (req: express.Request, res: express.Response): void => {
+    res.json({
+      ingress: req.clemIngress,
+      trusted: trustsForwardedClientIp(req),
+      billedIp: trustsForwardedClientIp(req) && typeof req.headers['cf-connecting-ip'] === 'string'
+        ? req.headers['cf-connecting-ip']
+        : req.socket.remoteAddress,
+    });
+  };
+  app.get('/api/status', report);
+  app.get('/m/auth/status', report);
+
+  const listeners = await startIngressListeners(app, {
+    host: '127.0.0.1',
+    port: 0,
+    // Loopback in tests: the trust property under test is the socket marker
+    // and the served certificate, neither of which depends on the interface.
+    directApp: { port: 0, keyPem: identity.keyPem, certPem: identity.certPem, host: '127.0.0.1' },
+  });
+  return { listeners, identity, stateDir, directAppPort: listeners.directAppPort! };
+}
+
+function rawTlsRequest(
+  port: number,
+  opts: { path: string; headers?: Record<string, string> },
+): Promise<{ status: number; body: string; peerCertDer: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const req = httpsRequest(
+      {
+        host: '127.0.0.1',
+        port,
+        method: 'GET',
+        path: opts.path,
+        headers: opts.headers,
+        // The app trusts by fingerprint, not by chain — mirror that here.
+        rejectUnauthorized: false,
+      },
+      (res) => {
+        const socket = res.socket as import('node:tls').TLSSocket;
+        const peerCertDer = socket.getPeerCertificate().raw;
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body, peerCertDer }));
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('direct-app door serves the pinned certificate and only the mobile surface', async () => {
+  const h = await startWithDirectApp();
+  try {
+    const mobile = await rawTlsRequest(h.directAppPort, { path: '/m/auth/status' });
+    assert.equal(mobile.status, 200);
+    assert.equal(JSON.parse(mobile.body).ingress, 'direct-app');
+
+    // The certificate the phone sees hashes to exactly the QR fingerprint.
+    const seenFp = createHash('sha256').update(mobile.peerCertDer).digest('base64url');
+    assert.equal(seenFp, h.identity.fingerprint);
+
+    const admin = await rawTlsRequest(h.directAppPort, { path: '/api/status' });
+    assert.equal(admin.status, 404, 'the admin API must not be reachable over the direct-app door');
+  } finally {
+    await h.listeners.close();
+    rmSync(h.stateDir, { recursive: true, force: true });
+  }
+});
+
+test('direct-app door ignores CF-Connecting-IP — the socket peer is the client', async () => {
+  const h = await startWithDirectApp();
+  try {
+    const res = await rawTlsRequest(h.directAppPort, {
+      path: '/m/auth/status',
+      headers: { 'CF-Connecting-IP': '203.0.113.7' },
+    });
+    const parsed = JSON.parse(res.body);
+    assert.equal(parsed.trusted, false);
+    assert.notEqual(parsed.billedIp, '203.0.113.7');
+  } finally {
+    await h.listeners.close();
+    rmSync(h.stateDir, { recursive: true, force: true });
+  }
+});
+
+test('omitting directApp keeps the door closed', async () => {
+  const app = express();
+  app.use(classifyIngress);
+  const listeners = await startIngressListeners(app, { host: '127.0.0.1', port: 0 });
+  try {
+    assert.equal(listeners.directApp, null);
+    assert.equal(listeners.directAppPort, null);
+  } finally {
+    await listeners.close();
+  }
 });

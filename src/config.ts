@@ -374,6 +374,11 @@ export const WEBHOOK_ENABLED = getEnv('WEBHOOK_ENABLED', 'false').toLowerCase() 
 export const WEBHOOK_PORT = parseInt(getEnv('WEBHOOK_PORT', '8420'), 10);
 export const WEBHOOK_HOST = normalizeWebhookHost(getEnv('WEBHOOK_HOST', '127.0.0.1'));
 export const WEBHOOK_ALLOW_LAN = getEnv('WEBHOOK_ALLOW_LAN', 'false').toLowerCase() === 'true';
+// Direct-app door: the pinned-TLS listener the iOS app connects to without a
+// tunnel. Serves only /m/* (socket-enforced), so it is on by default; the env
+// is a kill switch, not a rollout flag.
+export const MOBILE_APP_PORT = parseInt(getEnv('CLEMENTINE_MOBILE_APP_PORT', '8421'), 10);
+export const MOBILE_APP_LISTENER_ENABLED = getEnv('CLEMENTINE_MOBILE_APP_LISTENER', 'on').toLowerCase() !== 'off';
 // Vault first — matches CompositeSecretStore precedence (vault → env).
 // Previously env beat vault, which masked freshly-saved values when a
 // stale .env was present. (Observed 2026-05-23 for composio_api_key;

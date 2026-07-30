@@ -126,6 +126,27 @@ export function mobileSetupView(payload: MobileAccessStatusPayload): MobileSetup
     };
   }
 
+  // Ready is ready, regardless of transport. The direct-app door (pinned TLS,
+  // no tunnel) can be live with cloudflared absent entirely, so this must be
+  // decided before any Cloudflare-installer branching below.
+  if (payload.target.qrReady) {
+    return {
+      phase: 'live',
+      headline: payload.target.mode === 'direct-app'
+        ? 'Scan from the Clem app on your iPhone'
+        : 'Scan with your phone’s camera',
+      detail: payload.target.mode === 'direct-app'
+        ? 'Open the Clem app and point it at this code. The phone connects straight to this Mac — nothing in between.'
+        : payload.state.tunnel?.mode === 'quick'
+          ? 'This link works until this Mac restarts. Add it to your home screen.'
+          : undefined,
+      url: payload.target.url,
+      qrReady: true,
+      devices,
+      advanced,
+    };
+  }
+
   const installing = payload.install.recent.find((job) => job.status === 'running');
   if (installing) {
     return {
@@ -162,20 +183,6 @@ export function mobileSetupView(payload: MobileAccessStatusPayload): MobileSetup
         message: payload.state.lastError,
         remedy: { label: 'Try again', action: 'retry' },
       },
-    };
-  }
-
-  if (payload.target.qrReady) {
-    return {
-      phase: 'live',
-      headline: 'Scan with your phone’s camera',
-      detail: advanced.mode === 'quick'
-        ? 'This link works until this Mac restarts. Add it to your home screen.'
-        : undefined,
-      url: payload.target.url,
-      qrReady: true,
-      devices,
-      advanced,
     };
   }
 

@@ -54,6 +54,7 @@ import {
 import {
   removeWebPushDestinationByEndpoint,
   removeWebPushDestinationsByDeviceId,
+  upsertApnsDestination,
   upsertWebPushDestination,
 } from '../runtime/notifications.js';
 import { getVapidPublicKey } from '../runtime/web-push-keys.js';
@@ -1387,6 +1388,29 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       deviceId: ctx.record.deviceId,
       deviceLabel: ctx.record.deviceLabel,
       expirationTime,
+    });
+    await markPushSubscribed(ctx.token, true, stateOpts).catch(() => undefined);
+    res.json({ ok: true, destinationId: destination.id });
+  });
+
+  /**
+   * Native iOS push registration. The Clem app obtains an APNs device token
+   * and hands it in over the same authenticated device session the PWA uses
+   * — the native shell asks the page to make this call, so the device-bound
+   * proof machinery stays the single auth path. Idempotent per device.
+   */
+  router.post('/push/apns', requireMobileSession, async (req, res) => {
+    const ctx = req.mobileSession!;
+    const deviceToken = typeof req.body?.deviceToken === 'string' ? req.body.deviceToken.trim() : '';
+    // APNs tokens are opaque hex; 64 bytes today but Apple says do not assume.
+    if (!/^[0-9a-fA-F]{16,512}$/.test(deviceToken)) {
+      res.status(400).json({ error: 'INVALID_DEVICE_TOKEN' });
+      return;
+    }
+    const destination = upsertApnsDestination({
+      deviceToken: deviceToken.toLowerCase(),
+      deviceId: ctx.record.deviceId,
+      deviceLabel: ctx.record.deviceLabel,
     });
     await markPushSubscribed(ctx.token, true, stateOpts).catch(() => undefined);
     res.json({ ok: true, destinationId: destination.id });

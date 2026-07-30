@@ -1075,3 +1075,59 @@ test('setPin enforces 8-64 char floor + allowed-char policy', async () => {
     await setPin('Clem-Test-2024!', { stateDir: h.stateDir });
   } finally { await h.close(); }
 });
+
+// ---- native (APNs) push registration ---------------------------------------
+
+test('APNs registration: valid token upserts one destination per device, bad token 400s, unsubscribe reaps it', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Clem iPhone');
+    const { listNotificationDestinations } = await import('../runtime/notifications.js');
+
+    const bad = await fetch(`${h.url}/m/push/apns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ deviceToken: 'not-hex!!' }),
+    });
+    assert.equal(bad.status, 400);
+
+    const token = 'ab'.repeat(32);
+    const first = await fetch(`${h.url}/m/push/apns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ deviceToken: token.toUpperCase() }),
+    });
+    assert.equal(first.status, 200);
+
+    // Token rotation from the same device replaces, never accumulates.
+    const rotated = 'cd'.repeat(32);
+    const second = await fetch(`${h.url}/m/push/apns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ deviceToken: rotated }),
+    });
+    assert.equal(second.status, 200);
+
+    const apns = listNotificationDestinations().filter((d) => d.type === 'apns');
+    assert.equal(apns.length, 1, 'one destination per device across re-registrations');
+    assert.equal(apns[0].apnsDeviceToken, rotated, 'stored lowercased and rotated in place');
+    assert.equal(apns[0].name, 'Clem iPhone');
+
+    // The PWA's "disable notifications" path drops native registrations too.
+    const unsub = await fetch(`${h.url}/m/push/unsubscribe`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({}),
+    });
+    assert.equal(unsub.status, 200);
+    assert.equal(listNotificationDestinations().filter((d) => d.type === 'apns').length, 0);
+
+    // No session, no registration.
+    const anon = await fetch(`${h.url}/m/push/apns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ deviceToken: token }),
+    });
+    assert.equal(anon.status, 401);
+  } finally { await h.close(); }
+});

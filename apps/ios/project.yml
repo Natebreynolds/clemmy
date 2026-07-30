@@ -1,0 +1,40 @@
+# XcodeGen spec for the Clem iOS command center.
+#
+# Regenerate the Xcode project after changing this file or adding sources:
+#   cd apps/ios && xcodegen generate
+#
+# The generated Clem.xcodeproj is disposable and gitignored — this file is the
+# source of truth, so the project never rots in code review.
+name: Clem
+options:
+  bundleIdPrefix: ai.breakthroughcoaching
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: 4AR3Y8XD72
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.9"
+targets:
+  Clem:
+    type: application
+    platform: iOS
+    sources:
+      - Clem
+    entitlements:
+      path: Clem/Clem.entitlements
+      properties:
+        # Xcode debug builds get sandbox APNs tokens; the daemon's APNS_ENV
+        # default (sandbox) matches. Flip both together for TestFlight.
+        aps-environment: development
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.breakthroughcoaching.clem
+        PRODUCT_NAME: Clem
+        INFOPLIST_FILE: Clem/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: false
+        ENABLE_PREVIEWS: true
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 0.1.0

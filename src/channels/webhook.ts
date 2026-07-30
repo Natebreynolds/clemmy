@@ -13,6 +13,8 @@ import {
   SLACK_ALLOWED_CHANNELS,
   SLACK_ALLOWED_USERS,
   SLACK_PROACTIVE_CHANNEL,
+  MOBILE_APP_LISTENER_ENABLED,
+  MOBILE_APP_PORT,
   WEBHOOK_ALLOW_LAN,
   WEBHOOK_HOST,
   WEBHOOK_PORT,
@@ -2868,9 +2870,26 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   // catalog on first paint.
   await warmModelDiscovery();
   const app = await buildWebhookApp(assistant);
+
+  // Pinned-TLS door for the iOS app. Identity minting shells out to openssl;
+  // if that fails the door stays closed and everything else boots normally.
+  let directApp: import('../runtime/mobile-ingress.js').DirectAppListenerOptions | undefined;
+  let directAppFingerprint: string | null = null;
+  if (MOBILE_APP_LISTENER_ENABLED) {
+    try {
+      const { ensureMobileTlsIdentity } = await import('../runtime/mobile-tls.js');
+      const identity = ensureMobileTlsIdentity();
+      directApp = { port: MOBILE_APP_PORT, keyPem: identity.keyPem, certPem: identity.certPem };
+      directAppFingerprint = identity.fingerprint;
+    } catch (err) {
+      logger.warn({ err }, 'Mobile TLS identity unavailable; direct-app door stays closed');
+    }
+  }
+
   const listeners = await startIngressListeners(app, {
     host: WEBHOOK_HOST,
     port: WEBHOOK_PORT,
+    directApp,
     // The LAN double-gate applies only to the publicly-bindable listener. The
     // private ingress listener is always loopback + ephemeral.
     guardMainBind: () => {
@@ -2884,6 +2903,17 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     },
   });
   logger.info({ host: WEBHOOK_HOST, port: WEBHOOK_PORT }, 'Webhook server listening');
+
+  if (listeners.directAppPort !== null && directAppFingerprint) {
+    const { setDirectAppRuntime } = await import('../runtime/mobile-ingress.js');
+    setDirectAppRuntime({ port: listeners.directAppPort, fingerprint: directAppFingerprint });
+    logger.info({ port: listeners.directAppPort }, 'Direct-app mobile door open (pinned TLS)');
+    // Advertise the door on the LAN so the app can follow this Mac across
+    // DHCP address changes without re-pairing. Best-effort: without it the
+    // QR-baked address still works until the IP rotates.
+    const { startBonjourAdvertisement } = await import('../runtime/mobile-bonjour.js');
+    startBonjourAdvertisement({ port: listeners.directAppPort, fingerprint: directAppFingerprint });
+  }
 
   // Publish the private port BEFORE the tunnel auto-start reads it, or the
   // tunnel would be pointed at the shared listener and land in tunnel-legacy.

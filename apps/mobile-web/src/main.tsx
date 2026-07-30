@@ -1,6 +1,11 @@
 import { render } from 'preact';
 import { App } from './app';
+import { installNativeBridge } from './lib/native-bridge';
 import './styles.css';
+
+// Before first render so a native shell can hand in its APNs token whenever
+// it likes — including during the pairing load.
+installNativeBridge();
 
 render(<App />, document.getElementById('app')!);
 

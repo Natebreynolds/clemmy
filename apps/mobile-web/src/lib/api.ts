@@ -291,6 +291,14 @@ export async function registerPushSubscription(subscription: PushSubscription): 
   });
 }
 
+/** Native shell only: registers the iOS APNs device token over this session. */
+export async function registerApnsToken(deviceToken: string): Promise<{ destinationId: string }> {
+  return api<{ ok: true; destinationId: string }>('/m/push/apns', {
+    method: 'POST',
+    body: JSON.stringify({ deviceToken }),
+  });
+}
+
 export async function unregisterPushSubscription(endpoint?: string): Promise<{ removed: number }> {
   return api<{ ok: true; removed: number }>('/m/push/unsubscribe', {
     method: 'POST',

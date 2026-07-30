@@ -131,7 +131,7 @@ export interface NotificationRecord {
 export interface NotificationDestination {
   id: string;
   name: string;
-  type: 'generic_webhook' | 'discord_webhook' | 'discord_channel' | 'discord_user' | 'slack_webhook' | 'slack_channel' | 'slack_user' | 'web_push' | 'desktop';
+  type: 'generic_webhook' | 'discord_webhook' | 'discord_channel' | 'discord_user' | 'slack_webhook' | 'slack_channel' | 'slack_user' | 'web_push' | 'apns' | 'desktop';
   url?: string;
   channelId?: string;
   threadTs?: string;
@@ -147,6 +147,8 @@ export interface NotificationDestination {
   deviceId?: string;
   /** Expiration hint reported by the browser (Unix ms), if any. */
   pushExpirationTime?: number | null;
+  /** APNs device token (hex) for native iOS pushes. */
+  apnsDeviceToken?: string;
   enabled: boolean;
   createdAt: string;
 }
@@ -636,11 +638,56 @@ export function removeWebPushDestinationByEndpoint(endpoint: string): boolean {
 export function removeWebPushDestinationsByDeviceId(deviceId: string): number {
   const items = loadDestinations();
   const next = items.filter(
-    (entry) => !(entry.type === 'web_push' && entry.deviceId === deviceId),
+    (entry) => !((entry.type === 'web_push' || entry.type === 'apns') && entry.deviceId === deviceId),
   );
   const removed = items.length - next.length;
   if (removed > 0) saveDestinations(next);
   return removed;
+}
+
+/**
+ * Native iOS push registration. One destination per device token; a device
+ * that re-registers (fresh install, token rotation) updates in place keyed by
+ * deviceId so the destination list never accumulates ghost phones.
+ */
+export function upsertApnsDestination(input: {
+  deviceToken: string;
+  deviceId: string;
+  deviceLabel?: string;
+}): NotificationDestination {
+  const items = loadDestinations();
+  const existing = items.find(
+    (entry) => entry.type === 'apns'
+      && (entry.deviceId === input.deviceId || entry.apnsDeviceToken === input.deviceToken),
+  );
+  const id = existing?.id ?? `apns-${input.deviceId}-${Date.now().toString(36)}`;
+  const destination: NotificationDestination = {
+    id,
+    name: input.deviceLabel?.trim() || `iPhone ${input.deviceId}`,
+    type: 'apns',
+    apnsDeviceToken: input.deviceToken,
+    deviceId: input.deviceId,
+    enabled: true,
+    createdAt: existing?.createdAt ?? new Date().toISOString(),
+  };
+  if (existing) {
+    items[items.indexOf(existing)] = destination;
+  } else {
+    items.push(destination);
+  }
+  saveDestinations(items);
+  return destination;
+}
+
+/** Reap a dead token (APNs said Unregistered/BadDeviceToken/410). */
+export function removeApnsDestinationByToken(deviceToken: string): boolean {
+  const items = loadDestinations();
+  const next = items.filter(
+    (entry) => !(entry.type === 'apns' && entry.apnsDeviceToken === deviceToken),
+  );
+  if (next.length === items.length) return false;
+  saveDestinations(next);
+  return true;
 }
 
 export function listQueuedNotificationDeliveries(): NotificationDeliveryJob[] {

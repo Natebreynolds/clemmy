@@ -33,8 +33,13 @@
  *                     trust as before this change, so nobody breaks; we log a
  *                     one-time nudge to re-point at the private port.
  *   'loopback'      — everything else. Full surface, CF headers IGNORED.
+ *   'direct-app'    — arrived on the pinned-TLS listener the iOS app connects
+ *                     to directly (no tunnel). Restricted to /m/* by socket,
+ *                     like 'tunnel'. CF headers IGNORED — the socket peer IS
+ *                     the client, so the real IP needs no forwarding header.
  */
 import http from 'node:http';
+import https from 'node:https';
 import type { Express, Request, Response, NextFunction } from 'express';
 import pino from 'pino';
 import { readMobileAccess } from './mobile-access-state.js';
@@ -42,7 +47,7 @@ import { normalizeHostHeader } from './http-origin-guard.js';
 
 const logger = pino({ name: 'clementine-next.mobile-ingress' });
 
-export type ClemIngress = 'loopback' | 'tunnel' | 'tunnel-legacy';
+export type ClemIngress = 'loopback' | 'tunnel' | 'tunnel-legacy' | 'direct-app';
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -60,12 +65,25 @@ declare global {
  * header can collide with it.
  */
 const TUNNEL_SOCKET = Symbol('clem.tunnelSocket');
+const DIRECT_APP_SOCKET = Symbol('clem.directAppSocket');
+
+export interface DirectAppListenerOptions {
+  /** 0 = kernel-assigned; the bound port is reported in `directAppPort`. */
+  port: number;
+  keyPem: string;
+  certPem: string;
+  /** Defaults to all interfaces — the phone reaches this door over the LAN. */
+  host?: string;
+}
 
 export interface IngressListeners {
   main: http.Server;
   tunnel: http.Server | null;
   /** Loopback port to point cloudflared at. Null when the tunnel door is off. */
   tunnelPort: number | null;
+  directApp: https.Server | null;
+  /** LAN-reachable TLS port the iOS app connects to. Null when the door is off. */
+  directAppPort: number | null;
   close(): Promise<void>;
 }
 
@@ -91,6 +109,11 @@ export function classifyIngress(req: Request, _res: Response, next: NextFunction
   const raw = req as unknown as Record<symbol, unknown>;
   if (raw[TUNNEL_SOCKET] === true) {
     req.clemIngress = 'tunnel';
+    next();
+    return;
+  }
+  if (raw[DIRECT_APP_SOCKET] === true) {
+    req.clemIngress = 'direct-app';
     next();
     return;
   }
@@ -120,7 +143,7 @@ export function classifyIngress(req: Request, _res: Response, next: NextFunction
  * which socket accepted the connection, which a caller cannot influence.
  */
 export function restrictTunnelIngressToMobile(req: Request, res: Response, next: NextFunction): void {
-  if (req.clemIngress !== 'tunnel' && req.clemIngress !== 'tunnel-legacy') {
+  if (req.clemIngress !== 'tunnel' && req.clemIngress !== 'tunnel-legacy' && req.clemIngress !== 'direct-app') {
     next();
     return;
   }
@@ -157,6 +180,14 @@ export async function startIngressListeners(
     port: number;
     guardMainBind?: () => void;
     enableTunnelListener?: boolean;
+    /**
+     * When present, opens the pinned-TLS door for the iOS app. Serves only
+     * /m/* (enforced by restrictTunnelIngressToMobile via socket marker), so
+     * unlike the main listener it carries no admin surface and needs no
+     * LAN double-gate — the mobile surface brings its own auth: PIN,
+     * device-bound sessions, scoped rate limits, default-deny routes.
+     */
+    directApp?: DirectAppListenerOptions;
   },
 ): Promise<IngressListeners> {
   const wantTunnel = opts.enableTunnelListener ?? ingressSplitEnabled();
@@ -204,13 +235,43 @@ export async function startIngressListeners(
     }
   }
 
+  let directApp: https.Server | null = null;
+  let directAppPort: number | null = null;
+  if (opts.directApp) {
+    try {
+      const conf = opts.directApp;
+      directApp = await new Promise<https.Server>((resolve, reject) => {
+        const server = https.createServer({ key: conf.keyPem, cert: conf.certPem }, (req, res) => {
+          (req as unknown as Record<symbol, unknown>)[DIRECT_APP_SOCKET] = true;
+          app(req as never, res as never);
+        });
+        server.once('error', reject);
+        server.listen(conf.port, conf.host ?? '0.0.0.0', () => {
+          server.removeListener('error', reject);
+          resolve(server);
+        });
+      });
+      const addr = directApp.address();
+      directAppPort = addr && typeof addr === 'object' ? addr.port : null;
+      logger.info({ directAppPort }, 'Direct-app pinned-TLS listener bound');
+    } catch (err) {
+      // Same posture as the tunnel door: a failed optional ingress never takes
+      // the daemon down; the app door just stays closed until the next boot.
+      logger.warn({ err }, 'Direct-app pinned-TLS listener failed to bind');
+      directApp = null;
+      directAppPort = null;
+    }
+  }
+
   return {
     main,
     tunnel,
     tunnelPort,
+    directApp,
+    directAppPort,
     async close() {
       await Promise.all(
-        [main, tunnel].filter((s): s is http.Server => Boolean(s)).map(
+        [main, tunnel, directApp].filter((s): s is http.Server | https.Server => Boolean(s)).map(
           (s) => new Promise<void>((resolve) => s.close(() => resolve())),
         ),
       );
@@ -221,4 +282,26 @@ export async function startIngressListeners(
 /** Test seam — resets the once-per-process legacy-ingress warning. */
 export function resetIngressWarningsForTests(): void {
   warnedLegacyIngress = false;
+}
+
+// ─── direct-app runtime registry ────────────────────────────────────
+//
+// QR generation (console process = this process) needs to know whether the
+// pinned-TLS door is open, on which port, and with which cert fingerprint.
+// Plain module state: the door binds once at boot and never moves.
+
+export interface DirectAppRuntime {
+  port: number;
+  /** base64url(SHA-256(cert DER)) — rides in the pairing QR as `fp`. */
+  fingerprint: string;
+}
+
+let directAppRuntime: DirectAppRuntime | null = null;
+
+export function setDirectAppRuntime(runtime: DirectAppRuntime | null): void {
+  directAppRuntime = runtime;
+}
+
+export function getDirectAppRuntime(): DirectAppRuntime | null {
+  return directAppRuntime;
 }

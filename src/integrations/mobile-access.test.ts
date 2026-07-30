@@ -181,6 +181,75 @@ test('generateQrSvg returns one-time pairing SVG when custom-domain target is re
   assert.ok(result.expiresAt);
 });
 
+// ─── direct-app target (pinned-TLS door, no tunnel) ─────────────────
+
+test('lanIPv4Address prefers en0 and skips internal/virtual interfaces', () => {
+  const pick = integration.lanIPv4Address({
+    lo0: [{ family: 'IPv4', internal: true, address: '127.0.0.1' } as never],
+    utun3: [{ family: 'IPv4', internal: false, address: '100.64.0.9' } as never],
+    en5: [{ family: 'IPv4', internal: false, address: '10.0.0.8' } as never],
+    en0: [
+      { family: 'IPv6', internal: false, address: 'fe80::1' } as never,
+      { family: 'IPv4', internal: false, address: '192.168.1.50' } as never,
+    ],
+  });
+  assert.equal(pick, '192.168.1.50');
+  assert.equal(integration.lanIPv4Address({ lo0: [{ family: 'IPv4', internal: true, address: '127.0.0.1' } as never] }), null);
+});
+
+test('with the direct-app door open and no tunnel, the QR is the pinned-TLS LAN url with fp', async () => {
+  integration._resetMobileAccessForTests();
+  await setMobileAccessTunnel(null);
+  const { setDirectAppRuntime } = await import('../runtime/mobile-ingress.js');
+  setDirectAppRuntime({ port: 8421, fingerprint: 'test-fp-b64url' });
+  try {
+    const result = await integration.generateQrSvg(undefined, { lanIp: '192.168.1.50' });
+    assert.equal(result.target.mode, 'direct-app');
+    assert.equal(result.target.qrReady, true);
+    assert.match(result.targetUrl, /^https:\/\/192\.168\.1\.50:8421\/m\/\?pair=/);
+    const url = new URL(result.targetUrl);
+    assert.equal(url.searchParams.get('fp'), 'test-fp-b64url', 'the cert pin rides in the QR');
+    assert.ok(url.searchParams.get('pair'), 'one-time pairing token present');
+  } finally {
+    setDirectAppRuntime(null);
+  }
+});
+
+test('direct-app QR is blocked when the Mac has no LAN address', async () => {
+  integration._resetMobileAccessForTests();
+  await setMobileAccessTunnel(null);
+  const { setDirectAppRuntime } = await import('../runtime/mobile-ingress.js');
+  setDirectAppRuntime({ port: 8421, fingerprint: 'test-fp-b64url' });
+  try {
+    await assert.rejects(
+      () => integration.generateQrSvg(undefined, { lanIp: null }),
+      (err: unknown) => {
+        assert.ok(err instanceof integration.MobileQrNotReadyError);
+        assert.equal(err.target.mode, 'direct-app');
+        assert.match(err.target.qrBlockedReason ?? '', /no network address/i);
+        return true;
+      },
+    );
+  } finally {
+    setDirectAppRuntime(null);
+  }
+});
+
+test('a configured tunnel still wins over the direct-app door, without an fp param', async () => {
+  integration._resetMobileAccessForTests();
+  const { setDirectAppRuntime } = await import('../runtime/mobile-ingress.js');
+  setDirectAppRuntime({ port: 8421, fingerprint: 'test-fp-b64url' });
+  try {
+    await setMobileAccessTunnel({ id: 'tid', name: 'clem', hostname: 'clem.example.com', mode: 'named' });
+    integration._setTunnelRuntimeForTests({ running: true, connected: true, events: [] });
+    const result = await integration.generateQrSvg(undefined, { lanIp: '192.168.1.50' });
+    assert.equal(result.target.mode, 'custom-domain');
+    assert.equal(new URL(result.targetUrl).searchParams.get('fp'), null, 'the pin never rides a tunnel QR');
+  } finally {
+    setDirectAppRuntime(null);
+  }
+});
+
 test('quick tunnel QR is allowed only for a running connected quick target', async () => {
   integration._resetMobileAccessForTests();
   await setMobileAccessTunnel({ id: 'quick', name: 'Quick mobile link', hostname: 'alpha.trycloudflare.com', mode: 'quick' });

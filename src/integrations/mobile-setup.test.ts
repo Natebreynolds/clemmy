@@ -55,6 +55,21 @@ test('a machine without cloudflared is not-set-up, with no jargon', () => {
   assert.doesNotMatch(view.headline, /tunnel|cloudflared|DNS|domain/i);
 });
 
+test('a ready direct-app QR is live even with cloudflared entirely absent', () => {
+  // Pin for the branch ordering: readiness must be decided before any
+  // Cloudflare-installer branching, or a tunnel-free Mac shows "not-set-up"
+  // while the pinned-TLS door is open and scannable.
+  const view = mobileSetupView(payload({
+    detect: { binary: null, version: null } as never,
+    target: { url: 'https://192.168.1.50:8421/m/', mode: 'direct-app', qrReady: true } as never,
+  }));
+  assert.equal(view.phase, 'live');
+  assert.equal(view.qrReady, true);
+  assert.equal(view.url, 'https://192.168.1.50:8421/m/');
+  assert.match(view.headline, /Clem app/i, 'direct-app QRs are scanned in the app, not the camera');
+  assert.doesNotMatch(view.detail ?? '', /cloudflare|tunnel/i);
+});
+
 test('a running install job reports honest progress rather than a spinner', () => {
   const view = mobileSetupView(payload({
     install: {
