@@ -28,6 +28,29 @@ import { resolveSafeCliProbe } from '../../runtime/cli-discovery.js';
 
 export type CliInstallSource = 'npm' | 'brew' | 'uv' | 'pipx';
 
+/**
+ * Read-only auth-state probe for a catalog CLI. By contract the probe
+ * command must be a pure status read (whoami/status/list shapes) — the
+ * catalog test pins that no probe carries a mutating verb. Output is
+ * ANSI-stripped before classification (netlify colors its status output).
+ *
+ * Classification order (auth-health.ts): signedOutPattern match →
+ * signed_out; exit 0 with output → ok; otherwise → error. The pattern is
+ * checked FIRST because some CLIs report signed-out states with exit 0
+ * (verified live: `gcloud auth list --filter=status:ACTIVE` prints `[]`
+ * and exits 0 with no active account).
+ */
+export interface CliAuthProbe {
+  /** argv appended to the entry's command, e.g. ['whoami']. */
+  args: string[];
+  /** Regex source (case-insensitive) marking a signed-out result. */
+  signedOutPattern?: string;
+  /** Regex source whose first capture group extracts the account name. */
+  usernameCapture?: string;
+  /** Probe timeout; default 5s in auth-health. */
+  timeoutMs?: number;
+}
+
 export interface CliCatalogEntry {
   /** Stable id used by the UI + connected-clis record. kebab-case. */
   id: string;
@@ -50,6 +73,17 @@ export interface CliCatalogEntry {
   authCommand?: string;
   /** Optional project / product homepage shown on the card. */
   homepage?: string;
+  /** Optional read-only auth-state probe. Absent → auth status 'unknown'. */
+  authProbe?: CliAuthProbe;
+  /**
+   * True ONLY when authCommand completes without TTY input (opens a
+   * browser / device-code flow and waits on a localhost callback). Gates
+   * the one-click Sign in job — a wrong `true` means a hung job, so this
+   * is set per-entry only after the flow is verified by hand. Entries
+   * whose login prompts in the terminal (aws configure, gcloud init,
+   * vercel's method picker, stripe's press-Enter pairing) stay absent.
+   */
+  authHeadless?: boolean;
 }
 
 /**
@@ -98,6 +132,12 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     installSource: 'npm',
     authDocsUrl: 'https://docs.railway.com/guides/cli',
     authCommand: 'railway login',
+    // Verified live: exit 0 + "Logged in as user@host 👋"; signed out
+    // reports "Unauthorized. Please login with `railway login`".
+    authProbe: { args: ['whoami'], signedOutPattern: 'unauthorized|not logged in', usernameCapture: 'Logged in as (\\S+)' },
+    // `railway login` opens the browser and waits on a callback — no TTY
+    // input. Job runner enforces a hard timeout as the safety net.
+    authHeadless: true,
     homepage: 'https://railway.com',
   },
   {
@@ -163,6 +203,10 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     installSource: 'brew',
     authDocsUrl: 'https://cloud.google.com/sdk/docs/initializing',
     authCommand: 'gcloud init',
+    // Verified live: active account as a JSON array; with NO active
+    // account it prints `[]` and still exits 0 — the pattern carries the
+    // signed-out truth, not the exit code.
+    authProbe: { args: ['auth', 'list', '--format=json', '--filter=status:ACTIVE'], signedOutPattern: '^\\s*\\[\\s*\\]\\s*$', usernameCapture: '"account":\\s*"([^"]+)"', timeoutMs: 10_000 },
     homepage: 'https://cloud.google.com/sdk',
   },
   {
@@ -233,6 +277,11 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     installSource: 'npm',
     authDocsUrl: 'https://docs.netlify.com/cli/get-started/',
     authCommand: 'netlify login',
+    // Verified live: exit 0 with a "Current Netlify User" block (ANSI
+    // colored — auth-health strips escapes) even outside a linked
+    // project; signed out prints "Not logged in".
+    authProbe: { args: ['status'], signedOutPattern: 'not logged in', usernameCapture: 'Email:\\s*(\\S+)', timeoutMs: 10_000 },
+    authHeadless: true,
     homepage: 'https://www.netlify.com',
   },
   {
@@ -373,6 +422,9 @@ export interface ConnectedCliRecord {
   installedAt: string;
   authDocsUrl: string;
   authCommand?: string;
+  /** Denormalized from the catalog at record time (same as authCommand). */
+  authProbe?: CliAuthProbe;
+  authHeadless?: boolean;
 }
 
 interface ConnectedClisFile {
@@ -435,6 +487,8 @@ export function recordConnectedCli(entry: CliCatalogEntry): ConnectedCliRecord {
     installedAt: new Date().toISOString(),
     authDocsUrl: entry.authDocsUrl,
     authCommand: entry.authCommand,
+    ...(entry.authProbe ? { authProbe: entry.authProbe } : {}),
+    ...(entry.authHeadless !== undefined ? { authHeadless: entry.authHeadless } : {}),
   };
   current[entry.id] = record;
   writeConnectedClis(current);
@@ -477,6 +531,8 @@ export function reconnectCli(id: string): ConnectedCliRecord | null {
     installedAt: new Date().toISOString(),
     authDocsUrl: entry.authDocsUrl,
     authCommand: entry.authCommand,
+    ...(entry.authProbe ? { authProbe: entry.authProbe } : {}),
+    ...(entry.authHeadless !== undefined ? { authHeadless: entry.authHeadless } : {}),
   };
   current[entry.id] = record;
   writeConnectedClis(current, forgotten);
