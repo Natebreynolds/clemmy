@@ -1808,7 +1808,14 @@ export function migrateMemoryDatabaseHandle(
       `Memory schema ${current} is newer than migration target ${targetVersion}; refusing an implicit downgrade.`,
     );
   }
-  const apply = db.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)');
+  // OR IGNORE: two processes can open the same fresh DB at once (daemon + a CLI
+  // command; several test files sharing one home) and both decide to apply the
+  // same migration. The SQL bodies are written idempotently, but the version
+  // RECORD is a PRIMARY KEY — so the loser of that race threw
+  // "UNIQUE constraint failed: schema_version.version" out of an async
+  // continuation and killed the process. Recording a version another process
+  // already recorded is a no-op, not an error.
+  const apply = db.prepare('INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)');
 
   for (const migration of MIGRATIONS) {
     if (migration.version <= current) continue;
