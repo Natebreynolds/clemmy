@@ -40,6 +40,10 @@ export interface GuestRunJob {
   startedAt: string;
   completedAt?: string;
   durationMs?: number;
+  /** The conversation that started this run — completion reports back into it
+   *  through the canonical outcome pipeline (same spine as background tasks),
+   *  so the origin turn can END instead of babysitting a 20-minute run. */
+  originSessionId?: string;
 }
 
 const EVENTS_TAIL_MAX = 100;
@@ -91,6 +95,7 @@ export function startGuestRun(input: StartGuestRunInput): GuestRunJob {
     finalMessage: '',
     changedFiles: [],
     startedAt: new Date().toISOString(),
+    ...(input.sessionId ? { originSessionId: input.sessionId } : {}),
   };
   const abort = new AbortController();
   jobs.set(id, { job, abort });
@@ -115,6 +120,7 @@ export function startGuestRun(input: StartGuestRunInput): GuestRunJob {
       job.error = err instanceof Error ? err.message : String(err);
       job.completedAt = new Date().toISOString();
       notifyDone(job);
+      deliverGuestOutcome(job);
     },
   );
 
@@ -134,6 +140,54 @@ function finishJob(job: GuestRunJob, result: GuestRunResult): void {
   }
   if (job.status === 'succeeded') recordRunDeliverables(job);
   notifyDone(job);
+  deliverGuestOutcome(job);
+}
+
+/** Test seam — capture outcome deliveries instead of touching the real pipeline. */
+type OutcomeDeliverer = (job: GuestRunJob) => void;
+let outcomeDelivererForTests: OutcomeDeliverer | null = null;
+export function _setGuestOutcomeDelivererForTests(fn: OutcomeDeliverer | null): void {
+  outcomeDelivererForTests = fn;
+}
+
+/**
+ * Report the finished run back into the conversation that started it, through
+ * the canonical outcome pipeline (the same always-report-back spine background
+ * tasks and workflows use). This is what frees the origin turn to END with a
+ * conversational ack instead of polling for 20 minutes. Skips: no origin
+ * (console-started runs — the dashboard notification covers those) and kills
+ * (the user ended it on purpose; a report-back would be noise).
+ */
+function deliverGuestOutcome(job: GuestRunJob): void {
+  if (!job.originSessionId || job.status === 'killed' || job.status === 'running') return;
+  if (outcomeDelivererForTests) {
+    outcomeDelivererForTests(job);
+    return;
+  }
+  void Promise.all([import('../runtime/outcome.js'), import('../runtime/report-voice.js')])
+    .then(([{ deliverOutcome }, { humanizeReportBody }]) => {
+      const minutes = job.durationMs ? `${Math.round(job.durationMs / 60000)} min` : undefined;
+      deliverOutcome(
+        {
+          status: job.status === 'succeeded' ? 'done' : 'failed',
+          summary: job.status === 'succeeded'
+            ? `${job.harness} finished in ${job.projectName}${minutes ? ` (${minutes})` : ''}`
+            : `${job.harness} run failed in ${job.projectName}`,
+          detail: humanizeReportBody(job.finalMessage || job.error || '')
+            + (job.changedFiles.length
+              ? `\n\nFiles created/changed in ${job.projectPath}:\n${job.changedFiles.map((f) => `- ${f}`).join('\n')}`
+              : ''),
+        },
+        {
+          originSessionId: job.originSessionId,
+          sourceLabel: 'project run',
+          sourceId: job.id,
+          title: `${job.harness} · ${job.projectName}`,
+          proactiveTurn: true,
+        },
+      );
+    })
+    .catch(() => { /* dashboard notification + poll path still carry the outcome */ });
 }
 
 /** Document-shaped outputs a user will later ask "where did we put…" about.

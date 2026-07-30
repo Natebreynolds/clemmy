@@ -19,7 +19,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { setGuestHarnessSpawnForTest, setGuestHarnessBinaryResolverForTest } = await import('./guest-harness.js');
-const { startGuestRun, getGuestRun, killGuestRun } = await import('./guest-run-jobs.js');
+const { startGuestRun, getGuestRun, killGuestRun, _setGuestOutcomeDelivererForTests } = await import('./guest-run-jobs.js');
 const { updateEnvKey, clearWorkspaceProjectCache } = await import('../tools/shared.js');
 
 const workspace = mkdtempSync(path.join(os.tmpdir(), 'clemmy-guest-jobs-ws-'));
@@ -82,6 +82,46 @@ test('start → poll → succeeded, resolving the project by NAME', async () => 
   assert.equal(done.status, 'succeeded');
   assert.equal(done.finalMessage, 'All done.');
   assert.ok(done.events.some((e) => e.includes('working')));
+});
+
+test('completion reports back into the ORIGIN conversation — kills and console runs stay quiet', async () => {
+  // The class fix for the babysat-turn UX (live incident 2026-07-30, Discord
+  // /build-brief): the origin turn may END with a conversational ack because
+  // completion rides the canonical outcome pipeline back into that session.
+  const delivered: Array<{ id: string; status: string; origin?: string }> = [];
+  _setGuestOutcomeDelivererForTests((job) => delivered.push({ id: job.id, status: job.status, origin: job.originSessionId }));
+  try {
+    // With an origin session: completion delivers exactly once, to that session.
+    const a = fakeChild();
+    setGuestHarnessSpawnForTest((() => a.child) as any);
+    const withOrigin = startGuestRun({ harness: 'claude', project: 'fixture-project', prompt: '/build-brief x', sessionId: 'discord-sess-1' });
+    assert.equal(withOrigin.originSessionId, 'discord-sess-1', 'the starting conversation is captured on the job');
+    a.child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'result', subtype: 'success', result: 'Brief done.' })}\n`));
+    a.finish(0);
+    await settle();
+    assert.deepEqual(delivered, [{ id: withOrigin.id, status: 'succeeded', origin: 'discord-sess-1' }]);
+
+    // No origin (console-started): the silent dashboard notification is enough.
+    delivered.length = 0;
+    const b = fakeChild();
+    setGuestHarnessSpawnForTest((() => b.child) as any);
+    startGuestRun({ harness: 'claude', project: 'fixture-project', prompt: 'x' });
+    b.child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' })}\n`));
+    b.finish(0);
+    await settle();
+    assert.equal(delivered.length, 0, 'console runs do not report into a conversation');
+
+    // Killed: the user ended it on purpose — a report-back would be noise.
+    const c = fakeChild();
+    setGuestHarnessSpawnForTest((() => c.child) as any);
+    const killedJob = startGuestRun({ harness: 'claude', project: 'fixture-project', prompt: 'x', sessionId: 'discord-sess-2' });
+    killGuestRun(killedJob.id);
+    c.finish(143);
+    await settle();
+    assert.equal(delivered.length, 0, 'a user-killed run never reports back');
+  } finally {
+    _setGuestOutcomeDelivererForTests(null);
+  }
 });
 
 test('kill: abort reaches the running child and the job reports killed', async () => {

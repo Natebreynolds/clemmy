@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { textResult } from './shared.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 
 /**
  * `project_run` — drive the user's REAL Claude Code / Codex CLI as a full
@@ -78,12 +79,19 @@ async function startAction(
     );
   }
   const { startGuestRun } = await import('../execution/guest-run-jobs.js');
-  const job = startGuestRun({ harness: chosen, project, prompt, model });
+  const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+  const job = startGuestRun({ harness: chosen, project, prompt, model, sessionId });
   return textResult(
-    `Started ${job.harness} in ${job.projectName} (${job.projectPath}) — runId ${job.id}.\n`
+    `Started ${job.harness} in ${job.projectName} (${job.projectPath}) — runId ${job.id}, running in the background.\n`
     + `Prompt: ${job.prompt}\n`
-    + 'This can take many minutes. Poll with project_run {"action":"status","runId":"' + job.id + '"} '
-    + 'and tell the user it is underway; deliver the final message and changed files when it completes.',
+    + (job.originSessionId
+      ? 'When it finishes, the result is reported back into this conversation AUTOMATICALLY — you do not need to '
+        + 'poll or wait. Reply to the user NOW in your own words: what is running, where, roughly how long it '
+        + 'usually takes (often 10–30 minutes), that they can ask for a progress check or say stop at any time, '
+        + 'and that you will report back the moment it completes. Then END your reply. Use '
+        + 'project_run {"action":"status","runId":"' + job.id + '"} only if the user asks for a progress check.'
+      : 'This can take many minutes. Poll with project_run {"action":"status","runId":"' + job.id + '"} '
+        + 'and tell the user it is underway; deliver the final message and changed files when it completes.'),
   );
 }
 
