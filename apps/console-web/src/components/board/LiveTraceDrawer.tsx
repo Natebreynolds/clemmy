@@ -30,6 +30,7 @@ import {
   canStopCanonicalRunFromDrawer,
   cardTone,
   getBackgroundTaskDetail,
+  isWorkflowCatchupCard,
   listReportBackChannels,
   pendingActionReviewFacts,
   repostBackgroundTaskResult,
@@ -38,6 +39,7 @@ import {
   setBackgroundTaskReportBackChannel,
   setBackgroundTaskReportBackTarget,
   sourceLabel,
+  workflowCatchupReadinessFacts,
   type BackgroundReportBackTarget,
   type BackgroundReportBackTargetType,
   type BackgroundTaskNotification,
@@ -391,14 +393,16 @@ export function LiveTraceDrawer({
   const [revisionNotice, setRevisionNotice] = useState('');
   const [actionBusy, setActionBusy] = useState<BoardButtonIntent | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const isCatchup = isWorkflowCatchupCard(card);
+  const catchupReadiness = workflowCatchupReadinessFacts(card);
 
   // A finished run loses its `sourceKind === 'workflow'` tag but still carries a
   // runId + workflow reference — treat those as workflow cards too, else the
   // drawer opens EMPTY for completed workflows (the structured detail never
   // renders because it falls into the harness-SSE branch with no session).
   const isWorkflow =
-    card.sourceKind === 'workflow' ||
-    Boolean(card.raw.runId && (card.raw.workflowSlug || card.raw.workflowName));
+    !isCatchup && (card.sourceKind === 'workflow' ||
+    Boolean(card.raw.runId && (card.raw.workflowSlug || card.raw.workflowName)));
   const isBackground = card.sourceKind === 'background';
 
   useEffect(() => {
@@ -670,7 +674,12 @@ export function LiveTraceDrawer({
   const canStopCanonicalRun = Boolean(onAction && canStopCanonicalRunFromDrawer(card));
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label={`Live trace: ${card.title}`}>
+    <div
+      className="fixed inset-0 z-50 flex justify-end"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`${isCatchup ? 'Review missed run' : 'Live trace'}: ${card.title}`}
+    >
       <div className="absolute inset-0 bg-black/30 animate-fade-in" onClick={onClose} />
       <div className="relative flex h-full w-full max-w-xl flex-col border-l border-border bg-surface shadow-lg animate-fade-in">
         <header className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
@@ -724,6 +733,68 @@ export function LiveTraceDrawer({
             )}
           </div>
         </div>
+
+        {isCatchup && (
+          <div className="border-b border-warning/40 bg-warning-tint px-5 py-4">
+            <div className="flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-warning">
+              <Hand className="h-3.5 w-3.5" aria-hidden />
+              Your decision
+            </div>
+            <p className="mt-1.5 text-body text-fg">
+              This scheduled occurrence has not started executing. No model, tool, workflow step, or external action has run.
+            </p>
+            {catchupReadiness.blocked && (
+              <div className="mt-3 rounded-md border border-warning/40 bg-surface px-3 py-2.5">
+                <div className="text-small font-semibold text-warning">Needs connection/fix before Resume</div>
+                <ul className="mt-1 space-y-1 text-caption text-fg">
+                  {(catchupReadiness.blockerMessages.length > 0
+                    ? catchupReadiness.blockerMessages
+                    : ['A required workflow dependency is not ready.'])
+                    .slice(0, 3)
+                    .map((message, index) => <li key={`${message}-${index}`}>• {message}</li>)}
+                </ul>
+                {catchupReadiness.blockerCount > 3 && (
+                  <p className="mt-1 text-caption text-faint">
+                    +{catchupReadiness.blockerCount - 3} more blocker{catchupReadiness.blockerCount - 3 === 1 ? '' : 's'}
+                  </p>
+                )}
+              </div>
+            )}
+            {!catchupReadiness.blocked && catchupReadiness.warningCount > 0 && (
+              <div className="mt-3 rounded-md border border-warning/30 bg-surface px-3 py-2.5">
+                <div className="text-small font-semibold text-warning">Check connection before Resume</div>
+                <p className="mt-1 text-caption text-fg">
+                  {catchupReadiness.warningMessages[0] ?? `${catchupReadiness.warningCount} readiness warning${catchupReadiness.warningCount === 1 ? '' : 's'}.`}
+                </p>
+              </div>
+            )}
+            {onAction && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  disabled={actionBusy !== null}
+                  title={catchupReadiness.blocked ? 'Resume rechecks these dependencies now.' : undefined}
+                  onClick={() => { void runCardAction('resume'); }}
+                >
+                  <Play className="h-4 w-4" aria-hidden />
+                  {actionBusy === 'resume' ? 'Resuming…' : 'Resume run'}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={actionBusy !== null}
+                  onClick={() => { void runCardAction('skip'); }}
+                >
+                  <X className="h-4 w-4" aria-hidden />
+                  {actionBusy === 'skip' ? 'Skipping…' : 'Skip run'}
+                </Button>
+              </div>
+            )}
+            <p className="mt-2 text-caption text-muted">
+              Skipping closes only this missed occurrence. Future scheduled runs stay enabled.
+            </p>
+          </div>
+        )}
 
         {isBackground && (taskDetail?.task.status === 'awaiting_input' || card.status === 'awaiting_input') && (
           <div className="border-b border-warning/40 bg-warning-tint px-5 py-4">
@@ -1175,7 +1246,49 @@ export function LiveTraceDrawer({
         )}
 
         <div className="px-5 py-4">
-          {showRaw ? (
+          {isCatchup ? (
+            <div className="space-y-4">
+              <div className="rounded-md border border-border bg-subtle px-4 py-3">
+                <div className="text-small font-semibold text-fg">Missed schedule</div>
+                <dl className="mt-3 grid gap-3 text-small sm:grid-cols-2">
+                  <div>
+                    <dt className="text-caption font-semibold text-faint">Scheduled for</dt>
+                    <dd className="mt-0.5 text-fg">
+                      {formatTime(card.raw.scheduledFor || (
+                        Number.isFinite(card.raw.occurrenceAtMs)
+                          ? new Date(Number(card.raw.occurrenceAtMs)).toISOString()
+                          : undefined
+                      ))}
+                    </dd>
+                  </div>
+                  {card.raw.schedule && (
+                    <div>
+                      <dt className="text-caption font-semibold text-faint">Schedule</dt>
+                      <dd className="mt-0.5 font-mono text-fg">{card.raw.schedule}</dd>
+                    </div>
+                  )}
+                  {card.raw.timezone && (
+                    <div>
+                      <dt className="text-caption font-semibold text-faint">Timezone</dt>
+                      <dd className="mt-0.5 text-fg">{card.raw.timezone}</dd>
+                    </div>
+                  )}
+                  {(card.raw.missedCount ?? 0) > 1 && (
+                    <div>
+                      <dt className="text-caption font-semibold text-faint">Collapsed occurrences</dt>
+                      <dd className="mt-0.5 text-fg">{card.raw.missedCount}</dd>
+                    </div>
+                  )}
+                </dl>
+              </div>
+              <div className="rounded-md border border-success/30 bg-success-tint px-4 py-3">
+                <div className="text-small font-semibold text-success">Nothing has run yet</div>
+                <p className="mt-1 text-caption text-fg">
+                  Resume releases this saved occurrence through the normal bounded workflow queue. Skip closes it without executing the workflow.
+                </p>
+              </div>
+            </div>
+          ) : showRaw ? (
             <pre className="whitespace-pre-wrap break-words rounded-sm bg-canvas p-3 text-caption text-muted">
               {JSON.stringify(isWorkflow ? rawWorkflow : rawHarness, null, 2)}
             </pre>
@@ -1205,17 +1318,23 @@ export function LiveTraceDrawer({
 
         <footer className="flex items-center justify-between gap-4 border-t border-border px-5 py-3">
           <span className="text-caption text-faint">
-            {isWorkflow ? `${rawWorkflow.length} events · polling` : traceSessionId ? `${rawHarness.length} events · live` : 'No live session'}
+            {isCatchup
+              ? 'Awaiting your decision · no execution started'
+              : isWorkflow
+                ? `${rawWorkflow.length} events · polling`
+                : traceSessionId ? `${rawHarness.length} events · live` : 'No live session'}
           </span>
           <div className="flex items-center gap-4">
-            {!isWorkflow && !showRaw && (
+            {!isCatchup && !isWorkflow && !showRaw && (
               <button onClick={() => setShowDetails((v) => !v)} className="text-caption font-semibold text-muted transition-colors hover:text-fg">
                 {showDetails ? 'Hide details' : 'Details'}
               </button>
             )}
-            <button onClick={() => setShowRaw((v) => !v)} className="text-caption font-semibold text-primary hover:underline">
-              {showRaw ? 'Show timeline' : 'Show raw events'}
-            </button>
+            {!isCatchup && (
+              <button onClick={() => setShowRaw((v) => !v)} className="text-caption font-semibold text-primary hover:underline">
+                {showRaw ? 'Show timeline' : 'Show raw events'}
+              </button>
+            )}
           </div>
         </footer>
       </div>

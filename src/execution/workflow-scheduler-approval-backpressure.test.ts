@@ -24,6 +24,7 @@ test('scheduled approval backpressure counts a parked run separately from execut
   run('parked-1', 'daily-standup-email', 'parked');
   run('queued-1', 'daily-standup-email', 'queued');
   run('finalizing-1', 'daily-standup-email', 'finalizing');
+  run('held-1', 'daily-standup-email', 'awaiting_catchup_decision');
   run('done-1', 'daily-standup-email', 'completed');
   run('other-1', 'another-workflow', 'parked');
 

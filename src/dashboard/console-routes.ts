@@ -470,6 +470,11 @@ import {
 } from '../tools/workflow-run-queue.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import { cancelWorkflowRunAtBoundary, isTerminalWorkflowRunStatus } from '../execution/workflow-run-cancellation.js';
+import {
+  listHeldWorkflowCatchupRuns,
+  resumeWorkflowCatchupRun,
+  skipWorkflowCatchupRun,
+} from '../execution/workflow-catchup-decision.js';
 import { resumeCapabilityBlockedWorkflowRun } from '../execution/workflow-runner.js';
 import {
   findCatalogEntry,
@@ -2492,7 +2497,7 @@ function consoleFocusView(row: FocusRow): ConsoleFocusView {
 /** One normalized card on the Tasks board (see GET /api/console/board). */
 interface BoardCard {
   id: string;
-  sourceKind: 'background' | 'run' | 'execution' | 'workflow' | 'approval';
+  sourceKind: 'background' | 'run' | 'execution' | 'workflow' | 'approval' | 'schedule';
   title: string;
   column: BoardColumnId;
   /** Raw source status, for the pill label / tooltip. */
@@ -10176,6 +10181,56 @@ export function registerConsoleRoutes(
       const legacyRuns = listRuns(80);
       const legacyRunById = new Map(legacyRuns.map((run) => [run.id, run]));
 
+      // 0) Missed schedules held BEFORE execution. These are decision cards,
+      // not live workflow traces: no model, tool, step, or external effect has
+      // run. Resume releases the durable occurrence into the ordinary bounded
+      // queue; Skip closes only this occurrence and leaves future schedules on.
+      for (const held of listHeldWorkflowCatchupRuns()) {
+        const workflowEntry = workflowBySlug.get(held.workflowSlug)
+          ?? workflowByDisplayName.get(held.workflowName);
+        const scheduledAtMs = Number.isFinite(held.scheduledAtMs)
+          ? held.scheduledAtMs
+          : Date.parse(held.scheduledAt);
+        const scheduledAt = Number.isFinite(scheduledAtMs)
+          ? new Date(scheduledAtMs).toISOString()
+          : held.scheduledAt;
+        const scheduledLabel = Number.isFinite(scheduledAtMs)
+          ? new Date(scheduledAtMs).toLocaleString(undefined, {
+            dateStyle: 'medium',
+            timeStyle: 'short',
+          })
+          : held.scheduledAt;
+        const collapsed = Math.max(1, Number.isFinite(held.missedCount) ? held.missedCount : 1);
+        cards.push({
+          id: `catchup:${held.runId}`,
+          sourceKind: 'schedule',
+          title: workflowEntry?.data.name ?? held.workflowName,
+          column: 'needs_you',
+          status: held.status,
+          progressHint:
+            `Scheduled for ${scheduledLabel} and paused before execution. Nothing has started.`
+            + (collapsed > 1
+              ? ` ${collapsed} missed occurrences were collapsed into this one decision.`
+              : ''),
+          sessionId: null,
+          ageMs: ageMs(held.heldAt || held.createdAt),
+          updatedAt: held.heldAt || held.createdAt,
+          actions: ['resume', 'cancel', 'skip'],
+          primaryAction: 'none',
+          continueMode: 'none',
+          nextSafeAction: 'Resume this one occurrence or skip it. Future scheduled runs stay enabled.',
+          raw: {
+            workflowName: workflowEntry?.data.name ?? held.workflowName,
+            workflowSlug: held.workflowSlug,
+            runId: held.runId,
+            occurrenceAtMs: scheduledAtMs,
+            scheduledFor: scheduledAt,
+            missedCount: collapsed,
+            readiness: held.readiness,
+          },
+        });
+      }
+
       // 1) Background tasks — the autonomous "go do this while I'm away" work.
       //    ?includeArchived=1 surfaces soft-deleted tasks (restore-only) for a
       //    future "Archived" view; default hides them.
@@ -10706,6 +10761,58 @@ export function registerConsoleRoutes(
         return;
       }
       res.status(400).json({ ok: false, reason: `Unknown action: ${action}` });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Decide one held missed schedule before execution begins. The workflow slug
+   * is an optimistic ownership check, not a display-name lookup: a stale card
+   * can never resume or skip a run that has moved to another workflow.
+   *
+   * `cancel` is intentionally not accepted here. The product verb is Skip
+   * because this closes one missed occurrence while keeping future schedules
+   * enabled; active runs continue to use the separate Cancel boundary.
+   */
+  app.post('/api/console/board/workflow-catchups/:slug/:runId/:action', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const workflowSlug = String(req.params.slug ?? '').trim();
+    const runId = String(req.params.runId ?? '').trim();
+    const action = String(req.params.action ?? '').trim();
+    if (!workflowSlug || !runId) {
+      res.status(400).json({ ok: false, reason: 'workflow slug and catch-up run id are required' });
+      return;
+    }
+    if (action !== 'resume' && action !== 'skip') {
+      res.status(400).json({ ok: false, reason: 'action must be resume or skip' });
+      return;
+    }
+    try {
+      if (action === 'resume') {
+        const result = resumeWorkflowCatchupRun({ runId, expectedWorkflow: workflowSlug });
+        const ok = result.status === 'resumed' || result.status === 'already_resumed';
+        const notFound = result.status === 'not_found' || result.status === 'workflow_not_found';
+        res.status(ok ? 200 : notFound ? 404 : 409).json({
+          ok,
+          status: result.status,
+          message: result.message,
+          ...(!ok ? { reason: result.message } : {}),
+          ...('run' in result && result.run ? { run: result.run } : {}),
+          ...('readiness' in result && result.readiness ? { readiness: result.readiness } : {}),
+        });
+        return;
+      }
+      const result = skipWorkflowCatchupRun({ runId, expectedWorkflow: workflowSlug });
+      const ok = result.status === 'skipped' || result.status === 'already_skipped';
+      const notFound = result.status === 'not_found';
+      res.status(ok ? 200 : notFound ? 404 : 409).json({
+        ok,
+        status: result.status,
+        message: result.message,
+        ...(!ok ? { reason: result.message } : {}),
+        ...('run' in result && result.run ? { run: result.run } : {}),
+      });
     } catch (err) {
       res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
     }

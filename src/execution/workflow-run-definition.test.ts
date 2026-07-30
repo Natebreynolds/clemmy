@@ -5,6 +5,7 @@ import {
   createWorkflowRunDefinitionSnapshot,
   resolveWorkflowRunDefinitionSnapshot,
   workflowDefinitionMatchesSnapshotIgnoringEnabled,
+  workflowDefinitionMatchesScheduledCatchupSnapshot,
   workflowDefinitionHash,
 } from './workflow-run-definition.js';
 
@@ -84,5 +85,37 @@ test('creation-test compatibility ignores only the enable bit', () => {
     ...original,
     enabled: true,
     steps: [{ ...original.steps[0], prompt: 'A newer edit.' }],
+  }), false);
+});
+
+test('scheduled catch-up compatibility ignores admission controls but pins execution semantics', () => {
+  const original = workflow();
+  original.trigger = { schedule: '0 9 * * *', timezone: 'America/Los_Angeles' };
+  const snapshot = createWorkflowRunDefinitionSnapshot(
+    'pinned-workflow',
+    original,
+    '2026-07-26T12:00:00.000Z',
+  );
+
+  assert.equal(workflowDefinitionMatchesScheduledCatchupSnapshot(snapshot, {
+    ...original,
+    enabled: false,
+    trigger: { schedule: '30 10 * * 1-5', timezone: 'America/New_York' },
+  }), true, 'enabled/trigger edits govern future admissions, not this held occurrence');
+
+  assert.equal(workflowDefinitionMatchesScheduledCatchupSnapshot(snapshot, {
+    ...original,
+    steps: [{ ...original.steps[0], prompt: 'Use a newer prompt.' }],
+  }), false);
+  assert.equal(workflowDefinitionMatchesScheduledCatchupSnapshot(snapshot, {
+    ...original,
+    inputs: { account: { type: 'string', required: true } },
+  }), false);
+  assert.equal(workflowDefinitionMatchesScheduledCatchupSnapshot(snapshot, {
+    ...original,
+    steps: [{
+      ...original.steps[0],
+      call: { tool: 'composio_gmail_search', args: { query: 'newer than:1d' } },
+    }],
   }), false);
 });

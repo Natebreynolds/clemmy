@@ -27,6 +27,8 @@ const STATUS_LABELS: Record<string, string> = {
   running: 'Working',
   active: 'Working',
   queued: 'Queued',
+  missed_schedule: 'Missed schedule',
+  awaiting_catchup_decision: 'Missed schedule',
   completed: 'Done',
   succeeded: 'Done',
 };

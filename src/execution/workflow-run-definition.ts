@@ -119,6 +119,23 @@ export function workflowDefinitionMatchesSnapshotIgnoringEnabled(
 }
 
 /**
+ * A held scheduled occurrence has already been admitted at one concrete due
+ * time. Changing `enabled` or `trigger` controls only future admissions, so it
+ * must not strand that occurrence. Everything that can change execution
+ * (steps/prompts/calls, inputs, resources, tools, models, goals, etc.) remains
+ * pinned and must match before Resume is allowed.
+ */
+export function workflowDefinitionMatchesScheduledCatchupSnapshot(
+  snapshot: WorkflowRunDefinitionSnapshot,
+  current: WorkflowDefinition,
+): boolean {
+  const normalized = cloneDefinition(current);
+  normalized.enabled = snapshot.definition.enabled;
+  normalized.trigger = cloneDefinition(snapshot.definition).trigger;
+  return workflowDefinitionHash(normalized) === snapshot.definitionHash;
+}
+
+/**
  * Validate an untrusted run-record value, including its content hash. A present
  * but corrupt snapshot is never treated like a legacy run: falling back to the
  * current workflow would silently authorize definition drift.

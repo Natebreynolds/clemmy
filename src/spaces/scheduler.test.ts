@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -46,6 +46,59 @@ test('a due (every-minute) data source fires and persists; dedupes within the mi
   } finally {
     runner._setSpaceComposioDispatchForTests(null);
     // Archive so this every-minute source doesn't re-fire across later tests.
+    store.spaceStore.archive(slug);
+  }
+});
+
+test('a 24-hour hourly backlog invokes the real refresh path exactly once at the latest occurrence', async () => {
+  const slug = 'sched-hourly-collapse';
+  const stateFile = path.join(process.env.CLEMENTINE_HOME!, 'state', 'space-schedule-state.json');
+  const beforeOutage = new Date('2026-06-08T11:01:00.000Z');
+  mkdirSync(path.dirname(stateFile), { recursive: true });
+  writeFileSync(stateFile, JSON.stringify({
+    lastEvaluatedAtMs: beforeOutage.getTime(),
+    lastRunByMinute: {},
+    lastReengageByKey: {},
+    pausedRetryBySlug: {},
+  }), 'utf-8');
+
+  store.spaceStore.save({
+    id: slug,
+    title: 'Hourly collapse',
+    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '0 * * * *' }],
+  });
+
+  let dispatches = 0;
+  runner._setSpaceComposioDispatchForTests(async () => {
+    dispatches += 1;
+    return {
+      ok: true as const,
+      result: { dispatches },
+      connectionId: 'ca-proof',
+      identity: 'proof@example.test',
+    };
+  });
+
+  try {
+    const wake = new Date('2026-06-09T11:01:00.000Z');
+    const first = await sched.processSpaceSchedules(wake);
+    assert.equal(first.fired, 1, 'the source refreshes once after the outage');
+    assert.equal(dispatches, 1, '24 matched hourly minutes collapse before provider dispatch');
+    assert.deepEqual((data.readData(slug) as any).pull, { dispatches: 1 });
+    const persisted = JSON.parse(readFileSync(stateFile, 'utf-8')) as {
+      lastRunByMinute?: Record<string, string>;
+    };
+    assert.equal(
+      persisted.lastRunByMinute?.[`${slug}:pull`],
+      '2026-06-09T11:00',
+      'collapse commits the latest missed occurrence, not the first one in the scan',
+    );
+
+    const sameMinute = await sched.processSpaceSchedules(wake);
+    assert.equal(sameMinute.fired, 0, 'the latest occurrence remains idempotent');
+    assert.equal(dispatches, 1, 'same-minute reevaluation never repeats the provider call');
+  } finally {
+    runner._setSpaceComposioDispatchForTests(null);
     store.spaceStore.archive(slug);
   }
 });

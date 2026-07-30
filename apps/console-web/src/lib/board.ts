@@ -14,7 +14,7 @@ import type { RunEnvironmentDetail } from './run-environment';
 import type { PendingActionApprovalView } from './types';
 
 export type BoardColumnId = 'queued' | 'running' | 'needs_you' | 'done';
-export type BoardSourceKind = 'background' | 'run' | 'execution' | 'workflow' | 'approval';
+export type BoardSourceKind = 'background' | 'run' | 'execution' | 'workflow' | 'approval' | 'schedule';
 export type BoardPrimaryAction = 'approve' | 'continue' | 'retry_failed_items' | 'open_result' | 'none';
 export type BoardContinueMode = 'approval' | 'background' | 'workflow_failed_items' | 'workflow_resume' | 'open_result' | 'none';
 
@@ -28,6 +28,21 @@ export interface BoardFailureSummary {
   failedItems: number;
   retryable: boolean;
   reason: string;
+}
+
+export interface WorkflowCatchupReadinessItem {
+  kind?: string;
+  name?: string;
+  status?: string;
+  reason?: string;
+  stepIds?: string[];
+}
+
+export interface WorkflowCatchupReadinessSnapshot {
+  ok?: boolean;
+  checkedAt?: string;
+  blockers?: WorkflowCatchupReadinessItem[];
+  warnings?: WorkflowCatchupReadinessItem[];
 }
 
 /** The draft body + image of a CONTENT approval (a post/email), so it's reviewed
@@ -82,6 +97,15 @@ export interface BoardCard {
     pendingApprovalId?: string;
     approvalKind?: string;
     workflowSlug?: string;
+    /** A missed scheduled occurrence held before workflow execution begins. */
+    occurrenceAtMs?: number;
+    scheduledFor?: string;
+    schedule?: string;
+    timezone?: string;
+    missedCount?: number;
+    /** Readiness captured when this missed occurrence was admitted. Resume
+     * rechecks it; Skip remains available even while blockers are unresolved. */
+    readiness?: WorkflowCatchupReadinessSnapshot;
     needsAttention?: boolean;
     outcomeSnapshot?: TaskOutcomeSnapshot;
   };
@@ -453,6 +477,63 @@ export function canStopCanonicalRunFromDrawer(card: BoardCard): boolean {
     && card.cancelEndpoint.startsWith('/api/');
 }
 
+/** A missed schedule is a decision card, not an executing workflow. Its
+ * durable run id identifies the held occurrence, but it has no event stream
+ * or external effects until the user explicitly resumes it. */
+export function isWorkflowCatchupCard(card: BoardCard): boolean {
+  return card.sourceKind === 'schedule'
+    && (card.status === 'missed_schedule' || card.status === 'awaiting_catchup_decision')
+    && typeof card.raw.workflowSlug === 'string'
+    && card.raw.workflowSlug.length > 0
+    && typeof card.raw.runId === 'string'
+    && card.raw.runId.length > 0;
+}
+
+/** Concise, defensive projection for the missed-run decision UI. Held records
+ * may outlive workflow edits or connections, so malformed/stale readiness must
+ * never hide Skip or manufacture a green Resume state. */
+export function workflowCatchupReadinessFacts(card: BoardCard): {
+  blocked: boolean;
+  blockerCount: number;
+  warningCount: number;
+  blockerMessages: string[];
+  warningMessages: string[];
+} {
+  const readiness = card.raw.readiness;
+  if (!isWorkflowCatchupCard(card) || !readiness || typeof readiness !== 'object') {
+    return { blocked: false, blockerCount: 0, warningCount: 0, blockerMessages: [], warningMessages: [] };
+  }
+  const blockers = Array.isArray(readiness.blockers) ? readiness.blockers : [];
+  const warnings = Array.isArray(readiness.warnings) ? readiness.warnings : [];
+  const message = (item: WorkflowCatchupReadinessItem): string => {
+    const reason = typeof item?.reason === 'string' ? item.reason.trim() : '';
+    if (reason) return reason;
+    const name = typeof item?.name === 'string' ? item.name.trim() : '';
+    return name ? `${name} is not ready.` : 'A required workflow dependency is not ready.';
+  };
+  return {
+    blocked: readiness.ok === false || blockers.length > 0,
+    blockerCount: blockers.length,
+    warningCount: warnings.length,
+    blockerMessages: blockers.map(message),
+    warningMessages: warnings.map(message),
+  };
+}
+
+/** Exact authenticated action endpoint for one held occurrence. The legacy
+ * drag-to-Done `cancel` gesture and the explicit button's `skip` intent both
+ * resolve to Skip: this closes only the missed run and keeps future schedules
+ * enabled. */
+export function workflowCatchupActionPath(
+  card: BoardCard,
+  intent: 'resume' | 'cancel' | 'skip',
+): string | null {
+  if (!isWorkflowCatchupCard(card)) return null;
+  const action = intent === 'resume' ? 'resume' : 'skip';
+  return `/api/console/board/workflow-catchups/${encodeURIComponent(card.raw.workflowSlug!)}`
+    + `/${encodeURIComponent(card.raw.runId!)}/${action}`;
+}
+
 export const getBackgroundTaskDetail = (id: string) =>
   apiGet<BackgroundTaskDetail>(`/api/console/background-tasks/${encodeURIComponent(id)}`);
 
@@ -589,7 +670,7 @@ export function rejectReason(card: BoardCard, target: BoardColumnId): string {
 }
 
 export type BoardActionIntent = 'cancel' | 'resume' | 'promote' | 'archive' | 'restore';
-export type BoardButtonIntent = BoardActionIntent | 'approve' | 'reject' | 'retry_failed_items' | 'resume_safe';
+export type BoardButtonIntent = BoardActionIntent | 'approve' | 'reject' | 'retry_failed_items' | 'resume_safe' | 'skip';
 
 /** Answer a parked task's clarifying question from the board drawer — the same
  *  resume machinery as the chat/Home/Discord/Slack bridges, making the Tasks
@@ -614,6 +695,13 @@ export async function runBoardAction(card: BoardCard, intent: BoardButtonIntent)
         return { ok: false, reason: 'The run did not provide a safe cancellation endpoint.' };
       }
       return await apiPost<{ ok: boolean; reason?: string }>(card.cancelEndpoint);
+    }
+    if (card.sourceKind === 'schedule' && (intent === 'resume' || intent === 'cancel' || intent === 'skip')) {
+      const endpoint = workflowCatchupActionPath(card, intent);
+      if (!endpoint) {
+        return { ok: false, reason: 'This missed run no longer has a valid occurrence identity.' };
+      }
+      return await apiPost<{ ok: boolean; reason?: string }>(endpoint);
     }
     if (card.sourceKind === 'workflow' && intent === 'retry_failed_items' && card.raw.runId) {
       const workflowName = card.raw.workflowSlug || card.raw.workflowName || card.title;
@@ -666,6 +754,7 @@ export function sourceLabel(kind: BoardSourceKind): string {
     case 'execution': return 'Tracked';
     case 'run': return 'Run';
     case 'approval': return 'Approval';
+    case 'schedule': return 'Missed run';
   }
 }
 

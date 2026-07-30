@@ -560,6 +560,25 @@ export interface QueuedRunRecord {
   workflow: string;
   inputs?: Record<string, string>;
   status?: string;
+  /** A run descended from a missed scheduled occurrence. Execution admission
+   *  permits at most one such lineage at a time. */
+  catchupFire?: boolean;
+  /** Root occurrence age, preserved across every requeue for fair admission. */
+  catchupOccurrenceAtMs?: number;
+  /** User-owned stale-occurrence decision. Only `resumed` is executable;
+   * `held` remains outside the drain until Resume/Skip wins the record lock. */
+  catchupDisposition?: 'held' | 'resumed' | 'skipped';
+  /** Stable workflow entry identity and collapsed-window evidence for the
+   * recovery card. These are durable metadata, never model instructions. */
+  workflowSlug?: string;
+  catchupFirstDueAtMs?: number;
+  catchupScheduledAtMs?: number;
+  catchupMissedCount?: number;
+  catchupDecidedAt?: string;
+  catchupHeldAt?: string;
+  /** Occurrence-stable scheduler receipt and requeue lineage. */
+  triggerReceiptId?: string;
+  requeuedFromRunId?: string;
   createdAt?: string;
   startedAt?: string;
   finishedAt?: string;
@@ -7289,15 +7308,273 @@ export function reapResolvedParkedRuns(): void {
 // concurrent slots (or two overlapping drain passes). Module-scoped so
 // it persists across passes.
 const inFlightRunIds = new Set<string>();
+// Catch-ups are globally single-flight at the point where work can actually
+// execute. Parked/capability-blocked records never enter the eligible set, so
+// they release this slot; once resumed as `running`, they must win admission
+// again. Keep this separate from inFlightRunIds so ordinary runs may consume
+// the remaining bounded-pool capacity.
+const inFlightCatchupRunIds = new Set<string>();
+
+type WorkflowDrainCandidate = { file: string; filePath: string; run: QueuedRunRecord };
+
+function catchupAdmissionAge(run: QueuedRunRecord): number {
+  if (Number.isFinite(run.catchupOccurrenceAtMs)) return run.catchupOccurrenceAtMs!;
+  const createdAtMs = Date.parse(run.createdAt ?? '');
+  return Number.isFinite(createdAtMs) ? createdAtMs : 0;
+}
+
+interface LegacyScheduledCatchupIdentity {
+  workflowSlug: string;
+  scheduledAtMs: number;
+}
+
+/** v3.0.1/v3.0.2 scheduler authority was encoded in the random run id because
+ * those releases did not yet mint occurrence receipts. Bind that id back to
+ * the admission timestamp so a hand-authored `source:"schedule"` record is not
+ * enough to gain upgrade-migration authority. */
+function historicalSchedulerAdmissionAtMs(run: QueuedRunRecord): number | null {
+  const match = /^sched-(\d{12,14})-[a-f0-9]{6}$/.exec(run.id);
+  if (!match) return null;
+  const idAtMs = Number(match[1]);
+  const createdAtMs = Date.parse(run.createdAt ?? '');
+  if (
+    !Number.isSafeInteger(idAtMs)
+    || idAtMs < 0
+    || !Number.isFinite(createdAtMs)
+    // createdAt is captured immediately before the create-only run-id install.
+    // Leave generous room for a slow local readiness scan without accepting an
+    // unrelated scheduler-looking id copied onto an old record.
+    || Math.abs(idAtMs - createdAtMs) > 5 * 60_000
+  ) return null;
+  return Math.floor(createdAtMs);
+}
+
+function legacyScheduledCatchupIdentity(run: QueuedRunRecord): LegacyScheduledCatchupIdentity | null {
+  if (
+    run.status !== 'queued'
+    || run.catchupDisposition !== undefined
+    || run.source !== 'schedule'
+  ) return null;
+
+  // Every historical scheduler admission in the supported upgrade range
+  // carries the immutable definition snapshot written by queueWorkflowRun.
+  // Besides authenticating the exact definition, it is the only reliable
+  // source for the stable directory slug: record.workflow is the mutable
+  // display name in v3.0.1/v3.0.2.
+  const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
+  if (
+    admitted.status !== 'valid'
+    || admitted.snapshot.definition.name.trim() !== run.workflow.trim()
+  ) return null;
+  const workflowSlug = admitted.snapshot.workflowSlug;
+
+  // A short-lived pre-release shape included the canonical occurrence receipt.
+  // Keep accepting it, but bind it to the authenticated snapshot slug.
+  if (run.triggerReceiptId !== undefined) {
+    // The current scheduler also receipts ordinary live-minute fires. Only the
+    // explicit pre-pause catch-up marker authorizes upgrade holding; otherwise
+    // this bridge would turn every normal scheduled run into a Resume prompt.
+    if (run.catchupFire !== true || typeof run.triggerReceiptId !== 'string') return null;
+    const receipt = /^workflow-schedule:v1:([^:]+):(\d+)$/.exec(run.triggerReceiptId);
+    if (!receipt || receipt[1] !== workflowSlug) return null;
+    const scheduledAtMs = Number(receipt[2]);
+    if (!Number.isSafeInteger(scheduledAtMs) || scheduledAtMs < 0) return null;
+    if (
+      Number.isFinite(run.catchupOccurrenceAtMs)
+      && (
+        !Number.isSafeInteger(run.catchupOccurrenceAtMs)
+        || run.catchupOccurrenceAtMs! < 0
+        || run.catchupOccurrenceAtMs! > scheduledAtMs
+      )
+    ) return null;
+    return { workflowSlug, scheduledAtMs };
+  }
+
+  // Actual v3.0.1/v3.0.2 records omitted catchupFire entirely. The final
+  // pre-pause anti-stampede build added catchupFire=true, but still omitted the
+  // receipt and occurrence timestamp. Both retained the exact scheduler id,
+  // empty scheduled inputs, snapshot, and source shape.
+  if (run.catchupFire !== undefined && run.catchupFire !== true) return null;
+  const scheduledAtMs = historicalSchedulerAdmissionAtMs(run);
+  if (scheduledAtMs === null) return null;
+  if (
+    Number.isFinite(run.catchupOccurrenceAtMs)
+    && (
+      !Number.isSafeInteger(run.catchupOccurrenceAtMs)
+      || run.catchupOccurrenceAtMs! < 0
+      || run.catchupOccurrenceAtMs! > scheduledAtMs
+    )
+  ) return null;
+  return { workflowSlug, scheduledAtMs };
+}
+
+/** Conservative v3.0.x bridge. Only the original, provably-unstarted
+ * scheduler record may become held. A requeue descendant, a run with any
+ * execution projection, or a record with a run-local artifact directory is
+ * left alone because work may already have crossed an effect boundary. */
+export function _testOnly_isLegacyScheduledCatchupSafeToHold(
+  run: QueuedRunRecord,
+  runArtifactsExist = false,
+): boolean {
+  if (!legacyScheduledCatchupIdentity(run) || runArtifactsExist) return false;
+  return (
+    run.inputs !== undefined
+    && run.inputs !== null
+    && typeof run.inputs === 'object'
+    && !Array.isArray(run.inputs)
+    && Object.keys(run.inputs).length === 0
+    && run.startedAt === undefined
+    && run.finishedAt === undefined
+    && run.cancelledAt === undefined
+    && run.originSessionId === undefined
+    && run.originSessionIds === undefined
+    && run.requeuedFromRunId === undefined
+    && run.retryFailedItemsFromRunId === undefined
+    && run.retryFailedItemsStepId === undefined
+    && run.retryFailedItemKeys === undefined
+    && run.targetStepId === undefined
+    && run.selfHealAttempt === undefined
+    && run.goalAttempt === undefined
+    && run.stepOutputs === undefined
+    && run.output === undefined
+    && run.error === undefined
+    && run.mutationContractSnapshot === undefined
+    && run.parked === undefined
+    && run.capabilityBlock === undefined
+    && run.workflowGraphFinalizingFingerprint === undefined
+    && run.reportBack === undefined
+  );
+}
+
+function legacyCatchupRunArtifactsExist(identity: LegacyScheduledCatchupIdentity, runId: string): boolean {
+  return existsSync(path.join(WORKFLOWS_DIR, identity.workflowSlug, 'runs', runId));
+}
+
+/** Atomically freezes an upgrade-era queued catch-up before it can enter the
+ * execution pool. Returns the authoritative post-lock record. */
+function migrateLegacyScheduledCatchupToHold(
+  filePath: string,
+  snapshot: QueuedRunRecord,
+): QueuedRunRecord {
+  const identity = legacyScheduledCatchupIdentity(snapshot);
+  if (
+    !identity
+    || !_testOnly_isLegacyScheduledCatchupSafeToHold(
+      snapshot,
+      legacyCatchupRunArtifactsExist(identity, snapshot.id),
+    )
+  ) return snapshot;
+
+  const result = withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    if (!current) return snapshot;
+    const currentIdentity = legacyScheduledCatchupIdentity(current);
+    if (
+      !currentIdentity
+      || !_testOnly_isLegacyScheduledCatchupSafeToHold(
+        current,
+        legacyCatchupRunArtifactsExist(currentIdentity, current.id),
+      )
+    ) return current;
+    const firstDueAtMs = Number.isFinite(current.catchupOccurrenceAtMs)
+      ? Math.floor(current.catchupOccurrenceAtMs!)
+      : currentIdentity.scheduledAtMs;
+    const heldAt = new Date().toISOString();
+    const held: QueuedRunRecord = {
+      ...current,
+      status: 'awaiting_catchup_decision',
+      catchupFire: true,
+      catchupOccurrenceAtMs: firstDueAtMs,
+      catchupDisposition: 'held',
+      workflowSlug: currentIdentity.workflowSlug,
+      catchupFirstDueAtMs: firstDueAtMs,
+      catchupScheduledAtMs: currentIdentity.scheduledAtMs,
+      catchupMissedCount: 1,
+      catchupHeldAt: heldAt,
+    };
+    writeWorkflowRunRecordDurablyUnlocked(filePath, held);
+    return held;
+  });
+  if (result.catchupDisposition === 'held') {
+    try {
+      addNotification({
+        id: `system-workflow-catchup-held-${result.id}`,
+        kind: 'system',
+        title: `Scheduled workflow waiting: "${result.workflow}"`,
+        body:
+          `"${result.workflow}" was queued by an older Clementine version and remained unstarted during the upgrade. `
+          + 'It is paused before execution; no workflow steps have run. Open Tasks to review it, then Resume or Skip.',
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: {
+          errorCategory: 'workflow_schedule_catchup_held',
+          workflow: result.workflow,
+          workflowRunId: result.id,
+          runId: result.id,
+          catchupHeld: true,
+          legacyMigration: true,
+        },
+      });
+    } catch { /* the durable Tasks card remains authoritative */ }
+  }
+  return result;
+}
+
+/** Focused proof seam for the one-time legacy migration. */
+export const _testOnly_migrateLegacyScheduledCatchupToHold = migrateLegacyScheduledCatchupToHold;
+
+function selectWorkflowDrainCandidates<T extends { run: QueuedRunRecord }>(
+  eligible: T[],
+  catchupSlotOccupied = inFlightCatchupRunIds.size > 0,
+): T[] {
+  // Defense in depth: production status filtering already excludes held runs,
+  // but the admission selector itself must never let malformed/stale callers
+  // count a held decision as executable concurrency.
+  const executable = eligible.filter((item) =>
+    item.run.status !== 'awaiting_catchup_decision'
+    && item.run.catchupDisposition !== 'held');
+  if (catchupSlotOccupied) return executable.filter((item) => item.run.catchupFire !== true);
+  const oldestCatchup = executable
+    .filter((item) => item.run.catchupFire === true)
+    .sort((a, b) =>
+      catchupAdmissionAge(a.run) - catchupAdmissionAge(b.run)
+      || a.run.id.localeCompare(b.run.id))[0];
+  if (!oldestCatchup) return executable;
+  return executable.filter((item) =>
+    item.run.catchupFire !== true || item.run.id === oldestCatchup.run.id);
+}
+
+/** Direct deterministic proof seam; the production drain uses the same
+ * selector immediately before entering its bounded execution pool. */
+export function _testOnly_selectWorkflowDrainCandidates(
+  runs: QueuedRunRecord[],
+  catchupSlotOccupied = false,
+): QueuedRunRecord[] {
+  return selectWorkflowDrainCandidates(
+    runs.map((run) => ({ run })),
+    catchupSlotOccupied,
+  ).map((item) => item.run);
+}
 
 // How many queued runs may execute at once. Read at call time so it's
 // runtime-configurable and testable. Default 1 = today's sequential
 // behavior (forward-only: no behavior change until explicitly raised);
 // set CLEMENTINE_WORKFLOW_RUN_CONCURRENCY=3 (etc.) to let independent
 // runs progress in parallel once you've soaked it.
+const MAX_RUN_DRAIN_CONCURRENCY = 4;
+/** Test seam for the clamp — the ceiling is a safety property, so it is pinned. */
+export const _testOnly_runDrainConcurrency = (): number => runDrainConcurrency();
 function runDrainConcurrency(): number {
   const raw = parseInt(getRuntimeEnv('CLEMENTINE_WORKFLOW_RUN_CONCURRENCY', '1') || '1', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 1;
+  if (!Number.isFinite(raw) || raw <= 0) return 1;
+  // Upper clamp (v3.0.1 incident): this knob had NO ceiling, so any positive
+  // value was honored on the heaviest resource in the product. A machine that
+  // exhausts itself gets its daemon SIGKILLed, restarts into the same backlog,
+  // and repeats — the failure is self-reinforcing, so the ceiling is a safety
+  // property rather than a preference. Concurrent workflow runs each carry a
+  // model lane plus tool subprocesses; beyond a handful the wall-clock win is
+  // gone and only the crash risk remains.
+  return Math.min(raw, MAX_RUN_DRAIN_CONCURRENCY);
 }
 
 // Flag-gate for the constrained, structured-output step agent. Default
@@ -7456,6 +7733,14 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
       dashboardNotified = terminalDashboardNotificationRunIdsFrom(notifications);
     } catch { /* best-effort: a bad notification log must not block the cancel notify */ }
     let notificationPersisted = reported.has(run.id) || dashboardNotified.has(run.id);
+    const skippedHeldCatchup = run.catchupDisposition === 'skipped';
+    const skipReasonAlreadyProvesNoExecution = typeof run.error === 'string'
+      && /\b(?:before (?:any )?workflow step|no workflow steps? (?:ran|were run)|before execution)\b/i.test(run.error);
+    const terminalDetail = skippedHeldCatchup
+      ? skipReasonAlreadyProvesNoExecution
+        ? run.error!
+        : `${run.error || 'You skipped this missed workflow occurrence.'} No workflow steps ran.`
+      : run.error || 'This workflow run was cancelled.';
     if (shouldNotifyCancelledRun(run, Date.now(), reported)) {
       addNotification({
         // Stable id → addNotification id-dedup makes this at-most-once even if
@@ -7463,11 +7748,18 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
         // card for the same run.
         id: `workflow-${run.id}-cancelled`,
         kind: 'workflow',
-        title: `Workflow cancelled: ${run.workflow}`,
-        body: run.error || 'This workflow run was cancelled.',
+        title: skippedHeldCatchup
+          ? `Missed workflow skipped: ${run.workflow}`
+          : `Workflow cancelled: ${run.workflow}`,
+        body: terminalDetail,
         createdAt: new Date().toISOString(),
         read: false,
-        metadata: { workflow: run.workflow, runId: run.id, status: 'cancelled' },
+        metadata: {
+          workflow: run.workflow,
+          runId: run.id,
+          status: skippedHeldCatchup ? 'skipped' : 'cancelled',
+          ...(skippedHeldCatchup ? { catchupSkipped: true } : {}),
+        },
       });
       notificationPersisted = true;
       // A chat-fired run's cancellation re-enters the origin chat too —
@@ -7480,7 +7772,7 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
         recordAndAttemptWorkflowRunReportBack(filePath, {
           workflowName: run.workflow,
           outcome: 'failed',
-          detail: run.error || 'This workflow run was cancelled.',
+          detail: terminalDetail,
         });
       }
     }
@@ -7494,11 +7786,27 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
 
 async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
   const workflows = listWorkflows();
-  const eligible: Array<{ file: string; filePath: string; run: QueuedRunRecord }> = [];
+  const eligible: WorkflowDrainCandidate[] = [];
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     let run = readRunRecord(filePath);
     if (!run) continue;
+    // One-time upgrade bridge: legacy versions wrote a missed schedule
+    // directly as queued. Freeze only a pristine original scheduler record,
+    // under the same lock as every other run transition, before eligibility is
+    // considered. If durability fails, fail closed for this tick rather than
+    // executing stale work the user has not chosen to resume.
+    if (legacyScheduledCatchupIdentity(run)) {
+      try {
+        run = migrateLegacyScheduledCatchupToHold(filePath, run);
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err), runId: run.id },
+          'Could not durably hold legacy scheduled catch-up; execution remains closed',
+        );
+        continue;
+      }
+    }
     // A terminal outcome is a durable delivery intent, not a one-shot side
     // effect. Retry failed origins and late observer sidecars every drain tick;
     // duplicate turns acknowledge successfully without being appended again.
@@ -7535,16 +7843,20 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
     eligible.push({ file, filePath, run });
   }
   if (eligible.length === 0) return;
+  const admitted = selectWorkflowDrainCandidates(eligible);
+  if (admitted.length === 0) return;
 
   await runBoundedPool(
-    eligible,
+    admitted,
     runDrainConcurrency(),
     async (item) => {
       if (inFlightRunIds.has(item.run.id)) return;
       inFlightRunIds.add(item.run.id);
+      if (item.run.catchupFire === true) inFlightCatchupRunIds.add(item.run.id);
       try {
         await processOneRunFile(item.file, item.filePath, item.run, workflows, assistant);
       } finally {
+        inFlightCatchupRunIds.delete(item.run.id);
         inFlightRunIds.delete(item.run.id);
       }
     },

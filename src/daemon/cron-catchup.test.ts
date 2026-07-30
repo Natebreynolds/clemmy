@@ -14,12 +14,17 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.DISCORD_ENABLED = 'false';
 process.env.SLACK_ENABLED = 'false';
 process.env.WEBHOOK_ENABLED = 'false';
+process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { cronMatchedKeysInWindow } = await import('./runner.js');
+const {
+  cronMatchedKeysInWindow,
+  cronMatchedOccurrencesInWindow,
+  cronOccurrenceSessionId,
+} = await import('./runner.js');
 const { scheduleCatchupWindow } = await import('../execution/workflow-scheduler.js');
 
 test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
@@ -62,4 +67,37 @@ test('a week offline: backfill is capped at 24h (older occurrences stay missed, 
   const window = scheduleCatchupWindow(lastTick, NOW);
   const keys = cronMatchedKeysInWindow('0 9 * * *', window, undefined);
   assert.equal(keys.length, 1, 'only the in-window (last 24h) daily occurrence backfills');
+});
+
+test('epoch dedupe survives DST fall-back when the local minute key moves backward', () => {
+  const priorTz = process.env.TZ;
+  process.env.TZ = 'America/Los_Angeles';
+  try {
+    const first = new Date('2026-11-01T08:59:00.000Z'); // 01:59 PDT
+    const second = new Date('2026-11-01T09:00:00.000Z'); // 01:00 PST
+    const matched = cronMatchedOccurrencesInWindow(
+      '* * * * *',
+      [second],
+      first.getTime(),
+      '2026-11-01T01:59',
+    );
+    assert.equal(matched.length, 1);
+    assert.ok(matched[0].minuteKey < '2026-11-01T01:59', 'the local key rolled backward');
+    assert.ok(matched[0].atMs > first.getTime(), 'the physical occurrence remains strictly newer');
+  } finally {
+    if (priorTz === undefined) delete process.env.TZ;
+    else process.env.TZ = priorTz;
+  }
+});
+
+test('scheduled retry identity is stable per occurrence and fresh for the next recurrence', () => {
+  assert.equal(
+    cronOccurrenceSessionId('daily-brief', 123_000),
+    cronOccurrenceSessionId('daily-brief', 123_000),
+  );
+  assert.notEqual(
+    cronOccurrenceSessionId('daily-brief', 123_000),
+    cronOccurrenceSessionId('daily-brief', 183_000),
+    'external-write receipts from one legitimate recurrence must not suppress the next',
+  );
 });

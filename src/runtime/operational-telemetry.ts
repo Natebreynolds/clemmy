@@ -34,6 +34,9 @@ export const WORKFLOW_OPERATIONAL_EVENT_TYPES = [
   'workflow_rollback_completed',
   'workflow_trigger_fired',
   'workflow_trigger_deduped',
+  // A missed scheduled occurrence was durably admitted but intentionally did
+  // not execute: it is waiting for the user's Resume/Skip decision.
+  'workflow_catchup_held',
   'workflow_resume_replayed',
   // A workflow step / forEach item failed transiently and is being retried
   // after backoff (mirrored from the runner's step_retry / item_retry events).

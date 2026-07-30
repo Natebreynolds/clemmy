@@ -6,10 +6,14 @@ import {
   canStopCanonicalRunFromDrawer,
   findBoardCardForRun,
   cardTone,
+  isWorkflowCatchupCard,
   intentForDrop,
   pendingActionReviewFacts,
   reconcileOpenBoardCard,
   rejectReason,
+  sourceLabel,
+  workflowCatchupReadinessFacts,
+  workflowCatchupActionPath,
   type BoardCard,
 } from './board';
 
@@ -218,6 +222,85 @@ test('drag Needs You → Running approves a parked card; non-approvable cards sn
   // fires when the card actually carries an approvable action.
   const resumable = card({ id: 'bg-1', column: 'needs_you', status: 'awaiting_continue', actions: ['resume', 'cancel'] });
   assert.equal(intentForDrop(resumable, 'running'), 'resume');
+});
+
+test('a held missed schedule has exact Resume/Skip actions without pretending to be a live run', () => {
+  const held = card({
+    id: 'catchup:sched-held-1',
+    sourceKind: 'schedule',
+    column: 'needs_you',
+    status: 'awaiting_catchup_decision',
+    sessionId: null,
+    actions: ['resume', 'cancel', 'skip'],
+    raw: {
+      workflowName: 'Morning prospect outreach',
+      workflowSlug: 'morning-prospect-outreach',
+      runId: 'sched-held-1',
+      occurrenceAtMs: Date.parse('2026-07-28T15:00:00.000Z'),
+      scheduledFor: '2026-07-28T15:00:00.000Z',
+      missedCount: 3,
+    },
+  });
+
+  assert.equal(isWorkflowCatchupCard(held), true);
+  assert.equal(sourceLabel(held.sourceKind), 'Missed run');
+  assert.deepEqual(cardTone(held), { tone: 'warning', label: 'Missed schedule' });
+  assert.equal(intentForDrop(held, 'running'), 'resume');
+  assert.equal(intentForDrop(held, 'done'), 'cancel',
+    'Done uses the existing cancel gesture, translated to a no-effects skip at the action boundary');
+  assert.equal(
+    workflowCatchupActionPath(held, 'resume'),
+    '/api/console/board/workflow-catchups/morning-prospect-outreach/sched-held-1/resume',
+  );
+  assert.equal(
+    workflowCatchupActionPath(held, 'skip'),
+    '/api/console/board/workflow-catchups/morning-prospect-outreach/sched-held-1/skip',
+  );
+
+  const stale = { ...held, raw: { ...held.raw, runId: undefined } };
+  assert.equal(isWorkflowCatchupCard(stale), false, 'a stale card without exact durable identity fails closed');
+  assert.equal(workflowCatchupActionPath(stale, 'resume'), null);
+});
+
+test('a blocked held schedule keeps actionable readiness while Skip remains available', () => {
+  const held = card({
+    id: 'catchup:sched-blocked-1',
+    sourceKind: 'schedule',
+    column: 'needs_you',
+    status: 'awaiting_catchup_decision',
+    sessionId: null,
+    actions: ['resume', 'cancel', 'skip'],
+    raw: {
+      workflowSlug: 'scripted-brief',
+      runId: 'sched-blocked-1',
+      readiness: {
+        ok: false,
+        blockers: [{
+          kind: 'script',
+          name: 'merge.py',
+          status: 'missing',
+          reason: 'Workflow script "merge.py" is missing.',
+          stepIds: ['merge'],
+        }],
+        warnings: [{
+          kind: 'composio',
+          name: 'gmail',
+          status: 'unknown',
+          reason: 'Gmail connection could not be confirmed.',
+          stepIds: ['send'],
+        }],
+      },
+    },
+  });
+
+  assert.deepEqual(workflowCatchupReadinessFacts(held), {
+    blocked: true,
+    blockerCount: 1,
+    warningCount: 1,
+    blockerMessages: ['Workflow script "merge.py" is missing.'],
+    warningMessages: ['Gmail connection could not be confirmed.'],
+  });
+  assert.ok(held.actions.includes('skip'), 'readiness blockers never remove the no-effects Skip decision');
 });
 
 // A parked run must never wear a live "Working" pill — it is waiting on a
