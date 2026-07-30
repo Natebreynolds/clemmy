@@ -2,11 +2,11 @@
   "name": "@clemmy/desktop",
   "version": "3.1.0",
   "private": true,
-  "description": "Clementine \u2014 native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
+  "description": "Clementine — native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
   "main": "dist/main.js",
   "type": "module",
   "scripts": {
-    "build": "npm run build:notch-helper && tsc -p . && tsc -p tsconfig.preload.json && node scripts/rename-preload.mjs",
+    "build": "npm run build:notch-helper && tsc -p . && tsc -p tsconfig.preload.json --noEmit && node scripts/build-preload.mjs",
     "build:notch-helper": "node scripts/build-notch-click-helper.mjs",
     "typecheck": "tsc -p . --noEmit",
     "dev": "npm run build:notch-helper && tsx src/main.ts",
@@ -34,6 +34,7 @@
     "@types/node": "^24.13.2",
     "electron": "^43.0.0",
     "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.1",
     "tar": "7.5.22",
     "tsx": "^4.23.1",
     "typescript": "^5.7.0"

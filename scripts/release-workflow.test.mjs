@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { load } from 'js-yaml';
 import {
   assertValidCandidateVersion,
@@ -284,6 +285,37 @@ test('candidate dispatcher defaults to the next patch prerelease and rejects dow
   assert.match(dispatcherText, /release-candidate-version\.mjs default/);
   assert.match(dispatcherText, /release-candidate-version\.mjs validate/);
   assert.match(runScripts(workflow.jobs?.preflight), /release-candidate-version\.mjs validate/);
+});
+
+test('preload scripts bundle to self-contained files a sandboxed renderer can load', () => {
+  // Live incident (v3.0.x–v3.1.0): the bare tsc emit shipped
+  // `require("./workspace-view-url.cjs")` inside preload.cjs. The dashboard
+  // window runs sandboxed, where require() resolves ONLY 'electron' — the
+  // preload threw on load and the entire window.clemmy bridge (updater UI,
+  // notch settings, meeting capture) silently died in the packaged app.
+  const buildScript = String(desktopPackage.scripts?.build ?? '');
+  assert.match(buildScript, /build-preload\.mjs/);
+  assert.doesNotMatch(buildScript, /rename-preload/);
+  const builderText = readFileSync(
+    new URL('../apps/desktop/scripts/build-preload.mjs', import.meta.url),
+    'utf-8',
+  );
+  assert.match(builderText, /bundle: true/);
+  assert.match(builderText, /external: \['electron'\]/);
+  assert.match(builderText, /sandbox/i, 'the script must explain the sandboxed-require constraint');
+
+  const run = spawnSync(process.execPath, ['scripts/build-preload.mjs'], {
+    cwd: fileURLToPath(new URL('../apps/desktop', import.meta.url)),
+    encoding: 'utf-8',
+  });
+  assert.equal(run.status, 0, run.stderr);
+  for (const name of ['preload', 'live-preload']) {
+    const built = readFileSync(new URL(`../apps/desktop/dist/${name}.cjs`, import.meta.url), 'utf-8');
+    const foreign = [...built.matchAll(/\brequire\((["'])([^"']+)\1\)/g)]
+      .map((m) => m[2])
+      .filter((specifier) => specifier !== 'electron');
+    assert.deepEqual(foreign, [], `${name}.cjs must only require 'electron' — a sandboxed preload cannot load anything else`);
+  }
 });
 
 test('unsigned macOS rehearsal overrides the configured production signing identity', () => {
