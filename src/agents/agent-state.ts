@@ -40,6 +40,7 @@ export interface AgentStateRecord {
   commitments?: string[];
   nextWakeAt?: string;
   lastError?: string;
+  failedInboxFingerprint?: string;
 }
 
 function inboxFilePath(slug: string): string {

@@ -1,4 +1,14 @@
-import { existsSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import matter from 'gray-matter';
@@ -33,7 +43,7 @@ import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { fireDueTimers } from '../runtime/timers.js';
 import { syncProspectiveIntentions } from '../runtime/prospective-sync.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
-import { maxCatchupFiresPerTick, processWorkflowSchedules, reapStaleWorkflowRuns, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
+import { processWorkflowSchedules, reapStaleWorkflowRuns, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
 import { recoverPendingWorkflowTriggerEvents, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
@@ -116,6 +126,12 @@ interface CronJobRecord {
 
 interface DaemonState {
   lastCronRunByMinute: Record<string, string>;
+  /** Canonical occurrence identity. Local minute strings repeat during DST
+   *  fall-back; epoch minutes do not. Optional for legacy state records. */
+  lastCronRunAtMs?: Record<string, number>;
+  /** Frozen work discovered before the rolling 24h scan advances. These
+   *  occurrences survive restarts and are never retention-pruned. */
+  pendingCronOccurrences?: Record<string, PendingCronOccurrence>;
   // Wall-clock heartbeat written on every tick so a boot-time check
   // can detect daemon-offline gaps and notify the user about cron runs
   // that would have fired during the outage. Without this, a daemon
@@ -135,6 +151,15 @@ interface DaemonState {
   // Tier A2/A3: nightly memory-hygiene day-stamp (decay + dedup). Same
   // once-per-local-day-across-restarts contract as recursive reflection.
   lastMemoryHygieneDay?: string;
+}
+
+interface PendingCronOccurrence {
+  /** Stable admission age while newer occurrences collapse into atMs. */
+  firstDueAtMs: number;
+  atMs: number;
+  minuteKey: string;
+  scheduleKey: string;
+  missed: number;
 }
 
 const DELIVERY_MAX_ATTEMPTS = 5;
@@ -205,10 +230,10 @@ function sleep(ms: number): Promise<void> {
 
 function loadState(): DaemonState {
   if (!existsSync(STATE_FILE)) {
-    return { lastCronRunByMinute: {} };
+    return normalizeDaemonScheduleState({ lastCronRunByMinute: {} });
   }
   try {
-    return JSON.parse(readFileSync(STATE_FILE, 'utf-8')) as DaemonState;
+    return normalizeDaemonScheduleState(JSON.parse(readFileSync(STATE_FILE, 'utf-8')) as DaemonState);
   } catch (err) {
     // Notify-don't-swallow (2026-07-20 schedules audit G4): a corrupt state
     // file silently disabled missed-run detection (lastHealthyTickAt gone) and
@@ -225,8 +250,63 @@ function loadState(): DaemonState {
         read: false,
       });
     } catch { /* best-effort; the log line stands */ }
-    return { lastCronRunByMinute: {} };
+    return normalizeDaemonScheduleState({ lastCronRunByMinute: {} });
   }
+}
+
+function normalizeDaemonScheduleState(state: DaemonState): DaemonState {
+  if (
+    !state.lastCronRunByMinute
+    || typeof state.lastCronRunByMinute !== 'object'
+    || Array.isArray(state.lastCronRunByMinute)
+  ) {
+    state.lastCronRunByMinute = {};
+  } else {
+    for (const [name, value] of Object.entries(state.lastCronRunByMinute)) {
+      if (typeof value !== 'string') delete state.lastCronRunByMinute[name];
+    }
+  }
+  if (
+    !state.lastCronRunAtMs
+    || typeof state.lastCronRunAtMs !== 'object'
+    || Array.isArray(state.lastCronRunAtMs)
+  ) {
+    state.lastCronRunAtMs = {};
+  } else {
+    for (const [name, value] of Object.entries(state.lastCronRunAtMs)) {
+      if (!Number.isFinite(value)) delete state.lastCronRunAtMs[name];
+    }
+  }
+  if (
+    !state.pendingCronOccurrences
+    || typeof state.pendingCronOccurrences !== 'object'
+    || Array.isArray(state.pendingCronOccurrences)
+  ) {
+    state.pendingCronOccurrences = {};
+  } else {
+    for (const [name, value] of Object.entries(state.pendingCronOccurrences)) {
+      if (
+        value
+        && typeof value === 'object'
+        && Number.isFinite(value.atMs)
+        && typeof value.minuteKey === 'string'
+        && typeof value.scheduleKey === 'string'
+      ) {
+        state.pendingCronOccurrences[name] = {
+          firstDueAtMs: Number.isFinite(value.firstDueAtMs)
+            ? Math.floor(value.firstDueAtMs / 60_000) * 60_000
+            : Math.floor(value.atMs / 60_000) * 60_000,
+          atMs: Math.floor(value.atMs / 60_000) * 60_000,
+          minuteKey: value.minuteKey,
+          scheduleKey: value.scheduleKey,
+          missed: Number.isFinite(value.missed) && value.missed >= 0 ? Math.floor(value.missed) : 0,
+        };
+      } else {
+        delete state.pendingCronOccurrences[name];
+      }
+    }
+  }
+  return state;
 }
 
 // Cron deduplication keys are minute-stamped strings like
@@ -238,23 +318,58 @@ function loadState(): DaemonState {
 const CRON_STATE_RETENTION_DAYS = 7;
 
 function pruneDaemonState(state: DaemonState): DaemonState {
-  const cutoff = new Date(Date.now() - CRON_STATE_RETENTION_DAYS * 24 * 60 * 60 * 1000)
-    .toISOString()
-    .slice(0, 16); // YYYY-MM-DDTHH:MM — lexicographically comparable to currentMinuteKey
+  normalizeDaemonScheduleState(state);
+  const referenceMs = Number.isFinite(state.lastCronEvaluatedAtMs) ? state.lastCronEvaluatedAtMs! : Date.now();
+  const cutoffMs = referenceMs - CRON_STATE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const legacyCutoff = new Date(cutoffMs).toISOString().slice(0, 16);
   const next: Record<string, string> = {};
+  const nextEpoch: Record<string, number> = {};
   for (const [name, key] of Object.entries(state.lastCronRunByMinute)) {
-    if (key >= cutoff) next[name] = key;
+    const epoch = state.lastCronRunAtMs?.[name];
+    if ((Number.isFinite(epoch) && epoch! >= cutoffMs) || (!Number.isFinite(epoch) && key >= legacyCutoff)) {
+      next[name] = key;
+      if (Number.isFinite(epoch)) nextEpoch[name] = epoch!;
+    }
   }
-  return { ...state, lastCronRunByMinute: next };
+  return { ...state, lastCronRunByMinute: next, lastCronRunAtMs: nextEpoch };
 }
 
 function saveState(state: DaemonState): void {
   ensureDir(path.dirname(STATE_FILE));
   const pruned = pruneDaemonState(state);
-  writeFileSync(STATE_FILE, JSON.stringify(pruned, null, 2), 'utf-8');
+  const tempFile = `${STATE_FILE}.${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+  let tempFd: number | undefined;
+  try {
+    tempFd = openSync(tempFile, 'wx', 0o600);
+    writeFileSync(tempFd, JSON.stringify(pruned, null, 2), 'utf-8');
+    fsyncSync(tempFd);
+    closeSync(tempFd);
+    tempFd = undefined;
+    renameSync(tempFile, STATE_FILE);
+    if (process.platform !== 'win32') {
+      const directoryFd = openSync(path.dirname(STATE_FILE), 'r');
+      try {
+        fsyncSync(directoryFd);
+      } finally {
+        closeSync(directoryFd);
+      }
+    }
+  } catch (err) {
+    if (tempFd !== undefined) {
+      try {
+        closeSync(tempFd);
+      } catch { /* best-effort descriptor cleanup */ }
+    }
+    try {
+      rmSync(tempFile, { force: true });
+    } catch { /* best-effort temp cleanup */ }
+    throw err;
+  }
   // Mutate in place so callers retain a reference to the pruned map —
   // otherwise the next saveState would re-write the dropped entries.
   state.lastCronRunByMinute = pruned.lastCronRunByMinute;
+  state.lastCronRunAtMs = pruned.lastCronRunAtMs;
+  state.pendingCronOccurrences = pruned.pendingCronOccurrences;
 }
 
 function fieldMatch(field: string, value: number): boolean {
@@ -386,16 +501,43 @@ function startCronHeartbeat(job: CronJobRecord, startedAt: string, startMs: numb
   };
 }
 
-async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, source: 'schedule' | 'trigger'): Promise<void> {
+interface CronOccurrenceIdentity {
+  occurrenceAtMs: number;
+}
+
+/** Stable per-physical-occurrence session. Harness external-write receipts are
+ * scoped to a session/run, so a crash replay of the same occurrence sees its
+ * prior dispatch proof while a later recurrence gets a fresh scope. */
+export function cronOccurrenceSessionId(jobName: string, occurrenceAtMs: number): string {
+  return `cron:${jobName}:${Math.floor(occurrenceAtMs / 60_000) * 60_000}`;
+}
+
+async function runCronJob(
+  assistant: ClementineAssistant,
+  job: CronJobRecord,
+  source: 'schedule' | 'trigger',
+  identity?: CronOccurrenceIdentity,
+): Promise<void> {
   const startedAt = new Date().toISOString();
   const startMs = Date.now();
+  const cronSessionId = identity
+    ? cronOccurrenceSessionId(job.name, identity.occurrenceAtMs)
+    : `cron:${job.name}`;
+  const cronRunId = identity
+    ? `cron-occurrence:v1:${job.name}:${Math.floor(identity.occurrenceAtMs / 60_000) * 60_000}`
+    : undefined;
   const stopHeartbeat = startCronHeartbeat(job, startedAt, startMs);
   recordOperationalEvent({
     source: 'scheduler',
     type: 'cron_job_started',
-    sessionId: `cron:${job.name}`,
+    sessionId: cronSessionId,
     actor: `cron:${job.name}`,
-    payload: { job: job.name, source, mode: job.mode },
+    payload: {
+      job: job.name,
+      source,
+      mode: job.mode,
+      ...(identity ? { occurrenceAtMs: identity.occurrenceAtMs } : {}),
+    },
   });
   try {
     const prompt = [
@@ -408,11 +550,10 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       job.prompt,
     ].filter(Boolean).join('\n');
 
-    const cronSessionId = `cron:${job.name}`;
     const cronBudgetMs = resolveCronWallClockMs(job);
     openPlanScope({
       sessionId: cronSessionId,
-      planProposalId: `cron:${job.name}`,
+      planProposalId: cronRunId ?? `cron:${job.name}`,
       approvedPlanObjective: `Approved cron job "${job.name}"`,
       ttlMs: cronBudgetMs + 60_000,
       allowedTools: ['*'],
@@ -422,6 +563,7 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
     // write gates matter most. Kill-switch CLEMMY_HARNESS_CRON=off.
     const response = await respondPreferHarness('cron', {
       sessionId: cronSessionId,
+      ...(cronRunId ? { runId: cronRunId } : {}),
       channel: 'cron',
       message: prompt,
       model: job.mode === 'unleashed' ? MODELS.deep : MODELS.primary,
@@ -445,7 +587,9 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       ...(verdict.delivered ? {} : { blockedReason: verdict.reason }),
     });
     addNotification({
-      id: `${Date.now()}-cron-${job.name}`,
+      id: identity
+        ? `cron-occurrence-${job.name}-${Math.floor(identity.occurrenceAtMs / 60_000) * 60_000}-completed`
+        : `${Date.now()}-cron-${job.name}`,
       kind: 'cron',
       title: verdict.delivered ? `Cron job completed: ${job.name}` : `Cron job needs attention: ${job.name}`,
       // Send the full body. Discord delivery (notification-delivery.ts)
@@ -464,7 +608,7 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       source: 'scheduler',
       type: 'cron_job_completed',
       severity: verdict.delivered ? 'info' : 'warn',
-      sessionId: `cron:${job.name}`,
+      sessionId: cronSessionId,
       actor: `cron:${job.name}`,
       payload: { job: job.name, source, delivered: verdict.delivered, durationMs: Date.now() - startMs, ...(verdict.delivered ? {} : { blockedReason: verdict.reason }) },
     });
@@ -478,7 +622,9 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       error: error instanceof Error ? error.message : String(error),
     });
     addNotification({
-      id: `${Date.now()}-cron-${job.name}-error`,
+      id: identity
+        ? `cron-occurrence-${job.name}-${Math.floor(identity.occurrenceAtMs / 60_000) * 60_000}-error`
+        : `${Date.now()}-cron-${job.name}-error`,
       kind: 'cron',
       title: `Cron job failed: ${job.name}`,
       body: error instanceof Error ? error.message : String(error),
@@ -491,12 +637,12 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       source: 'scheduler',
       type: 'cron_job_failed',
       severity: 'error',
-      sessionId: `cron:${job.name}`,
+      sessionId: cronSessionId,
       actor: `cron:${job.name}`,
       payload: { job: job.name, source, durationMs: Date.now() - startMs, error: error instanceof Error ? error.message : String(error) },
     });
   } finally {
-    closePlanScope(`cron:${job.name}`, 'cron-run-finished');
+    closePlanScope(cronSessionId, 'cron-run-finished');
     stopHeartbeat();
   }
 }
@@ -625,104 +771,218 @@ async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
   }
 }
 
-/** The minute-keys in `window` where `schedule` fires and hasn't already been
- *  deduped. Pure + exported for tests — the collapse rule (fire ONCE on the
- *  LATEST key, report the rest as missed) lives in processCronSchedules. */
+export interface CronMatchedOccurrence {
+  atMs: number;
+  minuteKey: string;
+}
+
+/** Physical occurrences in `window` that have not been handled. Epoch is the
+ *  canonical identity; minuteKey remains for display and legacy migration. */
+export function cronMatchedOccurrencesInWindow(
+  schedule: string,
+  window: Date[],
+  lastFiredAtMs: number | undefined,
+  legacyLastFiredKey?: string,
+): CronMatchedOccurrence[] {
+  const matched: CronMatchedOccurrence[] = [];
+  for (const minute of window) {
+    if (!cronMatches(schedule, minute)) continue;
+    const atMs = Math.floor(minute.getTime() / 60_000) * 60_000;
+    const minuteKey = currentMinuteKey(minute);
+    const handled = Number.isFinite(lastFiredAtMs)
+      ? atMs <= lastFiredAtMs!
+      : legacyLastFiredKey !== undefined && minuteKey <= legacyLastFiredKey;
+    if (!handled) matched.push({ atMs, minuteKey });
+  }
+  return matched;
+}
+
+/** Backwards-compatible minute-key facade used by existing callers/tests. */
 export function cronMatchedKeysInWindow(
   schedule: string,
   window: Date[],
   lastFiredKey: string | undefined,
 ): string[] {
-  const matched: string[] = [];
-  for (const minute of window) {
-    if (!cronMatches(schedule, minute)) continue;
-    const key = currentMinuteKey(minute);
-    // Strictly newer than the last fired key (zero-padded → lexical ==
-    // temporal). The catch-up stagger below can REWIND the evaluation window
-    // to keep held jobs eligible, so equality alone is not enough: a rewound
-    // window must never re-fire an occurrence at or before one already run.
-    if (lastFiredKey === undefined || key > lastFiredKey) matched.push(key);
-  }
-  return matched;
+  return cronMatchedOccurrencesInWindow(schedule, window, undefined, lastFiredKey)
+    .map((occurrence) => occurrence.minuteKey);
 }
+
+/** Cron catch-up has an independent starvation budget. Workflow catch-up's
+ *  one-active invariant must not be weakened by tuning sequential cron work. */
+export function maxCronCatchupFiresPerTick(): number {
+  const raw = parseInt(getRuntimeEnv('CLEMENTINE_CRON_CATCHUP_PER_TICK', '1') || '1', 10);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 10) : 1;
+}
+
+interface CronScheduleLane {
+  token: object;
+  promise: Promise<void>;
+}
+
+// The daemon loop must never await a multi-minute cron brain turn. A dedicated
+// single-flight lane owns the turn while the main loop continues scheduling,
+// watchdog, autonomy, and report-back work.
+let cronScheduleLaneInFlight: CronScheduleLane | undefined;
 
 async function processCronSchedules(assistant: ClementineAssistant, state: DaemonState, now: Date = new Date()): Promise<void> {
-  // Sleep/downtime catch-up (2026-07-20, attorney-bar schedules audit G2):
-  // this loop used to match ONLY `now`, so a laptop asleep at fire time
-  // silently skipped the occurrence — the boot-time missed-run scan never
-  // covers sleep (the process stays resident) and it only NOTIFIES anyway.
-  // Reuse the workflow scheduler's tested primitive: evaluate every minute
-  // since the last tick (24h cap), collapse a job's N missed matches into
-  // ONE run on the LATEST minute, and tell the user what was caught up.
+  normalizeDaemonScheduleState(state);
   const window = scheduleCatchupWindow(state.lastCronEvaluatedAtMs, now.getTime());
   const jobs = loadCronJobs();
-  const nowMinuteKey = currentMinuteKey(now);
-  // Cross-job catch-up budget (sibling of the workflow-scheduler stampede,
-  // v3.0.1). Cron jobs already run SEQUENTIALLY, so the failure here is not
-  // machine exhaustion but loop starvation: each job is a full brain turn with
-  // a multi-minute wall-clock budget, and N missed jobs after downtime block
-  // this tick — and with it workflow scheduling, autonomy, briefs, and the
-  // watchdog — for the SUM of their durations. A catch-up is not urgent by
-  // definition; run at most the budget per tick and hold the rest, ELIGIBLE,
-  // for the next tick.
-  let cronCatchupBudget = maxCatchupFiresPerTick();
-  let heldEarliestMs: number | undefined;
+  const nowMinuteMs = Math.floor(now.getTime() / 60_000) * 60_000;
+  const configured = new Map<string, CronJobRecord>();
+  const pendingByName = state.pendingCronOccurrences!;
 
+  // Freeze every newly discovered occurrence to disk before running any cron.
+  // A 24h scan cap is only a discovery bound; it is never a retention policy
+  // for work we already know is due.
   for (const job of jobs) {
     if (job.enabled === false) continue;
-    const matchedKeys = cronMatchedKeysInWindow(job.schedule, window, state.lastCronRunByMinute[job.name]);
-    if (matchedKeys.length === 0) continue;
-    const latestKey = matchedKeys[matchedKeys.length - 1];
-    const missed = matchedKeys.length - 1;
-    const isCatchupFire = latestKey !== nowMinuteKey;
-    if (isCatchupFire && cronCatchupBudget <= 0) {
-      // Held: no stamp, no notification — the occurrence stays eligible and
-      // the watermark below is parked so the next window still contains it.
-      const heldMs = Date.parse(`${latestKey}:00`);
-      if (Number.isFinite(heldMs) && (heldEarliestMs === undefined || heldMs < heldEarliestMs)) {
-        heldEarliestMs = heldMs;
-      }
-      continue;
+    configured.set(job.name, job);
+    const scheduleKey = job.schedule;
+    let pending: PendingCronOccurrence | undefined = pendingByName[job.name];
+    if (
+      pending
+      && (
+        pending.scheduleKey !== scheduleKey
+        || (
+          Number.isFinite(state.lastCronRunAtMs![job.name])
+          && pending.atMs <= state.lastCronRunAtMs![job.name]
+        )
+      )
+    ) {
+      delete pendingByName[job.name];
+      pending = undefined;
     }
-    if (isCatchupFire) cronCatchupBudget -= 1;
-    // In-memory dedup BEFORE await so a follow-up tick within the
-    // same minute doesn't re-fire. Persist AFTER successful run so a
-    // crash mid-job leaves the disk state clean — the boot-time
-    // missed-run scan will see the gap and surface it instead of
-    // silently treating it as "ran."
-    state.lastCronRunByMinute[job.name] = latestKey;
-    if (missed > 0) {
-      try {
-        addNotification({
-          id: `cron-catchup-${job.name}-${latestKey}`,
-          kind: 'cron',
-          title: `Catching up: ${job.name}`,
-          body: `"${job.name}" missed ${missed} scheduled ${missed === 1 ? 'run' : 'runs'} while the app was closed or your Mac was asleep. Running it once now to catch up.`,
-          createdAt: new Date().toISOString(),
-          read: false,
-          metadata: { cronJob: job.name, missed, firedMinuteKey: latestKey },
-        });
-      } catch { /* the catch-up run below is the substance; the notice is best-effort */ }
+
+    const occurrences = cronMatchedOccurrencesInWindow(
+      job.schedule,
+      window,
+      state.lastCronRunAtMs![job.name],
+      state.lastCronRunByMinute[job.name],
+    );
+    for (const occurrence of occurrences) {
+      if (pending && occurrence.atMs <= pending.atMs) continue;
+      pending = {
+        ...occurrence,
+        firstDueAtMs: pending?.firstDueAtMs ?? occurrence.atMs,
+        scheduleKey,
+        missed: (pending?.missed ?? -1) + 1,
+      };
+      pendingByName[job.name] = pending;
     }
-    await runCronJob(assistant, job, 'schedule');
-    saveState(state);
   }
-  // Hold-aware watermark: advancing unconditionally would drop every held job
-  // out of the next window (the exact silent-loss bug the workflow scheduler's
-  // first stagger had). Park it just before the earliest held minute; the
-  // strictly-newer matcher above makes the rewound window safe for jobs that
-  // already ran.
-  state.lastCronEvaluatedAtMs = heldEarliestMs !== undefined
-    ? Math.min(now.getTime(), heldEarliestMs - 60_000)
-    : now.getTime();
+
+  for (const name of Object.keys(pendingByName)) {
+    if (!configured.has(name)) delete pendingByName[name];
+  }
+  state.lastCronEvaluatedAtMs = nowMinuteMs;
   saveState(state);
+
+  const candidates = jobs
+    .filter((job) => job.enabled !== false && configured.get(job.name) === job)
+    .map((job) => {
+      const occurrence = pendingByName[job.name];
+      return occurrence ? { job, occurrence } : undefined;
+    })
+    .filter((candidate): candidate is NonNullable<typeof candidate> =>
+      candidate !== undefined && candidate.occurrence.atMs <= nowMinuteMs);
+
+  // Live commitments win over recovery. Within each class use oldest-first,
+  // then stable name order, so YAML/config order cannot starve a sibling.
+  candidates.sort((a, b) => {
+    const aLive = a.occurrence.atMs === nowMinuteMs ? 0 : 1;
+    const bLive = b.occurrence.atMs === nowMinuteMs ? 0 : 1;
+    return aLive - bLive
+      || a.occurrence.firstDueAtMs - b.occurrence.firstDueAtMs
+      || a.occurrence.atMs - b.occurrence.atMs
+      || a.job.name.localeCompare(b.job.name);
+  });
+
+  if (cronScheduleLaneInFlight || candidates.length === 0) return;
+  const { job, occurrence } = candidates[0];
+  const token = {};
+  // Start on the next microtask so even synchronous setup (plan scope,
+  // heartbeat, harness routing) is outside the daemon loop's critical path.
+  const promise = Promise.resolve()
+    .then(() => executeCronScheduleOccurrence(assistant, state, job, occurrence))
+    .catch((err) => {
+      logger.error(
+        {
+          err: err instanceof Error ? err.message : String(err),
+          job: job.name,
+          occurrenceAtMs: occurrence.atMs,
+        },
+        'Cron schedule lane failed before its durable completion commit',
+      );
+    })
+    .finally(() => {
+      if (cronScheduleLaneInFlight?.token === token) cronScheduleLaneInFlight = undefined;
+    });
+  cronScheduleLaneInFlight = { token, promise };
 }
 
-/** Test seam: the cron catch-up stagger + hold-aware watermark are pinned end
- *  to end (see cron-catchup-stagger.test.ts) — a decision-rule-only pin missed
- *  the watermark data-loss bug in the workflow scheduler's first stagger. */
+async function executeCronScheduleOccurrence(
+  assistant: ClementineAssistant,
+  state: DaemonState,
+  job: CronJobRecord,
+  occurrence: PendingCronOccurrence,
+): Promise<void> {
+  const latestKey = occurrence.minuteKey;
+  const missed = occurrence.missed;
+  if (missed > 0) {
+    try {
+      addNotification({
+        id: `cron-catchup-${job.name}-${occurrence.atMs}`,
+        kind: 'cron',
+        title: `Catching up: ${job.name}`,
+        body: `"${job.name}" missed ${missed} scheduled ${missed === 1 ? 'run' : 'runs'} while the app was closed or your Mac was asleep. Running it once now to catch up.`,
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: {
+          cronJob: job.name,
+          missed,
+          firedMinuteKey: latestKey,
+          occurrenceAtMs: occurrence.atMs,
+        },
+      });
+    } catch { /* the catch-up run below is the substance; the notice is best-effort */ }
+  }
+
+  await runCronJob(assistant, job, 'schedule', { occurrenceAtMs: occurrence.atMs });
+
+  // Completion owns the second phase of the checkpoint. Preserve any newer
+  // pending occurrence discovered while this long turn was running.
+  normalizeDaemonScheduleState(state);
+  const priorMinuteKey = state.lastCronRunByMinute[job.name];
+  const priorAtMs = state.lastCronRunAtMs![job.name];
+  const pendingAtCommit = state.pendingCronOccurrences![job.name];
+  state.lastCronRunByMinute[job.name] = latestKey;
+  state.lastCronRunAtMs![job.name] = occurrence.atMs;
+  if (pendingAtCommit?.atMs === occurrence.atMs) {
+    delete state.pendingCronOccurrences![job.name];
+  }
+  try {
+    saveState(state);
+  } catch (err) {
+    if (priorMinuteKey === undefined) delete state.lastCronRunByMinute[job.name];
+    else state.lastCronRunByMinute[job.name] = priorMinuteKey;
+    if (priorAtMs === undefined) delete state.lastCronRunAtMs![job.name];
+    else state.lastCronRunAtMs![job.name] = priorAtMs;
+    if (pendingAtCommit?.atMs === occurrence.atMs) {
+      state.pendingCronOccurrences![job.name] = pendingAtCommit;
+    }
+    throw err;
+  }
+}
+
+/** Test seam for durable cron catch-up behavior. */
 export const _testOnly_processCronSchedules = processCronSchedules;
 export const _testOnly_loadDaemonState = loadState;
+export async function _testOnly_waitForCronScheduleIdle(): Promise<void> {
+  while (cronScheduleLaneInFlight) {
+    await cronScheduleLaneInFlight.promise;
+  }
+}
 
 // Surfaces critical setup gaps as one-per-day notifications at daemon
 // boot. The doctor CLI catches the same things but only when the user

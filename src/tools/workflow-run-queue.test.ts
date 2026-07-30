@@ -17,6 +17,7 @@ import { pathToFileURL } from 'node:url';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-wf-queue-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
+process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 
 const {
   queueWorkflowRun,
@@ -726,6 +727,106 @@ test('queueWorkflowRun: readiness-blocked trigger receipts remain unbound and la
   assert.equal(readWorkflowTriggerReceiptAcceptance('pending-receipt-b'), second.id);
 });
 
+test('queueWorkflowRun: scheduler catch-up hold is atomic, receipt-bound, and remains skippable when readiness is blocked', () => {
+  writeWorkflow('held-missing-script', {
+    name: 'Held Missing Script',
+    description: 'A missed scheduled workflow with a currently missing helper.',
+    enabled: true,
+    trigger: { schedule: '0 9 * * *' },
+    steps: [{ id: 'merge', prompt: 'Merge evidence.', deterministic: { runner: 'missing.py' } }],
+  });
+  const firstDueAtMs = 1_800_000;
+  const scheduledAtMs = 3_600_000;
+  const receiptId = `workflow-schedule:v1:held-missing-script:${scheduledAtMs}`;
+  const held = queueWorkflowRun('Held Missing Script', {}, {
+    source: 'schedule',
+    catchupFire: true,
+    catchupOccurrenceAtMs: firstDueAtMs,
+    holdForCatchupDecision: true,
+    workflowSlug: 'held-missing-script',
+    catchupFirstDueAtMs: firstDueAtMs,
+    catchupMissedCount: 4,
+    triggerReceiptId: receiptId,
+    idPrefix: 'sched',
+    dedupe: false,
+  });
+
+  assert.equal(held.status, 'held');
+  assert.equal(held.readiness?.ok, false, 'red readiness is stored instead of hiding the Skip decision');
+  assert.match(held.message, /no workflow step will run/i);
+  assert.equal(readWorkflowTriggerReceiptAcceptance(receiptId), held.id);
+  assert.equal(runFiles().length, 1);
+  const record = JSON.parse(
+    readFileSync(path.join(WORKFLOW_RUNS_DIR, `${held.id}.json`), 'utf-8'),
+  ) as Record<string, unknown>;
+  assert.equal(record.status, 'awaiting_catchup_decision', 'the first durable record is held, never briefly queued');
+  assert.equal(record.source, 'schedule');
+  assert.equal(record.catchupFire, true);
+  assert.equal(record.catchupDisposition, 'held');
+  assert.equal(record.workflowSlug, 'held-missing-script');
+  assert.equal(record.catchupOccurrenceAtMs, firstDueAtMs);
+  assert.equal(record.catchupFirstDueAtMs, firstDueAtMs);
+  assert.equal(record.catchupScheduledAtMs, scheduledAtMs);
+  assert.equal(record.catchupMissedCount, 4, 'count means total collapsed missed occurrences');
+  assert.equal(record.catchupHeldAt, record.createdAt);
+  assert.equal((record.readiness as { ok?: unknown }).ok, false);
+
+  const replay = queueWorkflowRun('Held Missing Script', {}, {
+    source: 'schedule',
+    catchupFire: true,
+    catchupOccurrenceAtMs: firstDueAtMs,
+    holdForCatchupDecision: true,
+    workflowSlug: 'held-missing-script',
+    catchupFirstDueAtMs: firstDueAtMs,
+    catchupMissedCount: 4,
+    triggerReceiptId: receiptId,
+    idPrefix: 'sched',
+    dedupe: false,
+  });
+  assert.equal(replay.status, 'duplicate');
+  assert.equal(replay.id, held.id);
+  assert.equal(runFiles().length, 1);
+  assert.equal(
+    (JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${held.id}.json`), 'utf-8')) as Record<string, unknown>).status,
+    'awaiting_catchup_decision',
+  );
+});
+
+test('queueWorkflowRun: catch-up hold authority is schedule-only and canonical-receipt-bound', () => {
+  writeAuditWorkflow();
+  const base = {
+    catchupFire: true,
+    catchupOccurrenceAtMs: 60_000,
+    holdForCatchupDecision: true,
+    workflowSlug: 'audit-brief',
+    catchupFirstDueAtMs: 60_000,
+    catchupMissedCount: 1,
+    triggerReceiptId: 'workflow-schedule:v1:audit-brief:120000',
+  } as const;
+
+  assert.throws(
+    () => queueWorkflowRun('audit-brief', {}, { ...base, source: 'console' }),
+    /requires source=schedule/i,
+  );
+  assert.throws(
+    () => queueWorkflowRun('audit-brief', {}, {
+      ...base,
+      source: 'schedule',
+      triggerReceiptId: 'unscoped-receipt',
+    }),
+    /canonical workflow schedule receipt/i,
+  );
+  assert.throws(
+    () => queueWorkflowRun('audit-brief', {}, {
+      ...base,
+      source: 'schedule',
+      catchupMissedCount: 0,
+    }),
+    /catch-up metadata/i,
+  );
+  assert.equal(runFiles().length, 0);
+});
+
 test('queueWorkflowRun: allows unknown Composio slugs as warnings when the broker exists', () => {
   writeWorkflow('unknown-composio-flow', {
     name: 'unknown-composio-flow',
@@ -849,7 +950,13 @@ test('requeueWorkflowFromRun re-queues a failed run with its original inputs (bu
   const origId = 'orig-failed-run';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://evergreen-group.example' }, status: 'error' }),
+    JSON.stringify({
+      id: origId,
+      workflow: 'audit-brief',
+      inputs: { url: 'https://evergreen-group.example' },
+      status: 'error',
+      catchupFire: true,
+    }),
     'utf-8',
   );
   const rq = requeueWorkflowFromRun(origId);
@@ -862,6 +969,7 @@ test('requeueWorkflowFromRun re-queues a failed run with its original inputs (bu
       inputs: Record<string, string>;
       status: string;
       createdAt?: string;
+      catchupFire?: boolean;
       requeuedFromRunId?: string;
       recoveryIntent?: { kind?: string; createdAt?: string; sourceRunId?: string; reason?: string };
     });
@@ -869,6 +977,7 @@ test('requeueWorkflowFromRun re-queues a failed run with its original inputs (bu
   assert.equal(queued[0].workflow, 'audit-brief');
   assert.equal(queued[0].inputs.url, 'https://evergreen-group.example');
   assert.equal(queued[0].status, 'queued');
+  assert.equal(queued[0].catchupFire, true, 'whole-run/self-heal/goal lineage inherits catch-up admission');
   assert.equal(queued[0].requeuedFromRunId, origId);
   assert.deepEqual(queued[0].recoveryIntent, {
     kind: 'manual_requeue',
@@ -1311,15 +1420,49 @@ test('requeueWorkflowFromRun carries originSessionId from the prior run (re-run 
   const origId = 'orig-with-origin';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://site-alt.example' }, status: 'completed', originSessionId: 'sess-abc' }),
+    JSON.stringify({
+      id: origId,
+      workflow: 'audit-brief',
+      inputs: { url: 'https://site-alt.example' },
+      status: 'completed',
+      originSessionId: 'sess-abc',
+      catchupFire: true,
+      catchupOccurrenceAtMs: 456_000,
+      workflowSlug: 'audit-brief',
+      catchupFirstDueAtMs: 456_000,
+      catchupScheduledAtMs: 789_000,
+      catchupMissedCount: 3,
+      catchupDisposition: 'resumed',
+      catchupDecidedAt: '2026-07-29T12:00:00.000Z',
+    }),
     'utf-8',
   );
   requeueWorkflowFromRun(origId);
   const fresh = readdirSync(WORKFLOW_RUNS_DIR)
     .filter((f) => f.endsWith('.json') && f !== `${origId}.json`)
-    .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as { originSessionId?: string });
+    .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as {
+      originSessionId?: string;
+      catchupFire?: boolean;
+      catchupOccurrenceAtMs?: number;
+      workflowSlug?: string;
+      catchupFirstDueAtMs?: number;
+      catchupScheduledAtMs?: number;
+      catchupMissedCount?: number;
+      catchupDisposition?: string;
+      catchupDecidedAt?: string;
+    });
   assert.equal(fresh.length, 1);
   assert.equal(fresh[0].originSessionId, 'sess-abc');
+  assert.equal(fresh[0].catchupFire, true);
+  assert.equal(fresh[0].catchupOccurrenceAtMs, 456_000,
+    'whole-run requeues retain the root catch-up occurrence age');
+  assert.equal(fresh[0].workflowSlug, 'audit-brief');
+  assert.equal(fresh[0].catchupFirstDueAtMs, 456_000);
+  assert.equal(fresh[0].catchupScheduledAtMs, 789_000);
+  assert.equal(fresh[0].catchupMissedCount, 3);
+  assert.equal(fresh[0].catchupDisposition, 'resumed',
+    'an executable catch-up descendant keeps explicit resume authority');
+  assert.equal(fresh[0].catchupDecidedAt, '2026-07-29T12:00:00.000Z');
 });
 
 test('requeueWorkflowFromRun preserves duplicate observer origins from the prior run', () => {
@@ -1348,7 +1491,21 @@ test('requeueWorkflowFailedItemsFromRun queues lineage for only final failed for
   const origId = 'orig-partial-failure';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://site-alt.example' }, status: 'completed_with_errors', originSessionId: 'sess-failed-items' }),
+    JSON.stringify({
+      id: origId,
+      workflow: 'audit-brief',
+      inputs: { url: 'https://site-alt.example' },
+      status: 'completed_with_errors',
+      originSessionId: 'sess-failed-items',
+      catchupFire: true,
+      catchupOccurrenceAtMs: 123_000,
+      workflowSlug: 'audit-brief',
+      catchupFirstDueAtMs: 123_000,
+      catchupScheduledAtMs: 456_000,
+      catchupMissedCount: 2,
+      catchupDisposition: 'skipped',
+      catchupDecidedAt: '2026-07-29T13:00:00.000Z',
+    }),
     'utf-8',
   );
   appendWorkflowEvent('audit-brief', origId, { kind: 'step_completed', stepId: 'normalize', output: ['a', 'b', 'c'] });
@@ -1364,6 +1521,14 @@ test('requeueWorkflowFailedItemsFromRun queues lineage for only final failed for
     .filter((f) => f.endsWith('.json') && f !== `${origId}.json`)
     .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as {
       createdAt?: string;
+      catchupFire?: boolean;
+      catchupOccurrenceAtMs?: number;
+      workflowSlug?: string;
+      catchupFirstDueAtMs?: number;
+      catchupScheduledAtMs?: number;
+      catchupMissedCount?: number;
+      catchupDisposition?: string;
+      catchupDecidedAt?: string;
       retryFailedItemsFromRunId?: string;
       retryFailedItemsStepId?: string;
       retryFailedItemKeys?: string[];
@@ -1371,6 +1536,17 @@ test('requeueWorkflowFailedItemsFromRun queues lineage for only final failed for
       recoveryIntent?: { kind?: string; createdAt?: string; sourceRunId?: string; sourceStepId?: string; reason?: string };
     });
   assert.equal(fresh.length, 1);
+  assert.equal(fresh[0].catchupFire, true, 'failed-item recovery remains in the one-active catch-up lineage');
+  assert.equal(fresh[0].catchupOccurrenceAtMs, 123_000,
+    'failed-item recovery keeps the original occurrence age for fair reacquisition');
+  assert.equal(fresh[0].workflowSlug, 'audit-brief');
+  assert.equal(fresh[0].catchupFirstDueAtMs, 123_000);
+  assert.equal(fresh[0].catchupScheduledAtMs, 456_000);
+  assert.equal(fresh[0].catchupMissedCount, 2);
+  assert.equal(fresh[0].catchupDisposition, 'resumed',
+    'the explicit failed-item requeue is new execution authority, never a propagated skip');
+  assert.equal(fresh[0].catchupDecidedAt, undefined,
+    'a skipped source decision timestamp is not misrepresented as the new resume decision');
   assert.equal(fresh[0].retryFailedItemsFromRunId, origId);
   assert.equal(fresh[0].retryFailedItemsStepId, 'blast');
   assert.deepEqual(fresh[0].retryFailedItemKeys, ['b']);

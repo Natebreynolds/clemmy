@@ -754,7 +754,7 @@ function attachOriginSessionIdsToRun(runId: string, origins: string[]): void {
 }
 
 export interface QueueWorkflowRunResult {
-  status: 'queued' | 'duplicate' | 'blocked_readiness';
+  status: 'queued' | 'held' | 'duplicate' | 'blocked_readiness';
   id?: string;
   message: string;
   readiness?: WorkflowRunReadinessCheck;
@@ -862,6 +862,29 @@ export interface QueueWorkflowRunOptions {
    *  scheduler holds further catch-up admissions, so a post-downtime backlog
    *  drains at run-completion pace instead of piling into the drain lane. */
   catchupFire?: boolean;
+  /** Root scheduled occurrence for catch-up fairness. Every descendant requeue
+   *  keeps this value so a resumed/self-healed/failed-item lineage reacquires
+   *  the single execution slot by its original age, not its retry timestamp. */
+  catchupOccurrenceAtMs?: number;
+  /** Scheduler-only admission boundary for a MISSED occurrence. The queue
+   *  installs the run directly as awaiting_catchup_decision, so an independent
+   *  drain tick can never start it between queueing and a later "hold" write. */
+  holdForCatchupDecision?: boolean;
+  /** Stable workflow entry/directory slug. Required for held catch-ups because
+   *  the display name is mutable and cannot safely own a recovery decision. */
+  workflowSlug?: string;
+  /** Oldest occurrence collapsed into this held decision. */
+  catchupFirstDueAtMs?: number;
+  /** Total number of missed fires collapsed into this one decision. */
+  catchupMissedCount?: number;
+  /** Exact latest scheduled occurrence represented by this lineage. Derived
+   *  from the canonical schedule receipt for new holds and carried on retries. */
+  catchupScheduledAtMs?: number;
+  /** Durable user disposition. `held` is scheduler-only; `resumed` is carried
+   *  through every descendant so recovery never mistakes it for a fresh hold. */
+  catchupDisposition?: 'held' | 'resumed' | 'skipped';
+  /** When the user made the Resume/Skip decision. */
+  catchupDecidedAt?: string;
   /** Durable lineage for whole-run requeues, so dashboards can compare attempts
    *  without inferring ancestry from timestamps or matching inputs. */
   requeuedFromRunId?: string;
@@ -904,6 +927,71 @@ const TERMINAL_WORKFLOW_RUN_STATUSES = new Set([
 
 function workflowRunIsTerminal(status: unknown): boolean {
   return typeof status === 'string' && TERMINAL_WORKFLOW_RUN_STATUSES.has(status);
+}
+
+interface NormalizedCatchupHold {
+  workflowSlug: string;
+  firstDueAtMs: number;
+  scheduledAtMs: number;
+  missedCount: number;
+}
+
+/**
+ * Validate the narrow authority that may create a non-executable held run.
+ * This is intentionally stricter than ordinary queueing: only the workflow
+ * scheduler, with its occurrence-stable receipt, may install this status.
+ */
+function normalizeCatchupHold(
+  opts: QueueWorkflowRunOptions | undefined,
+  triggerReceiptId: string | undefined,
+): NormalizedCatchupHold | undefined {
+  if (opts?.holdForCatchupDecision !== true) return undefined;
+  const workflowSlug = normalizedOptionalString(opts.workflowSlug);
+  const firstDueAtMs = Number.isFinite(opts.catchupFirstDueAtMs)
+    ? Math.floor(opts.catchupFirstDueAtMs!)
+    : undefined;
+  const missedCount = Number.isFinite(opts.catchupMissedCount)
+    ? Math.floor(opts.catchupMissedCount!)
+    : undefined;
+  if (
+    normalizedOptionalString(opts.source) !== 'schedule'
+    || opts.catchupFire !== true
+    || !triggerReceiptId
+    || !workflowSlug
+    || workflowSlug.includes(':')
+    || firstDueAtMs === undefined
+    || firstDueAtMs < 0
+    || missedCount === undefined
+    || missedCount < 1
+  ) {
+    throw new Error(
+      'A held workflow catch-up requires source=schedule, catchupFire=true, '
+      + 'a stable workflowSlug, valid catch-up metadata (a non-negative first due time and '
+      + 'a positive collapsed missed count), '
+      + 'and a deterministic trigger receipt.',
+    );
+  }
+  const receiptPrefix = `workflow-schedule:v1:${workflowSlug}:`;
+  if (!triggerReceiptId.startsWith(receiptPrefix)) {
+    throw new Error('A held workflow catch-up requires its canonical workflow schedule receipt.');
+  }
+  const scheduledRaw = triggerReceiptId.slice(receiptPrefix.length);
+  const scheduledAtMs = Number(scheduledRaw);
+  if (
+    !/^\d+$/.test(scheduledRaw)
+    || !Number.isSafeInteger(scheduledAtMs)
+    || scheduledAtMs < 0
+    || firstDueAtMs > scheduledAtMs
+  ) {
+    throw new Error('A held workflow catch-up receipt carries an invalid scheduled occurrence.');
+  }
+  if (
+    Number.isFinite(opts.catchupOccurrenceAtMs)
+    && Math.floor(opts.catchupOccurrenceAtMs!) !== firstDueAtMs
+  ) {
+    throw new Error('A held workflow catch-up must use its first due occurrence as the lineage age.');
+  }
+  return { workflowSlug, firstDueAtMs, scheduledAtMs, missedCount };
 }
 
 function workflowRunReadinessSnapshot(
@@ -960,6 +1048,7 @@ function queueWorkflowRunUnlocked(
 ): QueueWorkflowRunResult {
   ensureDir(WORKFLOW_RUNS_DIR);
   const triggerReceiptId = normalizedOptionalString(opts?.triggerReceiptId);
+  const catchupHold = normalizeCatchupHold(opts, triggerReceiptId);
   const boundTriggerMarker = triggerReceiptId
     ? readWorkflowTriggerReceiptMarker(triggerReceiptId)
     : null;
@@ -1007,7 +1096,9 @@ function queueWorkflowRunUnlocked(
     return {
       status: 'duplicate',
       id: duplicate.id,
-      message: `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs — it's running in the background and will report back here when it finishes. No duplicate was queued; just tell the user it's already on it. (Only call workflow_run_status if the user explicitly asks for a progress check.)`,
+      message: catchupHold
+        ? `This missed schedule occurrence for "${name}" was already accepted as workflow run ${duplicate.id}; no duplicate was created. Its existing Resume or Skip decision remains authoritative.`
+        : `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs — it's running in the background and will report back here when it finishes. No duplicate was queued; just tell the user it's already on it. (Only call workflow_run_status if the user explicitly asks for a progress check.)`,
     };
   }
   const createdAt = new Date().toISOString();
@@ -1019,7 +1110,10 @@ function queueWorkflowRunUnlocked(
     readiness = checkWorkflowRunReadiness(workflowEntry.data, workflowEntry.name, {
       targetStepId: readinessTargetStepId,
     });
-    if (!readiness.ok) {
+    // A held catch-up performs no work. Persist it even when execution
+    // readiness is red so the user can still Skip it; Resume rechecks the
+    // current workflow and leaves the record held until blockers are fixed.
+    if (!readiness.ok && !catchupHold) {
       return {
         status: 'blocked_readiness',
         message: readiness.message,
@@ -1075,12 +1169,42 @@ function queueWorkflowRunUnlocked(
           }
         : undefined;
   const recoveryIntent = normalizeWorkflowRunRecoveryIntent(opts?.recoveryIntent, fallbackRecoveryIntent, createdAt);
+  const catchupOccurrenceAtMs = catchupHold?.firstDueAtMs ?? (Number.isFinite(opts?.catchupOccurrenceAtMs)
+    ? Math.floor(opts!.catchupOccurrenceAtMs!)
+    : undefined);
+  const catchupScheduledAtMs = catchupHold?.scheduledAtMs ?? (Number.isFinite(opts?.catchupScheduledAtMs)
+    ? Math.floor(opts!.catchupScheduledAtMs!)
+    : undefined);
+  const catchupFirstDueAtMs = catchupHold?.firstDueAtMs ?? (Number.isFinite(opts?.catchupFirstDueAtMs)
+    ? Math.floor(opts!.catchupFirstDueAtMs!)
+    : undefined);
+  const catchupMissedCount = catchupHold?.missedCount ?? (Number.isFinite(opts?.catchupMissedCount)
+    ? Math.max(0, Math.floor(opts!.catchupMissedCount!))
+    : undefined);
+  const workflowSlug = catchupHold?.workflowSlug ?? normalizedOptionalString(opts?.workflowSlug);
+  // An executable queue record may only carry explicit resumed authority.
+  // `held` is installed atomically above; `skipped` is terminal-only.
+  const catchupDisposition = catchupHold
+    ? 'held'
+    : opts?.catchupFire === true && opts.catchupDisposition === 'resumed'
+      ? 'resumed'
+      : undefined;
   const buildRunRecord = (runId: string): Record<string, unknown> => ({
     id: runId,
     workflow: name,
     inputs: normalizedInputs,
-    status: 'queued',
+    status: catchupHold ? 'awaiting_catchup_decision' : 'queued',
     ...(opts?.catchupFire ? { catchupFire: true } : {}),
+    ...(opts?.catchupFire && catchupOccurrenceAtMs !== undefined ? { catchupOccurrenceAtMs } : {}),
+    ...(workflowSlug ? { workflowSlug } : {}),
+    ...(opts?.catchupFire && catchupFirstDueAtMs !== undefined ? { catchupFirstDueAtMs } : {}),
+    ...(opts?.catchupFire && catchupScheduledAtMs !== undefined ? { catchupScheduledAtMs } : {}),
+    ...(opts?.catchupFire && catchupMissedCount !== undefined ? { catchupMissedCount } : {}),
+    ...(opts?.catchupFire && catchupDisposition ? { catchupDisposition } : {}),
+    ...(catchupHold ? { catchupHeldAt: createdAt } : {}),
+    ...(opts?.catchupFire && normalizedOptionalString(opts?.catchupDecidedAt)
+      ? { catchupDecidedAt: normalizedOptionalString(opts?.catchupDecidedAt) }
+      : {}),
     mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
     ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
     createdAt,
@@ -1138,14 +1262,15 @@ function queueWorkflowRunUnlocked(
     id = installFreshRandomRunRecord(opts?.idPrefix, buildRunRecord).id;
   }
   return {
-    status: 'queued',
+    status: catchupHold ? 'held' : 'queued',
     id,
     ...(readiness ? { readiness } : {}),
-    message:
-      `Queued "${name}" (run ${id}) — it is now running in the BACKGROUND. `
-      + `Tell the user it's running and that you'll report back here when it finishes; the outcome is delivered to this chat automatically on completion. `
-      + `Do NOT wait, poll, or call workflow_run_status, and do NOT do the workflow's work yourself — you're free to take the user's next request right now. `
-      + `(Only call workflow_run_status later if the user explicitly asks how it's going.)`,
+    message: catchupHold
+      ? `Held missed schedule for "${name}" (run ${id}) — no workflow step will run until the user chooses Resume. They may also Skip it without performing any work.`
+      : `Queued "${name}" (run ${id}) — it is now running in the BACKGROUND. `
+        + `Tell the user it's running and that you'll report back here when it finishes; the outcome is delivered to this chat automatically on completion. `
+        + `Do NOT wait, poll, or call workflow_run_status, and do NOT do the workflow's work yourself — you're free to take the user's next request right now. `
+        + `(Only call workflow_run_status later if the user explicitly asks how it's going.)`,
   };
 }
 
@@ -1227,7 +1352,7 @@ export function queueWorkflowCreationTest(
 }
 
 export interface ResumeWorkflowRunResult {
-  status: 'queued' | 'duplicate' | 'blocked_readiness' | 'missing_inputs' | 'not_found' | 'disabled';
+  status: 'queued' | 'held' | 'duplicate' | 'blocked_readiness' | 'missing_inputs' | 'not_found' | 'disabled';
   id?: string;
   missing?: string[];
   message: string;
@@ -1258,7 +1383,7 @@ export function resumeWorkflowRun(
 }
 
 export interface RequeueResult {
-  status: 'queued' | 'duplicate' | 'blocked_readiness' | 'not_found' | 'no_failed_items' | 'ambiguous';
+  status: 'queued' | 'held' | 'duplicate' | 'blocked_readiness' | 'not_found' | 'no_failed_items' | 'ambiguous';
   id?: string;
   failedItems?: Array<{ stepId: string; itemKey: string; error: string }>;
   message: string;
@@ -1289,6 +1414,14 @@ export function requeueWorkflowFromRun(
     inputs?: unknown;
     originSessionId?: unknown;
     originSessionIds?: unknown;
+    catchupFire?: unknown;
+    catchupOccurrenceAtMs?: unknown;
+    workflowSlug?: unknown;
+    catchupFirstDueAtMs?: unknown;
+    catchupScheduledAtMs?: unknown;
+    catchupMissedCount?: unknown;
+    catchupDisposition?: unknown;
+    catchupDecidedAt?: unknown;
   };
   try {
     rec = JSON.parse(readFileSync(file, 'utf-8')) as typeof rec;
@@ -1471,6 +1604,26 @@ export function requeueWorkflowFromRun(
     selfHealBackupId: opts.selfHealBackupId,
     goalAttempt: opts.goalAttempt,
     goalFeedback: opts.goalFeedback,
+    catchupFire: rec.catchupFire === true || opts.catchupFire === true,
+    catchupOccurrenceAtMs: Number.isFinite(rec.catchupOccurrenceAtMs)
+      ? Number(rec.catchupOccurrenceAtMs)
+      : opts.catchupOccurrenceAtMs,
+    workflowSlug: typeof rec.workflowSlug === 'string' ? rec.workflowSlug : opts.workflowSlug,
+    catchupFirstDueAtMs: Number.isFinite(rec.catchupFirstDueAtMs)
+      ? Number(rec.catchupFirstDueAtMs)
+      : opts.catchupFirstDueAtMs,
+    catchupScheduledAtMs: Number.isFinite(rec.catchupScheduledAtMs)
+      ? Number(rec.catchupScheduledAtMs)
+      : opts.catchupScheduledAtMs,
+    catchupMissedCount: Number.isFinite(rec.catchupMissedCount)
+      ? Number(rec.catchupMissedCount)
+      : opts.catchupMissedCount,
+    catchupDisposition: rec.catchupFire === true || opts.catchupFire === true
+      ? 'resumed'
+      : undefined,
+    catchupDecidedAt: rec.catchupDisposition === 'resumed' && typeof rec.catchupDecidedAt === 'string'
+      ? rec.catchupDecidedAt
+      : opts.catchupDecidedAt,
     excludeRunId: originalRunId,
     requeuedFromRunId: originalRunId,
     recoveryIntent: opts.recoveryIntent ?? {
@@ -1500,6 +1653,14 @@ export function requeueWorkflowFailedItemsFromRun(
     inputs?: unknown;
     originSessionId?: unknown;
     originSessionIds?: unknown;
+    catchupFire?: unknown;
+    catchupOccurrenceAtMs?: unknown;
+    workflowSlug?: unknown;
+    catchupFirstDueAtMs?: unknown;
+    catchupScheduledAtMs?: unknown;
+    catchupMissedCount?: unknown;
+    catchupDisposition?: unknown;
+    catchupDecidedAt?: unknown;
   };
   try {
     rec = JSON.parse(readFileSync(file, 'utf-8')) as typeof rec;
@@ -1631,6 +1792,26 @@ export function requeueWorkflowFailedItemsFromRun(
     selfHealAttempt: opts.selfHealAttempt,
     goalAttempt: opts.goalAttempt,
     goalFeedback: opts.goalFeedback,
+    catchupFire: rec.catchupFire === true || opts.catchupFire === true,
+    catchupOccurrenceAtMs: Number.isFinite(rec.catchupOccurrenceAtMs)
+      ? Number(rec.catchupOccurrenceAtMs)
+      : opts.catchupOccurrenceAtMs,
+    workflowSlug: typeof rec.workflowSlug === 'string' ? rec.workflowSlug : opts.workflowSlug,
+    catchupFirstDueAtMs: Number.isFinite(rec.catchupFirstDueAtMs)
+      ? Number(rec.catchupFirstDueAtMs)
+      : opts.catchupFirstDueAtMs,
+    catchupScheduledAtMs: Number.isFinite(rec.catchupScheduledAtMs)
+      ? Number(rec.catchupScheduledAtMs)
+      : opts.catchupScheduledAtMs,
+    catchupMissedCount: Number.isFinite(rec.catchupMissedCount)
+      ? Number(rec.catchupMissedCount)
+      : opts.catchupMissedCount,
+    catchupDisposition: rec.catchupFire === true || opts.catchupFire === true
+      ? 'resumed'
+      : undefined,
+    catchupDecidedAt: rec.catchupDisposition === 'resumed' && typeof rec.catchupDecidedAt === 'string'
+      ? rec.catchupDecidedAt
+      : opts.catchupDecidedAt,
     excludeRunId: originalRunId,
     retryFailedItems: {
       fromRunId: originalRunId,

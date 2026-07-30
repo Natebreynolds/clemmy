@@ -387,6 +387,7 @@ test('runtime cycle timeout actively cancels the underlying Claude turn', async 
   } finally {
     globalThis.setTimeout = realSetTimeout;
     releaseRuntime?.();
+    await autonomy._testOnly_waitForAutonomyLaneIdle();
   }
 });
 
@@ -429,6 +430,7 @@ test('a timed-out cycle remains single-flight until its underlying run actually 
   } finally {
     globalThis.setTimeout = realSetTimeout;
     releaseConversation?.();
+    await autonomy._testOnly_waitForAutonomyLaneIdle();
   }
 });
 

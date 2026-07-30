@@ -12,35 +12,50 @@
  *
  * This suite drives processCronSchedules itself with injected clocks and a
  * stub brain, because the workflow scheduler's first stagger proved a
- * decision-rule-only pin is blind to the deadly half: the watermark. Held
- * jobs must stay INSIDE the next evaluation window (parked watermark) and a
- * rewound window must never re-fire a job that already ran (strictly-newer
- * dedupe). Both halves are asserted here through the real function.
+ * decision-rule-only pin is blind to the deadly half: durable state. Held jobs
+ * must be frozen before the evaluation watermark advances, survive restart and
+ * the 24h discovery horizon, and never re-fire a job already handled. Those
+ * properties are asserted here through the real function.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-cron-stagger-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
-delete process.env.CLEMENTINE_WORKFLOW_CATCHUP_PER_TICK; // default budget: 1
+delete process.env.CLEMENTINE_CRON_CATCHUP_PER_TICK; // independent default budget: 1
+process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 // Route runCronJob to the stub brain: disable the cron harness lane AND
 // explicitly opt into the legacy respond fallback (without the second flag the
 // bridge blocks pre-run instead of falling back — by design).
 process.env.CLEMMY_HARNESS_CRON = 'off';
 process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 
-const { _testOnly_processCronSchedules: processCron, CRON_FILE } = await import('./runner.js') as unknown as {
+const {
+  _testOnly_processCronSchedules: processCron,
+  _testOnly_waitForCronScheduleIdle: waitForCronScheduleIdle,
+  _testOnly_loadDaemonState: loadDaemonState,
+  maxCronCatchupFiresPerTick,
+} = await import('./runner.js') as unknown as {
   _testOnly_processCronSchedules: (assistant: unknown, state: CronState, now?: Date) => Promise<void>;
-  CRON_FILE?: string;
+  _testOnly_waitForCronScheduleIdle: () => Promise<void>;
+  _testOnly_loadDaemonState: () => CronState;
+  maxCronCatchupFiresPerTick: () => number;
 };
 const { CRON_FILE: cronFile } = await import('../memory/vault.js');
 
 type CronState = {
   lastCronRunByMinute: Record<string, string>;
+  lastCronRunAtMs?: Record<string, number>;
+  pendingCronOccurrences?: Record<string, {
+    atMs: number;
+    minuteKey: string;
+    scheduleKey: string;
+    missed: number;
+  }>;
   lastCronEvaluatedAtMs?: number;
 };
 
@@ -48,10 +63,18 @@ type CronState = {
 const ran: string[] = [];
 const stubAssistant = {
   respond: async (req: { sessionId?: string }) => {
-    ran.push(String(req.sessionId ?? 'unknown').replace(/^cron:/, ''));
+    ran.push(String(req.sessionId ?? 'unknown').replace(/^cron:/, '').replace(/:\d+$/, ''));
     return { text: 'done', sessionId: req.sessionId };
   },
 };
+
+test.beforeEach(async () => {
+  await waitForCronScheduleIdle();
+  ran.length = 0;
+  rmSync(path.join(TMP_HOME, 'state', 'daemon-state.json'), { force: true });
+  delete process.env.CLEMENTINE_CRON_CATCHUP_PER_TICK;
+  delete process.env.CLEMENTINE_WORKFLOW_CATCHUP_PER_TICK;
+});
 
 function seedCronFile(jobs: Array<{ name: string; schedule: string }>): void {
   mkdirSync(path.dirname(cronFile), { recursive: true });
@@ -76,6 +99,11 @@ const day1_0600 = new Date(2026, 6, 29, 6, 0);
 const boot = new Date(2026, 6, 30, 0, 1); // downtime boot: all three missed
 const plusMin = (d: Date, m: number) => new Date(d.getTime() + m * 60_000);
 
+async function processCronAndWait(assistant: unknown, state: CronState, now: Date): Promise<void> {
+  await processCron(assistant, state, now);
+  await waitForCronScheduleIdle();
+}
+
 test('missed cron jobs drain one per tick — the daemon loop is never starved by a catch-up train', async () => {
   seedCronFile([
     { name: 'cron-daily-brief', schedule: '0 8 * * *' },
@@ -85,22 +113,23 @@ test('missed cron jobs drain one per tick — the daemon loop is never starved b
   const state: CronState = { lastCronRunByMinute: {} };
 
   // Establish the watermark before the missed windows.
-  await processCron(stubAssistant, state, day1_0600);
+  await processCronAndWait(stubAssistant, state, day1_0600);
   assert.equal(ran.length, 0, 'nothing due at 06:00');
 
   // Boot after downtime: exactly ONE catch-up job runs on the boot tick.
-  await processCron(stubAssistant, state, boot);
+  await processCronAndWait(stubAssistant, state, boot);
   assert.equal(ran.length, 1,
     `exactly one catch-up cron job runs on the boot tick — the tick stays short (ran: ${JSON.stringify(ran)})`);
 
-  // The watermark is PARKED, not advanced: held jobs stay inside the window.
-  assert.ok(state.lastCronEvaluatedAtMs !== undefined && state.lastCronEvaluatedAtMs < boot.getTime(),
-    'held jobs must remain inside the next evaluation window');
+  // The watermark advances because held work has its own durable identity.
+  assert.equal(state.lastCronEvaluatedAtMs, boot.getTime());
+  assert.equal(Object.keys(state.pendingCronOccurrences ?? {}).length, 2,
+    'held jobs are frozen durably instead of depending on a rewound window');
 
   // Subsequent ticks drain the rest, one per tick, no repeats, none lost.
   for (let i = 1; i <= 4 && ran.length < 3; i++) {
     const before = ran.length;
-    await processCron(stubAssistant, state, plusMin(boot, i));
+    await processCronAndWait(stubAssistant, state, plusMin(boot, i));
     assert.ok(ran.length - before <= 1, 'never more than one catch-up per tick');
   }
   assert.deepEqual([...ran].sort(),
@@ -109,7 +138,7 @@ test('missed cron jobs drain one per tick — the daemon loop is never starved b
 
   // Once drained, the watermark advances to now and nothing re-fires.
   const settledNow = plusMin(boot, 6);
-  await processCron(stubAssistant, state, settledNow);
+  await processCronAndWait(stubAssistant, state, settledNow);
   assert.equal(ran.length, 3, 'the backlog is drained; no ghost re-fires');
   assert.equal(state.lastCronEvaluatedAtMs, settledNow.getTime(),
     'with nothing held the watermark tracks now again');
@@ -117,44 +146,133 @@ test('missed cron jobs drain one per tick — the daemon loop is never starved b
 
 test('a live-minute cron job is never delayed by a spent catch-up budget', async () => {
   seedCronFile([
-    { name: 'cron-live-at-ten', schedule: '0 10 * * *' },
     { name: 'cron-missed-nine-thirty', schedule: '30 9 * * *' },
+    { name: 'cron-live-at-ten', schedule: '0 10 * * *' },
   ]);
   const state: CronState = { lastCronRunByMinute: {}, lastCronEvaluatedAtMs: new Date(2026, 6, 30, 9, 0).getTime() };
-  ran.length = 0;
 
   const now = new Date(2026, 6, 30, 10, 0);
-  await processCron(stubAssistant, state, now);
+  await processCronAndWait(stubAssistant, state, now);
+  assert.equal(ran[0], 'cron-live-at-ten', 'live work executes before an earlier YAML catch-up');
   assert.ok(ran.includes('cron-live-at-ten'),
     'the live-minute job runs on its exact minute regardless of catch-up traffic');
 
   // The missed one drains within bounded ticks rather than being lost.
   for (let i = 1; i <= 4 && !ran.includes('cron-missed-nine-thirty'); i++) {
-    await processCron(stubAssistant, state, plusMin(now, i));
+    await processCronAndWait(stubAssistant, state, plusMin(now, i));
   }
   assert.ok(ran.includes('cron-missed-nine-thirty'), 'the held catch-up still runs');
   assert.equal(ran.filter((n) => n === 'cron-missed-nine-thirty').length, 1, 'exactly once');
 });
 
-test('rewound windows are safe: a job that already ran is never re-fired by the parked watermark', async () => {
-  // Two missed jobs at the SAME minute: one fires, one is held, the watermark
-  // rewinds to before that shared minute. The strictly-newer matcher must
-  // exclude the already-run job from the rewound window.
+test('durable same-minute siblings drain without re-firing the one already handled', async () => {
   seedCronFile([
     { name: 'cron-a-same-minute', schedule: '15 8 * * *' },
     { name: 'cron-b-same-minute', schedule: '15 8 * * *' },
   ]);
   const state: CronState = { lastCronRunByMinute: {}, lastCronEvaluatedAtMs: new Date(2026, 6, 30, 8, 0).getTime() };
-  ran.length = 0;
-
   const tick1 = new Date(2026, 6, 30, 8, 40);
-  await processCron(stubAssistant, state, tick1);
+  await processCronAndWait(stubAssistant, state, tick1);
   assert.equal(ran.length, 1, 'one fires, one is held');
 
-  await processCron(stubAssistant, state, plusMin(tick1, 1));
+  await processCronAndWait(stubAssistant, state, plusMin(tick1, 1));
   assert.deepEqual([...ran].sort(), ['cron-a-same-minute', 'cron-b-same-minute'],
     'the held sibling fires next tick');
 
-  await processCron(stubAssistant, state, plusMin(tick1, 2));
-  assert.equal(ran.length, 2, 'no repeats from the rewound window');
+  await processCronAndWait(stubAssistant, state, plusMin(tick1, 2));
+  assert.equal(ran.length, 2, 'no repeats after the durable pending sibling drains');
+});
+
+test('a pending cron occurrence survives restart and aging beyond 24 hours', async () => {
+  seedCronFile([
+    { name: 'cron-restart-a', schedule: '0 8 * * *' },
+    { name: 'cron-restart-b', schedule: '0 9 * * *' },
+  ]);
+  const state: CronState = {
+    lastCronRunByMinute: {},
+    lastCronEvaluatedAtMs: new Date(2026, 6, 28, 7, 0).getTime(),
+  };
+  const bootTick = new Date(2026, 6, 29, 10, 0);
+  await processCronAndWait(stubAssistant, state, bootTick);
+  assert.equal(ran.length, 1);
+  assert.equal(Object.keys(state.pendingCronOccurrences ?? {}).length, 1);
+  const heldName = ran[0] === 'cron-restart-a' ? 'cron-restart-b' : 'cron-restart-a';
+  seedCronFile([{
+    name: heldName,
+    schedule: heldName === 'cron-restart-a' ? '0 8 * * *' : '0 9 * * *',
+  }]);
+
+  const restarted = loadDaemonState();
+  await processCronAndWait(stubAssistant, restarted, new Date(2026, 7, 1, 12, 0));
+  assert.equal(ran.length, 2, 'the held occurrence runs after restart even outside the scan horizon');
+  assert.notEqual(ran[0], ran[1]);
+});
+
+test('cron has an independent catch-up knob', () => {
+  process.env.CLEMENTINE_WORKFLOW_CATCHUP_PER_TICK = '9';
+  assert.equal(maxCronCatchupFiresPerTick(), 1, 'workflow tuning does not alter cron');
+  process.env.CLEMENTINE_CRON_CATCHUP_PER_TICK = '3';
+  assert.equal(maxCronCatchupFiresPerTick(), 3);
+});
+
+test('cron admission is non-blocking and single-flight while completion owns the durable commit', async () => {
+  seedCronFile([{ name: 'cron-slow', schedule: '0 8 * * *' }]);
+  const state: CronState = {
+    lastCronRunByMinute: {},
+    lastCronEvaluatedAtMs: new Date(2026, 6, 30, 7, 0).getTime(),
+  };
+  const due = new Date(2026, 6, 30, 9, 0);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let starts = 0;
+  const slowAssistant = {
+    respond: async (req: { sessionId?: string }) => {
+      starts += 1;
+      await gate;
+      return { text: 'done', sessionId: req.sessionId };
+    },
+  };
+
+  await processCron(slowAssistant, state, due);
+  assert.equal(starts, 1, 'the background lane was admitted');
+  assert.ok(state.pendingCronOccurrences?.['cron-slow'], 'pending is checkpointed before the turn');
+  assert.equal(state.lastCronRunAtMs?.['cron-slow'], undefined, 'completion has not committed yet');
+
+  await processCron(slowAssistant, state, plusMin(due, 1));
+  assert.equal(starts, 1, 'a second tick cannot overlap the active cron lane');
+
+  release();
+  await waitForCronScheduleIdle();
+  assert.equal(state.lastCronRunAtMs?.['cron-slow'], new Date(2026, 6, 30, 8, 0).getTime());
+  assert.equal(state.pendingCronOccurrences?.['cron-slow'], undefined);
+});
+
+test('oldest cron catch-up wins even when YAML order points at a newer occurrence', async () => {
+  seedCronFile([
+    { name: 'cron-newer-first', schedule: '0 9 * * *' },
+    { name: 'cron-older-second', schedule: '0 8 * * *' },
+  ]);
+  const state: CronState = {
+    lastCronRunByMinute: {},
+    lastCronEvaluatedAtMs: new Date(2026, 6, 30, 7, 0).getTime(),
+  };
+
+  await processCronAndWait(stubAssistant, state, new Date(2026, 6, 30, 10, 0));
+  assert.deepEqual(ran, ['cron-older-second']);
+});
+
+test('a recurring first YAML job cannot refresh its way ahead of an older held sibling', async () => {
+  seedCronFile([
+    { name: 'cron-a-recurring-first', schedule: '*/2 * * * *' },
+    { name: 'cron-z-recurring-held', schedule: '*/2 * * * *' },
+  ]);
+  const state: CronState = {
+    lastCronRunByMinute: {},
+    lastCronEvaluatedAtMs: new Date(2026, 6, 30, 9, 1).getTime(),
+  };
+
+  await processCronAndWait(stubAssistant, state, new Date(2026, 6, 30, 9, 3));
+  assert.deepEqual(ran, ['cron-a-recurring-first']);
+  await processCronAndWait(stubAssistant, state, new Date(2026, 6, 30, 9, 5));
+  assert.deepEqual(ran, ['cron-a-recurring-first', 'cron-z-recurring-held']);
 });
