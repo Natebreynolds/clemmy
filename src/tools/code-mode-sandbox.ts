@@ -13,7 +13,10 @@
  *     So the program can load NOTHING dangerous; it cannot touch the filesystem,
  *     spawn, or open a socket via a module.
  *   - The blocker deletes the no-import network globals (fetch / WebSocket / …)
- *     and the process-internal escape hatches (binding / dlopen).
+ *     and the process-internal escape hatches (binding / dlopen /
+ *     getBuiltinModule / _linkedBinding) — the last two return a builtin
+ *     directly, bypassing the resolve hook, so deleting them is what actually
+ *     closes the child_process / fs / sqlite direct-access path.
  *   - Bounded: wall-clock timeout (kill), max RPC calls, max return size.
  * The program reaches Clementine ONLY through `clem.<tool>(args)`, which the
  * PARENT dispatches through the real gated tool path — so Phase 2 (gated writes)
@@ -153,7 +156,7 @@ function toolResultFailureReason(value: unknown): string | null {
 }
 
 // The blocked module set — shared by both blocker mechanisms below.
-const BLOCKED_RE = `/^(node:)?(fs|fs\\/promises|child_process|net|http|https|http2|dns|dns\\/promises|tls|dgram|cluster|worker_threads|module|vm|inspector|repl|v8|wasi|perf_hooks|trace_events|diagnostics_channel|os|readline|tty)$/`;
+const BLOCKED_RE = `/^(node:)?(fs|fs\\/promises|child_process|net|http|https|http2|dns|dns\\/promises|tls|dgram|cluster|worker_threads|module|vm|inspector|repl|v8|wasi|perf_hooks|trace_events|diagnostics_channel|os|readline|tty|sqlite)$/`;
 
 // The off-thread loader (Node 20.6+ path): registered via module.register, runs in
 // a worker thread, and THROWS for a blocked specifier so the import rejects. This
@@ -199,6 +202,13 @@ for (const g of ['fetch', 'WebSocket', 'XMLHttpRequest', 'EventSource', 'navigat
 }
 try { delete process.binding; } catch {}
 try { delete process.dlopen; } catch {}
+// Direct builtin-access hatches return a builtin WITHOUT going through the
+// module loader, so the resolve hook above never sees them — a program could
+// otherwise reach child_process / fs / net / sqlite via
+// process.getBuiltinModule('node:child_process') regardless of the loader
+// block. Remove them the same way as binding/dlopen (both configurable here).
+try { delete process.getBuiltinModule; } catch {}
+try { delete process._linkedBinding; } catch {}
 `;
 
 /** Wrap the user program: clem RPC over stdin/stdout, console → stderr (stdout is

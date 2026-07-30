@@ -57,6 +57,31 @@ test('SECURITY: global fetch is removed (no network without a module)', async ()
   assert.deepEqual(r.value, { fetch: 'undefined', ws: 'undefined' });
 });
 
+// REGRESSION (2026-07): process.getBuiltinModule returns a builtin WITHOUT
+// going through the module loader, so the resolve-hook block never saw it — a
+// program could reach child_process/fs/net/sqlite directly. The blocker now
+// deletes it (and _linkedBinding) alongside binding/dlopen. These pins run the
+// real escape, not a mock, so the hole cannot silently reopen.
+test('SECURITY: process.getBuiltinModule is removed (direct builtin access)', async () => {
+  const r = await runCodeModeProgram('return { g: typeof process.getBuiltinModule, lb: typeof process._linkedBinding, b: typeof process.binding, d: typeof process.dlopen };', noDispatch, { timeoutMs: 15_000 });
+  assert.equal(r.ok, true, r.error);
+  assert.deepEqual(r.value, { g: 'undefined', lb: 'undefined', b: 'undefined', d: 'undefined' });
+});
+
+test('SECURITY: getBuiltinModule("node:child_process") cannot spawn', async () => {
+  const r = await runCodeModeProgram(
+    'try { const cp = process.getBuiltinModule("node:child_process"); return cp.execSync("id").toString(); } catch (e) { return "blocked"; }',
+    noDispatch,
+    { timeoutMs: 15_000 },
+  );
+  assert.equal(r.value, 'blocked');
+});
+
+test('SECURITY: import("node:sqlite") is blocked (arbitrary file read/write)', async () => {
+  const r = await runCodeModeProgram('try { await import("node:sqlite"); return "LEAKED"; } catch (e) { return "blocked"; }', noDispatch, { timeoutMs: 15_000 });
+  assert.equal(r.value, 'blocked');
+});
+
 test('BUDGET: a program exceeding the RPC budget is stopped', async () => {
   const r = await runCodeModeProgram('for (let i = 0; i < 100; i++) { await clem.noop({}); } return "done";', noDispatch, { timeoutMs: 15_000, maxRpcCalls: 3 });
   assert.equal(r.ok, false);

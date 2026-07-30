@@ -1703,6 +1703,32 @@ export function pendingActionApprovalRequiredError(
   );
 }
 
+/**
+ * Sibling of pendingActionApprovalRequiredError for a NON-send local tool that
+ * the tool's OWN needsApproval hook flags (a danger-classified run_shell_command,
+ * a sensitive-path read/write) when it is reached through a nested dispatcher — a
+ * code-mode program or call_tool — which cannot open its own approval card. The
+ * direct wrapped.invoke() path skips the SDK's per-tool needsApproval hook, so
+ * without this the call would run card-free. Same class ⇒ provenNoDispatch: the
+ * call is refused BEFORE it runs, never a retryable failure.
+ */
+export function pendingNestedToolApprovalRequiredError(
+  toolName: string,
+  payload: unknown,
+): ExternalWritePreDispatchError {
+  let payloadLabel = '';
+  try {
+    const encoded = JSON.stringify(payload);
+    if (encoded && encoded.length <= 400) payloadLabel = ` The blocked payload was ${encoded}.`;
+  } catch { /* omit an unserializable payload */ }
+  return new ExternalWritePreDispatchError(
+    `PENDING_ACTION_APPROVAL_REQUIRED: "${toolName}" needs your approval and was reached through a nested dispatcher `
+    + '(a code-mode program or call_tool), which cannot open its own approval card. Do not retry it inside the program. '
+    + `Run "${toolName}" as a direct tool call so the normal approval card can surface — or, if this is part of an approved plan, ensure the plan scope authorizes it.`
+    + payloadLabel,
+  );
+}
+
 function assertNoDuplicateExternalWrite(input: {
   sessionId: string;
   toolName: string;

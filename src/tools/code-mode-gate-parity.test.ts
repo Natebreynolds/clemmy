@@ -140,3 +140,58 @@ test('SAFETY: with writes OFF, a program cannot reach a mutating tool at all (re
   );
   _setCodeModeToolsForTests(null);
 });
+
+// ── REGRESSION (2026-07 bypass hunt, Hole 2) ─────────────────────────────────
+// The code-mode/call_tool dispatch calls wrapped.invoke() DIRECTLY, which skips
+// the SDK's per-tool needsApproval hook — where run_shell_command's danger
+// classifier and the read/write sensitive-path checks live. Without a floor a
+// danger-classified shell command runs card-free. These pins inject a local tool
+// whose OWN needsApproval hook is controlled, and assert the dispatcher consults
+// it (parity with a direct call) and parks on a proven-no-dispatch error.
+function injectShellFake(needsApproval: unknown, onInvoke: () => void): void {
+  _setCodeModeToolsForTests(new Map<string, { name: string; needsApproval?: unknown; invoke: (c: unknown, i: string, d: unknown) => Promise<unknown> }>([
+    ['run_shell_command', { name: 'run_shell_command', needsApproval, invoke: async () => { onInvoke(); return 'RAN'; } }],
+  ]));
+}
+
+test('BYPASS-FIX: a code-mode tool whose needsApproval hook says APPROVE parks before invoke (no card-free run)', async () => {
+  setBaselineEnv(); // gates off + writes on: proves the floor is NOT a toggled gate
+  resetEventLog();
+  let ran = false;
+  injectShellFake(async () => true, () => { ran = true; });
+  const sess = createSession({ kind: 'chat' });
+  await assert.rejects(
+    () => dispatchCodeModeTool('run_shell_command', { command: 'rm -rf /' }, sess.id),
+    /PENDING_ACTION_APPROVAL_REQUIRED/,
+    'a hook that requires approval must park the nested call',
+  );
+  assert.equal(ran, false, 'the tool must NOT execute when its hook requires approval');
+  _setCodeModeToolsForTests(null);
+});
+
+test('BYPASS-FIX: a hook that AUTO-APPROVES still runs (gate-parity, not a blanket block)', async () => {
+  setBaselineEnv();
+  resetEventLog();
+  let ran = false;
+  injectShellFake(async () => false, () => { ran = true; });
+  const sess = createSession({ kind: 'chat' });
+  const out = await dispatchCodeModeTool('run_shell_command', { command: 'ls -la' }, sess.id);
+  assert.equal(ran, true, 'an auto-approved command must still execute');
+  assert.equal(out, 'RAN');
+  _setCodeModeToolsForTests(null);
+});
+
+test('BYPASS-FIX: a needsApproval hook that THROWS fails closed (parks, never a silent grant)', async () => {
+  setBaselineEnv();
+  resetEventLog();
+  let ran = false;
+  injectShellFake(async () => { throw new Error('hook boom'); }, () => { ran = true; });
+  const sess = createSession({ kind: 'chat' });
+  await assert.rejects(
+    () => dispatchCodeModeTool('run_shell_command', { command: 'rm -rf /' }, sess.id),
+    /PENDING_ACTION_APPROVAL_REQUIRED/,
+    'a throwing hook must fail closed, not auto-run',
+  );
+  assert.equal(ran, false, 'a throwing hook must not let the tool execute');
+  _setCodeModeToolsForTests(null);
+});

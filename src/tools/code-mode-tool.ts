@@ -23,6 +23,7 @@ import {
   ToolCallsLimitExceeded,
   harnessRunContextStorage,
   pendingActionApprovalRequiredError,
+  pendingNestedToolApprovalRequiredError,
 } from '../runtime/harness/brackets.js';
 import { maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
@@ -41,9 +42,11 @@ import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
 // registry module is fully loaded.
 
 export function codeModeEnabled(): boolean {
-  // DEFAULT-ON since v0.11.0: the sandbox containment was adversarially soaked
-  // (2026-06-22, scripts/soak-code-mode-escape.ts — 14/14 escapes contained incl.
-  // secret-exfil + file-write). Kill-switch CLEMMY_CODE_MODE=off.
+  // DEFAULT-ON since v0.11.0: the sandbox containment is adversarially soaked
+  // (scripts/soak-code-mode-escape.ts — module-load, secret-exfil, file-write,
+  // and the direct builtin-access hatches getBuiltinModule/_linkedBinding +
+  // node:sqlite, all contained; pinned in code-mode-sandbox.test.ts).
+  // Kill-switch CLEMMY_CODE_MODE=off.
   return (getRuntimeEnv('CLEMMY_CODE_MODE', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
@@ -612,6 +615,36 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
         counter.increment();
       }
       throw pendingActionApprovalRequiredError(method, args);
+    }
+
+    // EXECUTE/WRITE PARITY (2026-07 bypass hunt): the direct wrapped.invoke()
+    // below ALSO skips the tool's OWN needsApproval hook — where
+    // run_shell_command's danger classifier and the read/write sensitive-path
+    // checks live. classifyExternalWrite (above) only recognizes SEND-class
+    // irreversibility, so a danger-classified shell command or a sensitive-path
+    // write reached via code-mode/call_tool would otherwise run card-free.
+    // Consult the real tool's hook with the SAME sessionId-scoped runContext the
+    // invoke uses, so plan-scope / workspace / yolo policy resolve IDENTICALLY to
+    // a direct tool call — this is gate-parity, not a new gate. Fail CLOSED: a
+    // hook that throws is treated as needs-approval, never a silent grant.
+    const approvalHook = (real as { needsApproval?: unknown }).needsApproval;
+    let hookRequiresApproval = false;
+    if (approvalHook === true) {
+      hookRequiresApproval = true;
+    } else if (typeof approvalHook === 'function') {
+      try {
+        hookRequiresApproval =
+          (await (approvalHook as (rc: unknown, input: unknown) => unknown)({ context: { sessionId } }, args)) === true;
+      } catch {
+        hookRequiresApproval = true;
+      }
+    }
+    if (hookRequiresApproval) {
+      if (counter) {
+        if (counter.willExceed()) throw new ToolCallsLimitExceeded(counter.limit);
+        counter.increment();
+      }
+      throw pendingNestedToolApprovalRequiredError(method, args);
     }
   }
   const wrapped = wrapToolForHarness(real as never) as InvokableTool;
