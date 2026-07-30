@@ -57,6 +57,7 @@ const memo = new Map<string, { at: number; value: CliHealth }>();
 const inFlight = new Map<string, Promise<CliHealth>>();
 type RecoveredListener = (health: CliHealth) => void;
 const recoveredListeners = new Set<RecoveredListener>();
+const signedOutListeners = new Set<RecoveredListener>();
 
 /** Strip ANSI escapes before classification — netlify (and friends) color
  *  their status output, which would defeat plain-text patterns. */
@@ -100,6 +101,13 @@ export function invalidateCliHealth(id?: string): void {
 export function onCliAuthRecovered(fn: RecoveredListener): () => void {
   recoveredListeners.add(fn);
   return () => recoveredListeners.delete(fn);
+}
+
+/** Subscribe to transitions INTO signed_out (fired once per transition —
+ *  ok/unknown/error → signed_out; a signed_out re-probe never re-fires). */
+export function onCliSignedOut(fn: RecoveredListener): () => void {
+  signedOutListeners.add(fn);
+  return () => signedOutListeners.delete(fn);
 }
 
 // ─── Probe execution ────────────────────────────────────────────────
@@ -278,6 +286,15 @@ function commitHealth(next: CliHealth): CliHealth {
         listener(next);
       } catch (err) {
         logger.warn({ err: err instanceof Error ? err.message : String(err), cli: next.id }, 'cli-auth recovered listener failed');
+      }
+    }
+  }
+  if (previous?.authStatus !== 'signed_out' && next.authStatus === 'signed_out') {
+    for (const listener of signedOutListeners) {
+      try {
+        listener(next);
+      } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : String(err), cli: next.id }, 'cli signed-out listener failed');
       }
     }
   }

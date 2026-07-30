@@ -92,3 +92,43 @@ test('recovery resumes ONLY tagged tasks, caps per event, and leaves text-mentio
   assert.ok(resumedTask?.inputResolution?.answer.includes('signed in again'),
     'resume goes through the canonical input-resolution verb with a truthful answer');
 });
+
+test('signed-out transitions notify once per day for roster CLIs; unreferenced CLIs stay pill-only', async () => {
+  const { loadNotifications } = await import('../runtime/notifications.js');
+  const countCliAuth = (id) => loadNotifications().filter((n) => n.id.startsWith(`cli-auth-${id}-`)).length;
+
+  // railway is CONNECTED (roster) — a signed-out transition notifies.
+  let output = 'Logged in as nathan@example.com';
+  _testOnly_setProbeExec(async () => ({ exitCode: output.startsWith('Logged') ? 0 : 1, output, timedOut: false }));
+  invalidateCliHealth('railway');
+  await getCliHealth('railway', { force: true }); // ok baseline
+
+  output = 'Unauthorized. Please login with `railway login`';
+  invalidateCliHealth('railway');
+  await getCliHealth('railway', { force: true }); // → signed_out (transition)
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(countCliAuth('railway'), 1, 'the transition into signed_out notifies exactly once');
+
+  // A signed_out re-probe is NOT a transition — no second record; and even a
+  // flap (ok → signed_out again) the same day collides on the daily id.
+  invalidateCliHealth('railway');
+  await getCliHealth('railway', { force: true });
+  output = 'Logged in as nathan@example.com';
+  invalidateCliHealth('railway');
+  await getCliHealth('railway', { force: true });
+  output = 'Unauthorized. Please login with `railway login`';
+  invalidateCliHealth('railway');
+  await getCliHealth('railway', { force: true });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(countCliAuth('railway'), 1, 'same-day flaps collapse onto one daily-bucketed record');
+
+  // gcloud is NOT connected here and no parked task references it → pill only.
+  output = '[]';
+  invalidateCliHealth('gcloud');
+  const before = loadNotifications().length;
+  await getCliHealth('gcloud', { force: true });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(countCliAuth('gcloud'), 0, 'an unreferenced CLI never notifies');
+  assert.equal(loadNotifications().length >= before, true);
+  _testOnly_setProbeExec();
+});
