@@ -34,10 +34,12 @@ function nodeColor(node: GraphNode): string {
   return TYPE_COLOR[node.type] ?? '#FBE9D6';
 }
 
+/* Thumb-sized raycast targets — nodeVal scales the sphere the raycaster
+   hits, and phone taps land within ~20px, not 2. */
 function nodeSize(node: GraphNode): number {
-  if (node.type === 'kind') return 7;
-  if (node.type === 'entity' || node.type === 'goal' || node.type === 'workflow') return 5;
-  return 3.5;
+  if (node.type === 'kind') return 14;
+  if (node.type === 'entity' || node.type === 'goal' || node.type === 'workflow') return 9;
+  return 6;
 }
 
 const EDGE_COLOR: Record<string, string> = {
@@ -104,9 +106,13 @@ export function MemoryGraph3D() {
         });
 
         const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-        if (!reduce) {
-          const controls = graph.controls?.() as { autoRotate?: boolean; autoRotateSpeed?: number } | undefined;
-          if (controls) { controls.autoRotate = true; controls.autoRotateSpeed = 0.55; }
+        const controls = graph.controls?.() as { autoRotate?: boolean; autoRotateSpeed?: number } | undefined;
+        if (!reduce && controls) {
+          controls.autoRotate = true;
+          controls.autoRotateSpeed = 0.55;
+          // The idle spin is ambience, not a fight: the first touch wins and
+          // the scene holds still for aiming from then on.
+          host.addEventListener('pointerdown', () => { controls.autoRotate = false; }, { once: true, capture: true });
         }
 
         graphRef.current = graph;

@@ -810,6 +810,9 @@ input, textarea { font: inherit; }
   min-height: 320px;
 }
 .constellation-canvas { position: absolute; inset: 0; }
+/* Without this, WebKit claims canvas touches for page scrolling and taps
+   never reach the graph's raycaster — orbit, pinch, and tap all die. */
+.constellation, .constellation-canvas, .constellation-canvas canvas { touch-action: none; }
 .constellation-note {
   position: absolute;
   inset: 0;
