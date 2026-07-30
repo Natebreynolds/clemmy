@@ -807,12 +807,6 @@ export function cronMatchedKeysInWindow(
     .map((occurrence) => occurrence.minuteKey);
 }
 
-/** Cron catch-up has an independent starvation budget. Workflow catch-up's
- *  one-active invariant must not be weakened by tuning sequential cron work. */
-export function maxCronCatchupFiresPerTick(): number {
-  const raw = parseInt(getRuntimeEnv('CLEMENTINE_CRON_CATCHUP_PER_TICK', '1') || '1', 10);
-  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 10) : 1;
-}
 
 interface CronScheduleLane {
   token: object;
@@ -977,6 +971,7 @@ async function executeCronScheduleOccurrence(
 
 /** Test seam for durable cron catch-up behavior. */
 export const _testOnly_processCronSchedules = processCronSchedules;
+export const _testOnly_processCronTriggers = processCronTriggers;
 export const _testOnly_loadDaemonState = loadState;
 export async function _testOnly_waitForCronScheduleIdle(): Promise<void> {
   while (cronScheduleLaneInFlight) {
@@ -1167,6 +1162,16 @@ function reportMissedCronRunsOnBoot(state: DaemonState): void {
 }
 
 async function processCronTriggers(assistant: ClementineAssistant): Promise<void> {
+  // Serialize against the async schedule lane (v3.0.3 regression): before the
+  // lane existed, schedule jobs ran inline in the tick, so a manual "run now"
+  // could never overlap a scheduled run of the SAME job. The lane made them
+  // concurrent — two simultaneous executions under different sessions. Defer
+  // the trigger pass while ANY lane job is mid-turn: trigger files are only
+  // consumed when their job actually runs, so a deferred trigger simply
+  // retries next tick (~15s) — queued, never lost. The reverse direction is
+  // free: trigger jobs run inline on this loop, which blocks the next lane
+  // admission until they finish.
+  if (cronScheduleLaneInFlight) return;
   ensureDir(CRON_TRIGGERS_DIR);
   const jobs = loadCronJobs();
   for (const file of readdirSync(CRON_TRIGGERS_DIR).filter((entry) => entry.endsWith('.json'))) {

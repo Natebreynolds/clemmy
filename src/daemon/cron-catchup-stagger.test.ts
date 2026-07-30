@@ -19,7 +19,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -36,14 +36,14 @@ process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 
 const {
   _testOnly_processCronSchedules: processCron,
+  _testOnly_processCronTriggers: processTriggers,
   _testOnly_waitForCronScheduleIdle: waitForCronScheduleIdle,
   _testOnly_loadDaemonState: loadDaemonState,
-  maxCronCatchupFiresPerTick,
 } = await import('./runner.js') as unknown as {
   _testOnly_processCronSchedules: (assistant: unknown, state: CronState, now?: Date) => Promise<void>;
+  _testOnly_processCronTriggers: (assistant: unknown) => Promise<void>;
   _testOnly_waitForCronScheduleIdle: () => Promise<void>;
   _testOnly_loadDaemonState: () => CronState;
-  maxCronCatchupFiresPerTick: () => number;
 };
 const { CRON_FILE: cronFile } = await import('../memory/vault.js');
 
@@ -208,11 +208,49 @@ test('a pending cron occurrence survives restart and aging beyond 24 hours', asy
   assert.notEqual(ran[0], ran[1]);
 });
 
-test('cron has an independent catch-up knob', () => {
-  process.env.CLEMENTINE_WORKFLOW_CATCHUP_PER_TICK = '9';
-  assert.equal(maxCronCatchupFiresPerTick(), 1, 'workflow tuning does not alter cron');
-  process.env.CLEMENTINE_CRON_CATCHUP_PER_TICK = '3';
-  assert.equal(maxCronCatchupFiresPerTick(), 3);
+test('a manual trigger cannot overlap the schedule lane — the same job never runs twice concurrently', async () => {
+  // v3.0.3 regression (validation finding, shipped): the async schedule lane
+  // made a Console "run now" concurrent with a scheduled run of the SAME job.
+  // The trigger pass now defers whole while the lane is mid-turn; the trigger
+  // file is consumed only when its job actually runs, so it retries next tick.
+  seedCronFile([{ name: 'cron-overlap-job', schedule: '0 8 * * *' }]);
+  const state: CronState = {
+    lastCronRunByMinute: {},
+    lastCronEvaluatedAtMs: new Date(2026, 7, 2, 7, 0).getTime(),
+  };
+  ran.length = 0;
+
+  // Hold the schedule-lane job open mid-turn.
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const slowAssistant = {
+    respond: async (req: { sessionId?: string }) => {
+      ran.push(String(req.sessionId ?? 'unknown').replace(/^cron:/, '').replace(/:\d+$/, ''));
+      await gate;
+      return { text: 'done', sessionId: req.sessionId };
+    },
+  };
+  await processCron(slowAssistant, state, new Date(2026, 7, 2, 8, 0));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(ran, ['cron-overlap-job'], 'the scheduled run is mid-turn on the lane');
+
+  // A manual trigger for the SAME job arrives while the lane is busy.
+  const { CRON_TRIGGERS_DIR } = await import('../tools/shared.js');
+  const triggersDir = CRON_TRIGGERS_DIR;
+  mkdirSync(triggersDir, { recursive: true });
+  const triggerFile = path.join(triggersDir, 'overlap-trigger.json');
+  writeFileSync(triggerFile, JSON.stringify({ jobName: 'cron-overlap-job' }), 'utf-8');
+
+  await processTriggers(slowAssistant);
+  assert.equal(ran.length, 1, 'the trigger DEFERS — no second concurrent execution of the job');
+  assert.ok(existsSync(triggerFile), 'the deferred trigger file survives for the next tick');
+
+  // Lane completes → the next trigger pass runs it.
+  release();
+  await waitForCronScheduleIdle();
+  await processTriggers(slowAssistant);
+  assert.equal(ran.length, 2, 'the queued trigger runs once the lane is idle');
+  assert.equal(existsSync(triggerFile), false, 'a trigger that RAN is consumed');
 });
 
 test('cron admission is non-blocking and single-flight while completion owns the durable commit', async () => {
