@@ -1,4 +1,6 @@
 import { randomBytes } from 'node:crypto';
+import { getSavedClis } from '../runtime/saved-clis.js';
+import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
 import {
   closeSync,
   existsSync,
@@ -219,6 +221,11 @@ export interface BackgroundTaskRecord {
   /** Parked clarifying question (status 'awaiting_input'), twin of
    *  pendingApprovalId/approvalResolution but carrying freeform Q&A. */
   pendingQuestionId?: string;
+  /** Structured auth-recovery tag: the ROSTER CLI command whose auth/absence
+   * parked this task. Set only at park time from a permission-classified
+   * blocker naming a roster CLI — never inferred later from free text. The
+   * auth-recovery sweep resumes ONLY tagged tasks. */
+  blockedOnCli?: string;
   pendingQuestion?: string;
   inputResolution?: {
     questionId: string;
@@ -2142,6 +2149,38 @@ interface BackgroundInputPauseOptions {
   blockerType?: BlockerType;
 }
 
+/**
+ * Roster-bounded CLI attribution for an auth-shaped park. Deliberately
+ * narrow: only PERMISSION-classified blockers qualify, and only commands
+ * the user has actually connected/saved are candidates (word-boundary
+ * match) — an arbitrary tool name in prose can never mint a tag, so the
+ * recovery sweep can never resume a task on the strength of a guess.
+ */
+export function detectBlockedOnCli(
+  blockerType: BlockerType | undefined,
+  blockerText: string | undefined,
+  rosterCommands: string[],
+): string | undefined {
+  if (blockerType !== 'permission' || !blockerText) return undefined;
+  for (const command of rosterCommands) {
+    if (!/^[A-Za-z0-9._+-]{1,60}$/.test(command)) continue;
+    const pattern = new RegExp(`(?:^|[^A-Za-z0-9._+-])${command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^A-Za-z0-9._+-])`);
+    if (pattern.test(blockerText)) return command;
+  }
+  return undefined;
+}
+
+function rosterCliCommands(): string[] {
+  try {
+    const commands = new Set<string>();
+    for (const command of getSavedClis()) commands.add(command);
+    for (const record of Object.values(readConnectedClis())) commands.add(record.command);
+    return [...commands];
+  } catch {
+    return [];
+  }
+}
+
 function progressPreservingPauseDetail(
   question: string,
   opts: BackgroundInputPauseOptions = {},
@@ -2190,12 +2229,14 @@ export function markBackgroundTaskAwaitingInput(
   if (!prepareWorkerSettlementForCas(id)) return null;
   const reportDetail = progressPreservingPauseDetail(question, opts);
   const notificationBody = progressPreservingPauseDetail(question, opts, 2000);
+  const blockedOnCli = detectBlockedOnCli(opts.blockerType, opts.blockerReason, rosterCliCommands());
   const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, (task) => ({
     ...clearParkedBackgroundState(),
     status: 'awaiting_input',
     completedAt: undefined,
     error: opts.blockerReason ? clean(opts.blockerReason, 1000) : undefined,
     pendingQuestionId: questionId,
+    ...(blockedOnCli ? { blockedOnCli } : {}),
     pendingQuestion: question.slice(0, RESULT_TRUNCATE_CHARS),
     result: (opts.resultText ?? question).slice(0, RESULT_TRUNCATE_CHARS),
     outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'needs_input', {

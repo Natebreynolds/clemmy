@@ -13,6 +13,7 @@ import { startChatCli } from './cli/chat.js';
 import { startSupervisorIpcHeartbeat } from './daemon/phase.js';
 import { startDaemon } from './daemon/runner.js';
 import { startCliHealthSweep } from './integrations/cli-catalog/auth-health.js';
+import { registerCliAuthRecoverySweep } from './execution/cli-auth-recovery.js';
 import {
   acquireDaemonLease,
   daemonPidIsForeignReuse,
@@ -520,6 +521,7 @@ async function main(): Promise<void> {
       });
       await prepareLocalTranscriptionRuntime();
     startCliHealthSweep();
+    registerCliAuthRecoverySweep();
       logger.info({ pid: process.pid }, 'Daemon starting in foreground mode');
       const assistant = new ClementineAssistant(createRuntimeFromConfig());
       if (WEBHOOK_ENABLED) await startWebhookServer(assistant);
@@ -551,6 +553,7 @@ async function main(): Promise<void> {
     });
     await prepareLocalTranscriptionRuntime();
     startCliHealthSweep();
+    registerCliAuthRecoverySweep();
     const assistant = new ClementineAssistant(createRuntimeFromConfig());
     await startDaemon(assistant);
     return;
@@ -739,6 +742,7 @@ async function main(): Promise<void> {
     });
     await prepareLocalTranscriptionRuntime();
     startCliHealthSweep();
+    registerCliAuthRecoverySweep();
     // Warm the markitdown runtime in the background so a user's FIRST file
     // conversion doesn't eat a ~½GB download under the per-conversion timeout.
     // Fire-and-forget, idempotent, never blocks the daemon loop.
