@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
+  claimResumableApproval,
   isActionable,
   isExpired,
   listPending,
@@ -29,7 +30,8 @@ import {
   resolve,
   type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
-import { createSession, getSession } from '../runtime/harness/eventlog.js';
+import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
+import { appendEvent, createSession, getSession } from '../runtime/harness/eventlog.js';
 import { appendNote, listNotes } from './data-store.js';
 import {
   resolveInSpace,
@@ -38,8 +40,9 @@ import {
   type SpaceDataSource,
   type SpaceRecord,
 } from './store.js';
+import { SPACE_DATA_RUNNER_TRUST_TOOL } from './space-execution-policy.js';
 
-export const SPACE_DATA_RUNNER_TRUST_TOOL = 'space_trust_data_runner';
+export { SPACE_DATA_RUNNER_TRUST_TOOL };
 export const SPACE_DATA_RUNNER_TRUST_VERSION = 1;
 const RUNNER_TRUST_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
@@ -59,6 +62,43 @@ export type RunnerTrustDecision =
   | { state: 'approved'; runnerSha256: string; approvalId: string }
   | { state: 'pending'; approvalId: string; error: string }
   | { state: 'rejected' | 'blocked'; error: string };
+
+export interface RunnerTrustRefreshRequest {
+  spaceSlug: string;
+  sourceId: string;
+  approvalId: string;
+}
+
+export interface RunnerTrustRefreshOutcome {
+  ok: boolean;
+  sourceId: string;
+  error?: string;
+  pendingApprovalId?: string;
+}
+
+type RunnerTrustRefreshHandler = (
+  request: RunnerTrustRefreshRequest,
+) => Promise<RunnerTrustRefreshOutcome[]>;
+
+let runnerTrustRefreshHandler: RunnerTrustRefreshHandler | null = null;
+
+/** The runner owns refresh serialization and observation commits. This seam
+ * lets approval resolution request that work without creating an import cycle. */
+export function registerRunnerTrustRefreshHandler(handler: RunnerTrustRefreshHandler): void {
+  runnerTrustRefreshHandler = handler;
+  setImmediate(() => {
+    for (const row of listPending({ status: 'resolved' })) {
+      if (
+        row.tool === SPACE_DATA_RUNNER_TRUST_TOOL
+        && row.resolution === 'approved'
+        && row.consumedAt === null
+        && row.args?.spaceDataRunnerTrustVersion === SPACE_DATA_RUNNER_TRUST_VERSION
+      ) {
+        recordRunnerTrustDecision(row);
+      }
+    }
+  });
+}
 
 function normalizedPolicy(source: SpaceDataSource): RunnerTrustSnapshot['schedulePolicy'] {
   return {
@@ -145,13 +185,6 @@ function ensureSpaceSession(rec: SpaceRecord): string {
   return sessionId;
 }
 
-/**
- * Approval resolution deliberately does not rewrite data.json: that document
- * is last-write-wins, and a synchronous read/modify/write here could clobber a
- * refresh already in flight. Instead, project an immediate durable note that
- * says both what the human decided and that _meta may remain stale until the
- * next refresh. The next refresh is the sole owner of refresh metadata.
- */
 function recordRunnerTrustDecision(row: PendingApprovalRow): void {
   if (row.tool !== SPACE_DATA_RUNNER_TRUST_TOOL || !row.resolution) return;
   const args = row.args ?? {};
@@ -166,27 +199,81 @@ function recordRunnerTrustDecision(row: PendingApprovalRow): void {
   const rec = spaceStore.get(slug);
   const installed = rec?.dataSources.find((source) => source.id === sourceId);
   if (!rec || installed?.runner?.trim() !== runner.trim()) return;
-  if (listNotes(slug, Number.MAX_SAFE_INTEGER).some((note) => (
+  const decisionAlreadyProjected = listNotes(slug, Number.MAX_SAFE_INTEGER).some((note) => (
     note.meta?.approvalId === row.approvalId
     && note.meta?.kind === SPACE_DATA_RUNNER_TRUST_TOOL
-  ))) return;
+    && note.meta?.status === row.resolution
+  ));
 
   const status = row.resolution;
-  const effect = status === 'approved'
-    ? 'The next refresh can use this entry-file grant if its bound hash and schedule still match.'
-    : 'The runner remains blocked.';
-  appendNote(slug, {
-    text: `Runner trust was ${status} for data source “${sourceId}” (${row.approvalId}). No refresh was run automatically. The current Workspace data status may continue to show “awaiting approval” until the next space_refresh. ${effect}`,
-    kind: 'data-source',
-    meta: {
-      kind: SPACE_DATA_RUNNER_TRUST_TOOL,
-      sourceId,
-      runner,
-      runnerSha256,
-      approvalId: row.approvalId,
-      status,
-      staleDataStatus: true,
-    },
+  if (!decisionAlreadyProjected) {
+    appendNote(slug, {
+      text: status === 'approved'
+        ? `Runner trust was approved for data source “${sourceId}” (${row.approvalId}). The blocked refresh is resuming automatically; its observation will report the real outcome.`
+        : `Runner trust was ${status} for data source “${sourceId}” (${row.approvalId}). The runner remains blocked and was not executed.`,
+      kind: 'data-source',
+      meta: {
+        kind: SPACE_DATA_RUNNER_TRUST_TOOL,
+        sourceId,
+        runner,
+        runnerSha256,
+        approvalId: row.approvalId,
+        status,
+        staleDataStatus: status !== 'approved',
+      },
+    });
+  }
+
+  if (status !== 'approved' || !row.resumeKey || !runnerTrustRefreshHandler) return;
+  const claim = claimResumableApproval(row.resumeKey);
+  if (claim.state !== 'approved') return;
+
+  void runnerTrustRefreshHandler({
+    spaceSlug: slug,
+    sourceId,
+    approvalId: row.approvalId,
+  }).then((results) => {
+    const succeeded = results.length > 0 && results.every((result) => result.ok);
+    const failures = results.filter((result) => !result.ok);
+    const reply = succeeded
+      ? `Approved ${row.approvalId}. “${rec.title}” refreshed ${sourceId} successfully.`
+      : `Approved ${row.approvalId}, but “${rec.title}” could not refresh ${sourceId}: ${
+        failures.map((result) => result.error ?? 'unknown refresh error').join('; ')
+      }`;
+    appendEvent({
+      sessionId: row.sessionId,
+      turn: 0,
+      role: 'Clem',
+      type: 'conversation_completed',
+      data: {
+        reason: succeeded
+          ? 'workspace_runner_approval_refresh_completed'
+          : 'workspace_runner_approval_refresh_failed',
+        summary: reply,
+        reply,
+        steps: 0,
+        approvalId: row.approvalId,
+        sourceId,
+      },
+    });
+  }).catch((error: unknown) => {
+    const reply = `Approved ${row.approvalId}, but “${rec.title}” could not refresh ${sourceId}: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+    appendEvent({
+      sessionId: row.sessionId,
+      turn: 0,
+      role: 'Clem',
+      type: 'conversation_completed',
+      data: {
+        reason: 'workspace_runner_approval_refresh_failed',
+        summary: reply,
+        reply,
+        steps: 0,
+        approvalId: row.approvalId,
+        sourceId,
+      },
+    });
   });
 }
 
@@ -248,7 +335,7 @@ export function authorizeInstalledDataRunner(
 
   const subject = `Allow pinned entrypoint “${snapshot.runner}” to refresh “${rec.title}” automatically`;
   const reason = 'Legacy compatibility: this approval pins only the runner entrypoint bytes. Helpers, packages, CLIs, local files, auth state, and network services remain live and outside the digest; arbitrary runner code is not a read-only sandbox. The grant expires after 90 days; any entrypoint, source, or schedule change invalidates it.';
-  const { row } = registerResumable({
+  const { row, created } = registerResumable({
     sessionId,
     resumeKey: `space-data-runner-trust:v${SPACE_DATA_RUNNER_TRUST_VERSION}:${trustKey}`,
     ttlMs: RUNNER_TRUST_TTL_MS,
@@ -269,6 +356,28 @@ export function authorizeInstalledDataRunner(
       },
     },
   });
+  if (created) {
+    appendNote(rec.id, {
+      text: `Data source “${snapshot.sourceId}” is waiting for one-time runner approval (${row.approvalId}).`,
+      kind: 'data-source',
+      meta: {
+        kind: SPACE_DATA_RUNNER_TRUST_TOOL,
+        sourceId: snapshot.sourceId,
+        runner: snapshot.runner,
+        runnerSha256: snapshot.runnerSha256,
+        approvalId: row.approvalId,
+        status: 'pending',
+      },
+    });
+    emitApprovalRequestedCard({
+      sessionId,
+      approvalId: row.approvalId,
+      extra: {
+        workspaceId: rec.id,
+        sourceId: snapshot.sourceId,
+      },
+    });
+  }
   return {
     state: 'pending',
     approvalId: row.approvalId,

@@ -4,6 +4,11 @@
  * path /console/spaces/<id>/view (by the daemon, outside the SPA router).
  */
 import { apiGet, apiPost, apiPatch, apiDelete } from './api';
+import {
+  refreshFailureForResults,
+  type WorkspaceRefreshResult,
+} from './workspace-refresh';
+export { WorkspaceRefreshError } from './workspace-refresh';
 
 export interface SpaceDataSource {
   id: string;
@@ -93,7 +98,7 @@ export interface SpaceDetail {
   audit: SpaceAudit[];
   health?: SpaceHealthSnapshot;
 }
-export interface RefreshResult { ok: boolean; sourceId: string; error?: string }
+export type RefreshResult = WorkspaceRefreshResult;
 
 export type SpaceObservationStatus = 'ok' | 'error' | 'awaiting_approval';
 
@@ -179,10 +184,14 @@ export const archiveSpace = (id: string) =>
 export const deleteSpace = (id: string) =>
   apiDelete<{ removed: boolean }>(`/api/console/spaces/${encodeURIComponent(id)}?hard=1`);
 
-export const refreshSpace = (id: string, sourceId?: string) =>
-  apiPost<{ results: RefreshResult[]; data: unknown }>(
+export const refreshSpace = async (id: string, sourceId?: string) => {
+  const response = await apiPost<{ results: RefreshResult[]; data: unknown }>(
     `/api/console/spaces/${encodeURIComponent(id)}/refresh`, sourceId ? { sourceId } : {},
   );
+  const failure = refreshFailureForResults(response.results);
+  if (failure) throw failure;
+  return response;
+};
 
 /** Narrow operations used by the parent-owned Workspace iframe RPC bridge.
  *  Auth stays here in the trusted console; authored view code never receives a
@@ -277,24 +286,25 @@ export const reengageSpace = (id: string, body: { trigger?: 'note' | 'ask' | 'th
     `/api/console/spaces/${encodeURIComponent(id)}/reengage`, body,
   );
 
-/** Count actions still WAITING on approval (E1): a 'pending' action note whose
- *  approvalId hasn't been resolved by a later note (ran → meta.ok set, or
- *  rejected → meta.status 'rejected'). Drives the toolbar "N waiting" badge. */
+/** Count exact Workspace cards still waiting. Action and legacy data-runner
+ * approvals share the same status vocabulary and badge. */
 export function openApprovalCount(notes: SpaceNote[]): number {
   const resolved = new Set<string>();
   for (const n of notes) {
     const m = n.meta;
     const aid = m && typeof m.approvalId === 'string' ? m.approvalId : null;
-    if (aid && (m!.ok !== undefined || m!.status === 'rejected')) resolved.add(aid);
+    if (aid && (m!.ok !== undefined || (typeof m!.status === 'string' && m!.status !== 'pending'))) {
+      resolved.add(aid);
+    }
   }
-  let open = 0;
+  const open = new Set<string>();
   for (const n of notes) {
     const m = n.meta;
-    if (n.kind !== 'action' || !m || m.status !== 'pending') continue;
+    if ((n.kind !== 'action' && n.kind !== 'data-source') || !m || m.status !== 'pending') continue;
     const aid = typeof m.approvalId === 'string' ? m.approvalId : null;
-    if (aid && !resolved.has(aid)) open += 1;
+    if (aid && !resolved.has(aid)) open.add(aid);
   }
-  return open;
+  return open.size;
 }
 
 export interface GapQuestion { question: string; why?: string }

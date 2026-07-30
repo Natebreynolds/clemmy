@@ -19,7 +19,7 @@ import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
   getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions,
   latestRefreshFailures, buildWorkspaceFixPrompt, type SpaceStatus, type SpaceDiffResponse,
-  type SpaceObservationSummary,
+  type SpaceObservationSummary, WorkspaceRefreshError,
 } from '@/lib/spaces';
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
@@ -262,7 +262,14 @@ function WorkspaceViewForId({ id }: { id: string }) {
               size="sm"
               disabled={busy}
               onClick={() => act(async () => {
-                await refreshSpace(id);
+                try {
+                  await refreshSpace(id);
+                } catch (err) {
+                  if (err instanceof WorkspaceRefreshError && err.pendingApprovalIds.length > 0) {
+                    setDockOpen(true);
+                  }
+                  throw err;
+                }
                 await history.refetch();
               }, true)}
             >
@@ -320,6 +327,10 @@ function WorkspaceViewForId({ id }: { id: string }) {
           title={space.title}
           className="absolute inset-0 h-full w-full border-0"
           onMutation={() => { void detail.refetch(); }}
+          onError={(message) => {
+            setError(message);
+            if (/approval needed/i.test(message)) setDockOpen(true);
+          }}
         />
 
         {/* Details drawer */}

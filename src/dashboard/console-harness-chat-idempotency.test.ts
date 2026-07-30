@@ -698,6 +698,23 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
     await postDecision(`reject ${second.approvalId}`, 'approval-exact-second');
     await waitFor(() => approvalRegistry.get(second.approvalId)?.status === 'resolved');
     assert.equal(approvalRegistry.get(second.approvalId)?.resolution, 'rejected');
+
+    const workspaceRunner = approvalRegistry.register({
+      sessionId: session.id,
+      channel: 'desktop',
+      subject: 'Trust the pinned Salesforce refresh runner',
+      tool: 'space_trust_data_runner',
+      args: { spaceSlug: 'sales', sourceId: 'weekly' },
+    });
+    await postDecision(`approve ${workspaceRunner.approvalId}`, 'approval-workspace-runner');
+    await waitFor(() => approvalRegistry.get(workspaceRunner.approvalId)?.status === 'resolved');
+    const workspaceAck = listEvents(session.id, { types: ['conversation_step'] })
+      .find((event) => (
+        (event.data as { approvalId?: string }).approvalId === workspaceRunner.approvalId
+      ));
+    assert.ok(workspaceAck);
+    assert.match(String((workspaceAck.data as { summary?: string }).summary), /refreshing.*now/i);
+    assert.doesNotMatch(String((workspaceAck.data as { summary?: string }).summary), /continuing/i);
     assert.equal(brainCalls, 0);
   } finally {
     await harness.close();

@@ -25,6 +25,7 @@ import { createHash } from 'node:crypto';
 import {
   listPending, onApprovalResolved, registerResumable, type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
+import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
 import { getSession, createSession } from '../runtime/harness/eventlog.js';
 import { spaceStore, type SpaceAction, type SpaceRecord } from './store.js';
 import { appendNote, appendAudit, listAudit, listNotes } from './data-store.js';
@@ -259,6 +260,14 @@ export function enqueueSpaceActionApproval(
     }),
   });
   if (registered.created) {
+    emitApprovalRequestedCard({
+      sessionId,
+      approvalId: registered.row.approvalId,
+      extra: {
+        workspaceId: rec.id,
+        actionId: action.id,
+      },
+    });
     appendAudit(rec.id, {
       method: 'ACTION_PENDING',
       path: `/action/${action.id}`,

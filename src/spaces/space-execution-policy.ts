@@ -12,6 +12,7 @@ import { classifyCanonicalExternalEffect } from '../runtime/harness/execution-ga
 import type { SpaceAction, SpaceDataSource } from './store.js';
 
 export const SPACE_ACTION_APPROVAL_TOOL = 'space_execute_action';
+export const SPACE_DATA_RUNNER_TRUST_TOOL = 'space_trust_data_runner';
 
 export function workspaceComposioIsProvablyReadOnly(slug: string | null | undefined): boolean {
   const normalized = slug?.trim();

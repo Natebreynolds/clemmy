@@ -243,6 +243,9 @@ test('enqueueSpaceActionApproval registers an approval + a pending note', () => 
   assert.match(approvalId, /^apr-/);
   assert.ok(registry.listPending({ status: 'pending' }).some((r) => r.approvalId === approvalId));
   assert.ok(dataStore.listNotes(slug).some((n) => n.meta?.status === 'pending'));
+  const inlineCard = eventlog.listEvents(`space-${slug}`, { types: ['approval_requested'] })
+    .find((event) => (event.data as { approvalId?: string }).approvalId === approvalId);
+  assert.ok(inlineCard, 'the exact action card is visible inside Workspace chat');
 });
 
 test('runner action approval discloses pinned-entrypoint scope and executes the snapshotted bytes', async () => {

@@ -49,7 +49,10 @@ import {
   workspaceDataSourceSafetyError,
 } from './space-execution-policy.js';
 import { verifySpaceActionApprovalAuthority } from './space-action-authority.js';
-import { authorizeInstalledDataRunner } from './space-data-runner-trust.js';
+import {
+  authorizeInstalledDataRunner,
+  registerRunnerTrustRefreshHandler,
+} from './space-data-runner-trust.js';
 
 // Tunable so a heavy data pull can be given more room without a code change.
 const RUNNER_TIMEOUT_MS = (() => {
@@ -535,6 +538,14 @@ export async function refreshSpaceData(slug: string, sourceId?: string, opts: Re
   return enqueueSpaceRefresh(slug, () => refreshSpaceDataLocked(slug, sourceId, opts));
 }
 
+registerRunnerTrustRefreshHandler(async ({ spaceSlug, sourceId, approvalId }) => (
+  refreshSpaceData(spaceSlug, sourceId, {
+    cause: 'manual',
+    refreshId: `runner-trust:${approvalId}`,
+    batchId: `runner-trust:${approvalId}`,
+  })
+));
+
 async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: RefreshSpaceOptions = {}): Promise<RefreshResult[]> {
   const rec = spaceStore.get(slug);
   if (!rec) return [{ ok: false, sourceId: sourceId ?? '(none)', error: `no workspace "${slug}"` }];
@@ -581,7 +592,12 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
   for (const source of sources) {
     const run = await runSpaceDataSource(slug, source);
     const observedAt = new Date().toISOString();
-    const refreshId = opts.refreshId ?? randomUUID();
+    // Repeated clicks while the same trust card is pending are one observation,
+    // not new facts. The approval id is already exact to workspace + source +
+    // runner hash + schedule and therefore makes the correct durable key.
+    const refreshId = run.ok
+      ? (opts.refreshId ?? randomUUID())
+      : (run.pendingApprovalId ? `runner-trust-pending:${run.pendingApprovalId}` : (opts.refreshId ?? randomUUID()));
     const provenance: Record<string, unknown> = source.composioSlug
       ? {
         provider: 'composio',

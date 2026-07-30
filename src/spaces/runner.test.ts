@@ -243,6 +243,12 @@ test('an installed legacy data runner requests one pinned-entrypoint trust card,
     schedule: source.schedule,
     timezone: source.timezone,
   });
+  const inlineCards = eventlog.listEvents(`space-${slug}`, { types: ['approval_requested'] });
+  assert.equal(inlineCards.length, 1, 'the exact trust card is visible in Workspace chat');
+  assert.equal(
+    (inlineCards[0]?.data as { approvalId?: string }).approvalId,
+    cards[0]?.approvalId,
+  );
 
   const duplicate = await runner.runSpaceDataSource(slug, source);
   assert.equal(duplicate.ok, false);
@@ -330,7 +336,7 @@ test('verified runner snapshots are cleaned after a non-zero runner exit', async
   assert.equal(existsSync(snapshotPath), false, 'ephemeral approved-entry snapshot is removed after failure');
 });
 
-test('runner-trust approval and rejection immediately leave a truthful no-execution stale-state note', async () => {
+test('runner-trust approval resumes exactly one refresh while rejection never executes', async () => {
   for (const resolution of ['approved', 'rejected'] as const) {
     const slug = `legacy-runner-trust-note-${resolution}`;
     const source = { id: 'pull', runner: 'pull.mjs' };
@@ -350,24 +356,66 @@ process.stdout.write('{}');`,
     const refresh = await runner.refreshSpaceData(slug, source.id);
     assert.match(refresh[0]?.pendingApprovalId ?? '', /^apr-/);
     const approvalId = refresh[0]!.pendingApprovalId!;
+    const repeated = await runner.refreshSpaceData(slug, source.id);
+    assert.equal(repeated[0]?.pendingApprovalId, approvalId);
+    assert.equal(
+      workspaceDb.listWorkspaceDatasetObservations(slug, {
+        sourceKey: source.id,
+        limit: 10,
+      }).filter((observation) => observation.status === 'awaiting_approval').length,
+      1,
+      'repeated clicks on one trust card remain one historical observation',
+    );
     assert.equal(approvalRegistry.resolve(approvalId, resolution, 'runner-trust-note-test').ok, true);
 
+    const spawnedPath = store.resolveInSpace(slug, 'data/decision-spawned.txt');
+    if (resolution === 'approved') {
+      const deadline = Date.now() + 3_000;
+      while (Date.now() < deadline) {
+        const projected = dataStore.readData(slug) as {
+          _meta?: { pull?: { ok?: boolean } };
+        };
+        if (projected._meta?.pull?.ok === true) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     const current = dataStore.readData(slug) as {
       _meta?: { pull?: { status?: string; approvalId?: string } };
     };
-    assert.equal(current._meta?.pull?.status, 'awaiting_approval');
-    assert.equal(current._meta?.pull?.approvalId, approvalId);
     assert.equal(
-      (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/decision-spawned.txt')),
-      false,
-      'a trust decision projects status but never auto-runs the runner',
+      (await import('node:fs')).existsSync(spawnedPath),
+      resolution === 'approved',
+      resolution === 'approved'
+        ? 'the exact approved refresh resumes automatically'
+        : 'rejection never executes the runner',
     );
-    const note = dataStore.listNotes(slug).find((item) => item.meta?.approvalId === approvalId);
+    const note = dataStore.listNotes(slug).find((item) => (
+      item.meta?.approvalId === approvalId && item.meta?.status === resolution
+    ));
     assert.ok(note);
     assert.equal(note.meta?.status, resolution);
-    assert.equal(note.meta?.staleDataStatus, true);
-    assert.match(note.text, /no refresh was run automatically/i);
-    assert.match(note.text, /may continue to show.*awaiting/i);
+    if (resolution === 'approved') {
+      assert.equal((current._meta?.pull as { ok?: boolean } | undefined)?.ok, true);
+      assert.equal(approvalRegistry.get(approvalId)?.consumedAt !== null, true);
+      assert.match(note.text, /refresh.*resum/i);
+      const completion = eventlog.listEvents(`space-${slug}`, {
+        types: ['conversation_completed'],
+      }).find((event) => (
+        (event.data as { approvalId?: string }).approvalId === approvalId
+      ));
+      assert.ok(completion, 'Workspace chat receives the real resumed refresh outcome');
+      assert.equal(
+        (completion.data as { reason?: string }).reason,
+        'workspace_runner_approval_refresh_completed',
+      );
+    } else {
+      assert.equal(current._meta?.pull?.status, 'awaiting_approval');
+      assert.equal(current._meta?.pull?.approvalId, approvalId);
+      assert.equal(note.meta?.staleDataStatus, true);
+      assert.match(note.text, /runner remains blocked/i);
+    }
   }
 });
 

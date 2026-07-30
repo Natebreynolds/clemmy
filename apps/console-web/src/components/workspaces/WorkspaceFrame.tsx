@@ -35,6 +35,7 @@ interface WorkspaceFrameProps {
   ariaHidden?: boolean;
   readOnly?: boolean;
   onMutation?: () => void;
+  onError?: (message: string) => void;
 }
 
 const MAX_IN_FLIGHT = 16;
@@ -141,10 +142,13 @@ export function WorkspaceFrame({
   ariaHidden,
   readOnly = false,
   onMutation,
+  onError,
 }: WorkspaceFrameProps) {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const onMutationRef = useRef(onMutation);
+  const onErrorRef = useRef(onError);
   onMutationRef.current = onMutation;
+  onErrorRef.current = onError;
 
   useLayoutEffect(() => {
     const frame = frameRef.current;
@@ -227,10 +231,12 @@ export function WorkspaceFrame({
           }
         })
         .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : 'Workspace request failed';
           reply(workspaceRpcFailure(
             request,
-            error instanceof Error ? error.message : 'Workspace request failed',
+            message,
           ));
+          onErrorRef.current?.(message);
         })
         .finally(() => { inFlight -= 1; });
     };

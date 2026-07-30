@@ -319,6 +319,11 @@ import { addNotification, isNeedsAttentionNotification, listNotifications, markN
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { buildWorkspaceContextPrimer } from '../spaces/workspace-context.js';
 import {
+  SPACE_ACTION_APPROVAL_TOOL,
+  SPACE_DATA_RUNNER_TRUST_TOOL,
+} from '../spaces/space-execution-policy.js';
+import { initApprovalFocusReconciliation } from '../runtime/harness/approval-focus-reconcile.js';
+import {
   appendEvent as appendHarnessEvent,
   claimRunAttemptLease,
   claimHarnessChatRequest,
@@ -2717,6 +2722,7 @@ export function registerConsoleRoutes(
   try {
     interruptForeignRunAttemptLeases(HARNESS_CHAT_LEASE_OWNER, { runIdPrefix: 'desktop:' });
   } catch { /* eventlog startup recovery is best-effort; request-time TTL still applies */ }
+  initApprovalFocusReconciliation();
 
   // Missing-bundle /console fallback (2026-07-21: the 1.35 MB legacy inlined-
   // HTML renderer + its /console-legacy route were DELETED — it was a second,
@@ -13640,13 +13646,12 @@ export function registerConsoleRoutes(
       } catch { /* best-effort primer */ }
     }
     const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
-    // The Agent SDK brain lane pauses in the approval registry (its still-alive
-    // query() awaits a poll), NOT in RunState. Detect that separately so a typed
-    // approve/reject resolves the registry row instead of trying (and failing) to
-    // rehydrate a RunState that does not exist.
-    const sdkApprovalPending = !isPausedOnApproval
+    // Registry-owned approvals have no RunState interrupt. Most belong to a
+    // still-alive Agent SDK query; Workspace buttons are standalone continuations
+    // owned by their deterministic runtime.
+    const registryApprovalPending = !isPausedOnApproval
       && approvalRegistry.listPending({ sessionId, status: 'pending' }).length > 0;
-    const intent = (isPausedOnApproval || sdkApprovalPending) ? parseApprovalIntent(input) : null;
+    const intent = (isPausedOnApproval || registryApprovalPending) ? parseApprovalIntent(input) : null;
     const sinceSeq = getLatestHarnessEventSeq(sessionId);
     const autonomy = loadProactivityPolicy().autoApproveScope;
     const planFirst = !intent && shouldUsePlanFirst({ input: turnInput, freshSession, autonomy });
@@ -13985,13 +13990,43 @@ export function registerConsoleRoutes(
         // the original still-alive query() picks it up via its poll and continues,
         // delivering its own final reply. Do NOT runConversationFromResume here —
         // there is no RunState to rehydrate (that would fail + clear state).
-        if (intent && sdkApprovalPending) {
+        if (intent && registryApprovalPending) {
           const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
           const row = addressedApprovalId ? approvalRegistry.get(addressedApprovalId) : null;
+          const standaloneWorkspaceApproval = row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
+            || row?.tool === SPACE_ACTION_APPROVAL_TOOL;
           const resolved = !!row
             && row.sessionId === sessionId
             && row.status === 'pending'
             && approvalRegistry.resolve(row.approvalId, resolution, 'chat-dock-user').ok;
+          if (standaloneWorkspaceApproval) {
+            const approvedRunner = resolved
+              && resolution === 'approved'
+              && row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL;
+            const reply = !resolved
+              ? 'That approval was no longer pending. Nothing else was approved or rejected.'
+              : approvedRunner
+                ? `Approved ${addressedApprovalId}. Refreshing the blocked Workspace data source now; I’ll report its real outcome here.`
+                : resolution === 'approved'
+                  ? `Approved ${addressedApprovalId}. The exact Workspace action is now authorized and its runtime is executing it.`
+                  : `Rejected ${addressedApprovalId}. The Workspace runner or action remains blocked and was not executed.`;
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'Clem',
+              type: approvedRunner ? 'conversation_step' : 'conversation_completed',
+              data: {
+                reason: approvedRunner
+                  ? 'workspace_runner_approval_refresh_started'
+                  : 'workspace_approval_resolved',
+                summary: reply,
+                ...(approvedRunner ? {} : { reply }),
+                steps: 0,
+                approvalId: addressedApprovalId,
+              },
+            });
+            return;
+          }
           appendHarnessEvent({
             sessionId,
             turn: 0,
