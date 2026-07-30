@@ -10411,7 +10411,7 @@ export function registerConsoleRoutes(
           column: 'needs_you',
           status: held.status,
           progressHint:
-            `Scheduled ${scheduledLabel} while Clementine was offline. Nothing has started.`
+            `Scheduled for ${scheduledLabel} and paused before execution. Nothing has started.`
             + (collapsed > 1
               ? ` ${collapsed} missed occurrences were collapsed into this one decision.`
               : ''),

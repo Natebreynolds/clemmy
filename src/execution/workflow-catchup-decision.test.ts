@@ -1,6 +1,9 @@
 import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -29,6 +32,29 @@ const {
 const {
   workflowRunCancellationRequested,
 } = await import('./workflow-run-cancellation.js');
+
+const DECISION_MODULE_URL = new URL('./workflow-catchup-decision.ts', import.meta.url).href;
+const DECISION_CHILD_CODE = String.raw`
+  import { existsSync, writeFileSync } from 'node:fs';
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  const mod = await import(process.env.CLEM_DECISION_MODULE_URL);
+  writeFileSync(process.env.CLEM_DECISION_READY, 'ready', 'utf-8');
+  while (!existsSync(process.env.CLEM_DECISION_START)) Atomics.wait(wait, 0, 0, 10);
+  try {
+    const input = {
+      runId: process.env.CLEM_DECISION_RUN_ID,
+      expectedWorkflow: 'daily-brief',
+    };
+    const result = process.env.CLEM_DECISION_ACTION === 'resume'
+      ? mod.resumeWorkflowCatchupRun(input)
+      : mod.skipWorkflowCatchupRun(input);
+    writeFileSync(process.env.CLEM_DECISION_RESULT, JSON.stringify({ status: result.status }), 'utf-8');
+  } catch (error) {
+    writeFileSync(process.env.CLEM_DECISION_RESULT, JSON.stringify({
+      error: error instanceof Error ? error.message : String(error),
+    }), 'utf-8');
+  }
+`;
 
 beforeEach(() => {
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
@@ -74,6 +100,39 @@ function readRun(runId: string): Record<string, unknown> {
   return JSON.parse(
     readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8'),
   ) as Record<string, unknown>;
+}
+
+async function waitForFile(file: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(file)) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function launchDecisionChild(input: {
+  action: 'resume' | 'skip';
+  runId: string;
+  readyFile: string;
+  startFile: string;
+  resultFile: string;
+}): ChildProcess {
+  return spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', DECISION_CHILD_CODE], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLEMENTINE_HOME: TMP_HOME,
+      HOME: TMP_HOME,
+      CLEMMY_LOCAL_EMBEDDINGS: 'off',
+      CLEM_DECISION_MODULE_URL: DECISION_MODULE_URL,
+      CLEM_DECISION_ACTION: input.action,
+      CLEM_DECISION_RUN_ID: input.runId,
+      CLEM_DECISION_READY: input.readyFile,
+      CLEM_DECISION_START: input.startFile,
+      CLEM_DECISION_RESULT: input.resultFile,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
 }
 
 test('held catch-ups list exact collapsed schedule metadata and Resume is an idempotent same-run CAS', () => {
@@ -154,6 +213,81 @@ test('Resume rechecks the admitted definition readiness and leaves a blocked occ
   assert.equal(readRun(held.id!).status, 'awaiting_catchup_decision');
 });
 
+test('Resume rejects meaningful workflow definition drift and leaves the admitted occurrence held', () => {
+  const edits = [
+    {
+      label: 'step prompt',
+      apply: () => writeWorkflow('daily-brief', {
+        name: 'Daily Brief',
+        description: 'Build the daily brief.',
+        enabled: true,
+        trigger: { schedule: '0 9 * * *' },
+        steps: [{ id: 'read', prompt: 'Read the edited notes.', sideEffect: 'read' }],
+      }),
+    },
+    {
+      label: 'workflow input contract',
+      apply: () => writeWorkflow('daily-brief', {
+        name: 'Daily Brief',
+        description: 'Build the daily brief.',
+        enabled: true,
+        trigger: { schedule: '0 9 * * *' },
+        inputs: { account: { type: 'string', required: true } },
+        steps: [{ id: 'read', prompt: 'Read the latest notes.', sideEffect: 'read' }],
+      }),
+    },
+    {
+      label: 'tool authority',
+      apply: () => writeWorkflow('daily-brief', {
+        name: 'Daily Brief',
+        description: 'Build the daily brief.',
+        enabled: true,
+        trigger: { schedule: '0 9 * * *' },
+        allowedTools: ['composio_gmail_search'],
+        steps: [{ id: 'read', prompt: 'Read the latest notes.', sideEffect: 'read' }],
+      }),
+    },
+  ];
+
+  for (const [index, edit] of edits.entries()) {
+    rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
+    rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+    writeReadyWorkflow();
+    const held = queueHeld({ scheduledAtMs: 420_000 + index * 60_000 });
+    edit.apply();
+
+    const result = resumeWorkflowCatchupRun({
+      runId: held.id!,
+      expectedWorkflow: 'daily-brief',
+    });
+    assert.equal(result.status, 'definition_conflict', edit.label);
+    assert.match(result.message, /definition changed/i, edit.label);
+    assert.equal(readRun(held.id!).status, 'awaiting_catchup_decision', edit.label);
+    assert.equal(readRun(held.id!).catchupDisposition, 'held', edit.label);
+    assert.equal(workflowRunCancellationRequested(held.id!), false, edit.label);
+  }
+});
+
+test('Resume allows schedule-only edits because they govern future occurrences', () => {
+  writeReadyWorkflow();
+  const held = queueHeld({ scheduledAtMs: 600_000 });
+  writeWorkflow('daily-brief', {
+    name: 'Daily Brief',
+    description: 'Build the daily brief.',
+    enabled: true,
+    trigger: { schedule: '30 10 * * 1-5', timezone: 'America/New_York' },
+    steps: [{ id: 'read', prompt: 'Read the latest notes.', sideEffect: 'read' }],
+  });
+
+  const result = resumeWorkflowCatchupRun({
+    runId: held.id!,
+    expectedWorkflow: 'daily-brief',
+  });
+  assert.equal(result.status, 'resumed');
+  assert.equal(readRun(held.id!).status, 'queued');
+  assert.equal(readRun(held.id!).catchupDisposition, 'resumed');
+});
+
 test('Resume leaves held occurrences in place when their current workflow is disabled or deleted', () => {
   writeReadyWorkflow();
   const disabledHeld = queueHeld({ scheduledAtMs: 240_000 });
@@ -211,6 +345,72 @@ test('Skip terminalizes only a still-held occurrence and is idempotent without c
   }).status, 'already_resumed');
   assert.equal(readRun(resumedHeld.id!).status, 'queued');
   assert.equal(workflowRunCancellationRequested(resumedHeld.id!), false);
+});
+
+test('concurrent cross-process Resume and Skip serialize to one authoritative decision', async () => {
+  writeReadyWorkflow();
+  const held = queueHeld({ scheduledAtMs: 660_000 });
+  const nonce = `${process.pid}-${Date.now()}`;
+  const startFile = path.join(TMP_HOME, `decision-${nonce}.start`);
+  const resumeReady = path.join(TMP_HOME, `decision-${nonce}.resume.ready`);
+  const skipReady = path.join(TMP_HOME, `decision-${nonce}.skip.ready`);
+  const resumeResult = path.join(TMP_HOME, `decision-${nonce}.resume.json`);
+  const skipResult = path.join(TMP_HOME, `decision-${nonce}.skip.json`);
+  const resume = launchDecisionChild({
+    action: 'resume',
+    runId: held.id!,
+    readyFile: resumeReady,
+    startFile,
+    resultFile: resumeResult,
+  });
+  const skip = launchDecisionChild({
+    action: 'skip',
+    runId: held.id!,
+    readyFile: skipReady,
+    startFile,
+    resultFile: skipResult,
+  });
+
+  try {
+    await Promise.all([waitForFile(resumeReady), waitForFile(skipReady)]);
+    writeFileSync(startFile, 'go', 'utf-8');
+    const [[resumeCode], [skipCode]] = await Promise.all([
+      once(resume, 'close') as Promise<[number | null]>,
+      once(skip, 'close') as Promise<[number | null]>,
+    ]);
+    assert.equal(resumeCode, 0);
+    assert.equal(skipCode, 0);
+    const resumeOutcome = JSON.parse(readFileSync(resumeResult, 'utf-8')) as {
+      status?: string;
+      error?: string;
+    };
+    const skipOutcome = JSON.parse(readFileSync(skipResult, 'utf-8')) as {
+      status?: string;
+      error?: string;
+    };
+    assert.equal(resumeOutcome.error, undefined);
+    assert.equal(skipOutcome.error, undefined);
+
+    const canonical = readRun(held.id!);
+    if (resumeOutcome.status === 'resumed') {
+      assert.equal(skipOutcome.status, 'already_resumed');
+      assert.equal(canonical.status, 'queued');
+      assert.equal(canonical.catchupDisposition, 'resumed');
+      assert.equal(workflowRunCancellationRequested(held.id!), false);
+    } else {
+      assert.equal(resumeOutcome.status, 'already_skipped');
+      assert.equal(skipOutcome.status, 'skipped');
+      assert.equal(canonical.status, 'cancelled');
+      assert.equal(canonical.catchupDisposition, 'skipped');
+      assert.equal(workflowRunCancellationRequested(held.id!), true);
+    }
+  } finally {
+    if (resume.exitCode === null && resume.signalCode === null) resume.kill('SIGKILL');
+    if (skip.exitCode === null && skip.signalCode === null) skip.kill('SIGKILL');
+    for (const file of [startFile, resumeReady, skipReady, resumeResult, skipResult]) {
+      rmSync(file, { force: true });
+    }
+  }
 });
 
 test('catch-up decisions fail closed on a cross-workflow request', () => {

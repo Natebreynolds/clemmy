@@ -576,6 +576,7 @@ export interface QueuedRunRecord {
   catchupScheduledAtMs?: number;
   catchupMissedCount?: number;
   catchupDecidedAt?: string;
+  catchupHeldAt?: string;
   /** Occurrence-stable scheduler receipt and requeue lineage. */
   triggerReceiptId?: string;
   requeuedFromRunId?: string;
@@ -7330,19 +7331,84 @@ interface LegacyScheduledCatchupIdentity {
   scheduledAtMs: number;
 }
 
+/** v3.0.1/v3.0.2 scheduler authority was encoded in the random run id because
+ * those releases did not yet mint occurrence receipts. Bind that id back to
+ * the admission timestamp so a hand-authored `source:"schedule"` record is not
+ * enough to gain upgrade-migration authority. */
+function historicalSchedulerAdmissionAtMs(run: QueuedRunRecord): number | null {
+  const match = /^sched-(\d{12,14})-[a-f0-9]{6}$/.exec(run.id);
+  if (!match) return null;
+  const idAtMs = Number(match[1]);
+  const createdAtMs = Date.parse(run.createdAt ?? '');
+  if (
+    !Number.isSafeInteger(idAtMs)
+    || idAtMs < 0
+    || !Number.isFinite(createdAtMs)
+    // createdAt is captured immediately before the create-only run-id install.
+    // Leave generous room for a slow local readiness scan without accepting an
+    // unrelated scheduler-looking id copied onto an old record.
+    || Math.abs(idAtMs - createdAtMs) > 5 * 60_000
+  ) return null;
+  return Math.floor(createdAtMs);
+}
+
 function legacyScheduledCatchupIdentity(run: QueuedRunRecord): LegacyScheduledCatchupIdentity | null {
   if (
     run.status !== 'queued'
-    || run.catchupFire !== true
     || run.catchupDisposition !== undefined
     || run.source !== 'schedule'
-    || typeof run.triggerReceiptId !== 'string'
   ) return null;
-  const match = /^workflow-schedule:v1:([^:]+):(\d+)$/.exec(run.triggerReceiptId);
-  if (!match) return null;
-  const scheduledAtMs = Number(match[2]);
-  if (!Number.isSafeInteger(scheduledAtMs) || scheduledAtMs < 0) return null;
-  return { workflowSlug: match[1], scheduledAtMs };
+
+  // Every historical scheduler admission in the supported upgrade range
+  // carries the immutable definition snapshot written by queueWorkflowRun.
+  // Besides authenticating the exact definition, it is the only reliable
+  // source for the stable directory slug: record.workflow is the mutable
+  // display name in v3.0.1/v3.0.2.
+  const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
+  if (
+    admitted.status !== 'valid'
+    || admitted.snapshot.definition.name.trim() !== run.workflow.trim()
+  ) return null;
+  const workflowSlug = admitted.snapshot.workflowSlug;
+
+  // A short-lived pre-release shape included the canonical occurrence receipt.
+  // Keep accepting it, but bind it to the authenticated snapshot slug.
+  if (run.triggerReceiptId !== undefined) {
+    // The current scheduler also receipts ordinary live-minute fires. Only the
+    // explicit pre-pause catch-up marker authorizes upgrade holding; otherwise
+    // this bridge would turn every normal scheduled run into a Resume prompt.
+    if (run.catchupFire !== true || typeof run.triggerReceiptId !== 'string') return null;
+    const receipt = /^workflow-schedule:v1:([^:]+):(\d+)$/.exec(run.triggerReceiptId);
+    if (!receipt || receipt[1] !== workflowSlug) return null;
+    const scheduledAtMs = Number(receipt[2]);
+    if (!Number.isSafeInteger(scheduledAtMs) || scheduledAtMs < 0) return null;
+    if (
+      Number.isFinite(run.catchupOccurrenceAtMs)
+      && (
+        !Number.isSafeInteger(run.catchupOccurrenceAtMs)
+        || run.catchupOccurrenceAtMs! < 0
+        || run.catchupOccurrenceAtMs! > scheduledAtMs
+      )
+    ) return null;
+    return { workflowSlug, scheduledAtMs };
+  }
+
+  // Actual v3.0.1/v3.0.2 records omitted catchupFire entirely. The final
+  // pre-pause anti-stampede build added catchupFire=true, but still omitted the
+  // receipt and occurrence timestamp. Both retained the exact scheduler id,
+  // empty scheduled inputs, snapshot, and source shape.
+  if (run.catchupFire !== undefined && run.catchupFire !== true) return null;
+  const scheduledAtMs = historicalSchedulerAdmissionAtMs(run);
+  if (scheduledAtMs === null) return null;
+  if (
+    Number.isFinite(run.catchupOccurrenceAtMs)
+    && (
+      !Number.isSafeInteger(run.catchupOccurrenceAtMs)
+      || run.catchupOccurrenceAtMs! < 0
+      || run.catchupOccurrenceAtMs! > scheduledAtMs
+    )
+  ) return null;
+  return { workflowSlug, scheduledAtMs };
 }
 
 /** Conservative v3.0.x bridge. Only the original, provably-unstarted
@@ -7355,16 +7421,26 @@ export function _testOnly_isLegacyScheduledCatchupSafeToHold(
 ): boolean {
   if (!legacyScheduledCatchupIdentity(run) || runArtifactsExist) return false;
   return (
-    run.startedAt === undefined
+    run.inputs !== undefined
+    && run.inputs !== null
+    && typeof run.inputs === 'object'
+    && !Array.isArray(run.inputs)
+    && Object.keys(run.inputs).length === 0
+    && run.startedAt === undefined
     && run.finishedAt === undefined
     && run.cancelledAt === undefined
+    && run.originSessionId === undefined
+    && run.originSessionIds === undefined
     && run.requeuedFromRunId === undefined
     && run.retryFailedItemsFromRunId === undefined
+    && run.retryFailedItemsStepId === undefined
+    && run.retryFailedItemKeys === undefined
     && run.targetStepId === undefined
     && run.selfHealAttempt === undefined
     && run.goalAttempt === undefined
     && run.stepOutputs === undefined
     && run.output === undefined
+    && run.error === undefined
     && run.mutationContractSnapshot === undefined
     && run.parked === undefined
     && run.capabilityBlock === undefined
@@ -7406,14 +7482,18 @@ function migrateLegacyScheduledCatchupToHold(
     const firstDueAtMs = Number.isFinite(current.catchupOccurrenceAtMs)
       ? Math.floor(current.catchupOccurrenceAtMs!)
       : currentIdentity.scheduledAtMs;
+    const heldAt = new Date().toISOString();
     const held: QueuedRunRecord = {
       ...current,
       status: 'awaiting_catchup_decision',
+      catchupFire: true,
+      catchupOccurrenceAtMs: firstDueAtMs,
       catchupDisposition: 'held',
       workflowSlug: currentIdentity.workflowSlug,
       catchupFirstDueAtMs: firstDueAtMs,
       catchupScheduledAtMs: currentIdentity.scheduledAtMs,
       catchupMissedCount: 1,
+      catchupHeldAt: heldAt,
     };
     writeWorkflowRunRecordDurablyUnlocked(filePath, held);
     return held;
@@ -7423,10 +7503,10 @@ function migrateLegacyScheduledCatchupToHold(
       addNotification({
         id: `system-workflow-catchup-held-${result.id}`,
         kind: 'system',
-        title: `Missed workflow waiting: "${result.workflow}"`,
+        title: `Scheduled workflow waiting: "${result.workflow}"`,
         body:
-          `"${result.workflow}" was queued by an older Clementine version after a missed schedule. `
-          + 'It is now paused before execution; no workflow steps have run. Open Tasks to review it, then Resume or Skip.',
+          `"${result.workflow}" was queued by an older Clementine version and remained unstarted during the upgrade. `
+          + 'It is paused before execution; no workflow steps have run. Open Tasks to review it, then Resume or Skip.',
         createdAt: new Date().toISOString(),
         read: false,
         metadata: {

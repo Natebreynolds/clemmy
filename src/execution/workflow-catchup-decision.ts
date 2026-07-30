@@ -18,6 +18,7 @@ import {
 import {
   resolveWorkflowRunDefinitionSnapshot,
   workflowCodeRevisionMatchesSnapshot,
+  workflowDefinitionMatchesScheduledCatchupSnapshot,
 } from './workflow-run-definition.js';
 
 export const WORKFLOW_CATCHUP_DECISION_STATUS = 'awaiting_catchup_decision' as const;
@@ -292,6 +293,16 @@ export function resumeWorkflowCatchupRun(
         message:
           'This held occurrence has no valid admitted workflow snapshot. Start a fresh run or Skip it; '
           + 'Clementine will not guess which definition to execute.',
+        run: record,
+      };
+    }
+    if (!workflowDefinitionMatchesScheduledCatchupSnapshot(admitted.snapshot, workflow.data)) {
+      return {
+        status: 'definition_conflict',
+        runId: input.runId,
+        message:
+          'The workflow definition changed after this missed occurrence was held. '
+          + 'Start a fresh run to use the new definition, or Skip this old occurrence.',
         run: record,
       };
     }
