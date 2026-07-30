@@ -11,6 +11,7 @@ import { registerBatchTools } from './batch-tools.js';
 import { registerBrowserHarnessTools } from './browser-harness-tools.js';
 import { registerCapabilityTools } from './capability-tools.js';
 import { registerCliTools } from './cli-tools.js';
+import { registerCliSetupTools } from './cli-setup-tools.js';
 import { registerSkillTools } from './skill-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerModelRoleTools } from './model-role-tools.js';
@@ -251,6 +252,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerCapabilityTools(server);
   registerHarnessStatusTools(server);
   registerCliTools(server);
+  registerCliSetupTools(server);
   registerSkillTools(server);
   registerToolChoiceTools(server);
   registerModelRoleTools(server);

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -840,13 +841,26 @@ export function annotateShellStderr(stderr: string, command: string): string {
     // Tightened (2026-06-15): require a real command-not-found shape so an HTTP
     // "404: Not Found" no longer matches and falsely claims the binary is absent.
     const firstWord = command.trim().split(/\s+/)[0];
-    hints.push(
-      `CLEMENTINE HINT: "${firstWord}" is not on PATH. ` +
-      `Install it via Homebrew/npm (\`brew install ${firstWord}\` or \`npm install -g ${firstWord}\`), or pick a different tool.`,
-    );
+    hints.push(missingBinaryHint(firstWord));
   }
   if (hints.length === 0) return stderr;
   return `${stderr}\n\n${hints.join('\n')}`;
+}
+
+/** Missing-binary guidance. Catalog CLIs get the exact cli_setup call —
+ *  the sanctioned install path with approval + the validated runner —
+ *  instead of a raw brew/npm guess; unknown binaries keep the guess. */
+export function missingBinaryHint(firstWord: string): string {
+  return `CLEMENTINE HINT: "${firstWord}" is not on PATH. ${missingBinaryFixClause(firstWord)}`;
+}
+
+function missingBinaryFixClause(firstWord: string): string {
+  const entry = CLI_CATALOG.find((candidate) => candidate.command === firstWord);
+  if (entry) {
+    return `Clementine can install it for the user: offer, then on approval call `
+      + `cli_setup {"action":"install","catalogId":"${entry.id}"} (runs \`${entry.installCommand}\` via the approved runner).`;
+  }
+  return `Install it via Homebrew/npm (\`brew install ${firstWord}\` or \`npm install -g ${firstWord}\`), or pick a different tool.`;
 }
 
 /**
@@ -872,7 +886,7 @@ export function annotateSpawnError(error: unknown, command: string, cwd?: string
       + `(1) the working directory does not exist${cwd ? ` — cwd was "${cwd}"` : ''}, or `
       + `(2) the binary "${firstWord}" is not on PATH. `
       + `Fix the cause before retrying: omit \`cwd\` to use the safe default (~/.clementine-next) or pass an existing directory inside an allowed workspace root; `
-      + `if it's the binary, install it (\`brew install ${firstWord}\` / \`npm install -g ${firstWord}\`) or pick another tool. `
+      + `if it's the binary: ${missingBinaryFixClause(firstWord)} `
       + `Do NOT re-issue the identical command — it will fail the same way.`;
   }
   if (code === 'EACCES' || code === 'EPERM') {

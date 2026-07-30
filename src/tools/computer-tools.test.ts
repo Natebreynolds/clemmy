@@ -57,6 +57,14 @@ test('annotateShellStderr: a GENUINE command-not-found still gets the install hi
   assert.match(out, /brew install foo|npm install -g foo/);
 });
 
+test('annotateShellStderr: a CATALOG binary routes to cli_setup (approved install path), not a raw brew guess', () => {
+  const out = annotateShellStderr('zsh: railway: command not found', 'railway status');
+  assert.match(out, /not on PATH/i);
+  assert.match(out, /cli_setup \{"action":"install","catalogId":"railway"\}/, 'the sanctioned fix is the exact tool call');
+  assert.match(out, /offer, then on approval/i, 'the hint keeps the ask-first contract');
+  assert.doesNotMatch(out, /brew install railway/, 'no raw package-manager guess for catalog CLIs');
+});
+
 test('annotateShellStderr: exact-run npx cache materialization failure routes to canonical CLI discovery', () => {
   const stderr = [
     'npm error code EEXIST',

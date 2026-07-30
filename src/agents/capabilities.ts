@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
 import path from 'node:path';
 import pino from 'pino';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
@@ -394,10 +395,16 @@ export function renderCapabilityResult(result: CapabilityCheckResult, descriptor
     ];
     return lines.filter(Boolean).join('\n');
   }
+  // Catalog CLIs get the sanctioned one-call fix on top of the prose hint:
+  // cli_setup routes through the validated install runner with approval,
+  // so the model can OFFER and execute instead of dead-ending on docs.
+  const catalogEntry = CLI_CATALOG.find((entry) =>
+    entry.command === result.name || entry.command === descriptor?.name);
   const lines = [
     `✗ ${descriptor?.friendlyName ?? result.name} is NOT available.`,
     result.error ? `  Error: ${result.error}` : '',
     descriptor?.installHint ? `  Install: ${descriptor.installHint}` : '',
+    catalogEntry ? `  Or let Clementine install it (ask the user first): cli_setup {"action":"install","catalogId":"${catalogEntry.id}"}` : '',
     descriptor?.docsUrl ? `  Docs: ${descriptor.docsUrl}` : '',
   ];
   return lines.filter(Boolean).join('\n');
