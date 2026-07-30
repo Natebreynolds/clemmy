@@ -14,6 +14,7 @@ import { stripInlineMarkdown } from '@/lib/markdown-text';
 import {
   focusActionHref,
   hasWorkstateDetails,
+  shouldShowWorkstate,
   type FocusActionStatus,
   type FocusCandidateStatus,
   type FocusSnapshot,
@@ -69,7 +70,9 @@ export function CollaborativeWorkstate({
   className?: string;
 }) {
   const focus = snapshot?.active;
-  if (!focus) return null;
+  // A bare title+summary card is an echo of the last chat message — render
+  // only when there is structured detail or a context check to answer.
+  if (!focus || !shouldShowWorkstate(snapshot)) return null;
   const state = focus.workstate;
   const hasDetails = hasWorkstateDetails(state);
   const itemLimit = compact ? 2 : 8;
