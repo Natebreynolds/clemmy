@@ -33,7 +33,7 @@ import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { fireDueTimers } from '../runtime/timers.js';
 import { syncProspectiveIntentions } from '../runtime/prospective-sync.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
-import { processWorkflowSchedules, reapStaleWorkflowRuns, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
+import { maxCatchupFiresPerTick, processWorkflowSchedules, reapStaleWorkflowRuns, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
 import { recoverPendingWorkflowTriggerEvents, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
@@ -637,13 +637,16 @@ export function cronMatchedKeysInWindow(
   for (const minute of window) {
     if (!cronMatches(schedule, minute)) continue;
     const key = currentMinuteKey(minute);
-    if (lastFiredKey !== key) matched.push(key);
+    // Strictly newer than the last fired key (zero-padded → lexical ==
+    // temporal). The catch-up stagger below can REWIND the evaluation window
+    // to keep held jobs eligible, so equality alone is not enough: a rewound
+    // window must never re-fire an occurrence at or before one already run.
+    if (lastFiredKey === undefined || key > lastFiredKey) matched.push(key);
   }
   return matched;
 }
 
-async function processCronSchedules(assistant: ClementineAssistant, state: DaemonState): Promise<void> {
-  const now = new Date();
+async function processCronSchedules(assistant: ClementineAssistant, state: DaemonState, now: Date = new Date()): Promise<void> {
   // Sleep/downtime catch-up (2026-07-20, attorney-bar schedules audit G2):
   // this loop used to match ONLY `now`, so a laptop asleep at fire time
   // silently skipped the occurrence — the boot-time missed-run scan never
@@ -653,6 +656,17 @@ async function processCronSchedules(assistant: ClementineAssistant, state: Daemo
   // ONE run on the LATEST minute, and tell the user what was caught up.
   const window = scheduleCatchupWindow(state.lastCronEvaluatedAtMs, now.getTime());
   const jobs = loadCronJobs();
+  const nowMinuteKey = currentMinuteKey(now);
+  // Cross-job catch-up budget (sibling of the workflow-scheduler stampede,
+  // v3.0.1). Cron jobs already run SEQUENTIALLY, so the failure here is not
+  // machine exhaustion but loop starvation: each job is a full brain turn with
+  // a multi-minute wall-clock budget, and N missed jobs after downtime block
+  // this tick — and with it workflow scheduling, autonomy, briefs, and the
+  // watchdog — for the SUM of their durations. A catch-up is not urgent by
+  // definition; run at most the budget per tick and hold the rest, ELIGIBLE,
+  // for the next tick.
+  let cronCatchupBudget = maxCatchupFiresPerTick();
+  let heldEarliestMs: number | undefined;
 
   for (const job of jobs) {
     if (job.enabled === false) continue;
@@ -660,6 +674,17 @@ async function processCronSchedules(assistant: ClementineAssistant, state: Daemo
     if (matchedKeys.length === 0) continue;
     const latestKey = matchedKeys[matchedKeys.length - 1];
     const missed = matchedKeys.length - 1;
+    const isCatchupFire = latestKey !== nowMinuteKey;
+    if (isCatchupFire && cronCatchupBudget <= 0) {
+      // Held: no stamp, no notification — the occurrence stays eligible and
+      // the watermark below is parked so the next window still contains it.
+      const heldMs = Date.parse(`${latestKey}:00`);
+      if (Number.isFinite(heldMs) && (heldEarliestMs === undefined || heldMs < heldEarliestMs)) {
+        heldEarliestMs = heldMs;
+      }
+      continue;
+    }
+    if (isCatchupFire) cronCatchupBudget -= 1;
     // In-memory dedup BEFORE await so a follow-up tick within the
     // same minute doesn't re-fire. Persist AFTER successful run so a
     // crash mid-job leaves the disk state clean — the boot-time
@@ -682,9 +707,22 @@ async function processCronSchedules(assistant: ClementineAssistant, state: Daemo
     await runCronJob(assistant, job, 'schedule');
     saveState(state);
   }
-  state.lastCronEvaluatedAtMs = now.getTime();
+  // Hold-aware watermark: advancing unconditionally would drop every held job
+  // out of the next window (the exact silent-loss bug the workflow scheduler's
+  // first stagger had). Park it just before the earliest held minute; the
+  // strictly-newer matcher above makes the rewound window safe for jobs that
+  // already ran.
+  state.lastCronEvaluatedAtMs = heldEarliestMs !== undefined
+    ? Math.min(now.getTime(), heldEarliestMs - 60_000)
+    : now.getTime();
   saveState(state);
 }
+
+/** Test seam: the cron catch-up stagger + hold-aware watermark are pinned end
+ *  to end (see cron-catchup-stagger.test.ts) — a decision-rule-only pin missed
+ *  the watermark data-loss bug in the workflow scheduler's first stagger. */
+export const _testOnly_processCronSchedules = processCronSchedules;
+export const _testOnly_loadDaemonState = loadState;
 
 // Surfaces critical setup gaps as one-per-day notifications at daemon
 // boot. The doctor CLI catches the same things but only when the user
