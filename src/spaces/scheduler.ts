@@ -121,10 +121,22 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
       if (!ds.schedule) continue;
       evaluated += 1;
       const key = `${space.id}:${ds.id}`;
+      // Collapse a long absence into ONE refresh (v3.0.1 incident, sibling of
+      // the workflow-scheduler stampede). This loop used to refresh once per
+      // MATCHED MINUTE: an hourly source missed for a day fired 24 sequential
+      // provider refreshes in a single tick, and a daily one missed for a week
+      // fired 7 — repeated identical work, real provider spend, and a tick that
+      // blocks for minutes. Only the most recent occurrence carries information;
+      // the earlier ones are superseded by definition.
+      const matched: Date[] = [];
       for (const minute of minutes) {
         if (!cronMatches(ds.schedule, minute, ds.timezone)) continue;
+        if (lastRun[key] === minuteKey(minute)) continue; // already fired
+        matched.push(minute);
+      }
+      const latest = matched[matched.length - 1];
+      for (const minute of latest ? [latest] : []) {
         const mk = minuteKey(minute);
-        if (lastRun[key] === mk) continue; // already fired this minute
         lastRun[key] = mk;
         try {
           const results = await refreshSpaceData(space.id, ds.id, {

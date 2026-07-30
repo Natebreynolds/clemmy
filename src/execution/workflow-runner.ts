@@ -7295,9 +7295,20 @@ const inFlightRunIds = new Set<string>();
 // behavior (forward-only: no behavior change until explicitly raised);
 // set CLEMENTINE_WORKFLOW_RUN_CONCURRENCY=3 (etc.) to let independent
 // runs progress in parallel once you've soaked it.
+const MAX_RUN_DRAIN_CONCURRENCY = 4;
+/** Test seam for the clamp — the ceiling is a safety property, so it is pinned. */
+export const _testOnly_runDrainConcurrency = (): number => runDrainConcurrency();
 function runDrainConcurrency(): number {
   const raw = parseInt(getRuntimeEnv('CLEMENTINE_WORKFLOW_RUN_CONCURRENCY', '1') || '1', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 1;
+  if (!Number.isFinite(raw) || raw <= 0) return 1;
+  // Upper clamp (v3.0.1 incident): this knob had NO ceiling, so any positive
+  // value was honored on the heaviest resource in the product. A machine that
+  // exhausts itself gets its daemon SIGKILLed, restarts into the same backlog,
+  // and repeats — the failure is self-reinforcing, so the ceiling is a safety
+  // property rather than a preference. Concurrent workflow runs each carry a
+  // model lane plus tool subprocesses; beyond a handful the wall-clock win is
+  // gone and only the crash risk remains.
+  return Math.min(raw, MAX_RUN_DRAIN_CONCURRENCY);
 }
 
 // Flag-gate for the constrained, structured-output step agent. Default
