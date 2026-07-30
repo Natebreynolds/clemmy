@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { listFacts, searchMemory, type MemoryFact, type MemoryHit } from '../lib/api';
+import { MemoryGraph3D } from './MemoryGraph3D';
 
 type FactKindFilter = 'all' | MemoryFact['kind'];
 const KIND_OPTIONS: { value: FactKindFilter; label: string }[] = [
@@ -55,8 +56,26 @@ export function Memory() {
     }
   }
 
+  const [view, setView] = useState<'list' | 'constellation'>('list');
+
+  if (view === 'constellation') {
+    return (
+      <div>
+        <div class="segmented">
+          <button onClick={() => setView('list')}>List</button>
+          <button class="active">Constellation</button>
+        </div>
+        <MemoryGraph3D />
+      </div>
+    );
+  }
+
   return (
     <div>
+      <div class="segmented">
+        <button class="active">List</button>
+        <button onClick={() => setView('constellation')}>Constellation</button>
+      </div>
       <form class="memory-search" onSubmit={submitSearch}>
         <input
           class="memory-search-input"

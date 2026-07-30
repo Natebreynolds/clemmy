@@ -1131,3 +1131,43 @@ test('APNs registration: valid token upserts one destination per device, bad tok
     assert.equal(anon.status, 401);
   } finally { await h.close(); }
 });
+
+// ---- memory graph + reminders (command-center surfaces) ---------------------
+
+test('memory graph, neighborhood, and reminders routes serve the mobile surfaces', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Graph phone');
+
+    const graph = await fetch(`${h.url}/m/api/memory/graph`, { headers: { cookie } });
+    assert.equal(graph.status, 200);
+    const graphBody = await graph.json() as { nodes: unknown[]; edges: unknown[] };
+    assert.ok(Array.isArray(graphBody.nodes), 'graph has a nodes array even when memory is empty');
+    assert.ok(Array.isArray(graphBody.edges), 'graph has an edges array even when memory is empty');
+
+    const noNode = await fetch(`${h.url}/m/api/memory/neighborhood`, { headers: { cookie } });
+    assert.equal(noNode.status, 400);
+
+    const { appendTimer } = await import('../runtime/timers.js');
+    appendTimer({
+      id: 'timer-test-1',
+      message: 'Nudge Dana about the proposal',
+      fireAt: Date.now() + 60 * 60 * 1000,
+      createdAt: Date.now(),
+    });
+    appendTimer({
+      id: 'timer-test-expired',
+      message: 'Already fired — must not appear',
+      fireAt: Date.now() - 60 * 1000,
+      createdAt: Date.now(),
+    });
+    const reminders = await fetch(`${h.url}/m/api/reminders`, { headers: { cookie } });
+    assert.equal(reminders.status, 200);
+    const items = (await reminders.json() as { items: Array<{ id: string; kind: string; text: string }> }).items;
+    assert.ok(items.some((item) => item.id === 'timer-test-1' && item.kind === 'reminder'));
+    assert.ok(!items.some((item) => item.id === 'timer-test-expired'), 'past timers are not upcoming');
+
+    const anon = await fetch(`${h.url}/m/api/reminders`);
+    assert.equal(anon.status, 401, 'reminders require the device session');
+  } finally { await h.close(); }
+});

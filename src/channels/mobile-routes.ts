@@ -1678,6 +1678,84 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  /**
+   * The memory constellation, phone-sized. Same tested builder the desktop
+   * console uses (buildMemoryGraph), with mobile-tuned defaults: fewer nodes,
+   * semantic PCA layout and similarity edges on by default so the graph
+   * arrives ready to render, no client-side knobs required.
+   */
+  router.get('/api/memory/graph', requireMobileSession, async (req, res) => {
+    try {
+      const { buildMemoryGraph } = await import('../dashboard/memory-graph.js');
+      const { openMemoryDb } = await import('../memory/db.js');
+      const result = buildMemoryGraph(openMemoryDb(), {
+        factsLimit: clampInt(req.query.facts, 120, 10, 200),
+        filesLimit: clampInt(req.query.files, 30, 0, 80),
+        entitiesLimit: clampInt(req.query.entities, 60, 0, 100),
+        semanticLayout: true,
+        simEdges: clampInt(req.query.simEdges, 3, 0, 6),
+        simThreshold: 0.7,
+        simCap: 200,
+        clusterMode: 'kind',
+        truthMode: 'stored',
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get('/api/memory/neighborhood', requireMobileSession, async (req, res) => {
+    const nodeId = typeof req.query.nodeId === 'string' ? req.query.nodeId.trim() : '';
+    if (!nodeId) { res.status(400).json({ error: 'nodeId required' }); return; }
+    try {
+      const { buildMemoryNeighborhood } = await import('../dashboard/memory-graph.js');
+      const { openMemoryDb } = await import('../memory/db.js');
+      res.json(buildMemoryNeighborhood(openMemoryDb(), nodeId, req.query.depth === '2' ? 2 : 1));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Everything Clementine has committed to do later, in one list: one-shot
+   * reminders (timers) and armed prospective intentions. Read-only — the
+   * phone surfaces them; managing them stays a conversation.
+   */
+  router.get('/api/reminders', requireMobileSession, async (_req, res) => {
+    try {
+      const { readTimers } = await import('../runtime/timers.js');
+      const { listProspectiveIntentions } = await import('../runtime/prospective-intentions.js');
+      const now = Date.now();
+      const timers = readTimers()
+        .filter((timer) => timer.fireAt > now)
+        .map((timer) => ({
+          id: timer.id,
+          kind: 'reminder' as const,
+          text: timer.message,
+          at: new Date(timer.fireAt).toISOString(),
+          recurring: false,
+        }));
+      const intentions = listProspectiveIntentions({ statuses: ['active', 'due', 'blocked'], limit: 50 })
+        .map((intention) => ({
+          id: intention.id,
+          kind: 'intention' as const,
+          text: intention.objective,
+          at: intention.dueAt ?? null,
+          recurring: intention.recurring,
+          status: intention.status,
+        }));
+      const items = [...timers, ...intentions].sort((a, b) => {
+        if (!a.at) return 1;
+        if (!b.at) return -1;
+        return a.at.localeCompare(b.at);
+      });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // ─── Workflows (list + trigger + recent runs + events) ───────────
 
   router.get('/api/workflows', requireMobileSession, (_req, res) => {

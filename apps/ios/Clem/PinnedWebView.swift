@@ -28,6 +28,14 @@ final class WebViewModel: NSObject, ObservableObject {
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
+        // The page owns safe-area padding via env(); the shell stays dark and
+        // silent — no white flash before first paint, no double insets.
+        let peelBlack = UIColor(red: 12 / 255, green: 9 / 255, blue: 6 / 255, alpha: 1)
+        webView.isOpaque = false
+        webView.backgroundColor = peelBlack
+        webView.underPageBackgroundColor = peelBlack
+        webView.scrollView.backgroundColor = peelBlack
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
         #if DEBUG
         webView.isInspectable = true
         #endif

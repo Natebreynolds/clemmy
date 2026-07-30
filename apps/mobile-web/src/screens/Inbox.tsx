@@ -2,12 +2,14 @@ import { useCallback, useEffect, useState } from 'preact/hooks';
 import {
   approveApproval,
   approvePlanProposal,
+  getReminders,
   listApprovals,
   listPlanProposals,
   rejectApproval,
   rejectPlanProposal,
   type ApprovalRow,
   type PlanProposalRow,
+  type ReminderItem,
 } from '../lib/api';
 
 const POLL_INTERVAL_MS = 5000;
@@ -15,19 +17,24 @@ const POLL_INTERVAL_MS = 5000;
 export function Inbox() {
   const [approvals, setApprovals] = useState<ApprovalRow[]>([]);
   const [plans, setPlans] = useState<PlanProposalRow[]>([]);
+  const [reminders, setReminders] = useState<ReminderItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [acting, setActing] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [approvalResult, planResult] = await Promise.all([
+      const [approvalResult, planResult, reminderResult] = await Promise.all([
         listApprovals(),
         listPlanProposals(),
+        // Reminders are ambient context, never an error state — a miss just
+        // leaves the section as it was.
+        getReminders().catch(() => null),
       ]);
       // Only show pending ones — resolved appear in a future history view.
       setApprovals(approvalResult.approvals.filter((row) => row.status === 'pending'));
       setPlans(planResult.proposals.filter((row) => row.status === 'pending'));
+      if (reminderResult) setReminders(reminderResult.items);
       setError(null);
     } catch (err) {
       const message = (err as Error).message ?? 'Failed to load approvals';
@@ -83,9 +90,12 @@ export function Inbox() {
 
   if (approvals.length === 0 && plans.length === 0) {
     return (
-      <div class="inbox-empty">
-        Nothing pending.<br />
-        Clem will push here when she needs a yes/no.
+      <div>
+        <UpcomingSection items={reminders} />
+        <div class="inbox-empty">
+          Nothing pending.<br />
+          Clem will push here when she needs a yes/no.
+        </div>
       </div>
     );
   }
@@ -93,6 +103,7 @@ export function Inbox() {
   return (
     <div>
       {error ? <div class="global-error">{error}</div> : null}
+      <UpcomingSection items={reminders} />
       {plans.map((row) => (
         <PlanCard
           key={row.id}
@@ -104,6 +115,49 @@ export function Inbox() {
       {approvals.map((row) => <ApprovalCard key={row.approvalId} row={row} acting={acting === row.approvalId} onAct={act} />)}
     </div>
   );
+}
+
+/**
+ * What Clem has committed to do later — one-shot reminders and standing
+ * intentions — pinned to the top of the Inbox so nothing she promised is
+ * invisible. Read-only: changing a commitment is a conversation.
+ */
+function UpcomingSection({ items }: { items: ReminderItem[] }) {
+  if (items.length === 0) return null;
+  return (
+    <div class="upcoming">
+      <div class="upcoming-head">Coming up</div>
+      {items.slice(0, 6).map((item) => (
+        <div key={item.id} class="upcoming-row">
+          <span class={`upcoming-dot ${item.kind}`} aria-hidden="true" />
+          <div class="upcoming-body">
+            <div class="upcoming-text">{item.text}</div>
+            <div class="upcoming-when">
+              {item.at ? formatUpcoming(item.at) : 'when the moment comes'}
+              {item.recurring ? ' · repeats' : ''}
+              {item.status === 'blocked' ? ' · waiting on something' : ''}
+            </div>
+          </div>
+        </div>
+      ))}
+      {items.length > 6 ? <div class="upcoming-more">+{items.length - 6} more scheduled</div> : null}
+    </div>
+  );
+}
+
+function formatUpcoming(iso: string): string {
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return iso;
+  const delta = then - Date.now();
+  if (delta <= 0) return 'due now';
+  const minutes = Math.round(delta / 60_000);
+  if (minutes < 60) return `in ${minutes}m`;
+  const date = new Date(then);
+  const time = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const days = Math.floor((then - new Date().setHours(0, 0, 0, 0)) / 86_400_000);
+  if (days === 0) return `today ${time}`;
+  if (days === 1) return `tomorrow ${time}`;
+  return `${date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })} ${time}`;
 }
 
 interface PlanCardProps {

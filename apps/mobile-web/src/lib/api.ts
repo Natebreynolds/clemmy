@@ -566,3 +566,51 @@ export async function listRecentRuns(limit = 20): Promise<{ runs: RunSummary[] }
     throw err;
   }
 }
+
+// ─── memory graph (the constellation) ─
+
+export interface GraphNode {
+  id: string;
+  label: string;
+  type: string;
+  /** Optional PCA seed positions from the daemon's semantic layout. */
+  fx?: number;
+  fy?: number;
+  fz?: number;
+  data?: Record<string, unknown>;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  type: string;
+  weight?: number;
+}
+
+export interface MemoryGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export async function getMemoryGraph(): Promise<MemoryGraph> {
+  return api<MemoryGraph>('/m/api/memory/graph');
+}
+
+export async function getMemoryNeighborhood(nodeId: string, depth: 1 | 2 = 1): Promise<MemoryGraph> {
+  return api<MemoryGraph>(`/m/api/memory/neighborhood?nodeId=${encodeURIComponent(nodeId)}&depth=${depth}`);
+}
+
+// ─── reminders (what Clem has committed to do later) ─
+
+export interface ReminderItem {
+  id: string;
+  kind: 'reminder' | 'intention';
+  text: string;
+  at: string | null;
+  recurring: boolean;
+  status?: string;
+}
+
+export async function getReminders(): Promise<{ items: ReminderItem[] }> {
+  return api<{ items: ReminderItem[] }>('/m/api/reminders');
+}
