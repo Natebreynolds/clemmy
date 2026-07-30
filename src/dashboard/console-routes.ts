@@ -315,6 +315,7 @@ import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { buildWorkspaceContextPrimer } from '../spaces/workspace-context.js';
 import {
   SPACE_ACTION_APPROVAL_TOOL,
+  SPACE_CLI_SOURCE_TRUST_TOOL,
   SPACE_DATA_RUNNER_TRUST_TOOL,
 } from '../spaces/space-execution-policy.js';
 import { initApprovalFocusReconciliation } from '../runtime/harness/approval-focus-reconcile.js';
@@ -14269,6 +14270,7 @@ export function registerConsoleRoutes(
           const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
           const row = addressedApprovalId ? approvalRegistry.get(addressedApprovalId) : null;
           const standaloneWorkspaceApproval = row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
+            || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL
             || row?.tool === SPACE_ACTION_APPROVAL_TOOL;
           const resolved = !!row
             && row.sessionId === sessionId
@@ -14277,7 +14279,7 @@ export function registerConsoleRoutes(
           if (standaloneWorkspaceApproval) {
             const approvedRunner = resolved
               && resolution === 'approved'
-              && row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL;
+              && (row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL);
             const reply = !resolved
               ? 'That approval was no longer pending. Nothing else was approved or rejected.'
               : approvedRunner

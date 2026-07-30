@@ -16,6 +16,7 @@ import {
   closeSync,
   existsSync,
   fstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   unlinkSync,
@@ -37,7 +38,7 @@ import { finalizeWorkspaceObservationCommit } from './workspace-observation-fina
 import { augmentPath } from '../runtime/spawn-env.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
-  interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript,
+  interpreterFor, resolveOnPath, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript,
 } from '../runtime/sandboxed-script.js';
 import {
   executeWorkflowCallMutation,
@@ -50,6 +51,7 @@ import {
 } from './space-execution-policy.js';
 import { verifySpaceActionApprovalAuthority } from './space-action-authority.js';
 import {
+  authorizeCliDataSource,
   authorizeInstalledDataRunner,
   registerRunnerTrustRefreshHandler,
 } from './space-data-runner-trust.js';
@@ -81,6 +83,15 @@ export const SPACE_ACTION_MUTATION_WORKFLOW_SLUG = '__clementine-space-actions';
 export interface SpaceActionRunOptions {
   /** Present only after the canonical approval registry resolved this action. */
   approvalId?: string;
+  /**
+   * Present only for STANDING-covered invocations (a prior approval whose
+   * exact authority still holds). Each covered click is its own effect
+   * instance, so the durable receipt slot must be unique per invocation —
+   * otherwise the second refresh would REPLAY the first run's stale result
+   * instead of executing. Standing coverage is restricted to non-outbound
+   * runner actions, so per-invocation slots do not weaken send idempotency.
+   */
+  executionNonce?: string;
 }
 
 type SpaceComposioDispatch = typeof import('../tools/composio-tools.js').dispatchComposioTool;
@@ -327,6 +338,60 @@ export async function runScript(
   }
 }
 
+/**
+ * Execute an APPROVED frozen CLI declaration. The argv comes from the trust
+ * decision (the exact vector the human approved), never from caller input.
+ * No shell is involved: the command resolves to an installed binary on the
+ * augmented PATH and every argument is passed as data. Stdout is the dataset —
+ * JSON when the CLI emits it (the common `-r json` case), otherwise wrapped as
+ * `{ stdout }` so text-mode CLIs still produce a usable dataset.
+ */
+async function runCliSource(slug: string, cliArgv: string[]): Promise<RunSourceResult> {
+  const commandLabel = cliArgv.join(' ');
+  const augmentedPath = augmentPath(process.env.PATH);
+  const command = resolveOnPath(cliArgv[0], augmentedPath);
+  if (!command) {
+    return {
+      ok: false,
+      error: `CLI "${cliArgv[0]}" was not found on PATH; install it (or fix the declared command) and refresh again`,
+      provenNoDispatch: true,
+    };
+  }
+  const spaceDir = resolveInSpace(slug, 'data');
+  // CLI-only workspaces have no authored runner files, so data/ may not exist
+  // yet — and a missing spawn cwd is a launch ENOENT, not a clear error.
+  mkdirSync(spaceDir, { recursive: true });
+  const env = scrubbedChildEnv({ CLEMENTINE_SPACE_SLUG: slug });
+  const outcome = await spawnSandboxedScript({
+    command,
+    args: cliArgv.slice(1),
+    cwd: spaceDir,
+    env,
+    stdinPayload: '',
+    timeoutMs: RUNNER_TIMEOUT_MS,
+    maxOutputBytes: RUNNER_MAX_OUTPUT_BYTES,
+  });
+  if (outcome.launchError) {
+    return {
+      ok: false,
+      error: `CLI failed to launch: ${outcome.launchError.message}`,
+      provenNoDispatch: true,
+    };
+  }
+  if (outcome.overflowed) return { ok: false, error: `CLI output exceeded ${RUNNER_MAX_OUTPUT_BYTES} bytes ("${commandLabel}")` };
+  if (outcome.timedOut) return { ok: false, error: `CLI timed out after ${RUNNER_TIMEOUT_MS}ms ("${commandLabel}")` };
+  if (outcome.code !== 0) {
+    return { ok: false, error: `CLI exited ${outcome.signal ?? outcome.code} ("${commandLabel}"): ${[outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join(' | ').slice(0, 2000)}` };
+  }
+  const out = outcome.stdout.trim();
+  if (!out) return { ok: false, error: `CLI produced no output ("${commandLabel}")` };
+  try {
+    return { ok: true, data: JSON.parse(out) };
+  } catch {
+    return { ok: true, data: { stdout: out } };
+  }
+}
+
 /** Space composio dispatch — through the SAME gateway as chat/workflow (owner
  *  resolution, sender constraints, typed blocks). A blocked resolution surfaces
  *  as the source/action error with the gateway's deterministic message, so a
@@ -398,6 +463,18 @@ export async function runSpaceDataSource(slug: string, source: SpaceDataSource):
       { expectedSha256: trust.runnerSha256 },
     );
   }
+  if (source.cliArgv?.length) {
+    const trust = authorizeCliDataSource(slug, source);
+    if (trust.state !== 'approved') {
+      return {
+        ok: false,
+        error: trust.error,
+        provenNoDispatch: true,
+        ...(trust.state === 'pending' ? { pendingApprovalId: trust.approvalId } : {}),
+      };
+    }
+    return runCliSource(slug, trust.cliArgv);
+  }
   const safetyError = workspaceDataSourceSafetyError(source);
   if (safetyError) return { ok: false, error: safetyError, provenNoDispatch: true };
   if (source.composioSlug && source.composioSlug.trim()) {
@@ -407,7 +484,7 @@ export async function runSpaceDataSource(slug: string, source: SpaceDataSource):
       return { ok: false, error: `composio call failed: ${(err as Error).message}` };
     }
   }
-  return { ok: false, error: `data source "${source.id}" declares neither a runner nor a composio_slug` };
+  return { ok: false, error: `data source "${source.id}" declares no execution mode (runner, cli_argv, or composio_slug)` };
 }
 
 /** Execute one declared action with caller-supplied args merged over its template. */
@@ -436,13 +513,15 @@ export async function runSpaceAction(
     };
   }
   const approvalId = authority.ok ? authority.approvalId ?? '' : '';
-  const mutationSlot = approvalId
-    ? spaceActionMutationSlot(slug, action.id, approvalId)
+  const nonce = opts.executionNonce?.trim() ?? '';
+  const slotRunId = approvalId && nonce ? `${approvalId}#${nonce}` : approvalId;
+  const mutationSlot = slotRunId
+    ? spaceActionMutationSlot(slug, action.id, slotRunId)
     : undefined;
   if (action.composioSlug && action.composioSlug.trim()) {
     try {
       if (mutationSlot) {
-        const replay = replaySpaceActionMutation(slug, action, approvalId);
+        const replay = replaySpaceActionMutation(slug, action, slotRunId);
         if (replay.replayed) return replay.result;
       }
       return await runSpaceComposio(slug, action.composioSlug.trim(), args, mutationSlot);
@@ -460,7 +539,7 @@ export async function runSpaceAction(
       };
     }
     try {
-      const replay = replaySpaceActionMutation(slug, action, approvalId);
+      const replay = replaySpaceActionMutation(slug, action, slotRunId);
       if (replay.replayed) return replay.result;
       return await executeWorkflowCallMutation({
         ...mutationSlot,

@@ -8,7 +8,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { get as getApproval } from '../runtime/harness/approval-registry.js';
+import { get as getApproval, listPending } from '../runtime/harness/approval-registry.js';
 import { SPACE_ACTION_APPROVAL_TOOL } from './space-execution-policy.js';
 import { resolveInSpace, type SpaceAction, type SpaceRecord } from './store.js';
 
@@ -133,6 +133,40 @@ export interface SpaceActionAuthorityResult {
   approvalId?: string;
   runnerSha256?: string;
   error?: string;
+}
+
+/**
+ * Standing coverage: a prior human approval whose EXACT authority still holds.
+ *
+ * Reuses verifySpaceActionApprovalAuthority row by row, so coverage means
+ * precisely what a fresh approval would mean — same workspace, same action id,
+ * byte-identical caller args, and a runner entrypoint whose LIVE sha256 still
+ * equals the approved digest (the snapshot equality recomputes it from disk,
+ * so any edit to the runner voids coverage before a spawn). The row's own
+ * expiresAt bounds the grant window; eligibility policy (which actions may be
+ * covered at all) is the caller's concern, not this module's.
+ */
+export function findStandingSpaceActionApproval(input: {
+  slug: string;
+  action: SpaceAction;
+  callerArgs: Record<string, unknown>;
+  now?: number;
+}): SpaceActionAuthorityResult | null {
+  const now = input.now ?? Date.now();
+  const rows = listPending({ sessionId: `space-${input.slug}`, status: 'any' });
+  for (const row of rows) {
+    if (row.tool !== SPACE_ACTION_APPROVAL_TOOL) continue;
+    if (row.status !== 'resolved' || row.resolution !== 'approved') continue;
+    if (!row.expiresAt || Date.parse(row.expiresAt) <= now) continue;
+    const verified = verifySpaceActionApprovalAuthority({
+      approvalId: row.approvalId,
+      slug: input.slug,
+      action: input.action,
+      callerArgs: input.callerArgs,
+    });
+    if (verified.ok) return verified;
+  }
+  return null;
 }
 
 export function verifySpaceActionApprovalAuthority(input: {

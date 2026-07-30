@@ -125,11 +125,59 @@ export function runnerFilenameError(runner: string): string | null {
   return null;
 }
 
+/** Product/UI bounds keeping frozen CLI declarations reviewable on one card. */
+export const CLI_ARGV_MAX_ITEMS = 64;
+export const CLI_ARGV_MAX_CHARS = 4000;
+
+/**
+ * A frozen CLI declaration is a fixed argv vector, never a shell string: the
+ * command must be a bare name resolved on PATH (an installed CLI, not an
+ * arbitrary local file), and every argument is passed as data — no shell, no
+ * interpolation, no path traversal into workspace-served directories.
+ */
+export function cliArgvError(argv: unknown): string | null {
+  if (!Array.isArray(argv) || argv.length === 0) {
+    return 'cli_argv must be a non-empty array of strings (e.g. ["sf", "data", "query", "-q", "...", "-r", "json"])';
+  }
+  if (argv.length > CLI_ARGV_MAX_ITEMS) {
+    return `cli_argv has ${argv.length} items; the maximum is ${CLI_ARGV_MAX_ITEMS}`;
+  }
+  let chars = 0;
+  for (const [i, item] of argv.entries()) {
+    if (typeof item !== 'string' || item.length === 0) {
+      return `cli_argv[${i}] must be a non-empty string`;
+    }
+    if (item.includes('\0') || WORKSPACE_IDENTITY_CONTROL_RE.test(item)) {
+      return `cli_argv[${i}] contains control characters`;
+    }
+    chars += item.length;
+  }
+  if (chars > CLI_ARGV_MAX_CHARS) {
+    return `cli_argv totals ${chars} characters; the maximum is ${CLI_ARGV_MAX_CHARS}`;
+  }
+  const command = argv[0] as string;
+  if (
+    command === '.'
+    || command === '..'
+    || command.includes('/')
+    || command.includes('\\')
+    || command.startsWith('-')
+  ) {
+    return `cli_argv[0] must be a bare installed-command name resolved on PATH (for example "sf"), not a path or flag: ${command}`;
+  }
+  return null;
+}
+
 export interface SpaceDataSource {
   /** Stable id within the Space (e.g. "daily_pull"). */
   id: string;
   /** Script filename Clem authored; copied into the shadow workflow's scripts/. */
   runner?: string;
+  /** OR a frozen read-only CLI invocation (bare command + fixed args, no
+   * shell). One human approval pins {workspace, source, argv, schedule};
+   * after that, scheduled and manual refreshes run it unattended. Any argv or
+   * schedule change voids the grant and re-asks. */
+  cliArgv?: string[];
   /** OR a stored Composio op + frozen args (creds resolve server-side). */
   composioSlug?: string;
   composioArgs?: Record<string, unknown>;
@@ -472,7 +520,15 @@ function normDataSource(raw: unknown, manifestErrors: string[], index: number): 
     const err = runnerFilenameError(runner);
     if (err) manifestErrors.push(`${label} ${err}.`);
   }
+  const cliArgvRaw = d.cliArgv ?? d.cli_argv;
+  if (cliArgvRaw != null) {
+    const err = cliArgvError(cliArgvRaw);
+    if (err) manifestErrors.push(`${label} ${err}.`);
+    else ds.cliArgv = (cliArgvRaw as string[]).slice();
+    if (runner) manifestErrors.push(`${label} declares both a runner and cli_argv; declare exactly one execution mode.`);
+  }
   const cs = asStr(d.composioSlug) ?? asStr(d.composio_slug); if (cs) ds.composioSlug = cs;
+  if (cs && ds.cliArgv) manifestErrors.push(`${label} declares both cli_argv and a composio_slug; declare exactly one execution mode.`);
   if (d.composioArgs != null) {
     const ca = parseJsonObjField(d.composioArgs, `${label} composioArgs`, manifestErrors);
     if (ca) ds.composioArgs = ca;
@@ -573,9 +629,16 @@ function declaredRunnerErrors(
 ): string[] {
   const errors: string[] = [];
   for (const [index, src] of (dataSources ?? []).entries()) {
+    const label = `Data source "${src.id || `#${index + 1}`}"`;
+    if (src.cliArgv !== undefined) {
+      const cliErr = cliArgvError(src.cliArgv);
+      if (cliErr) errors.push(`${label} ${cliErr}.`);
+      if (src.runner !== undefined) errors.push(`${label} declares both a runner and cli_argv; declare exactly one execution mode.`);
+      if (src.composioSlug?.trim()) errors.push(`${label} declares both cli_argv and a composio_slug; declare exactly one execution mode.`);
+    }
     if (src.runner === undefined) continue;
     const err = runnerFilenameError(src.runner);
-    if (err) errors.push(`Data source "${src.id || `#${index + 1}`}" ${err}.`);
+    if (err) errors.push(`${label} ${err}.`);
   }
   for (const [index, action] of (actions ?? []).entries()) {
     if (action.runner === undefined) continue;

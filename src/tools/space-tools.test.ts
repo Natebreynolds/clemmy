@@ -221,7 +221,7 @@ test('space_save preserves an installed runner source and holds its smoke for pi
 
   assert.match(out, /Updated workspace/);
   assert.match(out, /Legacy runner.*preserved/i);
-  assert.match(out, /waiting for your pinned-entrypoint approval/i);
+  assert.match(out, /waiting for your one-time approval/i);
   assert.doesNotMatch(out, /Data refreshed:.*pull/i);
   assert.equal(store.spaceStore.get(slug)?.status, 'active', 'migration wait is not a broken build');
   assert.equal(store.spaceStore.get(slug)?.dataSources[0]?.runner, 'pull.mjs');

@@ -833,3 +833,76 @@ test('data-plane path-safety: a bad slug cannot escape', () => {
   assert.throws(() => data.writeData('../evil', { x: 1 }));
   assert.throws(() => data.appendNote('../evil', { text: 'nope' }));
 });
+
+test('cliArgvError pins the frozen-CLI declaration shape: bare PATH command + plain string args only', () => {
+  assert.equal(store.cliArgvError(['sf', 'data', 'query', '-q', 'SELECT Id FROM Account', '-r', 'json']), null);
+  assert.equal(store.cliArgvError(['node', '-e', 'console.log(1)']), null);
+  assert.match(store.cliArgvError([]) ?? '', /non-empty array/);
+  assert.match(store.cliArgvError('sf data query') ?? '', /non-empty array/);
+  assert.match(store.cliArgvError(['sf', 42]) ?? '', /must be a non-empty string/);
+  assert.match(store.cliArgvError(['sf', '']) ?? '', /must be a non-empty string/);
+  // argv[0] must be an installed command resolved on PATH — a path or flag
+  // would reopen arbitrary-local-file execution under a friendlier name.
+  assert.match(store.cliArgvError(['./steal.sh']) ?? '', /bare installed-command name/);
+  assert.match(store.cliArgvError(['/bin/sh', '-c', 'anything']) ?? '', /bare installed-command name/);
+  assert.match(store.cliArgvError(['..\\evil']) ?? '', /bare installed-command name/);
+  assert.match(store.cliArgvError(['--version']) ?? '', /bare installed-command name/);
+  assert.match(store.cliArgvError(['sf', 'a\tb']) ?? '', /control characters/);
+  assert.match(store.cliArgvError(Array.from({ length: 65 }, () => 'x')) ?? '', /maximum is 64/);
+  assert.match(store.cliArgvError(['sf', 'y'.repeat(4000)]) ?? '', /maximum is 4000/);
+});
+
+test('a data source declares exactly ONE execution mode: cli_argv is exclusive with runner and composio_slug', () => {
+  assert.throws(
+    () => store.spaceStore.save({
+      id: 'cli-exclusive-a',
+      title: 'CLI exclusive',
+      dataSources: [{ id: 'pull', runner: 'pull.mjs', cliArgv: ['sf', 'org', 'list'] }],
+    }),
+    /declares both a runner and cli_argv/,
+  );
+  assert.throws(
+    () => store.spaceStore.save({
+      id: 'cli-exclusive-b',
+      title: 'CLI exclusive',
+      dataSources: [{ id: 'pull', cliArgv: ['sf', 'org', 'list'], composioSlug: 'GMAIL_FETCH_EMAILS' }],
+    }),
+    /declares both cli_argv and a composio_slug/,
+  );
+  assert.throws(
+    () => store.spaceStore.save({
+      id: 'cli-exclusive-c',
+      title: 'CLI invalid argv',
+      dataSources: [{ id: 'pull', cliArgv: ['./local.sh'] }],
+    }),
+    /bare installed-command name/,
+  );
+
+  // A valid frozen CLI declaration round-trips through save + manifest reload.
+  store.spaceStore.save({
+    id: 'cli-roundtrip',
+    title: 'CLI roundtrip',
+    dataSources: [{ id: 'pull', cliArgv: ['sf', 'data', 'query', '-q', 'SELECT Id FROM Account', '-r', 'json'], schedule: '0 7 * * *' }],
+  });
+  const rec = store.spaceStore.get('cli-roundtrip');
+  assert.deepEqual(rec?.dataSources[0]?.cliArgv, ['sf', 'data', 'query', '-q', 'SELECT Id FROM Account', '-r', 'json']);
+  assert.equal(rec?.manifestErrors, undefined, 'a clean cli_argv manifest carries no errors');
+});
+
+test('hand-written manifest normalization accepts cli_argv (snake_case) and flags malformed shapes', () => {
+  const slug = 'cli-handwritten';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Hand-written CLI',
+    dataSources: [
+      { id: 'good', cli_argv: ['gh', 'pr', 'list', '--json', 'number,title'] },
+      { id: 'bad', cli_argv: ['/abs/path'] },
+    ],
+  }), 'utf-8');
+  const rec = store.spaceStore.get(slug);
+  assert.deepEqual(rec?.dataSources[0]?.cliArgv, ['gh', 'pr', 'list', '--json', 'number,title']);
+  assert.equal(rec?.dataSources[1]?.cliArgv, undefined, 'malformed argv is not silently installed');
+  assert.match((rec?.manifestErrors ?? []).join('\n'), /bad.*bare installed-command name/s);
+});

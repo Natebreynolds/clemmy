@@ -13,6 +13,7 @@ import type { SpaceAction, SpaceDataSource } from './store.js';
 
 export const SPACE_ACTION_APPROVAL_TOOL = 'space_execute_action';
 export const SPACE_DATA_RUNNER_TRUST_TOOL = 'space_trust_data_runner';
+export const SPACE_CLI_SOURCE_TRUST_TOOL = 'space_trust_cli_source';
 
 export function workspaceComposioIsProvablyReadOnly(slug: string | null | undefined): boolean {
   const normalized = slug?.trim();
@@ -32,7 +33,14 @@ export function workspaceDataSourceSafetyError(source: SpaceDataSource): string 
   if (source.runner?.trim()) {
     return `Data source "${source.id}" uses opaque runner "${source.runner.trim()}". `
       + 'Automatic, scheduled, and manual Workspace refreshes cannot execute arbitrary code because it may mutate external systems without approval. '
-      + 'Replace it with a provably read-only Composio action; keep executable runners only as approval-gated Workspace actions.';
+      + 'Replace it with a provably read-only Composio action or a frozen CLI declaration (cli_argv); keep executable runners only as approval-gated Workspace actions.';
+  }
+  if (source.cliArgv?.length) {
+    // A frozen argv is not statically read-only either, but unlike an opaque
+    // runner its full invocation fits on one approval card. The CLI trust
+    // authority requires that one human decision before any spawn; policy here
+    // only vouches that the declaration shape is reviewable.
+    return null;
   }
   const slug = source.composioSlug?.trim();
   if (slug && !workspaceComposioIsProvablyReadOnly(slug)) {

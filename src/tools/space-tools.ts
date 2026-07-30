@@ -45,6 +45,7 @@ import {
 import {
   enqueueSpaceActionApproval,
   spaceActionNeedsApproval,
+  standingSpaceActionAuthority,
 } from '../spaces/space-action-gate.js';
 import { redactSensitiveText } from '../runtime/security.js';
 
@@ -183,6 +184,7 @@ const dataSourceShape = z.object({
   runner_path: z.string().max(1000).nullish().describe('Legacy compatibility only: may update the file of an existing runner-backed source, which invalidates its prior entrypoint grant and requires a fresh pinned-entrypoint approval. New data-source runner installation is refused.'),
   composio_slug: z.string().max(120).nullish().describe('A PROVABLY READ-ONLY Composio tool slug (GET/LIST/SEARCH/FETCH/READ) to call server-side for data. Writes, unknown actions, and runners are refused; credentials resolve server-side, never in the view.'),
   composio_args_json: z.string().max(4000).nullish().describe('JSON string of frozen args for composio_slug.'),
+  cli_argv: z.array(z.string().min(1).max(1000)).max(64).nullish().describe('OR a frozen READ-ONLY CLI invocation as an argv array (no shell), e.g. ["sf","data","query","-q","SELECT ...","-r","json"]. argv[0] must be a bare installed-command name on PATH. The user approves the exact command once; after that, scheduled and manual refreshes run it unattended. Any argv or schedule change re-asks. Stdout becomes the dataset (JSON parsed when possible, else {stdout}). Declare only commands that read — never ones that create/update/delete.'),
   allow_empty: z.boolean().nullish().describe('Set true only when zero rows is an intentional valid product state (for example a brand-new content calendar). The creation smoke will still run, but will not mislabel that expected empty state as broken.'),
   schedule: z.string().max(60).nullish().describe('Optional 5-field cron for an automatic daily/periodic refresh — LIVE: the in-process scheduler runs it server-side (and harvests _reengage from the output). Omit for on-demand only.'),
   timezone: z.string().max(60).nullish().describe('IANA timezone for the schedule (e.g. "America/Los_Angeles").'),
@@ -270,6 +272,7 @@ function toDataSource(
   const runner = declaredRunner(raw.runner, raw.runner_path, `Data source "${ds.id}"`, errors, staged);
   if (runner) ds.runner = runner;
   if (raw.composio_slug && raw.composio_slug.trim()) ds.composioSlug = raw.composio_slug.trim();
+  if (raw.cli_argv && raw.cli_argv.length > 0) ds.cliArgv = raw.cli_argv.map((item) => item.trim()).filter(Boolean);
   const composioArgs = parseJsonObjectField(raw.composio_args_json, `Data source "${ds.id}" composio_args_json`, errors);
   if (composioArgs) ds.composioArgs = composioArgs;
   if (raw.schedule && raw.schedule.trim()) ds.schedule = raw.schedule.trim();
@@ -401,6 +404,7 @@ export function registerSpaceTools(server: McpServer): void {
       'A helper `clem` is auto-injected into every served view. For declared data, PREFER `const data = await clem.data()` and read the exact declared id as `data["<sourceId>"]`; `await clem.refresh(sourceId?)` also returns `{ results, data }`. Legacy placeholders such as `{{tasks}}` are NOT expanded and embedded seeds are static. Existing absolute `/api/console/spaces/<slug>/data` views remain supported through the same scoped RPC bridge. Also available: `await clem.compose(instructions, context)` → a grounded draft; `await clem.action(actionId, args)`; `await clem.note(text, kind?, meta?)`.',
       'APPROVAL CONTRACT: an action that SENDS or writes to an external system takes ONE user approval before it fires — for those `clem.action()` returns {pending:true, approvalId} (it surfaces in the user\'s inbox/board and runs when approved); a read-only action returns {ok:true, result} immediately. Build the view to show a "waiting for approval" state on a pending result — never tell the user it sent until it actually ran.',
       'Optionally declare NEW data_sources as PROVABLY READ-ONLY Composio operations so the workspace can refresh server-side without spending tokens. Only GET/LIST/SEARCH/FETCH/READ-class actions are accepted. Unknown or mutating slugs and new arbitrary runner scripts are refused.',
+      'When the data lives behind a LOCAL CLI the user already authenticated (sf, gh, netlify, aws…), declare the source with cli_argv instead: a frozen read-only argv the user approves ONCE, after which every scheduled/manual refresh runs it unattended. Prefer the CLI\'s JSON output flag so stdout parses into a dataset.',
       'Compatibility: an already-installed runner-backed data source may retain the same source id + filename. Its first refresh requests one time-bounded human approval bound to the runner entrypoint hash + schedule; entrypoint edits invalidate that grant. Helpers, packages, CLIs, local files, auth state, and network services remain live outside the digest, so this is not a read-only sandbox. Prefer migrating it to read-only Composio. Executable ACTION runners remain per-invocation approval-gated under the same pinned-entrypoint boundary.',
       'PROACTIVE WAKE (optional): a scheduled read-only source can be paired with threshold re-engagement guidance; the scheduler dedups a persistent condition so it does not ping on every refresh.',
       'OPERATING CONTRACT: persist the Workspace\'s user-owned objective, concrete success criteria, and semantic invariants (things later edits/refreshes must never drift). This is a compact north star, not a procedure or an extra judge. Omit fields on later saves to preserve them.',
@@ -639,7 +643,7 @@ export function registerSpaceTools(server: McpServer): void {
         }
         if (smoke.awaitingApproval.length > 0) {
           parts.push(
-            `Legacy data refresh is waiting for your pinned-entrypoint approval (the Workspace stays active): ${smoke.awaitingApproval.map((item) => `${item.id} · ${item.approvalId}`).join(', ')}.`,
+            `Data refresh is waiting for your one-time approval (the Workspace stays active): ${smoke.awaitingApproval.map((item) => `${item.id} · ${item.approvalId}`).join(', ')}.`,
           );
         }
         if (smoke.actionWarnings.length > 0) parts.push(smoke.actionWarnings.map((w) => `- ${w}`).join('\n'));
@@ -734,6 +738,21 @@ export function registerSpaceTools(server: McpServer): void {
         }
       }
 
+      // Standing trust: a prior approval whose exact authority still holds
+      // (same action + args, byte-identical runner) covers this invocation.
+      const standing = standingSpaceActionAuthority(rec, action, callerArgs);
+      if (standing?.ok) {
+        const { runSpaceAction } = await import('../spaces/runner.js');
+        const { randomUUID } = await import('node:crypto');
+        const result = await runSpaceAction(rec.id, action, callerArgs, {
+          approvalId: standing.approvalId,
+          executionNonce: randomUUID(),
+        });
+        return textResult(result.ok
+          ? `Ran "${action.label ?? action.id}" in workspace "${rec.title}" under standing approval ${standing.approvalId} `
+            + '(the user already approved this exact runner version; no new approval was needed).'
+          : `"${action.label ?? action.id}" was covered by standing approval ${standing.approvalId} but failed: ${result.error}`);
+      }
       try {
         const prepared = enqueueSpaceActionApproval(rec, action, callerArgs);
         return textResult(

@@ -733,3 +733,53 @@ test('boot recovery re-projects an authoritative rejection when the first memory
     gate._setWorkspaceActionMemoryCaptureForTests(null);
   }
 });
+
+test('standing trust: approve a non-outbound runner ONCE — later identical clicks run without a new card', async () => {
+  // Live complaint 2026-07-30: "I was simply updating the Salesforce data" —
+  // a hash-pinned read runner re-asked on every refresh click.
+  const slug = 'gate-standing';
+  store.spaceStore.save({
+    id: slug, title: 'Standing',
+    actions: [{ id: 'refresh_sf', label: 'Refresh from Salesforce', runner: 'act.mjs', confirm: true }],
+  });
+  writeCountingRunner(slug);
+  const rec = store.spaceStore.get(slug)!;
+  const action = rec.actions[0];
+
+  // Eligibility boundary: local non-outbound runner yes; sends and Composio never.
+  assert.equal(gate.standingActionTrustEligible(action), true);
+  assert.equal(gate.standingActionTrustEligible({ id: 'send_email', label: 'Send email', runner: 's.mjs' }), false, 'outbound stays per-invocation');
+  assert.equal(gate.standingActionTrustEligible({ id: 'u', composioSlug: 'GMAIL_SEND_EMAIL' }), false, 'composio mutations stay per-invocation');
+
+  // No coverage before any approval.
+  assert.equal(gate.standingSpaceActionAuthority(rec, action, {}), null);
+
+  // First click: one card, approved by the human; the approved row carries the
+  // 90-day grant window.
+  const { approvalId } = gate.enqueueSpaceActionApproval(rec, action, {});
+  const row = approvalRow(approvalId);
+  assert.match(String(row.args?.reason ?? ''), /STANDING trust/i, 'the card DISCLOSES that approval grants standing trust');
+  assert.ok(Date.parse(row.expiresAt) - Date.now() > 80 * 24 * 60 * 60 * 1000, 'grant window ≈ 90 days, not the 24h decision default');
+  await gate.executeApprovedSpaceAction(resolveApproval(approvalId));
+  assert.equal(dispatchCount(slug), 1);
+
+  // Second click: covered — runs directly under the SAME approval, and the
+  // per-invocation execution nonce prevents replaying run #1's receipt.
+  const standing = gate.standingSpaceActionAuthority(rec, action, {});
+  assert.ok(standing?.ok, 'the prior approval covers an identical invocation');
+  assert.equal(standing!.approvalId, approvalId);
+  const second = await runner.runSpaceAction(slug, action, {}, {
+    approvalId: standing!.approvalId,
+    executionNonce: 'nonce-2',
+  });
+  assert.equal(second.ok, true, JSON.stringify(second));
+  assert.equal(dispatchCount(slug), 2, 'the covered click EXECUTES — never replays the first receipt');
+
+  // Different caller args = a different question — not covered.
+  assert.equal(gate.standingSpaceActionAuthority(rec, action, { window: '180d' }), null);
+
+  // Editing the runner voids the grant before any spawn.
+  writeFileSync(path.join(store.resolveInSpace(slug, 'data'), 'act.mjs'),
+    'process.stdout.write(JSON.stringify({ changed: true }))', 'utf-8');
+  assert.equal(gate.standingSpaceActionAuthority(store.spaceStore.get(slug)!, action, {}), null, 'byte drift re-asks');
+});

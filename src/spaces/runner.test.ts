@@ -264,6 +264,122 @@ test('an installed legacy data runner requests one pinned-entrypoint trust card,
   assert.deepEqual(approved, { ok: true, data: { version: 1 } });
 });
 
+test('frozen CLI data source: ONE approval pins the exact argv + schedule, then refreshes run unattended', async () => {
+  const slug = 'cli-source-trust';
+  const source = {
+    id: 'pull',
+    cliArgv: ['node', '-e', 'console.log(JSON.stringify({ rows: [1, 2, 3] }))'],
+    schedule: '0 7 * * *',
+    timezone: 'America/Los_Angeles',
+  };
+  store.spaceStore.save({
+    id: slug,
+    title: 'CLI source trust',
+    dataSources: [source],
+  });
+
+  // 1. First refresh never spawns — it mints exactly one approval card that
+  //    shows the human the full frozen command line.
+  const first = await runner.runSpaceDataSource(slug, source);
+  assert.equal(first.ok, false);
+  assert.match(first.ok ? '' : first.error, /one-time approval/i);
+  assert.equal(first.provenNoDispatch, true, 'blocked CLI refresh must prove it never spawned');
+  const cards = approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' });
+  assert.equal(cards.length, 1, 'first refresh mints one decision');
+  assert.equal(cards[0]?.tool, 'space_trust_cli_source');
+  assert.deepEqual(cards[0]?.args?.cliArgv, source.cliArgv, 'the card pins the exact argv vector');
+  assert.deepEqual(cards[0]?.args?.schedulePolicy, { schedule: source.schedule, timezone: source.timezone });
+  assert.match(cards[0]?.subject ?? '', /refresh .*automatically/i);
+  assert.match(String(cards[0]?.args?.reason ?? ''), /no shell, no substitutions/i);
+  assert.match(String(cards[0]?.args?.reason ?? ''), /auth state.*network services.*live/i);
+  assert.match(String(cards[0]?.args?.reason ?? ''), /90 days/);
+
+  // 2. Retries and scheduler ticks converge on the same pending card.
+  await runner.runSpaceDataSource(slug, source);
+  assert.equal(
+    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
+    1,
+  );
+
+  // 3. Approve once → the CLI actually runs and stdout JSON is the dataset,
+  //    with no new card (this is the unattended scheduled-refresh path).
+  assert.equal(approvalRegistry.resolve(cards[0]!.approvalId, 'approved', 'cli-trust-test').ok, true);
+  const approved = await runner.runSpaceDataSource(slug, source);
+  assert.deepEqual(approved, { ok: true, data: { rows: [1, 2, 3] } });
+  const again = await runner.runSpaceDataSource(slug, source);
+  assert.equal(again.ok, true, 'repeat refreshes stay covered without a new decision');
+  assert.equal(
+    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
+    0,
+    'covered refreshes never mint another card',
+  );
+
+  // 4. Any argv drift voids the grant BEFORE a spawn and re-asks.
+  const drifted = {
+    ...source,
+    cliArgv: ['node', '-e', 'console.log(JSON.stringify({ rows: ["changed"] }))'],
+  };
+  store.spaceStore.save({ id: slug, title: 'CLI source trust', dataSources: [drifted] });
+  const afterDrift = await runner.runSpaceDataSource(slug, drifted);
+  assert.equal(afterDrift.ok, false);
+  assert.match(afterDrift.ok ? '' : afterDrift.error, /one-time approval/i);
+  assert.equal(
+    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
+    1,
+    'a changed argv is a NEW decision',
+  );
+});
+
+test('frozen CLI source: schedule drift re-asks, caller/installed mismatch and unknown commands fail closed', async () => {
+  const slug = 'cli-source-trust-edges';
+  const source = {
+    id: 'pull',
+    cliArgv: ['node', '-e', 'console.log("plain text, not json")'],
+  };
+  store.spaceStore.save({ id: slug, title: 'CLI edges', dataSources: [source] });
+
+  const first = await runner.runSpaceDataSource(slug, source);
+  assert.equal(first.ok, false);
+  const card = approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' })[0];
+  assert.ok(card);
+  assert.equal(approvalRegistry.resolve(card.approvalId, 'approved', 'cli-trust-test').ok, true);
+
+  // Non-JSON stdout still yields a usable dataset instead of an error.
+  const text = await runner.runSpaceDataSource(slug, source);
+  assert.deepEqual(text, { ok: true, data: { stdout: 'plain text, not json' } });
+
+  // A caller-supplied argv that differs from the installed manifest is not the
+  // approved program — blocked without spawning, and without minting a card
+  // for the mismatched shape.
+  const tampered = await runner.runSpaceDataSource(slug, {
+    id: 'pull',
+    cliArgv: ['node', '-e', 'console.log("tampered")'],
+  });
+  assert.equal(tampered.ok, false);
+  assert.match(tampered.ok ? '' : tampered.error, /does not exactly match its installed CLI declaration/i);
+  assert.equal(tampered.provenNoDispatch, true);
+
+  // Schedule drift on the same argv is a new decision (the human approved
+  // "runs at THIS cadence", not "runs whenever").
+  const rescheduled = { ...source, schedule: '*/5 * * * *' };
+  store.spaceStore.save({ id: slug, title: 'CLI edges', dataSources: [rescheduled] });
+  const afterReschedule = await runner.runSpaceDataSource(slug, rescheduled);
+  assert.equal(afterReschedule.ok, false);
+  assert.match(afterReschedule.ok ? '' : afterReschedule.error, /one-time approval/i);
+
+  // An approved command that is not installed fails with a clear PATH error.
+  const missing = { id: 'gone', cliArgv: ['definitely-not-a-real-cli-9f3a', '--version'] };
+  store.spaceStore.save({ id: `${slug}-missing`, title: 'CLI missing', dataSources: [missing] });
+  const pendingMissing = await runner.runSpaceDataSource(`${slug}-missing`, missing);
+  assert.equal(pendingMissing.ok, false);
+  const missingCard = approvalRegistry.listPending({ sessionId: `space-${slug}-missing`, status: 'pending' })[0];
+  assert.ok(missingCard);
+  assert.equal(approvalRegistry.resolve(missingCard.approvalId, 'approved', 'cli-trust-test').ok, true);
+  const ran = await runner.runSpaceDataSource(`${slug}-missing`, missing);
+  assert.equal(ran.ok, false);
+  assert.match(ran.ok ? '' : ran.error, /not found on PATH/i);
+});
+
 test('verified runner execution snapshots approved entry bytes before spawn and cleans the snapshot', async () => {
   const slug = 'verified-entrypoint-snapshot';
   const file = 'pull.mjs';

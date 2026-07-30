@@ -71,6 +71,7 @@ import { refreshSpaceData, runSpaceAction } from '../spaces/runner.js';
 import { composeForSpace } from '../spaces/compose.js';
 import {
   spaceActionNeedsApproval, enqueueSpaceActionApproval, initSpaceActionApprovals,
+  standingSpaceActionAuthority,
 } from '../spaces/space-action-gate.js';
 import { reengageSpace } from '../spaces/reengage.js';
 import { buildPublishSnapshot } from '../spaces/publish.js';
@@ -876,7 +877,13 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     // ONE approval (surfaced in the inbox/board) before it fires; READ-class
     // actions run instantly. The runtime boundary repeats this check, so an
     // alternate caller or stale debug configuration cannot bypass approval.
-    if (spaceActionNeedsApproval(action)) {
+    // Standing trust: a prior approval whose EXACT authority still holds
+    // (same action, same args, byte-identical runner) covers this click —
+    // approve once per runner version instead of once per refresh.
+    const standing = spaceActionNeedsApproval(action)
+      ? standingSpaceActionAuthority(rec, action, callerArgs)
+      : null;
+    if (spaceActionNeedsApproval(action) && !standing?.ok) {
       try {
         const { approvalId, subject } = enqueueSpaceActionApproval(rec, action, callerArgs);
         res.status(202).json({ pending: true, approvalId, subject });
@@ -886,8 +893,20 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       return;
     }
     try {
-      const result = await runSpaceAction(slug, action, callerArgs);
-      appendAudit(slug, { method: 'ACTION', path: `/action/${actionId}`, outcome: result.ok ? 'ok' : 'error', note: result.ok ? undefined : result.error });
+      const result = standing?.ok
+        ? await runSpaceAction(slug, action, callerArgs, {
+            approvalId: standing.approvalId,
+            executionNonce: randomUUID(),
+          })
+        : await runSpaceAction(slug, action, callerArgs);
+      appendAudit(slug, {
+        method: 'ACTION',
+        path: `/action/${actionId}`,
+        outcome: result.ok ? 'ok' : 'error',
+        note: standing?.ok
+          ? `covered by standing approval ${standing.approvalId}${result.ok ? '' : ` — ${result.error}`}`
+          : result.ok ? undefined : result.error,
+      });
       // Record what happened so the workspace's Clem has context.
       appendNote(slug, {
         text: result.ok ? `Ran "${action.label ?? actionId}"` : `"${action.label ?? actionId}" failed: ${result.error}`,

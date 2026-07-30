@@ -43,8 +43,10 @@ import {
   actionApprovalSnapshot,
   actionApprovalSnapshotsEqual,
   actionFromApprovalSnapshot,
+  findStandingSpaceActionApproval,
   parseActionApprovalSnapshot,
   spaceActionApprovalResumeKey,
+  type SpaceActionAuthorityResult,
 } from './space-action-authority.js';
 import {
   createWorkspaceObservationMemoryBridge,
@@ -57,6 +59,33 @@ export const SPACE_ACTION_TOOL = SPACE_ACTION_APPROVAL_TOOL;
 export { SPACE_ACTION_MUTATION_WORKFLOW_SLUG };
 const SPACE_ACTION_EXECUTION_VERSION = 1;
 const RUNNER_ACTION_SCOPE_REASON = 'This approval covers a pinned entrypoint: only the runner entrypoint bytes are frozen. Helpers, packages, CLIs, local files, auth state, and network services remain live and outside the digest; arbitrary runner code is not a read-only sandbox.';
+export const STANDING_ACTION_TRUST_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+const STANDING_RUNNER_ACTION_REASON = 'Approving grants STANDING trust for this exact pinned entrypoint version: this action re-runs without asking again for up to 90 days, as long as the runner file stays byte-identical (any edit voids the grant and re-asks). Only the runner entrypoint bytes are frozen — helpers, packages, CLIs, local files, auth state, and network services remain live and outside the digest; arbitrary runner code is not a read-only sandbox.';
+
+/**
+ * Which gated actions may be covered by a STANDING approval instead of one
+ * card per click. Deliberately narrow: local runner scripts that are not
+ * outbound (no send semantics) and not Composio mutations. A read-shaped
+ * refresh re-clicked daily is the same question re-asked; a send is a new
+ * effect every time and stays per-invocation (live complaint 2026-07-30:
+ * "I was simply updating the Salesforce data" — a hash-pinned SOQL runner
+ * demanded approval on every refresh).
+ */
+export function standingActionTrustEligible(action: SpaceAction): boolean {
+  return Boolean(action.runner?.trim())
+    && !action.composioSlug?.trim()
+    && !workspaceActionLooksOutbound(action);
+}
+
+/** A prior approval that still exactly covers this invocation, or null. */
+export function standingSpaceActionAuthority(
+  rec: SpaceRecord,
+  action: SpaceAction,
+  callerArgs: Record<string, unknown>,
+): SpaceActionAuthorityResult | null {
+  if (!standingActionTrustEligible(action)) return null;
+  return findStandingSpaceActionApproval({ slug: rec.id, action, callerArgs });
+}
 const workspaceMemoryBridge = createWorkspaceObservationMemoryBridge();
 type WorkspaceMemoryCapture = (
   signal: WorkspaceMemorySignal,
@@ -238,6 +267,7 @@ export function enqueueSpaceActionApproval(
   const verb = workspaceActionLooksOutbound(action) ? 'Send' : 'Run';
   const subject = `${verb} “${action.label ?? action.id}” in workspace “${rec.title}”`;
   const sessionId = ensureSpaceSession(rec);
+  const standingEligible = standingActionTrustEligible(action);
   const args = {
     spaceSlug: rec.id,
     actionId: action.id,
@@ -245,7 +275,9 @@ export function enqueueSpaceActionApproval(
     composioSlug: action.composioSlug ?? null,
     spaceActionExecutionVersion: SPACE_ACTION_EXECUTION_VERSION,
     actionSnapshot: actionApprovalSnapshot(rec, action),
-    ...(action.runner?.trim() ? { reason: RUNNER_ACTION_SCOPE_REASON } : {}),
+    ...(standingEligible
+      ? { reason: STANDING_RUNNER_ACTION_REASON }
+      : action.runner?.trim() ? { reason: RUNNER_ACTION_SCOPE_REASON } : {}),
     preview: actionPreview(action, callerArgs),
   };
   const registered = registerResumable({
@@ -253,6 +285,11 @@ export function enqueueSpaceActionApproval(
     subject,
     tool: SPACE_ACTION_TOOL,
     args,
+    // The approved row IS the standing grant for eligible actions: its
+    // expiresAt bounds the reuse window checked by
+    // findStandingSpaceActionApproval. Everything else keeps the default
+    // decision-window TTL.
+    ...(standingEligible ? { ttlMs: STANDING_ACTION_TRUST_TTL_MS } : {}),
     resumeKey: spaceActionApprovalResumeKey({
       sessionId,
       tool: SPACE_ACTION_TOOL,
