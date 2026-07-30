@@ -1041,6 +1041,15 @@ function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 8);
 }
 
+/** Seam for the cycle-stagger pin: the runtime cycle hard-requires live brain
+ *  auth (tool-scoped requests never widen through the legacy fallback), so the
+ *  end-to-end tick test injects a stub cycle here instead. Production never
+ *  touches this. */
+let runtimeCycleImpl: typeof runAgentCycleViaRuntime | undefined;
+export const _testOnly_setRuntimeCycleImpl = (fn?: typeof runAgentCycleViaRuntime): void => {
+  runtimeCycleImpl = fn;
+};
+
 async function runAgentCycleViaRuntime(
   assistant: ClementineAssistant,
   record: TeamAgentRecord,
@@ -1257,13 +1266,20 @@ export async function processAgentAutonomyV2(assistant?: ClementineAssistant): P
     const records = loadTeamAgents().filter((rec) => optIn.has(rec.slug) && rec.autonomyEnabled !== false);
     // Sequential on purpose: runtime turns are heavier than SDK cycles, and
     // serializing them keeps one slow agent from stacking brain-lane load.
+    // AND at most ONE fired cycle per tick (v3.0.1 stampede family): after
+    // downtime every agent's cadence is due at once, and N sequential brain
+    // turns inside one awaited phase starve the daemon loop — workflow
+    // scheduling, briefs, and the watchdog wait for the SUM of them. Holding
+    // is free here: a held agent stamps nothing, stays due, and runs next
+    // tick (~15s later) — a non-event against a 30-minute cadence.
     for (const rec of records) {
-      const claimed = claimCycle(rec.slug, (signal) => runAgentCycleViaRuntime(assistant, rec, signal));
+      const claimed = claimCycle(rec.slug, (signal) => (runtimeCycleImpl ?? runAgentCycleViaRuntime)(assistant, rec, signal));
       if (!claimed.started) {
         summary.attempted++;
         summary.skipped++;
         continue;
       }
+      let firedBrainTurn = false;
       try {
         const result = await withTimeout(
           claimed.promise,
@@ -1273,13 +1289,15 @@ export async function processAgentAutonomyV2(assistant?: ClementineAssistant): P
         );
         summary.attempted++;
         if (!result.runId) summary.skipped++;
-        else if (result.success) summary.succeeded++;
-        else summary.failed++;
+        else if (result.success) { summary.succeeded++; firedBrainTurn = true; }
+        else { summary.failed++; firedBrainTurn = true; }
       } catch (err) {
         summary.attempted++;
         summary.failed++;
+        firedBrainTurn = true; // a rejected cycle still consumed the tick's brain budget
         logger.warn({ err, agent: rec.slug }, 'autonomy runtime cycle rejected');
       }
+      if (firedBrainTurn) break; // one real cycle per tick; the rest stay due
     }
     summary.durationMs = Date.now() - start;
     return summary;

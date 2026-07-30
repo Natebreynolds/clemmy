@@ -17,6 +17,10 @@ const logger = pino({ name: 'clementine-next.orphan-tool-reports' });
 /** Only sweep sessions touched within this window — an orphan older than the
  *  loop-side ORPHAN_TOOL_MAX_AGE_MS is already dropped by the drain. */
 const ORPHAN_SWEEP_WINDOW_MS = 60 * 60_000;
+/** Max report turns fired per sweep — they run as parallel fire-and-forget
+ *  brain turns, so an unbounded post-crash drain is the machine-exhaustion
+ *  shape of the v3.0.1 incident. Held sessions stay queued for the next tick. */
+const MAX_REPORT_FIRES_PER_SWEEP = 2;
 
 export interface OrphanReportDeps {
   now: () => number;
@@ -34,6 +38,14 @@ export function sweepOrphanedToolReports(deps: OrphanReportDeps): { fired: numbe
   let sessionIds: string[];
   try { sessionIds = deps.recentSessionIds(since); } catch { return { fired: 0 }; }
   for (const sessionId of sessionIds) {
+    // Per-sweep budget (v3.0.1 stampede family): each fire is a PARALLEL
+    // fire-and-forget brain turn, and the post-crash case — the one this sweep
+    // exists for — is exactly when many sessions have stranded completions at
+    // once. Stop DRAINING new sessions once the budget is spent; undrained
+    // sessions keep their reports and the sweep (every tick, 60-min lookback)
+    // picks them up next pass. Never split within a session: drain() is
+    // removal, so a partially-fired drain would silently drop the rest.
+    if (fired >= MAX_REPORT_FIRES_PER_SWEEP) break;
     let reports: OrphanedToolReport[];
     try { reports = deps.drain(sessionId); } catch { continue; }
     for (const report of reports) {
