@@ -255,6 +255,19 @@ function WorkspaceViewForId({ id }: { id: string }) {
             refreshed {new Date(space.lastRefreshedAt).toLocaleTimeString()}
           </span>
         )}
+        {/* The automation feeding this workspace — one click to its workflow. */}
+        {(detail.data?.linkedWorkflows ?? []).map((wf) => (
+          <button
+            key={wf.name}
+            type="button"
+            title={`${wf.description || wf.name}${wf.enabled ? '' : ' (disabled)'} — open in Automate`}
+            onClick={() => navigate(`/automate?workflow=${encodeURIComponent(wf.name)}`)}
+            className={`hidden items-center gap-1 rounded-full border border-border px-2 py-0.5 text-caption md:inline-flex ${wf.enabled ? 'text-muted hover:text-primary hover:border-primary/40' : 'text-faint line-through'}`}
+          >
+            <Zap className="h-3 w-3" aria-hidden />
+            <span className="max-w-[160px] truncate">{wf.name}</span>
+          </button>
+        ))}
         <div className="ml-auto flex items-center gap-1.5">
           {space.dataSources.length > 0 && (
             <Button

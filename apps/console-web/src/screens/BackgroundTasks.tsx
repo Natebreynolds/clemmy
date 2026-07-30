@@ -26,6 +26,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import { BoardColumn } from '@/components/board/BoardColumn';
+import { DeliveredShelf } from '@/components/board/DeliveredShelf';
 import { LiveTraceDrawer } from '@/components/board/LiveTraceDrawer';
 import { NowStrip } from '@/components/board/NowStrip';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
@@ -305,6 +306,7 @@ export function BackgroundTasks() {
           </DragOverlay>
         </DndContext>
           )}
+          <DeliveredShelf />
         </>
       )}
 

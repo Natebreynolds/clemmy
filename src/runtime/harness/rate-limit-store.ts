@@ -141,6 +141,40 @@ export function getRateLimitSnapshot(): RateLimitSnapshot {
   return snapshot;
 }
 
+export interface CodexQuotaView {
+  fiveHour?: CodexWindow;
+  weekly?: CodexWindow;
+  capturedAt?: number;
+}
+
+/**
+ * Assign captured Codex windows to UI slots by their DURATION, never their
+ * header position. The provider has shipped the weekly window as "primary"
+ * (live 2026-07-30: primary.windowMinutes=10080 rendered under the 5h label,
+ * while a zero-duration placeholder secondary showed as "wk 0%").
+ *
+ * Rules: ≥2 days ⇒ weekly slot; a positive shorter duration ⇒ 5h slot; a
+ * zero-duration window is a placeholder and is DROPPED (never rendered as a
+ * fake 0%); a window with no duration header at all keeps the legacy
+ * positional meaning (primary ⇒ 5h, secondary ⇒ weekly).
+ */
+export function classifyCodexQuota(codex: RateLimitSnapshot['codex']): CodexQuotaView {
+  const out: CodexQuotaView = { capturedAt: codex?.capturedAt };
+  if (!codex) return out;
+  const assign = (window: CodexWindow | undefined, positionalSlot: 'fiveHour' | 'weekly'): void => {
+    if (!window) return;
+    const minutes = window.windowMinutes;
+    if (minutes === 0) return; // placeholder, not a real limit
+    const slot = minutes == null
+      ? positionalSlot
+      : minutes >= 2880 ? 'weekly' : 'fiveHour';
+    if (!out[slot]) out[slot] = window;
+  };
+  assign(codex.primary, 'fiveHour');
+  assign(codex.secondary, 'weekly');
+  return out;
+}
+
 /** Test-only: clear the in-memory snapshot. */
 export function __resetRateLimitStoreForTests(): void {
   snapshot = {};

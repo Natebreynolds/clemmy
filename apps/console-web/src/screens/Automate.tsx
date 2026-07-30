@@ -68,7 +68,11 @@ export function Automate() {
   const [installing, setInstalling] = useState(false);
   const [checking, setChecking] = useState(false);
   const [busyRecovery, setBusyRecovery] = useState<string | null>(null);
-  const [openWf, setOpenWf] = useState<string | null>(null);
+  // Deep-link: /automate?workflow=<name> opens that workflow's drawer directly
+  // (used by the workspace header's "powered by" chips).
+  const [openWf, setOpenWf] = useState<string | null>(
+    () => new URLSearchParams(window.location.search).get('workflow'),
+  );
   const [openRun, setOpenRun] = useState<{ workflow: string; runId?: string } | null>(null);
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
 

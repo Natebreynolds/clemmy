@@ -16,7 +16,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { recordDeliverable, searchDeliverables, renderDeliverableHit, deliverableKindForShape, deliverableContextBlock } = await import('./deliverable-index.js');
+const { recordDeliverable, searchDeliverables, listRecentDeliverables, renderDeliverableHit, deliverableKindForShape, deliverableContextBlock } = await import('./deliverable-index.js');
 
 after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -201,4 +201,23 @@ test('deliverableContextBlock: relevant ledger rows with the never-ask rubric; e
   assert.match(block, /test-outreach-sheet|research-batch-1/, 'ledger rows are in the block');
 
   assert.equal(deliverableContextBlock('completely unrelated quantum basket weaving'), '', 'no hits, no block');
+});
+
+test('Delivered shelf read: newest first, limit honored, missing files flagged not hidden', () => {
+  // The console Work screen's shelf reads this — finished work must never go
+  // dark even when the file moved (flag it) or nothing matches a query.
+  const ghost = path.join(TMP_HOME, 'moved-away.html');
+  recordDeliverable({ kind: 'file', target: ghost, why: 'a brief whose file later moved' });
+  const url = 'https://sheets.example.test/shelf-check';
+  recordDeliverable({ kind: 'url', target: url, why: 'the shelf-check sheet', lane: 'workflow' });
+
+  const recent = listRecentDeliverables(50);
+  assert.ok(recent.length >= 2);
+  const times = recent.map((r) => Date.parse(r.createdAt));
+  assert.deepEqual(times, [...times].sort((a, b) => b - a), 'newest first');
+  assert.equal(recent[0].target, url, 'the most recent write leads the shelf');
+  const ghostRow = recent.find((r) => r.target === ghost);
+  assert.ok(ghostRow, 'a moved file still appears');
+  assert.equal(ghostRow.stillExists, false, 'flagged as moved, never silently dropped');
+  assert.equal(listRecentDeliverables(1).length, 1, 'limit honored');
 });

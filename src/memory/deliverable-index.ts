@@ -116,6 +116,26 @@ function tokensOf(text: string): string[] {
 
 /** Lexical + recency search over the index. File entries are verified against
  *  the live filesystem so a stale pointer can never gaslight recall. */
+/** Recent deliverables, newest first — the read surface for the Delivered
+ *  shelf (console Work screen). Same durability contract as recall: the index
+ *  survives wipes and daemon restarts, so finished work never goes dark. */
+export function listRecentDeliverables(limit = 30): DeliverableHit[] {
+  try {
+    const db = ensureTable();
+    const rows = db.prepare(`
+      SELECT id, created_at AS createdAt, kind, target, title, why, session_id AS sessionId, lane
+      FROM deliverables ORDER BY created_at DESC LIMIT ?
+    `).all(Math.max(1, Math.min(limit, 100))) as DeliverableRecord[];
+    return rows.map((row) => {
+      const hit: DeliverableHit = { ...row, score: 1 };
+      if (row.kind === 'file') hit.stillExists = existsSync(row.target);
+      return hit;
+    });
+  } catch {
+    return [];
+  }
+}
+
 export function searchDeliverables(query: string, limit = 6): DeliverableHit[] {
   try {
     const qTokens = new Set(tokensOf(query));

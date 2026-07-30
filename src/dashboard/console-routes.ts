@@ -378,7 +378,7 @@ import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/to
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
 import { modelDiscoveryStatus } from '../runtime/harness/model-discovery.js';
-import { getRateLimitSnapshot } from '../runtime/harness/rate-limit-store.js';
+import { getRateLimitSnapshot, classifyCodexQuota } from '../runtime/harness/rate-limit-store.js';
 import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces, getFusionHealthSnapshot } from '../runtime/harness/debate-model.js';
 import { getJudgeMetricsSnapshot } from '../runtime/harness/judge-family.js';
@@ -6659,6 +6659,18 @@ export function registerConsoleRoutes(
   // (rotate PIN, revoke sessions) are gated by isAuthorized — the
   // Bearer/cookie that lets you reach the console at all is sufficient.
 
+  // ─── Delivered shelf — finished work never goes dark ─────────────
+  app.get('/api/console/delivered', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listRecentDeliverables } = await import('../memory/deliverable-index.js');
+      const limitRaw = Number.parseInt(String(req.query.limit ?? '30'), 10);
+      res.json({ items: listRecentDeliverables(Number.isFinite(limitRaw) ? limitRaw : 30) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/mobile-access/status', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -7723,8 +7735,17 @@ export function registerConsoleRoutes(
       const togetherConnected = byoProviders.some(
         (p) => p.id === 'together' || p.id === 'together-ai' || /together/i.test(p.label),
       );
+      // Window slots assigned by DURATION, not header position — the provider
+      // has shipped weekly as "primary" (see classifyCodexQuota). Wire names
+      // stay primary=5h-slot / secondary=weekly-slot for renderer compat.
+      const codexQuota = classifyCodexQuota(rl.codex);
       res.json({
-        codex: { connected: codexModelsAvailable(), ...(rl.codex ?? {}) },
+        codex: {
+          connected: codexModelsAvailable(),
+          primary: codexQuota.fiveHour,
+          secondary: codexQuota.weekly,
+          capturedAt: codexQuota.capturedAt,
+        },
         claude: { connected: claudeConnected, ...(claudeUsage ?? {}) },
         openai: { connected: Boolean(getOpenAiApiKey()) },
         byoProviders,

@@ -36,6 +36,35 @@ import {
   type WorkspaceDatasetObservation,
 } from '../spaces/workspace-db.js';
 import { diffWorkspaceObservationDocuments } from '../spaces/observation-diff.js';
+import { listWorkflows, readWorkflowDefinitionFile } from '../memory/workflow-store.js';
+
+/**
+ * Workflows that feed this workspace — any enabled workflow whose definition
+ * references the workspace slug (space_refresh, data pulls, the CONSTANTS
+ * block Clem writes). Computed by content scan so the link needs no schema:
+ * the workflow's own text is the source of truth, exactly as authored.
+ */
+function linkedWorkflowsForSpace(slug: string): Array<{ name: string; description: string; enabled: boolean }> {
+  try {
+    const needle = slug.toLowerCase();
+    const out: Array<{ name: string; description: string; enabled: boolean }> = [];
+    for (const entry of listWorkflows()) {
+      try {
+        const raw = readFileSync(entry.filePath, 'utf-8');
+        if (!raw.toLowerCase().includes(needle)) continue;
+        const def = readWorkflowDefinitionFile(entry.filePath);
+        out.push({
+          name: entry.name,
+          description: (def?.description ?? '').slice(0, 200),
+          enabled: def?.enabled !== false,
+        });
+      } catch { /* an unreadable workflow never breaks the workspace payload */ }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
 import { finalizeWorkspaceObservationCommit } from '../spaces/workspace-observation-finalize.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { refreshSpaceData, runSpaceAction } from '../spaces/runner.js';
@@ -416,7 +445,15 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       viewMtimeMs = statSync(vf).mtimeMs; // lets the UI auto-reload on ANY view edit (incl. write_file)
     } catch { /* no view yet */ }
     const health = buildSpaceHealthSnapshot(rec);
-    res.json({ space: { ...rec, health }, viewSource, viewMtimeMs, notes: listNotes(slug, 50), audit: listAudit(slug, 50), health });
+    res.json({
+      space: { ...rec, health },
+      viewSource,
+      viewMtimeMs,
+      notes: listNotes(slug, 50),
+      audit: listAudit(slug, 50),
+      health,
+      linkedWorkflows: linkedWorkflowsForSpace(slug),
+    });
   });
 
   app.patch('/api/console/spaces/:id', (req, res) => {

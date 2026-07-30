@@ -15,6 +15,7 @@ process.env.NODE_ENV = 'test';
 const {
   recordCodexRateLimit,
   getRateLimitSnapshot,
+  classifyCodexQuota,
   __resetRateLimitStoreForTests,
 } = await import('./rate-limit-store.js');
 
@@ -69,4 +70,36 @@ test('malformed headers never throw (best-effort capture)', () => {
   assert.doesNotThrow(() => recordCodexRateLimit({ 'x-codex-primary-used-percent': 'not-a-number' }));
   // nothing parseable → snapshot stays empty, no crash
   assert.equal(getRateLimitSnapshot().codex, undefined);
+});
+
+test('classifyCodexQuota assigns slots by duration — the weekly-as-primary live shape', () => {
+  // Live 2026-07-30: provider ships weekly (10080 min) as "primary" plus a
+  // zero-duration placeholder secondary. The top bar rendered weekly 46%
+  // under the 5h label and a fake "wk 0%".
+  const live = classifyCodexQuota({
+    primary: { usedPercent: 46, resetAt: 1, windowMinutes: 10080 },
+    secondary: { usedPercent: 0, resetAt: 2, windowMinutes: 0 },
+    capturedAt: 123,
+  });
+  assert.equal(live.weekly?.usedPercent, 46, 'the 7-day window lands in the weekly slot');
+  assert.equal(live.fiveHour, undefined, 'a zero-duration placeholder is dropped, never a fake 0%');
+  assert.equal(live.capturedAt, 123);
+
+  // True dual-window shape: both slots filled by duration.
+  const dual = classifyCodexQuota({
+    primary: { usedPercent: 12, windowMinutes: 300 },
+    secondary: { usedPercent: 34, windowMinutes: 10080 },
+  });
+  assert.equal(dual.fiveHour?.usedPercent, 12);
+  assert.equal(dual.weekly?.usedPercent, 34);
+
+  // Legacy captures without duration headers keep positional meaning.
+  const legacy = classifyCodexQuota({
+    primary: { usedPercent: 20 },
+    secondary: { usedPercent: 5 },
+  });
+  assert.equal(legacy.fiveHour?.usedPercent, 20);
+  assert.equal(legacy.weekly?.usedPercent, 5);
+
+  assert.deepEqual(classifyCodexQuota(undefined), { capturedAt: undefined });
 });

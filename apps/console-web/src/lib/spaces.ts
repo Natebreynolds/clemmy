@@ -97,6 +97,9 @@ export interface SpaceDetail {
   notes: SpaceNote[];
   audit: SpaceAudit[];
   health?: SpaceHealthSnapshot;
+  /** Enabled/disabled workflows whose definitions reference this workspace —
+   *  the automation feeding it, linkable from the workspace header. */
+  linkedWorkflows?: Array<{ name: string; description: string; enabled: boolean }>;
 }
 export type RefreshResult = WorkspaceRefreshResult;
 
