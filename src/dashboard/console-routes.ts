@@ -83,6 +83,7 @@ import { subscribeWorkflowChanges } from '../memory/workflow-change-bus.js';
 import { extractArchitectDiff } from './architect-diff.js';
 import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflowEvents, reconstructWorkflowRunQueue } from '../execution/workflow-events.js';
 import { normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
+import { getGuestRun, killGuestRun, listGuestRuns, type GuestRunJob } from '../execution/guest-run-jobs.js';
 import {
   validateWorkflowDefinition as runValidator,
   type WorkflowValidation,
@@ -111,6 +112,7 @@ import {
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
+import { resolveWorkflowRunConcurrency } from '../execution/workflow-run-concurrency.js';
 import { certifyWorkflow, type WorkflowCertification } from '../execution/workflow-certification.js';
 import { workflowCodeRevisionFingerprint } from '../execution/workflow-code-certification.js';
 import { buildWorkflowResourceBindingReportFromRuntime } from '../execution/workflow-resource-binding.js';
@@ -475,6 +477,11 @@ import {
 } from '../tools/workflow-run-queue.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import { cancelWorkflowRunAtBoundary, isTerminalWorkflowRunStatus } from '../execution/workflow-run-cancellation.js';
+import {
+  listHeldWorkflowCatchupRuns,
+  resumeWorkflowCatchupRun,
+  skipWorkflowCatchupRun,
+} from '../execution/workflow-catchup-decision.js';
 import { resumeCapabilityBlockedWorkflowRun } from '../execution/workflow-runner.js';
 import {
   findCatalogEntry,
@@ -825,7 +832,7 @@ function workflowRunSummary(workflowSlug: string, runId: string): {
 function workflowExecutionPlanOptions() {
   return {
     stepConcurrency: positiveEnvInt('CLEMENTINE_WORKFLOW_CONCURRENCY', 5),
-    runConcurrency: positiveEnvInt('CLEMENTINE_WORKFLOW_RUN_CONCURRENCY', 1),
+    runConcurrency: resolveWorkflowRunConcurrency(),
     forEachBatchSize: positiveEnvInt('CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS', 200),
   };
 }
@@ -863,7 +870,11 @@ function memoizedWorkflowListDerivations(
   runRecords: WorkflowRunRecordSummary[],
   lastRunId: string | null,
 ): { proof: unknown; certification: ReturnType<typeof workflowCertificationFor> } {
-  const key = `${djb2(JSON.stringify(entry.data))}::${workflowCodeRevisionFingerprint(entry.data, entry.name)}::${lastRunId ?? 'none'}`;
+  // Plan settings are live-readable. Include the effective values in the memo
+  // identity so Console truth changes with runtime truth instead of waiting for
+  // a workflow edit, new run, or daemon restart to invalidate certification.
+  const planOptionsKey = JSON.stringify(workflowExecutionPlanOptions());
+  const key = `${djb2(JSON.stringify(entry.data))}::${workflowCodeRevisionFingerprint(entry.data, entry.name)}::${lastRunId ?? 'none'}::${planOptionsKey}`;
   const hit = workflowListMemo.get(entry.name);
   if (hit && hit.key === key) return { proof: hit.proof, certification: hit.certification };
   const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
@@ -1419,6 +1430,10 @@ function workflowMcpConnectionCheck(item: WorkflowToolReadinessItem): WorkflowTo
 async function workflowConnectionCheckForItem(item: WorkflowToolReadinessItem): Promise<WorkflowToolConnectionCheck> {
   if (item.kind === 'composio') return workflowComposioConnectionCheck(item);
   if (item.kind === 'mcp') return workflowMcpConnectionCheck(item);
+  if (item.kind === 'cli') {
+    const cliCheck = await workflowCliConnectionCheck(item);
+    if (cliCheck) return cliCheck;
+  }
   return {
     runtime: item.kind,
     name: item.name,
@@ -1430,6 +1445,67 @@ async function workflowConnectionCheckForItem(item: WorkflowToolReadinessItem): 
       label: 'Inspect runtime tool',
       detail: 'Verify this tool exists in the active Clementine runtime catalog.',
     }],
+  };
+}
+
+/**
+ * CLI readiness with a REAL fix path. A missing catalog CLI gets the
+ * one-click install endpoint; installed-but-signed-out (per the persisted
+ * auth-health snapshot) gets the auth endpoint when the login flow is
+ * verified headless, else the exact command for the user to run. Non-
+ * catalog CLIs fall through to the generic inspect action.
+ */
+async function workflowCliConnectionCheck(item: WorkflowToolReadinessItem): Promise<WorkflowToolConnectionCheck | null> {
+  const command = workflowCliCommandFromReadinessItem(item);
+  if (!command) return null;
+  const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
+  const entry = CLI_CATALOG.find((candidate) => candidate.command === command);
+  if (!entry) return null;
+  const { readPersistedHealth } = await import('../integrations/cli-catalog/auth-health.js');
+  const health = readPersistedHealth()[entry.id];
+  const installed = health?.installed ?? item.status === 'ready';
+  const signedOut = installed && health?.authStatus === 'signed_out';
+  const nextActions: WorkflowToolConnectionAction[] = [];
+  if (!installed) {
+    nextActions.push({
+      kind: 'cli_install',
+      label: `Install ${entry.name}`,
+      detail: `Runs \`${entry.installCommand}\` via the approved install runner.`,
+      method: 'POST',
+      endpoint: '/api/console/cli-catalog/install',
+    });
+  } else if (signedOut) {
+    if (entry.authHeadless && entry.authCommand) {
+      nextActions.push({
+        kind: 'cli_auth',
+        label: `Sign in to ${entry.name}`,
+        detail: 'Starts the browser sign-in flow; finish in the opened window.',
+        method: 'POST',
+        endpoint: `/api/console/cli-catalog/${encodeURIComponent(entry.id)}/auth`,
+      });
+    } else {
+      nextActions.push({
+        kind: 'cli_auth_manual',
+        label: `Sign in to ${entry.name}`,
+        detail: 'Run this in your terminal, then re-check readiness.',
+        command: entry.authCommand ?? `${entry.command} login`,
+        href: entry.authDocsUrl,
+      });
+    }
+  }
+  if (nextActions.length === 0) return null;
+  return {
+    runtime: 'cli',
+    name: item.name,
+    status: installed ? 'ready' : 'missing',
+    summary: !installed
+      ? `CLI "${command}" is not installed.`
+      : `CLI "${command}" is installed but signed out.`,
+    evidence: [
+      `cli_command:${command}=${installed ? 'installed' : 'missing'}`,
+      ...(health ? [`auth:${health.authStatus}${health.username ? ` (${health.username})` : ''} @ ${health.checkedAt}`] : []),
+    ],
+    nextActions,
   };
 }
 
@@ -2497,7 +2573,7 @@ function consoleFocusView(row: FocusRow): ConsoleFocusView {
 /** One normalized card on the Tasks board (see GET /api/console/board). */
 interface BoardCard {
   id: string;
-  sourceKind: 'background' | 'run' | 'execution' | 'workflow' | 'approval';
+  sourceKind: 'background' | 'run' | 'execution' | 'workflow' | 'approval' | 'schedule' | 'guest';
   title: string;
   column: BoardColumnId;
   /** Raw source status, for the pill label / tooltip. */
@@ -5909,9 +5985,13 @@ export function registerConsoleRoutes(
 
   // User-saved CLIs — the tools the user has explicitly told Clementine they
   // use (works even when the PATH scan can't see/probe them, e.g. sf).
-  app.get('/api/console/clis/saved', (req, res) => {
+  app.get('/api/console/clis/saved', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    res.json({ saved: getSavedClis() });
+    // Same persisted-only health enrichment as the catalog route: saved
+    // bare names surface under `saved:<command>` ids (or their catalog id
+    // when the command matches a catalog entry).
+    const { readPersistedHealth } = await import('../integrations/cli-catalog/auth-health.js');
+    res.json({ saved: getSavedClis(), health: readPersistedHealth() });
   });
   app.post('/api/console/clis/saved', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
@@ -5923,6 +6003,43 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const command = typeof req.query.command === 'string' ? req.query.command : '';
     res.json({ saved: removeSavedCli(command) });
+  });
+
+  // ─── Guest harness runs (project_run) ─────────────────────────
+
+  const guestRunView = (run: GuestRunJob) => ({
+    id: run.id,
+    harness: run.harness,
+    projectName: run.projectName,
+    projectPath: run.projectPath,
+    prompt: run.prompt,
+    status: run.status,
+    events: run.events,
+    finalMessage: run.finalMessage,
+    changedFiles: run.changedFiles,
+    error: run.error,
+    startedAt: run.startedAt,
+    completedAt: run.completedAt,
+    durationMs: run.durationMs,
+  });
+
+  app.get('/api/console/guest-runs', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ runs: listGuestRuns().map(guestRunView) });
+  });
+
+  app.get('/api/console/guest-runs/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const run = getGuestRun(req.params.id);
+    if (!run) { res.status(404).json({ error: 'no such guest run' }); return; }
+    res.json(guestRunView(run));
+  });
+
+  app.post('/api/console/guest-runs/:id/kill', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const run = killGuestRun(req.params.id);
+    if (!run) { res.status(404).json({ ok: false, reason: 'no such guest run' }); return; }
+    res.json({ ok: true, status: run.status });
   });
 
   // ─── Projects (workspace) ─────────────────────────────────────
@@ -6749,11 +6866,18 @@ export function registerConsoleRoutes(
       // metadata + dashboard surfaces it as a connected integration.
       const { autoPromoteInstalledClis } = await import('../integrations/cli-catalog/catalog.js');
       const promotion = autoPromoteInstalledClis();
+      // Auth health: persisted last-known state only (never a blocking
+      // probe in the request path) + a fire-and-forget refresh kick so
+      // the pills converge on reality within one poll cycle.
+      const { readPersistedHealth, getRosterHealth } = await import('../integrations/cli-catalog/auth-health.js');
+      const health = readPersistedHealth();
+      void getRosterHealth().catch(() => { /* pills update on the next poll */ });
       res.json({
         query: q,
         results: q ? statusForSearchResults(q) : [],
         connected: readConnectedClis(),
         autoPromoted: promotion.promoted,
+        health,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -6816,7 +6940,48 @@ export function registerConsoleRoutes(
         job.connectedRecorded = true;
       }
     }
+    // Paste-your-own installs: "remember this CLI" saves the bare name so
+    // the roster (and the agent, via local_cli_list) picks it up — the
+    // same shape as the cliCatalogId → recordConnectedCli hook above.
+    if (job.status === 'succeeded' && job.metadata?.savedCli && !job.connectedRecorded) {
+      try {
+        addSavedCli(job.metadata.savedCli);
+        job.connectedRecorded = true;
+      } catch { /* invalid names were rejected at submit; belt-and-braces */ }
+    }
     res.json({ job });
+  });
+
+  /**
+   * Paste-your-own install command. The command is validated against the
+   * SAME allowlist as catalog installs (npm -g / brew / uv tool / pipx /
+   * pip --user / git clone https; no sudo, no metacharacters) and runs on
+   * the streaming install-job runner. `saveAs` remembers the binary as a
+   * saved CLI once the install succeeds.
+   */
+  app.post('/api/console/install-commands', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const command = typeof req.body?.command === 'string' ? req.body.command.trim() : '';
+    const saveAs = typeof req.body?.saveAs === 'string' ? req.body.saveAs.trim() : '';
+    if (!command) { res.status(400).json({ error: 'command required' }); return; }
+    try {
+      const { validateInstallCommand, startApprovedInstallCommand } = await import('../integrations/browser-harness.js');
+      const verdict = validateInstallCommand(command);
+      if (!verdict.ok) { res.status(400).json({ error: verdict.error }); return; }
+      if (saveAs && !/^[A-Za-z0-9._+-]{1,60}$/.test(saveAs)) {
+        res.status(400).json({ error: 'saveAs must be a bare CLI name (letters, numbers, . _ + -)' });
+        return;
+      }
+      const firstWord = verdict.normalized.split(/\s+/)[0] ?? 'tool';
+      const job = startApprovedInstallCommand(
+        verdict.normalized,
+        `Install via ${firstWord}`,
+        saveAs ? { savedCli: saveAs } : undefined,
+      );
+      res.json({ job });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.post('/api/console/browser-harness/doctor', async (req, res) => {
@@ -7800,6 +7965,43 @@ export function registerConsoleRoutes(
         getGitHubCliStatus(),
       ]);
       res.json({ composio, github });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * One-click sign-in for a catalog CLI verified as headless (browser /
+   * device-code flow). The client sends only the catalog id; the command
+   * is resolved server-side from CLI_CATALOG. Poll the returned job via
+   * GET /api/console/managed-cli-jobs/:id (shared jobs map).
+   */
+  app.post('/api/console/cli-catalog/:id/auth', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = String(req.params.id ?? '').trim();
+    if (!id) { res.status(400).json({ error: 'catalog id required' }); return; }
+    try {
+      const { startCatalogAuthJob } = await import('../runtime/managed-cli-jobs.js');
+      res.json({ job: await startCatalogAuthJob(id) });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Interactive-login hand-off: open the user's Terminal with the catalog
+   * CLI's login command already running (macOS Automation; command is
+   * resolved server-side by id). The auth-health watcher detects the
+   * sign-in flip and drives the recovery machinery.
+   */
+  app.post('/api/console/cli-catalog/:id/terminal-auth', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = String(req.params.id ?? '').trim();
+    if (!id) { res.status(400).json({ error: 'catalog id required' }); return; }
+    try {
+      const { openTerminalAuthSession } = await import('../runtime/terminal-handoff.js');
+      const result = await openTerminalAuthSession(id);
+      res.status(result.ok ? 200 : 400).json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -10182,6 +10384,56 @@ export function registerConsoleRoutes(
       const legacyRuns = listRuns(80);
       const legacyRunById = new Map(legacyRuns.map((run) => [run.id, run]));
 
+      // 0) Missed schedules held BEFORE execution. These are decision cards,
+      // not live workflow traces: no model, tool, step, or external effect has
+      // run. Resume releases the durable occurrence into the ordinary bounded
+      // queue; Skip closes only this occurrence and leaves future schedules on.
+      for (const held of listHeldWorkflowCatchupRuns()) {
+        const workflowEntry = workflowBySlug.get(held.workflowSlug)
+          ?? workflowByDisplayName.get(held.workflowName);
+        const scheduledAtMs = Number.isFinite(held.scheduledAtMs)
+          ? held.scheduledAtMs
+          : Date.parse(held.scheduledAt);
+        const scheduledAt = Number.isFinite(scheduledAtMs)
+          ? new Date(scheduledAtMs).toISOString()
+          : held.scheduledAt;
+        const scheduledLabel = Number.isFinite(scheduledAtMs)
+          ? new Date(scheduledAtMs).toLocaleString(undefined, {
+            dateStyle: 'medium',
+            timeStyle: 'short',
+          })
+          : held.scheduledAt;
+        const collapsed = Math.max(1, Number.isFinite(held.missedCount) ? held.missedCount : 1);
+        cards.push({
+          id: `catchup:${held.runId}`,
+          sourceKind: 'schedule',
+          title: workflowEntry?.data.name ?? held.workflowName,
+          column: 'needs_you',
+          status: held.status,
+          progressHint:
+            `Scheduled ${scheduledLabel} while Clementine was offline. Nothing has started.`
+            + (collapsed > 1
+              ? ` ${collapsed} missed occurrences were collapsed into this one decision.`
+              : ''),
+          sessionId: null,
+          ageMs: ageMs(held.heldAt || held.createdAt),
+          updatedAt: held.heldAt || held.createdAt,
+          actions: ['resume', 'cancel', 'skip'],
+          primaryAction: 'none',
+          continueMode: 'none',
+          nextSafeAction: 'Resume this one occurrence or skip it. Future scheduled runs stay enabled.',
+          raw: {
+            workflowName: workflowEntry?.data.name ?? held.workflowName,
+            workflowSlug: held.workflowSlug,
+            runId: held.runId,
+            occurrenceAtMs: scheduledAtMs,
+            scheduledFor: scheduledAt,
+            missedCount: collapsed,
+            readiness: held.readiness,
+          },
+        });
+      }
+
       // 1) Background tasks — the autonomous "go do this while I'm away" work.
       //    ?includeArchived=1 surfaces soft-deleted tasks (restore-only) for a
       //    future "Archived" view; default hides them.
@@ -10601,6 +10853,48 @@ export function registerConsoleRoutes(
         });
       }
 
+      // Guest harness runs — the user's own Claude Code / Codex CLI working
+      // inside one of their projects, driven via project_run. No harness
+      // session (the guest is an external process); the drawer polls the
+      // guest-run events feed instead of the SSE stream.
+      for (const run of listGuestRuns()) {
+        const running = run.status === 'running';
+        const lastEvent = run.events[run.events.length - 1] ?? '';
+        cards.push({
+          id: `guest:${run.id}`,
+          sourceKind: 'guest',
+          title: `${run.projectName}: ${run.prompt.length > 60 ? `${run.prompt.slice(0, 60)}…` : run.prompt}`,
+          column: running ? 'running' : 'done',
+          status: run.status,
+          progressHint: running
+            ? (lastEvent || `${run.harness} is starting up`)
+            : run.status === 'succeeded'
+              ? (run.changedFiles.length
+                ? `Produced ${run.changedFiles.length} file${run.changedFiles.length === 1 ? '' : 's'} in ${run.projectName}.`
+                : 'Finished with no file changes.')
+              : (run.error || run.status),
+          sessionId: null,
+          ageMs: ageMs(run.startedAt),
+          updatedAt: run.completedAt ?? run.startedAt,
+          actions: running ? ['cancel'] : [],
+          cancelEndpoint: running ? `/api/console/guest-runs/${encodeURIComponent(run.id)}/kill` : undefined,
+          primaryAction: 'none',
+          continueMode: 'none',
+          nextSafeAction: running
+            ? 'Watch the live feed, or stop the run — the CLI gets a clean terminate.'
+            : undefined,
+          raw: {
+            guestRunId: run.id,
+            harness: run.harness,
+            projectName: run.projectName,
+            projectPath: run.projectPath,
+            prompt: run.prompt,
+            changedFiles: run.changedFiles,
+            finalMessage: run.finalMessage.slice(0, 1500),
+          },
+        });
+      }
+
       // U1 (v2.3.0): one pipeline = one card. A background task's ORIGIN chat
       // attempt is the same pipeline — its FINISHED attempt card (the handoff
       // turn) duplicates the task card (live 2026-07-22: bg row + completed
@@ -10712,6 +11006,58 @@ export function registerConsoleRoutes(
         return;
       }
       res.status(400).json({ ok: false, reason: `Unknown action: ${action}` });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Decide one held missed schedule before execution begins. The workflow slug
+   * is an optimistic ownership check, not a display-name lookup: a stale card
+   * can never resume or skip a run that has moved to another workflow.
+   *
+   * `cancel` is intentionally not accepted here. The product verb is Skip
+   * because this closes one missed occurrence while keeping future schedules
+   * enabled; active runs continue to use the separate Cancel boundary.
+   */
+  app.post('/api/console/board/workflow-catchups/:slug/:runId/:action', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const workflowSlug = String(req.params.slug ?? '').trim();
+    const runId = String(req.params.runId ?? '').trim();
+    const action = String(req.params.action ?? '').trim();
+    if (!workflowSlug || !runId) {
+      res.status(400).json({ ok: false, reason: 'workflow slug and catch-up run id are required' });
+      return;
+    }
+    if (action !== 'resume' && action !== 'skip') {
+      res.status(400).json({ ok: false, reason: 'action must be resume or skip' });
+      return;
+    }
+    try {
+      if (action === 'resume') {
+        const result = resumeWorkflowCatchupRun({ runId, expectedWorkflow: workflowSlug });
+        const ok = result.status === 'resumed' || result.status === 'already_resumed';
+        const notFound = result.status === 'not_found' || result.status === 'workflow_not_found';
+        res.status(ok ? 200 : notFound ? 404 : 409).json({
+          ok,
+          status: result.status,
+          message: result.message,
+          ...(!ok ? { reason: result.message } : {}),
+          ...('run' in result && result.run ? { run: result.run } : {}),
+          ...('readiness' in result && result.readiness ? { readiness: result.readiness } : {}),
+        });
+        return;
+      }
+      const result = skipWorkflowCatchupRun({ runId, expectedWorkflow: workflowSlug });
+      const ok = result.status === 'skipped' || result.status === 'already_skipped';
+      const notFound = result.status === 'not_found';
+      res.status(ok ? 200 : notFound ? 404 : 409).json({
+        ok,
+        status: result.status,
+        message: result.message,
+        ...(!ok ? { reason: result.message } : {}),
+        ...('run' in result && result.run ? { run: result.run } : {}),
+      });
     } catch (err) {
       res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
     }

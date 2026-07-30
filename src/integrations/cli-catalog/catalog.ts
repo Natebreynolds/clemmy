@@ -323,6 +323,46 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     authCommand: 'doctl auth init',
     homepage: 'https://www.digitalocean.com/products/tools',
   },
+  // Guest agent harnesses — these two are what project_run drives inside the
+  // user's local projects. They cannot ship bundled with the app (Claude Code
+  // is proprietary; both self-update and carry per-user subscription auth),
+  // so install-on-demand through this catalog IS the distribution story.
+  {
+    id: 'claude-code',
+    name: 'Claude Code',
+    command: 'claude',
+    vendor: 'Anthropic',
+    description: 'Anthropic’s coding agent — runs your projects’ slash commands and skills on your Claude subscription.',
+    tags: ['claude', 'claude code', 'anthropic', 'agent', 'harness', 'coding'],
+    installCommand: 'npm install -g @anthropic-ai/claude-code',
+    installSource: 'npm',
+    authDocsUrl: 'https://docs.anthropic.com/en/docs/claude-code/setup',
+    authCommand: 'claude auth login',
+    // Verified live (claude 2.1.220): `claude auth status` exits 0 with JSON
+    // {"loggedIn":true,...,"email":"..."}. Signed-out shape not exercised
+    // (would require logging the user out) — pattern targets the documented
+    // loggedIn:false field, and pattern-first classification covers an
+    // exit-0 signed-out report, same trap class as gcloud.
+    authProbe: { args: ['auth', 'status'], signedOutPattern: '"loggedIn"\\s*:\\s*false', usernameCapture: '"email"\\s*:\\s*"([^"]+)"' },
+    homepage: 'https://www.anthropic.com/claude-code',
+  },
+  {
+    id: 'codex',
+    name: 'Codex CLI',
+    command: 'codex',
+    vendor: 'OpenAI',
+    description: 'OpenAI’s coding agent — works in your projects on your ChatGPT subscription.',
+    tags: ['codex', 'openai', 'chatgpt', 'agent', 'harness', 'coding'],
+    installCommand: 'npm install -g @openai/codex',
+    installSource: 'npm',
+    authDocsUrl: 'https://developers.openai.com/codex/cli',
+    authCommand: 'codex login',
+    // Verified live (codex-cli 0.144.3): `codex login status` exits 0 with
+    // "Logged in using ChatGPT". Signed-out shape not exercised — the CLI
+    // reports "Not logged in" per its own docs/help.
+    authProbe: { args: ['login', 'status'], signedOutPattern: 'not logged in', usernameCapture: 'Logged in using (\\S+)' },
+    homepage: 'https://developers.openai.com/codex',
+  },
 ];
 
 // ─── Search ─────────────────────────────────────────────────────────

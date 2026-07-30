@@ -7,11 +7,15 @@ import { Input } from '@/components/ui/Field';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
-import { getProjects, addWorkspace, removeWorkspace, browseFolders } from '@/lib/connect';
+import { getProjects, getGuestRuns, addWorkspace, removeWorkspace, browseFolders } from '@/lib/connect';
 
 export function ProjectsPanel() {
   const qc = useQueryClient();
   const projects = usePoll(['projects'], getProjects, 30000);
+  const guestRuns = usePoll(['guest-runs'], getGuestRuns, 10000);
+  const runningIn = new Set(
+    (guestRuns.data?.runs ?? []).filter((r) => r.status === 'running').map((r) => r.projectPath),
+  );
   const dirs = projects.data?.workspaceDirs ?? [];
   const found = projects.data?.projects ?? [];
   const [path, setPath] = useState('');
@@ -91,10 +95,31 @@ export function ProjectsPanel() {
                   <Card key={p.path} className="p-3.5">
                     <div className="flex items-center gap-2">
                       <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{p.name}</span>
+                      {runningIn.has(p.path) && (
+                        <StatusPill tone="info">
+                          <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current" aria-hidden />
+                          Clementine is working here
+                        </StatusPill>
+                      )}
                       {p.type && <StatusPill tone="neutral">{p.type}</StatusPill>}
                     </div>
                     {p.description && <p className="mt-0.5 line-clamp-1 text-caption text-muted">{p.description}</p>}
                     <p className="mt-1 truncate font-mono text-caption text-faint">{p.path}</p>
+                    {(p.capabilities?.commands.length || p.capabilities?.skills.length || p.capabilities?.hasMcp || p.capabilities?.hasAgentsMd) ? (
+                      <div className="mt-2 flex flex-wrap gap-1" title="Things Clementine can run in this project through your Claude Code / Codex CLI">
+                        {(p.capabilities?.commands ?? []).slice(0, 6).map((c) => (
+                          <span key={c} className="rounded-sm bg-primary/10 px-1.5 py-0.5 font-mono text-caption text-primary">/{c}</span>
+                        ))}
+                        {(p.capabilities?.commands.length ?? 0) > 6 && (
+                          <span className="px-1 py-0.5 text-caption text-faint">+{(p.capabilities?.commands.length ?? 0) - 6} more</span>
+                        )}
+                        {(p.capabilities?.skills ?? []).slice(0, 3).map((s) => (
+                          <span key={s} className="rounded-sm bg-hover px-1.5 py-0.5 text-caption text-muted">{s}</span>
+                        ))}
+                        {p.capabilities?.hasMcp && <span className="rounded-sm bg-hover px-1.5 py-0.5 text-caption text-muted">MCP</span>}
+                        {p.capabilities?.hasAgentsMd && <span className="rounded-sm bg-hover px-1.5 py-0.5 text-caption text-muted">AGENTS.md</span>}
+                      </div>
+                    ) : null}
                   </Card>
                 ))}
               </div>

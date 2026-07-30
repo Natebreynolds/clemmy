@@ -117,6 +117,10 @@ test('orchestrator discovery surface: critical members present, non-orchestrator
     'composio_execute_tool', 'memory_forget', 'memory_pin', 'space_save', 'workflow_create',
     'workflow_from_session', 'goal_upsert', 'run_batch', 'run_tool_program', 'recall_tool_result',
     'tool_output_query', 'workspace_artifact_query', 'focus_get', 'browser_harness_run', 'pending_action_queue', 'tool_search',
+    // Incident 2026-07-24: GPT-5.6 Sol searched for a one-time reminder,
+    // could not see set_timer on the orchestrator surface, wrote a TODO instead,
+    // and then falsely claimed a notification had been scheduled.
+    'set_timer',
   ]) {
     assert.ok(surface.has(n), `orchestrator discovery surface must include ${n}`);
   }
@@ -141,7 +145,7 @@ test('SDK local-authoring ⊇ read-only + its authoring members', () => {
   const ro = asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS);
   const auth = asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS);
   for (const n of ro) assert.ok(auth.has(n), `authoring must be a superset of read-only (missing ${n})`);
-  for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'pending_action_execute', 'set_model_role', 'focus_get', 'focus_set', 'focus_update']) {
+  for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'pending_action_execute', 'set_model_role', 'focus_get', 'focus_set', 'focus_update', 'set_timer']) {
     assert.ok(auth.has(n), `authoring must include ${n}`);
   }
 });
@@ -150,7 +154,7 @@ test('SDK full (brain) ⊇ authoring + execution + brain-only fan-out', () => {
   const auth = asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS);
   const full = asSet(CLAUDE_AGENT_SDK_FULL_TOOLS);
   for (const n of auth) assert.ok(full.has(n), `full must be a superset of authoring (missing ${n})`);
-  for (const n of ['run_worker', 'run_batch', 'write_file', 'run_shell_command', 'composio_execute_tool', 'execution_create', 'notify_user']) {
+  for (const n of ['run_worker', 'run_batch', 'write_file', 'run_shell_command', 'composio_execute_tool', 'execution_create', 'notify_user', 'set_timer']) {
     assert.ok(full.has(n), `full must include ${n}`);
   }
 });
@@ -322,5 +326,22 @@ test('deriveNeedsApproval defaults non-reads to ask (risk #2)', () => {
   for (const d of TOOL_REGISTRY) {
     if (d.needsApproval != null) continue;
     assert.equal(deriveNeedsApproval(d), d.sideEffect !== 'read', `${d.name} approval default`);
+  }
+});
+
+test('sdk-brain lane parity: chat-side effect tools are registered on the Claude SDK MCP surface', async () => {
+  // Live 07-30: cli_setup and project_run existed only in the Codex lane's
+  // local-runtime registration, so the Claude SDK brain could not reach them —
+  // tool_search returned nothing and the model hand-rolled the same effect
+  // through run_shell_command with skip-permissions flags (the exact ungated
+  // path these tools exist to prevent). A tool registered for the 'sdk-brain'
+  // lane must actually exist on that lane's MCP surface.
+  const { listClementineMcpToolNames } = await import('./mcp-server.js');
+  const surface = new Set(listClementineMcpToolNames({ gatedMutations: true }));
+  for (const name of ['cli_setup', 'project_run']) {
+    const entry = TOOL_REGISTRY.find((d) => d.name === name);
+    assert.ok(entry, `${name} must exist in the registry`);
+    assert.ok(entry!.lanes?.includes('sdk-brain'), `${name} declares the sdk-brain lane`);
+    assert.ok(surface.has(name), `${name} must be registered on the Claude SDK MCP surface (mcp-server.ts) — codex-lane-only registration regresses the live 07-30 shell-hack hole`);
   }
 });

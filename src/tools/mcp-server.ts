@@ -29,6 +29,8 @@ import { registerProfileTools } from './profile-tools.js';
 import { registerCapabilityTools } from './capability-tools.js';
 import { registerHarnessStatusTools } from './harness-status-tools.js';
 import { registerCliTools } from './cli-tools.js';
+import { registerCliSetupTools } from './cli-setup-tools.js';
+import { registerProjectRunTools } from './project-run-tools.js';
 import { registerSkillTools } from './skill-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
 import { registerSpaceTools } from './space-tools.js';
@@ -283,6 +285,14 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerCapabilityTools(server);
   registerHarnessStatusTools(server);
   registerCliTools(server);
+  // Lane parity (live 07-30): these were registered only on the Codex lane's
+  // local-runtime surface, so the Claude SDK brain could not reach them —
+  // tool_search came up empty and the model hand-rolled the SAME effect through
+  // run_shell_command with --dangerously-skip-permissions-class flags. Both
+  // tools carry their own gates (approved runners / workspace-roster boundary
+  // + ask-first contracts), identical on both lanes.
+  registerCliSetupTools(server);
+  registerProjectRunTools(server);
   registerSkillTools(server);
   registerWorkflowScheduleTools(server);
   registerSpaceTools(server);

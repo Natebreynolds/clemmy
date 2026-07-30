@@ -37,7 +37,12 @@ test('every catalog auth probe is a READ-ONLY status command', () => {
     if (!entry.authProbe) continue;
     assert.ok(entry.authProbe.args.length > 0, `${entry.id}: probe args must be non-empty`);
     const joined = entry.authProbe.args.join(' ');
-    assert.ok(!mutating.test(joined),
+    // A trailing `status` marks a status SUBCOMMAND of an otherwise-mutating
+    // group (codex nests its read under `login`: `codex login status`,
+    // verified live as a pure read) — that shape is exactly what this pin
+    // wants probes to be.
+    const isStatusSubcommand = entry.authProbe.args[entry.authProbe.args.length - 1] === 'status';
+    assert.ok(isStatusSubcommand || !mutating.test(joined),
       `${entry.id}: probe "${joined}" carries a mutating verb — probes must be pure status reads`);
   }
 });

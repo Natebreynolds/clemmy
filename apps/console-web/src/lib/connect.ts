@@ -371,8 +371,21 @@ export const browserHarnessDoctor = () => apiPost<BrowserHarnessCommandResult>('
 export const browserHarnessTest = () => apiPost<BrowserHarnessCommandResult>('/api/console/browser-harness/test', {});
 export const browserHarnessChromeSetup = () => apiPost<BrowserHarnessCommandResult>('/api/console/browser-harness/open-chrome-setup', {});
 
-export interface ProjectInfo { name: string; path: string; type?: string; description?: string; hasClaude?: boolean }
+export interface ProjectCapabilities { commands: string[]; skills: string[]; hasMcp: boolean; hasAgentsMd: boolean }
+export interface ProjectInfo { name: string; path: string; type?: string; description?: string; hasClaude?: boolean; capabilities?: ProjectCapabilities }
 export const getProjects = () => apiGet<{ workspaceDirs?: string[]; projects?: ProjectInfo[] }>('/api/console/projects');
+
+export interface GuestRunSummary {
+  id: string;
+  harness: string;
+  projectName: string;
+  projectPath: string;
+  prompt: string;
+  status: 'running' | 'succeeded' | 'failed' | 'killed';
+  startedAt: string;
+  completedAt?: string;
+}
+export const getGuestRuns = () => apiGet<{ runs: GuestRunSummary[] }>('/api/console/guest-runs');
 
 export interface BrowseEntry { name: string; path: string }
 export interface BrowseResult { path: string; parent: string | null; home: string; entries: BrowseEntry[] }

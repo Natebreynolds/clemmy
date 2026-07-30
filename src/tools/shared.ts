@@ -267,12 +267,28 @@ export function nextTaskId(body: string): string {
   return `T-${String(maxId + 1).padStart(3, '0')}`;
 }
 
+/** What a project can DO when a guest agent harness runs inside it —
+ *  slash commands and skills the user has built there, plus the wiring
+ *  (MCP servers, AGENTS.md) each harness picks up from the directory. */
+export interface WorkspaceProjectCapabilities {
+  /** Slash-command names from .claude/commands (no leading slash;
+   *  one nesting level maps to Claude Code's "dir:name" namespacing). */
+  commands: string[];
+  /** Skill directory names under .claude/skills. */
+  skills: string[];
+  /** .mcp.json present — the project brings its own MCP servers/creds. */
+  hasMcp: boolean;
+  /** AGENTS.md present — the Codex CLI reads it as project instructions. */
+  hasAgentsMd: boolean;
+}
+
 export interface WorkspaceProject {
   name: string;
   path: string;
   type: string;
   description: string;
   hasClaude: boolean;
+  capabilities: WorkspaceProjectCapabilities;
 }
 
 const DEFAULT_WORKSPACE_CANDIDATES = [
@@ -449,6 +465,55 @@ function isCloudStoragePath(dirPath: string): boolean {
   }
 }
 
+/** Bound per-list payloads: a runaway commands/skills dir must not bloat
+ *  the cached project list the dashboard polls every 30s. */
+const MAX_CAPABILITY_ENTRIES = 40;
+
+function detectCapabilities(dirPath: string, entries: string[]): WorkspaceProjectCapabilities {
+  const caps: WorkspaceProjectCapabilities = {
+    commands: [],
+    skills: [],
+    hasMcp: entries.includes('.mcp.json'),
+    hasAgentsMd: entries.includes('AGENTS.md'),
+  };
+  // readdir is metadata-only, but stay out of hydrate-on-demand cloud
+  // mounts entirely — same policy as extractDescription above.
+  if (!entries.includes('.claude') || isCloudStoragePath(dirPath)) return caps;
+
+  try {
+    const commandsDir = path.join(dirPath, '.claude', 'commands');
+    const names: string[] = [];
+    for (const entry of readdirSync(commandsDir, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith('.md')) {
+        names.push(entry.name.slice(0, -3));
+      } else if (entry.isDirectory()) {
+        try {
+          for (const nested of readdirSync(path.join(commandsDir, entry.name))) {
+            if (nested.endsWith('.md')) names.push(`${entry.name}:${nested.slice(0, -3)}`);
+          }
+        } catch {
+          // Unreadable namespace dir — skip it.
+        }
+      }
+    }
+    caps.commands = names.sort().slice(0, MAX_CAPABILITY_ENTRIES);
+  } catch {
+    // No commands dir.
+  }
+
+  try {
+    caps.skills = readdirSync(path.join(dirPath, '.claude', 'skills'), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort()
+      .slice(0, MAX_CAPABILITY_ENTRIES);
+  } catch {
+    // No skills dir.
+  }
+
+  return caps;
+}
+
 function extractDescription(dirPath: string, entries: string[]): string {
   if (isCloudStoragePath(dirPath)) return '';
 
@@ -530,6 +595,7 @@ export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
           type: detectProjectType(subEntries),
           description: extractDescription(candidate, subEntries),
           hasClaude: existsSync(path.join(candidate, '.claude', 'CLAUDE.md')),
+          capabilities: detectCapabilities(candidate, subEntries),
         });
       } catch {
         continue;

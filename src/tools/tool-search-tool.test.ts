@@ -12,6 +12,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 const { registerToolSearchTool } = await import('./tool-search-tool.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { getHotSet, _resetHotSetForTest } = await import('../agents/tool-hotset.js');
+const { deriveOrchestratorDiscoveryNames } = await import('./tool-registry.js');
 
 type Handler = (input: { query: string; limit?: number }) => Promise<{ content: Array<{ type: 'text'; text: string }> }>;
 
@@ -71,6 +72,33 @@ test('returns ranked names + summaries and full schemas for the top hits', async
   // A returned schema is a real JSON Schema object.
   const first = out.schemas[schemaNames[0]] as { type?: string; properties?: unknown };
   assert.ok(first && typeof first === 'object' && ('properties' in first || 'type' in first), 'schema looks like JSON Schema');
+});
+
+test('incident replay: scoped reminder discovery ranks the firing timer above a non-notifying TODO', async () => {
+  const previousDisabled = process.env.EMBEDDINGS_DISABLED;
+  process.env.EMBEDDINGS_DISABLED = 'true';
+  try {
+    const t = captureToolSearch(deriveOrchestratorDiscoveryNames(), true);
+    const raw = await t.handler({
+      query: 'schedule a one-time reminder notification for the user at a specified date and time',
+      limit: 5,
+    });
+    const out = JSON.parse(raw.content[0].text) as {
+      results: Array<{ name: string }>;
+      schemas: Record<string, unknown>;
+    };
+    const timerIndex = out.results.findIndex((result) => result.name === 'set_timer');
+    const todoIndex = out.results.findIndex((result) => result.name === 'task_add');
+    assert.ok(timerIndex >= 0, 'set_timer must be discoverable on the live orchestrator scope');
+    assert.ok(
+      todoIndex < 0 || timerIndex < todoIndex,
+      'a firing reminder must rank above task_add, whose due date does not notify',
+    );
+    assert.ok(out.schemas.set_timer, 'the winning reminder tool must include its callable schema');
+  } finally {
+    if (previousDisabled === undefined) delete process.env.EMBEDDINGS_DISABLED;
+    else process.env.EMBEDDINGS_DISABLED = previousDisabled;
+  }
 });
 
 test('an explicitly named tool survives a one-result limit ahead of stronger lexical neighbors', async () => {
