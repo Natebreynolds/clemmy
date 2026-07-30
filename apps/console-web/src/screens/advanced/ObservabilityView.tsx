@@ -10,6 +10,7 @@ import {
   OPERATIONAL_SOURCES,
   type OperationalEvent,
   type OperationalSeverity,
+  type OperationalSource,
 } from '@/lib/telemetry';
 
 const BUFFER_MAX = 400;
@@ -21,14 +22,25 @@ const SEVERITY_DOT: Record<OperationalSeverity, string> = {
   error: 'bg-red-500',
 };
 
-const SOURCE_LABEL: Record<string, string> = {
+// Exhaustive by type: adding a source to OPERATIONAL_SOURCES without a label
+// here is now a compile error, not two chips silently rendering as raw
+// lowercase (which is exactly how 'harness' and 'scheduler' drifted).
+const SOURCE_LABEL: Record<OperationalSource, string> = {
   workflow: 'Workflow',
   model: 'Model',
   workspace: 'Workspace',
   memory: 'Memory',
   safety: 'Safety',
   tool: 'Tool',
+  harness: 'Harness',
+  scheduler: 'Scheduler',
 };
+
+/** Label for a source. The map above is exhaustive over the known sources; this
+ *  still falls back for a source a newer daemon emits that this build predates. */
+function sourceLabel(source: string): string {
+  return (SOURCE_LABEL as Record<string, string>)[source] ?? source;
+}
 
 function relTime(ts: string): string {
   const then = new Date(ts).getTime();
@@ -124,7 +136,7 @@ export function ObservabilityView() {
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <FilterChip label="All" active={source === 'all'} count={events.length} onClick={() => setSource('all')} />
         {OPERATIONAL_SOURCES.map((s) => (
-          <FilterChip key={s} label={SOURCE_LABEL[s] ?? s} active={source === s} count={counts[s] ?? 0} onClick={() => setSource(s)} />
+          <FilterChip key={s} label={sourceLabel(s)} active={source === s} count={counts[s] ?? 0} onClick={() => setSource(s)} />
         ))}
       </div>
 
@@ -138,7 +150,7 @@ export function ObservabilityView() {
           {filtered.map((ev) => (
             <div key={ev.eventId} className="flex items-center gap-3 px-4 py-2.5">
               <span className={cn('h-2 w-2 shrink-0 rounded-full', SEVERITY_DOT[ev.severity] ?? 'bg-faint')} aria-hidden />
-              <span className="w-20 shrink-0 text-caption uppercase tracking-wide text-faint">{SOURCE_LABEL[ev.source] ?? ev.source}</span>
+              <span className="w-20 shrink-0 text-caption uppercase tracking-wide text-faint">{sourceLabel(ev.source)}</span>
               <span className="shrink-0 font-mono text-small font-medium text-fg">{ev.type}</span>
               <span className="min-w-0 flex-1 truncate text-small text-muted">{eventDetail(ev)}</span>
               <span className="shrink-0 text-caption tabular-nums text-faint">{relTime(ev.ts)}</span>
