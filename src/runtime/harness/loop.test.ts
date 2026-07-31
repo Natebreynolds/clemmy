@@ -7768,3 +7768,12 @@ test('primer FALLBACK facts record a session-stamped recall run — parity with 
   assert.equal(row.session_id, 'sess-fallback-pin', 'session stamp makes the fallback sweepable for post-turn credit');
   void fact;
 });
+
+test('primer recall ceiling covers measured p90 and matches the Claude lane (2026-07-31)', async () => {
+  const { TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS } = await import('./loop.js');
+  // Live 7d data: unified recall p50=658ms / p90=1370ms. A ceiling under p90
+  // silently downgrades ~1 in 8 turns to the lexical fallback. Both brains
+  // must agree on how long good memory is worth waiting for.
+  assert.ok(TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS >= 1500,
+    'the Codex-lane primer ceiling must cover measured p90 recall latency');
+});

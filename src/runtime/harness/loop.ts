@@ -1858,7 +1858,15 @@ export function factsBlockForPrimer(query: string, sessionId = ''): { text: stri
     return { text: '' };
   }
 }
-const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS', 800);
+// 1500ms, raised from 800 (2026-07-31, measured): live unified-recall latency
+// ran p50=658ms / p90=1370ms against the 800ms ceiling, so ~1 in 8 turns lost
+// the ranked evidence-backed primer to a timeout and got the weaker lexical
+// fallback — a silent memory downgrade whose downstream cost (mis-routes,
+// extra tool calls) dwarfs the sub-second wait. It's a race, not a sleep:
+// turns faster than the ceiling pay nothing. 1500 covers p90 and matches the
+// Claude lane's CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS default — the two brains
+// should not disagree on how long good memory is worth waiting for.
+export const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS', 1500);
 // Wave 2 Move A: AUGMENT the turn primer with cross-store breadcrumbs (people/
 // places/proven-tools) via the shared crossStoreBreadcrumbs helper — APPENDED to
 // the existing facts+vault+episodic primer, sync-only (no latency). Same helper is
