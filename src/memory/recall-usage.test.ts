@@ -265,3 +265,46 @@ test('M2: the exclusion window closes — an old correction falls back to demoti
   assert.equal(signal!.corrections, 1);
   assert.equal(correctionExcludesFromRecall(signal), false, 'a spurious correction self-heals after the window');
 });
+
+test('earn-your-way-back: crediting a retired fact resurrects it through the canonical restore path (2026-07-31)', async () => {
+  const { forgetFact } = await import('./facts.js');
+  const fact = rememberFact({ kind: 'project', content: 'The Northwind renewal contact is the regional ops lead.' });
+  const run = recordRecallRun({
+    objective: 'who handles the Northwind renewal?',
+    surface: 'memory_search_facts',
+    answerability: 'partial',
+    candidateRefs: [{ type: 'fact', id: String(fact.id), snippet: fact.content }],
+  });
+  forgetFact(fact.id);
+  assert.equal(getFact(fact.id)?.active, false, 'precondition: the fact is archived');
+
+  const result = recordRecallUse({ recallId: run.id, refs: [`fact:${fact.id}`], detail: 'auto:content' });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.resurrectedFactIds, [fact.id], 'demonstrable use resurrects the archived fact');
+  assert.deepEqual(result.utilityFactIds, [fact.id], 'the resurrected fact is credited in the same pass');
+  const restored = getFact(fact.id);
+  assert.equal(restored?.active, true, 'the fact is live again');
+  assert.equal(restored?.utilityCount, 1, 'utility credit landed after restore');
+  assert.ok(restored?.lastUsedAt, 'restore refreshes last_used_at so the next hygiene pass cannot instantly re-decay it');
+});
+
+test('a SUPERSEDED archived fact is never resurrected by recall credit', async () => {
+  const { forgetFact } = await import('./facts.js');
+  const oldFact = rememberFact({ kind: 'project', content: 'The Northwind renewal closes in March.' });
+  const newFact = rememberFact({ kind: 'project', content: 'The Northwind renewal closes in June.' });
+  const run = recordRecallRun({
+    objective: 'when does Northwind close?',
+    surface: 'memory_search_facts',
+    answerability: 'partial',
+    candidateRefs: [{ type: 'fact', id: String(oldFact.id), snippet: oldFact.content }],
+  });
+  forgetFact(oldFact.id);
+  openMemoryDb().prepare('UPDATE consolidated_facts SET superseded_by_fact_id = ? WHERE id = ?')
+    .run(newFact.id, oldFact.id);
+
+  const result = recordRecallUse({ recallId: run.id, refs: [`fact:${oldFact.id}`] });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.resurrectedFactIds, [], 'a replaced claim stays down');
+  assert.deepEqual(result.utilityFactIds, [], 'and earns no utility');
+  assert.equal(getFact(oldFact.id)?.active, false, 'the superseded fact remains archived');
+});

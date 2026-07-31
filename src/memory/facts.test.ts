@@ -881,3 +881,45 @@ test('readLiveFactEmbeddingCoverage counts ONLY rows recall can use — a provid
     _setEmbeddingProviderForTest(undefined);
   }
 });
+
+test('cold-tier archive search finds retired facts, never active or superseded ones (2026-07-31)', async () => {
+  const { searchArchivedFactsScored } = await import('./facts.js');
+  const live = rememberFact({ kind: 'project', content: 'The Meridian rollout checklist lives in the ops handbook.' });
+  const retired = rememberFact({ kind: 'project', content: 'The Meridian rollout kickoff call happens on Fridays.' });
+  const replaced = rememberFact({ kind: 'project', content: 'The Meridian rollout owner is the platform team.' });
+  forgetFact(retired.id);
+  forgetFact(replaced.id);
+  openMemoryDb().prepare('UPDATE consolidated_facts SET superseded_by_fact_id = ? WHERE id = ?')
+    .run(live.id, replaced.id);
+
+  const hits = await searchArchivedFactsScored('Meridian rollout kickoff');
+  const ids = hits.map((h) => h.fact.id);
+  assert.ok(ids.includes(retired.id), 'a retired (soft-deleted) fact is reachable from the archive');
+  assert.ok(!ids.includes(live.id), 'active facts never appear in archive results');
+  assert.ok(!ids.includes(replaced.id), 'a SUPERSEDED fact stays down — it was replaced, not stale');
+});
+
+test('archive search lexical arm demands two token hits so one common word cannot resurface junk', async () => {
+  const { searchArchivedFactsScored } = await import('./facts.js');
+  const junk = rememberFact({ kind: 'project', content: 'Random rollout trivia from a long-dead thread.' });
+  forgetFact(junk.id);
+  const hits = await searchArchivedFactsScored('Meridian rollout kickoff');
+  assert.ok(!hits.some((h) => h.fact.id === junk.id), 'a single shared token ("rollout") is not enough to resurface');
+});
+
+test('180d purge eats only never-rescued archives — a resurrected fact survives (2026-07-31)', async () => {
+  const { purgeSoftDeletedFacts } = await import('./db.js');
+  const doomed = rememberFact({ kind: 'project', content: 'Stale archive row nobody ever used again.' });
+  const rescued = rememberFact({ kind: 'project', content: 'Archive row that earned its way back through use.' });
+  forgetFact(doomed.id);
+  forgetFact(rescued.id);
+  const past = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString();
+  const db = openMemoryDb();
+  db.prepare('UPDATE consolidated_facts SET updated_at = ? WHERE id IN (?, ?)').run(past, doomed.id, rescued.id);
+  reactivateFact(rescued.id);
+
+  const purged = purgeSoftDeletedFacts();
+  assert.ok(purged >= 1, 'the long-cold archive row is hard-purged');
+  assert.equal(getFact(doomed.id), null, 'never-used archive weight is finally gone');
+  assert.equal(getFact(rescued.id)?.active, true, 'resurrection moves a fact out of the purge domain entirely');
+});

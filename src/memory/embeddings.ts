@@ -1223,6 +1223,34 @@ export function loadActiveFactEmbeddings(kind?: string): Map<number, Float32Arra
   return vectors;
 }
 
+/** Load vectors for ARCHIVED facts — soft-retired (active=0) rows still inside
+ * the recovery window and never superseded by a newer claim. This is the cold
+ * tier the archive-fallback search ranks over: a decayed fact keeps its
+ * embedding (content never changes on retirement, so content_hash still
+ * matches), which is what makes the archive searchable for free. Superseded
+ * rows stay out — they were REPLACED, not merely stale, and resurfacing a
+ * contradicted claim is worse than silence. Deliberately uncached: this only
+ * runs when live recall came back thin. */
+export function loadArchivedFactEmbeddings(kind?: string): Map<number, Float32Array> {
+  const active = activeEmbeddingSelector();
+  if (!active) return new Map();
+  const db = openMemoryDb();
+  const rows = db.prepare(`
+    SELECT fe.fact_id AS id, fe.vector AS vector
+    FROM fact_embeddings fe
+    JOIN consolidated_facts cf ON cf.id = fe.fact_id
+    WHERE cf.active = 0
+      AND cf.superseded_by_fact_id IS NULL
+      ${kind ? 'AND cf.kind = ?' : ''}
+      AND fe.model = ?
+      AND fe.dim = ?
+      AND fe.content_hash = cf.content_hash
+  `).all(...(kind ? [kind] : []), active.model, active.dim) as Array<{ id: number; vector: Buffer }>;
+  const vectors = new Map<number, Float32Array>();
+  for (const row of rows) vectors.set(row.id, bufferToVector(row.vector));
+  return vectors;
+}
+
 export interface EmbeddingStats {
   enabled: boolean;
   count: number;

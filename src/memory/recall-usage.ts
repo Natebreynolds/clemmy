@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { openMemoryDb } from './db.js';
+import { reactivateFact } from './facts.js';
+import { appendHygieneAudit } from './hygiene-audit.js';
 
 export const RECALL_REF_TYPES = ['fact', 'note', 'entity', 'resource', 'episode', 'policy', 'procedure', 'deliverable'] as const;
 export type RecallRefType = (typeof RECALL_REF_TYPES)[number];
@@ -31,6 +33,9 @@ export interface RecallUseResult {
   duplicates: RecallCandidateRef[];
   rejected: string[];
   utilityFactIds: number[];
+  /** Archived (active=0) facts that earned their way back: a demonstrable use
+   *  through this sink reactivates them (earn-your-way-back resurrection). */
+  resurrectedFactIds: number[];
   reason?: 'not_found' | 'expired';
 }
 
@@ -251,9 +256,9 @@ export function recordRecallUse(input: {
     FROM memory_recall_runs
     WHERE id = ?
   `).get(input.recallId) as { candidate_refs_json: string; expires_at: string } | undefined;
-  if (!run) return { ok: false, recorded: [], duplicates: [], rejected: input.refs, utilityFactIds: [], reason: 'not_found' };
+  if (!run) return { ok: false, recorded: [], duplicates: [], rejected: input.refs, utilityFactIds: [], resurrectedFactIds: [], reason: 'not_found' };
   if (Date.parse(run.expires_at) < Date.parse(now)) {
-    return { ok: false, recorded: [], duplicates: [], rejected: input.refs, utilityFactIds: [], reason: 'expired' };
+    return { ok: false, recorded: [], duplicates: [], rejected: input.refs, utilityFactIds: [], resurrectedFactIds: [], reason: 'expired' };
   }
 
   const candidates = new Set(parseCandidateRefs(run.candidate_refs_json).map(serializeRecallRef));
@@ -273,6 +278,7 @@ export function recordRecallUse(input: {
   const recorded: RecallCandidateRef[] = [];
   const duplicates: RecallCandidateRef[] = [];
   const utilityFactIds = new Set<number>();
+  const resurrectedFactIds = new Set<number>();
   const insert = db.prepare(`
     INSERT OR IGNORE INTO memory_recall_uses
       (recall_id, ref_type, ref_id, outcome, detail, recorded_at)
@@ -346,12 +352,44 @@ export function recordRecallUse(input: {
     if (outcome === 'used') {
       for (const factId of newlyRecordedFactIds) {
         if (preexistingFactIds.has(factId)) continue;
-        if (creditFact.run(now, now, factId).changes > 0) utilityFactIds.add(factId);
+        if (creditFact.run(now, now, factId).changes > 0) {
+          utilityFactIds.add(factId);
+          continue;
+        }
+        // Earn-your-way-back resurrection (2026-07-31): the credit UPDATE is
+        // guarded on active=1, so an ARCHIVED fact surfaced by the cold-tier
+        // fallback used to earn nothing here — preserved yet unrewardable.
+        // Demonstrable use is the strongest possible evidence a retirement was
+        // premature, so restore through the canonical reactivateFact path
+        // (which also refreshes last_used_at against immediate re-decay), then
+        // credit. Superseded rows stay down: they were replaced, not stale.
+        try {
+          const archived = db.prepare(
+            'SELECT 1 FROM consolidated_facts WHERE id = ? AND active = 0 AND superseded_by_fact_id IS NULL',
+          ).get(factId);
+          if (archived && reactivateFact(factId) && creditFact.run(now, now, factId).changes > 0) {
+            utilityFactIds.add(factId);
+            resurrectedFactIds.add(factId);
+          }
+        } catch {
+          // Resurrection is opportunistic bookkeeping — never fail the credit.
+        }
       }
     }
   })();
 
-  return { ok: true, recorded, duplicates, rejected, utilityFactIds: [...utilityFactIds] };
+  if (resurrectedFactIds.size > 0) {
+    // Same reviewable trail as decay itself, so the owner can see round trips:
+    // what the janitor retired AND what usage brought back.
+    appendHygieneAudit({
+      at: now,
+      kind: 'resurrect',
+      ids: [...resurrectedFactIds],
+      detail: { recallId: input.recallId, trigger: detail ?? 'recall-use' },
+    });
+  }
+
+  return { ok: true, recorded, duplicates, rejected, utilityFactIds: [...utilityFactIds], resurrectedFactIds: [...resurrectedFactIds] };
 }
 
 export function readRecallUsageHealth(windowDays = 30, nowIso = new Date().toISOString()): RecallUsageHealth {

@@ -506,3 +506,18 @@ test('memory_embed_backfill can backfill durable fact embeddings', async () => {
     _setEmbeddingProviderForTest(undefined);
   }
 });
+
+test('archivedFactFallback opens the cold tier only when live recall is thin, with the restore promise in the label', async () => {
+  const { archivedFactFallback, ARCHIVE_FALLBACK_THRESHOLD } = await import('./memory-tools.js');
+  const { forgetFact, rememberFact: remember } = await import('../memory/facts.js');
+  const retired = remember({ kind: 'project', content: 'The Coral proposal deck template lives in the shared drive.' });
+  forgetFact(retired.id);
+
+  const thin = await archivedFactFallback('Coral proposal deck', 0);
+  assert.ok(thin.lines[0]?.includes('From the archive'), 'archived hits are clearly labeled, never mixed into live results');
+  assert.ok(thin.lines[0]?.includes('restores it automatically'), 'the label states the resurrection contract');
+  assert.ok(thin.refs.some((r) => r.id === String(retired.id)), 'archived refs join the recall run for auto-credit');
+
+  const rich = await archivedFactFallback('Coral proposal deck', ARCHIVE_FALLBACK_THRESHOLD);
+  assert.deepEqual(rich, { lines: [], refs: [] }, 'enough live results keeps the archive closed');
+});

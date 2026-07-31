@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { formatSearchHits, searchVaultAsync } from '../memory/search.js';
 import { recallHybrid } from '../memory/recall.js';
 import { embedMissingChunks, embedMissingFacts, readEmbeddingStats, readFactEmbeddingStats } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, reviewStandingInstructions, searchFacts, searchFactsByText, setFactPinned, recordFactImpression } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, reviewStandingInstructions, searchArchivedFactsScored, searchFacts, searchFactsByText, setFactPinned, recordFactImpression } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
 import { recallEverything, formatUnifiedRecall, projectedRecallAnswerability, unifiedHitRecallRef, visibleUnifiedRecallHits } from '../memory/unified-recall.js';
@@ -25,6 +25,41 @@ import { compileWordMatcher } from '../memory/word-match.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 import { listEvents, recentToolOutputs } from '../runtime/harness/eventlog.js';
+
+/** Live results below this count mean recall came back thin enough to open
+ *  the archive (cold tier). At or above it, retired facts stay retired. */
+export const ARCHIVE_FALLBACK_THRESHOLD = 3;
+
+/**
+ * Cold-tier fallback (2026-07-31): when an EXPLICIT recall comes back thin,
+ * surface soft-retired facts in a clearly labeled section instead of leaving
+ * the archive write-only. Zero ambient token cost by construction — only the
+ * explicit search tools call this, never the per-turn context builders.
+ * Archived hits record NO impression (they didn't win live recall; mere
+ * exposure must not extend their purge clock), but their refs join the recall
+ * run so the post-turn auto-credit hook can prove use — and demonstrable use
+ * resurrects the fact through recordRecallUse (earn-your-way-back).
+ */
+export async function archivedFactFallback(
+  query: string,
+  liveFactCount: number,
+): Promise<{ lines: string[]; refs: Array<{ type: 'fact'; id: string; snippet: string }> }> {
+  if (liveFactCount >= ARCHIVE_FALLBACK_THRESHOLD) return { lines: [], refs: [] };
+  let hits: Awaited<ReturnType<typeof searchArchivedFactsScored>> = [];
+  try {
+    hits = await searchArchivedFactsScored(query, { topK: 5 });
+  } catch {
+    return { lines: [], refs: [] };
+  }
+  if (hits.length === 0) return { lines: [], refs: [] };
+  return {
+    lines: [
+      'From the archive (previously retired memories — using one restores it automatically):',
+      ...hits.map(({ fact }) => `- [fact:${fact.id}] ${fact.kind}: ${fact.content}`),
+    ],
+    refs: hits.map(({ fact }) => ({ type: 'fact' as const, id: String(fact.id), snippet: fact.content })),
+  };
+}
 
 /** Register a recall run with the active turn so the post-turn auto-credit
  *  hook can match its candidates against what the turn produced. */
@@ -869,7 +904,9 @@ export function registerMemoryTools(server: McpServer): void {
       // A returned candidate is an impression, not proof the agent materially
       // used it. Utility is reserved for an applied/cited memory signal so a
       // broad search cannot make every displayed row rank higher next time.
+      // Archived fallback hits deliberately record NOTHING here.
       for (const fact of facts) recordFactImpression(fact.id);
+      const archive = await archivedFactFallback(query, facts.length);
       appendFactRecallTrace({
         surface: 'memory_search_facts',
         query,
@@ -881,17 +918,24 @@ export function registerMemoryTools(server: McpServer): void {
           objective: query,
           surface: 'memory_search_facts',
           answerability: facts.length > 0 ? 'partial' : 'insufficient',
-          candidateRefs: facts.map((fact) => ({ type: 'fact', id: String(fact.id), snippet: fact.content })),
+          candidateRefs: [
+            ...facts.map((fact) => ({ type: 'fact' as const, id: String(fact.id), snippet: fact.content })),
+            ...archive.refs,
+          ],
         });
         recallId = run.id;
         noteTurnRecallRun(run.id);
       } catch {
         // Attribution must never make a scoped recall unavailable.
       }
-      if (facts.length === 0) {
+      if (facts.length === 0 && archive.lines.length === 0) {
         return textResult(`No relevant facts found.${recallId ? ` Recall ${recallId}.` : ''}`);
       }
       const lines = facts.map((fact) => `- [fact:${fact.id}] ${fact.kind}: ${fact.content}`);
+      if (archive.lines.length > 0) {
+        if (lines.length > 0) lines.push('');
+        lines.push(...archive.lines);
+      }
       return textResult(lines.join('\n'));
     },
   );
@@ -906,6 +950,10 @@ export function registerMemoryTools(server: McpServer): void {
     async ({ objective, limit }) => {
       const result = await recallEverything(objective, { limit: limit ?? 12 });
       scheduleRecallShadow({ query: objective, surface: 'memory_recall_all', limit: limit ?? 12 });
+      // Cold-tier fallback keys on LIVE fact-store hits specifically: notes or
+      // entities answering the objective doesn't mean the fact store did.
+      const liveFactHits = result.hits.filter((h) => h.type === 'fact' || h.type === 'policy').length;
+      const archive = await archivedFactFallback(objective, liveFactHits);
       try {
         const recallId = createRecallRunId();
         result.recallId = recallId;
@@ -916,7 +964,7 @@ export function registerMemoryTools(server: McpServer): void {
           objective,
           surface: 'memory_recall_all',
           answerability: result.answerability ?? 'partial',
-          candidateRefs: result.hits.map(unifiedHitRecallRef),
+          candidateRefs: [...result.hits.map(unifiedHitRecallRef), ...archive.refs],
         });
         result.recallId = run.id;
         noteTurnRecallRun(run.id);
@@ -926,9 +974,14 @@ export function registerMemoryTools(server: McpServer): void {
       }
       if (result.hits.length === 0) {
         const recall = result.recallId ? ` Recall ${result.recallId}.` : '';
+        if (archive.lines.length > 0) {
+          return textResult(`No LIVE memory found across facts, notes, entities, resources, episodes, policies, or procedures.${recall}\n\n${archive.lines.join('\n')}`);
+        }
         return textResult(`No relevant memory found across facts, notes, entities, resources, episodes, policies, or procedures.${recall}`);
       }
-      const block = formatUnifiedRecall(result, 4000);
+      const block = archive.lines.length > 0
+        ? `${formatUnifiedRecall(result, 4000)}\n\n${archive.lines.join('\n')}`
+        : formatUnifiedRecall(result, 4000);
       // Record exposure only. Unified recall deliberately returns alternatives;
       // simply appearing in that pack does not establish material usefulness.
       const recalledFactIds = new Set(result.hits

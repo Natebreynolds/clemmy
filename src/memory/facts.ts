@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow } from './db.js';
-import { cosine, embedQuery, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
+import { cosine, embedQuery, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadArchivedFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
 import { getRecallStats } from './recall.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { appendFactRecallTrace } from './recall-trace.js';
@@ -964,6 +964,95 @@ export async function searchFactsHybrid(query: string, limit = 5): Promise<Conso
     .sort((a, b) => b.score - a.score)
     .slice(0, cap)
     .map((entry) => entry.fact);
+}
+
+/** Only a genuinely similar archived fact may resurface — the archive exists
+ *  to rescue useful memories, not to re-inject the junk decay retired. */
+const ARCHIVED_MIN_SIM = 0.5;
+
+/**
+ * Cold-tier search over ARCHIVED facts (2026-07-31): soft-retired (active=0)
+ * rows that were never superseded. Decay demotes to this tier instead of
+ * destroying — every retired row keeps its content, embedding, and provenance
+ * for the 180-day recovery window — but until now nothing could READ the tier,
+ * so a retired fact was preserved yet useless. This makes the archive a real
+ * reading room at zero ambient cost: it is called ONLY by the explicit recall
+ * tools' thin-results fallback, never by the per-turn context builders.
+ *
+ * Conservative on both arms: semantic hits must clear ARCHIVED_MIN_SIM, and
+ * the lexical fallback demands at least two distinct content-bearing token
+ * hits (when the query has two to give). Superseded rows never surface — they
+ * were replaced by a newer claim, not merely stale, and recalling a
+ * contradicted memory is worse than recalling nothing.
+ */
+export async function searchArchivedFactsScored(
+  query: string,
+  options: { topK?: number } = {},
+): Promise<ScoredFact[]> {
+  const topK = Math.max(1, Math.min(10, options.topK ?? 5));
+  const normalized = normalizeContent(query);
+  if (!normalized) return [];
+  const db = openMemoryDb();
+
+  if (isEmbeddingsEnabled()) {
+    try {
+      const vectors = loadArchivedFactEmbeddings();
+      if (vectors.size > 0) {
+        const queryVector = await embedQuery(normalized);
+        if (queryVector) {
+          const scored: Array<{ id: number; sim: number }> = [];
+          for (const [id, vec] of vectors) {
+            const sim = cosine(queryVector, vec);
+            if (sim >= ARCHIVED_MIN_SIM) scored.push({ id, sim });
+          }
+          scored.sort((a, b) => b.sim - a.sim);
+          const top = scored.slice(0, topK);
+          if (top.length > 0) {
+            const simById = new Map(top.map((s) => [s.id, s.sim]));
+            const rows = db.prepare(
+              `SELECT * FROM consolidated_facts WHERE id IN (${top.map(() => '?').join(',')})`,
+            ).all(...top.map((s) => s.id)) as ConsolidatedFactRow[];
+            const byId = new Map(rows.map((r) => [r.id, r]));
+            return top
+              .map((s) => byId.get(s.id))
+              .filter((r): r is ConsolidatedFactRow => Boolean(r))
+              .map((r) => ({ fact: rowToFact(r), sim: simById.get(r.id) ?? null }));
+          }
+          return [];
+        }
+      }
+      // No archived vectors / query embed failed — fall through to lexical.
+    } catch {
+      // Embed failure → lexical fallback, same as the live search.
+    }
+  }
+
+  const tokens = normalized
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 3 && !FACT_QUERY_STOPWORDS.has(t))
+    .slice(0, 12);
+  if (tokens.length === 0) return [];
+  const minHits = Math.min(2, tokens.length);
+  try {
+    const matches = db.prepare(`
+      SELECT * FROM consolidated_facts
+      WHERE active = 0
+        AND superseded_by_fact_id IS NULL
+        AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
+    `).all(...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
+    return matches
+      .map((row) => {
+        const lc = row.content.toLowerCase();
+        return { row, hits: tokens.reduce((sum, t) => sum + (lc.includes(t) ? 1 : 0), 0) };
+      })
+      .filter((s) => s.hits >= minHits)
+      .sort((a, b) => b.hits - a.hits || (b.row.updated_at || '').localeCompare(a.row.updated_at || ''))
+      .slice(0, topK)
+      .map((s) => ({ fact: rowToFact(s.row), sim: null }));
+  } catch {
+    return [];
+  }
 }
 
 /**
