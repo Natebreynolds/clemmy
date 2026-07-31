@@ -255,3 +255,20 @@ export function reapDeadSkillChoices(nowMs = Date.now()): number {
   }
   return reaped;
 }
+
+/**
+ * Wire the proven-standard lookup into the turn-control beat. Done here, at the
+ * memory layer, so turn-control (on the hot path for every turn) never imports
+ * the store. Idempotent; safe to call more than once.
+ */
+export function installProvenStandardBeatLine(): void {
+  void import('../runtime/harness/turn-control.js').then(({ bindProvenStandardLine }) => {
+    bindProvenStandardLine((request: string) => {
+      const [best] = matchSkillChoices(request, 1);
+      if (!best?.record.skill) return '';
+      const runs = best.record.successCount;
+      return `[standard] \`${best.record.skill}\` governs this kind of work (${runs} previous run${runs === 1 ? '' : 's'}). `
+        + 'Name it in your beat so the user can correct it, load it before producing anything, and follow it.';
+    });
+  }).catch(() => { /* the beat degrades to its generic form */ });
+}

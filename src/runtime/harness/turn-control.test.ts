@@ -31,6 +31,8 @@ const {
   classifyTurnPreflight,
   closeTheLoopNudge,
   confirmBeatDirective,
+  confirmBeatEnabled,
+  setProvenStandardLineForTest,
   effectiveTurnObjective,
   recordTurnPreflightDecision,
 } = await import('./turn-control.js');
@@ -45,8 +47,8 @@ function freshSession(kind = 'chat'): string {
 }
 
 beforeEach(() => {
-  // Most tests below exercise the legacy alignment mechanism directly. The
-  // production default is asserted separately and remains off.
+  // Most tests below exercise the alignment mechanism directly. The production
+  // default is asserted separately (it is now ON).
   process.env.CLEMMY_CONFIRM_BEAT = 'on';
 });
 
@@ -220,14 +222,17 @@ test('evaluateTurnBoundary precedence: kill → wall-clock → token budget → 
 
 // ── confirm beat (legacy opt-in) ─────────────────────────────────────────────
 
-test('confirm beat is default-off so an explicit action does not require a duplicate go-ahead', () => {
-  delete process.env.CLEMMY_CONFIRM_BEAT;
+test('the kill-switch still silences an explicit action request', () => {
+  // Contract INVERTED 2026-07-31: the beat is on by default (it shipped
+  // default-off and therefore never fired in production). `off` remains the
+  // operator escape hatch.
   const sessionId = freshSession('chat');
   const message = 'Deploy this prepared directory to the exact Netlify site I named, then verify it.';
+  process.env.CLEMMY_CONFIRM_BEAT = 'off';
   assert.equal(confirmBeatDirective({ message, sessionId, sessionKind: 'chat' }), null);
   assert.equal(classifyTurnPreflight({ message, sessionId, sessionKind: 'chat' }).phase, 'execute');
   process.env.CLEMMY_CONFIRM_BEAT = 'on';
-  assert.ok(confirmBeatDirective({ message, sessionId, sessionKind: 'chat' }), 'operators can still opt in');
+  assert.ok(confirmBeatDirective({ message, sessionId, sessionKind: 'chat' }), 'the beat is available by default');
 });
 
 test('confirm beat: fires for a FRESH chat execution-shaped request only', () => {
@@ -520,4 +525,81 @@ test('closeTheLoopNudge: a recommendation with no question/offer nudges; closed 
   assert.equal(closeTheLoopNudge('Brett sent 14 prospecting emails today; here are the five most recent.'), null);
   assert.equal(closeTheLoopNudge(''), null);
   assert.equal(closeTheLoopNudge(null), null);
+});
+
+test('the beat is ON by default — it shipped disabled and therefore never once fired (2026-07-31)', () => {
+  const prior = process.env.CLEMMY_CONFIRM_BEAT;
+  delete process.env.CLEMMY_CONFIRM_BEAT;
+  try {
+    assert.equal(confirmBeatEnabled(), true, 'validated behavior is the default, not a rollout flag');
+    process.env.CLEMMY_CONFIRM_BEAT = 'off';
+    assert.equal(confirmBeatEnabled(), false, 'off survives as an operator kill-switch');
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_CONFIRM_BEAT; else process.env.CLEMMY_CONFIRM_BEAT = prior;
+  }
+});
+
+test('a request stated AFTER its context, in plural voice, still earns alignment', () => {
+  const sess = { id: freshSession() };
+  // The owner's live message: context first, ask last, "we/lets" voice, and a
+  // polite trailing "?" — it classified as a READ and skipped the beat entirely.
+  const decision = classifyTurnPreflight({
+    message: 'Okay, remember we need to touch all accounts always, so these 266 we need to get a mid year audit email ready for them in my drafts, lets get at least 50 of them ready right now please?',
+    sessionId: sess.id,
+    sessionKind: 'chat',
+  });
+  assert.equal(decision.phase, 'align', `context-first plural request must align, got ${decision.phase}/${decision.reason}`);
+});
+
+test('pre-authorized work is never interrupted by a beat', () => {
+  const sess = { id: freshSession() };
+  for (const message of [
+    'fully autonomously in the background please: build my outreach sheet and email the top 20',
+    'go ahead and send the follow-ups, no need to check with me',
+    'just do it — draft and publish the recap to slack',
+  ]) {
+    const decision = classifyTurnPreflight({ message, sessionId: sess.id, sessionKind: 'chat' });
+    assert.equal(decision.phase, 'execute', `pre-authorized message must execute: "${message.slice(0, 40)}"`);
+    assert.equal(decision.reason, 'pre_authorized');
+  }
+});
+
+test('quick reads and chit-chat stay silent', () => {
+  const sess = { id: freshSession() };
+  for (const message of ['whats on my calendar today', 'Hey', 'hows it going', 'can Google Docs create tables?']) {
+    const decision = classifyTurnPreflight({ message, sessionId: sess.id, sessionKind: 'chat' });
+    assert.notEqual(decision.phase, 'align', `"${message}" must not earn a beat`);
+  }
+});
+
+test('the beat names the governing standard when one is proven', () => {
+  const sess = { id: freshSession() };
+  setProvenStandardLineForTest(() => '[standard] `brand-outbound` governs this kind of work (3 previous runs).');
+  try {
+    const directive = confirmBeatDirective({
+      message: 'draft outbound emails to the top 20 accounts and put them in my drafts',
+      sessionId: sess.id,
+      sessionKind: 'chat',
+    });
+    assert.ok(directive, 'a consequential request earns a beat');
+    assert.match(directive!, /brand-outbound/, 'the beat names the standard in force');
+  } finally {
+    setProvenStandardLineForTest(null);
+  }
+});
+
+test('with no standard, the beat asks the ONE question that defines it', () => {
+  const sess = { id: freshSession() };
+  setProvenStandardLineForTest(() => '');
+  try {
+    const directive = confirmBeatDirective({
+      message: 'draft outbound emails to the top 20 accounts and put them in my drafts',
+      sessionId: sess.id,
+      sessionKind: 'chat',
+    });
+    assert.match(directive!, /No proven standard governs/);
+    assert.match(directive!, /remember it so this is never asked again/, 'the answer becomes a standard — the beat self-extinguishes');
+  } finally {
+    setProvenStandardLineForTest(null);
+  }
 });

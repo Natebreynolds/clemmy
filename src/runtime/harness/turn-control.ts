@@ -244,8 +244,41 @@ const REQUESTED_ACTION_PATTERNS = [
   new RegExp(`^(?:please\\s+)?${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
   new RegExp(`^(?:can|could|would|will)\\s+you\\s+(?:please\\s+)?${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
   new RegExp(`^i\\s+(?:need|want|would\\s+like)(?:\\s+for)?\\s+(?:you\\s+)?to\\s+${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
-  new RegExp(`^let(?:'s|\\s+us)\\s+${REQUEST_ACTION}\\b`, 'i'),
+  // "lets" without the apostrophe is how people actually type it, and a request
+  // stated in the first-person PLURAL ("we need to draft these") is the owner's
+  // habitual voice — neither was recognized, so his own bulk-draft request read
+  // as a question and skipped alignment entirely (live, 2026-07-31).
+  new RegExp(`^let'?s(?:\\s+us)?\\s+${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
+  new RegExp(`^let\\s+us\\s+${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
+  new RegExp(`^we\\s+(?:need|want|have|should|ought)(?:\\s+to)?\\s+${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
+  new RegExp(`^we(?:'re|\\s+are)?\\s+(?:going\\s+to|gonna)\\s+${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
+  /^(?:please\s+)?(?:let'?s\s+|we\s+(?:need|want|have)\s+to\s+|i\s+(?:need|want)\s+to\s+|can\s+you\s+)?get\s+[^.!?\n]{0,60}?\bready\b/i,
 ] as const;
+
+/**
+ * Pre-authorization: when the user has ALREADY said "do this without me", an
+ * alignment beat is not collaboration, it is an interruption of the exact
+ * autonomy they asked for. Found by replaying the owner's real corpus — two of
+ * the newly-aligned messages were explicit hand-offs ("fully autonomously in
+ * the background please"), which the beat would have stalled.
+ */
+const PRE_AUTHORIZED_RE =
+  /\b(?:fully\s+autonomous(?:ly)?|autonomously|without\s+(?:asking|checking|stopping|confirming)|don'?t\s+(?:ask|stop|check\s+with)|no\s+need\s+to\s+(?:ask|confirm|check)|just\s+do\s+it|go\s+ahead\s+and|explicitly\s+authoriz(?:e|es|ed)|i\s+authoriz(?:e|ed))\b/i;
+
+/**
+ * A request is legible wherever it appears, not only at the start of a message.
+ * Real requests arrive AFTER their context ("remember X, so … lets get 50
+ * ready"), and every action pattern is anchored to `^` — so a context-first
+ * message carried no action signal at all and fell through to the read-only
+ * branch. Splitting on clause boundaries lets the SAME anchored patterns see
+ * the ask, without loosening any of them.
+ */
+export function requestClauses(text: string): string[] {
+  return (text ?? '')
+    .split(/(?:[.!?;\n]+|,\s*(?=(?:so|then|and|but|now)\b)|(?=\b(?:let'?s|can\s+you|could\s+you|please\s+\w|we\s+(?:need|want|should|have)\b|i\s+(?:need|want)\b)))/i)
+    .map((clause) => clause.replace(/^\s*(?:so|then|and|but|now|okay|ok|also|actually)\b[,\s]*/i, '').trim())
+    .filter((clause) => clause.length >= 6);
+}
 const EXTERNAL_ACTION_RE =
   /\b(?:send|post|publish|deploy|host|notify|email|upload|submit|schedule|dispatch|delete|push|merge|migrate|sync)\b|\b(?:create|update|remove|import|export|draft|write|prepare|make|generate|build|design|convert)\b[^.!?\n]{0,50}\b(?:google\s+docs?|documents?|sites?|website|calendar|event|email|message|record|crm|sheets?|drive|notion|slack|teams|outlook|github|netlify)\b/i;
 const CONFIRM_CONTROLS = new Set([
@@ -282,6 +315,7 @@ export interface TurnPreflightDecision {
   reason:
     | 'non_chat'
     | 'feature_disabled'
+    | 'pre_authorized'
     | 'continuation_approved'
     | 'already_aligned_session'
     | 'read_only_request'
@@ -570,8 +604,15 @@ export function classifyTurnPreflight(input: {
     }
   }
 
+  // Pre-authorized work never earns a beat: the user already handed it off.
+  if (PRE_AUTHORIZED_RE.test(text)) {
+    return { phase: 'execute', consequential: false, reason: 'pre_authorized' };
+  }
   const signalText = positivePreflightSignalText(text);
-  const requestedAction = REQUESTED_ACTION_PATTERNS.some((pattern) => pattern.test(signalText.trim()));
+  // The ask may follow its context, so test the whole message AND its clauses
+  // against the same (unchanged, still `^`-anchored) patterns.
+  const requestedAction = REQUESTED_ACTION_PATTERNS.some((pattern) => pattern.test(signalText.trim()))
+    || requestClauses(signalText).some((clause) => REQUESTED_ACTION_PATTERNS.some((pattern) => pattern.test(clause)));
   const genericProviders = genericProviderAliasesFromObjective(signalText);
   const destination = destinationFromText(signalText) ?? genericProviders[0]?.replace(/^provider:/, '');
   const externalAction = requestedAction && (Boolean(destination) || EXTERNAL_ACTION_RE.test(signalText) || genericProviders.length > 0);
@@ -642,9 +683,56 @@ export function closeTheLoopNudge(reply: string | null | undefined): string | nu
   return '[close-the-loop] Your reply lands on a recommendation but never asks the user what they want done with it — the decision is left sitting on the table. Re-state your final reply, closing with the concrete next step you would take and ONE direct question offering to do it, phrased in your own words. If a closing question genuinely does not fit this reply, re-state it unchanged.';
 }
 
+/**
+ * Default ON. This shipped default-OFF and therefore never once fired: every
+ * chat turn recorded `feature_disabled`, so the alignment layer existed in code
+ * and not in the product. Measured on the owner's real 207-message chat corpus,
+ * the beat lands on roughly one message in eleven — and only on substantial
+ * action requests. A rollout flag on validated behavior is exactly the pattern
+ * the project forbids; `off` survives as an operator kill-switch.
+ */
 export function confirmBeatEnabled(): boolean {
-  const v = (getRuntimeEnv('CLEMMY_CONFIRM_BEAT', 'off') ?? 'off').trim().toLowerCase();
-  return v === 'on' || v === '1' || v === 'true' || v === 'yes';
+  const v = (getRuntimeEnv('CLEMMY_CONFIRM_BEAT', 'on') ?? 'on').trim().toLowerCase();
+  return v !== 'off' && v !== '0' && v !== 'false' && v !== 'no';
+}
+
+/**
+ * Standard-aware beat. The generic beat asks about plan and destination; what
+ * actually determines whether a deliverable is RIGHT is the standard governing
+ * it — and that standard is per-user, invisible, and silently absent (a user
+ * with no outbound standard gets improvised emails and reads it as the model
+ * being sloppy). So the beat says which standard is in force, or, when none is,
+ * asks the ONE question that defines it and captures the answer. It gets
+ * quieter over time by construction: every answered question becomes a standard
+ * that never needs asking again.
+ */
+export function standardAwareBeatText(request: string): string {
+  let proven = '';
+  try {
+    // Imported lazily: turn-control is on the hot path for every turn, and the
+    // standard lookup only matters on the rare turn that earns a beat.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    proven = requireProvenStandardLine(request);
+  } catch { proven = ''; }
+  if (proven) return `${CONFIRM_BEAT_TEXT}\n${proven}`;
+  return `${CONFIRM_BEAT_TEXT}\n`
+    + '[standard] No proven standard governs this kind of work yet. If HOW the output should look is at all open '
+    + '(format, personalization, tone, which fields), ask that ONE question in your beat — it is the question that '
+    + 'decides whether the result is usable. Once they answer, remember it so this is never asked again.';
+}
+
+/** Indirection kept tiny so the memory layer is not imported on every turn. */
+let provenStandardLineImpl: ((request: string) => string) | null = null;
+export function setProvenStandardLineForTest(fn: ((request: string) => string) | null): void {
+  provenStandardLineImpl = fn;
+}
+function requireProvenStandardLine(request: string): string {
+  if (provenStandardLineImpl) return provenStandardLineImpl(request);
+  return '';
+}
+/** Wired at startup by the memory layer so turn-control stays dependency-free. */
+export function bindProvenStandardLine(fn: (request: string) => string): void {
+  provenStandardLineImpl = fn;
 }
 
 export const CONFIRM_BEAT_TEXT =
@@ -662,7 +750,9 @@ export function confirmBeatDirective(input: {
   sourceUserSeq?: number;
 }): string | null {
   try {
-    return classifyTurnPreflight(input).phase === 'align' ? CONFIRM_BEAT_TEXT : null;
+    return classifyTurnPreflight(input).phase === 'align'
+      ? standardAwareBeatText(input.message)
+      : null;
   } catch { return null; }
 }
 

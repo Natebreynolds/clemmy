@@ -58,7 +58,7 @@ import {
   classifyTurnPreflight,
   effectiveTurnObjective,
   recordTurnPreflightDecision,
-  CONFIRM_BEAT_TEXT,
+  standardAwareBeatText,
 } from './turn-control.js';
 import {
   pullRecentTurnsForSession,
@@ -1148,7 +1148,9 @@ async function buildClaudeAgentBrainTurnContext(
     if (preflightSessionKind === 'chat') {
       recordTurnPreflightDecision(request.sessionId, preflight, opts?.sourceUserSeq);
     }
-    confirmBeat = preflight.phase === 'align' ? CONFIRM_BEAT_TEXT : '';
+    // Standard-aware on BOTH lanes — a beat that names the governing standard
+    // on one brain and not the other is the two-lane trap in miniature.
+    confirmBeat = preflight.phase === 'align' ? standardAwareBeatText(request.message) : '';
   } catch {
     // (fold 2026-07-17) Preflight state is directive/telemetry, not execution
     // authority — a classify/persist failure degrades to no beat, never a
