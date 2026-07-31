@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Composio } from '@composio/core';
+import { Composio, ComposioToolNotFoundError } from '@composio/core';
 import { BASE_DIR } from '../../config.js';
 import { readEnvFile, writeEnvFile } from '../../setup/env-file.js';
 import { getMachineId } from '../../runtime/machine-id.js';
@@ -441,7 +441,7 @@ export class ComposioDispatchUncertainError extends Error {
  * mutation committed; it cannot become an instance created by this process
  * before dispatch. */
 export class ComposioPreDispatchError extends ExternalWritePreDispatchError {
-  readonly reason: 'cli-unavailable' | 'cli-auth' | 'sdk-unavailable';
+  readonly reason: 'cli-unavailable' | 'cli-auth' | 'sdk-unavailable' | 'tool-not-found';
 
   constructor(
     reason: ComposioPreDispatchError['reason'],
@@ -1943,6 +1943,29 @@ export async function executeComposioTool(
       const healed = await reResolveFreshRetry(err);
       if (healed.retried) return healed.result;
       throw new ComposioReconnectRequiredError(toolSlug, err);
+    }
+    // NOMINAL tool-not-found proof (live 2026-07-31: a wrong GOOGLESHEETS slug
+    // parked a whole turn as "dispatch uncertain" + artifact jail — the user
+    // read it as "the sheet died mid-flight" when NOTHING was ever sent). The
+    // SDK throws ComposioToolNotFoundError at exactly ONE site — the
+    // tool-definition GET inside execute, BEFORE any execution request is
+    // constructed (verified against @composio/core dist). An instanceof of the
+    // SDK's own class is therefore local-boundary proof of zero dispatch —
+    // unlike message TEXT, which a provider or post-commit sub-call could echo
+    // (the long-standing rule below stays intact for text shapes).
+    if (err instanceof ComposioToolNotFoundError) {
+      if (body.version === undefined) {
+        // With proof of no dispatch, the curated-slug version retry is safe
+        // for mutations too, not only reads.
+        const version = await resolveComposioToolVersion(toolSlug);
+        if (version) return await (composio as any).tools.execute(toolSlug, { ...body, version });
+      }
+      throw new ComposioPreDispatchError(
+        'tool-not-found',
+        `Tool slug "${toolSlug}" does not exist in the Composio catalog — the provider never received any request, so nothing was created, sent, or changed. `
+        + 'Find the correct slug (composio_search_tools or tool_search) and retry with it.',
+        err,
+      );
     }
     // v0.5.65 — discover/execute version split. The SDK resolves a slug under
     // toolkit_versions=latest, but CURATED slugs (now discoverable via the

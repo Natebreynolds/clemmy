@@ -673,3 +673,23 @@ test('a benched CLI lane reports unauthenticated so AUTO routes SDK-first until 
     _resetComposioCliBenchForTests();
   }
 });
+
+test("SDK ComposioToolNotFoundError is nominal proof of ZERO dispatch — a wrong slug never parks a turn as uncertain (live 2026-07-31)", async () => {
+  const { ComposioToolNotFoundError } = await import('@composio/core');
+  // The SDK throws this class at exactly ONE site: the tool-definition GET
+  // inside execute, BEFORE any execution request is constructed. The wrong
+  // GOOGLESHEETS slug tonight took this path and got misfiled as ambiguous,
+  // cascading into the artifact jail ("the sheet died mid-flight" — it never
+  // dispatched at all).
+  const sdkErr = new ComposioToolNotFoundError('Unable to retrieve tool with slug GOOGLESHEETS_CREATE_GOOGLE_SHEET');
+  const wrapped = new ComposioPreDispatchError(
+    'tool-not-found',
+    'Tool slug "GOOGLESHEETS_CREATE_GOOGLE_SHEET" does not exist in the Composio catalog — the provider never received any request.',
+    sdkErr,
+  );
+  assert.equal(composioCliErrorProvesNoDispatch(wrapped), true, 'the wrapped resolver miss is replay-safe proof');
+  assert.match(wrapped.message, /never received any request/i, 'the message teaches the truth');
+  // TEXT alone (a provider could echo it post-commit) still proves nothing —
+  // the long-standing nominal rule is intact.
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('Unable to retrieve tool with slug X — Tool not found')), false);
+});
