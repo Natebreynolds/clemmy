@@ -9,6 +9,7 @@ import { NotificationsEditor } from './settings/NotificationsEditor';
 import { ModelsRoutingSection } from './settings/ModelsRoutingSection';
 import { DeveloperModeCard } from './settings/DeveloperModeCard';
 import { StartupDoctorCard } from './settings/StartupDoctorCard';
+import { LicenseCard } from './settings/LicenseCard';
 import { NotchSettingsCard } from './settings/NotchSettingsCard';
 import { cn } from '@/lib/cn';
 
@@ -41,6 +42,7 @@ const SECTIONS: { id: string; label: string }[] = [
   { id: 'appearance', label: 'Appearance' },
   { id: 'notch', label: 'Notch' },
   { id: 'profile', label: 'Profile' },
+  { id: 'license', label: 'License' },
   { id: 'notifications', label: 'Notifications' },
   { id: 'models', label: 'Models' },
   { id: 'developer', label: 'Developer' },
@@ -89,6 +91,8 @@ export function Settings() {
           <ProfileForm />
           <div className="mt-4"><StartupDoctorCard /></div>
         </div>
+
+        <div id="license" className="scroll-mt-16"><LicenseCard /></div>
 
         <div id="notifications" className="scroll-mt-16"><NotificationsEditor /></div>
 
