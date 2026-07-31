@@ -36,6 +36,7 @@ import {
   verifyPendingComposioExecutionAuthority,
 } from './pending-action-admission.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import { skillBindingHold } from '../memory/skill-binding-gate.js';
 import type { ComposioCliDefaultAccountAuthority } from '../integrations/composio/cli-default-account-authority.js';
 
 const textResult = (text: string) => ({ content: [{ type: 'text' as const, text }] });
@@ -263,6 +264,19 @@ export function registerBatchTools(server: McpServer): void {
             return textResult(
               `Plan refused before certification: ${error instanceof Error ? error.message : String(error)}`,
             );
+          }
+          // Binding load: bulk irreversible work must carry the standard that
+          // has already proven itself for this class. Checked BEFORE
+          // certification so nothing is dispatched or queued first, and only
+          // for write/send plans — reads are never held.
+          if (planForExecution.sideEffect !== 'read') {
+            const hold = skillBindingHold({
+              sessionId,
+              objective: planForExecution.objective,
+              bulkIrreversible: true,
+              itemCount: planForExecution.items.length,
+            });
+            if (hold) return textResult(hold.message);
           }
           const repairNote = prepared.repairs.length > 0
             ? ` Harness normalized ${prepared.repairs.length} batch item shape(s) before certification.`
