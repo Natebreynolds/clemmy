@@ -3,7 +3,23 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+import { mkdtempSync, mkdirSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// Own home, set BEFORE the module graph loads (BASE_DIR is resolved at import
+// time). This suite writes agent state/inbox files, and the runner executes
+// every test file against ONE shared CLEMENTINE_HOME — so it could be
+// interfered with by any of ~8,000 other tests. It passed alone and with its
+// sibling agent suites (722/722) yet failed intermittently in full runs with a
+// process-level exit and no failing assertion. Isolation removes the whole
+// class rather than chasing a partner that only collides under real load.
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-autonomy-v2-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.HOME = TMP_HOME;
+mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+
+const {
   AgentDecisionSchema,
   buildPolicyEvent,
   buildPolicyText,
@@ -14,8 +30,9 @@ import {
   parseToolArguments,
   _testOnly_buildRunnerConfig,
   _testOnly_sanitizeAgentDecisionOutput,
-} from './autonomy-v2.js';
-import { DEFAULT_PROACTIVITY_POLICY, type ProactivityPolicySnapshot } from './proactivity-policy.js';
+} = await import('./autonomy-v2.js');
+const { DEFAULT_PROACTIVITY_POLICY } = await import('./proactivity-policy.js');
+type ProactivityPolicySnapshot = import('./proactivity-policy.js').ProactivityPolicySnapshot;
 
 test('AgentDecisionSchema accepts the minimal valid shape', () => {
   const r = AgentDecisionSchema.safeParse({
