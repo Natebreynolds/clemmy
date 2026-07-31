@@ -1,3 +1,5 @@
+import { licensePosture } from '../licensing/license-status.js';
+import { licenseTickIntervalMs, tickLicense } from '../licensing/license-tick.js';
 import {
   closeSync,
   existsSync,
@@ -1033,6 +1035,27 @@ function reportBootSetupIssues(): void {
     );
   }
 
+  // Licensing is a notification here and never a boot failure. Note what is
+  // NOT reported: `unlicensed` (a fresh install that hasn't been given a key
+  // yet) and `stale` (the license server was unreachable — our problem, not
+  // the user's). Only a genuinely dead license is worth interrupting someone.
+  try {
+    const posture = licensePosture();
+    if (posture.state === 'expired' || posture.state === 'revoked') {
+      const blocking = posture.gaps.find((gap) => gap.blocking);
+      issues.push({
+        slug: 'license',
+        title: posture.state === 'revoked' ? 'License is no longer active' : 'License needs to be refreshed',
+        body: `${blocking?.message ?? 'This copy needs an active license.'}\n\nOpen the desktop app → Connect and check your license key.`,
+      });
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Boot setup check: licensePosture threw',
+    );
+  }
+
   if (WEBHOOK_ENABLED && (!WEBHOOK_SECRET || WEBHOOK_SECRET === 'change-me' || WEBHOOK_SECRET === 'change-me-local-secret')) {
     issues.push({
       slug: 'webhook-secret',
@@ -1957,6 +1980,18 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   setTimeout(() => { void tickAuthKeepalive(); }, 30_000).unref?.();
   const authKeepaliveTimer = setInterval(() => { void tickAuthKeepalive(); }, 5 * 60_000);
   authKeepaliveTimer.unref?.();
+
+  // Licensing. Deliberately AFTER boot and never awaited: a slow or dead
+  // license server must never become a slow app launch. The tick itself is
+  // cheap and mostly a no-op — it only reaches the network when there is no
+  // lease or the current one has entered its final third.
+  setTimeout(() => {
+    void tickLicense().catch(() => { /* never fatal — the posture reflects it */ });
+  }, 20_000).unref?.();
+  const licenseTimer = setInterval(() => {
+    void tickLicense().catch(() => { /* see above */ });
+  }, licenseTickIntervalMs());
+  licenseTimer.unref?.();
 
   // Boot warmup: one model call + one embed ping shortly after boot so the
   // FIRST real user turn doesn't pay the cold-start tax (observed live on the

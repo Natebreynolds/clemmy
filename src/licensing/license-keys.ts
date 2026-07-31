@@ -44,5 +44,5 @@ export function licensePublicKeys(env: NodeJS.ProcessEnv = process.env): License
 
 /** Where the daemon talks to. Overridable so tests never hit production. */
 export function licenseServerUrl(env: NodeJS.ProcessEnv = process.env): string {
-  return (env.CLEMENTINE_LICENSE_URL?.trim() || 'https://license.breakthroughcoaching.ai').replace(/\/+$/, '');
+  return (env.CLEMENTINE_LICENSE_URL?.trim() || 'https://license-production-f998.up.railway.app').replace(/\/+$/, '');
 }
