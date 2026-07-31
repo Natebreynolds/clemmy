@@ -8,10 +8,15 @@
  * and the whole blob went to the chat, so the user read Clem's bookkeeping
  * instead of Clem's answer.
  *
- * This is a display-layer repair, not model steering: when a reply provably
- * narrates the envelope, surface the `reply:` field — the part actually written
- * for the human — and drop the rest. Everything remains in the transcript and
- * event log; only the rendered text changes.
+ * The CONTENT is not the problem — the labels are. A second live case made that
+ * decisive: a fully successful run reported real verification detail under
+ * `done:`, four firms needing enrichment under `nextAction:`, and read-back
+ * evidence under `reason:`. Surfacing only `reply:` would have collapsed a
+ * substantive report into one line and thrown the rest away. So this strips the
+ * FIELD LABELS and keeps every value, in the model's own order — the message
+ * stops reading like a form dump and loses nothing.
+ *
+ * Display-layer only; the raw text remains in the transcript and event log.
  *
  * Conservative by design. It requires THREE distinct contract keys at line
  * starts before it will touch anything, so ordinary prose that happens to
@@ -30,8 +35,8 @@ function normalizeKey(raw: string): string {
 }
 
 export interface NarratedEnvelope {
-  /** Text written for the human — the `reply` field. */
-  reply: string;
+  /** Every field value, in the order the model wrote them, labels removed. */
+  blocks: string[];
   /** Any text that preceded the envelope (often the real question). */
   preamble: string;
   /** Distinct contract keys found, for telemetry. */
@@ -56,20 +61,23 @@ export function parseNarratedEnvelope(text: string): NarratedEnvelope | null {
   // that happens to use a colon.
   if (found.size < 3) return null;
 
-  const firstKeyLine = Math.min(...found.values());
+  const keyLines = [...found.values()].sort((a, b) => a - b);
+  const firstKeyLine = keyLines[0];
   const preamble = lines.slice(0, firstKeyLine).join('\n').trim();
 
-  const replyLine = found.get('reply');
-  if (replyLine === undefined) return null;
+  // Each field runs from its own line until the next labelled line. Values are
+  // kept verbatim and in order; only the label is removed.
+  const blocks: string[] = [];
+  for (let i = 0; i < keyLines.length; i++) {
+    const start = keyLines[i];
+    const end = i + 1 < keyLines.length ? keyLines[i + 1] : lines.length;
+    const head = lines[start].replace(KEY_LINE_RE, '');
+    const value = [head, ...lines.slice(start + 1, end)].join('\n').trim();
+    if (value) blocks.push(value);
+  }
+  if (blocks.length === 0) return null;
 
-  // The reply runs from its own line until the next contract-key line.
-  const laterKeyLines = [...found.values()].filter((n) => n > replyLine);
-  const end = laterKeyLines.length > 0 ? Math.min(...laterKeyLines) : lines.length;
-  const firstLine = lines[replyLine].replace(KEY_LINE_RE, '');
-  const reply = [firstLine, ...lines.slice(replyLine + 1, end)].join('\n').trim();
-  if (!reply) return null;
-
-  return { reply, preamble, keys: [...found.keys()] };
+  return { blocks, preamble, keys: [...found.keys()] };
 }
 
 /**
@@ -80,5 +88,5 @@ export function parseNarratedEnvelope(text: string): NarratedEnvelope | null {
 export function stripNarratedEnvelope(text: string): string {
   const parsed = parseNarratedEnvelope(text);
   if (!parsed) return text;
-  return [parsed.preamble, parsed.reply].filter(Boolean).join('\n\n');
+  return [parsed.preamble, ...parsed.blocks].filter(Boolean).join('\n\n');
 }
