@@ -504,6 +504,44 @@ const SKILL_ARTIFACT_TERMS = new Set([
   'document', 'spreadsheet', 'presentation', 'website', 'pdf', 'image', 'email',
 ]);
 
+/**
+ * Action verbs carry real intent ("draft an email" vs "report on email") but a
+ * verb ALONE must never surface a skill — that was the original reason they were
+ * pooled with stopwords. Pooling them, however, deleted the signal entirely: a
+ * request to get an audit email ready in drafts kept neither "draft" nor its
+ * verb sense, scored below the precision floor, and lost to skills matching on
+ * incidental nouns (2026-07-31, live: the owner's own outbound standard was not
+ * selected for his own outbound request). They now contribute WEAK, capped
+ * evidence that can complete a match but can never carry one.
+ */
+const SKILL_ACTION_VERBS = new Set([
+  'analyze', 'build', 'create', 'draft', 'generate', 'make', 'prepare', 'pull',
+  'read', 'report', 'review', 'run', 'search', 'send', 'summarize', 'update', 'write',
+]);
+const SKILL_ACTION_VERB_WEIGHT = 3;
+const SKILL_ACTION_VERB_MAX = 6;
+/** Both sides naming the same artifact is strong, structural agreement — the
+ *  same signal the artifact FILTER already trusts to exclude. Scoring it below
+ *  a stray description word was why artifact-correct skills lost to neighbors. */
+const SKILL_ARTIFACT_AGREEMENT_BONUS = 5;
+
+/** Verb-sense tokens only: same normalization, stopwords NOT applied, so the
+ *  action sense of a request survives for weak scoring. */
+function skillActionVerbs(value: string): Set<string> {
+  const out = new Set<string>();
+  for (const token of value
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)) {
+    const singular = token.length > 4 && token.endsWith('s') && !token.endsWith('ss')
+      ? token.slice(0, -1)
+      : token;
+    if (SKILL_ACTION_VERBS.has(singular)) out.add(singular);
+  }
+  return out;
+}
+
 const SKILL_TOKEN_ALIASES: Record<string, string> = {
   doc: 'document', docs: 'document', document: 'document', documents: 'document',
   docx: 'document', gdoc: 'document', googledoc: 'document', googledocs: 'document',
@@ -561,6 +599,7 @@ export function findRelevantSkills(query: string, options?: RelevantSkillOptions
   const q = query.replace(/\s+/g, ' ').trim().toLowerCase();
   const queryTerms = [...new Set(skillSearchTokens(q))];
   const queryArtifactTerms = queryTerms.filter((term) => SKILL_ARTIFACT_TERMS.has(term));
+  const queryActionVerbs = skillActionVerbs(q);
   if (!q || queryTerms.length === 0) return [];
 
   const matches: RelevantSkillMatch[] = [];
@@ -596,6 +635,19 @@ export function findRelevantSkills(query: string, options?: RelevantSkillOptions
       if (applicabilityTerms.has(term)) { score += 7; matched = true; }
       if (descriptionTerms.has(term)) { score += 4; matched = true; }
       if (matched) matchedTerms.push(term);
+    }
+    // Structural agreement on the artifact both sides name.
+    if (queryArtifactTerms.some((term) => skillArtifactTerms.includes(term))) {
+      score += SKILL_ARTIFACT_AGREEMENT_BONUS;
+    }
+    // Weak, capped verb evidence — completes a match, never carries one (a
+    // verb-only overlap still cannot clear the two-signal floor below).
+    const sharedVerbs = [...queryActionVerbs].filter((verb) => skillActionVerbs(
+      `${skill.name} ${skill.frontmatter.name ?? ''} ${skill.frontmatter.description ?? ''}`,
+    ).has(verb));
+    if (sharedVerbs.length > 0) {
+      score += Math.min(SKILL_ACTION_VERB_MAX, sharedVerbs.length * SKILL_ACTION_VERB_WEIGHT);
+      matchedTerms.push(...sharedVerbs);
     }
     const uniqueMatches = [...new Set(matchedTerms)];
     // One generic overlap is too weak for prompt injection (for example, every

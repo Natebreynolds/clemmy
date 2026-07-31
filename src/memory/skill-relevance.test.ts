@@ -73,3 +73,22 @@ test('stable discovery stays constant while per-turn skill context is strictly b
   assert.match(tight, /skill_read\("<name>"\)/, 'tight bounds preserve the complete read fallback');
   assert.match(tight, /skill_list\(\)/, 'tight bounds preserve the complete catalog fallback');
 });
+
+test('an action-shaped request reaches its artifact skill even when neighbors share the artifact word (2026-07-31 live)', () => {
+  // The owner's own outbound standard was NOT selected for his own outbound
+  // request: "draft"/"prepare" were pooled with stopwords, so the request kept
+  // no skill-bearing signal and lost to skills that merely mention email.
+  install('brand-outbound', 'Brand-enforced outbound email. Shapes a template or draft into an on-brand prospect email.');
+  install('dashboard-recipe', 'Build an interactive workspace report — auto-refreshing data with one-click email from rows.');
+  install('deal-risk-board', 'Build a deal-risk workspace for a rep with open opportunities flagged by email and call engagement.');
+
+  const matches = findRelevantSkills(
+    'these 266 we need to get a mid year audit email ready for them in my drafts, lets get at least 50 of them ready right now please?',
+  );
+  const names = matches.map((m) => m.skill.name);
+  assert.ok(names.includes('brand-outbound'), `the artifact-correct standard must be a candidate, got: ${names.join(', ') || 'none'}`);
+
+  // Precision floor holds: a verb alone can never surface a skill.
+  assert.deepEqual(findRelevantSkills('can you draft something for me'), [], 'a bare action verb surfaces nothing');
+  assert.deepEqual(findRelevantSkills('whats on my calendar today'), [], 'an unrelated read stays quiet');
+});
