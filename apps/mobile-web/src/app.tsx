@@ -1,22 +1,25 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useState } from 'preact/hooks';
-import { getAuthStatus, logout, pairDevice, type AuthStatus } from './lib/api';
+import { api, getAuthStatus, logout, pairDevice, type AuthStatus, type ChatSession } from './lib/api';
 import { Login } from './screens/Login';
-import { Inbox } from './screens/Inbox';
+import { Home } from './screens/Home';
 import { Activity } from './screens/Activity';
 import { Chats } from './screens/Chats';
 import { Memory } from './screens/Memory';
 import { Workflows } from './screens/Workflows';
-import { PushPrompt } from './components/PushPrompt';
 
-type Tab = 'inbox' | 'chats' | 'workflows' | 'memory' | 'activity';
+type Tab = 'home' | 'chats' | 'workflows' | 'memory' | 'activity';
 
 export function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
   const [pairing, setPairing] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('inbox');
+  const [tab, setTab] = useState<Tab>('home');
+  const [name, setName] = useState('');
+  const [decisions, setDecisions] = useState(0);
+  /** Set when Home hands a question to Chats — consumed once on arrival. */
+  const [handoff, setHandoff] = useState<{ draft?: string; session?: ChatSession } | null>(null);
 
   const refreshAuth = useCallback(async () => {
     try {
@@ -34,6 +37,15 @@ export function App() {
     window.addEventListener('clem:needs-login', handler);
     return () => window.removeEventListener('clem:needs-login', handler);
   }, [refreshAuth]);
+
+  // The greeting name, resolved at runtime from the profile — never hardcoded,
+  // and a miss simply means an unnamed greeting.
+  useEffect(() => {
+    if (!authStatus?.authenticated) return;
+    void api<{ name?: string }>('/m/api/whoami')
+      .then((who) => setName(who.name ?? ''))
+      .catch(() => setName(''));
+  }, [authStatus?.authenticated]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -72,21 +84,19 @@ export function App() {
   if (bootError && !authStatus) {
     return (
       <div class="login-shell">
+        <img class="login-mark" src="/m/clemmy.png" alt="" width="88" height="88" />
         <h1>Clementine</h1>
         <p class="error">{bootError}</p>
       </div>
     );
   }
 
-  if (!authStatus) {
-    return <div class="login-shell"><p>Loading…</p></div>;
-  }
-
-  if (pairing) {
+  if (!authStatus || pairing) {
     return (
       <div class="login-shell">
+        <img class="login-mark breathe" src="/m/clemmy.png" alt="" width="88" height="88" />
         <h1>Clementine</h1>
-        <p>Pairing this device…</p>
+        <p class="muted">{pairing ? 'Pairing this device…' : 'Waking up…'}</p>
       </div>
     );
   }
@@ -95,12 +105,22 @@ export function App() {
     return <Login pinConfigured={authStatus.pinConfigured} pairError={pairError} onAuthenticated={refreshAuth} />;
   }
 
+  const goToChat = (payload: { draft?: string; session?: ChatSession }) => {
+    setHandoff(payload);
+    setTab('chats');
+  };
+
   return (
     <>
       <header class="app-header">
-        <h1><img class="brand-mark" src="/m/clemmy.png" alt="" width="26" height="26" />Clementine</h1>
+        <div class="brand">
+          <img class="brand-mark" src="/m/clemmy.png" alt="" width="28" height="28" />
+          <span class="brand-name">{TAB_TITLES[tab]}</span>
+        </div>
         <div class="meta">
-          <span class="conn-pill" title="Connected directly to your Mac — end-to-end encrypted">Direct</span>
+          <span class="conn-pill" title="Connected straight to your Mac — end-to-end encrypted">
+            <span class="conn-dot" aria-hidden="true" />Direct
+          </span>
           <button
             class="icon-btn"
             aria-label="Sign out"
@@ -112,21 +132,36 @@ export function App() {
           </button>
         </div>
       </header>
-      <main class="app-main">
-        <div class="screen-enter" key={tab}>
-          <PushPrompt />
-          {tab === 'inbox' ? <Inbox />
-            : tab === 'chats' ? <Chats />
-            : tab === 'workflows' ? <Workflows />
-            : tab === 'memory' ? <Memory />
-            : <Activity />}
-        </div>
+
+      <main class="app-main" key={tab}>
+        {tab === 'home' ? (
+          <Home
+            name={name}
+            onAsk={(draft) => goToChat({ draft })}
+            onOpenChat={(session) => goToChat({ session })}
+            onDecisionCount={setDecisions}
+          />
+        ) : tab === 'chats' ? (
+          <Chats handoff={handoff} onHandoffConsumed={() => setHandoff(null)} />
+        ) : tab === 'workflows' ? <Workflows />
+          : tab === 'memory' ? <Memory />
+          : <Activity />}
       </main>
-      <nav class="section-tab-bar" aria-label="Sections">
+
+      <nav class="dock" aria-label="Sections">
         {TABS.map((t) => (
-          <button key={t.id} class={tab === t.id ? 'active' : ''} onClick={() => setTab(t.id)} aria-label={t.label}>
-            {t.icon}
-            {t.label}
+          <button
+            key={t.id}
+            class={tab === t.id ? 'active' : ''}
+            onClick={() => setTab(t.id)}
+            aria-label={t.label}
+            aria-current={tab === t.id ? 'page' : undefined}
+          >
+            <span class="dock-icon">
+              {t.icon}
+              {t.id === 'home' && decisions > 0 ? <span class="dock-badge">{decisions > 9 ? '9+' : decisions}</span> : null}
+            </span>
+            <span class="dock-label">{t.label}</span>
           </button>
         ))}
       </nav>
@@ -134,15 +169,23 @@ export function App() {
   );
 }
 
+const TAB_TITLES: Record<Tab, string> = {
+  home: 'Clementine',
+  chats: 'Chats',
+  workflows: 'Flows',
+  memory: 'Memory',
+  activity: 'Activity',
+};
+
 const stroke = { fill: 'none', stroke: 'currentColor', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' } as const;
 
 const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
   {
-    id: 'inbox',
-    label: 'Inbox',
+    id: 'home',
+    label: 'Home',
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
-        <path d="M22 12h-6l-2 3h-4l-2-3H2" /><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+        <path d="m3 10 9-7 9 7v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M9 21V12h6v9" />
       </svg>
     ),
   },

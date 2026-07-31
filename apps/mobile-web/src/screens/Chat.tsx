@@ -12,6 +12,8 @@ import {
 interface Props {
   sessionId?: string;
   initialTitle?: string;
+  /** Text typed on Home's ask bar, waiting in the composer on arrival. */
+  initialDraft?: string;
   onBack: () => void;
 }
 
@@ -25,14 +27,14 @@ interface PendingEcho {
   sentAt: number;
 }
 
-export function Chat({ sessionId: initialSessionId, initialTitle, onBack }: Props) {
+export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, onBack }: Props) {
   const [sessionId, setSessionId] = useState<string | undefined>(initialSessionId);
   const [events, setEvents] = useState<ChatEvent[]>([]);
   const [pending, setPending] = useState<PendingEcho[]>([]);
   const [title, setTitle] = useState(initialTitle ?? '');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(Boolean(initialSessionId));
-  const [draft, setDraft] = useState('');
+  const [draft, setDraft] = useState(initialDraft ?? '');
   const [sending, setSending] = useState(false);
   const [planActing, setPlanActing] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);

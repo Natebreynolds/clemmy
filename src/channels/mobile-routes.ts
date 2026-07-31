@@ -1086,14 +1086,23 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     res.json({ sessions });
   });
 
-  /** Smoke endpoint — confirms the cookie middleware works end-to-end. */
-  router.get('/api/whoami', requireMobileSession, (req, res) => {
+  /** Smoke endpoint — confirms the cookie middleware works end-to-end.
+   *  Also carries the profile name so the phone can greet the way the desktop
+   *  console does: resolved at runtime, never hardcoded, empty when unknown. */
+  router.get('/api/whoami', requireMobileSession, async (req, res) => {
     const ctx = req.mobileSession!;
+    let name = '';
+    try {
+      const { loadUserProfile } = await import('../runtime/user-profile.js');
+      const profile = loadUserProfile() as { preferredName?: string; displayName?: string; name?: string } | null;
+      name = profile?.preferredName?.trim() || profile?.displayName?.trim() || profile?.name?.trim() || '';
+    } catch { /* a nameless greeting is the graceful degrade */ }
     res.json({
       deviceId: ctx.record.deviceId,
       deviceLabel: ctx.record.deviceLabel,
       expiresAt: ctx.record.expiresAt,
       lastSeenAt: ctx.record.lastSeenAt,
+      name,
     });
   });
 

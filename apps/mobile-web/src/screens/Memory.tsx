@@ -122,10 +122,13 @@ export function Memory() {
             </button>
           ))}
         </div>
-        {factsLoading ? <div class="inbox-empty">Loading…</div> : null}
-        {!factsLoading && factsError ? <div class="inbox-empty">{factsError}</div> : null}
+        {factsLoading ? <div class="skeleton-stack" aria-hidden="true"><i /><i /></div> : null}
+        {!factsLoading && factsError ? <p class="error">{factsError}</p> : null}
         {!factsLoading && !factsError && facts.length === 0 ? (
-          <div class="inbox-empty">No facts in this category yet.</div>
+          <div class="empty">
+            <p class="empty-title">Nothing here yet</p>
+            <p class="empty-body">What Clem learns about this lands here automatically.</p>
+          </div>
         ) : null}
         {facts.map((fact) => (
           <div key={fact.id} class={`memory-fact memory-fact-${fact.kind}`}>

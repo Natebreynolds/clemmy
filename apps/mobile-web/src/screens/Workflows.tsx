@@ -37,9 +37,26 @@ export function Workflows() {
     return <WorkflowDetail workflow={selected} onBack={() => { setSelected(null); refresh(); }} />;
   }
 
-  if (loading && workflows.length === 0) return <div class="inbox-empty">Loading…</div>;
-  if (error && workflows.length === 0) return <div class="inbox-empty">{error}</div>;
-  if (workflows.length === 0) return <div class="inbox-empty">No workflows installed yet.</div>;
+  if (loading && workflows.length === 0) {
+    return <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>;
+  }
+  if (error && workflows.length === 0) {
+    return (
+      <div class="empty">
+        <p class="empty-title">Couldn't load flows</p>
+        <p class="empty-body">{error}</p>
+      </div>
+    );
+  }
+  if (workflows.length === 0) {
+    return (
+      <div class="empty">
+        <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
+        <p class="empty-title">No flows yet</p>
+        <p class="empty-body">Flows are the routines Clem runs for you. Build one on the desktop and trigger it from here.</p>
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -145,8 +162,8 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
         </div>
         {error ? <div class="global-error">{error}</div> : null}
         <div class="memory-section-head">Recent runs</div>
-        {runsLoading && runs.length === 0 ? <div class="inbox-empty">Loading…</div> : null}
-        {!runsLoading && runs.length === 0 ? <div class="inbox-empty">No runs yet.</div> : null}
+        {runsLoading && runs.length === 0 ? <div class="skeleton-stack" aria-hidden="true"><i /></div> : null}
+        {!runsLoading && runs.length === 0 ? <p class="muted">Hasn\u2019t run yet.</p> : null}
         {runs.map((run) => (
           <button key={run.id} class="run-card" onClick={() => setSelectedRun(run)}>
             <div class="title">{run.id}</div>
@@ -202,8 +219,8 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
           <span>{run.status}</span>
           {run.error ? <span class="memory-section-count" style="color:var(--accent-fail)">error</span> : null}
         </div>
-        {loading && events.length === 0 ? <div class="inbox-empty">Loading…</div> : null}
-        {!loading && events.length === 0 ? <div class="inbox-empty">No events yet.</div> : null}
+        {loading && events.length === 0 ? <div class="skeleton-stack" aria-hidden="true"><i /></div> : null}
+        {!loading && events.length === 0 ? <p class="muted">No steps recorded yet.</p> : null}
         {error ? <div class="global-error">{error}</div> : null}
         {events.map((ev, idx) => (
           <div key={idx} class={`workflow-event ${ev.error ? 'event-error' : ''}`}>
