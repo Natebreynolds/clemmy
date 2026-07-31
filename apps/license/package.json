@@ -1,0 +1,19 @@
+{
+  "name": "clementine-license",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "License issuing + admin API for Clementine. Signs short-lived Ed25519 leases that installs verify offline.",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "genkey": "node scripts/genkey.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
