@@ -1,12 +1,12 @@
 /**
- * Live-agents panel presentation — the simple "who is working right now"
+ * Live-agents panel presentation — the glanceable "who is working right now"
  * projection of the Tasks board, for the slide-in panel on every screen.
  *
- * Replaces the old Run environment panel (plan/helpers/provenance bookkeeping
- * inline) with the owner's actual mental model: Clem kicks work off, the chat
- * stays free, a side panel shows the live agents, and results come back
- * proactively. Deep inspection stays on the Tasks board; this surface is
- * glanceable rows + a stop button.
+ * PURE RUNNING WORK ONLY (owner decision, 2026-07-30 declutter): the first
+ * live day filled this panel with week-old "waiting on you" rows and it read
+ * as nagging backlog, not live work. Waiting items belong to the chat's
+ * Needs-you strip, the Inbox, and the Tasks board — this surface answers one
+ * question: what is Clem doing right now.
  *
  * Everything here is pure so the row projection, badge count, and the
  * auto-pop decision get cheap regression pins (same pattern as
@@ -20,7 +20,6 @@ export interface LiveAgentRow {
   title: string;
   /** One glanceable line: the card's live progress hint (may be ''). */
   statusLine: string;
-  needsYou: boolean;
   elapsedLabel: string;
   canStop: boolean;
   sessionId: string | null;
@@ -52,49 +51,63 @@ export function sourceKindLabel(kind: BoardSourceKind): string {
 }
 
 /**
- * The panel's rows: everything live (running) or blocked on the user
- * (needs_you), needs-you first so a waiting decision is never below the fold,
- * then newest-first. Queued and done stay off this surface — queued work has
- * not started and finished work reports back into the chat + Delivered.
+ * The panel's rows: genuinely RUNNING work only, newest first. Queued work
+ * has not started, finished work reports back into the chat + Delivered, and
+ * waiting-on-you items live on the Needs-you strip / Inbox / Tasks — none of
+ * them belong here. A `parked` workflow run mis-columns as running upstream
+ * (the column derives from inFlightStepId alone) but is actually blocking on
+ * the user, so it is excluded too.
  */
 export function liveAgentRows(cards: BoardCard[]): LiveAgentRow[] {
   return cards
-    .filter((card) => (card.column === 'running' || card.column === 'needs_you') && !card.archived)
-    .sort((a, b) => {
-      if (a.column !== b.column) return a.column === 'needs_you' ? -1 : 1;
-      return a.ageMs - b.ageMs;
-    })
+    .filter((card) => card.column === 'running' && !card.archived && card.status !== 'parked')
+    .sort((a, b) => a.ageMs - b.ageMs)
     .map((card) => ({
       id: `${card.sourceKind}:${card.id}`,
       sourceKind: card.sourceKind,
       title: card.title,
       statusLine: card.progressHint || '',
-      needsYou: card.column === 'needs_you',
       elapsedLabel: elapsedLabel(card.ageMs),
-      canStop: card.column === 'running' && card.actions.includes('cancel'),
+      canStop: card.actions.includes('cancel'),
       sessionId: card.sessionId,
       card,
     }));
 }
 
-/** Badge on the toggle button: live + waiting-on-you, the two states worth a glance. */
+/** Badge on the toggle button: how many agents are live right now. */
 export function liveAgentBadgeCount(cards: BoardCard[]): number {
   return liveAgentRows(cards).length;
 }
 
+/** A row only counts as "just started" for this long — older rows appearing
+ *  in the poll are pre-existing work (an app launch, a re-focused tab), not a
+ *  live kickoff, and must not pop the panel at the user. */
+export const AUTO_OPEN_FRESH_MS = 5 * 60_000;
+
+export interface LiveAgentAutoOpenState {
+  seenIds: string[];
+  /** False until the first poll has seeded the seen-set. */
+  primed: boolean;
+}
+
 /**
- * Auto-pop decision: the panel opens itself exactly when a NEW live row
- * appears (Clem just kicked something off, or something started needing the
- * user) — and never re-opens for rows the user already saw and closed the
- * panel on. Pure: the caller persists `seenIds` across polls.
+ * Auto-pop decision: the panel opens itself ONLY when work starts while the
+ * user is actually here — a new row that is genuinely fresh, observed on a
+ * poll AFTER the first. The first poll seeds the seen-set silently, so an app
+ * launch with pre-existing work never pops (the live 2026-07-30 regression:
+ * the in-memory seen-set made every launch "new"). Closing the panel is
+ * respected until the next live start. Pure: the caller persists the state.
  */
 export function liveAgentAutoOpen(
-  seenIds: readonly string[],
+  state: LiveAgentAutoOpenState,
   cards: BoardCard[],
-): { open: boolean; seenIds: string[] } {
+): { open: boolean; state: LiveAgentAutoOpenState } {
   const rows = liveAgentRows(cards);
   const current = rows.map((row) => row.id);
-  const seen = new Set(seenIds);
-  const open = current.some((id) => !seen.has(id));
-  return { open, seenIds: current };
+  if (!state.primed) {
+    return { open: false, state: { seenIds: current, primed: true } };
+  }
+  const seen = new Set(state.seenIds);
+  const open = rows.some((row) => !seen.has(row.id) && row.card.ageMs < AUTO_OPEN_FRESH_MS);
+  return { open, state: { seenIds: current, primed: true } };
 }

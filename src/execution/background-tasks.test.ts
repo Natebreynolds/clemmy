@@ -46,6 +46,7 @@ const {
   restoreBackgroundTask,
   staleTaskKind,
   findStaleBackgroundTasks,
+  reapStaleBackgroundTasks,
   STALE_TASK_AGE_MS,
   registerBackgroundDrainKick,
   requestBackgroundDrain,
@@ -3335,4 +3336,39 @@ test('strategy capture remembers only exactly-settled deliverables, never a late
   const strategy = renderRunStrategiesForContext('lunar kelp settlement atlas');
   assert.match(strategy, /spreadsheet:lunar-kelp-confirmed/);
   assert.doesNotMatch(strategy, /spreadsheet:lunar-kelp-failed-reservation/);
+});
+
+test('reapStaleBackgroundTasks: week-idle finished + parked auto-archive WITH a reason; fresh + active untouched; restore clears it', () => {
+  for (const x of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(x.id);
+
+  const finished = createBackgroundTask({ title: 'old finished', prompt: 'x' });
+  markBackgroundTaskDone(finished.id, 'done');
+  const parked = createBackgroundTask({ title: 'forgotten question', prompt: 'x' });
+  updateBackgroundTask(parked.id, { status: 'awaiting_input' });
+  const active = createBackgroundTask({ title: 'still pending', prompt: 'x' });
+  const base = Date.parse(getBackgroundTask(finished.id)!.updatedAt);
+
+  // Day 6: inside the window — nothing archived.
+  assert.equal(reapStaleBackgroundTasks(base + STALE_TASK_AGE_MS - DAY).length, 0);
+  assert.equal(getBackgroundTask(finished.id)!.archived, undefined);
+
+  // Day 8: both stale kinds soft-archive, each explaining itself.
+  const swept = reapStaleBackgroundTasks(base + STALE_TASK_AGE_MS + DAY);
+  assert.deepEqual(new Set(swept.map((s) => s.id)), new Set([finished.id, parked.id]));
+  const finishedAfter = getBackgroundTask(finished.id)!;
+  const parkedAfter = getBackgroundTask(parked.id)!;
+  assert.equal(finishedAfter.archived, true);
+  assert.match(finishedAfter.archiveReason ?? '', /finished over 7 days ago/i);
+  assert.equal(parkedAfter.archived, true);
+  assert.match(parkedAfter.archiveReason ?? '', /waited on an answer/i, 'a dropped question says WHY it left');
+  assert.equal(getBackgroundTask(active.id)!.archived, undefined, 'active work is never expired');
+
+  // Idempotent: nothing left for a second sweep.
+  assert.equal(reapStaleBackgroundTasks(base + STALE_TASK_AGE_MS + DAY).length, 0);
+
+  // Restore brings it back clean and resets the clock.
+  const restored = restoreBackgroundTask(parked.id)!;
+  assert.equal(restored.archived, false);
+  assert.equal(restored.archiveReason, undefined, 'restore clears the auto-archive note');
+  assert.equal(staleTaskKind(restored, Date.parse(restored.updatedAt) + 1000), null);
 });

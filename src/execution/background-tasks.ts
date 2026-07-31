@@ -266,6 +266,10 @@ export interface BackgroundTaskRecord {
    *  task. Set by archiveBackgroundTask, cleared by restoreBackgroundTask. */
   archived?: boolean;
   archivedAt?: string;
+  /** WHY it was archived when the user didn't do it themselves (the auto-expiry
+   *  sweep records itself here) — surfaced in the task detail so nothing ever
+   *  just silently vanishes. Cleared on restore. */
+  archiveReason?: string;
 }
 
 export interface BackgroundTaskContractRevision {
@@ -1452,11 +1456,17 @@ export function sweepInvalidDoneBackgroundTasks(
 }
 
 /** Soft-delete a task: drop it off the active board + every sweep, keep the
- *  record (restorable). The single irreversible-feeling action made reversible. */
-export function archiveBackgroundTask(id: string): BackgroundTaskRecord | null {
+ *  record (restorable). The single irreversible-feeling action made reversible.
+ *  `reason` is recorded when the archive wasn't the user's own click (the
+ *  auto-expiry sweep) so the record explains its own disappearance. */
+export function archiveBackgroundTask(id: string, reason?: string): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task || task.archived) return task; // idempotent — re-archiving is a no-op
-  return updateBackgroundTask(id, { archived: true, archivedAt: nowIso() });
+  return updateBackgroundTask(id, {
+    archived: true,
+    archivedAt: nowIso(),
+    ...(reason ? { archiveReason: reason } : {}),
+  });
 }
 
 /** Restore an archived task back onto the board. Its updatedAt is bumped (by
@@ -1465,7 +1475,31 @@ export function restoreBackgroundTask(id: string): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task) return null;
   if (!task.archived) return task;
-  return updateBackgroundTask(id, { archived: false, archivedAt: undefined });
+  return updateBackgroundTask(id, { archived: false, archivedAt: undefined, archiveReason: undefined });
+}
+
+/**
+ * Auto-expire stale tasks (2026-07-30 declutter): the 7-day stale flag was
+ * purely cosmetic — it unlocked an archive button and a prompt but never
+ * cleared anything, so week-old parked tasks haunted every surface. The sweep
+ * soft-archives them WITH a reason (nothing silently vanishes; restore from
+ * Tasks brings any of them back and resets the clock). Runs on the daemon's
+ * hourly reaper tick.
+ */
+export function reapStaleBackgroundTasks(now: number = Date.now()): Array<{ id: string; kind: StaleTaskKind }> {
+  const out: Array<{ id: string; kind: StaleTaskKind }> = [];
+  for (const { task, kind } of findStaleBackgroundTasks(now)) {
+    const reason = kind === 'parked'
+      ? 'Auto-archived: this task waited on an answer for over 7 days with no activity. Restore it from Tasks if it still matters.'
+      : 'Auto-archived: finished over 7 days ago with no further activity. Restore it from Tasks if you still need it.';
+    try {
+      archiveBackgroundTask(task.id, reason);
+      out.push({ id: task.id, kind });
+    } catch {
+      // One bad record must not stop the sweep; the next tick retries.
+    }
+  }
+  return out;
 }
 
 export function getBackgroundTaskByApprovalId(approvalId: string): BackgroundTaskRecord | null {

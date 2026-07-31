@@ -176,8 +176,13 @@ export function Chat() {
         <div className="mb-6 text-center">
           <DogMark size={56} className="mx-auto mb-4" />
           <h2 className="text-display text-fg">{timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile))}</h2>
+          {/* The away-message derives from workingNow[0] ?? needsYou[0] — the
+              exact item the AttentionStrip renders right below. Printing it
+              twice is the clutter; when the strip will show it, stay quiet. */}
           <p className="mt-1 text-body-lg text-muted">
-            {cc.data?.presence?.awayMessage ?? "I'm here. Ask me anything, or tap Talk."}
+            {(needsYou.length > 0 || workingNow.length > 0)
+              ? "I'm here. Ask me anything, or tap Talk."
+              : (cc.data?.presence?.awayMessage ?? "I'm here. Ask me anything, or tap Talk.")}
           </p>
         </div>
 

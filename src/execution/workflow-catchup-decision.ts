@@ -435,3 +435,44 @@ export function skipWorkflowCatchupRun(
     };
   });
 }
+
+/** A missed occurrence gets this long of user attention (from heldAt — a hold
+ *  discovered late still gets its full window) before the moment is judged
+ *  passed and the occurrence auto-skips. Future schedules are untouched. */
+export const CATCHUP_AUTO_SKIP_AGE_MS = 24 * 60 * 60 * 1000;
+
+export interface CatchupReapOutcome {
+  runId: string;
+  workflowSlug: string;
+  status: WorkflowCatchupSkipResult['status'];
+}
+
+/**
+ * Auto-expire stale held catch-ups (2026-07-30 declutter): held occurrences
+ * were excluded from the run reaper's terminal statuses, so nothing ever
+ * expired them — three "Waiting on you" cards sat 12h+ on every surface. A
+ * missed occurrence older than the window auto-skips through the SAME
+ * idempotent, lock-taking primitive the user's Skip button uses (it can never
+ * touch a run that started), and the paired held-notification is marked read
+ * so the notice doesn't outlive the card. Runs on the daemon's hourly reaper
+ * tick; failures are per-record and never throw out of the sweep.
+ */
+export function reapStaleWorkflowCatchups(now = Date.now()): CatchupReapOutcome[] {
+  const out: CatchupReapOutcome[] = [];
+  for (const held of listHeldWorkflowCatchupRuns()) {
+    const heldAtMs = Date.parse(held.heldAt);
+    if (!Number.isFinite(heldAtMs) || now - heldAtMs <= CATCHUP_AUTO_SKIP_AGE_MS) continue;
+    try {
+      const result = skipWorkflowCatchupRun({ runId: held.runId, expectedWorkflow: held.workflowSlug });
+      out.push({ runId: held.runId, workflowSlug: held.workflowSlug, status: result.status });
+      if (result.status === 'skipped' || result.status === 'already_skipped') {
+        void import('../runtime/notifications.js')
+          .then(({ markNotificationRead }) => markNotificationRead(`system-workflow-catchup-held-${held.runId}`))
+          .catch(() => { /* the notification reaper is the backstop */ });
+      }
+    } catch {
+      // One bad record must not stop the sweep; the next tick retries.
+    }
+  }
+  return out;
+}

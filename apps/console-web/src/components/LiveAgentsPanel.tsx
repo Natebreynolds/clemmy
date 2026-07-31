@@ -21,7 +21,7 @@ import { cn } from '@/lib/cn';
 import { runBoardAction, type BoardCard } from '@/lib/board';
 import { liveAgentRows, sourceKindLabel, type LiveAgentRow } from '@/lib/live-agents';
 
-function AgentRow({ row, onOpenTasks }: { row: LiveAgentRow; onOpenTasks: () => void }) {
+function AgentRow({ row }: { row: LiveAgentRow }) {
   const qc = useQueryClient();
   const [stopping, setStopping] = useState(false);
   const [stopError, setStopError] = useState('');
@@ -41,37 +41,18 @@ function AgentRow({ row, onOpenTasks }: { row: LiveAgentRow; onOpenTasks: () => 
   };
 
   return (
-    <li
-      className={cn(
-        'rounded-lg border px-3 py-2.5',
-        row.needsYou ? 'border-warning/50 bg-warning-tint/40' : 'border-border bg-canvas',
-      )}
-    >
+    <li className="rounded-lg border border-border bg-canvas px-3 py-2.5">
       <div className="flex min-w-0 items-center gap-2">
-        <span
-          className={cn(
-            'h-2 w-2 shrink-0 rounded-full',
-            row.needsYou ? 'bg-warning' : 'animate-breathe bg-success',
-          )}
-          aria-hidden
-        />
+        <span className="h-2 w-2 shrink-0 animate-breathe rounded-full bg-success" aria-hidden />
         <span className="min-w-0 flex-1 truncate text-small font-medium text-fg" title={row.title}>{row.title}</span>
         <span className="shrink-0 text-caption text-faint">{row.elapsedLabel}</span>
       </div>
       <div className="mt-1 flex min-w-0 items-center gap-2 pl-4">
         <span className="shrink-0 rounded border border-border px-1.5 py-px text-caption text-muted">{sourceKindLabel(row.sourceKind)}</span>
         <span className="min-w-0 flex-1 truncate text-caption text-muted" title={row.statusLine}>
-          {row.needsYou ? 'Waiting on you' : (row.statusLine || 'Working…')}
+          {row.statusLine || 'Working…'}
         </span>
-        {row.needsYou ? (
-          <button
-            type="button"
-            onClick={onOpenTasks}
-            className="shrink-0 rounded-md px-1.5 py-0.5 text-caption font-medium text-warning transition-colors hover:bg-warning-tint"
-          >
-            Review
-          </button>
-        ) : row.canStop ? (
+        {row.canStop && (
           <button
             type="button"
             onClick={() => { void stop(); }}
@@ -82,7 +63,7 @@ function AgentRow({ row, onOpenTasks }: { row: LiveAgentRow; onOpenTasks: () => 
           >
             <CircleStop className="h-3.5 w-3.5" aria-hidden />
           </button>
-        ) : null}
+        )}
       </div>
       {stopError && <div className="mt-1 pl-4 text-caption text-danger">{stopError}</div>}
     </li>
@@ -197,7 +178,7 @@ export function LiveAgentsPanel({
             </div>
           ) : (
             <ul className="flex flex-col gap-2">
-              {rows.map((row) => <AgentRow key={row.id} row={row} onOpenTasks={openTasks} />)}
+              {rows.map((row) => <AgentRow key={row.id} row={row} />)}
             </ul>
           )}
         </div>

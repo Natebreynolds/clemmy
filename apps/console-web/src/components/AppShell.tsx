@@ -40,14 +40,15 @@ export function AppShell() {
   const boardCards = board.data?.cards ?? [];
   const liveRunCount = liveAgentBadgeCount(boardCards);
 
-  // Auto-pop: open exactly when a NEW live row appears (Clem just kicked
-  // something off or something started waiting on the user). Closing the
-  // panel is respected until the next new row — the seen-set is the memory.
-  const seenRef = useRef<string[]>([]);
+  // Auto-pop: open ONLY when work starts while the user is here. The first
+  // poll seeds the seen-set silently (an app launch with pre-existing rows
+  // never pops — the live 2026-07-30 regression), and later polls pop only
+  // for a genuinely fresh new row. Closing the panel is respected.
+  const autoOpenRef = useRef<{ seenIds: string[]; primed: boolean }>({ seenIds: [], primed: false });
   useEffect(() => {
     if (!board.data) return;
-    const decision = liveAgentAutoOpen(seenRef.current, boardCards);
-    seenRef.current = decision.seenIds;
+    const decision = liveAgentAutoOpen(autoOpenRef.current, boardCards);
+    autoOpenRef.current = decision.state;
     if (decision.open) setLiveAgentsOpen(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [board.data]);

@@ -26,6 +26,7 @@ const {
 } = await import('../tools/workflow-run-queue.js');
 const {
   listHeldWorkflowCatchupRuns,
+  reapStaleWorkflowCatchups,
   resumeWorkflowCatchupRun,
   skipWorkflowCatchupRun,
 } = await import('./workflow-catchup-decision.js');
@@ -426,4 +427,32 @@ test('catch-up decisions fail closed on a cross-workflow request', () => {
   }).status, 'workflow_mismatch');
   assert.equal(readRun(held.id!).status, 'awaiting_catchup_decision');
   assert.equal(workflowRunCancellationRequested(held.id!), false);
+});
+
+test('reapStaleWorkflowCatchups: fresh holds get their 24h; older holds auto-skip via the same idempotent verb and leave every surface', () => {
+  writeReadyWorkflow();
+  const held = queueHeld();
+  assert.equal(held.status, 'held');
+
+  // Fresh hold → untouched (the user gets their full decision window).
+  assert.deepEqual(reapStaleWorkflowCatchups(), []);
+  assert.equal(listHeldWorkflowCatchupRuns().length, 1);
+
+  // Age it past the window (heldAt, not scheduledAt, is the clock).
+  const file = path.join(WORKFLOW_RUNS_DIR, `${held.id}.json`);
+  const rec = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  rec.catchupHeldAt = new Date(Date.now() - 25 * 3600_000).toISOString();
+  writeFileSync(file, JSON.stringify(rec), 'utf-8');
+
+  const swept = reapStaleWorkflowCatchups();
+  assert.deepEqual(
+    swept.map((o) => ({ runId: o.runId, workflowSlug: o.workflowSlug, status: o.status })),
+    [{ runId: held.id, workflowSlug: 'daily-brief', status: 'skipped' }],
+  );
+  const after = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  assert.equal(after.catchupDisposition, 'skipped', 'the skip verb committed the terminal disposition');
+  assert.equal(listHeldWorkflowCatchupRuns().length, 0, 'a skipped hold leaves the board/panel/strip feeds');
+
+  // Idempotent: a second sweep finds nothing to do.
+  assert.deepEqual(reapStaleWorkflowCatchups(), []);
 });

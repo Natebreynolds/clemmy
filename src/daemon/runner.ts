@@ -28,7 +28,7 @@ import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
-import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks } from '../execution/background-tasks.js';
+import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, reapStaleBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks } from '../execution/background-tasks.js';
 import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRuns } from '../execution/workflow-runner.js';
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
@@ -73,6 +73,7 @@ import {
   processMemoryMaintenance,
 } from '../memory/maintenance.js';
 import { reapStaleCheckIns } from '../agents/check-ins.js';
+import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decision.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
@@ -2295,6 +2296,48 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
             { err: err instanceof Error ? err.message : String(err) },
             'Workflow run reaper failed',
           );
+        }
+      });
+      // Home-surface auto-expiry (2026-07-30 declutter): stale "Waiting on
+      // you" clutter ages out at the SOURCE instead of haunting every surface.
+      // Held catch-ups auto-skip after 24h (the moment passed; future
+      // schedules untouched); week-idle parked/finished tasks soft-archive
+      // with a reason (restorable). Both primitives are the same idempotent
+      // verbs the user's own buttons call.
+      await withDaemonRuntimePhase('daemon.loop.home_clutter_reaper', { tickCount }, async () => {
+        try {
+          const skipped = reapStaleWorkflowCatchups();
+          if (skipped.length > 0) {
+            logger.info({ skipped }, 'Auto-skipped stale held workflow catch-ups');
+          }
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Catch-up auto-skip sweep failed');
+        }
+        try {
+          const archived = reapStaleBackgroundTasks();
+          if (archived.length > 0) {
+            logger.info({ archived }, 'Auto-archived stale background tasks');
+          }
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Stale-task auto-archive sweep failed');
+        }
+        // These two were BOOT-ONLY, so a daemon that stays up for days never
+        // re-ran them — exactly the uptime where clutter accumulates.
+        try {
+          const reapedNotifs = reapStaleNotifications();
+          if (reapedNotifs.markedRead > 0 || reapedNotifs.purged > 0) {
+            logger.info(reapedNotifs, 'Reaped stale notifications');
+          }
+        } catch (err) {
+          logger.warn({ err }, 'Notification reap failed');
+        }
+        try {
+          const closedCheckIns = reapStaleCheckIns();
+          if (closedCheckIns > 0) {
+            logger.info({ closedCheckIns }, 'Auto-closed stale open check-ins');
+          }
+        } catch (err) {
+          logger.warn({ err }, 'Check-in reap failed');
         }
       });
     }

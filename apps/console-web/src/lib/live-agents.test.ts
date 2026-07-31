@@ -1,14 +1,21 @@
 /**
  * Run: npx tsx --test apps/console-web/src/lib/live-agents.test.ts
  *
- * Pins the live-agents panel projection: which board cards surface as rows
- * (running + needs_you only), their order (waiting-on-you first, then
- * newest), the stop affordance, the badge, and the auto-pop decision that
- * opens the panel exactly once per newly-appeared live row.
+ * Pins the decluttered live-agents projection (owner decision 2026-07-30):
+ * RUNNING rows only — no needs_you, no parked, no archived — the badge counts
+ * live agents, and the auto-pop fires ONLY for work that starts while the
+ * user is here (first poll seeds silently; stale rows never pop).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { elapsedLabel, liveAgentAutoOpen, liveAgentBadgeCount, liveAgentRows, sourceKindLabel } from './live-agents';
+import {
+  AUTO_OPEN_FRESH_MS,
+  elapsedLabel,
+  liveAgentAutoOpen,
+  liveAgentBadgeCount,
+  liveAgentRows,
+  sourceKindLabel,
+} from './live-agents';
 import type { BoardCard } from './board';
 
 function card(over: Partial<BoardCard>): BoardCard {
@@ -28,43 +35,54 @@ function card(over: Partial<BoardCard>): BoardCard {
   } as BoardCard;
 }
 
-test('liveAgentRows: running + needs_you only; waiting-on-you first, then newest; queued/done/archived never surface', () => {
+test('liveAgentRows: RUNNING only — needs_you, queued, done, archived, and parked runs never surface (the 8-stale-rows regression)', () => {
   const rows = liveAgentRows([
-    card({ id: 'old-run', column: 'running', ageMs: 10 * 60_000, title: 'Old run' }),
-    card({ id: 'done', column: 'done', title: 'Finished' }),
+    card({ id: 'run-old', column: 'running', ageMs: 10 * 60_000, title: 'Old run' }),
+    card({ id: 'run-new', column: 'running', ageMs: 30_000, title: 'Fresh run', sourceKind: 'guest', actions: ['cancel'] }),
+    card({ id: 'ask', column: 'needs_you', title: 'Stale approval', sourceKind: 'approval', ageMs: 12 * 3600_000 }),
+    card({ id: 'catchup', column: 'needs_you', title: 'Missed schedule', sourceKind: 'schedule', ageMs: 12 * 3600_000 }),
     card({ id: 'q', column: 'queued', title: 'Queued' }),
-    card({ id: 'ask', column: 'needs_you', ageMs: 8 * 60_000, title: 'Needs a decision', sourceKind: 'approval' }),
-    card({ id: 'new-run', column: 'running', ageMs: 30_000, title: 'Fresh run', sourceKind: 'guest', actions: ['cancel'] }),
+    card({ id: 'done', column: 'done', title: 'Finished' }),
     card({ id: 'gone', column: 'running', archived: true, title: 'Archived' }),
+    // A parked workflow run mis-columns as running upstream but is actually
+    // waiting on the user — it is NOT live work.
+    card({ id: 'parked', column: 'running', status: 'parked', sourceKind: 'workflow', title: 'Parked on approval' }),
   ]);
-  assert.deepEqual(rows.map((r) => r.title), ['Needs a decision', 'Fresh run', 'Old run']);
-  assert.equal(rows[0].needsYou, true);
-  assert.equal(rows[1].canStop, true, 'a running card with a cancel action gets the stop affordance');
-  assert.equal(rows[2].canStop, false, 'no cancel action → no stop button');
-  assert.equal(rows[0].canStop, false, 'needs_you rows resolve on the board, not via stop');
+  assert.deepEqual(rows.map((r) => r.title), ['Fresh run', 'Old run']);
+  assert.equal(rows[0].canStop, true, 'a running card with a cancel action gets the stop affordance');
+  assert.equal(liveAgentBadgeCount([
+    card({ id: 'a', column: 'running' }),
+    card({ id: 'b', column: 'needs_you', sourceKind: 'approval' }),
+  ]), 1, 'the badge counts live agents, never waiting items');
 });
 
-test('badge counts live + waiting rows; auto-pop opens ONLY for a newly appeared row', () => {
-  const first = [card({ id: 'a', column: 'running' })];
-  assert.equal(liveAgentBadgeCount(first), 1);
+test('auto-pop: first poll seeds silently (no launch pop); only a FRESH new row pops later; close is respected', () => {
+  const preExisting = [
+    card({ id: 'old-a', column: 'running', ageMs: 2 * 3600_000 }),
+    card({ id: 'old-b', column: 'running', ageMs: 40 * 60_000, sourceKind: 'guest' }),
+  ];
+  // App launch with pre-existing work → NEVER pops (the every-launch regression).
+  const s1 = liveAgentAutoOpen({ seenIds: [], primed: false }, preExisting);
+  assert.equal(s1.open, false, 'the first poll after mount must not pop for pre-existing rows');
 
-  // First sighting of 'a' → pop.
-  const s1 = liveAgentAutoOpen([], first);
-  assert.equal(s1.open, true);
+  // Same rows on the next poll → quiet.
+  const s2 = liveAgentAutoOpen(s1.state, preExisting);
+  assert.equal(s2.open, false);
 
-  // Same rows again (user may have closed the panel) → never re-pop.
-  const s2 = liveAgentAutoOpen(s1.seenIds, first);
-  assert.equal(s2.open, false, 'a row the user already saw must not re-open the panel');
+  // A STALE row newly appearing (e.g. an old run resurfacing in the window)
+  // is not a live start → quiet.
+  const withStaleNew = [...preExisting, card({ id: 'resurfaced', column: 'running', ageMs: AUTO_OPEN_FRESH_MS + 1 })];
+  const s3 = liveAgentAutoOpen(s2.state, withStaleNew);
+  assert.equal(s3.open, false, 'an old row appearing is not a live kickoff');
 
-  // A second agent starts → pop again.
-  const second = [...first, card({ id: 'b', column: 'running', sourceKind: 'guest' })];
-  const s3 = liveAgentAutoOpen(s2.seenIds, second);
-  assert.equal(s3.open, true);
+  // A genuinely fresh row → pop.
+  const withFresh = [...withStaleNew, card({ id: 'kicked-off', column: 'running', ageMs: 20_000, sourceKind: 'guest' })];
+  const s4 = liveAgentAutoOpen(s3.state, withFresh);
+  assert.equal(s4.open, true, 'work starting while the user is here pops the panel');
 
-  // Everything finishes → quiet, and the seen set resets with the board.
-  const s4 = liveAgentAutoOpen(s3.seenIds, [card({ id: 'b', column: 'done', sourceKind: 'guest' })]);
-  assert.equal(s4.open, false);
-  assert.deepEqual(s4.seenIds, []);
+  // Seen once → closing the panel is respected on the next poll.
+  const s5 = liveAgentAutoOpen(s4.state, withFresh);
+  assert.equal(s5.open, false, 'a row the user already saw must not re-open the panel');
 });
 
 test('labels: elapsed is glanceable and source kinds speak product language, not plumbing', () => {
