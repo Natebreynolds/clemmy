@@ -973,16 +973,6 @@ input, textarea { font: inherit; }
   transition: border-color 0.16s ease, box-shadow 0.2s ease;
 }
 .memory-search-input:focus { border-color: var(--line-hot); box-shadow: 0 0 0 4px var(--accent-soft); }
-.memory-search-go {
-  border-radius: 999px;
-  border: none;
-  background: var(--bg-3);
-  color: var(--fg-2);
-  padding: 0 20px;
-  font-weight: 700;
-  font-family: var(--font-display);
-  font-size: var(--t-sm);
-}
 .memory-filter { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: var(--sp-3); }
 .memory-filter button {
   background: var(--bg-2);
@@ -996,6 +986,68 @@ input, textarea { font: inherit; }
 }
 .memory-filter button.active { background: var(--accent-soft); border-color: var(--line-hot); color: var(--accent); }
 
+/* Live-search spinner. Sits inside the field's trailing padding rather than
+   taking layout, so results don't jump as it appears and disappears. */
+.memory-search { position: relative; }
+.memory-search-input { padding-right: 34px; }
+.memory-search-busy {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin-top: -7px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: memory-spin 0.7s linear infinite;
+}
+@keyframes memory-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .memory-search-busy { animation-duration: 2.4s; }
+}
+
+.memory-overview {
+  font-size: var(--t-xs);
+  color: var(--fg-3);
+  margin-bottom: var(--sp-3);
+}
+
+.memory-hit-kind {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-3);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 5px;
+  flex: none;
+}
+
+/* Why a result surfaced. Muted on purpose — it is supporting evidence for the
+   snippet above it, not competing with it. */
+.memory-why { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.memory-why-chip {
+  font-size: 11px;
+  color: var(--fg-3);
+  background: var(--bg-2);
+  border-radius: 5px;
+  padding: 2px 6px;
+}
+.memory-hit-meta { font-size: var(--t-xs); color: var(--fg-3); margin-top: 6px; }
+
+.memory-clear, .memory-clear-inline {
+  font: inherit;
+  font-size: var(--t-xs);
+  color: var(--accent);
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.memory-clear { margin-top: var(--sp-3); text-decoration: underline; }
+
 .memory-hit, .memory-section, .workflow-row, .workflow-detail, .chat-row, .pending-action,
 .run-card, .approval-card {
   background: linear-gradient(180deg, rgba(255, 232, 200, 0.045), rgba(255, 232, 200, 0) 46%), var(--bg-1);
@@ -1007,8 +1059,6 @@ input, textarea { font: inherit; }
 }
 .memory-hit-head { display: flex; justify-content: space-between; gap: var(--sp-3); align-items: baseline; }
 .memory-hit-title { font-weight: 650; }
-.memory-hit-score, .memory-hit-path { font-family: var(--font-mono); font-size: var(--t-xs); color: var(--fg-3); }
-.memory-hit-path { margin: 2px 0 6px; }
 .memory-hit-snippet { font-size: var(--t-sm); color: var(--fg-2); }
 .memory-section-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-3); }
 .memory-section-count { font-family: var(--font-mono); font-size: var(--t-xs); color: var(--fg-3); }
@@ -1018,28 +1068,6 @@ input, textarea { font: inherit; }
 .fact-pinned { color: var(--accent); font-size: var(--t-xs); }
 .fact-importance { font-family: var(--font-mono); font-size: var(--t-xs); color: var(--fg-3); }
 
-.segmented {
-  display: flex;
-  gap: 2px;
-  padding: 4px;
-  background: var(--bg-1);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  margin: 2px 0 var(--sp-4);
-}
-.segmented button {
-  flex: 1;
-  border: none;
-  background: transparent;
-  border-radius: 999px;
-  padding: 10px 12px;
-  font-size: var(--t-sm);
-  font-weight: 700;
-  font-family: var(--font-display);
-  color: var(--fg-3);
-  transition: background 0.2s var(--ease-spring), color 0.18s ease;
-}
-.segmented button.active { background: var(--accent-soft); color: var(--accent); }
 
 .constellation {
   position: relative;

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { listFacts, searchMemory, type MemoryFact, type MemoryHit } from '../lib/api';
-import { MemoryGraph3D } from './MemoryGraph3D';
+import { humanizeReasons } from '../lib/memory-reasons';
 
 type FactKindFilter = 'all' | MemoryFact['kind'];
 const KIND_OPTIONS: { value: FactKindFilter; label: string }[] = [
@@ -10,6 +10,10 @@ const KIND_OPTIONS: { value: FactKindFilter; label: string }[] = [
   { value: 'feedback', label: 'Feedback' },
   { value: 'reference', label: 'Reference' },
 ];
+
+/** Long enough that typing doesn't fire a request per keystroke, short enough
+ *  that results feel like they're keeping up with you. */
+const SEARCH_DEBOUNCE_MS = 220;
 
 export function Memory() {
   const [query, setQuery] = useState('');
@@ -36,119 +40,194 @@ export function Memory() {
 
   useEffect(() => { refreshFacts(); }, [refreshFacts]);
 
-  async function submitSearch(ev: Event) {
-    ev.preventDefault();
-    const q = query.trim();
-    if (!q) {
+  // Search as you type. Every request carries a sequence number and late
+  // replies are dropped, because search latency varies with query length —
+  // without this, a slow reply for "pla" can land after "platform 49" and
+  // overwrite the better results with staler ones.
+  const seq = useRef(0);
+  const searchQuery = query.trim();
+  useEffect(() => {
+    if (!searchQuery) {
+      seq.current += 1;
       setHits([]);
       setSearchError(null);
+      setSearching(false);
       return;
     }
+    const mine = ++seq.current;
     setSearching(true);
-    setSearchError(null);
-    try {
-      const result = await searchMemory(q, 20);
-      setHits(result.hits);
-    } catch (err) {
-      setSearchError((err as Error).message ?? 'Search failed');
-    } finally {
-      setSearching(false);
-    }
+    const timer = setTimeout(async () => {
+      try {
+        const result = await searchMemory(searchQuery, 25);
+        if (seq.current !== mine) return;
+        setHits(result.hits);
+        setSearchError(null);
+      } catch (err) {
+        if (seq.current !== mine) return;
+        setSearchError((err as Error).message ?? 'Search failed');
+      } finally {
+        if (seq.current === mine) setSearching(false);
+      }
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  const pinnedCount = useMemo(() => facts.filter((f) => f.pinned).length, [facts]);
+
+  return (
+    <div>
+      <form class="memory-search" onSubmit={(ev) => ev.preventDefault()}>
+        <input
+          class="memory-search-input"
+          type="search"
+          placeholder="Search everything Clem knows…"
+          value={query}
+          onInput={(ev) => setQuery((ev.currentTarget as HTMLInputElement).value)}
+          autoComplete="off"
+          enterKeyHint="search"
+        />
+        {searching ? <span class="memory-search-busy" aria-label="Searching" /> : null}
+      </form>
+
+      {searchQuery ? (
+        <SearchResults
+          hits={hits}
+          searching={searching}
+          error={searchError}
+          onClear={() => setQuery('')}
+        />
+      ) : (
+        <Browse
+          facts={facts}
+          loading={factsLoading}
+          error={factsError}
+          pinnedCount={pinnedCount}
+          kindFilter={kindFilter}
+          onKind={setKindFilter}
+        />
+      )}
+    </div>
+  );
+}
+
+function SearchResults(props: {
+  hits: MemoryHit[];
+  searching: boolean;
+  error: string | null;
+  onClear: () => void;
+}) {
+  const { hits, searching, error, onClear } = props;
+
+  if (error) return <div class="global-error">{error}</div>;
+  if (hits.length === 0 && searching) {
+    return <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>;
   }
-
-  const [view, setView] = useState<'list' | 'constellation'>('list');
-
-  if (view === 'constellation') {
+  if (hits.length === 0) {
     return (
-      <div>
-        <div class="segmented">
-          <button onClick={() => setView('list')}>List</button>
-          <button class="active">Constellation</button>
-        </div>
-        <MemoryGraph3D />
+      <div class="empty">
+        <p class="empty-title">No matches</p>
+        <p class="empty-body">Try a different word, or browse everything.</p>
+        <button class="memory-clear" onClick={onClear}>Show all memory</button>
       </div>
     );
   }
 
   return (
-    <div>
-      <div class="segmented">
-        <button class="active">List</button>
-        <button onClick={() => setView('constellation')}>Constellation</button>
+    <div class="memory-section">
+      <div class="memory-section-head">
+        <span>{hits.length} {hits.length === 1 ? 'match' : 'matches'}</span>
+        <button class="memory-clear-inline" onClick={onClear}>Clear</button>
       </div>
-      <form class="memory-search" onSubmit={submitSearch}>
-        <input
-          class="memory-search-input"
-          type="search"
-          placeholder="Search memory…"
-          value={query}
-          onInput={(ev) => setQuery((ev.currentTarget as HTMLInputElement).value)}
-          autoComplete="off"
-        />
-        <button class="memory-search-go" type="submit" disabled={searching}>
-          {searching ? '…' : 'Find'}
-        </button>
-      </form>
-      {searchError ? <div class="global-error">{searchError}</div> : null}
-      {hits.length > 0 ? (
-        <div class="memory-section">
-          <div class="memory-section-head">Results ({hits.length})</div>
-          {hits.map((hit) => (
-            <div key={`${hit.path}-${hit.score}`} class="memory-hit">
-              <div class="memory-hit-head">
-                <span class="memory-hit-path">{hit.path}</span>
-                <span class="memory-hit-score">{Math.round(hit.score * 100)}</span>
-              </div>
-              {hit.title ? <div class="memory-hit-title">{hit.title}</div> : null}
-              <div class="memory-hit-snippet">{hit.snippet}</div>
-            </div>
-          ))}
-        </div>
-      ) : null}
-
-      <div class="memory-section">
-        <div class="memory-section-head">
-          <span>Facts</span>
-          <span class="memory-section-count">{facts.length}</span>
-        </div>
-        <div class="memory-filter">
-          {KIND_OPTIONS.map((option) => (
-            <button
-              key={option.value}
-              class={`memory-filter-chip ${kindFilter === option.value ? 'active' : ''}`}
-              onClick={() => setKindFilter(option.value)}
-            >
-              {option.label}
-            </button>
-          ))}
-        </div>
-        {factsLoading ? <div class="skeleton-stack" aria-hidden="true"><i /><i /></div> : null}
-        {!factsLoading && factsError ? <p class="error">{factsError}</p> : null}
-        {!factsLoading && !factsError && facts.length === 0 ? (
-          <div class="empty">
-            <p class="empty-title">Nothing here yet</p>
-            <p class="empty-body">What Clem learns about this lands here automatically.</p>
+      {hits.map((hit) => (
+        <div key={`${hit.path}-${hit.score}`} class="memory-hit">
+          <div class="memory-hit-head">
+            <span class="memory-hit-title">{hit.title || hit.path}</span>
+            {hit.ref?.type ? <span class="memory-hit-kind">{hit.ref.type}</span> : null}
           </div>
-        ) : null}
-        {facts.map((fact) => (
-          <div key={fact.id} class={`memory-fact memory-fact-${fact.kind}`}>
-            <div class="memory-fact-head">
-              <span class={`fact-kind kind-${fact.kind}`}>{fact.kind}</span>
-              {fact.pinned ? (
-                <span class="fact-pinned" title="pinned standing instruction">📌</span>
-              ) : null}
-              {typeof fact.importance === 'number' ? (
-                <span class="fact-importance" title="importance">★ {fact.importance.toFixed(1)}</span>
-              ) : null}
+          <div class="memory-hit-snippet">{hit.snippet}</div>
+          {/* The API already explains why something surfaced. Showing it is the
+              difference between a list of results and something you can trust:
+              you can see whether a match was about meaning or just wording. */}
+          {humanizeReasons(hit.whyRecalled).length ? (
+            <div class="memory-why">
+              {humanizeReasons(hit.whyRecalled).map((reason) => (
+                <span key={reason} class="memory-why-chip">{reason}</span>
+              ))}
             </div>
-            <div class="memory-fact-content">{fact.content}</div>
-            <div class="memory-fact-meta">updated {formatDate(fact.updatedAt)}</div>
-          </div>
-        ))}
-      </div>
+          ) : null}
+          {typeof hit.evidenceCount === 'number' && hit.evidenceCount > 0 ? (
+            <div class="memory-hit-meta">
+              seen {hit.evidenceCount} {hit.evidenceCount === 1 ? 'time' : 'times'}
+            </div>
+          ) : null}
+        </div>
+      ))}
     </div>
   );
 }
+
+function Browse(props: {
+  facts: MemoryFact[];
+  loading: boolean;
+  error: string | null;
+  pinnedCount: number;
+  kindFilter: FactKindFilter;
+  onKind: (kind: FactKindFilter) => void;
+}) {
+  const { facts, loading, error, pinnedCount, kindFilter, onKind } = props;
+
+  return (
+    <div class="memory-section">
+      <div class="memory-filter">
+        {KIND_OPTIONS.map((option) => (
+          <button
+            key={option.value}
+            class={`memory-filter-chip ${kindFilter === option.value ? 'active' : ''}`}
+            onClick={() => onKind(option.value)}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+
+      {/* A plain count of what is actually loaded. Deliberately not a total:
+          claiming a number the list doesn't contain invites the "where are the
+          rest?" question this screen exists to avoid. */}
+      {!loading && !error && facts.length > 0 ? (
+        <div class="memory-overview">
+          {facts.length} {facts.length === 1 ? 'memory' : 'memories'}
+          {pinnedCount > 0 ? ` · ${pinnedCount} pinned` : ''}
+        </div>
+      ) : null}
+
+      {loading ? <div class="skeleton-stack" aria-hidden="true"><i /><i /></div> : null}
+      {!loading && error ? <p class="error">{error}</p> : null}
+      {!loading && !error && facts.length === 0 ? (
+        <div class="empty">
+          <p class="empty-title">Nothing here yet</p>
+          <p class="empty-body">What Clem learns about this lands here automatically.</p>
+        </div>
+      ) : null}
+
+      {facts.map((fact) => (
+        <div key={fact.id} class={`memory-fact memory-fact-${fact.kind}`}>
+          <div class="memory-fact-head">
+            <span class={`fact-kind kind-${fact.kind}`}>{fact.kind}</span>
+            {fact.pinned ? (
+              <span class="fact-pinned" title="pinned standing instruction">📌</span>
+            ) : null}
+            {typeof fact.importance === 'number' ? (
+              <span class="fact-importance" title="importance">★ {fact.importance.toFixed(1)}</span>
+            ) : null}
+          </div>
+          <div class="memory-fact-content">{fact.content}</div>
+          <div class="memory-fact-meta">updated {formatDate(fact.updatedAt)}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 
 function formatDate(iso: string): string {
   const t = Date.parse(iso);

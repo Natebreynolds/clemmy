@@ -10,7 +10,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "3d-force-graph": "^1.80.0",
     "preact": "^10.24.0"
   },
   "devDependencies": {
