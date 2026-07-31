@@ -90,11 +90,18 @@ UPDATE products SET enforce = false
    AND tenant_id = (SELECT id FROM tenants WHERE slug = 'clementine');
 ```
 
-**How fast it propagates:** most installs within ~6 hours, as they renew. The
-outer bound is the 72h lease TTL — an install that renewed a minute ago holds
-its old `enforce=true` lease until its next renewal. There is no way to make it
-faster than the lease TTL; that is the same property that makes outages
-survivable.
+**How fast it propagates — slower than you would guess.** An install picks up
+the new value at its next *renewal*, and it does not renew until its lease is
+into its final third. An install that renewed a minute ago will not call home
+for roughly another 48 hours.
+
+- Installs already in their renewal window: within ~6h.
+- Typical: **up to ~2 days**.
+- Outer bound: **72h**, the lease TTL.
+
+There is no way to make it faster than the lease TTL. That is the same property
+that makes outages survivable — you cannot have one without the other. If a
+specific customer needs it now, have them hit **Check now** in the console.
 
 **The matching switch for phone access** is on the `relay` service, not here:
 
@@ -378,7 +385,7 @@ than serving a half-migrated schema.
 | `LICENSE_SIGNING_KEY_PEM` | yes | Ed25519 PKCS#8 PEM, `\n`-escaped |
 | `LICENSE_MACHINE_PEPPER` | yes | Never change — see above |
 | `LICENSE_SIGNING_KID` | no | Defaults to `k1` |
-| `LICENSE_ADMIN_BOOTSTRAP_TOKEN` | no | First admin bearer token; works until a row exists in `admin_tokens` |
+| `LICENSE_ADMIN_BOOTSTRAP_TOKEN` | no | First admin bearer token. **Accepted for as long as it is set** — creating a row in `admin_tokens` does not retire it. Unset it once a real token exists |
 | `RELAY_SERVICE_TOKEN` | no | Lets the relay read `/v1/revocations`; without it that route 401s |
 | `PORT` | no | Railway provides it; defaults to 8080 |
 
@@ -387,7 +394,9 @@ Missing a required variable fails the boot loudly with
 
 ### Endpoints
 
-Public (`routes-public.mjs`), rate-limited to 120 requests/min per IP:
+Everything under `/v1` is rate-limited to 120 requests/min per IP — admin routes
+included — with `/v1/health` the only exemption. Public routes
+(`routes-public.mjs`):
 
 | Route | Purpose |
 | --- | --- |
