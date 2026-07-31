@@ -104,7 +104,7 @@ import {
   classifyShellCommand,
 } from './destination-gate.js';
 import { establishedTargetsFor, recordPublishedDestination } from './published-destinations.js';
-import { creditMatchingRecall, isTransientFailure } from '../../memory/procedural-recall-link.js';
+import { creditMatchingRecall, isNonTeachingFailure } from '../../memory/procedural-recall-link.js';
 import { extractCompleteJsonObjects } from './json-repair.js';
 import {
   asyncJobTimeoutCorrective,
@@ -1939,7 +1939,9 @@ function creditRecallFromToolResult(
     // the proven path's fault, so don't teach a good memo a failure from it
     // (auto-invalidate after 3 strikes could otherwise blacklist a working tool on
     // a flaky window). Skip crediting entirely; success crediting is unaffected.
-    if (failed && isTransientFailure(resultStr)) return;
+    // Not just a flaky window: a call that never ran because it needed an
+    // account chosen is evidence about CONFIGURATION, not about the tool.
+    if (failed && isNonTeachingFailure(resultStr)) return;
     creditMatchingRecall(sessionId, haystack, !failed);
   } catch { /* learning is best-effort — never break the tool result */ }
 }

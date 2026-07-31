@@ -53,7 +53,7 @@ import {
   mcpErrorCorrectiveEnabled,
   toolFailureCorrective,
 } from './harness/tool-error-corrective.js';
-import { creditMatchingRecall, isTransientFailure } from '../memory/procedural-recall-link.js';
+import { creditMatchingRecall, isNonTeachingFailure } from '../memory/procedural-recall-link.js';
 import { assertDispatchLeaseCurrent } from './harness/dispatch-lease.js';
 
 // Bound MCP startup below the SDK's default (~60s), but leave enough
@@ -450,7 +450,7 @@ function creditMcpOutcome(toolName: string, failed: boolean, text: string): void
   try {
     const sessionId = harnessRunContextStorage.getStore()?.sessionId;
     if (!sessionId) return;
-    if (failed && isTransientFailure(text)) return;
+    if (failed && isNonTeachingFailure(text)) return;
     creditMatchingRecall(sessionId, toolName, !failed);
   } catch { /* learning is best-effort — never affect the tool result */ }
 }

@@ -71,6 +71,39 @@ export function isTransientFailure(text: string): boolean {
   return /\b(?:429|502|503|rate.?limit(?:ed)?|overloaded|temporarily unavailable|timed?\s?out|etimedout|econnreset|econnrefused|enotfound|socket hang up)\b/i.test(text);
 }
 
+/**
+ * A failure where the tool never RAN because an unresolved precondition needed a
+ * human decision — most often several connected accounts with none pinned, so
+ * the call cannot choose a target on its own.
+ *
+ * Live 2026-07-31: a run logged five worker failures. The 429 and the timeout
+ * were correctly skipped by the transient rule above, but THREE said
+ * "FIRECRAWL_EXTRACT required choosing between two unpinned connected accounts".
+ * Those three counted as tool failures, hit the three-strike threshold, and
+ * retired a proven FIRECRAWL binding mid-run — a tool that was working
+ * perfectly and simply needed an account chosen. Retiring it then forced
+ * rediscovery, which spent more of the same API budget.
+ *
+ * Same principle as the transient rule: a memo may only be taught by evidence
+ * about the TOOL. Configuration ambiguity is evidence about the setup.
+ */
+export function isUnresolvedPreconditionFailure(text: string): boolean {
+  return /\b(?:unpinned|unprovided)\b/i.test(text)
+    || /\bchoos(?:e|ing)\s+between\b[^.\n]{0,60}\baccounts?\b/i.test(text)
+    || /\baccounts?\s+(?:choice|selection)\s+(?:required|needed)\b/i.test(text)
+    || /\brequired\s+an?\s+(?:unprovided|explicit)\s+account\b/i.test(text)
+    || /\b(?:multiple|two|several)\s+connected\s+accounts?\b/i.test(text);
+}
+
+/**
+ * Failures a proven memo must never learn from: the tool is not at fault, so
+ * counting them can blacklist a working path. Used at every credit site so the
+ * rule lives once.
+ */
+export function isNonTeachingFailure(text: string): boolean {
+  return isTransientFailure(text) || isUnresolvedPreconditionFailure(text);
+}
+
 export function _resetProceduralRecallLinkForTests(): void {
   pending.clear();
   _resetToolProcedureUsesForTests();

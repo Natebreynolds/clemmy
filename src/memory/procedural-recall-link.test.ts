@@ -248,3 +248,40 @@ test('explicit recall still requires the CLI to be causally invoked', () => {
   assert.equal(peekToolChoice('netlify.deploy.explicit')!.choice!.successCount ?? 0, 0);
   assert.equal(creditMatchingRecall(SID, 'netlify deploy --site x', true), 'netlify.deploy.explicit');
 });
+
+test('a proven memo is never taught by the three failures that retired FIRECRAWL live (2026-07-31)', async () => {
+  const { isNonTeachingFailure, isUnresolvedPreconditionFailure, isTransientFailure } =
+    await import('./procedural-recall-link.js');
+
+  // Verbatim worker outputs from the live run. THREE were account-ambiguity —
+  // they counted as tool failures, hit the 3-strike threshold, and retired a
+  // working FIRECRAWL binding mid-run.
+  const preconditionFailures = [
+    'ERROR: Website inspection failed: FIRECRAWL_EXTRACT required choosing between two unpinned connected accounts, and retry via http_fetch returned HTTP 401 Authentication required; required Boston PI/contact/SEO evidence could not be verified.',
+    'ERROR: Site inspection could not be completed after retry: FIRECRAWL_EXTRACT required choosing between two unpinned Firecrawl accounts, and browser_harness_run failed because browser-harness was unavailable.',
+    'ERROR: Site inspection was incomplete: Firecrawl could not run because two connected accounts required an unprovided account choice, and the fallback extraction tool failed after one retry due to missing Python dependencies.',
+  ];
+  for (const text of preconditionFailures) {
+    assert.equal(isUnresolvedPreconditionFailure(text), true, `precondition failure: ${text.slice(0, 60)}`);
+    assert.equal(isNonTeachingFailure(text), true, 'must never teach the memo a failure');
+  }
+
+  // The other two were already handled by the transient rule; they must stay handled.
+  const transientFailures = [
+    'ERROR: FIRECRAWL_EXTRACT on account ca_beM_DDCN4Crf failed twice with HTTP 429 rate-limit exceeded, so the enrichment could not be verified.',
+    'ERROR: FIRECRAWL_EXTRACT timed out on both the initial pinned-account call and one narrowed retry, returning no extraction data for bardilaw.com.',
+  ];
+  for (const text of transientFailures) {
+    assert.equal(isTransientFailure(text), true, `transient: ${text.slice(0, 50)}`);
+    assert.equal(isNonTeachingFailure(text), true);
+  }
+
+  // A REAL tool failure still teaches — otherwise nothing could ever be retired.
+  for (const text of [
+    '⚠️ composio_execute_tool FAILED (slug=FIRECRAWL_EXTRACT): 401 unauthorized',
+    'ERROR: the tool has been removed from the toolkit',
+    'exit_code: 1 command not found',
+  ]) {
+    assert.equal(isNonTeachingFailure(text), false, `a real breakage must still count: ${text.slice(0, 40)}`);
+  }
+});
