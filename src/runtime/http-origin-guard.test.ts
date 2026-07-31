@@ -49,6 +49,7 @@ const {
   requireSameOriginForMutations,
   isAllowedHost,
   normalizeHostHeader,
+  allowHostName,
 } = await import('./http-origin-guard.js');
 
 async function startApp(): Promise<{ port: number; close: () => Promise<void> }> {
@@ -154,4 +155,14 @@ test('a cross-site fetch without Origin is still refused via Sec-Fetch-Site', as
   } finally {
     await app.close();
   }
+});
+
+test('allowHostName registers a runtime host — the relay hostname must not 421', () => {
+  // Regression pin: the first live request through the Railway relay was
+  // refused with 421 because <pairId>.<relay base> was not allowlisted.
+  // The relay wiring registers it at boot; this pins the mechanism.
+  assert.equal(isAllowedHost('de9334b0f70862c5.r.example.com'), false);
+  allowHostName('de9334b0f70862c5.r.example.com:53028');
+  assert.equal(isAllowedHost('de9334b0f70862c5.r.example.com'), true, 'port must be normalized away');
+  assert.equal(isAllowedHost('other.r.example.com'), false, 'only the exact registered host is allowed');
 });

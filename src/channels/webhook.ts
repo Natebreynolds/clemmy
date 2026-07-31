@@ -2899,9 +2899,14 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
           keyPem: directApp.keyPem,
           certPem: directApp.certPem,
         });
+        const pairId = relayPairId(directApp.certPem);
+        // The phone addresses this daemon as <pairId>.<base> through the
+        // relay; without this the host allowlist 421s every relayed request.
+        const { allowHostName } = await import('../runtime/http-origin-guard.js');
+        allowHostName(`${pairId}.${relayConfig.baseDomain}`);
         startMobileRelayClient({
           config: relayConfig,
-          pairId: relayPairId(directApp.certPem),
+          pairId,
           authToken: ensureRelayAuthToken(),
           localPort: relayListener.port,
         });

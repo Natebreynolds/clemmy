@@ -48,12 +48,26 @@ function extraAllowedHosts(): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Hosts registered at runtime by subsystems that legitimately answer for a
+ * name we cannot know statically — today the mobile relay, whose hostname is
+ * `<pairId>.<relay base>` and only exists once relay config is loaded. Kept
+ * additive and process-local; nothing request-controlled can reach it.
+ */
+const runtimeAllowedHosts = new Set<string>();
+
+export function allowHostName(hostname: string): void {
+  const normalized = normalizeHostHeader(hostname);
+  if (normalized) runtimeAllowedHosts.add(normalized);
+}
+
 /** Builds the allowlist fresh on every call — env-driven entries stay live. */
 export function buildAllowedHostNames(): Set<string> {
   const allowed = new Set<string>(LOOPBACK_NAMES);
   const configured = normalizeHostHeader(WEBHOOK_HOST);
   if (configured && !net.isIP(configured) && configured !== '0.0.0.0') allowed.add(configured);
   for (const extra of extraAllowedHosts()) allowed.add(extra);
+  for (const runtime of runtimeAllowedHosts) allowed.add(runtime);
   return allowed;
 }
 
