@@ -105,7 +105,14 @@ export function detectUsedRefs(input: {
     if (tokens.length === 0) continue;
 
     const identifierHits = tokens.filter((t) => isIdentifierToken(t) && containsToken(corpus, t));
-    const wordHits = new Set(tokens.filter((t) => isDistinctiveWord(t) && containsToken(corpus, t)));
+    const distinctiveTokens = new Set(tokens.filter(isDistinctiveWord));
+    const wordHits = new Set([...distinctiveTokens].filter((t) => containsToken(corpus, t)));
+    // Proportional bar: a fixed >=3 made SHORT facts structurally uncreditable —
+    // a two-distinctive-word memory ("prospecting cadence") could never clear it
+    // even when the output reproduced every distinctive word it has. Demand
+    // everything the snippet can offer, capped at 3, floored at 2 (a single
+    // shared word stays insufficient; identifiers and phrases have own tiers).
+    const wordBar = Math.max(2, Math.min(3, distinctiveTokens.size));
 
     // Contiguous 4-word phrase from the snippet appearing verbatim.
     const words = snippet.toLowerCase().split(/\s+/).filter((w) => w.length >= 3);
@@ -117,7 +124,7 @@ export function detectUsedRefs(input: {
       if (corpus.includes(phrase)) phraseHit = true;
     }
 
-    if (identifierHits.length > 0 || wordHits.size >= 3 || phraseHit) {
+    if (identifierHits.length > 0 || (distinctiveTokens.size >= 2 && wordHits.size >= wordBar) || phraseHit) {
       content.push({
         ref,
         evidence: 'content',

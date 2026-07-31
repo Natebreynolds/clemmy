@@ -1,4 +1,5 @@
 import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
+import { listSessionRecallRunIds } from '../../memory/recall-usage.js';
 import { safeDetectCorrection } from './correction-hook.js';
 import { appendEvent } from './eventlog.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
@@ -40,6 +41,14 @@ export interface PostTurnHookInput {
    * miniature). Defaults to true.
    */
   detectCorrection?: boolean;
+  /**
+   * When the turn started (ISO). Enables the cross-process recall-run sweep:
+   * runs recorded for this session since this instant are merged into
+   * `recallIds`, so explicit tool recalls executed in the separate MCP process
+   * (Claude Agent SDK lane) earn credit even though their ids never reach the
+   * lane's in-memory context. Omitted → only lane-passed ids are matched.
+   */
+  turnStartedAt?: string;
 }
 
 export function runPostTurnHooks(input: PostTurnHookInput): void {
@@ -53,8 +62,18 @@ export function runPostTurnHooks(input: PostTurnHookInput): void {
   // Positive half: match this turn's recall runs against what it produced and
   // credit demonstrable use; record the attribution event.
   try {
+    // Cross-process sweep: the lane's list can only carry ids that survived in
+    // ITS process memory. Memory tools in the Claude Agent SDK lane run in a
+    // separate MCP process, so their runs are recoverable only via the shared
+    // DB's session stamp. Merged (not replacing) — autoCreditRecallRuns dedupes.
+    let sweptIds: string[] = [];
+    if (input.turnStartedAt) {
+      try {
+        sweptIds = listSessionRecallRunIds(input.sessionId, input.turnStartedAt);
+      } catch { /* sweep is recovery, never required */ }
+    }
     const credited = autoCreditRecallRuns({
-      recallIds: input.recallIds,
+      recallIds: [...input.recallIds, ...sweptIds],
       replyText: input.replyText,
       toolArgTexts: input.toolArgTexts,
       queryText: input.queryText,

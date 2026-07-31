@@ -187,7 +187,12 @@ test('migration rehearsal upgrades a consistent copy and leaves a physical v21 s
     assert.equal(fileHash(sourcePath), beforeHash, 'source database bytes never change');
     assert.equal(report.copy.schemaVersionBefore, 21);
     assert.equal(report.copy.schemaVersionAfter, MEMORY_SCHEMA_VERSION);
-    assert.deepEqual(report.copy.migrationsApplied, [22, 23, 24, 25, 26, 27, 28, 29]);
+    // Derived, not hardcoded: from a v21 fixture the rehearsal applies every
+    // migration 22..HEAD, so a new migration can't break this pin by existing.
+    assert.deepEqual(
+      report.copy.migrationsApplied,
+      Array.from({ length: MEMORY_SCHEMA_VERSION - 21 }, (_, i) => 22 + i),
+    );
     assert.deepEqual(report.copy.integrityMessages, ['ok']);
     assert.equal(report.copy.foreignKeyViolations, 0);
     assert.deepEqual(report.copy.inventoryAfter, report.copy.inventoryBefore);

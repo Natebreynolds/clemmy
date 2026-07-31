@@ -23,6 +23,7 @@ import { searchFactsHybrid } from '../../memory/facts.js';
 import { recallMemory } from '../../memory/recall-memory.js';
 import { isTemporalMeetingQuery } from '../../memory/recall.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
+import { recordRecallRun } from '../../memory/recall-usage.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { runPostTurnHooks } from './post-turn.js';
@@ -1037,13 +1038,28 @@ async function buildClaudeAgentBrainTurnContext(
           .filter((line) => line.length > 2);
         const bullets = [...meetingBullets, ...factBullets].join('\n');
         if (bullets) recall = `## Relevant To Your Request\n${bullets}`;
+        // The fallback shows real facts, so it must record a real run — with
+        // recallId null this surface was credit-blind: facts it put in front
+        // of the model could never earn utility no matter how they were used.
+        let fallbackRecallId: string | null = null;
+        if (hits.length > 0) {
+          try {
+            fallbackRecallId = recordRecallRun({
+              objective: q,
+              surface: 'claude_primer_fallback',
+              answerability: 'partial',
+              candidateRefs: hits.map((f) => ({ type: 'fact' as const, id: String(f.id), snippet: String(f.content ?? '') })),
+              sessionId: request.sessionId,
+            }).id;
+          } catch { /* attribution must never break primer rendering */ }
+        }
         memoryPrimer = {
           ...memoryPrimer,
           hitCount: meetingBullets.length + factBullets.length,
           omittedCount: 0,
           candidateCount: meetingBullets.length + hits.length,
           source: `legacy_fallback_${unified.status}`,
-          recallId: null,
+          recallId: fallbackRecallId,
           answerability: recall ? 'partial' : 'insufficient',
           stores: [...new Set([
             ...(meetingBullets.length > 0 ? ['note'] : []),
@@ -1379,6 +1395,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   attempt: RunAttemptRef,
 ): Promise<AssistantResponse> {
   const sessionId = request.sessionId;
+  // Anchor for the post-turn recall-run sweep: this lane's memory tools run in
+  // a separate MCP process, so their recall-run ids are recoverable only by
+  // (session_id, created_at >= turn start) from the shared DB.
+  const turnStartedAt = new Date().toISOString();
   const mode = claudeAgentSdkBrainMode() ?? 'read_only';
   const completionJudgeForSurface = surface !== 'background' && surface !== 'cron' && completionJudgeEnabled();
   const isSpaceSession = workspaceSlugFromSessionId(sessionId) != null;
@@ -2595,6 +2615,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     recallIds: [renderedTurnContext.memoryPrimer.recallId],
     replyText: text,
     toolArgTexts: result.toolUses,
+    // Recovers the MCP-process recall runs (memory_search_facts /
+    // memory_recall_all) this lane could never see in memory — before this,
+    // explicit tool recalls in the Claude lane earned zero utility credit.
+    turnStartedAt,
   });
   // Autonomous learning parity: every brain reaches the same evidence-first
   // boundary. A clean independent judge, accepted execution controller, or

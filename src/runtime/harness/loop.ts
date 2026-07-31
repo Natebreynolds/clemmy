@@ -5325,6 +5325,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   if (!row) throw new Error(`unknown session: ${options.sessionId}`);
   const session = HarnessSession.load(options.sessionId);
   if (!session) throw new Error(`unable to load session: ${options.sessionId}`);
+  // Anchor for the post-turn recall-run sweep (cross-process credit recovery).
+  const turnStartedAtIso = new Date().toISOString();
 
   const turn = nextTurnNumber(row);
 
@@ -6241,6 +6243,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       turn,
       userInput: options.authoritativeUserInput ?? options.input,
       recallIds: [turnMemoryPrimer.recallId, ...(harnessCtx?.turnRecallRunIds ?? [])],
+      turnStartedAt: turnStartedAtIso,
       replyText: typeof outcome.finalOutput === 'string'
         ? outcome.finalOutput
         : (() => { try { return JSON.stringify(outcome.finalOutput) ?? ''; } catch { return ''; } })(),
@@ -6359,6 +6362,8 @@ export async function resumePendingApproval(
   if (!row) throw new Error(`unknown session: ${options.sessionId}`);
   const session = HarnessSession.load(options.sessionId);
   if (!session) throw new Error(`unable to load session: ${options.sessionId}`);
+  // Anchor for the post-turn recall-run sweep (cross-process credit recovery).
+  const turnStartedAtIso = new Date().toISOString();
 
   const blob = session.loadInterruptState();
   if (!blob) {
@@ -6770,6 +6775,7 @@ export async function resumePendingApproval(
       userInput: undefined,
       detectCorrection: false,
       recallIds: resumeCtx?.turnRecallRunIds ?? [],
+      turnStartedAt: turnStartedAtIso,
       replyText: typeof outcome.finalOutput === 'string'
         ? outcome.finalOutput
         : (() => { try { return JSON.stringify(outcome.finalOutput) ?? ''; } catch { return ''; } })(),

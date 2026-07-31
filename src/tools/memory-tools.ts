@@ -922,6 +922,11 @@ export function registerMemoryTools(server: McpServer): void {
             ...facts.map((fact) => ({ type: 'fact' as const, id: String(fact.id), snippet: fact.content })),
             ...archive.refs,
           ],
+          // Session stamp = the cross-process credit link. In the Claude Agent
+          // SDK lane this tool runs in a separate MCP process, so noteTurnRecallRun
+          // below lands in a context the brain never sees — the post-turn sweep
+          // recovers the run by (session_id, created_at) instead.
+          sessionId: harnessRunContextStorage.getStore()?.sessionId,
         });
         recallId = run.id;
         noteTurnRecallRun(run.id);
@@ -965,6 +970,7 @@ export function registerMemoryTools(server: McpServer): void {
           surface: 'memory_recall_all',
           answerability: result.answerability ?? 'partial',
           candidateRefs: [...result.hits.map(unifiedHitRecallRef), ...archive.refs],
+          sessionId: harnessRunContextStorage.getStore()?.sessionId,
         });
         result.recallId = run.id;
         noteTurnRecallRun(run.id);

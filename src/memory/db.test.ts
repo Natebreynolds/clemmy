@@ -127,7 +127,10 @@ test('v22 removes only rebuildable orphan indexes, audits cleanup, and preserves
     INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
     VALUES (9999995, 'test-model', 1, ?, 'orphan', ?)
   `).run(Buffer.alloc(4), now);
-  db.prepare('DELETE FROM schema_version WHERE version IN (22, 23, 24, 25, 26, 27, 28, 29)').run();
+  // >= 22 (not a hardcoded list): the replay is triggered by dropping every
+  // version from 22 upward, so adding migration v30+ can never silently turn
+  // this into a no-op replay again (the runner replays from MAX(version)).
+  db.prepare('DELETE FROM schema_version WHERE version >= 22').run();
   closeMemoryDb();
 
   const migrated = openMemoryDb();
@@ -175,7 +178,10 @@ test('v22 refuses to discard an orphaned grounded relationship', () => {
       (fact_id, entity_id, created_at, link_type, confidence, evidence_excerpt)
     VALUES (8888881, 8888882, ?, 'extracted', 0.99, 'Durable relationship evidence')
   `).run(now);
-  db.prepare('DELETE FROM schema_version WHERE version IN (22, 23, 24, 25, 26, 27, 28, 29)').run();
+  // >= 22 (not a hardcoded list): the replay is triggered by dropping every
+  // version from 22 upward, so adding migration v30+ can never silently turn
+  // this into a no-op replay again (the runner replays from MAX(version)).
+  db.prepare('DELETE FROM schema_version WHERE version >= 22').run();
   closeMemoryDb();
 
   assert.throws(

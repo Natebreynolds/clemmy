@@ -293,3 +293,28 @@ test('a credited fact outranks and outlives an impression-only twin', async () =
   assert.ok(!decay.ids.includes(credited.id), 'the demonstrably-used fact survives');
   assert.equal(getFact(credited.id)?.active, true);
 });
+
+test('content: a SHORT fact credits when the output reproduces every distinctive word it has (2026-07-31)', () => {
+  // Two distinctive words is ALL this snippet can offer — the old fixed >=3 bar
+  // made memories like this structurally uncreditable forever.
+  const short = detectUsedRefs({
+    candidates: [{ type: 'fact', id: '9', snippet: 'Use the salesforce commandline.' }],
+    replyText: 'Pulled it via the salesforce commandline just now.',
+    queryText: 'find the record',
+  });
+  assert.equal(short.length, 1, 'both distinctive words reproduced -> credit');
+
+  const half = detectUsedRefs({
+    candidates: [{ type: 'fact', id: '9', snippet: 'Use the salesforce commandline.' }],
+    replyText: 'I searched salesforce records directly.',
+    queryText: 'find the record',
+  });
+  assert.deepEqual(half, [], 'one of two distinctive words is still insufficient');
+
+  const single = detectUsedRefs({
+    candidates: [{ type: 'fact', id: '10', snippet: 'Note the passphrase.' }],
+    replyText: 'Here is the passphrase you asked about.',
+    queryText: 'help me log in',
+  });
+  assert.deepEqual(single, [], 'a snippet with ONE distinctive word can never word-credit (identifier/phrase tiers only)');
+});

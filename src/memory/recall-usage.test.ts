@@ -308,3 +308,30 @@ test('a SUPERSEDED archived fact is never resurrected by recall credit', async (
   assert.deepEqual(result.utilityFactIds, [], 'and earns no utility');
   assert.equal(getFact(oldFact.id)?.active, false, 'the superseded fact remains archived');
 });
+
+test('session-stamped runs are sweepable by (session, since) — the cross-process credit channel (2026-07-31)', async () => {
+  const { listSessionRecallRunIds } = await import('./recall-usage.js');
+  const fact = rememberFact({ kind: 'project', content: 'The Delta account demo uses the staging tenant.' });
+  const early = '2026-07-31T10:00:00.000Z';
+  const inTurn = '2026-07-31T10:05:00.000Z';
+  recordRecallRun({
+    objective: 'before the turn', surface: 'memory_search_facts', answerability: 'partial',
+    candidateRefs: [{ type: 'fact', id: String(fact.id) }], sessionId: 'sess-a', nowIso: early,
+  });
+  const during = recordRecallRun({
+    objective: 'during the turn', surface: 'memory_search_facts', answerability: 'partial',
+    candidateRefs: [{ type: 'fact', id: String(fact.id) }], sessionId: 'sess-a', nowIso: inTurn,
+  });
+  recordRecallRun({
+    objective: 'other session', surface: 'memory_search_facts', answerability: 'partial',
+    candidateRefs: [{ type: 'fact', id: String(fact.id) }], sessionId: 'sess-b', nowIso: inTurn,
+  });
+  recordRecallRun({
+    objective: 'unstamped legacy run', surface: 'memory_search_facts', answerability: 'partial',
+    candidateRefs: [{ type: 'fact', id: String(fact.id) }], nowIso: inTurn,
+  });
+
+  const swept = listSessionRecallRunIds('sess-a', '2026-07-31T10:04:00.000Z', { nowIso: inTurn });
+  assert.deepEqual(swept, [during.id], 'only this session, only since the turn started, never other sessions or unstamped rows');
+  assert.deepEqual(listSessionRecallRunIds('sess-a', 'not-a-date'), [], 'a bad anchor sweeps nothing');
+});

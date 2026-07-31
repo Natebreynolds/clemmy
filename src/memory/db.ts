@@ -1764,6 +1764,29 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
       })();
     },
   },
+  {
+    // v30 — session-stamped recall runs. The Claude Agent SDK lane runs its
+    // memory tools in a SEPARATE MCP process, so the in-memory turn context
+    // that carried recall-run ids to the post-turn auto-credit hook could
+    // never cross that boundary — explicit tool recalls in that lane earned
+    // zero utility credit forever (2026-07-31 audit: 50/1772 facts had any).
+    // The shared memory.db IS the durable cross-process channel: stamp each
+    // run with its session so the post-turn seam can read this turn's runs
+    // back regardless of which process recorded them. Additive + nullable.
+    version: 30,
+    run: (db: Database.Database) => {
+      // Guarded ALTER: recovery/rehearsal flows replay migrations against a
+      // database that may already carry the column, and SQLite's ADD COLUMN
+      // has no IF NOT EXISTS.
+      const hasColumn = (db.pragma('table_info(memory_recall_runs)') as Array<{ name: string }>)
+        .some((col) => col.name === 'session_id');
+      if (!hasColumn) db.exec('ALTER TABLE memory_recall_runs ADD COLUMN session_id TEXT');
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_memory_recall_runs_session
+          ON memory_recall_runs(session_id, created_at DESC);
+      `);
+    },
+  },
 ];
 
 /**

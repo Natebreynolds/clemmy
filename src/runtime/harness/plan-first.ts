@@ -335,6 +335,8 @@ function surfacePlanFirstFailure(input: PlanFirstRunInput, error: string): PlanF
 
 export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<PlanFirstResult> {
   if (!input.force && !shouldUsePlanFirst(input)) return { surfaced: false };
+  // Anchor for the post-turn recall-run sweep (cross-process credit recovery).
+  const turnStartedAtIso = new Date().toISOString();
 
   appendEvent({
     sessionId: input.sessionId,
@@ -532,6 +534,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       recallIds: [memoryRecallId],
       replyText: JSON.stringify(plan),
       queryText: input.input,
+      turnStartedAt: turnStartedAtIso,
     });
 
     if (plan.needsUserInput.length > 0) {

@@ -166,6 +166,9 @@ export function recordRecallRun(input: {
   surface: string;
   answerability: RecallRun['answerability'];
   candidateRefs: RecallCandidateRef[];
+  /** Session this recall served. The durable cross-process link that lets the
+   *  post-turn auto-credit seam find runs recorded by the MCP tool process. */
+  sessionId?: string;
   nowIso?: string;
   ttlHours?: number;
 }): RecallRun {
@@ -184,8 +187,8 @@ export function recordRecallRun(input: {
   };
   openMemoryDb().prepare(`
     INSERT INTO memory_recall_runs
-      (id, objective, surface, answerability, candidate_refs_json, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+      (id, objective, surface, answerability, candidate_refs_json, created_at, expires_at, session_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     run.id,
     run.objective,
@@ -194,8 +197,40 @@ export function recordRecallRun(input: {
     JSON.stringify(run.candidateRefs),
     run.createdAt,
     run.expiresAt,
+    input.sessionId?.trim() || null,
   );
   return run;
+}
+
+/**
+ * Recall-run ids recorded for `sessionId` at or after `sinceIso` — the
+ * post-turn auto-credit seam's cross-process recovery path. The Claude Agent
+ * SDK lane's memory tools run in a separate MCP process, so ids noted into the
+ * in-memory turn context there are invisible to the brain process; the DB is
+ * the one channel both sides share. Bounded and unexpired-only; ordering is
+ * oldest-first so credit matching sees runs in the order the turn made them.
+ */
+export function listSessionRecallRunIds(
+  sessionId: string,
+  sinceIso: string,
+  opts: { nowIso?: string; limit?: number } = {},
+): string[] {
+  const session = sessionId?.trim();
+  if (!session || !Number.isFinite(Date.parse(sinceIso))) return [];
+  const now = opts.nowIso ?? new Date().toISOString();
+  const limit = Math.max(1, Math.min(50, opts.limit ?? 20));
+  try {
+    const rows = openMemoryDb().prepare(`
+      SELECT id FROM memory_recall_runs
+      WHERE session_id = ? AND created_at >= ? AND expires_at > ?
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).all(session, sinceIso, now, limit) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  } catch {
+    // Pre-v30 databases lack the column; credit falls back to lane-passed ids.
+    return [];
+  }
 }
 
 /** Load an unexpired recall run with its candidate refs (snippets included when

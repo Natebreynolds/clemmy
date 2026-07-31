@@ -190,6 +190,7 @@ export async function buildUnifiedTurnPrimer(input: {
       surface: input.surface,
       answerability: result.answerability ?? 'partial',
       candidateRefs: result.hits.map(unifiedHitRecallRef),
+      sessionId: input.sessionId,
     });
     persistedRecallId = run.id;
   } catch {
