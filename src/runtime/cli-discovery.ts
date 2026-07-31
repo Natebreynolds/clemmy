@@ -157,7 +157,20 @@ export function scanPath(): { command: string; path: string }[] {
  * timed out, or errored. We don't distinguish — for probing, we just
  * want to know "did it respond like a CLI."
  */
-function runQuick(command: string, args: string[], cwd: string, timeoutMs = 2000): Promise<string | undefined> {
+/**
+ * Probe timeout. Default 2s — unchanged — but tunable, because a hard 2s is
+ * tight on a loaded machine: spawning a CLI while the daemon is running several
+ * workflows can exceed it, and a timed-out probe is INDISTINGUISHABLE from a
+ * missing tool, so discovery silently drops a CLI the user actually has. Also
+ * lets the test suite stay honest under full-suite CPU contention instead of
+ * failing on a race it cannot control.
+ */
+function cliProbeTimeoutMs(): number {
+  const raw = Number.parseInt(process.env.CLEMMY_CLI_PROBE_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(60_000, raw) : 2000;
+}
+
+function runQuick(command: string, args: string[], cwd: string, timeoutMs = cliProbeTimeoutMs()): Promise<string | undefined> {
   return new Promise((resolve) => {
     let settled = false;
     const child = spawn(command, args, {

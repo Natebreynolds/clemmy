@@ -18,6 +18,9 @@ import os from 'node:os';
 import path from 'node:path';
 
 const originalClementineHome = process.env.CLEMENTINE_HOME;
+// Full-suite runs contend for CPU; a hard 2s probe timeout makes these tests
+// race the scheduler rather than test discovery. The PRODUCT default is unchanged.
+process.env.CLEMMY_CLI_PROBE_TIMEOUT_MS = '20000';
 const testHome = mkdtempSync(path.join(os.tmpdir(), 'clementine-cli-discovery-test-'));
 process.env.CLEMENTINE_HOME = testHome;
 
