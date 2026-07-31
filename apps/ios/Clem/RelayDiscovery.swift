@@ -83,9 +83,11 @@ final class PinnedSessionDelegate: NSObject, URLSessionDelegate {
             completionHandler(.performDefaultHandling, nil)
             return
         }
-        // No pin (publicly-trusted host) → system trust store, unmodified.
+        // Fails closed, for the same reason the webview's pin does: an
+        // unpinned pairing must never be talked into trusting a certificate
+        // just because some public CA signed it.
         guard let fingerprint else {
-            completionHandler(.performDefaultHandling, nil)
+            completionHandler(.cancelAuthenticationChallenge, nil)
             return
         }
         if CertificatePin.trustMatches(trust, fingerprint: fingerprint) {

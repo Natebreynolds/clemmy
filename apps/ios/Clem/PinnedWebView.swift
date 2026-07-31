@@ -157,9 +157,17 @@ final class WebViewModel: NSObject, ObservableObject {
 }
 
 extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
-    /// The pin. With a fingerprint stored, exactly that certificate is
-    /// accepted — self-signed is fine, a rotated or substituted cert is not.
-    /// Without one (tunnel-mode pairing), default evaluation runs.
+    /// The pin, and the whole basis of trusting this connection: exactly the
+    /// certificate the QR carried is accepted — self-signed is fine, a
+    /// rotated or substituted one is not.
+    ///
+    /// A pairing with no fingerprint is REFUSED rather than falling back to
+    /// the system trust store. That fallback existed for tunnel-mode pairing,
+    /// which no longer exists; leaving it in place meant that anyone able to
+    /// obtain a publicly-trusted certificate for the relay hostname could
+    /// have been trusted by an unpinned pairing. Off the LAN the pin is the
+    /// only thing standing between a relay operator and the session, so it
+    /// fails closed.
     func webView(
         _ webView: WKWebView,
         didReceive challenge: URLAuthenticationChallenge,
@@ -171,7 +179,7 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
             return
         }
         guard let expected = pairing.fingerprint else {
-            completionHandler(.performDefaultHandling, nil)
+            completionHandler(.cancelAuthenticationChallenge, nil)
             return
         }
         if CertificatePin.trustMatches(trust, fingerprint: expected) {
