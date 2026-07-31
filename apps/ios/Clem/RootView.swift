@@ -10,6 +10,8 @@ struct RootView: View {
     @State private var launchURL: URL?
     @State private var confirmUnpair = false
     @State private var searching = false
+    @StateObject private var gate = BiometricGate()
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         if let pairing = PairingStore.load() {
@@ -21,22 +23,56 @@ struct RootView: View {
         ZStack {
             peelBlack.ignoresSafeArea()
             if let model {
-                CommandCenterView(
-                    model: model,
-                    launchURL: launchURL,
-                    searching: $searching,
-                    confirmUnpair: $confirmUnpair,
-                    onUnpair: unpair
-                )
+                // The gate wraps the paired experience only. Scanning a QR is
+                // itself a physical act at the Mac, and requiring Face ID
+                // before the camera would just be a step in front of a step.
+                if gate.unlocked {
+                    CommandCenterView(
+                        model: model,
+                        launchURL: launchURL,
+                        searching: $searching,
+                        confirmUnpair: $confirmUnpair,
+                        onUnpair: unpair
+                    )
+                } else {
+                    LockScreen(gate: gate)
+                        .onAppear { gate.authenticate() }
+                }
             } else {
                 ScannerScreen { newPairing, newLaunchURL in
                     PairingStore.save(newPairing)
                     launchURL = newLaunchURL
                     model = WebViewModel(pairing: newPairing)
+                    // A fresh pair is a deliberate in-person act; unlock it
+                    // rather than demanding a second proof immediately.
+                    gate.authenticate()
                 }
             }
         }
+        // iOS photographs the app as it leaves the foreground, and that image
+        // lives in the task switcher. Covering the UI the moment we go
+        // inactive keeps the conversation out of that snapshot.
+        .overlay {
+            if scenePhase != .active {
+                ZStack {
+                    peelBlack.ignoresSafeArea()
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 44))
+                        .foregroundStyle(Color(red: 1, green: 0.54, blue: 0.24).opacity(0.85))
+                }
+                .transition(.opacity)
+            }
+        }
         .preferredColorScheme(.dark)
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            // .inactive fires before the app is visible in the switcher, so
+            // locking here keeps the transcript out of the task snapshot.
+            case .inactive, .background: gate.noteBackgrounded()
+            case .active: gate.noteForegrounded()
+            @unknown default: break
+            }
+        }
     }
 
     private func unpair() {

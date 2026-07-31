@@ -15,7 +15,7 @@ import net from 'node:net';
 import tls from 'node:tls';
 import os from 'node:os';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, createSign } from 'node:crypto';
 import express from 'express';
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), 'clemmy-mobile-relay-test-'));
@@ -108,6 +108,8 @@ test('relay E2E: pinned TLS passes through untouched; routes and IP survive; pai
     pairId,
     authToken,
     localPort: relayListener.port,
+    certPem: daemonIdentity.certPem,
+    keyPem: daemonIdentity.keyPem,
     logger: { info: () => {}, warn: () => {}, error: () => {} },
   });
 
@@ -160,21 +162,50 @@ test('relay E2E: pinned TLS passes through untouched; routes and IP survive; pai
 
     // TOFU: a second daemon claiming the same pairId with a different token
     // is refused.
-    const impostor: { refused: boolean } = await new Promise((resolve, reject) => {
-      const sock = tls.connect({ host: '127.0.0.1', port: relay.port, servername: 'tunnel.r.test.local', rejectUnauthorized: false });
-      const feed = frameReader();
-      sock.on('secureConnect', () => {
-        sock.write(encodeFrame(FRAME.HELLO, 0, JSON.stringify({ pairId, authToken: 'wrong-token-wrong-token', proto: 1 })));
+    // Squatting: a stranger who has seen this Mac's QR knows its fingerprint,
+    // and therefore its tunnel address. Without proof-of-possession they could
+    // register it first and lock the real Mac out forever. They cannot sign
+    // the relay's challenge, because the key never leaves the Mac.
+    const squat = async (proofBody: Record<string, unknown> | null): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const sock = tls.connect({ host: '127.0.0.1', port: relay.port, servername: 'tunnel.r.test.local', rejectUnauthorized: false });
+        const feed = frameReader();
+        sock.on('secureConnect', () => {
+          sock.write(encodeFrame(FRAME.HELLO, 0, JSON.stringify({ pairId, authToken: 'wrong-token-wrong-token', proto: 1 })));
+        });
+        sock.on('data', (chunk) => {
+          for (const frame of feed(chunk)) {
+            if (frame.type === FRAME.CHALLENGE) {
+              sock.write(encodeFrame(FRAME.PROOF, 0, JSON.stringify(proofBody ?? {})));
+              continue;
+            }
+            if (frame.type === FRAME.HELLO_ERR) {
+              const body = JSON.parse(frame.payload.toString('utf8')) as { error: string };
+              sock.destroy();
+              resolve(body.error);
+              return;
+            }
+            if (frame.type === FRAME.HELLO_OK) { sock.destroy(); resolve('ACCEPTED'); return; }
+          }
+        });
+        sock.on('error', reject);
       });
-      sock.on('data', (chunk) => {
-        for (const frame of feed(chunk)) {
-          if (frame.type === FRAME.HELLO_ERR) { sock.destroy(); resolve({ refused: true }); return; }
-          if (frame.type === FRAME.HELLO_OK) { sock.destroy(); resolve({ refused: false }); return; }
-        }
-      });
-      sock.on('error', reject);
-    });
-    assert.equal(impostor.refused, true, 'a wrong auth token must not steal a claimed pairId');
+
+    assert.equal(await squat(null), 'BAD_PROOF', 'no proof must not claim an address');
+    // Even holding the public certificate — which the QR reveals — is not enough.
+    assert.equal(
+      await squat({ certPem: daemonIdentity.certPem, signature: Buffer.from('nope').toString('base64url') }),
+      'BAD_PROOF',
+      'the certificate alone must not claim an address; only the key can',
+    );
+    // A different Mac's real key proves possession of a DIFFERENT address.
+    const other = ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'daemon-impostor') });
+    const otherSig = createSign('sha256').update('whatever').sign(other.keyPem).toString('base64url');
+    assert.equal(
+      await squat({ certPem: other.certPem, signature: otherSig }),
+      'BAD_PROOF',
+      'a valid signature over the wrong certificate must not claim this address',
+    );
   } finally {
     client.stop();
     await relay.close();

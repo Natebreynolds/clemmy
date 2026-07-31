@@ -130,15 +130,25 @@ export function restrictDirectAppIngressToMobile(req: Request, res: Response, ne
     res.status(404).type('text/plain').send('Not found');
     return;
   }
-  // Pairing is a LAN ceremony: the QR is displayed on the user's own screen
-  // and scanned in the same room. Consuming a pairing token from across the
-  // internet is never legitimate, so the relay door refuses it outright.
-  if (req.clemIngress === 'relay' && req.path === '/m/auth/pair') {
+  // Two credential ceremonies are LAN-only, and the relay refuses both:
+  //
+  //   /m/auth/pair  — the QR is on the user's own screen, in the same room.
+  //                   Consuming a pairing token from across the internet is
+  //                   never legitimate.
+  //   /m/auth/login — a PIN is a password, and a password box reachable from
+  //                   the whole internet is a brute-force surface no rate
+  //                   limiter fully answers. Deleting the surface beats
+  //                   defending it; remote access rides the device-bound key
+  //                   established at pairing, and the phone itself is gated
+  //                   by Face ID.
+  if (req.clemIngress === 'relay' && RELAY_FORBIDDEN_PATHS.has(req.path)) {
     res.status(404).type('text/plain').send('Not found');
     return;
   }
   next();
 }
+
+const RELAY_FORBIDDEN_PATHS = new Set(['/m/auth/pair', '/m/auth/login']);
 
 /**
  * Binds the main listener plus (when configured) the pinned-TLS direct-app

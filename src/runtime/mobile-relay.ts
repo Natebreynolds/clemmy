@@ -20,7 +20,7 @@
  */
 import net from 'node:net';
 import tls from 'node:tls';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createSign, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
@@ -32,7 +32,11 @@ const logger = pino({ name: 'clementine-next.mobile-relay' });
 
 // ─── mux framing (mirrors apps/relay/server.mjs — keep in sync) ─────────────
 // [u32 payloadLen BE][u8 type][u32 streamId BE][payload]
-export const FRAME = { HELLO: 1, HELLO_OK: 2, HELLO_ERR: 3, OPEN: 4, DATA: 5, CLOSE: 6, PING: 7, PONG: 8 } as const;
+export const FRAME = {
+  HELLO: 1, HELLO_OK: 2, HELLO_ERR: 3, OPEN: 4, DATA: 5, CLOSE: 6, PING: 7, PONG: 8,
+  /** Proof-of-possession: the relay challenges, this daemon signs. */
+  CHALLENGE: 9, PROOF: 10,
+} as const;
 const HEADER_LEN = 9;
 const MAX_FRAME = 1024 * 1024;
 
@@ -193,6 +197,9 @@ export interface StartRelayClientOptions {
   authToken: string;
   /** The loopback relay listener's port (startRelayInternalListener). */
   localPort: number;
+  /** The mobile TLS identity — proves this Mac owns the address it claims. */
+  certPem: string;
+  keyPem: string;
   logger?: Pick<typeof logger, 'info' | 'warn' | 'error'>;
 }
 
@@ -257,6 +264,28 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
     });
 
     function handleFrame(frame: RelayFrame): void {
+      if (frame.type === FRAME.CHALLENGE) {
+        // Prove we hold the key for the certificate this address is derived
+        // from. Without this a stranger who had seen our QR could claim the
+        // address first and lock this Mac out of its own tunnel.
+        let nonce = '';
+        try {
+          nonce = String((JSON.parse(frame.payload.toString('utf8')) as { nonce?: string }).nonce ?? '');
+        } catch { /* handled by the empty check below */ }
+        if (!nonce) {
+          log.error('mobile-relay: relay sent no challenge nonce');
+          socket.destroy();
+          return;
+        }
+        try {
+          const signature = createSign('sha256').update(nonce).sign(opts.keyPem).toString('base64url');
+          socket.write(encodeFrame(FRAME.PROOF, 0, JSON.stringify({ certPem: opts.certPem, signature })));
+        } catch (err) {
+          log.error({ err }, 'mobile-relay: could not sign the relay challenge');
+          socket.destroy();
+        }
+        return;
+      }
       if (frame.type === FRAME.HELLO_OK) {
         isConnected = true;
         backoffMs = RECONNECT_BASE_MS;

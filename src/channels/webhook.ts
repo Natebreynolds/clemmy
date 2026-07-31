@@ -2914,6 +2914,8 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
           pairId,
           authToken: ensureRelayAuthToken(),
           localPort: relayListener.port,
+          certPem: directApp.certPem,
+          keyPem: directApp.keyPem,
         });
         logger.info({ relay: relayConfig.url, base: relayConfig.baseDomain }, 'Mobile relay tunnel starting');
       }

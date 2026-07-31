@@ -1,91 +1,41 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
-import { login } from '../lib/api';
-
+/**
+ * Pairing is the only way in.
+ *
+ * There used to be a PIN box here as a second credential. It is gone on
+ * purpose, and removing it made the system *safer*, not more convenient:
+ *
+ *   - A PIN is a password, and once the relay exists a password box is
+ *     reachable from the whole internet. Deleting it deletes that entire
+ *     brute-force surface rather than defending it.
+ *   - Pairing is the stronger credential anyway: a single-use 256-bit token,
+ *     scanned in person, on the local network, that establishes a device-bound
+ *     key which signs every later request.
+ *   - The phone is now gated by Face ID / Touch ID / device passcode, so
+ *     asking for a second secret was making people prove themselves twice for
+ *     no additional security.
+ *
+ * The cost, stated plainly: recovery requires being near the Mac. If a session
+ * ends while travelling, you re-pair when you get home. That is the trade a
+ * security-first product should make.
+ */
 interface Props {
-  pinConfigured: boolean;
   pairError?: string | null;
-  onAuthenticated: () => void;
 }
 
-export function Login({ pinConfigured, pairError, onAuthenticated }: Props) {
-  const [pin, setPin] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [lockedSeconds, setLockedSeconds] = useState(0);
-  const inputRef = useRef<HTMLInputElement | null>(null);
-
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    if (lockedSeconds <= 0) return;
-    const t = setTimeout(() => setLockedSeconds((s) => Math.max(0, s - 1)), 1000);
-    return () => clearTimeout(t);
-  }, [lockedSeconds]);
-
-  if (!pinConfigured) {
-    return (
-      <div class="login-shell">
-        <h1>Clementine</h1>
-        <p class="notice">Open the desktop app → Mobile and scan the pairing QR code. A PIN can be added there as a manual fallback.</p>
-      </div>
-    );
-  }
-
-  async function submit(ev: Event) {
-    ev.preventDefault();
-    if (busy || lockedSeconds > 0) return;
-    setError(null);
-    setBusy(true);
-    try {
-      await login(pin, navigator.userAgent.slice(0, 80));
-      onAuthenticated();
-    } catch (err) {
-      const e = err as { status?: number; body?: unknown; message?: string };
-      if (e.status === 429) {
-        const body = e.body as { retryAfterMs?: number } | null;
-        const seconds = Math.ceil((body?.retryAfterMs ?? 30 * 60 * 1000) / 1000);
-        setLockedSeconds(seconds);
-        setError(`Locked out. Try again in ${Math.ceil(seconds / 60)} min.`);
-      } else if (e.status === 401) {
-        setError('Wrong PIN.');
-      } else if (e.status === 409) {
-        setError('No PIN configured. Set one in the desktop app first.');
-      } else {
-        setError(e.message ?? 'Login failed.');
-      }
-      setPin('');
-      inputRef.current?.focus();
-    } finally {
-      setBusy(false);
-    }
-  }
-
+export function Login({ pairError }: Props) {
   return (
-    <form class="login-shell" onSubmit={submit}>
-      <h1>Clementine</h1>
-      <p>Scan the desktop QR code to pair automatically, or enter your mobile PIN.</p>
-      <input
-        ref={inputRef}
-        class="login-pin"
-        type="password"
-        autoComplete="current-password"
-        maxLength={64}
-        value={pin}
-        onInput={(ev) => setPin((ev.currentTarget as HTMLInputElement).value)}
-        disabled={busy || lockedSeconds > 0}
-      />
-      {pairError ? <div class="error">{pairError}</div> : null}
-      {error ? <div class="error">{error}</div> : null}
-      {lockedSeconds > 0 ? <div class="notice">Try again in {lockedSeconds}s</div> : null}
-      <button
-        class="btn"
-        type="submit"
-        disabled={busy || pin.length < 4 || lockedSeconds > 0}
-      >
-        {busy ? 'Checking…' : 'Unlock'}
-      </button>
-    </form>
+    <div class="login-shell">
+      <img class="login-mark" src="/m/clemmy.png" alt="" width="88" height="88" />
+      <h1>Pair with your Mac</h1>
+      <p>
+        Open Clementine on your Mac, go to <strong>Mobile</strong>, and scan the QR code
+        from inside this app.
+      </p>
+      {pairError ? <div class="global-error">{pairError}</div> : null}
+      <p class="login-fineprint">
+        Pairing happens on your own network and never leaves it. After that, Face ID keeps
+        this app locked to you.
+      </p>
+    </div>
   );
 }

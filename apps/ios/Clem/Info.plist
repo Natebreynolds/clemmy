@@ -26,6 +26,8 @@
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Clem uses Face ID to make sure only you can reach your Mac from this app.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Clem uses the camera only to scan the pairing QR code shown on your Mac.</string>
 	<key>NSLocalNetworkUsageDescription</key>

@@ -111,7 +111,7 @@ export function App() {
   }
 
   if (!authStatus.authenticated) {
-    return <Login pinConfigured={authStatus.pinConfigured} pairError={pairError} onAuthenticated={refreshAuth} />;
+    return <Login pairError={pairError} />;
   }
 
   const goToChat = (payload: { draft?: string; session?: ChatSession }) => {

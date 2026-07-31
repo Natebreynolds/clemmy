@@ -16,10 +16,15 @@
  *                     because the HELLO carries the pairing's auth token.
  *   <pairId>.<base> — a phone. Raw passthrough into that pairing's tunnel.
  *
- * Claims are trust-on-first-use: the first HELLO for a pairId stores
- * sha256(authToken); later HELLOs must present the same token. Hijacking a
- * claim would only deny service — phones refuse any peer that is not the
- * pinned Mac certificate.
+ * Registration requires PROOF OF POSSESSION. A tunnel address is
+ * sha256(daemon certificate) truncated, and that fingerprint is printed in
+ * every pairing QR — so with a first-come claim, anyone who had seen a user's
+ * QR could register their address first and lock the real Mac out for good.
+ * Instead the relay issues a random challenge and the daemon returns its
+ * certificate plus a signature over it; the relay checks the certificate
+ * hashes to the claimed address AND that the signature verifies against it.
+ * The private key never leaves the user's Mac, so the address is unclaimable
+ * by anyone else. The auth token is retained on top as a rebind check.
  *
  * Zero runtime dependencies. Configuration (env):
  *   PORT                — listen port (Railway injects this)
@@ -31,13 +36,17 @@
 import net from 'node:net';
 import tls from 'node:tls';
 import { Duplex } from 'node:stream';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual, randomBytes, createVerify, X509Certificate } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 
 // ─── mux framing (mirrored in src/runtime/mobile-relay.ts — keep in sync) ───
 // [u32 payloadLen BE][u8 type][u32 streamId BE][payload]
-export const FRAME = { HELLO: 1, HELLO_OK: 2, HELLO_ERR: 3, OPEN: 4, DATA: 5, CLOSE: 6, PING: 7, PONG: 8 };
+export const FRAME = {
+  HELLO: 1, HELLO_OK: 2, HELLO_ERR: 3, OPEN: 4, DATA: 5, CLOSE: 6, PING: 7, PONG: 8,
+  // Proof-of-possession: the relay challenges, the daemon signs.
+  CHALLENGE: 9, PROOF: 10,
+};
 const HEADER_LEN = 9;
 const MAX_FRAME = 1024 * 1024;
 
@@ -238,44 +247,109 @@ export function startRelay(opts) {
     return duplex;
   }
 
+  /**
+   * Registration, with proof that the caller owns the address it claims.
+   *
+   * A tunnel address is `sha256(daemon certificate)` truncated — and that
+   * certificate's fingerprint is printed in every pairing QR. So with a
+   * first-come claim, anyone who had ever seen a user's QR could register
+   * their address first and lock the real Mac out permanently.
+   *
+   * The fix is to make the address unclaimable without the private key: the
+   * relay sends a random challenge, the daemon returns its certificate plus a
+   * signature over that challenge, and the relay checks that (a) the
+   * certificate hashes to the claimed address and (b) the signature verifies
+   * against that certificate's public key. Squatting now requires the key,
+   * which never leaves the user's Mac.
+   */
   function handleTunnelLeg(rawSocket, buffered) {
     const tlsSocket = new tls.TLSSocket(replayedSocket(rawSocket, buffered), {
       isServer: true,
-      secureContext: tls.createSecureContext({ key: tlsKeyPem, cert: tlsCertPem }),
+      secureContext: tls.createSecureContext({
+        key: tlsKeyPem,
+        cert: tlsCertPem,
+        // The control leg is our own code on both ends, so there is no legacy
+        // client to accommodate and no reason to accept anything older.
+        minVersion: 'TLSv1.3',
+      }),
     });
     const feed = frameReader();
-    let helloDone = false;
-    const helloTimer = setTimeout(() => { if (!helloDone) tlsSocket.destroy(); }, HELLO_TIMEOUT_MS);
-    const onHelloData = (chunk) => {
+    let stage = 'hello';
+    let pendingPairId = null;
+    let pendingToken = '';
+    const nonce = randomBytes(32).toString('base64url');
+    const helloTimer = setTimeout(() => { if (stage !== 'done') tlsSocket.destroy(); }, HELLO_TIMEOUT_MS);
+
+    const refuse = (error) => {
+      tlsSocket.write(encodeFrame(FRAME.HELLO_ERR, 0, JSON.stringify({ error })));
+      tlsSocket.destroy();
+    };
+
+    const onData = (chunk) => {
       let frames;
       try { frames = feed(chunk); } catch { tlsSocket.destroy(); return; }
       for (const frame of frames) {
-        if (frame.type !== FRAME.HELLO) { tlsSocket.destroy(); return; }
-        let hello;
-        try { hello = JSON.parse(frame.payload.toString('utf8')); } catch { tlsSocket.destroy(); return; }
-        const pairId = String(hello.pairId ?? '').toLowerCase();
-        const token = String(hello.authToken ?? '');
-        if (!PAIR_ID_RE.test(pairId) || token.length < 16) {
-          tlsSocket.write(encodeFrame(FRAME.HELLO_ERR, 0, JSON.stringify({ error: 'BAD_HELLO' })));
-          tlsSocket.destroy();
+        if (stage === 'hello') {
+          if (frame.type !== FRAME.HELLO) { tlsSocket.destroy(); return; }
+          let hello;
+          try { hello = JSON.parse(frame.payload.toString('utf8')); } catch { tlsSocket.destroy(); return; }
+          const pairId = String(hello.pairId ?? '').toLowerCase();
+          const token = String(hello.authToken ?? '');
+          if (!PAIR_ID_RE.test(pairId) || token.length < 16) { refuse('BAD_HELLO'); return; }
+          pendingPairId = pairId;
+          pendingToken = token;
+          stage = 'proof';
+          tlsSocket.write(encodeFrame(FRAME.CHALLENGE, 0, JSON.stringify({ nonce })));
+          continue;
+        }
+        if (stage === 'proof') {
+          if (frame.type !== FRAME.PROOF) { tlsSocket.destroy(); return; }
+          let proof;
+          try { proof = JSON.parse(frame.payload.toString('utf8')); } catch { tlsSocket.destroy(); return; }
+          if (!verifyPossession(pendingPairId, nonce, proof)) {
+            log.warn(`relay: possession proof failed for ${pendingPairId}`);
+            refuse('BAD_PROOF');
+            return;
+          }
+          if (!claims.verify(pendingPairId, pendingToken)) {
+            log.warn(`relay: rejected HELLO for claimed pairId ${pendingPairId}`);
+            refuse('CLAIMED');
+            return;
+          }
+          stage = 'done';
+          clearTimeout(helloTimer);
+          tlsSocket.removeListener('data', onData);
+          tlsSocket.write(encodeFrame(FRAME.HELLO_OK, 0, JSON.stringify({ ok: true })));
+          attachTunnel(tlsSocket, pendingPairId);
           return;
         }
-        if (!claims.verify(pairId, token)) {
-          log.warn(`relay: rejected HELLO for claimed pairId ${pairId}`);
-          tlsSocket.write(encodeFrame(FRAME.HELLO_ERR, 0, JSON.stringify({ error: 'CLAIMED' })));
-          tlsSocket.destroy();
-          return;
-        }
-        helloDone = true;
-        clearTimeout(helloTimer);
-        tlsSocket.removeListener('data', onHelloData);
-        tlsSocket.write(encodeFrame(FRAME.HELLO_OK, 0, JSON.stringify({ ok: true })));
-        attachTunnel(tlsSocket, pairId);
-        return;
       }
     };
-    tlsSocket.on('data', onHelloData);
+    tlsSocket.on('data', onData);
     tlsSocket.on('error', () => tlsSocket.destroy());
+  }
+
+  /**
+   * True when `proof` shows the caller holds the private key for the
+   * certificate whose hash is `pairId`.
+   */
+  function verifyPossession(pairId, nonce, proof) {
+    try {
+      const certPem = String(proof?.certPem ?? '');
+      const signature = String(proof?.signature ?? '');
+      if (!certPem || !signature) return false;
+      const cert = new X509Certificate(certPem);
+      // (a) the certificate really is the one this address names
+      const derived = createHash('sha256').update(cert.raw).digest('hex').slice(0, 16);
+      if (derived !== pairId) return false;
+      // (b) the caller can sign for it. `cert.publicKey` is already a
+      // KeyObject — re-wrapping it throws INVALID_KEY_OBJECT_TYPE.
+      return createVerify('sha256')
+        .update(nonce)
+        .verify(cert.publicKey, Buffer.from(signature, 'base64url'));
+    } catch {
+      return false;
+    }
   }
 
   function handlePhoneLeg(rawSocket, pairId, buffered) {
