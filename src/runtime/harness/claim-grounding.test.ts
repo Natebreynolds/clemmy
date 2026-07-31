@@ -20,13 +20,13 @@ import {
 test('extraction: URLs and paths come out of prose; trivia and bare prose words stay out', () => {
   const pointers = extractDeliverablePointers(
     'Yes—the brief finished. It lives at https://myatt-bell-brief.netlify.app and the QA shots are in '
-    + '`myatt-bell-brief/screenshots/` plus the deck at /Users/nate/client/deck.pptx. '
+    + '`myatt-bell-brief/screenshots/` plus the deck at /opt/workspace/client/deck.pptx. '
     + 'I also updated the README.md wording and we should talk pricing.',
   );
   const kinds = new Map(pointers.map((p) => [p.raw, p.kind]));
   assert.equal(kinds.get('https://myatt-bell-brief.netlify.app'), 'url');
   assert.equal(kinds.get('myatt-bell-brief/screenshots'), 'path');
-  assert.equal(kinds.get('/Users/nate/client/deck.pptx'), 'path');
+  assert.equal(kinds.get('/opt/workspace/client/deck.pptx'), 'path');
   // "README.md" with no directory context is prose about a file, not a handoff.
   assert.ok(![...kinds.keys()].some((raw) => raw.toLowerCase() === 'readme.md'));
 });
