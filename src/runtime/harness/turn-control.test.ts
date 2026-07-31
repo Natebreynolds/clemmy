@@ -30,6 +30,7 @@ const {
   backgroundOfferEnabled,
   classifyTurnPreflight,
   closeTheLoopNudge,
+  CONFIRM_BEAT_TEXT,
   confirmBeatDirective,
   confirmBeatEnabled,
   setProvenStandardLineForTest,
@@ -629,4 +630,17 @@ test('a missing session id can never produce a beat', () => {
     null,
     'no session context → no beat (fail-safe, not fail-open-to-asking)',
   );
+});
+
+test('the beat asks for a conversation, never a plan card', () => {
+  // The 2026-06-01 rollback was specifically about a plan/approve card being
+  // the first response to an action request; the owner's ideal is one natural
+  // line that states the reading and invites a correction. A beat that produces
+  // a briefing document re-creates the thing that was rolled back.
+  assert.match(CONFIRM_BEAT_TEXT, /conversational beat/i);
+  assert.match(CONFIRM_BEAT_TEXT, /invite a correction/i, 'the beat must open a door, not announce a plan');
+  assert.match(CONFIRM_BEAT_TEXT, /do not call tools yet/i, 'the pause is the point');
+  assert.match(CONFIRM_BEAT_TEXT, /without asking again/i, 'approve once, then run — never per-step approvals');
+  assert.doesNotMatch(CONFIRM_BEAT_TEXT, /2–3 lines|bulleted proposal is fine|checklist of steps/i);
+  assert.match(CONFIRM_BEAT_TEXT, /Do NOT produce a plan summary/i, 'the plan-card shape is explicitly refused');
 });

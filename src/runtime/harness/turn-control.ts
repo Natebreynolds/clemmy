@@ -735,9 +735,25 @@ export function bindProvenStandardLine(fn: (request: string) => string): void {
   provenStandardLineImpl = fn;
 }
 
+/**
+ * The beat is a CONVERSATION, not a status report. The earlier wording asked for
+ * a 2–3 line plan summary plus the connection name plus a background note, which
+ * produces a small briefing document — the opposite of the owner's stated ideal:
+ * "sure, I'll search Salesforce for Brett's prospecting today — or did you want
+ * something else?" A heavy beat is worse than none, because it adds ceremony to
+ * every substantial request and trains the user to skim past it.
+ *
+ * This is a DIRECTIVE about shape and intent, never a script to parrot: it says
+ * what the beat must accomplish (state the reading, invite the correction) and
+ * what it must not become (a plan card, a checklist), and leaves the wording to
+ * the model.
+ */
 export const CONFIRM_BEAT_TEXT =
-  '[confirm-first] Before executing, take one brief alignment beat: summarize the plan and destination in 2–3 lines, name the connection/capability you expect to use, and mention background execution if this may take several minutes. '
-  + 'Do not call tools yet. Wait for the user’s go-ahead; then verify the connection and execute without asking again. Skip this only if the request is actually read-only.';
+  '[confirm-first] Before doing the work, take ONE short conversational beat in your own words — a sentence or two, the way a colleague checks they understood before starting. '
+  + 'Say how you are reading the request and which source or tool you would use, and invite a correction. '
+  + 'Do NOT produce a plan summary, a checklist, or a bulleted proposal — that is a plan card, not a conversation. '
+  + 'If the work may run for several minutes, say you will pick it up in the background and report back here. '
+  + 'Do not call tools yet: wait for the go-ahead, then do the whole thing without asking again. Skip the beat entirely if the request is actually read-only.';
 
 /** Directive for a fresh execution-shaped chat turn, or null. Pure over its
  *  inputs plus one point read (prior completed turns); never throws. */
