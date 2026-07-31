@@ -82,11 +82,24 @@ test('recovery resumes ONLY tagged tasks, caps per event, and leaves text-mentio
   output = 'Logged in as nathan@example.com 👋';
   invalidateCliHealth('railway');
   await getCliHealth('railway', { force: true });
-  // The sweep is async fire-and-forget off the event; give it a beat.
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  // The sweep is async fire-and-forget off the event. Wait for the OBSERVABLE
+  // settled state rather than a guessed duration: a fixed 250ms sleep raced the
+  // sweep on a loaded machine and produced false failures in full-suite runs
+  // (one was misread as a real regression, 2026-07-31). Polling keeps a genuine
+  // regression failing — it just stops the clock from deciding the verdict.
+  const settled = async (): Promise<Map<string, ReturnType<typeof listBackgroundTasks>[number]>> => {
+    const deadline = Date.now() + 5_000;
+    let byId = new Map(listBackgroundTasks({}).map((task) => [task.id, task]));
+    while (Date.now() < deadline) {
+      const resumed = tagged.filter((t) => byId.get(t.id)?.status === 'pending').length;
+      if (resumed >= 5) return byId;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      byId = new Map(listBackgroundTasks({}).map((task) => [task.id, task]));
+    }
+    return byId;
+  };
+  const byId = await settled();
   _testOnly_setProbeExec();
-
-  const byId = new Map(listBackgroundTasks({}).map((task) => [task.id, task]));
   const resumedCount = tagged.filter((t) => byId.get(t.id)?.status === 'pending').length;
   assert.equal(resumedCount, 5, `cap: exactly 5 of 6 tagged tasks resume (got ${resumedCount})`);
   assert.equal(byId.get(untagged.id)?.status, 'awaiting_input',
