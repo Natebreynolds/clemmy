@@ -66,7 +66,7 @@ import {
   renderCrossSessionPrefixesForModel,
 } from './session-transcript.js';
 import { resolveWriteEvidence } from './work-report.js';
-import { gatherSessionSkills } from './skill-execution.js';
+import { gatherSessionSkills, skillExecutionShortfall } from './skill-execution.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../../memory/skill-store.js';
 import { renderProvenSkillForPrompt } from '../../memory/skill-choice-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput, projectCommandsLineForInput } from './context-packet.js';
@@ -2306,6 +2306,54 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         try {
           appendEvent({ sessionId, turn: 0, role: 'system', type: 'sdk_auto_continue', data: { attempt: autoContinues, stillLimited: Boolean(cont.limitHit) } });
         } catch { /* telemetry best-effort */ }
+      }
+    }
+
+    // DETERMINISTIC skill-execution floor — parity with the loop lane, which has
+    // enforced this since the 2026-06-15 lunar-audit (an LLM judge HAD the
+    // evidence that no render script ran and still passed hand-rolled output).
+    // This lane re-injected skill bodies but never verified EXECUTION, so a
+    // skill that prescribes bundled scripts could be treated as reading
+    // material — and a single-model user has no judge to catch it either. One
+    // continuation, conservative zero-ran threshold, kill-switch and fail-open
+    // identical to the loop lane.
+    if (!result.limitHit && !resultIsAwaitingInput()
+      && (getRuntimeEnv('HARNESS_SKILL_EXEC_GATE', 'on') ?? 'on').toLowerCase() !== 'off') {
+      const skillGap = skillExecutionShortfall(sessionId);
+      if (skillGap) {
+        try {
+          appendEvent({
+            sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'heartbeat',
+            data: { kind: 'skill_execution_repair', skill: skillGap.skill, prescribed: skillGap.prescribed },
+          });
+        } catch { /* telemetry best-effort */ }
+        const priorSkillResult = result;
+        try {
+          const repaired = await runContinuation({
+            prompt: [
+              `You treated this as finished, but the "${skillGap.skill}" skill was NOT executed: you ran none of its prescribed scripts (${skillGap.prescribed.join(', ')}).`,
+              "Do NOT hand-roll the deliverable. Run the skill's actual pipeline — its bundled render script and any mandatory validate script (re-read it with skill_read if needed) — so the output matches the skill's template exactly, then finish.",
+              "Only treat this as complete once the skill's own scripts have produced and validated the artifact.",
+            ].join(' '),
+            ...cleanContinuationRunOptions(),
+          });
+          // A null continuation (cancelled / budget-exhausted) leaves the
+          // original result intact rather than erasing completed work.
+          result = repaired
+            ? {
+                ...repaired,
+                toolUses: [...priorSkillResult.toolUses, ...repaired.toolUses],
+                text: repaired.text?.trim() ? repaired.text : priorSkillResult.text,
+              }
+            : priorSkillResult;
+        } catch {
+          // Repair is best-effort: a failed continuation must never swallow the
+          // work already done.
+          result = priorSkillResult;
+        }
       }
     }
 

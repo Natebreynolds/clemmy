@@ -219,3 +219,17 @@ test('all helpers FAIL-OPEN on an unknown/bad session', () => {
   // summarize returns a string (possibly the "no tool calls" sentinel) and never throws.
   assert.equal(typeof summarizeToolCallsForJudge('nope-not-a-session'), 'string');
 });
+
+test('BOTH lanes enforce the skill floor — the Claude lane no longer treats a skill as reading material (2026-07-31)', async () => {
+  const { readFileSync } = await import('node:fs');
+  // Parity is asserted structurally: the loop lane has enforced this since the
+  // 2026-06-15 lunar-audit, while the SDK lane re-injected skill bodies and
+  // never verified execution — and a single-model user has no judge to catch
+  // the difference. Both must consult the same deterministic detector behind
+  // the same kill-switch.
+  for (const lane of ['./loop.ts', './claude-agent-brain.ts']) {
+    const src = readFileSync(new URL(lane, import.meta.url), 'utf-8');
+    assert.match(src, /skillExecutionShortfall\(/, `${lane} must consult the deterministic skill floor`);
+    assert.match(src, /HARNESS_SKILL_EXEC_GATE/, `${lane} must honor the shared kill-switch`);
+  }
+});
