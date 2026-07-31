@@ -60,7 +60,7 @@ test('clip footer reports the TRUE record count + that recall returns ALL (acme 
   // The Airtable shape that broke: full result with 59 records, clipped to a few.
   const full = JSON.stringify({ data: { records: Array.from({ length: 59 }, (_, i) => ({ id: i, fields: { Name: 'Contact ' + i, Email: `c${i}@site.example` } })) }, error: null, successful: true });
   const visible = formatRecallableToolText(full, { sessionId: sess.id, callId: 'call_air', toolName: 'composio_execute_tool', maxChars: 400 });
-  assert.match(visible, /[Cc]ontains 59 records/);
+  assert.match(visible, /[Cc]ontains 59 record\(s\) at data\.records\[\*\]/);
   assert.match(visible, /returns ALL 59/);
   assert.match(visible, /no pagination/i);
   assert.match(visible, /recall_tool_result\("call_air"\)/);

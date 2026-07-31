@@ -73,7 +73,7 @@ test('formatComposioToolOutput stores full oversized JSON before returning a rec
   assert.match(output, /recall_tool_result\("call_composio_full"\)/);
   // List payload → the footer now reports the TRUE item count + that recall
   // returns ALL of them (the acme 44→4 fix), not a bare char count.
-  assert.match(output, /20 value/);
+  assert.match(output, /20 record\(s\) at data\.value\[\*\]/);
   assert.match(output, /ALL 20/);
 
   const row = getToolOutput(sess.id, 'call_composio_full');

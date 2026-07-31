@@ -294,3 +294,67 @@ test('budget exhaustion is unmistakably an ERROR string, never parseable-looking
   // the returned message shape used by the tool handler.
   assert.match(`ERROR: ${err}`, /^ERROR: recall budget exhausted/);
 });
+
+test('tool_output_query unwraps provider-wrapped records — the 2026-07-31 calendar-run class', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  // Microsoft Graph shape: records nested at data.value, wrapped in envelope keys.
+  const payload = JSON.stringify({
+    data: {
+      '@odata.context': 'https://graph.microsoft.com/v1.0/$metadata#calendarView',
+      value: Array.from({ length: 7 }, (_, i) => ({
+        subject: `Meeting ${i}`, start: { dateTime: `2026-07-31T0${i}:00:00` }, organizer: 'nate',
+      })),
+    },
+    successful: true,
+    error: null,
+  });
+  writeToolOutput({ sessionId: sess.id, callId: 'call_cal', tool: 'composio_execute_tool', output: payload });
+
+  const query = captureToolOutputQueryHandler();
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_cal', fields: ['subject', 'start'] }),
+  );
+  const text = res.content[0].text;
+  assert.match(text, /of 7 matching \(7 total from data\.value\[\*\]\)/, 'the engine queries the RECORDS, naming where they live');
+  assert.ok(text.includes('Meeting 6'), 'record fields project without knowing the envelope');
+  assert.doesNotMatch(text, /Object \(\d+ top-level keys\)/, 'never the useless envelope summary');
+});
+
+test('a projection that matches nothing returns the MAP, never "{}"', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({
+    sessionId: sess.id, callId: 'call_flat', tool: 'composio_execute_tool',
+    output: JSON.stringify({ status: 'ok', meta: { region: 'us' } }),
+  });
+  const query = captureToolOutputQueryHandler();
+  const missTop = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_flat', fields: ['events'] }),
+  );
+  const t1 = missTop.content[0].text;
+  assert.match(t1, /None of \["events"\] exist at the top level/);
+  assert.match(t1, /status: string/, 'the shape outline names what DOES exist');
+
+  writeToolOutput({
+    sessionId: sess.id, callId: 'call_wrap', tool: 'composio_execute_tool',
+    output: JSON.stringify({ data: { value: [{ subject: 'A' }, { subject: 'B' }] } }),
+  });
+  const missRecords = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_wrap', fields: ['zzz_not_real'] }),
+  );
+  const t2 = missRecords.content[0].text;
+  assert.match(t2, /None of \["zzz_not_real"\] exist on these records/);
+  assert.match(t2, /subject/, 'record fields are named so the next query lands');
+
+  const missFilter = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_wrap', filter_field: 'subject', filter_equals: 'Z' }),
+  );
+  const t3 = missFilter.content[0].text;
+  assert.match(t3, /0 records matched filter_field="subject"/);
+  assert.match(t3, /record fields: subject/, 'zero matches still teach the shape');
+});

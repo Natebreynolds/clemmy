@@ -62,6 +62,57 @@ export function dominantListCount(text: string): { key: string; count: number } 
   return countDominantArray(tryParse(text));
 }
 
+/** Locate the ACTUAL dominant list array (not just its count): the value at
+ *  `key`, or nested one level under `data` — the composio/Graph/Airtable wrap
+ *  `{ data: { value: [...] } }`. Returns the rows plus the dotted path so a
+ *  query engine can operate on the records directly and NAME where they live. */
+export function resolveDominantArray(value: unknown): { rows: unknown[]; path: string } | null {
+  const dom = countDominantArray(value);
+  if (!dom || dom.count === 0) return null;
+  if (Array.isArray(value)) return { rows: value, path: '' };
+  const obj = value as Record<string, unknown>;
+  if (Array.isArray(obj[dom.key])) return { rows: obj[dom.key] as unknown[], path: dom.key };
+  const data = obj.data;
+  if (data && typeof data === 'object' && Array.isArray((data as Record<string, unknown>)[dom.key])) {
+    return { rows: (data as Record<string, unknown>)[dom.key] as unknown[], path: `data.${dom.key}` };
+  }
+  return null;
+}
+
+/**
+ * One-line-per-key shape outline of a JSON value — the MAP a model needs to
+ * write a query that lands on the first try (2026-07-31 calendar-run audit: a
+ * no-match projection answered "{}" with no shape, so the model gave up on
+ * querying and recalled the full 26KB payload). Pure, bounded, no content.
+ */
+export function describeJsonShape(value: unknown, maxLines = 12): string {
+  if (Array.isArray(value)) {
+    const fields = collectFields(value);
+    return `array of ${value.length} record(s)${fields.length ? ` — record fields: ${fields.slice(0, 24).join(', ')}${fields.length > 24 ? ', …' : ''}` : ''}`;
+  }
+  if (!value || typeof value !== 'object') return typeof value;
+  const obj = value as Record<string, unknown>;
+  const lines: string[] = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (lines.length >= maxLines) { lines.push(`… (+${Object.keys(obj).length - maxLines} more keys)`); break; }
+    if (Array.isArray(v)) {
+      const fields = collectFields(v);
+      lines.push(`${k}: array(${v.length})${fields.length ? ` of {${fields.slice(0, 10).join(', ')}${fields.length > 10 ? ', …' : ''}}` : ''}`);
+    } else if (v && typeof v === 'object') {
+      const inner = Object.keys(v as object);
+      lines.push(`${k}: object {${inner.slice(0, 10).join(', ')}${inner.length > 10 ? ', …' : ''}}`);
+    } else {
+      lines.push(`${k}: ${v === null ? 'null' : typeof v}`);
+    }
+  }
+  const dom = resolveDominantArray(value);
+  if (dom && dom.path) {
+    const fields = collectFields(dom.rows);
+    lines.push(`→ the records live at ${dom.path}[*]${fields.length ? ` (fields: ${fields.slice(0, 12).join(', ')}${fields.length > 12 ? ', …' : ''})` : ''}`);
+  }
+  return lines.join('\n');
+}
+
 /** Union of keys across the first N objects in an array (the "schema"). */
 function collectFields(arr: unknown[], sample = 12): string[] {
   const keys = new Set<string>();
@@ -197,9 +248,16 @@ function digestObject(obj: Record<string, unknown>, totalChars: number, maxChars
   // Surface the TRUE count of a nested records/items array so the model knows
   // the full set size + that recall returns ALL of it — never reads the clip as
   // "maybe more pages" and guesses an offset (the acme 44→4 / 'itr2' bug).
-  const dom = countDominantArray(obj);
-  const domNote = dom && dom.count > 0
-    ? ` Contains ${dom.count} ${dom.key} — recall_tool_result returns ALL ${dom.count} (no pagination needed).`
+  const resolved = resolveDominantArray(obj);
+  const domFields = resolved ? collectFields(resolved.rows) : [];
+  // Name WHERE the records live and their fields, and say the query engine
+  // operates on them directly — so the first tool_output_query is written
+  // against known shape instead of a guessed top-level projection (the
+  // 2026-07-31 calendar run paid 3 extra calls + a 26KB replay for that guess).
+  const domNote = resolved
+    ? ` Contains ${resolved.rows.length} record(s) at ${resolved.path ? `${resolved.path}[*]` : '[*]'}` +
+      `${domFields.length ? ` with fields: ${domFields.slice(0, 16).join(', ')}${domFields.length > 16 ? ', …' : ''}` : ''}` +
+      ` — tool_output_query filters/projects/paginates THESE records directly; recall_tool_result returns ALL ${resolved.rows.length} (no pagination needed).`
     : '';
   const footer =
     `\n[digest: ${toolName} returned a JSON object with ${entries.length} top-level key${entries.length === 1 ? '' : 's'} (~${totalChars.toLocaleString()} chars)${moreKeys > 0 ? `; ${moreKeys} key(s) not shown` : ''}.${domNote} ` +

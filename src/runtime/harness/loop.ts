@@ -115,6 +115,7 @@ import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
 import { isUserFacingSession } from '../../execution/scope.js';
 import { primeTurnRecallVector, recordFactImpression, searchFactsByText } from '../../memory/facts.js';
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
+import { recordRecallRun } from '../../memory/recall-usage.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import {
   activateDispatchLease,
@@ -1822,10 +1823,10 @@ function episodicBlockForPrimer(sessionId: string): string {
  *  a fact remembered seconds ago, before its embedding indexes). The primer's
  *  vault search never touched consolidated_facts, so a freshly-stated "remember
  *  X" was invisible to auto-context and the model would confabulate. */
-function factsBlockForPrimer(query: string): string {
+export function factsBlockForPrimer(query: string, sessionId = ''): { text: string; recallId?: string } {
   try {
     const facts = searchFactsByText(query, TURN_MEMORY_PRIMER_FACT_TOP_K);
-    if (facts.length === 0) return '';
+    if (facts.length === 0) return { text: '' };
     // Primer exposure is an impression, not proof that the memory helped.
     // Keeping this separate from utility prevents repeated auto-context from
     // making the same memories rank higher merely because they were shown.
@@ -1835,10 +1836,26 @@ function factsBlockForPrimer(query: string): string {
       query,
       facts: facts.map((fact) => ({ fact, reason: 'lexical-primer-match' })),
     });
+    // The unified primer records a run; this timeout/error FALLBACK injected
+    // the same class of facts with no run at all (recallId null, observed live
+    // 2026-07-31), so anything it surfaced was credit-blind. Parity restored.
+    let recallId: string | undefined;
+    try {
+      recallId = recordRecallRun({
+        objective: query,
+        surface: 'automatic_primer_fallback',
+        answerability: 'partial',
+        candidateRefs: facts.map((fact) => ({ type: 'fact', id: String(fact.id), snippet: fact.content })),
+        sessionId: sessionId || undefined,
+      }).id;
+    } catch { /* attribution must never block the primer */ }
     const lines = facts.map((f) => `- ${f.content}`);
-    return ['[REMEMBERED FACTS — durable, user-stated or curated; treat as known]', ...lines].join('\n');
+    return {
+      text: ['[REMEMBERED FACTS — durable, user-stated or curated; treat as known]', ...lines].join('\n'),
+      recallId,
+    };
   } catch {
-    return '';
+    return { text: '' };
   }
 }
 const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS', 800);
@@ -2051,7 +2068,7 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
   const formatted = formatSearchHits(hits, TURN_MEMORY_PRIMER_MAX_CHARS);
   // Durable facts relevant to THIS message — the primer's vault search alone
   // never surfaced consolidated_facts, so a just-remembered fact was invisible.
-  const factsBlock = factsBlockForPrimer(query);
+  const { text: factsBlock, recallId } = factsBlockForPrimer(query, sessionId);
   // Recently-observed breadcrumbs for this session (was a write-only table).
   const episodicBlock = episodicBlockForPrimer(sessionId);
   if (!formatted && !factsBlock && !episodicBlock && !breadcrumbs) {
@@ -2072,7 +2089,7 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
     // above are never lost.
     ...(breadcrumbs ? ['', breadcrumbs] : []),
   ].join('\n');
-  return { enabled: true, query, hitCount: hits.length, injectedBytes: text.length, source, text };
+  return { enabled: true, query, hitCount: hits.length, injectedBytes: text.length, source, text, recallId };
 }
 
 async function searchVaultAsyncWithTimeout(query: string): Promise<ReturnType<typeof searchVault> | null> {

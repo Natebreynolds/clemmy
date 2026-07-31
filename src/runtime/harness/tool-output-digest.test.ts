@@ -208,7 +208,35 @@ test('dominantListCount: parses text then counts', () => {
 test('digestObject: surfaces the nested records count + recall-returns-all (no pagination)', () => {
   const big = { data: { records: Array.from({ length: 61 }, (_, i) => ({ id: i, name: 'x'.repeat(80) })) }, error: null, successful: true };
   const out = digestToolOutput(JSON.stringify(big, null, 2), { maxChars: 1500, toolName: 'composio_execute_tool', callId: 'call_X' });
-  assert.match(out, /Contains 61 records/);
+  assert.match(out, /Contains 61 record\(s\) at data\.records\[\*\]/);
   assert.match(out, /recall_tool_result returns ALL 61/);
   assert.match(out, /no pagination needed/i);
+});
+
+test('object digest names WHERE the records live and that the query engine reaches them (2026-07-31)', () => {
+  const graphish = JSON.stringify({
+    data: {
+      '@odata.context': 'https://graph.microsoft.com/v1.0/$metadata#calendarView',
+      value: Array.from({ length: 9 }, (_, i) => ({ subject: `Mtg ${i}`, start: `T0${i}`, organizer: 'nate' })),
+    },
+    successful: true,
+    error: null,
+  });
+  const digest = digestToolOutput('x'.repeat(0) + graphish, { maxChars: 900, toolName: 'composio_execute_tool', callId: 'call_g' });
+  assert.match(digest, /9 record\(s\) at data\.value\[\*\]/, 'the digest is a map, not just a count');
+  assert.match(digest, /fields: subject, start, organizer/);
+  assert.match(digest, /tool_output_query filters\/projects\/paginates THESE records directly/);
+});
+
+test('describeJsonShape outlines keys, arrays, and the record path', async () => {
+  const { describeJsonShape } = await import('./tool-output-digest.js');
+  const shape = describeJsonShape({
+    successful: true,
+    error: null,
+    data: { value: [{ subject: 'A', start: 'T1' }] },
+  });
+  assert.match(shape, /successful: boolean/);
+  assert.match(shape, /error: null/);
+  assert.match(shape, /data: object \{value\}/);
+  assert.match(shape, /→ the records live at data\.value\[\*\] \(fields: subject, start\)/);
 });

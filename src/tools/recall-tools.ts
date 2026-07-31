@@ -5,6 +5,7 @@ import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './code-mode-tool.js';
 import { extractCompleteJsonObjects, extractJsonCandidate } from '../runtime/harness/json-repair.js';
+import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -199,6 +200,33 @@ export function registerRecallTools(server: McpServer): void {
         return out;
       };
 
+      // Unwrap the dominant nested list: providers wrap their records —
+      // `{ data: { value: [...] } }` (Graph), `{ data: { records: [...] } }`
+      // (composio/Airtable) — and the object path below can only project
+      // TOP-LEVEL keys, so every filter/project/paginate query against a
+      // wrapped result missed (2026-07-31 calendar run: the miss cost 3 extra
+      // calls and a full 26KB recall). The records ARE the result; query them.
+      let unwrappedPath = '';
+      if (!Array.isArray(parsed) && parsed && typeof parsed === 'object') {
+        const wantsRecordQuery = Boolean(
+          input.filter_field !== undefined || input.offset !== undefined || input.limit !== undefined
+          || input.fields !== undefined,
+        );
+        const dom = resolveDominantArray(parsed);
+        if (dom && dom.path && wantsRecordQuery) {
+          // Only when the requested fields aren't literal top-level keys — an
+          // explicit top-level projection still means the top-level object.
+          const topLevel = new Set(Object.keys(parsed as Record<string, unknown>));
+          const fieldsAreTopLevel = Array.isArray(input.fields)
+            && (input.fields as string[]).length > 0
+            && (input.fields as string[]).every((f) => topLevel.has(f));
+          if (!fieldsAreTopLevel) {
+            parsed = dom.rows;
+            unwrappedPath = dom.path;
+          }
+        }
+      }
+
       if (Array.isArray(parsed)) {
         const ff = typeof input.filter_field === 'string' ? input.filter_field : undefined;
         const contains = typeof input.filter_contains === 'string' ? input.filter_contains.toLowerCase() : undefined;
@@ -213,17 +241,35 @@ export function registerRecallTools(server: McpServer): void {
           });
         }
         const matched = rows.length;
+        // Zero matches must TEACH, not stonewall: name the fields that exist so
+        // the next filter lands (weakest-model rule — every dead end escapable
+        // from its text alone).
+        if (matched === 0 && ff) {
+          const shape = describeJsonShape(parsed);
+          const bodyText = `0 records matched filter_field=${JSON.stringify(ff)}. The result is an ${shape}. `
+            + 'Check the field name/value and re-query.';
+          return textResult(bodyText, { maxChars: bodyText.length });
+        }
         const offset = Number.isFinite(input.offset as number) ? Math.max(0, Math.trunc(input.offset as number)) : 0;
         const limit = Number.isFinite(input.limit as number) ? Math.min(200, Math.max(1, Math.trunc(input.limit as number))) : 50;
         const page = rows.slice(offset, offset + limit).map(project);
+        // A projection that strips EVERY record to {} is the same dead end as a
+        // missed top-level projection — teach the record fields instead.
+        if (fields && fields.length > 0 && page.length > 0
+          && page.every((r) => r && typeof r === 'object' && !Array.isArray(r) && Object.keys(r as object).length === 0)) {
+          const bodyText = `None of ${JSON.stringify(fields)} exist on these records. The result is an ${describeJsonShape(rows)}. Re-query with fields that exist.`;
+          return textResult(bodyText, { maxChars: bodyText.length });
+        }
+        const from = unwrappedPath ? ` from ${unwrappedPath}[*]` : '';
         const header = recoveredClippedArrayPrefix
           ? `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching among ${(parsed as unknown[]).length} complete record(s) recovered from a clipped JSON-array prefix (full total unknown)`
-          : `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total)`;
+          : `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total${from})`;
         // Hand the model the EXACT, copy-paste reference for these values, so a
         // downstream send binds them by reference instead of retyping (which is
         // how a value gets invented or dropped). Root array + single projected
         // field → a precise path.
-        const refPath = fields && fields.length === 1 ? `[*].${fields[0]}` : '[*]';
+        const refBase = unwrappedPath ? `${unwrappedPath}[*]` : '[*]';
+        const refPath = fields && fields.length === 1 ? `${refBase}.${fields[0]}` : refBase;
         const refHint = `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
         const bodyText = clipQueryBody(`${header}\n\n${JSON.stringify(page, null, 1)}`) + refHint;
         return textResult(bodyText, { maxChars: bodyText.length });
@@ -231,6 +277,17 @@ export function registerRecallTools(server: McpServer): void {
 
       if (parsed && typeof parsed === 'object') {
         const projected = project(parsed);
+        // A projection that matched NOTHING must return the map, not "{}" —
+        // the 2026-07-31 calendar run got the empty object, learned nothing,
+        // and fell back to recalling the entire 26KB raw payload.
+        const projectionMissed = fields && fields.length > 0
+          && Object.keys(projected as Record<string, unknown>).length === 0;
+        if (projectionMissed) {
+          const bodyText = `None of ${JSON.stringify(fields)} exist at the top level. The result's shape:\n`
+            + `${describeJsonShape(parsed)}\n`
+            + `Re-query with the fields/filter of the records themselves — this tool queries the record list directly.`;
+          return textResult(bodyText, { maxChars: bodyText.length });
+        }
         const refHint = `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
         const bodyText = clipQueryBody(`Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`) + refHint;
         return textResult(bodyText, { maxChars: bodyText.length });

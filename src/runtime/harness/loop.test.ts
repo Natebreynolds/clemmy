@@ -7751,3 +7751,20 @@ test('stall judge: a fake transcript on a NON-instructional ask keeps the determ
     _setStallJudgeForTests(null);
   }
 });
+
+test('primer FALLBACK facts record a session-stamped recall run — parity with the unified path (2026-07-31)', async () => {
+  const { factsBlockForPrimer } = await import('./loop.js');
+  const { rememberFact } = await import('../../memory/facts.js');
+  const { openMemoryDb } = await import('../../memory/db.js');
+  const fact = rememberFact({ kind: 'project', content: 'The Beacon rollout window is Thursday evenings.' });
+
+  const block = factsBlockForPrimer('Beacon rollout window', 'sess-fallback-pin');
+  assert.ok(block.text.includes('Beacon rollout window'), 'the fact is injected');
+  assert.ok(block.recallId, 'the fallback records a run instead of injecting credit-blind (observed recallId:null live 2026-07-31)');
+  const row = openMemoryDb().prepare(
+    'SELECT surface, session_id FROM memory_recall_runs WHERE id = ?',
+  ).get(block.recallId) as { surface: string; session_id: string | null };
+  assert.equal(row.surface, 'automatic_primer_fallback');
+  assert.equal(row.session_id, 'sess-fallback-pin', 'session stamp makes the fallback sweepable for post-turn credit');
+  void fact;
+});
