@@ -9,6 +9,7 @@
  * unchanged. `classifyTurnText` at the bottom is the forward-looking
  * unified entry point later phases adopt.
  */
+import { stripNarratedEnvelope } from './envelope-narration.js';
 import { listEvents, type EventRow } from './eventlog.js';
 import { isToolSurfaceProbeTool } from './tool-evidence.js';
 import { isCanonicalTopLevelToolEvent, projectCanonicalTopLevelToolEvents } from './tool-effect.js';
@@ -433,9 +434,32 @@ function parseDecisionText(text: string): OrchestratorDecisionShape | null {
 }
 
 export function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | null {
-  if (typeof value === 'string') return parseDecisionText(value);
-  if (value && typeof value === 'object') return decisionFromObject(value as Record<string, unknown>);
-  return null;
+  const decision = typeof value === 'string'
+    ? parseDecisionText(value)
+    : value && typeof value === 'object'
+      ? decisionFromObject(value as Record<string, unknown>)
+      : null;
+  return decision ? withoutNarratedEnvelope(decision) : decision;
+}
+
+/**
+ * A model can emit the decision envelope as PROSE instead of returning it
+ * structurally — live 3.5.0 showed a user "summary: … reply: … done: …
+ * nextAction: … reason: …" where an answer belonged. Repair it at the single
+ * parse choke point so every downstream consumer (chat delivery, transcripts,
+ * notifications) is fixed at once rather than each learning the same lesson.
+ * Conservative: the stripper needs three distinct contract keys at line starts
+ * and a usable reply, otherwise the text is returned untouched.
+ */
+function withoutNarratedEnvelope(decision: OrchestratorDecisionShape): OrchestratorDecisionShape {
+  const cleanedReply = typeof decision.reply === 'string'
+    ? stripNarratedEnvelope(decision.reply)
+    : decision.reply;
+  const cleanedSummary = typeof decision.summary === 'string'
+    ? stripNarratedEnvelope(decision.summary)
+    : decision.summary;
+  if (cleanedReply === decision.reply && cleanedSummary === decision.summary) return decision;
+  return { ...decision, reply: cleanedReply, summary: cleanedSummary };
 }
 
 /**
