@@ -51,11 +51,26 @@ final class WebViewModel: NSObject, ObservableObject {
     }
 
     /// Bonjour found the Mac at a new address: persist and reload.
-    func adoptOrigin(_ origin: String) {
-        guard origin != pairing.origin else { return }
+    /// `isLan` records whether this is a local address worth preferring later
+    /// — the relay origin is durable config, not a discovered LAN address.
+    func adoptOrigin(_ origin: String, isLan: Bool = true) {
+        if isLan { pairing.lanOrigin = origin }
+        guard origin != pairing.origin else {
+            PairingStore.save(pairing)
+            return
+        }
         pairing.origin = origin
         PairingStore.save(pairing)
         loadHome()
+    }
+
+    /// Remembers the daemon-published relay door. Silent: it changes nothing
+    /// about the current connection, it just makes the next off-LAN attempt
+    /// possible — which is why an existing pairing needs no re-scan.
+    func rememberRelayOrigin(_ relayOrigin: String) {
+        guard pairing.relayOrigin != relayOrigin else { return }
+        pairing.relayOrigin = relayOrigin
+        PairingStore.save(pairing)
     }
 
     /// Hands the APNs token to the PWA, which registers it over its own

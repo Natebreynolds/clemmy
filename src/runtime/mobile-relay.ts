@@ -84,25 +84,38 @@ export interface MobileRelayConfig {
 }
 
 interface PersistedRelayState {
-  authToken: string;
+  authToken?: string;
+  /** Optional relay endpoint config — same meaning as the CLEMENTINE_RELAY_* envs.
+   *  The packaged app owns the daemon and cannot practically inject env vars,
+   *  so file config is the production path; env wins when both are present. */
+  url?: string;
+  baseDomain?: string;
+  relayCertFp?: string;
 }
 
 function relayStatePath(stateDir?: string): string {
   return path.join(stateDir ?? path.join(BASE_DIR, 'state'), 'mobile-relay.json');
 }
 
+function readRelayState(stateDir?: string): PersistedRelayState {
+  const file = relayStatePath(stateDir);
+  if (!existsSync(file)) return {};
+  try {
+    return JSON.parse(readFileSync(file, 'utf8')) as PersistedRelayState;
+  } catch {
+    return {};
+  }
+}
+
 /** The per-pairing relay auth token, minted once and persisted (0600). */
 export function ensureRelayAuthToken(stateDir?: string): string {
-  const file = relayStatePath(stateDir);
-  if (existsSync(file)) {
-    try {
-      const parsed = JSON.parse(readFileSync(file, 'utf8')) as PersistedRelayState;
-      if (typeof parsed.authToken === 'string' && parsed.authToken.length >= 16) return parsed.authToken;
-    } catch { /* fall through to re-mint */ }
-  }
+  const state = readRelayState(stateDir);
+  if (typeof state.authToken === 'string' && state.authToken.length >= 16) return state.authToken;
   const authToken = randomBytes(32).toString('base64url');
+  const file = relayStatePath(stateDir);
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  writeFileSync(file, JSON.stringify({ authToken } satisfies PersistedRelayState, null, 2), { mode: 0o600 });
+  // Merge rather than replace: the same file may carry endpoint config.
+  writeFileSync(file, JSON.stringify({ ...state, authToken } satisfies PersistedRelayState, null, 2), { mode: 0o600 });
   return authToken;
 }
 
@@ -122,6 +135,45 @@ export function relayConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Mobile
   const relayCertFp = env.CLEMENTINE_RELAY_CERT_FP?.trim();
   if (!url || !baseDomain || !relayCertFp) return null;
   return { url, baseDomain, relayCertFp };
+}
+
+/**
+ * The production loader: env config wins (dev/testing), else the persisted
+ * state file (how the packaged, app-owned daemon is configured). The kill
+ * switch applies to both sources.
+ */
+export function loadRelayConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.env): MobileRelayConfig | null {
+  if ((env.CLEMENTINE_MOBILE_RELAY ?? '').toLowerCase() === 'off') return null;
+  const fromEnv = relayConfigFromEnv(env);
+  if (fromEnv) return fromEnv;
+  const state = readRelayState(stateDir);
+  const url = state.url?.trim();
+  const baseDomain = state.baseDomain?.trim();
+  const relayCertFp = state.relayCertFp?.trim();
+  if (!url || !baseDomain || !relayCertFp) return null;
+  return { url, baseDomain, relayCertFp };
+}
+
+// ─── relay runtime registry ─────────────────────────────────────────────────
+//
+// Mirrors the direct-app runtime registry in mobile-ingress.ts: the mobile
+// router needs to tell an already-paired phone where the relay door is
+// (GET /m/relay-info), and only the boot wiring knows. Plain module state —
+// set once when the tunnel starts.
+
+export interface MobileRelayRuntime {
+  /** The origin the phone should use off-LAN, e.g. "https://<pairId>.r.example.com:53028". */
+  origin: string;
+}
+
+let relayRuntime: MobileRelayRuntime | null = null;
+
+export function setMobileRelayRuntime(runtime: MobileRelayRuntime | null): void {
+  relayRuntime = runtime;
+}
+
+export function getMobileRelayRuntime(): MobileRelayRuntime | null {
+  return relayRuntime;
 }
 
 // ─── the supervised tunnel ──────────────────────────────────────────────────

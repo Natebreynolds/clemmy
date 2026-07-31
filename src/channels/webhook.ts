@@ -2890,9 +2890,9 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     // registered. Best-effort like Bonjour — no relay means LAN-only, never
     // a boot failure.
     try {
-      const { relayConfigFromEnv, ensureRelayAuthToken, relayPairId, startMobileRelayClient } =
+      const { loadRelayConfig, ensureRelayAuthToken, relayPairId, startMobileRelayClient, setMobileRelayRuntime } =
         await import('../runtime/mobile-relay.js');
-      const relayConfig = relayConfigFromEnv();
+      const relayConfig = loadRelayConfig();
       if (relayConfig && directApp) {
         const { startRelayInternalListener } = await import('../runtime/mobile-ingress.js');
         const relayListener = await startRelayInternalListener(app, {
@@ -2904,6 +2904,10 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         // relay; without this the host allowlist 421s every relayed request.
         const { allowHostName } = await import('../runtime/http-origin-guard.js');
         allowHostName(`${pairId}.${relayConfig.baseDomain}`);
+        // The public TCP port is the relay endpoint's own port — DNS carries
+        // only the name. Published to paired phones via GET /m/relay-info.
+        const relayPublicPort = relayConfig.url.split(':')[1];
+        setMobileRelayRuntime({ origin: `https://${pairId}.${relayConfig.baseDomain}:${relayPublicPort}` });
         startMobileRelayClient({
           config: relayConfig,
           pairId,

@@ -9,6 +9,7 @@ import os from 'node:os';
 import QRCode from 'qrcode';
 import { WEBHOOK_HOST, WEBHOOK_PORT } from '../config.js';
 import { getDirectAppRuntime } from '../runtime/mobile-ingress.js';
+import { getMobileRelayRuntime } from '../runtime/mobile-relay.js';
 import { createMobilePairingCode } from '../runtime/mobile-pairing.js';
 import { setPin, hasPin, readPinMeta } from '../runtime/mobile-pin.js';
 import {
@@ -134,6 +135,13 @@ export async function generateQrSvg(targetInput?: { lanIp?: string | null }): Pr
   // purpose. The iOS app stores it and accepts exactly this cert.
   const fp = getDirectAppRuntime()?.fingerprint;
   if (fp) pairUrl.searchParams.set('fp', fp);
+  // The off-LAN door, when one is configured. Safe to publish: it is a
+  // hostname derived from the (public) certificate hash, and the same pin
+  // plus the device session still gate everything behind it. Already-paired
+  // phones learn this from GET /m/relay-info instead, so this is only the
+  // head start for a fresh scan.
+  const relayOrigin = getMobileRelayRuntime()?.origin;
+  if (relayOrigin) pairUrl.searchParams.set('relay', relayOrigin);
   const svg = await QRCode.toString(pairUrl.toString(), {
     type: 'svg',
     errorCorrectionLevel: 'M',

@@ -12,8 +12,25 @@ struct Pairing: Codable, Equatable {
     /// pointed at a publicly-trusted hostname (tunnel mode) — then the system
     /// trust store applies unmodified.
     var fingerprint: String?
+    /// The off-LAN door, learned from GET /m/relay-info on any LAN visit (so
+    /// existing pairings gain remote access without re-scanning) or from the
+    /// QR's `relay` param. Same certificate pin applies: the relay is a byte
+    /// pipe, so the TLS peer through it is still this Mac.
+    var relayOrigin: String?
+    /// The LAN origin, remembered while connected over the relay so the app
+    /// can prefer the fast local path again the moment it is reachable.
+    var lanOrigin: String?
 
     var homeURL: URL? { URL(string: origin + "/m/") }
+
+    /// Origins to try, in order: whatever we last used, then the remembered
+    /// LAN address, then the relay. Deduplicated, order preserved.
+    var candidateOrigins: [String] {
+        var seen = Set<String>()
+        return [origin, lanOrigin, relayOrigin]
+            .compactMap { $0 }
+            .filter { seen.insert($0).inserted }
+    }
 }
 
 enum PairingParseError: LocalizedError {
@@ -32,7 +49,7 @@ enum PairingParseError: LocalizedError {
 
 enum PairingParser {
     /// Accepts the exact URL the daemon encodes in its QR:
-    ///   https://<host>:<port>/m/?pair=<token>[&fp=<base64url sha-256>]
+    ///   https://<host>:<port>/m/?pair=<token>[&fp=<base64url sha-256>][&relay=<origin>]
     /// Returns the durable pairing plus the full one-time launch URL, which is
     /// loaded once so the PWA can consume the token.
     static func parse(_ raw: String) throws -> (pairing: Pairing, launchURL: URL) {
@@ -49,7 +66,14 @@ enum PairingParser {
         let fp = items.first(where: { $0.name == "fp" })?.value
         var origin = "https://" + host
         if let port = url.port { origin += ":\(port)" }
-        return (Pairing(origin: origin, fingerprint: fp?.isEmpty == false ? fp : nil), url)
+        let relay = items.first(where: { $0.name == "relay" })?.value
+        let pairing = Pairing(
+            origin: origin,
+            fingerprint: fp?.isEmpty == false ? fp : nil,
+            relayOrigin: relay?.isEmpty == false ? relay : nil,
+            lanOrigin: origin
+        )
+        return (pairing, url)
     }
 }
 

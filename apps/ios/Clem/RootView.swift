@@ -87,18 +87,22 @@ private struct CommandCenterView: View {
                 model.load(launchURL ?? model.pairing.homeURL!)
             }
             .onChange(of: model.hasLoadedOnce) { _, loaded in
-                if loaded { AppDelegate.requestPushAuthorization() }
+                guard loaded else { return }
+                AppDelegate.requestPushAuthorization()
+                // Learn the off-LAN door from whichever door just worked, so
+                // pairings made before the relay existed gain remote access
+                // without re-scanning anything.
+                RelayDiscovery.fetchRelayOrigin(
+                    from: model.pairing.origin,
+                    fingerprint: model.pairing.fingerprint
+                ) { relay in
+                    if let relay { model.rememberRelayOrigin(relay) }
+                }
             }
             .onChange(of: model.connectionLost) { _, lost in
-                guard lost, !searching, let fp = model.pairing.fingerprint else { return }
+                guard lost, !searching else { return }
                 searching = true
-                rediscovery = Rediscovery()
-                rediscovery.findMac(fingerprint: fp) { origin in
-                    searching = false
-                    if let origin {
-                        model.adoptOrigin(origin)
-                    }
-                }
+                reconnect()
             }
             .onReceive(NotificationCenter.default.publisher(for: AppDelegate.tokenNotification)) { note in
                 if let token = note.userInfo?["token"] as? String {
@@ -113,6 +117,44 @@ private struct CommandCenterView: View {
             .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
                 confirmUnpair = true
             }
+    }
+
+    /// The reconnect ladder, cheapest and most private first:
+    ///   1. a known origin that answers right now (LAN, or the relay if that
+    ///      is where we already are),
+    ///   2. Bonjour — the Mac moved to a new LAN address,
+    ///   3. the relay — we are off the LAN entirely.
+    /// Every rung enforces the same certificate pin, so "which door" never
+    /// widens what the app trusts.
+    private func reconnect() {
+        let pairing = model.pairing
+        RelayDiscovery.firstReachable(pairing.candidateOrigins, fingerprint: pairing.fingerprint) { reachable in
+            if let reachable {
+                searching = false
+                model.adoptOrigin(reachable, isLan: reachable != pairing.relayOrigin)
+                return
+            }
+            guard let fp = pairing.fingerprint else {
+                searching = false
+                return
+            }
+            rediscovery = Rediscovery()
+            rediscovery.findMac(fingerprint: fp) { origin in
+                if let origin {
+                    searching = false
+                    model.adoptOrigin(origin)
+                    return
+                }
+                guard let relay = pairing.relayOrigin else {
+                    searching = false
+                    return
+                }
+                RelayDiscovery.probe(origin: relay, fingerprint: fp, timeout: 8) { ok in
+                    searching = false
+                    if ok { model.adoptOrigin(relay, isLan: false) }
+                }
+            }
+        }
     }
 }
 

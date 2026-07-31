@@ -748,6 +748,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     .requireMobileSession = requireMobileSession;
 
   /** Liveness probe — setup uses this to confirm the daemon is answering. */
+  /**
+   * Where the relay door is, if one is configured. Public by construction:
+   * the origin is a hostname derived from the (public) certificate hash —
+   * knowing it grants nothing, since the TLS pin and the device session
+   * still gate everything behind it. Served anonymously so the native shell
+   * can learn/refresh it on any LAN visit without a web session.
+   */
+  router.get('/relay-info', async (_req, res) => {
+    const { getMobileRelayRuntime } = await import('../runtime/mobile-relay.js');
+    res.json({ origin: getMobileRelayRuntime()?.origin ?? null });
+  });
+
   router.get('/health', (_req, res) => {
     res.json({ ok: true });
   });

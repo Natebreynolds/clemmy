@@ -1211,3 +1211,25 @@ test('/m/api/runs degrades to 503 when no collector is injected (auth-only harne
     assert.equal(res.status, 503);
   } finally { await h.close(); }
 });
+
+test('/m/relay-info publishes the relay origin anonymously, null when no relay', async () => {
+  const { setMobileRelayRuntime } = await import('../runtime/mobile-relay.js');
+  const h = await startHarness();
+  try {
+    const before = await fetch(`${h.url}/m/relay-info`);
+    assert.equal(before.status, 200);
+    assert.equal((await before.json() as { origin: string | null }).origin, null);
+
+    setMobileRelayRuntime({ origin: 'https://abcd1234abcd1234.r.example.com:53028' });
+    const after = await fetch(`${h.url}/m/relay-info`);
+    assert.equal(after.status, 200);
+    assert.equal(
+      (await after.json() as { origin: string | null }).origin,
+      'https://abcd1234abcd1234.r.example.com:53028',
+      'the native shell learns the relay door on any LAN visit — no re-pairing',
+    );
+  } finally {
+    setMobileRelayRuntime(null);
+    await h.close();
+  }
+});
