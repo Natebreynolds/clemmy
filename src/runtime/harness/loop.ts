@@ -278,6 +278,19 @@ function artifactVerificationProjection(state: StandardArtifactTerminalState): R
  * this lane does not yet have an equally strict tool-only repair boundary, so
  * it parks honestly and asks for a retry instead of relying on prompt wording
  * that could accidentally create a replacement. */
+/** Read-only view of the create claims that would park this request: still
+ *  pending/uncertain, not superseded by a verified sibling, not bound. */
+function trulyUnresolvedArtifactClaims(
+  state: NonNullable<ReturnType<typeof standardArtifactTerminalState>>,
+): typeof state.pending {
+  const partition = partitionSupersededPendingClaims(state);
+  const supersededIds = new Set(partition.superseded.map((a) => a.id));
+  const stillPendingIds = new Set(partition.stillPending.map((a) => a.id));
+  return state.pending.filter(
+    (a) => stillPendingIds.has(a.id) && !supersededIds.has(a.id) && a.status !== 'bound',
+  );
+}
+
 function parkForPendingStandardArtifacts(input: {
   sessionId: string;
   sourceUserSeq?: number;
@@ -2517,6 +2530,7 @@ async function runConversationCore(
   let objectiveJudgeContinuations = 0;
   let closeLoopNudged = false;
   let claimGroundingNudged = false;
+  let selfResolveNudged = false;
   let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
   let totalToolCalls = 0;
   let meaningfulToolEvidence = false;
@@ -4228,6 +4242,63 @@ async function runConversationCore(
             }
           }
         } catch { /* fail-open: never wedge a completion */ }
+      }
+      // SELF-RESOLVE BEFORE ASKING (2026-07-31, owner directive: ambiguity is
+      // CLEM'S problem to settle, never the user's — the "reply retry/stop"
+      // park and the ambiguous-write confession both handed the user work the
+      // model can do itself in one continuation). Two shapes, one nudge:
+      //  (a) truly-unresolved create claims (the would-be artifact park);
+      //  (b) an AMBIGUOUS external-write outcome on this request.
+      // The nudge teaches the exact settlement verbs (weakest-model rule);
+      // the park and the honesty floor remain as fallbacks when even the
+      // verification read fails.
+      if (
+        !selfResolveNudged
+        && decision.nextAction === 'completed'
+        && objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
+      ) {
+        const selfResolve = (() => {
+          try {
+            if (HarnessSession.load(options.sessionId)?.sessionRow.kind !== 'chat') return null;
+            const parts: string[] = [];
+            let unresolved: ReturnType<typeof trulyUnresolvedArtifactClaims> = [];
+            try {
+              const state = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
+              unresolved = state ? trulyUnresolvedArtifactClaims(state) : [];
+            } catch { unresolved = []; }
+            if (unresolved.length > 0) {
+              const listed = unresolved.slice(0, 3)
+                .map((a) => `${a.provider} ${a.kind}${a.resourceId ? ` id ${a.resourceId}` : ''} (artifactId ${a.id})`)
+                .join('; ');
+              parts.push(
+                `${unresolved.length === 1 ? 'A create attempt is' : `${unresolved.length} create attempts are`} UNRESOLVED: ${listed}. `
+                + 'Verify YOURSELF now — read the provider back (a list/get/search for the exact title or id), then settle with artifact_claim_resolve: bind the found resource id, or mark it absent and create ONCE more.',
+              );
+            }
+            let writeStatus: string = 'missing';
+            try { writeStatus = requestFreshExternalWriteStatus(options.sessionId, activeSourceUserSeq); } catch { writeStatus = 'missing'; }
+            if (writeStatus === 'ambiguous') {
+              parts.push(
+                'An external write from THIS request has an AMBIGUOUS outcome. Read the exact target back now, then settle it with execution_reconcile_write — verdict "present" if it landed (report it done), "absent" if not (one corrected retry is then authorized).',
+              );
+            }
+            if (parts.length === 0) return null;
+            return `[self-resolve] Do NOT hand this uncertainty to the user. ${parts.join(' ')} `
+              + 'Only if the verification read itself fails should you stop — and then explain in your own words exactly what you checked and what remains unknown.';
+          } catch { return null; }
+        })();
+        if (selfResolve) {
+          selfResolveNudged = true;
+          objectiveJudgeContinuations += 1;
+          try {
+            safeAppend({
+              sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'guardrail_tripped',
+              data: { kind: 'self_resolve_nudge', reason: 'unresolved claim/ambiguous write settled by the model, not the user' },
+            });
+          } catch { /* telemetry must never block */ }
+          nextInput = selfResolve;
+          continue;
+        }
       }
       // CLAIM GROUNDING (2026-07-30, live 404 handoff): a completed reply that
       // hands the user a deliverable pointer (URL, file path) nothing in this

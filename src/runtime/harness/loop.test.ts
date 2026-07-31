@@ -2273,6 +2273,65 @@ test('standard lane parks unresolved provider artifacts and carries exact pendin
   assert.match(String(ask.data.question), /unresolved|cannot honestly confirm/i);
 });
 
+// SELF-RESOLVE (2026-07-31, owner directive): before ANY unresolved-claim
+// park reaches the user, the model gets one continuation teaching it to
+// verify + settle ITSELF (artifact_claim_resolve / execution_reconcile_write).
+// The park stays as the fallback when the model still can't resolve.
+test('an unresolved create claim first gets the SELF-RESOLVE continuation — the user beat is the fallback, not the default', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const rootScopeId = `${sess.id}::turn:1`;
+  const inputs: string[] = [];
+  let srCalls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const last = items.at(-1) as { content?: string } | undefined;
+    if (typeof last?.content === 'string') inputs.push(last.content);
+    srCalls += 1;
+    if (srCalls === 1) {
+      artifactLedger.claimArtifactSlot(sess.id, {
+        kind: 'google_doc',
+        provider: 'Google Docs',
+        slotKey: 'google_doc:selfresolve',
+        title: 'Self-resolve report',
+        createShape: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      }, 'create-selfresolve-doc', rootScopeId);
+    }
+    return {
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Created the requested report.',
+        reply: 'Done — I created the Google Doc.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create a Google Doc report for me',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  // 1. The model was told to settle it ITSELF, with the exact verbs, before
+  //    any user-facing park.
+  const selfResolveInput = inputs.find((i) => i.includes('[self-resolve]'));
+  assert.ok(selfResolveInput, 'the self-resolve continuation fired before parking');
+  assert.match(selfResolveInput!, /Do NOT hand this uncertainty to the user/i);
+  assert.match(selfResolveInput!, /artifact_claim_resolve/);
+  assert.equal(inputs.filter((i) => i.includes('[self-resolve]')).length, 1, 'one-shot per request');
+  // 2. The stub never resolves it, so the honest park remains the FALLBACK.
+  assert.equal(result.status, 'awaiting_user_input', 'still never a green completion on an unresolved claim');
+  const nudges = listEvents(sess.id, { types: ['guardrail_tripped'] })
+    .filter((e) => (e.data as { kind?: string }).kind === 'self_resolve_nudge');
+  assert.equal(nudges.length, 1, 'the nudge is recorded in telemetry');
+});
+
 // F-artifact (live 2026-07-23, the owner's own acceptance run): a BOUND claim
 // — provider returned the resource, URI recorded, VALUES_UPDATE already
 // writing to it — parked the run behind an unanswerable "reply retry" loop.
