@@ -77,13 +77,14 @@ test('Tasks handoff carries exact canonical attempt and scope identity', () => {
   assert.equal(runEnvironmentTasksHref({ id: 'legacy-run' }), '/tasks?select=legacy-run');
 });
 
-test('mobile Environment dialog is viewport-contained and its actions can wrap', () => {
-  const source = readFileSync(new URL('../components/RunEnvironmentPanel.tsx', import.meta.url), 'utf8');
+// The old Run environment panel was replaced by the Live agents panel
+// (2026-07-30 — the owner's call: simple who-is-working rows in a pop-in
+// side panel; deep inspection lives on the Tasks board). The viewport
+// containment pin moves with it.
+test('mobile Live agents dialog is viewport-contained', () => {
+  const source = readFileSync(new URL('../components/LiveAgentsPanel.tsx', import.meta.url), 'utf8');
   assert.match(source, /fixed inset-x-3 inset-y-3[^'\n]*min-w-0[^'\n]*max-w-\[calc\(100vw-24px\)\][^'\n]*overflow-hidden/);
-  assert.match(source, /min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto/);
-  assert.match(source, /w-full min-w-0 max-w-full rounded-md/);
-  assert.match(source, /flex min-w-0 flex-wrap gap-2/);
-  assert.match(source, /min-w-0 flex-1 basis-\[8rem\]/);
+  assert.match(source, /min-h-0 flex-1 overflow-y-auto/);
 });
 
 test('counts only canonical top-level calls and reports transport mirrors separately', () => {

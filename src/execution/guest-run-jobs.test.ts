@@ -19,7 +19,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { setGuestHarnessSpawnForTest, setGuestHarnessBinaryResolverForTest } = await import('./guest-harness.js');
-const { startGuestRun, getGuestRun, killGuestRun, _setGuestOutcomeDelivererForTests } = await import('./guest-run-jobs.js');
+const { startGuestRun, getGuestRun, killGuestRun, listGuestRuns, _setGuestOutcomeDelivererForTests, _reloadPersistedJobsForTests } = await import('./guest-run-jobs.js');
 const { updateEnvKey, clearWorkspaceProjectCache } = await import('../tools/shared.js');
 
 const workspace = mkdtempSync(path.join(os.tmpdir(), 'clemmy-guest-jobs-ws-'));
@@ -120,6 +120,50 @@ test('completion reports back into the ORIGIN conversation — kills and console
     await settle();
     assert.equal(delivered.length, 0, 'a user-killed run never reports back');
   } finally {
+    _setGuestOutcomeDelivererForTests(null);
+  }
+});
+
+test('durable registry: runs persist to state, and a daemon restart orphan-fails in-flight runs WITH report-back', async () => {
+  const stateFile = path.join(TMP_HOME, 'state', 'guest-runs.json');
+  const delivered: Array<{ id: string; status: string; origin?: string; error?: string }> = [];
+  _setGuestOutcomeDelivererForTests((job) => delivered.push({ id: job.id, status: job.status, origin: job.originSessionId, error: job.error }));
+  const b = fakeChild();
+  try {
+    // A finished run is on disk (identity + status; no narration tail).
+    const a = fakeChild();
+    setGuestHarnessSpawnForTest((() => a.child) as any);
+    const done = startGuestRun({ harness: 'claude', project: 'fixture-project', prompt: 'finished one', sessionId: 'sess-done' });
+    a.child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'result', subtype: 'success', result: 'done.' })}\n`));
+    a.finish(0);
+    await settle();
+
+    // A run still in flight when the "daemon" stops.
+    setGuestHarnessSpawnForTest((() => b.child) as any);
+    const inflight = startGuestRun({ harness: 'claude', project: 'fixture-project', prompt: 'long one', sessionId: 'sess-inflight' });
+    await settle();
+    const persisted = JSON.parse((await import('node:fs')).readFileSync(stateFile, 'utf-8'));
+    assert.ok(persisted.some((r: any) => r.id === inflight.id && r.status === 'running'), 'in-flight run is on disk as running');
+    assert.ok(persisted.every((r: any) => r.events === undefined), 'the narration tail stays memory-only');
+
+    // "Restart": reload from disk. The orphan is marked failed with an honest
+    // reason and reports back into its origin conversation; history survives.
+    delivered.length = 0;
+    _reloadPersistedJobsForTests();
+    await settle();
+    const orphan = getGuestRun(inflight.id);
+    assert.equal(orphan?.status, 'failed');
+    assert.match(orphan?.error ?? '', /restarted while this run was in progress/i);
+    assert.deepEqual(delivered.map((d) => ({ id: d.id, origin: d.origin })), [{ id: inflight.id, origin: 'sess-inflight' }]);
+    assert.equal(getGuestRun(done.id)?.status, 'succeeded', 'completed history survives the restart');
+    assert.ok(listGuestRuns().some((j) => j.id === done.id));
+    const reWritten = JSON.parse((await import('node:fs')).readFileSync(stateFile, 'utf-8'));
+    assert.ok(reWritten.some((r: any) => r.id === inflight.id && r.status === 'failed'), 'the orphan terminal state is durable');
+  } finally {
+    // Close the still-open fake child so its harness timeout timer cannot hold
+    // the test process alive past the suite.
+    b.finish(143);
+    await settle();
     _setGuestOutcomeDelivererForTests(null);
   }
 });

@@ -15,6 +15,7 @@
  * a guest harness at an arbitrary directory.
  */
 import { randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   runGuestHarness,
@@ -22,6 +23,7 @@ import {
   type GuestRunResult,
 } from './guest-harness.js';
 import { listWorkspaceProjects, type WorkspaceProject } from '../tools/shared.js';
+import { BASE_DIR } from '../config.js';
 
 export type GuestRunStatus = 'running' | 'succeeded' | 'failed' | 'killed';
 
@@ -49,7 +51,67 @@ export interface GuestRunJob {
 const EVENTS_TAIL_MAX = 100;
 const JOBS_MAX = 50;
 
-const jobs = new Map<string, { job: GuestRunJob; abort: AbortController }>();
+// Loaded-from-disk records have no live process, hence no AbortController.
+const jobs = new Map<string, { job: GuestRunJob; abort?: AbortController }>();
+
+// ─── Durable registry (2026-07-30) ──────────────────────────────────────────
+// The registry used to be memory-only: a daemon restart silently orphaned
+// every record — the origin conversation never heard back, and the console
+// showed nothing. Runs now persist to state/guest-runs.json (identity +
+// status; the live narration tail stays memory-only), and boot marks any
+// still-"running" record as failed with an honest reason, delivering that
+// outcome through the same report-back spine as a normal finish. The child
+// CLI process cannot survive the daemon, so orphan-fail is the truthful
+// terminal state, not a resume.
+const STATE_DIR = path.join(BASE_DIR, 'state');
+const GUEST_RUNS_FILE = path.join(STATE_DIR, 'guest-runs.json');
+
+type PersistedGuestRun = Omit<GuestRunJob, 'events'>;
+
+function persistJobs(): void {
+  try {
+    if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
+    const records: PersistedGuestRun[] = [...jobs.values()]
+      .map(({ job }) => { const { events: _events, ...rest } = job; return rest; })
+      .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+      .slice(0, JOBS_MAX);
+    writeFileSync(GUEST_RUNS_FILE, JSON.stringify(records, null, 2), 'utf-8');
+  } catch { /* persistence is best-effort; the live map still serves this process */ }
+}
+
+function loadPersistedJobs(): void {
+  try {
+    if (!existsSync(GUEST_RUNS_FILE)) return;
+    const parsed = JSON.parse(readFileSync(GUEST_RUNS_FILE, 'utf-8'));
+    if (!Array.isArray(parsed)) return;
+    let orphaned = false;
+    for (const raw of parsed as PersistedGuestRun[]) {
+      if (!raw || typeof raw.id !== 'string' || jobs.has(raw.id)) continue;
+      const job: GuestRunJob = { ...raw, events: [] };
+      if (job.status === 'running') {
+        job.status = 'failed';
+        job.error = 'The app restarted while this run was in progress, so the CLI process did not survive. Start it again to re-run.';
+        job.completedAt = new Date().toISOString();
+        orphaned = true;
+        jobs.set(job.id, { job });
+        notifyDone(job);
+        deliverGuestOutcome(job);
+      } else {
+        jobs.set(job.id, { job });
+      }
+    }
+    if (orphaned) persistJobs();
+  } catch { /* a corrupt file only costs history, never boot */ }
+}
+
+loadPersistedJobs();
+
+/** Test seam: simulate a daemon restart — drop the live map and re-run the
+ *  boot-time load + orphan sweep against whatever is on disk. */
+export function _reloadPersistedJobsForTests(): void {
+  jobs.clear();
+  loadPersistedJobs();
+}
 
 /** Resolve a user-supplied project reference (name or path) against the
  *  workspace roster. Returns null when it is not a detected project. */
@@ -100,6 +162,7 @@ export function startGuestRun(input: StartGuestRunInput): GuestRunJob {
   const abort = new AbortController();
   jobs.set(id, { job, abort });
   pruneJobs();
+  persistJobs();
 
   void runGuestHarness({
     harness: input.harness,
@@ -121,6 +184,7 @@ export function startGuestRun(input: StartGuestRunInput): GuestRunJob {
       job.completedAt = new Date().toISOString();
       notifyDone(job);
       deliverGuestOutcome(job);
+      persistJobs();
     },
   );
 
@@ -141,6 +205,7 @@ function finishJob(job: GuestRunJob, result: GuestRunResult): void {
   if (job.status === 'succeeded') recordRunDeliverables(job);
   notifyDone(job);
   deliverGuestOutcome(job);
+  persistJobs();
 }
 
 /** Test seam — capture outcome deliveries instead of touching the real pipeline. */
@@ -248,7 +313,7 @@ export function listGuestRuns(): GuestRunJob[] {
 export function killGuestRun(id: string): GuestRunJob | undefined {
   const entry = jobs.get(id);
   if (!entry) return undefined;
-  if (entry.job.status === 'running') entry.abort.abort();
+  if (entry.job.status === 'running') entry.abort?.abort();
   return entry.job;
 }
 

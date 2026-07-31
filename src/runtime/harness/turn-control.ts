@@ -621,6 +621,27 @@ export function classifyTurnPreflight(input: {
   return { phase: 'execute', consequential: false, destination, reason: 'ordinary_execution' };
 }
 
+// ─── Close-the-loop completion nudge (2026-07-30, live miss) ────────────────
+// A completed chat reply that lands on a RECOMMENDATION with no question and
+// no offer strands the decision with the user: they got a great answer and
+// still have to carry the "so… do it?" back themselves. Deterministic trigger,
+// model-owned phrasing: code only detects the shape (conservative markers, so
+// false negatives are fine — this is a nudge, not a gate) and asks the model
+// to close the loop in its own words; the model may return the reply unchanged
+// when a closing question genuinely doesn't fit.
+const RECOMMENDATION_MARKER_RE =
+  /\b(?:best\s+(?:setup|route|approach|option|bet)\b|i(?:['’]d|\s+would)\s+recommend|i\s+recommend|my\s+recommendation|the\s+better\s+(?:route|approach|option|path)\b|you\s+should\s+(?:use|go\s+with))/i;
+const DECISION_OFFER_RE =
+  /\b(?:want\s+me\s+to|shall\s+i|should\s+i|i\s+can\s+(?:set|build|do|run|start|pull|create|kick)|say\s+the\s+word|let\s+me\s+know\s+(?:if|which|when)|if\s+you(?:['’]d|\s+would)?\s*like,?\s+i|happy\s+to\s+(?:set|build|do|run|start))\b/i;
+
+export function closeTheLoopNudge(reply: string | null | undefined): string | null {
+  const text = (reply ?? '').trim();
+  if (!text || text.includes('?')) return null;
+  if (!RECOMMENDATION_MARKER_RE.test(text)) return null;
+  if (DECISION_OFFER_RE.test(text)) return null;
+  return '[close-the-loop] Your reply lands on a recommendation but never asks the user what they want done with it — the decision is left sitting on the table. Re-state your final reply, closing with the concrete next step you would take and ONE direct question offering to do it, phrased in your own words. If a closing question genuinely does not fit this reply, re-state it unchanged.';
+}
+
 export function confirmBeatEnabled(): boolean {
   const v = (getRuntimeEnv('CLEMMY_CONFIRM_BEAT', 'off') ?? 'off').trim().toLowerCase();
   return v === 'on' || v === '1' || v === 'true' || v === 'yes';

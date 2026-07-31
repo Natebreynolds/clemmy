@@ -827,12 +827,26 @@ export function evaluateToolCall(
     }
     if (fanoutEntity != null) entitySet.add(fanoutEntity);
     const distinctEntities = entitySet.size;
-    const at = thresholds.fanoutNudgeAt;
+    // RESEARCH EXEMPTION (2026-07-30, from a live misfire): a handful of
+    // DIFFERENT free-text queries is how the model explores a topic — compare,
+    // refine, cross-check — not per-item batch work, and injecting "spawn a
+    // worker" advice into a 3-search research turn is wrong guidance at the
+    // worst moment. Query-shaped fan-out (entity key q/query/keyword) therefore
+    // nudges only once the batch is unambiguous — the same ≥6 distinct-entity
+    // boundary the 2026-07-11 historical replay proved for the block — and
+    // counts ENTITIES (distinct queries), so option-refinement of one query
+    // never trips it. Id/url-shaped fan-out keeps the early nudge: 3 distinct
+    // ids already means per-item iteration.
+    const queryShapedResearch = /^(?:q|query|keyword):/.test(fanoutEntity ?? '');
+    const at = queryShapedResearch
+      ? Math.max(thresholds.fanoutNudgeAt, 6)
+      : thresholds.fanoutNudgeAt;
+    const nudgeCount = queryShapedResearch ? Math.min(distinct, distinctEntities) : distinct;
     const callLabel = slug ?? toolName;
-    if (distinct >= at && (distinct - at) % 5 === 0) {
+    if (nudgeCount >= at && (nudgeCount - at) % 5 === 0) {
       const batchHint = slug ? batchApiHintFor(slug) : undefined;
       fanoutNudge =
-        `[harness fan-out check] You have now made ${distinct} DISTINCT ${callLabel} calls in this conversation's recent window — `
+        `[harness fan-out check] You have now made ${nudgeCount} DISTINCT ${callLabel} calls in this conversation's recent window — `
         + `you are serializing per-item batch work through your own context. STOP looping serially: `
         + `fan the REMAINING items out with one run_worker call carrying the complete stable-id items array, `
         + `or use the service's real batch API if it accepts an array of items in one call. `

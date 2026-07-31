@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import { AlertTriangle, X } from 'lucide-react';
 import { Sidebar } from './Sidebar';
@@ -8,13 +8,13 @@ import { VoiceOverlay } from './VoiceOverlay';
 import { UpdaterBanner } from './UpdaterBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { LocalRecordingBanner } from './LocalRecordingBanner';
-import { RunEnvironmentPanel } from './RunEnvironmentPanel';
+import { LiveAgentsPanel } from './LiveAgentsPanel';
 import { ALL_NAV } from '@/lib/nav';
-import { listRuns } from '@/lib/inbox';
+import { listBoard } from '@/lib/board';
 import { usePoll } from '@/lib/poll';
-import { isRunLive } from '@/lib/run-environment';
+import { liveAgentAutoOpen, liveAgentBadgeCount } from '@/lib/live-agents';
 
-const RUN_ENVIRONMENT_PREF = 'clem.run-environment.open';
+const LIVE_AGENTS_PREF = 'clem.live-agents.open';
 
 function titleForPath(pathname: string): string {
   // Longest matching prefix wins (so /advanced/usage beats /advanced).
@@ -30,27 +30,39 @@ export function AppShell() {
   ));
   const location = useLocation();
   const title = titleForPath(location.pathname);
-  const [runEnvironmentOpen, setRunEnvironmentOpen] = useState(() => {
-    try { return localStorage.getItem(RUN_ENVIRONMENT_PREF) === '1'; } catch { return false; }
+  const [liveAgentsOpen, setLiveAgentsOpen] = useState(() => {
+    try { return localStorage.getItem(LIVE_AGENTS_PREF) === '1'; } catch { return false; }
   });
-  // The drawer is intentionally lazy. Tasks/Inbox already own ambient run
-  // monitoring; a closed inspection panel must not add another permanent DB
-  // poll on every desktop screen.
-  const runs = usePoll(['run-environment-runs'], () => listRuns(12), 4000, { enabled: runEnvironmentOpen });
-  const runRows = runs.data?.runs ?? [];
-  const liveRunCount = runEnvironmentOpen ? runRows.filter((run) => isRunLive(run)).length : 0;
+  // One shared board poll powers the badge, the auto-pop, and the panel rows.
+  // Faster while the panel is open; a slow heartbeat while closed so a freshly
+  // kicked-off agent can still pop the panel and the badge stays honest.
+  const board = usePoll(['board'], listBoard, liveAgentsOpen ? 4000 : 12_000);
+  const boardCards = board.data?.cards ?? [];
+  const liveRunCount = liveAgentBadgeCount(boardCards);
 
-  const toggleRunEnvironment = () => {
-    setRunEnvironmentOpen((current) => {
+  // Auto-pop: open exactly when a NEW live row appears (Clem just kicked
+  // something off or something started waiting on the user). Closing the
+  // panel is respected until the next new row — the seen-set is the memory.
+  const seenRef = useRef<string[]>([]);
+  useEffect(() => {
+    if (!board.data) return;
+    const decision = liveAgentAutoOpen(seenRef.current, boardCards);
+    seenRef.current = decision.seenIds;
+    if (decision.open) setLiveAgentsOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [board.data]);
+
+  const toggleLiveAgents = () => {
+    setLiveAgentsOpen((current) => {
       const next = !current;
-      try { localStorage.setItem(RUN_ENVIRONMENT_PREF, next ? '1' : '0'); } catch { /* preference only */ }
+      try { localStorage.setItem(LIVE_AGENTS_PREF, next ? '1' : '0'); } catch { /* preference only */ }
       return next;
     });
   };
 
-  const closeRunEnvironment = () => {
-    setRunEnvironmentOpen(false);
-    try { localStorage.setItem(RUN_ENVIRONMENT_PREF, '0'); } catch { /* preference only */ }
+  const closeLiveAgents = () => {
+    setLiveAgentsOpen(false);
+    try { localStorage.setItem(LIVE_AGENTS_PREF, '0'); } catch { /* preference only */ }
   };
 
   // A 401 from the daemon dispatches a global `clem:needs-login` event
@@ -88,9 +100,9 @@ export function AppShell() {
           title={title}
           sidebarCollapsed={collapsed}
           onToggleSidebar={() => setCollapsed((v) => !v)}
-          runEnvironmentOpen={runEnvironmentOpen}
+          liveAgentsOpen={liveAgentsOpen}
           liveRunCount={liveRunCount}
-          onToggleRunEnvironment={toggleRunEnvironment}
+          onToggleLiveAgents={toggleLiveAgents}
         />
         <LocalRecordingBanner />
         {needsLogin && (
@@ -117,13 +129,13 @@ export function AppShell() {
         </main>
       </div>
 
-      <RunEnvironmentPanel
-        open={runEnvironmentOpen}
-        runs={runRows}
-        runsLoading={runs.isLoading}
-        runsError={runs.isError}
-        onRetryRuns={() => { void runs.refetch(); }}
-        onClose={closeRunEnvironment}
+      <LiveAgentsPanel
+        open={liveAgentsOpen}
+        cards={boardCards}
+        loading={board.isLoading}
+        error={board.isError}
+        onRetry={() => { void board.refetch(); }}
+        onClose={closeLiveAgents}
       />
 
       <CommandPalette />

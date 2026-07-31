@@ -294,6 +294,44 @@ test('fanoutNudge: 3rd DISTINCT same-slug composio call attaches the nudge (and 
   assert.ok(call(8).fanoutNudge, '8th distinct re-fires the nudge');
 });
 
+test('fanoutNudge: a handful of DISTINCT research queries never nudges; an unambiguous query batch still does', () => {
+  _resetAllTrackersForTests();
+  const search = (q: string) =>
+    evaluateToolCall('sess-research', 'composio_execute_tool', {
+      tool_slug: 'FIRECRAWL_SEARCH',
+      arguments: JSON.stringify({ query: q }),
+    });
+  // Live misfire (2026-07-30): 3 different research queries on ONE subject got
+  // "STOP looping serially: spawn a worker" injected mid-research. Exploring a
+  // topic with a few distinct queries is not per-item batch work.
+  const queries = [
+    'apify ai search scraper',
+    'site:apify.com google-search-scraper ai mode',
+    'google ads transparency center scraper apify',
+    'composio openai bulk prompts',
+    'chatgpt account history export api',
+  ];
+  for (const [i, q] of queries.entries()) {
+    assert.equal(search(q).fanoutNudge, undefined, `research query #${i + 1} must not be nudged to fan out`);
+  }
+  // The ≥6 distinct-query boundary (proven for the block by the 2026-07-11
+  // replay) still catches a genuine per-item search batch.
+  const d6 = search('flowers by irene reviews');
+  assert.ok(d6.fanoutNudge, '6th distinct query is an unambiguous batch and must nudge');
+  assert.match(d6.fanoutNudge!, /6 DISTINCT/);
+});
+
+test('fanoutNudge: refining ONE query with different options never nudges (one entity, many signatures)', () => {
+  _resetAllTrackersForTests();
+  for (let i = 0; i < 8; i += 1) {
+    const d = evaluateToolCall('sess-refine', 'composio_execute_tool', {
+      tool_slug: 'FIRECRAWL_SEARCH',
+      arguments: JSON.stringify({ query: 'apify ai search scraper', limit: i + 1 }),
+    });
+    assert.equal(d.fanoutNudge, undefined, 'query refinement is not a batch');
+  }
+});
+
 test('fanoutNudge: re-polling the SAME id never nudges (identical args = one distinct entry)', () => {
   _resetAllTrackersForTests();
   const args = { tool_slug: 'DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID', arguments: '{"id":"task-1"}' };
@@ -554,12 +592,16 @@ test('fanoutNudge: native MCP data tools (<server>__<tool>) are keyed too — 3r
       keyword: `site:firm-${i}.com`,
       location_name: 'United States',
     });
-  assert.equal(call(1).fanoutNudge, undefined);
-  assert.equal(call(2).fanoutNudge, undefined);
-  const d3 = call(3);
-  assert.ok(d3.fanoutNudge, '3rd distinct same-MCP-tool call must carry the nudge');
-  assert.match(d3.fanoutNudge!, /run_worker/);
-  assert.match(d3.fanoutNudge!, /dataforseo__serp_organic_live_advanced/);
+  // keyword-shaped calls carry the research exemption, so the nudge waits for
+  // the unambiguous ≥6 distinct-query boundary instead of 3 — the 29-call live
+  // batch this test pins still gets nudged at 6, 11, 16… long before 29.
+  for (let i = 1; i <= 5; i += 1) {
+    assert.equal(call(i).fanoutNudge, undefined, `keyword call #${i} is still plausibly research`);
+  }
+  const d6 = call(6);
+  assert.ok(d6.fanoutNudge, '6th distinct same-MCP-tool keyword call must carry the nudge');
+  assert.match(d6.fanoutNudge!, /run_worker/);
+  assert.match(d6.fanoutNudge!, /dataforseo__serp_organic_live_advanced/);
 });
 
 test('fanoutNudge: local tools and clementine-local MCP tools are never keyed', () => {
@@ -735,9 +777,9 @@ test('fanoutNudge: slug-specific batch-API hints (DataForSEO tasks array, TASKS_
 test('fanoutNudge: applyMode off strips the nudge', () => {
   _resetAllTrackersForTests();
   for (let i = 1; i <= 2; i += 1) {
-    evaluateToolCall('sess-off', 'composio_execute_tool', { tool_slug: 'SALESFORCE_QUERY', arguments: `{"q":${i}}` });
+    evaluateToolCall('sess-off', 'composio_execute_tool', { tool_slug: 'SALESFORCE_GET_RECORD', arguments: `{"id":"rec-${i}"}` });
   }
-  const d3 = evaluateToolCall('sess-off', 'composio_execute_tool', { tool_slug: 'SALESFORCE_QUERY', arguments: '{"q":3}' });
+  const d3 = evaluateToolCall('sess-off', 'composio_execute_tool', { tool_slug: 'SALESFORCE_GET_RECORD', arguments: '{"id":"rec-3"}' });
   assert.ok(d3.fanoutNudge);
   assert.equal(applyMode(d3, 'off').fanoutNudge, undefined);
   assert.equal(applyMode(d3, 'warn').fanoutNudge, d3.fanoutNudge);

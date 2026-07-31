@@ -137,7 +137,7 @@ import {
   runTokenBudgetEnforcementEnabled,
 } from './run-token-budget.js';
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
-import { backgroundOfferEnabled, effectiveTurnObjective } from './turn-control.js';
+import { backgroundOfferEnabled, closeTheLoopNudge, effectiveTurnObjective } from './turn-control.js';
 import {
   getArtifactRootForSourceUserSeq,
   latestPendingArtifactRootForSession,
@@ -2512,6 +2512,7 @@ async function runConversationCore(
   // of how the request was phrased.
   const OBJECTIVE_JUDGE_WORK_THRESHOLD = 3;
   let objectiveJudgeContinuations = 0;
+  let closeLoopNudged = false;
   let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
   let totalToolCalls = 0;
   let meaningfulToolEvidence = false;
@@ -4209,7 +4210,11 @@ async function runConversationCore(
               nextInput = buildOutputGroundingChatRetry(og);
               continue;
             } else if (og.action === 'advisory') {
-              outputGroundingNote = `Note: I couldn't independently verify these figures against my captured data — please double-check ${og.figures.slice(0, 4).join(', ')} before relying on them.`;
+              // FLOOR disclosure (allowed template class): fires only for figures
+              // traceable to NEITHER this session's tool results NOR consolidated
+              // memory — genuinely unverifiable, so honest uncertainty is owed.
+              const figs = og.figures.slice(0, 4).join(', ');
+              outputGroundingNote = `Heads up: I couldn't trace ${figs} back to anything I've pulled or remember, so treat ${og.figures.length > 1 ? 'those numbers' : 'that number'} as unverified.`;
               try {
                 safeAppend({
                   sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'output_grounding_judged',
@@ -4219,6 +4224,37 @@ async function runConversationCore(
             }
           }
         } catch { /* fail-open: never wedge a completion */ }
+      }
+      // CLOSE THE LOOP (2026-07-30, live miss): a completed chat reply that
+      // lands on a recommendation with no question and no offer strands the
+      // decision with the user — great answer, and they still have to carry
+      // "so… do it?" back themselves. Deterministic shape-detection in
+      // turn-control, model-owned phrasing, at most ONE bounce per turn inside
+      // the shared continuation budget. Advisory: the model may re-state the
+      // reply unchanged, and any error skips the nudge entirely.
+      if (
+        !closeLoopNudged
+        && decision.nextAction === 'completed'
+        && objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
+      ) {
+        const loopNudge = (() => {
+          try {
+            if (HarnessSession.load(options.sessionId)?.sessionRow.kind !== 'chat') return null;
+            return closeTheLoopNudge(decision.reply);
+          } catch { return null; }
+        })();
+        if (loopNudge) {
+          closeLoopNudged = true;
+          objectiveJudgeContinuations += 1;
+          try {
+            safeAppend({
+              sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'guardrail_tripped',
+              data: { kind: 'close_loop_nudge', reason: 'recommendation with no closing question or offer' },
+            });
+          } catch { /* telemetry must never block */ }
+          nextInput = loopNudge;
+          continue;
+        }
       }
       // Render priority on the chat surface: prefer `reply` (the
       // natural-language message intended for the user) over `summary`

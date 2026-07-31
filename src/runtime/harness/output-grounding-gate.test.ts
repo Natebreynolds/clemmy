@@ -223,6 +223,63 @@ test('evaluateOutputGrounding: no-figures and no-sources ALLOW; a judge error wi
   _setOutputGroundingJudgeForTests(null);
 });
 
+test('evaluateOutputGrounding: a figure recalled from consolidated MEMORY is grounded — no advisory caveat (live 2026-07-30 false-flag)', async () => {
+  _resetOutputGroundingStateForTests();
+  resetEventLog();
+  const { rememberFact } = await import('../../memory/facts.js');
+  rememberFact({
+    kind: 'user',
+    content: 'User maintains a spreadsheet tracking 120 law firm accounts assigned to 8 sales representatives',
+  });
+  const sessionId = 'og-memory-grounded';
+  createSession({ id: sessionId, kind: 'chat', title: 'memory grounding' });
+  // ONE unrelated tool output so the session isn't empty (an empty session
+  // short-circuits before source assembly on some paths).
+  writeToolOutput({ sessionId, callId: 'c-1', tool: 'composio_execute_tool', output: 'Apify actor list: google-search-scraper, ads-transparency' });
+  let judgeCalls = 0;
+  _setOutputGroundingJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { verdict: 'unverifiable', reason: 'not in tool results', offending: [{ figure: '120', kind: 'no_source' }] };
+  });
+  try {
+    const res = await evaluateOutputGrounding(
+      sessionId,
+      'Composio can run benchmark prompts across your 120 accounts.',
+    );
+    // The fact store IS a source: "120" clears in the deterministic pre-pass,
+    // so no judge call and no "double-check 120" caveat on a TRUE statement.
+    assert.equal(res.action, 'allow', `memory-grounded figure must not be flagged (got ${res.action}: ${res.reason})`);
+    assert.equal(judgeCalls, 0, 'deterministic memory grounding must clear before the LLM judge');
+    assert.ok(res.sourceCallIds.some((id) => id.startsWith('memory:fact:')), 'memory facts appear in the source universe');
+  } finally {
+    _setOutputGroundingJudgeForTests(null);
+  }
+});
+
+test('evaluateOutputGrounding: memory alone can SUPPORT a figure but never convict one — capture-less sessions stay allowed', async () => {
+  _resetOutputGroundingStateForTests();
+  resetEventLog();
+  const { rememberFact } = await import('../../memory/facts.js');
+  // A fact that will MATCH the claim's label terms without containing the figure.
+  rememberFact({ kind: 'user', content: 'User drafts outbound emails in the Outlook drafts folder before review' });
+  const sessionId = 'og-memory-only';
+  createSession({ id: sessionId, kind: 'chat', title: 'memory only' });
+  // NO tool outputs in this session at all (the L1 self-retry regression:
+  // stubbed completions with zero captures must never grow an advisory tail).
+  let judgeCalls = 0;
+  _setOutputGroundingJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { verdict: 'unverifiable', reason: 'x', offending: [{ figure: '29', kind: 'no_source' }] };
+  });
+  try {
+    const res = await evaluateOutputGrounding(sessionId, 'All 29 drafts are in your Outlook drafts folder.');
+    assert.equal(res.action, 'allow', `absence from memory is not evidence against fresh work (got ${res.action}: ${res.reason})`);
+    assert.equal(judgeCalls, 0, 'memory-only sources must not open the judge pathway');
+  } finally {
+    _setOutputGroundingJudgeForTests(null);
+  }
+});
+
 test('buildOutputGroundingChatRetry: names the figures + recompute instruction; escalates on repeat', () => {
   const first = buildOutputGroundingChatRetry({ action: 'bounce', reason: 'spend mismatch', figures: ['$24.5K'], sourceCallIds: ['c1'], failureCount: 1 });
   assert.match(first, /\$24\.5K/);

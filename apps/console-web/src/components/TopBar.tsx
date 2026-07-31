@@ -11,16 +11,16 @@ export function TopBar({
   title,
   onToggleSidebar,
   sidebarCollapsed,
-  runEnvironmentOpen,
+  liveAgentsOpen,
   liveRunCount,
-  onToggleRunEnvironment,
+  onToggleLiveAgents,
 }: {
   title: string;
   onToggleSidebar: () => void;
   sidebarCollapsed: boolean;
-  runEnvironmentOpen: boolean;
+  liveAgentsOpen: boolean;
   liveRunCount: number;
-  onToggleRunEnvironment: () => void;
+  onToggleLiveAgents: () => void;
 }) {
   const openPalette = () => window.dispatchEvent(new Event('clem:command-palette'));
   const openVoice = () => window.dispatchEvent(new Event('clem:open-voice'));
@@ -62,18 +62,18 @@ export function TopBar({
         <ThemeToggle />
 
         <Button
-          variant={runEnvironmentOpen ? 'secondary' : 'ghost'}
+          variant={liveAgentsOpen ? 'secondary' : 'ghost'}
           size="sm"
-          onClick={onToggleRunEnvironment}
-          aria-pressed={runEnvironmentOpen}
-          aria-expanded={runEnvironmentOpen}
-          aria-controls="run-environment-panel"
-          aria-label={liveRunCount > 0 ? `Run environment, ${liveRunCount} active` : 'Run environment'}
-          title="Plan, helpers, tools, and verified outputs"
+          onClick={onToggleLiveAgents}
+          aria-pressed={liveAgentsOpen}
+          aria-expanded={liveAgentsOpen}
+          aria-controls="live-agents-panel"
+          aria-label={liveRunCount > 0 ? `Live agents, ${liveRunCount} working` : 'Live agents'}
+          title="What Clem is working on right now"
           className="relative gap-2"
         >
           <Activity className="h-4 w-4" aria-hidden />
-          <span className="hidden lg:inline">Run</span>
+          <span className="hidden lg:inline">Agents</span>
           {liveRunCount > 0 && (
             <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-caption font-bold text-primary-fg">
               {liveRunCount > 99 ? '99+' : liveRunCount}

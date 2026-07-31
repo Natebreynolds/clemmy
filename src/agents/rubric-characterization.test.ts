@@ -93,13 +93,19 @@ const GOLDEN = {
   // 2026-07-28 deterministic approval graph: every flagship lane now queues
   // the exact payload, asks once, and lets the runtime link the formal card;
   // approval resumes the exact single-call or batch executor without rebuild.
-  instructions: { len: 35419, sha16: '544f580e7e54a4dc' },
-  native: { len: 34522, sha16: '8389d9195c9267a4' },
-  claudeBrain: { len: 6291, sha16: '38e852a3e070644c' },
+  // 2026-07-30 close-the-loop + waited-on retrieval beat (live misses): the
+  // shared readiness rubric now tells the model to end a recommendation with
+  // the concrete next step + one offering question (never leave the decision
+  // on the table), and a retrieval the user is waiting on that needs minutes
+  // of tool work gets a one-line route echo then backgrounds with
+  // report-back-here instead of grinding tool calls in the chat.
+  instructions: { len: 36142, sha16: '188e50c752132c97' },
+  native: { len: 35245, sha16: 'a49fff3400b24563' },
+  claudeBrain: { len: 6574, sha16: '90973b1bc0abb234' },
   // 2026-07-27 live efficiency proof: execution_create already guards against
   // a duplicate active lane, so the lean rubric no longer makes the model dump
   // every user's old executions before opening/reusing the current one.
-  lean: { len: 9836, sha16: '05458612e51fe869' },
+  lean: { len: 10119, sha16: 'a8f8e6d6406a1a2b' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

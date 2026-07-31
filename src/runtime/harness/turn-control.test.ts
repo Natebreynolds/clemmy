@@ -29,6 +29,7 @@ const {
   shouldOfferBackground,
   backgroundOfferEnabled,
   classifyTurnPreflight,
+  closeTheLoopNudge,
   confirmBeatDirective,
   effectiveTurnObjective,
   recordTurnPreflightDecision,
@@ -493,4 +494,30 @@ test('background offer: default OFF; opt-in triggers on tool count OR elapsed; o
   assert.equal(shouldOfferBackground({ ...base, sessionId: 'background:bg-1', toolCalls: 20 }), false);
   process.env.CLEMMY_BG_OFFER_NUDGE = 'off';
   assert.equal(shouldOfferBackground({ ...base, toolCalls: 20 }), false, 'kill-switch respected');
+});
+
+test('closeTheLoopNudge: a recommendation with no question/offer nudges; closed or offered replies never do (live 2026-07-30 Apify miss)', () => {
+  // The live miss: a great comparison answer ending on "Best setup: X for A; Y
+  // for B." with the decision left on the table.
+  const stranded = [
+    'Apify is the better bulk route. Best setup: Apify for external visibility; Composio for benchmark prompts across your accounts.',
+    'I would recommend the sf CLI here since your org already authenticates it locally.',
+    'The better approach is a nightly scheduled pull into the workspace.',
+  ];
+  for (const reply of stranded) {
+    const nudge = closeTheLoopNudge(reply);
+    assert.ok(nudge, `must nudge: ${reply.slice(0, 50)}`);
+    assert.match(nudge!, /own words/i, 'phrasing stays model-owned');
+  }
+
+  // Closing question present → the loop is closed; never nudge.
+  assert.equal(closeTheLoopNudge('Best setup: Apify for visibility. Want me to set that up?'), null);
+  // An explicit offer counts even without a question mark.
+  assert.equal(closeTheLoopNudge('I recommend the Apify route — say the word and I will build the workspace.'), null);
+  assert.equal(closeTheLoopNudge('My recommendation is Apify. Happy to set it up on a nightly schedule — let me know which accounts.'), null);
+  // Plain answers with no recommendation shape never nudge (this is a nudge for
+  // stranded DECISIONS, not a tax on every reply).
+  assert.equal(closeTheLoopNudge('Brett sent 14 prospecting emails today; here are the five most recent.'), null);
+  assert.equal(closeTheLoopNudge(''), null);
+  assert.equal(closeTheLoopNudge(null), null);
 });

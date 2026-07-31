@@ -44,6 +44,7 @@
 import { getRuntimeEnv } from '../../config.js';
 import { searchToolOutputs, recentToolOutputs } from './eventlog.js';
 import { rankSources, type GroundingSource } from './grounding-gate.js';
+import { searchFactsByText } from '../../memory/facts.js';
 
 // ─────────────────────────────────────────────────────────────────
 // Config
@@ -317,7 +318,7 @@ export function _setOutputGroundingJudgeForTests(fn: OutputGroundingJudgeFn | nu
 export function buildOutputGroundingPrompt(claims: NumericClaim[], sources: GroundingSource[]): string {
   return [
     'You are a NUMERIC INTEGRITY judge. An agent is about to DELIVER a report/message to a user.',
-    "Verify every LOAD-BEARING FIGURE listed below traces to the agent's own captured tool results from THIS session.",
+    "Verify every LOAD-BEARING FIGURE listed below traces to the agent's own sources: captured tool results from THIS session, or its consolidated memory facts (sources labeled memory:fact — remembered knowledge counts as grounded).",
     '',
     'CRITICAL — numbers are usually DERIVED, not copied verbatim. Treat a figure as GROUNDED when it is plausibly derivable from the sources by:',
     '  • rounding (raw 6460.78 reported as 6,461 — grounded)',
@@ -471,6 +472,30 @@ export async function evaluateOutputGrounding(
   } catch {
     return { action: 'allow', reason: 'source retrieval failed — fail open', figures: [], sourceCallIds: [] };
   }
+  // MEMORY IS A GROUNDING SOURCE (2026-07-30, live false-flag): an ever-learning
+  // employee's consolidated memory is her knowledge — a recalled figure ("your
+  // 120 accounts") is grounded, not fabricated. The source universe previously
+  // held only THIS session's captured tool results, so a correct memory-recalled
+  // number was advisory-flagged and shipped with a canned "double-check" caveat
+  // that undermined trust in a true statement. Facts ride the same deterministic
+  // + judge pipeline as tool captures; retrieval failure fails open (no facts).
+  // Memory may only SUPPORT a figure, never convict one: with zero session tool
+  // captures, "the fact store doesn't mention 29" is expected for fresh work and
+  // must not open the judge/advisory pathway (see toolSourceCount below).
+  const toolSourceCount = sources.length;
+  try {
+    const factQuery = [...new Set(claims.flatMap((c) => c.labels))].slice(0, 12).join(' ');
+    if (factQuery) {
+      for (const fact of searchFactsByText(factQuery, 6)) {
+        sources.push({
+          callId: `memory:fact:${fact.id}`,
+          tool: 'memory_recall',
+          excerpt: fact.content.length > 600 ? `${fact.content.slice(0, 600)}…` : fact.content,
+          createdAt: fact.updatedAt,
+        });
+      }
+    }
+  } catch { /* fail open — memory unavailable never blocks a completion */ }
   if (sources.length === 0) {
     return { action: 'allow', reason: 'no captured tool results to verify figures against', figures: [], sourceCallIds: [] };
   }
@@ -479,6 +504,12 @@ export async function evaluateOutputGrounding(
   const sourceCallIds = sources.map((s) => s.callId);
   if (residual.length === 0) {
     return { action: 'allow', reason: 'every figure traces to captured tool results (deterministic)', figures: [], sourceCallIds };
+  }
+  if (toolSourceCount === 0) {
+    // Only memory sources exist and they didn't clear the residual. Absence
+    // from memory is not evidence against a figure about work just performed —
+    // preserve the pre-memory behavior for capture-less sessions.
+    return { action: 'allow', reason: 'no captured tool results to verify figures against', figures: [], sourceCallIds };
   }
   let verdict: OutputGroundingVerdict;
   try {
