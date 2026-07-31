@@ -646,3 +646,47 @@ export async function cancelRun(runId: string): Promise<{ ok: boolean; message: 
 export async function controlTask(taskId: string, action: 'cancel' | 'resume'): Promise<{ ok: true; status: string }> {
   return api<{ ok: true; status: string }>(`/m/api/tasks/${encodeURIComponent(taskId)}/${action}`, { method: 'POST' });
 }
+
+// ─── workspaces ─
+//
+// The authored workspace view is loopback-only (agent-written JS never leaves
+// the Mac), so the phone reads a server-side projection of the same data.
+
+export interface WorkspaceSummary {
+  id: string;
+  title: string;
+  status: 'active' | 'paused' | 'archived';
+  objective: string | null;
+  updatedAt: string;
+  lastRefreshedAt: string | null;
+  freshness: string;
+  issues: string[];
+}
+
+export interface WorkspaceField { label: string; value: string }
+export interface WorkspaceRecord { key: string; primary: string; fields: WorkspaceField[] }
+
+export interface WorkspaceDetail extends WorkspaceSummary {
+  sources: Array<{ id: string; ok: boolean; refreshedAt: string | null; error: string | null }>;
+  projection: {
+    recordPath: string | null;
+    recordLabel: string | null;
+    total: number;
+    shown: number;
+    headline: WorkspaceField[];
+    records: WorkspaceRecord[];
+  };
+}
+
+export async function listWorkspaces(): Promise<{ workspaces: WorkspaceSummary[] }> {
+  return api<{ workspaces: WorkspaceSummary[] }>('/m/api/workspaces');
+}
+
+export async function getWorkspace(id: string): Promise<WorkspaceDetail> {
+  return api<WorkspaceDetail>(`/m/api/workspaces/${encodeURIComponent(id)}`);
+}
+
+/** Starts the runners; returns immediately (a refresh can take minutes). */
+export async function refreshWorkspace(id: string): Promise<{ ok: true; started: true }> {
+  return api<{ ok: true; started: true }>(`/m/api/workspaces/${encodeURIComponent(id)}/refresh`, { method: 'POST' });
+}

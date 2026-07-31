@@ -1890,6 +1890,92 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  // ─── workspaces ────────────────────────────────────────────────
+  //
+  // A workspace's authored view is loopback-only on purpose: it is
+  // agent-written JavaScript and it never leaves this machine. So the phone
+  // gets the DATA, re-projected (src/spaces/mobile-projection.ts) into
+  // headline numbers and scannable records. That is a different view of the
+  // same workspace, and the UI says so rather than pretending to be the
+  // desktop.
+
+  router.get('/api/workspaces', requireMobileSession, async (_req, res) => {
+    try {
+      const { spaceStore } = await import('../spaces/store.js');
+      const spaces = spaceStore.list().map((record) => {
+        const health = spaceStore.health(record.id);
+        return {
+          id: record.id,
+          title: record.title,
+          status: record.status,
+          objective: record.contract?.objective ?? null,
+          updatedAt: record.updatedAt,
+          lastRefreshedAt: record.lastRefreshedAt ?? null,
+          freshness: health?.freshness.state ?? 'unknown',
+          issues: (health?.issues ?? []).slice(0, 3),
+          counts: health?.counts ?? null,
+        };
+      });
+      res.json({ workspaces: spaces });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get('/api/workspaces/:id', requireMobileSession, async (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    try {
+      const { spaceStore, isValidSpaceSlug } = await import('../spaces/store.js');
+      if (!isValidSpaceSlug(id)) { res.status(400).json({ error: 'INVALID_ID' }); return; }
+      const record = spaceStore.get(id);
+      if (!record || record.status === 'archived') { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+      const { readData } = await import('../spaces/data-store.js');
+      const { projectWorkspaceData, projectSourceHealth, shortenDiagnostic } = await import('../spaces/mobile-projection.js');
+      const data = readData(id);
+      const health = spaceStore.health(id);
+      res.json({
+        id: record.id,
+        title: record.title,
+        status: record.status,
+        objective: record.contract?.objective ?? null,
+        updatedAt: record.updatedAt,
+        lastRefreshedAt: record.lastRefreshedAt ?? null,
+        freshness: health?.freshness.state ?? 'unknown',
+        // Health issues quote runner stderr verbatim; unbounded, one of them
+        // pushed the whole workspace off a phone screen.
+        issues: (health?.issues ?? []).slice(0, 3).map((issue) => shortenDiagnostic(issue, 160)),
+        sources: projectSourceHealth(data),
+        projection: projectWorkspaceData(data),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Kick a refresh. Deliberately fire-and-forget: a runner can take five
+   * minutes, and holding a mobile connection open that long would time out
+   * on any real network. The phone polls the record for the new timestamp.
+   */
+  router.post('/api/workspaces/:id/refresh', requireMobileSession, async (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    try {
+      const { spaceStore, isValidSpaceSlug } = await import('../spaces/store.js');
+      if (!isValidSpaceSlug(id)) { res.status(400).json({ error: 'INVALID_ID' }); return; }
+      const record = spaceStore.get(id);
+      if (!record || record.status === 'archived') { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+      const { refreshSpaceData } = await import('../spaces/runner.js');
+      void Promise.resolve()
+        .then(() => refreshSpaceData(id))
+        .catch((err) => {
+          console.warn(`mobile workspace refresh failed for ${id}:`, err instanceof Error ? err.message : err);
+        });
+      res.status(202).json({ ok: true, started: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Stop a workflow run from the phone. Cancels at the next step boundary —
    * the same verb the desktop console uses, so a run stopped from the couch

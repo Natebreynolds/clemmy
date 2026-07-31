@@ -670,6 +670,9 @@ input, textarea { font: inherit; }
 .dock {
   position: fixed;
   left: 50%;
+  right: auto;
+  width: calc(100% - 20px);
+  max-width: 460px;
   transform: translateX(-50%);
   /* Clear of the home indicator even when the shell reports a zero inset. */
   bottom: max(22px, calc(env(safe-area-inset-bottom) + 12px));
@@ -690,9 +693,12 @@ input, textarea { font: inherit; }
   flex-direction: column;
   align-items: center;
   gap: 3px;
-  min-width: 60px;
+  /* Six destinations have to fit a 390px phone without the dock wrapping or
+     clipping, so the buttons flex down and the labels shrink with them. */
+  flex: 1 1 0;
+  min-width: 0;
   min-height: 48px;
-  padding: 7px 8px 6px;
+  padding: 7px 4px 6px;
   border: none;
   background: transparent;
   border-radius: 999px;
@@ -703,9 +709,13 @@ input, textarea { font: inherit; }
 .dock-icon { position: relative; display: block; line-height: 0; }
 .dock button svg { width: 21px; height: 21px; stroke-width: 1.8; }
 .dock-label {
-  font-size: 10px;
+  font-size: clamp(8.5px, 2.4vw, 10px);
   font-weight: 700;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.02em;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .dock button.active {
   color: var(--accent);
@@ -1224,3 +1234,124 @@ input, textarea { font: inherit; }
 @media (min-height: 850px) and (max-width: 699px) {
   .home { gap: var(--sp-6); }
 }
+
+
+/* ── workspaces ─────────────────────────────────────────────────── */
+
+.ws-objective {
+  font-size: var(--t-xs);
+  color: var(--fg-2);
+  margin-top: 3px;
+}
+.ws-objective-full {
+  font-size: var(--t-sm);
+  color: var(--fg-2);
+  margin: 0 2px var(--sp-3);
+}
+.ws-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+/* Freshness is the first thing you look for away from your desk, so it is
+   a color before it is a sentence. */
+.ws-fresh-fresh { background: var(--accent-2); }
+.ws-fresh-aging { background: var(--accent-warn); }
+.ws-fresh-stale { background: var(--accent-fail); }
+.ws-fresh-unknown, .ws-fresh-never { background: var(--fg-3); }
+
+/* A failed runner leaves last week's numbers wearing today's timestamp. */
+.ws-warn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--fail-soft);
+  border: 1px solid rgba(240, 101, 90, 0.32);
+  border-radius: var(--r-md);
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-3);
+  font-size: var(--t-sm);
+  color: var(--fg-2);
+}
+.ws-warn strong { color: var(--accent-fail); font-family: var(--font-display); }
+.ws-warn-detail {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--fg-3);
+  word-break: break-word;
+}
+
+.ws-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: var(--sp-2);
+}
+.ws-tile {
+  background: linear-gradient(180deg, rgba(255, 232, 200, 0.05), transparent 55%), var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: var(--sp-3);
+  box-shadow: var(--shadow-card);
+  min-width: 0;
+}
+.ws-tile-value {
+  font-family: var(--font-display);
+  font-size: clamp(17px, 4.6vw, 22px);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-tile-label {
+  font-size: var(--t-xs);
+  color: var(--fg-3);
+  margin-top: 2px;
+  line-height: 1.25;
+}
+
+/* Rows as label/value pairs rather than a grid: a 40-column table cannot
+   reflow, but four pairs read fine on any width. */
+.ws-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--sp-2) var(--sp-3);
+  margin: var(--sp-3) 0 0;
+}
+.ws-field { min-width: 0; }
+.ws-field dt {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-3);
+  font-weight: 700;
+}
+.ws-field dd {
+  margin: 1px 0 0;
+  font-size: var(--t-sm);
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-more {
+  font-size: var(--t-xs);
+  color: var(--fg-3);
+  text-align: center;
+  margin: var(--sp-3) 0 0;
+}
+
+.ws-issues { margin-bottom: var(--sp-3); }
+.ws-issue-list {
+  margin: var(--sp-2) 0 0;
+  padding-left: 18px;
+  font-size: var(--t-xs);
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  line-height: 1.45;
+}
+.ws-issue-list li { margin-bottom: 4px; word-break: break-word; }

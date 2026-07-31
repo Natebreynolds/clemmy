@@ -8,8 +8,9 @@ import { Activity } from './screens/Activity';
 import { Chats } from './screens/Chats';
 import { Memory } from './screens/Memory';
 import { Workflows } from './screens/Workflows';
+import { Workspaces } from './screens/Workspaces';
 
-type Tab = 'home' | 'chats' | 'workflows' | 'memory' | 'activity';
+type Tab = 'home' | 'chats' | 'spaces' | 'workflows' | 'memory' | 'activity';
 
 export function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
@@ -152,6 +153,7 @@ export function App() {
         ) : tab === 'chats' ? (
           <Chats handoff={handoff} onHandoffConsumed={() => setHandoff(null)} />
         ) : tab === 'workflows' ? <Workflows />
+          : tab === 'spaces' ? <Workspaces />
           : tab === 'memory' ? <Memory />
           : <Activity />}
       </main>
@@ -191,6 +193,7 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 const TAB_TITLES: Record<Tab, string> = {
   home: 'Clementine',
   chats: 'Chats',
+  spaces: 'Workspaces',
   workflows: 'Flows',
   memory: 'Memory',
   activity: 'Activity',
@@ -214,6 +217,16 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'spaces',
+    label: 'Spaces',
+    icon: (
+      <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+        <rect x="3" y="3" width="7" height="9" rx="1.5" /><rect x="14" y="3" width="7" height="5" rx="1.5" />
+        <rect x="14" y="12" width="7" height="9" rx="1.5" /><rect x="3" y="16" width="7" height="5" rx="1.5" />
       </svg>
     ),
   },
