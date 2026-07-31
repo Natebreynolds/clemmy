@@ -402,6 +402,8 @@ export async function sendChatMessage(
 export interface ChatStreamHandlers {
   onReplay?: (payload: { sessionId: string; sessionStatus: SessionStatus; events: ChatEvent[] }) => void;
   onEvent?: (event: ChatEvent) => void;
+  /** Live text as the reply is written, before the durable event lands. */
+  onDelta?: (text: string) => void;
   onError?: (err: Event) => void;
 }
 
@@ -458,6 +460,14 @@ export function subscribeChatStream(sessionId: string, handlers: ChatStreamHandl
       source.addEventListener('event', (ev) => {
         try {
           handlers.onEvent?.(JSON.parse((ev as MessageEvent).data));
+        } catch { /* ignore */ }
+      });
+    }
+    if (handlers.onDelta) {
+      source.addEventListener('delta', (ev) => {
+        try {
+          const parsed = JSON.parse((ev as MessageEvent).data) as { text?: string };
+          if (typeof parsed.text === 'string') handlers.onDelta?.(parsed.text);
         } catch { /* ignore */ }
       });
     }

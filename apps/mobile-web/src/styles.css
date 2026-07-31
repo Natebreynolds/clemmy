@@ -875,6 +875,24 @@ input, textarea { font: inherit; }
   border: 1px solid var(--line);
   border-bottom-left-radius: 7px;
 }
+/* Live text, still being written. The trailing caret is the only signal that
+   distinguishes it from a finished message — the bubble deliberately looks
+   identical otherwise, so the text does not shift when the real one lands. */
+.bubble-streaming::after {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  animation: bubble-caret 1s steps(2, start) infinite;
+}
+@keyframes bubble-caret { to { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .bubble-streaming::after { animation: none; }
+}
+
 .bubble-note { align-self: center; background: transparent; color: var(--fg-3); font-size: var(--t-xs); padding: 2px 8px; box-shadow: none; }
 .bubble-error {
   align-self: center;

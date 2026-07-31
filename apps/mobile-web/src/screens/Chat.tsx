@@ -36,6 +36,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const [loading, setLoading] = useState<boolean>(Boolean(initialSessionId));
   const [draft, setDraft] = useState(initialDraft ?? '');
   const [sending, setSending] = useState(false);
+  // Text arriving live from the model. Cleared the moment the durable event
+  // lands, so the finished message is always the persisted one, never this.
+  const [streaming, setStreaming] = useState('');
   const [planActing, setPlanActing] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -65,7 +68,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             setEvents((current) => mergeEventsBySeq(current, replay));
             for (const e of replay) latestSeq = Math.max(latestSeq, e.seq);
           },
+          onDelta: (text) => { setStreaming((current) => current + text); },
           onEvent: (event) => {
+            // The real message has landed; stop showing the provisional text.
+            setStreaming('');
             if (cancelled) return;
             setEvents((current) => mergeEventsBySeq(current, [event]));
             latestSeq = Math.max(latestSeq, event.seq);
@@ -113,6 +119,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       sentAt: Date.now(),
     };
     setPending((current) => [...current, echo]);
+    setStreaming('');
     setDraft('');
     setSending(true);
     if (textareaRef.current) {
@@ -227,6 +234,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             onPlanAction={actOnPlan}
           />
         ))}
+        {streaming ? (
+          <div class="bubble bubble-assistant bubble-streaming">{streaming}</div>
+        ) : null}
         {pending.map((echo) => (
           <PendingBubble key={echo.id} echo={echo} onRetry={retryPending} onDiscard={discardPending} />
         ))}

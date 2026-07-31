@@ -567,6 +567,43 @@ declare module 'express-serve-static-core' {
   }
 }
 
+/**
+ * Open chat streams, by session.
+ *
+ * The phone already holds an SSE connection per open conversation, but that
+ * stream only carried PERSISTED harness events — so while the model was
+ * writing, the phone showed nothing at all. Desktop passes an onChunk and
+ * paints tokens as they arrive; mobile awaited the whole turn and then dumped
+ * the result, which is why an identical message felt far slower on a phone
+ * despite doing identical work on the same model.
+ *
+ * This lets the send route push token deltas onto that existing stream. Kept
+ * as module-local state rather than a new shared event kind: token deltas are
+ * high-frequency and transient, and putting them on the global action bus
+ * would make every other subscriber pay for them.
+ */
+const chatStreams = new Map<string, Set<(delta: string) => void>>();
+
+function addChatStream(sessionId: string, write: (delta: string) => void): () => void {
+  let set = chatStreams.get(sessionId);
+  if (!set) { set = new Set(); chatStreams.set(sessionId, set); }
+  set.add(write);
+  return () => {
+    set!.delete(write);
+    if (set!.size === 0) chatStreams.delete(sessionId);
+  };
+}
+
+function pushChatDelta(sessionId: string, delta: string): void {
+  const set = chatStreams.get(sessionId);
+  if (!set) return;
+  for (const write of set) {
+    // One slow or broken client must never break the turn that is producing
+    // the tokens.
+    try { write(delta); } catch { /* dropped; the persisted event still lands */ }
+  }
+}
+
 export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   const router = express.Router();
   const stateOpts = deps.stateDir ? { stateDir: deps.stateDir } : undefined;
@@ -1536,6 +1573,13 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const shaped = serializeEventForMobile(event.event as HarnessEventRow);
       writeEvent('event', shaped, shaped.seq);
     });
+
+    // Live text, so the phone shows the reply forming instead of a blank
+    // screen. Deltas carry no seq: they are transient and the durable
+    // `event` above remains the source of truth for replay.
+    const detachDeltas = addChatStream(session.id, (delta) => {
+      writeEvent('delta', { text: delta });
+    });
     const heartbeat = setInterval(() => {
       if (closed || res.destroyed) return;
       res.write(`: ping\n\n`);
@@ -1545,6 +1589,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       closed = true;
       clearInterval(heartbeat);
       unsubscribe();
+      detachDeltas();
     };
     res.on('close', cleanup);
     res.on('error', cleanup);
@@ -1616,6 +1661,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         userId: ctx.record.deviceId,
         channel: 'mobile',
         source: 'mobile',
+        // Paint the reply as it is written. Without this the phone waits out
+        // the entire turn behind a spinner while the desktop, doing exactly
+        // the same work, starts showing text in about a second.
+        onChunk: (delta) => { pushChatDelta(sessionId, delta); },
       });
       const payload: ChatSendResponse = {
         sessionId: gatewayResponse.sessionId,

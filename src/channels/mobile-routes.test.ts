@@ -9,6 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
 import path from 'node:path';
@@ -1278,4 +1279,27 @@ test('run control: task actions are allow-listed — no arbitrary verb reaches t
     const missing = await fetch(`${h.url}/m/api/tasks/task-missing/cancel`, { method: 'POST', headers: { cookie } });
     assert.equal(missing.status, 404);
   } finally { await h.close(); }
+});
+
+test('mobile chat send streams tokens instead of awaiting the whole turn', async () => {
+  // This is a source-contract pin rather than a behavioural one because the
+  // streaming callback only fires on the harness path, which this suite stubs
+  // out. It is here because the defect it guards was silent: mobile awaited
+  // the entire turn and returned one JSON blob, so an identical message felt
+  // dramatically slower on a phone than on the desktop while doing exactly the
+  // same work on the same model. Nothing failed, nothing logged — it just felt
+  // broken. Deleting the callback would restore that with no other signal.
+  const source = await readFile(new URL('./mobile-routes.ts', import.meta.url), 'utf8');
+
+  const sendCall = source.slice(source.indexOf("channel: 'mobile'"));
+  assert.ok(
+    sendCall.slice(0, 400).includes('onChunk'),
+    'chat/send must pass onChunk to handleMessage, or the phone shows nothing until the turn ends',
+  );
+
+  // ...and the deltas must have somewhere to go: the stream the phone already
+  // holds open has to register a writer, and release it on disconnect or every
+  // closed conversation leaks one.
+  assert.ok(source.includes('addChatStream('), 'the SSE handler must register a delta writer');
+  assert.ok(source.includes('detachDeltas()'), 'the delta writer must be released when the stream closes');
 });
