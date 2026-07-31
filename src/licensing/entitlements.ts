@@ -41,3 +41,23 @@ export function lockMessage(): string | null {
   const blocking = posture.gaps.find((gap) => gap.blocking);
   return blocking?.message ?? 'This copy of Clementine needs an active license.';
 }
+
+/**
+ * The gate's user-facing form.
+ *
+ * Returns null when work should proceed — which is the case for every state
+ * except a genuinely dead license while the server has asked us to enforce.
+ * Callers get a plain response object rather than a thrown error so the
+ * refusal reads like Clem talking, not like a crash.
+ */
+export function licenseLockResponse(sessionId: string): { text: string; sessionId: string; handledControl: true } | null {
+  const posture = licensePosture();
+  if (!licenseLocksFeatures(posture)) return null;
+  const reason = posture.gaps.find((gap) => gap.blocking)?.message
+    ?? 'This copy of Clementine needs an active license.';
+  return {
+    text: `${reason}\n\nOpen Settings → Connect on your Mac to enter or refresh your license key. Your data is untouched and still yours — nothing here deletes or locks your notes.`,
+    sessionId,
+    handledControl: true,
+  };
+}

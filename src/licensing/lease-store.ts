@@ -32,6 +32,16 @@ export interface LeaseRecord {
   consecutiveFailures?: number;
   /** Set when the local clock is behind the high-water mark. Advisory only. */
   clockUntrusted?: boolean;
+  /**
+   * The `enforce` flag from the last lease we successfully verified.
+   *
+   * Kept separately because an expired lease can no longer be read, and
+   * assuming "enforcing" in that case would quietly defeat the kill switch:
+   * a product with enforcement turned OFF would still start locking people
+   * out as their leases aged. The last thing the server actually told us
+   * stands until a new lease says otherwise.
+   */
+  lastKnownEnforce?: boolean;
 }
 
 function leaseFile(stateDir?: string): string {

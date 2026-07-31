@@ -84,7 +84,8 @@ export function licensePosture(opts?: { stateDir?: string; hasKey?: boolean; now
       ...base,
       state: 'revoked',
       ok: false,
-      enforcing: true,
+      // A rejection is only actionable if the server was enforcing.
+      enforcing: record.lastKnownEnforce !== false,
       gaps: [...gaps, {
         code: 'LICENSE_REVOKED',
         message: record.lastCheckMessage || 'This license is no longer active.',
@@ -120,7 +121,9 @@ export function licensePosture(opts?: { stateDir?: string; hasKey?: boolean; now
       ...base,
       state: 'expired',
       ok: false,
-      enforcing: true,
+      // An expired lease can no longer be read, so fall back to the last
+      // thing the server told us rather than assuming enforcement.
+      enforcing: record.lastKnownEnforce === true,
       gaps: [...gaps, {
         code: 'LEASE_EXPIRED',
         message: "Couldn't confirm your license for over two weeks. Reconnect to the internet to refresh it.",

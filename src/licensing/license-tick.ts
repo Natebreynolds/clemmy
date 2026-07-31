@@ -97,6 +97,7 @@ export async function tickLicense(opts: { pairId?: string | null; force?: boolea
     payload: verdict.payload,
     activationId: result.activationId ?? record.activationId,
     serverTimeHighWater: verdict.payload.srv,
+    lastKnownEnforce: Boolean(verdict.payload.enforce),
     lastCheckAt: at,
     lastCheckOutcome: 'ok',
     lastCheckMessage: undefined,
