@@ -169,3 +169,39 @@ test('recordOperationalEvent persists redacted envelopes and list filters them',
     db.close();
   }
 });
+
+test('usage-metric NUMBERS survive redaction while secret-named strings still redact (2026-07-29 blackout regression)', () => {
+  const db = new Database(':memory:');
+  try {
+    db.exec(OPERATIONAL_TELEMETRY_SCHEMA_SQL);
+    recordOperationalEvent({
+      eventId: 'evt-usage-1',
+      now: new Date('2026-07-31T05:00:00.000Z'),
+      source: 'model',
+      type: 'model_call_completed',
+      sessionId: 'sess-usage',
+      payload: {
+        model: 'gpt-5.6-sol',
+        inputTokens: 1200,
+        cachedInputTokens: 90_000,
+        outputTokens: 450,
+        reasoningTokens: 128,
+        totalTokens: 91_650,
+        // The trap keys: numeric metric names the classifier used to eat…
+        tokens: 91_650,
+        // …and a REAL secret-shaped string that must still redact.
+        apiToken: 'sk-live-abc123',
+      },
+    }, db);
+    const [event] = listOperationalEvents({ source: 'model', limit: 1 }, db);
+    assert.equal(event.payload.inputTokens, 1200);
+    assert.equal(event.payload.cachedInputTokens, 90_000);
+    assert.equal(event.payload.outputTokens, 450);
+    assert.equal(event.payload.reasoningTokens, 128);
+    assert.equal(event.payload.totalTokens, 91_650);
+    assert.equal(event.payload.tokens, 91_650, 'bare numeric "tokens" is a metric, not a secret');
+    assert.equal(event.payload.apiToken, '[REDACTED]', 'string secrets under token-named keys still redact');
+  } finally {
+    db.close();
+  }
+});

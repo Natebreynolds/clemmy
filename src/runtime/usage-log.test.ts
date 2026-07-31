@@ -13,6 +13,7 @@ const {
   classifyUsageKind,
   parseWorkflowSource,
   reconcilePromptComponents,
+  uncachedTokensForAccrual,
 } = await import('./usage-log.js');
 
 function ev(over: Partial<import('./usage-log.js').UsageEvent>): import('./usage-log.js').UsageEvent {
@@ -115,4 +116,16 @@ test('parseWorkflowSource returns {} for non-workflow sources (join keys absent 
   assert.deepEqual(parseWorkflowSource('console:home'), {});
   assert.deepEqual(parseWorkflowSource('cron:morning-briefing'), {});
   assert.deepEqual(parseWorkflowSource('warmup-1781833012346'), {});
+});
+
+test('uncachedTokensForAccrual handles BOTH metering dialects (2026-07-30: 8M guest tokens accrued zero)', () => {
+  // Cached-INCLUSIVE (Codex-style): total covers cache reads — subtract them.
+  assert.equal(uncachedTokensForAccrual({ inputTokens: 91_000, cachedInputTokens: 90_000, outputTokens: 650, totalTokens: 91_650 }), 1_650);
+  // Cached-EXCLUSIVE (Anthropic-style, the live guest row): total < cached —
+  // the old blanket subtraction clamped to ZERO; uncached work is in + out.
+  assert.equal(uncachedTokensForAccrual({ inputTokens: 81, cachedInputTokens: 6_549_707, outputTokens: 75_286, totalTokens: 75_367 }), 75_367);
+  // No cache at all: plain total.
+  assert.equal(uncachedTokensForAccrual({ inputTokens: 1000, cachedInputTokens: 0, outputTokens: 100, totalTokens: 1100 }), 1100);
+  // Degenerate/absent fields never go negative.
+  assert.equal(uncachedTokensForAccrual({}), 0);
 });

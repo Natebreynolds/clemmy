@@ -455,12 +455,37 @@ function ensureStateDir(): void {
   if (!existsSync(OPERATIONAL_TELEMETRY_STATE_DIR)) mkdirSync(OPERATIONAL_TELEMETRY_STATE_DIR, { recursive: true });
 }
 
+/** Usage-METRIC key names whose NUMERIC values must survive redaction. The
+ *  secret classifier matches the bare word "tokens", which silently redacted
+ *  every token count in telemetry from 2026-07-29 on — the day's spend became
+ *  unmeasurable (live audit finding). A finite number under a metric name can
+ *  never be a leaked credential, so this narrow numeric allowlist restores
+ *  observability WITHOUT weakening the classifier anywhere else. */
+const USAGE_METRIC_KEY_RE =
+  /^(?:input|cached_input|output|reasoning|total|prompt|completion|cache_read_input|cache_creation_input)_tokens$|^tokens?(?:_used|_count|_remaining)?$/;
+
+function isUsageMetricKey(key: string): boolean {
+  const normalized = String(key ?? '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase();
+  return USAGE_METRIC_KEY_RE.test(normalized);
+}
+
 function redactPayload(payload: Record<string, unknown>): Record<string, unknown> {
-  const redacted = redactSensitiveValue(payload);
-  if (redacted && typeof redacted === 'object' && !Array.isArray(redacted)) {
-    return redacted as Record<string, unknown>;
+  const preserved: Record<string, number> = {};
+  const rest: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (typeof value === 'number' && Number.isFinite(value) && isUsageMetricKey(key)) {
+      preserved[key] = value;
+    } else {
+      rest[key] = value;
+    }
   }
-  return { value: redacted };
+  const redacted = redactSensitiveValue(rest);
+  if (redacted && typeof redacted === 'object' && !Array.isArray(redacted)) {
+    return { ...(redacted as Record<string, unknown>), ...preserved };
+  }
+  return { value: redacted, ...preserved };
 }
 
 function parsePayload(value: string | null): Record<string, unknown> {

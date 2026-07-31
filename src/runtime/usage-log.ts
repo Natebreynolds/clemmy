@@ -140,6 +140,29 @@ export function reconcilePromptComponents(
  * invisible, so cache-hit-rate was unmeasurable for non-Codex brains). Fails
  * silently — observability must never break the model call path.
  */
+/**
+ * Uncached work for the run token meter, across BOTH metering dialects (live
+ * audit 2026-07-30: 8M guest-lane tokens silently accrued ZERO):
+ *  - cached-INCLUSIVE totals (Codex-style: total covers cache reads) →
+ *    subtract the cache reads;
+ *  - cached-EXCLUSIVE (Anthropic-style: input/total already exclude cache
+ *    reads, so total < cached and the old blanket subtraction clamped to 0) →
+ *    the uncached work is simply input + output.
+ * `total > cached` identifies the dialect deterministically. Pure.
+ */
+export function uncachedTokensForAccrual(event: {
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+}): number {
+  const total = event.totalTokens ?? 0;
+  const cached = event.cachedInputTokens ?? 0;
+  return total > cached
+    ? total - cached
+    : Math.max(0, event.inputTokens ?? 0) + Math.max(0, event.outputTokens ?? 0);
+}
+
 export function recordModelUsage(args: {
   sessionId: string;
   channel?: string;
@@ -190,8 +213,7 @@ export function recordModelUsage(args: {
   // ~10M mostly-cached "tokens"). Silent no-op for rowless sources (warmup,
   // 'unknown'); atomic under parallel worker completions.
   try {
-    const uncached = Math.max(0, (event.totalTokens ?? 0) - (event.cachedInputTokens ?? 0));
-    accrueSessionTokens(source, uncached);
+    accrueSessionTokens(source, uncachedTokensForAccrual(event));
   } catch { /* the meter must never break the model-call path */ }
   recordOperationalEvent({
     source: 'model',
