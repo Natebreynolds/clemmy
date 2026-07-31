@@ -694,7 +694,11 @@ test('spine confirm beat: each new consequential intent aligns; an old completio
   const msg = 'send outreach emails to the 20 firms on my prospect list';
   const fresh = await renderClaudeAgentBrainTurnContext({ message: msg, sessionId: sid });
   assert.match(fresh, /\[confirm-first\]/, 'fresh execution-shaped turn gets the beat');
-  assert.match(fresh, /name the connection\/capability/, 'the shovel line — required capabilities are surfaced, not improvised around');
+  // Wording updated 2026-07-31 when the beat was rewritten from a briefing to a
+  // conversation; the REQUIREMENT is unchanged — the beat must name the source/
+  // capability it intends to use, so a missing connection surfaces to the user
+  // instead of being improvised around.
+  assert.match(fresh, /which source or tool you would use/, 'the shovel line — required capabilities are surfaced, not improvised around');
   const firstDecision = listEvents(sid, { types: ['turn_preflight_decision'] }).at(-1);
   assert.equal(firstDecision?.data.phase, 'align', 'the typed alignment decision is persisted for enforcement');
   appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'conversation_completed', data: { reason: 'success' } });
