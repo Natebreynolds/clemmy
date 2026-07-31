@@ -87,17 +87,6 @@ html, body {
   border-radius: 16px;
 }
 
-/* Monospace for the licensing admin.
-   Tailwind's `font-mono` resolves to var(--font-geist-mono), which nothing on
-   this site defines — an undefined var makes the whole font-family declaration
-   invalid, so `font-mono` currently computes to the browser default serif. The
-   admin prints license keys, activation IDs and audit payloads, where a
-   proportional serif makes l/1 and O/0 ambiguous, so it asks for monospace
-   directly instead. Additive: no existing page uses this class. */
-.admin-mono {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-}
-
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;

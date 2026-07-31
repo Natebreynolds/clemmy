@@ -36,7 +36,7 @@
 import net from 'node:net';
 import tls from 'node:tls';
 import { Duplex } from 'node:stream';
-import { createHash, timingSafeEqual, randomBytes, createVerify, createPublicKey, verify as cryptoVerify, X509Certificate } from 'node:crypto';
+import { createHash, timingSafeEqual, randomBytes, createVerify, X509Certificate } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 
@@ -173,22 +173,9 @@ const PING_INTERVAL_MS = 30_000;
 const PONG_DEADLINE_MS = 90_000;
 
 export function startRelay(opts) {
-  const {
-    port, baseDomain, tlsKeyPem, tlsCertPem, dataDir, log = console,
-    // Licensing. Ships OFF: the relay parses and logs leases first so we can
-    // confirm every real install presents a valid one before it can lock
-    // anyone out. Flipping requireLicense is an env change, not a release.
-    licensePublicKeys = {}, productSlug = null, requireLicense = false,
-    licenseApiUrl = null, licenseServiceToken = null, denylist = [],
-  } = opts;
+  const { port, baseDomain, tlsKeyPem, tlsCertPem, dataDir, log = console } = opts;
   const base = baseDomain.toLowerCase();
   const claims = claimStore(dataDir);
-  const licensePubKeys = new Map(Object.entries(licensePublicKeys));
-  // Break-glass plus the polled feed. Fails OPEN by design — see the poller.
-  const revoked = {
-    licenses: new Set(denylist.filter(Boolean)),
-    activations: new Set(),
-  };
   /** pairId → tunnel { socket, feed, streams: Map<streamId, phoneSocket>, nextStreamId, lastPong } */
   const tunnels = new Map();
 
@@ -290,7 +277,6 @@ export function startRelay(opts) {
     let stage = 'hello';
     let pendingPairId = null;
     let pendingToken = '';
-    let pendingLease = null;
     const nonce = randomBytes(32).toString('base64url');
     const helloTimer = setTimeout(() => { if (stage !== 'done') tlsSocket.destroy(); }, HELLO_TIMEOUT_MS);
 
@@ -312,7 +298,6 @@ export function startRelay(opts) {
           if (!PAIR_ID_RE.test(pairId) || token.length < 16) { refuse('BAD_HELLO'); return; }
           pendingPairId = pairId;
           pendingToken = token;
-          pendingLease = typeof hello.lease === 'string' ? hello.lease : null;
           stage = 'proof';
           tlsSocket.write(encodeFrame(FRAME.CHALLENGE, 0, JSON.stringify({ nonce })));
           continue;
@@ -331,17 +316,6 @@ export function startRelay(opts) {
             refuse('CLAIMED');
             return;
           }
-          const licenseRefusal = verifyLicense(pendingLease, pendingPairId);
-          if (licenseRefusal) {
-            if (requireLicense) {
-              log.warn(`relay: ${licenseRefusal} for ${pendingPairId}`);
-              refuse(licenseRefusal);
-              return;
-            }
-            // Observation mode: log what WOULD have been refused so the gate
-            // can be turned on with evidence rather than hope.
-            log.warn(`relay: would refuse ${pendingPairId} (${licenseRefusal}) — requireLicense is off`);
-          }
           stage = 'done';
           clearTimeout(helloTimer);
           tlsSocket.removeListener('data', onData);
@@ -353,72 +327,6 @@ export function startRelay(opts) {
     };
     tlsSocket.on('data', onData);
     tlsSocket.on('error', () => tlsSocket.destroy());
-  }
-
-  /**
-   * Licensing, verified offline with a baked public key.
-   *
-   * This is where licensing actually has teeth. The daemon runs on the user's
-   * own machine and can be patched, so a local check is deterrence; the relay
-   * is our server and our clock, so this check holds.
-   *
-   * Note the composition with proof-of-possession above: binding the lease to
-   * the pairId means a leaked lease is worthless to anyone else, because using
-   * it also requires the private key that never left the original Mac.
-   *
-   * Returns null when acceptable, or a refusal code.
-   */
-  function verifyLicense(lease, pairId) {
-    if (!lease) return requireLicense ? 'LICENSE_REQUIRED' : null;
-
-    const parts = String(lease).split('.');
-    if (parts.length !== 3) return 'LICENSE_MALFORMED';
-    const [headerB64, payloadB64, sigB64] = parts;
-
-    let header;
-    let payload;
-    try {
-      header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8'));
-      payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
-    } catch {
-      return 'LICENSE_MALFORMED';
-    }
-    if (header.alg !== 'Ed25519') return 'LICENSE_BAD_ALG';
-
-    const spki = licensePubKeys.get(header.kid);
-    if (!spki) return 'LICENSE_UNKNOWN_KEY';
-
-    let verified = false;
-    try {
-      const publicKey = createPublicKey({ key: Buffer.from(spki, 'base64'), format: 'der', type: 'spki' });
-      // Verify the received bytes, never a re-serialization.
-      verified = cryptoVerify(
-        null,
-        Buffer.from(`${headerB64}.${payloadB64}`, 'ascii'),
-        publicKey,
-        Buffer.from(sigB64, 'base64url'),
-      );
-    } catch {
-      verified = false;
-    }
-    if (!verified) return 'LICENSE_BAD_SIGNATURE';
-
-    if (productSlug && payload.product !== productSlug) return 'LICENSE_WRONG_PRODUCT';
-
-    // Our clock, and NO client grace. The daemon's grace window exists so a
-    // laptop on a plane keeps working; it is not a license to keep using the
-    // relay after a subscription lapses.
-    const now = Math.floor(Date.now() / 1000);
-    if (payload.nbf && now + 300 < payload.nbf) return 'LICENSE_NOT_YET_VALID';
-    if (payload.exp && now - 300 > payload.exp) return 'LICENSE_EXPIRED';
-
-    // The binding that makes a stolen lease useless.
-    if (payload.pair && payload.pair !== pairId) return 'LICENSE_PAIR_MISMATCH';
-
-    if (revoked.licenses.has(String(payload.licenseId))) return 'LICENSE_REVOKED';
-    if (revoked.activations.has(String(payload.activationId))) return 'LICENSE_BLOCKED';
-
-    return null;
   }
 
   /**
@@ -499,36 +407,6 @@ export function startRelay(opts) {
     socket.on('error', () => socket.destroy());
   });
 
-  /**
-   * Revocation feed. The lease TTL is the outer bound on revocation; this
-   * narrows it to about a minute without giving the relay a database.
-   *
-   * It FAILS OPEN: if the license server is unreachable we keep the last known
-   * set rather than start refusing tunnels. That is consistent with this
-   * relay's stated threat model — it is an availability control, and a
-   * licensing outage must not take phone access away from paying customers.
-   */
-  let revocationTimer = null;
-  if (licenseApiUrl && licenseServiceToken) {
-    const pollRevocations = async () => {
-      try {
-        const res = await fetch(`${licenseApiUrl.replace(/\/+$/, '')}/v1/revocations`, {
-          headers: { authorization: `Bearer ${licenseServiceToken}` },
-          signal: AbortSignal.timeout(8000),
-        });
-        if (!res.ok) return;
-        const body = await res.json();
-        revoked.licenses = new Set([...denylist.filter(Boolean), ...(body.revokedLicenseIds ?? []).map(String)]);
-        revoked.activations = new Set((body.blockedActivationIds ?? []).map(String));
-      } catch {
-        // Keep the previous set. See the fail-open note above.
-      }
-    };
-    void pollRevocations();
-    revocationTimer = setInterval(pollRevocations, 60_000);
-    revocationTimer.unref?.();
-  }
-
   const heartbeat = setInterval(() => {
     const now = Date.now();
     for (const [pairId, tunnel] of tunnels) {
@@ -552,7 +430,6 @@ export function startRelay(opts) {
         tunnelCount: () => tunnels.size,
         close: () => new Promise((done) => {
           clearInterval(heartbeat);
-          if (revocationTimer) clearInterval(revocationTimer);
           for (const tunnel of tunnels.values()) tunnel.socket.destroy();
           server.close(() => done());
         }),
@@ -573,24 +450,12 @@ if (isMain) {
   };
   const baseDomain = env.RELAY_BASE_DOMAIN;
   if (!baseDomain) throw new Error('relay: RELAY_BASE_DOMAIN is required');
-  // `k1:BASE64,k2:BASE64`
-  const licensePublicKeys = Object.fromEntries(
-    (env.RELAY_LICENSE_PUBKEYS ?? '')
-      .split(',').map((e) => e.trim()).filter(Boolean)
-      .map((e) => [e.slice(0, e.indexOf(':')), e.slice(e.indexOf(':') + 1)]),
-  );
   startRelay({
     port: Number(env.PORT ?? 9400),
     baseDomain,
     tlsKeyPem: readMaterial('RELAY_TLS_KEY_PEM', 'RELAY_TLS_KEY_FILE', 'TLS key'),
     tlsCertPem: readMaterial('RELAY_TLS_CERT_PEM', 'RELAY_TLS_CERT_FILE', 'TLS cert'),
     dataDir: env.RELAY_DATA_DIR ?? './data',
-    licensePublicKeys,
-    productSlug: env.RELAY_PRODUCT_SLUG ?? null,
-    requireLicense: (env.RELAY_REQUIRE_LICENSE ?? '').toLowerCase() === 'true',
-    licenseApiUrl: env.LICENSE_API_URL ?? null,
-    licenseServiceToken: env.RELAY_SERVICE_TOKEN ?? null,
-    denylist: (env.RELAY_LICENSE_DENYLIST ?? '').split(',').map((v) => v.trim()).filter(Boolean),
   }).catch((err) => {
     console.error(err);
     process.exit(1);

@@ -27,7 +27,6 @@ import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import { pemCertToDer } from './mobile-tls.js';
 import { registerRelayStreamPeer, unregisterRelayStreamPeer } from './mobile-ingress.js';
-import { readLeaseRecord } from '../licensing/lease-store.js';
 
 const logger = pino({ name: 'clementine-next.mobile-relay' });
 
@@ -249,13 +248,7 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
         socket.destroy();
         return;
       }
-      // The lease rides along so the relay can verify licensing offline. Absent
-        // is fine while the relay is in observation mode.
-        let lease: string | undefined;
-        try { lease = readLeaseRecord().leaseCompact; } catch { lease = undefined; }
-        socket.write(encodeFrame(FRAME.HELLO, 0, JSON.stringify({
-          pairId: opts.pairId, authToken: opts.authToken, proto: 1, lease,
-        })));
+      socket.write(encodeFrame(FRAME.HELLO, 0, JSON.stringify({ pairId: opts.pairId, authToken: opts.authToken, proto: 1 })));
     });
 
     socket.on('data', (chunk: Buffer) => {
@@ -300,12 +293,7 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
         return;
       }
       if (frame.type === FRAME.HELLO_ERR) {
-        const body = frame.payload.toString('utf8');
-        log.error({ body }, 'mobile-relay: relay refused registration');
-        // A licensing refusal will not resolve by retrying in two seconds, so
-        // stop hammering: go straight to the maximum backoff and let the
-        // license tick fix the cause.
-        if (body.includes('LICENSE_')) backoffMs = RECONNECT_MAX_MS;
+        log.error({ body: frame.payload.toString('utf8') }, 'mobile-relay: relay refused registration');
         socket.destroy();
         return;
       }

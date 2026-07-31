@@ -1,5 +1,4 @@
 import type { SecretDescriptor, SecretName, SecretValidationResult } from './types.js';
-import { probeLicenseKey } from '../../licensing/license-client.js';
 
 // Generic HTTP probe used by validators. 401/403 → invalid; 2xx → valid;
 // everything else (5xx, timeout, DNS) → unknown so the user can still
@@ -73,20 +72,6 @@ async function probeSlackAuth(key: string): Promise<SecretValidationResult> {
  * required: false and a deprecation note in the description.
  */
 export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
-  {
-    name: 'license_key',
-    description: 'Clementine license key — activates this Mac. One key can cover several machines depending on your plan.',
-    envVarName: 'CLEMENTINE_LICENSE_KEY',
-    // Never mark this required: `required` paints the Connect screen amber
-    // with "Action needed", and every existing install would light up the
-    // moment this ships. Licensing state has its own, honest surface.
-    required: false,
-    setupHint: 'Starts with clem_live_. Check your welcome email.',
-    // Deliberately a DRY RUN — it must not consume a seat. If a real
-    // activation ran here and the vault write then failed, the user would
-    // have burned a seat on a key that was never saved.
-    validate: (value) => probeLicenseKey(value),
-  },
   {
     name: 'openai_api_key',
     description: 'Optional OpenAI API key — enables embeddings, Realtime live voice, and direct OpenAI API features. Not required when the agent runtime uses Codex OAuth.',

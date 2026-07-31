@@ -47,8 +47,7 @@ export type SecretName =
   | 'browser_use_api_key'
   | 'codex_oauth_access_token'
   | 'codex_oauth_refresh_token'
-  | 'webhook_secret'
-  | 'license_key';
+  | 'webhook_secret';
 
 /** Per-credential audit metadata. Stored in secrets-meta.json. */
 export interface SecretMetadata {

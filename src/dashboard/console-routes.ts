@@ -11,7 +11,6 @@ import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whis
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
-import { registerConsoleLicenseRoutes } from './console-license-routes.js';
 import {
   BASE_DIR,
   DEFAULT_MODELS,
@@ -2825,9 +2824,6 @@ export function registerConsoleRoutes(
   // Read-only multi-agent workspace API (roster, canMessage graph, comms,
   // per-agent runs). Shares this function's auth gate.
   registerConsoleAgentsRoutes(app, isAuthorized);
-  // License posture + an explicit "check now". Same auth gate; never returns
-  // the key itself.
-  registerConsoleLicenseRoutes(app, isAuthorized);
   armWorkflowListMemoWarm();
 
   /**

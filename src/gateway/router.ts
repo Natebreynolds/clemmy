@@ -1,5 +1,4 @@
 import pino from 'pino';
-import { licenseLockResponse } from '../licensing/entitlements.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { ExecutionStore, renderExecutionSummary } from '../execution/store.js';
 import {
@@ -591,23 +590,6 @@ export class ClementineGateway {
   }
 
   async handleMessage(request: GatewayRequest): Promise<GatewayResponse> {
-    // The licensing gate, deliberately at the ONE place every channel
-    // converges — chat, Discord, Slack, mobile, workflows all arrive here — so
-    // enforcement is a single readable check rather than a dozen scattered
-    // ones that drift apart.
-    //
-    // What this cannot do, and must not try to: gate the console shell, the
-    // activation screen, or a user's access to their own data. Those live
-    // outside this path on purpose. Locking someone out of their own notes
-    // turns an annoyed customer into a motivated attacker and is not what a
-    // license is for.
-    //
-    // It is a no-op until the SERVER says to enforce (`enforce` inside the
-    // signed lease), and it never fires for `unlicensed` or `stale` — a fresh
-    // install and a laptop on a plane both keep working.
-    const licenseBlock = licenseLockResponse(request.sessionId);
-    if (licenseBlock) return licenseBlock;
-
     const run = startRun({
       id: request.runId,
       sessionId: request.sessionId,
