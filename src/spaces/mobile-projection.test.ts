@@ -151,3 +151,75 @@ test('breakdowns surface the distribution behind the headline', () => {
   // A caption string is not a distribution.
   assert.ok(!p.breakdowns.some((b) => /label/i.test(b.label)));
 });
+
+test('an authored _mobile block wins over inference — intent beats guessing', () => {
+  // The case that motivated this: platform-49's desktop view shows "Feature
+  // requests", a number computed in view code that exists NOWHERE in the data.
+  // Inference can never recover it; the workspace has to say so.
+  const data = {
+    slack_feed: { data: { messages: Array.from({ length: 15 }, (_, i) => ({ ts: `170${i}`, subtype: 'x', inviter: 'U1' })) } },
+    _mobile: {
+      headline: [
+        { label: 'Items logged', value: '142' },
+        { label: 'Feature requests', value: '18' },
+      ],
+      records: {
+        label: 'Recent requests',
+        total: 42,
+        items: [{ key: 'r1', primary: 'Bulk export for reports', fields: [{ label: 'Channel', value: '#platform-49' }] }],
+      },
+      breakdowns: [{ label: 'By section', entries: [{ label: 'Reports', value: 12 }, { label: 'Billing', value: 3 }] }],
+    },
+  };
+  const p = projectWorkspaceData(data);
+  assert.equal(p.headline[0].label, 'Items logged');
+  assert.equal(p.headline[1].value, '18', 'a computed number no heuristic could find');
+  assert.equal(p.recordLabel, 'Recent requests');
+  assert.equal(p.total, 42, 'the author may report a total larger than the items shipped');
+  assert.equal(p.records[0].primary, 'Bulk export for reports');
+  // Ratios derive from the values when the author gave none, so bars stay honest.
+  assert.equal(p.breakdowns[0].entries[0].ratio, 1);
+  assert.ok(p.breakdowns[0].entries[1].ratio < 0.3);
+  // And the raw Slack metadata inference would have shown is nowhere in sight.
+  assert.ok(!JSON.stringify(p).includes('inviter'));
+});
+
+test('a malformed authored block falls back to inference, never breaks the screen', () => {
+  // This is what makes the feature safe to add: a bad _mobile block can only
+  // ever be as bad as having none.
+  const rows = Array.from({ length: 5 }, (_, i) => ({ account: `Acme ${i}`, amount: 1000 * i, stage: 'Open' }));
+  for (const junk of [null, 42, 'nope', [], {}, { headline: 'not-an-array' }, { headline: [{ label: 'x' }] }, { records: { items: [{}] } }]) {
+    const p = projectWorkspaceData({ deals: rows, _mobile: junk });
+    assert.equal(p.recordPath, 'deals', `_mobile=${JSON.stringify(junk)} must fall back to inference`);
+    assert.equal(p.total, 5);
+  }
+});
+
+test('authored content is bounded and coerced — it is agent-written, not trusted', () => {
+  const p = projectWorkspaceData({
+    _mobile: {
+      headline: Array.from({ length: 40 }, (_, i) => ({ label: `L${i}`, value: i })),
+      records: {
+        items: Array.from({ length: 500 }, (_, i) => ({
+          primary: 'x'.repeat(300),
+          fields: Array.from({ length: 90 }, (_, f) => ({ label: `f${f}`, value: 'y'.repeat(200) })),
+        })),
+      },
+    },
+  });
+  assert.ok(p.headline.length <= 8, 'tile count is capped');
+  assert.ok(p.records.length <= 60, 'record count is capped');
+  assert.ok(p.records[0].fields.length <= 28, 'field count is capped');
+  assert.ok(p.records[0].primary.length <= 80, 'long strings are truncated');
+  assert.equal(p.headline[0].value, '0', 'numbers are coerced to display strings');
+});
+
+test('_mobile is never mistaken for the dataset by inference', () => {
+  // Without excluding it, the walk could pick _mobile's own items array as
+  // "the largest array of objects" and render the summary as the data.
+  const p = projectWorkspaceData({
+    deals: [{ account: 'A' }, { account: 'B' }],
+    _mobile: { headline: [] },
+  });
+  assert.equal(p.recordPath, 'deals');
+});

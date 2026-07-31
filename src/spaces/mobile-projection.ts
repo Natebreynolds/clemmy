@@ -159,8 +159,9 @@ function findRecords(data: unknown): { path: string; rows: Array<Record<string, 
     }
     if (Array.isArray(node)) return;
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-      // `_meta` is provenance, never content.
-      if (key === '_meta') continue;
+      // `_meta` is provenance and `_mobile` is the authored summary —
+      // neither is the dataset.
+      if (key === '_meta' || key === '_mobile') continue;
       visit(value, path ? `${path}.${key}` : key, depth + 1);
     }
   };
@@ -174,7 +175,7 @@ function findHeadline(data: unknown): MobileWorkspaceField[] {
   const visit = (node: unknown, depth: number): void => {
     if (depth > 3 || node === null || typeof node !== 'object' || Array.isArray(node)) return;
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-      if (key === '_meta') continue;
+      if (key === '_meta' || key === '_mobile') continue;
       if (/^(summary|totals|stats|overview)$/i.test(key) && value && typeof value === 'object' && !Array.isArray(value)) {
         summaries.push(value as Record<string, unknown>);
       }
@@ -228,7 +229,7 @@ function findBreakdowns(data: unknown): MobileWorkspaceBreakdown[] {
   const visit = (node: unknown, depth: number): void => {
     if (depth > 3 || node === null || typeof node !== 'object' || Array.isArray(node)) return;
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-      if (key === '_meta') continue;
+      if (key === '_meta' || key === '_mobile') continue;
       if (/^(summary|totals|stats|overview)$/i.test(key) && value && typeof value === 'object') {
         for (const [groupKey, groupValue] of Object.entries(value as Record<string, unknown>)) {
           if (!groupValue || typeof groupValue !== 'object' || Array.isArray(groupValue)) continue;
@@ -259,6 +260,10 @@ function findBreakdowns(data: unknown): MobileWorkspaceBreakdown[] {
 }
 
 export function projectWorkspaceData(data: unknown): MobileWorkspaceProjection {
+  // A summary the workspace wrote for itself always beats one we guessed.
+  const authored = readAuthoredProjection(data);
+  if (authored) return authored;
+
   const headline = findHeadline(data);
   const breakdowns = findBreakdowns(data);
   const found = findRecords(data);
@@ -353,4 +358,134 @@ export function projectSourceHealth(data: unknown): MobileSourceHealth[] {
         : null,
     };
   });
+}
+
+// ─── the authored summary ───────────────────────────────────────────────────
+//
+// Everything above INFERS what matters from an opaque blob, and there is a
+// hard ceiling on that: a real workspace's desktop view shows numbers like
+// "Feature requests" that exist nowhere in the data — Clem computes them in
+// her own view code. No heuristic can recover an intent that was never
+// written down.
+//
+// So a workspace may write its own phone summary into `data.json` under
+// `_mobile`, from the same runner that produces the data. That keeps the
+// security boundary intact: the authored HTML view stays loopback-only, and
+// what travels to the phone is plain DATA that no one executes.
+//
+// It is agent-authored, so none of it is trusted: every field is coerced,
+// every list is capped, and anything malformed falls back to inference rather
+// than propagating a broken shape to the phone.
+
+const AUTHORED_MAX_TILES = 8;
+const AUTHORED_MAX_RECORDS = 60;
+const AUTHORED_MAX_FIELDS = 28;
+
+function asText(value: unknown, max = MAX_VALUE_CHARS): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : null;
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function authoredFields(raw: unknown, cap: number): MobileWorkspaceField[] {
+  if (!Array.isArray(raw)) return [];
+  const out: MobileWorkspaceField[] = [];
+  for (const entry of raw.slice(0, cap)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const record = entry as Record<string, unknown>;
+    const label = asText(record.label, 40);
+    const value = asText(record.value);
+    if (label && value) out.push({ label, value });
+  }
+  return out;
+}
+
+/**
+ * Reads `_mobile` if the workspace wrote one. Returns null when it is absent
+ * or too malformed to be worth showing — inference then takes over, which is
+ * why adding this can never make an existing workspace worse.
+ */
+export function readAuthoredProjection(data: unknown): MobileWorkspaceProjection | null {
+  if (!data || typeof data !== 'object') return null;
+  const authored = (data as Record<string, unknown>)._mobile;
+  if (!authored || typeof authored !== 'object' || Array.isArray(authored)) return null;
+  const block = authored as Record<string, unknown>;
+
+  const headline = authoredFields(block.headline, AUTHORED_MAX_TILES);
+
+  const breakdowns: MobileWorkspaceBreakdown[] = [];
+  if (Array.isArray(block.breakdowns)) {
+    for (const raw of block.breakdowns.slice(0, MAX_BREAKDOWNS)) {
+      if (!raw || typeof raw !== 'object') continue;
+      const group = raw as Record<string, unknown>;
+      const label = asText(group.label, 40);
+      if (!label || !Array.isArray(group.entries)) continue;
+      const entries = group.entries
+        .slice(0, MAX_BREAKDOWN_ENTRIES)
+        .map((entry) => {
+          if (!entry || typeof entry !== 'object') return null;
+          const e = entry as Record<string, unknown>;
+          const entryLabel = asText(e.label, 40);
+          const value = asText(e.value, 24);
+          if (!entryLabel || !value) return null;
+          // A bar is only honest if the ratio is real; when the author gave
+          // none, derive it from the numbers rather than invent a length.
+          const ratio = typeof e.ratio === 'number' && Number.isFinite(e.ratio)
+            ? Math.max(0, Math.min(1, e.ratio))
+            : null;
+          return { label: entryLabel, value, ratio, raw: typeof e.value === 'number' ? e.value : null };
+        })
+        .filter((e): e is { label: string; value: string; ratio: number | null; raw: number | null } => e !== null);
+      if (entries.length < 2) continue;
+      const max = Math.max(...entries.map((e) => Math.abs(e.raw ?? 0))) || 0;
+      breakdowns.push({
+        label,
+        entries: entries.map((e) => ({
+          label: e.label,
+          value: e.value,
+          ratio: e.ratio ?? (max > 0 ? Math.min(1, Math.abs(e.raw ?? 0) / max) : 0),
+        })),
+      });
+    }
+  }
+
+  const recordsBlock = (block.records && typeof block.records === 'object' && !Array.isArray(block.records))
+    ? block.records as Record<string, unknown>
+    : null;
+  const items = Array.isArray(recordsBlock?.items) ? recordsBlock!.items : [];
+  const records: MobileWorkspaceRecord[] = items
+    .slice(0, AUTHORED_MAX_RECORDS)
+    .map((raw, index) => {
+      if (!raw || typeof raw !== 'object') return null;
+      const item = raw as Record<string, unknown>;
+      const primary = asText(item.primary);
+      if (!primary) return null;
+      return {
+        key: asText(item.key, 64) ?? `authored-${index}`,
+        primary,
+        fields: authoredFields(item.fields, AUTHORED_MAX_FIELDS),
+      };
+    })
+    .filter((r): r is MobileWorkspaceRecord => r !== null);
+
+  // An authored block that says nothing is not an improvement on inference.
+  if (headline.length === 0 && records.length === 0 && breakdowns.length === 0) return null;
+
+  const total = typeof recordsBlock?.total === 'number' && Number.isFinite(recordsBlock.total)
+    ? Math.max(records.length, Math.floor(recordsBlock.total))
+    : records.length;
+
+  return {
+    recordPath: '_mobile',
+    recordLabel: asText(recordsBlock?.label, 40) ?? (records.length > 0 ? 'Records' : null),
+    total,
+    shown: records.length,
+    headline,
+    breakdowns,
+    records,
+  };
 }
