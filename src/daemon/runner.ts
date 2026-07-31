@@ -75,6 +75,7 @@ import {
 import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decision.js';
 import { reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
+import { reapDeadSkillChoices } from '../memory/skill-choice-store.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
@@ -2349,6 +2350,15 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
           }
         } catch (err) {
           logger.warn({ err }, 'Tool-memo hygiene reap failed');
+        }
+        // Same window, same discipline, for proven-standard memos.
+        try {
+          const retiredSkillMemos = reapDeadSkillChoices();
+          if (retiredSkillMemos > 0) {
+            logger.info({ retiredSkillMemos }, 'Retired never-proven skill-choice memos');
+          }
+        } catch (err) {
+          logger.warn({ err }, 'Skill-memo hygiene reap failed');
         }
       });
     }

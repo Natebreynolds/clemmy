@@ -1,5 +1,7 @@
 import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
 import { listSessionRecallRunIds } from '../../memory/recall-usage.js';
+import { captureProvenSkill } from '../../memory/skill-choice-capture.js';
+import { gatherSessionSkills } from './skill-execution.js';
 import { safeDetectCorrection } from './correction-hook.js';
 import { appendEvent } from './eventlog.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
@@ -95,6 +97,26 @@ export function runPostTurnHooks(input: PostTurnHookInput): void {
   } catch (err) {
     // Crediting is bookkeeping; it must never break the turn.
     console.warn('[harness] post-turn auto-credit failed', err instanceof Error ? err.message : err);
+  }
+
+  // Proven-skill capture: a standard that governed a WORKING run becomes
+  // memory, so the next run of this class binds it instead of re-deriving it
+  // from lexical retrieval (which silently lost the owner's own outbound
+  // standard, live 2026-07-31). Lives in the shared spine so both brains learn
+  // identically. Best-effort — learning must never fail a turn.
+  try {
+    const loaded = gatherSessionSkills(input.sessionId).map((s) => s.name);
+    if (loaded.length > 0) {
+      captureProvenSkill({
+        request: typeof input.userInput === 'string' ? input.userInput : (input.queryText ?? ''),
+        loadedSkillNames: loaded,
+        // Real work reached a clean end: the turn produced output AND applied
+        // the skill through at least one tool call.
+        workingRun: Boolean(input.replyText?.trim()) && (input.toolArgTexts?.length ?? 0) > 0,
+      });
+    }
+  } catch (err) {
+    console.warn('[harness] post-turn skill capture failed', err instanceof Error ? err.message : err);
   }
 
   // Focus is a provider-neutral continuity aid. Keeping this in the shared

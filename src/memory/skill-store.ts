@@ -642,9 +642,13 @@ export function findRelevantSkills(query: string, options?: RelevantSkillOptions
     }
     // Weak, capped verb evidence — completes a match, never carries one (a
     // verb-only overlap still cannot clear the two-signal floor below).
-    const sharedVerbs = [...queryActionVerbs].filter((verb) => skillActionVerbs(
-      `${skill.name} ${skill.frontmatter.name ?? ''} ${skill.frontmatter.description ?? ''}`,
-    ).has(verb));
+    // Computed ONCE per skill: tokenizing the skill text per query verb turned
+    // retrieval into O(verbs x skills) string work and measurably slowed a hot
+    // path (it blew an async recovery sweep's window in test).
+    const skillVerbs = queryActionVerbs.size > 0
+      ? skillActionVerbs(`${skill.name} ${skill.frontmatter.name ?? ''} ${skill.frontmatter.description ?? ''}`)
+      : new Set<string>();
+    const sharedVerbs = [...queryActionVerbs].filter((verb) => skillVerbs.has(verb));
     if (sharedVerbs.length > 0) {
       score += Math.min(SKILL_ACTION_VERB_MAX, sharedVerbs.length * SKILL_ACTION_VERB_WEIGHT);
       matchedTerms.push(...sharedVerbs);

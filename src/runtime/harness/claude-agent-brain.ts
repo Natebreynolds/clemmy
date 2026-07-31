@@ -68,6 +68,7 @@ import {
 import { resolveWriteEvidence } from './work-report.js';
 import { gatherSessionSkills } from './skill-execution.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../../memory/skill-store.js';
+import { renderProvenSkillForPrompt } from '../../memory/skill-choice-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput, projectCommandsLineForInput } from './context-packet.js';
 import { looksLikeToolCallShape, looksLikeToolCallShapeStreaming } from './tool-narration-shapes.js';
 import { createReplyStreamExtractor } from './reply-stream.js';
@@ -958,7 +959,10 @@ async function buildClaudeAgentBrainTurnContext(
   let relevantSkills = '';
   if (splitContext && q) {
     try {
-      const rendered = renderRelevantSkillsForPrompt(q);
+      // Proven standard first — same contract as the Codex lane (parity is a
+      // hard requirement; a standard that binds on one brain and not the other
+      // is exactly the two-lane trap).
+      const rendered = [renderProvenSkillForPrompt(q), renderRelevantSkillsForPrompt(q)].filter(Boolean).join('\n\n');
       if (rendered) relevantSkills = `## Relevant Skills\n${rendered}`;
     } catch { relevantSkills = ''; }
   }

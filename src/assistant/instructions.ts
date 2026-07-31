@@ -9,6 +9,7 @@ import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
 import { renderLearnedBlocks, renderAutonomy, renderCurrentTimeForInstructions, renderFocusForInstructions } from '../agents/harness-context.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
+import { renderProvenSkillForPrompt } from '../memory/skill-choice-store.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
 import type { MessageIntent } from './message-intent.js';
@@ -259,7 +260,12 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
     // Tiered mode injects this once in buildTurnContextBlock. Only the legacy
     // unsplit path needs to compute it here.
     if (!tieredContextEnabled()) {
-      try { relevantSkillsBlock = section('Relevant Skills', renderRelevantSkillsForPrompt(message ?? '')); } catch { relevantSkillsBlock = ''; }
+      // The PROVEN standard leads: a memo that already worked outranks a
+      // fresh lexical guess, and it costs one line instead of a discovery
+      // round trip every single turn.
+      try {
+        relevantSkillsBlock = section('Relevant Skills', [renderProvenSkillForPrompt(message ?? ''), renderRelevantSkillsForPrompt(message ?? '')].filter(Boolean).join('\n\n'));
+      } catch { relevantSkillsBlock = ''; }
     }
   }
 
@@ -353,7 +359,9 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
   if (!tieredContextEnabled()) return '';
   let relevantSkills = '';
   if (chatContextParityEnabled()) {
-    try { relevantSkills = section('Relevant Skills', renderRelevantSkillsForPrompt(message ?? '')); } catch { relevantSkills = ''; }
+    try {
+      relevantSkills = section('Relevant Skills', [renderProvenSkillForPrompt(message ?? ''), renderRelevantSkillsForPrompt(message ?? '')].filter(Boolean).join('\n\n'));
+    } catch { relevantSkills = ''; }
   }
   // Step 2: casual greetings / meta turns don't need the working context — keep
   // them lean. The standing/pinned facts live in Tier-1, so nothing durable is

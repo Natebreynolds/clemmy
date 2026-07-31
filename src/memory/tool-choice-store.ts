@@ -1449,13 +1449,13 @@ const SHORT_TOOL_ALIASES: Record<string, string[]> = {
  *  "account" (live 2026-07-31: the proven sf memo missed promotion because
  *  the user's plural never token-matched the memo's singular). Longer-word
  *  only, plain trailing-s only — "less"/"was"/ids stay untouched. */
-function singularFold(token: string): string {
+export function singularFold(token: string): string {
   return token.length > 4 && token.endsWith('s') && !token.endsWith('ss')
     ? token.slice(0, -1)
     : token;
 }
 
-function wordTokens(text: string): Set<string> {
+export function wordTokens(text: string): Set<string> {
   const out = new Set<string>();
   for (const raw of (text || '').toLowerCase().split(/[^a-z0-9]+/)) {
     const t = raw.trim();
