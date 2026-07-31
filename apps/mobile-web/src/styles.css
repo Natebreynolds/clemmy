@@ -87,7 +87,6 @@ body {
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  padding-top: env(safe-area-inset-top);
   overscroll-behavior-y: contain;
   -webkit-tap-highlight-color: transparent;
 }
@@ -98,6 +97,12 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* The inset lives HERE, not on <body>. On body it pushed the whole app
+     down while #app stayed a full 100dvh tall, so the bottom of every
+     screen hung off the display — which is why the chat composer ended up
+     underneath the floating dock. Global border-box keeps the padding
+     inside the 100dvh. */
+  padding-top: env(safe-area-inset-top);
 }
 
 button { font: inherit; cursor: pointer; color: inherit; }
@@ -1355,3 +1360,16 @@ input, textarea { font: inherit; }
   line-height: 1.45;
 }
 .ws-issue-list li { margin-bottom: 4px; word-break: break-word; }
+
+/* Distribution bars: the shape of the data, not just its total. */
+.ws-bars { display: flex; flex-direction: column; gap: 7px; margin-top: var(--sp-3); }
+.ws-bar-row { display: grid; grid-template-columns: minmax(64px, 1fr) 2fr auto; align-items: center; gap: var(--sp-2); }
+.ws-bar-label { font-size: var(--t-xs); color: var(--fg-2); min-width: 0; }
+.ws-bar-track { height: 6px; border-radius: 999px; background: var(--bg-3); overflow: hidden; }
+.ws-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent-deep), var(--accent-hi));
+}
+.ws-bar-value { font-size: var(--t-xs); color: var(--fg); font-variant-numeric: tabular-nums; }

@@ -16,7 +16,9 @@ import {
   getWorkspace,
   listWorkspaces,
   refreshWorkspace,
+  type WorkspaceBreakdown,
   type WorkspaceDetail,
+  type WorkspaceRecord,
   type WorkspaceSummary,
 } from '../lib/api';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
@@ -115,7 +117,7 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
 
   useEffect(() => {
     load();
-    const timer = setInterval(load, 10_000);
+    const timer = setInterval(load, 60_000);
     const onPull = () => { void load(); };
     window.addEventListener(REFRESH_EVENT, onPull);
     return () => { clearInterval(timer); window.removeEventListener(REFRESH_EVENT, onPull); };
@@ -197,6 +199,8 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
         </section>
       ) : null}
 
+      {projection.breakdowns.length > 0 ? <Breakdowns groups={projection.breakdowns} /> : null}
+
       {projection.records.length > 0 ? (
         <section class="home-section">
           <h2 class="section-head">
@@ -205,19 +209,7 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
           </h2>
           <div class="stack">
             {projection.records.map((record, i) => (
-              <article key={record.key} class="card rise" style={{ '--i': Math.min(i, 12) }}>
-                <div class="card-title-sm">{record.primary}</div>
-                {record.fields.length > 0 ? (
-                  <dl class="ws-fields">
-                    {record.fields.map((field) => (
-                      <div key={field.label} class="ws-field">
-                        <dt>{field.label}</dt>
-                        <dd>{field.value}</dd>
-                      </div>
-                    ))}
-                  </dl>
-                ) : null}
-              </article>
+              <RecordCard key={record.key} record={record} index={Math.min(i, 12)} />
             ))}
           </div>
           {projection.total > projection.shown ? (
@@ -236,6 +228,63 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
         </div>
       )}
     </div>
+  );
+}
+
+/** Four fields on the face of the card, every field one tap away. */
+const CARD_FIELDS = 4;
+
+function RecordCard({ record, index }: { record: WorkspaceRecord; index: number }) {
+  const [open, setOpen] = useState(false);
+  const hidden = record.fields.length - CARD_FIELDS;
+  const shown = open ? record.fields : record.fields.slice(0, CARD_FIELDS);
+  return (
+    <article class="card rise" style={{ '--i': index }}>
+      <div class="card-title-sm">{record.primary}</div>
+      {shown.length > 0 ? (
+        <dl class="ws-fields">
+          {shown.map((field) => (
+            <div key={field.label} class="ws-field">
+              <dt>{field.label}</dt>
+              <dd>{field.value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+      {hidden > 0 ? (
+        <button class="link-btn" onClick={() => { haptic('light'); setOpen(!open); }}>
+          {open ? 'Show less' : `All ${record.fields.length} fields`}
+        </button>
+      ) : null}
+    </article>
+  );
+}
+
+/** The distribution behind the headline numbers — by stage, by band, by
+ *  loss reason. Without these the phone showed a summary of a summary. */
+function Breakdowns({ groups }: { groups: WorkspaceBreakdown[] }) {
+  return (
+    <section class="home-section">
+      <h2 class="section-head">Breakdown</h2>
+      <div class="stack">
+        {groups.map((group, i) => (
+          <article key={group.label} class="card rise" style={{ '--i': i }}>
+            <div class="card-title-sm">{group.label}</div>
+            <div class="ws-bars">
+              {group.entries.map((entry) => (
+                <div key={entry.label} class="ws-bar-row">
+                  <span class="ws-bar-label truncate">{entry.label}</span>
+                  <span class="ws-bar-track">
+                    <span class="ws-bar-fill" style={{ width: `${Math.round(entry.ratio * 100)}%` }} />
+                  </span>
+                  <span class="ws-bar-value">{entry.value}</span>
+                </div>
+              ))}
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 

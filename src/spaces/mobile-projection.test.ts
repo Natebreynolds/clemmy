@@ -65,7 +65,7 @@ test('projects the largest object array and never ships the whole dataset', () =
   const p = projectWorkspaceData(data);
   assert.equal(p.recordPath, 'risk.deals', 'picks the biggest array, not the first');
   assert.equal(p.total, 96);
-  assert.equal(p.shown, 40, 'caps what it ships');
+  assert.equal(p.shown, 60, 'caps what it ships');
   assert.equal(p.records[0].primary, 'Account 0');
   // Nested breakdowns are charts, and *Label fields caption other numbers —
   // neither belongs in a row of tiles.
@@ -73,7 +73,7 @@ test('projects the largest object array and never ships the whole dataset', () =
   assert.ok(!labels.includes('By Stage'));
   assert.ok(!labels.some((l) => /label/i.test(l)));
   assert.ok(labels.includes('At Risk Count'));
-  assert.ok(JSON.stringify(p).length < 20_000, 'a 350KB dataset must not become a 350KB response');
+  assert.ok(JSON.stringify(p).length < 40_000, 'a 350KB dataset must not become a 350KB response');
 });
 
 test('a field that merely repeats the card title is dropped', () => {
@@ -117,4 +117,37 @@ test('degrades rather than throws on shapes it has never seen', () => {
     assert.ok(Array.isArray(p.records));
   }
   assert.deepEqual(projectSourceHealth(null), []);
+});
+
+test('records carry every field, not just the four on the card', () => {
+  // The complaint this fixes: "I need to see data, not just records." The card
+  // shows a few fields; the row must still carry the rest for expansion.
+  const wide = Object.fromEntries(
+    Array.from({ length: 30 }, (_, i) => [`field${String(i).padStart(2, '0')}`, `v${i}`]),
+  );
+  const data = { set: { rows: Array.from({ length: 3 }, () => ({ account: 'Acme', amount: 1000, ...wide })) } };
+  const p = projectWorkspaceData(data);
+  assert.ok(p.records[0].fields.length > 10, 'a 30-column row must not be truncated to four');
+  assert.ok(p.records[0].fields.length <= 28, 'but it is still bounded');
+});
+
+test('breakdowns surface the distribution behind the headline', () => {
+  const data = {
+    risk: {
+      summary: {
+        atRiskCount: 23,
+        byStage: { Proposal: 12, Negotiation: 6, Discovery: 2 },
+        thisMonthLabel: 'July',
+      },
+      deals: [{ account: 'a' }, { account: 'b' }],
+    },
+  };
+  const p = projectWorkspaceData(data);
+  const stage = p.breakdowns.find((b) => b.label === 'By Stage');
+  assert.ok(stage, 'nested summary objects become breakdowns');
+  assert.equal(stage!.entries[0].label, 'Proposal', 'largest slice leads');
+  assert.equal(stage!.entries[0].ratio, 1, 'the biggest entry fills its bar');
+  assert.ok(stage!.entries[2].ratio < 0.5);
+  // A caption string is not a distribution.
+  assert.ok(!p.breakdowns.some((b) => /label/i.test(b.label)));
 });

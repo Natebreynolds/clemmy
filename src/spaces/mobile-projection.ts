@@ -32,7 +32,16 @@ export interface MobileWorkspaceField {
 export interface MobileWorkspaceRecord {
   key: string;
   primary: string;
+  /** Every scalar the row carries, most meaningful first. The card shows the
+   *  leading few; the rest are one tap away, because "I can see the summary
+   *  but not the actual data" is the complaint a summary-only view earns. */
   fields: MobileWorkspaceField[];
+}
+
+/** A named breakdown out of the summary — byStage, byBand, byLeadSource. */
+export interface MobileWorkspaceBreakdown {
+  label: string;
+  entries: Array<{ label: string; value: string; ratio: number }>;
 }
 
 export interface MobileWorkspaceProjection {
@@ -43,12 +52,18 @@ export interface MobileWorkspaceProjection {
   total: number;
   shown: number;
   headline: MobileWorkspaceField[];
+  breakdowns: MobileWorkspaceBreakdown[];
   records: MobileWorkspaceRecord[];
 }
 
-const MAX_RECORDS = 40;
+const MAX_RECORDS = 60;
 const MAX_HEADLINE = 6;
-const MAX_FIELDS = 4;
+/** Shown on a collapsed card; the rest expand in place. */
+export const CARD_FIELDS = 4;
+/** Ceiling on a fully expanded row — real workspaces reach 40 columns. */
+const MAX_FIELDS = 28;
+const MAX_BREAKDOWNS = 4;
+const MAX_BREAKDOWN_ENTRIES = 8;
 const MAX_VALUE_CHARS = 80;
 
 /** Field-name families, most identifying first. Ranking beats column order:
@@ -203,11 +218,52 @@ export function chooseFields(rows: Array<Record<string, unknown>>): string[] {
     .slice(0, MAX_FIELDS + 1);
 }
 
+/**
+ * Pulls the nested breakdowns out of the summary — `byStage`, `byBand`,
+ * `byLeadSource`. These are the shape of the dataset, and leaving them out
+ * was the difference between "a summary" and "the data".
+ */
+function findBreakdowns(data: unknown): MobileWorkspaceBreakdown[] {
+  const out: MobileWorkspaceBreakdown[] = [];
+  const visit = (node: unknown, depth: number): void => {
+    if (depth > 3 || node === null || typeof node !== 'object' || Array.isArray(node)) return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === '_meta') continue;
+      if (/^(summary|totals|stats|overview)$/i.test(key) && value && typeof value === 'object') {
+        for (const [groupKey, groupValue] of Object.entries(value as Record<string, unknown>)) {
+          if (!groupValue || typeof groupValue !== 'object' || Array.isArray(groupValue)) continue;
+          const pairs = Object.entries(groupValue as Record<string, unknown>)
+            .filter(([, v]) => typeof v === 'number' && Number.isFinite(v)) as Array<[string, number]>;
+          if (pairs.length < 2) continue;
+          const max = Math.max(...pairs.map(([, v]) => Math.abs(v))) || 1;
+          out.push({
+            label: humanizeKey(groupKey),
+            entries: pairs
+              .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+              .slice(0, MAX_BREAKDOWN_ENTRIES)
+              .map(([k, v]) => ({
+                label: humanizeKey(k),
+                value: formatValue(groupKey, v),
+                // Drives a bar so the distribution is readable at a glance.
+                ratio: Math.min(1, Math.abs(v) / max),
+              })),
+          });
+        }
+        continue;
+      }
+      visit(value, depth + 1);
+    }
+  };
+  visit(data, 0);
+  return out.slice(0, MAX_BREAKDOWNS);
+}
+
 export function projectWorkspaceData(data: unknown): MobileWorkspaceProjection {
   const headline = findHeadline(data);
+  const breakdowns = findBreakdowns(data);
   const found = findRecords(data);
   if (!found) {
-    return { recordPath: null, recordLabel: null, total: 0, shown: 0, headline, records: [] };
+    return { recordPath: null, recordLabel: null, total: 0, shown: 0, headline, breakdowns, records: [] };
   }
   const { path, rows } = found as { path: string; rows: Array<Record<string, unknown>> };
   const chosen = chooseFields(rows);
@@ -234,6 +290,7 @@ export function projectWorkspaceData(data: unknown): MobileWorkspaceProjection {
     total: rows.length,
     shown: records.length,
     headline,
+    breakdowns,
     records,
   };
 }

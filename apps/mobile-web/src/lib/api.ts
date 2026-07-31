@@ -665,6 +665,10 @@ export interface WorkspaceSummary {
 
 export interface WorkspaceField { label: string; value: string }
 export interface WorkspaceRecord { key: string; primary: string; fields: WorkspaceField[] }
+export interface WorkspaceBreakdown {
+  label: string;
+  entries: Array<{ label: string; value: string; ratio: number }>;
+}
 
 export interface WorkspaceDetail extends WorkspaceSummary {
   sources: Array<{ id: string; ok: boolean; refreshedAt: string | null; error: string | null }>;
@@ -674,6 +678,7 @@ export interface WorkspaceDetail extends WorkspaceSummary {
     total: number;
     shown: number;
     headline: WorkspaceField[];
+    breakdowns: WorkspaceBreakdown[];
     records: WorkspaceRecord[];
   };
 }
