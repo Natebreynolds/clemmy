@@ -46,6 +46,9 @@ export interface GuestRunJob {
    *  through the canonical outcome pipeline (same spine as background tasks),
    *  so the origin turn can END instead of babysitting a 20-minute run. */
   originSessionId?: string;
+  /** Last narration event, for liveness (a run's health is whether it is
+   *  still emitting events, not how long it has been running). */
+  lastEventAt?: string;
 }
 
 const EVENTS_TAIL_MAX = 100;
@@ -113,6 +116,59 @@ export function _reloadPersistedJobsForTests(): void {
   loadPersistedJobs();
 }
 
+// ─── Stall liveness (2026-07-30 graph directive) ────────────────────────────
+// A guest run's health is whether it still emits events — never elapsed time.
+// When a RUNNING job goes quiet past the threshold, the ORIGIN conversation
+// gets one proactive "gone quiet — wait, peek, or kill?" beat per stall
+// episode (fresh activity resets the episode). The daemon owns the watching;
+// Clem is woken only when there is a decision worth waking her for.
+export const GUEST_RUN_STALL_MS = 12 * 60 * 1000;
+const STALL_CHECK_INTERVAL_MS = 60 * 1000;
+const stallNotifiedForJob = new Set<string>();
+
+export function _checkGuestRunStalls(now = Date.now()): string[] {
+  const stalled: string[] = [];
+  for (const { job } of jobs.values()) {
+    if (job.status !== 'running' || !job.originSessionId) continue;
+    if (stallNotifiedForJob.has(job.id)) continue;
+    const lastActivity = Date.parse(job.lastEventAt ?? job.startedAt);
+    if (!Number.isFinite(lastActivity) || now - lastActivity <= GUEST_RUN_STALL_MS) continue;
+    stallNotifiedForJob.add(job.id);
+    stalled.push(job.id);
+    const quietMinutes = Math.round((now - lastActivity) / 60000);
+    const lastSeen = job.events.at(-1) ?? '(no activity recorded yet)';
+    if (outcomeDelivererForTests) {
+      outcomeDelivererForTests(job);
+      continue;
+    }
+    void import('../runtime/outcome.js')
+      .then(({ deliverOutcome }) => {
+        deliverOutcome(
+          {
+            status: 'blocked',
+            summary: `${job.harness} in ${job.projectName} has gone quiet (${quietMinutes} min without activity)`,
+            detail: `Still running, but nothing new for ${quietMinutes} minutes. Last activity: ${lastSeen.slice(0, 200)}`,
+            blocker: 'No new activity — it may be deep in long work, or genuinely stuck.',
+            nextAction: `Wait, peek at it (project_run status "${job.id}"), or stop it (project_run kill "${job.id}").`,
+            resumable: true,
+          },
+          {
+            originSessionId: job.originSessionId,
+            sourceLabel: 'project run',
+            sourceId: `${job.id}#stall-${lastActivity}`,
+            title: `${job.harness} · ${job.projectName}`,
+            proactiveTurn: true,
+          },
+        );
+      })
+      .catch(() => { stallNotifiedForJob.delete(job.id); /* retry next tick */ });
+  }
+  return stalled;
+}
+
+const stallTimer = setInterval(() => { try { _checkGuestRunStalls(); } catch { /* never crash the timer */ } }, STALL_CHECK_INTERVAL_MS);
+stallTimer.unref?.();
+
 /** Resolve a user-supplied project reference (name or path) against the
  *  workspace roster. Returns null when it is not a detected project. */
 export function resolveRosterProject(ref: string): WorkspaceProject | null {
@@ -175,6 +231,8 @@ export function startGuestRun(input: StartGuestRunInput): GuestRunJob {
     onEvent: (event) => {
       job.events.push(`${event.kind}: ${event.text.slice(0, 300)}`);
       if (job.events.length > EVENTS_TAIL_MAX) job.events.splice(0, job.events.length - EVENTS_TAIL_MAX);
+      job.lastEventAt = new Date().toISOString();
+      stallNotifiedForJob.delete(job.id); // fresh activity resets the stall episode
     },
   }).then(
     (result: GuestRunResult) => finishJob(job, result),
@@ -199,7 +257,8 @@ function finishJob(job: GuestRunJob, result: GuestRunResult): void {
   job.completedAt = new Date().toISOString();
   if (!result.ok && !result.killed) {
     job.error = result.timedOut
-      ? 'Timed out before finishing.'
+      ? `Hit Clementine's run ceiling (${Math.round((job.durationMs ?? 0) / 60000)} min) and was stopped — the CLI itself did not fail. `
+        + 'If this task genuinely needs longer, start it again with a bigger timeout_ms.'
       : `Exited with code ${result.exitCode}${result.stderrTail ? ` — stderr tail: ${result.stderrTail.slice(-500)}` : ''}`;
   }
   if (job.status === 'succeeded') recordRunDeliverables(job);

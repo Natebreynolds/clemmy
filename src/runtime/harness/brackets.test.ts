@@ -1453,6 +1453,57 @@ test('orphaned-write retry: a paired successful canonical READ after the orphan 
   });
 });
 
+test('orphaned-write retry: a LIST read whose OUTPUT names the target unlocks — the natural verification is shape-agnostic (live 2026-07-30 rail)', async () => {
+  await withActualOrphan(async ({ sessionId, invoke, dispatchCount }) => {
+    await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'annie@example.com', n: 1 } },
+      'timeout-write',
+    );
+    // The model's most natural check: list everything and look. The target is
+    // NOT in the args — the old args-only rule could never accept this, so the
+    // hold wedged forever and got mis-blamed on the provider.
+    appendCanonicalToolPair({
+      sessionId,
+      callId: 'list-all',
+      tool: 'composio_execute_tool',
+      args: { tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: {} },
+      result: { successful: true, data: { note: 'records for annie@example.com: none found; others: bob@example.com' } },
+      ok: true,
+    });
+    const retry = await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'annie@example.com', n: 2 } },
+      'post-list-retry',
+    );
+    assert.deepEqual(retry, { successful: true, data: { id: 'rec-2' } });
+    assert.equal(dispatchCount(), 2, 'a read whose OUTPUT names the target is real verification');
+  });
+});
+
+test('orphaned-write retry: an explicit reconciliation settlement opens the gate even without a matching read', async () => {
+  await withActualOrphan(async ({ sessionId, invoke, dispatchCount }) => {
+    await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'settled@example.com', n: 1 } },
+      'timeout-write',
+    );
+    // execution_reconcile_write appends the settlement outcome for the same
+    // shape+target — the deliberate verified path out of the speed bump.
+    appendEvent({
+      sessionId, turn: 0, role: 'system', type: 'external_write_failed',
+      data: {
+        callId: 'timeout-write', canonicalCallId: 'timeout-write',
+        shapeKey: 'AIRTABLE_CREATE_RECORD', targets: ['settled@example.com'],
+        reason: 'reconciled_absent', reconciledBy: 'execution_reconcile_write',
+      },
+    });
+    const retry = await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'settled@example.com', n: 2 } },
+      'post-settlement-retry',
+    );
+    assert.deepEqual(retry, { successful: true, data: { id: 'rec-2' } });
+    assert.equal(dispatchCount(), 2, 'a settlement event clears the orphan speed bump');
+  });
+});
+
 test('orphaned-write retry: legacy orphan rows keyed by slug remain protected', async () => {
   const saved = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,

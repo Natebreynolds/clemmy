@@ -6,7 +6,7 @@ import { textResult } from './shared.js';
 import type { ExecutionRecord } from '../types.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { recentExecutionToolEvidence } from '../execution/completion-evidence.js';
-import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { appendEvent, getToolOutput, listEvents } from '../runtime/harness/eventlog.js';
 import {
   externalWriteAdmissionKey,
   externalWriteDuplicateIdentityKeys,
@@ -191,7 +191,11 @@ function authorizeExternalWriteRetryUnlocked(input: {
     || event.type === 'external_write_orphaned'
   );
   if (latestOutcome?.type !== 'external_write_failed') {
-    return `Retry authorization refused: ${input.retryOfCallId} is not a currently proven failed write. Ambiguous/orphaned writes require read-only reconciliation.`;
+    return `Retry authorization refused: ${input.retryOfCallId} is not a currently proven failed write. `
+      + 'This hold is Clementine\'s OWN duplicate-safety ledger, not the provider refusing. '
+      + 'To settle an ambiguous/orphaned attempt: read the exact target back with any read-only call, then call '
+      + 'execution_reconcile_write with that read\'s call id — verdict "absent" proves the write never landed (and unlocks one retry); '
+      + 'verdict "present" proves it DID land (treat it as already done).';
   }
   const failure = latestOutcome.data as {
     sourceUserSeq?: unknown;
@@ -245,6 +249,126 @@ function authorizeExternalWriteRetryUnlocked(input: {
     },
   });
   return undefined;
+}
+
+/**
+ * Settle an AMBIGUOUS/ORPHANED external write from read-back evidence — the
+ * missing graph edge (live 2026-07-30 rail: a user's draft-create died
+ * ambiguous, the model verified the target absent, and NOTHING could record
+ * that, so the duplicate-safety hold wedged forever and the model mis-blamed
+ * "Outlook's provider-side hold"). Mirrors resolveUncertainArtifactClaim for
+ * the external-write ledger:
+ *   - the attempt must exist in this execution's request lineage and be
+ *     genuinely unsettled (no succeeded/failed outcome yet);
+ *   - the evidence must be a real read in THIS session, AFTER the attempt —
+ *     any read the model chose (a list, a search, a get): when the attempt has
+ *     target identities we require one to appear in the read's args OR output,
+ *     so the evidence provably concerns this target without dictating a shape;
+ *   - verdict 'absent' appends external_write_failed (reason reconciled_absent)
+ *     — the EXISTING one-shot retry authorization then works unchanged and the
+ *     duplicate wall stays intact for everything else;
+ *   - verdict 'present' appends external_write_succeeded (reconciled_present)
+ *     — completion can honestly report the work done, no re-send.
+ */
+function reconcileExternalWriteUnlocked(input: {
+  execution: ExecutionRecord;
+  sourceUserSeq: number | undefined;
+  callId: string;
+  verdict: 'absent' | 'present';
+  evidenceCallId: string;
+}): string | { actionKey: string } {
+  if (!input.sourceUserSeq) {
+    return 'Reconciliation requires an exact harness user-request boundary.';
+  }
+  const acceptedSources = new Set([
+    input.execution.sourceUserSeq,
+    ...(input.execution.sourceUserSeqs ?? []),
+  ].filter((seq): seq is number => Number.isSafeInteger(seq) && (seq ?? 0) > 0));
+  const events = listEvents(input.execution.sessionId, {
+    types: [
+      'external_write',
+      'external_write_succeeded',
+      'external_write_failed',
+      'external_write_orphaned',
+    ],
+  });
+  const sameCall = events.filter((event) => evidenceCallId(event.data) === input.callId);
+  const attempt = sameCall.find((event) => event.type === 'external_write');
+  if (!attempt) {
+    return `Reconciliation refused: no external-write attempt with call id ${input.callId} exists in this session.`;
+  }
+  const attemptData = attempt.data as {
+    sourceUserSeq?: unknown;
+    actionKey?: unknown;
+    shapeKey?: unknown;
+    targets?: unknown;
+    duplicateIdentityKeys?: unknown;
+    correlationFingerprint?: unknown;
+  };
+  if (
+    !Number.isSafeInteger(attemptData.sourceUserSeq)
+    || !acceptedSources.has(attemptData.sourceUserSeq as number)
+  ) {
+    return `Reconciliation refused: ${input.callId} is outside this execution's explicit request lineage.`;
+  }
+  const settled = [...sameCall].reverse().find((event) =>
+    event.type === 'external_write_succeeded' || event.type === 'external_write_failed');
+  if (settled) {
+    return `Reconciliation refused: ${input.callId} already has a settled outcome (${settled.type}). `
+      + 'Use execution_update_step with retryOfCallId for a proven failure; a succeeded write needs nothing.';
+  }
+  const evidence = getToolOutput(input.execution.sessionId, input.evidenceCallId);
+  if (!evidence || !evidence.output?.trim()) {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} has no stored output in this session. `
+      + 'Run the read-only check first, then pass its exact call id.';
+  }
+  if (Date.parse(evidence.createdAt) <= Date.parse(attempt.createdAt)) {
+    return 'Reconciliation refused: the evidence read predates the ambiguous attempt — read the target back AFTER the attempt.';
+  }
+  const targets = Array.isArray(attemptData.targets)
+    ? attemptData.targets.filter((value): value is string => typeof value === 'string' && value.length >= 3)
+    : [];
+  if (targets.length > 0) {
+    const haystack = `${evidence.output}\n${evidence.tool ?? ''}`.toLowerCase();
+    const argsRow = listEvents(input.execution.sessionId, { types: ['tool_called'] })
+      .find((event) => evidenceCallId(event.data) === input.evidenceCallId);
+    const argsText = argsRow ? JSON.stringify(argsRow.data ?? {}).toLowerCase() : '';
+    const mentioned = targets.some((target) => {
+      const t = target.toLowerCase();
+      return haystack.includes(t) || argsText.includes(t);
+    });
+    if (!mentioned) {
+      return `Reconciliation refused: the evidence output never mentions the attempt's target (${targets[0]}). `
+        + 'Use a read that provably concerns this exact record — any list/search/get whose args or results name it.';
+    }
+  }
+  const actionKey = typeof attemptData.actionKey === 'string' && attemptData.actionKey.trim()
+    ? attemptData.actionKey.trim()
+    : `call:${input.callId}`;
+  appendEvent({
+    sessionId: input.execution.sessionId,
+    turn: 0,
+    role: 'system',
+    type: input.verdict === 'absent' ? 'external_write_failed' : 'external_write_succeeded',
+    data: {
+      callId: input.callId,
+      canonicalCallId: input.callId,
+      sourceUserSeq: attemptData.sourceUserSeq,
+      actionKey,
+      ...(typeof attemptData.shapeKey === 'string' ? { shapeKey: attemptData.shapeKey } : {}),
+      ...(targets.length > 0 ? { targets } : {}),
+      ...(Array.isArray(attemptData.duplicateIdentityKeys)
+        ? { duplicateIdentityKeys: attemptData.duplicateIdentityKeys }
+        : {}),
+      ...(typeof attemptData.correlationFingerprint === 'string'
+        ? { correlationFingerprint: attemptData.correlationFingerprint }
+        : {}),
+      reason: input.verdict === 'absent' ? 'reconciled_absent' : 'reconciled_present',
+      evidenceCallId: input.evidenceCallId,
+      reconciledBy: 'execution_reconcile_write',
+    },
+  });
+  return { actionKey };
 }
 
 async function authorizeExternalWriteRetry(input: {
@@ -403,6 +527,42 @@ export function registerExecutionTools(server: McpServer): void {
       });
       if (!updated) return textResult(`Failed to update execution ${id}.`);
       return textResult(`Execution ${id} advanced. Next step: ${updated.nextStep}`);
+    },
+  );
+
+  server.tool(
+    'execution_reconcile_write',
+    'Settle an AMBIGUOUS or ORPHANED external write from read-back evidence. When a write died mid-flight (timeout/crash), Clementine\'s duplicate-safety ledger holds the outcome as ambiguous — this is HER ledger, never "the provider refusing". Flow: (1) read the exact target back with ANY read-only call you choose (a get, a list, a search); (2) call this with the ambiguous attempt\'s call id, the read\'s call id as evidence, and your verdict. verdict "absent" records a proven failure — execution_update_step with retryOfCallId then authorizes exactly ONE corrected retry. verdict "present" records the write as landed — report it done, never re-send. The evidence read must postdate the attempt and provably concern its target.',
+    {
+      id: z.string().min(1).describe('The active execution id.'),
+      call_id: z.string().min(1).max(200).describe('Exact call id of the ambiguous/orphaned external-write attempt.'),
+      verdict: z.enum(['absent', 'present']).describe('"absent" = the read-back proves the write never landed. "present" = it DID land.'),
+      evidence_call_id: z.string().min(1).max(200).describe('Call id of YOUR read-only check (after the attempt) whose args or output name the target.'),
+    },
+    async ({ id, call_id, verdict, evidence_call_id }) => {
+      let e = store.get(id);
+      if (!e) return textResult(`No execution found with id ${id}.`);
+      const binding = await bindCurrentRequestToExecution(e, 'execution_reconcile_write');
+      if (binding.error) return textResult(binding.error);
+      e = binding.execution;
+      const settled = await withExternalWriteAdmissionLock(
+        externalWriteAdmissionKey(e.sessionId),
+        async () => reconcileExternalWriteUnlocked({
+          execution: e,
+          sourceUserSeq: binding.sourceUserSeq,
+          callId: call_id,
+          verdict,
+          evidenceCallId: evidence_call_id,
+        }),
+      );
+      if (typeof settled === 'string') return textResult(settled);
+      const truth = store.reconcileExternalWriteTruth(id);
+      const laneNote = truth ? ` Execution write-truth is now "${truth.status}".` : '';
+      return textResult(verdict === 'absent'
+        ? `Reconciled ${call_id} as ABSENT (evidence ${evidence_call_id}) — the write provably never landed, recorded as a proven failure.${laneNote}\n`
+          + `You may now retry it ONCE: call execution_update_step with retryOfCallId: "${call_id}", then re-issue the corrected write.`
+        : `Reconciled ${call_id} as PRESENT (evidence ${evidence_call_id}) — the write landed and is recorded as succeeded.${laneNote}\n`
+          + 'Report it as done. Do NOT send it again.');
     },
   );
 

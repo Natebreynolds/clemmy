@@ -19,7 +19,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { setGuestHarnessSpawnForTest, setGuestHarnessBinaryResolverForTest } = await import('./guest-harness.js');
-const { startGuestRun, getGuestRun, killGuestRun, listGuestRuns, _setGuestOutcomeDelivererForTests, _reloadPersistedJobsForTests } = await import('./guest-run-jobs.js');
+const { startGuestRun, getGuestRun, killGuestRun, listGuestRuns, _setGuestOutcomeDelivererForTests, _reloadPersistedJobsForTests, _checkGuestRunStalls, GUEST_RUN_STALL_MS } = await import('./guest-run-jobs.js');
 const { updateEnvKey, clearWorkspaceProjectCache } = await import('../tools/shared.js');
 
 const workspace = mkdtempSync(path.join(os.tmpdir(), 'clemmy-guest-jobs-ws-'));
@@ -215,5 +215,43 @@ test('missing binary surfaces as a failed job naming cli_setup, not an unhandled
     assert.match(done?.error ?? '', /not installed.*cli_setup/s);
   } finally {
     setGuestHarnessBinaryResolverForTest(() => process.execPath);
+  }
+});
+
+test('stall liveness: a quiet RUNNING run pings the origin once per episode; fresh activity resets; healthy runs never ping', async () => {
+  const pinged: Array<{ id: string; status: string }> = [];
+  _setGuestOutcomeDelivererForTests((job) => pinged.push({ id: job.id, status: job.status }));
+  const child = fakeChild();
+  setGuestHarnessSpawnForTest((() => child.child) as any);
+  try {
+    const job = startGuestRun({ harness: 'claude', project: 'fixture-project', prompt: 'long migration', sessionId: 'sess-stall' });
+    const startedMs = Date.parse(job.startedAt);
+
+    // Healthy (inside the window): silent.
+    assert.deepEqual(_checkGuestRunStalls(startedMs + GUEST_RUN_STALL_MS - 1000), []);
+    assert.equal(pinged.length, 0);
+
+    // Quiet past the window: ONE ping, while the run is still RUNNING.
+    const firstStall = _checkGuestRunStalls(startedMs + GUEST_RUN_STALL_MS + 60_000);
+    assert.deepEqual(firstStall, [job.id]);
+    assert.deepEqual(pinged, [{ id: job.id, status: 'running' }], 'the stall beat reaches origin while the run lives');
+
+    // Same episode: never re-ping.
+    assert.deepEqual(_checkGuestRunStalls(startedMs + GUEST_RUN_STALL_MS + 120_000), []);
+
+    // Fresh activity resets the episode…
+    child.child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'still working' }] } })}\n`));
+    await settle();
+    const lastEventMs = Date.parse(getGuestRun(job.id)!.lastEventAt!);
+    assert.deepEqual(_checkGuestRunStalls(lastEventMs + 1000), [], 'fresh activity means healthy');
+
+    // …and a SECOND quiet stretch pings again.
+    const secondStall = _checkGuestRunStalls(lastEventMs + GUEST_RUN_STALL_MS + 60_000);
+    assert.deepEqual(secondStall, [job.id]);
+    assert.equal(pinged.length, 2);
+  } finally {
+    child.finish(0);
+    await settle();
+    _setGuestOutcomeDelivererForTests(null);
   }
 });

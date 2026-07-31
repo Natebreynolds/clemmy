@@ -239,6 +239,10 @@ test('v3.0.1 queued scheduled occurrence migrates durably to the held decision c
   assert.match(notices[0].body, /no workflow steps have run/i);
   assert.match(notices[0].body, /Open Tasks/i);
   assert.match(notices[0].body, /Resume or Skip/i);
+  // 2026-07-30 audit: three held morning workflows sat SILENT 13h because this
+  // notice never classified as needs-attention — it must reach the chat strip
+  // and Inbox so the user gets their decision window before the 24h auto-skip.
+  assert.equal(notices[0].metadata?.needsAttention, true, 'held catch-ups surface on the Needs-you strip');
 });
 
 test('the catchupFire-only pre-pause admission shape also migrates without a fabricated receipt', () => {

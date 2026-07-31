@@ -7517,6 +7517,9 @@ function migrateLegacyScheduledCatchupToHold(
           runId: result.id,
           catchupHeld: true,
           legacyMigration: true,
+          // Same visibility contract as the scheduler's held notice: the user
+          // gets their decision window on the Needs-you strip, never silence.
+          needsAttention: true,
         },
       });
     } catch { /* the durable Tasks card remains authoritative */ }

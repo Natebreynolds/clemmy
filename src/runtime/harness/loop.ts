@@ -15,6 +15,8 @@ import {
   isKillRequested,
   listEvents,
   openEventLog,
+  recentToolOutputs,
+  searchToolOutputs,
   type AppendEventInput,
   type EventRow,
   type KillRequestTarget,
@@ -138,6 +140,7 @@ import {
 } from './run-token-budget.js';
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
 import { backgroundOfferEnabled, closeTheLoopNudge, effectiveTurnObjective } from './turn-control.js';
+import { claimGroundingNudge, extractDeliverablePointers, ungroundedPointers } from './claim-grounding.js';
 import {
   getArtifactRootForSourceUserSeq,
   latestPendingArtifactRootForSession,
@@ -2513,6 +2516,7 @@ async function runConversationCore(
   const OBJECTIVE_JUDGE_WORK_THRESHOLD = 3;
   let objectiveJudgeContinuations = 0;
   let closeLoopNudged = false;
+  let claimGroundingNudged = false;
   let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
   let totalToolCalls = 0;
   let meaningfulToolEvidence = false;
@@ -4224,6 +4228,57 @@ async function runConversationCore(
             }
           }
         } catch { /* fail-open: never wedge a completion */ }
+      }
+      // CLAIM GROUNDING (2026-07-30, live 404 handoff): a completed reply that
+      // hands the user a deliverable pointer (URL, file path) nothing in this
+      // run ever OBSERVED gets ONE advisory bounce — verify it however fits,
+      // or say plainly what's real. Structural only: no provider rules, no
+      // verification recipes (owner directive — rigidity here is the old
+      // rabbit hole). Evidence = the session's lossless tool outputs + call
+      // args, searched per-pointer so long sessions stay cheap.
+      if (
+        !claimGroundingNudged
+        && decision.nextAction === 'completed'
+        && objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
+      ) {
+        const groundNudge = (() => {
+          try {
+            if (HarnessSession.load(options.sessionId)?.sessionRow.kind !== 'chat') return null;
+            const replyText = (decision.reply && decision.reply.trim()) ? decision.reply : (decision.summary ?? '');
+            const pointers = extractDeliverablePointers(replyText);
+            if (pointers.length === 0) return null;
+            // A session with NO captured observations has nothing to ground
+            // against — "did you do any work at all" is the objective judge's
+            // question, not this one's. Mirrors the figures judge's
+            // no-captures allow.
+            if (recentToolOutputs(options.sessionId, { limit: 1 }).length === 0) return null;
+            const evidence: string[] = [];
+            for (const pointer of pointers) {
+              for (const row of searchToolOutputs(options.sessionId, [pointer.searchTerm], { limit: 4 })) {
+                evidence.push(row.output);
+              }
+            }
+            for (const row of recentToolOutputs(options.sessionId, { limit: 10 })) evidence.push(row.output);
+            try {
+              for (const ev of listEvents(options.sessionId, { types: ['tool_called'], desc: true, limit: 40 })) {
+                evidence.push(JSON.stringify(ev.data ?? {}));
+              }
+            } catch { /* args are supplementary evidence */ }
+            return claimGroundingNudge(ungroundedPointers(pointers, evidence));
+          } catch { return null; }
+        })();
+        if (groundNudge) {
+          claimGroundingNudged = true;
+          objectiveJudgeContinuations += 1;
+          try {
+            safeAppend({
+              sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'guardrail_tripped',
+              data: { kind: 'claim_grounding_nudge', reason: 'reply hands over pointers this run never observed' },
+            });
+          } catch { /* telemetry must never block */ }
+          nextInput = groundNudge;
+          continue;
+        }
       }
       // CLOSE THE LOOP (2026-07-30, live miss): a completed chat reply that
       // lands on a recommendation with no question and no offer strands the

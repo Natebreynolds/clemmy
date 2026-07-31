@@ -23,6 +23,7 @@ import {
   extractExplicitPublishTargets,
   destinationIdentityForms,
   UnverifiedDestinationError,
+  publishProjectKeyFromCommand,
   _resetDestinationStateForTests,
 } from './destination-gate.js';
 
@@ -385,4 +386,18 @@ test('cross-project clobber STILL blocked: an unrelated site is not provenanced 
   const prov = evaluateDestinationProvenance(cmd, hasProvenance);
   assert.equal(prov.action, 'flag');
   assert.equal(prov.hardBlock, true);
+});
+
+test('publishProjectKeyFromCommand: cwd wins; cwd-null derives the PROJECT from the path flag, minus one build-artifact segment (live 2026-07-30: cwd:null deploys keyed the registry on nothing)', () => {
+  assert.equal(publishProjectKeyFromCommand('/work/proj', 'netlify deploy --prod --dir /x/dist'), '/work/proj');
+  assert.equal(
+    publishProjectKeyFromCommand(undefined, 'netlify deploy --prod --site foo --dir /Users/n/proposal-builder/myatt-bell-brief/dist --json'),
+    '/Users/n/proposal-builder/myatt-bell-brief',
+  );
+  assert.equal(
+    publishProjectKeyFromCommand(undefined, 'vercel deploy --cwd "/Users/n/my site/app" --prod'),
+    '/Users/n/my site/app',
+  );
+  assert.equal(publishProjectKeyFromCommand(undefined, 'wrangler pages deploy ./out --project-name x'), undefined, 'no recognized path flag → no key (status quo)');
+  assert.equal(publishProjectKeyFromCommand(undefined, ''), undefined);
 });

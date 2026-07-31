@@ -147,3 +147,35 @@ test('run_batch gets the long-executor timeout tier, never the 60s default (2026
   assert.equal(timeoutForTool('run_batch'), DEFAULT_TIMEOUTS_MS.shell);
   assert.ok(timeoutForTool('run_batch') >= 600_000);
 });
+
+test('CONFIRM-MINT: an asked "publish to X?" + a short user affirmative provenances the asked host (live 2026-07-30 friction)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: {
+    question: 'The dedicated Netlify site already exists from an earlier attempt. Confirm I should publish this brief to myatt-bell-brief.netlify.app?',
+  } });
+  appendEvent({ sessionId: sess.id, turn: 2, role: 'user', type: 'user_input_received', data: {
+    text: 'Perfect can you give me the link then please',
+  } });
+  const has = buildPublishProvenance(sess.id);
+  assert.equal(has('myatt-bell-brief.netlify.app'), true, 'the user-affirmed asked destination is user-sanctioned');
+  assert.equal(has('myatt-bell-brief'), true, 'identity forms of the affirmed host ride along');
+});
+
+test('CONFIRM-MINT: a NON-affirmative or long answer confers nothing; an unanswered ask confers nothing', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: {
+    question: 'Confirm I should publish to fixture-site-a.netlify.app?',
+  } });
+  appendEvent({ sessionId: sess.id, turn: 2, role: 'user', type: 'user_input_received', data: {
+    text: 'No — actually use a different site, and while you are at it change the headline copy too.',
+  } });
+  appendEvent({ sessionId: sess.id, turn: 3, role: 'Clem', type: 'awaiting_user_input', data: {
+    question: 'Should I publish to fixture-site-b.netlify.app?',
+  } });
+  // (no answer to the second ask)
+  const has = buildPublishProvenance(sess.id);
+  assert.equal(has('fixture-site-a.netlify.app'), false, 'a rejection never mints the asked destination');
+  assert.equal(has('fixture-site-b.netlify.app'), false, 'an unanswered ask never mints');
+});

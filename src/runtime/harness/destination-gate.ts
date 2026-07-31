@@ -877,6 +877,28 @@ export function destinationIdentityForms(target: string): string[] {
   return [...forms];
 }
 
+/**
+ * Stable project identity for the established-destinations registry. cwd wins;
+ * when a publish runs with NO cwd (the live 2026-07-30 friction: every deploy
+ * had cwd:null with an absolute --dir, so the registry keyed on nothing and a
+ * site this project deployed to hours earlier had no provenance), fall back to
+ * the directory named by the command's own path flag, minus one trailing
+ * build-artifact segment (dist/build/out/public — generic build convention) so
+ * the key is the PROJECT, stable across builds. Pure and structural.
+ */
+export function publishProjectKeyFromCommand(
+  cwd: string | undefined,
+  command: string,
+): string | undefined {
+  if (typeof cwd === 'string' && cwd.trim()) return cwd.trim();
+  if (!command || typeof command !== 'string') return undefined;
+  const m = command.match(/(?:--dir|--cwd|--source|--prefix|-C)(?:=|\s+)("[^"]+"|'[^']+'|\S+)/);
+  if (!m) return undefined;
+  const raw = m[1].replace(/^["']|["']$/g, '').trim();
+  if (!raw || raw.startsWith('-')) return undefined;
+  return raw.replace(/\/+$/, '').replace(/\/(?:dist|build|out|public)$/i, '') || undefined;
+}
+
 export function extractExplicitPublishTargets(command: string): string[] {
   if (!command || typeof command !== 'string') return [];
   const out = new Set<string>();

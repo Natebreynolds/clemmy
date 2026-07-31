@@ -866,6 +866,11 @@ function emitCatchupHeldNotice(
         catchupHeld: true,
         missedCount,
         scheduledMinuteKey,
+        // Surfaces in the chat Needs-you strip + Inbox (2026-07-30 audit: three
+        // held morning workflows sat SILENT 13h — the hold was correct, the
+        // invisibility was the bug). The 24h auto-skip reaper is the backstop;
+        // this gives the user their decision window.
+        needsAttention: true,
       },
     });
   } catch (err) {

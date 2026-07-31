@@ -69,7 +69,13 @@ export interface GuestRunResult {
   stderrTail: string;
 }
 
-export const GUEST_RUN_DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+/** Hours-scale HARD ceiling, not a pace-setter (owner directive 2026-07-30:
+ *  sub-CLI handoffs can legitimately run 2–3 hours; a run's liveness is
+ *  whether it is still emitting events, which the stall detector owns — see
+ *  guest-run-jobs). The live incident: the old 30-minute default would have
+ *  guillotined a healthy 35-minute brief right before its finish line. When
+ *  this DOES fire it reports loudly down the origin lineage, never silently. */
+export const GUEST_RUN_DEFAULT_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 
 type SpawnLike = typeof spawn;
 let spawnImpl: SpawnLike = spawn;
@@ -243,7 +249,15 @@ function parseClaudeLine(raw: string): ParsedLine | null {
         return { event: { kind: 'assistant', text: block.text } };
       }
       if (block?.type === 'tool_use' && typeof block.name === 'string') {
-        return { event: { kind: 'tool', text: block.name } };
+        // Narration must carry REALITY (live 2026-07-30: eight bare
+        // "tool: Bash" lines were useless to the user, the panel, and the
+        // stall detector). Structural pick of the most informative input
+        // field — no per-tool knowledge beyond common CLI arg names.
+        const input = block.input && typeof block.input === 'object' ? block.input as Record<string, unknown> : {};
+        const detail = [input.command, input.file_path, input.path, input.pattern, input.url, input.query, input.prompt, input.description]
+          .find((value): value is string => typeof value === 'string' && value.trim().length > 0)
+          ?? Object.values(input).find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+        return { event: { kind: 'tool', text: detail ? `${block.name}: ${String(detail).slice(0, 200)}` : block.name } };
       }
     }
     return null;

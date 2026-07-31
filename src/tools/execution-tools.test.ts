@@ -595,3 +595,117 @@ test('execution_complete gives the judge exact durable readback receipts without
   assert.match(result.content[0].text, /completed/);
   assert.equal(new ExecutionStore().get(execution.id)?.status, 'completed');
 });
+
+test('execution_reconcile_write settles an ambiguous attempt from ANY read whose evidence names the target — absent unlocks ONE retry, present records done', async () => {
+  const sessionId = `sess-exec-reconcile-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'reconcile settlement' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Draft the follow-up email for Annie.' },
+  });
+  const execution = createTrackedExecution({
+    sessionId, sourceUserSeq: source.seq, status: 'active',
+  } as never);
+  // The ambiguous attempt: dispatch started, outcome never settled (the live
+  // 2026-07-30 rail — the model verified the draft absent and had NO verb to
+  // record it, so the duplicate-safety hold wedged forever).
+  appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'external_write',
+    data: {
+      sourceUserSeq: source.seq,
+      callId: 'draft-ambiguous', canonicalCallId: 'draft-ambiguous',
+      actionKey: 'email:draft', shapeKey: 'OUTLOOK_CREATE_DRAFT',
+      targets: ['annie@example.com'], preDispatch: true,
+    },
+  });
+  const reconcile = registeredToolHandlers().get('execution_reconcile_write');
+  assert.ok(reconcile, 'execution_reconcile_write should be registered');
+  const update = registeredToolHandlers().get('execution_update_step')!;
+  const ctx = { sessionId, sourceUserSeq: source.seq, counter: new ToolCallsCounter(20) };
+  const call = (args: Record<string, unknown>) => withHarnessRunContext(ctx, () => reconcile!(args));
+
+  // 1. The refusal path teaches the truth: retry of an ambiguous write is
+  //    refused by CLEMENTINE'S ledger — never blamed on the provider.
+  const refused = await withHarnessRunContext(ctx, () => update({
+    id: execution.id, nextStep: 'retry draft', retryOfCallId: 'draft-ambiguous',
+  }));
+  assert.match(refused.content[0].text, /Clementine's OWN duplicate-safety ledger, not the provider refusing/i);
+  assert.match(refused.content[0].text, /execution_reconcile_write/);
+
+  // 2. Evidence must exist and postdate the attempt.
+  const missingEvidence = await call({
+    id: execution.id, call_id: 'draft-ambiguous', verdict: 'absent', evidence_call_id: 'no-such-read',
+  });
+  assert.match(missingEvidence.content[0].text, /no stored output/i);
+
+  // 3. A LIST read (no target in args) whose OUTPUT names the target counts —
+  //    the shape-agnostic evidence rule.
+  appendEvent({
+    sessionId, turn: 2, role: 'system', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'list-drafts', canonicalCallId: 'list-drafts', arguments: '{"tool_slug":"OUTLOOK_LIST_DRAFTS"}' },
+  });
+  writeToolOutput({
+    sessionId, callId: 'list-drafts', tool: 'composio_execute_tool',
+    output: 'Drafts (2): weekly summary to team@example.com; intro to bob@example.com. No draft addressed to annie@example.com exists.',
+  });
+  const settled = await call({
+    id: execution.id, call_id: 'draft-ambiguous', verdict: 'absent', evidence_call_id: 'list-drafts',
+  });
+  assert.match(settled.content[0].text, /Reconciled draft-ambiguous as ABSENT/i);
+  assert.match(settled.content[0].text, /retryOfCallId/);
+
+  // 4. The settlement is a REAL proven failure: the one-shot retry now mints.
+  const retried = await withHarnessRunContext(ctx, () => update({
+    id: execution.id, nextStep: 'Re-issue the corrected draft once.', retryOfCallId: 'draft-ambiguous',
+  }));
+  assert.match(retried.content[0].text, /advanced/i);
+  const settlement = listEvents(sessionId, { types: ['external_write_failed'] })
+    .find((event) => event.data.callId === 'draft-ambiguous');
+  assert.equal(settlement?.data.reason, 'reconciled_absent');
+  assert.equal(settlement?.data.evidenceCallId, 'list-drafts');
+
+  // 5. Already-settled attempts refuse re-reconciliation.
+  const again = await call({
+    id: execution.id, call_id: 'draft-ambiguous', verdict: 'present', evidence_call_id: 'list-drafts',
+  });
+  assert.match(again.content[0].text, /already has a settled outcome/i);
+});
+
+test('execution_reconcile_write verdict PRESENT records success; unrelated evidence is refused', async () => {
+  const sessionId = `sess-exec-reconcile-p-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'reconcile present' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Create the row for acct-991.' },
+  });
+  const execution = createTrackedExecution({ sessionId, sourceUserSeq: source.seq, status: 'active' } as never);
+  appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'external_write',
+    data: {
+      sourceUserSeq: source.seq,
+      callId: 'row-ambiguous', canonicalCallId: 'row-ambiguous',
+      actionKey: 'sheet:append', shapeKey: 'GOOGLESHEETS_APPEND',
+      targets: ['acct-991'], preDispatch: true,
+    },
+  });
+  const reconcile = registeredToolHandlers().get('execution_reconcile_write')!;
+  const ctx = { sessionId, sourceUserSeq: source.seq, counter: new ToolCallsCounter(20) };
+
+  // Unrelated evidence (never names the target) is refused.
+  writeToolOutput({ sessionId, callId: 'other-read', tool: 'composio_execute_tool', output: 'Rows: acct-100, acct-101.' });
+  const unrelated = await withHarnessRunContext(ctx, () => reconcile({
+    id: execution.id, call_id: 'row-ambiguous', verdict: 'present', evidence_call_id: 'other-read',
+  }));
+  assert.match(unrelated.content[0].text, /never mentions the attempt's target/i);
+
+  // Evidence naming the target settles it as landed.
+  writeToolOutput({ sessionId, callId: 'target-read', tool: 'composio_execute_tool', output: 'Row found: acct-991 | Follow-up | 2026-07-30' });
+  const present = await withHarnessRunContext(ctx, () => reconcile({
+    id: execution.id, call_id: 'row-ambiguous', verdict: 'present', evidence_call_id: 'target-read',
+  }));
+  assert.match(present.content[0].text, /Reconciled row-ambiguous as PRESENT/i);
+  assert.match(present.content[0].text, /Do NOT send it again/i);
+  const settlement = listEvents(sessionId, { types: ['external_write_succeeded'] })
+    .find((event) => event.data.callId === 'row-ambiguous');
+  assert.equal(settlement?.data.reason, 'reconciled_present');
+});

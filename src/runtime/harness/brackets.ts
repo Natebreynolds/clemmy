@@ -94,6 +94,7 @@ import {
   evaluateShellDestination,
   evaluateDestinationProvenance,
   extractExplicitPublishTargets,
+  publishProjectKeyFromCommand,
   destinationIdentityForms,
   wasDestinationNudged,
   markDestinationNudged,
@@ -715,6 +716,7 @@ function hasSuccessfulReadBackAfter(
     .filter((event) => event.seq > orphanSeq)
     .sort((left, right) => left.seq - right.seq);
   const successfulReadCallIds = new Set<string>();
+  const candidateReadCallIds = new Set<string>();
   const normalizedTarget = normalizedOrphanIdentity(orphanTarget);
 
   for (const event of events) {
@@ -727,23 +729,34 @@ function hasSuccessfulReadBackAfter(
     if (event.type === 'tool_called') {
       const toolName = typeof data.tool === 'string' ? data.tool : '';
       const args = decodedOrphanVerificationArgs(data);
-      if (
-        toolName
-        && classifyRuntimeToolEffect(toolName, args).effect === 'read'
-        && orphanReadIdentityKeys(args).has(normalizedTarget)
-      ) {
-        successfulReadCallIds.add(callId);
+      if (toolName && classifyRuntimeToolEffect(toolName, args).effect === 'read') {
+        if (orphanReadIdentityKeys(args).has(normalizedTarget)) {
+          successfulReadCallIds.add(callId);
+        } else {
+          // SHAPE-AGNOSTIC unlock (live 2026-07-30 rail): a list/search read
+          // has no target in its ARGS ("list my drafts"), so the old
+          // args-only rule could never be satisfied by the most natural
+          // verification — the model verified the target absent and stayed
+          // walled forever, then mis-blamed the provider. Admit any READ
+          // whose OUTPUT mentions the target identity (checked below).
+          candidateReadCallIds.add(callId);
+        }
       }
       continue;
     }
 
-    if (event.type !== 'tool_returned' || !successfulReadCallIds.has(callId)) continue;
+    if (event.type !== 'tool_returned') continue;
     const output = orphanReadResult(data);
     if (
-      output.present
-      && meaningfulOrphanReadResult(output.value)
-      && toolOutputLooksSuccessful(output.value, data.ok)
-    ) return true;
+      !output.present
+      || !meaningfulOrphanReadResult(output.value)
+      || !toolOutputLooksSuccessful(output.value, data.ok)
+    ) continue;
+    if (successfulReadCallIds.has(callId)) return true;
+    if (candidateReadCallIds.has(callId)) {
+      const text = typeof output.value === 'string' ? output.value : JSON.stringify(output.value ?? '');
+      if (normalizedTarget.length >= 3 && text.toLowerCase().includes(normalizedTarget)) return true;
+    }
   }
   return false;
 }
@@ -776,6 +789,18 @@ function findOrphanedWriteMatch(
     return null;
   }
   if (orphans.length === 0) return null;
+  // An orphan explicitly SETTLED later (execution_reconcile_write appended a
+  // succeeded/failed outcome for the same shape+target) is no longer ambiguous
+  // — the settlement verb is the deliberate human-verified path out of this
+  // speed bump, so it must actually open the gate (live 2026-07-30 rail).
+  let settlements: Array<{ seq: number; shapeKey?: string | null; targets?: string[] }> = [];
+  try {
+    settlements = listEvents(sessionId, { types: ['external_write_failed', 'external_write_succeeded'] })
+      .map((ev) => ({
+        seq: ev.seq,
+        ...(ev.data as { shapeKey?: string | null; targets?: string[] }),
+      }));
+  } catch { /* no settlements visible — keep the speed bump */ }
   for (const target of targets) {
     const t = target.toLowerCase();
     const hit = orphans.filter((o) =>
@@ -783,6 +808,11 @@ function findOrphanedWriteMatch(
       (o.targets ?? []).some((x) => String(x).toLowerCase() === t));
     if (hit.length === 0) continue;
     const latestOrphanSeq = Math.max(...hit.map((o) => o.seq));
+    const settledLater = settlements.some((s) =>
+      s.seq > latestOrphanSeq
+      && (s.shapeKey === undefined || s.shapeKey === null || s.shapeKey === shapeKey)
+      && (s.targets ?? []).some((x) => String(x).toLowerCase() === t));
+    if (settledLater) continue;
     try {
       if (hasSuccessfulReadBackAfter(sessionId, latestOrphanSeq, t)) return null;
     } catch { /* can't tell — keep the speed bump */ }
@@ -803,9 +833,10 @@ export class OrphanedWriteRetryError extends Error {
     super(
       `ORPHANED_WRITE_RETRY: an earlier ${opts.shapeKey ?? opts.toolName} to ${opts.target} in this session TIMED OUT — ` +
         'the harness stopped waiting but the write MAY HAVE LANDED server-side, so retrying blindly could create a DUPLICATE. ' +
-        'FIRST verify whether it landed: READ THE TARGET BACK with a *_GET / *_LIST / *_SEARCH action for this same record/object. ' +
-        'Only write again if it is confirmed ABSENT (prefer an UPSERT or idempotency key if the toolkit supports one). ' +
-        'This is a one-time check — the conscious retry after you verify will go through.',
+        'This hold is CLEMENTINE\'S OWN duplicate-safety ledger — the provider is not refusing anything; never tell the user the provider is blocking you. ' +
+        'FIRST verify whether it landed: READ THE TARGET BACK with any read-only action (a get, a list, a search) for this same record/object. ' +
+        'If the read shows it LANDED, report it done — do not re-send. If it is confirmed ABSENT, retry once (prefer an UPSERT or idempotency key if the toolkit supports one). ' +
+        'If a retry is STILL held after your verification, settle the ledger explicitly: call execution_reconcile_write with the ambiguous attempt\'s call id, your read\'s call id as evidence, and the verdict — that is the deliberate path out of this hold.',
     );
     this.name = 'OrphanedWriteRetryError';
     this.toolName = opts.toolName;
@@ -1480,16 +1511,38 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
   // so it can never confer provenance across unrelated projects (no clobber).
   const established = establishedTargetsFor(projectKey);
   try {
-    const events = listEvents(sessionId, { types: ['user_input_received', 'tool_called', 'tool_returned'] });
+    const events = listEvents(sessionId, { types: ['user_input_received', 'tool_called', 'tool_returned', 'awaiting_user_input'] });
     const createCallNames = new Map<string, string[]>();
     const discoveryCallIds = new Set<string>();
     const discoveryResults: string[] = [];
     const userParts: string[] = [];
+    // CONFIRM-MINT (live 2026-07-30 friction): when CLEMENTINE asked "publish
+    // to <host>?" and the USER affirmed, that destination is user-sanctioned —
+    // but the user's "Perfect" contains no hostname, so the user-text
+    // provenance check could never see it and deploys stayed hard-blocked
+    // through an explicit confirmation. The asked question's text counts as
+    // user-named ONLY when the next user message is a short plain affirmative.
+    let pendingAskedQuestion = '';
+    const CONFIRM_AFFIRMATIVE_RE = /^(?:yes|yep|yeah|ya|ok(?:ay)?|perfect|sounds good|go ahead|do it|confirm(?:ed)?|approved?|sure|please do|correct)\b/i;
     for (const e of events) {
       const d = e.data as Record<string, unknown> | undefined;
+      if (e.type === 'awaiting_user_input') {
+        pendingAskedQuestion = String(d?.question ?? '').toLowerCase();
+        continue;
+      }
       if (e.type === 'user_input_received') {
-        userParts.push(String(d?.text ?? '').toLowerCase());
-      } else if (e.type === 'tool_called') {
+        const text = String(d?.text ?? '');
+        if (pendingAskedQuestion) {
+          const trimmed = text.trim();
+          if (trimmed.length <= 120 && CONFIRM_AFFIRMATIVE_RE.test(trimmed)) {
+            userParts.push(pendingAskedQuestion);
+          }
+          pendingAskedQuestion = '';
+        }
+        userParts.push(text.toLowerCase());
+        continue;
+      }
+      if (e.type === 'tool_called') {
         const args = joinedEventText(d?.arguments, d?.args, d?.rawArgs);
         const command = shellCommandFromEventData(d);
         const callId = String(d?.callId ?? '');
@@ -1830,8 +1883,11 @@ function recordPublishIfSucceeded(
     const targets = extractExplicitPublishTargets(command);
     if (targets.length === 0) return;
     if (!publishCreateSucceeded(stripAnsi(typeof result === 'string' ? result : ''))) return;
-    const projectKey = typeof (parsedInput as { cwd?: unknown })?.cwd === 'string'
-      ? (parsedInput as { cwd: string }).cwd : undefined;
+    const projectKey = publishProjectKeyFromCommand(
+      typeof (parsedInput as { cwd?: unknown })?.cwd === 'string'
+        ? (parsedInput as { cwd: string }).cwd : undefined,
+      command,
+    );
     recordPublishedDestination(projectKey, targets);
   } catch { /* learning is best-effort — never break the tool result */ }
 }
@@ -2584,8 +2640,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
             // Project key = the command's working dir, so provenance is scoped to
             // THIS project (a destination established for one project can't
             // provenance another — preserves the cross-project clobber guard).
-            const projectKey = typeof (parsedInput as { cwd?: unknown })?.cwd === 'string'
-              ? (parsedInput as { cwd: string }).cwd : undefined;
+            const projectKey = publishProjectKeyFromCommand(
+              typeof (parsedInput as { cwd?: unknown })?.cwd === 'string'
+                ? (parsedInput as { cwd: string }).cwd : undefined,
+              command,
+            );
             const prov = evaluateDestinationProvenance(command, buildPublishProvenance(ctx.sessionId, projectKey));
             if (prov.action === 'flag' && prov.shapeKey) {
               try {
