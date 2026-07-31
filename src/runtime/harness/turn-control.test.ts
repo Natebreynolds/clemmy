@@ -603,3 +603,30 @@ test('with no standard, the beat asks the ONE question that defines it', () => {
     setProvenStandardLineForTest(null);
   }
 });
+
+test('the beat can NEVER fire outside chat — workflows and cron have nobody to answer it', () => {
+  // The beat is on by default as of 2026-07-31, so this exemption is now
+  // load-bearing: a workflow/cron/execution run that paused for a go-ahead
+  // would hang with no human in the loop. Previously unpinned.
+  const message = 'Deploy this prepared directory to the exact Netlify site I named, then verify it.';
+  // 'cron' is not a session kind — cron work runs as workflow/execution sessions.
+  for (const kind of ['workflow', 'execution', 'agent']) {
+    const sessionId = freshSession(kind);
+    const decision = classifyTurnPreflight({ message, sessionId, sessionKind: kind });
+    assert.equal(decision.phase, 'execute', `${kind} sessions must never align`);
+    assert.equal(decision.reason, 'non_chat');
+    assert.equal(
+      confirmBeatDirective({ message, sessionId, sessionKind: kind }),
+      null,
+      `${kind} sessions must receive no beat directive`,
+    );
+  }
+});
+
+test('a missing session id can never produce a beat', () => {
+  assert.equal(
+    confirmBeatDirective({ message: 'deploy the site and email the team', sessionKind: 'chat' }),
+    null,
+    'no session context → no beat (fail-safe, not fail-open-to-asking)',
+  );
+});
