@@ -172,6 +172,70 @@ input, textarea { font: inherit; }
 }
 .breathe { animation: breathe 3s ease-in-out infinite; }
 
+/* The pill carries three truths, and the color is the fastest read: local,
+   remote-but-encrypted, or not reaching the Mac at all. */
+.conn-relay { color: var(--accent-hi); border-color: rgba(255, 138, 61, 0.3); }
+.conn-relay .conn-dot { background: var(--accent); box-shadow: 0 0 7px var(--accent-glow); }
+.conn-offline { color: var(--fg-3); }
+.conn-offline .conn-dot { background: var(--fg-3); box-shadow: none; animation: none; }
+
+/* ── run control ────────────────────────────────────────────────── */
+
+.run-control {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+.run-control.confirming {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.run-control-ask {
+  font-size: var(--t-xs);
+  color: var(--fg-2);
+  font-weight: 600;
+}
+.btn-quiet {
+  background: var(--bg-3);
+  border: 1px solid var(--line-strong);
+  color: var(--fg-2);
+  border-radius: 999px;
+  padding: 9px 16px;
+  font-size: var(--t-xs);
+  font-weight: 700;
+  font-family: var(--font-display);
+  min-height: 38px;
+  transition: transform 0.14s var(--ease-spring), color 0.16s ease, border-color 0.16s ease;
+}
+.btn-quiet:active { transform: scale(0.94); }
+.btn-resume { color: var(--accent-2); border-color: rgba(142, 201, 111, 0.35); }
+/* Destructive confirm earns red — it is the one action here that throws work
+   away, and it should never be mistaken for the neutral button beside it. */
+.btn-stop-yes {
+  background: var(--fail-soft);
+  border: 1px solid rgba(240, 101, 90, 0.45);
+  color: var(--accent-fail);
+  border-radius: 999px;
+  padding: 9px 16px;
+  font-size: var(--t-xs);
+  font-weight: 700;
+  font-family: var(--font-display);
+  min-height: 38px;
+  transition: transform 0.14s var(--ease-spring);
+}
+.btn-stop-yes:active { transform: scale(0.94); }
+.run-control-error { font-size: var(--t-xs); color: var(--accent-fail); flex-basis: 100%; text-align: right; }
+.run-open {
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .icon-btn {
   display: inline-flex;
   align-items: center;

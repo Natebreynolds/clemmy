@@ -1842,6 +1842,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     isAdminAuthorized: isAuthorized,
     assistant,
     listRecentRuns: collectRecentActivityRuns,
+    cancelRun: cancelTrackedRun,
   }));
 
   app.get('/dashboard', (req, res) => {

@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { api, getAuthStatus, logout, pairDevice, type AuthStatus, type ChatSession } from './lib/api';
+import { CONNECTION_EVENT, connectionDoor, haptic, type ConnectionDoor } from './lib/native-bridge';
 import { Login } from './screens/Login';
 import { Home } from './screens/Home';
 import { Activity } from './screens/Activity';
@@ -20,6 +21,13 @@ export function App() {
   const [decisions, setDecisions] = useState(0);
   /** Set when Home hands a question to Chats — consumed once on arrival. */
   const [handoff, setHandoff] = useState<{ draft?: string; session?: ChatSession } | null>(null);
+  const [door, setDoor] = useState<ConnectionDoor>(connectionDoor() ?? 'direct');
+
+  useEffect(() => {
+    const onDoor = (event: Event) => setDoor((event as CustomEvent<ConnectionDoor>).detail);
+    window.addEventListener(CONNECTION_EVENT, onDoor);
+    return () => window.removeEventListener(CONNECTION_EVENT, onDoor);
+  }, []);
 
   const refreshAuth = useCallback(async () => {
     try {
@@ -118,8 +126,8 @@ export function App() {
           <span class="brand-name">{TAB_TITLES[tab]}</span>
         </div>
         <div class="meta">
-          <span class="conn-pill" title="Connected straight to your Mac — end-to-end encrypted">
-            <span class="conn-dot" aria-hidden="true" />Direct
+          <span class={`conn-pill conn-${door}`} title={DOOR_COPY[door].hint}>
+            <span class="conn-dot" aria-hidden="true" />{DOOR_COPY[door].label}
           </span>
           <button
             class="icon-btn"
@@ -153,7 +161,7 @@ export function App() {
           <button
             key={t.id}
             class={tab === t.id ? 'active' : ''}
-            onClick={() => setTab(t.id)}
+            onClick={() => { if (tab !== t.id) haptic('light'); setTab(t.id); }}
             aria-label={t.label}
             aria-current={tab === t.id ? 'page' : undefined}
           >
@@ -168,6 +176,17 @@ export function App() {
     </>
   );
 }
+
+/**
+ * The pill has to be honest: on the relay the traffic is still end-to-end
+ * encrypted to this Mac, but it is no longer a direct local connection, and
+ * claiming "Direct" from a hotel wifi would be a lie the user could catch.
+ */
+const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
+  direct: { label: 'Direct', hint: 'Connected straight to your Mac on this network — end-to-end encrypted' },
+  relay: { label: 'Remote', hint: 'Reaching your Mac from away — still end-to-end encrypted, the relay only passes bytes' },
+  offline: { label: 'Offline', hint: "Can't reach your Mac right now" },
+};
 
 const TAB_TITLES: Record<Tab, string> = {
   home: 'Clementine',

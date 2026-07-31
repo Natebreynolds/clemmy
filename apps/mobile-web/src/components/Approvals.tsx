@@ -12,6 +12,7 @@ import {
   type ApprovalRow,
   type PlanProposalRow,
 } from '../lib/api';
+import { haptic } from '../lib/native-bridge';
 
 export function relativeTime(iso: string | number): string {
   const then = typeof iso === 'number' ? iso : Date.parse(iso);
@@ -37,10 +38,13 @@ export function Decisions({ approvals, plans, onResolved }: DecisionsProps) {
     if (acting) return;
     setActing(id);
     setError(null);
+    haptic('medium');
     try {
       await work();
+      haptic('success');
       onResolved();
     } catch (err) {
+      haptic('error');
       setError((err as Error).message ?? 'That did not go through');
     } finally {
       setActing(null);

@@ -8,6 +8,13 @@ import {
   type WorkflowEventSummary,
   type WorkflowRunSummary,
 } from '../lib/api';
+import { RunControl } from '../components/RunControl';
+import { haptic } from '../lib/native-bridge';
+
+/** Mirrors src/execution/workflow-run-cancellation.ts — anything else is live. */
+const TERMINAL_RUN_STATUSES = new Set([
+  'completed', 'completed_with_errors', 'error', 'failed', 'cancelled', 'dry_run', 'creation_test',
+]);
 
 export function Workflows() {
   const [workflows, setWorkflows] = useState<MobileWorkflow[]>([]);
@@ -114,6 +121,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   async function trigger() {
     if (triggering) return;
     setTriggering(true);
+    haptic('medium');
     setError(null);
     try {
       await runWorkflow(workflow.name);
@@ -163,15 +171,30 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
         {error ? <div class="global-error">{error}</div> : null}
         <div class="memory-section-head">Recent runs</div>
         {runsLoading && runs.length === 0 ? <div class="skeleton-stack" aria-hidden="true"><i /></div> : null}
-        {!runsLoading && runs.length === 0 ? <p class="muted">Hasn\u2019t run yet.</p> : null}
-        {runs.map((run) => (
-          <button key={run.id} class="run-card" onClick={() => setSelectedRun(run)}>
-            <div class="title">{run.id}</div>
-            <div class={`status ${run.terminalOutcome ?? run.status}`}>
-              {run.terminalOutcome ?? run.status}
-            </div>
-          </button>
-        ))}
+        {!runsLoading && runs.length === 0 ? <p class="muted">Hasn’t run yet.</p> : null}
+        <div class="stack">
+          {runs.map((run, i) => {
+            const live = !TERMINAL_RUN_STATUSES.has(run.status);
+            return (
+              <article key={run.id} class={`card rise ${live ? 'card-live' : ''}`} style={{ '--i': i }}>
+                {live ? <span class="pulse-dot" aria-hidden="true" /> : null}
+                <button class="run-open min-w-0" onClick={() => setSelectedRun(run)}>
+                  <div class="card-title-sm truncate">{run.id}</div>
+                  <div class="card-when">
+                    {live ? null : <span class={`status-dot status-${run.terminalOutcome ?? run.status}`} aria-hidden="true" />}
+                    {(run.terminalOutcome ?? run.status).replace(/_/g, ' ')}
+                  </div>
+                </button>
+                {live ? (
+                  <RunControl
+                    target={{ kind: 'workflow', workflow: workflow.name, runId: run.id }}
+                    onChanged={refresh}
+                  />
+                ) : null}
+              </article>
+            );
+          })}
+        </div>
       </div>
     </div>
   );

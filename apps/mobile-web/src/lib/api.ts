@@ -12,6 +12,7 @@
  * shell listens and bounces the user back to the login screen.
  */
 import { signProof, deviceKeySupported, exportPublicJwk } from './device-key.js';
+import { connectionDoor, setConnectionDoor } from './native-bridge.js';
 
 /**
  * The current session's fingerprint, which every proof is signed over.
@@ -55,6 +56,10 @@ async function proofHeader(path: string, method: string): Promise<Record<string,
 export interface ApiError extends Error {
   status: number;
   body?: unknown;
+  /** True when the request never reached the daemon (radio off, out of
+   *  range, Mac asleep). status is 0 — the caller can say "offline" instead
+   *  of surfacing a raw TypeError as if it were a bug. */
+  offline?: boolean;
 }
 
 function makeError(status: number, body?: unknown, message?: string): ApiError {
@@ -62,6 +67,10 @@ function makeError(status: number, body?: unknown, message?: string): ApiError {
   error.status = status;
   error.body = body;
   return error;
+}
+
+export function isOfflineError(err: unknown): boolean {
+  return Boolean((err as ApiError | undefined)?.offline);
 }
 
 export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
@@ -80,7 +89,20 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     opts.headers as Record<string, string>,
     await proofHeader(path, (init?.method ?? 'GET').toUpperCase()),
   );
-  const res = await fetch(path, opts);
+  let res: Response;
+  try {
+    res = await fetch(path, opts);
+  } catch {
+    // A transport failure is a fact about the network, not about the request.
+    // Reaching the daemon again is the recovery, so say so and let the shell
+    // and the UI show one honest "can't reach your Mac" state.
+    setConnectionDoor('offline');
+    const err = makeError(0, null, "Can't reach your Mac right now");
+    err.offline = true;
+    throw err;
+  }
+  // Any answer at all means the door is open again.
+  if (connectionDoor() === 'offline') setConnectionDoor('direct');
   const text = await res.text();
   let body: unknown = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
@@ -602,4 +624,25 @@ export interface ReminderItem {
 
 export async function getReminders(): Promise<{ items: ReminderItem[] }> {
   return api<{ items: ReminderItem[] }>('/m/api/reminders');
+}
+
+// ─── run control (away-from-desk) ─
+//
+// The same daemon verbs the desktop uses. Deliberately no "pause": nothing in
+// the system can suspend in-flight work and resume it later, so the phone
+// offers Stop (and Resume for work that already stopped) and says so plainly.
+
+export async function cancelWorkflowRun(name: string, runId: string): Promise<{ ok: true; outcome: string }> {
+  return api<{ ok: true; outcome: string }>(
+    `/m/api/workflows/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/cancel`,
+    { method: 'POST' },
+  );
+}
+
+export async function cancelRun(runId: string): Promise<{ ok: boolean; message: string }> {
+  return api<{ ok: boolean; message: string }>(`/m/api/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
+}
+
+export async function controlTask(taskId: string, action: 'cancel' | 'resume'): Promise<{ ok: true; status: string }> {
+  return api<{ ok: true; status: string }>(`/m/api/tasks/${encodeURIComponent(taskId)}/${action}`, { method: 'POST' });
 }

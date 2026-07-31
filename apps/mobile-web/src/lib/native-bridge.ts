@@ -18,12 +18,49 @@ import { registerApnsToken } from './api';
 
 const PENDING_KEY = 'clem.apns.pending';
 
+/** Where the phone is talking to the Mac from — published by the shell. */
+export type ConnectionDoor = 'direct' | 'relay' | 'offline';
+
 declare global {
   interface Window {
     clemNative?: {
       registerApnsToken(deviceToken: string): void;
+      /** Called by the shell's pull-to-refresh. */
+      refresh?(): void;
+      /** Called by the shell when the door or reachability changes. */
+      setConnection?(door: ConnectionDoor): void;
+    };
+    webkit?: {
+      messageHandlers?: Record<string, { postMessage(body: unknown): void } | undefined>;
     };
   }
+}
+
+export type HapticKind = 'light' | 'medium' | 'success' | 'warning' | 'error';
+
+/**
+ * Weight under the thumb. Silently absent in a plain browser — the app must
+ * never depend on the shell being there, only feel better when it is.
+ */
+export function haptic(kind: HapticKind = 'light'): void {
+  try {
+    window.webkit?.messageHandlers?.clemHaptic?.postMessage(kind);
+  } catch { /* not in the native shell */ }
+}
+
+/** Fires when the shell reports a new connection door. */
+export const CONNECTION_EVENT = 'clem:connection';
+/** Fires when the shell's pull-to-refresh asks the page for fresh data. */
+export const REFRESH_EVENT = 'clem:refresh';
+
+let currentDoor: ConnectionDoor | null = null;
+export function connectionDoor(): ConnectionDoor | null {
+  return currentDoor;
+}
+export function setConnectionDoor(door: ConnectionDoor): void {
+  if (currentDoor === door) return;
+  currentDoor = door;
+  window.dispatchEvent(new CustomEvent(CONNECTION_EVENT, { detail: door }));
 }
 
 async function tryRegister(deviceToken: string): Promise<boolean> {
@@ -43,8 +80,19 @@ export function installNativeBridge(): void {
     registerApnsToken(deviceToken: string): void {
       void tryRegister(deviceToken);
     },
+    refresh(): void {
+      window.dispatchEvent(new Event(REFRESH_EVENT));
+    },
+    setConnection(door: ConnectionDoor): void {
+      setConnectionDoor(door);
+    },
   };
   let pending: string | null = null;
   try { pending = localStorage.getItem(PENDING_KEY); } catch { /* private browsing */ }
   if (pending) void tryRegister(pending);
+
+  // In a plain browser (or before the shell speaks) the platform's own
+  // signals are the best available truth.
+  window.addEventListener('offline', () => setConnectionDoor('offline'));
+  window.addEventListener('online', () => setConnectionDoor('direct'));
 }

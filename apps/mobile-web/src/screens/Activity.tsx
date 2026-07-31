@@ -1,6 +1,8 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useState } from 'preact/hooks';
 import { listRecentRuns, type RunSummary } from '../lib/api';
 import { relativeTime } from '../components/Approvals';
+import { RunControl } from '../components/RunControl';
+import { REFRESH_EVENT } from '../lib/native-bridge';
 
 /** Runs still in flight, grouped above the finished ones. */
 const ACTIVE = new Set(['running', 'queued', 'received', 'awaiting_approval']);
@@ -10,25 +12,28 @@ export function Activity() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    async function refresh() {
-      try {
-        const { runs } = await listRecentRuns();
-        if (!cancelled) {
-          setRuns(runs);
-          setError(null);
-        }
-      } catch (err) {
-        if (!cancelled) setError((err as Error).message ?? 'Failed to load activity');
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
+  const refresh = useCallback(async () => {
+    try {
+      const { runs } = await listRecentRuns();
+      setRuns(runs);
+      setError(null);
+    } catch (err) {
+      setError((err as Error).message ?? 'Failed to load activity');
+    } finally {
+      setLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
     refresh();
     const interval = setInterval(refresh, 8000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, []);
+    const onPull = () => { void refresh(); };
+    window.addEventListener(REFRESH_EVENT, onPull);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener(REFRESH_EVENT, onPull);
+    };
+  }, [refresh]);
 
   if (loading && runs.length === 0) {
     return <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>;
@@ -60,7 +65,7 @@ export function Activity() {
         <section class="home-section">
           <h2 class="section-head">Happening now</h2>
           <div class="stack">
-            {live.map((run, i) => <RunCard key={run.id} run={run} index={i} live />)}
+            {live.map((run, i) => <RunCard key={run.id} run={run} index={i} live onChanged={refresh} />)}
           </div>
         </section>
       ) : null}
@@ -76,7 +81,12 @@ export function Activity() {
   );
 }
 
-function RunCard({ run, index, live }: { run: RunSummary; index: number; live?: boolean }) {
+function RunCard({ run, index, live, onChanged }: {
+  run: RunSummary;
+  index: number;
+  live?: boolean;
+  onChanged?: () => void;
+}) {
   return (
     <article class={`card rise ${live ? 'card-live' : ''}`} style={{ '--i': index }}>
       {live ? <span class="pulse-dot" aria-hidden="true" /> : null}
@@ -87,6 +97,7 @@ function RunCard({ run, index, live }: { run: RunSummary; index: number; live?: 
           {run.status.replace(/_/g, ' ')} · {relativeTime(run.updatedAt)}
         </div>
       </div>
+      {live && onChanged ? <RunControl target={{ kind: 'run', runId: run.id }} onChanged={onChanged} /> : null}
     </article>
   );
 }

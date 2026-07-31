@@ -52,7 +52,7 @@ interface Harness {
 
 let harnessCounter = 0;
 
-async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean; assistant?: Parameters<typeof createMobileRouter>[0]['assistant']; listRecentRuns?: Parameters<typeof createMobileRouter>[0]['listRecentRuns'] }): Promise<Harness> {
+async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean; assistant?: Parameters<typeof createMobileRouter>[0]['assistant']; listRecentRuns?: Parameters<typeof createMobileRouter>[0]['listRecentRuns']; cancelRun?: Parameters<typeof createMobileRouter>[0]['cancelRun'] }): Promise<Harness> {
   const stateDir = path.join(TMP_ROOT, `case-${++harnessCounter}`);
   const app = express();
   app.use(express.json());
@@ -65,6 +65,7 @@ async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean; as
       isAdminAuthorized: () => admin,
       assistant: opts?.assistant,
       listRecentRuns: opts?.listRecentRuns,
+      cancelRun: opts?.cancelRun,
     }),
   );
   const server: Server = await new Promise((resolve) => {
@@ -1232,4 +1233,49 @@ test('/m/relay-info publishes the relay origin anonymously, null when no relay',
     setMobileRelayRuntime(null);
     await h.close();
   }
+});
+
+test('run control: /m/api/runs/:id/cancel delegates to the injected canceller', async () => {
+  // Pin: the phone must use the SAME verb as the dashboard rather than
+  // inventing its own stop semantics.
+  const calls: string[] = [];
+  const h = await startHarness({
+    cancelRun: (id: string) => {
+      calls.push(id);
+      return { ok: true, httpStatus: 200, message: 'cancelling', runId: id, taskStatus: 'cancelling' };
+    },
+  });
+  try {
+    const anon = await fetch(`${h.url}/m/api/runs/run-1/cancel`, { method: 'POST' });
+    assert.equal(anon.status, 401, 'stopping work requires the device session');
+
+    const cookie = await loginMobile(h);
+    const res = await fetch(`${h.url}/m/api/runs/run-1/cancel`, { method: 'POST', headers: { cookie } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(calls, ['run-1']);
+    assert.equal((await res.json() as { taskStatus: string }).taskStatus, 'cancelling');
+  } finally { await h.close(); }
+});
+
+test('run control: the canceller is optional and degrades to 503, never a crash', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h);
+    const res = await fetch(`${h.url}/m/api/runs/run-1/cancel`, { method: 'POST', headers: { cookie } });
+    assert.equal(res.status, 503);
+  } finally { await h.close(); }
+});
+
+test('run control: task actions are allow-listed — no arbitrary verb reaches the task store', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h);
+    const bad = await fetch(`${h.url}/m/api/tasks/task-1/promote`, { method: 'POST', headers: { cookie } });
+    assert.equal(bad.status, 400);
+    assert.equal((await bad.json() as { error: string }).error, 'UNSUPPORTED_ACTION');
+
+    // A real action reaches the store and reports honestly when the task is gone.
+    const missing = await fetch(`${h.url}/m/api/tasks/task-missing/cancel`, { method: 'POST', headers: { cookie } });
+    assert.equal(missing.status, 404);
+  } finally { await h.close(); }
 });

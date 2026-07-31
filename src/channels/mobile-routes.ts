@@ -408,6 +408,11 @@ export interface MobileRouterDeps {
    * the endpoint will return 503.
    */
   listRecentRuns?: (limit: number) => unknown[];
+  /**
+   * Stops a tracked run, injected from webhook.ts so the phone uses the same
+   * verb as the dashboard. Omitted in auth-only test harnesses (route 503s).
+   */
+  cancelRun?: (id: string) => { ok: boolean; httpStatus: number; message: string; runId: string; taskStatus?: string };
   /** Test seam — override the state dir for fixtures. */
   stateDir?: string;
   /** Test seam — override secure-cookie behavior. */
@@ -1869,7 +1874,110 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           ? truncateOutput(ev.output)
           : null,
       }));
-      res.json({ runId, workflow: entry.data.name, events: tail });
+      // The run's own status rides along: without it the phone had to infer
+      // "is this still going?" from the last event kind, which is wrong the
+      // moment a run parks or is cancelled elsewhere.
+      const summary = (readMobileWorkflowRuns().get(entry.data.name) ?? []).find((run) => run.id === runId);
+      res.json({
+        runId,
+        workflow: entry.data.name,
+        status: summary?.status ?? null,
+        terminalOutcome: summary?.terminalOutcome ?? null,
+        events: tail,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Stop a workflow run from the phone. Cancels at the next step boundary —
+   * the same verb the desktop console uses, so a run stopped from the couch
+   * lands in exactly the state a run stopped at the desk does.
+   *
+   * There is deliberately no "pause": nothing in the system can suspend
+   * in-flight work and resume it later, and a button that implied otherwise
+   * would be a lie about what happens to the work.
+   */
+  router.post('/api/workflows/:name/runs/:runId/cancel', requireMobileSession, async (req, res) => {
+    const target = Array.isArray(req.params.name) ? req.params.name[0] : req.params.name;
+    const runId = Array.isArray(req.params.runId) ? req.params.runId[0] : req.params.runId;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+    try {
+      const { cancelWorkflowRunAtBoundary } = await import('../execution/workflow-run-cancellation.js');
+      const outcome = cancelWorkflowRunAtBoundary({
+        runId,
+        reason: 'Stopped from the phone',
+        source: 'mobile',
+        // Guards against a stale phone view stopping a different workflow's run.
+        expectedWorkflow: entry.data.name,
+      });
+      if (outcome.status === 'not_found' || outcome.status === 'workflow_mismatch') {
+        res.status(404).json({ error: 'RUN_NOT_FOUND' });
+        return;
+      }
+      if (outcome.status === 'already_terminal') {
+        res.status(409).json({ error: 'ALREADY_FINISHED', status: outcome.terminalStatus });
+        return;
+      }
+      try {
+        const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
+        appendWorkflowEvent(entry.name, runId, { kind: 'run_cancelled', error: 'Stopped from the phone' });
+      } catch { /* the cancellation is the effect; the event is a courtesy */ }
+      res.json({ ok: true, outcome: outcome.status });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Stop a tracked run (a chat turn or background job surfaced on Activity).
+   * Delegates to the same helper the desktop dashboard uses.
+   */
+  router.post('/api/runs/:id/cancel', requireMobileSession, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    if (!deps.cancelRun) {
+      res.status(503).json({ error: 'UNAVAILABLE' });
+      return;
+    }
+    try {
+      const result = deps.cancelRun(id);
+      res.status(result.httpStatus).json({
+        ok: result.ok,
+        message: result.message,
+        runId: result.runId,
+        taskStatus: result.taskStatus,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Background task control. `cancel` stops at the next safe checkpoint;
+   * `resume` picks a stopped task back up — the only genuine resume the
+   * system has, and the reason a phone is useful when work stalls while
+   * you're away from the desk.
+   */
+  router.post('/api/tasks/:id/:action', requireMobileSession, async (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const action = Array.isArray(req.params.action) ? req.params.action[0] : req.params.action;
+    if (action !== 'cancel' && action !== 'resume') {
+      res.status(400).json({ error: 'UNSUPPORTED_ACTION' });
+      return;
+    }
+    try {
+      const tasks = await import('../execution/background-tasks.js');
+      if (action === 'cancel') {
+        const task = tasks.cancelBackgroundTask(id, 'Stopped from the phone');
+        if (!task) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
+        res.json({ ok: true, status: task.status });
+        return;
+      }
+      const resumed = tasks.resumeBackgroundTask(id);
+      if (!resumed) { res.status(409).json({ error: 'NOT_RESUMABLE' }); return; }
+      res.json({ ok: true, status: resumed.status });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

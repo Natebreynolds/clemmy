@@ -18,6 +18,14 @@ final class WebViewModel: NSObject, ObservableObject {
     /// Deferred until the page is up so the bridge function exists.
     private var pendingApnsToken: String?
 
+    /// Pre-warmed so the first tap is as crisp as the hundredth — a cold
+    /// generator costs a few milliseconds, which is exactly the delay that
+    /// makes a web app feel like a web app.
+    private let impactLight = UIImpactFeedbackGenerator(style: .light)
+    private let impactMedium = UIImpactFeedbackGenerator(style: .medium)
+    private let notify = UINotificationFeedbackGenerator()
+    private let refreshControl = UIRefreshControl()
+
     init(pairing: Pairing) {
         self.pairing = pairing
         let config = WKWebViewConfiguration()
@@ -28,6 +36,22 @@ final class WebViewModel: NSObject, ObservableObject {
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
+
+        // JS → Swift. The web layer is the whole UI, so without this it can
+        // never reach the parts of "feels native" that only the OS can do.
+        // A proxy holds the handler so WKUserContentController's strong
+        // reference doesn't retain this model forever.
+        config.userContentController.add(ScriptProxy(self), name: "clemHaptic")
+        impactLight.prepare()
+        impactMedium.prepare()
+        notify.prepare()
+
+        // Pull-to-refresh belongs to the scroll view, not to JavaScript: the
+        // rubber-band, the threshold, and the spinner are all things iOS
+        // already does correctly and no web reimplementation matches.
+        refreshControl.tintColor = UIColor(red: 1, green: 0.54, blue: 0.24, alpha: 1)
+        refreshControl.addTarget(self, action: #selector(handlePullToRefresh), for: .valueChanged)
+        webView.scrollView.refreshControl = refreshControl
         // The page owns safe-area padding via env(); the shell stays dark and
         // silent — no white flash before first paint, no double insets.
         let peelBlack = UIColor(red: 12 / 255, green: 9 / 255, blue: 6 / 255, alpha: 1)
@@ -44,6 +68,47 @@ final class WebViewModel: NSObject, ObservableObject {
     func load(_ url: URL) {
         connectionLost = false
         webView.load(URLRequest(url: url))
+    }
+
+    /// Asks the page to reload its data in place. Falls back to a navigation
+    /// reload if the bridge isn't up yet, so the gesture is never a no-op.
+    @objc private func handlePullToRefresh() {
+        impactLight.impactOccurred()
+        webView.evaluateJavaScript(
+            "(window.clemNative && window.clemNative.refresh) ? (window.clemNative.refresh(), true) : false"
+        ) { [weak self] handled, _ in
+            guard let self else { return }
+            if (handled as? Bool) != true { self.webView.reload() }
+            // The spinner is a promise about freshness; hold it just long
+            // enough to read as deliberate rather than dropped.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                self.refreshControl.endRefreshing()
+            }
+        }
+    }
+
+    /// The OS-only half of "premium": weight under your thumb.
+    fileprivate func playHaptic(_ kind: String) {
+        switch kind {
+        case "light": impactLight.impactOccurred()
+        case "medium": impactMedium.impactOccurred()
+        case "success": notify.notificationOccurred(.success)
+        case "warning": notify.notificationOccurred(.warning)
+        case "error": notify.notificationOccurred(.error)
+        default: impactLight.impactOccurred()
+        }
+    }
+
+    /// Tells the page which door it is on and whether we think it is live, so
+    /// the connection pill can stop claiming "Direct" while on the relay —
+    /// away from your desk, that label is the difference between trust and
+    /// confusion.
+    func publishConnectionState() {
+        let onRelay = pairing.relayOrigin != nil && pairing.origin == pairing.relayOrigin
+        let door = connectionLost ? "offline" : (onRelay ? "relay" : "direct")
+        webView.evaluateJavaScript(
+            "window.clemNative && window.clemNative.setConnection && window.clemNative.setConnection('\(door)')"
+        )
     }
 
     func loadHome() {
@@ -123,6 +188,7 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
             pendingApnsToken = nil
             deliverApnsToken(token)
         }
+        publishConnectionState()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -179,6 +245,26 @@ enum CertificatePin {
         var diff: UInt8 = 0
         for i in 0..<lhs.count { diff |= lhs[i] ^ rhs[i] }
         return diff == 0
+    }
+}
+
+/// Breaks the retain cycle WKUserContentController would otherwise create by
+/// holding its message handler strongly for the life of the configuration.
+private final class ScriptProxy: NSObject, WKScriptMessageHandler {
+    private weak var model: WebViewModel?
+
+    init(_ model: WebViewModel) {
+        self.model = model
+    }
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "clemHaptic" else { return }
+        // Only ever a short enum from our own bundle; anything else is ignored
+        // rather than trusted.
+        let kind = (message.body as? String) ?? "light"
+        MainActor.assumeIsolated {
+            model?.playHaptic(kind)
+        }
     }
 }
 

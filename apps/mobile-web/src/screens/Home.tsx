@@ -23,6 +23,8 @@ import {
 import { greetingName, timeGreeting } from '../lib/greeting';
 import { Decisions, relativeTime } from '../components/Approvals';
 import { PushPrompt } from '../components/PushPrompt';
+import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
+import { RunControl } from '../components/RunControl';
 
 const POLL_MS = 5000;
 /** Runs in these states are live work, not history. */
@@ -65,7 +67,14 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
   useEffect(() => {
     refresh();
     const id = setInterval(refresh, POLL_MS);
-    return () => clearInterval(id);
+    // The shell's pull-to-refresh pulls THIS data, not the page — a reload
+    // would throw away scroll position and re-run the whole bootstrap.
+    const onPull = () => { void refresh(); };
+    window.addEventListener(REFRESH_EVENT, onPull);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener(REFRESH_EVENT, onPull);
+    };
   }, [refresh]);
 
   const decisionCount = approvals.length + plans.length;
@@ -79,6 +88,7 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
     event.preventDefault();
     const text = draft.trim();
     if (!text) return;
+    haptic('medium');
     setDraft('');
     onAsk(text);
   }
@@ -129,6 +139,7 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
                   <div class="card-title-sm">{run.title || 'Working…'}</div>
                   <div class="card-when">{run.status.replace(/_/g, ' ')} · {relativeTime(run.updatedAt)}</div>
                 </div>
+                <RunControl target={{ kind: 'run', runId: run.id }} onChanged={refresh} />
               </article>
             ))}
           </div>
