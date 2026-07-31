@@ -289,10 +289,30 @@ export function projectWorkspaceData(data: unknown): MobileWorkspaceProjection {
     recordLabel: humanizeKey(label),
     total: rows.length,
     shown: records.length,
-    headline,
+    // Most workspaces have no `summary` object at all — the agent only writes
+    // one when it decided the dataset needed condensing. Without a fallback
+    // those open to a blank top-of-screen above a wall of cards, so derive the
+    // few aggregates a phone can compute honestly from the rows themselves.
+    headline: headline.length > 0 ? headline : deriveHeadline(rows, chosen),
     breakdowns,
     records,
   };
+}
+
+/**
+ * A headline for datasets that never wrote a summary: the row count, plus a
+ * total for the first money-ish column if there is one. Deliberately modest —
+ * inventing statistics the workspace never claimed would be worse than an
+ * empty space.
+ */
+function deriveHeadline(rows: Array<Record<string, unknown>>, chosen: string[]): MobileWorkspaceField[] {
+  const fields: MobileWorkspaceField[] = [{ label: 'Records', value: rows.length.toLocaleString('en-US') }];
+  const moneyKey = chosen.find((key) => CURRENCYISH.test(key) && rows.some((row) => typeof row[key] === 'number'));
+  if (moneyKey) {
+    const total = rows.reduce((sum, row) => sum + (typeof row[moneyKey] === 'number' ? (row[moneyKey] as number) : 0), 0);
+    if (total > 0) fields.push({ label: `Total ${humanizeKey(moneyKey).toLowerCase()}`, value: formatValue(moneyKey, total) });
+  }
+  return fields;
 }
 
 export interface MobileSourceHealth {

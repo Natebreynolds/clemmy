@@ -1902,8 +1902,22 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   router.get('/api/workspaces', requireMobileSession, async (_req, res) => {
     try {
       const { spaceStore } = await import('../spaces/store.js');
+      const { readData } = await import('../spaces/data-store.js');
+      const { projectWorkspaceData } = await import('../spaces/mobile-projection.js');
       const spaces = spaceStore.list().map((record) => {
         const health = spaceStore.health(record.id);
+        // Whether there is anything to LOOK at, decided here rather than
+        // guessed in the UI. Half of a real user's workspaces are drafts and
+        // abandoned experiments with no data at all; on a laptop they are easy
+        // to scroll past, but on a phone they crowd out the two or three that
+        // actually matter.
+        let rows = 0;
+        let hasSummary = false;
+        try {
+          const projection = projectWorkspaceData(readData(record.id));
+          rows = projection.total;
+          hasSummary = projection.headline.length > 0;
+        } catch { /* unreadable data reads as empty, which is the truth */ }
         return {
           id: record.id,
           title: record.title,
@@ -1914,6 +1928,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           freshness: health?.freshness.state ?? 'unknown',
           issues: (health?.issues ?? []).slice(0, 3),
           counts: health?.counts ?? null,
+          rows,
+          hasSummary,
         };
       });
       res.json({ workspaces: spaces });

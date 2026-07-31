@@ -661,6 +661,9 @@ export interface WorkspaceSummary {
   lastRefreshedAt: string | null;
   freshness: string;
   issues: string[];
+  /** How many records the phone would show. 0 = nothing to look at yet. */
+  rows?: number;
+  hasSummary?: boolean;
 }
 
 export interface WorkspaceField { label: string; value: string }

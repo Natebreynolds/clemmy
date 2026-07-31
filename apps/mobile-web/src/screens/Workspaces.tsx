@@ -75,13 +75,33 @@ export function Workspaces() {
     );
   }
 
+  // Workspaces with something to show come first; drafts and abandoned
+  // experiments fold away behind a disclosure. On a laptop an empty workspace
+  // is easy to scroll past — on a phone it crowds out the two or three that
+  // actually matter, which is exactly what a real library looks like.
+  const live = spaces.filter((s) => (s.rows ?? 0) > 0);
+  const empty = spaces.filter((s) => (s.rows ?? 0) === 0);
+
   return (
     <div class="stack">
-      {spaces.map((space, i) => (
+      {live.length === 0 && empty.length > 0 ? (
+        <p class="ws-none-yet">
+          None of your workspaces have data yet. Refresh one on your Mac, or open it there to finish setting it up.
+        </p>
+      ) : null}
+      {renderRows(live, 0)}
+      {empty.length > 0 ? (
+        <EmptyWorkspaces spaces={empty} onOpen={(id) => setOpenId(id)} startIndex={live.length} />
+      ) : null}
+    </div>
+  );
+
+  function renderRows(rows: WorkspaceSummary[], offset: number) {
+    return rows.map((space, i) => (
         <button
           key={space.id}
           class="card card-tap rise"
-          style={{ '--i': i }}
+          style={{ '--i': i + offset }}
           onClick={() => { haptic('light'); setOpenId(space.id); }}
         >
           <div class="min-w-0">
@@ -96,7 +116,35 @@ export function Workspaces() {
             <path d="m9 18 6-6-6-6" />
           </svg>
         </button>
-      ))}
+    ));
+  }
+}
+
+/** Drafts and abandoned experiments, out of the way but never hidden. */
+function EmptyWorkspaces({ spaces, onOpen, startIndex }: {
+  spaces: WorkspaceSummary[];
+  onOpen: (id: string) => void;
+  startIndex: number;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div class="ws-empty-group">
+      <button class="link-btn" onClick={() => { haptic('light'); setOpen(!open); }}>
+        {open ? 'Hide' : `${spaces.length} with no data yet`}
+      </button>
+      {open ? spaces.map((space, i) => (
+        <button
+          key={space.id}
+          class="card card-tap rise ws-card-empty"
+          style={{ '--i': Math.min(i + startIndex, 12) }}
+          onClick={() => { haptic('light'); onOpen(space.id); }}
+        >
+          <div class="min-w-0">
+            <div class="card-title-sm truncate">{space.title}</div>
+            <div class="card-when">Not set up yet</div>
+          </div>
+        </button>
+      )) : null}
     </div>
   );
 }
