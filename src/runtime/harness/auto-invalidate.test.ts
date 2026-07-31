@@ -110,3 +110,41 @@ test('ambiguous identifier (two intents → same tool) is left to the agent (no 
   assert.equal(peekToolChoice('salesforce.count.a')?.choice?.identifier, 'sfdup', 'ambiguous → neither invalidated');
   assert.equal(peekToolChoice('salesforce.count.b')?.choice?.identifier, 'sfdup');
 });
+
+test('a transient failure never retires a proven tool (2026-07-31 live 429 spiral)', () => {
+  // Live: a Firecrawl 429 streak auto-invalidated FIRECRAWL_SEARCH and
+  // FIRECRAWL_EXTRACT mid-run. Nothing was broken — and retiring the binding
+  // pushed the agent back into tool DISCOVERY, which spent more API budget and
+  // provoked more rate limiting. The policy always said "never on a transient
+  // error"; it simply had no test, and no pattern for one.
+  const transient = [
+    '⚠️ composio_execute_tool FAILED (slug=FIRECRAWL_EXTRACT): HTTP 429 rate-limit exceeded',
+    '⚠️ composio_execute_tool FAILED (slug=FIRECRAWL_EXTRACT): too many requests, retry later',
+    '⚠️ composio_execute_tool FAILED (slug=FIRECRAWL_EXTRACT): request timed out',
+    '⚠️ composio_execute_tool FAILED (slug=FIRECRAWL_EXTRACT): 503 service unavailable',
+    '⚠️ composio_execute_tool FAILED (slug=FIRECRAWL_EXTRACT): socket hang up',
+    '⚠️ composio_execute_tool FAILED (slug=FIRECRAWL_EXTRACT): ECONNRESET',
+  ];
+  for (const resultStr of transient) {
+    remember('scrape firm website', 'composio', 'FIRECRAWL_EXTRACT');
+    autoInvalidateOnFailure({
+      toolName: 'composio_execute_tool',
+      args: '{"tool_slug":"FIRECRAWL_EXTRACT","arguments":"{}"}',
+      resultStr,
+    });
+    assert.equal(
+      peekToolChoice('scrape firm website')?.choice?.identifier,
+      'FIRECRAWL_EXTRACT',
+      `a proven tool must survive: ${resultStr.slice(-40)}`,
+    );
+  }
+
+  // A genuine breakage still retires the binding.
+  remember('scrape firm website', 'composio', 'FIRECRAWL_EXTRACT');
+  autoInvalidateOnFailure({
+    toolName: 'composio_execute_tool',
+    args: '{"tool_slug":"FIRECRAWL_EXTRACT","arguments":"{}"}',
+    resultStr: '⚠️ composio_execute_tool FAILED (slug=FIRECRAWL_EXTRACT): 401 unauthorized',
+  });
+  assert.equal(peekToolChoice('scrape firm website')?.choice, null, 'a real breakage must still invalidate');
+});

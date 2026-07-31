@@ -27,6 +27,14 @@
  *   - CLI: `command not found` / `: not found` / `EPERM … uv_cwd` (binary gone /
  *     TCC-clamped) — NOT a plain non-zero exit (a bad flag is user error).
  *   - MCP: `server_unavailable` — NOT `approval_blocked` (a gate, not a break).
+ *   - NEVER on a transient failure (rate limit, timeout, 5xx, reset). This was
+ *     the stated policy from the start but had no test for it: live 2026-07-31,
+ *     a Firecrawl 429 streak auto-invalidated FIRECRAWL_SEARCH and
+ *     FIRECRAWL_EXTRACT mid-run — tools the run still needed and that were not
+ *     broken at all. Worse, it is self-reinforcing: retiring the binding sends
+ *     the agent back to tool DISCOVERY (16 tool_search calls in that session),
+ *     which spends more API budget, which provokes more rate limiting. A
+ *     transient failure is the one case where memory must hold its nerve.
  * Ambiguity (two intents → the same identifier) → skip; a wrong auto-forget is
  * worse than a missed one.
  */
@@ -35,6 +43,10 @@ import {
   invalidateToolChoice,
   type ToolChoiceKind,
 } from '../../memory/tool-choice-store.js';
+
+/** Load/quota/network conditions: the tool is fine, the moment is not. */
+const TRANSIENT_FAILURE_RE =
+  /\b(?:429|rate[\s_-]?limit(?:ed|ing)?|too\s+many\s+requests|quota\s+exceeded|throttl(?:e|ed|ing)|timed?\s*out|timeout|deadline\s+exceeded|50[023]|service\s+unavailable|temporarily\s+unavailable|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket\s+hang\s+up)\b/i;
 
 interface FailedToolCall {
   kind: ToolChoiceKind;
@@ -73,6 +85,7 @@ function detectComposioFailure(
   const head = firstLine(resultStr);
   if (!head.startsWith('⚠️')) return null; // success path returns the body unchanged
   if (/NOT[\s_]?FOUND/i.test(head)) return null; // arg/discovery problem, tool is fine
+  if (TRANSIENT_FAILURE_RE.test(head)) return null; // load/quota, not a broken tool
   if (!/FAILED/i.test(head)) return null; // only hard failures
   // Slug: prefer the explicit arg (composio_execute_tool), else the corrective
   // header (`slug=…`, which cx_<slug> and the gateway both print).
