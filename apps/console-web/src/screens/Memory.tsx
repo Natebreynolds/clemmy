@@ -16,6 +16,7 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { MemoryGraphContainer } from '@/components/MemoryGraphContainer';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
+import { ToolRecallSection } from './advanced/ToolRecallSection';
 import {
   listFacts, forgetFact, pinFact, getContext, addFact, addGoal, searchMemory, getMemoryFiles,
   getBrainHealth, getMemoryHealth, listEntities, getSourceMap, fileBasename, FACT_KINDS,
@@ -35,7 +36,7 @@ import {
 } from '@/lib/memory';
 import { memoryAssuranceView, memoryClaimTemporalStatus } from '@/lib/memory-assurance';
 
-type Tab = 'overview' | 'facts' | 'episodes' | 'entities' | 'sources';
+type Tab = 'overview' | 'facts' | 'tools' | 'episodes' | 'entities' | 'sources';
 const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference', constraint: 'Hard constraint' };
 
 export function Memory() {
@@ -53,6 +54,9 @@ export function Memory() {
   const tabs: { key: Tab; label: string; icon: typeof Search }[] = [
     { key: 'overview', label: 'Overview', icon: Brain },
     { key: 'facts', label: 'Facts', icon: BookOpen },
+    // Confidence wave (2026-07-31): which tools she has PROVEN is user-facing
+    // memory — success counts belong next to facts, not buried in Advanced.
+    { key: 'tools', label: 'Learned tools', icon: Wrench },
     { key: 'episodes', label: 'Timeline', icon: History },
     { key: 'entities', label: 'People & things', icon: Users },
     { key: 'sources', label: 'Sources', icon: FileText },
@@ -85,6 +89,7 @@ export function Memory() {
           </div>
           {tab === 'overview' && <OverviewTab onNavigate={setTab} />}
           {tab === 'facts' && <FactsTab qc={qc} />}
+          {tab === 'tools' && <ToolRecallSection />}
           {tab === 'episodes' && <EpisodesTab />}
           {tab === 'entities' && <EntitiesTab />}
           {tab === 'sources' && <SourcesTab qc={qc} onNavigate={setTab} />}
@@ -696,7 +701,7 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
       </div>
       {facts.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
         : rows.length === 0 ? <Card><EmptyState title="Still getting to know you" description="As we work together, the important things land here — and you can edit or forget anything." /></Card>
-          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onEdit={(content) => onEdit(f.id, content)} />)}</div>}
+          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onEdit={(content) => onEdit(f.id, content)} onImportance={(value) => { void updateFact(f.id, { importance: value }).finally(() => qc.invalidateQueries({ queryKey: ['facts'] })); }} />)}</div>}
       {(reviews.data?.candidates.length ?? 0) > 0 && <Card className="mt-4 border-warning/40 bg-warning/5 p-4">
         <div className="mb-1 flex flex-wrap items-center gap-2">
           <div className="text-body font-medium text-fg">Memory review</div>
@@ -806,7 +811,7 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
   );
 }
 
-function FactCard({ fact, onPin, onForget, onRestore, onEdit }: { fact: Fact; onPin: () => void; onForget: () => void; onRestore: () => void; onEdit: (content: string) => Promise<void> }) {
+function FactCard({ fact, onPin, onForget, onRestore, onEdit, onImportance }: { fact: Fact; onPin: () => void; onForget: () => void; onRestore: () => void; onEdit: (content: string) => Promise<void>; onImportance?: (value: number) => void }) {
   const [expanded, setExpanded] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(fact.content);
@@ -825,6 +830,12 @@ function FactCard({ fact, onPin, onForget, onRestore, onEdit }: { fact: Fact; on
       <div className="min-w-0 flex-1">
         <div className="mb-1 flex flex-wrap gap-1.5">
           <StatusPill tone="neutral">{KIND_LABEL[fact.kind] ?? fact.kind}</StatusPill>
+          {/* Told-vs-learned origin (confidence wave 2026-07-31): the single
+              most trust-relevant attribute of a memory — whether the user
+              STATED it or Clem INFERRED it — was stored but never shown. */}
+          {fact.derivedFrom?.tool || fact.derivedFrom?.callId
+            ? <span title={fact.derivedFrom?.tool ? `Learned from ${fact.derivedFrom.tool}` : 'Learned from a tool result'}><StatusPill tone="neutral">she learned this</StatusPill></span>
+            : <StatusPill tone="success">you told her</StatusPill>}
           {fact.policy && <span title={policyReason || undefined}><StatusPill tone={fact.policy.enforcement === 'dispatch' ? 'warning' : 'neutral'}>{fact.policy.policy_type.replace(/_/g, ' ')} · {fact.policy.enforcement}</StatusPill></span>}
           {fact.active === false && <StatusPill tone="warning">historical</StatusPill>}
           {fact.active === false && fact.supersededByFactId != null && <StatusPill tone="neutral">continued as #{fact.supersededByFactId}</StatusPill>}
@@ -834,9 +845,17 @@ function FactCard({ fact, onPin, onForget, onRestore, onEdit }: { fact: Fact; on
           <div className="flex gap-2"><Button size="sm" onClick={async () => { await onEdit(draft.trim()); setEditing(false); }} disabled={!draft.trim() || draft.trim() === fact.content}>Save as correction</Button><Button size="sm" variant="ghost" onClick={() => { setDraft(fact.content); setEditing(false); }}>Cancel</Button></div>
         </div> : <p className={cn('text-body text-fg', !expanded && long && 'line-clamp-3')}>{fact.content}</p>}
         {long && <button type="button" onClick={() => setExpanded((v) => !v)} className="mt-1 text-caption font-semibold text-primary hover:underline cursor-pointer">{expanded ? 'Show less' : 'Show more'}</button>}
-        <div className="mt-1 text-caption text-faint">
-          {typeof fact.confidence === 'number' ? `${Math.round(fact.confidence * 100)}% confidence · ` : ''}{usableEvidence.length} source{usableEvidence.length === 1 ? '' : 's'}{unavailableEvidence.length > 0 ? ` · ${unavailableEvidence.length} unavailable` : ''} · used {fact.utilityCount ?? 0}× · shown {fact.impressionCount ?? 0}×
+        <div className="mt-1 flex flex-wrap items-center gap-x-2 text-caption text-faint">
+          <span>{typeof fact.confidence === 'number' ? `${Math.round(fact.confidence * 100)}% confidence · ` : ''}{usableEvidence.length} source{usableEvidence.length === 1 ? '' : 's'}{unavailableEvidence.length > 0 ? ` · ${unavailableEvidence.length} unavailable` : ''} · used {fact.utilityCount ?? 0}× · shown {fact.impressionCount ?? 0}×</span>
+          {fact.active !== false && typeof fact.importance === 'number' && onImportance && (
+            <span className="inline-flex items-center gap-1" title="Importance drives how strongly this memory competes for recall (0–10)">
+              · importance {fact.importance}
+              <button type="button" aria-label="Raise importance" disabled={fact.importance >= 10} onClick={() => onImportance(Math.min(10, (fact.importance ?? 5) + 1))} className="cursor-pointer rounded px-1 text-muted hover:bg-subtle hover:text-fg disabled:opacity-40">+</button>
+              <button type="button" aria-label="Lower importance" disabled={fact.importance <= 0} onClick={() => onImportance(Math.max(0, (fact.importance ?? 5) - 1))} className="cursor-pointer rounded px-1 text-muted hover:bg-subtle hover:text-fg disabled:opacity-40">−</button>
+            </span>
+          )}
         </div>
+        {fact.pinned && <div className="mt-0.5 text-caption text-primary">Pinned — always in her context, never ages out.</div>}
         {(fact.evidence?.length ?? 0) > 0 && <details className="mt-1 text-caption text-muted"><summary className="cursor-pointer">View provenance</summary><div className="mt-1 space-y-1">{fact.evidence?.map((item) => <div key={`${item.episodeId}:${item.excerpt}`} className="rounded bg-subtle p-2"><div>{item.excerpt || 'Supporting excerpt unavailable — the source expired before durable capture.'}</div><div className="mt-1 text-faint">{item.status ?? 'available'}{item.sourceUri ? ` · ${item.sourceUri}` : ''}</div></div>)}</div></details>}
         {(fact.validityIntervals?.length ?? 0) > 1 && <details className="mt-1 text-caption text-muted"><summary className="cursor-pointer">View validity history ({fact.validityIntervals?.length} periods)</summary><div className="mt-1 space-y-1">{fact.validityIntervals?.map((interval) => <div key={interval.id} className="rounded bg-subtle p-2"><div>{new Date(interval.validFrom).toLocaleString()} → {interval.validTo ? new Date(interval.validTo).toLocaleString() : 'current'}</div><div className="mt-1 text-faint">{interval.openedReason}{interval.closedReason ? ` · ${interval.closedReason}` : ''}</div></div>)}</div></details>}
       </div>

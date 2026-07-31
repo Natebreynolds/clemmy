@@ -960,8 +960,30 @@ export function evidenceLooksFailedOrBlocked(text: string | undefined): boolean 
   );
 }
 
+/** Sentence-slug guard (2026-07-31 live poison: 61 memos with WHOLE-SENTENCE
+ *  intents bound DataForSEO tools to Salesforce-audit prose — auto-captured
+ *  junk that degraded every fuzzy match). An intent is a short canonical slug
+ *  ("salesforce.account.query"); the task story belongs in description. */
+export function intentSlugError(intent: string): string | null {
+  const raw = (intent ?? '').trim();
+  if (!raw) return 'intent is empty';
+  if (raw.length > 80) {
+    return `intent is ${raw.length} chars — intents are short canonical slugs (max 80), e.g. "salesforce.account.query". Put the task story in description, never the intent.`;
+  }
+  const segments = raw.split(/[._\-/\s]+/).filter(Boolean);
+  if (segments.length > 10) {
+    return `intent has ${segments.length} words/segments — max 10. Use a short canonical slug ("service.object.operation") and put the story in description.`;
+  }
+  return null;
+}
+
 export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRecord {
   ensureCanonicalMigration();
+  const slugError = intentSlugError(input.intent);
+  if (slugError) {
+    emitToolChoiceEvent('remember_rejected_failed', input.intent.slice(0, 80), 'sentence_slug');
+    throw new Error(`tool_choice_remember rejected: ${slugError}`);
+  }
   const existing = parseRecord(filePathFor(input.intent));
   const now = new Date().toISOString();
   if (placeholderChoiceString(input.choice.identifier)) {
@@ -1423,14 +1445,26 @@ const SHORT_TOOL_ALIASES: Record<string, string[]> = {
 /** Word-tokenize free text (a step prompt) into a lowercase set, dropping
  *  punctuation and very short tokens. (recall's `tokenize` only splits slugs
  *  on `._-/`, so it can't tokenize a sentence — this is the prose counterpart.) */
+/** Fold trivial English inflection so "accounts" matches an intent's
+ *  "account" (live 2026-07-31: the proven sf memo missed promotion because
+ *  the user's plural never token-matched the memo's singular). Longer-word
+ *  only, plain trailing-s only — "less"/"was"/ids stay untouched. */
+function singularFold(token: string): string {
+  return token.length > 4 && token.endsWith('s') && !token.endsWith('ss')
+    ? token.slice(0, -1)
+    : token;
+}
+
 function wordTokens(text: string): Set<string> {
-  return new Set(
-    (text || '')
-      .toLowerCase()
-      .split(/[^a-z0-9]+/)
-      .map((t) => t.trim())
-      .filter((t) => t.length >= 2),
-  );
+  const out = new Set<string>();
+  for (const raw of (text || '').toLowerCase().split(/[^a-z0-9]+/)) {
+    const t = raw.trim();
+    if (t.length < 2) continue;
+    out.add(t);
+    const folded = singularFold(t);
+    if (folded !== t) out.add(folded);
+  }
+  return out;
 }
 
 /** The IDENTITY portion of a CLI command — the program + subcommands BEFORE
@@ -1642,6 +1676,16 @@ export interface MatchToolChoicesOptions {
   limit?: number;
   /** Override the store read (tests). */
   choices?: ToolChoiceRecord[];
+  /**
+   * 'bind' (default): full precision — a CLI match must name the program AND
+   * operation, because the consumer may AUTO-BIND the command to a step.
+   * 'advertise': relevance only — the consumer merely PROMOTES the memo in the
+   * advertised context (the model still decides). Requires a strong identity
+   * match (service aliases count: "salesforce" ⇒ sf) + one core token. Live
+   * 2026-07-31: bind-grade gates meant a Salesforce request could never
+   * promote the proven sf memo unless the user literally typed "sf … query".
+   */
+  purpose?: 'bind' | 'advertise';
 }
 
 /** Rank: lower = preferred. On a near-tie prefer cli/mcp over composio — routes
@@ -1681,6 +1725,7 @@ export function matchToolChoicesForStep(
   opts: MatchToolChoicesOptions = {},
 ): StepToolChoiceMatch[] {
   const limit = opts.limit ?? 3;
+  const advertiseOnly = opts.purpose === 'advertise';
   const prompt = wordTokens(promptText);
   if (prompt.size === 0) return [];
 
@@ -1728,15 +1773,23 @@ export function matchToolChoicesForStep(
     if (!alreadyBound) {
       if (matchedIdentity.length === 0) continue;
       if (!hasStrongIdentity) continue;
-      if (rec.choice.kind === 'mcp' && matchedMcpNamespace.length === 0) continue;
-      if (rec.choice.kind === 'cli') {
-        const matchedProgram = [...cliProgramTokens(rec)].some((t) => prompt.has(t));
-        if (!matchedProgram) continue;
-        if (!promptMatchesCliOperation(prompt, promptText, rec)) continue;
-        if (cliChoiceLooksCountQuery(rec) && !promptLooksCountQuery(promptText)) continue;
+      if (advertiseOnly) {
+        // Advertise tier: the service is clearly named (strong identity incl.
+        // aliases) and at least one substantive core token matches. No
+        // program/operation gates — nothing is bound from this path.
+        if (matchedCore.length < 1) continue;
+        if (!matchedCore.some((t) => t.length >= 4)) continue;
+      } else {
+        if (rec.choice.kind === 'mcp' && matchedMcpNamespace.length === 0) continue;
+        if (rec.choice.kind === 'cli') {
+          const matchedProgram = [...cliProgramTokens(rec)].some((t) => prompt.has(t));
+          if (!matchedProgram) continue;
+          if (!promptMatchesCliOperation(prompt, promptText, rec)) continue;
+          if (cliChoiceLooksCountQuery(rec) && !promptLooksCountQuery(promptText)) continue;
+        }
+        if (matchedCore.length < 2) continue;
+        if (!matchedCore.some((t) => t.length >= 4)) continue;
       }
-      if (matchedCore.length < 2) continue;
-      if (!matchedCore.some((t) => t.length >= 4)) continue;
     }
     // Containment score (for ranking only): how much of the choice's identity +
     // description the prompt names. Description tokens only raise/lower the
@@ -2386,6 +2439,39 @@ function contextInjectEnabled(): boolean {
 const TOOL_CHOICE_LINE_MAX = 160;
 const TOOL_CHOICE_BLOCK_MAX = 1400;
 
+/** Retire never-proven memos (2026-07-31 hygiene): a memo whose choice was
+ *  recorded but NEVER succeeded, was never approved, and hasn't been touched
+ *  in weeks is dead weight that degrades every fuzzy match. Retirement moves
+ *  the choice into the fallback history (reason preserved, rediscovery clean)
+ *  — nothing is deleted. Runs on the daemon's hourly reaper tick. */
+export const DEAD_MEMO_AGE_MS = 21 * 24 * 60 * 60 * 1000;
+
+export function reapDeadToolChoiceMemos(now = Date.now()): string[] {
+  const retired: string[] = [];
+  let records: ToolChoiceRecord[];
+  try { records = listToolChoices(); } catch { return retired; }
+  for (const rec of records) {
+    const choice = rec.choice;
+    if (!choice) continue;
+    if ((choice.successCount ?? 0) > 0 || (choice.approvalCount ?? 0) > 0) continue;
+    if (choice.lastSuccessAt) continue;
+    const touchedMs = Date.parse(choice.testedAt ?? '');
+    if (!Number.isFinite(touchedMs) || now - touchedMs <= DEAD_MEMO_AGE_MS) continue;
+    try {
+      // Retirement goes through the CANONICAL invalidate path — a hand-rolled
+      // writeRecord leaves the procedure layer's choice alive and the record
+      // resurrects on the next read.
+      const out = invalidateToolChoice(
+        rec.intent,
+        'Retired by hygiene reaper: never succeeded and untouched for 21+ days. Rediscover fresh if this intent recurs.',
+        { automatic: true },
+      );
+      if (out && !out.choice) retired.push(rec.intent);
+    } catch { /* one bad record never stops the sweep */ }
+  }
+  return retired;
+}
+
 export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_BLOCK_MAX, objective?: string): string {
   if (!contextInjectEnabled()) return '';
   let records: ToolChoiceRecord[];
@@ -2433,6 +2519,7 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
       const matches = matchToolChoicesForStep(trimmedObjective, {
         choices: byRecency,
         limit: byRecency.length,
+        purpose: 'advertise',
       });
       for (const m of matches) relevantIntents.add(m.intent);
       if (relevantIntents.size > 0) {

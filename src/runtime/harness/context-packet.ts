@@ -31,6 +31,7 @@ import {
   buildProspectiveIntentionContext,
   prospectiveCaptureDirective,
 } from '../prospective-intentions.js';
+import { standingRuleCaptureDirective } from '../../memory/rule-capture.js';
 import {
   BATCH_RE,
   READ_RE,
@@ -620,6 +621,12 @@ export function buildAgentContextPacket(
     : 'Memory preflight: disabled.';
   let prospective = { text: '', count: 0, ids: [] as string[], bytes: 0 };
   let prospectiveCapture: string | null = null;
+  // Standing-rule capture steer (2026-07-31): a rule-shaped user statement
+  // ("we ONLY use the sf CLI for Salesforce") must become a pinned constraint
+  // at the moment it is said, not stay chat prose the next session forgets.
+  // Deterministic detection, model-owned decision — same conditional pattern
+  // as the prospective steer. Workflow nodes never capture rules.
+  const ruleCapture = constrainedWorkflowNode ? null : standingRuleCaptureDirective(input);
   if (!constrainedWorkflowNode) {
     try {
       prospective = buildProspectiveIntentionContext({
@@ -705,6 +712,7 @@ export function buildAgentContextPacket(
     memoryLine,
     prospective.text,
     prospectiveCapture,
+    ruleCapture,
     `External MCP scope: ${toolScope.allowAll ? 'all external tools allowed' : `${(toolScope.allowedServerSlugs ?? []).join(', ') || 'none'}${toolScope.maxTools ? `, max ${toolScope.maxTools} tools` : ''}`} (${toolScope.reason}).`,
     providerAccessLine(),
     ...renderCandidates('Likely skills', skills, 'If one is relevant, call skill_read before creating the deliverable.'),

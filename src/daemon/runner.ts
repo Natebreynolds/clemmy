@@ -74,6 +74,7 @@ import {
 } from '../memory/maintenance.js';
 import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decision.js';
+import { reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
@@ -2338,6 +2339,16 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
           }
         } catch (err) {
           logger.warn({ err }, 'Check-in reap failed');
+        }
+        // Memory hygiene (2026-07-31): never-proven tool memos retire to the
+        // fallback history so fuzzy matching stays clean; nothing is deleted.
+        try {
+          const retiredMemos = reapDeadToolChoiceMemos();
+          if (retiredMemos.length > 0) {
+            logger.info({ retiredMemos }, 'Retired never-proven tool-choice memos');
+          }
+        } catch (err) {
+          logger.warn({ err }, 'Tool-memo hygiene reap failed');
         }
       });
     }

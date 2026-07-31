@@ -991,3 +991,39 @@ test('renderToolChoicesForContext: C6 — a choice bound to an account shows @id
     else process.env.TOOL_CHOICE_CONTEXT_INJECT = previous;
   }
 });
+
+test('write gate: whole-sentence intents are REJECTED with a teaching error (the 61-garbage-memo class)', async () => {
+  const { rememberToolChoice, intentSlugError } = await import('./tool-choice-store.js');
+  assert.equal(intentSlugError('salesforce.account.query'), null);
+  assert.equal(intentSlugError('append-rows-to-a-new-tab-in-google-sheets'), null, 'legit long-ish canonical intents pass');
+  assert.match(intentSlugError('asked nate to choose the sourcing writing lane before scraping and drafting fifteen emails') ?? '', /short canonical slug|max 10|max 80/i);
+  assert.throws(
+    () => rememberToolChoice({
+      intent: '90-day-salesforce-legal-email-audit-audit-last-90-day-legal-team-prospecting-emails-in-salesforce',
+      description: 'x',
+      choice: { kind: 'composio', identifier: 'DATAFORSEO_BACKLINKS_BULK_RANKS' },
+    }),
+    /short canonical slug|max 6|max 60/i,
+  );
+});
+
+test('hygiene reaper: never-proven stale memos retire to fallback history; proven and fresh memos survive', async () => {
+  const { rememberToolChoice, reapDeadToolChoiceMemos, listToolChoices, DEAD_MEMO_AGE_MS } = await import('./tool-choice-store.js');
+  rememberToolChoice({ intent: 'hygiene.dead.memo', description: 'never proven', choice: { kind: 'composio', identifier: 'NEVER_PROVEN_TOOL' } });
+  rememberToolChoice({ intent: 'hygiene.proven.memo', description: 'proven', choice: { kind: 'cli', identifier: 'sf' } });
+  const { updateToolChoiceOutcome } = await import('./tool-choice-store.js');
+  updateToolChoiceOutcome('hygiene.proven.memo', 'success');
+  rememberToolChoice({ intent: 'hygiene.fresh.memo', description: 'fresh unproven', choice: { kind: 'composio', identifier: 'FRESH_TOOL' } });
+
+  const future = Date.now() + DEAD_MEMO_AGE_MS + 24 * 3600_000;
+  // Fresh memo also crosses the age line in this simulated future — pin the
+  // boundary by checking BEFORE the horizon first.
+  assert.deepEqual(reapDeadToolChoiceMemos(Date.now()), [], 'nothing under the age horizon retires');
+
+  const retired = reapDeadToolChoiceMemos(future);
+  assert.ok(retired.includes('hygiene.dead.memo'), 'the never-proven stale memo retires');
+  assert.ok(!retired.includes('hygiene.proven.memo'), 'proven memos never retire');
+  const dead = listToolChoices().find((r) => r.intent === 'hygiene.dead.memo');
+  assert.equal(dead?.choice, null, 'retired memo has no active choice');
+  assert.match(dead?.fallbacks?.at(-1)?.reason ?? '', /hygiene reaper/i, 'the retirement explains itself in the fallback history');
+});

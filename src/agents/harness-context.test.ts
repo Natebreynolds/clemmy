@@ -406,3 +406,39 @@ test('recall + constraint lines under the bound are byte-identical (no clipping 
   const ctx = renderHarnessMemoryContext({ query: 'daily prospect outreach workflow salesforce' });
   assert.ok(ctx.includes(`- ${content}`), 'short fact renders unmodified');
 });
+
+test('HARNESS lane ranks memos by the CURRENT MESSAGE, not focus alone (live 2026-07-31: the proven sf memo sat below the recency fold)', async () => {
+  resetMemoryDb();
+  const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
+  // The proven route for the request domain…
+  rememberToolChoice({
+    intent: 'salesforce.account.query',
+    description: 'Query Salesforce accounts/contacts via the authenticated sf CLI.',
+    choice: { kind: 'cli', identifier: 'sf', invocationTemplate: 'sf data query --json --query "SELECT ..."' },
+  });
+  // …buried under a pile of fresher unrelated memos (the recency fold).
+  for (let i = 0; i < 15; i += 1) {
+    rememberToolChoice({
+      intent: `unrelated.tool.${i}`,
+      description: `Unrelated memo ${i}.`,
+      choice: { kind: 'composio', identifier: `UNRELATED_TOOL_${i}` },
+    });
+  }
+  // An active focus about something ELSE — the old ranking used ONLY this.
+  createFocus({ resourceRef: 'https://example.com/landing-draft', resourceKind: 'doc', title: 'Website copy review', summary: 'Reviewing landing page copy drafts.' });
+
+  // focusInput carries the current user message on the Codex lane
+  // (orchestrator passes options.userInput). The blend must promote the
+  // salesforce memo despite the unrelated focus + 15 fresher memos.
+  const ctx = renderHarnessMemoryContext({
+    focusInput: 'can you scrape all of brett lorenzinis accounts and contacts from salesforce and put them in a sheet',
+  });
+  const block = ctx.slice(ctx.indexOf('Remembered Tool Choices'));
+  const sfPos = block.indexOf('salesforce.account.query');
+  assert.ok(sfPos >= 0, 'the proven salesforce memo is IN the advertised block');
+  const firstUnrelated = block.indexOf('unrelated.tool.');
+  assert.ok(
+    firstUnrelated === -1 || sfPos < firstUnrelated,
+    'the request-relevant proven route ranks ABOVE fresher unrelated memos',
+  );
+});

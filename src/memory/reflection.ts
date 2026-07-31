@@ -28,6 +28,7 @@ import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { resolveBoundaryJudge, resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { captureFactEvidence, linkFactEvidence, recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
+import { looksLikeIncidentNarrative } from './incident-narrative.js';
 import { upsertEntity } from './entity-identity.js';
 import { compileWordMatcher } from './word-match.js';
 import { derivedFactRejectionReason } from './memory-quality.js';
@@ -277,6 +278,7 @@ function buildExtractorPreamble(includeResources: boolean, includeRelationships 
   const countWord = ['zero', 'one', 'two', 'three', 'four', 'five'][arrayCount] ?? String(arrayCount);
   lines.push(
     '- DO NOT extract ephemeral state (current weather, request-ids, timestamps).',
+    '- DO NOT extract INCIDENT NARRATIVES as durable facts: outages, expired/broken connections, "X is unreliable/failing", one-time errors and retries describe a MOMENT, not the user or their projects — remembered complaints poison future tool routing. If the trouble implies a durable lesson, state the RULE ("access X via Y"), never the complaint.',
     `- DO NOT invent facts. If the output is noise/empty/error, return all ${countWord} arrays empty.`,
     '- Output ONLY the JSON object. No markdown fences. No commentary.',
   );
@@ -1573,6 +1575,22 @@ async function consolidateFactInner(
   opts: ConsolidateOptions = {},
 ): Promise<ConsolidateOutcome> {
   const out: ConsolidateOutcome = { action: 'ignore', written: 0, updated: 0, deleted: 0, noop: 0, importanceAdded: 0 };
+
+  // INCIDENT QUARANTINE (2026-07-31 live poison): a DERIVED complaint about
+  // transient infrastructure trouble must never become a durable belief — it
+  // primes future misdiagnosis ("expired Composio" became remembered
+  // character, then steered a healthy CLI request wrong). The reflection
+  // episode already holds the bounded source with decay; the durable store
+  // holds RULES, not weather. User-authored statements and constraints are
+  // never filtered here.
+  if (
+    candidate.authority === 'derived'
+    && candidate.kind !== 'constraint'
+    && looksLikeIncidentNarrative(candidate.text)
+  ) {
+    logger.debug({ text: candidate.text.slice(0, 120) }, 'reflection: incident narrative quarantined to episodic memory');
+    return out;
+  }
 
   // Pin the resulting fact when the candidate asked for it (the safety-critical
   // prohibition path). Done HERE, where the ADD/UPDATE row id is known, so the

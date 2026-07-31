@@ -935,18 +935,35 @@ export function searchFactsByTextAt(query: string, asOf: string, limit = 5): Con
  */
 export async function searchFactsHybrid(query: string, limit = 5): Promise<ConsolidatedFact[]> {
   const cap = Math.max(1, limit);
-  const fts = searchFactsByText(query, cap);
+  // Over-fetch both arms so fusion has real candidates to weigh — the old
+  // concatenation fetched `cap` lexical hits and appended semantics into
+  // whatever slots remained, which at cap=5 shut the semantic arm out
+  // entirely whenever FTS had a handful of matches (2026-07-31 audit: no
+  // score fusion of any kind existed).
+  const fetch = Math.max(cap * 2, 10);
+  const fts = searchFactsByText(query, fetch);
   let semantic: ConsolidatedFact[] = [];
-  try { semantic = await findSimilarFacts(query, { topK: cap }); } catch { semantic = []; }
-  const seen = new Set<number>();
-  const out: ConsolidatedFact[] = [];
-  for (const f of [...fts, ...semantic]) {
-    if (seen.has(f.id)) continue;
-    seen.add(f.id);
-    out.push(f);
-    if (out.length >= cap) break;
-  }
-  return out;
+  try { semantic = await findSimilarFacts(query, { topK: fetch }); } catch { semantic = []; }
+  if (semantic.length === 0) return fts.slice(0, cap);
+  // Reciprocal-rank fusion: rank-based, so the two arms' incomparable score
+  // scales (LIKE hit-counts vs cosine) never need normalizing. k=60 is the
+  // standard damping constant. A fact BOTH arms rank sums both contributions
+  // and rises — exactly the "agrees twice" signal a hybrid exists to reward.
+  const K = 60;
+  const scores = new Map<number, { fact: ConsolidatedFact; score: number }>();
+  const addArm = (arm: ConsolidatedFact[]) => {
+    arm.forEach((fact, rank) => {
+      const entry = scores.get(fact.id) ?? { fact, score: 0 };
+      entry.score += 1 / (K + rank + 1);
+      scores.set(fact.id, entry);
+    });
+  };
+  addArm(fts);
+  addArm(semantic);
+  return [...scores.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, cap)
+    .map((entry) => entry.fact);
 }
 
 /**

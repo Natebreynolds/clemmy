@@ -1230,6 +1230,49 @@ export interface EmbeddingStats {
   dim: number | null;
 }
 
+export interface LiveFactEmbeddingCoverage {
+  activeFacts: number;
+  /** Rows that recall can ACTUALLY use: active fact + matching content_hash +
+   *  the active provider space (model+dim). */
+  usableEmbeds: number;
+  coverage: number;
+  model: string | null;
+  dim: number | null;
+}
+
+/**
+ * LIVE-USABLE coverage — the number the health surface must show (2026-07-31
+ * audit): the old metric divided ALL embedding rows (any model space, any
+ * hash, inactive facts included) by ALL facts, so a provider flip that
+ * zeroed recall would still read "100% embedded". This mirrors the EXACT
+ * WHERE clause of loadActiveFactEmbeddings, so the displayed number is the
+ * number recall lives on.
+ */
+export function readLiveFactEmbeddingCoverage(): LiveFactEmbeddingCoverage {
+  const out: LiveFactEmbeddingCoverage = { activeFacts: 0, usableEmbeds: 0, coverage: 0, model: null, dim: null };
+  try {
+    const db = openMemoryDb();
+    out.activeFacts = (db.prepare('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1').get() as { c: number }).c;
+    const active = activeEmbeddingSelector();
+    if (!active) return out;
+    out.model = active.model;
+    out.dim = active.dim;
+    out.usableEmbeds = (db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM fact_embeddings fe
+      JOIN consolidated_facts cf ON cf.id = fe.fact_id
+      WHERE cf.active = 1
+        AND fe.model = ?
+        AND fe.dim = ?
+        AND fe.content_hash = cf.content_hash
+    `).get(active.model, active.dim) as { c: number }).c;
+    out.coverage = out.activeFacts > 0 ? out.usableEmbeds / out.activeFacts : 0;
+  } catch {
+    // Health reads must never throw; zeros are legible.
+  }
+  return out;
+}
+
 export function readEmbeddingStats(): EmbeddingStats {
   const stats: EmbeddingStats = {
     enabled: isEmbeddingsEnabled(),

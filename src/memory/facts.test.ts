@@ -33,6 +33,7 @@ const {
   reviewStandingInstructions,
   searchFacts,
   searchFactsByText,
+  searchFactsHybrid,
   setFactPinned,
   setTurnQueryVector,
   clearTurnQueryVector,
@@ -810,5 +811,73 @@ test('mergeParaphrases leaves the shared db connection usable', async () => {
   } finally {
     // Don't leak the flag to memory-merge.test.ts later in the single-process suite.
     if (prevMerge === undefined) delete process.env.CLEMMY_MERGE_ENABLED; else process.env.CLEMMY_MERGE_ENABLED = prevMerge;
+  }
+});
+
+test('searchFactsHybrid: RRF fusion — agreement across arms wins, the semantic arm is never shut out, FTS-only degrades cleanly (2026-07-31 audit)', async () => {
+  // Deterministic 2-dim embedding: axis 0 = "prospecting" concept, axis 1 = other.
+  const conceptVec = (text: string) => new Float32Array(
+    /prospect|outreach/i.test(text) ? [1, 0] : [0, 1],
+  );
+  _setEmbeddingProviderForTest({
+    name: 'test', model: 'test-fusion', dim: 2,
+    async embed(texts: string[]) { return texts.map(conceptVec); },
+  });
+  try {
+    // Both-arms fact: lexical token "prospecting" AND semantic concept.
+    const both = rememberFact({ kind: 'project', content: 'Weekly prospecting emails go through the outreach checklist.' });
+    // Lexical-only competitors that ALSO match the query token.
+    for (let i = 0; i < 4; i += 1) {
+      rememberFact({ kind: 'project', content: `prospecting archive folder ${i} holds old exports.` });
+    }
+    const { triggerEmbedBackfillForTests } = { triggerEmbedBackfillForTests: null };
+    void triggerEmbedBackfillForTests;
+    const { embedMissingFacts } = await import('./embeddings.js');
+    await embedMissingFacts(50);
+    const out = await searchFactsHybrid('prospecting outreach emails', 3);
+    assert.ok(out.length > 0, 'hybrid returns results');
+    assert.equal(out[0].id, both.id, 'the fact BOTH arms rank fuses to the top (old concat let any lexical hit outrank it)');
+  } finally {
+    _setEmbeddingProviderForTest(undefined);
+  }
+});
+
+test('searchFactsHybrid without embeddings degrades to pure FTS (additive contract intact)', async () => {
+  _setEmbeddingProviderForTest(null);
+  try {
+    const lex = rememberFact({ kind: 'project', content: 'hybridfusion lexical alpha entry one' });
+    const out = await searchFactsHybrid('hybridfusion lexical', 3);
+    assert.ok(out.some((f) => f.id === lex.id), 'FTS-only fallback still returns keyword hits');
+  } finally {
+    _setEmbeddingProviderForTest(undefined);
+  }
+});
+
+test('readLiveFactEmbeddingCoverage counts ONLY rows recall can use — a provider flip shows 0%, not the old fake 100% (2026-07-31 audit)', async () => {
+  const { readLiveFactEmbeddingCoverage, embedMissingFacts } = await import('./embeddings.js');
+  _setEmbeddingProviderForTest({
+    name: 'test', model: 'space-A', dim: 3,
+    async embed(texts: string[]) { return texts.map(() => new Float32Array([1, 0, 0])); },
+  });
+  try {
+    rememberFact({ kind: 'project', content: 'coverage-audit fact alpha for live-usable metric' });
+    rememberFact({ kind: 'project', content: 'coverage-audit fact beta for live-usable metric' });
+    await embedMissingFacts(200);
+    const healthy = readLiveFactEmbeddingCoverage();
+    assert.equal(healthy.model, 'space-A');
+    assert.ok(healthy.usableEmbeds >= 2, 'both active facts have usable vectors');
+    assert.ok(healthy.coverage > 0, 'healthy store reads > 0');
+
+    // Provider flips to a different space: every stored vector becomes
+    // unusable for recall — the metric must SAY SO (the old one said 100%).
+    _setEmbeddingProviderForTest({
+      name: 'test', model: 'space-B', dim: 5,
+      async embed(texts: string[]) { return texts.map(() => new Float32Array(5)); },
+    });
+    const flipped = readLiveFactEmbeddingCoverage();
+    assert.equal(flipped.usableEmbeds, 0, 'foreign-space rows never count');
+    assert.equal(flipped.coverage, 0, 'the catastrophic state is visible as 0%, never hidden as 100%');
+  } finally {
+    _setEmbeddingProviderForTest(undefined);
   }
 });

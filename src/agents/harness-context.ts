@@ -388,9 +388,17 @@ export function renderHarnessMemoryContext(opts?: {
 
   // Learned context (Recently Learned + Remembered Tool Choices) — shared with
   // the chat assembler via renderLearnedBlocks so both surfaces see the same
-  // learned tools/facts. Scoped to the active focus objective. Returns
-  // SECTION-wrapped strings, placed below at their existing positions.
-  const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(getActiveObjective());
+  // learned tools/facts. RANKING OBJECTIVE = current message BLENDED with the
+  // active focus (live 2026-07-31: this lane ranked by focus alone, so a
+  // Salesforce request with an unrelated focus never promoted the proven
+  // 19-success sf-CLI memo above the recency fold of 358 memos — the model
+  // went Composio-first against the owner's standing rule). The chat assembler
+  // already blends message+focus; the two lanes now rank identically.
+  const learnedObjective = [
+    opts?.query?.trim() || opts?.focusInput?.trim() || '',
+    getActiveObjective() ?? '',
+  ].filter(Boolean).join('\n') || undefined;
+  const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(learnedObjective);
   const rememberedToolChoices = opts?.includeRememberedToolChoices === false ? '' : toolChoices;
 
   // Source-map / landscape memory — a pointer-first index of WHERE the user's

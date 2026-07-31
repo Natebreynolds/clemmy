@@ -39,7 +39,7 @@ import {
 } from '../integrations/composio/client.js';
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid, getRecallStats } from '../memory/recall.js';
-import { readEmbeddingStats, getEmbeddingHealth } from '../memory/embeddings.js';
+import { readEmbeddingStats, readLiveFactEmbeddingCoverage, getEmbeddingHealth } from '../memory/embeddings.js';
 import { countActiveFacts, FACT_KINDS, forgetFact, getFact, getFactWithEvidence, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, supersedeFact, updateFact } from '../memory/facts.js';
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { readHygieneAudit } from '../memory/hygiene-audit.js';
@@ -3750,6 +3750,7 @@ export function registerConsoleRoutes(
         ...readEntityRelationshipHealth(),
       };
       const embStats = readEmbeddingStats();
+      const liveCoverage = readLiveFactEmbeddingCoverage();
       const embHealth = getEmbeddingHealth();
       const recallUsage = readRecallUsageHealth(30);
       const reflectionReplay = readReflectionReplayHealth();
@@ -3772,7 +3773,15 @@ export function registerConsoleRoutes(
           lastErrorClass: embHealth.lastErrorClass,
           model: embStats.model,
           dim: embStats.dim,
-          factCoverage: factsTotal > 0 ? factEmbeds / factsTotal : 0,
+          // HONEST coverage (2026-07-31 audit): active facts vs rows recall
+          // can actually use (active provider space + hash match). The old
+          // all-rows/all-facts ratio read "100%" even when a provider flip
+          // would leave recall with ZERO usable vectors.
+          factCoverage: liveCoverage.coverage,
+          factModel: liveCoverage.model,
+          factDim: liveCoverage.dim,
+          activeFacts: liveCoverage.activeFacts,
+          usableFactEmbeds: liveCoverage.usableEmbeds,
           vaultCoverage: chunks > 0 ? chunkEmbeds / chunks : 0,
           factEmbeds,
           chunkEmbeds,

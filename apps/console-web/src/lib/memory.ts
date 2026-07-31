@@ -5,6 +5,9 @@ export interface Fact {
   kind: 'user' | 'project' | 'feedback' | 'reference' | 'constraint';
   content: string;
   importance?: number | null;
+  /** Present when reflection derived this from a tool result (vs the user
+   *  stating it) — powers the told-vs-learned origin badge. */
+  derivedFrom?: { sessionId?: string | null; callId?: string | null; tool?: string | null } | null;
   updatedAt?: string;
   pinned?: boolean;
   active?: boolean;
