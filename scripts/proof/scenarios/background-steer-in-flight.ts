@@ -168,7 +168,8 @@ export const backgroundSteerInFlight: ScenarioDef = {
       },
       {
         name: 'revalidation work-product matches the active contract',
-        pass: /REVALIDATED/i.test(revalidationBatchText) && !/\bBASELINE\b/i.test(revalidationBatchText),
+        pass: /\|\s*REVALIDATED\s*\|/i.test(revalidationBatchText)
+          && !/\|\s*BASELINE\s*\|/i.test(revalidationBatchText),
         detail: revalidationBatchText.slice(0, 220),
       },
       {
