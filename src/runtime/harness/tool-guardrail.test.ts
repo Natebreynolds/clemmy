@@ -444,8 +444,11 @@ test('strand-hunt C: a fanout-refused READ slug re-hammered past hardStop NEVER 
   try {
     // DATAFORSEO_*_TASK_POST reads as a WRITE to the coarse composioSlugIsMutating
     // (POST token) but is a READ per the authoritative classifier — it must never
-    // be hard-killable. 6 distinct reads → the 6th is fanout-refused.
-    for (let i = 1; i <= 6; i += 1)
+    // be hard-killable. KEYWORD-shaped, so the refusal now lands on the 9th
+    // distinct read rather than the 6th: the query-shaped nudge sits at 6, and a
+    // refusal must always be preceded by an advisory (2026-07-31). What this
+    // test guards — no escalate, ever, for a read — is unchanged.
+    for (let i = 1; i <= 9; i += 1)
       evaluateToolCall('sess-sh-C', 'composio_execute_tool', { tool_slug: 'DATAFORSEO_SERP_GOOGLE_ORGANIC_TASK_POST', arguments: JSON.stringify({ keyword: `kw-${i}` }) });
     let last;
     for (let i = 0; i < 15; i += 1) // re-hammer the SAME call far past hardStopAt(12)
@@ -460,11 +463,11 @@ test('strand-hunt B: re-hammering a fanout-refused read keeps the program recove
   _resetAllTrackersForTests();
   process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
   try {
-    for (let i = 1; i <= 6; i += 1) // 6 distinct native-MCP reads → fanout-refused
+    for (let i = 1; i <= 9; i += 1) // 9 distinct KEYWORD-shaped reads → fanout-refused
       evaluateToolCall('sess-sh-B', 'dataforseo__serp_organic_live_advanced', { keyword: `k${i}` });
     let last;
     for (let i = 0; i < 5; i += 1) // re-hammer identical → exactCount hits block branch
-      last = applyMode(evaluateToolCall('sess-sh-B', 'dataforseo__serp_organic_live_advanced', { keyword: 'k6' }));
+      last = applyMode(evaluateToolCall('sess-sh-B', 'dataforseo__serp_organic_live_advanced', { keyword: 'k9' }));
     assert.equal(last?.rule, 'exact_args_repeat', 'the exact-repeat branch is what returns at this count');
     assert.ok(last?.fanoutBlock, 'but it STILL carries the fanout recovery (does not degrade to generic loop advice)');
     assert.match(last!.fanoutBlock!, /run_tool_program/);
@@ -517,7 +520,9 @@ test('fanoutBlock safety envelope: fires only on serial external reads, silent o
   try {
     // FIRES:
     assert.equal(lastFires('e1', seq(8, i => composio('OUTLOOK_LIST_MESSAGES', i))), true, 'serial same composio READ');
-    assert.equal(lastFires('e2', seq(8, i => ['dataforseo__serp_organic', { q: i }] as [string, unknown])), true, 'serial external-MCP READ');
+    // `q` is QUERY-shaped, so this row needs 9 distinct reads to be refused: the
+    // query-shaped advisory lands at 6 and the refusal follows it (2026-07-31).
+    assert.equal(lastFires('e2', seq(9, i => ['dataforseo__serp_organic', { q: i }] as [string, unknown])), true, 'serial external-MCP READ');
     // SILENT (must never false-fire on legitimate work):
     assert.equal(lastFires('e3', [composio('OUTLOOK_LIST_MESSAGES',0),composio('GMAIL_FETCH_EMAILS',0),composio('AIRTABLE_LIST_RECORDS',0),composio('SLACK_FETCH_HISTORY',0),composio('GOOGLEDRIVE_LIST_FILES',0),composio('GOOGLECALENDAR_LIST_EVENTS',0)]), false, '6 DIFFERENT reads — varied work');
     assert.equal(lastFires('e4', seq(10, () => composio('OUTLOOK_LIST_MESSAGES', 0))), false, 're-poll same id (identical args)');
@@ -1043,4 +1048,51 @@ test('the memo is derived from the slug verb, so a new provider is covered on ar
     evaluateToolCall('s-new2', 'composio_execute_tool', write, 'm1');
     assert.equal(evaluateToolCall('s-new2', 'composio_execute_tool', write, 'm2').cachedCallId, undefined);
   });
+});
+
+// ─── The fan-out advisory window ──────────────────────────────────
+
+/** Fire N distinct fan-out reads of one shape and report, per call, whether the
+ *  advisory and the refusal were attached. */
+function fanoutLadder(scope: string, slug: string, mkArgs: (i: number) => string, calls: number) {
+  const prevBlock = process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    _resetAllTrackersForTests();
+    const out: Array<{ nudge: boolean; block: boolean }> = [];
+    for (let i = 0; i < calls; i += 1) {
+      const d = evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: slug, arguments: mkArgs(i) }, `c${i}`);
+      out.push({ nudge: Boolean(d.fanoutNudge), block: Boolean(d.fanoutBlock) });
+    }
+    return out;
+  } finally {
+    if (prevBlock === undefined) delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+    else process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = prevBlock;
+  }
+}
+
+test('every fan-out shape gets an advisory window before it is refused', () => {
+  // Live report 2026-07-31: "our own fan-out guardrail refused legitimate
+  // per-item work, twice." It did — and the model had never been nudged once.
+  // The research exemption raised the QUERY-shaped nudge from 3 to 6 and landed
+  // it exactly on the block, so that shape went from silence straight to a hard
+  // STOP. Firecrawl searches are query-shaped, which is why per-firm enrichment
+  // hit it. A refusal must always be preceded by advice it could have acted on.
+  const query = fanoutLadder('s-fan-q', 'FIRECRAWL_SEARCH', (i) => JSON.stringify({ query: `boston firm ${i}` }), 10);
+  const firstNudge = query.findIndex((c) => c.nudge);
+  const firstBlock = query.findIndex((c) => c.block);
+  assert.ok(firstNudge >= 0, 'query-shaped fan-out must still be nudged');
+  assert.ok(firstBlock >= 0, 'query-shaped fan-out must still eventually be refused');
+  assert.ok(
+    firstBlock > firstNudge,
+    `the refusal must come AFTER the advisory (nudge@${firstNudge + 1}, block@${firstBlock + 1})`,
+  );
+});
+
+test('the id-shaped ladder is unchanged — nudge at 3, refusal at 6', () => {
+  // The clamp derives its gap from the configured pair, so the shape that was
+  // already correct must be byte-identical.
+  const ids = fanoutLadder('s-fan-id', 'AIRTABLE_GET_RECORD', (i) => JSON.stringify({ id: `rec${i}` }), 8);
+  assert.equal(ids.findIndex((c) => c.nudge), 2, 'nudge on the 3rd distinct id');
+  assert.equal(ids.findIndex((c) => c.block), 5, 'refusal on the 6th distinct id');
 });

@@ -876,14 +876,37 @@ export function evaluateToolCall(
     // had 6+ distinct entities; all 5 false-fires had ≤4. Gating on entities
     // keeps every real batch and drops every false-fire. Unknown tool shapes fall
     // back to full-args entities (== signatures), so they fire exactly as before.
+    //
+    // ADVISORY WINDOW INVARIANT (2026-07-31, from the live report "our own
+    // fan-out guardrail refused legitimate per-item work, twice"). A refusal
+    // must never be the FIRST thing the model hears — it has to be preceded by
+    // advisories it could have acted on. The exact-args ladder states that
+    // invariant explicitly and clamps for it; the fan-out ladder did not, and
+    // had silently lost it for one whole shape.
+    //
+    // The research exemption above raised the QUERY-shaped nudge from 3 to 6 so
+    // exploratory research would stop being told to spawn workers. That was
+    // right, but it moved the nudge onto the block: for query-shaped fan-out
+    // both fired on call SIX, so the advisory window was exactly zero calls
+    // wide. Id-shaped fan-out kept its three-call window (nudge 3, block 6);
+    // query-shaped went from silence straight to refusal. Firecrawl searches
+    // are query-shaped, which is why per-firm enrichment met a hard STOP having
+    // never been nudged once.
+    //
+    // So the block sits a fixed distance ABOVE whatever nudge threshold applies
+    // to THIS shape, preserving the same gap for every shape. Id-shaped is
+    // unchanged (3 → 6); query-shaped becomes 6 → 9. Env overrides keep their
+    // meaning: the gap is derived from the configured pair, not hardcoded.
+    const nudgeToBlockGap = Math.max(1, thresholds.fanoutBlockAt - thresholds.fanoutNudgeAt);
+    const effectiveBlockAt = Math.max(thresholds.fanoutBlockAt, at + nudgeToBlockGap);
     if (
       fanoutBlockEnabled()
       && codeModeRecoveryAvailable()
       && !dangerousWrite
-      && distinct >= thresholds.fanoutBlockAt
-      && distinctEntities >= thresholds.fanoutBlockAt
+      && distinct >= effectiveBlockAt
+      && distinctEntities >= effectiveBlockAt
     ) {
-      fanoutBlock = buildFanoutRecoveryMessage({ toolName, slug, args, distinct, fanoutBlockAt: thresholds.fanoutBlockAt });
+      fanoutBlock = buildFanoutRecoveryMessage({ toolName, slug, args, distinct, fanoutBlockAt: effectiveBlockAt });
     }
   }
 

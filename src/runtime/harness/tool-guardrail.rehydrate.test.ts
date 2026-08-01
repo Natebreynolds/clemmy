@@ -43,11 +43,14 @@ test('strand-hunt F: legacy persisted rows (no fanoutEntity) still arm the entit
   const sid = 'sess-rehydrate-F';
   createSession({ id: sid, kind: 'chat' });
 
-  // Simulate 6 distinct native-MCP reads persisted by an OLDER build: real
+  // Simulate 8 distinct native-MCP reads persisted by an OLDER build: real
   // fanoutKey + distinct signatures, but NO fanoutEntity field (the pre-upgrade
-  // shape). These are exactly what rehydrateFromSqlite reads back.
+  // shape). These are exactly what rehydrateFromSqlite reads back. Count follows
+  // the KEYWORD-shaped refusal threshold (9 as of 2026-07-31, so that a refusal
+  // is always preceded by an advisory); what this test guards is the entity
+  // gate surviving a restart, not the specific number.
   const fanoutKey = 'mcp::dataforseo__serp_organic_live_advanced';
-  const legacyRecent = Array.from({ length: 6 }, (_v, i) => ({
+  const legacyRecent = Array.from({ length: 8 }, (_v, i) => ({
     signature: `legacy-sig-${i}`,
     toolName: 'dataforseo__serp_organic_live_advanced',
     firstSeenMs: 1_000 + i,
@@ -59,8 +62,8 @@ test('strand-hunt F: legacy persisted rows (no fanoutEntity) still arm the entit
   // Drop any in-memory tracker so the next call rehydrates from sqlite.
   _simulateRestartForTests(sid);
 
-  // One fresh direct read of the SAME slug, block on. If the 6 legacy rows armed
-  // the entity gate (entity := signature fallback), we are at 7 distinct entities
+  // One fresh direct read of the SAME slug, block on. If the 8 legacy rows armed
+  // the entity gate (entity := signature fallback), we are at 9 distinct entities
   // → the block fires. Without the fallback the gate rehydrated empty → no block.
   process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
   try {

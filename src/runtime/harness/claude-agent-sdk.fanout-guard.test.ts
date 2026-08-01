@@ -15,20 +15,23 @@ import { _resetAllTrackersForTests } from './tool-guardrail.js';
 type Result = { behavior: string; message?: string };
 const allowBase = (async () => ({ behavior: 'allow' })) as never;
 
-test('SDK read-fanout guard: 6 distinct-entity native-MCP reads → 6th DENIED with the program recovery', async () => {
+test('SDK read-fanout guard: serial native-MCP reads are DENIED with the program recovery', async () => {
   _resetAllTrackersForTests();
   const guard = withReadFanoutGuard(allowBase, 'sess-sdk-fanout');
   const name = 'mcp__dataforseo__serp_organic_live_advanced'; // SDK qualified form
-  for (let i = 1; i <= 5; i += 1) {
+  // KEYWORD-shaped, so the refusal lands on the 9th distinct entity rather than
+  // the 6th: query-shaped fan-out is nudged at 6, and a refusal must always be
+  // preceded by an advisory the model could have acted on (2026-07-31).
+  for (let i = 1; i <= 8; i += 1) {
     const r = (await guard(name, { keyword: `kw-${i}` }, {} as never)) as Result;
     assert.equal(r.behavior, 'allow', `read #${i} (< threshold) allowed`);
   }
-  const r6 = (await guard(name, { keyword: 'kw-6' }, {} as never)) as Result;
-  assert.equal(r6.behavior, 'deny', '6th distinct entity → denied');
-  assert.match(r6.message ?? '', /run_tool_program/, 'the refusal steers to a program');
+  const refused = (await guard(name, { keyword: 'kw-9' }, {} as never)) as Result;
+  assert.equal(refused.behavior, 'deny', 'past threshold → denied');
+  assert.match(refused.message ?? '', /run_tool_program/, 'the refusal steers to a program');
   // The recovery names the tool WITHOUT the mcp__ prefix so code mode can dispatch it.
-  assert.match(r6.message ?? '', /dataforseo__serp_organic_live_advanced/);
-  assert.doesNotMatch(r6.message ?? '', /mcp__dataforseo/, 'the mcp__ prefix is stripped for the code-mode dispatch name');
+  assert.match(refused.message ?? '', /dataforseo__serp_organic_live_advanced/);
+  assert.doesNotMatch(refused.message ?? '', /mcp__dataforseo/, 'the mcp__ prefix is stripped for the code-mode dispatch name');
 });
 
 test('SDK read-fanout guard: local/clementine + composio tools are NOT registered here (brackets owns them)', async () => {
