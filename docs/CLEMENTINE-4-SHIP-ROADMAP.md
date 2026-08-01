@@ -1,6 +1,6 @@
 # Clementine 4: Parallel Ship Roadmap
 
-Status: local freeze candidate complete; controlled live canary pending
+Status: local freeze candidate and isolated Codex proof complete; controlled cloned-workflow canary pending
 Date: 2026-08-01
 Immediate objective: produce a strong live-canary candidate today without claiming the unfinished parts of Clementine 4
 
@@ -43,11 +43,13 @@ Current evidence:
 - Shadow graph/compiler/observer and hook suites pass in isolation; the compiler benchmark is about 0.21 ms per compile.
 - Typecheck and `git diff --check` are green.
 - Immutable clean-checkout M3 evidence for code candidate `282ecb60`: full corpus 8,266 pass / 0 fail / 2 environment/build-conditional skips; post-build conditional set 42/42; journeys 5/5; release assets 40/40; proof self-tests 53/53; unified report-back 7/7; tracked hygiene green; fresh-install smoke green after its desktop-build prerequisite; and all root/mobile/console/desktop builds green.
+- Stable-commit Codex proof on `3c6186c6`: all five critical scenarios passed 89/89 checks plus the exact-brain-served backstop; the 120-item endurance manifest passed 20/20 with 120/120 durable completions, 240 checkpoints, one terminal outcome, no narration leak, and no ledger anomaly. The proof used a disposable home and proof-local provider shims; it did not mutate a real connected account.
 
 Still missing for today’s final go/no-go:
 
 - Independent sanitization/provenance review of the landed demo fixture; a fixture hash alone does not prove structural equivalence to the private raw source.
 - A controlled live canary on a cloned workflow and selected chat surfaces.
+- Claude/both-brain parity proof if the release claim will include Claude; the completed stable-commit proof establishes the Codex lane only.
 
 The experimental standalone chat capability resolver/executor has been parked outside the candidate: no live chat path calls it, and carrying unused execution code would add an unsupported release surface. Today’s executable long-task guarantee is the connected workflow graph; chat turn graphs remain observation-only until a production caller, authority binding, terminal ownership, and parity gate land together.
 

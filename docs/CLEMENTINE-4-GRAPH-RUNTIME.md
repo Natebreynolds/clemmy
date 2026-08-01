@@ -1,6 +1,6 @@
 # Clementine 4 Graph Runtime
 
-Status: Horizon A implemented; Horizon B pilot 1 implemented behind explicit graph semantics and shadow observation; local candidate gates are green; clean-commit live proofs and a controlled canary remain
+Status: Horizon A implemented; Horizon B pilot 1 implemented behind explicit graph semantics and shadow observation; local candidate gates and isolated Codex proof are green; Claude parity and a controlled cloned-workflow canary remain
 Date: 2026-08-01
 
 ## Implementation checkpoint
@@ -20,7 +20,7 @@ Neither path adds an environment gate. Shadow chat compilation is observational.
 
 The experimental standalone chat capability resolver/fan-out executor is parked outside the candidate: no chat ingress calls it, and it does not yet bind production context, capability authority, verification, terminal ownership, or publication. Today, real fan-out/fan-in execution belongs to the authored workflow graph; chat graph compilation remains private observation.
 
-Local v3.6 candidate validation is green from an immutable clean checkout of code candidate `282ecb60`: the release-focused graph/demo/effect/sales gate passed 167/167; the full isolated repository corpus passed 8,266 with zero failures and two environment/build-conditional skips; and the conditional console/runner/daemon set passed 42/42 after builds. Journeys passed 5/5, public-hygiene tests passed 3/3, release-asset tests passed 40/40, unified report-back smoke passed 7/7, proof self-tests passed 53/53, fresh-install smoke passed after its desktop-build prerequisite, and daemon, mobile-web, console-web, and desktop builds completed. Live both-brain/provider proof and the controlled cloned-workflow canary are deliberately not inferred from unit tests.
+Local v3.6 candidate validation is green from an immutable clean checkout of code candidate `282ecb60`: the release-focused graph/demo/effect/sales gate passed 167/167; the full isolated repository corpus passed 8,266 with zero failures and two environment/build-conditional skips; and the conditional console/runner/daemon set passed 42/42 after builds. Journeys passed 5/5, public-hygiene tests passed 3/3, release-asset tests passed 40/40, unified report-back smoke passed 7/7, proof self-tests passed 53/53, fresh-install smoke passed after its desktop-build prerequisite, and daemon, mobile-web, console-web, and desktop builds completed. Stable-commit Codex proof on `3c6186c6` then passed all five critical scenarios (89/89 checks plus exact-brain-served) and the 120-item endurance manifest (20/20, 120/120 durable completions, one terminal, no narration leak). Those proofs used a disposable home and proof-local provider shims. Claude parity, private-fixture provenance, and the controlled cloned-workflow canary are deliberately not inferred from them.
 
 ## Demo failure diagnosis
 
