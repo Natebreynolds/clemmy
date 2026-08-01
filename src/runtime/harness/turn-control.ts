@@ -238,7 +238,7 @@ export function shouldOfferBackground(input: {
 // continuation controls. Persisting the typed result lets the tool boundary
 // enforce it; a model cannot bypass alignment by ignoring prompt prose.
 const REQUEST_ACTION =
-  '(send|post|publish|deploy|host|notify|email|message|draft|create|update|upload|submit|schedule|dispatch|delete|remove|commit|push|merge|migrate|import|export|sync|build|write|prepare|research|analy[sz]e|collect|pull|gather|design|make|generate|convert|turn|transform|put|save|fill|add)';
+  '(?:send|post|publish|deploy|host|notify|email|message|draft|create|update|upload|submit|schedule|dispatch|delete|remove|commit|push|merge|migrate|import|export|sync|build|write|prepare|research|analy[sz]e|collect|pull|gather|design|make|generate|convert|turn|transform|put|save|fill|add)';
 const REQUEST_ASSIST_PREFIX = '(?:(?:try|attempt)\\s+to\\s+|help\\s+me\\s+(?:to\\s+)?)?';
 const REQUESTED_ACTION_PATTERNS = [
   new RegExp(`^(?:please\\s+)?${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
@@ -272,11 +272,32 @@ const PRE_AUTHORIZED_RE =
  * message carried no action signal at all and fell through to the read-only
  * branch. Splitting on clause boundaries lets the SAME anchored patterns see
  * the ask, without loosening any of them.
+ *
+ * A COMMA-SEPARATED LIST OF IMPERATIVES is the same problem wearing different
+ * punctuation, and it hid the exact request this fix came from (live
+ * 2026-07-31): "find me 10 firms…, give me the keywords…, put them in a
+ * spreadsheet, and find the best contact info". Only the conjunctions split, so
+ * "put them in a spreadsheet" — an unambiguous external write — never began a
+ * clause, no anchored pattern could see it, and the whole message classified
+ * read-only. No beat fired, no destination was recorded, no mutation authority
+ * was taken. The unstated spreadsheet then surfaced at the END of the run as a
+ * reason to stop, because the beginning of the run never knew a write was asked
+ * for at all.
+ *
+ * Splitting at a comma before an action verb is safe by construction: it only
+ * gives the same `^`-anchored patterns more places to be tested, and cannot
+ * make a non-action clause match one.
  */
 export function requestClauses(text: string): string[] {
   return (text ?? '')
-    .split(/(?:[.!?;\n]+|,\s*(?=(?:so|then|and|but|now)\b)|(?=\b(?:let'?s|can\s+you|could\s+you|please\s+\w|we\s+(?:need|want|should|have)\b|i\s+(?:need|want)\b)))/i)
-    .map((clause) => clause.replace(/^\s*(?:so|then|and|but|now|okay|ok|also|actually)\b[,\s]*/i, '').trim())
+    .split(new RegExp(
+      `(?:[.!?;\\n]+`
+      + `|,\\s*(?=(?:so|then|and|but|now)\\b)`
+      + `|,\\s*(?:and\\s+|then\\s+)?(?=${REQUEST_ACTION}\\b)`
+      + `|(?=\\b(?:let'?s|can\\s+you|could\\s+you|please\\s+\\w|we\\s+(?:need|want|should|have)\\b|i\\s+(?:need|want)\\b)))`,
+      'i',
+    ))
+    .map((clause) => (clause ?? '').replace(/^\s*(?:so|then|and|but|now|okay|ok|also|actually)\b[,\s]*/i, '').trim())
     .filter((clause) => clause.length >= 6);
 }
 const EXTERNAL_ACTION_RE =
@@ -287,8 +308,6 @@ const CONFIRM_CONTROLS = new Set([
 ]);
 const READ_ONLY_LEAD_RE =
   /^(?:what|why|how|when|where|who|which|tell me|show me|check|look at|find|search|summarize|review|explain|compare|inspect|read|list|get)\b/i;
-const EXTERNAL_DESTINATION_RE =
-  /\b(?:google\s+(?:docs?|documents?|sheets?|drive)|netlify|vercel|railway|website|web\s*site|calendar|outlook|gmail|emails?|messages?|salesforce|crm|notion|slack|teams|github|pull request)\b/i;
 const NOUN_SHAPED_REQUEST_RE =
   /\b(?:google\s+(?:docs?|documents?|sheets?)|website|web\s*site|calendar\s+event|email\s+draft|pull request)\b[^.!?\n]{0,100}\b(?:would\s+be|would\s+help|sounds?|please|for\s+me|i(?:'d|\s+would)\s+like)\b/i;
 
@@ -300,6 +319,9 @@ export interface TurnPreflightDecision {
   phase: TurnPreflightPhase;
   consequential: boolean;
   destination?: string;
+  /** The destination KIND is known and the specific one is not — the beat has
+   *  to settle it now rather than let it surface as a mid-run stop. */
+  destinationInstanceUnstated?: boolean;
   /** Digest of the concrete user request that is waiting for confirmation. */
   intentKey?: string;
   /** On the acknowledgement turn, the exact pending intent being authorized. */
@@ -341,21 +363,31 @@ function intentKeyFor(message: string, destination: string | undefined): string 
     .slice(0, 20);
 }
 
+/**
+ * The ONE destination vocabulary. Both the mutation-authority keys
+ * (`allowedDestinations`) and the human-facing destination label read from
+ * here, so the two can never disagree about whether a word names a place.
+ *
+ * Every noun is PLURALIZED. They were singular-only, which meant "draft
+ * outbound emails" carried no email destination while "draft an email" did —
+ * an under-granted authority that only stayed invisible because a second,
+ * separate regex happened to cover the plural for the other consumer.
+ */
 const DESTINATION_RULES: ReadonlyArray<readonly [string, RegExp]> = [
-  ['google_docs', /\b(?:google\s*docs?|googledocs|google\s+document)\b/i],
-  ['google_sheets', /\b(?:google\s*sheets?|googlesheets|spreadsheet)\b/i],
+  ['google_docs', /\b(?:google\s*docs?|googledocs|google\s+documents?)\b/i],
+  ['google_sheets', /\b(?:google\s*sheets?|googlesheets|spreadsheets?)\b/i],
   ['google_drive', /\b(?:google\s*drive|gdrive)\b/i],
-  ['email', /\b(?:e-?mail|gmail|outlook|mail)\b/i],
-  ['calendar', /\b(?:calendar|meeting|event)\b/i],
-  ['website', /\b(?:website|web\s*site|netlify|vercel|railway|deploy|publish|host)\b/i],
-  ['github', /\b(?:github|pull\s*request|git\s+push|push\s+it)\b/i],
+  ['email', /\b(?:e-?mails?|gmail|outlook|mail)\b/i],
+  ['calendar', /\b(?:calendars?|meetings?|events?)\b/i],
+  ['website', /\b(?:web\s*sites?|netlify|vercel|railway|deploy|publish|host)\b/i],
+  ['github', /\b(?:github|pull\s*requests?|git\s+push|push\s+it)\b/i],
   ['slack', /\bslack\b/i],
   ['teams', /\b(?:microsoft\s+teams|teams)\b/i],
   ['notion', /\bnotion\b/i],
   ['crm', /\b(?:crm|salesforce|hubspot)\b/i],
-  ['messages', /\b(?:message|sms|text\s+message|discord)\b/i],
-  ['documents', /\b(?:document|\bdoc\b|word\s+file)\b/i],
-  ['local', /\b(?:local|workspace|repository|\brepo\b|source\s+file|codebase|filesystem)\b/i],
+  ['messages', /\b(?:messages?|sms|text\s+messages?|discord)\b/i],
+  ['documents', /\b(?:documents?|\bdocs?\b|word\s+files?)\b/i],
+  ['local', /\b(?:local|workspace|repository|\brepo\b|source\s+files?|codebase|filesystem)\b/i],
   ['memory', /\b(?:memory|remember|profile)\b/i],
 ];
 
@@ -433,6 +465,64 @@ function hasExplicitValidationBlocker(text: string): boolean {
     /\b(?:email|e-mail|field|value|data|row|record|address|phone|url|id)\b\s*(?::|—|-|=|\bis\b)?\s*\b(?:missing|blank|unknown|null|not\s+provided|tbd)\b/i.test(concreteData)
     || /\b(?:missing|blank|unknown|null|not\s+provided|tbd)\b\s+(?:email|e-mail|field|value|data|row|record|address|phone|url|id)\b/i.test(concreteData)
   );
+}
+
+/**
+ * An unstated DESTINATION INSTANCE — the request names a kind of place to write
+ * ("put them in a spreadsheet", "add these to the CRM") but not WHICH one.
+ *
+ * This is the single most common way a request that is otherwise perfectly clear
+ * turns into nothing. Live 2026-07-31: a finished ten-firm scrape ended with "I
+ * didn't write to a base I didn't know I should" — the whole deliverable
+ * abandoned over a detail the user would have settled in four words, discovered
+ * at the END of the work instead of the beginning.
+ *
+ * An unknown destination is not a reason to stop. It is a thing to confirm, and
+ * the beat is where confirming belongs: before the work, in the same breath as
+ * "here's how I'm reading this", at a moment when the answer costs nothing. Ask
+ * it afterwards and the user has paid for the run and received none of it.
+ *
+ * Detection is deliberately generous, because the cost of a false positive is
+ * one extra clause in a sentence the model was already writing, while the cost
+ * of a false negative is an abandoned deliverable. Any concrete anchor counts as
+ * stated: a link, a quoted or explicitly-named target, an instruction to make a
+ * new one, or a possessive reference to a specific known thing.
+ */
+const DESTINATION_INSTANCE_ANCHOR_RE = new RegExp([
+  // A link pins it exactly.
+  'https?://\\S+',
+  // A quoted or explicitly-named target: the "Prospects" base, a sheet called X.
+  '["“‘\'][^"”’\']{2,60}["”’\']',
+  '\\b(?:named|called|titled|labelled|labeled|id|ID)\\b\\s*[:=]?\\s*\\S+',
+  // "a new spreadsheet" / "create a new base" — creating one IS the decision.
+  '\\bnew\\b',
+  // A reference to one specific existing thing the user has in mind.
+  '\\b(?:the\\s+same|same\\s+one|as\\s+(?:last|before)|existing|usual|current)\\b',
+].join('|'), 'i');
+
+export function destinationInstanceUnstated(text: string, destination: string | undefined): boolean {
+  if (!destination) return false;
+  // Destinations that are singular by nature have no "which one" to settle:
+  // there is one local filesystem, one memory, one connected calendar/mailbox
+  // until the user says otherwise. Asking there is ceremony, not alignment.
+  if (SINGULAR_DESTINATIONS.has(destination)) return false;
+  return !DESTINATION_INSTANCE_ANCHOR_RE.test(text ?? '');
+}
+
+const SINGULAR_DESTINATIONS: ReadonlySet<string> = new Set([
+  'local', 'memory', 'calendar', 'email', 'messages',
+]);
+
+/** The extra beat line for a request whose destination kind is clear and whose
+ *  destination INSTANCE is not. Names the shape of the answer wanted — a
+ *  proposal to correct, never an open question — so the beat stays one sentence
+ *  and the user can say "yes" instead of doing the choosing. */
+export function unstatedDestinationBeatLine(destination: string): string {
+  return `[destination] The request says WHERE-kind (${destination.replace(/_/g, ' ')}) but not WHICH one. `
+    + 'Name the specific destination you intend to use — an existing one you can see, or a new one you will create and what you will call it — '
+    + 'as part of your beat, phrased as the choice you are making so they need only correct it. '
+    + 'Do NOT start the work planning to settle this later: an unknown destination discovered at the END means the work is done and undelivered. '
+    + 'If you cannot see any candidate, say what you will create instead — never treat not knowing as a reason to stop.';
 }
 
 function mutationAuthorityForObjective(
@@ -563,8 +653,31 @@ function pendingAlignmentForCurrentInput(
   }
 }
 
+/**
+ * Destinations that live inside this machine. Writing to them is real work, but
+ * it is not the kind of write that needs the user to confirm WHERE first —
+ * there is one filesystem and one memory.
+ */
+const NON_EXTERNAL_DESTINATION_KEYS: ReadonlySet<string> = new Set(['local', 'memory', 'documents']);
+
+/**
+ * The external destination named in a request, as the user's own words.
+ *
+ * Derived from DESTINATION_RULES — the SAME vocabulary that already decides
+ * `allowedDestinations` — rather than from a second, narrower list. Two lists
+ * for one question is how "put them in a spreadsheet" ended up carrying a
+ * google_sheets authority key while reporting NO destination: the authority
+ * vocabulary knew the word and the destination vocabulary did not (live
+ * 2026-07-31). Whether a destination is external is now a property of its key,
+ * not of a duplicate regex that can drift away from it.
+ */
 function destinationFromText(text: string): string | undefined {
-  return text.match(EXTERNAL_DESTINATION_RE)?.[0]?.replace(/\s+/g, ' ').trim();
+  for (const [key, pattern] of DESTINATION_RULES) {
+    if (NON_EXTERNAL_DESTINATION_KEYS.has(key)) continue;
+    const match = text.match(pattern);
+    if (match?.[0]) return match[0].replace(/\s+/g, ' ').trim();
+  }
+  return undefined;
 }
 
 /** Pure, typed preflight decision. Regexes contribute grammatical evidence;
@@ -644,19 +757,25 @@ export function classifyTurnPreflight(input: {
   if (multiItemAction) {
     return {
       phase: 'align', consequential: true, destination, objective: text,
-      intentKey: intentKeyFor(text, destination), ...authority, reason: 'multi_item_action',
+      intentKey: intentKeyFor(text, destination), ...authority,
+      destinationInstanceUnstated: destinationInstanceUnstated(signalText, destination),
+      reason: 'multi_item_action',
     };
   }
   if (externalAction) {
     return {
       phase: 'align', consequential: true, destination, objective: text,
-      intentKey: intentKeyFor(text, destination), ...authority, reason: 'external_action',
+      intentKey: intentKeyFor(text, destination), ...authority,
+      destinationInstanceUnstated: destinationInstanceUnstated(signalText, destination),
+      reason: 'external_action',
     };
   }
   if (nounShapedArtifactRequest) {
     return {
       phase: 'align', consequential: true, destination, objective: text,
-      intentKey: intentKeyFor(text, destination), ...authority, reason: 'noun_shaped_artifact_request',
+      intentKey: intentKeyFor(text, destination), ...authority,
+      destinationInstanceUnstated: destinationInstanceUnstated(signalText, destination),
+      reason: 'noun_shaped_artifact_request',
     };
   }
   return { phase: 'execute', consequential: false, destination, reason: 'ordinary_execution' };
@@ -766,9 +885,12 @@ export function confirmBeatDirective(input: {
   sourceUserSeq?: number;
 }): string | null {
   try {
-    return classifyTurnPreflight(input).phase === 'align'
-      ? standardAwareBeatText(input.message)
-      : null;
+    const decision = classifyTurnPreflight(input);
+    if (decision.phase !== 'align') return null;
+    const beat = standardAwareBeatText(input.message);
+    return decision.destinationInstanceUnstated && decision.destination
+      ? `${beat}\n${unstatedDestinationBeatLine(decision.destination)}`
+      : beat;
   } catch { return null; }
 }
 

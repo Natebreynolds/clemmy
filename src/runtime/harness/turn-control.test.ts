@@ -32,6 +32,8 @@ const {
   closeTheLoopNudge,
   CONFIRM_BEAT_TEXT,
   confirmBeatDirective,
+  destinationInstanceUnstated,
+  unstatedDestinationBeatLine,
   confirmBeatEnabled,
   setProvenStandardLineForTest,
   effectiveTurnObjective,
@@ -643,4 +645,52 @@ test('the beat asks for a conversation, never a plan card', () => {
   assert.match(CONFIRM_BEAT_TEXT, /without asking again/i, 'approve once, then run — never per-step approvals');
   assert.doesNotMatch(CONFIRM_BEAT_TEXT, /2–3 lines|bulleted proposal is fine|checklist of steps/i);
   assert.match(CONFIRM_BEAT_TEXT, /Do NOT produce a plan summary/i, 'the plan-card shape is explicitly refused');
+});
+
+test('an unstated destination is settled in the beat, not discovered mid-run', () => {
+  // Live 2026-07-31: a finished ten-firm scrape ended "I didn't write to a base
+  // I didn't know I should" — the deliverable abandoned over a detail the user
+  // would have settled in four words, asked at the END instead of the start.
+  const chat = freshSession('chat');
+  const beat = confirmBeatDirective({
+    message: 'find me 10 Boston personal injury firms on page 2, give me the keywords and gaps keeping them off page 1, put them in a spreadsheet, and find the best contact info so I can prospect them',
+    sessionId: chat,
+    sessionKind: 'chat',
+  });
+  assert.ok(beat, 'a write-shaped multi-part request earns a beat');
+  assert.match(beat, /\[destination\]/, 'the beat must carry the which-one question');
+  assert.match(beat, /never treat not knowing as a reason to stop/i);
+});
+
+test('destinationInstanceUnstated: a named target is not an open question', () => {
+  // Any concrete anchor settles it — a link, a name, or an instruction to make
+  // a new one. Creating one IS the decision.
+  const cases: Array<[string, string, boolean]> = [
+    ['put them in a spreadsheet', 'google_sheets', true],
+    ['add these to the CRM', 'crm', true],
+    ['put them in the "Prospects" base', 'crm', false],
+    ['put them in a new spreadsheet', 'google_sheets', false],
+    ['append to https://docs.google.com/spreadsheets/d/abc', 'google_sheets', false],
+    ['add them to the sheet called Q3 Pipeline', 'google_sheets', false],
+    ['put them in the same spreadsheet as last time', 'google_sheets', false],
+  ];
+  for (const [text, destination, expected] of cases) {
+    assert.equal(
+      destinationInstanceUnstated(text, destination),
+      expected,
+      `${JSON.stringify(text)} → expected unstated=${expected}`,
+    );
+  }
+  // Singular-by-nature destinations have no "which one" to settle; asking there
+  // is ceremony, not alignment.
+  assert.equal(destinationInstanceUnstated('put it on my calendar', 'calendar'), false);
+  assert.equal(destinationInstanceUnstated('save it locally', 'local'), false);
+  assert.equal(destinationInstanceUnstated('anything at all', undefined), false);
+});
+
+test('the destination line proposes a choice rather than opening a question', () => {
+  const line = unstatedDestinationBeatLine('google_sheets');
+  assert.match(line, /google sheets/, 'the underscore key must not leak into the prompt');
+  assert.match(line, /phrased as the choice you are making/i, 'a proposal to correct, not an open question');
+  assert.match(line, /never treat not knowing as a reason to stop/i, 'the whole point of the fix');
 });
