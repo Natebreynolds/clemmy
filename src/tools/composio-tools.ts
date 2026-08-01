@@ -1,3 +1,4 @@
+import { readHarnessCapabilityHealth, recordHarnessCapabilityHealth } from '../runtime/harness/capability-health.js';
 import { createHash } from 'node:crypto';
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -59,7 +60,6 @@ import { cachedIdentityEmail, identityProbeAttempted, recordIdentityProbe } from
 import { validateComposioArgs, formatBatchValidationError, applyEmailRecipientAliases } from './composio-batch-validator.js';
 import { rememberToolSchema, getCachedToolSchema } from './composio-schema-cache.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
-import { sessionHasBackgroundOffer } from '../runtime/harness/convergence-steer.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import { composioSlugIsReadOnly } from '../integrations/composio/slug-effect.js';
 import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
@@ -607,7 +607,56 @@ function reconnectBreakerEnabled(): boolean {
 function reconnectBreakerKey(sid: string, toolSlug: string): string {
   return `${sid}::${registeredToolkitOfSlug(toolSlug)}`;
 }
+/**
+ * The provider half of a gateway slug: AIRTABLE_CREATE_RECORDS → "airtable".
+ * Derived, never listed, so a provider connected tomorrow is covered on arrival.
+ */
+function providerOfSlug(toolSlug: string): string {
+  return (toolSlug.split('_')[0] ?? '').trim().toLowerCase();
+}
+
+/**
+ * Mirror a connection's health into the DURABLE capability registry.
+ *
+ * The breaker below already knows exactly which toolkit is broken and when it
+ * recovers — and then throws that away: it is in-memory, per-session, and
+ * TTL'd. Nothing outside the failing turn ever learns. Measured on this machine
+ * (2026-08-01), the capability registry held exactly ONE record,
+ * `claude_sdk_local_mcp_surface`, because the only two callers of
+ * recordHarnessCapabilityHealth both watch the brain's own MCP surface. No
+ * provider, connection, or account state had ever been written.
+ *
+ * That is why a plan could promise "read-only via the Salesforce CLI" while the
+ * saved login was expired, and die on it mid-run eight minutes later. The story
+ * was never "the harness knew and did not say" — for providers, the harness did
+ * not know either. Every consumer of capability health was reading an empty
+ * table and correctly reporting nothing wrong.
+ *
+ * Only STATE CHANGES are written. recordHarnessCapabilityHealth persists on
+ * every call and the success path here runs on every gateway hit, so recording
+ * unconditionally would put a file write in the hot path. A transition is also
+ * the honest unit: health is a state machine, not a counter.
+ */
+function noteProviderHealth(toolSlug: string, state: 'healthy' | 'unavailable', reason?: string): void {
+  try {
+    const provider = providerOfSlug(toolSlug);
+    if (!provider) return;
+    if (readHarnessCapabilityHealth(provider)?.state === state) return;
+    recordHarnessCapabilityHealth({
+      id: provider,
+      state,
+      summary: state === 'healthy'
+        ? `${provider} is connected and answering`
+        : `${provider} needs reconnecting`,
+      reason: reason ?? null,
+    });
+  } catch { /* health telemetry must never break a tool call */ }
+}
+
 function recordReconnectBreaker(sid: string | undefined, toolSlug: string): void {
+  // Durable first, and independent of the session: a connection is broken for
+  // everything, not just for the turn that happened to discover it.
+  noteProviderHealth(toolSlug, 'unavailable', 'a gateway call returned a reconnect-required error');
   if (!sid) return;
   reconnectBreakerBySession.set(reconnectBreakerKey(sid, toolSlug), Date.now());
   if (reconnectBreakerBySession.size > 500) reconnectBreakerBySession.clear(); // crude bound
@@ -620,6 +669,9 @@ function reconnectBreakerTripped(sid: string | undefined, toolSlug: string): boo
   return true;
 }
 function clearReconnectBreaker(sid: string | undefined, toolSlug: string): void {
+  // A successful call is the only honest proof a connection recovered, so the
+  // registry clears from the same evidence the breaker does.
+  noteProviderHealth(toolSlug, 'healthy');
   if (sid) reconnectBreakerBySession.delete(reconnectBreakerKey(sid, toolSlug));
 }
 
@@ -976,29 +1028,14 @@ function latestUserInputForContext(context: unknown): string {
   }
 }
 
-function backgroundOfferSuppressedForContext(context: unknown): boolean {
-  const outer = context && typeof context === 'object' ? context as Record<string, unknown> : undefined;
-  const inner = outer?.context && typeof outer.context === 'object'
-    ? outer.context as Record<string, unknown>
-    : undefined;
-  const sessionId = sessionIdFromRunContext(context);
-  return outer?.suppressBackgroundOffer === true
-    || inner?.suppressBackgroundOffer === true
-    || harnessRunContextStorage.getStore()?.suppressBackgroundOffer === true
-    || sessionHasBackgroundOffer(sessionId);
-}
-
-/** Keep the default long-job guidance byte-identical, but do not create a
- * second conversational gate while executing the answer to a clarification. */
+/** A receipt is already accepted work. Keep it moving under the authority that
+ * started it instead of manufacturing a foreground/background permission beat. */
 export function formatComposioBudgetExceededOutput(
   receipt: JobReceipt,
   output: string,
-  context?: unknown,
+  _context?: unknown,
 ): string {
-  if (!backgroundOfferSuppressedForContext(context)) {
-    return `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Prefer handing it to the background (ask the user, then dispatch_background_task) so it finishes and reports back on its own — do NOT sit here firing back-to-back polls.\n\n${output}`;
-  }
-  return `${asyncReceiptBanner(receipt)}\n\nThis is the existing LONG-running job from the direction the user just clarified. Continue from this receipt and its job id; do not add another background-choice gate, do not restart or re-invoke the job, and do not fire back-to-back polls.\n\n${output}`;
+  return `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Continue autonomously from this receipt and its job id under the user's existing authority: either follow its polling guidance at a sensible cadence, or dispatch_background_task to monitor/finish it and report back here. Do not ask the user to choose a lane or stop for routing permission; do not restart or re-invoke the job, and do not fire back-to-back polls.\n\n${output}`;
 }
 
 function suppressComposioConnectionAfterHardFailure(connectionId: string | undefined, err: unknown): string {
