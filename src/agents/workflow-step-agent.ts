@@ -311,16 +311,37 @@ function buildGraphContextQueryTool(
   return tool({
     name: 'workspace_artifact_query',
     description: 'Query exact JSON/JSONL rows from this workflow run workspace only. Use the path supplied in STEP CONTEXT when an upstream value is offloaded.',
+    // The numeric bounds that used to live here (offset>=0, limit<=200,
+    // max_chars<=50_000) were the defect. queryWorkspaceArtifact ALREADY clamps
+    // all three into its own safe ranges, and its paged reply states the next
+    // offset, so re-declaring them bought no safety — it only converted a
+    // clampable overshoot into a hard schema rejection. Validation runs before
+    // execute, so the caller got back the SDK's field-less "Invalid JSON input
+    // for tool", naming neither the offending field nor the bound. A model told
+    // the artifact holds 514 rows naturally asks for 514, cannot learn what was
+    // wrong, and retries the same shape until the node blocks.
+    //
+    // That matters more here than anywhere else: this is the node's ONLY read
+    // tool. The compiler offloads large upstream values into a run-workspace
+    // artifact nothing else can reach, so a graph that offloads MUST grant a
+    // tool surface able to fetch what it offloaded. Bounds belong in the
+    // executor, which can clamp and explain; the schema's job is to let a
+    // well-formed call through.
+    //
+    // `.nullish()` is defence in depth, not part of the fix: this SDK strips
+    // nulls before validation today, but the strict function-calling convention
+    // does emit `null` for unused properties, and `.nullish()` is already the
+    // idiom the sibling SDK-native schemas use (orchestrator.ts).
     parameters: z.object({
       path: z.string().min(1),
-      json_path: z.string().optional(),
-      fields: z.array(z.string()).optional(),
-      filter_field: z.string().optional(),
-      filter_contains: z.string().optional(),
-      filter_equals: z.string().optional(),
-      offset: z.number().int().min(0).optional(),
-      limit: z.number().int().min(1).max(200).optional(),
-      max_chars: z.number().int().min(100).max(50_000).optional(),
+      json_path: z.string().nullish(),
+      fields: z.array(z.string()).nullish(),
+      filter_field: z.string().nullish(),
+      filter_contains: z.string().nullish(),
+      filter_equals: z.string().nullish(),
+      offset: z.number().int().nullish(),
+      limit: z.number().int().nullish(),
+      max_chars: z.number().int().nullish(),
     }),
     execute: async (input) => {
       try {
@@ -336,7 +357,20 @@ function buildGraphContextQueryTool(
         if (!allowedRelativePaths.has(workspaceRelative)) {
           return 'Refused: this artifact is not owned by a completed event in the active workflow run.';
         }
-        const result = queryWorkspaceArtifact({ ...input, path: resolved });
+        // `null` means "not supplied" on the wire; the query helper reads these
+        // as absent-or-value, so collapse null to undefined at the boundary.
+        const absent = <T>(value: T | null | undefined): T | undefined => value ?? undefined;
+        const result = queryWorkspaceArtifact({
+          path: resolved,
+          json_path: absent(input.json_path),
+          fields: absent(input.fields),
+          filter_field: absent(input.filter_field),
+          filter_contains: absent(input.filter_contains),
+          filter_equals: absent(input.filter_equals),
+          offset: absent(input.offset),
+          limit: absent(input.limit),
+          max_chars: absent(input.max_chars),
+        });
         return result.length <= 50_000
           ? result
           : `${result.slice(0, 50_000)}\n...[clipped; narrow the query or increase offset]`;
