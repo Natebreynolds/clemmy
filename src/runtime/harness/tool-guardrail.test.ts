@@ -668,17 +668,24 @@ test('FIX 2: flag OFF (default) never sets cachedCallId', () => {
   assert.equal(d2.cachedCallId, undefined, 'no nudge when the feature is off (default)');
 });
 
-test('FIX 2: external-mutable reads + pollers are NOT cached (allowlist polarity)', () => {
+test('FIX 2: gateway WRITES + pollers are NOT cached (allowlist polarity)', () => {
   withRecallNudge(() => {
-    // composio read (AIRTABLE_LIST_RECORDS): idempotent, but an external actor
-    // can change the rows between calls — never serve a cached copy.
+    // POLARITY CHANGED 2026-07-31. This previously asserted that composio reads
+    // are never memoized, on the grounds that an external actor could change
+    // the rows between calls. That reasoning over-applied: the nudge never
+    // serves a payload — it names the prior call so the model can choose to
+    // recall it — so it cannot serve stale data, only point at an answer
+    // already in hand. Meanwhile the exclusion had a measured cost: in the live
+    // log one session ran an identical calendar-window read 13 times, and a
+    // `find_or_create_tracker` step re-read one spreadsheet's info 4 times,
+    // with nothing to tell it so. A gateway WRITE is still never memoized.
     _resetAllTrackersForTests();
-    const a = { tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: '{"view":"v"}' };
-    evaluateToolCall('s-ext', 'composio_execute_tool', a, 'c1');
+    const w = { tool_slug: 'AIRTABLE_CREATE_RECORDS', arguments: '{"records":[]}' };
+    evaluateToolCall('s-ext-w', 'composio_execute_tool', w, 'w1');
     assert.equal(
-      evaluateToolCall('s-ext', 'composio_execute_tool', a, 'c2').cachedCallId,
+      evaluateToolCall('s-ext-w', 'composio_execute_tool', w, 'w2').cachedCallId,
       undefined,
-      'composio reads are never cached (external-mutable)',
+      'a gateway write is never memoized — repeating it is a duplicate, not a re-read',
     );
     // a poller — re-reading an async status is the whole point.
     _resetAllTrackersForTests();
@@ -984,4 +991,56 @@ test('identical-args READ repeats with changing results are a poll, not a loop',
     noteGuardrailToolResult(scope, 'composio_execute_tool', stuckArgs, '{"error":"not found"}');
   }
   assert.equal(sawAdvisory, true, 'identical results still draw the loop advisory');
+});
+
+// ─── Resolve once, remember for the session ───────────────────────
+
+test('a repeated gateway READ points back at the answer already in hand', () => {
+  withRecallNudge(() => {
+    // Live 2026-07-31: a `find_or_create_tracker` workflow step read the SAME
+    // spreadsheet's info four times, and a mobile session ran one identical
+    // calendar-window read thirteen times. Neither tripped anything.
+    _resetAllTrackersForTests();
+    const read = { tool_slug: 'GOOGLESHEETS_GET_SPREADSHEET_INFO', arguments: '{"spreadsheet_id":"1J2_1Y4sQpyVN20"}' };
+    evaluateToolCall('s-resolve', 'composio_execute_tool', read, 'r1');
+    const second = evaluateToolCall('s-resolve', 'composio_execute_tool', read, 'r2');
+    assert.equal(second.cachedCallId, 'r1', 'the second identical read knows about the first');
+    assert.equal(
+      second.cachedLabel,
+      'GOOGLESHEETS_GET_SPREADSHEET_INFO',
+      'the memo names the SLUG, not the opaque wrapper the user never typed',
+    );
+  });
+});
+
+test('a write between two identical gateway reads invalidates the memo', () => {
+  withRecallNudge(() => {
+    // We cannot know which provider a write touched, so any write at all drops
+    // the memo. Under-nudging is the correct failure direction.
+    _resetAllTrackersForTests();
+    const read = { tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: '{"view":"v"}' };
+    evaluateToolCall('s-inval', 'composio_execute_tool', read, 'r1');
+    evaluateToolCall('s-inval', 'composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_RECORDS', arguments: '{"records":[1]}' }, 'w1');
+    assert.equal(
+      evaluateToolCall('s-inval', 'composio_execute_tool', read, 'r2').cachedCallId,
+      undefined,
+      'the rows may have changed — say nothing rather than point at a stale answer',
+    );
+  });
+});
+
+test('the memo is derived from the slug verb, so a new provider is covered on arrival', () => {
+  withRecallNudge(() => {
+    // No provider list to update: a slug with no affirmative write verb is a
+    // read, whoever the provider is.
+    _resetAllTrackersForTests();
+    const read = { tool_slug: 'SOMENEWPROVIDER_GET_WORKSPACE_INFO', arguments: '{"id":"x"}' };
+    evaluateToolCall('s-new', 'composio_execute_tool', read, 'n1');
+    assert.equal(evaluateToolCall('s-new', 'composio_execute_tool', read, 'n2').cachedCallId, 'n1');
+
+    _resetAllTrackersForTests();
+    const write = { tool_slug: 'SOMENEWPROVIDER_SEND_INVITE', arguments: '{"id":"x"}' };
+    evaluateToolCall('s-new2', 'composio_execute_tool', write, 'm1');
+    assert.equal(evaluateToolCall('s-new2', 'composio_execute_tool', write, 'm2').cachedCallId, undefined);
+  });
 });

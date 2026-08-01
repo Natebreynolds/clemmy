@@ -451,6 +451,10 @@ export interface GuardrailDecision {
   rule: 'exact_args_repeat' | 'same_mut_tool_repeat' | 'allowed';
   /** Current count for the matched signature/tool. */
   count: number;
+  /** What to CALL the repeated call in the memo — the gateway slug when there
+   *  is one, so the nudge names AIRTABLE_LIST_RECORDS rather than the opaque
+   *  wrapper the user never typed. */
+  cachedLabel?: string;
   /** True when the user's open plan scope / standing grant covers THIS call
    *  (isAutoApprovedByScope, send-lock included) — an approved batch of
    *  distinct writes is deliberate work, not a runaway, so the enforced
@@ -891,13 +895,36 @@ export function evaluateToolCall(
   // reads and pollers out by construction; the nudge never serves a payload, so
   // it can't serve stale data. The serve-side (brackets.ts) additionally drops
   // it inside worker scope and when the prior output was error-shaped.
+  //
+  // RESOLVE ONCE (2026-07-31): the same memory now covers gateway READS, which
+  // the static allowlist could never reach because composio slugs are not
+  // registry members. The live log shows why that mattered — inside one session
+  // an identical calendar-window read ran 13 times, and a workflow step named
+  // `find_or_create_tracker` re-read the SAME spreadsheet's info 4 times. None
+  // of it tripped anything: the repeat ladder stands down for reads whose
+  // results differ between calls, and these differ in a byte or two every time.
+  // So the loop was invisible, and the only cost signal was minutes of wall
+  // clock (and, for a billed provider, the bill).
+  //
+  // Eligibility is derived, not listed: a gateway call whose slug carries no
+  // affirmative write verb is a read. Invalidation is deliberately blunt — ANY
+  // mutating call since the prior identical read drops the memo, because we
+  // cannot know which provider it touched. Under-nudging is the correct failure
+  // direction; the nudge never serves a payload, so it can never serve stale
+  // data, only point at an answer already in hand.
   let cachedCallId: string | undefined;
   let cachedAgeMs: number | undefined;
-  if (readNudgeEnabled() && CACHE_SAFE_READS.has(toolName)) {
+  let cachedLabel: string | undefined;
+  const gatewayRead = isGatewayReadCall(toolName, args);
+  if (readNudgeEnabled() && (CACHE_SAFE_READS.has(toolName) || gatewayRead)) {
     const prior = priorIdenticalCall(tracker, signature);
-    if (prior?.callId && !mutatedSince(tracker, toolName, signature)) {
+    const invalidated = gatewayRead
+      ? anyMutatingCallSincePriorIdentical(tracker, signature)
+      : mutatedSince(tracker, toolName, signature);
+    if (prior?.callId && !invalidated) {
       cachedCallId = prior.callId;
       cachedAgeMs = Math.max(0, Date.now() - prior.firstSeenMs);
+      cachedLabel = slug ?? toolName;
     }
   }
 
@@ -963,7 +990,7 @@ export function evaluateToolCall(
       effect: classified.effect,
       dangerousWrite,
       ...(fanoutNudge ? { fanoutNudge } : {}),
-      ...(cachedCallId ? { cachedCallId, cachedAgeMs } : {}),
+      ...(cachedCallId ? { cachedCallId, cachedAgeMs, cachedLabel } : {}),
     };
   }
   if (exactCount >= thresholds.exactArgsBlockAt) {
@@ -1000,7 +1027,7 @@ export function evaluateToolCall(
       dangerousWrite,
       ...(fanoutNudge ? { fanoutNudge } : {}),
       ...(fanoutBlock ? { fanoutBlock } : {}),
-      ...(cachedCallId ? { cachedCallId, cachedAgeMs } : {}),
+      ...(cachedCallId ? { cachedCallId, cachedAgeMs, cachedLabel } : {}),
     };
   }
 
@@ -1068,7 +1095,7 @@ export function evaluateToolCall(
     dangerousWrite,
     ...(fanoutNudge ? { fanoutNudge } : {}),
     ...(fanoutBlock ? { fanoutBlock } : {}),
-    ...(cachedCallId ? { cachedCallId, cachedAgeMs } : {}),
+    ...(cachedCallId ? { cachedCallId, cachedAgeMs, cachedLabel } : {}),
   };
 }
 
@@ -1086,6 +1113,47 @@ function priorIdenticalCall(tracker: SessionTrackerState, signature: string): Tr
     }
   }
   return undefined;
+}
+
+/**
+ * A gateway call that only READS — eligible for the resolve-once memo. Derived
+ * from the slug's own verb (the same affirmative-write-verb test the poll
+ * exemption uses), never from a list of provider slugs, so a newly connected
+ * provider is covered the day it arrives.
+ */
+export function isGatewayReadCall(toolName: string, args: unknown): boolean {
+  if (toolName !== 'composio_execute_tool') return false;
+  try {
+    const a = args as { tool_slug?: unknown; toolSlug?: unknown } | null;
+    const slug = typeof a?.tool_slug === 'string' ? a.tool_slug
+      : typeof a?.toolSlug === 'string' ? a.toolSlug : '';
+    return slug !== '' && !slugHasAffirmativeWriteVerb(slug);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when ANY mutating call ran between the prior identical read and this one.
+ * The blunt version of `mutatedSince` for gateway reads, where we cannot know
+ * which provider a write touched: if anything was written at all, assume the
+ * cached answer may be stale and stay quiet. Under-nudging is the safe side.
+ */
+function anyMutatingCallSincePriorIdentical(tracker: SessionTrackerState, signature: string): boolean {
+  const recent = tracker.recent;
+  let seen = 0;
+  let priorIdx = -1;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].signature === signature) {
+      seen += 1;
+      if (seen === 2) { priorIdx = i; break; }
+    }
+  }
+  if (priorIdx < 0) return false;
+  for (let i = priorIdx + 1; i < recent.length - 1; i++) {
+    if (recent[i]?.mutating === true) return true;
+  }
+  return false;
 }
 
 /** True when an in-session mutator for `readTool` ran AFTER the prior identical
@@ -1115,7 +1183,7 @@ function mutatedSince(tracker: SessionTrackerState, readTool: string, signature:
 /** Strict-mode promotion: in warn mode, block→warn and halt→warn.
  *  In strict mode, decisions enforce as-is. Off mode always allows. */
 export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = readMode()): GuardrailDecision {
-  if (mode === 'off') return { ...decision, action: 'allow', fanoutNudge: undefined, fanoutBlock: undefined, cachedCallId: undefined, cachedAgeMs: undefined };
+  if (mode === 'off') return { ...decision, action: 'allow', fanoutNudge: undefined, fanoutBlock: undefined, cachedCallId: undefined, cachedAgeMs: undefined, cachedLabel: undefined };
   // 'escalate' is a terminal-stuck signal — it is NEVER downgraded (even in
   // warn mode) because the model cannot recover by retrying. The ONLY way to
   // suppress it is mode 'off' (handled above). This is what actually stops the

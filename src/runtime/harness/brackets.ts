@@ -2156,7 +2156,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         if (priorOutput != null && !errorShaped) {
           const ageS = Math.round((decision.cachedAgeMs ?? 0) / 1000);
           cacheNudge =
-            `[within-task memory] You already ran ${decision.toolName} with these EXACT arguments ${ageS}s ago — `
+            `[within-task memory] You already ran ${decision.cachedLabel ?? decision.toolName} with these EXACT arguments ${ageS}s ago — `
             + `that result is still in your tool memory. Call recall_tool_result with call_id "${decision.cachedCallId}" `
             + `to re-read it instead of re-fetching, then take the next step. Do NOT repeat this read.`;
           try {
