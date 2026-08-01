@@ -14,6 +14,7 @@ import {
   manifestEventCounts,
   manifestFor,
   proofSessionId,
+  sessionEvents,
   waitForOutcomeEvents,
   waitForTerminal,
 } from './background-proof-helpers.js';
@@ -87,6 +88,9 @@ export const longHorizonManifest: ScenarioDef = {
     );
     const terminalOutcomes = outcomes.filter((event) => ['done', 'blocked', 'failed'].includes(String(event.data.status)));
     const result = task.resultFull ?? task.result ?? '';
+    const workerStarts = sessionEvents(daemon, task.runSessionId, ['worker_started']);
+    const targetOnlyReuses = sessionEvents(daemon, task.runSessionId, ['worker_result'])
+      .filter((event) => /target already completed in this session/i.test(String(event.data.reason ?? '')));
 
     let metrics = null;
     try {
@@ -132,6 +136,11 @@ export const longHorizonManifest: ScenarioDef = {
         name: 'durable manifest events were recorded',
         pass: eventCounts.declarations >= 1 && eventCounts.succeeded >= ITEM_COUNT * phaseCount,
         detail: JSON.stringify(eventCounts),
+      },
+      {
+        name: 'every declared item-phase executed fresh worker work',
+        pass: workerStarts.length === ITEM_COUNT * phaseCount && targetOnlyReuses.length === 0,
+        detail: `worker starts ${workerStarts.length}/${ITEM_COUNT * phaseCount}; target-only reuses ${targetOnlyReuses.length}`,
       },
       {
         name: 'exactly one terminal outcome returned to origin',

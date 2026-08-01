@@ -108,7 +108,7 @@ const { runClaudeAgentSdkWorker, setClaudeAgentSdkWorkerRunForTest } = await imp
 const { registerWorkerTools } = await import('./worker-tools.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { createSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
-const { summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
+const { reviseWorkContract, summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
 const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
 
 // The EXACT ok-gate the run_worker handler applies to a worker's result text
@@ -369,6 +369,194 @@ test('SDK-brain handler reuses a completed logical manifest item when the resume
       summarizeWorkManifest(sessionId, 'account-research')?.items[0]?.phases.research.attempts,
       2,
       'reuse leaves the original running/succeeded checkpoint history intact',
+    );
+  } finally {
+    if (priorAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = priorAuthMode;
+  }
+});
+
+test('SDK-brain handler re-executes a target when a manifest contract requires revalidation', async () => {
+  const sessionId = 'sess-handler-manifest-revalidate';
+  const item = 'Account A — account-a.example';
+  const priorAuthMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  createSession({ id: sessionId, kind: 'chat' });
+  const handler = captureRunWorker();
+  const initial = {
+    ...packet(item),
+    instructions: 'Include the exact item id and the marker BASELINE.',
+    expectedOutput: 'ITEM_ID | BASELINE | one short observation',
+    workManifest: {
+      id: 'account-revalidation',
+      contractVersion: '1',
+      phase: 'research',
+      mode: 'declare' as const,
+      phases: [{ id: 'research' }],
+    },
+  };
+  let dispatches = 0;
+  try {
+    await withInnerSdk(
+      async () => {
+        dispatches += 1;
+        return {
+          text: dispatches === 1
+            ? 'Account A | BASELINE | initial observation'
+            : 'Account A | REVALIDATED | revised observation',
+          toolUses: [],
+        };
+      },
+      async () => {
+        const first = await withToolOutputContext({ sessionId }, () => handler(initial));
+        assert.match(first.content[0].text, /BASELINE/);
+
+        reviseWorkContract({
+          sessionId,
+          manifestId: 'account-revalidation',
+          fromVersion: 1,
+          toVersion: 2,
+          instruction: 'Replace BASELINE with REVALIDATED and revalidate the item.',
+          evidencePolicy: 'revalidate',
+        });
+
+        const revised = await withToolOutputContext({ sessionId }, () => handler({
+          ...initial,
+          instructions: 'Include the exact item id and the marker REVALIDATED.',
+          expectedOutput: 'ITEM_ID | REVALIDATED | one short observation',
+          workManifest: {
+            ...initial.workManifest,
+            contractVersion: '2',
+            mode: 'reconcile' as const,
+          },
+        }));
+        assert.match(revised.content[0].text, /REVALIDATED/);
+        assert.doesNotMatch(revised.content[0].text, /BASELINE/);
+      },
+    );
+
+    assert.equal(dispatches, 2, 'the revised contract runs fresh work instead of target-only reuse');
+    assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 2);
+    assert.equal(summarizeWorkManifest(sessionId, 'account-revalidation')?.contractVersion, '2');
+    assert.equal(summarizeWorkManifest(sessionId, 'account-revalidation')?.remaining, 0);
+    assert.equal(
+      listEvents(sessionId, { types: ['worker_result'] }).some((event) => (
+        String((event.data as { reason?: string }).reason ?? '').includes('target already completed')
+      )),
+      false,
+    );
+  } finally {
+    if (priorAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = priorAuthMode;
+  }
+});
+
+test('SDK-brain handler never treats the same target as the same no-manifest operation', async () => {
+  const sessionId = 'sess-handler-distinct-target-operations';
+  const item = 'Account A — account-a.example';
+  const priorAuthMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  createSession({ id: sessionId, kind: 'execution' });
+  const handler = captureRunWorker();
+  let dispatches = 0;
+  try {
+    await withInnerSdk(
+      async () => {
+        dispatches += 1;
+        return {
+          text: dispatches === 1
+            ? 'Account A | RESEARCHED | source facts'
+            : 'Account A | VALIDATED | verification result',
+          toolUses: [],
+        };
+      },
+      async () => {
+        const researched = await withToolOutputContext({ sessionId }, () => handler({
+          ...packet(item),
+          objective: 'Research the account from the supplied source facts.',
+          instructions: 'Return the researched source facts.',
+          expectedOutput: 'ITEM_ID | RESEARCHED | source facts',
+        }));
+        assert.match(researched.content[0].text, /RESEARCHED/);
+
+        const validated = await withToolOutputContext({ sessionId }, () => handler({
+          ...packet(item),
+          objective: 'Validate the prior account research for completeness.',
+          instructions: 'Return an independent validation result.',
+          expectedOutput: 'ITEM_ID | VALIDATED | verification result',
+        }));
+        assert.match(validated.content[0].text, /VALIDATED/);
+        assert.doesNotMatch(validated.content[0].text, /RESEARCHED/);
+      },
+    );
+
+    assert.equal(dispatches, 2, 'same target with a different operation is fresh work');
+    assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 2);
+  } finally {
+    if (priorAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = priorAuthMode;
+  }
+});
+
+test('SDK-brain handler does not suppress an intentional repeated packet in chat', async () => {
+  const sessionId = 'sess-handler-chat-repeat';
+  const priorAuthMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  createSession({ id: sessionId, kind: 'chat' });
+  const handler = captureRunWorker();
+  const input = packet('Account A — account-a.example');
+  let dispatches = 0;
+  try {
+    await withInnerSdk(
+      async () => {
+        dispatches += 1;
+        return { text: `Account A | CHAT RUN ${dispatches}`, toolUses: [] };
+      },
+      async () => {
+        const first = await withToolOutputContext({ sessionId }, () => handler(input));
+        const second = await withToolOutputContext({ sessionId }, () => handler(input));
+        assert.match(first.content[0].text, /CHAT RUN 1/);
+        assert.match(second.content[0].text, /CHAT RUN 2/);
+      },
+    );
+
+    assert.equal(dispatches, 2, 'a reusable chat may intentionally repeat the same request');
+    assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 2);
+  } finally {
+    if (priorAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = priorAuthMode;
+  }
+});
+
+test('SDK-brain handler still reuses an exact packet replay inside one execution run', async () => {
+  const sessionId = 'sess-handler-execution-replay';
+  const priorAuthMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  createSession({ id: sessionId, kind: 'execution' });
+  const handler = captureRunWorker();
+  const input = packet('Account A — account-a.example');
+  let dispatches = 0;
+  try {
+    await withInnerSdk(
+      async () => {
+        dispatches += 1;
+        return { text: 'Account A | EXECUTED ONCE', toolUses: [] };
+      },
+      async () => {
+        const first = await withToolOutputContext({ sessionId }, () => handler(input));
+        const replay = await withToolOutputContext({ sessionId }, () => handler(input));
+        assert.match(first.content[0].text, /EXECUTED ONCE/);
+        assert.match(replay.content[0].text, /EXECUTED ONCE/);
+      },
+    );
+
+    assert.equal(dispatches, 1, 'an exact execution replay reuses the durable packet result');
+    assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 1);
+    assert.equal(
+      listEvents(sessionId, { types: ['worker_result'] }).some((event) => (
+        String((event.data as { reason?: string }).reason ?? '').includes('reused prior completed result')
+      )),
+      true,
     );
   } finally {
     if (priorAuthMode === undefined) delete process.env.AUTH_MODE;

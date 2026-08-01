@@ -89,6 +89,8 @@ export const backgroundSteerInFlight: ScenarioDef = {
     const result = task.resultFull ?? task.result ?? '';
     const runWorkerReturns = sessionEvents(daemon, task.runSessionId, ['tool_returned'])
       .filter((event) => event.data.tool === 'run_worker');
+    const workerStarts = sessionEvents(daemon, task.runSessionId, ['worker_started']);
+    const workerResults = sessionEvents(daemon, task.runSessionId, ['worker_result']);
     const workerReturnText = (event: (typeof runWorkerReturns)[number]): string => String(
       event.data.result ?? event.data.preview ?? event.data.output ?? '',
     );
@@ -98,6 +100,12 @@ export const backgroundSteerInFlight: ScenarioDef = {
     const rejectedBeforeDispatch = runWorkerReturns.filter((event) => (
       /workers were NOT started/i.test(workerReturnText(event))
     )).length;
+    const targetOnlyReuses = workerResults.filter((event) => (
+      /target already completed in this session/i.test(String(event.data.reason ?? ''))
+    )).length;
+    const revalidationBatchText = runWorkerReturns[1]
+      ? workerReturnText(runWorkerReturns[1])
+      : '';
 
     let metrics = null;
     try {
@@ -152,6 +160,16 @@ export const backgroundSteerInFlight: ScenarioDef = {
         pass: successfulWorkerBatches === 2
           && (metrics?.workerResults ?? 0) === ITEMS.length * 2,
         detail: `successful batches ${successfulWorkerBatches}; worker results ${metrics?.workerResults ?? 'unavailable'}; pre-dispatch refusals ${rejectedBeforeDispatch}; total run_worker calls ${metrics?.toolCalls['run_worker'] ?? 'unavailable'}`,
+      },
+      {
+        name: 'revalidation wave executed fresh workers instead of target-only reuse',
+        pass: workerStarts.length === ITEMS.length * 2 && targetOnlyReuses === 0,
+        detail: `worker starts ${workerStarts.length}; target-only reuses ${targetOnlyReuses}`,
+      },
+      {
+        name: 'revalidation work-product matches the active contract',
+        pass: /REVALIDATED/i.test(revalidationBatchText) && !/\bBASELINE\b/i.test(revalidationBatchText),
+        detail: revalidationBatchText.slice(0, 220),
       },
       {
         name: 'exactly one terminal outcome returned to origin',
