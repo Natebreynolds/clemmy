@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import { WorkerToolCallSchema, uniformFailureSignature, workerCallItems, workerPacketKey, workerResultIndicatesFailure, type WorkerToolCall, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { runBoundedPool } from '../execution/bounded-pool.js';
-import { recordSubagentRun, findCompletedSubagentOutput } from '../agents/subagent-runs.js';
+import { recordSubagentRun, findCompletedSubagentOutput, findCompletedSubagentOutputByTarget } from '../agents/subagent-runs.js';
 import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { acquireWorkerSlot } from '../agents/worker-concurrency.js';
 import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
@@ -429,6 +429,28 @@ export function registerWorkerTools(server: McpServer): void {
             }));
           }
           // No recoverable output → do NOT claim success; re-execute below.
+        }
+        // Same TARGET, new packet key. The check above is exact by design, so it
+        // is blind to the live 2026-07-31 failure: successive dispatch waves
+        // re-scraped the same firms under fresh packet keys and rewritten labels
+        // (one even swapped apostrophe characters), and those wasted calls are
+        // what provoked the rate limiting that then failed the run. Identity is
+        // the domain, which did not drift. Only a SUCCEEDED prior run with a real
+        // work-product reuses — a failed item must still retry, exactly as the
+        // one firm that failed then succeeded on its retry did.
+        if (workerResumeIdempotencyEnabled()) {
+          const parentRunId = getToolOutputContext()?.workflowRunId || sessionId;
+          const priorForTarget = findCompletedSubagentOutputByTarget(parentRunId, input.item);
+          if (priorForTarget && priorForTarget.trim()) {
+            recordResult(true, 'reused: this target already completed in this session');
+            return textResult(await buildWorkerReturn({
+              sessionId,
+              parentRunId,
+              item: input.item,
+              text: priorForTarget,
+              callId: `call_w_target_${packetKey.slice(0, 16)}`,
+            }));
+          }
         }
       } catch { /* fail-open */ }
 

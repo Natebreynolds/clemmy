@@ -15,6 +15,7 @@
  * else the chat sessionId. Best-effort + fail-open: a store error never breaks the
  * worker (the durable trace is a convenience, not the critical path).
  */
+import { workerTargetIdentity } from './worker-target-identity.js';
 import { existsSync, mkdirSync, appendFileSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
@@ -194,6 +195,38 @@ export function readSubagentOutput(parentRunId: string, id: string): string | nu
  * yields null and the caller RE-EXECUTES rather than passing a truncated preview
  * off as the deliverable (Defect 3 / F4). Fail-open.
  */
+/**
+ * Prior successful output for the same TARGET, however the item was relabelled.
+ *
+ * The packetKey/label matchers above are exact by design, which is correct for
+ * resume-idempotency but blind to the live 2026-07-31 failure: three dispatch
+ * waves scraped the same firms under new packet keys and rewritten labels, so
+ * six firms were fetched two or three times and the wasted calls are what
+ * provoked the rate limiting. Identity here is the domain (falling back to a
+ * hard text fold), which is stable across exactly the drift observed.
+ *
+ * Only `ok` runs with a real persisted work-product qualify: a FAILED item must
+ * still be retried (in that same run one firm failed and then succeeded on
+ * retry — that behaviour must survive). Fail-open.
+ */
+export function findCompletedSubagentOutputByTarget(parentRunId: string, item: string): string | null {
+  try {
+    const identity = workerTargetIdentity(item ?? '');
+    if (!identity) return null;
+    const runs = listSubagentRuns(parentRunId);
+    for (let i = runs.length - 1; i >= 0; i -= 1) {
+      const r = runs[i];
+      if (r.status !== 'ok' || !r.outputRef) continue;
+      if (workerTargetIdentity(r.task ?? '') !== identity) continue;
+      const full = readSubagentOutput(parentRunId, r.id);
+      if (full && full.trim()) return full;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function findCompletedSubagentOutput(parentRunId: string, item: string, packetKey?: string | null): string | null {
   try {
     const target = (item ?? '').trim();
