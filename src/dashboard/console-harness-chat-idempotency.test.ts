@@ -650,8 +650,12 @@ test('lost background-input response replays one accepted source, terminal, and 
     // The conversation renders the round-trip: the user's answer + the ack.
     const events = listEvents(session.id);
     const accepted = events.find((e) => e.type === 'user_input_received' && String((e.data as { text?: string }).text).includes('wspTEST123'));
-    const terminal = events.find((e) => e.type === 'conversation_completed');
     assert.ok(accepted);
+    const terminal = events.find((e) => (
+      e.type === 'conversation_completed'
+      && e.data.sourceUserSeq === accepted.seq
+    ));
+    assert.ok(terminal, 'the deterministic acknowledgement belongs to the accepted answer source');
     assert.equal(terminal?.data.turnOutcome && (terminal.data.turnOutcome as { status?: string }).status, 'done');
     assert.equal(
       terminal?.data.presentation && (terminal.data.presentation as { identity?: { sourceUserSeq?: number } }).identity?.sourceUserSeq,
