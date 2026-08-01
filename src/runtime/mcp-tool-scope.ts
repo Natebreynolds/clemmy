@@ -470,13 +470,34 @@ export function isToolScopeContinuation(input?: string | null): boolean {
  * are prior turn texts, NEWEST FIRST (this session + continuation lineage). Pure;
  * the caller supplies the history. Fail-safe: no continuation match or no prior
  * concrete scope → returns the direct (today's) result unchanged.
+ *
+ * `awaitingAnswer` is the STRUCTURAL half of the same question, and it is the
+ * one that matters. Recognizing a go-ahead by its wording means maintaining a
+ * list of ways to say yes, and that list will always be incomplete. Verified
+ * against the live event log (2026-07-31): "lets kick it off" and "yes please"
+ * were recognized, a bare "go" was not — and the "go" turn was a real one, whose
+ * request had named Salesforce, Outlook and Google Sheets. Its scope collapsed
+ * from 24 tools across seven servers to the bounded no-server fail-open surface,
+ * on the exact turn that had to do the work.
+ *
+ * The system already knew. That same turn was prompted "CONVERGE — your previous
+ * turn asked the user a clarifying question": the harness held the fact and the
+ * scope resolver never asked for it. A message is an answer when the previous
+ * turn asked something, whatever words the answer happens to use. The vocabulary
+ * stays as a fallback for callers that cannot supply the structure.
  */
 export function resolveMcpToolScopeWithContinuity(
-  options: { userInput?: string | null; priorUserInputs?: Array<string | null | undefined>; pinnedCalendarLabels?: string[] } = {},
+  options: {
+    userInput?: string | null;
+    priorUserInputs?: Array<string | null | undefined>;
+    pinnedCalendarLabels?: string[];
+    /** The previous turn ended by asking this user a question. */
+    awaitingAnswer?: boolean;
+  } = {},
 ): McpToolScope {
   const direct = resolveMcpToolScope({ userInput: options.userInput, pinnedCalendarLabels: options.pinnedCalendarLabels });
   if (scopeIsConcrete(direct)) return direct;
-  if (!isToolScopeContinuation(options.userInput)) return direct;
+  if (!options.awaitingAnswer && !isToolScopeContinuation(options.userInput)) return direct;
   for (const prior of options.priorUserInputs ?? []) {
     const inherited = resolveMcpToolScope({ userInput: prior, pinnedCalendarLabels: options.pinnedCalendarLabels });
     // Only inherit a CONCRETE keyword scope (maxTools>0) — never a prior allowAll
@@ -486,7 +507,7 @@ export function resolveMcpToolScopeWithContinuity(
     if (!inherited.failOpenCandidate && (inherited.maxTools ?? 0) > 0) {
       return {
         ...inherited,
-        reason: `continuity: inherited prior-turn scope for follow-up ("${(options.userInput ?? '').trim().slice(0, 40)}") → ${inherited.reason}`,
+        reason: `continuity: inherited prior-turn scope for ${options.awaitingAnswer ? 'answer-to-question' : 'follow-up'} ("${(options.userInput ?? '').trim().slice(0, 40)}") → ${inherited.reason}`,
       };
     }
   }
@@ -560,6 +581,9 @@ export function resolveMcpToolScopeWithRecall(
     priorUserInputs?: Array<string | null | undefined>;
     learnedMatches?: StepToolChoiceMatch[];
     pinnedCalendarLabels?: string[];
+    /** The previous turn ended by asking this user a question. Threaded to
+     *  continuity so a contentless go-ahead keeps the scope its request earned. */
+    awaitingAnswer?: boolean;
   } = {},
 ): McpToolScope {
   const base = resolveMcpToolScopeWithContinuity(options);

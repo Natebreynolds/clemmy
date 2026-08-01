@@ -27,6 +27,7 @@ import { detectMultiItemIntentFromConversation } from '../runtime/harness/contex
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
+import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { fanoutBudgetStatus, formatTokens } from '../runtime/harness/run-token-budget.js';
@@ -1029,6 +1030,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               userInput: options.userInput,
               priorUserInputs,
               pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+              // A contentless go-ahead ("go", "ok") is an ANSWER, and an answer
+              // must not be scoped as if it were a fresh topic with no keywords.
+              // Structural, so it never depends on a list of ways to say yes.
+              awaitingAnswer: priorTurnEndedAwaitingClarification(options.sessionId),
             })
           : resolveMcpToolScope({ userInput: options.userInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() })
       );

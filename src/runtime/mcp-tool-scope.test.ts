@@ -621,3 +621,42 @@ test('filterMcpToolsForScope: per-server caps keep multi-system tools available'
   assert.ok(names.includes('outlook__create_draft'));
   assert.ok(names.includes('outlook__send_message'));
 });
+
+test('a bare "go" answering Clem\'s question keeps the scope its request earned', () => {
+  // Live 2026-07-31 (harness.db seq 1382). The request named Salesforce,
+  // Outlook and Google Sheets; the user answered a clarifying question with
+  // "go". Because "go" is not in the go-ahead vocabulary, the execution turn —
+  // the one that had to do the work — dropped from 24 tools across seven
+  // servers to the bounded no-server fail-open surface.
+  const priors = ['fully autonomously please: find 20 law firms from my Salesforce (use the sf CLI, read-only), draft a short personalized outreach email for each, then create one Google Sheet'];
+  const vocabularyOnly = resolveMcpToolScopeWithContinuity({ userInput: 'go', priorUserInputs: priors });
+  assert.equal(vocabularyOnly.failOpenCandidate, true, 'the wording alone does not rescue it');
+
+  const structural = resolveMcpToolScopeWithContinuity({ userInput: 'go', priorUserInputs: priors, awaitingAnswer: true });
+  assert.ok((structural.allowedServerSlugs ?? []).includes('salesforce'), 'salesforce survives the go-ahead');
+  assert.ok((structural.allowedServerSlugs ?? []).some((slug) => /google_?sheets/.test(slug)), 'sheets survives too');
+  assert.match(structural.reason, /answer-to-question/);
+});
+
+test('the structural signal covers go-aheads no word list would contain', () => {
+  const priors = ['draft the outlook emails to the 20 firms'];
+  for (const answer of ['go', 'ok', 'mhm', 'fire away', 'send er', 'aye']) {
+    const scope = resolveMcpToolScopeWithContinuity({ userInput: answer, priorUserInputs: priors, awaitingAnswer: true });
+    assert.ok(
+      (scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
+      `"${answer}" answers a question — the scope must survive it`,
+    );
+  }
+});
+
+test('awaitingAnswer never over-inherits: a fresh topic still wins', () => {
+  // The user CAN change the subject while answering. A turn with its own intent
+  // keeps that intent, question pending or not.
+  const scope = resolveMcpToolScopeWithContinuity({
+    userInput: 'actually, run a fresh SEO audit of acme.example instead',
+    priorUserInputs: ['draft the outlook emails'],
+    awaitingAnswer: true,
+  });
+  assert.ok((scope.allowedServerSlugs ?? []).includes('dataforseo'));
+  assert.ok(!(scope.allowedServerSlugs ?? []).some((slug) => /outlook/.test(slug)));
+});

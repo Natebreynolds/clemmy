@@ -1681,6 +1681,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         userInput: turnObjective,
         priorUserInputs: priorBrainInputs,
         pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+        // An answer to Clem's own question keeps the scope the request earned,
+        // however the user phrases the go-ahead. Same predicate the CONVERGE
+        // steer already uses — the fact was known, just never consulted here.
+        awaitingAnswer: priorTurnEndedAwaitingClarification(sessionId),
       })
     : {
         reason: `Claude SDK ${mode} mode does not attach native external MCP servers`,
