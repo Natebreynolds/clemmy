@@ -2060,14 +2060,46 @@ test('sweepInvalidDoneBackgroundTasks still reclassifies a done task with no sav
   // The false-positive fix removes only the self-reported-blocked TEXT heuristic;
   // a positive/structural non-deliverable (here: an empty saved result) must
   // still reclassify so the sweep keeps healing genuine hollow completions.
+  // Constructed DIRECTLY, not through markBackgroundTaskDone: as of 2026-07-31
+  // that path refuses to settle a substanceless completion at all, so this state
+  // can now only arrive from an older build, a crash, or an out-of-band write.
+  // That is exactly what a boot-time backstop is for, and it must keep healing it.
   const task = createBackgroundTask({ title: 'Empty completion', prompt: 'Produce the deliverable.' });
-  markBackgroundTaskDone(task.id, '   ');
+  updateBackgroundTask(task.id, { status: 'done', completedAt: new Date().toISOString(), result: '   ' });
 
   const repaired = sweepInvalidDoneBackgroundTasks({ now: Date.now(), maxAgeMs: 60_000 });
 
   assert.ok(repaired.ids.includes(task.id), 'a done task with no saved result is still repaired');
   assert.equal(getBackgroundTask(task.id)?.status, 'blocked');
   assert.match(getBackgroundTask(task.id)?.error ?? '', /no saved result/i);
+});
+
+
+test('a completion with nothing to say is reported as blocked, not as a success', () => {
+  // Live 2026-07-23 (notification store): a long-running task settled `done`
+  // with an empty result, so the user was paged "Background task completed:"
+  // with a BLANK body — a success claim carrying no information — and eight
+  // minutes later paged again with "I couldn't finish this, I'm blocked."
+  // Two contradictory terminal reports for one task, the confident one first.
+  // The structural test for this already existed in the boot sweep; it just ran
+  // hours later, after the false page had already arrived.
+  for (const emptyish of ['', '   ', '\n\n']) {
+    const task = createBackgroundTask({ title: 'Hollow completion', prompt: 'Produce the deliverable.' });
+    const settled = markBackgroundTaskDone(task.id, emptyish);
+    assert.equal(settled?.status, 'blocked', `a ${JSON.stringify(emptyish)} result must not read as completed`);
+    assert.equal(getBackgroundTask(task.id)?.status, 'blocked');
+  }
+});
+
+test('a completion that says something is still a completion', () => {
+  // The guard must not make success harder to report: any real content settles
+  // done, including a caller-supplied body over a machine-shaped raw result.
+  const plain = createBackgroundTask({ title: 'Real completion', prompt: 'Do it.' });
+  assert.equal(markBackgroundTaskDone(plain.id, 'Sent the digest to 42 recipients.')?.status, 'done');
+
+  const machineShaped = createBackgroundTask({ title: 'Machine result', prompt: 'Do it.' });
+  const settled = markBackgroundTaskDone(machineShaped.id, '', { notificationBody: 'Watcher: 3 of 3 jobs finished.' });
+  assert.equal(settled?.status, 'done', 'a caller-supplied human body is substance even when the raw result is empty');
 });
 
 test('classifyBackgroundTaskOutcome: self-reported no tool access is blocked, not reported done', () => {

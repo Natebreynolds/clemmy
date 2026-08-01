@@ -2111,11 +2111,40 @@ function captureRunStrategyFromTrace(updated: BackgroundTaskRecord): void {
   });
 }
 
+/**
+ * A completion has to SAY something. Live 2026-07-23: a long-running task
+ * settled `done` with an empty result, so the user was paged "Background task
+ * completed:" with a blank body — a success claim carrying no information —
+ * and eight minutes later paged again with "I couldn't finish this, I'm
+ * blocked." Two contradictory terminal reports for one task, the confident one
+ * first and wrong.
+ *
+ * The check for this already existed and already ran: sweepInvalidDoneBackgroundTasks
+ * reclassifies a `done` with no saved result. It just runs at daemon BOOT, which
+ * repairs the record long after the false page has reached the user's phone.
+ * Right test, wrong moment — so the same standard is applied here, at the
+ * boundary where the claim is actually made, and the boot sweep goes back to
+ * being the backstop it was meant to be.
+ */
+function completionHasSubstance(result: string, notificationBody?: string): boolean {
+  return (notificationBody ?? result ?? '').trim().length > 0;
+}
+
 export function markBackgroundTaskDone(
   id: string,
   result: string,
   opts?: { notificationBody?: string },
 ): BackgroundTaskRecord | null {
+  // A settlement with nothing to report is not a completion. Route it to the
+  // blocked path instead, which is the honest outcome — and, in the live case,
+  // the outcome the task itself reached under its own steam minutes later.
+  if (!completionHasSubstance(result, opts?.notificationBody)) {
+    return markBackgroundTaskBlocked(
+      id,
+      'The run ended without producing any result text, so there is nothing to hand over.',
+      'The worker settled with an empty result. Nothing was saved, so this is reported as blocked rather than as a completion with no content.',
+    );
+  }
   if (!prepareWorkerSettlementForCas(id)) return null;
   // Cancellation is a terminal authority boundary. The result file and task
   // completion are created only after the latest record is checked while the
