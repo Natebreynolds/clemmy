@@ -1,6 +1,6 @@
 # Clementine 4: Parallel Ship Roadmap
 
-Status: active coordination plan
+Status: local freeze candidate complete; controlled live canary pending
 Date: 2026-08-01
 Immediate objective: produce a strong live-canary candidate today without claiming the unfinished parts of Clementine 4
 
@@ -39,15 +39,14 @@ Current evidence:
 - Serialized reconnect/publication regression gate: 197/197 passing across projection, transcripts, dashboard streams, mobile routes, and transport idempotency.
 - Executable workflow-graph integration: 11/11 passing, including creation-test parity, model-snapshot restart, real specialist overlap, final-page Platform 49 characterization, reducer-only publication, and fail-closed branch failure.
 - Durable Platform 49 runtime matrix: 5/5 passing; end-of-month sales-portal acceptance: 1/1 passing.
-- The earlier integrated graph/demo/effect/sales gate passed 80/80 serially, including 18 tests for the now-parked experimental resolver/executor. Recount the release-focused gate without those four files before freezing.
+- Release-focused graph/demo/effect/sales gate from the clean candidate: 167/167 passing serially; the parked experimental resolver/executor is not part of that count or release surface.
 - Shadow graph/compiler/observer and hook suites pass in isolation; the compiler benchmark is about 0.21 ms per compile.
 - Typecheck and `git diff --check` are green.
-- A later combined-tree full corpus ran 8,280 pass / 0 fail / 1 skip; journeys ran 5/5, release assets 40/40, proof self-tests 53/53, unified report-back 7/7, fresh-install smoke passed, and all root/mobile/console/desktop builds completed. Another agent moved HEAD from `9ab5beca` to `b5266010` during M3, so that evidence is strong but cannot name the final freeze SHA. The whole gate must be rerun after the candidate is committed atomically.
+- Immutable clean-checkout M3 evidence for code candidate `282ecb60`: full corpus 8,266 pass / 0 fail / 2 environment/build-conditional skips; post-build conditional set 42/42; journeys 5/5; release assets 40/40; proof self-tests 53/53; unified report-back 7/7; tracked hygiene green; fresh-install smoke green after its desktop-build prerequisite; and all root/mobile/console/desktop builds green.
 
 Still missing for today’s final go/no-go:
 
 - Independent sanitization/provenance review of the landed demo fixture; a fixture hash alone does not prove structural equivalence to the private raw source.
-- Final whole-repository tests, journeys, hygiene/release assets, proofs, and builds pinned to the final candidate commit; the same commands are green on the combined working tree, but HEAD moved during that run.
 - A controlled live canary on a cloned workflow and selected chat surfaces.
 
 The experimental standalone chat capability resolver/executor has been parked outside the candidate: no live chat path calls it, and carrying unused execution code would add an unsupported release surface. Today’s executable long-task guarantee is the connected workflow graph; chat turn graphs remain observation-only until a production caller, authority binding, terminal ownership, and parity gate land together.
@@ -252,9 +251,9 @@ git diff --check
 
 1. ~~Finish adversarial workflow-subgraph audit and incorporate only concrete blockers.~~ Complete; storage-slug artifact lookup and per-node `maxTurns` forwarding were repaired.
 2. ~~Rerun the graph runtime fixture after the report-back public-step projection fix.~~ Complete; 11/11 passing.
-3. ~~Merge Lane B/C acceptance evidence into the candidate.~~ Complete; the integrated graph/demo/effect/sales gate is 80/80.
-4. Run full isolated repository tests against a motionless worktree. The combined-tree run is 8,280/0/1, but it must be pinned to the final commit because HEAD moved during M3.
-5. Run journeys, public hygiene, release assets, report-back smoke, proof self-tests, and builds. All are green on the combined tree; rerun them after the atomic candidate commit.
+3. ~~Merge Lane B/C acceptance evidence into the candidate.~~ Complete; the release-focused graph/demo/effect/sales gate is 167/167.
+4. ~~Run full isolated repository tests against an immutable clean checkout.~~ Complete; 8,266/0/2, with the two conditional cases covered by a post-build 42/42 run.
+5. ~~Run journeys, public hygiene, release assets, report-back smoke, proof self-tests, and builds.~~ Complete and green; fresh-install smoke passed after building its required desktop bundle.
 6. Run live provider proofs only from a stable candidate commit with configured providers.
 7. Produce one go/no-go report with exact failures, no inferred green status.
 
@@ -283,8 +282,10 @@ npx tsx --test --test-concurrency=1 \
   src/runtime/graph/turn-graph-shadow.test.ts \
   src/runtime/harness/client-demo-golden-replay.test.ts \
   src/runtime/harness/public-presentation.test.ts \
+  src/runtime/harness/delivery-committer-terminal-states.test.ts \
   src/runtime/harness/respond-bridge.test.ts \
   src/runtime/harness/transcript.test.ts \
+  src/runtime/harness/session-transcript.test.ts \
   src/channels/transport-idempotency.test.ts \
   src/execution/workflow-graph-runtime.integration.test.ts \
   src/execution/platform49-effect-matrix.integration.test.ts \
@@ -306,7 +307,6 @@ npm run journeys
 npm run check:public-hygiene
 npm run test:public-hygiene
 npm run test:release-assets
-npm run test:smoke:gate
 npm run proof:selftest
 npm run smoke:report-back
 npm run build
@@ -314,9 +314,10 @@ npm run build:mobile-web
 npm run build:console-web
 npm --prefix apps/desktop run typecheck
 npm --prefix apps/desktop run build
+npm run test:smoke:gate
 ```
 
-Do not run repository-wide suites concurrently against shared test state. Record the command, exit code, pass/fail/skip counts, wall time, and exact source status in one go/no-go note. A later focused pass does not erase a whole-suite failure; classify the original failure as deterministic, environmental, or shared-state contention with the reproducing command.
+Do not run repository-wide suites concurrently against shared test state. Build desktop before `test:smoke:gate`; a pristine checkout correctly returns exit 2 when the required desktop bundle does not exist. Record the command, exit code, pass/fail/skip counts, wall time, and exact source status in one go/no-go note. A later focused pass does not erase a whole-suite failure; classify the original failure as deterministic, environmental, prerequisite ordering, or shared-state contention with the reproducing command.
 
 ### M4 — stable-commit provider proof
 
