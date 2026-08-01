@@ -349,6 +349,7 @@ import {
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
 import { selectAddressedApproval } from '../runtime/harness/approval-addressing.js';
+import { attachSessionViewer } from '../runtime/harness/session-viewers.js';
 import { buildActivitySnapshot, formatElapsed, isHarnessSessionCurrentlyWorking } from '../shared/activity-snapshot.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
@@ -12928,6 +12929,11 @@ export function registerConsoleRoutes(
       writeEvent('event', event.event);
     });
 
+    // This open stream IS the user having the conversation on screen — the only
+    // honest signal for "they are in the room". The terminal report-back reads
+    // it to decide whether a finished run still owes them an out-of-band ping.
+    const detachViewer = attachSessionViewer(sessionId);
+
     // 3) Heartbeat. The existing console-actions stream uses 15s.
     const heartbeat = setInterval(() => {
       if (closed || res.destroyed) return;
@@ -12938,6 +12944,7 @@ export function registerConsoleRoutes(
       if (closed) return;
       closed = true;
       clearInterval(heartbeat);
+      detachViewer();
       unsubscribe();
     };
     res.on('close', cleanup);

@@ -98,6 +98,7 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
 import { exactPendingActionApprovalPreflight } from '../runtime/harness/pending-action-approval.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+import { attachSessionViewer } from '../runtime/harness/session-viewers.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
@@ -1580,6 +1581,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const detachDeltas = addChatStream(session.id, (delta) => {
       writeEvent('delta', { text: delta });
     });
+    // Phone-in-hand is the same "in the room" signal the desktop dock provides:
+    // while this stream is open the user is watching, so a run that lands now
+    // does not also need an out-of-band ping. See terminal-report-back.ts.
+    const detachViewer = attachSessionViewer(session.id);
     const heartbeat = setInterval(() => {
       if (closed || res.destroyed) return;
       res.write(`: ping\n\n`);
@@ -1588,6 +1593,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       if (closed) return;
       closed = true;
       clearInterval(heartbeat);
+      detachViewer();
       unsubscribe();
       detachDeltas();
     };

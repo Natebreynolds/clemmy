@@ -54,6 +54,7 @@ import { listUsableConnectedToolkits } from '../integrations/composio/client.js'
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { reportInterruptedChatRuns } from '../runtime/harness/restart-recovery.js';
+import { startTerminalReportBackWatcher } from '../runtime/harness/terminal-report-back.js';
 import { interruptOrphanedRunAttemptsAtBoot } from '../runtime/harness/eventlog.js';
 import { reconcileDormantTerminalWorkSessions } from '../runtime/harness/session-reconcile.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
@@ -1650,6 +1651,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   if (recoveredChats > 0) {
     logger.warn({ recoveredChats }, 'Surfaced chat runs interrupted by a previous restart (safe ones auto-resumed)');
   }
+  // A FOREGROUND chat run that finishes while the user is away used to end in
+  // silence — the result sat in a transcript nobody was looking at until they
+  // came back and asked. This arms the same terminal report-back a background
+  // task emits, on the same channels, so "always reports back" stops depending
+  // on the user staying in the room (2026-07-31).
+  startTerminalReportBackWatcher();
   const reconciledHarnessSessions = reconcileDormantTerminalWorkSessions();
   if (reconciledHarnessSessions.reconciled > 0) {
     logger.warn(
