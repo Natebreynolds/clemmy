@@ -1256,6 +1256,7 @@ test('an in-flight contract correction preserves partial work and re-queues the 
   assert.match(messages[0], /Active contract version: 1/);
   assert.match(messages[1], /Active contract version: 2/);
   assert.match(messages[1], /corrected source policy/);
+  assert.match(messages[1], /later revision overrides any conflicting original or earlier requirement/);
   assert.match(messages[1], /Partial work from contract v1/);
 
   const runs = listRuns(80).filter((run) => run.sessionId === task.runSessionId);

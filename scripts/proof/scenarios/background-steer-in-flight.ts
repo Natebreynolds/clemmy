@@ -40,7 +40,9 @@ const PROMPT = [
   '- intent: writing',
   `- workManifest: ${JSON.stringify(V1_MANIFEST)}`,
   'A user may update this task while the worker batch is running. The latest durable task contract always overrides this v1 packet.',
-  'If a contract v2 course correction appears, re-run ONE batched worker call over the exact same 24 items with the same packet, but include marker REVALIDATED and set workManifest contractVersion to "2", phase "research", mode "reconcile".',
+  'If a contract v2 course correction appears, re-run ONE batched worker call over the exact same 24 items. Keep the objective, resolvedTools, context, intent, item universe, and manifest id unchanged.',
+  'For that v2 call, REPLACE the instructions field with: Include the exact item id and the marker REVALIDATED. No tools or delegation. Do not include the BASELINE marker anywhere in the v2 packet or output.',
+  'REPLACE expectedOutput with: ITEM_ID | REVALIDATED | one short observation. Set workManifest contractVersion to "2", phase "research", mode "reconcile".',
   'Finish only when the manifest for the latest contract says all 24 items succeeded. Report the active contract version and exact coverage.',
 ].join('\n');
 
@@ -87,6 +89,8 @@ export const backgroundSteerInFlight: ScenarioDef = {
       card.sourceKind === 'background' && card.raw?.originSessionId === dispatched.turn.sessionId
     ));
     const result = task.resultFull ?? task.result ?? '';
+    const runWorkerCalls = sessionEvents(daemon, task.runSessionId, ['tool_called'])
+      .filter((event) => event.data.tool === 'run_worker');
     const runWorkerReturns = sessionEvents(daemon, task.runSessionId, ['tool_returned'])
       .filter((event) => event.data.tool === 'run_worker');
     const workerStarts = sessionEvents(daemon, task.runSessionId, ['worker_started']);
@@ -106,6 +110,7 @@ export const backgroundSteerInFlight: ScenarioDef = {
     const revalidationBatchText = runWorkerReturns[1]
       ? workerReturnText(runWorkerReturns[1])
       : '';
+    const revalidationPacketText = String(runWorkerCalls[1]?.data.arguments ?? '');
 
     let metrics = null;
     try {
@@ -165,6 +170,12 @@ export const backgroundSteerInFlight: ScenarioDef = {
         name: 'revalidation wave executed fresh workers instead of target-only reuse',
         pass: workerStarts.length === ITEMS.length * 2 && targetOnlyReuses === 0,
         detail: `worker starts ${workerStarts.length}; target-only reuses ${targetOnlyReuses}`,
+      },
+      {
+        name: 'revalidation dispatch packet replaced the superseded requirement',
+        pass: /\|\s*REVALIDATED\s*\|/i.test(revalidationPacketText)
+          && !/\|\s*BASELINE\s*\|/i.test(revalidationPacketText),
+        detail: revalidationPacketText.slice(0, 220),
       },
       {
         name: 'revalidation work-product matches the active contract',

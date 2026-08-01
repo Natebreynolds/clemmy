@@ -1165,7 +1165,7 @@ function renderTaskContractBlock(task: BackgroundTaskRecord): string {
     `Active contract version: ${contractVersion}.`,
     revisions.length === 0
       ? 'Version 1 is the original request below.'
-      : 'The revisions below are authoritative and cumulative. Reconcile durable work against them before retrying; do not discard compatible completed evidence.',
+      : 'The revisions below are authoritative. Apply them in version order: a later revision overrides any conflicting original or earlier requirement; preserve only compatible requirements and completed evidence.',
     ...revisions.map((revision) => (
       `- v${revision.version} (${revision.evidencePolicy} prior evidence): ${revision.instruction}`
     )),
