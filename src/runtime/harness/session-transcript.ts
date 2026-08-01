@@ -17,6 +17,12 @@ import {
   type SessionRow,
 } from './eventlog.js';
 import { resolveWriteEvidence } from './work-report.js';
+import {
+  publicCompletionText,
+  publicReplyText,
+  publicUserInputText,
+  validTypedCompletionPresentation,
+} from './public-presentation.js';
 
 export interface PriorTurn { who: 'user' | 'assistant'; text: string; at: string }
 
@@ -195,7 +201,11 @@ function readRecentTranscriptRowsForSession(
   maxTurns: number,
   throughSeq?: number,
 ): RawTranscriptRow[] {
-  const rowLimit = Math.max(1, Math.trunc(maxTurns) * 3);
+  // Logical turns can contain an accepted source, an awaiting edge, a typed
+  // terminal, and (on an upgraded database) one or more losing historical
+  // terminals. Read bounded headroom so those audit rows do not crowd the
+  // owning source out of a small transcript window.
+  const rowLimit = Math.max(12, Math.trunc(maxTurns) * 6);
   const boundedThroughSeq = normalizeThroughSeq(throughSeq);
   return db.prepare(
     `SELECT seq, session_id, type, data_json, created_at, turn FROM events
@@ -207,6 +217,56 @@ function readRecentTranscriptRowsForSession(
   ).all(...(boundedThroughSeq === undefined
     ? [sessionId, rowLimit]
     : [sessionId, boundedThroughSeq, rowLimit])) as RawTranscriptRow[];
+}
+
+/**
+ * Passive async outcomes are durable execution context, but they are not human
+ * user turns. Keep them out of the conversational transcript while still
+ * making them available to a brain after reopen or provider switch. Directives
+ * used to trigger a proactive relay are intentionally excluded: replaying
+ * those would re-issue control flow instead of restoring facts.
+ */
+function renderPassiveOutcomeContextForSessions(
+  db: ReturnType<typeof openEventLog>,
+  sessionIds: string[],
+  maxOutcomes = 8,
+  throughSeq?: number,
+): string {
+  const boundedThroughSeq = normalizeThroughSeq(throughSeq);
+  const rows = uniqueSessionIds(sessionIds)
+    .flatMap((sessionId) => db.prepare(
+      `SELECT seq, session_id, type, data_json, created_at, turn FROM events
+         WHERE session_id = ?
+           AND type = 'user_input_received'
+           ${boundedThroughSeq === undefined ? '' : 'AND seq <= ?'}
+         ORDER BY seq DESC
+         LIMIT ?`,
+    ).all(...(boundedThroughSeq === undefined
+      ? [sessionId, Math.max(16, maxOutcomes * 8)]
+      : [sessionId, boundedThroughSeq, Math.max(16, maxOutcomes * 8)])) as RawTranscriptRow[])
+    .sort((left, right) => right.seq - left.seq);
+
+  const seen = new Set<string>();
+  const outcomes: Array<{ seq: number; text: string }> = [];
+  for (const row of rows) {
+    try {
+      const data = JSON.parse(row.data_json) as Record<string, unknown>;
+      if (data.synthetic !== true || data.source !== 'outcome' || data.deliveryPhase !== 'passive') continue;
+      const outcomeText = typeof data.text === 'string' ? data.text.trim() : '';
+      if (!outcomeText) continue;
+      const sourceKey = `${String(data.sourceLabel ?? '')}:${String(data.sourceId ?? '')}:${String(data.status ?? '')}`;
+      if (seen.has(sourceKey)) continue;
+      seen.add(sourceKey);
+      outcomes.push({ seq: row.seq, text: outcomeText.slice(0, 2_000) });
+      if (outcomes.length >= maxOutcomes) break;
+    } catch { /* malformed private context never blocks transcript replay */ }
+  }
+  if (outcomes.length === 0) return '';
+  outcomes.sort((left, right) => left.seq - right.seq);
+  return [
+    'Durable async outcomes (runtime context; not user-authored):',
+    ...outcomes.map((outcome) => outcome.text),
+  ].join('\n\n');
 }
 
 /** Read the recent user+assistant turns for ONE session, chronological order. */
@@ -227,53 +287,191 @@ export function pullRecentTurnsForSessions(
   throughSeq?: number,
 ): PriorTurn[] {
   const turnLimit = Math.max(1, Math.trunc(maxTurns));
-  // Read the last 2*maxTurns events (user inputs + agent completions) so we have
-  // headroom to filter and reorder chronologically.
   const rows = uniqueSessionIds(sessionIds)
     .flatMap((sessionId) => readRecentTranscriptRowsForSession(db, sessionId, turnLimit, throughSeq))
-    .sort((left, right) => right.seq - left.seq);
-  const completionTextByTurn = new Map<string, Set<string>>();
+    .sort((left, right) => left.seq - right.seq);
+
+  type ParsedRow = RawTranscriptRow & { data: Record<string, unknown> };
+  type SourceRecord = {
+    key: string;
+    row: ParsedRow;
+    userText: string;
+  };
+  type AssistantTurn = { seq: number; text: string; at: string };
+  type TranscriptUnit = { order: number; turns: PriorTurn[] };
+
+  const parsed: ParsedRow[] = [];
   for (const row of rows) {
+    try {
+      const data = JSON.parse(row.data_json) as unknown;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue;
+      parsed.push({ ...row, data: data as Record<string, unknown> });
+    } catch { /* malformed private rows never block model history */ }
+  }
+
+  const sourceKey = (sessionId: string, seq: number): string => `${sessionId}:${seq}`;
+  const positiveSeq = (value: unknown): number | null => (
+    Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : null
+  );
+  const claimsTyped = (data: Record<string, unknown>): boolean => (
+    Object.prototype.hasOwnProperty.call(data, 'presentation')
+      || Object.prototype.hasOwnProperty.call(data, 'turnOutcome')
+  );
+
+  // Index every accepted source, including hidden synthetic control edges. A
+  // synthetic source still owns its terminal; it simply does not render as a
+  // human-authored USER line.
+  const sources = new Map<string, SourceRecord>();
+  for (const row of parsed) {
+    if (row.type !== 'user_input_received') continue;
+    const key = sourceKey(row.session_id, row.seq);
+    sources.set(key, {
+      key,
+      row,
+      userText: row.data.synthetic === true ? '' : publicUserInputText(row.data),
+    });
+  }
+
+  // Elect the first valid terminal for each exact accepted source. A late
+  // completion for A is attached to A's unit even when B was accepted and
+  // completed first; losing rolling-upgrade rows remain in SQLite but never
+  // become extra YOU turns.
+  const assistantBySource = new Map<string, AssistantTurn>();
+  const typedTurnKeys = new Set<string>();
+  for (const row of parsed) {
     if (row.type !== 'conversation_completed') continue;
-    try {
-      const data = JSON.parse(row.data_json) as { summary?: string; reply?: string };
-      const reply = typeof data.reply === 'string' && data.reply.trim() ? data.reply.trim() : '';
-      const summary = typeof data.summary === 'string' && data.summary.trim() ? data.summary.trim() : '';
-      const text = normalizeTranscriptText(reply || summary);
-      if (!text) continue;
-      const turnKey = `${row.session_id}:${row.turn}`;
-      const set = completionTextByTurn.get(turnKey) ?? new Set<string>();
-      set.add(text);
-      completionTextByTurn.set(turnKey, set);
-    } catch { /* skip malformed rows */ }
+    const presentation = validTypedCompletionPresentation(row.data, row.session_id);
+    if (!presentation) continue;
+    const key = sourceKey(row.session_id, presentation.identity.sourceUserSeq);
+    if (!sources.has(key)) continue; // exact source fell outside/corrupts this bounded view
+    typedTurnKeys.add(`${row.session_id}:${presentation.identity.turn}`);
+    const prior = assistantBySource.get(key);
+    if (!prior || row.seq < prior.seq) {
+      assistantBySource.set(key, {
+        seq: row.seq,
+        text: presentation.text,
+        at: row.created_at,
+      });
+    }
   }
-  const turns: PriorTurn[] = [];
-  for (const row of rows) {
-    try {
-      const data = JSON.parse(row.data_json) as { text?: string; summary?: string; reply?: string; question?: string };
-      if (row.type === 'user_input_received' && typeof data.text === 'string') {
-        turns.push({ who: 'user', text: data.text, at: row.created_at });
-      } else if (row.type === 'conversation_completed') {
-        const reply = typeof data.reply === 'string' && data.reply.trim() ? data.reply.trim() : '';
-        const summary = typeof data.summary === 'string' && data.summary.trim() ? data.summary.trim() : '';
-        const text = reply || summary;
-        if (text) turns.push({ who: 'assistant', text, at: row.created_at });
-      } else if (row.type === 'awaiting_user_input') {
-        const question = typeof data.question === 'string' && data.question.trim() ? data.question.trim() : '';
-        if (!question) continue;
-        // Claude SDK ask_user_question writes both awaiting_user_input (from the
-        // tool) and a paired conversation_completed(reason='awaiting_user_input').
-        // Include unpaired questions so pause/resume context survives brain
-        // switches, but do not double-render the paired SDK case.
-        const completionTexts = completionTextByTurn.get(`${row.session_id}:${row.turn}`);
-        if (completionTexts?.has(normalizeTranscriptText(question))) continue;
-        turns.push({ who: 'assistant', text: question, at: row.created_at });
+
+  const orphanAssistants: TranscriptUnit[] = [];
+  const legacyCompletionTextsByTurn = new Map<string, Set<string>>();
+  const exactOrUniqueLegacySource = (row: ParsedRow): SourceRecord | null => {
+    const exactSeq = positiveSeq(row.data.sourceUserSeq);
+    if (exactSeq !== null) {
+      return sources.get(sourceKey(row.session_id, exactSeq)) ?? null;
+    }
+    const candidates = [...sources.values()].filter((source) => (
+      source.row.session_id === row.session_id
+      && source.row.turn === row.turn
+      && source.row.seq < row.seq
+      && !assistantBySource.has(source.key)
+    ));
+    return candidates.length === 1 ? candidates[0] : null;
+  };
+
+  // Legacy completions remain readable, but only a unique/exact association
+  // may turn them into a pair. Partial typed rows fail closed and never fall
+  // through to the legacy reply adapter.
+  for (const row of parsed) {
+    if (row.type !== 'conversation_completed' || claimsTyped(row.data)) continue;
+    const completion = publicCompletionText(row.data, '');
+    if (!completion) continue;
+    const claimedSourceSeq = positiveSeq(row.data.sourceUserSeq);
+    if (claimedSourceSeq !== null
+      && assistantBySource.has(sourceKey(row.session_id, claimedSourceSeq))) {
+      // A legacy-shaped retry can carry the exact source at top level during a
+      // rolling upgrade. It cannot replace the already validated typed winner.
+      continue;
+    }
+    const legacyTurnKey = `${row.session_id}:${row.turn}`;
+    const legacyTexts = legacyCompletionTextsByTurn.get(legacyTurnKey) ?? new Set<string>();
+    legacyTexts.add(normalizeTranscriptText(completion));
+    legacyCompletionTextsByTurn.set(legacyTurnKey, legacyTexts);
+    const source = exactOrUniqueLegacySource(row);
+    if (source) {
+      assistantBySource.set(source.key, {
+        seq: row.seq,
+        text: completion,
+        at: row.created_at,
+      });
+    } else {
+      orphanAssistants.push({
+        order: row.seq,
+        turns: [{ who: 'assistant', text: completion, at: row.created_at }],
+      });
+    }
+  }
+
+  // Awaiting rows are compatibility context, not a second public terminal.
+  // Prefer an explicit source. Numeric-turn inference is allowed only when no
+  // typed terminal owns that reused turn; otherwise retaining an extra question
+  // is safer than hiding A's question because B happened to use the same number.
+  for (const row of parsed) {
+    if (row.type !== 'awaiting_user_input') continue;
+    const question = publicReplyText(row.data.question, '');
+    if (!question) continue;
+    const exactSeq = positiveSeq(row.data.sourceUserSeq);
+    const turnKey = `${row.session_id}:${row.turn}`;
+    if (exactSeq === null
+      && !typedTurnKeys.has(turnKey)
+      && legacyCompletionTextsByTurn.get(turnKey)?.has(normalizeTranscriptText(question))) {
+      continue;
+    }
+    let source = exactSeq === null
+      ? null
+      : sources.get(sourceKey(row.session_id, exactSeq)) ?? null;
+    if (!source && exactSeq === null && !typedTurnKeys.has(turnKey)) {
+      source = exactOrUniqueLegacySource(row);
+    }
+    if (source) {
+      const completion = assistantBySource.get(source.key);
+      if (completion) {
+        // The terminal is authoritative for this exact source. Identical SDK
+        // question rows are the common case; a stale differing edge is also not
+        // allowed to become a second assistant answer.
+        continue;
       }
-    } catch { /* skip malformed rows */ }
+      assistantBySource.set(source.key, {
+        seq: row.seq,
+        text: question,
+        at: row.created_at,
+      });
+      continue;
+    }
+    orphanAssistants.push({
+      order: row.seq,
+      turns: [{ who: 'assistant', text: question, at: row.created_at }],
+    });
   }
-  // Newest last (chronological); cap to maxTurns of each kind.
-  turns.reverse();
-  return turns.slice(-turnLimit * 2);
+
+  const settled: TranscriptUnit[] = [...orphanAssistants];
+  const unpaired: TranscriptUnit[] = [];
+  for (const source of sources.values()) {
+    const assistant = assistantBySource.get(source.key);
+    const userTurn = source.userText
+      ? [{ who: 'user' as const, text: source.userText, at: source.row.created_at }]
+      : [];
+    if (assistant) {
+      settled.push({
+        order: source.row.seq,
+        turns: [
+          ...userTurn,
+          { who: 'assistant', text: assistant.text, at: assistant.at },
+        ],
+      });
+    } else if (userTurn.length > 0) {
+      // An accepted source with no terminal is the active edge. Put it after
+      // every settled pair so the next model never sees USER A, USER B, YOU B.
+      unpaired.push({ order: source.row.seq, turns: userTurn });
+    }
+  }
+
+  settled.sort((left, right) => left.order - right.order);
+  unpaired.sort((left, right) => left.order - right.order);
+  const units = [...settled, ...unpaired].slice(-turnLimit);
+  return units.flatMap((unit) => unit.turns);
 }
 
 function normalizeTranscriptText(text: string): string {
@@ -449,6 +647,12 @@ export function renderSessionHistoryForModel(
         isWorkflowAggregate ? 'THIS workflow run' : 'THIS conversation',
         boundedThroughSeq,
       );
+      const asyncOutcomes = renderPassiveOutcomeContextForSessions(
+        db,
+        relatedSessionIds,
+        8,
+        boundedThroughSeq,
+      );
       const turns = pullRecentTurnsForSessions(db, relatedSessionIds, maxTurns, boundedThroughSeq);
       const transcriptTitle = isWorkflowAggregate
         ? `Recent transcript for workflow run ${workflowRunId} (including ${relatedRows.length} step sessions):`
@@ -456,6 +660,7 @@ export function renderSessionHistoryForModel(
       const parts = [
         prefix,
         actions,
+        asyncOutcomes,
         turns.length > 0
           ? `${transcriptTitle}\n${renderTranscriptTurns(turns)}`
           : '',

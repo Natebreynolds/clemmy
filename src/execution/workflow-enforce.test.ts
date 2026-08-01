@@ -94,6 +94,42 @@ test('checkWorkflowForWrite: forEachNewOnly without forEach is rejected through 
   assert.match(result.errors.join(' '), /forEachNewOnly.*no forEach source/);
 });
 
+test('checkWorkflowForWrite: read_parallel_v1 topology is validated at the canonical write seam', () => {
+  const valid = checkWorkflowForWrite(wf({
+    steps: [{
+      id: 'analyze',
+      prompt: 'Reduce the specialist evidence.',
+      sideEffect: 'read',
+      subgraph: {
+        mode: 'read_parallel_v1',
+        specialists: [
+          { id: 'facts', prompt: 'Check the facts.' },
+          { id: 'risks', prompt: 'Check the risks.' },
+        ],
+      },
+    }],
+  }));
+  assert.equal(valid.ok, true, valid.errors.join('\n'));
+
+  const unsafe = checkWorkflowForWrite(wf({
+    steps: [{
+      id: 'analyze',
+      prompt: 'Reduce the specialist evidence and write the result.',
+      sideEffect: 'write',
+      subgraph: {
+        mode: 'read_parallel_v1',
+        specialists: [
+          { id: 'facts', prompt: 'Check the facts.' },
+          { id: 'facts', prompt: 'Check the risks.' },
+        ],
+      },
+    }],
+  }));
+  assert.equal(unsafe.ok, false);
+  assert.match(unsafe.errors.join(' '), /duplicate subgraph specialist id "facts"/);
+  assert.match(unsafe.errors.join(' '), /must explicitly declare sideEffect: read/);
+});
+
 // ─── runnability (the "can't author an unrunnable workflow" guarantee) ───
 
 test('checkRunnabilityConstraints: schedule-only + required non-common input with no default → warning', () => {
@@ -374,6 +410,26 @@ test('workflowExecutionSurfaceChanged: call nodes and watermarks are execution s
 
   assert.equal(workflowExecutionSurfaceChanged(before, changedCall), true);
   assert.equal(workflowExecutionSurfaceChanged(noWatermark, changedWatermark), true);
+});
+
+test('workflowExecutionSurfaceChanged: specialist topology is execution surface', () => {
+  const before = wf({
+    steps: [{
+      id: 'analyze',
+      prompt: 'Reduce evidence.',
+      sideEffect: 'read',
+      subgraph: {
+        mode: 'read_parallel_v1',
+        specialists: [
+          { id: 'facts', prompt: 'Check facts.' },
+          { id: 'risks', prompt: 'Check risks.' },
+        ],
+      },
+    }],
+  });
+  const after = JSON.parse(JSON.stringify(before)) as WorkflowDefinition;
+  after.steps[0].subgraph!.specialists[1].prompt = 'Check current risks and cite evidence.';
+  assert.equal(workflowExecutionSurfaceChanged(before, after), true);
 });
 
 test('autoRepair: hardens weak live-research contracts with evidence keys', () => {

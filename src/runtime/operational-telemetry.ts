@@ -124,6 +124,7 @@ export const HARNESS_OPERATIONAL_EVENT_TYPES = [
   'harness_turn_completed',
   'harness_run_completed',
   'harness_run_failed',
+  'turn_graph_shadow_compiled',
   'worker_spawned',
   'worker_queued',
   'worker_completed',

@@ -9,6 +9,12 @@
  */
 import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents } from './eventlog.js';
+import {
+  publicCompletionText,
+  publicReplyText,
+  publicUserInputText,
+  validTypedCompletionPresentation,
+} from './public-presentation.js';
 
 /**
  * Coerce a harness event payload into the human-facing reply text.
@@ -18,28 +24,21 @@ import { listEvents } from './eventlog.js';
  */
 export function humanHarnessText(value: unknown, fallback = ''): string {
   if (value == null) return fallback;
-  if (typeof value === 'object') {
+  if (typeof value === 'object' && !Array.isArray(value)) {
     const obj = value as Record<string, unknown>;
-    const reply = typeof obj.reply === 'string' ? obj.reply.trim() : '';
-    const summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
-    return reply || summary || fallback;
+    return publicCompletionText(obj, fallback);
   }
   const text = String(value).trim();
   if (!text) return fallback;
   if ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))) {
     try {
       const parsed = JSON.parse(text) as unknown;
-      if (parsed && typeof parsed === 'object') {
-        const obj = parsed as Record<string, unknown>;
-        const reply = typeof obj.reply === 'string' ? obj.reply.trim() : '';
-        const summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
-        if (reply || summary) return reply || summary;
-      }
+      if (parsed && typeof parsed === 'object') return humanHarnessText(parsed, fallback);
     } catch {
       // Not JSON after all; fall through to the raw text.
     }
   }
-  return text;
+  return publicReplyText(text, fallback);
 }
 
 /**
@@ -78,25 +77,126 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       }
     }
   }
-  const turns: UnifiedSessionTurn[] = [];
+  type SourceRecord = {
+    key: string;
+    event: (typeof events)[number];
+    userText: string;
+  };
+  type AssistantTurn = { seq: number; text: string; createdAt: string };
+  type Unit = { order: number; turns: UnifiedSessionTurn[] };
+  const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
+  const positiveSeq = (value: unknown): number | null => (
+    Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : null
+  );
+  const claimsTyped = (data: Record<string, unknown>): boolean => (
+    Object.prototype.hasOwnProperty.call(data, 'presentation')
+      || Object.prototype.hasOwnProperty.call(data, 'turnOutcome')
+  );
+
+  const sources = new Map<string, SourceRecord>();
+  for (const event of events) {
+    if (event.type !== 'user_input_received') continue;
+    const key = sourceKey(event.sessionId, event.seq);
+    sources.set(key, {
+      key,
+      event,
+      userText: event.data.synthetic === true ? '' : publicUserInputText(event.data),
+    });
+  }
+
+  // Pair typed terminals by the exact accepted event and elect the durable
+  // first writer. This deliberately ignores physical attempt/run identity.
+  const assistantBySource = new Map<string, AssistantTurn>();
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
-    if (event.type === 'user_input_received') {
-      // Skip synthetic user turns (outcome relays / report-back directives from
-      // runtime/outcome.ts). The user never typed them, so they must not render
-      // as user bubbles — the model-facing history keeps them.
-      if (event.data.synthetic === true) continue;
-      const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
-      if (text) turns.push({ role: 'user', text, createdAt: event.createdAt });
-    } else if (event.type === 'conversation_completed') {
-      // A superseded parse-exhaustion apology is internal — the recovered reply
-      // renders in its place. Skip it (never the only reply — see supersededIdx).
-      if (supersededIdx.has(i)) continue;
-      const text = humanHarnessText(event.data.reply ?? event.data.summary, '');
-      if (text) turns.push({ role: 'assistant', text, createdAt: event.createdAt });
+    if (event.type !== 'conversation_completed' || supersededIdx.has(i)) continue;
+    const presentation = validTypedCompletionPresentation(event.data, event.sessionId);
+    if (!presentation) continue;
+    const key = sourceKey(event.sessionId, presentation.identity.sourceUserSeq);
+    if (!sources.has(key)) continue;
+    const prior = assistantBySource.get(key);
+    if (!prior || event.seq < prior.seq) {
+      assistantBySource.set(key, {
+        seq: event.seq,
+        text: presentation.text,
+        createdAt: event.createdAt,
+      });
     }
   }
-  return turns;
+
+  const orphanAssistants: Unit[] = [];
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i];
+    if (event.type !== 'conversation_completed'
+      || supersededIdx.has(i)
+      || claimsTyped(event.data)) continue;
+    const text = humanHarnessText(event.data, '');
+    if (!text) continue;
+    const exactSeq = positiveSeq(event.data.sourceUserSeq);
+    if (exactSeq !== null
+      && assistantBySource.has(sourceKey(event.sessionId, exactSeq))) {
+      continue;
+    }
+    let source = exactSeq === null
+      ? null
+      : sources.get(sourceKey(event.sessionId, exactSeq)) ?? null;
+    if (!source) {
+      const candidates = [...sources.values()].filter((candidate) => (
+        candidate.event.sessionId === event.sessionId
+        && candidate.event.turn === event.turn
+        && candidate.event.seq < event.seq
+        && !assistantBySource.has(candidate.key)
+      ));
+      if (candidates.length === 1) [source] = candidates;
+      else if (candidates.length === 0) {
+        // Some legacy relays incremented the numeric turn independently from
+        // the accepted chat row. Fall back only when one visible human source
+        // is possible; hidden synthetic edges never borrow that association.
+        const visibleCandidates = [...sources.values()].filter((candidate) => (
+          candidate.event.sessionId === event.sessionId
+          && candidate.event.seq < event.seq
+          && candidate.userText.length > 0
+          && !assistantBySource.has(candidate.key)
+        ));
+        if (visibleCandidates.length === 1) [source] = visibleCandidates;
+      }
+    }
+    if (source) {
+      assistantBySource.set(source.key, {
+        seq: event.seq,
+        text,
+        createdAt: event.createdAt,
+      });
+    } else {
+      orphanAssistants.push({
+        order: event.seq,
+        turns: [{ role: 'assistant', text, createdAt: event.createdAt }],
+      });
+    }
+  }
+
+  const settled: Unit[] = [...orphanAssistants];
+  const unpaired: Unit[] = [];
+  for (const source of sources.values()) {
+    const assistant = assistantBySource.get(source.key);
+    const userTurns: UnifiedSessionTurn[] = source.userText
+      ? [{ role: 'user', text: source.userText, createdAt: source.event.createdAt }]
+      : [];
+    if (assistant) {
+      settled.push({
+        order: source.event.seq,
+        turns: [
+          ...userTurns,
+          { role: 'assistant', text: assistant.text, createdAt: assistant.createdAt },
+        ],
+      });
+    } else if (userTurns.length > 0) {
+      unpaired.push({ order: source.event.seq, turns: userTurns });
+    }
+  }
+  settled.sort((left, right) => left.order - right.order);
+  unpaired.sort((left, right) => left.order - right.order);
+  return [...settled, ...unpaired].flatMap((unit) => unit.turns);
 }
 
 /** The most recent meaningful turn text, for a list preview. Empty if none. */
@@ -109,7 +209,7 @@ export function harnessPreview(sessionId: string): string {
   const latest = events[0];
   if (!latest) return '';
   if (latest.type === 'user_input_received') {
-    return typeof latest.data.text === 'string' ? latest.data.text.trim() : '';
+    return publicUserInputText(latest.data);
   }
-  return humanHarnessText(latest.data.reply ?? latest.data.summary, '');
+  return humanHarnessText(latest.data, '');
 }

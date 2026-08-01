@@ -24,6 +24,7 @@ import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js'
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
 import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
+import { publicUserInputText } from '../runtime/harness/public-presentation.js';
 import { deriveTitle, humanizeReportBackTitle } from '../memory/derive-title.js';
 import type {
   SessionRecord,
@@ -105,6 +106,21 @@ function metaTags(meta: Record<string, unknown> | undefined): string[] {
   return Array.isArray(raw) ? raw.filter((t): t is string => typeof t === 'string') : [];
 }
 
+/** The legacy desktop store predates typed terminal events, so old assistant
+ * turns can contain narrated decision envelopes. Apply the same fail-closed
+ * projection used by harness replay before detail, preview, or search sees it. */
+function publicDesktopTurns(record: SessionRecord): UnifiedSessionTurn[] {
+  const turns: UnifiedSessionTurn[] = [];
+  for (const turn of record.turns) {
+    const text = turn.role === 'assistant'
+      ? humanHarnessText(turn.text, '')
+      : turn.text.trim();
+    if (!text) continue;
+    turns.push({ role: turn.role, text, createdAt: turn.createdAt });
+  }
+  return turns;
+}
+
 // ─── Summaries (preview filled in lazily for the final page) ─────────────
 
 function summarizeDesktop(record: SessionRecord): UnifiedSessionSummary {
@@ -129,7 +145,7 @@ function summarizeDesktop(record: SessionRecord): UnifiedSessionSummary {
     tags: Array.isArray(record.tags) ? record.tags : [],
     archived: Boolean(record.archived),
     continuable: true,
-    turnCount: record.turns.length,
+    turnCount: publicDesktopTurns(record).length,
   };
 }
 
@@ -273,7 +289,7 @@ function collectHarnessSummaries(): HarnessSummaryCollection {
 }
 
 function desktopSearchText(record: SessionRecord): string {
-  const tail = record.turns.slice(-20).map((t) => t.text).join(' ');
+  const tail = publicDesktopTurns(record).slice(-20).map((t) => t.text).join(' ');
   return `${record.title ?? ''} ${tail}`.toLowerCase();
 }
 
@@ -292,11 +308,11 @@ function workflowEventTurn(event: HarnessEventRow): (UnifiedSessionTurn & { seq:
     // Synthetic user turns (outcome relays / report-back directives from
     // runtime/outcome.ts) are machine input — never render them as user bubbles.
     if (event.data.synthetic === true) return null;
-    const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
+    const text = publicUserInputText(event.data);
     return text ? { role: 'user', text, createdAt: event.createdAt, seq: event.seq } : null;
   }
   if (event.type === 'conversation_completed') {
-    const text = humanHarnessText(event.data.reply ?? event.data.summary, '');
+    const text = humanHarnessText(event.data, '');
     return text ? { role: 'assistant', text, createdAt: event.createdAt, seq: event.seq } : null;
   }
   return null;
@@ -444,7 +460,8 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSe
   for (const summary of page) {
     if (summary.store === 'desktop') {
       const rec = desktopRecords.get(summary.id.slice(DESKTOP_PREFIX.length));
-      const last = rec?.turns[rec.turns.length - 1];
+      const publicTurns = rec ? publicDesktopTurns(rec) : [];
+      const last = publicTurns[publicTurns.length - 1];
       summary.preview = last ? clip(last.text, 140) : '';
     } else {
       fillHarnessPreviewAndCount(summary);
@@ -483,13 +500,9 @@ export function getUnifiedSessionDetail(id: string): SessionDetail | null {
     if (!store.exists(parsed.rawId)) return null;
     const record = store.get(parsed.rawId);
     const summary = summarizeDesktop(record);
-    const last = record.turns[record.turns.length - 1];
+    const turns = publicDesktopTurns(record);
+    const last = turns[turns.length - 1];
     summary.preview = last ? clip(last.text, 140) : '';
-    const turns: UnifiedSessionTurn[] = record.turns.map((t) => ({
-      role: t.role,
-      text: t.text,
-      createdAt: t.createdAt,
-    }));
     return { session: summary, turns, continueHint: continueHintFor(summary, parsed.rawId) };
   }
 
@@ -510,7 +523,8 @@ export function patchUnifiedSession(id: string, patch: SessionPatchInput): Unifi
     const updated = store.setMeta(parsed.rawId, patch);
     if (!updated) return null;
     const summary = summarizeDesktop(updated);
-    const last = updated.turns[updated.turns.length - 1];
+    const turns = publicDesktopTurns(updated);
+    const last = turns[turns.length - 1];
     summary.preview = last ? clip(last.text, 140) : '';
     return summary;
   }

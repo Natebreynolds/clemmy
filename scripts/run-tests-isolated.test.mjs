@@ -31,18 +31,24 @@ test('isolated test runner preserves an explicit targeted test without adding th
   );
 });
 
-test('isolated test runner disables real local embeddings even when the parent enables them', () => {
+test('isolated test runner contains home, provider, and nested temp state', () => {
   const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-runner-contract-'));
   const fixturePath = path.join(fixtureDir, 'environment.test.mjs');
   writeFileSync(fixturePath, `
     import { test } from 'node:test';
     import assert from 'node:assert/strict';
+    import os from 'node:os';
+    import path from 'node:path';
 
     test('receives the safe isolated environment', () => {
       assert.equal(process.env.CLEMMY_LOCAL_EMBEDDINGS, 'off');
       assert.equal(process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS, '1');
       assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1');
       assert.match(process.env.CLEMENTINE_HOME ?? '', /clementine-test-home-/);
+      assert.equal(os.tmpdir(), path.join(process.env.CLEMENTINE_HOME, 'tmp'));
+      assert.equal(process.env.TMPDIR, os.tmpdir());
+      assert.equal(process.env.TMP, os.tmpdir());
+      assert.equal(process.env.TEMP, os.tmpdir());
     });
   `);
 

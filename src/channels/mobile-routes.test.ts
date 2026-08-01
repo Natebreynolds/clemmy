@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -24,13 +25,23 @@ test.after(() => {
   try { rmSync(TMP_ROOT, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
-const { createMobileRouter, MOBILE_SESSION_COOKIE } = await import('./mobile-routes.js');
+const {
+  createMobileRouter,
+  MOBILE_SESSION_COOKIE,
+  _clearMobileChatInFlightForTests,
+} = await import('./mobile-routes.js');
+const { _clearIdempotencyForTests } = await import('../runtime/idempotency.js');
+const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
+const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
 const { setPin } = await import('../runtime/mobile-pin.js');
 const { createMobilePairingCode } = await import('../runtime/mobile-pairing.js');
 const {
   appendEvent,
+  beginRunAttempt,
+  claimHarnessChatRequest,
   createSession: createHarnessSession,
   listEvents,
+  recordRunAttemptUserInput,
   resetEventLog,
 } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
@@ -53,8 +64,8 @@ interface Harness {
 
 let harnessCounter = 0;
 
-async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean; assistant?: Parameters<typeof createMobileRouter>[0]['assistant']; listRecentRuns?: Parameters<typeof createMobileRouter>[0]['listRecentRuns']; cancelRun?: Parameters<typeof createMobileRouter>[0]['cancelRun'] }): Promise<Harness> {
-  const stateDir = path.join(TMP_ROOT, `case-${++harnessCounter}`);
+async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean; stateDir?: string; assistant?: Parameters<typeof createMobileRouter>[0]['assistant']; listRecentRuns?: Parameters<typeof createMobileRouter>[0]['listRecentRuns']; cancelRun?: Parameters<typeof createMobileRouter>[0]['cancelRun'] }): Promise<Harness> {
+  const stateDir = opts?.stateDir ?? path.join(TMP_ROOT, `case-${++harnessCounter}`);
   const app = express();
   app.use(express.json());
   const admin = opts?.admin ?? false;
@@ -266,7 +277,80 @@ test('mobile approvals list and approve use /m API without console auth', async 
       method: 'POST',
       headers: { cookie },
     });
-    assert.equal(reused.status, 409);
+    assert.equal(reused.status, 200);
+    assert.equal(reused.headers.get('idempotent-replay'), '1');
+  } finally { await h.close(); }
+});
+
+test('mobile approval B is accepted before mutation and owns B terminal, never approval A source', async () => {
+  resetEventLog();
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Exact approval source phone');
+    const session = createHarnessSession({
+      id: `mobile-exact-approval-${Date.now().toString(36)}`,
+      kind: 'chat',
+      channel: 'mobile',
+    });
+    const approvalA = approvalRegistry.register({
+      sessionId: session.id,
+      subject: 'Card A',
+      tool: 'run_shell_command',
+      args: { command: 'echo A' },
+    });
+    const approvalB = approvalRegistry.register({
+      sessionId: session.id,
+      subject: 'Card B',
+      tool: 'run_shell_command',
+      args: { command: 'echo B' },
+    });
+    const sourceA = appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: {
+        text: `Approve ${approvalA.approvalId}.`,
+        approvalId: approvalA.approvalId,
+        decision: 'approve',
+        source: 'mobile_approval',
+      },
+    });
+
+    const approved = await fetch(`${h.url}/m/api/approvals/${approvalB.approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(approved.status, 200);
+    assert.equal(approvalRegistry.get(approvalA.approvalId)?.status, 'pending');
+    assert.equal(approvalRegistry.get(approvalB.approvalId)?.resolution, 'approved');
+
+    const sourcesB = listEvents(session.id, { types: ['user_input_received'] })
+      .filter((event) => event.data.approvalId === approvalB.approvalId && event.data.decision === 'approve');
+    assert.equal(sourcesB.length, 1);
+    assert.notEqual(sourcesB[0].seq, sourceA.seq);
+    const terminalB = listEvents(session.id, { types: ['conversation_completed'] })
+      .find((event) => event.data.sourceUserSeq === sourcesB[0].seq);
+    assert.ok(terminalB, 'approval B has one durable source-bound terminal');
+    assert.equal(terminalB?.data.terminalKey, `turn:${sourcesB[0].seq}`);
+    assert.equal((terminalB?.data.turnOutcome as { status?: string } | undefined)?.status, 'done');
+
+    const replay = await fetch(`${h.url}/m/api/approvals/${approvalB.approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(replay.status, 200);
+    assert.equal(replay.headers.get('idempotent-replay'), '1');
+    assert.equal(
+      listEvents(session.id, { types: ['user_input_received'] })
+        .filter((event) => event.data.approvalId === approvalB.approvalId).length,
+      1,
+    );
+    assert.equal(
+      listEvents(session.id, { types: ['conversation_completed'] })
+        .filter((event) => event.data.sourceUserSeq === sourcesB[0].seq).length,
+      1,
+    );
   } finally { await h.close(); }
 });
 
@@ -967,6 +1051,267 @@ test('chat/send returns 503 when no assistant is wired', async () => {
   } finally { await h.close(); }
 });
 
+test('default mobile chat/send never exposes a thrown provider error message', async () => {
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  const previousAuthMode = process.env.AUTH_MODE;
+  delete process.env.CLEMMY_HARNESS_WEBHOOK;
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.AUTH_MODE = 'api_key';
+  const privateProviderMessage = 'provider rejected sk-live-private-detail';
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string }) => ({
+      sessionId: opts.sessionId,
+      status: 'failed',
+      steps: 1,
+      lastTurn: 1,
+      error: privateProviderMessage,
+    })) as never,
+  });
+  const assistant = {
+    respond: async () => {
+      throw new Error('legacy assistant must not run on the default mobile route');
+    },
+  } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h);
+    const res = await fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        'idempotency-key': 'mobile-private-provider-error',
+      },
+      body: JSON.stringify({ message: 'trigger a provider failure', sessionId: 'sess-mobile-private-error' }),
+    });
+    assert.equal(res.status, 500);
+    const raw = await res.text();
+    const body = JSON.parse(raw) as { error?: string; message?: string };
+    assert.equal(body.error, 'CHAT_SEND_FAILED');
+    assert.equal(body.message, PUBLIC_RUN_FAILURE_TEXT);
+    assert.doesNotMatch(raw, /provider rejected|sk-live-private-detail/);
+  } finally {
+    _setBridgeImplsForTests({});
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    if (previousAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = previousAuthMode;
+    await h.close();
+  }
+});
+
+test('concurrent mobile retries share one durable run, source, dispatch, and terminal', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  let dispatches = 0;
+  const assistant = {
+    respond: async (req: { sessionId: string }) => {
+      dispatches += 1;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return { text: 'Exactly once.', sessionId: req.sessionId };
+    },
+  } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h, 'Concurrent retry phone');
+    const send = (message = 'perform the exact mobile turn') => fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        'idempotency-key': 'mobile-concurrent-durable-key',
+      },
+      body: JSON.stringify({ message }),
+    });
+    const [firstResponse, duplicateResponse] = await Promise.all([send(), send()]);
+    assert.equal(firstResponse.status, 200);
+    assert.equal(duplicateResponse.status, 200);
+    const first = await firstResponse.json() as { sessionId: string; runId: string; reply: string };
+    const duplicate = await duplicateResponse.json() as typeof first;
+    assert.deepEqual(duplicate, first);
+    assert.equal(dispatches, 1, 'concurrent duplicate never dispatches a second gateway executor');
+
+    const users = listEvents(first.sessionId, { types: ['user_input_received'] });
+    const terminals = listEvents(first.sessionId, { types: ['conversation_completed'] });
+    assert.equal(users.length, 1);
+    assert.equal(terminals.length, 1);
+    assert.equal(terminals[0].data.sourceUserSeq, users[0].seq);
+    assert.equal(terminals[0].data.terminalKey, `turn:${users[0].seq}`);
+
+    const conflict = await send('different work under the same key');
+    assert.equal(conflict.status, 409);
+    assert.equal((await conflict.json() as { error: string }).error, 'IDEMPOTENCY_KEY_CONFLICT');
+    assert.equal(dispatches, 1);
+    assert.equal(listEvents(first.sessionId, { types: ['user_input_received'] }).length, 1);
+  } finally {
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    await h.close();
+  }
+});
+
+test('mobile retry after process-cache loss recovers the original fallback session and terminal', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  let dispatches = 0;
+  const assistant = {
+    respond: async (req: { sessionId: string }) => {
+      dispatches += 1;
+      return { text: 'Durable replay result.', sessionId: req.sessionId };
+    },
+  } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const firstServer = await startHarness({ assistant });
+  let replayServer: Harness | undefined;
+  try {
+    const cookie = await loginMobile(firstServer, 'Restart replay phone');
+    const request = (baseUrl: string) => fetch(`${baseUrl}/m/api/chat/send`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        'idempotency-key': 'mobile-restart-durable-key',
+      },
+      body: JSON.stringify({ message: 'Reply exactly MOBILE_DURABLE_REPLAY.' }),
+    });
+    const firstResponse = await request(firstServer.url);
+    assert.equal(firstResponse.status, 200);
+    const first = await firstResponse.json() as { sessionId: string; runId: string; reply: string };
+    await firstServer.close();
+
+    // Simulate daemon memory loss while preserving its durable state directory
+    // and harness DB. The retry has no sessionId to help it find the old turn.
+    _clearIdempotencyForTests();
+    _clearMobileChatInFlightForTests();
+    replayServer = await startHarness({ assistant, stateDir: firstServer.stateDir });
+    const replayResponse = await request(replayServer.url);
+    assert.equal(replayResponse.status, 200);
+    assert.equal(replayResponse.headers.get('idempotent-replay'), '1');
+    const replay = await replayResponse.json() as typeof first;
+    assert.equal(replay.sessionId, first.sessionId);
+    assert.equal(replay.runId, first.runId);
+    assert.equal(replay.reply, first.reply);
+    assert.equal(dispatches, 1, 'durable terminal replay never calls the assistant again');
+    assert.equal(listEvents(first.sessionId, { types: ['user_input_received'] }).length, 1);
+    assert.equal(listEvents(first.sessionId, { types: ['conversation_completed'] }).length, 1);
+  } finally {
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    if (replayServer) await replayServer.close();
+    else {
+      try { await firstServer.close(); } catch { /* already closed */ }
+    }
+  }
+});
+
+test('mobile retry after crash between acceptance and terminal fails closed without a second dispatch', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  let dispatches = 0;
+  const assistant = {
+    respond: async (req: { sessionId: string }) => {
+      dispatches += 1;
+      return { text: 'This must never be dispatched.', sessionId: req.sessionId };
+    },
+  } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h, 'Accepted-crash replay phone');
+    const whoami = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await whoami.json() as { deviceId: string };
+    const idempotencyKey = 'mobile-accepted-crash-key';
+    const message = 'perform an external write exactly once';
+    const sessionId = 'sess-mobile-accepted-crash';
+    const digest = createHash('sha256')
+      .update(deviceId)
+      .update('\0')
+      .update(idempotencyKey)
+      .digest('hex');
+    const requestId = `mobile:${digest}`;
+    const runId = `run-mobile-${digest}`;
+    const inputHash = createHash('sha256')
+      .update(JSON.stringify({ message, requestedSessionId: sessionId }))
+      .digest('hex');
+
+    createHarnessSession({
+      id: sessionId,
+      kind: 'chat',
+      channel: 'mobile',
+      userId: deviceId,
+      title: 'Accepted crash replay',
+      metadata: { source: 'mobile' },
+    });
+    claimHarnessChatRequest({ requestId, sessionId, runId, inputHash, sinceSeq: 0 });
+    const crashedAttempt = beginRunAttempt(sessionId, { runId });
+    const accepted = recordRunAttemptUserInput(crashedAttempt, {
+      turn: 1,
+      role: 'user',
+      data: {
+        text: message,
+        displayText: message,
+        runId,
+        attemptId: crashedAttempt.attemptId,
+        source: 'gateway:mobile',
+      },
+    }, { armRunInFlight: true });
+
+    // This is the first HTTP retry in the replacement process: its local
+    // single-flight/cache is empty, while the durable receipt and accepted
+    // source survive. It must close that uncertainty, never dispatch again.
+    _clearIdempotencyForTests();
+    _clearMobileChatInFlightForTests();
+    const replay = await fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify({ message, sessionId }),
+    });
+    assert.equal(replay.status, 500);
+    assert.equal(replay.headers.get('idempotent-replay'), '1');
+    assert.equal(dispatches, 0, 'uncertain accepted replay never starts a second executor');
+
+    const users = listEvents(sessionId, { types: ['user_input_received'] });
+    const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
+    assert.equal(users.length, 1);
+    assert.equal(users[0].seq, accepted.seq);
+    assert.equal(terminals.length, 1);
+    assert.equal(terminals[0].data.sourceUserSeq, accepted.seq);
+    assert.equal(terminals[0].data.terminalKey, `turn:${accepted.seq}`);
+  } finally {
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    await h.close();
+  }
+});
+
 test('chat/send includes model route diagnostics and preserves them on idempotent replay', async () => {
   const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
   const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
@@ -1281,25 +1626,10 @@ test('run control: task actions are allow-listed — no arbitrary verb reaches t
   } finally { await h.close(); }
 });
 
-test('mobile chat send streams tokens instead of awaiting the whole turn', async () => {
-  // This is a source-contract pin rather than a behavioural one because the
-  // streaming callback only fires on the harness path, which this suite stubs
-  // out. It is here because the defect it guards was silent: mobile awaited
-  // the entire turn and returned one JSON blob, so an identical message felt
-  // dramatically slower on a phone than on the desktop while doing exactly the
-  // same work on the same model. Nothing failed, nothing logged — it just felt
-  // broken. Deleting the callback would restore that with no other signal.
+test('mobile chat streams only persisted public graph events, never raw model deltas', async () => {
   const source = await readFile(new URL('./mobile-routes.ts', import.meta.url), 'utf8');
-
-  const sendCall = source.slice(source.indexOf("channel: 'mobile'"));
-  assert.ok(
-    sendCall.slice(0, 400).includes('onChunk'),
-    'chat/send must pass onChunk to handleMessage, or the phone shows nothing until the turn ends',
-  );
-
-  // ...and the deltas must have somewhere to go: the stream the phone already
-  // holds open has to register a writer, and release it on disconnect or every
-  // closed conversation leaks one.
-  assert.ok(source.includes('addChatStream('), 'the SSE handler must register a delta writer');
-  assert.ok(source.includes('detachDeltas()'), 'the delta writer must be released when the stream closes');
+  assert.ok(source.includes("event.kind !== 'harness.public_event'"));
+  assert.ok(source.includes('projectHarnessEventsForPublic('));
+  assert.ok(!source.includes('addChatStream('));
+  assert.ok(!source.includes('pushChatDelta('));
 });

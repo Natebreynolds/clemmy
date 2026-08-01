@@ -1174,8 +1174,9 @@ export interface ClaudeAgentSdkRunOptions {
    *  packet-derived scope; workflow steps derive run+step; chat derives the
    *  durable user-input event. */
   trackerScopeId?: string;
-  /** Exact accepted user event owned by this run attempt. Turn preflight uses
-   * this instead of session-global latest-user state. */
+  /** Exact accepted user event owned by this run attempt. Runtime authority,
+   * artifact lineage, and compatibility readers use this instead of ambient
+   * session-global latest-user state. */
   sourceUserSeq?: number;
   /** Physical SDK query generation. Local MCP (in-process or stdio) and native
    * canUseTool both enforce it before dispatch. */

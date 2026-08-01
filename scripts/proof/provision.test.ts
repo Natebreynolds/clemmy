@@ -143,7 +143,6 @@ test('live proof defaults Fusion off and only enables it through an explicit can
     CLEMMY_DEBATE_MODE: 'off',
     CLEMMY_FUSION_STRATEGY: 'verify',
     CLEMMY_JUDGE_CROSS_FAMILY: 'off',
-    CLEMMY_LONGTASK_APPROACH_BEAT: 'off',
   });
   assert.equal(proofRuntimeOverrides('all').CLEMMY_DEBATE_MODE, 'all');
   assert.equal(proofRuntimeOverrides('all').CLEMMY_FUSION_STRATEGY, 'verify');

@@ -102,12 +102,24 @@ test('shared step normalization and graph validation preserve execution fields',
     codifiedFrom: { prompt: 'Send adaptively.', allowedTools: ['GMAIL_SEND_EMAIL'] },
     loopUntil: { maxAttempts: 2, probe: { runner: 'check-send.mjs' }, until: { type: 'object', required_keys: ['done'] } },
     loopSafe: true,
+  }, {
+    id: 'analyze',
+    prompt: 'Reduce evidence.',
+    sideEffect: 'read',
+    subgraph: {
+      mode: 'read_parallel_v1',
+      specialists: [
+        { id: 'facts', prompt: 'Inspect facts.' },
+        { id: 'risks', prompt: 'Inspect risks.' },
+      ],
+    },
   }]);
   assert.equal(steps[0].prompt, '');
   assert.equal(steps[0].project, 'clementine-next');
   assert.deepEqual(steps[0].call, { tool: 'GMAIL_SEND_EMAIL', args: { to: '{{item.email}}' } });
   assert.deepEqual(steps[0].codifiedFrom, { prompt: 'Send adaptively.', allowedTools: ['GMAIL_SEND_EMAIL'] });
   assert.equal(steps[0].forEachNewOnly, true);
+  assert.deepEqual(steps[1].subgraph?.specialists.map((specialist) => specialist.id), ['facts', 'risks']);
   assert.match(validateWorkflowStepGraph(steps) ?? '', /depends on unknown step "pull"/);
 });
 

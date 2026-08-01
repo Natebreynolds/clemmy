@@ -1137,3 +1137,48 @@ test('CALL-3 is wired into validateWorkflowDefinition (the agent save path)', ()
   const res = validateWorkflowDefinition(def, {});
   assert.ok(res.errors.some((e) => /not a valid tool reference/.test(e)), 'the builder-error class is now un-saveable');
 });
+
+test('read_parallel_v1 accepts 2-6 explicit read-only specialists', () => {
+  const res = validateWorkflowDefinition({
+    name: 'parallel-read',
+    description: 'Analyze evidence with independent specialist branches.',
+    enabled: true,
+    steps: [{
+      id: 'analyze',
+      prompt: 'Reduce all specialist evidence into one concise result.',
+      sideEffect: 'read',
+      subgraph: {
+        mode: 'read_parallel_v1',
+        specialists: [
+          { id: 'facts', prompt: 'Check factual support.' },
+          { id: 'risks', prompt: 'Check risks and contradictions.', maxTurns: 6 },
+        ],
+      },
+    }],
+  });
+  assert.equal(res.ok, true, res.errors.join('; '));
+});
+
+test('read_parallel_v1 refuses write/send authority and incompatible executors', () => {
+  const res = validateWorkflowDefinition({
+    name: 'unsafe-parallel',
+    description: 'An invalid mutating specialist graph.',
+    enabled: true,
+    steps: [{
+      id: 'send',
+      prompt: 'Send the joined result.',
+      sideEffect: 'send',
+      requiresApproval: true,
+      subgraph: {
+        mode: 'read_parallel_v1',
+        specialists: [
+          { id: 'same', prompt: 'First branch.' },
+          { id: 'same', prompt: 'Second branch.' },
+        ],
+      },
+    }],
+  });
+  assert.ok(res.errors.some((error) => /must explicitly declare sideEffect: read/i.test(error)));
+  assert.ok(res.errors.some((error) => /cannot combine with requiresApproval/i.test(error)));
+  assert.ok(res.errors.some((error) => /duplicate subgraph specialist id/i.test(error)));
+});

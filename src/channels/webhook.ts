@@ -29,7 +29,9 @@ import { DASHBOARD_CRON_RUNS_DIR, buildDashboardSnapshot, loadCronJobs, loadWork
 // in the dashboard's Live Runs feed 404s and the inspector shows
 // "Run not found".
 import {
+  createSession as harnessCreateSession,
   countMatchingEvents as harnessCountMatchingEvents,
+  getHarnessChatRequestReceipt,
   getLatestEventSeq as harnessGetLatestEventSeq,
   getLatestRunAttempt as harnessGetLatestRunAttempt,
   getLatestRunAttemptByRunId as harnessGetLatestRunAttemptByRunId,
@@ -41,6 +43,11 @@ import {
   type RunAttemptRecord as HarnessRunAttemptRecord,
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
+import {
+  claimDurableRequest,
+  durablePayloadHash,
+  durableRequestIdentity,
+} from './durable-request.js';
 import { getArtifactRunScope, listRunArtifacts } from '../runtime/harness/artifact-ledger.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
 import {
@@ -871,6 +878,92 @@ function resolveApiMessageSession(body: {
   };
 }
 
+interface ApiMessageRequestBody {
+  text?: string;
+  session_id?: string;
+  sessionId?: string;
+  user_id?: string;
+  userId?: string;
+  model?: string;
+}
+
+function apiMessageIdempotencyKey(headers: Record<string, unknown>): string {
+  const raw = headers['idempotency-key'];
+  if (typeof raw === 'string') return raw.trim();
+  if (Array.isArray(raw) && raw.length > 0) return String(raw[0]).trim();
+  return '';
+}
+
+function apiMessageDurableIdentity(body: ApiMessageRequestBody, idempotencyKey: string): {
+  requestId: string;
+  runId: string;
+  sessionId: string;
+  userId: string | undefined;
+  inputHash: string;
+} {
+  const text = typeof body.text === 'string' ? body.text : '';
+  const { sessionId: proposedSessionId, userId } = resolveApiMessageSession(body);
+  const identity = durableRequestIdentity('webhook', idempotencyKey);
+  return {
+    requestId: identity.requestId,
+    runId: identity.runId,
+    sessionId: proposedSessionId,
+    userId,
+    inputHash: durablePayloadHash({
+      text,
+      sessionId: proposedSessionId,
+      userId: userId ?? null,
+      model: body.model ?? null,
+    }),
+  };
+}
+
+const apiMessageInFlight = new Map<string, Promise<GatewayResponse>>();
+
+function runApiMessageSingleFlight(
+  requestId: string,
+  execute: () => Promise<GatewayResponse>,
+): Promise<GatewayResponse> {
+  const existing = apiMessageInFlight.get(requestId);
+  if (existing) return existing;
+  let running: Promise<GatewayResponse>;
+  running = execute().finally(() => {
+    if (apiMessageInFlight.get(requestId) === running) apiMessageInFlight.delete(requestId);
+  });
+  apiMessageInFlight.set(requestId, running);
+  return running;
+}
+
+function claimApiMessageRequest(body: ApiMessageRequestBody, idempotencyKey: string) {
+  const identity = apiMessageDurableIdentity(body, idempotencyKey);
+  const prior = getHarnessChatRequestReceipt(identity.requestId);
+  const owningSessionId = prior?.sessionId ?? identity.sessionId;
+  if (!harnessGetSession(owningSessionId)) {
+    try {
+      harnessCreateSession({
+        id: owningSessionId,
+        kind: 'chat',
+        channel: 'webhook',
+        userId: identity.userId,
+        title: typeof body.text === 'string' ? body.text.slice(0, 100) : 'Webhook request',
+        metadata: { source: 'webhook' },
+      });
+    } catch (error) {
+      // A concurrent first delivery may have won session creation. Only
+      // suppress that race when the durable row is now visible.
+      if (!harnessGetSession(owningSessionId)) throw error;
+    }
+  }
+  const claim = claimDurableRequest({
+    requestId: identity.requestId,
+    sessionId: owningSessionId,
+    runId: identity.runId,
+    inputHash: identity.inputHash,
+    sinceSeq: harnessGetLatestEventSeq(owningSessionId),
+  });
+  return { identity, ...claim };
+}
+
 function deriveDashboardSessionToken(webhookSecret: string): string {
   if (!webhookSecret) return randomBytes(32).toString('base64url');
   // The cookie must survive a daemon restart, but must not expose or equal the
@@ -916,6 +1009,9 @@ function collectRecentActivityRuns(limit: number) {
 }
 
 export const __test__ = {
+  apiMessageDurableIdentity,
+  apiMessageIdempotencyKey,
+  claimApiMessageRequest,
   cancelTrackedRun,
   chooseArtifactProjectionScope,
   compactActivityRunListRow,
@@ -930,6 +1026,7 @@ export const __test__ = {
   latestCanonicalToolMilestone,
   projectScopedToolSummary,
   resolveApiMessageSession,
+  runApiMessageSingleFlight,
   serializeMessageResponse,
   supportsDesktopBackgroundHandoff,
   workflowRunRecordAsActivityRun,
@@ -2484,34 +2581,40 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   });
 
   app.post('/api/message', requireAuth, async (req, res) => {
-    const body = req.body as {
-      text?: string;
-      session_id?: string;
-      sessionId?: string;
-      user_id?: string;
-      userId?: string;
-      model?: string;
-    };
+    const body = req.body as ApiMessageRequestBody;
 
     if (!body.text) {
       res.status(400).json({ error: 'Missing "text" field' });
       return;
     }
 
-    const { sessionId, userId } = resolveApiMessageSession(body);
+    const idempotencyKey = apiMessageIdempotencyKey(req.headers as Record<string, unknown>);
+    if (!idempotencyKey) {
+      res.status(400).json({ error: 'Missing "Idempotency-Key" header' });
+      return;
+    }
 
     try {
-      const response = await new ClementineGateway(assistant).handleMessage({
-        message: body.text,
-        sessionId,
-        userId,
-        channel: 'webhook',
-        model: body.model,
-        source: 'webhook',
-      });
+      const claimed = claimApiMessageRequest(body, idempotencyKey);
+      if (!claimed.inserted) res.setHeader('Idempotent-Replay', '1');
+      const response = await runApiMessageSingleFlight(claimed.identity.requestId, () =>
+        new ClementineGateway(assistant).handleMessage({
+          message: body.text!,
+          sessionId: claimed.receipt.sessionId,
+          userId: claimed.identity.userId,
+          channel: 'webhook',
+          model: body.model,
+          source: 'webhook',
+          runId: claimed.receipt.runId,
+          failClosedOnUnsettledReplay: true,
+        }));
 
       res.json(serializeMessageResponse(response));
     } catch (err) {
+      if (err instanceof Error && /already bound to a different chat request/i.test(err.message)) {
+        res.status(409).json({ error: 'Idempotency key is already bound to a different request' });
+        return;
+      }
       logger.error({ err }, 'Webhook /api/message failed');
       res.status(500).json({ error: 'Internal server error' });
     }

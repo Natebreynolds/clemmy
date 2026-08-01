@@ -231,12 +231,18 @@ export interface BackgroundTaskRecord {
     questionId: string;
     answer: string;
     queuedAt: string;
+    requestId?: string;
   };
+  /** Durable ownership proof retained after the drain consumes inputResolution. */
+  lastInputResolutionRequestId?: string;
   continueResolution?: {
     queuedAt: string;
     reason?: string;
     auto?: boolean;
+    requestId?: string;
   };
+  /** Durable ownership proof retained after the drain consumes continueResolution. */
+  lastContinueResolutionRequestId?: string;
   resumedFromTaskId?: string;
   resumeCount?: number;
   /** Set on a resumed-from task once a resume has been spawned, so the
@@ -3831,7 +3837,11 @@ export function queueBackgroundTaskApprovalResolution(approvalId: string, approv
  * normally, so there is no serialized SDK state to replay; the run session holds
  * the full history and re-enters cleanly with the answer).
  */
-export function queueBackgroundTaskInputResolution(questionId: string, answer: string): BackgroundTaskRecord | null {
+export function queueBackgroundTaskInputResolution(
+  questionId: string,
+  answer: string,
+  opts: { requestId?: string } = {},
+): BackgroundTaskRecord | null {
   const task = getBackgroundTaskByQuestionId(questionId);
   if (!task || task.status !== 'awaiting_input') return null;
   backgroundTaskResolutionCasHookForTests?.();
@@ -3841,7 +3851,13 @@ export function queueBackgroundTaskInputResolution(questionId: string, answer: s
   ), {
     status: 'pending',
     pendingQuestionId: questionId,
-    inputResolution: { questionId, answer: clean(answer, RESULT_TRUNCATE_CHARS), queuedAt: now },
+    inputResolution: {
+      questionId,
+      answer: clean(answer, RESULT_TRUNCATE_CHARS),
+      queuedAt: now,
+      ...(opts.requestId ? { requestId: opts.requestId } : {}),
+    },
+    ...(opts.requestId ? { lastInputResolutionRequestId: opts.requestId } : {}),
     lastCheckInAt: now,
     lastCheckInMessage: `Answer received for ${questionId}; queued daemon continuation.`,
   });
@@ -3875,7 +3891,10 @@ export function queueBackgroundTaskInputResolution(questionId: string, answer: s
   return updated;
 }
 
-export function queueBackgroundTaskContinue(id: string, opts: { auto?: boolean; reason?: string } = {}): BackgroundTaskRecord | null {
+export function queueBackgroundTaskContinue(
+  id: string,
+  opts: { auto?: boolean; reason?: string; requestId?: string } = {},
+): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task || task.status !== 'awaiting_continue') return null;
   backgroundTaskResolutionCasHookForTests?.();
@@ -3888,7 +3907,9 @@ export function queueBackgroundTaskContinue(id: string, opts: { auto?: boolean; 
       queuedAt: now,
       reason: clean(opts.reason ?? latest.error ?? 'Continue requested.', 700),
       auto: opts.auto,
+      ...(opts.requestId ? { requestId: opts.requestId } : {}),
     },
+    ...(opts.requestId ? { lastContinueResolutionRequestId: opts.requestId } : {}),
     lastCheckInAt: now,
     lastCheckInMessage: opts.auto
       ? 'Internal run budget reached; queued automatic continuation.'

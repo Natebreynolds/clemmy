@@ -30,6 +30,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
 const { appendEvent, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
 
 type StreamEvent = {
   type?: string;
@@ -116,7 +117,7 @@ test('harness home stream forwards tool + progress frames and finishes with harn
 
     const tool = events.find((event) => event.type === 'tool');
     assert.equal(tool?.toolName, 'memory_search', 'harness tool_called reaches the stream as a tool frame');
-    assert.deepEqual(tool?.input, { query: 'status' });
+    assert.deepEqual(tool?.input, {}, 'public progress identifies the tool without exposing its arguments');
     assert.ok(
       events.some((event) => event.type === 'status' && /planning the next step/i.test(event.text ?? '')),
       'harness lifecycle progress reaches the stream as status frames',
@@ -133,6 +134,7 @@ test('harness home stream forwards tool + progress frames and finishes with harn
 
 test('harness home stream emits a terminal error frame when the run fails', async () => {
   resetEventLog();
+  const privateProviderMessage = 'provider runtime exploded with sk-live-private-detail';
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
@@ -141,7 +143,7 @@ test('harness home stream emits a terminal error frame when the run fails', asyn
       status: 'failed',
       steps: 1,
       lastTurn: 1,
-      error: 'runtime exploded',
+      error: privateProviderMessage,
     })) as never,
   });
 
@@ -156,9 +158,43 @@ test('harness home stream emits a terminal error frame when the run fails', asyn
     const events = parseNdjson(await res.text());
 
     const error = events.find((event) => event.type === 'error');
-    assert.match(error?.error ?? '', /runtime exploded/, 'harness failure surfaces in the stream');
+    assert.equal(error?.error, PUBLIC_RUN_FAILURE_TEXT, 'the stream exposes only the stable public failure copy');
+    assert.doesNotMatch(JSON.stringify(events), /runtime exploded|sk-live-private-detail/);
     assert.equal(events.at(-1)?.type, 'error', 'stream closes on the terminal error frame — never a silent hang');
     assert.equal(h.legacyCalls(), 0, 'no silent legacy retry after a harness failure');
+  } finally {
+    await h.close();
+  }
+});
+
+test('default non-streaming Home chat never exposes a thrown provider error message', async () => {
+  resetEventLog();
+  const privateProviderMessage = 'provider nonstream failure with sk-live-private-detail';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string }) => ({
+      sessionId: opts.sessionId,
+      status: 'failed',
+      steps: 1,
+      lastTurn: 1,
+      error: privateProviderMessage,
+    })) as never,
+  });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/home/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hello', sessionId: 'console:harness-nonstream-error' }),
+    });
+    assert.equal(res.status, 500);
+    const raw = await res.text();
+    const body = JSON.parse(raw) as { error?: string };
+    assert.equal(body.error, PUBLIC_RUN_FAILURE_TEXT);
+    assert.doesNotMatch(raw, /provider nonstream failure|sk-live-private-detail/);
+    assert.equal(h.legacyCalls(), 0, 'no legacy retry after the default harness fails');
   } finally {
     await h.close();
   }

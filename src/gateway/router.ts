@@ -21,11 +21,29 @@ import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import {
-  appendEvent as appendHarnessEvent,
+  beginRunAttempt,
   createSession as createHarnessSession,
+  finishRunAttempt,
+  getLatestRunAttemptByRunId,
   getSession as getHarnessSession,
   listEvents as listHarnessEvents,
+  recordRunAttemptUserInput,
+  type EventRow,
+  type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
+import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
+import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
+import {
+  PUBLIC_RUN_FAILURE_TEXT,
+  publicUserInputText,
+} from '../runtime/harness/public-presentation.js';
+import {
+  presentationEventFromCompletionData,
+  turnOutcomeId,
+  type PresentationEvent,
+  type TurnIdentity,
+  type TurnOutcome,
+} from '../runtime/harness/turn-outcome.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import type { AssistantResponse, AssistantRouteDiagnostics, ToolActivity } from '../types.js';
 
@@ -39,9 +57,17 @@ export interface GatewayRequest {
   model?: string;
   source?: 'discord' | 'webhook' | 'cli' | 'gateway' | 'mobile';
   runId?: string;
-  /** Streaming-text delta callback. Forwarded to assistant.respond,
-   *  which forwards it to the runtime. Only fires when the underlying
-   *  runtime supports streaming (OpenAI Agents SDK path). */
+  /** Provider/client retries may arrive after the process died with an
+   *  accepted source but before a public terminal.  Transport ingress uses
+   *  this fail-closed policy so an uncertain prior write is never dispatched
+   *  a second time merely because the HTTP/gateway delivery was retried. */
+  failClosedOnUnsettledReplay?: boolean;
+  /** Synchronous acceptance hook for channel control planes. It fires only
+   *  after the durable source/run binding exists and before any command,
+   *  mutation, model, or tool dispatch. */
+  onAcceptedTurn?: (accepted: { source: EventRow; attempt: RunAttemptRef | null }) => void;
+  /** Public-reply delta callback. Raw executor/model output is classified and
+   *  committed inside the runtime before it may reach this boundary. */
   onChunk?: (delta: string) => Promise<void> | void;
   /** Reasoning-text callback for o-series-style models. Captured for
    *  run-timeline observability via assistant.respond. */
@@ -215,7 +241,7 @@ function recordGatewayRoute(
   return route;
 }
 
-function registerQueuedBackgroundOriginTurn(request: GatewayRequest): void {
+function ensureGatewayHarnessSession(request: GatewayRequest): void {
   if (!getHarnessSession(request.sessionId)) {
     createHarnessSession({
       id: request.sessionId,
@@ -229,16 +255,239 @@ function registerQueuedBackgroundOriginTurn(request: GatewayRequest): void {
       },
     });
   }
-  appendHarnessEvent({
-    sessionId: request.sessionId,
-    turn: 0,
+}
+
+interface AcceptedGatewayTurn {
+  source: EventRow;
+  attempt: RunAttemptRef | null;
+  replayedSource: boolean;
+}
+
+/**
+ * Accept a gateway request before any command, parked-task mutation, durable
+ * promotion, or model dispatch. An explicit run id is also the gateway replay
+ * key: a transport retry reuses the exact accepted source rather than creating
+ * a second logical turn and repeating its side effect.
+ */
+function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGatewayTurn {
+  ensureGatewayHarnessSession(request);
+  const previous = getLatestRunAttemptByRunId(request.sessionId, runId);
+  if (previous?.sourceUserSeq) {
+    const source = listHarnessEvents(request.sessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === previous.sourceUserSeq);
+    if (!source) throw new Error(`accepted gateway source ${previous.sourceUserSeq} is missing`);
+    if (publicUserInputText(source.data) !== request.message.trim()) {
+      throw new Error(`gateway run ${runId} is already bound to different input`);
+    }
+    if (!previous.finishedAt) {
+      return {
+        source,
+        attempt: {
+          sessionId: previous.sessionId,
+          attemptId: previous.attemptId,
+          runId: previous.runId,
+          startedAt: previous.startedAt,
+        },
+        replayedSource: true,
+      };
+    }
+    return { source, attempt: null, replayedSource: true };
+  }
+
+  const attempt = beginRunAttempt(request.sessionId, { runId });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
     role: 'user',
-    type: 'user_input_received',
     data: {
       text: request.message,
-      queuedBackgroundOrigin: true,
+      displayText: request.message,
+      runId,
+      attemptId: attempt.attemptId,
+      source: `gateway:${request.source ?? 'gateway'}`,
     },
+  }, { armRunInFlight: true });
+  return { source, attempt, replayedSource: false };
+}
+
+function bindGatewayRetryAttempt(source: EventRow, runId: string): RunAttemptRef {
+  const attempt = beginRunAttempt(source.sessionId, { runId });
+  recordRunAttemptUserInput(attempt, {
+    turn: source.turn,
+    role: 'user',
+    data: source.data,
+  }, { existingEventSeq: source.seq, armRunInFlight: true });
+  return attempt;
+}
+
+function settleGatewayAttempt(
+  attempt: RunAttemptRef,
+  status: 'completed' | 'cancelled' | 'failed',
+): void {
+  try { finishRunAttempt(attempt, status); } finally {
+    // A late completion from superseded attempt A must never erase the
+    // restart marker now owned by newer attempt B on this reusable session.
+    clearRunInFlightAfterTerminal(attempt.sessionId, attempt.attemptId);
+  }
+}
+
+function clearGatewayRunMarkerIfIdle(sessionId: string): void {
+  clearRunInFlightAfterTerminal(sessionId);
+}
+
+function gatewayTurnIdentity(source: EventRow): TurnIdentity {
+  return {
+    sessionId: source.sessionId,
+    turn: source.turn,
+    sourceUserSeq: source.seq,
+  };
+}
+
+type GatewayTerminalStatus =
+  | 'done'
+  | 'needs_input'
+  | 'needs_approval'
+  | 'needs_continue'
+  | 'blocked'
+  | 'failed'
+  | 'cancelled';
+
+function commitGatewayTerminal(input: {
+  source: EventRow;
+  status: GatewayTerminalStatus;
+  text: string;
+  approvalId?: string;
+  legacyReason: string;
+  metadata?: Record<string, unknown>;
+}): ReturnType<typeof commitTurnOutcome> {
+  const identity = gatewayTurnIdentity(input.source);
+  const common = {
+    version: 2 as const,
+    id: turnOutcomeId(identity),
+    identity,
+  };
+  let outcome: TurnOutcome;
+  switch (input.status) {
+    case 'needs_input':
+      outcome = {
+        ...common,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'input' },
+        presentation: { kind: 'question', text: input.text },
+      };
+      break;
+    case 'needs_approval':
+      if (!input.approvalId) throw new Error('approval terminal requires approvalId');
+      outcome = {
+        ...common,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'approval' },
+        presentation: { kind: 'approval', text: input.text, approvalId: input.approvalId },
+      };
+      break;
+    case 'needs_continue':
+      outcome = {
+        ...common,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'continue' },
+        presentation: { kind: 'continue', text: input.text },
+      };
+      break;
+    case 'blocked':
+      outcome = {
+        ...common,
+        status: 'blocked',
+        resumable: true,
+        presentation: { kind: 'blocked', text: input.text },
+      };
+      break;
+    case 'failed':
+      outcome = {
+        ...common,
+        status: 'failed',
+        resumable: false,
+        presentation: { kind: 'error', text: input.text },
+      };
+      break;
+    case 'cancelled':
+      outcome = {
+        ...common,
+        status: 'cancelled',
+        resumable: false,
+        presentation: { kind: 'stopped', text: input.text },
+      };
+      break;
+    default:
+      outcome = {
+        ...common,
+        status: 'done',
+        resumable: false,
+        presentation: { kind: 'answer', text: input.text },
+      };
+      break;
+  }
+  return commitTurnOutcome(outcome, {
+    legacyReason: input.legacyReason,
+    metadata: input.metadata,
   });
+}
+
+function exactGatewayTerminal(source: EventRow): { event: EventRow; presentation: PresentationEvent } | null {
+  const terminalKey = `turn:${source.seq}`;
+  for (const event of listHarnessEvents(source.sessionId, {
+    types: ['conversation_completed'],
+    desc: true,
+  })) {
+    if (event.data.terminalKey !== terminalKey && event.data.sourceUserSeq !== source.seq) continue;
+    try {
+      const presentation = presentationEventFromCompletionData(event.data);
+      if (presentation?.identity.sourceUserSeq === source.seq) return { event, presentation };
+    } catch {
+      // A contradictory typed row is not replayable public authority.
+      return null;
+    }
+  }
+  return null;
+}
+
+function gatewayResponseFromTerminal(
+  terminal: { event: EventRow; presentation: PresentationEvent },
+  runId: string,
+): GatewayResponse {
+  const { event, presentation } = terminal;
+  const pendingApprovalId = presentation.kind === 'approval'
+    ? presentation.approvalId
+    : typeof event.data.pendingApprovalId === 'string'
+      ? event.data.pendingApprovalId
+      : undefined;
+  const stoppedReason = presentation.status === 'cancelled'
+    ? 'cancelled'
+    : presentation.needs?.kind === 'continue'
+      ? 'max-turns-with-grace'
+      : presentation.status === 'failed' || presentation.status === 'blocked'
+        ? 'error'
+        : undefined;
+  return {
+    text: presentation.text,
+    sessionId: event.sessionId,
+    runId,
+    ...(typeof event.data.queuedTaskId === 'string' ? { queuedTaskId: event.data.queuedTaskId } : {}),
+    ...(pendingApprovalId ? { pendingApprovalId } : {}),
+    ...(stoppedReason ? { stoppedReason } : {}),
+    ...(event.data.route && typeof event.data.route === 'object'
+      ? { route: event.data.route as AssistantRouteDiagnostics }
+      : {}),
+  };
+}
+
+function terminalStatusForResponse(response: AssistantResponse): GatewayTerminalStatus {
+  if (response.pendingApprovalId) return 'needs_approval';
+  if (response.stoppedReason === 'max-turns-with-grace') return 'needs_continue';
+  if (response.stoppedReason === 'cancelled') return 'cancelled';
+  if (response.stoppedReason === 'error') return 'failed';
+  return 'done';
 }
 
 // A pending "apply your last message to the parked task?" confirmation, keyed by origin
@@ -260,7 +509,12 @@ const declinedParkedQuestion = new Map<string, string>();
 const PARKED_CONFIRM_TTL_MS = 30 * 60_000;
 const PARKED_AFFIRM_RE = /^\/?(y|yes|yep|yeah|yup|sure|ok|okay|apply|apply it|send it|use (?:that|it)|do it|confirm|go ahead|please do)\b/i;
 
-function routeParkedBackgroundReply(request: GatewayRequest): GatewayResponse | null {
+interface ParkedBackgroundRoute {
+  response: GatewayResponse;
+  terminalStatus: Extract<GatewayTerminalStatus, 'done' | 'needs_input'>;
+}
+
+function routeParkedBackgroundReply(request: GatewayRequest): ParkedBackgroundRoute | null {
   const answer = request.message.trim();
 
   // ── Step 2: a confirmation is already pending for this session ──────────────
@@ -275,10 +529,13 @@ function routeParkedBackgroundReply(request: GatewayRequest): GatewayResponse | 
         const queued = queueBackgroundTaskInputResolution(pending.questionId, pending.candidate);
         declinedParkedQuestion.delete(request.sessionId);
         return {
-          sessionId: request.sessionId,
-          handledControl: true,
-          queuedTaskId: queued?.id ?? pending.taskId,
-          text: `Done — I sent "${pending.candidate}" to your background task "${pending.taskTitle}". It's resuming and will report back here when it's finished.`,
+          terminalStatus: 'done',
+          response: {
+            sessionId: request.sessionId,
+            handledControl: true,
+            queuedTaskId: queued?.id ?? pending.taskId,
+            text: `Done — I sent "${pending.candidate}" to your background task "${pending.taskTitle}". It's resuming and will report back here when it's finished.`,
+          },
         };
       }
       // The task moved on between the ask and the confirm — fall through to normal handling.
@@ -306,10 +563,13 @@ function routeParkedBackgroundReply(request: GatewayRequest): GatewayResponse | 
     });
     const asked = parkedTask.pendingQuestion ? ` It asked: "${parkedTask.pendingQuestion}"` : '';
     return {
-      sessionId: request.sessionId,
-      handledControl: true,
-      queuedTaskId: parkedTask.id,
-      text: `Heads up — your background task "${parkedTask.title}" is paused waiting on you.${asked}\n\nWant me to send your message — "${answer}" — as the answer? Reply **yes** to apply it, or just tell me what you meant and I'll handle that instead (the task stays paused).`,
+      terminalStatus: 'needs_input',
+      response: {
+        sessionId: request.sessionId,
+        handledControl: true,
+        queuedTaskId: parkedTask.id,
+        text: `Heads up — your background task "${parkedTask.title}" is paused waiting on you.${asked}\n\nWant me to send your message — "${answer}" — as the answer? Reply **yes** to apply it, or just tell me what you meant and I'll handle that instead (the task stays paused).`,
+      },
     };
   }
 
@@ -318,10 +578,13 @@ function routeParkedBackgroundReply(request: GatewayRequest): GatewayResponse | 
     if (continueTask) {
       const queued = queueBackgroundTaskContinue(continueTask.id);
       return {
-        sessionId: request.sessionId,
-        handledControl: true,
-        queuedTaskId: queued?.id ?? continueTask.id,
-        text: `Continuing background task "${continueTask.title}". It will report back here when it's done.`,
+        terminalStatus: 'done',
+        response: {
+          sessionId: request.sessionId,
+          handledControl: true,
+          queuedTaskId: queued?.id ?? continueTask.id,
+          text: `Continuing background task "${continueTask.title}". It will report back here when it's done.`,
+        },
       };
     }
   }
@@ -599,66 +862,166 @@ export class ClementineGateway {
       title: deriveTitle(request.message),
       message: request.message,
     });
-    const command = parseCommand(request.message);
-    if (command) {
-      const response = this.handleCommand(command, request);
+    let accepted: AcceptedGatewayTurn;
+    try {
+      accepted = acceptGatewayTurn(request, run.id);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      logger.error({ err: detail, sessionId: request.sessionId, runId: run.id }, 'gateway turn acceptance failed');
+      finishRun(run.id, { status: 'failed', message: detail, error: detail });
+      throw new Error(PUBLIC_RUN_FAILURE_TEXT);
+    }
+
+    const replay = exactGatewayTerminal(accepted.source);
+    if (replay) {
+      request.onAcceptedTurn?.({ source: accepted.source, attempt: accepted.attempt });
+      if (accepted.attempt) {
+        try { settleGatewayAttempt(accepted.attempt, 'completed'); } catch { /* replay stays authoritative */ }
+      } else {
+        clearGatewayRunMarkerIfIdle(request.sessionId);
+      }
+      const response = gatewayResponseFromTerminal(replay, run.id);
       finishRun(run.id, {
-        status: 'completed',
-        message: 'Control command handled.',
+        status: replay.presentation.status === 'cancelled'
+          ? 'cancelled'
+          : replay.presentation.status === 'failed' || replay.presentation.status === 'blocked'
+            ? 'failed'
+            : replay.presentation.needs?.kind === 'approval'
+              ? 'awaiting_approval'
+              : 'completed',
+        message: 'Replayed the durable gateway turn outcome.',
         outputPreview: response.text,
+        queuedTaskId: response.queuedTaskId,
+        pendingApprovalId: response.pendingApprovalId,
       });
-      return { ...response, runId: run.id };
+      return response;
     }
 
-    const parkedBackground = routeParkedBackgroundReply(request);
-    if (parkedBackground) {
-      addRunEvent(run.id, {
-        type: 'queued_background',
-        status: 'queued',
-        message: 'Reply routed to parked background task.',
+    // A durable transport replay that finds an accepted source but no public
+    // terminal is an uncertain prior execution.  Blindly starting a new
+    // physical executor here can repeat an external write that landed just
+    // before the daemon crashed.  Recovery gets first chance (a terminal above
+    // would have won); otherwise fail closed with one typed terminal.
+    if (accepted.replayedSource && request.failClosedOnUnsettledReplay) {
+      request.onAcceptedTurn?.({ source: accepted.source, attempt: accepted.attempt });
+      const committed = commitGatewayTerminal({
+        source: accepted.source,
+        status: 'failed',
+        text: PUBLIC_RUN_FAILURE_TEXT,
+        legacyReason: 'transport_replay_unsettled',
+        metadata: { uncertainPriorExecution: true },
       });
+      if (accepted.attempt) {
+        try { settleGatewayAttempt(accepted.attempt, 'failed'); } catch { /* terminal is authoritative */ }
+      } else {
+        clearGatewayRunMarkerIfIdle(request.sessionId);
+      }
       finishRun(run.id, {
-        status: 'completed',
-        message: 'Reply routed to parked background task.',
-        queuedTaskId: parkedBackground.queuedTaskId,
-        outputPreview: parkedBackground.text,
+        status: 'failed',
+        message: 'Transport retry found an unsettled prior execution; refused duplicate dispatch.',
+        error: 'uncertain prior execution',
+        outputPreview: committed.presentation.text,
       });
-      return { ...parkedBackground, runId: run.id };
+      return gatewayResponseFromTerminal({ event: committed.event, presentation: committed.presentation }, run.id);
     }
-
-    const effectiveMessage = rewriteBareContinueForHarness(request.sessionId, request.message);
-
-    if (shouldPromoteToDurable(request.message)) {
-      addRunEvent(run.id, {
-        type: 'queued_background',
-        status: 'queued',
-        message: 'Request promoted to a durable background task.',
-      });
-      registerQueuedBackgroundOriginTurn(request);
-      const task = enqueueDurableChatTask({
-        message: request.message,
-        sessionId: request.sessionId,
-        userId: request.userId,
-        channel: request.channel,
-        model: request.model,
-        source: request.source ?? 'gateway',
-      });
-      logger.info({ taskId: task.id, sessionId: request.sessionId, channel: request.channel }, 'Gateway queued background task');
-      finishRun(run.id, {
-        status: 'queued',
-        message: `Queued background task ${task.id}.`,
-        queuedTaskId: task.id,
-        outputPreview: renderTaskQueued(task.id),
-      });
-      return {
-        text: renderTaskQueued(task.id),
-        sessionId: request.sessionId,
-        queuedTaskId: task.id,
-        runId: run.id,
-      };
+    let activeAttempt: RunAttemptRef;
+    try {
+      activeAttempt = accepted.attempt ?? bindGatewayRetryAttempt(accepted.source, run.id);
+      accepted.attempt = activeAttempt;
+      request.onAcceptedTurn?.({ source: accepted.source, attempt: activeAttempt });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      logger.error({ err: detail, sessionId: request.sessionId, runId: run.id }, 'gateway replay attempt binding failed');
+      finishRun(run.id, { status: 'failed', message: detail, error: detail });
+      throw new Error(PUBLIC_RUN_FAILURE_TEXT);
     }
 
     try {
+      const command = parseCommand(request.message);
+      if (command) {
+        const response = this.handleCommand(command, request);
+        const committed = commitGatewayTerminal({
+          source: accepted.source,
+          status: 'done',
+          text: response.text,
+          legacyReason: 'gateway_command',
+        });
+        settleGatewayAttempt(activeAttempt, 'completed');
+        finishRun(run.id, {
+          status: 'completed',
+          message: 'Control command handled.',
+          outputPreview: committed.presentation.text,
+        });
+        return { ...response, text: committed.presentation.text, runId: run.id };
+      }
+
+      const parkedBackground = routeParkedBackgroundReply(request);
+      if (parkedBackground) {
+        const { response } = parkedBackground;
+        addRunEvent(run.id, {
+          type: 'queued_background',
+          status: 'queued',
+          message: 'Reply routed to parked background task.',
+        });
+        const committed = commitGatewayTerminal({
+          source: accepted.source,
+          status: parkedBackground.terminalStatus,
+          text: response.text,
+          legacyReason: parkedBackground.terminalStatus === 'needs_input'
+            ? 'parked_task_confirmation'
+            : 'parked_task_routed',
+          metadata: { queuedTaskId: response.queuedTaskId },
+        });
+        settleGatewayAttempt(activeAttempt, 'completed');
+        finishRun(run.id, {
+          status: 'completed',
+          message: 'Reply routed to parked background task.',
+          queuedTaskId: response.queuedTaskId,
+          outputPreview: committed.presentation.text,
+        });
+        return { ...response, text: committed.presentation.text, runId: run.id };
+      }
+
+      const effectiveMessage = rewriteBareContinueForHarness(request.sessionId, request.message);
+
+      if (shouldPromoteToDurable(request.message)) {
+        addRunEvent(run.id, {
+          type: 'queued_background',
+          status: 'queued',
+          message: 'Request promoted to a durable background task.',
+        });
+        const task = enqueueDurableChatTask({
+          message: request.message,
+          sessionId: request.sessionId,
+          userId: request.userId,
+          channel: request.channel,
+          model: request.model,
+          source: request.source ?? 'gateway',
+        });
+        const queuedText = renderTaskQueued(task.id);
+        const committed = commitGatewayTerminal({
+          source: accepted.source,
+          status: 'done',
+          text: queuedText,
+          legacyReason: 'queued_background',
+          metadata: { queuedTaskId: task.id },
+        });
+        settleGatewayAttempt(activeAttempt, 'completed');
+        logger.info({ taskId: task.id, sessionId: request.sessionId, channel: request.channel }, 'Gateway queued background task');
+        finishRun(run.id, {
+          status: 'queued',
+          message: `Queued background task ${task.id}.`,
+          queuedTaskId: task.id,
+          outputPreview: committed.presentation.text,
+        });
+        return {
+          text: committed.presentation.text,
+          sessionId: request.sessionId,
+          queuedTaskId: task.id,
+          runId: run.id,
+        };
+      }
+
       addRunEvent(run.id, {
         type: 'model_started',
         message: 'Assistant run started.',
@@ -668,6 +1031,8 @@ export class ClementineGateway {
       // contract preserved; kill-switch CLEMMY_HARNESS_WEBHOOK=off.
       const response = await respondPreferHarness('webhook', {
         message: effectiveMessage,
+        displayMessage: request.message,
+        sourceUserSeq: accepted.source.seq,
         sessionId: request.sessionId,
         userId: request.userId,
         channel: request.channel,
@@ -677,6 +1042,19 @@ export class ClementineGateway {
         onReasoning: request.onReasoning,
         onToolActivity: request.onToolActivity,
       }, (req) => this.assistant.respond(req));
+      const route = recordGatewayRoute(run.id, response, request.model);
+      const committed = commitGatewayTerminal({
+        source: accepted.source,
+        status: terminalStatusForResponse(response),
+        text: response.text,
+        approvalId: response.pendingApprovalId,
+        legacyReason: response.pendingApprovalId
+          ? 'awaiting_approval'
+          : response.stoppedReason === 'max-turns-with-grace'
+            ? 'awaiting_continue'
+            : response.stoppedReason ?? 'success',
+        metadata: { ...(route ? { route } : {}) },
+      });
       const runCancelled = response.stoppedReason === 'cancelled';
       // Report-back honesty: a non-pending, non-throwing respond() can still be
       // a blocked / promised / errored run. Fail-open + suspicious-only; the run
@@ -686,7 +1064,6 @@ export class ClementineGateway {
         ? null
         : await verifyDelivered(request.message, response.text, { stoppedReason: response.stoppedReason });
       const runFailedNotDelivered = verdict ? !verdict.delivered : false;
-      const route = recordGatewayRoute(run.id, response, request.model);
       finishRun(run.id, {
         status: runCancelled
           ? 'cancelled'
@@ -706,22 +1083,56 @@ export class ClementineGateway {
         pendingApprovalId: response.pendingApprovalId,
         ...(runFailedNotDelivered ? { error: verdict?.reason ?? 'Run did not finish cleanly.' } : {}),
       });
+      try {
+        settleGatewayAttempt(
+          activeAttempt,
+          runCancelled ? 'cancelled' : committed.presentation.status === 'failed' ? 'failed' : 'completed',
+        );
+      } catch { /* bridge may already have settled the shared physical attempt */ }
       return {
-        text: response.text,
+        text: committed.presentation.text,
         sessionId: response.sessionId,
-        pendingApprovalId: response.pendingApprovalId,
+        pendingApprovalId: committed.presentation.kind === 'approval'
+          ? committed.presentation.approvalId
+          : response.pendingApprovalId,
         runId: run.id,
-        stoppedReason: response.stoppedReason,
+        stoppedReason: committed.presentation.needs?.kind === 'continue'
+          ? 'max-turns-with-grace'
+          : committed.presentation.status === 'cancelled'
+            ? 'cancelled'
+            : committed.presentation.status === 'failed' || committed.presentation.status === 'blocked'
+              ? 'error'
+              : response.stoppedReason,
         turnsUsed: response.turnsUsed,
         route,
       };
     } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      logger.error({ err: detail, sessionId: request.sessionId, runId: run.id }, 'accepted gateway turn failed');
       finishRun(run.id, {
         status: 'failed',
-        message: error instanceof Error ? error.message : String(error),
-        error: error instanceof Error ? error.message : String(error),
+        message: detail,
+        error: detail,
       });
-      throw error;
+      try {
+        const failed = commitGatewayTerminal({
+          source: accepted.source,
+          status: 'failed',
+          text: PUBLIC_RUN_FAILURE_TEXT,
+          legacyReason: 'gateway_failed',
+        });
+        try { settleGatewayAttempt(activeAttempt, 'failed'); } catch { /* best effort */ }
+        if (failed.presentation.status !== 'failed') {
+          return gatewayResponseFromTerminal({ event: failed.event, presentation: failed.presentation }, run.id);
+        }
+      } catch (commitError) {
+        logger.error({
+          err: commitError instanceof Error ? commitError.message : String(commitError),
+          sessionId: request.sessionId,
+          runId: run.id,
+        }, 'accepted gateway failure could not commit its terminal');
+      }
+      throw new Error(PUBLIC_RUN_FAILURE_TEXT);
     }
   }
 }

@@ -76,7 +76,7 @@ import {
 import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decision.js';
 import { reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
-import { installProvenStandardBeatLine, reapDeadSkillChoices } from '../memory/skill-choice-store.js';
+import { reapDeadSkillChoices } from '../memory/skill-choice-store.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
@@ -1491,7 +1491,20 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
   }
 }
 
-export async function startDaemon(assistant: ClementineAssistant): Promise<void> {
+export interface StartDaemonOptions {
+  /**
+   * Open mutating network ingress only after boot has fenced orphan attempts,
+   * drained durable approval/chat recovery, and armed terminal report-back.
+   * `startDaemon` owns the readiness boundary because it never returns once
+   * the main loop starts.
+   */
+  onReady?: () => Promise<void> | void;
+}
+
+export async function startDaemon(
+  assistant: ClementineAssistant,
+  options: StartDaemonOptions = {},
+): Promise<void> {
   setDaemonRuntimePhase('daemon.boot.start', { build: describeBuild() });
   // Surface exactly which build is running so a stale packaged bundle
   // can't masquerade as the latest src silently (see build-info.ts).
@@ -1548,9 +1561,6 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // an exact non-generic personal email. This makes identity readiness true on
   // first boot instead of waiting for the 4:40 AM maintenance window.
   try {
-    // The alignment beat names the standard governing the work; wire that
-    // lookup at boot so turn-control keeps no memory-layer dependency.
-    try { installProvenStandardBeatLine(); } catch { /* beat degrades to generic */ }
     const identityFinalization = finalizeMemoryIdentityOnBoot();
     if (identityFinalization.reason === 'backup_failed') {
       logger.warn(identityFinalization, 'Withheld boot identity reconciliation because the safety backup failed');
@@ -1628,6 +1638,32 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot run-attempt sweep failed');
   }
+  // Register the live approval listener and drain decisions that landed before
+  // this daemon existed. This must run after orphan attempts are interrupted
+  // (so a dead executor cannot still own the session) and before generic chat
+  // restart recovery (so an approved parked card resumes with its exact
+  // approval directive/source rather than a generic "continue" prompt).
+  try {
+    const { startChatApprovalResume } = await import('../runtime/harness/chat-approval-resume.js');
+    await startChatApprovalResume(async (sessionId, directive, source) => {
+      await respondPreferHarness('background', {
+        sessionId,
+        channel: 'daemon',
+        message: directive,
+        displayMessage: source.displayMessage,
+        sourceUserSeq: source.sourceUserSeq,
+        // The stable run family resolves to source.runAttemptId, so neither
+        // brain inserts a sibling attempt/source.
+        runId: source.runId,
+        model: MODELS.primary,
+      }, (req) => assistant.respond(req));
+    });
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Chat approval auto-resume failed to start (parked approvals will need a manual "continue")',
+    );
+  }
   // Re-queue tasks interrupted by a previous restart/crash so the work
   // resumes instead of stranding (bounded by resumeCount to avoid loops).
   const autoResumed = resumeInterruptedBackgroundTasks({ cap: 2 });
@@ -1640,11 +1676,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // through the same harness spine a user's `continue` uses (2026-07-09: users
   // sat on "reply continue" banners after every restart; the resume path itself
   // was live-verified to work). Write-touched / stale runs keep the manual banner.
-  const recoveredChats = reportInterruptedChatRuns(Date.now, async (sessionId, directive) => {
+  const recoveredChats = reportInterruptedChatRuns(Date.now, async (sessionId, directive, sourceUserSeq) => {
     await respondPreferHarness('background', {
       sessionId,
       channel: 'daemon',
       message: directive,
+      sourceUserSeq,
       model: MODELS.primary,
     }, (req) => assistant.respond(req));
   }, { bootCutoffMs: performance.timeOrigin });
@@ -1747,8 +1784,6 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Pending workflow run reconcile failed');
   }
 
-  logger.info('Daemon loop started');
-
   // Start the approval reaper. Every 60s it expires past-due rows in
   // pending_approvals (default TTL 24h), clears the orphan session's
   // interrupt state, marks the session 'cancelled', and posts a user
@@ -1763,28 +1798,6 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
       'Approval reaper failed to start (continuing without periodic expiry)',
-    );
-  }
-
-  // Chat approval auto-resume (fail-closed park, 2026-07-20): when a WAIT-gate
-  // approval that PARKED (hold ceiling hit, turn ended honestly) is later
-  // APPROVED, re-drive the session through the normal respond spine so the
-  // approved action actually runs — "I approved it and nothing happened" is a
-  // trust break. Same injected-dispatcher shape as restart-recovery's resume.
-  try {
-    const { startChatApprovalResume } = await import('../runtime/harness/chat-approval-resume.js');
-    startChatApprovalResume(async (sessionId, directive) => {
-      await respondPreferHarness('background', {
-        sessionId,
-        channel: 'daemon',
-        message: directive,
-        model: MODELS.primary,
-      }, (req) => assistant.respond(req));
-    });
-  } catch (err) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : String(err) },
-      'Chat approval auto-resume failed to start (parked approvals will need a manual "continue")',
     );
   }
 
@@ -2114,6 +2127,16 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     const workflowRunTimer = setInterval(drainWorkflowRunsTick, 15_000);
     workflowRunTimer.unref?.();
   }
+
+  // RELEASE BOUNDARY: listeners must not accept a fresh mutation while the
+  // previous process's logical turns are still being fenced/reconciled or
+  // before their background/recovery consumers are armed. Keep this after all
+  // boot reconciliation and lane registration, immediately before the main
+  // loop. A bind failure is fatal so the supervisor cannot report a half-ready
+  // daemon as healthy.
+  await options.onReady?.();
+  setDaemonRuntimePhase('daemon.boot.ready', { ingressReady: Boolean(options.onReady) });
+  logger.info('Daemon loop started');
 
   // Stagger monitor runs — don't run them every 15s tick
   let tickCount = 0;

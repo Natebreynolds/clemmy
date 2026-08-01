@@ -11,7 +11,8 @@
  *      out gets N/N coverage;
  *   2. a single-item / paginated chat turn injects only the static line (no
  *      directive) — the no-fire regression guard;
- *   3. a non-chat (workflow) turn keeps the static line (suppression).
+ *   3. a workflow turn gets truthful runner-owned topology guidance without an
+ *      unavailable worker-spawn instruction.
  *
  * Offline + deterministic: no real Runner, model, or external API. The true
  * live coverage run (real model decides to fan out, real workers deliver) is a
@@ -169,11 +170,15 @@ test('SMOKE: paginated one-table chat turn does NOT inject the directive — no-
   assert.ok(!/Fan-out directive/.test(modelInputText), 'paginated read must NOT fan out');
 });
 
-test('SMOKE: workflow turn keeps the static line even for multi-item input — suppression', async () => {
+test('SMOKE: workflow turn gets runner-owned topology guidance without unavailable worker advice', async () => {
   const { modelInputText } = await runTurnCapturingModelInput({
     kind: 'workflow',
     input: 'Research these 10 prospects and capture each firm’s SEO posture.',
   });
-  assert.match(modelInputText, /Parallelism reminder:/, 'workflow keeps static line (forEach is authoring-time)');
+  assert.match(modelInputText, /Workflow parallelism: execute this node as one scoped unit/);
+  assert.match(modelInputText, /runner owns topology/);
+  assert.match(modelInputText, /authored forEach step or explicit sibling nodes/);
+  assert.doesNotMatch(modelInputText, /call run_worker/);
+  assert.doesNotMatch(modelInputText, /Parallelism reminder:/);
   assert.ok(!/Fan-out directive/.test(modelInputText), 'workflow step must not get the run_worker directive');
 });

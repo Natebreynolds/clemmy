@@ -58,6 +58,16 @@ export type ActionEvent =
       session?: HarnessSessionSignal;
     }
   | {
+      // User-facing projection of a persisted harness event. The raw
+      // `harness.event` channel remains the execution/audit plane; chat
+      // transports subscribe here so model output and control payloads cannot
+      // become presentation merely because they were logged.
+      kind: 'harness.public_event';
+      sessionId: string;
+      event: EventRow;
+      session?: HarnessSessionSignal;
+    }
+  | {
       // Reliability invariant (v0.4.20+): every CodexNativeRuntime.run
       // terminates with EXACTLY ONE of `runtime.completed` or
       // `runtime.failed`. Subscribers (Discord, dashboard, ops log)

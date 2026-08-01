@@ -47,7 +47,6 @@ const {
   OrphanedWriteRetryError,
   _setBeforeSharedWriteAdmissionForTests,
 } = await import('./brackets.js');
-const { classifyTurnPreflight, recordTurnPreflightDecision } = await import('./turn-control.js');
 
 test.after(() => {
   try {
@@ -547,31 +546,6 @@ test('wrapToolForHarness: forwards the execute call when flag is on', async () =
   }
 });
 
-test('wrapToolForHarness: an align-phase turn no longer hard-blocks tools (fold: gate demoted to directive)', async () => {
-  // Review wf_30a7ce7e-e9c: the align-phase all-tool deny was removed — the
-  // beat is delivered conversationally via the [confirm-first] directive, and
-  // consent enforcement stays with plan-scope/approvals. A tool call during an
-  // align turn rides the normal gate chain instead of a blanket refusal.
-  resetEventLog();
-  const sess = createSession({ kind: 'chat' });
-  const message = 'Turn this research into a Google Doc for the client.';
-  appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: message } });
-  recordTurnPreflightDecision(sess.id, classifyTurnPreflight({
-    message,
-    sessionId: sess.id,
-    sessionKind: 'chat',
-  }));
-  const counter = new ToolCallsCounter(10);
-  let executed = 0;
-  const wrapped = wrapToolForHarness({
-    name: 'memory_search',
-    execute: async () => { executed += 1; return 'found'; },
-  });
-  const result = await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ query: 'client research' }));
-  assert.doesNotMatch(String(result), /PREFLIGHT_ALIGNMENT_REQUIRED/);
-  assert.equal(executed, 1, 'reads during the alignment beat are allowed (the beat itself may need them)');
-});
-
 test('artifact admission: a duplicate create neither executes nor records/counts a second write', async () => {
   const saved = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
@@ -886,17 +860,15 @@ test('artifact lineage: create/readback stay on the context-bound source when a 
   }
 });
 
-test('artifact objective: confirmed go-ahead retains the aligned multi-document intent', async () => {
+test('artifact objective: a legacy go-ahead retains the aligned multi-document intent', async () => {
   const saved = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
     CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
     CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
-    CLEMMY_CONFIRM_BEAT: process.env.CLEMMY_CONFIRM_BEAT,
   };
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   process.env.CLEMMY_CONFIRM_FIRST = 'off';
-  process.env.CLEMMY_CONFIRM_BEAT = 'on';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const objective = 'Create a Google Doc set with two separate documents: a client brief and a technical appendix.';
@@ -907,14 +879,18 @@ test('artifact objective: confirmed go-ahead retains the aligned multi-document 
     type: 'user_input_received',
     data: { text: objective },
   });
-  const align = classifyTurnPreflight({
-    message: objective,
+  appendEvent({
     sessionId: sess.id,
-    sessionKind: 'chat',
-    sourceUserSeq: request.seq,
+    turn: 1,
+    role: 'system',
+    type: 'turn_preflight_decision',
+    data: {
+      phase: 'align',
+      objective,
+      intentKey: 'legacy-multi-doc',
+      sourceUserSeq: request.seq,
+    },
   });
-  assert.equal(align.phase, 'align');
-  recordTurnPreflightDecision(sess.id, align, request.seq);
   const approval = appendEvent({
     sessionId: sess.id,
     turn: 2,
@@ -922,15 +898,6 @@ test('artifact objective: confirmed go-ahead retains the aligned multi-document 
     type: 'user_input_received',
     data: { text: 'go ahead' },
   });
-  const execute = classifyTurnPreflight({
-    message: 'go ahead',
-    sessionId: sess.id,
-    sessionKind: 'chat',
-    sourceUserSeq: approval.seq,
-  });
-  assert.equal(execute.phase, 'execute');
-  assert.equal(execute.confirmedIntentKey, align.intentKey);
-  recordTurnPreflightDecision(sess.id, execute, approval.seq);
   try {
     const behaviorScopeId = 'confirmed-multi-doc-scope';
     const counter = new ToolCallsCounter(10);
@@ -1623,6 +1590,45 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
   }
 });
 
+test('confirm-first gate: reversible mutation batches are outside the irreversible-send guard', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  try {
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async () => 'created',
+    });
+
+    for (let n = 1; n <= 6; n += 1) {
+      const result = await withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+        wrapped.execute!({
+          tool_slug: 'AIRTABLE_CREATE_RECORD',
+          arguments: JSON.stringify({ record: { name: `record-${n}` } }),
+        }),
+      );
+      assert.ok(String(result).startsWith('created'), `reversible mutation #${n} should not require batch confirmation`);
+    }
+
+    const confirmTrips = listEvents(sess.id, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data?.kind === 'confirm_first_required');
+    assert.equal(confirmTrips.length, 0);
+  } finally {
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    if (prevConfirm === undefined) delete process.env.CLEMMY_CONFIRM_FIRST;
+    else process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    if (prevExecGate === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
+    else process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+  }
+});
+
 test('confirm-first gate: YOLO never extends to an irreversible batch — threshold blocks; a certified batch passes', async () => {
   // Supersedes the earlier contract after the ask-first batch regression: YOLO
   // waved 10 outbound emails through this gate. New contract: YOLO still skips
@@ -1903,7 +1909,6 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
   const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
   const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
   const prevDest = process.env.CLEMMY_DESTINATION_GATE;
-  const prevOffer = process.env.CLEMMY_BG_OFFER_NUDGE;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   // This test exercises OTHER gates with 8+ distinct mutating writes — keep
   // the (now default-ON) same-mut halt out of its way.
@@ -1912,10 +1917,6 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   process.env.CLEMMY_GROUNDING_GATE = 'off';
   process.env.CLEMMY_DESTINATION_GATE = 'on';
-  // This test drives 7+ tool calls in one chat session, crossing the background-
-  // offer nudge floor — orthogonal to the destination gate under test, so disable
-  // it here to keep the exact-output assertions byte-stable.
-  process.env.CLEMMY_BG_OFFER_NUDGE = 'off';
   resetEventLog();
   const destination = await import('./destination-gate.js');
   destination._resetDestinationStateForTests();
@@ -2034,7 +2035,6 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
     process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
     if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
     if (prevDest === undefined) delete process.env.CLEMMY_DESTINATION_GATE; else process.env.CLEMMY_DESTINATION_GATE = prevDest;
-    if (prevOffer === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE; else process.env.CLEMMY_BG_OFFER_NUDGE = prevOffer;
   }
 });
 
@@ -2499,117 +2499,6 @@ test('typed non-shell pre-dispatch errors release an artifact create claim', asy
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-  }
-});
-
-// ─── Inc A2: mid-runTurn background-offer nudge ──────────────────────────────
-
-test('Inc A2: background-offer nudge appends once after the tool-call floor in a foreground chat', async () => {
-  const prevB = process.env.HARNESS_TOOL_BRACKETS;
-  const prevN = process.env.CLEMMY_BG_OFFER_NUDGE;
-  process.env.HARNESS_TOOL_BRACKETS = 'on';
-  process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
-  try {
-    const sess = createSession({ kind: 'chat' });
-    const counter = new ToolCallsCounter(50);
-    for (let i = 0; i < 5; i++) counter.increment(); // 5 prior calls this runTurn
-    const wrapped = wrapToolForHarness({ name: 'probe', execute: async () => 'tool-output' });
-    const ctx = { sessionId: sess.id, counter } as { sessionId: string; counter: ToolCallsCounter; backgroundOfferNudged?: boolean };
-    // 6th call crosses the floor → nudge appended to the tool result.
-    const res = (await withHarnessRunContext(ctx, async () => wrapped.execute!({}))) as string;
-    assert.match(res, /tool-output/, 'real tool output preserved');
-    assert.match(res, /\[background offer\]/, 'crossing the 6-call floor appends the offer nudge');
-    assert.match(res, /dispatch_background_task on their yes/, 'nudge teaches the prose ask (ceremony stripped 2026-07-22)');
-    // At most once per runTurn (same ctx → flag set).
-    const res2 = (await withHarnessRunContext(ctx, async () => wrapped.execute!({}))) as string;
-    assert.doesNotMatch(res2, /\[background offer\]/, 'nudge fires at most once per runTurn');
-  } finally {
-    process.env.HARNESS_TOOL_BRACKETS = prevB;
-    delete process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE;
-    delete process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE;
-    if (prevN === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE; else process.env.CLEMMY_BG_OFFER_NUDGE = prevN;
-  }
-});
-
-test('Inc A2: no offer nudge below the floor, with the kill-switch off, or in a non-chat session', async () => {
-  const prevB = process.env.HARNESS_TOOL_BRACKETS;
-  const prevN = process.env.CLEMMY_BG_OFFER_NUDGE;
-  process.env.HARNESS_TOOL_BRACKETS = 'on';
-  const run = async (sessionId: string, priorCalls: number): Promise<string> => {
-    const counter = new ToolCallsCounter(50);
-    for (let i = 0; i < priorCalls; i++) counter.increment();
-    const wrapped = wrapToolForHarness({ name: 'probe', execute: async () => 'out' });
-    return (await withHarnessRunContext({ sessionId, counter }, async () => wrapped.execute!({}))) as string;
-  };
-  try {
-    // Normal operation never injects an ask-and-stop gate merely because the
-    // model used six tools.
-    delete process.env.CLEMMY_BG_OFFER_NUDGE;
-    const chatDefault = createSession({ kind: 'chat' });
-    assert.doesNotMatch(await run(chatDefault.id, 5), /\[background offer\]/, 'default OFF → let the task finish');
-    // below the floor (2 calls) → no nudge
-    process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
-    const chatA = createSession({ kind: 'chat' });
-    assert.doesNotMatch(await run(chatA.id, 1), /\[background offer\]/, 'below floor → no nudge');
-    // kill-switch off → no nudge even past the floor
-    process.env.CLEMMY_BG_OFFER_NUDGE = 'off';
-    const chatB = createSession({ kind: 'chat' });
-    assert.doesNotMatch(await run(chatB.id, 5), /\[background offer\]/, '=off → no nudge');
-    process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
-    // non-chat (execution) session → no nudge (offering to background a background run is nonsensical)
-    const exec = createSession({ kind: 'execution' });
-    assert.doesNotMatch(await run(exec.id, 5), /\[background offer\]/, 'non-chat → no nudge');
-  } finally {
-    process.env.HARNESS_TOOL_BRACKETS = prevB;
-    if (prevN === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE;
-    else process.env.CLEMMY_BG_OFFER_NUDGE = prevN;
-  }
-});
-
-test('Inc A2: clarification-resolution state suppresses the background offer rail', async () => {
-  const prevB = process.env.HARNESS_TOOL_BRACKETS;
-  const prevN = process.env.CLEMMY_BG_OFFER_NUDGE;
-  process.env.HARNESS_TOOL_BRACKETS = 'on';
-  process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
-  try {
-    const sess = createSession({ kind: 'chat' });
-    const counter = new ToolCallsCounter(50);
-    for (let i = 0; i < 5; i++) counter.increment();
-    const wrapped = wrapToolForHarness({ name: 'probe', execute: async () => 'tool-output' });
-    const result = await withHarnessRunContext(
-      { sessionId: sess.id, counter, suppressBackgroundOffer: true },
-      async () => wrapped.execute!({}),
-    );
-    assert.doesNotMatch(String(result), /\[background offer\]/);
-  } finally {
-    process.env.HARNESS_TOOL_BRACKETS = prevB;
-    if (prevN === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE;
-    else process.env.CLEMMY_BG_OFFER_NUDGE = prevN;
-  }
-});
-
-test('Inc A2: code-mode and batch-item carriers never receive conversational background offers', async () => {
-  const prevB = process.env.HARNESS_TOOL_BRACKETS;
-  const prevN = process.env.CLEMMY_BG_OFFER_NUDGE;
-  process.env.HARNESS_TOOL_BRACKETS = 'on';
-  process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
-  try {
-    const run = async (extra: { codeMode?: boolean; batchItem?: boolean }): Promise<string> => {
-      const sess = createSession({ kind: 'chat' });
-      const counter = new ToolCallsCounter(50);
-      for (let i = 0; i < 5; i++) counter.increment();
-      const wrapped = wrapToolForHarness({ name: 'probe', execute: async () => 'tool-output' });
-      return String(await withHarnessRunContext(
-        { sessionId: sess.id, counter, ...extra },
-        async () => wrapped.execute!({}),
-      ));
-    };
-    assert.doesNotMatch(await run({ codeMode: true }), /\[background offer\]/);
-    assert.doesNotMatch(await run({ batchItem: true }), /\[background offer\]/);
-  } finally {
-    process.env.HARNESS_TOOL_BRACKETS = prevB;
-    if (prevN === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE;
-    else process.env.CLEMMY_BG_OFFER_NUDGE = prevN;
   }
 });
 

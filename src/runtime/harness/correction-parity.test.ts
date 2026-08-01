@@ -24,7 +24,9 @@ const LANES = ['loop.ts', 'claude-agent-brain.ts', 'plan-first.ts', '../../assis
 for (const lane of LANES) {
   test(`${lane} runs post-turn hooks via the shared spine`, () => {
     const src = readFileSync(path.join(here, lane), 'utf8');
-    assert.match(src, /runPostTurnHooks\(/, `${lane} must call the shared runPostTurnHooks seam`);
+    // The Claude lane exposes an injectable alias for focused runtime tests,
+    // but that alias is initialized exclusively from the same imported seam.
+    assert.match(src, /runPostTurnHooks(?:Impl)?\s*\(/, `${lane} must call the shared runPostTurnHooks seam`);
     assert.match(src, /from '[^']*post-turn\.js'/, `${lane} must import the shared post-turn spine`);
   });
 }

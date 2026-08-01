@@ -19,7 +19,6 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-harness-chat-idempot
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.AUTH_MODE = 'claude_oauth';
 process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
-process.env.CLEMMY_CONFIRM_BEAT = 'off';
 process.env.CLEMMY_DEBATE_MODE = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'claude-auth.json'), JSON.stringify({
@@ -57,7 +56,6 @@ after(() => {
   resetEventLog();
   delete process.env.AUTH_MODE;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
-  delete process.env.CLEMMY_CONFIRM_BEAT;
   delete process.env.CLEMMY_DEBATE_MODE;
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
@@ -583,7 +581,7 @@ test('desktop Stop requires and latches only the exact active attempt', async ()
   }
 });
 
-test('conversation reply while ONE background task is parked routes as its answer — no model turn, no duplicate task', async () => {
+test('lost background-input response replays one accepted source, terminal, and task mutation', async () => {
   resetEventLog();
   resetHarnessRuntimeConfig();
   let brainCalls = 0;
@@ -605,14 +603,15 @@ test('conversation reply while ONE background task is parked routes as its answe
     });
     markBackgroundTaskAwaitingInput(task.id, 'q-workspace-1', 'Which Airtable workspace should I use?');
 
+    const requestBody = {
+      input: 'Use workspace wspTEST123 please.',
+      sessionId: session.id,
+      clientRequestId: 'bridge-answer-request-1',
+    };
     const res = await fetch(`${harness.url}/api/harness/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        input: 'Use workspace wspTEST123 please.',
-        sessionId: session.id,
-        clientRequestId: 'bridge-answer-request-1',
-      }),
+      body: JSON.stringify(requestBody),
     });
     assert.equal(res.status, 200);
     const body = await res.json() as { status: string; routedToBackgroundTask?: string; reply?: string };
@@ -623,6 +622,25 @@ test('conversation reply while ONE background task is parked routes as its answe
     const resumed = getBackgroundTask(task.id);
     assert.equal(resumed?.status, 'pending', 'the task left awaiting_input and queued its continuation');
     assert.equal(resumed?.inputResolution?.answer, 'Use workspace wspTEST123 please.');
+    assert.equal(resumed?.lastInputResolutionRequestId, requestBody.clientRequestId);
+    const firstUpdatedAt = resumed?.updatedAt;
+    const firstQueuedAt = resumed?.inputResolution?.queuedAt;
+
+    // Simulate a lost HTTP response: the browser sends the identical durable
+    // request again after the route has already committed its terminal.
+    const retry = await fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    assert.equal(retry.status, 200);
+    const replay = await retry.json() as { replayed?: boolean; routedToBackgroundTask?: string; reply?: string };
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.routedToBackgroundTask, task.id);
+    assert.equal(replay.reply, body.reply);
+    const afterReplay = getBackgroundTask(task.id);
+    assert.equal(afterReplay?.updatedAt, firstUpdatedAt, 'terminal replay performs no second task mutation');
+    assert.equal(afterReplay?.inputResolution?.queuedAt, firstQueuedAt);
     assert.equal(
       listBackgroundTasks().filter((t) => t.originSessionId === session.id).length,
       1,
@@ -631,8 +649,171 @@ test('conversation reply while ONE background task is parked routes as its answe
 
     // The conversation renders the round-trip: the user's answer + the ack.
     const events = listEvents(session.id);
-    assert.ok(events.some((e) => e.type === 'user_input_received' && String((e.data as { text?: string }).text).includes('wspTEST123')));
-    assert.ok(events.some((e) => e.type === 'conversation_completed'));
+    const accepted = events.find((e) => e.type === 'user_input_received' && String((e.data as { text?: string }).text).includes('wspTEST123'));
+    const terminal = events.find((e) => e.type === 'conversation_completed');
+    assert.ok(accepted);
+    assert.equal(terminal?.data.turnOutcome && (terminal.data.turnOutcome as { status?: string }).status, 'done');
+    assert.equal(
+      terminal?.data.presentation && (terminal.data.presentation as { identity?: { sourceUserSeq?: number } }).identity?.sourceUserSeq,
+      accepted?.seq,
+      'the deterministic acknowledgement is bound to the exact accepted user row',
+    );
+    assert.equal(
+      events.filter((event) => event.type === 'user_input_received' && event.data.clientRequestId === requestBody.clientRequestId).length,
+      1,
+    );
+    assert.equal(
+      events.filter((event) => event.type === 'conversation_completed' && event.data.sourceUserSeq === accepted?.seq).length,
+      1,
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+test('lost background-continue response replays one accepted source, terminal, and task mutation', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let brainCalls = 0;
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    claudeAgentBrain: (async () => {
+      brainCalls += 1;
+      return { text: 'model must not run for background continue', sessionId: 'none', stoppedReason: 'success' };
+    }) as never,
+  });
+  const {
+    createBackgroundTask,
+    markBackgroundTaskAwaitingContinue,
+  } = await import('../execution/background-tasks.js');
+  const harness = await boot();
+  try {
+    const session = createSession({ id: 'sess-desktop-bridge-continue', kind: 'chat', channel: 'desktop' });
+    const task = createBackgroundTask({
+      title: 'Pipeline awaiting another budget window',
+      prompt: 'Finish the pipeline.',
+      originSessionId: session.id,
+    });
+    markBackgroundTaskAwaitingContinue(task.id, 'turn budget', 'partial work');
+    const requestBody = {
+      input: 'continue',
+      sessionId: session.id,
+      clientRequestId: 'bridge-continue-request-1',
+    };
+
+    const firstResponse = await fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    assert.equal(firstResponse.status, 200);
+    const first = await firstResponse.json() as {
+      runId: string;
+      reply: string;
+      routedToBackgroundTask: string;
+      replayed: boolean;
+    };
+    assert.equal(first.replayed, false);
+    assert.equal(first.routedToBackgroundTask, task.id);
+    const resumed = getBackgroundTask(task.id);
+    assert.equal(resumed?.status, 'pending');
+    assert.equal(resumed?.lastContinueResolutionRequestId, requestBody.clientRequestId);
+    const firstUpdatedAt = resumed?.updatedAt;
+    const firstQueuedAt = resumed?.continueResolution?.queuedAt;
+
+    const retryResponse = await fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    assert.equal(retryResponse.status, 200);
+    const replay = await retryResponse.json() as typeof first;
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.runId, first.runId);
+    assert.equal(replay.reply, first.reply);
+    const afterReplay = getBackgroundTask(task.id);
+    assert.equal(afterReplay?.updatedAt, firstUpdatedAt, 'retry never queues continue twice');
+    assert.equal(afterReplay?.continueResolution?.queuedAt, firstQueuedAt);
+
+    const inputs = listEvents(session.id, { types: ['user_input_received'] })
+      .filter((event) => event.data.clientRequestId === requestBody.clientRequestId);
+    const terminals = listEvents(session.id, { types: ['conversation_completed'] })
+      .filter((event) => event.data.sourceUserSeq === inputs[0]?.seq);
+    assert.equal(inputs.length, 1);
+    assert.equal(terminals.length, 1);
+    assert.equal(terminals[0].data.sourceUserSeq, inputs[0].seq);
+    assert.equal(getLatestRunAttemptByRunId(session.id, first.runId)?.sourceUserSeq, inputs[0].seq);
+    assert.equal(brainCalls, 0);
+  } finally {
+    await harness.close();
+  }
+});
+
+test('desktop /new and /cancel acknowledgements are typed source-bound outcomes', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let brainCalls = 0;
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    claudeAgentBrain: (async () => {
+      brainCalls += 1;
+      return { text: 'command acknowledgements must not run the model', sessionId: 'none', stoppedReason: 'success' };
+    }) as never,
+  });
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const harness = await boot();
+  try {
+    const session = createSession({ id: 'sess-desktop-typed-commands', kind: 'chat', channel: 'desktop' });
+    const pending = approvalRegistry.register({
+      sessionId: session.id,
+      channel: 'desktop',
+      subject: 'Send the client update',
+      tool: 'send_client_update',
+      args: { id: 'client-1' },
+    });
+    const post = async (input: string, clientRequestId: string) => fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input, sessionId: session.id, clientRequestId }),
+    });
+
+    const fresh = await post('/new', 'typed-new-command-request');
+    assert.equal(fresh.status, 202);
+    const stopped = await post('/cancel', 'typed-cancel-command-request');
+    assert.equal(stopped.status, 202);
+    const firstResolution = approvalRegistry.get(pending.approvalId);
+    assert.equal(firstResolution?.resolution, 'cancelled_by_user');
+    assert.equal(firstResolution?.resolver, 'chat-dock-user:typed-cancel-command-request');
+    const firstResolvedAt = firstResolution?.resolvedAt;
+
+    const stoppedReplay = await post('/cancel', 'typed-cancel-command-request');
+    assert.equal(stoppedReplay.status, 202);
+    const replayBody = await stoppedReplay.json() as { replayed?: boolean };
+    assert.equal(replayBody.replayed, true);
+    assert.equal(
+      approvalRegistry.get(pending.approvalId)?.resolvedAt,
+      firstResolvedAt,
+      'lost command response replays without resolving the approval twice',
+    );
+
+    const events = listEvents(session.id);
+    const inputs = events.filter((event) => event.type === 'user_input_received');
+    const terminals = events.filter((event) => event.type === 'conversation_completed');
+    assert.equal(inputs.length, 2);
+    assert.equal(terminals.length, 2);
+    assert.deepEqual(
+      terminals.map((event) => (event.data.turnOutcome as { status?: string }).status),
+      ['done', 'cancelled'],
+    );
+    assert.deepEqual(
+      terminals.map((event) => (
+        event.data.presentation as { identity?: { sourceUserSeq?: number } }
+      ).identity?.sourceUserSeq),
+      inputs.map((event) => event.seq),
+    );
+    assert.equal(inputs.filter((event) => event.data.clientRequestId === 'typed-cancel-command-request').length, 1);
+    assert.equal(terminals.filter((event) => event.data.sourceUserSeq === inputs[1].seq).length, 1);
+    assert.equal(brainCalls, 0);
   } finally {
     await harness.close();
   }
@@ -675,6 +856,12 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
       tool: 'google_calendar_update_event',
       args: { eventId: 'event-2', title: 'Launch review' },
     });
+    const originalLiveAttempt = beginRunAttempt(session.id, { runId: 'desktop:live-sdk-owner' });
+    recordRunAttemptUserInput(originalLiveAttempt, {
+      turn: 0,
+      role: 'user',
+      data: { text: 'Run the live SDK task.', displayText: 'Run the live SDK task.' },
+    }, { armRunInFlight: true });
     const postDecision = async (input: string, clientRequestId: string) => {
       const response = await fetch(`${harness.url}/api/harness/chat`, {
         method: 'POST',
@@ -687,17 +874,37 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
     await postDecision('approve', 'approval-bare-must-pick');
     await waitFor(() => listEvents(session.id, { types: ['awaiting_user_input'] })
       .some((event) => (event.data as { reason?: string }).reason === 'approval_choice_required'));
+    const ambiguousTerminal = listEvents(session.id, { types: ['conversation_completed'] })
+      .find((event) => event.data.reason === 'awaiting_user_input');
+    assert.equal((ambiguousTerminal?.data.turnOutcome as { status?: string } | undefined)?.status, 'needs_input');
+    const ambiguousSource = (
+      ambiguousTerminal?.data.presentation as { identity?: { sourceUserSeq?: number } } | undefined
+    )?.identity?.sourceUserSeq;
+    assert.ok(
+      Number.isSafeInteger(ambiguousSource)
+      && listEvents(session.id, { types: ['user_input_received'] }).some((event) => event.seq === ambiguousSource),
+      'the approval question terminal is bound to the exact accepted desktop source',
+    );
     assert.equal(approvalRegistry.get(first.approvalId)?.status, 'pending');
     assert.equal(approvalRegistry.get(second.approvalId)?.status, 'pending');
+    assert.ok(
+      getSession(session.id)?.metadata.__run_in_flight,
+      'an ambiguous approval acknowledgement never clears the original live SDK marker',
+    );
 
     await postDecision(`approve ${first.approvalId}`, 'approval-exact-first');
     await waitFor(() => approvalRegistry.get(first.approvalId)?.status === 'resolved');
     assert.equal(approvalRegistry.get(first.approvalId)?.resolution, 'approved');
     assert.equal(approvalRegistry.get(second.approvalId)?.status, 'pending');
+    assert.ok(
+      getSession(session.id)?.metadata.__run_in_flight,
+      'a live-wait approval acknowledgement leaves restart ownership with the original query',
+    );
 
     await postDecision(`reject ${second.approvalId}`, 'approval-exact-second');
     await waitFor(() => approvalRegistry.get(second.approvalId)?.status === 'resolved');
     assert.equal(approvalRegistry.get(second.approvalId)?.resolution, 'rejected');
+    assert.ok(getSession(session.id)?.metadata.__run_in_flight);
 
     const workspaceRunner = approvalRegistry.register({
       sessionId: session.id,
@@ -708,13 +915,14 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
     });
     await postDecision(`approve ${workspaceRunner.approvalId}`, 'approval-workspace-runner');
     await waitFor(() => approvalRegistry.get(workspaceRunner.approvalId)?.status === 'resolved');
-    const workspaceAck = listEvents(session.id, { types: ['conversation_step'] })
-      .find((event) => (
-        (event.data as { approvalId?: string }).approvalId === workspaceRunner.approvalId
-      ));
-    assert.ok(workspaceAck);
-    assert.match(String((workspaceAck.data as { summary?: string }).summary), /refreshing.*now/i);
-    assert.doesNotMatch(String((workspaceAck.data as { summary?: string }).summary), /continuing/i);
+    const workspaceSource = listEvents(session.id, { types: ['user_input_received'] })
+      .find((event) => event.data.approvalId === workspaceRunner.approvalId);
+    const workspaceAck = listEvents(session.id, { types: ['conversation_completed'] })
+      .find((event) => event.data.sourceUserSeq === workspaceSource?.seq);
+    const workspaceText = String((workspaceAck?.data.presentation as { text?: string } | undefined)?.text ?? '');
+    assert.ok(workspaceSource && workspaceAck, 'Workspace approval is one source-bound typed terminal');
+    assert.match(workspaceText, /refreshing.*now/i);
+    assert.doesNotMatch(workspaceText, /continuing/i);
     assert.equal(brainCalls, 0);
   } finally {
     await harness.close();

@@ -2,9 +2,9 @@
  * Run: npx tsx --test src/runtime/harness/restart-recovery.test.ts
  *
  * Restart recovery (#3): a chat run killed mid-flight leaves an in-flight marker
- * that survives the restart; on boot we surface it (non-silent
- * conversation_completed + "reply continue") instead of dying silently. Cleanly-
- * finished runs (no marker) and non-chat sessions are never touched.
+ * that survives the restart; on boot we surface an exact typed continue outcome
+ * when a user must resume it, while automatic recovery remains nonterminal.
+ * Cleanly-finished runs (no marker) and non-chat sessions are never touched.
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -18,8 +18,22 @@ writeFileSync(path.join(TMP, 'state', 'machine-id'), 'machine-A\n');
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 const { HarnessSession } = await import('./session.js');
-const { listEvents } = await import('./eventlog.js');
-const { reportInterruptedChatRuns, recoverInterruptedChatRuns, markRunInFlight, restartRecoveryPrimerPrefixForTests } = await import('./restart-recovery.js');
+const {
+  beginRunAttempt,
+  finishRunAttempt,
+  getLatestRunAttempt,
+  listEvents,
+  recordRunAttemptUserInput,
+} = await import('./eventlog.js');
+const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { turnOutcomeId } = await import('./turn-outcome.js');
+const {
+  clearRunInFlightAfterTerminal,
+  reportInterruptedChatRuns,
+  recoverInterruptedChatRuns,
+  markRunInFlight,
+  restartRecoveryPrimerPrefixForTests,
+} = await import('./restart-recovery.js');
 
 test('exported markRunInFlight: arms + clears a CHAT session, skips non-chat, respects the kill-switch', () => {
   const chat = HarnessSession.create({ kind: 'chat', title: 'c' });
@@ -45,6 +59,24 @@ test('exported markRunInFlight: arms + clears a CHAT session, skips non-chat, re
   }
 });
 
+test('terminal marker clear refuses to steal ownership from a foreign active attempt', () => {
+  const chat = HarnessSession.create({ kind: 'chat', title: 'shared marker' });
+  const active = beginRunAttempt(chat.id, { runId: 'shared-marker-owner' });
+  markRunInFlight(chat.id, true);
+
+  assert.equal(clearRunInFlightAfterTerminal(chat.id), false, 'an unowned direct clear cannot cross an active attempt');
+  assert.ok(HarnessSession.load(chat.id)?.runInFlightSince());
+  assert.equal(
+    clearRunInFlightAfterTerminal(chat.id, 'attempt:some-other-run'),
+    false,
+    'a different physical attempt cannot settle the shared marker',
+  );
+  assert.ok(HarnessSession.load(chat.id)?.runInFlightSince());
+  assert.equal(clearRunInFlightAfterTerminal(chat.id, active.attemptId), true);
+  assert.equal(HarnessSession.load(chat.id)?.runInFlightSince(), null);
+  finishRunAttempt(active, 'completed');
+});
+
 test.after(() => {
   try { rmSync(TMP, { recursive: true, force: true }); } catch { /* best effort */ }
 });
@@ -54,6 +86,23 @@ function hasInterruptedEvent(sessionId: string): boolean {
     (e) => e.type === 'conversation_completed'
       && (e.data as { reason?: string } | undefined)?.reason === 'interrupted_by_restart',
   );
+}
+
+function armAcceptedInterruptedTurn(
+  session: InstanceType<typeof HarnessSession>,
+  since = '2026-06-07T00:00:00.000Z',
+): {
+  attempt: ReturnType<typeof beginRunAttempt>;
+  source: ReturnType<typeof recordRunAttemptUserInput>;
+} {
+  const attempt = beginRunAttempt(session.id, { runId: `restart-recovery-test:${session.id}` });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Finish the interrupted task.' },
+  });
+  session.setRunInFlight(since);
+  return { attempt, source };
 }
 
 test('marker round-trip: set then clear', () => {
@@ -67,7 +116,7 @@ test('marker round-trip: set then clear', () => {
 
 test('surfaces ONLY interrupted chat runs; leaves clean + non-chat sessions alone', () => {
   const interrupted = HarnessSession.create({ kind: 'chat', title: 'long task' });
-  interrupted.setRunInFlight('2026-06-07T00:00:00.000Z');
+  armAcceptedInterruptedTurn(interrupted);
   const clean = HarnessSession.create({ kind: 'chat', title: 'finished task' }); // no marker
   const wf = HarnessSession.create({ kind: 'workflow', title: 'wf' }); // wrong kind — never scanned
 
@@ -83,10 +132,24 @@ test('surfaces ONLY interrupted chat runs; leaves clean + non-chat sessions alon
   assert.ok(!hasInterruptedEvent(wf.id), 'a non-chat session is never flagged');
 });
 
+test('an identity-less legacy marker records pause state without inventing a public terminal', () => {
+  const legacy = HarnessSession.create({ kind: 'chat', title: 'pre-attempt legacy chat' });
+  legacy.setRunInFlight('2026-06-07T00:00:00.000Z');
+
+  const summary = recoverInterruptedChatRuns(() => 1100);
+
+  assert.equal(summary.recovered, 1);
+  assert.equal(listEvents(legacy.id, { types: ['conversation_completed'] }).length, 0);
+  const paused = listEvents(legacy.id, { types: ['run_paused'] });
+  assert.equal(paused.length, 1);
+  assert.equal(paused[0].data.reason, 'restart_recovery_identity_missing');
+  assert.equal(HarnessSession.load(legacy.id)?.runInFlightSince(), null);
+});
+
 test('structured recovery prepares a durable replay primer in the harness snapshot', () => {
   const interrupted = HarnessSession.create({ kind: 'chat', title: 'recoverable long task' });
   interrupted.updateConversationSnapshot([{ role: 'user', content: 'Research the market and build the report.' }]);
-  interrupted.setRunInFlight('2026-06-07T00:00:00.000Z');
+  armAcceptedInterruptedTurn(interrupted);
 
   const summary = recoverInterruptedChatRuns(() => 1234);
   assert.equal(summary.enabled, true);
@@ -108,17 +171,17 @@ test('structured recovery prepares a durable replay primer in the harness snapsh
       && content.includes('continue');
   }), 'restart primer is durably replayed on the next turn');
 
-  const notice = listEvents(interrupted.id, { limit: 20 }).find(
-    (e) => e.type === 'conversation_completed'
-      && (e.data as { reason?: string } | undefined)?.reason === 'interrupted_by_restart',
-  );
-  assert.equal((notice?.data as { replayPrepared?: boolean } | undefined)?.replayPrepared, true);
-  assert.equal((notice?.data as { snapshotItemsAfter?: number } | undefined)?.snapshotItemsAfter, 2);
+  const notice = listEvents(interrupted.id, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(notice?.data.presentation && (notice.data.presentation as { status?: string }).status, 'needs_input');
+  assert.equal(notice?.data.presentation && (notice.data.presentation as { kind?: string }).kind, 'continue');
+  const decision = listEvents(interrupted.id, { types: ['restart_recovery_decision'] }).at(-1);
+  assert.equal(decision?.data.replayPrepared, true);
+  assert.equal(decision?.data.snapshotItemsAfter, 2);
 });
 
 test('boot scan finds an interrupted chat behind newer session pages', () => {
   const interrupted = HarnessSession.create({ kind: 'chat', title: 'older interrupted task' });
-  interrupted.setRunInFlight('2026-06-07T00:00:00.000Z');
+  armAcceptedInterruptedTurn(interrupted);
 
   for (let i = 0; i < 125; i += 1) {
     HarnessSession.create({ kind: 'chat', title: `newer clean chat ${i}` });
@@ -132,35 +195,158 @@ test('boot scan finds an interrupted chat behind newer session pages', () => {
 
 test('idempotent: a second boot scan finds nothing (marker already cleared)', () => {
   const s = HarnessSession.create({ kind: 'chat', title: 'x' });
-  s.setRunInFlight('2026-06-07T00:00:00.000Z');
+  armAcceptedInterruptedTurn(s);
   assert.equal(reportInterruptedChatRuns(() => 2000), 1);
   assert.equal(reportInterruptedChatRuns(() => 2001), 0, 'no double-recovery');
+});
+
+test('commit then crash before marker clear reconciles the exact terminal without dispatch or notice', async () => {
+  const nowMs = Date.parse('2026-07-10T19:14:46.000Z');
+  const since = '2026-07-10T19:13:46.000Z';
+  const session = HarnessSession.create({ kind: 'chat', title: 'terminal committed before crash' });
+  const { attempt, source } = armAcceptedInterruptedTurn(session, since);
+  const identity = {
+    sessionId: session.id,
+    turn: source.turn,
+    attemptId: attempt.attemptId,
+    runId: attempt.runId ?? undefined,
+    sourceUserSeq: source.seq,
+  };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: 'The task finished before the restart.' },
+  });
+  // Deliberately omit finishRunAttempt() and clearRunInFlight(): this is the
+  // exact crash window the boot reconciler must close without replaying work.
+  const dispatched: string[] = [];
+
+  const summary = recoverInterruptedChatRuns(
+    () => nowMs,
+    async (sessionId) => { dispatched.push(sessionId); },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(summary.recovered, 1);
+  assert.equal(summary.notified, 0);
+  assert.deepEqual(dispatched, [], 'an already-terminal turn is never dispatched again');
+  assert.equal(summary.records[0]?.terminalReconciled, true);
+  assert.equal(summary.records[0]?.autoResumed, false);
+  assert.equal(summary.records[0]?.noticeRecorded, false);
+  assert.equal(summary.records[0]?.markerCleared, true);
+  assert.equal(HarnessSession.load(session.id)?.runInFlightSince(), null);
+  assert.equal(getLatestRunAttempt(session.id)?.status, 'completed');
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(listEvents(session.id, { types: ['run_resumed', 'run_paused'] }).length, 0);
+  assert.equal(
+    listEvents(session.id, { types: ['restart_recovery_decision'] }).at(-1)?.data.phase,
+    'terminal_reconciled',
+  );
+  assert.equal(
+    HarnessSession.load(session.id)?.toInputItems().some((item) => {
+      const content = (item as { content?: unknown }).content;
+      return typeof content === 'string' && content.startsWith(restartRecoveryPrimerPrefixForTests());
+    }),
+    false,
+    'reconciliation does not inject a continuation primer',
+  );
+});
+
+test('a terminal from another source with the same run id cannot settle the interrupted turn', async () => {
+  const nowMs = Date.parse('2026-07-10T19:14:46.000Z');
+  const session = HarnessSession.create({ kind: 'chat', title: 'reused run identity' });
+  const sharedRunId = `restart-recovery-shared:${session.id}`;
+  const oldAttempt = beginRunAttempt(session.id, { runId: sharedRunId });
+  const oldSource = recordRunAttemptUserInput(oldAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'First logical turn.' },
+  });
+  const oldIdentity = {
+    sessionId: session.id,
+    turn: oldSource.turn,
+    attemptId: oldAttempt.attemptId,
+    runId: sharedRunId,
+    sourceUserSeq: oldSource.seq,
+  };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(oldIdentity),
+    identity: oldIdentity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: 'The first logical turn is complete.' },
+  });
+  finishRunAttempt(oldAttempt, 'completed');
+
+  const interruptedAttempt = beginRunAttempt(session.id, { runId: sharedRunId });
+  const interruptedSource = recordRunAttemptUserInput(interruptedAttempt, {
+    turn: 2,
+    role: 'user',
+    data: { text: 'Second logical turn.' },
+  });
+  session.setRunInFlight('2026-07-10T19:13:46.000Z');
+  const dispatched: Array<{ sessionId: string; sourceUserSeq: number }> = [];
+
+  const summary = recoverInterruptedChatRuns(
+    () => nowMs,
+    async (sessionId, _directive, sourceUserSeq) => { dispatched.push({ sessionId, sourceUserSeq }); },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.notEqual(interruptedAttempt.attemptId, oldAttempt.attemptId);
+  assert.notEqual(interruptedSource.seq, oldSource.seq);
+  assert.equal(summary.records[0]?.terminalReconciled, false);
+  assert.equal(summary.records[0]?.autoResumed, true);
+  assert.deepEqual(
+    dispatched,
+    [{ sessionId: session.id, sourceUserSeq: interruptedSource.seq }],
+    'the distinct interrupted source follows normal recovery with exact binding',
+  );
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(listEvents(session.id, { types: ['run_resumed'] }).length, 1);
+  assert.notEqual(
+    HarnessSession.load(session.id)?.runInFlightSince(),
+    null,
+    'the fake dispatcher did not commit a terminal, so recovery ownership stays armed',
+  );
 });
 
 test('boot cutoff recovers only markers owned by the previous daemon process', async () => {
   const bootCutoffMs = Date.parse('2026-07-10T19:11:47.000Z');
   const scanNowMs = Date.parse('2026-07-10T19:14:46.000Z');
   const previousProcess = HarnessSession.create({ kind: 'chat', title: 'pre-boot work' });
-  previousProcess.setRunInFlight('2026-07-10T19:11:46.999Z');
+  armAcceptedInterruptedTurn(previousProcess, '2026-07-10T19:11:46.999Z');
   const liveProcess = HarnessSession.create({ kind: 'chat', title: 'live work' });
   liveProcess.setRunInFlight('2026-07-10T19:14:38.000Z');
   const equalCutoff = HarnessSession.create({ kind: 'chat', title: 'ambiguous boundary' });
   equalCutoff.setRunInFlight('2026-07-10T19:11:47.000Z');
   const malformed = HarnessSession.create({ kind: 'chat', title: 'malformed marker' });
   malformed.setRunInFlight('not-a-timestamp');
-  const dispatched: string[] = [];
+  const dispatched: Array<{ sessionId: string; sourceUserSeq: number }> = [];
 
   const summary = recoverInterruptedChatRuns(
     () => scanNowMs,
-    async (sessionId) => { dispatched.push(sessionId); },
+    async (sessionId, _directive, sourceUserSeq) => { dispatched.push({ sessionId, sourceUserSeq }); },
     { bootCutoffMs },
   );
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   assert.equal(summary.recovered, 1);
-  assert.deepEqual(dispatched, [previousProcess.id]);
-  assert.equal(HarnessSession.load(previousProcess.id)?.runInFlightSince(), null);
-  assert.ok(hasInterruptedEvent(previousProcess.id));
+  assert.deepEqual(dispatched, [{
+    sessionId: previousProcess.id,
+    sourceUserSeq: getLatestRunAttempt(previousProcess.id)?.sourceUserSeq ?? -1,
+  }]);
+  assert.notEqual(
+    HarnessSession.load(previousProcess.id)?.runInFlightSince(),
+    null,
+    'a fake dispatcher with no terminal cannot clear the previous process marker',
+  );
+  assert.equal(hasInterruptedEvent(previousProcess.id), false, 'automatic resume does not create a false terminal');
+  assert.equal(listEvents(previousProcess.id, { types: ['run_resumed'] }).length, 1);
 
   for (const session of [liveProcess, equalCutoff, malformed]) {
     assert.notEqual(HarnessSession.load(session.id)?.runInFlightSince(), null, `${session.title} marker remains armed`);

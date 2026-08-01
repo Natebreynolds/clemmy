@@ -22,6 +22,7 @@ const {
   reapStaleEpisodicPointers,
   MEMORY_BACKUP_DIR,
   MEMORY_DB_PATH,
+  MEMORY_PRE_MIGRATION_BACKUP_DIR,
   MEMORY_SCHEMA_VERSION,
   migrateMemoryDatabaseHandle,
 } = await import('./db.js');
@@ -37,6 +38,94 @@ beforeEach(() => {
   resetMemoryDb();
   openMemoryDb();
   rmSync(MEMORY_BACKUP_DIR, { recursive: true, force: true });
+});
+
+test('openMemoryDb creates a WAL-consistent unpruned snapshot before historical migration', () => {
+  resetMemoryDb();
+  rmSync(MEMORY_PRE_MIGRATION_BACKUP_DIR, { recursive: true, force: true });
+  const historical = new Database(MEMORY_DB_PATH);
+  try {
+    migrateMemoryDatabaseHandle(historical, { targetVersion: 30 });
+    historical.pragma('journal_mode = WAL');
+    historical.pragma('wal_autocheckpoint = 0');
+    historical.prepare(`
+      INSERT INTO inbound_messages
+        (channel, source_message_id, status, attempts, received_at, claimed_at)
+      VALUES ('discord:pre-migration', 'wal-resident-row', 'claimed', 1, ?, ?)
+    `).run('2026-07-31T12:00:00.000Z', '2026-07-31T12:00:00.000Z');
+
+    const migrated = openMemoryDb();
+    assert.equal(
+      (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+      MEMORY_SCHEMA_VERSION,
+    );
+    const snapshots = readdirSync(MEMORY_PRE_MIGRATION_BACKUP_DIR)
+      .filter((name) => /^memory-v30-to-v\d+-.+\.db$/.test(name));
+    assert.equal(snapshots.length, 1, 'one unique upgrade-boundary snapshot is retained');
+    const snapshotPath = path.join(MEMORY_PRE_MIGRATION_BACKUP_DIR, snapshots[0]);
+    const snapshot = new Database(snapshotPath, { readonly: true });
+    try {
+      assert.equal(
+        (snapshot.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+        30,
+      );
+      assert.equal(
+        (snapshot.prepare(`
+          SELECT status FROM inbound_messages
+           WHERE channel = 'discord:pre-migration' AND source_message_id = 'wal-resident-row'
+        `).get() as { status: string }).status,
+        'claimed',
+        'the snapshot includes committed data that was eligible to remain in WAL',
+      );
+      const columns = (snapshot.pragma('table_info(inbound_messages)') as Array<{ name: string }>)
+        .map((column) => column.name);
+      assert.equal(columns.includes('payload_hash'), false, 'snapshot remains physically v30');
+      assert.deepEqual(snapshot.pragma('integrity_check'), [{ integrity_check: 'ok' }]);
+    } finally {
+      snapshot.close();
+    }
+
+    // Nightly retention operates in a different directory and cannot erase an
+    // upgrade rollback point, even with the smallest retention window.
+    assert.ok(backupMemoryDb({ retain: 1 }));
+    assert.equal(existsSync(snapshotPath), true);
+  } finally {
+    historical.close();
+  }
+});
+
+test('snapshot creation failure blocks migration and leaves the historical schema unchanged', () => {
+  resetMemoryDb();
+  rmSync(MEMORY_PRE_MIGRATION_BACKUP_DIR, { recursive: true, force: true });
+  const historical = new Database(MEMORY_DB_PATH);
+  try {
+    migrateMemoryDatabaseHandle(historical, { targetVersion: 30 });
+  } finally {
+    historical.close();
+  }
+  // A file at the reserved directory path makes VACUUM INTO unable to create
+  // its unique child. The open must stop before applying v31/v32.
+  writeFileSync(MEMORY_PRE_MIGRATION_BACKUP_DIR, 'blocked by test', 'utf8');
+  try {
+    assert.throws(
+      () => openMemoryDb(),
+      /Refusing memory migration 30->\d+: pre-migration snapshot failed/,
+    );
+    const probe = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      assert.equal(
+        (probe.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+        30,
+      );
+      const columns = (probe.pragma('table_info(inbound_messages)') as Array<{ name: string }>)
+        .map((column) => column.name);
+      assert.equal(columns.includes('payload_hash'), false, 'no migration ran after backup failure');
+    } finally {
+      probe.close();
+    }
+  } finally {
+    rmSync(MEMORY_PRE_MIGRATION_BACKUP_DIR, { recursive: true, force: true });
+  }
 });
 
 test('backupMemoryDb writes a consistent snapshot containing the facts', () => {

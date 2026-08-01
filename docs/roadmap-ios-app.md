@@ -96,7 +96,7 @@ This is a ~3–4 week solo effort. The plan is broken into four phases so each i
 - `src/dashboard/console.ts` (modify) — new **Devices** subsection of Settings: list paired devices + QR pairing button that calls `POST /api/devices/pair/code` to mint a one-time code, encodes `{baseURL, code}` as QR.
 
 **Reuses (don't reinvent):**
-- `/api/message` — already exists, already supports streaming via `onChunk` callback (see `src/channels/discord.ts:437` for the working pattern)
+- `/api/message` — accepts one logical send per required `Idempotency-Key`; reuse that key only for transport retries. Live UI follows typed public SSE progress and the committed terminal, never raw model-token callbacks.
 - `WEBHOOK_PORT` binds to `0.0.0.0` already (`src/channels/webhook.ts:1361`) — Tailscale's `100.x.x.x` IP is just another interface; no change needed
 - `ClementineGateway.handleMessage()` — the same entry point Discord uses; iOS routes through the same plumbing
 
@@ -197,7 +197,7 @@ To install on the phone: download `.ipa` from a Release, use Apple Configurator 
 
 ## Reuses (do NOT reinvent)
 
-- `/api/message` endpoint with `onChunk` streaming (`src/channels/discord.ts:437` for the working pattern to copy)
+- `/api/message` with a required stable `Idempotency-Key`, `409` on conflicting reuse, typed public progress, and one atomic terminal reply
 - `WEBHOOK_SECRET` query/header auth as the fallback during pairing (`src/channels/webhook.ts:227`)
 - `approval-registry.ts` — already produces addressable short IDs perfect for push payloads
 - `notifications.ts` — already handles retry / dedup / multi-destination
@@ -224,7 +224,7 @@ To install on the phone: download `.ipa` from a Release, use Apple Configurator 
 
 **Phase 1 done when:**
 - Pair phone via QR from desktop's Devices panel; token lands in Keychain.
-- Send "hello" from phone chat → daemon receives via `/api/message`, response streams back to the phone token-by-token.
+- Send "hello" from phone chat with a fresh stable request key → daemon receives it once, streams typed progress, and publishes one committed terminal reply.
 - Kill Tailscale → app shows "daemon unreachable" with a retry button.
 - Revoke device from desktop → next phone request returns 401, app prompts re-pair.
 

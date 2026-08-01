@@ -32,6 +32,32 @@ import { emitWorkflowChange } from './workflow-change-bus.js';
  *     guarantees one parser, one writer, one schema.
  */
 
+/**
+ * One read-only reasoning branch inside an authored workflow step subgraph.
+ * The runtime compiles each specialist into a durable graph node with a
+ * result-only tool surface; the authored parent step becomes the reducer.
+ */
+export interface WorkflowStepSpecialist {
+  /** Stable, human-readable id within the parent step. */
+  id: string;
+  /** The specialist's narrow assignment. Upstream values arrive as context. */
+  prompt: string;
+  label?: string;
+  model?: string;
+  intent?: string;
+  maxTurns?: number;
+}
+
+/**
+ * Clementine 4 pilot topology. Presence is execution semantics, not a rollout
+ * gate: the compiler always expands a valid declaration into parallel,
+ * read-only specialist nodes and uses the authored step as their reducer.
+ */
+export interface WorkflowStepSubgraph {
+  mode: 'read_parallel_v1';
+  specialists: WorkflowStepSpecialist[];
+}
+
 export interface WorkflowStepInput {
   id: string;
   prompt: string;
@@ -76,6 +102,15 @@ export interface WorkflowStepInput {
    * prompt pattern for recurring feeds (new leads, new emails, new rows).
    */
   forEachNewOnly?: boolean;
+  /**
+   * Compile this read-only step into a real specialist fan-out followed by
+   * this step as the reducer. v1 deliberately gives specialists and reducer
+   * only `workflow_step_result` plus run-scoped artifact reads; external reads,
+   * writes, sends, scripts, approvals, nested fan-out, and loops stay outside
+   * this pilot until their graph authority/receipt contracts are executable.
+   * Serialized as `subgraph`.
+   */
+  subgraph?: WorkflowStepSubgraph;
   /**
    * Skip the LLM entirely — call a named helper from scripts/ instead.
    * Use for repeatable transforms (database writes, formatted exports)
@@ -666,6 +701,41 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       if (step.forEachNewOnly === true || (step as Record<string, unknown>).for_each_new_only === true) {
         result.forEachNewOnly = true;
       }
+      const rawSubgraph = step.subgraph;
+      if (rawSubgraph !== undefined) {
+        // Do not sanitize malformed executable topology into `undefined`.
+        // The canonical write/run preflight must see the declaration and fail
+        // it closed; silently dropping a bad branch list would flatten the
+        // workflow and execute different semantics than the author requested.
+        const sg = rawSubgraph && typeof rawSubgraph === 'object' && !Array.isArray(rawSubgraph)
+          ? rawSubgraph as Record<string, unknown>
+          : {};
+        const rawSpecialists = Array.isArray(sg.specialists) ? sg.specialists : [];
+        const specialists: WorkflowStepSpecialist[] = rawSpecialists.map((entry) => {
+          const specialist = entry && typeof entry === 'object' && !Array.isArray(entry)
+            ? entry as Record<string, unknown>
+            : {};
+          const rawMaxTurns = specialist.max_turns ?? specialist.maxTurns;
+          return {
+            id: typeof specialist.id === 'string' ? specialist.id.trim() : '',
+            prompt: typeof specialist.prompt === 'string' ? specialist.prompt.trim() : '',
+            ...(typeof specialist.label === 'string' && specialist.label.trim()
+              ? { label: specialist.label.trim() }
+              : {}),
+            ...(typeof specialist.model === 'string' && specialist.model.trim()
+              ? { model: specialist.model.trim() }
+              : {}),
+            ...(typeof specialist.intent === 'string' && specialist.intent.trim()
+              ? { intent: specialist.intent.trim() }
+              : {}),
+            ...(rawMaxTurns !== undefined ? { maxTurns: rawMaxTurns as number } : {}),
+          };
+        });
+        result.subgraph = {
+          mode: (typeof sg.mode === 'string' ? sg.mode : '') as WorkflowStepSubgraph['mode'],
+          specialists,
+        };
+      }
       if (step.deterministic && typeof step.deterministic === 'object') {
         const d = step.deterministic as Record<string, unknown>;
         if (typeof d.runner === 'string') result.deterministic = { runner: d.runner };
@@ -915,6 +985,19 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.maxTurns !== undefined) out.maxTurns = s.maxTurns;
       if (s.forEach) out.forEach = s.forEach;
       if (s.forEachNewOnly) out.forEachNewOnly = true;
+      if (s.subgraph !== undefined) {
+        out.subgraph = {
+          mode: s.subgraph.mode,
+          specialists: (s.subgraph.specialists ?? []).map((specialist) => ({
+            id: specialist.id,
+            prompt: specialist.prompt,
+            ...(specialist.label ? { label: specialist.label } : {}),
+            ...(specialist.model ? { model: specialist.model } : {}),
+            ...(specialist.intent ? { intent: specialist.intent } : {}),
+            ...(specialist.maxTurns !== undefined ? { max_turns: specialist.maxTurns } : {}),
+          })),
+        };
+      }
       if (s.deterministic) {
         // Authoring may carry the script's inline `source`. Materialize it into
         // scripts/<runner> so a freshly-authored deterministic step can run, and

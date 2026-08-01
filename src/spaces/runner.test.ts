@@ -33,6 +33,7 @@ const workspaceDb = await import('./workspace-db.js');
 const observationDiff = await import('./observation-diff.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
+const operationalTelemetry = await import('../runtime/operational-telemetry.js');
 
 function writeRunner(slug: string, file: string, body: string, exec = false): void {
   const dir = store.resolveInSpace(slug, 'data');
@@ -516,15 +517,22 @@ process.stdout.write('{}');`,
       assert.equal((current._meta?.pull as { ok?: boolean } | undefined)?.ok, true);
       assert.equal(approvalRegistry.get(approvalId)?.consumedAt !== null, true);
       assert.match(note.text, /refresh.*resum/i);
-      const completion = eventlog.listEvents(`space-${slug}`, {
-        types: ['conversation_completed'],
+      const outcome = eventlog.listEvents(`space-${slug}`, {
+        types: ['user_input_received'],
       }).find((event) => (
-        (event.data as { approvalId?: string }).approvalId === approvalId
+        event.data.synthetic === true
+        && event.data.source === 'outcome'
+        && event.data.sourceLabel === 'workspace refresh'
+        && event.data.sourceId === `${approvalId}:${source.id}`
       ));
-      assert.ok(completion, 'Workspace chat receives the real resumed refresh outcome');
+      assert.ok(outcome, 'Workspace refresh reports through the unified async Outcome edge');
+      assert.equal(outcome.data.status, 'done');
+      assert.match(String(outcome.data.text ?? ''), /refreshed pull successfully/i);
       assert.equal(
-        (completion.data as { reason?: string }).reason,
-        'workspace_runner_approval_refresh_completed',
+        eventlog.listEvents(`space-${slug}`, { types: ['conversation_completed'] })
+          .some((event) => event.data.approvalId === approvalId),
+        false,
+        'async approval work never fabricates a foreground turn terminal',
       );
     } else {
       assert.equal(current._meta?.pull?.status, 'awaiting_approval');
@@ -533,6 +541,59 @@ process.stdout.write('{}');`,
       assert.match(note.text, /runner remains blocked/i);
     }
   }
+});
+
+test('failed approved refresh reports a safe async Outcome while raw diagnostics stay operational', async () => {
+  const slug = 'legacy-runner-trust-safe-failure';
+  const source = { id: 'pull', runner: 'pull.mjs' };
+  writeRunner(
+    slug,
+    source.runner,
+    `process.stderr.write('provider-secret-diagnostic'); process.exit(7);`,
+  );
+  store.spaceStore.save({
+    id: slug,
+    title: 'Legacy runner safe failure',
+    dataSources: [source],
+  });
+
+  const refresh = await runner.refreshSpaceData(slug, source.id);
+  const approvalId = refresh[0]?.pendingApprovalId;
+  assert.match(approvalId ?? '', /^apr-/);
+  assert.equal(approvalRegistry.resolve(approvalId!, 'approved', 'safe-failure-test').ok, true);
+
+  let outcome: ReturnType<typeof eventlog.listEvents>[number] | undefined;
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    outcome = eventlog.listEvents(`space-${slug}`, { types: ['user_input_received'] })
+      .find((event) => (
+        event.data.synthetic === true
+        && event.data.source === 'outcome'
+        && event.data.sourceId === `${approvalId}:${source.id}`
+      ));
+    if (outcome) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  assert.ok(outcome);
+  assert.equal(outcome.data.status, 'failed');
+  assert.match(String(outcome.data.text ?? ''), /activity log for technical details/i);
+  assert.doesNotMatch(String(outcome.data.text ?? ''), /provider-secret-diagnostic/);
+  assert.equal(
+    eventlog.listEvents(`space-${slug}`, { types: ['conversation_completed'] })
+      .some((event) => event.data.approvalId === approvalId),
+    false,
+  );
+  const diagnostics = operationalTelemetry.listOperationalEvents({
+    source: 'workspace',
+    type: 'workspace_data_refresh_failed',
+    workspaceId: slug,
+    limit: 20,
+  });
+  assert.ok(
+    diagnostics.some((event) => JSON.stringify(event.payload).includes('provider-secret-diagnostic')),
+    'raw runner failure remains available on the private operational plane',
+  );
 });
 
 test('an unreaped expired runner-trust card renews cleanly without executing the runner', async () => {

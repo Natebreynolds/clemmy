@@ -15,7 +15,10 @@ import {
 import {
   bindDiscordHarnessSession,
   handleHarnessCancel,
+  handleHarnessNew,
+  handleHarnessSessions,
   isChannelSessionAwaitingApproval,
+  parseHarnessCommand,
   remainingApprovalDisplayState,
   requestBoundChannelRunStop,
   tryHandleHarnessApprovalReply,
@@ -30,7 +33,13 @@ import {
 } from './slack-harness.js';
 import { pendingActionIdFromArgs } from '../runtime/harness/pending-action-view.js';
 import { ClementineAssistant } from '../assistant/core.js';
-import { claimInbound, completeInbound } from './inbox-store.js';
+import {
+  bindInboundSource,
+  claimInbound,
+  completeInbound,
+  InboundIdentityConflictError,
+} from './inbox-store.js';
+import { durablePayloadHash, durableRequestIdentity } from './durable-request.js';
 import type { ApprovalResolutionResult } from '../types.js';
 import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal, listActiveGoalContracts, listPlanProposals } from '../agents/plan-proposals.js';
 import { createGoalFromDraft, dismissGoalDraft, getGoalDraft, listGoalDrafts } from '../agents/goal-drafts.js';
@@ -46,6 +55,31 @@ import { presentApproval, type ApprovalPresentationContext } from '../runtime/ap
 import { HarnessSession } from '../runtime/harness/session.js';
 import { readWorkflow } from '../memory/workflow-store.js';
 import { writeWorkflowAndSyncTriggers } from '../execution/workflow-write.js';
+import {
+  PUBLIC_APPROVAL_EDIT_FAILURE_TEXT,
+  PUBLIC_CHANNEL_FAILURE_TEXT,
+  publicApprovalDecisionFailure,
+} from './public-failure.js';
+import {
+  beginRunAttempt,
+  createSession as createHarnessSession,
+  finishRunAttempt,
+  getLatestRunAttemptByRunId,
+  getSession as getHarnessSession,
+  listEvents as listHarnessEvents,
+  recordRunAttemptUserInput,
+  type EventRow,
+  type RunAttemptRef,
+} from '../runtime/harness/eventlog.js';
+import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
+import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
+import {
+  presentationEventFromCompletionData,
+  turnOutcomeId,
+  type TurnIdentity,
+} from '../runtime/harness/turn-outcome.js';
+import { publicUserInputText } from '../runtime/harness/public-presentation.js';
+import { isStatusCommand } from '../dashboard/board-summary.js';
 
 const logger = pino({ name: 'clementine-next.slack' });
 
@@ -656,6 +690,261 @@ function parseSlackRunStopControl(prompt: string): SlackRunStopControl | null {
   return null;
 }
 
+interface SlackInboundIngress {
+  inboxKey: { channel: string; sourceMessageId: string };
+  identity: ReturnType<typeof durableRequestIdentity>;
+  payloadHash: string;
+  claim: ReturnType<typeof claimInbound>;
+}
+
+function canonicalSlackFiles(
+  files: Array<{ name?: string; url_private?: string }> | undefined,
+): Array<[string | null, string | null]> {
+  // Preserve provider order while using tuples so object key insertion order
+  // can never alter the payload authority hash.
+  return (files ?? []).map((file) => [
+    typeof file.name === 'string' ? file.name : null,
+    typeof file.url_private === 'string' ? file.url_private : null,
+  ]);
+}
+
+/** Claim the immutable Slack provider delivery before any approval, command,
+ * model, tool, or channel mutation. Slack timestamps are message ids within a
+ * channel, so (channel, ts) is the provider retry key. */
+function claimSlackInboundRequest(input: {
+  channelId: string;
+  sourceMessageId: string;
+  userId: string;
+  threadTs?: string;
+  prompt: string;
+  files?: Array<{ name?: string; url_private?: string }>;
+}): SlackInboundIngress {
+  const channelId = input.channelId.trim();
+  const sourceMessageId = input.sourceMessageId.trim();
+  if (!channelId) throw new Error('Slack channel id is required');
+  if (!sourceMessageId) throw new Error('Slack provider message timestamp is required');
+  const inboxKey = { channel: `slack:${channelId}`, sourceMessageId };
+  const identity = durableRequestIdentity('slack', `${channelId}:${sourceMessageId}`);
+  const payloadHash = durablePayloadHash({
+    channelId,
+    userId: input.userId,
+    threadTs: input.threadTs?.trim() || null,
+    prompt: input.prompt,
+    files: canonicalSlackFiles(input.files),
+  });
+  const claim = claimInbound({
+    ...inboxKey,
+    userId: input.userId,
+    runId: identity.runId,
+    payloadHash,
+  });
+  return { inboxKey, identity, payloadHash, claim };
+}
+
+function bindSlackInboundAcceptedSource(
+  ingress: SlackInboundIngress,
+  source: Pick<EventRow, 'sessionId' | 'seq'>,
+): void {
+  bindInboundSource({
+    ...ingress.inboxKey,
+    sessionId: source.sessionId,
+    runId: ingress.identity.runId,
+    sourceUserSeq: source.seq,
+  });
+}
+
+function exactSlackInboundTerminal(source: EventRow): string | undefined {
+  for (const event of listHarnessEvents(source.sessionId, { types: ['conversation_completed'], desc: true })) {
+    if (event.data.sourceUserSeq !== source.seq && event.data.terminalKey !== `turn:${source.seq}`) continue;
+    try {
+      const presentation = presentationEventFromCompletionData(event.data);
+      if (presentation?.identity.sourceUserSeq === source.seq) return presentation.text;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function slackInboundIdentity(source: EventRow): TurnIdentity {
+  return { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+}
+
+function commitSlackInboundTerminal(input: {
+  source: EventRow;
+  text: string;
+  status: 'done' | 'failed';
+  reason: string;
+}): string {
+  const identity = slackInboundIdentity(input.source);
+  const common = { version: 2 as const, id: turnOutcomeId(identity), identity };
+  const committed = commitTurnOutcome(input.status === 'failed'
+    ? {
+        ...common,
+        status: 'failed',
+        resumable: false,
+        presentation: { kind: 'error', text: input.text },
+      }
+    : {
+        ...common,
+        status: 'done',
+        resumable: false,
+        presentation: { kind: 'answer', text: input.text },
+      }, { legacyReason: input.reason });
+  return committed.presentation.text;
+}
+
+function settleSlackInboundAttempt(
+  sessionId: string,
+  runId: string,
+  status: 'completed' | 'failed',
+): void {
+  const row = getLatestRunAttemptByRunId(sessionId, runId);
+  if (!row || row.finishedAt) {
+    clearRunInFlightAfterTerminal(sessionId);
+    return;
+  }
+  const attempt: RunAttemptRef = {
+    sessionId: row.sessionId,
+    attemptId: row.attemptId,
+    runId: row.runId,
+    startedAt: row.startedAt,
+  };
+  try { finishRunAttempt(attempt, status); } finally {
+    clearRunInFlightAfterTerminal(sessionId, attempt.attemptId);
+  }
+}
+
+/** A stale provider retry with an already-bound logical source is never a new
+ * execution request. Replay its exact terminal, or close an unsettled source
+ * with one stable failure so a write that landed before a crash cannot repeat. */
+async function replayOrFailClosedSlackInbound(input: {
+  ingress: SlackInboundIngress;
+  prompt: string;
+  transport: DiscordHarnessTransport;
+}): Promise<boolean> {
+  const { record } = input.ingress.claim;
+  if (input.ingress.claim.isNew || !record.sessionId || !record.sourceUserSeq) return false;
+  const source = listHarnessEvents(record.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === record.sourceUserSeq);
+  if (!source) throw new Error(`Slack inbound source ${record.sourceUserSeq} is missing`);
+  if (publicUserInputText(source.data) !== input.prompt.trim()) {
+    throw new InboundIdentityConflictError('Slack provider id is bound to a different accepted input');
+  }
+  bindSlackInboundAcceptedSource(input.ingress, source);
+  const terminal = exactSlackInboundTerminal(source);
+  const text = terminal ?? commitSlackInboundTerminal({
+    source,
+    text: PUBLIC_CHANNEL_FAILURE_TEXT,
+    status: 'failed',
+    reason: 'slack_transport_replay_unsettled',
+  });
+  settleSlackInboundAttempt(
+    source.sessionId,
+    input.ingress.identity.runId,
+    terminal ? 'completed' : 'failed',
+  );
+  await input.transport.sendInitial(text);
+  completeInbound({ ...input.ingress.inboxKey, runId: input.ingress.identity.runId, status: 'replied' });
+  return true;
+}
+
+interface AcceptedSlackControl {
+  source: EventRow;
+  attempt: RunAttemptRef | null;
+  replayText?: string;
+  replayFailed?: boolean;
+}
+
+/** Early Slack controls execute outside the shared conversation runner. Give
+ * them their own durable logical edge so the provider receipt is bound before
+ * they reject an approval, stop a run, or mutate channel continuity. */
+function acceptSlackControlTurn(input: {
+  ingress: SlackInboundIngress;
+  conversationId: string;
+  userId: string;
+  prompt: string;
+}): AcceptedSlackControl {
+  const sessionDigest = durableRequestIdentity('slack-control-session', input.conversationId).digest;
+  const sessionId = input.ingress.claim.record.sessionId ?? `sess-slack-control-${sessionDigest.slice(0, 32)}`;
+  if (!getHarnessSession(sessionId)) {
+    try {
+      createHarnessSession({
+        id: sessionId,
+        kind: 'chat',
+        // Keep ingress-control bookkeeping out of Slack conversation
+        // continuity queries; otherwise this freshly-created edge can shadow
+        // the paused/active session the command is meant to control.
+        channel: 'system',
+        userId: input.userId,
+        title: 'Slack control',
+        metadata: { source: 'slack-control', controlChannelId: input.conversationId },
+      });
+    } catch (error) {
+      if (!getHarnessSession(sessionId)) throw error;
+    }
+  }
+  const prior = getLatestRunAttemptByRunId(sessionId, input.ingress.identity.runId);
+  if (prior?.sourceUserSeq) {
+    const source = listHarnessEvents(sessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === prior.sourceUserSeq);
+    if (!source || publicUserInputText(source.data) !== input.prompt.trim()) {
+      throw new InboundIdentityConflictError('Slack control run is bound to different input');
+    }
+    bindSlackInboundAcceptedSource(input.ingress, source);
+    const attempt: RunAttemptRef | null = prior.finishedAt ? null : {
+      sessionId: prior.sessionId,
+      attemptId: prior.attemptId,
+      runId: prior.runId,
+      startedAt: prior.startedAt,
+    };
+    const terminal = exactSlackInboundTerminal(source);
+    if (terminal) return { source, attempt, replayText: terminal };
+    return {
+      source,
+      attempt,
+      replayText: commitSlackInboundTerminal({
+        source,
+        text: PUBLIC_CHANNEL_FAILURE_TEXT,
+        status: 'failed',
+        reason: 'slack_control_replay_unsettled',
+      }),
+      replayFailed: true,
+    };
+  }
+  const attempt = beginRunAttempt(sessionId, { runId: input.ingress.identity.runId });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: {
+      text: input.prompt,
+      displayText: input.prompt,
+      source: 'slack_control',
+      runId: input.ingress.identity.runId,
+      attemptId: attempt.attemptId,
+    },
+  }, { armRunInFlight: true });
+  bindSlackInboundAcceptedSource(input.ingress, source);
+  return { source, attempt };
+}
+
+function capturingSlackTransport(
+  transport: DiscordHarnessTransport,
+  capture: { text?: string },
+): DiscordHarnessTransport {
+  return {
+    ...transport,
+    sendInitial: async (content) => {
+      capture.text = content;
+      return transport.sendInitial(content);
+    },
+    sendError: async (content) => {
+      capture.text = content;
+      return transport.sendError(content);
+    },
+  };
+}
+
 async function dispatchInbound(opts: {
   client: WebClient;
   channelId: string;
@@ -672,17 +961,82 @@ async function dispatchInbound(opts: {
    *  delivered to two listeners is answered exactly once, never doubled. */
   setStatus?: (status: string) => Promise<unknown>;
 }): Promise<void> {
-  const inboxKey = { channel: `slack:${opts.channelId}`, sourceMessageId: opts.ts };
-  const claim = claimInbound({ ...inboxKey, userId: opts.userId });
-  if (!claim.shouldProcess) {
-    logger.info({ ...inboxKey, status: claim.record.status }, 'Skipping already-handled Slack message');
+  const transport = buildSlackHarnessTransport({ client: opts.client, channel: opts.channelId, threadTs: opts.threadTs });
+  let ingress: SlackInboundIngress;
+  try {
+    ingress = claimSlackInboundRequest({
+      channelId: opts.channelId,
+      sourceMessageId: opts.ts,
+      userId: opts.userId,
+      threadTs: opts.threadTs,
+      prompt: opts.prompt,
+      files: opts.files,
+    });
+  } catch (error) {
+    if (error instanceof InboundIdentityConflictError) {
+      logger.warn({ channelId: opts.channelId, sourceMessageId: opts.ts }, 'Slack provider id payload conflict');
+      try { await transport.sendError(PUBLIC_CHANNEL_FAILURE_TEXT); } catch { /* best effort */ }
+      return;
+    }
+    throw error;
+  }
+  if (!ingress.claim.shouldProcess) {
+    logger.info({ ...ingress.inboxKey, status: ingress.claim.record.status }, 'Skipping already-handled Slack message');
     return;
   }
-  // Approval-resume shortcut: "approve apr-xxxx" while a session is paused.
-  const transport = buildSlackHarnessTransport({ client: opts.client, channel: opts.channelId, threadTs: opts.threadTs });
+
   const conversationId = slackHarnessConversationId(opts.channelId, opts.threadTs);
   const stopControl = parseSlackRunStopControl(opts.prompt);
+  let acceptedSource: EventRow | undefined;
+  const onSourceAccepted = (source: EventRow): void => {
+    acceptedSource = source;
+    bindSlackInboundAcceptedSource(ingress, source);
+  };
+  const durableRequest = {
+    runId: ingress.identity.runId,
+    sessionId: ingress.claim.record.sessionId,
+    onSourceAccepted,
+  };
+
+  const executeEarlyControl = async (
+    action: (capturing: DiscordHarnessTransport) => Promise<void>,
+  ): Promise<void> => {
+    const accepted = acceptSlackControlTurn({
+      ingress,
+      conversationId,
+      userId: opts.userId,
+      prompt: opts.prompt,
+    });
+    acceptedSource = accepted.source;
+    if (accepted.replayText) {
+      settleSlackInboundAttempt(
+        accepted.source.sessionId,
+        ingress.identity.runId,
+        accepted.replayFailed ? 'failed' : 'completed',
+      );
+      await transport.sendInitial(accepted.replayText);
+      completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
+      return;
+    }
+    const capture: { text?: string } = {};
+    await action(capturingSlackTransport(transport, capture));
+    const text = commitSlackInboundTerminal({
+      source: accepted.source,
+      text: capture.text ?? 'Slack command completed.',
+      status: 'done',
+      reason: 'slack_control',
+    });
+    // The handler already sent the same captured text; this commit is the
+    // reconnect/retry authority rather than a second channel message.
+    void text;
+    settleSlackInboundAttempt(accepted.source.sessionId, ingress.identity.runId, 'completed');
+    completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
+  };
+
   try {
+    if (await replayOrFailClosedSlackInbound({ ingress, prompt: opts.prompt, transport })) return;
+
+    // Approval-resume shortcut: "approve apr-xxxx" while a session is paused.
     const handled = await tryHandleHarnessApprovalReply({
       channelId: conversationId,
       // Approval remains the highest-priority state. A bare stop/cancel means
@@ -693,35 +1047,66 @@ async function dispatchInbound(opts: {
       transport,
       allowGlobalApprovalFallback: !opts.threadTs, // DMs (no thread) allow the global fallback, like Discord DMs
       channel: 'slack',
+      durableRequest,
+      onlyIfApprovalPending: Boolean(stopControl?.rejectRelevantApprovalFirst),
     });
     if (handled) {
-      completeInbound({ ...inboxKey, status: 'replied' });
+      completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
       return;
     }
     if (stopControl) {
-      const explicitPausedCancel = opts.prompt.trim().toLowerCase() === '/cancel'
-        && isChannelSessionAwaitingApproval(conversationId, 'slack');
-      const stopped = requestBoundChannelRunStop({
-        channelId: conversationId,
-        channel: 'slack',
-        reason: 'stopped from Slack',
+      await executeEarlyControl(async (capturing) => {
+        const explicitPausedCancel = opts.prompt.trim().toLowerCase() === '/cancel'
+          && isChannelSessionAwaitingApproval(conversationId, 'slack');
+        const stopped = requestBoundChannelRunStop({
+          channelId: conversationId,
+          channel: 'slack',
+          reason: 'stopped from Slack',
+        });
+        if (stopped && !explicitPausedCancel) {
+          await capturing.sendInitial('⏹ Stopping the current Slack run. It will halt at the next safe boundary.');
+          return;
+        }
+        if (!stopControl.fallbackToPausedCancel) {
+          await capturing.sendInitial('Nothing is actively running in this Slack conversation. Pending approvals in other chats were left untouched.');
+          return;
+        }
+        // Preserve the established bare-/slash-cancel semantics without model
+        // preflight, now behind the accepted control source above.
+        await handleHarnessCancel({ channelId: conversationId, transport: capturing, channel: 'slack' });
       });
-      if (stopped && !explicitPausedCancel) {
-        await transport.sendInitial('⏹ Stopping the current Slack run. It will halt at the next safe boundary.');
-        completeInbound({ ...inboxKey, status: 'replied' });
-        return;
-      }
-      if (!stopControl.fallbackToPausedCancel) {
-        await transport.sendInitial('Nothing is actively running in this Slack conversation. Pending approvals in other chats were left untouched.');
-        completeInbound({ ...inboxKey, status: 'replied' });
-        return;
-      }
-      // Preserve the established bare-/slash-cancel semantics without entering
-      // model preflight. For an explicit /cancel on a paused approval we have
-      // ALSO latched the exact attempt above; this resolves the approval as
-      // cancelled_by_user and clears the durable interrupt/session binding.
-      await handleHarnessCancel({ channelId: conversationId, transport, channel: 'slack' });
-      completeInbound({ ...inboxKey, status: 'replied' });
+      return;
+    }
+
+    const command = parseHarnessCommand(opts.prompt);
+    if (command === 'new') {
+      await executeEarlyControl((capturing) => handleHarnessNew({
+        channelId: conversationId,
+        transport: capturing,
+        channel: 'slack',
+      }));
+      return;
+    }
+    if (command === 'sessions') {
+      await executeEarlyControl((capturing) => handleHarnessSessions({
+        channelId: conversationId,
+        userId: opts.userId,
+        guildId: opts.teamId ?? null,
+        transport: capturing,
+        channel: 'slack',
+      }));
+      return;
+    }
+    if (isStatusCommand(opts.prompt)) {
+      await executeEarlyControl((capturing) => handleSlackHarnessMessage({
+        client: opts.client,
+        channelId: opts.channelId,
+        userId: opts.userId,
+        teamId: opts.teamId,
+        threadTs: opts.threadTs,
+        prompt: opts.prompt,
+        transportOverride: capturing,
+      }));
       return;
     }
     await handleSlackHarnessMessage({
@@ -733,12 +1118,30 @@ async function dispatchInbound(opts: {
       prompt: opts.prompt,
       files: opts.files,
       setStatus: opts.setStatus,
+      durableRequest,
     });
-    completeInbound({ ...inboxKey, status: 'replied' });
+    completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
   } catch (err) {
-    logger.error({ err, ...inboxKey }, 'Slack message handling failed');
-    completeInbound({ ...inboxKey, status: 'failed', error: err instanceof Error ? err.message : String(err) });
-    try { await transport.sendError('Something went wrong handling that — try again.'); } catch { /* best effort */ }
+    logger.error({ err, ...ingress.inboxKey }, 'Slack message handling failed');
+    let failureText = PUBLIC_CHANNEL_FAILURE_TEXT;
+    if (acceptedSource) {
+      try {
+        failureText = exactSlackInboundTerminal(acceptedSource) ?? commitSlackInboundTerminal({
+          source: acceptedSource,
+          text: PUBLIC_CHANNEL_FAILURE_TEXT,
+          status: 'failed',
+          reason: 'slack_inbound_failed',
+        });
+        settleSlackInboundAttempt(acceptedSource.sessionId, ingress.identity.runId, 'failed');
+      } catch { /* the retry path remains fail-closed */ }
+    }
+    completeInbound({
+      ...ingress.inboxKey,
+      runId: ingress.identity.runId,
+      status: 'failed',
+      error: err instanceof Error ? err.message : String(err),
+    });
+    try { await transport.sendError(failureText); } catch { /* best effort */ }
   }
 }
 
@@ -909,8 +1312,8 @@ async function handleSlackAction(opts: {
     try {
       text = await resolveApprovalOrQueueBackgroundContinuation(opts.assistant, targetId, approved);
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      await opts.respondEphemeral(`Could not ${approved ? 'approve' : 'reject'} \`${targetId}\`: ${detail}\nThe approval card is still actionable.`);
+      logger.warn({ err: error, approvalId: targetId, action: approved ? 'approve' : 'reject' }, 'Slack approval action failed');
+      await opts.respondEphemeral(publicApprovalDecisionFailure(approved ? 'approve' : 'reject', targetId));
       return;
     }
     await settleSlackApprovalCard(
@@ -1129,11 +1532,13 @@ async function handleEditModalSubmit(callbackId: string, answer: string): Promis
     });
     if (!response.ok) {
       const text = await response.text();
-      return { ok: false, message: `Edit-and-approve failed: ${response.status} ${text.slice(0, 200)}` };
+      logger.warn({ approvalId, status: response.status, responseBody: text.slice(0, 1000) }, 'Slack edit-and-approve endpoint rejected request');
+      return { ok: false, message: PUBLIC_APPROVAL_EDIT_FAILURE_TEXT };
     }
     return { ok: true, message: '🍊 Approved with edits. The agent is continuing with your updated args.' };
   } catch (err) {
-    return { ok: false, message: `Edit-and-approve failed: ${err instanceof Error ? err.message : String(err)}` };
+    logger.error({ err, approvalId }, 'Slack edit-and-approve request failed');
+    return { ok: false, message: PUBLIC_APPROVAL_EDIT_FAILURE_TEXT };
   }
 }
 
@@ -1310,7 +1715,7 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
         }
       } catch (err) {
         logger.error({ err, actionId }, 'Slack action handling failed');
-        await respondEphemeral(err instanceof Error ? err.message : String(err));
+        await respondEphemeral(PUBLIC_CHANNEL_FAILURE_TEXT);
       }
     });
 
@@ -1485,6 +1890,8 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
 // Exposed for unit tests.
 export const __test__ = {
   buildSlackActionsForNotification,
+  bindSlackInboundAcceptedSource,
+  claimSlackInboundRequest,
   formatSlackNotificationMessage,
   pickEditableField,
   userAllowedSlack,

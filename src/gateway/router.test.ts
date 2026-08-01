@@ -17,7 +17,19 @@ process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
 process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 
 const { ClementineGateway } = await import('./router.js');
-const { appendEvent, createSession, getSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const {
+  appendEvent,
+  beginRunAttempt,
+  createSession,
+  getActiveRunAttempt,
+  getSession,
+  listEvents,
+  recordRunAttemptUserInput,
+  resetEventLog,
+} = await import('../runtime/harness/eventlog.js');
+const { HarnessSession } = await import('../runtime/harness/session.js');
+const { presentationEventFromCompletionData } = await import('../runtime/harness/turn-outcome.js');
+const { PUBLIC_RUN_FAILURE_TEXT, publicUserInputText } = await import('../runtime/harness/public-presentation.js');
 const { getRun } = await import('../runtime/run-events.js');
 const {
   createBackgroundTask,
@@ -66,6 +78,7 @@ test('bare continue after an awaiting_continue completion is rewritten with prio
     sessionId: session.id,
     channel: 'mobile',
     source: 'mobile',
+    runId: 'run-gateway-literal-continue',
   });
 
   assert.equal(response.text, 'continued');
@@ -73,6 +86,107 @@ test('bare continue after an awaiting_continue completion is rewritten with prio
   assert.match(capturedMessage, /previous turn/);
   assert.match(capturedMessage, /do not restart/i);
   assert.match(capturedMessage, /Finished discovery; keep working until/);
+  const accepted = listEvents(session.id, { types: ['user_input_received'] });
+  assert.equal(accepted.length, 1);
+  assert.equal(publicUserInputText(accepted[0].data), 'continue');
+  assert.equal(accepted[0].data.text, 'continue', 'expanded continuation directive stays private model input');
+  const terminal = listEvents(session.id, { types: ['conversation_completed'], desc: true })
+    .find((event) => event.data.sourceUserSeq === accepted[0].seq)!;
+  assert.equal(terminal.data.terminalKey, `turn:${accepted[0].seq}`);
+  assert.equal(presentationEventFromCompletionData(terminal.data)?.identity.sourceUserSeq, accepted[0].seq);
+});
+
+test('gateway command is one accepted turn with one replay-safe typed terminal', async () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Gateway command' });
+  let respondCalls = 0;
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => {
+      respondCalls += 1;
+      return { text: 'model should not run', sessionId: req.sessionId };
+    },
+  } as never);
+  const request = {
+    message: 'tasks',
+    sessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile' as const,
+    runId: 'run-gateway-command-replay',
+  };
+
+  const first = await gateway.handleMessage(request);
+  const replay = await gateway.handleMessage(request);
+
+  assert.equal(respondCalls, 0);
+  assert.equal(replay.text, first.text);
+  const users = listEvents(session.id, { types: ['user_input_received'] });
+  const terminals = listEvents(session.id, { types: ['conversation_completed'] });
+  assert.equal(users.length, 1);
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].data.terminalKey, `turn:${users[0].seq}`);
+  assert.equal(presentationEventFromCompletionData(terminals[0].data)?.status, 'done');
+});
+
+test('accepted gateway exception reduces to one stable failed terminal', async () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Gateway failure' });
+  const privateDetail = 'provider leaked bearer-secret-123';
+  const gateway = new ClementineGateway({
+    respond: async () => { throw new Error(privateDetail); },
+  } as never);
+
+  await assert.rejects(
+    gateway.handleMessage({
+      message: 'trigger the provider failure',
+      sessionId: session.id,
+      channel: 'mobile',
+      source: 'mobile',
+      runId: 'run-gateway-stable-failure',
+    }),
+    (error: unknown) => error instanceof Error && error.message === PUBLIC_RUN_FAILURE_TEXT,
+  );
+
+  const [accepted] = listEvents(session.id, { types: ['user_input_received'] });
+  const terminals = listEvents(session.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  const presentation = presentationEventFromCompletionData(terminals[0].data);
+  assert.equal(terminals[0].data.terminalKey, `turn:${accepted.seq}`);
+  assert.equal(presentation?.status, 'failed');
+  assert.equal(presentation?.text, PUBLIC_RUN_FAILURE_TEXT);
+  assert.doesNotMatch(JSON.stringify(terminals[0].data), /bearer-secret-123/);
+});
+
+test('late gateway terminal A does not clear newer attempt B restart coverage', async () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Gateway overlap' });
+  let releaseA!: () => void;
+  let enteredA!: () => void;
+  const aEntered = new Promise<void>((resolve) => { enteredA = resolve; });
+  const aReleased = new Promise<void>((resolve) => { releaseA = resolve; });
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => {
+      enteredA();
+      await aReleased;
+      return { text: 'A finished late.', sessionId: req.sessionId };
+    },
+  } as never);
+
+  const lateA = gateway.handleMessage({
+    message: 'run A',
+    sessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile',
+    runId: 'run-gateway-overlap-a',
+  });
+  await aEntered;
+  const attemptB = beginRunAttempt(session.id, { runId: 'run-gateway-overlap-b' });
+  recordRunAttemptUserInput(attemptB, {
+    turn: 2,
+    role: 'user',
+    data: { text: 'run B', displayText: 'run B' },
+  }, { armRunInFlight: true });
+
+  releaseA();
+  await lateA;
+  assert.equal(getActiveRunAttempt(session.id)?.attemptId, attemptB.attemptId);
+  assert.ok(HarnessSession.load(session.id)?.runInFlightSince(), 'B retains restart coverage');
 });
 
 test('bare continue without a limit completion remains a normal user message', async () => {
@@ -310,8 +424,12 @@ test('gateway explicit "move this to the background" with task skips foreground 
   const origin = getSession(sessionId);
   assert.equal(origin?.kind, 'chat', 'queued-only background origin is registered as a harness chat session');
   const [originTurn] = listEvents(sessionId, { types: ['user_input_received'], limit: 5, desc: true });
-  assert.equal((originTurn?.data as { queuedBackgroundOrigin?: boolean } | undefined)?.queuedBackgroundOrigin, true);
+  assert.ok(originTurn);
   assert.match(String((originTurn?.data as { text?: string } | undefined)?.text ?? ''), /move this to the background/i);
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] })
+    .find((event) => event.data.sourceUserSeq === originTurn.seq);
+  assert.equal(terminal?.data.reason, 'queued_background');
+  assert.equal(terminal?.data.terminalKey, `turn:${originTurn.seq}`);
 });
 
 test('gateway records max-turns-with-grace as a non-completed run', async () => {

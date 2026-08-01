@@ -134,5 +134,6 @@ test('explicit decision-only authority blocks instead of using legacy fallback w
 
   assert.equal(legacyCalls, 0);
   assert.equal(response.stoppedReason, 'error');
-  assert.match(response.text, /harness lane is disabled/i);
+  assert.match(response.text, /runtime lane is temporarily unavailable/i);
+  assert.doesNotMatch(response.text, /harness|CLEMMY_/i, 'public preflight copy stays free of runtime internals');
 });

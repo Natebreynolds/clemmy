@@ -6,7 +6,12 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseNarratedEnvelope, stripNarratedEnvelope } from './envelope-narration.js';
+import {
+  parseNarratedEnvelope,
+  publicReplyFromNarratedEnvelope,
+  stripNarratedEnvelope,
+} from './envelope-narration.js';
+import { toOrchestratorDecision } from './turn-decision.js';
 
 // Reproduced from the live screenshot.
 const LIVE = [
@@ -19,26 +24,32 @@ const LIVE = [
   'reason: Selecting the wrong connected account could use the wrong organization\'s credits or data.',
 ].join('\n');
 
-test('the live narrated envelope loses its labels and keeps every word', () => {
+test('the live narrated envelope preserves field semantics but publishes only the reply and question', () => {
   const parsed = parseNarratedEnvelope(LIVE);
   assert.ok(parsed, 'the envelope is detected');
   assert.match(parsed!.preamble, /^Which Firecrawl connection/);
+  assert.match(parsed!.fields.summary ?? '', /Boston prospecting run/);
+  assert.match(parsed!.fields.done ?? '', /Confirmed the old DataForSEO task/);
+  assert.match(parsed!.fields.nextaction ?? '', /Run the four Boston searches/);
+  assert.match(parsed!.fields.reason ?? '', /wrong organization/);
 
   const shown = stripNarratedEnvelope(LIVE);
   assert.match(shown, /Which Firecrawl connection should I use/, 'the actual question survives');
   assert.match(shown, /two accounts are connected/, 'the human-facing reply survives');
-  assert.match(shown, /Confirmed the old DataForSEO task is unavailable/, 'what was done survives');
-  assert.match(shown, /Run the four Boston searches/, 'the next step survives');
-  assert.match(shown, /wrong organization/, 'the justification survives');
+  assert.doesNotMatch(shown, /Confirmed the old DataForSEO task is unavailable/, 'done bookkeeping is not chat copy');
+  assert.doesNotMatch(shown, /Run the four Boston searches/, 'nextAction bookkeeping is not chat copy');
+  assert.doesNotMatch(shown, /wrong organization/, 'reason bookkeeping is not chat copy');
   for (const leaked of ['summary:', 'reply:', 'done:', 'nextAction:', 'reason:']) {
     assert.ok(!shown.includes(leaked), `internal field label "${leaked}" must not reach the user`);
   }
+
+  const decision = toOrchestratorDecision(LIVE);
+  assert.equal(decision?.done, false);
+  assert.equal(decision?.nextAction, 'awaiting_user_input');
+  assert.equal(decision?.reply, shown);
 });
 
-test('a SUCCESSFUL run keeps its substance — stripping to reply-only would gut the report', () => {
-  // Second live case: the work went perfectly, and the useful detail lived
-  // under done/nextAction/reason. Showing only `reply` would have reduced a
-  // real report to one line.
+test('a successful narrated run keeps evidence in typed fields without narrating it as the answer', () => {
   const success = [
     'summary: All 10 prospects were added to Lunar Local CRM successfully.',
     'reply: Chris, they are in the Leads table of the Lunar Local CRM Airtable base.',
@@ -46,12 +57,23 @@ test('a SUCCESSFUL run keeps its substance — stripping to reply-only would gut
     'nextAction: The four firms still missing a verified decision-maker can be contact-enriched later: Boston Injury Law Group, Neumann Law Group, TopDog Law, and Diller Law.',
     'reason: The Airtable read-back returned all 10 requested firms, confirming the batch landed correctly.',
   ].join('\n');
-  const shown = stripNarratedEnvelope(success);
+  const parsed = parseNarratedEnvelope(success);
+  assert.ok(parsed);
+  assert.match(parsed!.fields.done ?? '', /Verified exactly 10 Boston records/);
+  assert.match(parsed!.fields.nextaction ?? '', /Neumann Law Group/);
+  assert.match(parsed!.fields.reason ?? '', /read-back returned all 10/);
+
+  const shown = publicReplyFromNarratedEnvelope(success) ?? '';
   assert.match(shown, /Leads table/, 'the answer survives');
-  assert.match(shown, /Verified exactly 10 Boston records/, 'the verification detail survives');
-  assert.match(shown, /Neumann Law Group/, 'the named follow-ups survive');
-  assert.match(shown, /read-back returned all 10/, 'the evidence survives');
+  assert.doesNotMatch(shown, /Verified exactly 10 Boston records/);
+  assert.doesNotMatch(shown, /Neumann Law Group/);
+  assert.doesNotMatch(shown, /read-back returned all 10/);
   assert.ok(!/^\s*(summary|reply|done|nextAction|reason)\s*:/m.test(shown), 'no field labels remain');
+
+  const decision = toOrchestratorDecision(success);
+  assert.equal(decision?.done, true);
+  assert.equal(decision?.nextAction, 'completed');
+  assert.equal(decision?.reply, shown);
 });
 
 test('ordinary prose is never rewritten', () => {
@@ -68,18 +90,32 @@ test('ordinary prose is never rewritten', () => {
   }
 });
 
-test('a partial envelope with no usable reply is left alone rather than blanked', () => {
+test('a partial envelope with no explicit reply fails closed at the public boundary', () => {
   const partial = [
     'summary: something happened',
     'done: true',
     'nextAction: keep going',
   ].join('\n');
-  // Three keys present and no `reply` — the remaining values are still real
-  // content, so they are kept (label-free) rather than discarded.
-  const shown = stripNarratedEnvelope(partial);
-  assert.match(shown, /something happened/);
-  assert.match(shown, /keep going/);
-  assert.ok(!shown.includes('nextAction:'));
+  assert.equal(publicReplyFromNarratedEnvelope(partial), null);
+  assert.equal(stripNarratedEnvelope(partial), '');
+  assert.equal(toOrchestratorDecision(partial), null);
+});
+
+test('two-field envelopes containing reply are still contract narration', () => {
+  const summaryReply = [
+    'summary: Asked the user which account to use.',
+    'reply: Which account should I use?',
+  ].join('\n');
+  assert.ok(parseNarratedEnvelope(summaryReply));
+  assert.equal(publicReplyFromNarratedEnvelope(summaryReply), 'Which account should I use?');
+  assert.equal(stripNarratedEnvelope(summaryReply), 'Which account should I use?');
+
+  const replyDone = [
+    'reply: The report is ready.',
+    'done: Verified the internal delivery ledger.',
+  ].join('\n');
+  assert.ok(parseNarratedEnvelope(replyDone));
+  assert.equal(stripNarratedEnvelope(replyDone), 'The report is ready.');
 });
 
 test('markdown-decorated envelope lines are still caught', () => {
@@ -89,7 +125,8 @@ test('markdown-decorated envelope lines are still caught', () => {
     '- done: base created',
     '- nextAction: enrich contacts',
   ].join('\n');
-  assert.match(stripNarratedEnvelope(decorated), /scoped the project/);
   assert.match(stripNarratedEnvelope(decorated), /I pulled 10 firms/);
+  assert.doesNotMatch(stripNarratedEnvelope(decorated), /scoped the project/);
+  assert.doesNotMatch(stripNarratedEnvelope(decorated), /base created/);
   assert.ok(!stripNarratedEnvelope(decorated).includes('nextAction:'));
 });

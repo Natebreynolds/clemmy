@@ -302,7 +302,10 @@ test('a fresh cross-session action gets the focus pointer but not historical rec
   assert.match(sameSession, /old-write-123/);
 });
 
-test('partition: default ("all") is byte-identical to no partition (regression guard for the cache split)', () => {
+test('partition: default ("all") is byte-identical to no partition (regression guard for the cache split)', (t) => {
+  // Both renders must observe the same dynamic input. Without a fixed clock,
+  // crossing a minute boundary can change only the intentional `Now` block.
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-07-31T12:34:00-07:00') });
   resetMemoryDb();
   rememberFact({ kind: 'project', content: 'Priority_Account__c marks priority account accounts.' });
   const q = 'pull my priority account accounts';

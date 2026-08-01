@@ -99,13 +99,20 @@ const GOLDEN = {
   // on the table), and a retrieval the user is waiting on that needs minutes
   // of tool work gets a one-line route echo then backgrounds with
   // report-back-here instead of grinding tool calls in the chat.
-  instructions: { len: 36142, sha16: '188e50c752132c97' },
-  native: { len: 35245, sha16: 'a49fff3400b24563' },
-  claudeBrain: { len: 6574, sha16: '90973b1bc0abb234' },
+  // 2026-08-01 graph-owned lane choice: full and lean brains now honor an
+  // explicit now/background/hold choice and otherwise choose foreground vs
+  // durable execution from the work itself. The routing permission question
+  // and route-confirmation beat are gone; missing-input and approval safety stay.
+  // 2026-08-01 workflow authority subtraction: an exact/unambiguous imperative
+  // dispatches the named workflow immediately; only ambiguous thematic matches
+  // receive an identifying clarification.
+  instructions: { len: 35006, sha16: '5d066cc63dbf16c9' },
+  native: { len: 34109, sha16: 'f04c8e5d52555c0b' },
+  claudeBrain: { len: 6856, sha16: 'c2d53a0c66080fa6' },
   // 2026-07-27 live efficiency proof: execution_create already guards against
   // a duplicate active lane, so the lean rubric no longer makes the model dump
   // every user's old executions before opening/reusing the current one.
-  lean: { len: 10119, sha16: 'a8f8e6d6406a1a2b' },
+  lean: { len: 10401, sha16: 'a64f695fb277ce5a' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -187,6 +194,35 @@ test('interaction contract: exploration is model-led while execution-ready ambig
     assert.doesNotMatch(rubric, /at most ONE (?:steering|consultative) beat/i);
     assert.doesNotMatch(rubric, /The moment the user answers, EXECUTE/i);
     assert.doesNotMatch(rubric, /END your reply with ONE concrete offer/i);
+  }
+});
+
+test('background execution contract: the graph chooses the lane without a routing permission beat', () => {
+  for (const [lane, rubric] of [
+    ['legacy', ORCHESTRATOR_INSTRUCTIONS],
+    ['lean-codex', ORCHESTRATOR_INSTRUCTIONS_LEAN],
+    ['claude', CLAUDE_BRAIN_RUBRIC],
+  ] as const) {
+    assert.match(rubric, /honor explicit now\/background\/hold/i, lane);
+    assert.match(rubric, /choose from workload/i, lane);
+    assert.match(rubric, /Never ask which lane/i, lane);
+    assert.match(rubric, /materially missing input.*external-write approval/is, lane);
+    assert.match(rubric, /approval graph remains authoritative/i, lane);
+    assert.doesNotMatch(rubric, /ask naturally once|ASK in ONE plain sentence whether to run it in the background/i, lane);
+  }
+});
+
+test('workflow execution contract: an exact imperative is authority; only ambiguous thematic matches clarify', () => {
+  for (const [lane, rubric] of [
+    ['codex', ORCHESTRATOR_INSTRUCTIONS],
+    ['native', ORCHESTRATOR_BEHAVIOR_NATIVE],
+  ] as const) {
+    assert.match(rubric, /imperative with the exact workflow name/i, lane);
+    assert.match(rubric, /sufficient execution authority.*call workflow_run immediately in the same turn/is, lane);
+    assert.match(rubric, /no separate confirmation turn is required/i, lane);
+    assert.match(rubric, /merely similar topic is not authority/i, lane);
+    assert.match(rubric, /could mean multiple workflows.*ask one concise identifying clarification/is, lane);
+    assert.doesNotMatch(rubric, /Run it now\?/i, lane);
   }
 });
 

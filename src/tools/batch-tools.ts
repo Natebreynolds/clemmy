@@ -29,7 +29,6 @@ import {
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
-import { maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import {
   admitPendingActionCall,
@@ -212,14 +211,6 @@ export function registerBatchTools(server: McpServer): void {
       try {
         if (action === 'propose') {
           if (!rawPlan) return textResult('run_batch propose needs a plan.');
-          // First-contact plan beat (armed at the policy classifier): the
-          // code-mode batch door gets the same one conversational beat as
-          // run_worker (2026-07-22: an inline batch bypassed the fan-out gate).
-          const alignmentBounce = maybeBounceMassExecution(sessionId, {
-            itemCount: rawPlan.items.length,
-            sideEffect: rawPlan.sideEffect,
-          });
-          if (alignmentBounce.bounce && alignmentBounce.steer) return textResult(alignmentBounce.steer);
           // Parse each item's JSON-string args into an object up front, with a
           // precise per-item error so a malformed item is fixable, not a loop.
           const parsedItems: Array<{ id: string; args: Record<string, unknown> }> = [];

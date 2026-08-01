@@ -32,6 +32,8 @@ const REAL_DEFAULT_HOME = path.join(os.homedir(), '.clementine-next');
 export const STATE_DIR = path.join(BASE_DIR, 'state');
 export const MEMORY_DB_PATH = path.join(STATE_DIR, 'memory.db');
 export const MEMORY_BACKUP_DIR = path.join(STATE_DIR, 'backups');
+/** Upgrade-boundary snapshots are never part of nightly retention pruning. */
+export const MEMORY_PRE_MIGRATION_BACKUP_DIR = path.join(STATE_DIR, 'pre-migration-backups');
 
 export type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference' | 'constraint';
 
@@ -1787,6 +1789,68 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
       `);
     },
   },
+  {
+    // v31 — durable transport identity for provider inbox rows. Discord can
+    // redeliver after a daemon crash; payload/run/source binding must survive
+    // so the retry cannot mint a second logical user turn or silently reuse a
+    // provider message id for different authority.
+    version: 31,
+    run: (db: Database.Database) => {
+      const columns = new Set(
+        (db.pragma('table_info(inbound_messages)') as Array<{ name: string }>).map((column) => column.name),
+      );
+      if (!columns.has('payload_hash')) db.exec('ALTER TABLE inbound_messages ADD COLUMN payload_hash TEXT');
+      if (!columns.has('source_user_seq')) db.exec('ALTER TABLE inbound_messages ADD COLUMN source_user_seq INTEGER');
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_inbound_run_id
+          ON inbound_messages(run_id) WHERE run_id IS NOT NULL;
+      `);
+    },
+  },
+  {
+    // v32 — quarantine unresolved provider deliveries that predate v31's
+    // payload authority. A legacy claimed/failed row cannot tell us whether
+    // tools or an external write landed before the daemon stopped. Reclaiming
+    // it under a newly backfilled payload/run would manufacture authority and
+    // could repeat that write. Replied/dropped history remains byte-for-byte
+    // status-compatible; only unresolved rows without a payload hash become
+    // inert. This separate migration also repairs databases already opened by
+    // the v31 release candidate, where editing v31 itself would never rerun.
+    version: 32,
+    run: (db: Database.Database) => {
+      const reason = 'legacy_inbound_without_durable_identity_v31_quarantine';
+      db.transaction(() => {
+        const result = db.prepare(`
+          UPDATE inbound_messages
+             SET status = 'dropped',
+                 error = CASE
+                   WHEN error IS NULL OR trim(error) = '' THEN ?
+                   ELSE error || ' | ' || ?
+                 END,
+                 completed_at = COALESCE(completed_at, ?)
+           WHERE status IN ('claimed', 'failed')
+             AND payload_hash IS NULL
+        `).run(reason, reason, new Date().toISOString());
+        const affected = Number(result.changes ?? 0);
+        if (affected > 0) {
+          db.prepare(`
+            INSERT INTO memory_migration_audit
+              (migration_version, action, affected_rows, detail_json, created_at)
+            VALUES (32, 'quarantine_legacy_unresolved_inbound', ?, ?, ?)
+          `).run(
+            affected,
+            JSON.stringify({
+              statuses: ['claimed', 'failed'],
+              missingAuthority: 'payload_hash',
+              resultingStatus: 'dropped',
+              reason,
+            }),
+            new Date().toISOString(),
+          );
+        }
+      })();
+    },
+  },
 ];
 
 /**
@@ -1795,6 +1859,69 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
  * is safe merely because its version can be read.
  */
 export const MEMORY_SCHEMA_VERSION = MIGRATIONS.at(-1)?.version ?? 0;
+
+let preMigrationSnapshotOrdinal = 0;
+
+function readMemorySchemaVersion(db: Database.Database): number {
+  const hasVersionTable = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+  ).get();
+  if (!hasVersionTable) return 0;
+  return (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number | null }).version ?? 0;
+}
+
+/**
+ * Write a WAL-consistent, immutable rollback point immediately before an
+ * existing database crosses a schema boundary. Unlike nightly backups these
+ * files live in a separate directory and are never retention-pruned. Failure
+ * is fatal: migrating canonical memory without a rollback image is unsafe.
+ */
+function createPreMigrationMemorySnapshot(
+  db: Database.Database,
+  fromVersion: number,
+  toVersion: number,
+): string {
+  if (fromVersion <= 0 || fromVersion >= toVersion) {
+    throw new Error(`invalid pre-migration snapshot boundary ${fromVersion}->${toVersion}`);
+  }
+  if (!existsSync(MEMORY_PRE_MIGRATION_BACKUP_DIR)) {
+    mkdirSync(MEMORY_PRE_MIGRATION_BACKUP_DIR, { recursive: true });
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  preMigrationSnapshotOrdinal += 1;
+  const filename = [
+    'memory',
+    `v${fromVersion}-to-v${toVersion}`,
+    stamp,
+    `p${process.pid}`,
+    String(preMigrationSnapshotOrdinal),
+  ].join('-') + '.db';
+  const snapshotPath = path.join(MEMORY_PRE_MIGRATION_BACKUP_DIR, filename);
+  try {
+    // VACUUM INTO reads one consistent SQLite snapshot, including committed
+    // pages still resident in WAL, and refuses to overwrite an existing file.
+    db.exec(`VACUUM INTO '${snapshotPath.replace(/'/g, "''")}'`);
+    const bytes = statSync(snapshotPath).size;
+    if (bytes <= 0) throw new Error('snapshot is empty');
+    const probe = new Database(snapshotPath, { readonly: true });
+    try {
+      const integrity = probe.pragma('integrity_check') as Array<{ integrity_check: string }>;
+      if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
+        throw new Error('snapshot failed integrity_check');
+      }
+      if (readMemorySchemaVersion(probe) !== fromVersion) {
+        throw new Error('snapshot schema boundary does not match source');
+      }
+    } finally {
+      probe.close();
+    }
+    return snapshotPath;
+  } catch (error) {
+    try { if (existsSync(snapshotPath)) unlinkSync(snapshotPath); } catch { /* best effort */ }
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Refusing memory migration ${fromVersion}->${toVersion}: pre-migration snapshot failed (${detail})`);
+  }
+}
 
 export interface MigrateMemoryDatabaseOptions {
   /**
@@ -1890,6 +2017,10 @@ export function openMemoryDb(): Database.Database {
   db.pragma('wal_autocheckpoint = 256');
 
   try {
+    const schemaBeforeOpen = readMemorySchemaVersion(db);
+    if (schemaBeforeOpen > 0 && schemaBeforeOpen < MEMORY_SCHEMA_VERSION) {
+      createPreMigrationMemorySnapshot(db, schemaBeforeOpen, MEMORY_SCHEMA_VERSION);
+    }
     migrateMemoryDatabaseHandle(db);
   } catch (error) {
     // Never leak a half-initialized handle or leave the file unnecessarily

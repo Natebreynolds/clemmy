@@ -41,21 +41,41 @@
  *      not parity. Only surfaces whose delivery depends on an open view (the
  *      desktop dock, mobile, the Workspace dock) can leave a result stranded.
  *
- * KNOWN BOUND: the grace window is an in-memory timer, so a daemon restart in
- * the ~45s between a run finishing and the decision being made loses that one
- * report. Making it durable would mean persisting a pending-report record and
- * reconciling it at boot — and a boot sweep cannot tell "nobody saw it" from
- * "the timer already decided somebody did", so it would have to re-derive that
- * too. Deliberately not built: the hole is one narrow window against a bug that
- * used to swallow EVERY foreground run, and the machinery would cost more than
- * it returns. Recorded here so the next person weighs it with the same numbers.
+ * The grace decision is a durable mini-outbox. A terminal is persisted before
+ * its timer is armed; viewer arrivals mark that row seen; and watcher startup
+ * reconciles rows whose timer belonged to a previous process. Notification ids
+ * are source-owned, so a crash after notification persistence but before
+ * outbox deletion repairs/reuses the same delivery instead of paging twice.
  *
  * Kill-switch: CLEMMY_FOREGROUND_REPORT_BACK=off.
  */
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { BASE_DIR } from '../../config.js';
 import { actionBus } from '../action-bus.js';
-import { addNotification } from '../notifications.js';
+import { addNotification, getNotification } from '../notifications.js';
 import { listEvents, type EventRow, type HarnessSessionSignal } from './eventlog.js';
-import { sessionViewerSeenSince } from './session-viewers.js';
+import { publicCompletionText } from './public-presentation.js';
+import {
+  sessionViewerSeenSince,
+  subscribeSessionViewerAttaches,
+} from './session-viewers.js';
+import {
+  presentationEventFromCompletionData,
+  type PresentationEvent,
+  type TurnOutcomeStatus,
+} from './turn-outcome.js';
 import { synthesizeWorkReport } from './work-report.js';
 
 export function foregroundReportBackEnabled(): boolean {
@@ -96,7 +116,9 @@ export interface TerminalRunFacts {
   externalWrites: number;
   /** Was a live viewer attached at any point since the run terminated? */
   seenByViewer: boolean;
-  outcome: 'completed' | 'failed' | 'awaiting';
+  /** Exact typed terminal state. Publication labels must never infer success
+   * from the generic conversation_completed event type. */
+  outcome: TurnOutcomeStatus;
   /** Seq of the user input that opened this run — the window's lower bound. */
   startSeq: number;
 }
@@ -141,62 +163,44 @@ export function decideTerminalReportBack(facts: TerminalRunFacts): TerminalRepor
 
 // ── Reading the run out of the event log ────────────────────────────────────
 
-const TERMINAL_TYPES: ReadonlySet<string> = new Set(['conversation_completed', 'run_failed']);
-
-function textOf(data: Record<string, unknown>, ...keys: string[]): string {
-  for (const key of keys) {
-    const value = data[key];
-    if (typeof value === 'string' && value.trim()) return value.trim();
-  }
-  return '';
-}
+const TERMINAL_TYPES: ReadonlySet<string> = new Set(['conversation_completed']);
 
 /**
  * Everything the decision needs about the run that just ended, read from the
- * durable log. The run's window is "since the user's last input" — the same
- * boundary every other per-request projection in the harness uses, so a long
- * conversation's earlier turns never inflate this one's work count.
+ * durable log. The run's window opens at the exact source identity carried by
+ * the typed terminal, so a later accepted request never steals an older run's
+ * work, body, or delivery id.
  */
 export function readTerminalRunFacts(input: {
   sessionId: string;
   sessionKind: string;
   channel: string | null;
   terminalSeq: number;
-  terminalType: string;
   terminalAt: string;
-  /** The terminal event's own payload — supplied by the caller, which already
-   *  has it, so finding the run's outcome never costs a query. */
-  terminalData?: Record<string, unknown>;
+  /** Exact accepted user event from the validated typed presentation. This is
+   * the run boundary even when a newer user turn was accepted before this
+   * terminal arrived. */
+  sourceUserSeq: number;
+  outcome: TurnOutcomeStatus;
   seenByViewer: boolean;
 }): TerminalRunFacts | null {
-  // The run's lower bound is the user's most recent input BEFORE the terminal.
-  // Ask for exactly that, rather than reading a slice of the session and
-  // scanning it: the first cut read the newest 2000 events and looked for the
-  // input inside them, which fails on precisely the runs this feature exists
-  // for. A scrape that makes two thousand tool calls pushes its own opening
-  // message out of that window, so startSeq stayed 0, the facts came back null,
-  // and the LONGEST runs — the ones nobody is still watching — were the only
-  // ones that never reported. Found by probing the new code against a
-  // 2200-event run before it shipped.
-  let startSeq = 0;
-  let startedAt = input.terminalAt;
+  if (!Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) return null;
+  // Resolve exactly one durable source row. `sinceSeq` is exclusive, so starting
+  // one sequence earlier makes this a bounded point lookup without adding an
+  // eventlog API. Never fall back to "latest before terminal": late completion A
+  // may legitimately arrive after accepted turn B and must still own A's work.
+  let source: EventRow | undefined;
   try {
-    for (const event of listEvents(input.sessionId, {
+    [source] = listEvents(input.sessionId, {
       types: ['user_input_received'],
-      desc: true,
-      limit: 20,
-    })) {
-      if (event.seq < input.terminalSeq && event.seq > startSeq) {
-        startSeq = event.seq;
-        startedAt = event.createdAt;
-      }
-    }
+      sinceSeq: input.sourceUserSeq - 1,
+      limit: 1,
+    });
   } catch {
     return null;
   }
-  // No user input before this terminal means it is not a user-facing run at all
-  // (a synthetic ack, a resumed system beat) — nothing to report.
-  if (startSeq === 0) return null;
+  if (!source || source.seq !== input.sourceUserSeq || source.seq >= input.terminalSeq) return null;
+  const startSeq = source.seq;
 
   // Only the event types the decision actually counts, and only from the run's
   // own boundary forward. Bounded by the run's real work, not by the session.
@@ -216,18 +220,11 @@ export function readTerminalRunFacts(input: {
   } catch { /* counts stay at zero — the decision simply reads as less substantive */ }
   const externalWrites = confirmedWrites || legacyWrites;
 
-  const startedMs = Date.parse(startedAt);
+  const startedMs = Date.parse(source.createdAt);
   const terminalMs = Date.parse(input.terminalAt);
   const elapsedMs = Number.isFinite(startedMs) && Number.isFinite(terminalMs)
     ? Math.max(0, terminalMs - startedMs)
     : 0;
-
-  const reason = textOf(input.terminalData ?? {}, 'reason');
-  const outcome: TerminalRunFacts['outcome'] = input.terminalType === 'run_failed'
-    ? 'failed'
-    : reason.startsWith('awaiting')
-      ? 'awaiting'
-      : 'completed';
 
   return {
     sessionId: input.sessionId,
@@ -237,7 +234,7 @@ export function readTerminalRunFacts(input: {
     toolCalls,
     externalWrites,
     seenByViewer: input.seenByViewer,
-    outcome,
+    outcome: input.outcome,
     startSeq,
   };
 }
@@ -258,7 +255,7 @@ export function buildTerminalReportBody(input: {
    *  reply was replaced by a generic line. */
   terminalData?: Record<string, unknown>;
 }): string {
-  const reply = textOf(input.terminalData ?? {}, 'reply', 'summary');
+  const reply = publicCompletionText(input.terminalData ?? {}, '');
   if (reply) return reply;
   // No prose: fall back to the durable write ledger for this run's window only.
   let evidence: EventRow[] = [];
@@ -294,11 +291,14 @@ function emitTerminalReportBack(
   body: string,
 ): void {
   const label = (session.title ?? '').trim() || 'your request';
-  const title = facts.outcome === 'failed'
-    ? `Chat run failed: ${label}`
-    : facts.outcome === 'awaiting'
-      ? `Chat run needs you: ${label}`
-      : `Chat run completed: ${label}`;
+  const titlePrefix: Record<TurnOutcomeStatus, string> = {
+    done: 'Chat run completed',
+    needs_input: 'Chat run needs you',
+    blocked: 'Chat run blocked',
+    failed: 'Chat run failed',
+    cancelled: 'Chat run cancelled',
+  };
+  const title = `${titlePrefix[facts.outcome]}: ${label}`;
   addNotification({
     id: `foreground-report-back-${facts.sessionId}-${facts.startSeq}`,
     kind: 'execution',
@@ -315,13 +315,206 @@ function emitTerminalReportBack(
       terminalReportBack: true,
       foregroundRun: true,
       status: facts.outcome,
-      needsAttention: facts.outcome !== 'completed',
+      needsAttention: facts.outcome !== 'done',
     },
   });
 }
 
+// ── Durable pending-report outbox ───────────────────────────────────────────
+
+interface PendingTerminalReport {
+  version: 1;
+  /** Stable logical source key, not a physical terminal/attempt key. */
+  id: string;
+  sessionId: string;
+  sessionKind: string;
+  channel: string | null;
+  userId: string | null;
+  title: string | null;
+  terminalSeq: number;
+  terminalAt: string;
+  sourceUserSeq: number;
+  outcome: TurnOutcomeStatus;
+  presentationText: string;
+  terminatedAtMs: number;
+  dueAtMs: number;
+  /** Persisted so a viewer who saw the result before a crash stays "seen". */
+  seenAtMs?: number;
+}
+
+const REPORT_BACK_OUTBOX_FILE = path.join(
+  BASE_DIR,
+  'state',
+  'terminal-report-back-outbox.json',
+);
+
+function pendingReportId(sessionId: string, sourceUserSeq: number): string {
+  return `${sessionId}:${sourceUserSeq}`;
+}
+
+function notificationIdForPending(pending: PendingTerminalReport): string {
+  return `foreground-report-back-${pending.sessionId}-${pending.sourceUserSeq}`;
+}
+
+function isTurnOutcomeStatus(value: unknown): value is TurnOutcomeStatus {
+  return value === 'done'
+    || value === 'needs_input'
+    || value === 'blocked'
+    || value === 'failed'
+    || value === 'cancelled';
+}
+
+function isPendingTerminalReport(value: unknown): value is PendingTerminalReport {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Partial<PendingTerminalReport>;
+  return row.version === 1
+    && typeof row.id === 'string'
+    && typeof row.sessionId === 'string'
+    && typeof row.sessionKind === 'string'
+    && (row.channel === null || typeof row.channel === 'string')
+    && (row.userId === null || typeof row.userId === 'string')
+    && (row.title === null || typeof row.title === 'string')
+    && Number.isSafeInteger(row.terminalSeq) && Number(row.terminalSeq) > 0
+    && typeof row.terminalAt === 'string'
+    && Number.isSafeInteger(row.sourceUserSeq) && Number(row.sourceUserSeq) > 0
+    && isTurnOutcomeStatus(row.outcome)
+    && typeof row.presentationText === 'string' && row.presentationText.trim().length > 0
+    && typeof row.terminatedAtMs === 'number' && Number.isFinite(row.terminatedAtMs)
+    && typeof row.dueAtMs === 'number' && Number.isFinite(row.dueAtMs)
+    && (row.seenAtMs === undefined
+      || (typeof row.seenAtMs === 'number' && Number.isFinite(row.seenAtMs)))
+    && row.id === pendingReportId(row.sessionId, Number(row.sourceUserSeq));
+}
+
+function loadPendingTerminalReports(): PendingTerminalReport[] {
+  if (!existsSync(REPORT_BACK_OUTBOX_FILE)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(REPORT_BACK_OUTBOX_FILE, 'utf8')) as unknown;
+    if (!Array.isArray(parsed)) throw new Error('terminal report-back outbox is not an array');
+    return parsed.filter(isPendingTerminalReport);
+  } catch {
+    // Never replace an unreadable canonical file in place. Preserve it for
+    // diagnosis; future terminals can start a fresh valid outbox.
+    const quarantined = `${REPORT_BACK_OUTBOX_FILE}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    try { renameSync(REPORT_BACK_OUTBOX_FILE, quarantined); } catch { /* best effort */ }
+    return [];
+  }
+}
+
+function savePendingTerminalReports(items: PendingTerminalReport[]): void {
+  mkdirSync(path.dirname(REPORT_BACK_OUTBOX_FILE), { recursive: true });
+  const tmp = `${REPORT_BACK_OUTBOX_FILE}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
+  try {
+    const fd = openSync(tmp, 'w');
+    try {
+      writeSync(fd, JSON.stringify(items, null, 2));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, REPORT_BACK_OUTBOX_FILE);
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+    throw error;
+  }
+}
+
+function persistPendingTerminalReport(pending: PendingTerminalReport): PendingTerminalReport | null {
+  // Notification persistence won a previous crash boundary. Reusing its stable
+  // id is the delivery receipt; never arm a second outbound signal.
+  if (getNotification(notificationIdForPending(pending))) return null;
+  const items = loadPendingTerminalReports();
+  const existing = items.find((item) => item.id === pending.id);
+  if (existing) return existing;
+  items.push(pending);
+  savePendingTerminalReports(items);
+  return pending;
+}
+
+function removePendingTerminalReport(id: string): void {
+  const items = loadPendingTerminalReports();
+  const next = items.filter((item) => item.id !== id);
+  if (next.length !== items.length) savePendingTerminalReports(next);
+}
+
+function markPendingReportsSeen(sessionId: string, seenAtMs: number): void {
+  const items = loadPendingTerminalReports();
+  let changed = false;
+  for (const item of items) {
+    if (item.sessionId !== sessionId || seenAtMs < item.terminatedAtMs) continue;
+    if (item.seenAtMs !== undefined && item.seenAtMs >= seenAtMs) continue;
+    item.seenAtMs = seenAtMs;
+    changed = true;
+  }
+  if (changed) savePendingTerminalReports(items);
+}
+
 type Timer = ReturnType<typeof setTimeout>;
 const armed = new Map<string, Timer>();
+
+function processPendingTerminalReport(id: string): void {
+  const pending = loadPendingTerminalReports().find((item) => item.id === id);
+  if (!pending) return;
+  try {
+    if (getNotification(notificationIdForPending(pending))) {
+      removePendingTerminalReport(id);
+      return;
+    }
+    const seenByViewer = pending.seenAtMs !== undefined
+      || sessionViewerSeenSince(pending.sessionId, pending.terminatedAtMs);
+    const facts = readTerminalRunFacts({
+      sessionId: pending.sessionId,
+      sessionKind: pending.sessionKind,
+      channel: pending.channel,
+      terminalSeq: pending.terminalSeq,
+      terminalAt: pending.terminalAt,
+      sourceUserSeq: pending.sourceUserSeq,
+      outcome: pending.outcome,
+      seenByViewer,
+    });
+    if (!facts || !decideTerminalReportBack(facts).deliver) {
+      removePendingTerminalReport(id);
+      return;
+    }
+    emitTerminalReportBack(
+      facts,
+      { title: pending.title, userId: pending.userId },
+      pending.presentationText,
+    );
+    // Notification first, then outbox acknowledgement. A crash between these
+    // writes replays the stable notification id and cannot duplicate delivery.
+    removePendingTerminalReport(id);
+  } catch {
+    // Keep the durable row. Watcher startup will reconcile it after restart.
+  }
+}
+
+function armPendingTerminalReport(pending: PendingTerminalReport, now: () => number): void {
+  if (armed.has(pending.id)) return;
+  const delay = Math.max(0, Math.min(2_147_483_647, pending.dueAtMs - now()));
+  const timer = setTimeout(() => {
+    armed.delete(pending.id);
+    processPendingTerminalReport(pending.id);
+  }, delay);
+  timer.unref?.();
+  armed.set(pending.id, timer);
+}
+
+function decodeOwnedPresentation(event: EventRow): PresentationEvent | null {
+  try {
+    const presentation = presentationEventFromCompletionData(event.data);
+    if (!presentation || presentation.identity.sessionId !== event.sessionId) return null;
+    if (presentation.identity.turn !== event.turn) return null;
+    return presentation;
+  } catch {
+    return null;
+  }
+}
+
+/** Test-only reset for the file-backed outbox. Watchers must be stopped first. */
+export function resetTerminalReportBackOutboxForTest(): void {
+  try { unlinkSync(REPORT_BACK_OUTBOX_FILE); } catch { /* absent is already reset */ }
+}
 
 /**
  * Watch the event log for chat-run terminals and arm a report-back for each.
@@ -338,8 +531,19 @@ export function startTerminalReportBackWatcher(options: {
 } = {}): () => void {
   const graceMs = options.graceMs ?? REPORT_BACK_GRACE_MS;
   const now = options.now ?? Date.now;
+  // Viewer observations are persisted while a row is pending, which keeps the
+  // no-duplicate decision truthful if the process dies inside the grace window.
+  const unsubscribeViewers = subscribeSessionViewerAttaches((sessionId, attachedAt) => {
+    try { markPendingReportsSeen(sessionId, attachedAt); } catch { /* best effort */ }
+  });
+  // This is the boot drain: the daemon's existing watcher registration is the
+  // only hook required. Rows whose old timer died are re-armed at their original
+  // deadline (or immediately when already due).
+  for (const pending of loadPendingTerminalReports()) {
+    armPendingTerminalReport(pending, now);
+  }
   const unsubscribe = actionBus.subscribe((busEvent) => {
-    if (busEvent.kind !== 'harness.event') return;
+    if (busEvent.kind !== 'harness.public_event') return;
     if (!foregroundReportBackEnabled()) return;
     const event = busEvent.event as EventRow;
     if (!TERMINAL_TYPES.has(event.type)) return;
@@ -347,42 +551,36 @@ export function startTerminalReportBackWatcher(options: {
     if (!session || session.kind !== 'chat') return;
     if (OUT_OF_BAND_CHANNELS.has((session.channel ?? '').toLowerCase())) return;
 
-    const key = `${event.sessionId}:${event.seq}`;
+    const presentation = decodeOwnedPresentation(event);
+    if (!presentation) return;
+    const key = pendingReportId(event.sessionId, presentation.identity.sourceUserSeq);
     if (armed.has(key)) return;
     const terminatedAtMs = now();
-    const timer = setTimeout(() => {
-      armed.delete(key);
-      try {
-        const facts = readTerminalRunFacts({
-          sessionId: event.sessionId,
-          sessionKind: session.kind,
-          channel: session.channel,
-          terminalSeq: event.seq,
-          terminalType: event.type,
-          terminalAt: event.createdAt,
-          terminalData: event.data,
-          seenByViewer: sessionViewerSeenSince(event.sessionId, terminatedAtMs),
-        });
-        if (!facts) return;
-        if (!decideTerminalReportBack(facts).deliver) return;
-        emitTerminalReportBack(
-          facts,
-          { title: session.title, userId: session.userId },
-          buildTerminalReportBody({
-            sessionId: event.sessionId,
-            terminalSeq: event.seq,
-            startSeq: facts.startSeq,
-            terminalData: event.data,
-          }),
-        );
-      } catch { /* report-back is best-effort; never break the event bus */ }
-    }, graceMs);
-    timer.unref?.();
-    armed.set(key, timer);
+    const pending = persistPendingTerminalReport({
+      version: 1,
+      id: key,
+      sessionId: event.sessionId,
+      sessionKind: session.kind,
+      channel: session.channel,
+      userId: session.userId,
+      title: session.title,
+      terminalSeq: event.seq,
+      terminalAt: event.createdAt,
+      sourceUserSeq: presentation.identity.sourceUserSeq,
+      outcome: presentation.status,
+      presentationText: presentation.text,
+      terminatedAtMs,
+      dueAtMs: terminatedAtMs + Math.max(0, graceMs),
+      ...(sessionViewerSeenSince(event.sessionId, terminatedAtMs)
+        ? { seenAtMs: terminatedAtMs }
+        : {}),
+    });
+    if (pending) armPendingTerminalReport(pending, now);
   });
   return () => {
     for (const timer of armed.values()) clearTimeout(timer);
     armed.clear();
     unsubscribe();
+    unsubscribeViewers();
   };
 }

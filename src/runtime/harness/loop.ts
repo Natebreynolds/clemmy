@@ -2,9 +2,10 @@ import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import { randomUUID } from 'node:crypto';
 import { HarnessSession } from './session.js';
-import { markRunInFlight } from './restart-recovery.js';
+import { clearRunInFlightAfterTerminal } from './restart-recovery.js';
 import { uncompensatedExternalWriteEvents } from './external-write-admission.js';
 import {
+  acceptUserInputForRun,
   appendEvent,
   clearKill,
   getActiveRunAttempt,
@@ -67,8 +68,15 @@ import { boundedAttemptResultIsTerminal, judgeObjectiveComplete, shouldRunObject
 import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import { synthesizeTurnReport } from './work-report.js';
-import { armFirstContactBeat } from '../../agents/fanout-alignment-gate.js';
-import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
+import { PUBLIC_RUN_FAILURE_TEXT, publicReplyText } from './public-presentation.js';
+import { commitTurnOutcome } from './delivery-committer.js';
+import {
+  turnOutcomeId,
+  type PresentationEvent,
+  type TurnIdentity,
+  type TurnOutcome,
+} from './turn-outcome.js';
+import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
 import {
   getActiveGoalForSession,
   recordGoalValidation,
@@ -140,7 +148,8 @@ import {
   runTokenBudgetEnforcementEnabled,
 } from './run-token-budget.js';
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
-import { backgroundOfferEnabled, closeTheLoopNudge, effectiveTurnObjective } from './turn-control.js';
+import { effectiveTurnObjective } from './turn-control.js';
+import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
 import { claimGroundingNudge, extractDeliverablePointers, ungroundedPointers } from './claim-grounding.js';
 import {
   getArtifactRootForSourceUserSeq,
@@ -292,6 +301,435 @@ function trulyUnresolvedArtifactClaims(
   );
 }
 
+function standardTurnIdentity(input: {
+  sessionId: string;
+  turn: number;
+  sourceUserSeq?: number;
+}): TurnIdentity {
+  const sourceUserSeq = Number.isSafeInteger(input.sourceUserSeq) && Number(input.sourceUserSeq) > 0
+    ? Number(input.sourceUserSeq)
+    : listEvents(input.sessionId, { types: ['user_input_received'], desc: true, limit: 1 })[0]?.seq;
+  if (!sourceUserSeq) {
+    throw new Error('Cannot commit a public turn outcome without an accepted user event.');
+  }
+  const accepted = listEvents(input.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === sourceUserSeq);
+  if (!accepted) {
+    throw new Error(`Accepted user event ${sourceUserSeq} is missing from session ${input.sessionId}.`);
+  }
+  // The logical turn identity is owned by the accepted user event, never by a
+  // provider attempt or a later synthetic continuation. Two brains may finish
+  // on different physical turns; both must still propose the same nested
+  // identity for appendTerminalEventOnce's durable winner.
+  return { sessionId: input.sessionId, turn: accepted.turn, sourceUserSeq };
+}
+
+function acceptedUserEvent(
+  sessionId: string,
+  sourceUserSeq: number,
+): EventRow {
+  const event = listEvents(sessionId, { types: ['user_input_received'] })
+    .find((candidate) => candidate.seq === sourceUserSeq);
+  if (!event) throw new Error(`Accepted user event ${sourceUserSeq} is missing from session ${sessionId}.`);
+  return event;
+}
+
+function acceptExistingConversationInput(sessionId: string, sourceUserSeq: number): number {
+  const accepted = acceptedUserEvent(sessionId, sourceUserSeq);
+  return acceptUserInputForRun({
+    sessionId,
+    turn: accepted.turn,
+    role: accepted.role,
+    ...(accepted.parentEventId ? { parentEventId: accepted.parentEventId } : {}),
+    data: accepted.data,
+  }, { existingEventSeq: accepted.seq }).seq;
+}
+
+function acceptFreshConversationInput(options: RunConversationOptions): number {
+  if (Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0) {
+    return acceptExistingConversationInput(options.sessionId, Number(options.sourceUserSeq));
+  }
+  if (options.reuseRecordedUserInput) {
+    const reused = listEvents(options.sessionId, { types: ['user_input_received'], desc: true, limit: 1 })[0];
+    if (!reused) throw new Error('Cannot reuse a user input that was never durably accepted.');
+    return acceptExistingConversationInput(options.sessionId, reused.seq);
+  }
+  const row = getSession(options.sessionId);
+  if (!row) throw new Error(`unknown session: ${options.sessionId}`);
+  return acceptUserInputForRun({
+    sessionId: options.sessionId,
+    turn: nextTurnNumber(row),
+    role: 'user',
+    data: { text: options.input },
+  }).seq;
+}
+
+function approvalDecisionMatches(text: unknown, decision: 'approve' | 'reject' | 'approve_with_edits'): boolean {
+  if (typeof text !== 'string') return false;
+  const normalized = text.trim().toLowerCase();
+  return decision === 'reject'
+    ? /\b(?:reject|deny|decline|cancel|stop)\b/.test(normalized)
+    : /\b(?:approve|approved|yes|confirm|go ahead|proceed)\b/.test(normalized);
+}
+
+function acceptResumeConversationInput(opts: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  approvalId?: string;
+  decision: 'approve' | 'reject' | 'approve_with_edits';
+}): number {
+  const explicitApprovalId = opts.approvalId?.trim();
+  if (explicitApprovalId) {
+    const exact = listEvents(opts.sessionId, {
+      types: ['user_input_received'],
+      desc: true,
+      limit: 200,
+    }).filter((event) =>
+      event.data.approvalId === explicitApprovalId
+      && event.data.decision === opts.decision);
+    if (exact.length > 1) {
+      throw new Error(`Approval ${explicitApprovalId} has ambiguous accepted response ownership.`);
+    }
+    if (Number.isSafeInteger(opts.sourceUserSeq) && (opts.sourceUserSeq ?? 0) > 0) {
+      const sourceUserSeq = Number(opts.sourceUserSeq);
+      if (exact.length !== 1 || exact[0].seq !== sourceUserSeq) {
+        throw new Error(`Accepted source ${sourceUserSeq} does not own approval ${explicitApprovalId}.`);
+      }
+      return acceptExistingConversationInput(opts.sessionId, sourceUserSeq);
+    }
+    if (exact.length === 1) return acceptExistingConversationInput(opts.sessionId, exact[0].seq);
+
+    const row = getSession(opts.sessionId);
+    if (!row) throw new Error(`unknown session: ${opts.sessionId}`);
+    return acceptUserInputForRun({
+      sessionId: opts.sessionId,
+      turn: nextTurnNumber(row),
+      role: 'user',
+      data: {
+        text: opts.decision === 'reject'
+          ? `Reject ${explicitApprovalId}.`
+          : `Approve ${explicitApprovalId}.`,
+        displayText: opts.decision === 'reject'
+          ? `Reject ${explicitApprovalId}`
+          : `Approve ${explicitApprovalId}`,
+        synthetic: true,
+        source: 'approval_resume',
+        decision: opts.decision,
+        approvalId: explicitApprovalId,
+      },
+    }).seq;
+  }
+  if (Number.isSafeInteger(opts.sourceUserSeq) && (opts.sourceUserSeq ?? 0) > 0) {
+    return acceptExistingConversationInput(opts.sessionId, Number(opts.sourceUserSeq));
+  }
+  const lastApprovalSeq = listEvents(opts.sessionId, { types: ['approval_requested'], desc: true, limit: 1 })[0]?.seq ?? 0;
+  const attemptSource = (() => {
+    try { return getLatestRunAttempt(opts.sessionId)?.sourceUserSeq; } catch { return undefined; }
+  })();
+  const candidates = listEvents(opts.sessionId, { types: ['user_input_received'], desc: true, limit: 20 });
+  const alreadyAccepted = candidates.find((event) => {
+    if (event.seq <= lastApprovalSeq) return false;
+    if (attemptSource && event.seq === attemptSource) return true;
+    const eventApprovalId = typeof event.data.approvalId === 'string' ? event.data.approvalId : undefined;
+    if (opts.approvalId && eventApprovalId === opts.approvalId) return true;
+    return approvalDecisionMatches(event.data.text, opts.decision);
+  });
+  if (alreadyAccepted) return acceptExistingConversationInput(opts.sessionId, alreadyAccepted.seq);
+
+  const row = getSession(opts.sessionId);
+  if (!row) throw new Error(`unknown session: ${opts.sessionId}`);
+  // Button/notification resumes do not always arrive as chat text. Record the
+  // accepted control edge explicitly so the resumed public terminal gets a new
+  // durable idempotency key instead of overwriting the request that opened the
+  // approval card. Synthetic keeps this control text out of the user transcript.
+  return acceptUserInputForRun({
+    sessionId: opts.sessionId,
+    turn: nextTurnNumber(row),
+    role: 'user',
+    data: {
+      text: opts.decision === 'reject' ? 'Reject the pending approval.' : 'Approve the pending action.',
+      synthetic: true,
+      source: 'approval_resume',
+      decision: opts.decision,
+      ...(opts.approvalId ? { approvalId: opts.approvalId } : {}),
+    },
+  }).seq;
+}
+
+/** Narrow test seam for exact approval-response source ownership. */
+export const _acceptResumeConversationInputForTest = acceptResumeConversationInput;
+
+function terminalQuestionText(result: RunConversationResult): string {
+  const eventQuestion = (() => {
+    try {
+      const event = listEvents(result.sessionId, { types: ['awaiting_user_input'], desc: true, limit: 40 })
+        .find((candidate) => candidate.turn === result.lastTurn);
+      return event ? publicReplyText(event.data.question, '') : '';
+    } catch { return ''; }
+  })();
+  return eventQuestion
+    || publicReplyText(result.lastDecision?.reply, '')
+    || publicReplyText(result.lastDecision?.summary, '')
+    || 'I need your input before I can continue.';
+}
+
+function exactPendingApprovalForTerminal(input: {
+  result: RunConversationResult;
+  approvalIdHint?: string;
+}): approvalRegistry.PendingApprovalRow | null {
+  const candidateIds: string[] = [];
+  if (input.approvalIdHint?.trim()) candidateIds.push(input.approvalIdHint.trim());
+  try {
+    for (const event of listEvents(input.result.sessionId, {
+      types: ['approval_requested'],
+      desc: true,
+      limit: 80,
+    })) {
+      if (event.turn !== input.result.lastTurn) continue;
+      const approvalId = typeof event.data.approvalId === 'string'
+        ? event.data.approvalId.trim()
+        : '';
+      if (approvalId) candidateIds.push(approvalId);
+    }
+  } catch { /* no registry-backed event means question, never invented approval */ }
+
+  const rows = [...new Set(candidateIds)]
+    .map((approvalId) => approvalRegistry.get(approvalId))
+    .filter((row): row is approvalRegistry.PendingApprovalRow => Boolean(
+      row
+      && row.sessionId === input.result.sessionId
+      && approvalRegistry.isActionable(row),
+    ));
+  // A public approval outcome names one exact authority. Multiple candidates
+  // need a choice question; selecting one implicitly would widen authority.
+  return rows.length === 1 ? rows[0] : null;
+}
+
+function reduceStandardConversationTerminal(input: {
+  result: RunConversationResult;
+  sourceUserSeq: number;
+  approvalIdHint?: string;
+}): RunConversationResult {
+  const { result, sourceUserSeq } = input;
+  if (result.completedReason) return result;
+
+  const identity = standardTurnIdentity({
+    sessionId: result.sessionId,
+    turn: result.lastTurn,
+    sourceUserSeq,
+  });
+  if (result.publicPresentation) {
+    const persisted = result.publicPresentation;
+    if (
+      persisted.identity.sessionId !== identity.sessionId
+      || persisted.identity.turn !== identity.turn
+      || persisted.identity.sourceUserSeq !== identity.sourceUserSeq
+      || ('attemptId' in persisted.identity && Boolean(persisted.identity.attemptId))
+      || persisted.identity.runId !== undefined
+    ) {
+      throw new Error('Persisted public presentation is not bound to the exact accepted standard turn.');
+    }
+    return result;
+  }
+
+  let outcome: TurnOutcome;
+  let legacyReason: string;
+  switch (result.status) {
+    case 'completed': {
+      let text = publicReplyText(result.lastDecision?.reply, '')
+        || publicReplyText(result.lastDecision?.summary, '');
+      if (!text) {
+        try { text = synthesizeTurnReport(result.sessionId, sourceUserSeq) ?? ''; } catch { text = ''; }
+      }
+      outcome = {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'done',
+        resumable: false,
+        presentation: { kind: 'answer', text: text || MISSING_REPLY_USER_FALLBACK },
+      };
+      legacyReason = 'success';
+      break;
+    }
+    case 'awaiting_approval': {
+      const approval = exactPendingApprovalForTerminal({
+        result,
+        approvalIdHint: input.approvalIdHint,
+      });
+      const question = terminalQuestionText(result);
+      if (approval) {
+        const approvalText = publicReplyText(
+          result.lastDecision?.reply,
+          `Approval required for ${approval.subject}. Review ${approval.approvalId} to continue.`,
+        );
+        outcome = {
+          version: 2,
+          id: turnOutcomeId(identity),
+          identity,
+          status: 'needs_input',
+          resumable: true,
+          needs: { kind: 'approval' },
+          presentation: { kind: 'approval', text: approvalText, approvalId: approval.approvalId },
+        };
+        legacyReason = 'awaiting_approval';
+      } else {
+        outcome = {
+          version: 2,
+          id: turnOutcomeId(identity),
+          identity,
+          status: 'needs_input',
+          resumable: true,
+          needs: { kind: 'input' },
+          presentation: { kind: 'question', text: question },
+        };
+        legacyReason = 'awaiting_user_input';
+      }
+      break;
+    }
+    case 'awaiting_user_input':
+      outcome = {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'input' },
+        presentation: { kind: 'question', text: terminalQuestionText(result) },
+      };
+      legacyReason = 'awaiting_user_input';
+      break;
+    case 'limit_exceeded':
+      outcome = {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'continue' },
+        presentation: {
+          kind: 'continue',
+          text: 'This run reached its current budget with more work remaining. Reply `continue` to keep going.',
+        },
+      };
+      legacyReason = 'awaiting_continue';
+      break;
+    case 'killed':
+      outcome = {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'cancelled',
+        resumable: false,
+        presentation: {
+          kind: 'stopped',
+          text: 'Stopped — this turn was cancelled. Nothing further will execute.',
+        },
+      };
+      legacyReason = 'cancelled';
+      break;
+    case 'failed':
+      outcome = {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'failed',
+        resumable: false,
+        presentation: { kind: 'error', text: PUBLIC_RUN_FAILURE_TEXT },
+      };
+      legacyReason = 'failed';
+      break;
+  }
+
+  const committed = commitTurnOutcome(outcome, {
+    legacyReason,
+    metadata: {
+      steps: result.steps,
+      ...(result.limitKind ? { limitKind: result.limitKind } : {}),
+    },
+  });
+  return { ...result, publicPresentation: committed.presentation };
+}
+
+function commitStandardNeedsInputTerminal(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  turn: number;
+  text: string;
+  need?: 'input' | 'continue';
+  legacyReason?: string;
+  metadata?: Record<string, unknown>;
+}): PresentationEvent {
+  const identity = standardTurnIdentity(input);
+  const outcome: TurnOutcome = input.need === 'continue'
+    ? {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'continue' },
+        presentation: { kind: 'continue', text: input.text },
+      }
+    : {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'input' },
+        presentation: { kind: 'question', text: input.text },
+      };
+  return commitTurnOutcome(outcome, {
+    ...(input.legacyReason ? { legacyReason: input.legacyReason } : {}),
+    metadata: input.metadata,
+  }).presentation;
+}
+
+function commitStandardBlockedTerminal(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  turn: number;
+  text: string;
+  legacyReason?: string;
+  metadata?: Record<string, unknown>;
+}): PresentationEvent {
+  const identity = standardTurnIdentity(input);
+  return commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'blocked',
+    resumable: true,
+    presentation: { kind: 'blocked', text: input.text },
+  }, {
+    ...(input.legacyReason ? { legacyReason: input.legacyReason } : {}),
+    metadata: input.metadata,
+  }).presentation;
+}
+
+function commitStandardCancelledTerminal(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  turn: number;
+  text: string;
+  legacyReason?: string;
+  metadata?: Record<string, unknown>;
+}): PresentationEvent {
+  const identity = standardTurnIdentity(input);
+  return commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'cancelled',
+    resumable: false,
+    presentation: { kind: 'stopped', text: input.text },
+  }, {
+    ...(input.legacyReason ? { legacyReason: input.legacyReason } : {}),
+    metadata: input.metadata,
+  }).presentation;
+}
+
 function parkForPendingStandardArtifacts(input: {
   sessionId: string;
   sourceUserSeq?: number;
@@ -359,18 +797,14 @@ function parkForPendingStandardArtifacts(input: {
       },
     });
   }
-  safeAppend({
+  const publicPresentation = commitStandardNeedsInputTerminal({
     sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
     turn: input.turn,
-    role: 'system',
-    type: 'conversation_completed',
-    data: {
+    text: question,
+    legacyReason: 'awaiting_user_input',
+    metadata: {
       steps: input.steps,
-      reason: 'awaiting_user_input',
-      summary: question,
-      internalSummary: input.internalSummary ?? input.summary,
-      reply: question,
-      delivered: false,
       blockedReason: 'artifact_binding_verification_pending',
       ...artifactVerificationProjection(state),
     },
@@ -381,6 +815,7 @@ function parkForPendingStandardArtifacts(input: {
     steps: input.steps,
     lastDecision: input.lastDecision,
     lastTurn: input.lastTurn,
+    publicPresentation,
   };
 }
 
@@ -426,20 +861,50 @@ function finalizeStandardConversation(input: {
     dataOut.summary = (floor && floor.trim()) || MISSING_REPLY_USER_FALLBACK;
     dataOut.missingReply = true;
   }
-  safeAppend({
-    sessionId: input.sessionId,
-    turn: input.turn,
-    role: 'system',
-    type: 'conversation_completed',
-    data: dataOut,
+  // Parse-exhaustion/stall results are recovery candidates, not public
+  // outcomes. The bridge may safely transplant a write-free attempt to another
+  // brain. Record the private execution state here; only the bridge's recovered
+  // or blocked TurnOutcome may cross the public terminal boundary.
+  if (input.result.completedReason) {
+    safeAppend({
+      sessionId: input.sessionId,
+      turn: input.turn,
+      role: 'system',
+      type: 'conversation_recovery_candidate',
+      data: {
+        ...dataOut,
+        reason: input.result.completedReason,
+        sourceUserSeq: input.sourceUserSeq,
+      },
+    });
+    return input.result;
+  }
+  const identity = standardTurnIdentity(input);
+  const text = publicReplyText(dataOut.reply, '')
+    || publicReplyText(dataOut.summary, '')
+    || MISSING_REPLY_USER_FALLBACK;
+  const legacyReason = typeof dataOut.reason === 'string'
+    && /^[a-z0-9_]{1,80}$/.test(dataOut.reason)
+    ? dataOut.reason
+    : undefined;
+  const committed = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text },
+  }, {
+    ...(legacyReason ? { legacyReason } : {}),
+    metadata: dataOut,
   });
-  return input.result;
+  return { ...input.result, publicPresentation: committed.presentation };
 }
 
 /** Pair an ordinary awaiting-user result with durable artifact lineage when
  * this turn owns artifacts. Calls with no artifacts remain byte-for-byte on
  * the existing event path (no extra terminal and no fake scope id). */
-function appendStandardArtifactPauseTerminal(input: {
+function commitStandardPauseTerminal(input: {
   sessionId: string;
   sourceUserSeq?: number;
   turn: number;
@@ -449,20 +914,15 @@ function appendStandardArtifactPauseTerminal(input: {
   delivered?: boolean;
 }): void {
   const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
-  if (!state) return;
-  safeAppend({
+  commitStandardNeedsInputTerminal({
     sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
     turn: input.turn,
-    role: 'system',
-    type: 'conversation_completed',
-    data: {
+    text: publicReplyText(input.reply, '') || publicReplyText(input.summary, '') || 'I need your input before I can continue.',
+    legacyReason: 'awaiting_user_input',
+    metadata: {
       steps: input.steps,
-      reason: 'awaiting_user_input',
-      summary: input.summary,
-      reply: input.reply ?? input.summary,
-      delivered: input.delivered ?? true,
-      awaitingUser: true,
-      ...artifactVerificationProjection(state),
+      ...(state ? artifactVerificationProjection(state) : {}),
     },
   });
 }
@@ -1215,7 +1675,8 @@ export interface RunTurnOptions {
   makeRunner?: () => Runner;
   /** Test injection: run the Runner. Defaults to a real runner.run(). */
   runRunner?: RunRunnerFn;
-  /** Opt-in: callback fired for each token delta (output_text_delta) emitted by the model. */
+  /** @deprecated Raw executor deltas are private. Retained temporarily for API
+   * compatibility; terminal delivery occurs through committed public events. */
   onChunk?: (delta: string) => void | Promise<void>;
   /** Set on continuation steps (step > 1) so auto-memory never learns from the
    *  harness's own synthetic re-prompts (judge/stall/grounding/YOLO). Only the
@@ -1232,9 +1693,6 @@ export interface RunTurnOptions {
    *  WITHOUT writing the infra-recovery ask, so runConversation can attempt
    *  cross-brain fallover first. Off (default) = today's behavior verbatim. */
   deferInfraAsk?: boolean;
-  /** Internal conversation state: the current run is acting on the answer to a
-   *  prior clarification, so background-offer nudges must not add another gate. */
-  suppressBackgroundOffer?: boolean;
   /** Exact external MCP authority for this run. When omitted, the agent's
    * construction-time binding wins, then the canonical turn scope. */
   mcpToolScope?: McpToolScope | null;
@@ -1355,7 +1813,8 @@ export interface RunConversationOptions {
   makeRunner?: () => Runner;
   /** Test injection. */
   runRunner?: RunRunnerFn;
-  /** Opt-in: callback fired for each token delta (output_text_delta) emitted by the model. Forwarded to each runTurn. */
+  /** @deprecated Raw executor deltas are private. Retained temporarily for API
+   * compatibility; terminal delivery occurs through committed public events. */
   onChunk?: (delta: string) => void | Promise<void>;
   /**
    * Internal bridge path: an earlier first-byte provider attempt already wrote
@@ -1402,6 +1861,8 @@ export interface RunConversationResult {
    *  exhausted / stall give-up) — the respond bridge uses it to re-run the
    *  turn ONCE on the next brain instead of shipping the apology. */
   completedReason?: 'no_structured_output' | 'sub_agent_stalled';
+  /** Durable user projection returned by the single delivery committer. */
+  publicPresentation?: PresentationEvent;
   /** Which ceiling produced a 'limit_exceeded' status — the bridge maps
    *  'token_budget' to its own distinct stoppedReason so the background
    *  drain parks instead of misclassifying the run (Stage 4). */
@@ -2321,7 +2782,7 @@ function emitRuntimeTerminalEvent(sessionId: string, result: RunConversationResu
       const err = new BoundaryError({
         kind: 'runtime.unknown',
         retryable: false,
-        userMessage: `Clementine hit an unexpected error during this turn. ${message.slice(0, 200)}`,
+        userMessage: 'Clementine hit an unexpected error during this turn. Please try again; technical details are available in the activity log.',
         operatorMessage: `runConversation status=failed: ${message}`,
         context: {
           sessionId,
@@ -2378,25 +2839,44 @@ export function shouldElevateOnStepProgress(opts: {
 export async function runConversation(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
-  // In-flight marker set BEFORE the run and cleared in the finally on ANY exit
-  // (return or throw). Only a hard process death between here and the finally
-  // leaves it set — which is exactly the "killed mid-run" case the boot scan
-  // surfaces so a long chat run never dies silently.
-  markRunInFlight(options.sessionId, true);
+  // Accept first: a marker with no accepted source has no logical turn to
+  // recover. Once armed, clear it only after the typed terminal commits. A
+  // reducer/SQLite failure must stay recoverable, and a completedReason
+  // candidate remains armed while the bridge tries the next brain.
+  const sourceUserSeq = acceptFreshConversationInput(options);
+  const acceptedSource = acceptedUserEvent(options.sessionId, sourceUserSeq);
+  recordTurnGraphShadow({
+    identity: {
+      sessionId: options.sessionId,
+      turn: acceptedSource.turn,
+      sourceUserSeq,
+    },
+    surface: 'direct',
+  });
+  let terminalSettled = false;
   try {
-    const result = await runConversationCore(options);
-    emitRuntimeTerminalEvent(options.sessionId, result);
+    const result = await runConversationCore({
+      ...options,
+      sourceUserSeq,
+      reuseRecordedUserInput: true,
+    });
+    const reduced = reduceStandardConversationTerminal({ result, sourceUserSeq });
+    if (reduced.completedReason) return reduced;
+    terminalSettled = Boolean(reduced.publicPresentation);
+    emitRuntimeTerminalEvent(options.sessionId, reduced);
     refreshTerminalWorkingMemory(options.sessionId);
-    return result;
+    return reduced;
   } finally {
-    markRunInFlight(options.sessionId, false);
+    if (terminalSettled) {
+      clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId);
+    }
   }
 }
 
 /** Refresh short-term memory only after the conversation terminal is durable.
  * The transcript reader is event-log-backed, so running this before completion
  * records a user-only snapshot that lags the assistant by one turn. End-of-turn
- * disk work is acceptable here (streaming has already delivered the reply), and
+ * disk work is acceptable here (the public terminal is already committed), and
  * remains best-effort so memory observability can never fail a conversation. */
 function refreshTerminalWorkingMemory(sessionId: string): void {
   try {
@@ -2468,8 +2948,6 @@ async function runConversationCore(
   // re-assign nextInput inside the loop, never options.input).
   const resolvingClarification = convergenceSteerEnabled()
     && priorTurnEndedAwaitingClarification(options.sessionId);
-  const suppressBackgroundOffer = resolvingClarification
-    || sessionHasBackgroundOffer(options.sessionId);
   if (resolvingClarification) {
     nextInput = `${CONVERGENCE_STEER}\n\n${options.input}`;
   }
@@ -2553,16 +3031,11 @@ async function runConversationCore(
   // of how the request was phrased.
   const OBJECTIVE_JUDGE_WORK_THRESHOLD = 3;
   let objectiveJudgeContinuations = 0;
-  let closeLoopNudged = false;
   let claimGroundingNudged = false;
   let selfResolveNudged = false;
   let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
   let totalToolCalls = 0;
   let meaningfulToolEvidence = false;
-  // Inc A code trigger: fire the "offer to move this to the background" nudge at
-  // most ONCE per run (a foreground chat grinding through a long action task).
-  let backgroundOfferNudged = false;
-
   // WATCHER judge (trajectory co-pilot, watcher-judge.ts). Spans the run for
   // opted-in action turns: every ~N tool calls a NON-BLOCKING background check
   // judges the trajectory against the GOAL; a confident drift verdict is
@@ -2682,10 +3155,8 @@ async function runConversationCore(
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
       runRunner: options.runRunner,
-      onChunk: options.onChunk,
       // Defer the infra ask only while another brain is still available to try.
       deferInfraAsk: canStillFallover,
-      suppressBackgroundOffer,
       mcpToolScope: options.mcpToolScope,
     });
     falloverReattempt = false;
@@ -2827,7 +3298,7 @@ async function runConversationCore(
       ? awaitingUserQuestionThisTurn(options.sessionId, turnResult.turn)
       : null;
     if (completedTurnQuestion) {
-      appendStandardArtifactPauseTerminal({
+      commitStandardPauseTerminal({
         sessionId: options.sessionId,
         sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
@@ -2852,7 +3323,7 @@ async function runConversationCore(
       if (status === 'awaiting_user_input') {
         const latestQuestion = awaitingUserQuestionThisTurn(options.sessionId, turnResult.turn)
           ?? 'Awaiting your input.';
-        appendStandardArtifactPauseTerminal({
+        commitStandardPauseTerminal({
           sessionId: options.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           turn: turnResult.turn,
@@ -3094,7 +3565,7 @@ async function runConversationCore(
             signal: structuredStallInfo.signal,
           },
         });
-        appendStandardArtifactPauseTerminal({
+        commitStandardPauseTerminal({
           sessionId: options.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           turn: turnResult.turn,
@@ -3127,7 +3598,7 @@ async function runConversationCore(
       })();
       if (toolAskThisTurn) {
         const question = String((toolAskThisTurn.data as { question?: unknown }).question ?? 'Awaiting your input.');
-        appendStandardArtifactPauseTerminal({
+        commitStandardPauseTerminal({
           sessionId: options.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           turn: turnResult.turn,
@@ -3563,7 +4034,7 @@ async function runConversationCore(
               signal: stallInfo?.signal ?? null,
             },
           });
-          appendStandardArtifactPauseTerminal({
+          commitStandardPauseTerminal({
             sessionId: options.sessionId,
             sourceUserSeq: activeSourceUserSeq,
             turn: turnResult.turn,
@@ -4099,7 +4570,8 @@ async function runConversationCore(
         // DELIVERED verbatim on every surface instead of respond-bridge falling
         // back to a stale session-wide question (adversarial review 2026-07-09).
         if (verdict.awaitingUser && !skillGap) {
-          const awaitingSummary = (decision.reply && decision.reply.trim() ? decision.reply : decision.summary) ?? '';
+          const awaitingSummary = publicReplyText(decision.reply, '')
+            || 'I need a little more information before I can continue safely. What would you like me to do next?';
           const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
           const askedThisTurn = (() => {
             try {
@@ -4116,18 +4588,14 @@ async function runConversationCore(
               data: { question: awaitingSummary, source: 'judge_awaiting_verdict' },
             });
           }
-          safeAppend({
+          const publicPresentation = commitStandardNeedsInputTerminal({
             sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
             turn: turnResult.turn,
-            role: 'system',
-            type: 'conversation_completed',
-            data: {
+            text: awaitingSummary,
+            legacyReason: 'awaiting_user_input',
+            metadata: {
               steps: stepIndex,
-              summary: awaitingSummary,
-              internalSummary: decision.summary,
-              reply: decision.reply ?? null,
-              delivered: true,
-              awaitingUser: true,
               ...(completionVerification ? { verification: completionVerification } : {}),
               ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
             },
@@ -4138,6 +4606,7 @@ async function runConversationCore(
             steps: stepIndex,
             lastDecision: decision,
             lastTurn,
+            publicPresentation,
           };
         }
         // A selfJudge NOT-DONE is the brain's own family grading its homework —
@@ -4376,37 +4845,6 @@ async function runConversationCore(
           continue;
         }
       }
-      // CLOSE THE LOOP (2026-07-30, live miss): a completed chat reply that
-      // lands on a recommendation with no question and no offer strands the
-      // decision with the user — great answer, and they still have to carry
-      // "so… do it?" back themselves. Deterministic shape-detection in
-      // turn-control, model-owned phrasing, at most ONE bounce per turn inside
-      // the shared continuation budget. Advisory: the model may re-state the
-      // reply unchanged, and any error skips the nudge entirely.
-      if (
-        !closeLoopNudged
-        && decision.nextAction === 'completed'
-        && objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
-      ) {
-        const loopNudge = (() => {
-          try {
-            if (HarnessSession.load(options.sessionId)?.sessionRow.kind !== 'chat') return null;
-            return closeTheLoopNudge(decision.reply);
-          } catch { return null; }
-        })();
-        if (loopNudge) {
-          closeLoopNudged = true;
-          objectiveJudgeContinuations += 1;
-          try {
-            safeAppend({
-              sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'guardrail_tripped',
-              data: { kind: 'close_loop_nudge', reason: 'recommendation with no closing question or offer' },
-            });
-          } catch { /* telemetry must never block */ }
-          nextInput = loopNudge;
-          continue;
-        }
-      }
       // Render priority on the chat surface: prefer `reply` (the
       // natural-language message intended for the user) over `summary`
       // (an internal log entry).
@@ -4516,22 +4954,23 @@ async function runConversationCore(
       if (delivery.verification) completionVerification = delivery.verification;
       if (!delivery.delivered) {
         const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
-        safeAppend({
+        const blockedText = terminalFreshWriteGap
+          ? userVisibleSummary
+          : hasReply
+            ? publicReplyText(decision.reply, 'I could not finish this turn safely. Please tell me how you would like to proceed.')
+            : missingReplyWorkReport
+              ? missingReplyWorkReport
+              : 'I could not finish this turn safely. Please tell me how you would like to proceed.';
+        const publicPresentation = commitStandardBlockedTerminal({
           sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
           turn: turnResult.turn,
-          role: 'system',
-          type: 'conversation_completed',
-          data: {
+          text: blockedText,
+          legacyReason: 'blocked',
+          metadata: {
             steps: stepIndex,
-            summary: userVisibleSummary,
-            internalSummary: decision.summary,
-            reply: terminalFreshWriteGap ? userVisibleSummary : decision.reply ?? null,
             missingReply: isCompletedAction && !hasReply ? true : undefined,
-            delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary).slice(0, 400),
-            ...(stallJudgeDelivery
-              ? { stallDetail: { signal: stallJudgeDelivery.signal, ...stallJudgeDelivery.detail } }
-              : {}),
             ...(completionVerification ? { verification: completionVerification } : {}),
             ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
           },
@@ -4546,6 +4985,7 @@ async function runConversationCore(
           steps: stepIndex,
           lastDecision: decision,
           lastTurn,
+          publicPresentation,
         };
       }
 
@@ -4557,7 +4997,12 @@ async function runConversationCore(
           steps: stepIndex,
           summary: userVisibleSummary,
           internalSummary: decision.summary,
-          reply: decision.reply ?? null,
+          // Goal/output-verification notes are part of the authorized public
+          // answer. Do not hand the committer the pre-verification model reply
+          // as a competing publication field or it will correctly prefer that
+          // stale text and hide the verifier's honest qualification.
+          reply: userVisibleSummary,
+          internalReply: decision.reply ?? null,
           missingReply: isCompletedAction && !hasReply ? true : undefined,
           delivered: true,
           ...(stallJudgeDelivery
@@ -4662,7 +5107,7 @@ async function runConversationCore(
       }
       const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
         ?? 'Could you clarify how you\'d like me to proceed?';
-      appendStandardArtifactPauseTerminal({
+      commitStandardPauseTerminal({
         sessionId: options.sessionId,
         sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
@@ -4778,7 +5223,7 @@ async function runConversationCore(
       }
       const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
         ?? 'I reached a point where I need your input to continue — how would you like me to proceed?';
-      appendStandardArtifactPauseTerminal({
+      commitStandardPauseTerminal({
         sessionId: options.sessionId,
         sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
@@ -4903,35 +5348,6 @@ async function runConversationCore(
     }
 
     // 'awaiting_handoff_result' or any other non-terminal state → loop.
-    // Inc A code trigger: if a FOREGROUND chat turn has ground through
-    // substantial multi-step ACTION work without offering/dispatching, nudge it
-    // ONCE to offer moving the task to the background (or holding it) so the user
-    // isn't silently blocked. Conservative gates (chat-only, action-intent,
-    // tool-call floor, one-shot, skip-if-already-offered) keep it off quick work;
-    // the nudge itself tells the model to just finish if it's nearly done.
-    let bgOfferNudge = '';
-    // Fire on OBSERVED WORK, not message phrasing: either the ask read as an
-    // action, OR the turn has genuinely been grinding (tool floor + elapsed).
-    // The elapsed path is what makes a conversationally-phrased long task (the
-    // 18-min foreground workflow edit) actually offer to move to Tasks.
-    const bgOfferMinMs = backgroundOfferNudgeMinElapsedMs();
-    const bgOfferLongRunning = bgOfferMinMs > 0 && (Date.now() - startedAt) >= bgOfferMinMs;
-    if (
-      !backgroundOfferNudged
-      && !suppressBackgroundOffer
-      && backgroundOfferNudgeEnabled()
-      && (objectiveJudgeActionIntent || bgOfferLongRunning)
-      && totalToolCalls >= BACKGROUND_OFFER_NUDGE_MIN_TOOLS
-      && !options.sessionId.startsWith('background:')
-    ) {
-      let isForegroundChat = false;
-      try { isForegroundChat = HarnessSession.load(options.sessionId)?.sessionRow.kind === 'chat'; } catch { isForegroundChat = false; }
-      if (isForegroundChat && !sessionHasBackgroundOffer(options.sessionId)) {
-        backgroundOfferNudged = true;
-        bgOfferNudge =
-          ' NOTE: you have already done substantial work on this in the foreground and it is taking a while. If finishing it will take more than a step or two, tell the user plainly in ONE sentence that this is a longer task you can keep working on in the background (it shows up in Tasks) and ASK if they want that — on their yes next turn call dispatch_background_task with the agreed objective — then STOP. If you are about to finish (only a step or two left), just finish; do NOT offer.';
-      }
-    }
     // WATCHER: (a) inject a resolved drift steer from the check that ran in the
     // background during the last turn; (b) start the next check without
     // awaiting it (it races the coming turn — zero critical-path latency).
@@ -4989,7 +5405,7 @@ async function runConversationCore(
         finally { watcherCheckInFlight = false; }
       })();
     }
-    nextInput = CONTINUATION_INPUT + bgOfferNudge + watcherSteerNote;
+    nextInput = CONTINUATION_INPUT + watcherSteerNote;
   }
 
   // Max steps without resolution.
@@ -5053,20 +5469,16 @@ function emitLimitExceededWithContinuePrompt(opts: {
     : opts.reason === 'token_budget'
       ? `This run has used its token budget (${formatTokens(Number(opts.limitDetail.tokensUsedWindow ?? 0))} of ${formatTokens(Number(opts.limitDetail.tokenCeiling ?? 0))}) after ${opts.steps} step${opts.steps === 1 ? '' : 's'}, with more to do. Reply \`continue\` to authorize another budget window, or break it into a smaller piece.`
       : `I've been working on this for ${opts.steps} step${opts.steps === 1 ? '' : 's'} and hit the step budget — there's more to do. Reply \`continue\` to keep going, or break it into a smaller piece.`;
-  const limitLabel = opts.reason === 'wall_clock' ? 'wall-clock' : opts.reason === 'token_budget' ? 'run token budget' : 'max-steps';
-  const internalSummary = `Hit ${limitLabel} limit at step ${opts.steps}; offered the user a \`continue\` prompt instead of silently failing.`;
   const artifactState = standardArtifactTerminalState(opts.sessionId, opts.sourceUserSeq);
-  safeAppend({
+  commitStandardNeedsInputTerminal({
     sessionId: opts.sessionId,
+    sourceUserSeq: opts.sourceUserSeq,
     turn: opts.turn,
-    role: 'system',
-    type: 'conversation_completed',
-    data: {
+    text: continueReply,
+    need: 'continue',
+    legacyReason: 'awaiting_continue',
+    metadata: {
       steps: opts.steps,
-      reason: 'awaiting_continue',
-      summary: continueReply,
-      reply: continueReply,
-      internalSummary,
       lastDecisionSummary: opts.lastDecision?.summary ?? null,
       limitKind: opts.reason,
       ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
@@ -5117,33 +5529,6 @@ async function withActiveTurnHeartbeat<T>(
 
 function goalContractEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
-}
-
-/** Optional Inc A code trigger: the one-time "offer to move
- *  this to the background" nudge for a foreground chat grinding through a long
- *  multi-step action task without offering/dispatching. Default off: background
- *  movement is a user/model choice, not a runtime-injected second gate. */
-function backgroundOfferNudgeEnabled(): boolean {
-  return backgroundOfferEnabled();
-}
-
-/** Tool-call floor before the background-offer nudge can fire — enough work that
- *  the task is clearly substantial (not a quick 1-3 tool wrap-up). */
-const BACKGROUND_OFFER_NUDGE_MIN_TOOLS = 6;
-
-/** Wall-clock floor (ms) that ALSO trips the background-offer nudge, independent
- *  of how the triggering message was phrased. The original gate required the
- *  user's message to classify as 'action' intent — so a task kicked off by a
- *  conversational message ("just make sure it works", "here's a good example
- *  <url>") ground for many minutes in the FOREGROUND and never offered to
- *  background, because the phrasing read as chat, not action. This mirrors the
- *  objective-judge's own rule (loop.ts): gate on OBSERVED WORK, not phrasing. A
- *  turn that has run the tool floor AND been going this long is self-evidently a
- *  long task worth offering to move to Tasks. Default 90s; 0 disables the
- *  elapsed path (reverts to intent-only). Env: CLEMMY_BG_OFFER_NUDGE_MIN_MS. */
-function backgroundOfferNudgeMinElapsedMs(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE_MIN_MS', '90000') ?? '90000', 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 90000;
 }
 
 /** Stream-inactivity threshold for the turn-stall watchdog. Default 5 min —
@@ -5821,10 +6206,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     input: classifierInput,
     sessionId: options.sessionId,
     sessionKind: session.sessionRow.kind,
-    // The confirm beat only ever evaluates a REAL user message: synthetic
-    // continuation nudges (classified against the goal objective above) and
-    // stall-retry boilerplate must not trip it mid-run (turn-control review).
-    suppressConfirmBeat: options.input === CONTINUATION_INPUT || Boolean(syntheticRetryOriginalInput),
     sourceUserSeq,
     memory: {
       enabled: turnMemoryPrimer.enabled,
@@ -5883,25 +6264,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     },
   });
   if (contextPacket.multiItem.detected) {
-    // First-contact plan beat: a fresh chat session whose FIRST turn already
-    // classifies as mass/multi-item work gets ONE conversational beat before
-    // mass execution — armed here (the classification every path crosses),
-    // bounced at the first mass-execution tool call (run_worker / run_batch /
-    // run_tool_program), so research stays free and the plan is informed.
-    // (2026-07-22: a 30-item run went straight to completion through the
-    // code-mode door with zero conversation; the run_worker-only gate was
-    // vacuous by path choice.)
-    try {
-      const userMessageCount = listEvents(options.sessionId, { types: ['user_input_received'] })
-        .filter((e) => !(e.data as { synthetic?: boolean } | undefined)?.synthetic).length;
-      armFirstContactBeat({
-        sessionId: options.sessionId,
-        sessionKind: session.sessionRow.kind,
-        itemCount: contextPacket.multiItem.itemCount ?? 0,
-        userMessageCount,
-        preflightPhase: contextPacket.preflightPhase,
-      });
-    } catch { /* fail-open */ }
     const policy = contextPacket.agentSystem.policy;
     safeAppend({
       sessionId: options.sessionId,
@@ -6088,7 +6450,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     context: {
       sessionId: options.sessionId,
       turn,
-      suppressBackgroundOffer: options.suppressBackgroundOffer,
     },
     maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
     callModelInputFilter: modelInputFilter,
@@ -6104,9 +6465,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     toolNotFoundBehavior: 'return_error_to_model',
     toolErrorFormatter: formatMissingToolForModel,
   };
-  if (options.onChunk) {
-    (opts as unknown as { onChunk?: typeof options.onChunk }).onChunk = options.onChunk;
-  }
+  // Provider deltas intentionally stay inside the execution plane. A model
+  // token stream is neither a verified result nor publication authority; the
+  // outer graph publishes only a committed TurnOutcome presentation.
   // DO NOT pass previousResponseId to the SDK when using the codex
   // backend. The SDK uses this flag to opt into a ServerConversationTracker
   // that only sends DELTAS to the model on each subsequent call —
@@ -6192,7 +6553,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
           behaviorScopeId: `${options.sessionId}::turn:${turn}`,
           recallBudget,
-          suppressBackgroundOffer: options.suppressBackgroundOffer,
           mcpToolScope: options.mcpToolScope !== undefined
             ? options.mcpToolScope
             : (() => {
@@ -6318,6 +6678,8 @@ export interface ResumePendingApprovalOptions {
   /** Durable outer request attempt. The resumed SDK state must retain the
    * same authority as the workflow/chat turn that originally parked it. */
   runAttemptId?: string;
+  /** Exact accepted approval-control event for terminal identity. */
+  sourceUserSeq?: number;
   /** Exact durable card the human acted on. When supplied, only the SDK
    * interruption whose tool and full payload match this row may inherit the
    * decision; every sibling interruption remains pending. */
@@ -6359,7 +6721,8 @@ export interface ResumePendingApprovalOptions {
   makeRunner?: () => Runner;
   /** Test injection: drive the resume with a pre-built outcome. */
   runRunner?: RunRunnerFn;
-  /** Opt-in: callback fired for each token delta (output_text_delta) emitted by the model. */
+  /** @deprecated Raw executor deltas are private. Retained temporarily for API
+   * compatibility; terminal delivery occurs through committed public events. */
   onChunk?: (delta: string) => void | Promise<void>;
 }
 
@@ -6424,9 +6787,11 @@ export async function resumePendingApproval(
 
   const turn = nextTurnNumber(row);
 
-  const resumeSourceUserSeq = (() => {
-    try { return getLatestRunAttempt(options.sessionId)?.sourceUserSeq ?? undefined; } catch { return undefined; }
-  })();
+  const resumeSourceUserSeq = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+    ? options.sourceUserSeq
+    : (() => {
+        try { return getLatestRunAttempt(options.sessionId)?.sourceUserSeq ?? undefined; } catch { return undefined; }
+      })();
   // Agent construction happens before RunState deserialization. Capture its
   // exact bound connector scope now so a second approval pause persists the
   // same authority even when tool brackets are disabled.
@@ -6866,6 +7231,8 @@ export async function runConversationFromResume(opts: {
   /** Durable outer request attempt, retained across the resumed SDK state and
    * every synthetic continuation that follows it. */
   runAttemptId?: string;
+  /** Exact accepted approval-control event when the caller already recorded it. */
+  sourceUserSeq?: number;
   approvalId?: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
   /** Required when decision === 'approve_with_edits'. JSON-encoded args. */
@@ -6881,19 +7248,45 @@ export async function runConversationFromResume(opts: {
   runRunner?: RunRunnerFn;
   /** Test injection for promise-shaped completion verification (defaults to judgeObjectiveComplete). */
   judgeFn?: ObjectiveJudgeFn;
-  /** Opt-in: callback fired for each token delta emitted by the model. */
+  /** @deprecated Raw executor deltas are private. Retained temporarily for API
+   * compatibility; terminal delivery occurs through committed public events. */
   onChunk?: (delta: string) => void | Promise<void>;
 }): Promise<RunConversationResult> {
-  const result = await runConversationFromResumeCore(opts);
-  emitRuntimeTerminalEvent(opts.sessionId, result);
-  refreshTerminalWorkingMemory(opts.sessionId);
-  return result;
+  const sourceUserSeq = acceptResumeConversationInput(opts);
+  const acceptedSource = acceptedUserEvent(opts.sessionId, sourceUserSeq);
+  recordTurnGraphShadow({
+    identity: {
+      sessionId: opts.sessionId,
+      turn: acceptedSource.turn,
+      sourceUserSeq,
+    },
+    surface: 'approval_resume',
+  });
+  let terminalSettled = false;
+  try {
+    const result = await runConversationFromResumeCore({ ...opts, sourceUserSeq });
+    const reduced = reduceStandardConversationTerminal({
+      result,
+      sourceUserSeq,
+      approvalIdHint: opts.approvalId,
+    });
+    if (reduced.completedReason) return reduced;
+    terminalSettled = Boolean(reduced.publicPresentation);
+    emitRuntimeTerminalEvent(opts.sessionId, reduced);
+    refreshTerminalWorkingMemory(opts.sessionId);
+    return reduced;
+  } finally {
+    if (terminalSettled) {
+      clearRunInFlightAfterTerminal(opts.sessionId, opts.runAttemptId);
+    }
+  }
 }
 
 async function runConversationFromResumeCore(opts: {
   agent: Agent<any, any>;
   sessionId: string;
   runAttemptId?: string;
+  sourceUserSeq: number;
   approvalId?: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
   modifiedArgs?: string;
@@ -6919,13 +7312,15 @@ async function runConversationFromResumeCore(opts: {
   const toolCallsPerTurn = opts.toolCallsPerTurn ?? budget.toolCallsPerTurn;
   const checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
   const startedAt = Date.now();
-  const activeSourceUserSeq = (() => {
+  const activeSourceUserSeq = Number.isSafeInteger(opts.sourceUserSeq) && opts.sourceUserSeq > 0
+    ? opts.sourceUserSeq
+    : (() => {
     try {
       const attemptSource = getLatestRunAttempt(opts.sessionId)?.sourceUserSeq;
       if (attemptSource && attemptSource > 0) return attemptSource;
       return listEvents(opts.sessionId, { types: ['user_input_received'] }).at(-1)?.seq;
     } catch { return undefined; }
-  })();
+      })();
   let lastCheckInAt = startedAt;
   // Stage 4 — resume-path twin of the primary loop's token-budget window
   // (self-baselined: an approval resume is a fresh user-consented window).
@@ -6957,6 +7352,7 @@ async function runConversationFromResumeCore(opts: {
     agent: opts.agent,
     sessionId: opts.sessionId,
     runAttemptId: opts.runAttemptId,
+    sourceUserSeq: activeSourceUserSeq,
     approvalId: opts.approvalId,
     decision: opts.decision,
     modifiedArgs: opts.modifiedArgs,
@@ -6966,7 +7362,6 @@ async function runConversationFromResumeCore(opts: {
     maxRunTokens: opts.maxRunTokens,
     makeRunner: opts.makeRunner,
     runRunner: opts.runRunner,
-    onChunk: opts.onChunk,
   });
   lastTurn = firstResult.turn;
 
@@ -6978,7 +7373,7 @@ async function runConversationFromResumeCore(opts: {
     ? awaitingUserQuestionThisTurn(opts.sessionId, firstResult.turn)
     : null;
   if (firstCompletedQuestion) {
-    appendStandardArtifactPauseTerminal({
+    commitStandardPauseTerminal({
       sessionId: opts.sessionId,
       sourceUserSeq: activeSourceUserSeq,
       turn: firstResult.turn,
@@ -7016,19 +7411,16 @@ async function runConversationFromResumeCore(opts: {
   // If reject was the decision, treat it as "done — we cancelled
   // the action" regardless of what the orchestrator says next.
   if (opts.decision === 'reject') {
-    const hasReply = decision?.reply && decision.reply.trim();
     const artifactState = standardArtifactTerminalState(opts.sessionId, activeSourceUserSeq);
-    safeAppend({
+    const rejectionReply = 'Okay — I rejected that action. Nothing else was approved.';
+    const publicPresentation = commitStandardCancelledTerminal({
       sessionId: opts.sessionId,
+      sourceUserSeq: activeSourceUserSeq,
       turn: lastTurn,
-      role: 'system',
-      type: 'conversation_completed',
-      data: {
+      text: rejectionReply,
+      legacyReason: 'rejected_by_user',
+      metadata: {
         steps: 1,
-        reason: 'rejected_by_user',
-        summary: hasReply ? decision!.reply! : decision?.summary,
-        internalSummary: decision?.summary,
-        reply: decision?.reply ?? null,
         ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
       },
     });
@@ -7038,6 +7430,7 @@ async function runConversationFromResumeCore(opts: {
       steps: 1,
       lastDecision: decision ?? undefined,
       lastTurn,
+      publicPresentation,
     };
   }
 
@@ -7139,18 +7532,18 @@ async function runConversationFromResumeCore(opts: {
         : { delivered: true as const, status: 'completed' as const };
       if (!delivery.delivered) {
         const artifactState = standardArtifactTerminalState(opts.sessionId, activeSourceUserSeq);
-        safeAppend({
+        const blockedText = publicReplyText(decision?.reply, '')
+          || resumeWorkReport
+          || 'I could not finish this turn safely. Please tell me how you would like to proceed.';
+        const publicPresentation = commitStandardBlockedTerminal({
           sessionId: opts.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
           turn: lastTurn,
-          role: 'system',
-          type: 'conversation_completed',
-          data: {
+          text: blockedText,
+          legacyReason: 'blocked',
+          metadata: {
             steps: stepIndex,
-            summary: userVisibleSummary,
-            internalSummary: decision?.summary,
-            reply: decision?.reply ?? null,
             missingReply: isCompletedAction && !hasReply ? true : undefined,
-            delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary ?? '').slice(0, 400),
             ...(delivery.verification ? { verification: delivery.verification } : {}),
             ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
@@ -7164,6 +7557,7 @@ async function runConversationFromResumeCore(opts: {
           steps: stepIndex,
           lastDecision: decision ?? undefined,
           lastTurn,
+          publicPresentation,
         };
       }
 
@@ -7238,7 +7632,7 @@ async function runConversationFromResumeCore(opts: {
         }
         const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
           ?? 'Could you clarify how you\'d like me to proceed?';
-        appendStandardArtifactPauseTerminal({
+        commitStandardPauseTerminal({
           sessionId: opts.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           turn: lastTurn,
@@ -7400,7 +7794,6 @@ async function runConversationFromResumeCore(opts: {
       toolCallsPerTurn,
       makeRunner: opts.makeRunner,
       runRunner: opts.runRunner,
-      onChunk: opts.onChunk,
     });
     lastTurn = turnResult.turn;
     if (activeSourceUserSeq) {
@@ -7422,7 +7815,7 @@ async function runConversationFromResumeCore(opts: {
       ? awaitingUserQuestionThisTurn(opts.sessionId, turnResult.turn)
       : null;
     if (completedTurnQuestion) {
-      appendStandardArtifactPauseTerminal({
+      commitStandardPauseTerminal({
         sessionId: opts.sessionId,
         sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
@@ -8245,7 +8638,7 @@ function handleRunError(
         err = BoundaryError.from(err, {
           kind: cls.kind,
           retryable: true,
-          userMessage: `The model backend hit a transient error (${cls.kind.replace('model.', '')}).`,
+          userMessage: 'The model runtime is temporarily unavailable.',
         });
       } else if (typeof cls.status === 'number' && !cls.isAuth && !isCodexAuthRevoked(err, message)) {
         // A2#3 — an unhandled MODEL-BACKEND HTTP error (a non-401/403/429/5xx status the
@@ -8260,11 +8653,7 @@ function handleRunError(
         err = BoundaryError.from(err, {
           kind: 'model.unknown',
           retryable: true,
-          // Carry the status + the provider's own words: an opaque "unexpected
-          // error" hides exactly the detail (e.g. Moonshot's "assistant message
-          // must not be empty") that lets a user report — or us diagnose — the
-          // real failure from a screenshot.
-          userMessage: `The model backend hit an unexpected error (HTTP ${cls.status}): ${clip(message, 160)}`,
+          userMessage: 'The model runtime returned an unexpected error.',
         });
       }
     } catch { /* classification is best-effort — fall through to normal handling */ }
@@ -8593,7 +8982,6 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     o: typeof opts,
   ) => Promise<StreamedResultLike>;
   const run = runner.run.bind(runner) as unknown as RunMethod;
-  const onChunk = (opts as unknown as { onChunk?: (delta: string) => void | Promise<void> })?.onChunk;
   // ALWAYS stream (matches the pre-streaming production behavior): with
   // stream: true, a structured-output (agent.outputType) parse/validation
   // failure surfaces at `result.completed` / the finalOutput read INSIDE the
@@ -8626,11 +9014,9 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   let structuredOutputFailed = false;
   let recoveryStreamText = '';
   // The id of the ACTIVE attempt. After a pre-content stall + retry, the
-  // abandoned stream keeps draining for a beat (its cancel isn't instant); if
-  // its late tokens reach the shared onChunk they INTERLEAVE with the live
-  // attempt's tokens in the user's SSE (observed as garbled output like
-  // "importportance" on a recovered heavy turn). Gating onChunk on this id —
-  // and capturing `result` per attempt — keeps a superseded stream silent.
+  // abandoned stream keeps draining for a beat (its cancel isn't instant).
+  // Its late tokens must not contaminate the winning attempt's private recovery
+  // buffer. Gating accumulation on this id keeps a superseded stream inert.
   let activeAttempt = 0;
   const parentHarnessContext = harnessRunContextStorage.getStore();
   // One scope per defaultRunRunner invocation, with a new generation for each
@@ -8704,15 +9090,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
           if (ev.type === 'run_item_stream_event' || (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta')) {
             yieldedContent = true;
           }
-          if (onChunk && myAttempt === activeAttempt && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
-            attemptStreamText += ev.data.delta;
-            feedChantDetector(ev.data.delta);
-            try {
-              await onChunk(ev.data.delta);
-            } catch {
-              // never let consumer errors abort the stream
-            }
-          } else if (myAttempt === activeAttempt && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
+          if (myAttempt === activeAttempt && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
             attemptStreamText += ev.data.delta;
             feedChantDetector(ev.data.delta);
           }

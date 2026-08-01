@@ -15,6 +15,7 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-wfstore-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
 const { writeWorkflow, readWorkflow } = await import('./workflow-store.js');
+const { checkWorkflowForWrite } = await import('../execution/workflow-enforce.js');
 const { WORKFLOWS_DIR } = await import('./vault.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ } });
@@ -132,6 +133,72 @@ test('forEachNewOnly round-trips through write→read for recurring fan-out work
   const send = wf!.data.steps.find((s) => s.id === 'send');
   assert.equal(send?.forEach, 'pull');
   assert.equal(send?.forEachNewOnly, true);
+});
+
+test('read_parallel_v1 specialist topology round-trips through write→read', () => {
+  writeWorkflow('subgraph-rt', {
+    name: 'subgraph-rt',
+    description: 'specialist graph round-trip',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'analyze',
+      prompt: 'Reduce specialist evidence.',
+      sideEffect: 'read',
+      subgraph: {
+        mode: 'read_parallel_v1',
+        specialists: [
+          { id: 'facts', prompt: 'Check facts.', intent: 'research', maxTurns: 5 },
+          { id: 'risks', prompt: 'Check risks.', model: 'worker-model' },
+        ],
+      },
+    }],
+  });
+
+  const wf = readWorkflow('subgraph-rt');
+  assert.deepEqual(wf?.data.steps[0]?.subgraph, {
+    mode: 'read_parallel_v1',
+    specialists: [
+      { id: 'facts', prompt: 'Check facts.', intent: 'research', maxTurns: 5 },
+      { id: 'risks', prompt: 'Check risks.', model: 'worker-model' },
+    ],
+  });
+  assert.match(readFileSync(wf!.filePath, 'utf-8'), /mode: read_parallel_v1/);
+});
+
+test('malformed hand-authored subgraph is preserved and rejected instead of silently flattened', () => {
+  const dir = path.join(WORKFLOWS_DIR, 'subgraph-invalid');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'SKILL.md'),
+    [
+      '---',
+      'name: subgraph-invalid',
+      'description: malformed specialist graph',
+      'enabled: true',
+      'steps:',
+      '  - id: analyze',
+      '    side_effect: read',
+      '    subgraph:',
+      '      mode: read_parallel_v1',
+      '      specialists:',
+      '        - id: only-one',
+      '          prompt: Inspect one lane.',
+      '---',
+      '',
+      '## step: analyze',
+      '',
+      'Reduce specialist evidence.',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const wf = readWorkflow('subgraph-invalid');
+  assert.ok(wf?.data.steps[0]?.subgraph, 'the executable declaration must survive parsing');
+  const validation = checkWorkflowForWrite(wf!.data);
+  assert.equal(validation.ok, false);
+  assert.match(validation.errors.join(' '), /needs 2–6 specialists/);
 });
 
 test('hand-authored snake_case for_each_new_only is parsed', () => {

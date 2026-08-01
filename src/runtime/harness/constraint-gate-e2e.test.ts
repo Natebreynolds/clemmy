@@ -20,7 +20,14 @@ const TEST_HOME = '/tmp/clemmy-test-constraint-gate';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
 // eslint-disable-next-line import/first
-const { openMemoryDb, closeMemoryDb, resetMemoryDb, MEMORY_DB_PATH, STATE_DIR } = await import('../../memory/db.js');
+const {
+  openMemoryDb,
+  closeMemoryDb,
+  resetMemoryDb,
+  migrateMemoryDatabaseHandle,
+  MEMORY_DB_PATH,
+  STATE_DIR,
+} = await import('../../memory/db.js');
 // eslint-disable-next-line import/first
 const { rememberFact, listConstraints } = await import('../../memory/facts.js');
 // eslint-disable-next-line import/first
@@ -162,7 +169,13 @@ function createOldSchemaDb(): void {
 test('migration 12 widens the kind CHECK on an existing DB without losing facts or embeddings', () => {
   createOldSchemaDb();
 
-  const db = openMemoryDb(); // runs migration 12 against the old schema
+  // This fixture intentionally models only the tables needed at the v11→v12
+  // boundary. Apply that boundary directly: asking a partial historical
+  // fixture to continue through every later, unrelated migration makes this
+  // regression test fail whenever a newer migration correctly requires a
+  // table that a real v11 database (but not this focused fixture) contained.
+  const db = new Database(MEMORY_DB_PATH);
+  migrateMemoryDatabaseHandle(db, { targetVersion: 12 });
 
   const ddl = (db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='consolidated_facts'`).get() as { sql: string }).sql;
   assert.ok(ddl.includes("'constraint'"), 'rebuilt table must admit the constraint kind');
@@ -182,6 +195,7 @@ test('migration 12 widens the kind CHECK on an existing DB without losing facts 
 
   const version = (db.prepare('SELECT MAX(version) AS v FROM schema_version').get() as { v: number }).v;
   assert.ok(version >= 12, 'migration 12 must be recorded');
+  db.close();
 });
 
 test('a fresh DB admits constraint rows and migration 12 is a no-op on it', () => {

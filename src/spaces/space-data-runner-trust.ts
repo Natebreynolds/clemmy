@@ -31,7 +31,9 @@ import {
   type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
-import { appendEvent, createSession, getSession } from '../runtime/harness/eventlog.js';
+import { createSession, getSession } from '../runtime/harness/eventlog.js';
+import { deliverOutcome } from '../runtime/outcome.js';
+import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { appendNote, listNotes } from './data-store.js';
 import {
   cliArgvError,
@@ -278,43 +280,76 @@ function resumeApprovedSourceRefresh(
     const failures = results.filter((result) => !result.ok);
     const reply = succeeded
       ? `Approved ${row.approvalId}. “${rec.title}” refreshed ${sourceId} successfully.`
-      : `Approved ${row.approvalId}, but “${rec.title}” could not refresh ${sourceId}: ${
-        failures.map((result) => result.error ?? 'unknown refresh error').join('; ')
-      }`;
-    appendEvent({
-      sessionId: row.sessionId,
-      turn: 0,
-      role: 'Clem',
-      type: 'conversation_completed',
-      data: {
-        reason: succeeded
-          ? 'workspace_runner_approval_refresh_completed'
-          : 'workspace_runner_approval_refresh_failed',
+      : `Approved ${row.approvalId}, but “${rec.title}” could not refresh ${sourceId} (${failures.length} failed step${failures.length === 1 ? '' : 's'}). Open the activity log for technical details, then try again.`;
+    if (!succeeded) {
+      recordOperationalEvent({
+        source: 'workspace',
+        type: 'workspace_data_refresh_failed',
+        severity: 'error',
+        workspaceId: slug,
+        sessionId: row.sessionId,
+        actor: 'space-runner',
+        payload: {
+          approvalId: row.approvalId,
+          sourceId,
+          failures: failures.slice(0, 20).map((result) => result.error ?? 'unknown refresh error'),
+        },
+      });
+    }
+    deliverOutcome(
+      {
+        status: succeeded ? 'done' : 'failed',
         summary: reply,
-        reply,
-        steps: 0,
-        approvalId: row.approvalId,
-        sourceId,
+        evidence: {
+          work: [{
+            label: `Refresh ${sourceId}`,
+            completed: results.filter((result) => result.ok).length,
+            total: Math.max(1, results.length),
+          }],
+        },
+        ...(!succeeded
+          ? { nextAction: 'Open the Workspace activity log for technical details, then retry the refresh.' }
+          : {}),
       },
-    });
+      {
+        originSessionId: row.sessionId,
+        sourceLabel: 'workspace refresh',
+        sourceId: `${row.approvalId}:${sourceId}`,
+        title: rec.title,
+        statusHint: `space_get('${slug}')`,
+        proactiveTurn: true,
+      },
+    );
   }).catch((error: unknown) => {
-    const reply = `Approved ${row.approvalId}, but “${rec.title}” could not refresh ${sourceId}: ${
-      error instanceof Error ? error.message : String(error)
-    }`;
-    appendEvent({
+    recordOperationalEvent({
+      source: 'workspace',
+      type: 'workspace_data_refresh_failed',
+      severity: 'error',
+      workspaceId: slug,
       sessionId: row.sessionId,
-      turn: 0,
-      role: 'Clem',
-      type: 'conversation_completed',
-      data: {
-        reason: 'workspace_runner_approval_refresh_failed',
-        summary: reply,
-        reply,
-        steps: 0,
+      actor: 'space-runner',
+      payload: {
         approvalId: row.approvalId,
         sourceId,
+        error: error instanceof Error ? error.message : String(error),
       },
     });
+    const reply = `Approved ${row.approvalId}, but “${rec.title}” could not refresh ${sourceId}. Open the activity log for technical details, then try again.`;
+    deliverOutcome(
+      {
+        status: 'failed',
+        summary: reply,
+        nextAction: 'Open the Workspace activity log for technical details, then retry the refresh.',
+      },
+      {
+        originSessionId: row.sessionId,
+        sourceLabel: 'workspace refresh',
+        sourceId: `${row.approvalId}:${sourceId}`,
+        title: rec.title,
+        statusHint: `space_get('${slug}')`,
+        proactiveTurn: true,
+      },
+    );
   });
 }
 

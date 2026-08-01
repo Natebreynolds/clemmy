@@ -59,6 +59,7 @@ const {
   requestHarnessChatCancellation,
   getHarnessChatCancellation,
   preserveCurrentKillAndClearStale,
+  acceptUserInputForRun,
   recordRunAttemptUserInput,
   reapStaleSessions,
   openEventLog,
@@ -114,7 +115,7 @@ test('latest schema upgrades an existing v4 approval table without losing rows',
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    16, // v16: subordinate internal provider-query leases
+    17, // v17: one public terminal per accepted user source
   );
   resetEventLog();
 });
@@ -158,7 +159,7 @@ test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => 
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    16, // v16: subordinate internal provider-query leases
+    17, // v17: one public terminal per accepted user source
   );
   resetEventLog();
 });
@@ -262,7 +263,7 @@ test('fresh schema v12 creates artifact truth and pre-ack cancellation tables ea
   ]) assert.ok(columns.has(name), name);
   assert.equal(
     (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    16, // v16: subordinate internal provider-query leases
+    17, // v17: one public terminal per accepted user source
   );
   resetEventLog();
 });
@@ -329,7 +330,7 @@ test('schema v12 upgrades a lazy artifact ledger in place and preserves its earl
   assert.equal(root.root_scope_id, 'root-first');
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    16, // v16: subordinate internal provider-query leases
+    17, // v17: one public terminal per accepted user source
   );
   resetEventLog();
 });
@@ -612,16 +613,64 @@ test('recordRunAttemptUserInput atomically inserts once and binding wins over tr
     turn: 1,
     role: 'user',
     data: { text: '/goal start Build the firm brief.' },
-  });
+  }, { armRunInFlight: true });
+  const acceptedAt = getSession(sess.id)?.metadata.__run_in_flight;
   const transformed = recordRunAttemptUserInput(attempt, {
     turn: 1,
     role: 'user',
     data: { text: 'Execute the normalized goal objective.' },
-  });
+  }, { armRunInFlight: true });
 
   assert.equal(transformed.seq, literal.seq, 'the exact binding outranks runtime prompt text');
   assert.equal(listEvents(sess.id, { types: ['user_input_received'] }).length, 1);
   assert.equal(getLatestRunAttempt(sess.id)?.sourceUserSeq, literal.seq);
+  assert.equal(typeof acceptedAt, 'string', 'accepted source and restart ownership commit together');
+  assert.equal(
+    getSession(sess.id)?.metadata.__run_in_flight,
+    acceptedAt,
+    'idempotent rebinding preserves the original recovery timestamp',
+  );
+});
+
+test('acceptUserInputForRun atomically accepts or reuses the source with restart ownership', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'cli' });
+  const accepted = acceptUserInputForRun({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    data: { text: 'Run the direct graph turn.' },
+  });
+  const acceptedAt = getSession(sess.id)?.metadata.__run_in_flight;
+
+  assert.equal(typeof acceptedAt, 'string');
+  assert.equal(listEvents(sess.id, { types: ['user_input_received'] }).length, 1);
+  assert.equal(
+    acceptUserInputForRun({
+      sessionId: sess.id,
+      turn: accepted.turn,
+      role: accepted.role,
+      data: accepted.data,
+    }, { existingEventSeq: accepted.seq }).seq,
+    accepted.seq,
+  );
+  assert.equal(getSession(sess.id)?.metadata.__run_in_flight, acceptedAt);
+
+  const other = createSession({ kind: 'chat', channel: 'cli' });
+  assert.throws(
+    () => acceptUserInputForRun({
+      sessionId: other.id,
+      turn: 1,
+      role: 'user',
+      data: { text: 'Must not bind a foreign source.' },
+    }, { existingEventSeq: accepted.seq }),
+    /not a user input for session/,
+  );
+  assert.equal(
+    getSession(other.id)?.metadata.__run_in_flight,
+    undefined,
+    'validation failure rolls back without arming a source-less recovery marker',
+  );
 });
 
 test('desktop run finds a pre-recorded request-id input only while it is unsettled', () => {
@@ -1062,6 +1111,46 @@ test('terminal completion is appended and broadcast only once per attempt key', 
   assert.equal(first.inserted, true);
   assert.equal(second.inserted, false);
   assert.equal(first.event.id, second.event.id);
+  assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).length, 1);
+});
+
+test('logical source uniqueness bridges old attempt keys and new turn keys', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 3,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'one accepted turn' },
+  });
+  const legacy = appendTerminalEventOnce({
+    sessionId: sess.id,
+    turn: source.turn,
+    role: 'system',
+    data: { reason: 'success', sourceUserSeq: source.seq },
+  }, 'brain:old-attempt');
+  const upgraded = appendTerminalEventOnce({
+    sessionId: sess.id,
+    turn: source.turn,
+    role: 'system',
+    data: { reason: 'success', sourceUserSeq: source.seq },
+  }, `turn:${source.seq}`);
+
+  assert.equal(legacy.inserted, true);
+  assert.equal(upgraded.inserted, false);
+  assert.equal(upgraded.event.id, legacy.event.id);
+  assert.throws(
+    () => appendEvent({
+      sessionId: sess.id,
+      turn: source.turn,
+      role: 'system',
+      type: 'conversation_completed',
+      data: { terminalKey: 'brain:rolling-old-writer', sourceUserSeq: source.seq },
+    }),
+    /logical terminal source already exists/i,
+    'the migration trigger also blocks a rolling old writer that bypasses the new preflight',
+  );
   assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).length, 1);
 });
 

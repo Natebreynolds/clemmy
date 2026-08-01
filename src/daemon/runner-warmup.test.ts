@@ -6,9 +6,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import ts from 'typescript';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-daemon-warmup-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -17,6 +18,68 @@ process.env.SLACK_ENABLED = 'false';
 process.env.WEBHOOK_ENABLED = 'false';
 
 const { bootAuthSetupSatisfied, bootModelWarmupEnabled, resolveBootModelWarmupGate } = await import('./runner.js');
+
+const RUNNER_SOURCE = readFileSync(new URL('./runner.ts', import.meta.url), 'utf-8');
+const INDEX_SOURCE = readFileSync(new URL('../index.ts', import.meta.url), 'utf-8');
+
+function parseSource(name: string, source: string): ts.SourceFile {
+  return ts.createSourceFile(name, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+}
+
+function descendants<T extends ts.Node>(
+  root: ts.Node,
+  matches: (node: ts.Node) => node is T,
+): T[] {
+  const found: T[] = [];
+  const visit = (node: ts.Node): void => {
+    if (matches(node)) found.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(root);
+  return found;
+}
+
+function callName(call: ts.CallExpression): string | undefined {
+  if (ts.isIdentifier(call.expression)) return call.expression.text;
+  if (ts.isPropertyAccessExpression(call.expression)) return call.expression.name.text;
+  return undefined;
+}
+
+function callsNamed(root: ts.Node, name: string): ts.CallExpression[] {
+  return descendants(
+    root,
+    (node): node is ts.CallExpression => ts.isCallExpression(node) && callName(node) === name,
+  );
+}
+
+function namedFunction(sourceFile: ts.SourceFile, name: string): ts.FunctionDeclaration {
+  const functions = descendants(
+    sourceFile,
+    (node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node),
+  );
+  const fn = functions.find((candidate) => candidate.name?.text === name);
+  assert.ok(fn, `${name} declaration must exist`);
+  return fn;
+}
+
+function containingIf(node: ts.Node): ts.IfStatement | undefined {
+  for (let current = node.parent; current; current = current.parent) {
+    if (ts.isIfStatement(current)) return current;
+  }
+  return undefined;
+}
+
+function isInsideOnReady(node: ts.Node): boolean {
+  for (let current = node.parent; current; current = current.parent) {
+    if (
+      ts.isPropertyAssignment(current)
+      && current.name.getText() === 'onReady'
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -133,4 +196,90 @@ test('resolveBootModelWarmupGate treats configure exceptions as skip unless a di
     directOpenAiKey: false,
     reason: 'router not ready',
   });
+});
+
+test('daemon readiness hook is awaited once after recovery and workflow-lane registration', () => {
+  const sourceFile = parseSource('runner.ts', RUNNER_SOURCE);
+  const startDaemon = namedFunction(sourceFile, 'startDaemon');
+
+  const readyCalls = callsNamed(startDaemon, 'onReady').filter((call) => {
+    const receiver = ts.isPropertyAccessExpression(call.expression)
+      ? call.expression.expression
+      : undefined;
+    return receiver !== undefined && ts.isIdentifier(receiver) && receiver.text === 'options';
+  });
+  assert.equal(readyCalls.length, 1, 'startDaemon must expose one readiness release point');
+  const [readyCall] = readyCalls;
+  assert.ok(ts.isAwaitExpression(readyCall.parent), 'the readiness hook must finish before boot proceeds');
+
+  const orphanFence = callsNamed(startDaemon, 'interruptOrphanedRunAttemptsAtBoot');
+  const approvalDrain = callsNamed(startDaemon, 'startChatApprovalResume');
+  const genericChatRecovery = callsNamed(startDaemon, 'reportInterruptedChatRuns');
+  const terminalReportBack = callsNamed(startDaemon, 'startTerminalReportBackWatcher');
+  for (const [label, calls] of [
+    ['orphan fencing', orphanFence],
+    ['approval drain', approvalDrain],
+    ['generic chat recovery', genericChatRecovery],
+    ['terminal report-back', terminalReportBack],
+  ] as const) {
+    assert.equal(calls.length, 1, `${label} must have one boot registration`);
+  }
+
+  const laneRegistrations = callsNamed(startDaemon, 'setImmediate').filter((call) =>
+    call.arguments.some((argument) => ts.isIdentifier(argument) && argument.text === 'drainWorkflowRunsTick')
+  );
+  assert.equal(laneRegistrations.length, 1, 'workflow recovery lane must be registered once during boot');
+
+  const orderedBootNodes = [
+    orphanFence[0],
+    approvalDrain[0],
+    genericChatRecovery[0],
+    terminalReportBack[0],
+    laneRegistrations[0],
+    readyCall,
+  ];
+  assert.deepEqual(
+    [...orderedBootNodes].sort((left, right) => left.getStart() - right.getStart()),
+    orderedBootNodes,
+    'boot must fence, drain exact approvals, recover generic chats, arm report-back, register lanes, then release ingress',
+  );
+});
+
+test('combined daemon and service listeners open only inside onReady', () => {
+  const sourceFile = parseSource('index.ts', INDEX_SOURCE);
+  const main = namedFunction(sourceFile, 'main');
+  const combinedStarts = callsNamed(main, 'startDaemon').filter((call) =>
+    call.arguments.some((argument) =>
+      ts.isObjectLiteralExpression(argument)
+      && argument.properties.some((property) => property.name?.getText() === 'onReady')
+    )
+  );
+  assert.equal(combinedStarts.length, 2, 'foreground daemon and combined service must both use the readiness barrier');
+
+  const expectedListeners = ['startDiscordBot', 'startSlackBot', 'startWebhookServer'];
+  const guardedBranches: string[] = [];
+  for (const start of combinedStarts) {
+    assert.ok(ts.isAwaitExpression(start.parent), 'combined startup must await startDaemon');
+    const branch = containingIf(start);
+    assert.ok(branch, 'combined startup must remain in an explicit command branch');
+    guardedBranches.push(branch.expression.getText(sourceFile).replaceAll(' ', ''));
+
+    const listenerCalls = descendants(
+      branch.thenStatement,
+      (node): node is ts.CallExpression =>
+        ts.isCallExpression(node) && expectedListeners.includes(callName(node) ?? ''),
+    );
+    assert.deepEqual(
+      listenerCalls.map((call) => callName(call)).sort(),
+      expectedListeners,
+      'each combined mode must register every listener exactly once',
+    );
+    assert.ok(
+      listenerCalls.every(isInsideOnReady),
+      'combined-mode listeners must not accept work until daemon recovery is ready',
+    );
+  }
+
+  assert.ok(guardedBranches.some((condition) => condition.includes("sub==='--foreground'")));
+  assert.ok(guardedBranches.some((condition) => condition === "command==='service'"));
 });

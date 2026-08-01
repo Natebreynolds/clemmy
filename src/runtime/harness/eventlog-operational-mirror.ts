@@ -69,6 +69,7 @@ const STATIC_MIRROR_MAP: Readonly<Partial<Record<EventType, MirrorMapping>>> = {
   run_completed: { type: 'harness_run_completed', source: 'harness' },
   conversation_completed: { type: 'harness_run_completed', source: 'harness' },
   run_failed: { type: 'harness_run_failed', source: 'harness', severity: 'error' },
+  turn_graph_compiled: { type: 'turn_graph_shadow_compiled', source: 'harness' },
   worker_capped: { type: 'worker_capped', source: 'harness', severity: 'warn' },
   sdk_auto_continue: { type: 'auto_continue', source: 'harness' },
   guardrail_tripped: { type: 'gate_verdict', source: 'safety', severity: 'warn' },
@@ -104,8 +105,38 @@ function buildPayload(event: EventRow, session: SessionRow | null | undefined, m
   const payload: Record<string, unknown> = {
     eventType: event.type,
     ...(session?.kind ? { sessionKind: session.kind } : {}),
-    ...(session?.title ? { sessionTitle: session.title } : {}),
+    // Chat titles are commonly derived from the first accepted prompt. The
+    // turn-graph metric promises classification/counters only, so do not copy
+    // that raw user-authored title into its operational/dashboard payload.
+    ...(session?.title && event.type !== 'turn_graph_compiled' ? { sessionTitle: session.title } : {}),
   };
+  // The durable harness row carries the compact IR for offline reconciliation.
+  // Operational telemetry needs only bounded counters/classifications; never
+  // copy the graph or its accepted-input hash into the dashboard store.
+  if (event.type === 'turn_graph_compiled') {
+    const data = event.data;
+    for (const key of [
+      'shadow',
+      'graphId',
+      'graphVersion',
+      'compilerVersion',
+      'graphHash',
+      'policyHash',
+      'sourceUserSeq',
+      'route',
+      'fastPath',
+      'effectCeiling',
+      'nodeCount',
+      'edgeCount',
+      'compileMs',
+      'authorityRequirements',
+      'capabilityKinds',
+      'warnings',
+    ] as const) {
+      if (data[key] !== undefined) payload[key] = data[key];
+    }
+    return payload;
+  }
   // brain_fallover is the workflow-runner's parity twin of the router-lane
   // fallover — tag the stage so the two model_fallover sources are distinguishable.
   if (event.type === 'brain_fallover') payload.stage = 'step_boundary';

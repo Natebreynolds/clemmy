@@ -121,7 +121,10 @@ Options
 
 function claimForegroundDaemonLease(): boolean {
   if (acquireDaemonLease(process.pid)) return true;
-  console.error(`Another Clementine daemon is already running (PID ${readDaemonPid() ?? 'unknown'}).`);
+  console.error(
+    `Another Clementine runtime already owns the foreground singleton lease `
+    + `(PID ${readDaemonPid() ?? 'unknown'}). Stop it before starting a second daemon or standalone transport.`,
+  );
   process.exitCode = 1;
   return false;
 }
@@ -517,10 +520,13 @@ async function main(): Promise<void> {
     registerCliAuthRecoverySweep();
       logger.info({ pid: process.pid }, 'Daemon starting in foreground mode');
       const assistant = new ClementineAssistant(createRuntimeFromConfig());
-      if (WEBHOOK_ENABLED) await startWebhookServer(assistant);
-      if (DISCORD_ENABLED) await startDiscordBot(assistant);
-      if (SLACK_ENABLED) await startSlackBot(assistant);
-      await startDaemon(assistant);
+      await startDaemon(assistant, {
+        onReady: async () => {
+          if (WEBHOOK_ENABLED) await startWebhookServer(assistant);
+          if (DISCORD_ENABLED) await startDiscordBot(assistant);
+          if (SLACK_ENABLED) await startSlackBot(assistant);
+        },
+      });
       return;
     }
 
@@ -660,7 +666,19 @@ async function main(): Promise<void> {
   }
 
   // --- Service commands (need assistant) ---
+  // Standalone ingress is still a production writer: it must share the same
+  // singleton admission boundary as the combined daemon. Otherwise a second
+  // listener can accept the same external event while the daemon owns recovery
+  // and poison the durable source with competing attempts. Discord invite and
+  // Slack manifest/scopes returned above, so read-only helpers never claim.
+  const standaloneIngress = command === 'webhook' || command === 'discord' || command === 'slack';
   if (command === 'service' && !claimForegroundDaemonLease()) return;
+  if (standaloneIngress) {
+    if (!claimForegroundDaemonLease()) return;
+    registerShutdownHandlers(async () => {
+      await shutdownLocalTranscriptionRuntime();
+    });
+  }
   const assistant = new ClementineAssistant(createRuntimeFromConfig());
 
   if (command === 'chat') {
@@ -693,11 +711,6 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.warn({ err }, 'initHome failed during service boot — continuing with whatever scaffold exists');
     }
-    if (WEBHOOK_ENABLED) {
-      await startWebhookServer(assistant);
-    } else {
-      logger.info('Skipping webhook (WEBHOOK_ENABLED=false)');
-    }
     // Degraded-auth boot (the factory no longer crashes on a missing grant):
     // tell the user ONCE per condition how to finish sign-in instead of
     // letting the first chat turn fail mysteriously. Stable id → at-most-once
@@ -720,16 +733,6 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.warn({ err }, 'auth-degraded boot notice failed — continuing');
     }
-    if (DISCORD_ENABLED) {
-      await startDiscordBot(assistant);
-    } else {
-      logger.info('Skipping Discord bot (DISCORD_ENABLED=false)');
-    }
-    if (SLACK_ENABLED) {
-      await startSlackBot(assistant);
-    } else {
-      logger.info('Skipping Slack bot (SLACK_ENABLED=false)');
-    }
     registerShutdownHandlers(async () => {
       await shutdownLocalTranscriptionRuntime();
     });
@@ -740,7 +743,25 @@ async function main(): Promise<void> {
     // conversion doesn't eat a ~½GB download under the per-conversion timeout.
     // Fire-and-forget, idempotent, never blocks the daemon loop.
     warmMarkitdownInBackground();
-    await startDaemon(assistant);
+    await startDaemon(assistant, {
+      onReady: async () => {
+        if (WEBHOOK_ENABLED) {
+          await startWebhookServer(assistant);
+        } else {
+          logger.info('Skipping webhook (WEBHOOK_ENABLED=false)');
+        }
+        if (DISCORD_ENABLED) {
+          await startDiscordBot(assistant);
+        } else {
+          logger.info('Skipping Discord bot (DISCORD_ENABLED=false)');
+        }
+        if (SLACK_ENABLED) {
+          await startSlackBot(assistant);
+        } else {
+          logger.info('Skipping Slack bot (SLACK_ENABLED=false)');
+        }
+      },
+    });
     return;
   }
 

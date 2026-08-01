@@ -18,7 +18,6 @@ const {
   respondPreferHarness,
   respondViaHarness,
   harnessSurfaceEnabled,
-  hasReusableRecordedUserInput,
   isChatBrainFalloverEligible,
   synthesizeCompletedWorkReport,
   _setBridgeImplsForTests,
@@ -39,6 +38,12 @@ const { AgentRuntimeCancelledError } = await import('../provider.js');
 const { ClaudeSdkCapacityExhaustedError, ClaudeSdkProviderOverloadError } = await import('./claude-agent-sdk.js');
 // eslint-disable-next-line import/first
 const capabilityHealth = await import('./capability-health.js');
+// eslint-disable-next-line import/first
+const { actionBus } = await import('../action-bus.js');
+// eslint-disable-next-line import/first
+const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
+// eslint-disable-next-line import/first
+const { HarnessSession } = await import('./session.js');
 
 const FAKE_AGENT = {} as never;
 const okConfigure = (async () => ({ ok: true })) as never;
@@ -131,7 +136,7 @@ test('home + dashboard ride the gated loop by default; the kill-switch blocks un
     const res = await respondPreferHarness('home', { message: 'hi', sessionId: 'home-killed' }, async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; });
     assert.equal(legacyCalled, 0, 'kill-switch blocks by default');
     assert.equal(res.stoppedReason, 'error');
-    assert.match(res.text, /harness lane is disabled/i);
+    assert.match(res.text, /runtime lane is temporarily unavailable/i);
   } finally {
     delete process.env.CLEMMY_HARNESS_HOME;
   }
@@ -251,6 +256,76 @@ test('structured no-tool completion opt-in requires explicit empty tool authorit
   );
 });
 
+test('exact-source model directive binds a new attempt without a synthetic user event', async () => {
+  const sessionId = 'exact-source-private-directive';
+  createSession({ id: sessionId, kind: 'chat' });
+  const accepted = appendEvent({
+    sessionId,
+    turn: 7,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Yes, approve that exact action.', approvalId: 'apr-7', decision: 'approve' },
+  });
+  let receivedInput = '';
+  let receivedSource: number | undefined;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (options: { input: string; sourceUserSeq?: number; sessionId: string }) => {
+      receivedInput = options.input;
+      receivedSource = options.sourceUserSeq;
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 7,
+        lastDecision: {
+          summary: 'approved action completed',
+          reply: 'The approved action completed.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+        publicPresentation: {
+          version: 1,
+          id: `turn:${accepted.seq}:presentation`,
+          outcomeId: `turn:${accepted.seq}`,
+          audience: 'user',
+          phase: 'final',
+          identity: { sessionId, turn: accepted.turn, sourceUserSeq: accepted.seq },
+          status: 'done',
+          kind: 'answer',
+          text: 'The approved action completed.',
+          resumable: false,
+        },
+      };
+    }) as never,
+  });
+
+  await respondViaHarness('home', {
+    sessionId,
+    message: '[approval-resume] Execute the already-approved exact payload.',
+    displayMessage: 'Yes, approve that exact action.',
+    sourceUserSeq: accepted.seq,
+  });
+
+  assert.match(receivedInput, /^\[approval-resume\]/);
+  assert.equal(receivedSource, accepted.seq);
+  const inputs = listEvents(sessionId, { types: ['user_input_received'] });
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0].data.text, 'Yes, approve that exact action.');
+  const graphs = listEvents(sessionId, { types: ['turn_graph_compiled'] });
+  assert.equal(graphs.length, 1, 'the bridge observes the exact accepted source once');
+  assert.equal(graphs[0].parentEventId, accepted.id);
+  assert.equal(graphs[0].data.sourceUserSeq, accepted.seq);
+  assert.equal((graphs[0].data.graph as { source?: { surface?: unknown } }).source?.surface, 'home');
+  assert.equal(
+    JSON.stringify(graphs[0].data).includes('[approval-resume]'),
+    false,
+    'the private model directive cannot replace the accepted display turn in graph telemetry',
+  );
+});
+
 test('respondPreferHarness: kill-switch blocks by default, legacy fallback requires explicit break-glass', async () => {
   process.env.CLEMMY_HARNESS_CRON = 'off';
   let legacyCalled = 0;
@@ -260,7 +335,7 @@ test('respondPreferHarness: kill-switch blocks by default, legacy fallback requi
   });
   assert.equal(legacyCalled, 0);
   assert.equal(res.stoppedReason, 'error');
-  assert.match(res.text, /harness lane is disabled/i);
+  assert.match(res.text, /runtime lane is temporarily unavailable/i);
 
   process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   const legacy = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-t1-legacy' }, async (req) => {
@@ -273,19 +348,73 @@ test('respondPreferHarness: kill-switch blocks by default, legacy fallback requi
 
 test('respondPreferHarness: preflight blocks are recorded in harness capability health', async () => {
   process.env.CLEMMY_HARNESS_CRON = 'off';
-  const res = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-health-block' }, async (req) => ({
-    text: 'legacy',
-    sessionId: req.sessionId,
-  }));
+  const publicEvents: Array<{ event: { type: string; data: Record<string, unknown> } }> = [];
+  const detach = actionBus.subscribe((event) => {
+    if (event.kind === 'harness.public_event'
+      && event.sessionId === 'bridge-health-block'
+      && event.event.type === 'conversation_completed') {
+      publicEvents.push(event);
+    }
+  });
+  let res;
+  try {
+    res = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-health-block' }, async (req) => ({
+      text: 'legacy',
+      sessionId: req.sessionId,
+    }));
+  } finally {
+    detach();
+  }
 
   assert.equal(res.stoppedReason, 'error');
   const rec = capabilityHealth.readHarnessCapabilityHealth('respond_bridge_surface_disabled');
   assert.ok(rec, 'preflight block is persisted for harness_status/model context');
   assert.equal(rec.state, 'unavailable');
   assert.equal(rec.sessionId, 'bridge-health-block');
-  assert.match(rec.reason ?? '', /cron: The cron harness lane is disabled/);
+  assert.equal(rec.reason, 'cron: surface_disabled');
   assert.equal(rec.details?.surface, 'cron');
   assert.equal(rec.details?.reason, 'surface_disabled');
+
+  const completions = listEvents('bridge-health-block', { types: ['conversation_completed'] });
+  assert.equal(completions.length, 1, 'a blocked preflight has one durable terminal');
+  assert.equal((completions[0].data.presentation as { audience?: string }).audience, 'user');
+  assert.equal((completions[0].data.presentation as { status?: string }).status, 'blocked');
+  assert.equal((completions[0].data.presentation as { kind?: string }).kind, 'blocked');
+  assert.equal(publicEvents.length, 1, 'the durable terminal publishes one public event');
+  assert.equal(publicEvents[0].event.type, 'conversation_completed');
+  assert.equal(
+    (publicEvents[0].event.data.presentation as { status?: string }).status,
+    'blocked',
+  );
+});
+
+test('preflight terminal write failure returns only stable failure and preserves restart ownership', async () => {
+  process.env.CLEMMY_HARNESS_HOME = 'off';
+  _setBridgeImplsForTests({
+    commitTurnOutcome: (() => { throw new Error('forced sqlite terminal failure'); }) as never,
+  });
+
+  const result = await respondPreferHarness(
+    'home',
+    { message: 'Please finish this.', sessionId: 'preflight-terminal-write-failure' },
+    async (request) => ({ text: 'legacy', sessionId: request.sessionId }),
+  );
+
+  assert.equal(result.stoppedReason, 'error');
+  assert.equal(result.text, PUBLIC_RUN_FAILURE_TEXT);
+  assert.doesNotMatch(result.text, /temporarily unavailable|sqlite/i);
+  assert.equal(
+    listEvents(result.sessionId, { types: ['conversation_completed'] }).length,
+    0,
+    'the proposed preflight block never escapes as a live-only terminal',
+  );
+  assert.equal(listEvents(result.sessionId, { types: ['user_input_received'] }).length, 1);
+  assert.notEqual(
+    HarnessSession.load(result.sessionId)?.runInFlightSince(),
+    null,
+    'the exact accepted source remains restart-recoverable after commit failure',
+  );
+  assert.equal((result.raw as { terminalCommitted?: boolean }).terminalCommitted, false);
 });
 
 test('respondPreferHarness: harness-FILTERABLE excludeToolNames ride the gated loop (exclusion passed to the builder)', async () => {
@@ -315,7 +444,7 @@ test('respondPreferHarness: a NON-filterable exclude blocks by default — no si
   );
   assert.equal(legacyCalled, 0, 'the harness cannot enforce an external-MCP exclude → block before run');
   assert.equal(res.stoppedReason, 'error');
-  assert.match(res.text, /tool exclusions cannot be enforced/i);
+  assert.match(res.text, /requested tool boundary is not supported/i);
 });
 
 test('respondPreferHarness: harness auth unavailable blocks by default instead of falling back to legacy', async () => {
@@ -327,8 +456,8 @@ test('respondPreferHarness: harness auth unavailable blocks by default instead o
   });
   assert.equal(legacyCalled, 0);
   assert.equal(res.stoppedReason, 'error');
-  assert.match(res.text, /model runtime is not configured/i);
-  assert.match(res.text, /no auth/i);
+  assert.match(res.text, /no model runtime is connected/i);
+  assert.doesNotMatch(res.text, /no auth/i, 'provider diagnostics stay out of public copy');
 });
 
 test('respondPreferHarness: Claude auth + SDK brain opt-in routes chat through Claude Agent SDK brain', async () => {
@@ -474,7 +603,7 @@ test('respondPreferHarness: Claude SDK brain relays harness tool/progress events
   }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
 
   assert.deepEqual(seenTools, [
-    { toolName: 'run_shell_command', input: { command: 'npm test' } },
+    { toolName: 'run_shell_command', input: {} },
   ]);
   assert.ok(seenReasoning.some((text) => /planning the next step/i.test(text)));
 });
@@ -608,12 +737,23 @@ test('Claude SDK uncommitted fallover reuses the pre-recorded user input row', a
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
   process.env.CLEMMY_BRAIN_FALLOVER = 'on';
-  let reuseRecordedUserInput: boolean | undefined;
+  const runId = 'run:fallover-reuse';
+  let claudeAttemptId = '';
+  let claudeSourceUserSeq = 0;
+  let harnessAttemptId = '';
+  let harnessSourceUserSeq = 0;
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
-    runConversation: (async (opts: { sessionId: string; reuseRecordedUserInput?: boolean }) => {
-      reuseRecordedUserInput = opts.reuseRecordedUserInput;
+    runConversation: (async (opts: {
+      sessionId: string;
+      reuseRecordedUserInput?: boolean;
+      sourceUserSeq?: number;
+      runAttemptId?: string;
+    }) => {
+      assert.equal(opts.reuseRecordedUserInput, true);
+      harnessAttemptId = opts.runAttemptId ?? '';
+      harnessSourceUserSeq = opts.sourceUserSeq ?? 0;
       return {
         sessionId: opts.sessionId,
         status: 'completed',
@@ -626,13 +766,14 @@ test('Claude SDK uncommitted fallover reuses the pre-recorded user input row', a
       if (!getSession(req.sessionId)) {
         createSession({ id: req.sessionId, kind: 'chat', title: 'fallover test' });
       }
-      appendEvent({
-        sessionId: req.sessionId,
+      const attempt = beginRunAttempt(req.sessionId, { runId: req.runId });
+      const source = recordRunAttemptUserInput(attempt, {
         turn: 1,
         role: 'user',
-        type: 'user_input_received',
         data: { text: req.message },
       });
+      claudeAttemptId = attempt.attemptId;
+      claudeSourceUserSeq = source.seq;
       appendEvent({
         sessionId: req.sessionId,
         turn: 1,
@@ -644,38 +785,81 @@ test('Claude SDK uncommitted fallover reuses the pre-recorded user input row', a
     }) as never,
   });
 
-  const res = await respondPreferHarness('home', { message: 'same turn', sessionId: 'fallover-reuse' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'same turn', sessionId: 'fallover-reuse', runId },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+  );
 
   assert.equal(res.text, 'fallback done');
-  assert.equal(reuseRecordedUserInput, true, 'fallback harness turn reuses the Claude-recorded user row');
-});
-
-test('fallover reuses the attempt-bound input when the runtime prompt was transformed', () => {
-  const sessionId = 'fallover-bound-transformed-input';
-  const runId = 'desktop:goal-run';
-  createSession({ id: sessionId, kind: 'chat', title: 'goal test' });
-  const attempt = beginRunAttempt(sessionId, { runId });
-  recordRunAttemptUserInput(attempt, {
-    turn: 1,
-    role: 'user',
-    data: { text: '/goal build the report', runId },
-  });
-  appendEvent({
-    sessionId,
-    turn: 1,
-    role: 'system',
-    type: 'conversation_completed',
-    data: { reason: 'provider_fallover' },
-  });
-
+  assert.ok(claudeAttemptId && harnessAttemptId);
+  assert.notEqual(harnessAttemptId, claudeAttemptId, 'fallover owns a fresh physical attempt');
+  assert.equal(harnessSourceUserSeq, claudeSourceUserSeq, 'both physical attempts bind the exact accepted event');
   assert.equal(
-    hasReusableRecordedUserInput(sessionId, 'A transformed goal execution prompt', runId),
-    true,
-    'attempt identity wins over transformed text and a prior terminal marker',
+    listEvents('fallover-reuse', { types: ['user_input_received'] }).length,
+    1,
+    'the logical user turn is recorded once',
   );
 });
 
-test('Claude SDK brain overload AFTER committing surfaces the error (no double-act)', async () => {
+test('a Claude exception after logical terminal commit returns that winner and never dispatches fallback', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'fallover-post-terminal-short-circuit';
+  const runId = 'run:post-terminal-short-circuit';
+  let runConversationCalled = 0;
+  const { commitTurnOutcome } = await import('./delivery-committer.js');
+  const { turnOutcomeId } = await import('./turn-outcome.js');
+  const { markRunInFlight } = await import('./restart-recovery.js');
+  const { HarnessSession } = await import('./session.js');
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      runConversationCalled += 1;
+      return { sessionId, status: 'completed' };
+    }) as never,
+    claudeAgentBrain: (async (_surface, req) => {
+      if (!getSession(req.sessionId)) createSession({ id: req.sessionId, kind: 'chat' });
+      const attempt = beginRunAttempt(req.sessionId, { runId: req.runId });
+      const source = recordRunAttemptUserInput(attempt, {
+        turn: 1,
+        role: 'user',
+        data: { text: req.message },
+      });
+      markRunInFlight(req.sessionId, true);
+      const identity = {
+        sessionId: req.sessionId,
+        turn: source.turn,
+        sourceUserSeq: source.seq,
+      } as const;
+      commitTurnOutcome({
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'done',
+        resumable: false,
+        presentation: { kind: 'answer', text: 'Committed before bookkeeping failed.' },
+      });
+      throw new Error('post-terminal learning database failure');
+    }) as never,
+  });
+
+  const response = await respondPreferHarness(
+    'home',
+    { message: 'do it once', sessionId, runId },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+  );
+
+  assert.equal(response.text, 'Committed before bookkeeping failed.');
+  assert.equal(response.stoppedReason, 'success');
+  assert.equal(runConversationCalled, 0, 'the exact durable terminal forbids a second brain dispatch');
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(HarnessSession.load(sessionId)?.runInFlightSince(), null);
+});
+
+test('Claude SDK brain overload AFTER committing reduces to one safe failed terminal without a double-act', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
   process.env.CLEMMY_BRAIN_FALLOVER = 'on';
@@ -688,11 +872,17 @@ test('Claude SDK brain overload AFTER committing surfaces the error (no double-a
     claudeAgentBrain: (async () => { throw new ClaudeSdkProviderOverloadError('API Error: 529 Overloaded', true); }) as never,
   });
 
-  await assert.rejects(
-    respondPreferHarness('home', { message: 'hi', sessionId: 'fallover-unsafe' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId })),
-    /529 Overloaded/,
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'hi', sessionId: 'fallover-unsafe' },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
   );
   assert.equal(runConversationCalled, 0, 'no fallover once the turn committed work');
+  assert.equal(res.stoppedReason, 'error');
+  assert.doesNotMatch(res.text, /529|overload/i, 'raw provider detail is private');
+  const terminals = listEvents('fallover-unsafe', { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal((terminals[0].data.presentation as { status?: string }).status, 'failed');
 });
 
 test('generic Claude terminal error after an Airtable write is salvaged without whole-turn fallover', async () => {
@@ -744,6 +934,67 @@ test('generic Claude terminal error after an Airtable write is salvaged without 
   assert.match(res.text, /Created a record/);
   assert.match(res.text, /did not rerun/i);
   assert.doesNotMatch(res.text, /blind rerun/);
+});
+
+test('blocked Claude recovery clears the in-flight marker only after its typed terminal commits', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'fallover-marker-after-blocked-terminal';
+  const runId = 'run:marker-after-blocked-terminal';
+  const { markRunInFlight } = await import('./restart-recovery.js');
+  const { HarnessSession } = await import('./session.js');
+  let markerWasArmedAtPublication = false;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      throw new Error('must not dispatch fallback');
+    }) as never,
+    claudeAgentBrain: (async (_surface, req) => {
+      if (!getSession(req.sessionId)) createSession({ id: req.sessionId, kind: 'chat' });
+      const attempt = beginRunAttempt(req.sessionId, { runId: req.runId });
+      recordRunAttemptUserInput(attempt, {
+        turn: 1,
+        role: 'user',
+        data: { text: req.message },
+      });
+      markRunInFlight(req.sessionId, true);
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write_orphaned',
+        data: {
+          callId: 'call-uncertain',
+          canonicalCallId: 'call-uncertain',
+          toolName: 'composio_execute_tool',
+          shapeKey: 'AIRTABLE_UPDATE_RECORD',
+          targets: ['record:rec-uncertain'],
+        },
+      });
+      throw new Error('provider stopped after uncertain write');
+    }) as never,
+  });
+  const detach = actionBus.subscribe((event) => {
+    if (event.kind === 'harness.public_event'
+      && event.sessionId === sessionId
+      && event.event.type === 'conversation_completed') {
+      markerWasArmedAtPublication = HarnessSession.load(sessionId)?.runInFlightSince() != null;
+    }
+  });
+  try {
+    const response = await respondPreferHarness(
+      'home',
+      { message: 'update once', sessionId, runId },
+      async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+    );
+    assert.equal(response.stoppedReason, 'error');
+  } finally {
+    detach();
+  }
+  assert.equal(markerWasArmedAtPublication, true, 'terminal durability happens before marker cleanup');
+  assert.equal(HarnessSession.load(sessionId)?.runInFlightSince(), null);
 });
 
 test('whole-turn recovery allows fallover after the exact call records a proven-no-dispatch failure', async () => {
@@ -1076,28 +1327,85 @@ test('CLEMMY_BRAIN_FALLOVER=off disables the chat-brain fallover (overload surfa
     runConversation: (async () => ({ status: 'completed' })) as never,
     claudeAgentBrain: (async () => { throw new ClaudeSdkProviderOverloadError('API Error: 529 Overloaded', false); }) as never,
   });
-  await assert.rejects(
-    respondPreferHarness('home', { message: 'hi', sessionId: 'fallover-off' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId })),
-    /529 Overloaded/,
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'hi', sessionId: 'fallover-off' },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
   );
+  assert.equal(res.stoppedReason, 'error');
+  assert.doesNotMatch(res.text, /529|overload/i);
   delete process.env.CLEMMY_BRAIN_FALLOVER;
 });
 
-test('respondPreferHarness: harness run errors PROPAGATE — no post-start legacy retry', async () => {
+test('respondPreferHarness: harness run errors commit one failed terminal — no post-start legacy retry', async () => {
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
     runConversation: (async () => { throw new Error('mid-run boom'); }) as never,
   });
   let legacyCalled = 0;
-  await assert.rejects(
-    respondPreferHarness('webhook', { message: 'hi', sessionId: 'bridge-t4' }, async (req) => {
+  const res = await respondPreferHarness(
+    'webhook',
+    { message: 'hi', sessionId: 'bridge-t4' },
+    async (req) => {
       legacyCalled += 1;
       return { text: 'legacy', sessionId: req.sessionId };
-    }),
-    /mid-run boom/,
+    },
   );
   assert.equal(legacyCalled, 0, 'a started harness run must never retry on legacy (double-send class)');
+  assert.equal(res.stoppedReason, 'error');
+  assert.doesNotMatch(res.text, /mid-run boom/);
+  assert.equal(listEvents('bridge-t4', { types: ['conversation_completed'] }).length, 1);
+});
+
+test('a corrupt typed terminal winner suppresses duplicate recovery publication and exposes no raw detail', async () => {
+  const sessionId = 'bridge-corrupt-terminal-winner';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number }) => {
+      const sourceUserSeq = opts.sourceUserSeq ?? 0;
+      appendEvent({
+        sessionId: opts.sessionId,
+        turn: 1,
+        role: 'system',
+        type: 'conversation_completed',
+        data: {
+          terminalKey: `turn:${sourceUserSeq}`,
+          sourceUserSeq,
+          reply: 'PRIVATE INVALID DUPLICATE REPLY',
+          summary: 'PRIVATE INVALID DUPLICATE SUMMARY',
+          presentation: {
+            version: 1,
+            id: `turn:${sourceUserSeq}:presentation`,
+            outcomeId: `turn:${sourceUserSeq}`,
+            audience: 'user',
+            phase: 'final',
+            identity: { sessionId: opts.sessionId, turn: 1, sourceUserSeq },
+            // Contradictory typed rows must fail strict parsing.
+            status: 'done',
+            kind: 'error',
+            text: 'PRIVATE INVALID DUPLICATE REPLY',
+            resumable: false,
+          },
+        },
+      });
+      throw new Error('private provider failure');
+    }) as never,
+  });
+
+  await assert.rejects(
+    respondViaHarness('webhook', { message: 'run once', sessionId }),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : String(error), PUBLIC_RUN_FAILURE_TEXT);
+      return true;
+    },
+  );
+  assert.equal(
+    listEvents(sessionId, { types: ['conversation_completed'] }).length,
+    1,
+    'the corrupt typed winner is never reinterpreted or followed by a duplicate terminal',
+  );
 });
 
 test('respondViaHarness: completed maps to AssistantResponse with reply preferred over summary', async () => {
@@ -1117,6 +1425,137 @@ test('respondViaHarness: completed maps to AssistantResponse with reply preferre
   const session = getSession('bridge-t5');
   assert.ok(session, 'harness session created');
   assert.equal(session?.kind, 'chat', 'webhook surface creates a chat-kind session');
+});
+
+test('respondViaHarness: standard runner never receives the user transport callback', async () => {
+  const streamed: string[] = [];
+  const transportOnChunk = async (delta: string): Promise<void> => { streamed.push(delta); };
+  let runnerOnChunk: ((delta: string) => void | Promise<void>) | undefined;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: {
+      sessionId: string;
+      onChunk?: (delta: string) => void | Promise<void>;
+    }) => {
+      runnerOnChunk = opts.onChunk;
+      await opts.onChunk?.('{"reply":"Hello');
+      await opts.onChunk?.(' from the harness."}');
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'Hello from the harness.', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+
+  await respondViaHarness('home', {
+    message: 'hi',
+    sessionId: 'bridge-public-stream-envelope',
+    onChunk: transportOnChunk,
+  });
+
+  assert.equal(runnerOnChunk, undefined, 'raw executor deltas have no public transport authority');
+  assert.deepEqual(streamed, [], 'the authoritative answer is returned/replayed from its committed terminal');
+});
+
+test('respondViaHarness: standard runner cannot stream plain prose or decision narration', async () => {
+  const streamed: string[] = [];
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: {
+      sessionId: string;
+      onChunk?: (delta: string) => void | Promise<void>;
+    }) => {
+      await opts.onChunk?.('I am going to inspect the account.');
+      await opts.onChunk?.('\nsummary: inspection complete\nreply: The account is healthy.\ndone: true');
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'The account is healthy.', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+
+  const response = await respondViaHarness('home', {
+    message: 'check the account',
+    sessionId: 'bridge-public-stream-private-narration',
+    onChunk: (delta) => { streamed.push(delta); },
+  });
+
+  assert.deepEqual(streamed, [], 'uncommitted executor output stays private');
+  assert.equal(response.text, 'The account is healthy.', 'the committed response still returns normally');
+});
+
+test('respondViaHarness sanitizes legacy pause results before returning them synchronously', async () => {
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string }) => {
+      appendEvent({
+        sessionId: opts.sessionId,
+        turn: 1,
+        role: 'Clem',
+        type: 'awaiting_user_input',
+        data: {
+          question: 'Which tenant should I use?',
+          options: ['Acme', 'Tool call: composio_execute_tool\n{"secret":true}'],
+        },
+      });
+      return {
+        sessionId: opts.sessionId,
+        status: 'awaiting_user_input',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          summary: 'summary: inspected connections\nreply: I found two tenants.\ndone: false\nnextAction: awaiting_user_input\nreason: selection required',
+          done: false,
+          nextAction: 'awaiting_user_input',
+        },
+      };
+    }) as never,
+  });
+
+  const response = await respondViaHarness('home', {
+    message: 'use the right tenant',
+    sessionId: 'bridge-public-legacy-pause',
+  });
+
+  assert.equal(response.text, 'Which tenant should I use?\n1. Acme\n(Reply with a number or in your own words.)');
+  assert.doesNotMatch(response.text, /summary:|done:|nextAction:|reason:|tool call|secret/i);
+});
+
+test('respondViaHarness: omits the runner stream callback when the transport did not request streaming', async () => {
+  let runnerOnChunk: ((delta: string) => void | Promise<void>) | undefined | 'unset' = 'unset';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: {
+      sessionId: string;
+      onChunk?: (delta: string) => void | Promise<void>;
+    }) => {
+      runnerOnChunk = opts.onChunk;
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'done', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+
+  await respondViaHarness('home', {
+    message: 'hi',
+    sessionId: 'bridge-public-stream-disabled',
+  });
+
+  assert.equal(runnerOnChunk, undefined);
 });
 
 test('all_in gpt-shaped BYO route diagnostics and event telemetry report the actual BYO wire', async () => {
@@ -1210,10 +1649,10 @@ test('respondViaHarness: relays harness tool/progress events to legacy callbacks
   });
 
   assert.deepEqual(seenTools, [
-    { toolName: 'memory_search', input: { query: 'status' } },
-    { toolName: 'run_shell_command', input: { command: 'npm test' } },
-    { toolName: 'browser_open', input: { url: 'http://127.0.0.1:3000' } },
-    { toolName: 'debug_probe', input: { value: 'not-json' } },
+    { toolName: 'memory_search', input: {} },
+    { toolName: 'run_shell_command', input: {} },
+    { toolName: 'browser_open', input: {} },
+    { toolName: 'debug_probe', input: {} },
   ]);
   assert.ok(seenReasoning.some((text) => /planning the next step/i.test(text)));
 });
@@ -1249,16 +1688,18 @@ test('respondViaHarness: limit_exceeded maps to max-turns-with-grace', async () 
   assert.equal(res.stoppedReason, 'max-turns-with-grace');
 });
 
-test('respondViaHarness: failed status throws (legacy callers own error handling)', async () => {
+test('respondViaHarness: failed status reduces to a durable safe error terminal', async () => {
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
     runConversation: fakeRun({ status: 'failed', error: 'runtime exploded' }),
   });
-  await assert.rejects(
-    respondViaHarness('cron', { message: 'job', sessionId: 'bridge-t8' }),
-    /runtime exploded/,
-  );
+  const res = await respondViaHarness('cron', { message: 'job', sessionId: 'bridge-t8' });
+  assert.equal(res.stoppedReason, 'error');
+  assert.doesNotMatch(res.text, /runtime exploded/);
+  const terminals = listEvents('bridge-t8', { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal((terminals[0].data.presentation as { status?: string }).status, 'failed');
 });
 
 test('respondViaHarness: caller-driven cancel throws AgentRuntimeCancelledError (background abort contract)', async () => {
@@ -1320,12 +1761,21 @@ test('parse-exhaustion completion re-runs ONCE on the next brain instead of ship
   const models: Array<string | undefined> = [];
   const recordingBuilder = (async (opts: { model?: string }) => { models.push(opts.model); return FAKE_AGENT; }) as never;
   let calls = 0;
-  const run = (async (opts: { sessionId: string }) => {
+  const attemptIds: string[] = [];
+  const sourceUserSeqs: number[] = [];
+  const run = (async (opts: { sessionId: string; runAttemptId?: string; sourceUserSeq?: number }) => {
     calls += 1;
+    attemptIds.push(opts.runAttemptId ?? '');
+    sourceUserSeqs.push(opts.sourceUserSeq ?? 0);
     if (calls === 1) {
       // Dead turn: parse retries exhausted, apology summary, completedReason set.
       return { sessionId: opts.sessionId, status: 'completed', steps: 3, lastTurn: 3, completedReason: 'no_structured_output' };
     }
+    assert.equal(
+      listEvents(opts.sessionId, { types: ['conversation_completed'] }).length,
+      0,
+      'the failed first brain remains a private recovery candidate until fallover resolves',
+    );
     return {
       sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
       lastDecision: { summary: 's', reply: 'recovered on the other brain', done: true, nextAction: 'completed', reason: null },
@@ -1333,21 +1783,46 @@ test('parse-exhaustion completion re-runs ONCE on the next brain instead of ship
   }) as never;
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: run });
 
-  const res = await respondViaHarness('webhook', { message: 'do the thing', sessionId: 'parse-exhaustion-fallover' });
+  const res = await respondViaHarness('webhook', {
+    message: 'do the thing',
+    sessionId: 'parse-exhaustion-fallover',
+    runId: 'run:parse-exhaustion-fallover',
+  });
   assert.equal(calls, 2, 'the dead turn must be re-run exactly once');
   assert.match(res.text, /recovered on the other brain/, 'the recovered reply ships, not the apology');
   assert.ok(models[1], 'the re-run pinned a modelOverride (the next brain)');
   assert.notEqual(models[1], models[0], 'the re-run must not use the same model');
+  assert.ok(attemptIds.every(Boolean));
+  assert.notEqual(attemptIds[0], attemptIds[1], 'parse recovery mints a fresh physical attempt');
+  assert.equal(sourceUserSeqs[0], sourceUserSeqs[1], 'both attempts bind the same logical user turn');
+  assert.equal(
+    listEvents('parse-exhaustion-fallover', { types: ['user_input_received'] }).length,
+    1,
+    'parse recovery does not duplicate the user transcript row',
+  );
 
   // And the guard: a re-run that ALSO dead-ends must NOT recurse.
   calls = 0;
   const alwaysDead = (async (opts: { sessionId: string }) => {
     calls += 1;
+    if (calls === 2) {
+      assert.equal(
+        listEvents(opts.sessionId, { types: ['conversation_completed'] }).length,
+        0,
+        'the first exhausted attempt does not publish an early terminal',
+      );
+    }
     return { sessionId: opts.sessionId, status: 'completed', steps: 3, lastTurn: 3, completedReason: 'no_structured_output', lastDecision: { summary: 'apology', reply: null, done: true, nextAction: 'completed', reason: null } };
   }) as never;
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: alwaysDead });
   await respondViaHarness('webhook', { message: 'do the thing', sessionId: 'parse-exhaustion-no-recurse' });
   assert.equal(calls, 2, 'exactly one recovery hop — never a loop');
+  const deadEndCompletions = listEvents('parse-exhaustion-no-recurse', { types: ['conversation_completed'] });
+  assert.equal(deadEndCompletions.length, 1, 'the exhausted recovery commits one terminal');
+  assert.equal(
+    (deadEndCompletions[0].data.presentation as { status?: string }).status,
+    'blocked',
+  );
 });
 
 test('narration give-up is fallover-eligible; without fallover it ships the graceful copy, never a raw error', async () => {
@@ -1408,10 +1883,17 @@ test('parse-exhaustion recovery is GATED on external writes — a run that commi
   let calls = 0;
   const runThatWrites = (async (opts: { sessionId: string }) => {
     calls += 1;
-    // The run commits an external write BEFORE dying at parse exhaustion.
+    // A lifecycle success without a legacy external_write row must still block
+    // replay; counting only the old event type was the fail-open bug.
     appendEvent({
-      sessionId: opts.sessionId, turn: 1, role: 'system', type: 'external_write',
-      data: { tool: 'composio_execute_tool', shapeKey: 'salesforce:update' },
+      sessionId: opts.sessionId, turn: 1, role: 'system', type: 'external_write_succeeded',
+      data: {
+        callId: 'call-salesforce-update',
+        canonicalCallId: 'call-salesforce-update',
+        tool: 'composio_execute_tool',
+        shapeKey: 'salesforce:update',
+        targets: ['record:rec-42'],
+      },
     });
     return {
       sessionId: opts.sessionId, status: 'completed', steps: 3, lastTurn: 3,
@@ -1420,9 +1902,34 @@ test('parse-exhaustion recovery is GATED on external writes — a run that commi
     };
   }) as never;
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: runThatWrites });
-  const res = await respondViaHarness('webhook', { message: 'update the account', sessionId });
+  const publicTerminals: Array<{ event: { type: string; data: Record<string, unknown> } }> = [];
+  const detach = actionBus.subscribe((event) => {
+    if (event.kind === 'harness.public_event'
+      && event.sessionId === sessionId
+      && event.event.type === 'conversation_completed') {
+      publicTerminals.push(event);
+    }
+  });
+  let res;
+  try {
+    res = await respondViaHarness('webhook', { message: 'update the account', sessionId });
+  } finally {
+    detach();
+  }
   assert.equal(calls, 1, 'NO recovery hop — the run committed an external write');
-  assert.match(res.text, /apology/, 'the honest completion ships instead of a blind re-run');
+  assert.match(res.text, /successful external write/i, 'the lifecycle success is reported instead of a blind re-run');
+  assert.doesNotMatch(res.text, /apology/i, 'internal parse-exhaustion copy never becomes the reply');
+  const writeGateCompletions = listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(writeGateCompletions.length, 1, 'the blocked recovery commits one terminal');
+  assert.equal(
+    (writeGateCompletions[0].data.presentation as { status?: string }).status,
+    'blocked',
+  );
+  assert.equal(
+    (writeGateCompletions[0].data.presentation as { kind?: string }).kind,
+    'blocked',
+  );
+  assert.equal(publicTerminals.length, 1, 'the typed blocked terminal publishes once');
 
   // Control: the SAME dead turn with no external write still recovers.
   const sessionId2 = 'parse-exhaustion-no-write-recovers';
@@ -1433,6 +1940,11 @@ test('parse-exhaustion recovery is GATED on external writes — a run that commi
     if (calls2 === 1) {
       return { sessionId: opts.sessionId, status: 'completed', steps: 3, lastTurn: 3, completedReason: 'no_structured_output' };
     }
+    assert.equal(
+      listEvents(opts.sessionId, { types: ['conversation_completed'] }).length,
+      0,
+      'a clean fallover also has no terminal before the recovered brain answers',
+    );
     return {
       sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
       lastDecision: { summary: 's', reply: 'recovered cleanly', done: true, nextAction: 'completed', reason: null },
@@ -1442,6 +1954,42 @@ test('parse-exhaustion recovery is GATED on external writes — a run that commi
   const res2 = await respondViaHarness('webhook', { message: 'update the account', sessionId: sessionId2 });
   assert.equal(calls2, 2, 'clean dead turn still gets the recovery hop');
   assert.match(res2.text, /recovered cleanly/);
+});
+
+test('parse-exhaustion recovery fails closed when its lifecycle ledger baseline is unreadable', async () => {
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'parse-exhaustion-ledger-unreadable';
+  let calls = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    recoveryListEvents: (() => {
+      throw new Error('event ledger unavailable');
+    }) as never,
+    runConversation: (async () => {
+      calls += 1;
+      return {
+        sessionId,
+        status: 'completed',
+        steps: 3,
+        lastTurn: 3,
+        completedReason: 'no_structured_output',
+      };
+    }) as never,
+  });
+
+  const response = await respondViaHarness('webhook', {
+    message: 'update the account',
+    sessionId,
+  });
+
+  assert.equal(calls, 1, 'an unreadable safety ledger cannot authorize a replay');
+  assert.equal(response.stoppedReason, 'error');
+  assert.match(response.text, /could not verify the external-write ledger/i);
+  assert.equal((response.raw as { recoverySkipped?: string }).recoverySkipped, 'ledger_unreadable');
+  const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal((terminals[0].data.presentation as { status?: string }).status, 'blocked');
 });
 
 test('always-reports-back: synthesizeCompletedWorkReport describes external writes when the model emitted no reply', () => {

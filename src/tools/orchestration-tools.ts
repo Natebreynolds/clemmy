@@ -739,6 +739,23 @@ const WorkflowStepInputBindingSchema = z.object({
     .describe('One-line note on why the step needs this argument.'),
 });
 
+const WorkflowReadParallelSubgraphSchema = z.object({
+  mode: z.literal('read_parallel_v1'),
+  specialists: z.array(z.object({
+    id: z.string().min(1).max(32)
+      .describe('Stable specialist id within this reducer step.'),
+    prompt: z.string().min(3)
+      .describe('Narrow read-only analysis assignment over upstream results/artifacts.'),
+    label: z.string().optional(),
+    model: z.string().optional(),
+    intent: z.string().optional(),
+    maxTurns: z.number().int().min(1).max(20).optional(),
+  })).min(2).max(6),
+}).describe(
+  'Compile this sideEffect:"read" step into 2–6 parallel result-only specialists, then run the authored step once as their reducer. '
+  + 'Specialists cannot write, send, call external tools, nest fan-out, or request approval; put data-fetch and effect nodes elsewhere in the workflow graph.',
+);
+
 const STEP_INPUT_CONTRACT_DESC =
   'OPTIONAL step input/argument contract — what this step NEEDS before it runs. '
   + 'Keys are the step argument names; each value can bind from input.<key>, steps.<id>.output[.path], item[.path], project.path, project.name, or date. '
@@ -985,6 +1002,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       + "ADVANCED MODE: Provide step-by-step definitions with full prompts, dependencies, and tool choices for complete control. I still validate and suggest improvements. "
       + "AUTHORING MODEL: Workflows are AUTONOMOUS BY DEFAULT — they run end-to-end on your one-time consent (enabling), WITHOUT pausing for per-step approval, unless you set `requiresApproval: true` on irreversible actions (sends, publishes). "
       + "Each step does ONE job; outputs flow to dependent steps automatically via `dependsOn`. Steps with the same dependsOn run in parallel. Use forEach for per-item fan-out. "
+      + "For a heavy read-only analysis over upstream results/artifacts, use `subgraph: {mode:'read_parallel_v1', specialists:[...]}` on the reducer step; its 2–6 result-only specialists run concurrently and the authored step joins them. Keep external fetches and all writes/sends as separate nodes. "
       + "DECLARE STEP INPUTS on mechanical tool steps: `inputs` maps argument names to sources like input.domain or steps.fetch.output.rows. If the exact tool + args are known, prefer `call`; otherwise a single direct allowedTools slug + inputs + output lets the compiler codify it safely. "
       + "DECLARE OUTPUT CONTRACTS on any step whose output a later step depends on (type, required_keys, verify.path_exists). The engine verifies before continuing, preventing hollow results from feeding downstream. "
       + "DECLARE sideEffect on every step ('read' | 'write' | 'send') — it drives the safety law: send steps never auto-retry, crash-resume halts on interrupted writes/sends. "
@@ -1005,6 +1023,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         useHarness: z.boolean().optional(),
         forEach: z.string().optional().describe('Fan out once per item from an upstream step output. The runner aggregates results as [{itemKey, output}]. Use an object/scalar output contract for EACH item, or an array output contract for the aggregate.'),
         forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
+        subgraph: WorkflowReadParallelSubgraphSchema.optional(),
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
           args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
@@ -1482,6 +1501,9 @@ export function registerOrchestrationTools(server: McpServer): void {
         const project = stp.project ? ` project=${stp.project}` : w.project ? ` project=${w.project}` : '';
         const model = stp.model ? ` model=${stp.model}` : '';
         const forEach = stp.forEach ? ` forEach=${stp.forEach}` : '';
+        const subgraph = stp.subgraph
+          ? ` subgraph=${stp.subgraph.mode}[${stp.subgraph.specialists.map((specialist) => specialist.id).join(',')}]`
+          : '';
         const det = stp.deterministic ? ` deterministic=${stp.deterministic.runner}` : '';
         const sources = deriveStepDataSources(stp);
         const sourcesLine = sources.length > 0 ? `    data: ${sources.join(' · ')}` : '';
@@ -1518,7 +1540,22 @@ export function registerOrchestrationTools(server: McpServer): void {
         const promptLines = (stp.prompt ?? '').split('\n');
         const pwidth = String(promptLines.length).length;
         const numbered = promptLines.map((l, i) => `      ${String(i + 1).padStart(pwidth)}\t${l}`).join('\n');
-        return [`  ${stp.id}${deps}${project}${model}${forEach}${det}`, sourcesLine, runnerLine, '    prompt:', numbered].filter(Boolean).join('\n');
+        const specialistLines = stp.subgraph?.specialists.flatMap((specialist) => [
+          `    specialist ${specialist.id}`
+            + (specialist.label ? ` label=${JSON.stringify(specialist.label)}` : '')
+            + (specialist.model ? ` model=${specialist.model}` : '')
+            + (specialist.intent ? ` intent=${specialist.intent}` : '')
+            + (specialist.maxTurns !== undefined ? ` maxTurns=${specialist.maxTurns}` : ''),
+          `      prompt: ${JSON.stringify(specialist.prompt)}`,
+        ]) ?? [];
+        return [
+          `  ${stp.id}${deps}${project}${model}${forEach}${subgraph}${det}`,
+          sourcesLine,
+          runnerLine,
+          ...specialistLines,
+          '    prompt:',
+          numbered,
+        ].filter(Boolean).join('\n');
       };
       // step=<id> targeting: when a workflow is large, read just one step in full.
       if (step) {
@@ -1657,6 +1694,7 @@ export function registerOrchestrationTools(server: McpServer): void {
     'Modify an existing workflow: update description, trigger schedule, steps, inputs, or synthesis. Pass only the fields you want to change — others are preserved. Step IDs and dependencies are re-validated. '
       + 'IMPORTANT: when `steps` is present it REPLACES THE ENTIRE STEP GRAPH; never send one step as a patch. Read and resend every step for a graph change, or use workflow_edit_step for a targeted prompt edit. '
       + 'Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT. '
+      + 'For a heavy read-only analysis, `subgraph: {mode:"read_parallel_v1", specialists:[...]}` compiles 2–6 concurrent result-only branches and uses the authored step as their reducer; keep fetch/effect nodes separate. '
       + 'For mechanical tool steps, declare `inputs` argument bindings plus `output`, or use `call` directly when the exact tool and args are known.',
     {
       name: z.string().min(1),
@@ -1673,6 +1711,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         useHarness: z.boolean().optional(),
         forEach: z.string().optional().describe('Fan out once per item from an upstream step output. The runner aggregates results as [{itemKey, output}]. Use an object/scalar output contract for EACH item, or an array output contract for the aggregate.'),
         forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
+        subgraph: WorkflowReadParallelSubgraphSchema.optional(),
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
           args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),

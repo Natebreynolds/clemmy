@@ -221,6 +221,16 @@ test('approval picker gives each ambiguous global approval explicit buttons', ()
   assert.equal(rows[1].components[1].custom_id, 'clementine:reject:apr-2222');
 });
 
+test('bare approval selects a card only when exactly one actionable card exists', () => {
+  const one = approvalRow({ approvalId: 'apr-only' });
+  assert.equal(__test__.exactBareApprovalCandidate([one])?.approvalId, 'apr-only');
+  assert.equal(__test__.exactBareApprovalCandidate([]), null);
+  assert.equal(__test__.exactBareApprovalCandidate([
+    one,
+    approvalRow({ approvalId: 'apr-sibling', sessionId: one.sessionId }),
+  ]), null, 'same-session sibling cards are still ambiguous');
+});
+
 test('guardrail_tripped stays internal and does not overwrite Discord status', () => {
   const s = { summary: 'Approval required: create sheet', status: 'approval required', done: true, toolsCalled: [], toolCount: 0 };
   applyEventToState(event('guardrail_tripped', { name: 'guardrail' }), s);
@@ -229,12 +239,12 @@ test('guardrail_tripped stays internal and does not overwrite Discord status', (
   assert.equal(s.done, true);
 });
 
-test('awaiting_user_input promotes the question to the summary and marks done', () => {
+test('awaiting_user_input updates the question but waits for the committed terminal', () => {
   const s = freshState();
   applyEventToState(event('awaiting_user_input', { question: 'which environment?' }), s);
   assert.equal(s.summary, 'which environment?');
   assert.equal(s.status, 'awaiting reply');
-  assert.equal(s.done, true);
+  assert.equal(s.done, false);
 });
 
 test('conversation_completed promotes summary, marks done, "complete" status', () => {
@@ -311,12 +321,10 @@ test('conversation_completed legacy limit_exceeded remains continuable', () => {
   assert.equal(s.done, true);
 });
 
-test('run_failed shows the error and marks done', () => {
-  const s = freshState();
-  applyEventToState(event('run_failed', { error: 'composio catalog timeout' }), s);
-  assert.match(s.summary, /composio catalog timeout/);
-  assert.equal(s.status, 'failed');
-  assert.equal(s.done, true);
+test('run_failed stays private and cannot settle or overwrite Discord copy', () => {
+  const s = { summary: 'Still working safely', status: 'working', done: false, toolsCalled: [], toolCount: 0 };
+  applyEventToState(event('run_failed', { error: 'provider bearer-secret-123' }), s);
+  assert.deepEqual(s, { summary: 'Still working safely', status: 'working', done: false, toolsCalled: [], toolCount: 0 });
 });
 
 test('conversation_limit_exceeded surfaces the reason without closing before the continue reply', () => {

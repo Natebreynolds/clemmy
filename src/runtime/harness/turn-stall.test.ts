@@ -349,10 +349,10 @@ test('disablePreContentRetry (approval-resume): a pre-content stall does NOT rep
   assert.equal(call, 1, 'the approved-tool RunState was NOT replayed');
 });
 
-test('a superseded (stalled) attempt does NOT stream its late tokens into the live retry (no garble)', async () => {
-  // The race that produced garbled output ("importportance") on a recovered
-  // heavy Claude turn: the stalled attempt's stream delivers a late token RIGHT
-  // as the retry begins, and both fed the same onChunk → interleaved SSE.
+test('provider deltas remain private across a stalled attempt and its live retry', async () => {
+  // A superseded attempt may still produce late tokens while the retry runs.
+  // Neither attempt has publication authority; the retry's private buffer alone
+  // may contribute to the eventual typed terminal outcome.
   let signalRetry!: () => void;
   const retryStarted = new Promise<void>((r) => { signalRetry = r; });
   const stale = {
@@ -381,7 +381,7 @@ test('a superseded (stalled) attempt does NOT stream its late tokens into the li
     { onChunk: (d: string) => { chunks.push(d); } } as never,
   );
   assert.deepEqual(out.finalOutput, { ok: true }, 'the live retry won');
-  assert.deepEqual(chunks, ['GOOD'], "the superseded attempt's late STALE token must be suppressed");
+  assert.deepEqual(chunks, [], 'raw provider output never reaches a user callback');
 });
 
 test('an authoritative normal attempt can mutate exactly once through the dispatch lease', async () => {

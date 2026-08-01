@@ -48,6 +48,7 @@ import {
   clearKill,
   createSession,
   finishRunAttempt,
+  getLatestRunAttempt,
   getLatestRunAttemptByRunId,
   getSession,
   listEvents,
@@ -73,8 +74,39 @@ import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import { actionBus } from '../action-bus.js';
 import type { AssistantRequest, AssistantResponse, AssistantRouteDiagnostics, ToolActivity } from '../../types.js';
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
+import {
+  PUBLIC_RUN_FAILURE_TEXT,
+  publicCompletionText,
+  publicReplyText,
+} from './public-presentation.js';
+import { commitTurnOutcome } from './delivery-committer.js';
+import {
+  presentationEventFromCompletionData,
+  turnOutcomeId,
+  type PresentationEvent,
+  type TurnIdentity,
+} from './turn-outcome.js';
+import { markRunInFlight } from './restart-recovery.js';
+import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
 
 export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow' | 'discord' | 'slack';
+
+function observeAcceptedBridgeTurnGraph(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+  source: EventRow,
+): void {
+  recordTurnGraphShadow({
+    identity: {
+      sessionId: request.sessionId,
+      turn: source.turn,
+      sourceUserSeq: source.seq,
+    },
+    surface,
+    allowedToolNames: request.allowedToolNames,
+    excludedToolNames: request.excludeToolNames,
+  });
+}
 
 /** Every surface runs on the gated harness loop by default (the FORK is dead as
  *  of v1.4.0). Each keeps a per-surface kill-switch (CLEMMY_HARNESS_<SURFACE>=off)
@@ -92,46 +124,6 @@ export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashbo
 const HARNESS_FILTERABLE_TOOLS: ReadonlySet<string> = new Set(LOCAL_MCP_TOOL_NAMES as readonly string[]);
 function harnessCanEnforceExcludes(names: string[] | undefined): boolean {
   return nonFilterableToolExcludes(names, HARNESS_FILTERABLE_TOOLS).length === 0;
-}
-
-const REUSE_USER_INPUT_TERMINALS = new Set<string>([
-  'conversation_completed',
-  'conversation_limit_exceeded',
-  'run_completed',
-  'run_failed',
-  'run_cancelled',
-  'run_paused',
-  'awaiting_user_input',
-  'approval_requested',
-]);
-
-export function hasReusableRecordedUserInput(sessionId: string, text: string, runId?: string): boolean {
-  try {
-    // The attempt binding is the durable identity of this accepted turn. It
-    // remains valid when the runtime prompt is transformed (/goal,
-    // attachments, continuation) and after the first brain writes a terminal
-    // event before a safe provider fallover. Text is only a legacy fallback.
-    const boundAttempt = runId?.trim()
-      ? getLatestRunAttemptByRunId(sessionId, runId.trim())
-      : null;
-    if (boundAttempt?.sourceUserSeq) return true;
-
-    const expected = text.trim();
-    if (!expected) return false;
-    const recent = listEvents(sessionId).slice(-12);
-    let matchSeq = -1;
-    for (const event of recent) {
-      if (event.type !== 'user_input_received') continue;
-      const got = typeof (event.data as { text?: unknown })?.text === 'string'
-        ? ((event.data as { text?: string }).text ?? '').trim()
-        : '';
-      if (got === expected) matchSeq = event.seq;
-    }
-    if (matchSeq < 0) return false;
-    return !recent.some((event) => event.seq > matchSeq && REUSE_USER_INPUT_TERMINALS.has(event.type));
-  } catch {
-    return false;
-  }
 }
 
 /** Interactive chat lanes get the objective-completion judge (parity with
@@ -194,13 +186,48 @@ function legacyRespondFallbackEnabled(): boolean {
   return raw === 'on' || raw === '1' || raw === 'true' || raw === 'yes';
 }
 
+async function runLegacyBreakGlass(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+  legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
+): Promise<AssistantResponse> {
+  const {
+    onChunk: _rawChunk,
+    onReasoning: _rawReasoning,
+    onToolActivity,
+    ...baseRequest
+  } = request;
+  const safeRequest: AssistantRequest = {
+    ...baseRequest,
+    ...(onToolActivity
+      ? {
+          onToolActivity: (activity: ToolActivity) => onToolActivity({
+            toolName: activity.toolName,
+            input: {},
+          }),
+        }
+      : {}),
+  };
+  const response = await legacyRespond(safeRequest);
+  return withRouteDiagnostics({
+    ...response,
+    text: publicReplyText(
+      response.text,
+      'I could not produce a safe final answer for that turn. Please ask me to try again.',
+    ),
+  }, routeForLegacyFallback(surface, request));
+}
+
 function blockedPreRunResponse(
   surface: HarnessSurface,
   request: AssistantRequest,
-  reason: string,
+  userText: string,
   details?: Record<string, unknown>,
 ): AssistantResponse {
   const route = routeForHarness(surface, request);
+  let committedText = PUBLIC_RUN_FAILURE_TEXT;
+  let terminalCommitted = false;
+  let preflightAttempt: ReturnType<typeof beginRunAttempt> | null = null;
   try {
     const code = typeof details?.reason === 'string' && details.reason.trim()
       ? details.reason.trim().replace(/[^a-z0-9_-]+/gi, '_').toLowerCase()
@@ -209,7 +236,7 @@ function blockedPreRunResponse(
       id: `respond_bridge_${code}`,
       state: 'unavailable',
       summary: 'Respond bridge preflight blocked a harness run before model or tool work started.',
-      reason: `${surface}: ${reason}`,
+      reason: `${surface}: ${code}`,
       sessionId: request.sessionId,
       details: {
         surface,
@@ -219,15 +246,66 @@ function blockedPreRunResponse(
         ...details,
       },
     });
+
+    if (!getSession(request.sessionId)) {
+      const config = SURFACE_CONFIG[surface];
+      const titleSeed = (request.displayMessage ?? request.message).trim().replace(/\s+/g, ' ');
+      createSession({
+        id: request.sessionId,
+        kind: config.kind,
+        channel: request.channel,
+        userId: request.userId,
+        title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
+        metadata: { source: `bridge:${surface}` },
+      });
+    }
+    preflightAttempt = beginRunAttempt(request.sessionId, { runId: request.runId });
+    const sourceUserEvent = recordRunAttemptUserInput(preflightAttempt, {
+      turn: 1,
+      role: 'user',
+      data: {
+        text: request.displayMessage ?? request.message,
+        ...(request.runId ? { runId: request.runId } : {}),
+        attemptId: preflightAttempt.attemptId,
+        source: `bridge:${surface}`,
+      },
+    }, { existingEventSeq: request.sourceUserSeq, armRunInFlight: true });
+    observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+    // recordRunAttemptUserInput atomically accepted this source and armed
+    // restart ownership. A failed terminal therefore cannot become live-only.
+    const identity: TurnIdentity = {
+      sessionId: request.sessionId,
+      turn: sourceUserEvent.turn,
+      sourceUserSeq: sourceUserEvent.seq,
+    };
+    committedText = commitTurnOutcomeImpl({
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'blocked',
+      resumable: true,
+      presentation: { kind: 'blocked', text: userText },
+    }, {
+      legacyReason: code,
+      metadata: { transport: 'harness_preflight_block' },
+    }).presentation.text;
+    terminalCommitted = true;
+    markRunInFlight(request.sessionId, false);
   } catch {
-    // Health telemetry is advisory; never change the preflight response.
+    // Stable failure copy only. The proposed block text is not deliverable
+    // without its durable terminal, and the in-flight marker remains armed.
+  } finally {
+    if (preflightAttempt) {
+      try { finishRunAttempt(preflightAttempt, 'failed'); } catch { /* best effort */ }
+    }
   }
   return withRouteDiagnostics({
-    text: reason,
+    text: committedText,
     sessionId: request.sessionId,
     stoppedReason: 'error',
     raw: {
       blockedBy: 'harness_preflight',
+      terminalCommitted,
       surface,
       ...details,
     },
@@ -276,23 +354,27 @@ type BuildAgentFn = typeof buildOrchestratorAgent;
 type ConfigureFn = typeof configureHarnessRuntime;
 type ClaudeAgentBrainFn = typeof respondViaClaudeAgentSdkBrain;
 type RecoveryListEventsFn = typeof listEvents;
+type CommitTurnOutcomeFn = typeof commitTurnOutcome;
 let runConversationImpl: RunConversationFn = runConversation;
 let buildAgentImpl: BuildAgentFn = buildOrchestratorAgent;
 let configureImpl: ConfigureFn = configureHarnessRuntime;
 let claudeAgentBrainImpl: ClaudeAgentBrainFn = respondViaClaudeAgentSdkBrain;
 let recoveryListEventsImpl: RecoveryListEventsFn = listEvents;
+let commitTurnOutcomeImpl: CommitTurnOutcomeFn = commitTurnOutcome;
 export function _setBridgeImplsForTests(impls: {
   runConversation?: RunConversationFn | null;
   buildAgent?: BuildAgentFn | null;
   configure?: ConfigureFn | null;
   claudeAgentBrain?: ClaudeAgentBrainFn | null;
   recoveryListEvents?: RecoveryListEventsFn | null;
+  commitTurnOutcome?: CommitTurnOutcomeFn | null;
 }): void {
   runConversationImpl = impls.runConversation ?? runConversation;
   buildAgentImpl = impls.buildAgent ?? buildOrchestratorAgent;
   configureImpl = impls.configure ?? configureHarnessRuntime;
   claudeAgentBrainImpl = impls.claudeAgentBrain ?? respondViaClaudeAgentSdkBrain;
   recoveryListEventsImpl = impls.recoveryListEvents ?? listEvents;
+  commitTurnOutcomeImpl = impls.commitTurnOutcome ?? commitTurnOutcome;
 }
 
 /** Poll cadence for mapping the legacy `shouldCancel` callback onto the
@@ -303,22 +385,6 @@ function objectRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
-function toolActivityInput(value: unknown): Record<string, unknown> {
-  if (value == null) return {};
-  if (typeof value === 'string') {
-    if (!value.trim()) return {};
-    try {
-      const parsed = JSON.parse(value);
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? parsed as Record<string, unknown>
-        : { value };
-    } catch {
-      return { value };
-    }
-  }
-  return objectRecord(value);
-}
-
 function toolActivityFromHarnessEvent(event: EventRow): ToolActivity | null {
   // Native SDK calls also emit a transport-mirror row from the inner MCP
   // wrapper. That row remains durable audit evidence, but forwarding it would
@@ -327,8 +393,9 @@ function toolActivityFromHarnessEvent(event: EventRow): ToolActivity | null {
   const data = objectRecord(event.data);
   const rawName = data.tool ?? data.toolName;
   const toolName = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : 'unknown_tool';
-  const rawArgs = data.arguments ?? data.args ?? data.input;
-  return { toolName, input: toolActivityInput(rawArgs) };
+  // Activity is presentation, not execution replay. Commands, queries, paths,
+  // URLs, and provider arguments remain on the private harness.event plane.
+  return { toolName, input: {} };
 }
 
 function reasoningProgressFromHarnessEvent(event: EventRow): string | null {
@@ -349,7 +416,7 @@ function reasoningProgressFromHarnessEvent(event: EventRow): string | null {
 function attachLegacyProgressRelay(request: AssistantRequest): () => void {
   if (!request.onToolActivity && !request.onReasoning) return () => {};
   return actionBus.subscribe((event) => {
-    if (event.kind !== 'harness.event') return;
+    if (event.kind !== 'harness.public_event') return;
     if (event.sessionId !== request.sessionId) return;
     if (request.onToolActivity) {
       const activity = toolActivityFromHarnessEvent(event.event);
@@ -378,10 +445,12 @@ function awaitingQuestionText(sessionId: string): string | null {
     const [ev] = listEvents(sessionId, { types: ['awaiting_user_input'], limit: 1, desc: true });
     if (!ev) return null;
     const data = ev.data as { question?: unknown; options?: unknown };
-    const question = typeof data.question === 'string' ? data.question.trim() : '';
+    const question = publicReplyText(data.question, '');
     if (!question) return null;
     const options = Array.isArray(data.options)
-      ? (data.options as unknown[]).filter((o): o is string => typeof o === 'string' && o.trim().length > 0)
+      ? (data.options as unknown[])
+        .map((option) => publicReplyText(option, ''))
+        .filter((option): option is string => option.length > 0)
       : [];
     if (options.length === 0) return question;
     const numbered = options.map((o, i) => `${i + 1}. ${o}`).join('\n');
@@ -403,16 +472,225 @@ export function synthesizeCompletedWorkReport(sessionId: string, afterSeq?: numb
   return synthesizeTurnReport(sessionId, afterSeq);
 }
 
+function commitRecoveryCandidateTerminal(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  sourceTurn: number;
+  steps: number;
+  completedReason: 'no_structured_output' | 'sub_agent_stalled';
+}): string {
+  const identity: TurnIdentity = {
+    sessionId: input.sessionId,
+    turn: Math.max(0, Math.trunc(input.sourceTurn)),
+    sourceUserSeq: input.sourceUserSeq,
+  };
+  const completedWork = synthesizeCompletedWorkReport(input.sessionId, input.sourceUserSeq);
+  const text = completedWork || (input.completedReason === 'no_structured_output'
+    ? 'I could not produce a safe final answer for that turn. Please ask me to try again.'
+    : 'I could not complete that run safely. Please ask me to continue from the recorded state.');
+  const committed = commitTurnOutcomeImpl({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'blocked',
+    resumable: true,
+    presentation: { kind: 'blocked', text },
+  }, {
+    legacyReason: input.completedReason,
+    metadata: { steps: input.steps },
+  });
+  markRunInFlight(input.sessionId, false);
+  return committed.presentation.text;
+}
+
+interface AcceptedRecoveryTurn {
+  attempt: {
+    sessionId: string;
+    attemptId: string;
+    runId: string | null;
+    startedAt: string;
+  };
+  sourceUserSeq: number;
+  sourceTurn: number;
+}
+
+function logicalTurnIdentity(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  sourceTurn: number;
+}): TurnIdentity {
+  return {
+    sessionId: input.sessionId,
+    turn: Math.max(0, Math.trunc(input.sourceTurn)),
+    sourceUserSeq: input.sourceUserSeq,
+  };
+}
+
+/** Resolve the exact accepted event owned by the failed Claude request. In
+ * production the SDK brain has already bound it atomically; the insert path is
+ * the pre-dispatch-failure fallback and still binds before publication. */
+function ensureAcceptedRecoveryTurn(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+): AcceptedRecoveryTurn {
+  const displayMessage = request.displayMessage ?? request.message;
+  if (!getSession(request.sessionId)) {
+    const config = SURFACE_CONFIG[surface];
+    const titleSeed = displayMessage.trim().replace(/\s+/g, ' ');
+    createSession({
+      id: request.sessionId,
+      kind: config.kind,
+      channel: request.channel,
+      userId: request.userId,
+      title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
+      metadata: { source: `bridge:recovery:${surface}` },
+    });
+  }
+  const requestedSource = Number.isSafeInteger(request.sourceUserSeq) && Number(request.sourceUserSeq) > 0
+    ? listEvents(request.sessionId, {
+        sinceSeq: Number(request.sourceUserSeq) - 1,
+        types: ['user_input_received'],
+        limit: 1,
+      }).find((event) => event.seq === Number(request.sourceUserSeq))
+    : undefined;
+  if (request.sourceUserSeq !== undefined && !requestedSource) {
+    throw new Error(`Accepted user event ${request.sourceUserSeq} is missing from session ${request.sessionId}.`);
+  }
+  const candidate = request.runId?.trim()
+    ? getLatestRunAttemptByRunId(request.sessionId, request.runId.trim())
+    : getLatestRunAttempt(request.sessionId);
+  const existing = candidate && (!requestedSource || candidate.sourceUserSeq === requestedSource.seq)
+    ? candidate
+    : null;
+  const attempt = existing
+    ? {
+        sessionId: existing.sessionId,
+        attemptId: existing.attemptId,
+        runId: existing.runId,
+        startedAt: existing.startedAt,
+      }
+    : beginRunAttempt(request.sessionId, { runId: requestedSource ? undefined : request.runId });
+  const source = requestedSource ?? (existing?.sourceUserSeq
+    ? listEvents(request.sessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === existing.sourceUserSeq)
+    : null);
+  const sourceUserEvent = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: {
+      text: displayMessage,
+      ...(request.runId ? { runId: request.runId } : {}),
+      attemptId: attempt.attemptId,
+      source: 'bridge:recovery',
+    },
+  }, { existingEventSeq: source?.seq, armRunInFlight: true });
+  observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+  return { attempt, sourceUserSeq: sourceUserEvent.seq, sourceTurn: sourceUserEvent.turn };
+}
+
+function exactTerminalForSource(sessionId: string, sourceUserSeq: number): EventRow | null {
+  const logicalKey = `turn:${sourceUserSeq}`;
+  return listEvents(sessionId, { types: ['conversation_completed'], desc: true })
+    .find((event) => event.data.terminalKey === logicalKey
+      || event.data.sourceUserSeq === sourceUserSeq
+      || (event.data.presentation as { identity?: { sourceUserSeq?: unknown } } | undefined)
+        ?.identity?.sourceUserSeq === sourceUserSeq)
+    ?? null;
+}
+
+function stoppedReasonForPresentation(
+  presentation: PresentationEvent,
+): NonNullable<AssistantResponse['stoppedReason']> {
+  if (presentation.status === 'done') return 'success';
+  if (presentation.status === 'cancelled') return 'cancelled';
+  if (presentation.status !== 'needs_input') return 'error';
+  if (presentation.needs?.kind === 'approval') return 'pending-approval';
+  if (presentation.needs?.kind === 'continue') return 'max-turns-with-grace';
+  return 'awaiting-input';
+}
+
+function responseForCommittedTerminal(
+  event: EventRow,
+  extraRaw?: Record<string, unknown>,
+): AssistantResponse {
+  let presentation: PresentationEvent | null = null;
+  try { presentation = presentationEventFromCompletionData(event.data); } catch { presentation = null; }
+  const text = presentation?.text ?? publicCompletionText(event.data, PUBLIC_RUN_FAILURE_TEXT);
+  return {
+    text,
+    sessionId: event.sessionId,
+    stoppedReason: presentation ? stoppedReasonForPresentation(presentation) : 'error',
+    turnsUsed: event.turn,
+    ...(presentation?.approvalId ? { pendingApprovalId: presentation.approvalId } : {}),
+    ...(extraRaw ? { raw: extraRaw } : {}),
+  };
+}
+
+function commitBridgeBlockedTerminal(input: {
+  request: AssistantRequest;
+  turn: AcceptedRecoveryTurn;
+  text: string;
+  reason: string;
+  metadata?: Record<string, unknown>;
+}): EventRow {
+  const identity = logicalTurnIdentity({
+    sessionId: input.request.sessionId,
+    sourceUserSeq: input.turn.sourceUserSeq,
+    sourceTurn: input.turn.sourceTurn,
+  });
+  const committed = commitTurnOutcomeImpl({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'blocked',
+    resumable: true,
+    presentation: { kind: 'blocked', text: input.text },
+  }, {
+    legacyReason: input.reason,
+    metadata: input.metadata,
+  });
+  markRunInFlight(input.request.sessionId, false);
+  return committed.event;
+}
+
+function commitBridgeFailedTerminal(input: {
+  request: AssistantRequest;
+  turn: AcceptedRecoveryTurn;
+  reason: string;
+  transport: string;
+}): EventRow {
+  const identity = logicalTurnIdentity({
+    sessionId: input.request.sessionId,
+    sourceUserSeq: input.turn.sourceUserSeq,
+    sourceTurn: input.turn.sourceTurn,
+  });
+  const committed = commitTurnOutcomeImpl({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'failed',
+    resumable: false,
+    presentation: { kind: 'error', text: PUBLIC_RUN_FAILURE_TEXT },
+  }, {
+    legacyReason: input.reason,
+    metadata: { transport: input.transport },
+  });
+  markRunInFlight(input.request.sessionId, false);
+  return committed.event;
+}
+
 export async function respondViaHarness(
   surface: HarnessSurface,
   request: AssistantRequest,
-  opts: { reuseRecordedUserInput?: boolean; modelOverride?: string } = {},
+  opts: { reuseRecordedUserInput?: boolean; sourceUserSeq?: number; modelOverride?: string } = {},
 ): Promise<AssistantResponse> {
   const config = SURFACE_CONFIG[surface];
   const sessionId = request.sessionId;
+  const acceptedSourceUserSeq = opts.sourceUserSeq ?? request.sourceUserSeq;
+  const displayMessage = request.displayMessage ?? request.message;
 
   if (!getSession(sessionId)) {
-    const titleSeed = request.message.trim().replace(/\s+/g, ' ');
+    const titleSeed = displayMessage.trim().replace(/\s+/g, ' ');
     createSession({
       id: sessionId,
       kind: config.kind,
@@ -432,12 +710,16 @@ export async function respondViaHarness(
     turn: 1,
     role: 'user',
     data: {
-      text: request.message,
+      text: displayMessage,
+      ...(displayMessage !== request.message ? { modelDirectiveApplied: true } : {}),
       ...(request.runId ? { runId: request.runId } : {}),
       attemptId: requestAttempt.attemptId,
       source: `bridge:${surface}`,
     },
-  });
+  }, { existingEventSeq: acceptedSourceUserSeq, armRunInFlight: true });
+  observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+  // Source binding and the chat recovery marker committed atomically above, so
+  // failures while building the agent/tool surface remain restart-recoverable.
   preserveCurrentKillAndClearStale(sessionId, requestAttempt);
 
   let cancelledByCaller = false;
@@ -516,12 +798,16 @@ export async function respondViaHarness(
         },
       });
     } catch { /* telemetry only */ }
-    // Baseline for the parse-exhaustion recovery gate below: a rerun on another
-    // brain is only safe when THIS run committed no external write (the same
-    // invariant as the step-boundary canSwitch guard in loop.ts). The
-    // duplicate-send wall is a second line of defense, not the gate.
-    let extWritesBeforeRun = 0;
-    try { extWritesBeforeRun = listEvents(sessionId, { types: ['external_write'] }).length; } catch { /* fail-open to 0 */ }
+    // Parse-exhaustion recovery uses the same fail-closed lifecycle ledger as
+    // Claude whole-turn fallover. A count of legacy success rows is not enough:
+    // succeeded/orphaned settlements and an unreadable ledger must also forbid
+    // replay, while an exact proven-no-dispatch failure may compensate only its
+    // own reservation.
+    const parseRecoveryBaseline = captureRecoveryLedgerBaseline(sessionId);
+    // Raw executor output is private regardless of its textual shape. In
+    // particular, a model-authored {"reply":"..."} envelope is still only a
+    // proposal: retries, judges, and effect verification can replace it. The
+    // terminal TurnOutcome committer publishes the authoritative presentation.
     const result = await runConversationImpl({
       agent,
       sessionId,
@@ -539,7 +825,6 @@ export async function respondViaHarness(
         request.acceptStructuredNoToolResult === true
         && Array.isArray(request.allowedToolNames)
         && request.allowedToolNames.length === 0,
-      onChunk: request.onChunk,
       reuseRecordedUserInput: true,
       falloverModelIds: fallover.falloverModelIds,
       rebuildAgentForBrain: fallover.rebuildAgentForBrain,
@@ -550,10 +835,8 @@ export async function respondViaHarness(
         ? 'failed'
         : 'completed';
 
-    const replyText =
-      (result.lastDecision?.reply && result.lastDecision.reply.trim())
-        ? result.lastDecision.reply
-        : (result.lastDecision?.summary ?? '');
+    const replyText = publicReplyText(result.publicPresentation?.text, '')
+      || publicReplyText(result.lastDecision?.reply, '');
 
     switch (result.status) {
       case 'completed': {
@@ -569,13 +852,41 @@ export async function respondViaHarness(
         // honest apology ships and the user decides; the duplicate-send wall
         // remains as defense-in-depth, not the primary gate.
         if (result.completedReason === 'no_structured_output' && !opts.modelOverride && chatBrainFalloverEnabled()) {
-          let extWritesDuringRun = 0;
-          try {
-            extWritesDuringRun = Math.max(0, listEvents(sessionId, { types: ['external_write'] }).length - extWritesBeforeRun);
-          } catch { /* fail-open to 0 — the send wall still protects the rerun */ }
-          if (extWritesDuringRun > 0) {
-            bridgeLogger.warn({ surface, extWritesDuringRun },
-              'parse-exhaustion recovery SKIPPED — this run committed external write(s); not re-running another brain over side effects');
+          const recoveryCheck = checkRecoveryLedger(sessionId, parseRecoveryBaseline);
+          if (!recoveryCheck.safeToRerun) {
+            bridgeLogger.warn({ surface, recoverySkipped: recoveryCheck.reason },
+              'parse-exhaustion recovery skipped because the attempt is not proven write-free');
+            const recorded = recoveryCheck.reason === 'external_write'
+              ? synthesizeWorkReport(recoveryCheck.evidence)?.replace(
+                  /^I finished — here's what I did this turn:/,
+                  'Before the brain stopped, the action ledger recorded:',
+                )
+              : null;
+            const hasConfirmedWrite = recoveryCheck.reason === 'external_write'
+              && recoveryCheck.evidence.some((event) => event.type === 'external_write_succeeded'
+                || (event.type === 'external_write' && event.data.preDispatch !== true));
+            const blockedText = recoveryCheck.reason === 'external_write'
+              ? `${recorded ?? (hasConfirmedWrite
+                  ? 'The action ledger recorded a successful external write before the brain stopped.'
+                  : 'The action ledger recorded an external write attempt with an unresolved outcome.')}\n\nI did not rerun the task on another model because that could repeat or conflict with the external action.`
+              : 'The first brain stopped before it produced a safe final answer. I could not verify the external-write ledger for that attempt, so I did not rerun the task on another model.';
+            const terminal = commitBridgeBlockedTerminal({
+              request,
+              turn: {
+                attempt: requestAttempt,
+                sourceUserSeq: sourceUserEvent.seq,
+                sourceTurn: sourceUserEvent.turn,
+              },
+              text: blockedText,
+              reason: recoveryCheck.reason === 'external_write'
+                ? 'parse_recovery_external_write'
+                : 'parse_recovery_ledger_unreadable',
+              metadata: { steps: result.steps },
+            });
+            return withRouteDiagnostics(
+              responseForCommittedTerminal(terminal, { recoverySkipped: recoveryCheck.reason }),
+              routeForHarness(surface, request, opts.modelOverride),
+            );
           } else try {
             const usedModel = modelForRun ?? resolveRoleModel('brain').modelId;
             const currentBrain = providerFor(usedModel) as BrainProviderClass | undefined;
@@ -584,14 +895,13 @@ export async function respondViaHarness(
             if (next) {
               bridgeLogger.warn({ surface, currentBrain, recoveryModel: next.modelId },
                 'harness brain exhausted structured-decision retries — re-running the turn once on the next brain instead of shipping the apology');
-              // Mark the parse-exhausted conversation_completed as superseded BEFORE the
-              // re-run so the desktop transcript reconstruction can skip the internal
-              // apology turn (the recovered reply is the ONE final answer the user sees).
-              try {
-                appendEvent({ sessionId, turn: 0, role: 'system', type: 'conversation_superseded', data: { reason: 'no_structured_output', recoveryModel: next.modelId, supersededAt: (replyText || '').slice(0, 240) } });
-              } catch { /* transcript hygiene only — never block the recovery hop */ }
+              // A retry is a fresh physical attempt, never a reopened execution
+              // receipt. Settle this dead attempt first, then bind the new one to
+              // the same exact accepted user event.
+              try { finishRunAttempt(requestAttempt, 'superseded'); } catch { /* the new begin still validates its source binding */ }
               const recovered = await respondViaHarness(surface, request, {
-                reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message, request.runId),
+                reuseRecordedUserInput: true,
+                sourceUserSeq: sourceUserEvent.seq,
                 modelOverride: next.modelId,
               });
               const route = routeDiagnosticsFromResponse(recovered);
@@ -601,6 +911,21 @@ export async function respondViaHarness(
             bridgeLogger.warn({ surface, err: falloverErr instanceof Error ? falloverErr.message : String(falloverErr) },
               'parse-exhaustion fallover failed — shipping the original completion');
           }
+        }
+        if (result.completedReason) {
+          const text = commitRecoveryCandidateTerminal({
+            sessionId,
+            sourceUserSeq: sourceUserEvent.seq,
+            sourceTurn: sourceUserEvent.turn,
+            steps: result.steps,
+            completedReason: result.completedReason,
+          });
+          return withRouteDiagnostics({
+            text,
+            sessionId,
+            stoppedReason: 'error',
+            turnsUsed: result.lastTurn,
+          }, routeForHarness(surface, request, opts.modelOverride));
         }
         return withRouteDiagnostics({
           // ALWAYS REPORT BACK: if the model produced no reply text but the turn
@@ -673,6 +998,41 @@ export async function respondViaHarness(
       default:
         throw new Error(result.error || `harness run ${result.status}`);
     }
+  } catch (err) {
+    if (err instanceof AgentRuntimeCancelledError) throw err;
+    requestAttemptStatus = 'failed';
+    // A hard provider/runtime error is reduced at the same durable public
+    // boundary as every other terminal. Raw exception text remains in private
+    // logs; if an exact terminal already committed, idempotency returns that
+    // authoritative winner rather than overwriting it with a failure.
+    try {
+      const terminal = commitBridgeFailedTerminal({
+        request,
+        turn: {
+          attempt: requestAttempt,
+          sourceUserSeq: sourceUserEvent.seq,
+          sourceTurn: sourceUserEvent.turn,
+        },
+        reason: 'bridge_runtime_failed',
+        transport: 'openai_agents_harness',
+      });
+      const response = responseForCommittedTerminal(terminal, {
+        failure: 'bridge_runtime_failed',
+      });
+      if (response.stoppedReason !== 'error') {
+        requestAttemptStatus = 'completed';
+      }
+      return withRouteDiagnostics(response, routeForHarness(surface, request, opts.modelOverride));
+    } catch (commitErr) {
+      bridgeLogger.error({
+        surface,
+        err: commitErr instanceof Error ? commitErr.message : String(commitErr),
+      }, 'could not durably reduce harness runtime failure');
+      // A corrupt or unavailable terminal ledger is a hard failure, but its
+      // parser/DB detail is private. Do not reinterpret the malformed row as a
+      // legacy reply and do not expose its contents through the transport.
+      throw new Error(PUBLIC_RUN_FAILURE_TEXT);
+    }
   } finally {
     detachProgressRelay();
     if (cancelPoll) clearInterval(cancelPoll);
@@ -697,12 +1057,12 @@ export async function respondPreferHarness(
   if (!harnessSurfaceEnabled(surface)) {
     if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, reason: 'surface_disabled' }, 'explicit legacy respond fallback engaged');
-      return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+      return runLegacyBreakGlass(surface, request, legacyRespond);
     }
     return blockedPreRunResponse(
       surface,
       request,
-      `The ${surface} harness lane is disabled by configuration, so I did not start the run. Re-enable CLEMMY_HARNESS_${surface.toUpperCase()} or set CLEMMY_LEGACY_RESPOND_FALLBACK=on only as a deliberate emergency rollback.`,
+      'That runtime lane is temporarily unavailable, so I did not start the turn. Check runtime settings or try again.',
       { reason: 'surface_disabled' },
     );
   }
@@ -714,13 +1074,13 @@ export async function respondPreferHarness(
   if (!harnessCanEnforceExcludes(request.excludeToolNames)) {
     if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, excludeToolNames: request.excludeToolNames, reason: 'non_filterable_excludes' }, 'explicit legacy respond fallback engaged');
-      return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+      return runLegacyBreakGlass(surface, request, legacyRespond);
     }
     const unsafe = nonFilterableToolExcludes(request.excludeToolNames, HARNESS_FILTERABLE_TOOLS);
     return blockedPreRunResponse(
       surface,
       request,
-      `I did not start this run because the requested tool exclusions cannot be enforced by the harness: ${unsafe.join(', ')}. Remove those exclusions or route the task through a scoped harness tool surface.`,
+      'I could not start this turn because its requested tool boundary is not supported. Please use a scoped tool surface or adjust the request.',
       { reason: 'non_filterable_excludes', excludeToolNames: request.excludeToolNames, nonFilterableExcludes: unsafe },
     );
   }
@@ -733,12 +1093,12 @@ export async function respondPreferHarness(
   if (!auth.ok) {
     if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, reason: 'harness_auth_unavailable', authReason: auth.reason }, 'explicit legacy respond fallback engaged');
-      return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+      return runLegacyBreakGlass(surface, request, legacyRespond);
     }
     return blockedPreRunResponse(
       surface,
       request,
-      `I could not start the harness because the model runtime is not configured: ${auth.reason ?? 'unknown auth/configuration error'}. Open Settings > Models and connect Codex, Claude, or a BYO model.`,
+      'I could not start this turn because no model runtime is connected. Open Settings > Models, connect a model, and try again.',
       { reason: 'harness_auth_unavailable', authReason: auth.reason },
     );
   }
@@ -779,13 +1139,44 @@ export async function respondPreferHarness(
     } catch (err) {
       const recovered = await recoverChatBrainFailure(surface, request, err, detach, recoveryBaseline);
       if (recovered) return recovered;
-      // Narration give-up with no fallover available: the error's message IS the
-      // graceful user-facing copy — ship it as a normal reply, never a raw error
-      // (zero tools ran; there is nothing to report as failed).
-      if (err instanceof Error && (err as { narrationGiveUp?: boolean }).narrationGiveUp === true) {
-        return { text: err.message } as AssistantResponse;
+      try {
+        const turn = ensureAcceptedRecoveryTurn(surface, request);
+        if (err instanceof Error && (err as { narrationGiveUp?: boolean }).narrationGiveUp === true) {
+          const terminal = commitBridgeBlockedTerminal({
+            request,
+            turn,
+            text: publicReplyText(
+              err.message,
+              'I could not complete that turn safely. Please ask me to try again.',
+            ),
+            reason: 'narration_giveup',
+            metadata: { transport: 'claude_agent_sdk_brain' },
+          });
+          const response = responseForCommittedTerminal(terminal, {
+            failure: 'narration_giveup',
+            transport: 'claude_agent_sdk_brain',
+          });
+          return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
+        }
+        const terminal = commitBridgeFailedTerminal({
+          request,
+          turn,
+          reason: 'claude_brain_failed',
+          transport: 'claude_agent_sdk_brain',
+        });
+        const response = responseForCommittedTerminal(terminal, {
+          failure: 'claude_brain_failed',
+          transport: 'claude_agent_sdk_brain',
+        });
+        return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
+      } catch (commitErr) {
+        bridgeLogger.error({
+          surface,
+          err: commitErr instanceof Error ? commitErr.message : String(commitErr),
+        }, 'could not durably reduce Claude brain failure');
+        // Raw provider/DB detail must not become a second publication protocol.
+        throw new Error(PUBLIC_RUN_FAILURE_TEXT);
       }
-      throw err;
     } finally {
       detach();
     }
@@ -857,6 +1248,7 @@ function checkRecoveryLedger(
 function blockedWholeTurnRecoveryResponse(
   surface: HarnessSurface,
   request: AssistantRequest,
+  turn: AcceptedRecoveryTurn,
   check: Exclude<RecoveryLedgerCheck, { safeToRerun: true }>,
 ): AssistantResponse {
   const recorded = check.reason === 'external_write'
@@ -868,18 +1260,22 @@ function blockedWholeTurnRecoveryResponse(
   const text = check.reason === 'external_write'
     ? `${recorded ?? 'The action ledger recorded an external write attempt but did not confirm a completed change.'}\n\nClaude stopped before it finished the turn. I did not rerun the task on another model because that could repeat or conflict with the external action.`
     : 'Claude stopped before it finished the turn. I could not verify the external-write ledger for this attempt, so I did not rerun the task on another model. The recovery path made no additional changes.';
-  const response: AssistantResponse = {
+  const terminal = commitBridgeBlockedTerminal({
+    request,
+    turn,
     text,
-    sessionId: request.sessionId,
-    stoppedReason: 'error',
-    raw: {
+    reason: check.reason === 'external_write'
+      ? 'claude_recovery_external_write'
+      : 'claude_recovery_ledger_unreadable',
+    metadata: { transport: 'claude_agent_sdk_brain' },
+  });
+  const response = responseForCommittedTerminal(terminal, {
       recoverySkipped: check.reason,
       transport: 'claude_agent_sdk_brain',
       recordedExternalWrites: check.reason === 'external_write'
         ? check.evidence.filter((event) => event.type === 'external_write').length
         : undefined,
-    },
-  };
+  });
   return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
 }
 
@@ -942,6 +1338,27 @@ export async function recoverChatBrainFailure(
   detach?: () => void,
   recoveryBaseline?: RecoveryLedgerBaseline,
 ): Promise<AssistantResponse | null> {
+  // Resolve logical ownership before checking retry eligibility. A provider can
+  // throw after its terminal committed (for example, a learning hook or local
+  // DB write). That exact terminal is already the answer and must short-circuit
+  // every recovery path, including errors whose provider flags say "committed".
+  let turn: AcceptedRecoveryTurn;
+  try {
+    turn = ensureAcceptedRecoveryTurn(surface, request);
+    const committed = exactTerminalForSource(request.sessionId, turn.sourceUserSeq);
+    if (committed) {
+      markRunInFlight(request.sessionId, false);
+      const response = responseForCommittedTerminal(committed, {
+        recoverySkipped: 'terminal_already_committed',
+        transport: 'claude_agent_sdk_brain',
+      });
+      return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
+    }
+  } catch {
+    // If exact ownership cannot be established, never authorize a rerun. The
+    // caller's generic failure reducer will make one final fail-closed attempt.
+    return null;
+  }
   if (!isChatBrainFalloverEligible(err)) return null;
   const kind = err instanceof ClaudeSdkCapacityExhaustedError ? 'capacity_exhausted'
     : err instanceof ClaudeSdkProviderOverloadError ? 'overload'
@@ -959,17 +1376,25 @@ export async function recoverChatBrainFailure(
       err: err instanceof Error ? err.message : String(err),
     }, 'Claude brain terminal failure — whole-turn recovery skipped because the attempt is not proven write-free');
     detach?.();
-    return blockedWholeTurnRecoveryResponse(surface, request, recoveryCheck);
+    return blockedWholeTurnRecoveryResponse(surface, request, turn, recoveryCheck);
   }
   const recoveryModel = recoveryHarnessModelAfterClaudeFailure();
   bridgeLogger.warn({ surface, kind, recoveryModel, err: err instanceof Error ? err.message : String(err) },
     'Claude brain terminal failure — write-free attempt verified; switching the turn over to a non-Claude harness brain when available');
   detach?.();
   try {
+    // The failed Claude receipt is historical. A recovery uses a new physical
+    // attempt that is bound to the same accepted event and therefore shares the
+    // logical terminal key without reopening the failed attempt.
+    try { finishRunAttempt(turn.attempt, 'superseded'); } catch { /* begin validates the exact source below */ }
     const recovered = await respondViaHarness(surface, request, {
-      reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message, request.runId),
+      reuseRecordedUserInput: true,
+      sourceUserSeq: turn.sourceUserSeq,
       modelOverride: recoveryModel,
     });
+    if (exactTerminalForSource(request.sessionId, turn.sourceUserSeq)) {
+      markRunInFlight(request.sessionId, false);
+    }
     const route = routeDiagnosticsFromResponse(recovered);
     return route ? withRouteDiagnostics(recovered, { ...route, falloverFrom: 'claude_agent_sdk_brain' }) : recovered;
   } catch (falloverErr) {

@@ -25,7 +25,6 @@ import {
   pendingActionApprovalRequiredError,
   pendingNestedToolApprovalRequiredError,
 } from '../runtime/harness/brackets.js';
-import { maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
@@ -559,7 +558,6 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
   | 'sourceUserSeq'
   | 'behaviorScopeId'
   | 'guardrailScopeId'
-  | 'suppressBackgroundOffer'
   | 'recallBudget'
   | 'defaultTimeoutMs'
   | 'turnRecallRunIds'
@@ -576,7 +574,6 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
     ...(parent.sourceUserSeq ? { sourceUserSeq: parent.sourceUserSeq } : {}),
     ...(parent.behaviorScopeId ? { behaviorScopeId: parent.behaviorScopeId } : {}),
     ...(parent.guardrailScopeId ? { guardrailScopeId: parent.guardrailScopeId } : {}),
-    ...(parent.suppressBackgroundOffer ? { suppressBackgroundOffer: true } : {}),
     ...(parent.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
     ...(parent.dispatchLease ? { dispatchLease: parent.dispatchLease } : {}),
     ...(parent.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
@@ -903,10 +900,6 @@ export function buildCodeModeTool() {
     }),
     execute: async ({ program }: { program: string }) => {
       const sessionId = harnessRunContextStorage.getStore()?.sessionId ?? '';
-      // First-contact plan beat (armed at the policy classifier) — the
-      // code-mode program door (2026-07-22 acceptance run took this path).
-      const alignmentBounce = maybeBounceMassExecution(sessionId);
-      if (alignmentBounce.bounce && alignmentBounce.steer) return alignmentBounce.steer;
       const result = await runCodeModeForSession(program, sessionId);
       if (result.ok) {
         return `code-mode program returned (${result.rpcCalls} tool call${result.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(result.value)}${codeModeDistillReSteer(result)}`;

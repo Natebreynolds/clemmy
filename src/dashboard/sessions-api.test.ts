@@ -143,6 +143,71 @@ test('detail hides synthetic outcome turns but keeps real user + assistant turns
   );
 });
 
+test('workflow detail, preview, and search all use the public terminal projection', () => {
+  const privateSentinel = 'PRIVATE_SEARCH_SENTINEL_93';
+  const step = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Projection Flow::only',
+    metadata: { source: 'workflow', workflowName: 'Projection Flow', workflowRunId: 'run-public-projection', stepId: 'only' },
+  });
+  appendEvent({
+    sessionId: step.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      reply: [
+        `summary: ${privateSentinel}`,
+        'reply: Public projection answer.',
+        'done: true',
+        'nextAction: completed',
+        'reason: private reducer state',
+      ].join('\n'),
+      internalSummary: privateSentinel,
+    },
+  });
+
+  const summary = buildUnifiedSessionList({ source: 'workflow', includeArchived: true, limit: 500 })
+    .find((item) => item.title === 'Projection Flow');
+  assert.ok(summary);
+  assert.equal(summary.preview, 'Public projection answer.');
+  assert.deepEqual(
+    getUnifiedSessionDetail(summary.id)?.turns.map((item) => item.text),
+    ['Public projection answer.'],
+  );
+  assert.equal(buildUnifiedSessionList({ q: privateSentinel, includeArchived: true, limit: 500 }).length, 0);
+  assert.equal(
+    buildUnifiedSessionList({ q: 'Public projection answer', includeArchived: true, limit: 500 })
+      .some((item) => item.id === summary.id),
+    true,
+  );
+});
+
+test('legacy desktop detail, preview, and search use the same public projection', () => {
+  const id = 'desktop-public-projection';
+  const privateSentinel = 'PRIVATE_DESKTOP_SEARCH_SENTINEL_41';
+  store.appendTurn(id, turn('user', 'show the public result'));
+  store.appendTurn(id, turn('assistant', [
+    `summary: ${privateSentinel}`,
+    'reply: Public desktop answer.',
+    'done: true',
+    'nextAction: completed',
+    'reason: private legacy reducer state',
+  ].join('\n')));
+
+  const detail = getUnifiedSessionDetail(`desktop:${id}`);
+  assert.ok(detail);
+  assert.deepEqual(detail.turns.map((item) => item.text), ['show the public result', 'Public desktop answer.']);
+  assert.equal(detail.session.preview, 'Public desktop answer.');
+  assert.equal(buildUnifiedSessionList({ q: privateSentinel, includeArchived: true, limit: 500 }).length, 0);
+  assert.equal(
+    buildUnifiedSessionList({ q: 'Public desktop answer', includeArchived: true, limit: 500 })
+      .some((item) => item.id === `desktop:${id}`),
+    true,
+  );
+});
+
 test('detail returns null for unknown / malformed ids', () => {
   assert.equal(getUnifiedSessionDetail('desktop:nope'), null);
   assert.equal(getUnifiedSessionDetail('harness:nope'), null);

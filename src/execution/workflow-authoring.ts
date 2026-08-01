@@ -172,6 +172,10 @@ export function normalizeWorkflowSteps(steps: Array<Partial<WorkflowStepInput> &
       useHarness: optionalBoolean(s.useHarness),
       forEach: optionalString(s.forEach),
       forEachNewOnly: optionalBoolean(s.forEachNewOnly),
+      // Preserve executable topology for the canonical validator. Tool schemas
+      // validate its exact shape; dashboard/file inputs still fail closed in
+      // checkWorkflowForWrite instead of being normalized into a flat step.
+      subgraph: optionalObject<WorkflowStepInput['subgraph']>(s.subgraph),
       deterministic: optionalObject<WorkflowStepInput['deterministic']>(s.deterministic),
       call: optionalObject<WorkflowStepInput['call']>(s.call),
       codifiedFrom: normalizeCodifiedFrom(s),

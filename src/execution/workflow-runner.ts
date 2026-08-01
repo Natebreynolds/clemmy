@@ -235,6 +235,7 @@ import {
   validateWorkflowGraph,
   WORKFLOW_GRAPH_ALLOWED_TOOLS,
   WORKFLOW_GRAPH_ADDITIVE_NODE_MODE,
+  workflowHasReadParallelSubgraph,
   workflowGraphDynamicNodeIdError,
   type WorkflowGraphDefinition,
   type WorkflowGraphNode,
@@ -2143,6 +2144,39 @@ function claudeIsActiveWorkflowBrain(): boolean {
 function resolveWorkflowStepModel(step: WorkflowStepInput, workflow?: WorkflowDefinition): WorkflowStepModelRoute {
   const explicit = step.model || undefined;
   if (explicit) return { model: explicit };
+  if (isGraphRuntimeSpecialist(step)) {
+    // Compiled specialists are worker nodes, not miniature brains. Honor an
+    // authored workflow worker pin first, then the user's worker/intent route.
+    // The reducer remains on the normal brain path below.
+    const pinnedWorker = workflow?.models?.worker?.trim();
+    if (pinnedWorker) {
+      return {
+        model: pinnedWorker,
+        trace: {
+          seam: 'workflow',
+          stepId: step.id,
+          attemptedIntent: step.intent ?? '',
+          matchedIntent: null,
+          modelId: pinnedWorker,
+          provider: resolveEffectiveProviderForModel(pinnedWorker),
+          source: 'workflow-worker-pin',
+        },
+      };
+    }
+    const routed = resolveRoleModel('worker', step.intent);
+    return {
+      model: routed.modelId,
+      trace: {
+        seam: 'workflow',
+        stepId: step.id,
+        attemptedIntent: step.intent ?? '',
+        matchedIntent: routed.matchedIntent ?? null,
+        modelId: routed.modelId,
+        provider: routed.provider,
+        source: routed.source,
+      },
+    };
+  }
   // Workflow-level brain pin (owner ask, 2026-07-24): an authored
   // `models: { brain }` is the default model for every step without its own
   // `model:` — pin once at authoring, every scheduled run stays cheap.
@@ -2540,6 +2574,9 @@ async function runStepViaHarness(
   // forEach item invocations use an object/scalar item contract when declared,
   // but never receive an array aggregate contract.
   isItemInvocation = false,
+  // The exact definition admitted for this run. Queued/restarted runs must not
+  // resolve model pins from a newer workflow file after admission.
+  admittedWorkflow?: WorkflowDefinition,
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
   // touches the model. Discord + chat-dock paths do this at every
@@ -2590,6 +2627,12 @@ async function runStepViaHarness(
     attemptId: `attempt:workflow:${workflowRunId}:${randomUUID().slice(0, 12)}`,
   });
   let stepAttemptStatus: 'completed' | 'cancelled' | 'failed' | 'interrupted' = 'failed';
+  let graphSpecialistEvent: {
+    item: string;
+    role: string;
+    model?: string;
+    provider: string;
+  } | undefined;
   let unregisterActiveAttempt = (): void => {};
   const stepAttemptWasKilled = (): boolean => {
     try { return isKillRequested(realSessionId, stepAttempt); } catch { return false; }
@@ -2603,7 +2646,7 @@ async function runStepViaHarness(
     );
     // Definition lookup for the workflow-level model pins (owner ask,
     // 2026-07-24). Best-effort: unreadable definition reverts to defaults.
-    const workflowDefForPin = ((): WorkflowDefinition | undefined => {
+    const workflowDefForPin = admittedWorkflow ?? ((): WorkflowDefinition | undefined => {
       try { return readWorkflow(workflowStorageName)?.data; } catch { return undefined; }
     })();
     const workflowWorkerPin = workflowDefForPin?.models?.worker?.trim();
@@ -2724,6 +2767,29 @@ async function runStepViaHarness(
     // RouterModelProvider dispatches the resolved id to its provider.
     const modelRoute = resolveWorkflowStepModel(step, workflowDefForPin);
     const stepModel = modelRoute.model;
+    if (isGraphRuntimeSpecialist(step)) {
+      const runtimeStep = step as GraphRuntimeWorkflowStep;
+      const role = runtimeStep.__graphRuntimeSpecialistId || step.intent || step.id;
+      const item = runtimeStep.__graphRuntimeParentNodeId
+        ? `${runtimeStep.__graphRuntimeParentNodeId}/${role}`
+        : role;
+      const resolvedModel = stepModel ?? defaultForRole('worker');
+      graphSpecialistEvent = {
+        item,
+        role,
+        model: resolvedModel,
+        provider: resolveEffectiveProviderForModel(resolvedModel),
+      };
+      try {
+        appendHarnessEvent({
+          sessionId: realSessionId,
+          turn: 0,
+          role: 'system',
+          type: 'worker_started',
+          data: { ...graphSpecialistEvent, lane: 'workflow_graph' },
+        });
+      } catch { /* specialist visibility is best-effort */ }
+    }
     const appendWorkerRoute = (data: Record<string, unknown>) => {
       try {
         appendHarnessEvent({
@@ -2851,7 +2917,12 @@ async function runStepViaHarness(
           resultOnlyTools: isGraphRuntimeWorkflowStep(step),
           ...(isGraphRuntimeWorkflowStep(step)
             ? {
-                graphContext: graphContextForRun(workflowName, workflowRunId),
+                // Creation tests do not persist a graph snapshot, so the
+                // display name cannot recover the owning run workspace there.
+                // Use the resolved storage slug for both creation-test and
+                // production graph nodes; otherwise exact artifact reads are
+                // falsely refused whenever name !== slug.
+                graphContext: graphContextForRun(workflowStorageName, workflowRunId),
               }
             : {}),
           model: stepModel,
@@ -2875,6 +2946,12 @@ async function runStepViaHarness(
         runAttemptId: stepAttempt.attemptId,
         mcpToolScope: workflowMcpToolScope,
         reuseRecordedUserInput: true,
+        // Specialist budgets are authored execution semantics. Keep this
+        // narrow to graph-runtime nodes so introducing read_parallel_v1 does
+        // not silently change legacy workflow-step budgeting.
+        ...(isGraphRuntimeWorkflowStep(step) && step.maxTurns !== undefined
+          ? { maxTurns: step.maxTurns }
+          : {}),
         // P2-10: bound the step on the harness path too. The legacy path passes
         // this (see below); without it a harness step fell back to the 120-min
         // chat budget, so a hung/runaway step wasn't bounded at the intended
@@ -3108,6 +3185,21 @@ async function runStepViaHarness(
     }
     throw err;
   } finally {
+    if (graphSpecialistEvent) {
+      try {
+        appendHarnessEvent({
+          sessionId: realSessionId,
+          turn: 0,
+          role: 'system',
+          type: 'worker_result',
+          data: {
+            ...graphSpecialistEvent,
+            ok: stepAttemptStatus === 'completed',
+            lane: 'workflow_graph',
+          },
+        });
+      } catch { /* specialist visibility is best-effort */ }
+    }
     unregisterActiveAttempt();
     try { finishRunAttempt(stepAttempt, stepAttemptStatus); } catch { /* control telemetry must not mask step outcome */ }
     // The submission-time contract dies with the step session (a later chat
@@ -4692,6 +4784,7 @@ export async function executeStep(
                   itemContext,
                   true, // approval parks propagate through runWithConcurrency
                   true, // isItemInvocation: object/scalar item contract yes; aggregate array contract no
+                  ctx.workflow,
                 );
                 output = r.output;
                 itemSessionId = r.sessionId;
@@ -4938,6 +5031,8 @@ export async function executeStep(
         ctx.runId,
         stepContext,
         true, // canPark: plain step unwinds cleanly to processOneRunFile
+        false,
+        ctx.workflow,
       );
       output = result.output;
       stepSessionId = result.sessionId;
@@ -5533,7 +5628,11 @@ function formatStepOutputs(
   opts?: StepContextRenderOptions,
 ): string {
   return steps
-    .filter((step) => stepOutputs[step.id] !== undefined)
+    // Specialist artifacts are reducer inputs, not user-facing sections. The
+    // reducer owns the compact joined result; omitting branches here prevents
+    // synthesis/final publication from paying for or exposing every private
+    // intermediate twice.
+    .filter((step) => !isGraphRuntimeSpecialist(step) && stepOutputs[step.id] !== undefined)
     .map((step) => {
       const out = stepOutputValueForPrompt(step.id, stepOutputs[step.id], opts);
       return `## ${step.id}\n${stringifyForPrompt(out)}`;
@@ -6128,10 +6227,23 @@ export function shouldHaltResumeForSideEffect(
 type GraphRuntimeWorkflowStep = WorkflowStepInput & {
   /** In-memory only. Never authored or serialized into SKILL.md. */
   __graphRuntimeAdded?: true;
+  /** Runtime authority/profile for compiled Clementine 4 graph nodes. */
+  __graphRuntimeRole?: 'dynamic' | 'specialist' | 'reducer';
+  __graphRuntimeParentNodeId?: string;
+  __graphRuntimeSpecialistId?: string;
 };
 
 function isGraphRuntimeWorkflowStep(step: WorkflowStepInput): step is GraphRuntimeWorkflowStep {
-  return (step as GraphRuntimeWorkflowStep).__graphRuntimeAdded === true;
+  const runtime = step as GraphRuntimeWorkflowStep;
+  return runtime.__graphRuntimeAdded === true || runtime.__graphRuntimeRole !== undefined;
+}
+
+function graphRuntimeRole(step: WorkflowStepInput): GraphRuntimeWorkflowStep['__graphRuntimeRole'] | undefined {
+  return (step as GraphRuntimeWorkflowStep).__graphRuntimeRole;
+}
+
+function isGraphRuntimeSpecialist(step: WorkflowStepInput): boolean {
+  return graphRuntimeRole(step) === 'specialist';
 }
 
 export interface MaterializedWorkflowGraphSteps {
@@ -6253,10 +6365,40 @@ export function materializeWorkflowGraphSteps(
     return { ok: false, steps: authoredSteps, errors: [...new Set(errors)] };
   }
 
+  const runtimeAuthoredSteps = authoredSteps.map((step): WorkflowStepInput => {
+    if (step.subgraph?.mode !== 'read_parallel_v1') return step;
+    const graphDependencies = graph.edges
+      .filter((edge) => !edge.disabled && edge.type === 'dependency' && edge.target === step.id)
+      .map((edge) => edge.source);
+    return {
+      ...step,
+      // The persisted graph owns the expanded topology. Strip the authoring
+      // macro from the executable reducer so any helper that recompiles this
+      // materialized list cannot expand the same specialists a second time.
+      subgraph: undefined,
+      dependsOn: [...new Set([...(step.dependsOn ?? []), ...graphDependencies])],
+      forEach: undefined,
+      forEachNewOnly: undefined,
+      deterministic: undefined,
+      call: undefined,
+      codifiedFrom: undefined,
+      usesSkill: undefined,
+      requiresApproval: false,
+      approvalPreview: undefined,
+      loopUntil: undefined,
+      loopSafe: undefined,
+      sideEffect: 'read',
+      allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS],
+      useHarness: true,
+      __graphRuntimeRole: 'reducer',
+    } as GraphRuntimeWorkflowStep;
+  });
+
   const dynamicSteps = addedNodes.map((node): WorkflowStepInput => {
     const dependsOn = graph.edges
       .filter((edge) => !edge.disabled && edge.type === 'dependency' && edge.target === node.id)
       .map((edge) => edge.source);
+    const specialist = node.config?.subgraphRole === 'specialist';
     return {
       id: node.id,
       prompt: node.prompt!.trim(),
@@ -6272,9 +6414,16 @@ export function materializeWorkflowGraphSteps(
       allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS],
       useHarness: true,
       __graphRuntimeAdded: true,
+      __graphRuntimeRole: specialist ? 'specialist' : 'dynamic',
+      ...(specialist && typeof node.config?.parentNodeId === 'string'
+        ? { __graphRuntimeParentNodeId: node.config.parentNodeId }
+        : {}),
+      ...(specialist && typeof node.config?.specialistId === 'string'
+        ? { __graphRuntimeSpecialistId: node.config.specialistId }
+        : {}),
     } as GraphRuntimeWorkflowStep;
   });
-  return { ok: true, steps: [...authoredSteps, ...dynamicSteps], errors: [] };
+  return { ok: true, steps: [...runtimeAuthoredSteps, ...dynamicSteps], errors: [] };
 }
 
 interface LiveWorkflowExecutionPlan {
@@ -6389,7 +6538,29 @@ function loadLiveWorkflowExecutionPlan(
   workflowSlug: string,
   runId: string,
 ): LiveWorkflowExecutionPlan {
-  const snapshot = loadWorkflowGraphSnapshotByRunId(runId);
+  let snapshot = loadWorkflowGraphSnapshotByRunId(runId);
+  if (!snapshot && workflowHasReadParallelSubgraph(authoredSteps)) {
+    // A read_parallel_v1 declaration is executable topology, not advisory
+    // metadata. If the best-effort admission write was interrupted, recreate
+    // the same deterministic graph before any specialist can run; falling back
+    // to the flat parent loop would silently erase the user's declared shape.
+    const graph = compileWorkflowStepsToGraph(authoredSteps, {
+      id: `${workflowSlug}:${runId}`,
+      name: workflowSlug,
+      metadata: { workflowSlug, runId, recoveredAtExecutionBoundary: true },
+    });
+    const validation = validateWorkflowGraph(graph);
+    if (!validation.ok) {
+      throw new Error(
+        `Workflow subgraph for run "${runId}" is invalid: ${validation.errors.join('; ')}`,
+      );
+    }
+    persistWorkflowGraphSnapshot({ workflowName: workflowSlug, runId, graph });
+    snapshot = loadWorkflowGraphSnapshotByRunId(runId);
+    if (!snapshot) {
+      throw new Error(`Workflow subgraph for run "${runId}" could not be persisted; no specialist work was started.`);
+    }
+  }
   if (!snapshot) return { steps: authoredSteps, graph: null, graphFingerprint: null };
   if (snapshot.workflowName !== workflowSlug) {
     throw new Error(
@@ -6614,6 +6785,11 @@ async function executeWorkflow(
     const step = steps[0];
     if (!step) {
       throw new Error(`Workflow step "${targetStepId}" not found.`);
+    }
+    if (graphRuntimeRole(step) === 'reducer') {
+      throw new Error(
+        `Workflow step "${targetStepId}" is a read_parallel_v1 reducer and cannot be tried without its specialist dependencies. Run the workflow so the graph can execute and join the complete subgraph.`,
+      );
     }
     throwIfWorkflowRunCancelled(runId);
     if (stepOutputs[step.id] !== undefined) {
@@ -6885,6 +7061,8 @@ async function executeWorkflow(
           runId,
           undefined,
           true, // canPark: synthesis runs outside any batch/forEach
+          false,
+          executionWorkflow,
         ),
         {
           budget: transientRetryFloor(),
@@ -8351,7 +8529,29 @@ export async function runCreationTest(
   const stepOutputs: Record<string, unknown> = {};
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
-  const steps = workflow.steps;
+  let steps = workflow.steps;
+  if (workflowHasReadParallelSubgraph(workflow.steps)) {
+    // Creation tests must verify the same executable topology that a scheduled
+    // run will use. Running only the authored parent would falsely certify a
+    // reducer that had never received either specialist result.
+    const graph = compileWorkflowStepsToGraph(workflow.steps, {
+      id: `${workflowSlug}:${runId}:creation-test`,
+      name: workflow.name,
+      metadata: { workflowSlug, runId, creationTest: true },
+    });
+    const materialized = materializeWorkflowGraphSteps(workflow.steps, graph);
+    if (!materialized.ok) {
+      return {
+        pass: false,
+        steps: [{
+          stepId: '(graph)',
+          status: 'error',
+          detail: materialized.errors.join('; ').slice(0, 500),
+        }],
+      };
+    }
+    steps = materialized.steps;
+  }
   const results: CreationTestStepResult[] = [];
   const completed = new Set<string>();
   // Steps whose result depends on a mutation that was deliberately not
@@ -8962,6 +9162,8 @@ async function processOneRunFile(
                 usesSkill: node.usesSkill,
                 requiresApproval: node.requiresApproval,
                 deterministic: Boolean(node.deterministic),
+                subgraphRole: node.config?.subgraphRole,
+                parentNodeId: node.config?.parentNodeId,
               })),
               edges: graph.edges,
             },
@@ -9049,6 +9251,11 @@ async function processOneRunFile(
       );
       const rawStepOutputs = Object.fromEntries(resume.completedSteps);
       const stepOutputs = stringifyOutputs(rawStepOutputs);
+      // Compiled specialist nodes are private reducer inputs. Public workflow
+      // output already excludes them; notification/report-back composition
+      // must use the same projection or it can re-narrate branch internals even
+      // when the canonical run output is clean.
+      const publicExecutionSteps = executionSteps.filter((step) => !isGraphRuntimeSpecialist(step));
       const runRecordStepOutputs = boundedStepOutputsForRunRecord(
         rawStepOutputs,
         { workflowName: workflow.name, runId: run.id },
@@ -9098,7 +9305,7 @@ async function processOneRunFile(
       // actually succeeded. Skipped for partial single-step re-runs and runs
       // with no deliverable; fully fail-open.
       const baseSuccessBody = renderSuccessBody({
-        steps: executionSteps,
+        steps: publicExecutionSteps,
         stepOutputs,
         finalOutput,
         hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
@@ -9637,12 +9844,12 @@ async function processOneRunFile(
       // appended to the human body ONLY when concrete artifacts exist — and a run
       // that produced artifacts is by definition NOT a routine no-op, so this can
       // never break the quiet-day no-op silencing.
-      const runArtifacts = summarizeRunArtifacts(executionSteps, rawStepOutputs);
+      const runArtifacts = summarizeRunArtifacts(publicExecutionSteps, rawStepOutputs);
       const succeededBecause = (runGoal && goalDecision?.action === 'satisfied')
         ? `goal met${typeof goalVerdict?.successRatePercent === 'number' ? ` (${goalVerdict.successRatePercent}%, ${goalVerdict.criteriaMet ?? '?'}/${goalVerdict.criteriaTotal ?? '?'} criteria)` : ''}`
         : (targetVerdict?.judged && targetVerdict.reached)
           ? 'reached the workflow target'
-          : `completed ${executionSteps.length} step${executionSteps.length === 1 ? '' : 's'}`;
+          : `completed ${publicExecutionSteps.length} step${publicExecutionSteps.length === 1 ? '' : 's'}`;
       const producedItems = [
         runArtifacts.counts.length ? runArtifacts.counts.join(', ') : '',
         ...runArtifacts.files,

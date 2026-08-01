@@ -8,6 +8,8 @@ import {
   getReadyWorkflowGraphNodes,
   validateWorkflowGraph,
   workflowGraphEdgeId,
+  workflowSubgraphSpecialistNodeId,
+  WORKFLOW_GRAPH_ALLOWED_TOOLS,
   type WorkflowGraphDefinition,
 } from './workflow-graph.js';
 
@@ -34,6 +36,55 @@ test('compileWorkflowStepsToGraph preserves step metadata and dependency edges',
   assert.deepEqual(graph.edges, [
     { id: 'dependency:pull->send', source: 'pull', target: 'send', type: 'dependency' },
   ]);
+});
+
+test('read_parallel_v1 compiles stable specialist siblings and the authored step as their join', () => {
+  const graph = compileWorkflowStepsToGraph([
+    { id: 'source', prompt: 'Return source evidence.', sideEffect: 'read' },
+    {
+      id: 'analyze',
+      prompt: 'Reduce the specialist evidence into one answer.',
+      dependsOn: ['source'],
+      sideEffect: 'read',
+      subgraph: {
+        mode: 'read_parallel_v1',
+        specialists: [
+          { id: 'facts', prompt: 'Check factual support.', intent: 'research' },
+          { id: 'risks', prompt: 'Check risks and contradictions.' },
+        ],
+      },
+    },
+  ]);
+
+  const factsId = workflowSubgraphSpecialistNodeId('analyze', 'facts');
+  const risksId = workflowSubgraphSpecialistNodeId('analyze', 'risks');
+  assert.deepEqual(graph.nodes.map((node) => node.id), ['source', 'analyze', factsId, risksId]);
+  assert.equal(graph.nodes.find((node) => node.id === 'analyze')?.type, 'join');
+  assert.deepEqual(graph.nodes.find((node) => node.id === 'analyze')?.allowedTools, WORKFLOW_GRAPH_ALLOWED_TOOLS);
+  assert.equal(graph.nodes.find((node) => node.id === factsId)?.config?.subgraphRole, 'specialist');
+  assert.deepEqual(graph.entryNodeIds, ['source']);
+
+  assert.deepEqual(
+    getReadyWorkflowGraphNodes(graph, ['source']).map((node) => node.id),
+    [factsId, risksId],
+    'specialists become one parallel ready wave after their shared dependency',
+  );
+  assert.deepEqual(
+    getReadyWorkflowGraphNodes(graph, ['source', factsId, risksId]).map((node) => node.id),
+    ['analyze'],
+    'the authored reducer waits for every specialist',
+  );
+  assert.ok(graph.edges.some((edge) => edge.source === factsId && edge.target === 'analyze'));
+  assert.ok(graph.edges.some((edge) => edge.source === risksId && edge.target === 'analyze'));
+});
+
+test('workflowSubgraphSpecialistNodeId is deterministic and stays inside the runtime id contract', () => {
+  const parent = `very-long-parent-${'x'.repeat(80)}`;
+  const first = workflowSubgraphSpecialistNodeId(parent, 'evidence-review');
+  const second = workflowSubgraphSpecialistNodeId(parent, 'evidence-review');
+  assert.equal(first, second);
+  assert.ok(first.length <= 64);
+  assert.match(first, /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/);
 });
 
 test('validateWorkflowGraph catches dangling edges and cycles', () => {

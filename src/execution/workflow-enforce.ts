@@ -47,6 +47,11 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
       dependsOn: s.dependsOn,
       forEach: s.forEach,
       forEachNewOnly: s.forEachNewOnly,
+      // `subgraph` is executable topology, not descriptive metadata. Carry it
+      // through the canonical write/preflight projection so malformed or
+      // effectful specialist graphs cannot bypass the validator and later run
+      // as an accidental flat step.
+      subgraph: s.subgraph,
       deterministic: s.deterministic,
       call: s.call,
       usesSkill: s.usesSkill,
@@ -352,6 +357,7 @@ function executionSurfaceProjection(def: WorkflowDefinition): string {
       dependsOn: s.dependsOn ?? [],
       forEach: s.forEach ?? null,
       forEachNewOnly: s.forEachNewOnly ?? false,
+      subgraph: s.subgraph ?? null,
       deterministic: s.deterministic ?? null,
       call: s.call ?? null,
       allowedTools: s.allowedTools ?? [],

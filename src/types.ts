@@ -213,17 +213,24 @@ export interface AssembledPromptContext {
 }
 
 export interface AssistantRequest {
+  /** Private model directive for this execution. For an ordinary fresh turn it
+   * is also the literal user text persisted in the conversation. */
   message: string;
+  /** Literal text shown in history when it differs from the model directive.
+   * Ignored when sourceUserSeq reuses an already accepted event. */
+  displayMessage?: string;
+  /** Exact pre-accepted user_input_received event to reuse. Supplying this
+   * binds a new physical attempt without appending a synthetic user turn. */
+  sourceUserSeq?: number;
   sessionId: string;
   userId?: string;
   channel?: string;
   model?: string;
   runId?: string;
   onToolActivity?: (activity: ToolActivity) => Promise<void> | void;
-  /** Fired per output-text delta when the runtime supports streaming.
-   *  The runtime fires this in addition to (not instead of) the final
-   *  text in the response. Callers that don't pass it get the same
-   *  non-streaming behavior as before. */
+  /** Fired only for deltas that have crossed the runtime's public-reply
+   *  boundary. Raw executor/model output is never a user-facing stream.
+   *  The final committed text is still returned in the response. */
   onChunk?: (delta: string) => Promise<void> | void;
   /** Fired per reasoning chunk (o-series models). Captured for
    *  observability in the run timeline; not intended for end-user
@@ -285,9 +292,6 @@ export interface RuntimeContextValue {
   sessionId: string;
   userId?: string;
   channel?: string;
-  /** Internal per-turn state: this run is executing the user's answer to a
-   * clarification, so tools must not inject another background-choice gate. */
-  suppressBackgroundOffer?: boolean;
 }
 
 export interface PendingApproval {

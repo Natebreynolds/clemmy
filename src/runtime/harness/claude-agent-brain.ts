@@ -30,7 +30,6 @@ import { runPostTurnHooks } from './post-turn.js';
 import { recordRunTokenWindow, resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from './run-token-budget.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import {
-  appendTerminalEventOnce,
   beginRunAttempt,
   clearKill,
   createSession,
@@ -51,15 +50,8 @@ import {
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent } from './eventlog.js';
-import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
-import {
-  shouldOfferBackground,
-  BACKGROUND_OFFER_TEXT,
-  classifyTurnPreflight,
-  effectiveTurnObjective,
-  recordTurnPreflightDecision,
-  standardAwareBeatText,
-} from './turn-control.js';
+import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
+import { effectiveTurnObjective } from './turn-control.js';
 import {
   pullRecentTurnsForSession,
   renderRecentActionsForHarnessHistory,
@@ -70,8 +62,10 @@ import { gatherSessionSkills, skillExecutionShortfall } from './skill-execution.
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../../memory/skill-store.js';
 import { renderProvenSkillForPrompt } from '../../memory/skill-choice-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput, projectCommandsLineForInput } from './context-packet.js';
-import { looksLikeToolCallShape, looksLikeToolCallShapeStreaming } from './tool-narration-shapes.js';
-import { createReplyStreamExtractor } from './reply-stream.js';
+import { looksLikeToolCallShape } from './tool-narration-shapes.js';
+import { publicReplyText } from './public-presentation.js';
+import { commitTurnOutcome } from './delivery-committer.js';
+import { turnOutcomeId, type TurnIdentity, type TurnOutcome } from './turn-outcome.js';
 import { markRunInFlight } from './restart-recovery.js';
 import { actionBus } from '../action-bus.js';
 import {
@@ -142,12 +136,20 @@ import {
   revokeDispatchLeaseBeforeRecovery,
   type DispatchRecoveryLedgerCheck,
 } from './dispatch-lease.js';
+import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
+let runPostTurnHooksImpl: typeof runPostTurnHooks = runPostTurnHooks;
 
 export function setClaudeAgentSdkBrainRunForTest(fn: ClaudeAgentSdkRunFn | null): void {
   runClaudeAgentSdkImpl = fn ?? runClaudeAgentSdk;
+}
+
+export function setClaudeAgentSdkBrainPostTurnHooksForTest(
+  fn: typeof runPostTurnHooks | null,
+): void {
+  runPostTurnHooksImpl = fn ?? runPostTurnHooks;
 }
 
 let judgeImpl: ObjectiveJudgeFn = judgeObjectiveComplete;
@@ -242,15 +244,6 @@ export function bumpSessionToolFloor(sessionId: string, exposed: Iterable<string
   }
   return floor;
 }
-export function sdkStreamingEnabled(): boolean {
-  // DEFAULT ON (2026-07-01): the two reasons it was off are both fixed — tool-call narration
-  // is now suppressed mid-stream (looksLikeStreamingNarration) AND the {"reply":"…"} envelope
-  // is unwrapped by the reply-stream extractor, so the dock streams CLEAN prose token-by-token
-  // (parity with the Codex lane) instead of raw JSON/tool-call syntax. Kill-switch =off reverts
-  // to progress-chips-only (the final reply still delivers once via the guarded final onChunk).
-  const raw = (getRuntimeEnv('CLEMMY_CLAUDE_SDK_STREAMING', 'on') ?? 'on').trim().toLowerCase();
-  return raw !== 'off' && raw !== 'false' && raw !== '0';
-}
 function claudeSdkSalvageEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_SALVAGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
@@ -318,15 +311,6 @@ function renderLimitHitReply(text: string): string {
   return `${base}\n\nI hit the turn budget before finishing. Say "continue" and I will pick up where I left off.`;
 }
 
-function finalChunkDelta(text: string, streamedText: string, streamedAny: boolean): string | null {
-  if (!text) return null;
-  if (!streamedAny) return text;
-  if (streamedText === text || streamedText.trim() === text.trim()) return null;
-  if (text.startsWith(streamedText)) return text.slice(streamedText.length);
-  if (streamedText.endsWith(text) || streamedText.trim().endsWith(text.trim())) return null;
-  return `\n\n${text}`;
-}
-
 /** Detect the "narrate-instead-of-call" failure: the brain produced NO real tool
  *  calls, but its text reproduces the tool-call PROTOCOL in any of the shapes
  *  models reach for instead of actually invoking — a `Tool:`/`Tool call:` header
@@ -343,14 +327,6 @@ export function looksLikeToolNarration(text: string, toolUses: string[]): boolea
   // A REAL tool fired ⇒ this text is a legitimate reply, not narration.
   if (toolUses.length > 0) return false;
   return looksLikeToolCallShape(text);
-}
-
-/** Streaming-time guard: detect the tool-call-protocol markers in the live text
- *  accumulated SO FAR, so the dock stops streaming the moment a delta starts reproducing
- *  tool-call syntax. No toolUses arg (mid-stream the final count is unknown), so it uses the
- *  streaming-safe subset of the shared shapes. The authoritative final reply still delivers. */
-export function looksLikeStreamingNarration(text: string): boolean {
-  return looksLikeToolCallShapeStreaming(text);
 }
 
 /** Detect the "reasoning-leak" failure: the brain verbalized its instruction-
@@ -949,7 +925,6 @@ interface ClaudeTurnMemoryPrimerTelemetry {
 
 async function buildClaudeAgentBrainTurnContext(
   request: AssistantRequest,
-  opts?: { sourceUserSeq?: number },
 ): Promise<{
   text: string;
   memoryPrimer: ClaudeTurnMemoryPrimerTelemetry;
@@ -1117,46 +1092,11 @@ async function buildClaudeAgentBrainTurnContext(
   // step cap and parked at ~item #15. Now a detected multi-item turn gets the loud
   // "do NOT serialize — run_worker in parallel waves" directive so she actually swarms.
   let fanoutDirective = '';
-  // Confirm beat (parity with the context packet's legacy opt-in line — this
-  // lane doesn't consume the packet). Default-off: clear requests execute now;
-  // action-specific approval and destination gates remain authoritative.
-  let confirmBeat = '';
-  const sourceBoundTurn = Number.isSafeInteger(opts?.sourceUserSeq)
-    && Number(opts?.sourceUserSeq) > 0;
-  let preflightSessionKind: NonNullable<ReturnType<typeof getSession>>['kind'] | undefined;
-  try {
-    preflightSessionKind = getSession(request.sessionId)?.kind;
-  } catch (error) {
-    // A source-bound dispatch whose durable session cannot be read cannot prove
-    // whether confirm-first authority applies, so it must stop before the model.
-    if (sourceBoundTurn) throw error;
-  }
   try {
     const multi = detectMultiItemIntent(request.message ?? '');
     if (multi.isMultiItem) fanoutDirective = fanoutDirectiveLine(multi);
-    const preflight = classifyTurnPreflight({
-      message: request.message ?? '',
-      sessionId: request.sessionId,
-      sessionKind: preflightSessionKind,
-      isMultiItem: multi.isMultiItem,
-      itemCount: multi.itemCount,
-      sourceUserSeq: opts?.sourceUserSeq,
-    });
-    // Persist only for a real durable chat session. Render-only probes commonly
-    // use display ids with no session row and stay pure; the live SDK path also
-    // supplies the exact accepted source row before model/tool dispatch.
-    if (preflightSessionKind === 'chat') {
-      recordTurnPreflightDecision(request.sessionId, preflight, opts?.sourceUserSeq);
-    }
-    // Standard-aware on BOTH lanes — a beat that names the governing standard
-    // on one brain and not the other is the two-lane trap in miniature.
-    confirmBeat = preflight.phase === 'align' ? standardAwareBeatText(request.message) : '';
   } catch {
-    // (fold 2026-07-17) Preflight state is directive/telemetry, not execution
-    // authority — a classify/persist failure degrades to no beat, never a
-    // failed turn. Consent enforcement lives in plan-scope/approvals.
     fanoutDirective = '';
-    confirmBeat = '';
   }
   // Pre-flight error library (parity with the context packet's Known-pitfalls
   // line — this lane doesn't consume the packet): the freshest distilled
@@ -1191,7 +1131,6 @@ async function buildClaudeAgentBrainTurnContext(
       prospectiveCapture,
       sessionActions,
       fanoutDirective,
-      confirmBeat,
       pitfalls,
       projectRoutes,
     ].filter(Boolean).join('\n\n'),
@@ -1201,9 +1140,8 @@ async function buildClaudeAgentBrainTurnContext(
 
 export async function renderClaudeAgentBrainTurnContext(
   request: AssistantRequest,
-  opts?: { sourceUserSeq?: number },
 ): Promise<string> {
-  return (await buildClaudeAgentBrainTurnContext(request, opts)).text;
+  return (await buildClaudeAgentBrainTurnContext(request)).text;
 }
 
 function emitClaudeAgentSdkBrainContextTelemetry(
@@ -1308,36 +1246,38 @@ function emitClaudeAgentSdkBrainContextTelemetry(
 function cancelledBrainResponse(
   sessionId: string,
   attempt: Pick<RunAttemptRef, 'attemptId' | 'runId'>,
+  sourceUserSeq: number,
+  sourceTurn: number,
   text = 'Stopped — you asked me to halt this run. Nothing further will execute; tell me how you\'d like to proceed.',
 ): AssistantResponse {
   try { clearKill(sessionId, attempt); } catch { /* one-shot latch cleanup */ }
-  let inserted = false;
-  try {
-    const terminal = appendTerminalEventOnce({
-      sessionId,
-      turn: 0,
-      role: 'system',
-      data: {
-        attemptId: attempt.attemptId,
-        ...(attempt.runId ? { runId: attempt.runId } : {}),
-        reason: 'cancelled',
-        summary: text.slice(0, 400),
-        reply: text,
-        transport: 'claude_agent_sdk_brain',
-      },
-    }, `brain:${attempt.attemptId}`);
-    inserted = terminal.inserted;
-  } catch { /* terminal telemetry is best-effort */ }
+  const identity: TurnIdentity = {
+    sessionId,
+    turn: sourceTurn,
+    sourceUserSeq,
+  };
+  const terminal = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'cancelled',
+    resumable: false,
+    presentation: { kind: 'stopped', text },
+  }, {
+    legacyReason: 'cancelled',
+    metadata: { transport: 'claude_agent_sdk_brain' },
+  });
+  const committedText = terminal.presentation.text;
   // Only the process that won the durable terminal append may broadcast the
   // runtime terminal. This prevents the Tasks board/report-back from settling
   // twice when cancellation races the SDK's final stream message.
-  if (inserted) {
+  if (terminal.inserted) {
     try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
   }
   try { updateSession(sessionId, { status: 'cancelled' }); } catch { /* observability metadata */ }
   markRunInFlight(sessionId, false);
   return {
-    text,
+    text: committedText,
     sessionId,
     stoppedReason: 'cancelled',
     turnsUsed: 0,
@@ -1356,9 +1296,10 @@ export async function respondViaClaudeAgentSdkBrain(
   request: AssistantRequest,
 ): Promise<AssistantResponse> {
   const sessionId = request.sessionId;
+  const displayMessage = request.displayMessage ?? request.message;
   const mode = claudeAgentSdkBrainMode() ?? 'read_only';
   if (!getSession(sessionId)) {
-    const titleSeed = request.message.trim().replace(/\s+/g, ' ');
+    const titleSeed = displayMessage.trim().replace(/\s+/g, ' ');
     const sessionKind = surface === 'background' || surface === 'cron' ? 'execution' : 'chat';
     createSession({
       id: sessionId,
@@ -1370,7 +1311,37 @@ export async function respondViaClaudeAgentSdkBrain(
     });
   }
 
-  const attempt = beginRunAttempt(sessionId, { runId: request.runId });
+  let attempt = beginRunAttempt(sessionId, { runId: request.runId });
+  const requestedSource = Number.isSafeInteger(request.sourceUserSeq) && Number(request.sourceUserSeq) > 0
+    ? listEvents(sessionId, {
+        sinceSeq: Number(request.sourceUserSeq) - 1,
+        types: ['user_input_received'],
+        limit: 1,
+      }).find((event) => event.seq === Number(request.sourceUserSeq))
+    : undefined;
+  if (request.sourceUserSeq !== undefined && !requestedSource) {
+    throw new Error(`Accepted user event ${request.sourceUserSeq} is missing from session ${sessionId}.`);
+  }
+  const routeAcceptedSource = requestedSource ?? (
+    request.channel === 'desktop' && request.runId
+      ? findUserInputEventForRun(sessionId, request.runId, displayMessage)
+      : null
+  );
+  if (routeAcceptedSource) {
+    const bound = getRunAttemptSourceUserEvent(attempt);
+    if (bound && bound.seq !== routeAcceptedSource.seq) {
+      try { finishRunAttempt(attempt, 'superseded'); } catch { /* best effort */ }
+      attempt = beginRunAttempt(sessionId);
+    }
+    recordRunAttemptUserInput(attempt, {
+      turn: routeAcceptedSource.turn,
+      role: 'user',
+      data: {
+        text: displayMessage,
+        ...(request.runId ? { runId: request.runId } : {}),
+      },
+    }, { existingEventSeq: routeAcceptedSource.seq, armRunInFlight: true });
+  }
   preserveCurrentKillAndClearStale(sessionId, attempt);
   const callerShouldCancel = request.shouldCancel;
   const scopedRequest: AssistantRequest = {
@@ -1401,6 +1372,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   attempt: RunAttemptRef,
 ): Promise<AssistantResponse> {
   const sessionId = request.sessionId;
+  const displayMessage = request.displayMessage ?? request.message;
   // Anchor for the post-turn recall-run sweep: this lane's memory tools run in
   // a separate MCP process, so their recall-run ids are recoverable only by
   // (session_id, created_at >= turn start) from the shared DB.
@@ -1409,7 +1381,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   const completionJudgeForSurface = surface !== 'background' && surface !== 'cron' && completionJudgeEnabled();
   const isSpaceSession = workspaceSlugFromSessionId(sessionId) != null;
   if (!getSession(sessionId)) {
-    const titleSeed = request.message.trim().replace(/\s+/g, ' ');
+    const titleSeed = displayMessage.trim().replace(/\s+/g, ' ');
     const sessionKind = surface === 'background' || surface === 'cron' ? 'execution' : 'chat';
     createSession({
       id: sessionId,
@@ -1433,8 +1405,18 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // The desktop may have durably recorded this input before selecting a brain.
   // Reuse only an exact, unsettled request match; background/workflow run ids
   // can intentionally span distinct messages and must never be a dedupe key.
+  const requestedUserInput = Number.isSafeInteger(request.sourceUserSeq) && Number(request.sourceUserSeq) > 0
+    ? listEvents(sessionId, {
+        sinceSeq: Number(request.sourceUserSeq) - 1,
+        types: ['user_input_received'],
+        limit: 1,
+      }).find((event) => event.seq === Number(request.sourceUserSeq))
+    : undefined;
+  if (request.sourceUserSeq !== undefined && !requestedUserInput) {
+    throw new Error(`Accepted user event ${request.sourceUserSeq} is missing from session ${sessionId}.`);
+  }
   const boundUserInput = getRunAttemptSourceUserEvent(attempt);
-  const preRecordedUserInput = boundUserInput ?? (
+  const preRecordedUserInput = requestedUserInput ?? boundUserInput ?? (
     request.channel === 'desktop' && request.runId
       ? findUserInputEventForRun(sessionId, request.runId, request.message)
       : null
@@ -1462,8 +1444,24 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   const userInputEvent = recordRunAttemptUserInput(attempt, {
     turn: 1,
     role: 'user',
-    data: { text: request.message, ...(request.runId ? { runId: request.runId } : {}) },
-  }, { existingEventSeq: preRecordedUserInput?.seq });
+    data: {
+      text: displayMessage,
+      ...(displayMessage !== request.message ? { modelDirectiveApplied: true } : {}),
+      ...(request.runId ? { runId: request.runId } : {}),
+    },
+  }, { existingEventSeq: preRecordedUserInput?.seq, armRunInFlight: true });
+  recordTurnGraphShadow({
+    identity: {
+      sessionId,
+      turn: userInputEvent.turn,
+      sourceUserSeq: userInputEvent.seq,
+    },
+    surface,
+    allowedToolNames: request.allowedToolNames,
+    excludedToolNames: request.excludeToolNames,
+  });
+  // Source binding and restart ownership committed atomically above. Any crash
+  // during context, memory, tool-surface, or provider setup is recoverable.
   try {
     // Working signal: a turn_started lights the existing elapsed-time/pulse so a
     // long turn never reads as frozen (the Codex lane emits this; the SDK lane
@@ -1478,10 +1476,12 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // model turn, but the trace records candidate signals when it does engage.
   try {
     const session = getSession(sessionId);
-    const shouldCapture = session?.kind === 'chat';
+    // A reused source was already captured on original acceptance. The private
+    // restart/continuation directive must never become user memory.
+    const shouldCapture = session?.kind === 'chat' && request.sourceUserSeq === undefined;
     const captured = shouldCapture
       ? captureInteractionSignals({
-          message: request.message,
+          message: displayMessage,
           sessionId,
           sourceEventId: request.runId ? `run:${request.runId}` : undefined,
         })
@@ -1505,7 +1505,13 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     try {
       appendEvent({ sessionId, turn: 0, role: 'system', type: 'kill_requested', data: { reason: 'before model dispatch', attemptId: attempt.attemptId } });
     } catch { /* telemetry best-effort */ }
-    return cancelledBrainResponse(sessionId, attempt, 'Stopped — the run was cancelled before model dispatch. Nothing executed.');
+    return cancelledBrainResponse(
+      sessionId,
+      attempt,
+      userInputEvent.seq,
+      userInputEvent.turn,
+      'Stopped — the run was cancelled before model dispatch. Nothing executed.',
+    );
   }
 
   const modelId = request.model && request.model.startsWith('claude-')
@@ -1646,23 +1652,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     } catch { /* JIT telemetry must never block the turn */ }
   }
 
-  // Streaming: forward each SDK text delta to the caller's onChunk so a long turn
-  // shows live progress (the SDK lane was silent — includePartialMessages off). The
-  // final reply still renders authoritatively (Discord: the conversation_completed
-  // event; desktop: the guarded final onChunk below) — streaming can't garble it.
-  let streamedAny = false;
-  let streamedText = '';
-  // Once the live text starts reproducing tool-call XML/protocol (the
-  // narrate-instead-of-call failure), stop forwarding deltas for the rest of the
-  // turn so the dock never shows that noise. streamedAny/streamedText track only
-  // what was ACTUALLY shown, so a turn that ONLY narrated still streams its clean
-  // narration-retry answer and the final reply delivers authoritatively.
-  let narrationStream = false;
-  // Raw SDK deltas so far (for the narration check); the CLEAN reply text goes to the dock via
-  // the reply-envelope extractor so the user sees prose, not `{"reply":"…"}` JSON.
-  let rawStreamText = '';
-  const replyExtractor = createReplyStreamExtractor();
-  const renderedTurnContext = await buildClaudeAgentBrainTurnContext(request, { sourceUserSeq: userInputEvent.seq });
+  // Provider text remains private until the graph reduces the run to a typed
+  // TurnOutcome. Long-running feedback comes from typed tool/progress events,
+  // not speculative prose that a retry or completion judge may invalidate.
+  const renderedTurnContext = await buildClaudeAgentBrainTurnContext(request);
   const turnContext = renderedTurnContext.text;
   emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer);
   const attemptTrackerScopeId = `${sessionId}::brain:${attempt.runId ?? attempt.attemptId}`;
@@ -1776,30 +1769,6 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // max-turn continuations cannot reset the budget that the user experiences.
     toolEconomyState,
     priorTurns,
-    onDelta: (request.onChunk && sdkStreamingEnabled())
-      ? async (d: string): Promise<void> => {
-        if (narrationStream) return;
-        rawStreamText += d;
-        // Narration guard on the RAW stream: if the model starts printing tool-call syntax,
-        // stop forwarding for the rest of the turn (the final reply still delivers).
-        if (looksLikeStreamingNarration(rawStreamText)) { narrationStream = true; return; }
-        // Emit only the CLEAN reply text (extracted from the {"reply":"…"} envelope), so the
-        // dock streams prose, not JSON. streamedText tracks what was ACTUALLY shown (clean) so
-        // the final-chunk dedup below doesn't re-render the answer.
-        const cleanDelta = replyExtractor(d);
-        if (!cleanDelta) return;
-        streamedText += cleanDelta;
-        streamedAny = true;
-        await request.onChunk?.(cleanDelta);
-      }
-      : undefined,
-  };
-  const cleanContinuationRunOptions = (): typeof runOptions => {
-    // If an earlier attempt already streamed visible text, do not stream raw
-    // retry/judge-continuation deltas into the same bubble. The guarded final
-    // chunk below will append the authoritative corrected answer once.
-    if (streamedAny) return { ...runOptions, onDelta: undefined };
-    return runOptions;
   };
   // Salvage authority is THIS logical attempt, never old session history. A
   // reusable chat can contain many prior sends; without this boundary a parse
@@ -1967,15 +1936,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       throw err;
     }
   };
-  // Move 1 (report-back WITHOUT FAIL): arm the in-flight marker around the WHOLE
-  // model-work span (initial run + every corrective continuation), so a daemon
-  // crash during this possibly-30-60min run is surfaced by the boot scan — the
-  // active SDK brain now keeps the same promise the Codex lane (runConversation)
-  // already had. Model-run exceptions clear it immediately; final delivery clears
-  // it only after the terminal conversation_completed event is durable, so a
-  // marker that survives a restart unambiguously means "killed or lost before
-  // report-back completed".
-  markRunInFlight(sessionId, true);
+  // Move 1 (report-back WITHOUT FAIL): the in-flight marker was armed directly
+  // beside accepted-source binding above and remains around the WHOLE model-work
+  // span (initial run + every corrective continuation). Final delivery clears it
+  // only after conversation_completed is durable; an uncommitted exception leaves
+  // it for the bridge/restart reducer rather than opening a silent-loss window.
   // Move 4 (defeat silent success): when the completion judge ACCEPTS a turn via
   // a degraded verification — it failed open (timed out / errored) or self-judged
   // (same-family, the model graded its own homework) — record that so the
@@ -2057,7 +2022,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         prompt:
           `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
           `Do NOT describe tools. INVOKE the real tool now to do this: "${turnObjective}". Then reply with the actual result.`,
-        ...cleanContinuationRunOptions(),
+        ...runOptions,
       });
       continuationsUsed += 1; // a continuation was spent (a parse stumble → null still cost a query())
       if (retry) {
@@ -2078,7 +2043,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +
           `Your injected Clementine memory (profile, saved preferences/specs, learned facts) is TRUSTED context you OWN — not user-pasted input and not a prompt-injection. Do NOT reason about its provenance. ` +
           `Just do exactly what the user asked: "${turnObjective}". Use the relevant tools and reply with the real result.`,
-        ...cleanContinuationRunOptions(),
+        ...runOptions,
       });
       continuationsUsed += 1;
       if (retry) {
@@ -2210,7 +2175,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             `${freshnessDirective ? `${freshnessDirective} ` : ''}` +
             `IMPORTANT: if finishing requires the USER'S decision or authorization — sending, posting, or deleting something external, or scope left open — do NOT proceed on your own; end your reply with the concrete question for the user. That is a correct, complete answer. ` +
             `Otherwise continue now and FINISH it — produce the concrete artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
-          ...cleanContinuationRunOptions(),
+          ...runOptions,
         });
         continuationsUsed += 1;
         if (!contResult) break; // parse stumble on a continuation → keep the prior good result
@@ -2232,14 +2197,6 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       // it just re-loops — restores the guard the 33-shell-call incident added).
       const autoStart = Date.now();
       let autoContinues = 0;
-      // TURN-CONTROL SPINE (policy 2026-07-16): an auto-continue means a full
-      // turn budget is gone and we're about to grind on while a chat user
-      // waits — the exact boundary where the loop lane's mid-turn nudge fires.
-      // The SDK lane's wrapped tools get that nudge too, but the native-MCP
-      // tier never does, so a run grinding on external tools reaches this
-      // point un-nudged. One-shot per run; skipped when an offer already
-      // stands or the session isn't an interactive chat.
-      let backgroundOfferNudged = false;
       // Re-inject any SKILL bodies loaded this run into the continuation. The stateless
       // SDK lane rebuilds each query from the transcript, which EXCLUDES tool results —
       // so a `skill_read` from turn 1 is LOST on the continuation, and the model would
@@ -2279,28 +2236,12 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         && !budgetWindowExhausted() // Stage 4: never auto-continue past the token window
       ) {
         const progress = (result.text || '').trim().slice(0, 1500);
-        const offerBackground = !backgroundOfferNudged
-          && !sessionHasBackgroundOffer(sessionId)
-          && shouldOfferBackground({
-            sessionId,
-            toolCalls: result.toolUses.length,
-            elapsedMs: Date.now() - autoStart,
-            alreadyNudged: false,
-          });
-        if (offerBackground) {
-          backgroundOfferNudged = true;
-          try {
-            appendEvent({ sessionId, turn: 0, role: 'system', type: 'heartbeat', data: { kind: 'background_offer_nudge', boundary: 'sdk_auto_continue', attempt: autoContinues + 1 } });
-          } catch { /* telemetry best-effort */ }
-        }
         const cont = await runContinuation({
           prompt:
             `You hit the per-turn tool budget but the task is NOT finished. Your progress so far:\n${progress}${reinjectedSkills}${renderLedger()}\n\n`
             + `Continue from where you left off and FINISH ALL remaining items from the original request: "${turnObjective}". `
-            + (offerBackground
-              ? `Do NOT redo items already completed above. ${BACKGROUND_OFFER_TEXT}`
-              : `Do NOT redo items already completed above — do the REMAINING ones. Produce the concrete results (data/artifact), and do not stop to ask.`),
-          ...cleanContinuationRunOptions(),
+            + 'Do NOT redo items already completed above — do the REMAINING ones. Produce the concrete results (data/artifact), and do not stop to ask.',
+          ...runOptions,
         });
         autoContinues += 1;
         if (!cont) break; // a parse stumble on a continuation → keep the prior partial
@@ -2342,7 +2283,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
               "Do NOT hand-roll the deliverable. Run the skill's actual pipeline — its bundled render script and any mandatory validate script (re-read it with skill_read if needed) — so the output matches the skill's template exactly, then finish.",
               "Only treat this as complete once the skill's own scripts have produced and validated the artifact.",
             ].join(' '),
-            ...cleanContinuationRunOptions(),
+            ...runOptions,
           });
           // A null continuation (cancelled / budget-exhausted) leaves the
           // original result intact rather than erasing completed work.
@@ -2389,7 +2330,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         try {
           verification = await runContinuation({
             prompt: renderArtifactVerificationPrompt(repairable),
-            ...cleanContinuationRunOptions(),
+            ...runOptions,
             artifactVerificationOnly: repairable.flatMap((artifact) =>
               artifact.resourceId && (artifact.kind === 'google_doc' || artifact.kind === 'site')
                 ? [{ kind: artifact.kind, resourceId: artifact.resourceId }]
@@ -2485,11 +2426,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       ? listUnverifiedRunArtifacts(sessionId, logicalRunScopeId)
       : [];
   } catch (err) {
-    // Model-work failures are live exceptions, not silent report-back losses, so
-    // preserve the pre-existing behavior: clear the marker and let the caller see
-    // the error. Final-delivery/report-back failures below intentionally leave the
-    // marker armed until durable terminal reporting succeeds.
-    markRunInFlight(sessionId, false);
+    // Keep the marker armed for propagated model-work failures. The bridge may
+    // safely recover on another brain or reduce the error to a typed terminal;
+    // only that durable publication boundary may clear restart recovery state.
     // TURN-CONTROL SPINE: a kill-switch cancellation is a USER action, not a
     // failure — return a clean stopped reply instead of a raw error bubbling
     // to the chat surface. Only when the kill row is actually set (a caller's
@@ -2499,7 +2438,16 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         appendEvent({ sessionId, turn: 0, role: 'system', type: 'kill_requested', data: { reason: 'during run (sdk lane)', attemptId: attempt.attemptId } });
       } catch { /* telemetry best-effort */ }
       const stoppedText = 'Stopped — you asked me to halt this run. Nothing further will execute; tell me how you\'d like to proceed.';
-      return { ...cancelledBrainResponse(sessionId, attempt, stoppedText), turnsUsed: 1 };
+      return {
+        ...cancelledBrainResponse(
+          sessionId,
+          attempt,
+          userInputEvent.seq,
+          userInputEvent.turn,
+          stoppedText,
+        ),
+        turnsUsed: 1,
+      };
     }
     throw err;
   }
@@ -2524,7 +2472,6 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       // OTHER brain is side-effect-safe — throw a typed error so the bridge's
       // cross-brain fallover completes the ask for real. The bridge falls back
       // to this error's graceful message when fallover is off/unavailable.
-      markRunInFlight(sessionId, false);
       try {
         appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'narration_giveup_fallover', preview: text.slice(0, 120) } });
       } catch { /* telemetry best-effort */ }
@@ -2544,12 +2491,6 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     text = 'Some of the work ran, but a later tool call was printed instead of executed, so I cannot claim the task is finished. I did not replay the turn because that could duplicate an action. Should I continue from the recorded state?';
     result = { ...result, stoppedReason: 'awaiting-input' };
   }
-  // Deliver only the missing final chunk. If the exact final already streamed,
-  // avoid a double-render. If a judge/retry replaced the answer, append the
-  // authoritative final reply so direct callers are not left with stale partial
-  // text while SSE/Discord still settle via conversation_completed.
-  const finalDelta = finalChunkDelta(text, streamedText, streamedAny);
-  if (request.onChunk && finalDelta) await request.onChunk(finalDelta);
   // Long-running parity: a turn-budget stop surfaces as a graceful
   // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
   const stoppedReason: AssistantResponse['stoppedReason'] =
@@ -2601,52 +2542,103 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       }
     } catch { /* pause telemetry is best-effort; completion below remains authoritative */ }
   }
-  let terminalEventRecorded = false;
-  let terminalEventInserted = false;
-  try {
-    const terminal = appendTerminalEventOnce({
-      sessionId,
-      turn: 0,
-      role: 'system',
-      data: {
-        attemptId: attempt.attemptId,
-        ...(attempt.runId ? { runId: attempt.runId } : {}),
-        reason: result.limitHit
-          ? 'awaiting_continue'
-          : awaitingInput
-            ? 'awaiting_user_input'
-            : awaitingApproval
-              ? 'awaiting_approval'
-              : 'claude_agent_sdk_brain',
-        summary: text.slice(0, 400),
-        reply: text,
-        ...(logicalRunScopeId ? { artifactRunScopeId: logicalRunScopeId } : {}),
-        ...(awaitingInput ? { awaitingUser: true } : {}),
-        ...(awaitingApproval && graphApprovalId ? { pendingApprovalId: graphApprovalId } : {}),
-        ...(artifactVerificationPending.length > 0
-          ? {
-              artifactVerification: {
-                status: 'pending',
-                count: artifactVerificationPending.length,
-                resources: artifactVerificationPending.map((artifact) => ({
-                  kind: artifact.kind,
-                  provider: artifact.provider,
-                  resourceId: artifact.resourceId,
-                  uri: artifact.uri,
-                  state: artifact.status,
-                })),
-              },
-            }
-          : {}),
-        // Move 4: surface degraded verification so a self-judged / judge-failed-open
-        // completion is distinguishable from an independently-verified one.
-        ...(completionVerification ? { verification: completionVerification } : {}),
-        ...(result.limitHit ? { transport: 'claude_agent_sdk_brain', maxTurns: sdkMaxTurns } : {}),
-      },
-    }, `brain:${attempt.attemptId}`);
-    terminalEventRecorded = true;
-    terminalEventInserted = terminal.inserted;
-  } catch { /* terminal telemetry is best-effort, but controls recovery marker clearing */ }
+  // Reduce the provider-specific run to one typed public outcome. This is the
+  // only foreground terminal write: raw model text, judge notes, and control
+  // fields are not accepted by the committer. A narrated legacy envelope is a
+  // compatibility input only; its explicit reply/question is projected before
+  // the typed boundary.
+  const publicText = publicReplyText(
+    text,
+    result.limitHit
+      ? 'I hit this run\'s budget before finishing. Say "continue" to keep going.'
+      : awaitingApproval
+        ? 'I need your approval before I can continue.'
+        : awaitingInput
+          ? 'I need your input before I can continue.'
+          : 'I finished the turn, but no safe final reply was produced.',
+  );
+  const identity: TurnIdentity = {
+    sessionId,
+    turn: userInputEvent.turn,
+    sourceUserSeq: userInputEvent.seq,
+  };
+  let outcome: TurnOutcome;
+  if (result.limitHit) {
+    outcome = {
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'needs_input',
+      resumable: true,
+      needs: { kind: 'continue' },
+      presentation: { kind: 'continue', text: publicText },
+    };
+  } else if (awaitingApproval && graphApprovalId) {
+    outcome = {
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'needs_input',
+      resumable: true,
+      needs: { kind: 'approval' },
+      presentation: { kind: 'approval', text: publicText, approvalId: graphApprovalId },
+    };
+  } else if (awaitingInput || awaitingApproval) {
+    outcome = {
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'needs_input',
+      resumable: true,
+      needs: { kind: 'input' },
+      presentation: { kind: 'question', text: publicText },
+    };
+  } else {
+    outcome = {
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'done',
+      resumable: false,
+      presentation: { kind: 'answer', text: publicText },
+    };
+  }
+  const terminal = commitTurnOutcome(outcome, {
+    legacyReason: result.limitHit
+      ? 'awaiting_continue'
+      : awaitingInput
+        ? 'awaiting_user_input'
+        : awaitingApproval
+          ? 'awaiting_approval'
+          : 'claude_agent_sdk_brain',
+    metadata: {
+      ...(logicalRunScopeId ? { artifactRunScopeId: logicalRunScopeId } : {}),
+      ...(artifactVerificationPending.length > 0
+        ? {
+            artifactVerification: {
+              status: 'pending',
+              count: artifactVerificationPending.length,
+              resources: artifactVerificationPending.map((artifact) => ({
+                kind: artifact.kind,
+                provider: artifact.provider,
+                resourceId: artifact.resourceId,
+                uri: artifact.uri,
+                state: artifact.status,
+              })),
+            },
+          }
+        : {}),
+      ...(completionVerification ? { verification: completionVerification } : {}),
+      ...(result.limitHit ? { transport: 'claude_agent_sdk_brain', maxTurns: sdkMaxTurns } : {}),
+    },
+  });
+  text = terminal.presentation.text;
+  const terminalEventRecorded = true;
+  const terminalEventInserted = terminal.inserted;
+
+  // The committed public event is the sole live-delivery signal. Emitting the
+  // same text through request.onChunk after commit races the terminal event and
+  // can leave a duplicate provisional bubble on mobile/Discord.
   if (terminalEventInserted) {
     try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
   }
@@ -2666,90 +2658,101 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   }
   // Post-turn hooks (correction detection then auto-credit) via the ONE shared
   // spine — identical on every brain lane. New post-turn behavior wires there.
-  runPostTurnHooks({
-    sessionId,
-    turn: 0,
-    userInput: request.message,
-    recallIds: [renderedTurnContext.memoryPrimer.recallId],
-    replyText: text,
-    toolArgTexts: result.toolUses,
-    // Recovers the MCP-process recall runs (memory_search_facts /
-    // memory_recall_all) this lane could never see in memory — before this,
-    // explicit tool recalls in the Claude lane earned zero utility credit.
-    turnStartedAt,
-  });
+  try {
+    runPostTurnHooksImpl({
+      sessionId,
+      turn: 0,
+      userInput: request.message,
+      recallIds: [renderedTurnContext.memoryPrimer.recallId],
+      replyText: text,
+      toolArgTexts: result.toolUses,
+      // Recovers the MCP-process recall runs (memory_search_facts /
+      // memory_recall_all) this lane could never see in memory — before this,
+      // explicit tool recalls in the Claude lane earned zero utility credit.
+      turnStartedAt,
+    });
+  } catch (err) {
+    console.warn('[claude-agent-brain] post-turn hooks failed after terminal commit', err instanceof Error ? err.message : err);
+  }
   // Autonomous learning parity: every brain reaches the same evidence-first
   // boundary. A clean independent judge, accepted execution controller, or
   // verified artifact read-back can issue a receipt; failed-open/self-judged,
   // paused, ambiguous, and incomplete runs remain useful traces but cannot
   // silently become procedural memory.
-  if (stoppedReason === 'success' && result.toolUses.length >= 2 && getSession(sessionId)?.kind === 'chat') {
-    const controllerVerified = claudeRequestHasAcceptedExecutionCompletion(
-      sessionId,
-      userInputEvent.seq,
-    );
-    const runArtifacts = logicalRunScopeId ? listRunArtifacts(sessionId, logicalRunScopeId) : [];
-    const artifactReadbackVerified = runArtifacts.length > 0 && artifactVerificationPending.length === 0;
-    const learningAuthority = completionIndependentlyVerified
-      ? 'independent_completion_judge' as const
-      : 'execution_controller' as const;
-    const learningManifests = summarizeWorkManifests(sessionId);
-    const learningExternalWriteStatus = freshExternalWriteRequired
-      ? claudeRequestFreshExternalWriteStatus(sessionId, userInputEvent.seq)
-      : 'confirmed';
-    const learningSourceId = attempt.runId ?? attempt.attemptId;
-    const learningInput = {
-      target: 'skill' as const,
-      authority: learningAuthority,
-      sessionId,
-      sourceId: learningSourceId,
-      terminalSuccess: true,
-      independentValidation: completionIndependentlyVerified,
-      controllerValidation: controllerVerified || artifactReadbackVerified,
-      failedOpen: completionVerification?.failedOpen === true,
-      selfJudge: completionVerification?.selfJudge === true,
-      artifactVerificationPending: artifactVerificationPending.length,
-      ambiguousExternalWrites: learningExternalWriteStatus === 'ambiguous' ? 1 : 0,
-      manifestRemaining: learningManifests.reduce((sum, manifest) => sum + manifest.remaining, 0),
-      manifestAnomalies: learningManifests.reduce((sum, manifest) => sum + manifest.anomalies.length, 0),
-      manifestUntrackedCheckpoints: learningManifests.reduce(
-        (sum, manifest) => sum + manifest.untrackedCheckpoints,
-        0,
-      ),
-      externalWriteRequired: freshExternalWriteRequired,
-      externalWriteReceipts: freshExternalWriteEvidenceIsVerified(
-        learningExternalWriteStatus,
-        controllerVerified,
-      ) ? 1 : 0,
-    };
-    const learningDecision = evaluateLearningCandidate(learningInput);
-    recordLearningDecision(learningInput, learningDecision, {
-      lane: 'claude_sdk',
-      toolUses: result.toolUses.length,
-      artifactCount: runArtifacts.length,
-    });
-    void (async () => {
-      try {
-        if (!learningDecision.receipt) return;
-        const { distillSkillFromSession, reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
-        const usedDrafts = gatherSessionSkills(sessionId).map((skill) => skill.name);
-        if (usedDrafts.length > 0) {
-          await reinforceDraftSkills(
-            usedDrafts,
-            'success',
-            undefined,
-            sessionId,
-            learningDecision.receipt,
-          );
-        }
-        await distillSkillFromSession(sessionId, {
-          objective: turnObjective,
-          evidence: text.slice(0, 4000),
-          origin: { kind: 'chat', sourceId: learningSourceId },
-          learningReceipt: learningDecision.receipt,
-        });
-      } catch { /* self-evolving is best-effort — never affects the turn */ }
-    })();
+  try {
+    if (stoppedReason === 'success' && result.toolUses.length >= 2 && getSession(sessionId)?.kind === 'chat') {
+      const controllerVerified = claudeRequestHasAcceptedExecutionCompletion(
+        sessionId,
+        userInputEvent.seq,
+      );
+      const runArtifacts = logicalRunScopeId ? listRunArtifacts(sessionId, logicalRunScopeId) : [];
+      const artifactReadbackVerified = runArtifacts.length > 0 && artifactVerificationPending.length === 0;
+      const learningAuthority = completionIndependentlyVerified
+        ? 'independent_completion_judge' as const
+        : 'execution_controller' as const;
+      const learningManifests = summarizeWorkManifests(sessionId);
+      const learningExternalWriteStatus = freshExternalWriteRequired
+        ? claudeRequestFreshExternalWriteStatus(sessionId, userInputEvent.seq)
+        : 'confirmed';
+      const learningSourceId = attempt.runId ?? attempt.attemptId;
+      const learningInput = {
+        target: 'skill' as const,
+        authority: learningAuthority,
+        sessionId,
+        sourceId: learningSourceId,
+        terminalSuccess: true,
+        independentValidation: completionIndependentlyVerified,
+        controllerValidation: controllerVerified || artifactReadbackVerified,
+        failedOpen: completionVerification?.failedOpen === true,
+        selfJudge: completionVerification?.selfJudge === true,
+        artifactVerificationPending: artifactVerificationPending.length,
+        ambiguousExternalWrites: learningExternalWriteStatus === 'ambiguous' ? 1 : 0,
+        manifestRemaining: learningManifests.reduce((sum, manifest) => sum + manifest.remaining, 0),
+        manifestAnomalies: learningManifests.reduce((sum, manifest) => sum + manifest.anomalies.length, 0),
+        manifestUntrackedCheckpoints: learningManifests.reduce(
+          (sum, manifest) => sum + manifest.untrackedCheckpoints,
+          0,
+        ),
+        externalWriteRequired: freshExternalWriteRequired,
+        externalWriteReceipts: freshExternalWriteEvidenceIsVerified(
+          learningExternalWriteStatus,
+          controllerVerified,
+        ) ? 1 : 0,
+      };
+      const learningDecision = evaluateLearningCandidate(learningInput);
+      recordLearningDecision(learningInput, learningDecision, {
+        lane: 'claude_sdk',
+        toolUses: result.toolUses.length,
+        artifactCount: runArtifacts.length,
+      });
+      void (async () => {
+        try {
+          if (!learningDecision.receipt) return;
+          const { distillSkillFromSession, reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
+          const usedDrafts = gatherSessionSkills(sessionId).map((skill) => skill.name);
+          if (usedDrafts.length > 0) {
+            await reinforceDraftSkills(
+              usedDrafts,
+              'success',
+              undefined,
+              sessionId,
+              learningDecision.receipt,
+            );
+          }
+          await distillSkillFromSession(sessionId, {
+            objective: turnObjective,
+            evidence: text.slice(0, 4000),
+            origin: { kind: 'chat', sourceId: learningSourceId },
+            learningReceipt: learningDecision.receipt,
+          });
+        } catch { /* self-evolving is best-effort — never affects the turn */ }
+      })();
+    }
+  } catch (err) {
+    // Terminal publication already succeeded. Learning and receipt bookkeeping
+    // can be retried independently; they must never escape into whole-turn
+    // recovery and execute the user's tools a second time.
+    console.warn('[claude-agent-brain] learning failed after terminal commit', err instanceof Error ? err.message : err);
   }
   return {
     text,

@@ -7,6 +7,7 @@ import { BASE_DIR } from '../../config.js';
 import { actionBus } from '../action-bus.js';
 import { mirrorEventToOperational } from './eventlog-operational-mirror.js';
 import { AUDIT_MIRRORED_EVENT_TYPES, appendAuditRecord } from '../audit-ledger.js';
+import { projectHarnessEventForPublic } from './public-presentation.js';
 
 /**
  * Event log — the spine of the 0.3 harness.
@@ -49,10 +50,8 @@ export const EVENT_TYPES = [
   'handoff',
   'awaiting_user_input',
   'user_input_received',
-  // Turn-control preflight: one typed read/align/execute decision tied to the
-  // latest user-input event. The prompt may explain an alignment beat, but the
-  // tool boundary reads this durable state so ignoring the prose cannot start
-  // execution before the user's next turn.
+  // One-release read compatibility for align rows persisted by Clementine 3.5.
+  // New turns do not append this event; remove after the upgrade window.
   'turn_preflight_decision',
   'approval_requested',
   'approval_resolved',
@@ -83,6 +82,10 @@ export const EVENT_TYPES = [
   // two runTurn() calls inside the same runConversation(). The
   // OrchestratorDecision drives whether the loop recurses.
   'conversation_step',
+  // A brain stopped without a safe structured outcome. This is execution-graph
+  // state only: the bridge may recover on another brain, then commits exactly
+  // one public terminal for the accepted user turn.
+  'conversation_recovery_candidate',
   'conversation_completed',
   'conversation_limit_exceeded',
   // Auto-capture writeback: emitted from the harness loop whenever a
@@ -170,6 +173,10 @@ export const EVENT_TYPES = [
   // complexity classification that were injected transiently before
   // the model call.
   'agent_context_packet',
+  // Provider-neutral, shadow-only turn graph compiled from one exact accepted
+  // chat source. Observational only: it cannot grant authority or alter the
+  // active v3.6 execution path.
+  'turn_graph_compiled',
   // Planner-first gate: fresh complex requests get a read-only plan
   // proposal before the full external MCP surface is opened.
   'plan_first_started',
@@ -333,13 +340,9 @@ export const EVENT_TYPES = [
   // follow-up report turn so the session self-reports the result to the user.
   'orphaned_tool_inflight',
   'orphaned_tool_reported',
-  // Parse-exhaustion recovery marker: a `conversation_completed` with
-  // reason 'no_structured_output' (the internal "couldn't be structured"
-  // apology) is being re-run once on the next brain. Appended BEFORE the
-  // recovery hop so transcript reconstruction can suppress the apology turn
-  // and show ONLY the recovered reply. Carries {reason, recoveryModel,
-  // supersededAt?}. Absent when a genuine dead-end apology has no recovery,
-  // so the sole reply still renders. (2026-07-03.)
+  // Legacy parse-exhaustion marker retained for replay compatibility. New
+  // graph turns use conversation_recovery_candidate and never publish the
+  // exhausted brain's proposal as a terminal in the first place.
   'conversation_superseded',
   // Restart recovery decision: emitted once per interrupted chat session found
   // on boot, before the visible recovery notice/resume dispatch. Carries the
@@ -1114,6 +1117,47 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     },
   },
+  {
+    // One public terminal belongs to one accepted user_input_received event,
+    // even across rolling upgrades where an older process still writes the
+    // former brain:<attempt> key. A trigger can be installed safely when a
+    // historical database already contains duplicate rows (a UNIQUE index
+    // cannot); it prevents every future writer, including an old binary, from
+    // adding another terminal for an already-settled logical source.
+    version: 17,
+    sql: '',
+    backfill: (db) => {
+      const hasEvents = Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'`,
+      ).get());
+      if (!hasEvents) return;
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_events_one_terminal_per_user_source
+        BEFORE INSERT ON events
+        WHEN NEW.type = 'conversation_completed'
+          AND COALESCE(
+            json_extract(NEW.data_json, '$.sourceUserSeq'),
+            json_extract(NEW.data_json, '$.presentation.identity.sourceUserSeq')
+          ) IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+              FROM events AS settled
+             WHERE settled.session_id = NEW.session_id
+               AND settled.type = 'conversation_completed'
+               AND COALESCE(
+                 json_extract(settled.data_json, '$.sourceUserSeq'),
+                 json_extract(settled.data_json, '$.presentation.identity.sourceUserSeq')
+               ) = COALESCE(
+                 json_extract(NEW.data_json, '$.sourceUserSeq'),
+                 json_extract(NEW.data_json, '$.presentation.identity.sourceUserSeq')
+               )
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'logical terminal source already exists');
+        END;
+      `);
+    },
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
@@ -1449,6 +1493,7 @@ export function getSessionTokensUsed(sessionId: string): number {
 
 function publishPersistedEvent(event: EventRow): EventRow {
   const session = getSession(event.sessionId);
+  const sessionSignal = session ? summarizeSessionForSignal(session) : undefined;
   // Fan out for live SSE subscribers. Best-effort — emit errors are
   // swallowed inside actionBus so a flaky listener can never block
   // an event write.
@@ -1456,8 +1501,20 @@ function publishPersistedEvent(event: EventRow): EventRow {
     kind: 'harness.event',
     sessionId: event.sessionId,
     event,
-    session: session ? summarizeSessionForSignal(session) : undefined,
+    session: sessionSignal,
   });
+  // The raw ledger is not a presentation protocol. Publish a separate,
+  // fail-closed projection for user-facing transports while retaining the
+  // original event above for operator/audit consumers.
+  const publicEvent = projectHarnessEventForPublic(event);
+  if (publicEvent) {
+    actionBus.emit({
+      kind: 'harness.public_event',
+      sessionId: event.sessionId,
+      event: publicEvent,
+      session: sessionSignal,
+    });
+  }
   // Mirror whitelisted events into the operational-telemetry store so the
   // dashboard / Slack / Discord see run lifecycle, swarms, verdicts and
   // fallovers without touching the hot files. Fail-open — never throws.
@@ -1674,6 +1731,187 @@ export function appendEvent(input: AppendEventInput): EventRow {
   return publishPersistedEvent(event);
 }
 
+function rawTurnGraphEventForSource(
+  db: Database.Database,
+  sessionId: string,
+  sourceUserSeq: number,
+): RawEventRow | undefined {
+  return db.prepare(
+    `SELECT * FROM events
+      WHERE session_id = ?
+        AND type = 'turn_graph_compiled'
+        AND json_extract(data_json, '$.sourceUserSeq') = ?
+      ORDER BY seq ASC
+      LIMIT 1`,
+  ).get(sessionId, sourceUserSeq) as RawEventRow | undefined;
+}
+
+/** Point-read the one observational turn graph owned by an exact accepted
+ * source. This avoids loading every later graph (including each full private
+ * IR) when a bridge/recovery hook retries an older logical turn. */
+export function getTurnGraphEventForSource(
+  sessionId: string,
+  sourceUserSeq: number,
+): EventRow | null {
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return null;
+  const row = rawTurnGraphEventForSource(openEventLog(), sessionId, sourceUserSeq);
+  return row ? rowToEvent(row) : null;
+}
+
+/**
+ * Atomically append one source-owned shadow graph, or reuse the existing row.
+ *
+ * The bridge and both brain lanes can observe the same accepted turn. An
+ * IMMEDIATE transaction serializes those observers across processes so their
+ * read-before-write cannot create duplicate graph rows. The transaction also
+ * revalidates the exact chat/user source and parent link before persistence;
+ * the returned observation is never execution or publication authority.
+ */
+export function appendTurnGraphEventOnce(input: {
+  sessionId: string;
+  turn: number;
+  sourceUserSeq: number;
+  data: Record<string, unknown>;
+}): { event: EventRow; inserted: boolean } {
+  if (!input.sessionId || !Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) {
+    throw new Error('turn graph requires an accepted sourceUserSeq');
+  }
+  if (input.data.sourceUserSeq !== input.sourceUserSeq) {
+    throw new Error('turn graph payload source does not match its accepted source');
+  }
+  const db = openEventLog();
+  const append = db.transaction((): { row: RawEventRow; inserted: boolean } => {
+    const source = db.prepare(
+      `SELECT events.*, sessions.kind AS session_kind
+         FROM events
+         JOIN sessions ON sessions.id = events.session_id
+        WHERE events.session_id = ?
+          AND events.seq = ?
+          AND events.type = 'user_input_received'
+        LIMIT 1`,
+    ).get(input.sessionId, input.sourceUserSeq) as (RawEventRow & { session_kind: SessionKind }) | undefined;
+    if (
+      !source
+      || source.session_kind !== 'chat'
+      || source.role !== 'user'
+      || source.turn !== input.turn
+    ) {
+      throw new Error('turn graph source is not the exact accepted chat user turn');
+    }
+
+    const prior = rawTurnGraphEventForSource(db, input.sessionId, input.sourceUserSeq);
+    if (prior) {
+      const priorData = JSON.parse(prior.data_json) as Record<string, unknown>;
+      if (
+        prior.turn !== source.turn
+        || prior.parent_event_id !== source.id
+        || priorData.sourceUserSeq !== input.sourceUserSeq
+      ) {
+        throw new Error('existing turn graph does not belong to its claimed accepted source');
+      }
+      return { row: prior, inserted: false };
+    }
+
+    const id = randomUUID();
+    const now = nowIso();
+    db.prepare(
+      `INSERT INTO events
+         (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+       VALUES (?, ?, ?, 'system', 'turn_graph_compiled', ?, ?, ?)`,
+    ).run(
+      id,
+      input.sessionId,
+      input.turn,
+      source.id,
+      JSON.stringify(input.data),
+      now,
+    );
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+    const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    return { row, inserted: true };
+  });
+
+  // Shadow observability must not add the connection's normal five-second
+  // lock wait to a user turn. If another process owns the eventlog writer, the
+  // observation fails open immediately and a later bridge/recovery hook can
+  // retry the same exact source.
+  const priorBusyTimeout = Number(db.pragma('busy_timeout', { simple: true }));
+  let inserted: { row: RawEventRow; inserted: boolean };
+  try {
+    db.pragma('busy_timeout = 0');
+    inserted = append.immediate();
+  } finally {
+    db.pragma(`busy_timeout = ${Number.isFinite(priorBusyTimeout) ? Math.max(0, Math.floor(priorBusyTimeout)) : 5000}`);
+  }
+
+  const event = rowToEvent(inserted.row);
+  return inserted.inserted
+    ? { event: publishPersistedEvent(event), inserted: true }
+    : { event, inserted: false };
+}
+
+/**
+ * Atomically insert-or-reuse an accepted user input and establish chat restart
+ * ownership. This is the no-attempt twin of recordRunAttemptUserInput, used by
+ * direct runConversation callers such as the CLI.
+ */
+export function acceptUserInputForRun(
+  input: Omit<AppendEventInput, 'type'>,
+  options: { existingEventSeq?: number } = {},
+): EventRow {
+  const db = openEventLog();
+  const id = randomUUID();
+  const now = nowIso();
+  const data = JSON.stringify(input.data ?? {});
+  const shouldArm = (process.env.CLEMMY_CHAT_RESTART_RECOVERY ?? 'on').toLowerCase() !== 'off';
+  const tx = db.transaction((): { event: EventRow; inserted: boolean } => {
+    const armAcceptedChat = (): void => {
+      if (!shouldArm) return;
+      db.prepare(
+        `UPDATE sessions
+            SET metadata_json = json_set(
+                  metadata_json,
+                  '$.__run_in_flight',
+                  COALESCE(json_extract(metadata_json, '$.__run_in_flight'), ?)
+                ),
+                updated_at = ?
+          WHERE id = ? AND kind = 'chat'`,
+      ).run(now, now, input.sessionId);
+    };
+
+    if (options.existingEventSeq !== undefined) {
+      const existing = db.prepare('SELECT * FROM events WHERE seq = ?').get(
+        options.existingEventSeq,
+      ) as RawEventRow | undefined;
+      if (!existing || existing.session_id !== input.sessionId || existing.type !== 'user_input_received') {
+        throw new Error(`event ${options.existingEventSeq} is not a user input for session ${input.sessionId}`);
+      }
+      armAcceptedChat();
+      return { event: rowToEvent(existing), inserted: false };
+    }
+
+    db.prepare(
+      `INSERT INTO events
+         (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+       VALUES (?, ?, ?, ?, 'user_input_received', ?, ?, ?)`,
+    ).run(
+      id,
+      input.sessionId,
+      input.turn,
+      input.role,
+      input.parentEventId ?? null,
+      data,
+      now,
+    );
+    const inserted = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    armAcceptedChat();
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+    return { event: rowToEvent(inserted), inserted: true };
+  });
+  const result = tx();
+  return result.inserted ? publishPersistedEvent(result.event) : result.event;
+}
+
 /**
  * Atomically insert-or-reuse a user input and bind it to one run attempt.
  *
@@ -1686,13 +1924,33 @@ export function appendEvent(input: AppendEventInput): EventRow {
 export function recordRunAttemptUserInput(
   attempt: Pick<RunAttemptRef, 'sessionId' | 'attemptId'>,
   input: Omit<AppendEventInput, 'sessionId' | 'type'>,
-  options: { existingEventSeq?: number } = {},
+  options: {
+    existingEventSeq?: number;
+    /** Atomically establish restart ownership beside source insert/binding.
+     * Chat-only and honors CLEMMY_CHAT_RESTART_RECOVERY=off. */
+    armRunInFlight?: boolean;
+  } = {},
 ): EventRow {
   const db = openEventLog();
   const id = randomUUID();
   const now = nowIso();
   const data = JSON.stringify(input.data ?? {});
+  const shouldArmRunInFlight = options.armRunInFlight === true
+    && (process.env.CLEMMY_CHAT_RESTART_RECOVERY ?? 'on').toLowerCase() !== 'off';
   const tx = db.transaction((): { event: EventRow; inserted: boolean } => {
+    const armAcceptedChat = (): void => {
+      if (!shouldArmRunInFlight) return;
+      db.prepare(
+        `UPDATE sessions
+            SET metadata_json = json_set(
+                  metadata_json,
+                  '$.__run_in_flight',
+                  COALESCE(json_extract(metadata_json, '$.__run_in_flight'), ?)
+                ),
+                updated_at = ?
+          WHERE id = ? AND kind = 'chat'`,
+      ).run(now, now, attempt.sessionId);
+    };
     const attemptRow = db.prepare(
       'SELECT session_id, source_user_seq FROM run_attempts WHERE attempt_id = ?',
     ).get(attempt.attemptId) as { session_id: string; source_user_seq: number | null } | undefined;
@@ -1712,6 +1970,7 @@ export function recordRunAttemptUserInput(
             SET source_user_seq = COALESCE(source_user_seq, ?)
           WHERE attempt_id = ? AND session_id = ?`,
       ).run(selectedSeq, attempt.attemptId, attempt.sessionId);
+      armAcceptedChat();
       return { event: rowToEvent(existing), inserted: false };
     }
 
@@ -1732,6 +1991,7 @@ export function recordRunAttemptUserInput(
     db.prepare(
       'UPDATE run_attempts SET source_user_seq = ? WHERE attempt_id = ? AND session_id = ?',
     ).run(inserted.seq, attempt.attemptId, attempt.sessionId);
+    armAcceptedChat();
     db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, attempt.sessionId);
     return { event: rowToEvent(inserted), inserted: true };
   });
@@ -1751,17 +2011,46 @@ export function appendTerminalEventOnce(
 ): { event: EventRow; inserted: boolean } {
   const key = terminalKey.trim();
   if (!key) throw new Error('terminalKey is required');
+  const rawSourceUserSeq = input.data?.sourceUserSeq;
+  const sourceUserSeq = Number.isSafeInteger(rawSourceUserSeq) && Number(rawSourceUserSeq) > 0
+    ? Number(rawSourceUserSeq)
+    : null;
+  const findByLogicalSource = (): RawEventRow | undefined => {
+    if (sourceUserSeq === null) return undefined;
+    return openEventLog().prepare(
+      `SELECT * FROM events
+        WHERE session_id = ?
+          AND type = 'conversation_completed'
+          AND (
+            json_extract(data_json, '$.sourceUserSeq') = ?
+            OR json_extract(data_json, '$.presentation.identity.sourceUserSeq') = ?
+            OR json_extract(data_json, '$.terminalKey') = ?
+          )
+        ORDER BY seq ASC
+        LIMIT 1`,
+    ).get(input.sessionId, sourceUserSeq, sourceUserSeq, `turn:${sourceUserSeq}`) as RawEventRow | undefined;
+  };
+
+  // Upgrade bridge: a typed 3.5 row may already own this exact source under a
+  // brain:<attempt> key. It is still the durable first writer; never append a
+  // parallel turn:<source> row beside it.
+  const logicalWinner = findByLogicalSource();
+  if (logicalWinner) return { event: rowToEvent(logicalWinner), inserted: false };
   try {
     const event = appendEvent({
       ...input,
       type: 'conversation_completed',
-      data: { ...(input.data ?? {}), terminalKey: key },
+      data: {
+        ...(input.data ?? {}),
+        terminalKey: key,
+        ...(sourceUserSeq !== null ? { logicalTerminalVersion: 1 } : {}),
+      },
     });
     return { event, inserted: true };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (!/unique constraint failed/i.test(message)) throw err;
-    const row = openEventLog().prepare(
+    if (!/unique constraint failed|logical terminal source already exists/i.test(message)) throw err;
+    const row = findByLogicalSource() ?? openEventLog().prepare(
       `SELECT * FROM events
         WHERE session_id = ?
           AND type = 'conversation_completed'

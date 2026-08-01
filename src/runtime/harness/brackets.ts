@@ -1,10 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, getToolOutput, type KillRequestTarget } from './eventlog.js';
-import {
-  backgroundOfferEnabled as spineBackgroundOfferEnabled,
-  effectiveTurnObjective,
-} from './turn-control.js';
+import { effectiveTurnObjective } from './turn-control.js';
 import { runWithToolAbortSignal } from '../tool-abort-context.js';
 import {
   takeShellExecutionOutcome,
@@ -34,7 +31,6 @@ import {
   projectCanonicalTopLevelToolEvents,
 } from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
-import { sessionHasBackgroundOffer } from './convergence-steer.js';
 import {
   isMutatingExternalWrite,
   isGateEnabled as isExecutionGateEnabled,
@@ -995,13 +991,6 @@ export interface HarnessRunContext {
    * Reasoning is buffered until text/tool output makes the attempt replay-unsafe,
    * but the outer stream watchdog still needs to know the model is alive. */
   privateModelActivityAt?: number;
-  /** Inc A2 — set once per runTurn after the mid-step background-offer nudge has
-   *  been evaluated, so a long grind nudges AT MOST once per step (the context is
-   *  rebuilt per Runner.run, so this naturally resets each runTurn). */
-  backgroundOfferNudged?: boolean;
-  /** This run is resolving the user's answer to a clarification. Do not inject
-   *  a second conversational gate by offering background execution mid-turn. */
-  suppressBackgroundOffer?: boolean;
   /** Per-turn budget for recall_tool_result calls. Optional — when
    *  absent (e.g. tests, non-harness call paths), recall is unmetered. */
   recallBudget?: RecallBudget;
@@ -1153,19 +1142,6 @@ export interface WrapToolOptions {
 export function harnessToolBracketsEnabled(): boolean {
   return (getRuntimeEnv('HARNESS_TOOL_BRACKETS', 'on') ?? 'on').toLowerCase() !== 'off';
 }
-
-// Optional Inc A2 — mid-runTurn background-offer nudge. The loop's between-steps nudge
-// can't catch a model that grinds a long task in a SINGLE runTurn (many tool
-// calls, then done/ask — no continuation). This rail fires WITHIN the runTurn,
-// appended to a tool result like the fan-out nudge, so the model reads it
-// mid-stride and can offer to move the work to the background. Same kill-switch
-// as the loop nudge (CLEMMY_BG_OFFER_NUDGE). Defined locally to avoid a
-// brackets→loop import cycle.
-function backgroundOfferNudgeEnabled(): boolean {
-  // 2026-07-16 policy: default ON via the shared turn-control spine.
-  return spineBackgroundOfferEnabled();
-}
-const BACKGROUND_OFFER_NUDGE_MIN_TOOLS = 6;
 
 // Pre-write LATENCY: the irreversible-write/send path runs three independent,
 // fail-open model-judges (grounding, goal-fidelity, output-grounding) that today
@@ -2923,8 +2899,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
 
             let count = 1;
             let underScope = false;
-            const gateThisSession = sessionRow?.kind === 'chat' || shape.irreversible;
-            if (isConfirmFirstEnabled() && gateThisSession) {
+            if (isConfirmFirstEnabled() && shape.irreversible) {
               let prior = 0;
               try {
                 for (const ev of listEvents(ctx.sessionId, { types: ['external_write'] })) {
@@ -2945,26 +2920,18 @@ export function wrapToolForHarness<T extends WrappableTool>(
               const threshold = policy.batchConfirmThreshold;
               const review = decideInstructionReview({ priorSameShapeCount: prior, threshold });
               count = review.count;
-              const yoloStandingApproval = policy.autoApproveScope === 'yolo' && !shape.irreversible;
               const approvedCertifiedBatch = Boolean(ctx.certifiedBatch);
               const { getPlanScope, isUngrantableMultiplexer } = await import('../../agents/plan-scope.js');
               const scope = getPlanScope(ctx.sessionId);
               const scopeOpen = Boolean(scope && !scope.closedAt);
-              underScope = shape.irreversible
-                ? Boolean(scopeOpen && scope && (
-                    (scope.allowedSends ?? []).some((value) => value === shape.shapeKey)
-                    || (scope.allowedComposioSlugs ?? []).some((value) => value === shape.shapeKey)
-                    || (!isUngrantableMultiplexer(tool.name) && scope.allowedTools.includes(tool.name))
-                  ))
-                : scopeOpen;
-              const gateAllMutating =
-                (getRuntimeEnv('CLEMMY_CONFIRM_FIRST_ALL_WRITES', 'off') ?? 'off').toLowerCase() === 'on';
-              const severityRequiresGate = gateAllMutating || shape.irreversible;
+              underScope = Boolean(scopeOpen && scope && (
+                (scope.allowedSends ?? []).some((value) => value === shape.shapeKey)
+                || (scope.allowedComposioSlugs ?? []).some((value) => value === shape.shapeKey)
+                || (!isUngrantableMultiplexer(tool.name) && scope.allowedTools.includes(tool.name))
+              ));
               if (
-                !yoloStandingApproval
-                && !approvedCertifiedBatch
+                !approvedCertifiedBatch
                 && review.required
-                && severityRequiresGate
                 && !underScope
               ) {
                 try {
@@ -3044,35 +3011,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // (sessionId arg is unused — included for future per-session
     // behavior without forcing callers to refactor.)
     void sessionId;
-    // Inc A2 — mid-runTurn background-offer nudge. Once this runTurn has made
-    // enough tool calls in a FOREGROUND chat without offering/dispatching, append
-    // a one-time "offer to move this to the background" nudge so the model reads
-    // it mid-grind. Evaluated AT MOST once per runTurn (ctx flag); skipped in
-    // worker scopes, non-chat sessions, and once an offer was already posted.
-    let bgOfferNudge: string | undefined;
-    if (
-      !ctx.backgroundOfferNudged
-      && !ctx.suppressBackgroundOffer
-      && !ctx.codeMode
-      && !ctx.batchItem
-      && backgroundOfferNudgeEnabled()
-      && !ctx.guardrailScopeId
-      && ctx.counter.calls >= BACKGROUND_OFFER_NUDGE_MIN_TOOLS
-    ) {
-      ctx.backgroundOfferNudged = true; // evaluate the (slightly heavier) checks once per runTurn
-      try {
-        if (
-          !ctx.sessionId.startsWith('background:')
-          && getSession(ctx.sessionId)?.kind === 'chat'
-          && !sessionHasBackgroundOffer(ctx.sessionId)
-        ) {
-          bgOfferNudge =
-            '[background offer] You have already made several tool calls on this in the foreground while the user waits. '
-            + 'If finishing will take more than a step or two, ASK the user in one plain sentence whether to move it to the background (dispatch_background_task on their yes) or hold it for later — then STOP. '
-            + 'If you are nearly done (a step or two left), just finish; do not offer.';
-        }
-      } catch { /* advisory only — never block the tool */ }
-    }
     // WORKER FINISH WINDOW (2026-07-22): a worker one call from its ceiling
     // gets a wrap-up notice ON this result instead of a guillotine on the
     // next — productive partial work lands as an honest partial answer
@@ -3096,7 +3034,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if (ctx.codeMode) return undefined;
     // All nudges ride the same advisory rail (appended to the tool result by the
     // caller). Combine so a turn that trips several still delivers each.
-    const nudges = [fanoutNudge, cacheNudge, bgOfferNudge, workerFinishNudge].filter(Boolean);
+    const nudges = [fanoutNudge, cacheNudge, workerFinishNudge].filter(Boolean);
     return nudges.length > 0 ? nudges.join('\n\n') : undefined;
   };
 

@@ -19,9 +19,13 @@ import { test, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { appendEvent, createSession } = await import('./eventlog.js');
+const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { turnOutcomeId } = await import('./turn-outcome.js');
 const {
+  buildTerminalReportBody,
   decideTerminalReportBack,
   readTerminalRunFacts,
+  resetTerminalReportBackOutboxForTest,
   startTerminalReportBackWatcher,
 } = await import('./terminal-report-back.js');
 type TerminalRunFacts = import('./terminal-report-back.js').TerminalRunFacts;
@@ -37,13 +41,20 @@ const BASE: TerminalRunFacts = {
   toolCalls: 40,
   externalWrites: 0,
   seenByViewer: false,
-  outcome: 'completed',
+  outcome: 'done',
   startSeq: 1,
 };
 
 let stopWatcher: (() => void) | null = null;
-beforeEach(() => { resetSessionViewersForTest(); });
-afterEach(() => { stopWatcher?.(); stopWatcher = null; });
+beforeEach(() => {
+  resetSessionViewersForTest();
+  resetTerminalReportBackOutboxForTest();
+});
+afterEach(() => {
+  stopWatcher?.();
+  stopWatcher = null;
+  resetTerminalReportBackOutboxForTest();
+});
 
 // ── The decision ────────────────────────────────────────────────────────────
 
@@ -73,6 +84,27 @@ test('an external write is substantive at any duration', () => {
     ...BASE, elapsedMs: 4_000, toolCalls: 1, externalWrites: 1,
   });
   assert.equal(decision.deliver, true);
+});
+
+test('report-back body uses the same safe public projection as live chat', () => {
+  const body = buildTerminalReportBody({
+    sessionId: 'sess-x',
+    terminalSeq: 2,
+    startSeq: 1,
+    terminalData: {
+      reply: [
+        'Which tenant should I use?',
+        'summary: inspected all connections',
+        'reply: I found two valid tenants.',
+        'done: false',
+        'nextAction: awaiting_user_input',
+        'reason: tenant choice is user-owned',
+      ].join('\n'),
+      internalSummary: 'private execution notes',
+    },
+  });
+  assert.equal(body, 'I found two valid tenants.\n\nWhich tenant should I use?');
+  assert.doesNotMatch(body, /summary:|done:|nextAction:|reason:|private execution/i);
 });
 
 test('Discord and Slack already delivered the reply — pinging again is a duplicate', () => {
@@ -117,10 +149,15 @@ function seedRun(sessionId: string, toolCalls: number, startedAt: string, endedA
   for (let i = 0; i < toolCalls; i += 1) {
     appendEvent({ sessionId, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'firecrawl_search', callId: `c${i}` } });
   }
-  const terminal = appendEvent({
-    sessionId, turn: 1, role: 'assistant', type: 'conversation_completed',
-    data: { reply: 'Done — 10 firms, keywords and gaps, in the sheet.', steps: 12 },
-  });
+  const identity = { sessionId, turn: 1, sourceUserSeq: start.seq };
+  const terminal = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: 'Done — 10 firms, keywords and gaps, in the sheet.' },
+  }, { metadata: { steps: 12 } }).event;
   // The event log stamps its own createdAt; overwrite the pair we time against
   // so the elapsed calculation is deterministic rather than sub-millisecond.
   void startedAt; void endedAt;
@@ -136,12 +173,20 @@ test('the run window is scoped to the last user input, not the whole session', (
   }
   appendEvent({ sessionId, turn: 1, role: 'assistant', type: 'conversation_completed', data: { reply: 'first done' } });
   const second = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'thanks' } });
-  const terminal = appendEvent({ sessionId, turn: 2, role: 'assistant', type: 'conversation_completed', data: { reply: 'anytime' } });
+  const identity = { sessionId, turn: 2, sourceUserSeq: second.seq };
+  const terminal = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: 'anytime' },
+  }).event;
 
   const facts = readTerminalRunFacts({
     sessionId, sessionKind: 'chat', channel: null,
-    terminalSeq: terminal.seq, terminalType: 'conversation_completed',
-    terminalAt: terminal.createdAt, seenByViewer: false,
+    terminalSeq: terminal.seq, terminalAt: terminal.createdAt,
+    sourceUserSeq: second.seq, outcome: 'done', seenByViewer: false,
   });
   assert.ok(facts);
   assert.equal(facts.startSeq, second.seq, 'window opens at the SECOND user input');
@@ -222,6 +267,120 @@ test('one user request pages the user once, however many terminal events it writ
   assert.equal(matches[0]!.id, `foreground-report-back-${sessionId}-${startSeq}`);
 });
 
+test('a late terminal for A keeps A source ownership after B was accepted', async () => {
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-late-terminal-a';
+  createSession({ id: sessionId, kind: 'chat', title: 'overlapping turns' });
+  const sourceA = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'do A' },
+  });
+  for (let i = 0; i < 12; i += 1) {
+    appendEvent({
+      sessionId, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { tool: 'research', callId: `late-a-${i}` },
+    });
+  }
+  const sourceB = appendEvent({
+    sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'do B' },
+  });
+  const identityA = { sessionId, turn: 1, sourceUserSeq: sourceA.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identityA),
+    identity: identityA,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: 'A finished after B was accepted.' },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const notification = listNotifications(100).find(
+    (item) => item.id === `foreground-report-back-${sessionId}-${sourceA.seq}`,
+  );
+  assert.ok(notification, 'late A still emits A-owned report-back');
+  assert.match(notification.body, /^A finished/);
+  assert.equal(
+    listNotifications(100).some(
+      (item) => item.id === `foreground-report-back-${sessionId}-${sourceB.seq}`,
+    ),
+    false,
+    'the latest accepted input B must never steal A terminal ownership',
+  );
+});
+
+test('typed failed terminal is labeled failed, never completed', async () => {
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-typed-failure-label';
+  createSession({ id: sessionId, kind: 'chat', title: 'client export' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'export it' },
+  });
+  for (let i = 0; i < 8; i += 1) {
+    appendEvent({
+      sessionId, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { tool: 'export', callId: `failed-${i}` },
+    });
+  }
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'failed',
+    resumable: false,
+    presentation: { kind: 'error', text: 'The export failed before a file was produced.' },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const notification = listNotifications(100).find(
+    (item) => item.id === `foreground-report-back-${sessionId}-${source.seq}`,
+  );
+  assert.ok(notification);
+  assert.match(notification.title, /^Chat run failed:/);
+  assert.doesNotMatch(notification.title, /completed/i);
+  assert.equal(notification.metadata?.status, 'failed');
+  assert.equal(notification.metadata?.needsAttention, true);
+});
+
+test('pending report survives a process restart during the grace window', async () => {
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 45_000, now: () => 1_000 });
+  const sessionId = 'sess-pending-restart';
+  const { startSeq } = seedRun(sessionId, 12, '', '');
+
+  // Stop tears down every in-memory timer/listener, as a process exit would.
+  // The replacement watcher sees the durable row after its original deadline.
+  stopWatcher();
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 45_000, now: () => 100_000 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const matches = listNotifications(100).filter(
+    (item) => item.id === `foreground-report-back-${sessionId}-${startSeq}`,
+  );
+  assert.equal(matches.length, 1, 'restart reconciliation delivers the stable source exactly once');
+});
+
+test('watched decision survives a process restart during the grace window', async () => {
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 45_000, now: () => 1_000 });
+  const sessionId = 'sess-watched-restart';
+  const { startSeq } = seedRun(sessionId, 12, '', '');
+  // Arriving after the terminal exercises the outbox's durable viewer mark,
+  // rather than only the viewer-presence snapshot taken while it is armed.
+  attachSessionViewer(sessionId, 1_100);
+
+  stopWatcher();
+  resetSessionViewersForTest(); // a live socket ledger does not survive restart
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 45_000, now: () => 100_000 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(
+    listNotifications(100).some(
+      (item) => item.id === `foreground-report-back-${sessionId}-${startSeq}`,
+    ),
+    false,
+    'durable seen marker prevents a duplicate page after restart',
+  );
+});
+
 test('a run long enough to outgrow a read window still reports back', () => {
   // Found by probing the new code adversarially before it shipped (2026-07-31).
   // The first cut read the newest 2000 events and looked for the user's input
@@ -239,15 +398,20 @@ test('a run long enough to outgrow a read window still reports back', () => {
   for (let i = 0; i < 2200; i += 1) {
     appendEvent({ sessionId, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'firecrawl_search', callId: 'x' + i } });
   }
-  const terminal = appendEvent({
-    sessionId, turn: 1, role: 'assistant', type: 'conversation_completed',
-    data: { reply: 'Done - 10 firms, keywords and gaps, in the sheet.' },
-  });
+  const identity = { sessionId, turn: 1, sourceUserSeq: start.seq };
+  const terminal = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: 'Done - 10 firms, keywords and gaps, in the sheet.' },
+  }).event;
 
   const facts = readTerminalRunFacts({
     sessionId, sessionKind: 'chat', channel: null,
-    terminalSeq: terminal.seq, terminalType: 'conversation_completed',
-    terminalAt: terminal.createdAt, terminalData: terminal.data, seenByViewer: false,
+    terminalSeq: terminal.seq, terminalAt: terminal.createdAt,
+    sourceUserSeq: start.seq, outcome: 'done', seenByViewer: false,
   });
   assert.ok(facts, 'a 2200-event run is still a run');
   assert.equal(facts.startSeq, start.seq, 'the opening message is found however far back it is');

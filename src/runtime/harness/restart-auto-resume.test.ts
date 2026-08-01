@@ -15,6 +15,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 const {
   appendEvent,
   beginRunAttempt,
+  getLatestRunAttempt,
   isKillRequested,
   listEvents,
   recordRunAttemptUserInput,
@@ -32,14 +33,22 @@ beforeEach(() => {
 
 function interruptedChatSession(): string {
   const sess = HarnessSession.create({ kind: 'chat', title: 'diag' });
+  const attempt = beginRunAttempt(sess.id, { runId: `restart-test:${sess.id}` });
+  recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Finish the interrupted task.' },
+  });
   markRunInFlight(sess.id, true); // never cleared = killed mid-run
   return sess.id;
 }
 
-test('a clean interrupted run (no external writes) is AUTO-RESUMED with the truthful notice', async () => {
+test('a clean interrupted run is auto-resumed with nonterminal progress only', async () => {
   const id = interruptedChatSession();
-  const dispatched: Array<{ sessionId: string; directive: string }> = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId, directive) => { dispatched.push({ sessionId, directive }); });
+  const dispatched: Array<{ sessionId: string; directive: string; sourceUserSeq: number }> = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId, directive, sourceUserSeq) => {
+    dispatched.push({ sessionId, directive, sourceUserSeq });
+  });
   assert.equal(summary.recovered, 1);
   const rec = summary.records[0];
   assert.equal(rec.autoResumed, true);
@@ -48,8 +57,21 @@ test('a clean interrupted run (no external writes) is AUTO-RESUMED with the trut
   assert.equal(dispatched.length, 1);
   assert.equal(dispatched[0].sessionId, id);
   assert.equal(dispatched[0].directive, AUTO_RESUME_DIRECTIVE);
-  const notices = listEvents(id, { types: ['conversation_completed'] });
-  assert.match(String((notices.at(-1)?.data as { reply?: string }).reply ?? ''), /resuming it automatically/);
+  assert.equal(dispatched[0].sourceUserSeq, getLatestRunAttempt(id)?.sourceUserSeq);
+  assert.equal(
+    listEvents(id, { types: ['user_input_received'] }).length,
+    1,
+    'restart dispatch reuses the accepted source instead of appending its directive as a user turn',
+  );
+  assert.equal(
+    listEvents(id, { types: ['conversation_completed'] }).length,
+    0,
+    'auto-resume progress is not published as a false terminal before the resumed answer',
+  );
+  const resumed = listEvents(id, { types: ['run_resumed'] });
+  assert.equal(resumed.length, 1);
+  assert.equal(resumed[0].data.reason, 'restart_auto_resume');
+  assert.equal(resumed[0].data.autoResume, true);
   const decisions = listEvents(id, { types: ['restart_recovery_decision'] });
   assert.equal(decisions.length, 1);
   assert.deepEqual(
@@ -92,6 +114,14 @@ test('a persisted user stop is never resurrected by restart auto-resume', async 
   assert.equal(notice.reason, 'stopped_before_restart');
   assert.match(String(notice.reply ?? ''), /stopped as requested/i);
   assert.doesNotMatch(String(notice.reply ?? ''), /reply `continue`/i);
+  assert.equal(
+    (notice as { presentation?: { status?: string } }).presentation?.status,
+    'cancelled',
+  );
+  assert.equal(
+    (notice as { presentation?: { kind?: string } }).presentation?.kind,
+    'stopped',
+  );
   assert.equal(isKillRequested(sess.id, attempt), false, 'restart terminal cleanup consumes only the stopped attempt latch');
 });
 
@@ -333,11 +363,24 @@ test('kill-switch CLEMMY_CHAT_AUTO_RESUME=off restores banner-only for everyone'
 });
 
 test('no dispatcher (legacy caller) behaves exactly as before — banner only', () => {
-  interruptedChatSession();
+  const id = interruptedChatSession();
   const summary = recoverInterruptedChatRuns(Date.now);
   assert.equal(summary.recovered, 1);
   assert.equal(summary.records[0].autoResumed, false);
   assert.equal(summary.records[0].autoResumeSkipped, 'no_dispatcher');
+  const attempt = getLatestRunAttempt(id);
+  const terminal = listEvents(id, { types: ['conversation_completed'] }).at(-1)?.data as {
+    terminalKey?: string;
+    attemptId?: string;
+    sourceUserSeq?: number;
+    presentation?: { status?: string; kind?: string; needs?: { kind?: string } };
+  };
+  assert.equal(terminal.terminalKey, `turn:${attempt?.sourceUserSeq}`);
+  assert.equal(terminal.attemptId, attempt?.attemptId);
+  assert.equal(terminal.sourceUserSeq, attempt?.sourceUserSeq);
+  assert.equal(terminal.presentation?.status, 'needs_input');
+  assert.equal(terminal.presentation?.kind, 'continue');
+  assert.equal(terminal.presentation?.needs?.kind, 'continue');
 });
 
 test('boot cap: only the first 3 eligible runs auto-resume; the rest keep the banner', async () => {
@@ -357,7 +400,16 @@ test('a FAILED dispatch falls back to the manual banner + a notification', async
   assert.equal(summary.records[0].autoResumed, true, 'dispatch was attempted');
   await new Promise((r) => setTimeout(r, 30));
   const notices = listEvents(id, { types: ['conversation_completed'] });
-  const last = notices.at(-1)?.data as { autoResumeFailed?: boolean; reply?: string };
-  assert.equal(last.autoResumeFailed, true);
+  const last = notices.at(-1)?.data as {
+    reply?: string;
+    presentation?: { status?: string; kind?: string; needs?: { kind?: string } };
+  };
   assert.match(String(last.reply ?? ''), /Reply `continue`/, 'the user still gets the manual path');
+  assert.equal(last.presentation?.status, 'needs_input');
+  assert.equal(last.presentation?.kind, 'continue');
+  assert.equal(last.presentation?.needs?.kind, 'continue');
+  const privateFailure = listEvents(id, { types: ['restart_recovery_decision'] })
+    .find((event) => event.data.phase === 'dispatch_failed');
+  assert.equal(privateFailure?.data.error, 'brain unavailable');
+  assert.doesNotMatch(JSON.stringify(last), /brain unavailable/);
 });

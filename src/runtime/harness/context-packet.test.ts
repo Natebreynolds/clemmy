@@ -839,7 +839,7 @@ test('repair-loop policy is scoped to repair work and cannot globally block unre
   assert.doesNotMatch(ordinaryRunPacket.text, /AGENT SYSTEM GUIDANCE|repair-loop|replan instead of retrying/i);
 });
 
-test('packet keeps the static line (no directive) for NON-chat sessions even when multi-item', () => {
+test('packet gives workflow nodes truthful runner-owned topology guidance while other non-chat sessions keep the static line', () => {
   for (const kind of ['workflow', 'execution', 'agent']) {
     const packet = buildAgentContextPacket(
       'Research these 10 prospects.',
@@ -848,13 +848,19 @@ test('packet keeps the static line (no directive) for NON-chat sessions even whe
     );
     assert.equal(packet.multiItem.detected, true, `${kind}: still detects`);
     assert.equal(packet.multiItem.offered, false, `${kind}: directive suppressed`);
-    assert.match(packet.text, /Parallelism reminder:/, `${kind}: static line preserved (zero-regression)`);
     assert.ok(!/Fan-out directive/.test(packet.text), `${kind}: no directive`);
     if (kind === 'workflow') {
+      assert.match(packet.text, /Workflow parallelism: execute this node as one scoped unit/);
+      assert.match(packet.text, /runner owns topology/);
+      assert.match(packet.text, /authored forEach step or explicit sibling nodes/);
+      assert.doesNotMatch(packet.text, /call run_worker/);
+      assert.doesNotMatch(packet.text, /Parallelism reminder:/);
       assert.deepEqual(packet.skills, [], 'a pinned workflow node receives no ambient skill candidates');
       assert.deepEqual(packet.workflows, [], 'a pinned workflow node receives no ambient workflow candidates');
       assert.equal(packet.prospective.injected, false, 'proactive chat intentions do not contaminate a constrained workflow node');
       assert.deepEqual(packet.mcp, [], 'workflow nodes rely on their authored tool scope instead of probing unrelated MCP health');
+    } else {
+      assert.match(packet.text, /Parallelism reminder:/, `${kind}: static line preserved (zero-regression)`);
     }
   }
 });

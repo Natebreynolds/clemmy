@@ -43,6 +43,31 @@ test('workflow definition hash is stable across object key order but preserves s
   assert.notEqual(workflowDefinitionHash(first), workflowDefinitionHash(reversed));
 });
 
+test('workflow definition admission pins read_parallel_v1 topology and specialist instructions', () => {
+  const original = workflow();
+  original.steps[0].subgraph = {
+    mode: 'read_parallel_v1',
+    specialists: [
+      { id: 'facts', prompt: 'Inspect factual evidence.' },
+      { id: 'risks', prompt: 'Inspect risk evidence.' },
+    ],
+  };
+  const snapshot = createWorkflowRunDefinitionSnapshot(
+    'pinned-workflow',
+    original,
+    '2026-08-01T12:00:00.000Z',
+  );
+
+  const edited = JSON.parse(JSON.stringify(original)) as WorkflowDefinition;
+  edited.steps[0].subgraph!.specialists[1].prompt = 'Use a newer specialist instruction.';
+  assert.notEqual(workflowDefinitionHash(edited), snapshot.definitionHash);
+  assert.equal(workflowDefinitionMatchesSnapshotIgnoringEnabled(snapshot, edited), false);
+  assert.equal(
+    snapshot.definition.steps[0].subgraph?.specialists[1].prompt,
+    'Inspect risk evidence.',
+  );
+});
+
 test('workflow definition snapshot is a defensive immutable copy', () => {
   const def = workflow();
   const snapshot = createWorkflowRunDefinitionSnapshot('pinned-workflow', def, '2026-07-26T12:00:00.000Z');

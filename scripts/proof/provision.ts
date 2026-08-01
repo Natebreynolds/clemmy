@@ -324,10 +324,6 @@ export function proofRuntimeOverrides(fusionMode: FusionProofMode = 'off'): Reco
     CLEMMY_DEBATE_MODE: fusionMode,
     CLEMMY_FUSION_STRATEGY: 'verify',
     CLEMMY_JUDGE_CROSS_FAMILY: 'off',
-    // Proof scenarios need the durable task to start on the explicit
-    // `/background` request. The optional conversational approach beat is a
-    // product UX choice, not part of background execution correctness.
-    CLEMMY_LONGTASK_APPROACH_BEAT: 'off',
   };
 }
 

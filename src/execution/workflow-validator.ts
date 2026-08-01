@@ -51,6 +51,18 @@ export interface WorkflowStepShape {
   forEach?: string;
   forEachNewOnly?: boolean;
   for_each_new_only?: boolean;
+  subgraph?: {
+    mode?: string;
+    specialists?: Array<{
+      id?: string;
+      prompt?: string;
+      label?: string;
+      model?: string;
+      intent?: string;
+      maxTurns?: number;
+      max_turns?: number;
+    }>;
+  };
   deterministic?: { runner?: string };
   call?: { tool?: string; args?: Record<string, unknown> };
   usesSkill?: string;
@@ -772,6 +784,76 @@ export function validateWorkflowDefinition(
       // un-saveable and un-runnable.
       if (!step.requiresApproval && callSideEffectClass(step) === 'send') {
         errors.push(`Step "${step.id ?? '?'}" is a SEND-class call node (${step.call?.tool ?? '?'}) with no approval. A structured send call dispatches directly with no approval card — set requiresApproval: true (+ a short approvalPreview), or route the send through run_batch so it queues for the user's approval.`);
+      }
+    }
+    if (step.subgraph !== undefined) {
+      const subgraph = step.subgraph;
+      if (!subgraph || typeof subgraph !== 'object' || Array.isArray(subgraph)) {
+        errors.push(`Step "${step.id ?? '?'}" subgraph must be an object.`);
+      } else {
+        if (subgraph.mode !== 'read_parallel_v1') {
+          errors.push(
+            `Step "${step.id ?? '?'}" declares unsupported subgraph mode "${String(subgraph.mode)}". Use read_parallel_v1.`,
+          );
+        }
+        const specialists = Array.isArray(subgraph.specialists) ? subgraph.specialists : [];
+        if (specialists.length < 2 || specialists.length > 6) {
+          errors.push(
+            `Step "${step.id ?? '?'}" read_parallel_v1 needs 2–6 specialists; received ${specialists.length}.`,
+          );
+        }
+        const specialistIds = new Set<string>();
+        specialists.forEach((specialist, index) => {
+          const specialistId = typeof specialist?.id === 'string' ? specialist.id.trim() : '';
+          const specialistPrompt = typeof specialist?.prompt === 'string' ? specialist.prompt.trim() : '';
+          if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(specialistId)) {
+            errors.push(
+              `Step "${step.id ?? '?'}" subgraph specialist ${index + 1} needs a safe id (1–32 letters, numbers, "_", or "-").`,
+            );
+          } else if (specialistIds.has(specialistId)) {
+            errors.push(`Step "${step.id ?? '?'}" has duplicate subgraph specialist id "${specialistId}".`);
+          } else {
+            specialistIds.add(specialistId);
+          }
+          if (specialistPrompt.length < 3) {
+            errors.push(
+              `Step "${step.id ?? '?'}" subgraph specialist "${specialistId || index + 1}" has no substantive prompt.`,
+            );
+          }
+          const rawMaxTurns = specialist?.maxTurns ?? specialist?.max_turns;
+          if (
+            rawMaxTurns !== undefined
+            && (!Number.isInteger(rawMaxTurns) || rawMaxTurns < 1 || rawMaxTurns > 20)
+          ) {
+            errors.push(
+              `Step "${step.id ?? '?'}" subgraph specialist "${specialistId || index + 1}" maxTurns must be an integer from 1 to 20.`,
+            );
+          }
+        });
+
+        const declaredEffect = step.sideEffect ?? step.side_effect;
+        if (declaredEffect !== 'read') {
+          errors.push(
+            `Step "${step.id ?? '?'}" read_parallel_v1 must explicitly declare sideEffect: read. Write/send authority stays on separate runner-owned nodes.`,
+          );
+        }
+        const incompatible: string[] = [];
+        if (step.forEach) incompatible.push('forEach');
+        if (step.call) incompatible.push('call');
+        if (step.deterministic) incompatible.push('deterministic');
+        if (step.requiresApproval || step.requires_approval) incompatible.push('requiresApproval');
+        if (step.loopUntil || step.loop_until) incompatible.push('loopUntil');
+        if (incompatible.length > 0) {
+          errors.push(
+            `Step "${step.id ?? '?'}" read_parallel_v1 cannot combine with ${incompatible.join(', ')}. Keep effects and other executors as separate graph nodes.`,
+          );
+        }
+        if (step.allowedTools && step.allowedTools.some((tool) =>
+          tool !== 'workflow_step_result' && tool !== 'workspace_artifact_query')) {
+          warnings.push(
+            `Step "${step.id ?? '?'}" read_parallel_v1 narrows its specialists and reducer to workflow_step_result plus workspace_artifact_query; other allowedTools are intentionally ignored.`,
+          );
+        }
       }
     }
     if (step.id) {

@@ -21,8 +21,10 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const { surfaceAskingPlan, surfacePlan, listPlanProposals, supersedePlanProposal, rejectPlanProposal, surfaceWorkflowPendingInputs, setWorkflowPendingInputValues, getPlanProposal } =
   await import('../../agents/plan-proposals.js');
-const { findOpenQuestionPlan, findOpenWorkflowPendingInputs, buildClassifierPrompt, buildWorkflowInputClassifierPrompt, applySelfContainedGuard, parsePlanContinuityVerdict, parseWorkflowInputVerdict } =
+const { findOpenQuestionPlan, findOpenWorkflowPendingInputs, buildClassifierPrompt, buildWorkflowInputClassifierPrompt, applySelfContainedGuard, parsePlanContinuityVerdict, parseWorkflowInputVerdict, routeOpenQuestionPlan } =
   await import('./plan-continuity.js');
+const { appendEvent, createSession, listEvents } = await import('./eventlog.js');
+const { Runner } = await import('@openai/agents');
 
 const SHEET_ID = '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz';
 function proposalFor(objective: string, questions: string[] = []) {
@@ -192,6 +194,82 @@ test('continuity re-entry gate: an EXPLICIT-plan originating request still engag
     true,
     'an explicit-plan originating request must still re-surface the plan when resumed',
   );
+});
+
+test('continuity preserves the accepted reply source even when a newer user row exists', async () => {
+  const sessionId = 'continuity-exact-source';
+  const channel = 'discord:continuity-exact-source';
+  createSession({ id: sessionId, kind: 'chat' });
+  surfaceAskingPlan({
+    plan: aPlan(),
+    originatingRequest: 'Draft me a plan first to create Outlook drafts for the closed deals.',
+    sessionId,
+    channel,
+  });
+  const acceptedReply = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Use last quarter and create a new sheet.' },
+  });
+  const unrelated = appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'This newer row belongs to another boundary.' },
+  });
+
+  const prototype = Runner.prototype as unknown as {
+    run: (...args: unknown[]) => Promise<{ finalOutput: unknown }>;
+  };
+  const originalRun = prototype.run;
+  prototype.run = async (...args: unknown[]) => {
+    const prompt = String(args[1] ?? '');
+    if (prompt.includes('Open plan objective:')) {
+      return { finalOutput: 'ANSWERS: use last quarter and create a new sheet' };
+    }
+    return {
+      finalOutput: {
+        objective: 'Create Outlook drafts for the closed deals.',
+        steps: [{
+          n: 1,
+          action: 'Create Outlook drafts for the selected closed deals.',
+          rationale: 'Deliver the requested drafts.',
+          verification: 'The drafts exist in Outlook.',
+        }],
+        successCriteria: ['The requested Outlook drafts exist.'],
+        stages: null,
+        risks: [],
+        estimatedComplexity: 'moderate',
+        recommendsTrackedExecution: false,
+        needsUserInput: [],
+        appliedInstructions: [],
+        externalSends: null,
+        voiceMessage: null,
+      },
+    };
+  };
+  try {
+    const result = await routeOpenQuestionPlan({
+      channel,
+      input: 'Use last quarter and create a new sheet.',
+      sessionId,
+      sourceUserSeq: acceptedReply.seq,
+      reuseRecordedUserInput: true,
+    });
+    assert.equal(result.handled, true);
+  } finally {
+    prototype.run = originalRun;
+  }
+
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.ok(terminal);
+  assert.equal(terminal.turn, acceptedReply.turn);
+  assert.equal(terminal.data.sourceUserSeq, acceptedReply.seq);
+  assert.equal(terminal.data.terminalKey, `turn:${acceptedReply.seq}`);
+  assert.notEqual(terminal.data.sourceUserSeq, unrelated.seq);
 });
 
 // ─── workflow ask-then-resume (data-flow, no model) ────────────

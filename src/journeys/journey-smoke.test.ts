@@ -27,7 +27,6 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-journey-smoke-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.AUTH_MODE = 'claude_oauth';
 process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
-process.env.CLEMMY_CONFIRM_BEAT = 'off';
 process.env.CLEMMY_DEBATE_MODE = 'off';
 process.env.CLEMMY_PROACTIVE_REPORT_DEFER = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
@@ -78,7 +77,6 @@ after(async () => {
   resetEventLog();
   delete process.env.AUTH_MODE;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
-  delete process.env.CLEMMY_CONFIRM_BEAT;
   delete process.env.CLEMMY_DEBATE_MODE;
   delete process.env.CLEMMY_PROACTIVE_REPORT_DEFER;
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }

@@ -30,11 +30,23 @@ import {
   createSession as createHarnessSession,
   finishRunAttempt,
   getActiveRunAttempt,
+  getLatestRunAttemptByRunId,
   getSession as getHarnessSession,
+  listEvents as listHarnessEvents,
   listSessions as listHarnessSessions,
+  recordRunAttemptUserInput,
   requestKill,
+  type EventRow,
   type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
+import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
+import {
+  presentationEventFromCompletionData,
+  turnOutcomeId,
+  type TurnIdentity,
+} from '../runtime/harness/turn-outcome.js';
+import { publicUserInputText } from '../runtime/harness/public-presentation.js';
+import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { buildActivitySnapshot, formatElapsed } from '../shared/activity-snapshot.js';
 import {
   DISCORD_ALLOWED_CHANNELS,
@@ -54,6 +66,8 @@ import {
   bindDiscordHarnessSession,
   getBoundDiscordHarnessSessionId,
   handleDiscordHarnessMessage,
+  handleHarnessCancel,
+  handleHarnessNew,
   handleHarnessSessions,
   remainingApprovalDisplayState,
   resolveActiveDiscordHarnessRuns,
@@ -66,7 +80,13 @@ import { pendingActionIdFromArgs } from '../runtime/harness/pending-action-view.
 import { ClementineAssistant } from '../assistant/core.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { getOrCreateDiscordSessionId } from './discord-store.js';
-import { claimInbound, completeInbound } from './inbox-store.js';
+import {
+  bindInboundSource,
+  claimInbound,
+  completeInbound,
+  InboundIdentityConflictError,
+} from './inbox-store.js';
+import { durablePayloadHash, durableRequestIdentity } from './durable-request.js';
 import type { ApprovalResolutionResult, PendingApproval, ToolActivity } from '../types.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import { actionBus } from '../runtime/action-bus.js';
@@ -92,6 +112,12 @@ import { approveTrustProposal, declineTrustProposal, getTrustProposal } from '..
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { cancelBackgroundTask, queueBackgroundTaskApprovalResolution, listBackgroundTasks } from '../execution/background-tasks.js';
 import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
+import {
+  PUBLIC_APPROVAL_CARD_REFRESH_FAILURE_TEXT,
+  PUBLIC_APPROVAL_EDIT_FAILURE_TEXT,
+  PUBLIC_CHANNEL_FAILURE_TEXT,
+  publicApprovalDecisionFailure,
+} from './public-failure.js';
 
 const logger = pino({ name: 'clementine-next.discord' });
 
@@ -1268,7 +1294,8 @@ async function resolveNaturalApproval(input: {
     try {
       results.push(await resolveApprovalOrQueueBackgroundContinuation(input.assistant, approval.id, approve));
     } catch (error) {
-      results.push(`Failed to ${approve ? 'approve' : 'reject'} \`${approval.id}\`: ${error instanceof Error ? error.message : String(error)}`);
+      logger.warn({ err: error, approvalId: approval.id, action: approve ? 'approve' : 'reject' }, 'Discord natural-language approval failed');
+      results.push(publicApprovalDecisionFailure(approve ? 'approve' : 'reject', approval.id));
     }
   }
 
@@ -1424,12 +1451,52 @@ function appendGatewayTail(text: string, tail: string): string {
   return tail ? `${text}\n\n${tail}` : text;
 }
 
+function claimDiscordInboundRequest(input: {
+  channelId: string;
+  sourceMessageId: string;
+  userId: string;
+  guildId?: string | null;
+  prompt: string;
+}) {
+  const inboxKey = { channel: `discord:${input.channelId}`, sourceMessageId: input.sourceMessageId };
+  const identity = durableRequestIdentity('discord', `${input.channelId}:${input.sourceMessageId}`);
+  const payloadHash = durablePayloadHash({
+    prompt: input.prompt,
+    channelId: input.channelId,
+    userId: input.userId,
+    guildId: input.guildId ?? null,
+  });
+  const claim = claimInbound({
+    ...inboxKey,
+    userId: input.userId,
+    runId: identity.runId,
+    payloadHash,
+  });
+  return { inboxKey, identity, payloadHash, claim };
+}
+
+function bindDiscordInboundAcceptedSource(
+  ingress: ReturnType<typeof claimDiscordInboundRequest>,
+  source: { sessionId: string; seq: number },
+): void {
+  bindInboundSource({
+    ...ingress.inboxKey,
+    sessionId: source.sessionId,
+    runId: ingress.identity.runId,
+    sourceUserSeq: source.seq,
+  });
+}
+
 async function runGatewayPrompt(input: {
   assistant: ClementineAssistant;
   prompt: string;
   channelId: string;
   userId: string;
   guildId?: string | null;
+  /** Stable provider-level request identity. Discord message ingress always
+   *  supplies this; buttons without a provider message id may omit it. */
+  runId?: string;
+  onAcceptedSource?: (source: { sessionId: string; seq: number }) => void;
   /** Streaming-text callback. Only fires when the underlying runtime
    *  supports streaming (OpenAI Agents SDK path). Codex CLI bridge
    *  ignores it — non-streaming users get the same one-shot reveal. */
@@ -1452,14 +1519,9 @@ async function runGatewayPrompt(input: {
       metadata: { source: 'discord-gateway', channelId: input.channelId, guildId: input.guildId ?? null },
     });
   }
-  // Register before ClementineGateway's async preflight so a concurrent stop
-  // message cannot land in the gap and then be erased by brain startup.
-  const attempt = beginRunAttempt(sessionId);
   const activeKey = discordGatewayRunKey(input);
   const activeRuns = activeDiscordGatewayRuns.get(activeKey) ?? new Map<string, { sessionId: string; attempt: RunAttemptRef }>();
-  activeRuns.set(attempt.attemptId, { sessionId, attempt });
-  activeDiscordGatewayRuns.set(activeKey, activeRuns);
-  let status: 'completed' | 'cancelled' | 'failed' = 'failed';
+  let activeAttemptId: string | null = null;
   try {
     const response = await new ClementineGateway(input.assistant).handleMessage({
       message: input.prompt,
@@ -1467,15 +1529,21 @@ async function runGatewayPrompt(input: {
       userId: input.userId,
       channel: buildChannelLabelFromParts(input.channelId, input.guildId),
       source: 'discord',
-      runId: attempt.attemptId,
+      runId: input.runId,
+      failClosedOnUnsettledReplay: Boolean(input.runId),
+      onAcceptedTurn: ({ source, attempt }) => {
+        input.onAcceptedSource?.({ sessionId: source.sessionId, seq: source.seq });
+        if (!attempt) return;
+        activeAttemptId = attempt.attemptId;
+        activeRuns.set(attempt.attemptId, { sessionId, attempt });
+        activeDiscordGatewayRuns.set(activeKey, activeRuns);
+      },
       onChunk: input.onChunk,
       onToolActivity: input.onToolActivity,
     });
-    status = response.stoppedReason === 'cancelled' ? 'cancelled' : 'completed';
     return response;
   } finally {
-    try { finishRunAttempt(attempt, status); } catch { /* control telemetry best-effort */ }
-    activeRuns.delete(attempt.attemptId);
+    if (activeAttemptId) activeRuns.delete(activeAttemptId);
     if (activeRuns.size === 0) activeDiscordGatewayRuns.delete(activeKey);
   }
 }
@@ -1497,6 +1565,7 @@ async function continueDiscordSessionFromButton(input: {
 }
 
 export const __test__ = {
+  claimDiscordInboundRequest,
   continueDiscordSessionFromButton,
   runGatewayPrompt,
   renderGatewayTail,
@@ -1509,6 +1578,115 @@ export const __test__ = {
 };
 
 const DISCORD_STOP_CONTROL_RE = /^(stop|halt|abort|kill it|stop it|cancel the run|stop the run)$/i;
+
+interface DiscordControlTurn {
+  source: EventRow;
+  attempt: RunAttemptRef | null;
+  replayText?: string;
+}
+
+function exactDiscordControlTerminal(source: EventRow): string | undefined {
+  const rows = listHarnessEvents(source.sessionId, { types: ['conversation_completed'], desc: true });
+  for (const event of rows) {
+    if (event.data.sourceUserSeq !== source.seq && event.data.terminalKey !== `turn:${source.seq}`) continue;
+    try {
+      const presentation = presentationEventFromCompletionData(event.data);
+      if (presentation?.identity.sourceUserSeq === source.seq) return presentation.text;
+    } catch { return undefined; }
+  }
+  return undefined;
+}
+
+function commitDiscordControlTerminal(turn: DiscordControlTurn, text: string, failed = false): string {
+  const identity: TurnIdentity = {
+    sessionId: turn.source.sessionId,
+    turn: turn.source.turn,
+    sourceUserSeq: turn.source.seq,
+  };
+  const committed = commitTurnOutcome(failed ? {
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'failed',
+    resumable: false,
+    presentation: { kind: 'error', text },
+  } : {
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text },
+  }, { legacyReason: failed ? 'discord_control_failed' : 'discord_control' });
+  if (turn.attempt) {
+    try { finishRunAttempt(turn.attempt, failed ? 'failed' : 'completed'); } catch { /* terminal wins */ }
+    clearRunInFlightAfterTerminal(turn.source.sessionId, turn.attempt.attemptId);
+  }
+  return committed.presentation.text;
+}
+
+function acceptDiscordControlTurn(input: {
+  runId: string;
+  prompt: string;
+  channelId: string;
+  userId: string;
+  guildId?: string | null;
+  onSourceAccepted?: (source: { sessionId: string; seq: number }) => void;
+}): DiscordControlTurn {
+  const sessionId = getOrCreateDiscordSessionId({
+    channelId: input.channelId,
+    userId: input.userId,
+    guildId: input.guildId ?? undefined,
+  });
+  if (!getHarnessSession(sessionId)) {
+    createHarnessSession({
+      id: sessionId,
+      kind: 'chat',
+      channel: buildChannelLabelFromParts(input.channelId, input.guildId),
+      userId: input.userId,
+      title: input.prompt.slice(0, 80),
+      metadata: { source: 'discord-control', channelId: input.channelId, guildId: input.guildId ?? null },
+    });
+  }
+  const previous = getLatestRunAttemptByRunId(sessionId, input.runId);
+  if (previous?.sourceUserSeq) {
+    const source = listHarnessEvents(sessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === previous.sourceUserSeq);
+    if (!source || publicUserInputText(source.data) !== input.prompt.trim()) {
+      throw new Error(`Discord control run ${input.runId} is bound to different input`);
+    }
+    input.onSourceAccepted?.({ sessionId, seq: source.seq });
+    const turn: DiscordControlTurn = {
+      source,
+      attempt: previous.finishedAt ? null : {
+        sessionId,
+        attemptId: previous.attemptId,
+        runId: previous.runId,
+        startedAt: previous.startedAt,
+      },
+    };
+    const terminal = exactDiscordControlTerminal(source);
+    if (terminal) return { ...turn, replayText: terminal };
+    return {
+      ...turn,
+      replayText: commitDiscordControlTerminal(turn, PUBLIC_CHANNEL_FAILURE_TEXT, true),
+    };
+  }
+  const attempt = beginRunAttempt(sessionId, { runId: input.runId });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: {
+      text: input.prompt,
+      displayText: input.prompt,
+      runId: input.runId,
+      attemptId: attempt.attemptId,
+      source: 'discord_control',
+    },
+  }, { armRunInFlight: true });
+  input.onSourceAccepted?.({ sessionId, seq: source.seq });
+  return { source, attempt };
+}
 
 const activeDiscordGatewayRuns = new Map<string, Map<string, { sessionId: string; attempt: RunAttemptRef }>>();
 
@@ -1618,9 +1796,61 @@ function stopDiscordContext(input: {
   };
 }
 
-async function handleDiscordCommand(message: Message<boolean>, assistant: ClementineAssistant, prompt: string): Promise<boolean> {
+async function handleDiscordCommand(
+  message: Message<boolean>,
+  assistant: ClementineAssistant,
+  prompt: string,
+  durableRequest?: { runId: string; onSourceAccepted?: (source: { sessionId: string; seq: number }) => void },
+): Promise<boolean> {
   const normalized = normalizeCommandText(prompt);
   const runtime = assistant.getRuntime();
+  const relevantRuntimeApprovals = relevantApprovalsForMessage(message, runtime.listPendingApprovals());
+  const isDurableControl = Boolean(
+    DISCORD_STOP_CONTROL_RE.test(normalized)
+    || /^(?:\/?cancel|\/?new)$/i.test(normalized)
+    || isSessionsCommand(normalized)
+    || (detectNaturalApprovalAction(normalized) && relevantRuntimeApprovals.length > 0)
+    || /^(help|discord help|commands|status|approvals|pending approvals|notifications|inbox|my notifications)$/i.test(normalized)
+    || /^(?:approve|reject|read|retry)\s+[a-zA-Z0-9-]+$/i.test(normalized),
+  );
+  const controlTurn = durableRequest && isDurableControl
+    ? acceptDiscordControlTurn({
+        ...durableRequest,
+        prompt,
+        channelId: message.channelId,
+        userId: message.author.id,
+        guildId: message.guildId,
+      })
+    : null;
+  if (controlTurn?.replayText) {
+    await sendChunks(message.channel, controlTurn.replayText, message);
+    return true;
+  }
+  const publicTexts: string[] = [];
+  const send = async (text: string): Promise<void> => {
+    publicTexts.push(text);
+    await sendChunks(message.channel, text, message);
+  };
+  const completeControl = (fallback = 'Discord command handled.'): true => {
+    if (controlTurn) commitDiscordControlTerminal(controlTurn, publicTexts.join('\n\n') || fallback);
+    return true;
+  };
+
+  if (/^\/?cancel$/i.test(normalized)) {
+    await handleHarnessCancel({
+      channelId: message.channelId,
+      transport: buildDiscordMessageHarnessTransport(message),
+    });
+    return completeControl('Discord session cancelled.');
+  }
+
+  if (/^\/?new$/i.test(normalized)) {
+    await handleHarnessNew({
+      channelId: message.channelId,
+      transport: buildDiscordMessageHarnessTransport(message),
+    });
+    return completeControl('Fresh Discord session ready.');
+  }
 
   // TURN-CONTROL SPINE (2026-07-16 incident: "i couldnt even stop it from
   // discord"): a bare stop/halt/abort with NO pending approval kills the
@@ -1631,7 +1861,6 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
   // kill-aware shouldCancel + canUseTool gate now actually observe.
   if (DISCORD_STOP_CONTROL_RE.test(normalized)) {
     const naturalApproval = detectNaturalApprovalAction(normalized);
-    const relevantRuntimeApprovals = relevantApprovalsForMessage(message, runtime.listPendingApprovals());
     if (naturalApproval && DISCORD_HARNESS_ENABLED) {
       // `stop` is intentionally not a global approval synonym. Re-offer it as
       // an explicit rejection only to the contextual harness resolver, which
@@ -1644,7 +1873,7 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
         // origin/report-back/session link to this exact conversation.
         allowGlobalApprovalFallback: true,
       });
-      if (handled) return true;
+      if (handled) return completeControl('Approval decision handled.');
     }
     // "stop" is rejection vocabulary only when THIS conversation actually has
     // an approval waiting. An unrelated global approval must never swallow the
@@ -1655,8 +1884,8 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
         userId: message.author.id,
         guildId: message.guildId,
       });
-      await sendChunks(message.channel, stopped.detail, message);
-      return true;
+      await send(stopped.detail);
+      return completeControl();
     }
     // fall through — the relevant approval resolver owns stop/cancel as reject.
   }
@@ -1668,7 +1897,7 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
       guildId: message.guildId,
       transport: buildDiscordMessageHarnessTransport(message),
     });
-    return true;
+    return completeControl('Discord sessions listed.');
   }
 
   if (await resolveNaturalApproval({
@@ -1677,14 +1906,13 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
     userId: message.author.id,
     channelId: message.channelId,
     guildId: message.guildId,
-    send: (text) => sendChunks(message.channel, text, message),
+    send,
   })) {
-    return true;
+    return completeControl('Approval decision handled.');
   }
 
   if (/^(help|discord help|commands)$/i.test(normalized)) {
-    await sendChunks(
-      message.channel,
+    await send(
       [
         'Discord commands:',
         '`help`',
@@ -1705,19 +1933,18 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
         '',
         'Any other message is sent to the assistant.',
       ].join('\n'),
-      message,
     );
-    return true;
+    return completeControl();
   }
 
   if (/^status$/i.test(normalized)) {
-    await sendChunks(message.channel, renderDiscordStatusForContext({
+    await send(renderDiscordStatusForContext({
       userId: message.author.id,
       channelId: message.channelId,
       guildId: message.guildId,
       assistant,
-    }), message);
-    return true;
+    }));
+    return completeControl();
   }
 
   if (/^(approvals|pending approvals)$/i.test(normalized)) {
@@ -1727,7 +1954,7 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
       guildId: message.guildId,
     });
     const checkIns = listOpenCheckIns();
-    await sendChunks(message.channel, renderCombinedApprovalList(approvals, harnessApprovals, checkIns), message);
+    await send(renderCombinedApprovalList(approvals, harnessApprovals, checkIns));
     for (const approval of harnessApprovals.slice(0, 5)) {
       await sendComponentMessage(message.channel, {
         content: renderHarnessApprovalCardContent(approval),
@@ -1746,19 +1973,19 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
         components: buildCheckInActions(checkIn.id),
       });
     }
-    return true;
+    return completeControl();
   }
 
   if (/^(notifications|inbox|my notifications)$/i.test(normalized)) {
     const notifications = relevantNotificationsForUser(message.author.id).slice(0, 5);
-    await sendChunks(message.channel, renderNotificationList(message.author.id), message);
+    await send(renderNotificationList(message.author.id));
     for (const notification of notifications) {
       await sendComponentMessage(message.channel, {
         content: `Notification \`${notification.id}\`\n${truncate(notification.title, 100)}`,
         components: buildNotificationActions(notification.id, notification.read),
       });
     }
-    return true;
+    return completeControl();
   }
 
   const match = normalized.match(/^(approve|reject)\s+([a-zA-Z0-9-]+)$/i);
@@ -1767,15 +1994,12 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
     const approvalId = match[2];
     try {
       const text = await resolveApprovalOrQueueBackgroundContinuation(assistant, approvalId, approved);
-      await sendChunks(message.channel, text, message);
+      await send(text);
     } catch (error) {
-      await sendChunks(
-        message.channel,
-        `Failed to ${approved ? 'approve' : 'reject'} \`${approvalId}\`: ${error instanceof Error ? error.message : String(error)}`,
-        message,
-      );
+      logger.warn({ err: error, approvalId, action: approved ? 'approve' : 'reject' }, 'Discord approval command failed');
+      await send(publicApprovalDecisionFailure(approved ? 'approve' : 'reject', approvalId));
     }
-    return true;
+    return completeControl();
   }
 
   const readMatch = normalized.match(/^read\s+([a-zA-Z0-9-]+)$/i);
@@ -1783,12 +2007,12 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
     const notificationId = readMatch[1];
     const notification = getNotification(notificationId);
     if (!notification) {
-      await sendChunks(message.channel, `Notification \`${notificationId}\` was not found.`, message);
-      return true;
+      await send(`Notification \`${notificationId}\` was not found.`);
+      return completeControl();
     }
     markNotificationRead(notificationId);
-    await sendChunks(message.channel, `Marked notification \`${notificationId}\` as read.`, message);
-    return true;
+    await send(`Marked notification \`${notificationId}\` as read.`);
+    return completeControl();
   }
 
   const retryMatch = normalized.match(/^retry\s+([a-zA-Z0-9-]+)$/i);
@@ -1796,14 +2020,18 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
     const notificationId = retryMatch[1];
     const notification = getNotification(notificationId);
     if (!notification) {
-      await sendChunks(message.channel, `Notification \`${notificationId}\` was not found.`, message);
-      return true;
+      await send(`Notification \`${notificationId}\` was not found.`);
+      return completeControl();
     }
     requeueNotificationDelivery(notificationId);
-    await sendChunks(message.channel, `Requeued delivery for notification \`${notificationId}\`.`, message);
-    return true;
+    await send(`Requeued delivery for notification \`${notificationId}\`.`);
+    return completeControl();
   }
 
+  if (controlTurn) {
+    commitDiscordControlTerminal(controlTurn, PUBLIC_CHANNEL_FAILURE_TEXT, true);
+    return true;
+  }
   return false;
 }
 
@@ -1813,14 +2041,60 @@ async function handleDiscordRestCommand(input: {
   channelId: string;
   userId: string;
   guildId?: string | null;
+  durableRequest?: { runId: string; onSourceAccepted?: (source: { sessionId: string; seq: number }) => void };
 }): Promise<boolean> {
   const normalized = normalizeCommandText(input.prompt);
   const runtime = input.assistant.getRuntime();
-  const send = (text: string) => sendDiscordRestChunks(input.channelId, text);
+  const relevantRuntimeApprovals = relevantApprovalsForContext(input, runtime.listPendingApprovals());
+  const isDurableControl = Boolean(
+    DISCORD_STOP_CONTROL_RE.test(normalized)
+    || /^(?:\/?cancel|\/?new)$/i.test(normalized)
+    || isSessionsCommand(normalized)
+    || (detectNaturalApprovalAction(normalized) && relevantRuntimeApprovals.length > 0)
+    || /^(approvals|pending approvals)$/i.test(normalized)
+    || /^(?:approve|reject)\s+[a-zA-Z0-9-]+$/i.test(normalized),
+  );
+  const controlTurn = input.durableRequest && isDurableControl
+    ? acceptDiscordControlTurn({
+        ...input.durableRequest,
+        prompt: input.prompt,
+        channelId: input.channelId,
+        userId: input.userId,
+        guildId: input.guildId,
+      })
+    : null;
+  const publicTexts: string[] = [];
+  const send = async (text: string): Promise<void> => {
+    publicTexts.push(text);
+    await sendDiscordRestChunks(input.channelId, text);
+  };
+  if (controlTurn?.replayText) {
+    await send(controlTurn.replayText);
+    return true;
+  }
+  const completeControl = (fallback = 'Discord command handled.'): true => {
+    if (controlTurn) commitDiscordControlTerminal(controlTurn, publicTexts.join('\n\n') || fallback);
+    return true;
+  };
+
+  if (/^\/?cancel$/i.test(normalized)) {
+    await handleHarnessCancel({
+      channelId: input.channelId,
+      transport: buildDiscordRestTransport(input.channelId),
+    });
+    return completeControl('Discord session cancelled.');
+  }
+
+  if (/^\/?new$/i.test(normalized)) {
+    await handleHarnessNew({
+      channelId: input.channelId,
+      transport: buildDiscordRestTransport(input.channelId),
+    });
+    return completeControl('Fresh Discord session ready.');
+  }
 
   if (DISCORD_STOP_CONTROL_RE.test(normalized)) {
     const naturalApproval = detectNaturalApprovalAction(normalized);
-    const relevantRuntimeApprovals = relevantApprovalsForContext(input, runtime.listPendingApprovals());
     if (naturalApproval && DISCORD_HARNESS_ENABLED) {
       const handled = await tryHandleHarnessApprovalReply({
         channelId: input.channelId,
@@ -1828,12 +2102,12 @@ async function handleDiscordRestCommand(input: {
         transport: buildDiscordRestTransport(input.channelId),
         allowGlobalApprovalFallback: true,
       });
-      if (handled) return true;
+      if (handled) return completeControl('Approval decision handled.');
     }
     if (!naturalApproval || relevantRuntimeApprovals.length === 0) {
       const stopped = stopDiscordContext(input);
       await send(stopped.detail);
-      return true;
+      return completeControl();
     }
   }
 
@@ -1844,7 +2118,7 @@ async function handleDiscordRestCommand(input: {
       guildId: input.guildId,
       transport: buildDiscordRestTransport(input.channelId),
     });
-    return true;
+    return completeControl('Discord sessions listed.');
   }
 
   if (await resolveNaturalApproval({
@@ -1855,7 +2129,7 @@ async function handleDiscordRestCommand(input: {
     guildId: input.guildId,
     send,
   })) {
-    return true;
+    return completeControl('Approval decision handled.');
   }
 
   if (/^(approvals|pending approvals)$/i.test(normalized)) {
@@ -1881,7 +2155,7 @@ async function handleDiscordRestCommand(input: {
         components: buildCheckInActions(checkIn.id),
       });
     }
-    return true;
+    return completeControl();
   }
 
   const match = normalized.match(/^(approve|reject)\s+([a-zA-Z0-9-]+)$/i);
@@ -1892,11 +2166,16 @@ async function handleDiscordRestCommand(input: {
       const text = await resolveApprovalOrQueueBackgroundContinuation(input.assistant, approvalId, approved);
       await send(text);
     } catch (error) {
-      await send(`Failed to ${approved ? 'approve' : 'reject'} \`${approvalId}\`: ${error instanceof Error ? error.message : String(error)}`);
+      logger.warn({ err: error, approvalId, action: approved ? 'approve' : 'reject' }, 'Discord REST approval command failed');
+      await send(publicApprovalDecisionFailure(approved ? 'approve' : 'reject', approvalId));
     }
-    return true;
+    return completeControl();
   }
 
+  if (controlTurn) {
+    commitDiscordControlTerminal(controlTurn, PUBLIC_CHANNEL_FAILURE_TEXT, true);
+    return true;
+  }
   return false;
 }
 
@@ -2339,13 +2618,14 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<v
     });
     if (!response.ok) {
       const text = await response.text();
-      await interaction.editReply({ content: `Edit-and-approve failed: ${response.status} ${text.slice(0, 200)}` });
+      logger.warn({ approvalId, status: response.status, responseBody: text.slice(0, 1000) }, 'Discord edit-and-approve endpoint rejected request');
+      await interaction.editReply({ content: PUBLIC_APPROVAL_EDIT_FAILURE_TEXT });
       return;
     }
     await interaction.editReply({ content: `🍊 Approved with edits. The agent is continuing with your updated args.` });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    await interaction.editReply({ content: `Edit-and-approve failed: ${message}` });
+    logger.error({ err, approvalId }, 'Discord edit-and-approve request failed');
+    await interaction.editReply({ content: PUBLIC_APPROVAL_EDIT_FAILURE_TEXT });
   }
 }
 
@@ -2390,9 +2670,10 @@ async function collapseApprovalCard(
     // Likely DiscordAPIError 10062 (unknown interaction) or 50001 (no
     // permission). Fall back to an ephemeral reply so the click isn't
     // silent.
+    logger.warn({ err, status }, 'Discord approval card update failed after decision');
     try {
       await interaction.reply({
-        content: `${emoji} ${label}${footerDetail ? ` — ${footerDetail}` : ''} (could not update original card: ${err instanceof Error ? err.message : 'unknown'})`,
+        content: `${emoji} ${label}${footerDetail ? ` — ${footerDetail}` : ''}\n\n${PUBLIC_APPROVAL_CARD_REFRESH_FAILURE_TEXT}`,
         ephemeral: true,
       });
     } catch {
@@ -2425,9 +2706,10 @@ async function refreshDiscordApprovalSiblings(
       components: components as InteractionUpdateOptions['components'],
     });
   } catch (err) {
+    logger.warn({ err, approvalId: row.approvalId, decision }, 'Discord sibling approval card refresh failed');
     try {
       await interaction.reply({
-        content: `Decision recorded, but I could not refresh the remaining approval buttons: ${err instanceof Error ? err.message : 'unknown error'}. Open Clementine → Inbox to review them.`,
+        content: PUBLIC_APPROVAL_CARD_REFRESH_FAILURE_TEXT,
         ephemeral: true,
       });
     } catch {
@@ -2892,17 +3174,19 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
           });
         }
       } catch (err) {
-        await interaction.editReply({ content: err instanceof Error ? err.message : String(err) });
+        logger.error({ err, sessionId, userId: interaction.user.id }, 'Discord Continue button failed');
+        await interaction.editReply({ content: PUBLIC_CHANNEL_FAILURE_TEXT });
       }
       return;
     }
 
     await interaction.reply({ content: 'Unknown action.', ephemeral: true });
   } catch (error) {
-    await interaction.reply({
-      content: error instanceof Error ? error.message : String(error),
-      ephemeral: true,
-    });
+    logger.error({ err: error, action, targetId, userId: interaction.user.id }, 'Discord button action failed');
+    const payload = { content: PUBLIC_CHANNEL_FAILURE_TEXT, ephemeral: true };
+    if (interaction.deferred) await interaction.editReply({ content: payload.content });
+    else if (interaction.replied) await interaction.followUp(payload);
+    else await interaction.reply(payload);
   }
 }
 
@@ -3070,10 +3354,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
     await interaction.reply({ content: 'Unknown command.', ephemeral: true });
   } catch (error) {
     logger.error({ err: error, command: interaction.commandName, userId: interaction.user.id }, 'Discord slash command failed');
-    const text = error instanceof Error
-      ? `I hit an error while handling that command: ${error.message}`
-      : 'I hit an internal error while handling that command.';
-    await sendInteractionChunks(interaction, text, { ephemeral: true });
+    await sendInteractionChunks(interaction, PUBLIC_CHANNEL_FAILURE_TEXT, { ephemeral: true });
   }
 }
 
@@ -3098,6 +3379,37 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
   const prompt = extractPrompt(message);
   if (!prompt) return;
 
+  // Provider identity is claimed before approval routing, commands, model
+  // dispatch, or any mutation. Discord may redeliver the same message after a
+  // reconnect; a changed payload under that id fails closed.
+  let ingress: ReturnType<typeof claimDiscordInboundRequest>;
+  try {
+    ingress = claimDiscordInboundRequest({
+      channelId: message.channelId,
+      sourceMessageId: message.id,
+      userId: message.author.id,
+      guildId: message.guildId,
+      prompt,
+    });
+  } catch (error) {
+    if (error instanceof InboundIdentityConflictError) {
+      logger.warn({ channelId: message.channelId, sourceMessageId: message.id }, 'Discord provider id payload conflict');
+      try { await message.reply(PUBLIC_CHANNEL_FAILURE_TEXT); } catch { /* best effort */ }
+      return;
+    }
+    throw error;
+  }
+  if (!ingress.claim.shouldProcess) {
+    logger.info({ ...ingress.inboxKey, status: ingress.claim.record.status }, 'Skipping already-handled Discord message');
+    return;
+  }
+  const durableRequest = {
+    runId: ingress.identity.runId,
+    sessionId: ingress.claim.record.sessionId,
+    onSourceAccepted: (source: { sessionId: string; seq: number }) =>
+      bindDiscordInboundAcceptedSource(ingress, source),
+  };
+
   // Harness-approval shortcut MUST run before handleDiscordCommand
   // (which calls v0.2's resolveNaturalApproval). When the harness
   // session is paused waiting on approval, "approve" / "reject"
@@ -3106,34 +3418,32 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
   // reply "No pending approval".
   if (DISCORD_HARNESS_ENABLED) {
     const gatewayTransport = buildDiscordMessageHarnessTransport(message);
-    if (await tryHandleHarnessApprovalReply({
-      channelId: message.channelId,
-      prompt,
-      transport: gatewayTransport,
-      allowGlobalApprovalFallback: message.channel.type === ChannelType.DM,
-    })) {
+    try {
+      if (await tryHandleHarnessApprovalReply({
+        channelId: message.channelId,
+        prompt,
+        transport: gatewayTransport,
+        allowGlobalApprovalFallback: message.channel.type === ChannelType.DM,
+        durableRequest,
+      })) {
+        completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
+        return;
+      }
+    } catch (error) {
+      completeInbound({
+        ...ingress.inboxKey,
+        runId: ingress.identity.runId,
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      logger.warn({ err: error, channelId: message.channelId }, 'Discord approval reply could not bind a durable graph source');
+      try { await message.reply(PUBLIC_CHANNEL_FAILURE_TEXT); } catch { /* best effort */ }
       return;
     }
   }
 
-  if (await handleDiscordCommand(message, assistant, prompt)) {
-    return;
-  }
-
-  // Claim the inbound message in the persistent inbox before we spend
-  // any model tokens. Two reliability properties this enforces:
-  //   1. Idempotency. If Discord re-delivers the same message id
-  //      (gateway reconnect, retried HTTP edit, etc.) we skip the
-  //      second model call entirely — that bug was a real source of
-  //      double-replies and double-billed turns.
-  //   2. Restart durability. A 'claimed' row that never reaches
-  //      'replied' is the signal that the daemon crashed mid-reply;
-  //      future restart-replay code can pick those up.
-  // Zero LLM tokens — pure local SQLite.
-  const inboxKey = { channel: `discord:${message.channelId}`, sourceMessageId: message.id };
-  const claim = claimInbound({ ...inboxKey, userId: message.author.id });
-  if (!claim.shouldProcess) {
-    logger.info({ ...inboxKey, status: claim.record.status }, 'Skipping already-handled Discord message');
+  if (await handleDiscordCommand(message, assistant, prompt, durableRequest)) {
+    completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
     return;
   }
 
@@ -3143,12 +3453,12 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
   // events arrive on actionBus.
   if (DISCORD_HARNESS_ENABLED) {
     try {
-      await handleDiscordHarnessMessage(message, prompt);
-      completeInbound({ ...inboxKey, status: 'replied' });
+      await handleDiscordHarnessMessage(message, prompt, durableRequest);
+      completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
     } catch (err) {
       logger.error({ err, channelId: message.channelId }, 'Discord harness handler failed');
-      completeInbound({ ...inboxKey, status: 'failed', error: err instanceof Error ? err.message : String(err) });
-      try { await message.reply('Harness run failed: ' + ((err as Error).message ?? 'unknown')); } catch {}
+      completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'failed', error: err instanceof Error ? err.message : String(err) });
+      try { await message.reply(PUBLIC_CHANNEL_FAILURE_TEXT); } catch {}
     }
     return;
   }
@@ -3172,6 +3482,8 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
       channelId: message.channelId,
       userId: message.author.id,
       guildId: message.guildId,
+      runId: ingress.identity.runId,
+      onAcceptedSource: durableRequest.onSourceAccepted,
       onChunk: async (delta) => {
         chunkSeen = true;
         await streamHandler.onChunk(delta);
@@ -3205,17 +3517,18 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
         logger.warn({ err }, 'Failed to attach Continue button to Discord reply');
       }
     }
-    completeInbound({ ...inboxKey, runId: response.runId, status: 'replied' });
+    completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
   } catch (error) {
     logger.error({ err: error, channelId: message.channelId, userId: message.author.id }, 'Discord message handling failed');
     completeInbound({
-      ...inboxKey,
+      ...ingress.inboxKey,
+      runId: ingress.identity.runId,
       status: 'failed',
       error: error instanceof Error ? error.message : String(error),
     });
     await sendChunks(
       message.channel,
-      error instanceof Error ? `I hit an error while handling that message: ${error.message}` : 'I hit an internal error while handling that message.',
+      PUBLIC_CHANNEL_FAILURE_TEXT,
       message,
     );
   } finally {
@@ -3267,6 +3580,34 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
           continue;
         }
 
+        let ingress: ReturnType<typeof claimDiscordInboundRequest>;
+        try {
+          ingress = claimDiscordInboundRequest({
+            channelId: dm.id,
+            sourceMessageId: message.id,
+            userId: message.author.id,
+            guildId: null,
+            prompt,
+          });
+        } catch (error) {
+          if (error instanceof InboundIdentityConflictError) {
+            logger.warn({ channelId: dm.id, sourceMessageId: message.id }, 'Discord DM provider id payload conflict');
+            markDiscordDmMessageSeen(dm.id, message.id);
+            continue;
+          }
+          throw error;
+        }
+        if (!ingress.claim.shouldProcess) {
+          markDiscordDmMessageSeen(dm.id, message.id);
+          continue;
+        }
+        const durableRequest = {
+          runId: ingress.identity.runId,
+          sessionId: ingress.claim.record.sessionId,
+          onSourceAccepted: (source: { sessionId: string; seq: number }) =>
+            bindDiscordInboundAcceptedSource(ingress, source),
+        };
+
         // Harness-approval shortcut MUST run before
         // handleDiscordRestCommand. v0.2's resolveNaturalApproval
         // (called from handleDiscordRestCommand) checks its own
@@ -3287,16 +3628,24 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
               prompt,
               transport: dmTransport,
               allowGlobalApprovalFallback: true,
+              durableRequest,
             });
           } catch (err) {
             // Mark seen so we don't re-poll a permanently-broken
             // message. The error surfaces in logs; the user can resend
             // if they meant to approve something.
             console.error('[discord-dm] tryHandleHarnessApprovalReply threw — marking message seen to prevent re-poll loop:', err);
+            completeInbound({
+              ...ingress.inboxKey,
+              runId: ingress.identity.runId,
+              status: 'failed',
+              error: err instanceof Error ? err.message : String(err),
+            });
             markDiscordDmMessageSeen(dm.id, message.id);
             continue;
           }
           if (handled) {
+            completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
             markDiscordDmMessageSeen(dm.id, message.id);
             continue;
           }
@@ -3308,7 +3657,9 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
           channelId: dm.id,
           userId: message.author.id,
           guildId: null,
+          durableRequest,
         })) {
+          completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
           markDiscordDmMessageSeen(dm.id, message.id);
           continue;
         }
@@ -3319,19 +3670,6 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
         // conversation runner here with a REST transport: POST a
         // placeholder, PATCH it as actionBus events arrive.
         if (DISCORD_HARNESS_ENABLED) {
-          // Inbox claim — the gateway-side path at line ~1576 already
-          // does this, but the polling path used to skip it. When both
-          // paths fire for the same DM message (gateway AND polling
-          // pick it up because Discord delivers DM events through both
-          // channels in some setups), the user saw two "starting…"
-          // messages and the harness ran twice for one ask. Claiming
-          // here makes the second attempt a no-op.
-          const inboxKey = { channel: `discord:${dm.id}`, sourceMessageId: message.id };
-          const claim = claimInbound({ ...inboxKey, userId: message.author.id });
-          if (!claim.shouldProcess) {
-            markDiscordDmMessageSeen(dm.id, message.id);
-            continue;
-          }
           try {
             await runDiscordHarnessConversation({
               prompt,
@@ -3339,19 +3677,17 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
               userId: message.author.id,
               guildId: null,
               transport: buildDiscordRestTransport(dm.id),
+              durableRequest,
             });
-            completeInbound({ ...inboxKey, status: 'replied' });
+            completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
           } catch (err) {
-            completeInbound({ ...inboxKey, status: 'failed', error: err instanceof Error ? err.message : String(err) });
+            completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'failed', error: err instanceof Error ? err.message : String(err) });
             logger.error(
               { err, channelId: dm.id, userId: message.author.id },
               'Discord harness DM handler failed',
             );
             try {
-              await sendDiscordRestChunks(
-                dm.id,
-                `Harness run failed: ${err instanceof Error ? err.message : String(err)}`,
-              );
+              await sendDiscordRestChunks(dm.id, PUBLIC_CHANNEL_FAILURE_TEXT);
             } catch {
               /* swallow — already in error path */
             }
@@ -3375,6 +3711,8 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
             channelId: dm.id,
             userId: message.author.id,
             guildId: null,
+            runId: ingress.identity.runId,
+            onAcceptedSource: durableRequest.onSourceAccepted,
             onChunk: async (delta) => {
               chunkSeen = true;
               await streamHandler.onChunk(delta);
@@ -3403,11 +3741,18 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
           }
 
           markDiscordDmMessageSeen(dm.id, message.id);
+          completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
         } catch (error) {
           logger.error({ err: error, channelId: dm.id, userId: message.author.id }, 'Discord DM polled message handling failed');
+          completeInbound({
+            ...ingress.inboxKey,
+            runId: ingress.identity.runId,
+            status: 'failed',
+            error: error instanceof Error ? error.message : String(error),
+          });
           await sendDiscordRestChunks(
             dm.id,
-            error instanceof Error ? `I hit an error while handling that message: ${error.message}` : 'I hit an internal error while handling that message.',
+            PUBLIC_CHANNEL_FAILURE_TEXT,
           );
           markDiscordDmMessageSeen(dm.id, message.id);
         } finally {

@@ -18,10 +18,10 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-console-home-stream-
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_HARNESS_HOME = 'off';
 process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
-process.env.CLEMMY_LONGTASK_APPROACH_BEAT = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
+const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
 const { appendEvent, createSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { archiveBackgroundTask, listBackgroundTasks } = await import('../execution/background-tasks.js');
 
@@ -31,7 +31,6 @@ type StreamEvent = { type?: string; text?: string; error?: string; route?: { rou
 test.after(() => {
   delete process.env.CLEMMY_HARNESS_HOME;
   delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  delete process.env.CLEMMY_LONGTASK_APPROACH_BEAT;
   resetEventLog();
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
@@ -70,7 +69,7 @@ function parseNdjson(text: string): StreamEvent[] {
     .map((line) => JSON.parse(line) as StreamEvent);
 }
 
-test('home chat stream forwards specific progress text', async () => {
+test('home chat stream does not forward raw model reasoning text', async () => {
   const h = await boot();
   try {
     const res = await fetch(`${h.url}/api/console/home/chat/stream`, {
@@ -81,9 +80,14 @@ test('home chat stream forwards specific progress text', async () => {
     assert.equal(res.status, 200);
     const events = parseNdjson(await res.text());
 
-    assert.ok(events.some((event) =>
-      event.type === 'status' && event.text === 'Clementine is recovering from a stalled step.',
-    ), 'stream preserves non-generic progress text');
+    assert.ok(
+      events.some((event) => event.type === 'status' && event.text === 'Clementine run started.'),
+      'the route still emits its own public lifecycle status',
+    );
+    assert.ok(
+      !events.some((event) => event.text === 'Clementine is recovering from a stalled step.'),
+      'executor/model reasoning stays private',
+    );
     const done = events.find((event) => event.type === 'done');
     assert.equal(done?.text, 'done', 'stream ends with done event');
     assert.equal(done?.route?.routeKind, 'legacy', 'terminal frame includes model route diagnostics');
@@ -95,7 +99,7 @@ test('home chat stream forwards specific progress text', async () => {
 
 test('home chat stream emits terminal error event when assistant throws', async () => {
   const h = await boot(async () => {
-    throw new Error('simulated stream failure');
+    throw new Error('simulated stream failure with private provider detail');
   });
   try {
     const res = await fetch(`${h.url}/api/console/home/chat/stream`, {
@@ -107,7 +111,8 @@ test('home chat stream emits terminal error event when assistant throws', async 
     const events = parseNdjson(await res.text());
 
     const error = events.find((event) => event.type === 'error');
-    assert.match(error?.error ?? '', /simulated stream failure/);
+    assert.equal(error?.error, PUBLIC_RUN_FAILURE_TEXT);
+    assert.doesNotMatch(JSON.stringify(events), /private provider detail/);
     assert.equal(events.at(-1)?.type, 'error', 'stream closes after a terminal error event');
   } finally {
     await h.close();
@@ -148,12 +153,23 @@ test('explicit background commands create visible durable tasks without invoking
     createdTaskIds.push(...created.map((task) => task.id));
     assert.ok(created.some((task) => task.originSessionId === streamSession));
     assert.ok(created.some((task) => task.originSessionId === jsonSession));
-    assert.ok(
-      listEvents(streamSession).some((event) => (
+    const streamTerminal = listEvents(streamSession).find((event) => (
         event.type === 'conversation_completed'
         && event.data.queuedTaskId === created.find((task) => task.originSessionId === streamSession)?.id
-      )),
+      ));
+    assert.ok(
+      streamTerminal,
       'the model-free handoff still establishes a canonical origin transcript',
+    );
+    assert.equal(
+      (streamTerminal?.data.turnOutcome as { status?: string } | undefined)?.status,
+      'done',
+      'the handoff acknowledgement crosses the typed delivery boundary',
+    );
+    assert.equal(
+      (streamTerminal?.data.presentation as { identity?: { sourceUserSeq?: number } } | undefined)?.identity?.sourceUserSeq,
+      listEvents(streamSession).find((event) => event.type === 'user_input_received')?.seq,
+      'the handoff terminal belongs to the exact recorded command',
     );
     assert.equal(assistantCalls, 0, 'the explicit command bypasses plan-only model narration');
   } finally {

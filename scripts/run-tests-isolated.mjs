@@ -7,7 +7,7 @@
  * without this outer boundary an early config import can accidentally bind a
  * test to ~/.clementine-next and create backups/caches in real user state.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -16,6 +16,8 @@ import { isolatedTestArgs } from './run-tests-isolated-args.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testHome = mkdtempSync(path.join(os.tmpdir(), 'clementine-test-home-'));
+const testTmp = path.join(testHome, 'tmp');
+mkdirSync(testTmp, { recursive: true });
 const tsxBin = path.join(repoRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
 const forwarded = process.argv.slice(2);
 const args = isolatedTestArgs(forwarded);
@@ -53,6 +55,13 @@ try {
       // third-party CLIs that do not know about CLEMENTINE_HOME.
       HOME: testHome,
       USERPROFILE: testHome,
+      // Most test files create their own os.tmpdir() fixtures. Keep those
+      // children under the process-wide disposable root as well, so an abort
+      // or missing per-file cleanup cannot leak thousands of multi-megabyte
+      // `clem*` directories into the host temp volume.
+      TMPDIR: testTmp,
+      TMP: testTmp,
+      TEMP: testTmp,
       CLEMENTINE_HOME: testHome,
       CLEMMY_TEST_ISOLATED_HOME: '1',
       CLEMMY_TEST_DISABLE_LIVE_MODELS: '1',

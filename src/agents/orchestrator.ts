@@ -49,7 +49,7 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from './worker-model-fallover.js';
-import { maybeFanoutAlignmentBounce, maybeBounceMassExecution, maybeHeavyPerItemToolAdvisory } from './fanout-alignment-gate.js';
+import { maybeHeavyPerItemToolAdvisory } from './fanout-alignment-gate.js';
 import { faultInjectWorkerModel, injectedWorkerRateLimitText } from '../runtime/harness/fault-inject.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -1172,12 +1172,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (!callItems || callItems.length === 0) {
         return 'ERROR: run_worker needs `item` (one identifier) or `items` (the full list for a parallel batch).';
       }
-      // First-contact mass fan-out earns ONE alignment beat (fail-open,
-      // one-shot; see fanout-alignment-gate.ts — live 2026-07-22).
-      const armedBounce = maybeBounceMassExecution(extractSessionId(runContext) ?? undefined);
-      if (armedBounce.bounce && armedBounce.steer) return armedBounce.steer;
-      const alignmentBounce = maybeFanoutAlignmentBounce({ sessionId: extractSessionId(runContext) ?? undefined, itemCount: callItems.length });
-      if (alignmentBounce.bounce && alignmentBounce.steer) return alignmentBounce.steer;
       // Advisory-only cost note for browser-per-item fan-outs (live 2026-07-23).
       const heavyAdvisory = maybeHeavyPerItemToolAdvisory(
         extractSessionId(runContext) ?? undefined,

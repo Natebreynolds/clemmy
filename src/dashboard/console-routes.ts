@@ -258,7 +258,6 @@ import {
   parseGoalCommand,
   handleGoalContractCommand,
 } from '../agents/goal-commands.js';
-import { createJsonFieldStreamer } from '../runtime/harness/stream-reply.js';
 import {
   countProspectiveIntentions,
   listProspectiveIntentions,
@@ -307,7 +306,7 @@ import {
   deriveTaskTitle,
 } from '../execution/background-tasks.js';
 import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
-import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground, longTaskApproachGate } from '../execution/background-promote.js';
+import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
 import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
@@ -346,6 +345,19 @@ import {
   type SessionRow as HarnessSessionRow,
   type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
+import {
+  projectHarnessEventsForPublic,
+  PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT,
+  PUBLIC_RUN_FAILURE_TEXT,
+} from '../runtime/harness/public-presentation.js';
+import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
+import {
+  presentationEventFromCompletionData,
+  turnOutcomeId,
+  type PresentationEvent,
+  type TurnIdentity,
+  type TurnOutcome,
+} from '../runtime/harness/turn-outcome.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
 import { selectAddressedApproval } from '../runtime/harness/approval-addressing.js';
@@ -353,6 +365,7 @@ import { attachSessionViewer } from '../runtime/harness/session-viewers.js';
 import { buildActivitySnapshot, formatElapsed, isHarnessSessionCurrentlyWorking } from '../shared/activity-snapshot.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from '../runtime/harness/claude-agent-brain.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
@@ -526,6 +539,17 @@ interface WorkflowStepShape {
   maxTurns?: number;
   forEach?: string;
   forEachNewOnly?: boolean;
+  subgraph?: {
+    mode: 'read_parallel_v1';
+    specialists: Array<{
+      id: string;
+      prompt: string;
+      label?: string;
+      model?: string;
+      intent?: string;
+      maxTurns?: number;
+    }>;
+  };
   deterministic?: { runner: string };
   call?: { tool: string; args?: Record<string, unknown> };
   allowedTools?: string[];
@@ -2684,6 +2708,154 @@ function harnessChatPayloadHash(input: string, attachmentIds: string[]): string 
   return createHash('sha256')
     .update(JSON.stringify({ input, attachmentIds }))
     .digest('hex');
+}
+
+type ConsoleTerminalStatus = 'done' | 'needs_input' | 'failed' | 'cancelled';
+
+type ConsoleAcceptedEarlyRoute =
+  | {
+      kind: 'background_input';
+      taskId: string;
+      taskTitle: string;
+      questionId: string;
+      answer: string;
+    }
+  | {
+      kind: 'background_continue';
+      taskId: string;
+      taskTitle: string;
+    }
+  | {
+      kind: 'cancel';
+      approvalIds: string[];
+    }
+  | {
+      kind: 'new';
+    };
+
+function consoleAcceptedEarlyRoute(value: unknown): ConsoleAcceptedEarlyRoute | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (row.kind === 'background_input') {
+    if (
+      typeof row.taskId !== 'string'
+      || typeof row.taskTitle !== 'string'
+      || typeof row.questionId !== 'string'
+      || typeof row.answer !== 'string'
+    ) return null;
+    return {
+      kind: 'background_input',
+      taskId: row.taskId,
+      taskTitle: row.taskTitle,
+      questionId: row.questionId,
+      answer: row.answer,
+    };
+  }
+  if (row.kind === 'background_continue') {
+    if (typeof row.taskId !== 'string' || typeof row.taskTitle !== 'string') return null;
+    return { kind: 'background_continue', taskId: row.taskId, taskTitle: row.taskTitle };
+  }
+  if (row.kind === 'cancel') {
+    if (!Array.isArray(row.approvalIds) || !row.approvalIds.every((id) => typeof id === 'string')) return null;
+    return { kind: 'cancel', approvalIds: row.approvalIds };
+  }
+  return row.kind === 'new' ? { kind: 'new' } : null;
+}
+
+function consoleTerminalForSource(
+  sessionId: string,
+  sourceUserSeq: number,
+): { event: HarnessEventRow; presentation: PresentationEvent } | null {
+  const event = listHarnessEvents(sessionId, { types: ['conversation_completed'], desc: true })
+    .find((candidate) => candidate.data.sourceUserSeq === sourceUserSeq);
+  if (!event) return null;
+  const presentation = presentationEventFromCompletionData(event.data);
+  return presentation ? { event, presentation } : null;
+}
+
+/**
+ * Deterministic desktop acknowledgements are still real user-facing turn
+ * outcomes. Route them through the same typed/exact-once delivery boundary as
+ * model-backed turns so a route cannot publish an arbitrary control payload as
+ * chat copy.
+ */
+function commitConsoleTerminal(input: {
+  identity: TurnIdentity;
+  text: string;
+  status: ConsoleTerminalStatus;
+  legacyReason: string;
+  metadata?: Record<string, unknown>;
+}): string {
+  const common = {
+    version: 2 as const,
+    id: turnOutcomeId(input.identity),
+    identity: input.identity,
+  };
+  let outcome: TurnOutcome;
+  if (input.status === 'needs_input') {
+    outcome = {
+      ...common,
+      status: 'needs_input',
+      resumable: true,
+      needs: { kind: 'input' },
+      presentation: { kind: 'question', text: input.text },
+    };
+  } else if (input.status === 'failed') {
+    outcome = {
+      ...common,
+      status: 'failed',
+      resumable: false,
+      presentation: { kind: 'error', text: input.text },
+    };
+  } else if (input.status === 'cancelled') {
+    outcome = {
+      ...common,
+      status: 'cancelled',
+      resumable: false,
+      presentation: { kind: 'stopped', text: input.text },
+    };
+  } else {
+    outcome = {
+      ...common,
+      status: 'done',
+      resumable: false,
+      presentation: { kind: 'answer', text: input.text },
+    };
+  }
+  return commitTurnOutcome(outcome, {
+    legacyReason: input.legacyReason,
+    metadata: input.metadata,
+  }).presentation.text;
+}
+
+/** Do not let a late desktop completion erase a newer attempt's marker. */
+function clearConsoleRunMarkerIfIdle(sessionId: string, ownerAttemptId?: string): void {
+  clearRunInFlightAfterTerminal(sessionId, ownerAttemptId);
+}
+
+/** Record a route-owned accepted turn and bind its terminal to that exact row. */
+function recordAndCommitConsoleTerminal(input: {
+  sessionId: string;
+  userText: string;
+  reply: string;
+  status?: ConsoleTerminalStatus;
+  legacyReason: string;
+  metadata?: Record<string, unknown>;
+}): string {
+  const accepted = appendHarnessEvent({
+    sessionId: input.sessionId,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: input.userText, displayText: input.userText },
+  });
+  return commitConsoleTerminal({
+    identity: { sessionId: input.sessionId, turn: 0, sourceUserSeq: accepted.seq },
+    text: input.reply,
+    status: input.status ?? 'done',
+    legacyReason: input.legacyReason,
+    metadata: input.metadata,
+  });
 }
 
 function harnessAttemptRunScopeId(
@@ -11180,7 +11352,11 @@ export function registerConsoleRoutes(
         }
 
         const auth = await configureHarnessRuntime();
-        if (!auth.ok) { res.status(412).json({ ok: false, reason: auth.reason }); return; }
+        if (!auth.ok) {
+          console.warn('tasks-board approval resume blocked by unavailable model runtime:', auth.reason);
+          res.status(412).json({ ok: false, reason: PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT });
+          return;
+        }
 
         const result = approvalRegistry.resolve(id, auditResolution, 'desktop-tasks-board');
         if (!result.ok) {
@@ -11630,7 +11806,11 @@ export function registerConsoleRoutes(
     }
 
     const auth = await configureHarnessRuntime();
-    if (!auth.ok) { res.status(412).json({ error: auth.reason }); return; }
+    if (!auth.ok) {
+      console.warn('command-center approval resume blocked by unavailable model runtime:', auth.reason);
+      res.status(412).json({ error: PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT });
+      return;
+    }
 
     const sessionId = existing.sessionId;
     const result = approvalRegistry.resolve(id, auditResolution, 'desktop-command-center');
@@ -12882,8 +13062,8 @@ export function registerConsoleRoutes(
    * running 0.3 harness conversation. Each connection:
    *   1. Replays existing events for this session from SQLite, so
    *      subscribers that connect mid-run render history immediately.
-   *   2. Subscribes to actionBus and forwards every 'harness.event'
-   *      matching this sessionId.
+   *   2. Subscribes to actionBus and forwards every user-facing
+   *      'harness.public_event' matching this sessionId.
    *   3. Heartbeats every 15s so proxies/Electron don't close the
    *      idle keep-alive.
    *
@@ -12916,15 +13096,18 @@ export function registerConsoleRoutes(
     // doesn't flood the initial frame; subscribers can reconnect
     // with ?sinceSeq= for older slices if needed.
     try {
-      const replay = listHarnessEvents(sessionId, { sinceSeq, limit: 500 });
+      const replay = projectHarnessEventsForPublic(
+        listHarnessEvents(sessionId, { sinceSeq, limit: 500 }),
+      );
       writeEvent('replay', { sessionId, sessionStatus: session.status, events: replay });
     } catch (err) {
-      writeEvent('replay', { sessionId, events: [], error: (err as Error).message });
+      console.error('desktop harness replay failed:', err);
+      writeEvent('replay', { sessionId, events: [], error: PUBLIC_RUN_FAILURE_TEXT });
     }
 
     // 2) Live subscription.
     const unsubscribe = actionBus.subscribe((event) => {
-      if (event.kind !== 'harness.event') return;
+      if (event.kind !== 'harness.public_event') return;
       if (event.sessionId !== sessionId) return;
       writeEvent('event', event.event);
     });
@@ -12969,7 +13152,9 @@ export function registerConsoleRoutes(
     const limitRaw = typeof req.query.limit === 'string' ? Number(req.query.limit) : 500;
     const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.trunc(limitRaw))) : 500;
     try {
-      const events = listHarnessEvents(sessionId, { sinceSeq, limit });
+      const events = projectHarnessEventsForPublic(
+        listHarnessEvents(sessionId, { sinceSeq, limit }),
+      );
       res.json({
         sessionId,
         sessionStatus: session.status,
@@ -12977,7 +13162,8 @@ export function registerConsoleRoutes(
         events,
       });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      console.error('desktop harness recent-event replay failed:', err);
+      res.status(500).json({ error: PUBLIC_RUN_FAILURE_TEXT });
     }
   });
 
@@ -13711,8 +13897,12 @@ export function registerConsoleRoutes(
     let requestIdentity: ReturnType<typeof harnessChatRequestIdentity>;
     try {
       requestIdentity = harnessChatRequestIdentity(req, body as Record<string, unknown>);
+      if (!requestIdentity.clientProvided) throw new Error('clientRequestId is required');
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      res.status(400).json({
+        error: err instanceof Error ? err.message : String(err),
+        code: 'INVALID_CHAT_REQUEST_ID',
+      });
       return;
     }
     const payloadHash = harnessChatPayloadHash(input, attachmentIds);
@@ -13727,42 +13917,14 @@ export function registerConsoleRoutes(
       res.status(409).json({ error: 'client request id belongs to a different session' });
       return;
     }
-    // Background needs_input round-trip (2026-07-22): the SAME bridge home-chat
-    // and Discord already have, previously missing from THIS endpoint — the one
-    // the desktop conversation window uses. Without it, answering a parked
-    // task's question in a conversation went to the orchestrator model, which
-    // improvised (live: answered the autonomy check-in store — a dead end for
-    // background tasks — then dispatched a DUPLICATE task while the original
-    // sat parked forever). Only fires while exactly ONE task from this chat is
-    // parked on a question, so the mis-route window stays narrow.
-    if (requestedSessionId && input) {
-      const parkedTask = findSoleAwaitingInputTaskForOrigin(requestedSessionId);
-      if (parkedTask?.pendingQuestionId) {
-        queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, input);
-        // Neutral routing ack (owner feedback, 2026-07-24): no fabricated
-        // first-person voice on harness-only beats — the RESUMING model owns
-        // the next real words in this chat.
-        const ackText = `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`;
-        try {
-          appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: input } });
-          appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'assistant', type: 'conversation_completed', data: { reply: ackText, summary: ackText } });
-        } catch { /* the resume is queued regardless; the ack render is best-effort */ }
-        res.json({ sessionId: requestedSessionId, status: 'completed', reply: ackText, routedToBackgroundTask: parkedTask.id });
-        return;
-      }
-      if (/^\/?(continue|resume|keep going)$/i.test(input)) {
-        const continueTask = findSoleAwaitingContinueTaskForOrigin(requestedSessionId);
-        if (continueTask) {
-          queueBackgroundTaskContinue(continueTask.id);
-          const ackText = `"${continueTask.title}" is continuing — the result lands here.`;
-          try {
-            appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: input } });
-            appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'assistant', type: 'conversation_completed', data: { reply: ackText, summary: ackText } });
-          } catch { /* best-effort ack */ }
-          res.json({ sessionId: requestedSessionId, status: 'completed', reply: ackText, routedToBackgroundTask: continueTask.id });
-          return;
-        }
-      }
+    const parsedHarnessCommand = parseHarnessCommand(input);
+    if (
+      (parsedHarnessCommand === 'cancel' || parsedHarnessCommand === 'new')
+      && !requestedSessionId
+      && !priorReceipt
+    ) {
+      res.status(400).json({ error: 'sessionId is required for this chat command' });
+      return;
     }
     if (getHarnessChatCancellation(requestIdentity.requestId)) {
       res.status(409).json({
@@ -13807,75 +13969,57 @@ export function registerConsoleRoutes(
       });
     }
 
-    const auth = await configureHarnessRuntime();
-    if (!auth.ok) { res.status(412).json({ error: auth.reason }); return; }
-
     const sessionId = session.id;
     const streamUrl = `/api/sessions/${sessionId}/events`;
 
-    // /cancel, /new, and /continue commands — handled BEFORE the
-    // approval-resume path so a user typing "cancel" gets to abandon
-    // the pause instead of being routed through reject. /continue
-    // is the T1.3 graceful-continue path: when the loop hits a step
-    // or wall-clock budget, it emits a "Reply `continue` to keep
-    // going" message; the user typing `continue` rewrites the prompt
-    // into a structured continuation directive and falls through to
-    // the normal turn path.
-    const command = parseHarnessCommand(input);
-    if (command === 'cancel') {
-      const harnessSessionForCancel = HarnessSession.load(sessionId);
-      const sinceSeq = getLatestHarnessEventSeq(sessionId);
-      const { listPending: listPendingApprovals, resolve: resolveApproval } =
-        await import('../runtime/harness/approval-registry.js');
-      const pending = listPendingApprovals({ sessionId, status: 'pending' });
-      let cancelledCount = 0;
-      for (const row of pending) {
-        const r = resolveApproval(row.approvalId, 'cancelled_by_user', 'chat-dock-user');
-        if (r.ok) cancelledCount++;
+    // Resolve deterministic route intent before acceptance, but do not mutate
+    // anything yet. The selected target is copied onto the accepted user edge
+    // below, making it the recovery authority after a lost response or crash.
+    // Background replies retain priority over command parsing, matching the
+    // historical desktop behavior.
+    const command = parsedHarnessCommand;
+    let proposedEarlyRoute: ConsoleAcceptedEarlyRoute | null = null;
+    if (requestedSessionId && input) {
+      const parkedTask = findSoleAwaitingInputTaskForOrigin(requestedSessionId);
+      if (parkedTask?.pendingQuestionId) {
+        proposedEarlyRoute = {
+          kind: 'background_input',
+          taskId: parkedTask.id,
+          taskTitle: parkedTask.title,
+          questionId: parkedTask.pendingQuestionId,
+          answer: input,
+        };
+      } else if (/^\/?(continue|resume|keep going)$/i.test(input)) {
+        const continueTask = findSoleAwaitingContinueTaskForOrigin(requestedSessionId);
+        if (continueTask) {
+          proposedEarlyRoute = {
+            kind: 'background_continue',
+            taskId: continueTask.id,
+            taskTitle: continueTask.title,
+          };
+        }
       }
-      try {
-        harnessSessionForCancel?.clearInterruptState();
-        harnessSessionForCancel?.markStatus('cancelled');
-      } catch { /* best effort */ }
-      const { appendEvent } = await import('../runtime/harness/eventlog.js');
-      try {
-        appendEvent({
-          sessionId,
-          turn: 0,
-          role: 'system',
-          type: 'conversation_completed',
-          data: {
-            summary: cancelledCount > 0
-              ? `Cancelled. Abandoned ${cancelledCount} pending approval${cancelledCount === 1 ? '' : 's'}. Send a new message to start fresh.`
-              : 'Cancelled. Session cleared. Send a new message to start fresh.',
-            reason: 'cancelled_by_user',
-            approvalsCancelled: cancelledCount,
-          },
-        });
-      } catch { /* best effort */ }
-      res.status(202).json({ sessionId, streamUrl, status: 'cancelled', mode: 'command', sinceSeq });
-      return;
     }
-    if (command === 'new') {
-      // The chat-dock client owns the sessionId reference, so /new is
-      // a hint to start a fresh session on the next message. Confirm
-      // and return; the next POST without sessionId creates a new one.
-      const { appendEvent } = await import('../runtime/harness/eventlog.js');
-      const sinceSeq = getLatestHarnessEventSeq(sessionId);
-      try {
-        appendEvent({
-          sessionId,
-          turn: 0,
-          role: 'system',
-          type: 'conversation_completed',
-          data: {
-            summary: 'Fresh session ready. Your next message will start a new conversation.',
-            reason: 'new_requested',
-          },
-        });
-      } catch { /* best effort */ }
-      res.status(202).json({ sessionId, streamUrl, status: 'new-pending', mode: 'command', sinceSeq });
-      return;
+    if (!proposedEarlyRoute && command === 'cancel') {
+      proposedEarlyRoute = {
+        kind: 'cancel',
+        approvalIds: approvalRegistry.listPending({ sessionId, status: 'pending' })
+          .map((row) => row.approvalId),
+      };
+    } else if (!proposedEarlyRoute && command === 'new') {
+      proposedEarlyRoute = { kind: 'new' };
+    }
+
+    // Route-owned control edges do not need a model runtime. Normal turns still
+    // fail before acceptance when no brain is available, preserving the prior
+    // retry contract without blocking /cancel or a parked-task answer on auth.
+    if (!proposedEarlyRoute) {
+      const auth = await configureHarnessRuntime();
+      if (!auth.ok) {
+        console.warn('chat start blocked by unavailable model runtime:', auth.reason);
+        res.status(412).json({ error: PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT });
+        return;
+      }
     }
 
     // /continue — rewrite the bare keyword into a structured
@@ -13926,7 +14070,7 @@ export function registerConsoleRoutes(
     // Clem knows WHICH Workspace this thread is about and how to edit it.
     // Without it the dock is a contextless generic assistant (it asked "which
     // app? send me the file path" instead of knowing it's this Workspace).
-    if (harnessSession && /^space-[a-z0-9][a-z0-9-]*$/.test(sessionId)) {
+    if (!proposedEarlyRoute && harnessSession && /^space-[a-z0-9][a-z0-9-]*$/.test(sessionId)) {
       try {
         // Single source of truth for BOTH lanes — buildWorkspaceContextPrimer is
         // the same primer the Claude SDK lane appends to its system prompt. (Was a
@@ -13944,6 +14088,52 @@ export function registerConsoleRoutes(
     const registryApprovalPending = !isPausedOnApproval
       && approvalRegistry.listPending({ sessionId, status: 'pending' }).length > 0;
     const intent = (isPausedOnApproval || registryApprovalPending) ? parseApprovalIntent(input) : null;
+    // Freeze approval addressing at acceptance. A bare approve/reject owns an
+    // exact card only when one actionable card exists now; if the registry
+    // changes before the async executor runs, it must ask again rather than
+    // silently transferring authority to a different/latest card.
+    const acceptedApprovalId = intent
+      ? (() => {
+          const actionable = approvalRegistry.listPending({ sessionId, status: 'pending' })
+            .filter((row) => approvalRegistry.isActionable(row));
+          const selection = selectAddressedApproval(actionable, intent.approvalId);
+          return selection.kind === 'selected' ? selection.row.approvalId : undefined;
+        })()
+      : undefined;
+    const acceptedApprovalRow = acceptedApprovalId ? approvalRegistry.get(acceptedApprovalId) : null;
+    const acceptedApprovalParked = !!acceptedApprovalRow && listHarnessEvents(sessionId, {
+      types: ['approval_parked'],
+      desc: true,
+      limit: 80,
+    }).some((event) => event.data.approvalId === acceptedApprovalRow.approvalId);
+    const acceptedApprovalIsStandaloneWorkspace = acceptedApprovalRow?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
+      || acceptedApprovalRow?.tool === SPACE_CLI_SOURCE_TRUST_TOOL
+      || acceptedApprovalRow?.tool === SPACE_ACTION_APPROVAL_TOOL;
+    const acceptedApprovalHasLinkedPendingAction = (() => {
+      if (!acceptedApprovalRow) return false;
+      const linked = pendingActionApprovalViewFromArgs(acceptedApprovalRow.args);
+      return !!linked?.id && linked.approvalId === acceptedApprovalRow.approvalId;
+    })();
+    const acceptedApprovalIsLiveSdkWait = !!intent
+      && registryApprovalPending
+      && !!acceptedApprovalRow
+      && !acceptedApprovalParked
+      && !acceptedApprovalHasLinkedPendingAction
+      && !acceptedApprovalIsStandaloneWorkspace;
+    // The approval POST accepts the source, but the parked re-drive owns the
+    // execution marker. Arming here would make the resume listener see a live
+    // run and wait forever for this non-terminal progress edge to clear it.
+    const acceptedApprovalWillAutoResume = intent?.decision === 'approve'
+      && registryApprovalPending
+      && !!acceptedApprovalRow
+      && !acceptedApprovalIsStandaloneWorkspace
+      && (acceptedApprovalParked || acceptedApprovalHasLinkedPendingAction);
+    const acceptedApprovalProtectsExistingLiveOwner = !!intent
+      && !acceptedApprovalParked
+      && !!getActiveHarnessRunAttempt(sessionId);
+    const acceptedApprovalDefersMarkerOwnership = acceptedApprovalIsLiveSdkWait
+      || acceptedApprovalWillAutoResume
+      || acceptedApprovalProtectsExistingLiveOwner;
     const sinceSeq = getLatestHarnessEventSeq(sessionId);
     const autonomy = loadProactivityPolicy().autoApproveScope;
     const planFirst = !intent && shouldUsePlanFirst({ input: turnInput, freshSession, autonomy });
@@ -13961,9 +14151,13 @@ export function registerConsoleRoutes(
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const cancelledBeforeAcceptance = message.includes('cancelled before acceptance');
+      console.error('could not claim durable chat request receipt:', err);
       res.status(409).json({
-        error: message,
-        ...(message.includes('cancelled before acceptance') ? { code: 'CHAT_REQUEST_CANCELLED' } : {}),
+        error: cancelledBeforeAcceptance
+          ? 'This chat request was cancelled before acceptance.'
+          : 'This chat request could not be accepted. Send it again with a new request ID.',
+        ...(cancelledBeforeAcceptance ? { code: 'CHAT_REQUEST_CANCELLED' } : {}),
       });
       return;
     }
@@ -13993,9 +14187,9 @@ export function registerConsoleRoutes(
           if (shouldSchedule) finishRunAttempt(requestAttempt, 'cancelled');
         }
       } catch (err) {
+        console.error('chat cancellation was recorded but its accepted run could not be stopped:', err);
         res.status(500).json({
-          error: 'chat cancellation was recorded but its accepted run could not be stopped',
-          detail: err instanceof Error ? err.message : String(err),
+          error: PUBLIC_RUN_FAILURE_TEXT,
         });
         return;
       }
@@ -14019,9 +14213,10 @@ export function registerConsoleRoutes(
     // plan continuity, or background promotion). The receipt/run id makes this
     // exact-once across a lost 202 and daemon recovery; the attempt binding is
     // what lets /api/runs project only this turn instead of guessing by time.
+    let requestAcceptedUserEvent: HarnessEventRow | undefined;
     if (shouldSchedule && requestAttempt) {
       try {
-        recordRunAttemptUserInput(requestAttempt, {
+        const acceptedUserEvent = recordRunAttemptUserInput(requestAttempt, {
           turn: 1,
           role: 'user',
           data: {
@@ -14031,16 +14226,212 @@ export function registerConsoleRoutes(
             clientRequestId: requestClaim.receipt.requestId,
             runId: requestRunId,
             attemptId: requestAttempt.attemptId,
+            ...(proposedEarlyRoute ? { consoleEarlyRoute: proposedEarlyRoute } : {}),
+            ...(acceptedApprovalId
+              ? {
+                  approvalId: acceptedApprovalId,
+                  decision: intent?.decision,
+                  source: 'desktop_approval',
+                }
+              : {}),
           },
-        });
+        }, { armRunInFlight: !acceptedApprovalDefersMarkerOwnership });
+        requestAcceptedUserEvent = acceptedUserEvent;
       } catch (err) {
         try { finishRunAttempt(requestAttempt, 'interrupted'); } catch { /* best effort */ }
+        console.error('could not durably record the accepted chat turn:', err);
         res.status(500).json({
-          error: 'could not durably record the accepted chat turn',
-          detail: err instanceof Error ? err.message : String(err),
+          error: PUBLIC_RUN_FAILURE_TEXT,
         });
         return;
       }
+    }
+
+    const durableAttempt = getLatestHarnessRunAttemptByRunId(sessionId, requestRunId);
+    const durableSourceUserSeq = requestAcceptedUserEvent?.seq ?? durableAttempt?.sourceUserSeq ?? null;
+    const durableAcceptedUserEvent = requestAcceptedUserEvent ?? (
+      durableSourceUserSeq
+        ? listHarnessEvents(sessionId, {
+            sinceSeq: durableSourceUserSeq - 1,
+            types: ['user_input_received'],
+            limit: 1,
+          }).find((event) => event.seq === durableSourceUserSeq)
+        : undefined
+    );
+    const acceptedEarlyRoute = consoleAcceptedEarlyRoute(
+      durableAcceptedUserEvent?.data.consoleEarlyRoute,
+    );
+
+    const earlyResponseBase = () => ({
+      sessionId,
+      streamUrl,
+      sinceSeq: requestClaim.receipt.sinceSeq,
+      clientRequestId: requestClaim.receipt.requestId,
+      runId: requestRunId,
+      replayed: !requestClaim.inserted,
+      ...(requestAttempt
+        ? {
+            attemptId: requestAttempt.attemptId,
+            runScopeId: harnessAttemptRunScopeId(sessionId, requestAttempt),
+          }
+        : {}),
+    });
+    const sendEarlyTerminalResponse = (
+      route: ConsoleAcceptedEarlyRoute,
+      presentation: PresentationEvent,
+    ): void => {
+      if (presentation.status === 'failed') {
+        res.status(500).json({ ...earlyResponseBase(), error: presentation.text });
+        return;
+      }
+      if (route.kind === 'background_input' || route.kind === 'background_continue') {
+        res.status(200).json({
+          ...earlyResponseBase(),
+          status: 'completed',
+          reply: presentation.text,
+          routedToBackgroundTask: route.taskId,
+        });
+        return;
+      }
+      res.status(202).json({
+        ...earlyResponseBase(),
+        status: route.kind === 'cancel' ? 'cancelled' : 'new-pending',
+        mode: 'command',
+      });
+    };
+
+    if (acceptedEarlyRoute) {
+      if (!durableAcceptedUserEvent || !durableSourceUserSeq) {
+        if (shouldSchedule && requestAttempt) {
+          try { finishRunAttempt(requestAttempt, 'interrupted'); } catch { /* best effort */ }
+        }
+        res.status(500).json({ error: PUBLIC_RUN_FAILURE_TEXT });
+        return;
+      }
+      const existingTerminal = consoleTerminalForSource(sessionId, durableSourceUserSeq);
+      if (existingTerminal) {
+        sendEarlyTerminalResponse(acceptedEarlyRoute, existingTerminal.presentation);
+        return;
+      }
+      if (!shouldSchedule || !requestAttempt) {
+        // A concurrent retry may arrive while the first process owns the brief
+        // synchronous control mutation. It rejoins the accepted run; a later
+        // lost-response retry replays the exact terminal above.
+        res.status(202).json({
+          ...earlyResponseBase(),
+          status: 'accepted',
+          mode: 'control',
+        });
+        return;
+      }
+
+      const earlyIdentity: TurnIdentity = {
+        sessionId,
+        turn: durableAcceptedUserEvent.turn,
+        sourceUserSeq: durableSourceUserSeq,
+        attemptId: requestAttempt.attemptId,
+        runId: requestRunId,
+      };
+      let attemptStatus: 'completed' | 'cancelled' | 'failed' = 'completed';
+      try {
+        let reply: string;
+        let legacyReason: string;
+        let metadata: Record<string, unknown> | undefined;
+        if (acceptedEarlyRoute.kind === 'background_input') {
+          const updated = queueBackgroundTaskInputResolution(
+            acceptedEarlyRoute.questionId,
+            acceptedEarlyRoute.answer,
+            { requestId: requestClaim.receipt.requestId },
+          );
+          const owned = updated?.lastInputResolutionRequestId === requestClaim.receipt.requestId
+            || getBackgroundTask(acceptedEarlyRoute.taskId)?.lastInputResolutionRequestId === requestClaim.receipt.requestId;
+          if (!owned) throw new Error('accepted background-input target is no longer safely resumable');
+          reply = `Answer sent to "${acceptedEarlyRoute.taskTitle}" — resuming now; the result lands here.`;
+          legacyReason = 'background_input_routed';
+          metadata = { queuedTaskId: acceptedEarlyRoute.taskId };
+        } else if (acceptedEarlyRoute.kind === 'background_continue') {
+          const updated = queueBackgroundTaskContinue(acceptedEarlyRoute.taskId, {
+            requestId: requestClaim.receipt.requestId,
+          });
+          const owned = updated?.lastContinueResolutionRequestId === requestClaim.receipt.requestId
+            || getBackgroundTask(acceptedEarlyRoute.taskId)?.lastContinueResolutionRequestId === requestClaim.receipt.requestId;
+          if (!owned) throw new Error('accepted background-continue target is no longer safely resumable');
+          reply = `"${acceptedEarlyRoute.taskTitle}" is continuing — the result lands here.`;
+          legacyReason = 'background_continue_routed';
+          metadata = { queuedTaskId: acceptedEarlyRoute.taskId };
+        } else if (acceptedEarlyRoute.kind === 'cancel') {
+          const resolver = `chat-dock-user:${requestClaim.receipt.requestId}`;
+          let cancelledCount = 0;
+          for (const approvalId of acceptedEarlyRoute.approvalIds) {
+            const current = approvalRegistry.get(approvalId);
+            if (current?.resolution === 'cancelled_by_user' && current.resolver === resolver) {
+              cancelledCount++;
+              continue;
+            }
+            if (
+              current?.status === 'pending'
+              && approvalRegistry.resolve(approvalId, 'cancelled_by_user', resolver).ok
+            ) cancelledCount++;
+          }
+          const harnessSessionForCancel = HarnessSession.load(sessionId);
+          harnessSessionForCancel?.clearInterruptState();
+          harnessSessionForCancel?.markStatus('cancelled');
+          reply = cancelledCount > 0
+            ? `Cancelled. Abandoned ${cancelledCount} pending approval${cancelledCount === 1 ? '' : 's'}. Send a new message to start fresh.`
+            : 'Cancelled. Session cleared. Send a new message to start fresh.';
+          legacyReason = 'cancelled_by_user';
+          attemptStatus = 'cancelled';
+        } else {
+          // The chat-dock client owns the session reference; /new is a durable
+          // acknowledgement that tells it to omit that reference on next send.
+          reply = 'Fresh session ready. Your next message will start a new conversation.';
+          legacyReason = 'new_requested';
+        }
+
+        const committedReply = commitConsoleTerminal({
+          identity: earlyIdentity,
+          text: reply,
+          status: acceptedEarlyRoute.kind === 'cancel' ? 'cancelled' : 'done',
+          legacyReason,
+          metadata,
+        });
+        try { finishRunAttempt(requestAttempt, attemptStatus); } catch { /* terminal is authoritative */ }
+        try { clearConsoleRunMarkerIfIdle(sessionId, requestAttempt.attemptId); } catch { /* recovery reconciliation can heal */ }
+        sendEarlyTerminalResponse(acceptedEarlyRoute, {
+          ...consoleTerminalForSource(sessionId, durableSourceUserSeq)!.presentation,
+          text: committedReply,
+        });
+      } catch (err) {
+        attemptStatus = 'failed';
+        try {
+          appendHarnessEvent({
+            sessionId,
+            turn: durableAcceptedUserEvent.turn,
+            role: 'system',
+            type: 'run_failed',
+            data: {
+              error: err instanceof Error ? err.message : String(err),
+              stage: 'desktop_early_route',
+              requestId: requestClaim.receipt.requestId,
+            },
+          });
+        } catch { /* private diagnostics are best-effort */ }
+        try {
+          commitConsoleTerminal({
+            identity: earlyIdentity,
+            text: PUBLIC_RUN_FAILURE_TEXT,
+            status: 'failed',
+            legacyReason: 'desktop_early_route_failed',
+          });
+        } catch (commitErr) {
+          console.error('accepted desktop control could not commit its stable failure terminal:', commitErr);
+        }
+        try { finishRunAttempt(requestAttempt, attemptStatus); } catch { /* best effort */ }
+        const terminal = consoleTerminalForSource(sessionId, durableSourceUserSeq);
+        if (terminal) clearConsoleRunMarkerIfIdle(sessionId, requestAttempt.attemptId);
+        res.status(500).json({ ...earlyResponseBase(), error: PUBLIC_RUN_FAILURE_TEXT });
+      }
+      return;
     }
 
     res.status(202).json({
@@ -14067,6 +14458,18 @@ export function registerConsoleRoutes(
     // schedule a second model/tool loop for the same client request.
     if (!shouldSchedule) return;
     if (!requestAttempt) return; // defensive: the durable lease claim is authoritative
+    if (!requestAcceptedUserEvent) {
+      try { finishRunAttempt(requestAttempt, 'interrupted'); } catch { /* best effort */ }
+      console.error('claimed desktop chat request has no exact accepted source event');
+      return;
+    }
+    const requestSourceUserSeq = requestAcceptedUserEvent.seq;
+
+    const requestTurnIdentity: TurnIdentity = {
+      sessionId,
+      turn: requestAcceptedUserEvent.turn,
+      sourceUserSeq: requestSourceUserSeq,
+    };
 
     setImmediate(async () => {
       let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'completed';
@@ -14090,6 +14493,10 @@ export function registerConsoleRoutes(
             .slice(0, 12)
             .map((row) => `${intent.decision} ${row.approvalId} — ${row.subject}`);
           if (selection.kind === 'ambiguous') {
+            const question = [
+              `You have ${selection.rows.length} pending approvals. Choose the exact card; I did not approve or reject any of them.`,
+              ...choiceLines,
+            ].join('\n');
             appendHarnessEvent({
               sessionId,
               turn: 0,
@@ -14097,12 +14504,16 @@ export function registerConsoleRoutes(
               type: 'awaiting_user_input',
               data: {
                 reason: 'approval_choice_required',
-                question: [
-                  `You have ${selection.rows.length} pending approvals. Choose the exact card; I did not approve or reject any of them.`,
-                  ...choiceLines,
-                ].join('\n'),
+                question,
                 options: choiceLines,
               },
+            });
+            commitConsoleTerminal({
+              identity: requestTurnIdentity,
+              text: question,
+              status: 'needs_input',
+              legacyReason: 'awaiting_user_input',
+              metadata: { steps: 0 },
             });
             return;
           }
@@ -14113,18 +14524,53 @@ export function registerConsoleRoutes(
                   ...choiceLines,
                 ].join('\n')
               : `Approval ${selection.approvalId} is no longer pending. Nothing was approved or rejected.`;
-            appendHarnessEvent({
-              sessionId,
-              turn: 0,
-              role: 'Clem',
-              type: actionable.length > 0 ? 'awaiting_user_input' : 'conversation_completed',
-              data: actionable.length > 0
-                ? { reason: 'approval_not_pending', question: reply, options: choiceLines }
-                : { reason: 'approval_not_pending', summary: reply, reply, steps: 0 },
-            });
+            if (actionable.length > 0) {
+              appendHarnessEvent({
+                sessionId,
+                turn: 0,
+                role: 'Clem',
+                type: 'awaiting_user_input',
+                data: { reason: 'approval_not_pending', question: reply, options: choiceLines },
+              });
+              commitConsoleTerminal({
+                identity: requestTurnIdentity,
+                text: reply,
+                status: 'needs_input',
+                legacyReason: 'awaiting_user_input',
+                metadata: { steps: 0 },
+              });
+            } else {
+              commitConsoleTerminal({
+                identity: requestTurnIdentity,
+                text: reply,
+                status: 'done',
+                legacyReason: 'approval_not_pending',
+                metadata: { steps: 0 },
+              });
+            }
             return;
           }
-          if (selection.kind === 'selected') addressedApprovalId = selection.row.approvalId;
+          if (selection.kind === 'selected') {
+            if (!acceptedApprovalId || selection.row.approvalId !== acceptedApprovalId) {
+              const question = 'The pending approval set changed after I accepted that reply. Choose the exact approval card; I did not approve or reject anything.';
+              appendHarnessEvent({
+                sessionId,
+                turn: 0,
+                role: 'Clem',
+                type: 'awaiting_user_input',
+                data: { reason: 'approval_set_changed', question, options: choiceLines },
+              });
+              commitConsoleTerminal({
+                identity: requestTurnIdentity,
+                text: question,
+                status: 'needs_input',
+                legacyReason: 'awaiting_user_input',
+                metadata: { steps: 0 },
+              });
+              return;
+            }
+            addressedApprovalId = selection.row.approvalId;
+          }
         }
         // /goal slash command (goal-contract P3): pin/inspect/cancel the
         // session's parked goal. status/cancel are reply-only; start/resume
@@ -14134,40 +14580,61 @@ export function registerConsoleRoutes(
         if (goalCmd) {
           const outcome = handleGoalContractCommand({ command: goalCmd, sessionId, channel: 'desktop' });
           if (!outcome.runInput) {
-            appendHarnessEvent({
-              sessionId,
-              turn: 0,
-              role: 'Clem',
-              type: 'conversation_completed',
-              data: { reason: 'goal_command', summary: outcome.reply, reply: outcome.reply, steps: 0 },
+            commitConsoleTerminal({
+              identity: requestTurnIdentity,
+              text: outcome.reply,
+              status: 'done',
+              legacyReason: 'goal_command',
+              metadata: { steps: 0 },
             });
             return;
           }
           goalRunInput = outcome.runInput;
         }
         if (!intent) {
+          const continuityNotes: string[] = [];
           const continuity = await routeOpenQuestionPlan({
             channel: 'desktop',
             input: turnInput,
             sessionId,
+            sourceUserSeq: requestSourceUserSeq!,
             autonomy,
             reuseRecordedUserInput: true,
-            // Surface continuity notes (workflow resumed, set-aside, re-ask)
-            // into the desktop stream the same way the cancel path does, so
-            // desktop reaches parity with Discord's sendFollowup.
+            // Buffer continuity notes until routing tells us whether the note
+            // owns this turn or merely precedes a still-pending real answer.
             sendNote: async (message: string) => {
-              try {
-                appendHarnessEvent({
-                  sessionId,
-                  turn: 0,
-                  role: 'system',
-                  type: 'conversation_completed',
-                  data: { summary: message, reason: 'plan_continuity_note', steps: 0 },
-                });
-              } catch { /* note is best-effort */ }
+              continuityNotes.push(message);
             },
           });
-          if (continuity.handled) return;
+          if (continuity.handled) {
+            // Workflow-input continuity owns this accepted turn and has no
+            // later brain response. Its deterministic note is therefore the
+            // terminal presentation. Plan-first continuity commits its own
+            // typed outcome and does not send a note here.
+            const note = continuityNotes.at(-1);
+            if (note) {
+              commitConsoleTerminal({
+                identity: requestTurnIdentity,
+                text: note,
+                status: /still needed|reply with/i.test(note) ? 'needs_input' : 'done',
+                legacyReason: 'plan_continuity_note',
+                metadata: { steps: 0 },
+              });
+            }
+            return;
+          }
+          // A set-aside/new-topic note is control context for a turn that will
+          // still produce a real answer. Keep it in the private trace; treating
+          // it as a second terminal caused duplicate assistant replies.
+          for (const note of continuityNotes) {
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'conversation_step',
+              data: { summary: note, reason: 'plan_continuity_note', steps: 0 },
+            });
+          }
         }
         // Durable background promotion (gap C1): explicit durable asks AND
         // high-confidence unattended data pipelines go to the daemon's durable
@@ -14180,57 +14647,27 @@ export function registerConsoleRoutes(
         // Skips approval-resume, a session paused on approval, and /goal runs.
         // Space sessions stay foreground unless the background lane is named
         // explicitly — the user is watching the workspace being edited.
-        const approachGate = (!intent && !isPausedOnApproval && !goalRunInput)
-          ? longTaskApproachGate(sessionId, turnInput, () => shouldPromoteToDurable(input, { sessionId }))
-          : { action: 'none' as const };
-        if (approachGate.action === 'beat') {
-          // Long-task approach beat (2026-07-23): plan WITH the user first —
-          // the model presents its approach this turn; the user's "go"
-          // dispatches the original ask on the next turn.
-          turnInput = `${turnInput}${approachGate.steer}`;
-        }
-        if (approachGate.action === 'dispatch') {
+        const promoteToDurable = !intent
+          && !isPausedOnApproval
+          && !goalRunInput
+          && shouldPromoteToDurable(input, { sessionId });
+        if (promoteToDurable) {
           const task = enqueueDurableChatTask({
-            message: approachGate.message,
+            message: turnInput,
             sessionId,
             channel: 'desktop',
             source: 'desktop',
           });
           const queuedReply = renderDurableTaskQueued(task);
-          appendHarnessEvent({
-            sessionId,
-            turn: 0,
-            role: 'Clem',
-            type: 'conversation_completed',
-            data: {
-              reason: 'queued_background',
-              summary: queuedReply,
-              reply: queuedReply,
-              steps: 0,
-              queuedTaskId: task.id,
-            },
+          commitConsoleTerminal({
+            identity: requestTurnIdentity,
+            text: queuedReply,
+            status: 'done',
+            legacyReason: 'queued_background',
+            metadata: { steps: 0, queuedTaskId: task.id },
           });
           return;
         }
-        // Stream CLEAN text, not raw structured-output JSON: extract the
-        // reply (chat decisions) / objective+actions (streamed plans) as
-        // they form. Non-JSON model output emits nothing — the final reply
-        // always lands via conversation_completed.
-        const emitToken = (delta: string) => {
-          actionBus.emit({
-            kind: 'harness.event',
-            sessionId,
-            event: {
-              seq: 0,
-              sessionId,
-              turn: 0,
-              role: 'assistant',
-              type: 'stream_token',
-              data: { delta },
-            } as any,
-          });
-        };
-        const onChunk = createJsonFieldStreamer(['reply', 'objective', 'action'], emitToken);
         // A /goal start already pinned its goal — skip plan-first and run
         // the objective directly on the normal loop.
         if (planFirst && !goalRunInput) {
@@ -14240,8 +14677,8 @@ export function registerConsoleRoutes(
             channel: 'desktop',
             freshSession,
             autonomy,
-            onChunk,
             reuseRecordedUserInput: true,
+            sourceUserSeq: requestSourceUserSeq!,
           });
           if (preflight.surfaced) return;
         }
@@ -14259,21 +14696,14 @@ export function registerConsoleRoutes(
             && row.sessionId === sessionId
             && row.status === 'pending'
             && approvalRegistry.resolve(row.approvalId, resolution, 'chat-dock-user').ok;
-          appendHarnessEvent({
-            sessionId,
-            turn: 0,
-            role: 'Clem',
-            type: 'conversation_completed',
-            data: {
-              reason: 'workflow_approval_resolved',
-              summary: resolved
-                ? `${resolution} ${addressedApprovalId} — the workflow resumes on its own`
-                : '(no pending approval was resolved)',
-              reply: resolved
-                ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} ${addressedApprovalId} — the workflow picks this up and resumes by itself.`
-                : 'That approval was no longer pending. Nothing else was approved or rejected.',
-              steps: 0,
-            },
+          commitConsoleTerminal({
+            identity: requestTurnIdentity,
+            text: resolved
+              ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} ${addressedApprovalId} — the workflow picks this up and resumes by itself.`
+              : 'That approval was no longer pending. Nothing else was approved or rejected.',
+            status: 'done',
+            legacyReason: 'workflow_approval_resolved',
+            metadata: { steps: 0 },
           });
           return;
         }
@@ -14285,6 +14715,15 @@ export function registerConsoleRoutes(
         if (intent && registryApprovalPending) {
           const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
           const row = addressedApprovalId ? approvalRegistry.get(addressedApprovalId) : null;
+          const linkedPendingAction = row ? pendingActionApprovalViewFromArgs(row.args) : undefined;
+          const parkedSdkApproval = !!row && (
+            listHarnessEvents(sessionId, {
+              types: ['approval_parked'],
+              desc: true,
+              limit: 80,
+            }).some((event) => event.data.approvalId === row.approvalId)
+            || (!!linkedPendingAction?.id && linkedPendingAction.approvalId === row.approvalId)
+          );
           const standaloneWorkspaceApproval = row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
             || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL
             || row?.tool === SPACE_ACTION_APPROVAL_TOOL;
@@ -14303,36 +14742,55 @@ export function registerConsoleRoutes(
                 : resolution === 'approved'
                   ? `Approved ${addressedApprovalId}. The exact Workspace action is now authorized and its runtime is executing it.`
                   : `Rejected ${addressedApprovalId}. The Workspace runner or action remains blocked and was not executed.`;
-            appendHarnessEvent({
-              sessionId,
-              turn: 0,
-              role: 'Clem',
-              type: approvedRunner ? 'conversation_step' : 'conversation_completed',
-              data: {
-                reason: approvedRunner
-                  ? 'workspace_runner_approval_refresh_started'
-                  : 'workspace_approval_resolved',
-                summary: reply,
-                ...(approvedRunner ? {} : { reply }),
-                steps: 0,
-                approvalId: addressedApprovalId,
-              },
+            // The approval click/message is a complete control turn. The
+            // standalone Workspace runtime reports its later data refresh as
+            // separate work; leaving this accepted edge on conversation_step
+            // made the chat spinner wait forever.
+            commitConsoleTerminal({
+              identity: requestTurnIdentity,
+              text: reply,
+              status: 'done',
+              legacyReason: approvedRunner
+                ? 'workspace_runner_approval_refresh_started'
+                : 'workspace_approval_resolved',
+              metadata: { steps: 0 },
             });
             return;
           }
-          appendHarnessEvent({
-            sessionId,
-            turn: 0,
-            role: 'Clem',
-            type: 'conversation_step',
-            data: {
-              reason: 'sdk_approval_resolved',
-              summary: resolved
-                ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} ${addressedApprovalId} — continuing.`
-                : '(no pending approval to resolve)',
-              steps: 0,
-            },
-          });
+          const reply = resolved
+            ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} ${addressedApprovalId}${parkedSdkApproval && resolution === 'approved' ? ' — resuming the parked turn.' : ' — continuing.'}`
+            : 'That approval was no longer pending. Nothing was approved or rejected.';
+          if (resolved && parkedSdkApproval && resolution === 'approved') {
+            // A parked SDK query already committed its original source as
+            // needs-approval. The auto-resume listener re-drives the work with
+            // THIS approval-response source, whose eventual result must be its
+            // sole terminal. This acknowledgement is private progress only.
+            appendHarnessEvent({
+              sessionId,
+              turn: requestAcceptedUserEvent.turn,
+              role: 'system',
+              type: 'conversation_step',
+              data: {
+                reason: 'sdk_approval_resume_started',
+                summary: reply,
+                approvalId: addressedApprovalId,
+                sourceUserSeq: requestSourceUserSeq,
+              },
+            });
+          } else {
+            // Live-wait SDK query: its original source has not committed a
+            // pause terminal and will own the later model result. The approval
+            // response is a separate accepted control edge, completed by this
+            // immediate acknowledgement. Rejections and stale cards also end
+            // here because no parked re-drive will run.
+            commitConsoleTerminal({
+              identity: requestTurnIdentity,
+              text: reply,
+              status: 'done',
+              legacyReason: 'sdk_approval_resolved',
+              metadata: { steps: 0 },
+            });
+          }
           return;
         }
         // Agentic Claude brain lane (claude_oauth + CLEMMY_CLAUDE_AGENT_SDK_BRAIN):
@@ -14347,32 +14805,33 @@ export function registerConsoleRoutes(
         // to its own assistant turn. Flag-gated + auth-gated, so Codex / API-key
         // users are byte-identical (branch never taken).
         if (!intent && claudeAgentSdkBrainEnabled('home')) {
-          // Stream brain text deltas to the desktop SSE (raw — the brain emits
-          // plain prose, not the {reply,…} JSON the field-streamer parses).
-          // Final reply still arrives via the conversation_completed event.
           const brainReq = {
             message: effectiveInput,
+            displayMessage: input,
+            sourceUserSeq: requestSourceUserSeq,
             sessionId,
             runId: requestRunId,
             channel: 'desktop',
             userId: 'desktop',
-            onChunk: emitToken,
           };
           try {
             const response = await respondPreferHarness('home', brainReq, (req) => respondViaClaudeAgentSdkBrain('home', req));
             if (response.stoppedReason === 'cancelled') requestAttemptStatus = 'cancelled';
           } catch (err) {
             requestAttemptStatus = 'failed';
-            appendHarnessEvent({
-              sessionId,
-              turn: 0,
-              role: 'system',
-              type: 'run_failed',
-              data: {
-                error: err instanceof Error ? err.message : String(err),
-                stage: 'respond_bridge',
-              },
-            });
+            try {
+              appendHarnessEvent({
+                sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'run_failed',
+                data: {
+                  error: err instanceof Error ? err.message : String(err),
+                  stage: 'respond_bridge',
+                },
+              });
+            } catch { /* private diagnostics are best-effort */ }
+            throw err;
           }
           return;
         }
@@ -14385,10 +14844,11 @@ export function registerConsoleRoutes(
           await runConversationFromResume({
             agent,
             sessionId,
+            runAttemptId: requestAttempt.attemptId,
+            sourceUserSeq: requestSourceUserSeq,
             approvalId: addressedApprovalId,
             decision: intent.decision,
             resolver: 'chat-dock-user',
-            onChunk,
           });
           return;
         }
@@ -14404,7 +14864,15 @@ export function registerConsoleRoutes(
         // excludes / auth not ready) — never taken after a harness run starts.
         const response = await respondPreferHarness(
           'home',
-          { message: effectiveInput, sessionId, runId: requestRunId, channel: 'desktop', userId: 'desktop', onChunk },
+          {
+            message: effectiveInput,
+            displayMessage: input,
+            sourceUserSeq: requestSourceUserSeq,
+            sessionId,
+            runId: requestRunId,
+            channel: 'desktop',
+            userId: 'desktop',
+          },
           async (req) => {
             const agent = await buildOrchestratorAgent({
               userInput: req.message,
@@ -14415,8 +14883,9 @@ export function registerConsoleRoutes(
               agent,
               sessionId,
               input: req.message,
+              sourceUserSeq: requestSourceUserSeq,
+              runAttemptId: requestAttempt.attemptId,
               judgeCompletion: true,
-              onChunk,
               reuseRecordedUserInput: true,
             });
             const replyText = (result.lastDecision?.reply && result.lastDecision.reply.trim())
@@ -14428,10 +14897,9 @@ export function registerConsoleRoutes(
         if (response.stoppedReason === 'cancelled') requestAttemptStatus = 'cancelled';
       } catch (err) {
         requestAttemptStatus = 'failed';
-        // The loop emits its own run_failed when a turn throws. If we
-        // got here, the throw happened BEFORE any turn started
-        // (typically inside buildOrchestratorAgent / handoff catalog
-        // build). Emit run_failed so the SSE stream surfaces it.
+        // Preserve raw diagnostics privately, then reduce this accepted source
+        // to the shared stable public error. `run_failed` is deliberately not
+        // an SSE publication event.
         const message = err instanceof Error ? err.message : String(err);
         try {
           appendHarnessEvent({
@@ -14442,11 +14910,28 @@ export function registerConsoleRoutes(
             data: { error: message, stage: 'pre_first_turn' },
           });
         } catch {
-          // last-ditch — swallow to avoid an unhandled rejection
+          // last-ditch — the typed failure below remains authoritative
+        }
+        try {
+          commitConsoleTerminal({
+            identity: requestTurnIdentity,
+            text: PUBLIC_RUN_FAILURE_TEXT,
+            status: 'failed',
+            legacyReason: 'desktop_turn_failed',
+          });
+        } catch (commitErr) {
+          console.error('accepted desktop turn could not commit its stable failure terminal:', commitErr);
         }
       } finally {
         clearInterval(leaseHeartbeat);
         try { finishRunAttempt(requestAttempt, requestAttemptStatus); } catch { /* receipt telemetry is best-effort */ }
+        if (!acceptedApprovalDefersMarkerOwnership) {
+          const terminal = listHarnessEvents(sessionId, { types: ['conversation_completed'], desc: true })
+            .find((event) => event.data.sourceUserSeq === requestSourceUserSeq);
+          if (terminal) {
+            clearConsoleRunMarkerIfIdle(sessionId, requestAttempt.attemptId);
+          }
+        }
       }
     });
   });
@@ -14466,19 +14951,12 @@ export function registerConsoleRoutes(
           metadata: { source: 'desktop' },
         });
       }
-      appendHarnessEvent({
+      recordAndCommitConsoleTerminal({
         sessionId,
-        turn: 0,
-        role: 'user',
-        type: 'user_input_received',
-        data: { text: message },
-      });
-      appendHarnessEvent({
-        sessionId,
-        turn: 0,
-        role: 'assistant',
-        type: 'conversation_completed',
-        data: { reason: 'queued_background', summary: reply, reply, steps: 0, queuedTaskId: taskId },
+        userText: message,
+        reply,
+        legacyReason: 'queued_background',
+        metadata: { steps: 0, queuedTaskId: taskId },
       });
     } catch {
       // The task is already durable; transcript projection is best-effort.
@@ -14521,14 +14999,9 @@ export function registerConsoleRoutes(
       // model to narrate. Route it through the same durable choke point as the
       // harness chat API so Home cannot acknowledge a background plan without
       // actually creating a visible, restart-safe task.
-      const backgroundGate = longTaskApproachGate(
-        sessionId,
-        message,
-        () => shouldPromoteToDurable(message, { sessionId }),
-      );
-      if (backgroundGate.action === 'dispatch') {
+      if (shouldPromoteToDurable(message, { sessionId })) {
         const task = enqueueDurableChatTask({
-          message: backgroundGate.message,
+          message,
           sessionId,
           channel: 'desktop',
           source: 'desktop',
@@ -14539,17 +15012,11 @@ export function registerConsoleRoutes(
         res.end();
         return;
       }
-      const effectiveMessage = backgroundGate.action === 'beat'
-        ? `${message}${backgroundGate.steer}`
-        : message;
       const streamReq: AssistantRequest = {
-        message: effectiveMessage,
+        message,
         sessionId,
         channel: 'cli',
         userId: 'console',
-        onChunk: (delta) => {
-          writeEvent({ type: 'chunk', delta });
-        },
         onToolActivity: (activity) => {
           writeEvent({
             type: 'tool',
@@ -14564,6 +15031,11 @@ export function registerConsoleRoutes(
       };
       const response = await respondPreferHarness('home', streamReq, (req) => assistant.respond(req));
       const route = routeDiagnosticsFromResponse(response);
+      if (response.stoppedReason === 'error') {
+        writeEvent({ type: 'error', error: PUBLIC_RUN_FAILURE_TEXT });
+        res.end();
+        return;
+      }
       writeEvent({
         type: 'done',
         sessionId,
@@ -14577,7 +15049,8 @@ export function registerConsoleRoutes(
       });
       res.end();
     } catch (err) {
-      writeEvent({ type: 'error', error: err instanceof Error ? err.message : String(err) });
+      console.error('console chat stream failed:', err);
+      writeEvent({ type: 'error', error: PUBLIC_RUN_FAILURE_TEXT });
       res.end();
     }
   });
@@ -14856,14 +15329,9 @@ export function registerConsoleRoutes(
       // Keep the non-streaming/CLI-compatible Home endpoint behavior identical
       // to the React stream: an explicit durable command must create the task
       // before any model has a chance to stop at plan narration.
-      const backgroundGate = longTaskApproachGate(
-        sessionId,
-        message,
-        () => shouldPromoteToDurable(message, { sessionId }),
-      );
-      if (backgroundGate.action === 'dispatch') {
+      if (shouldPromoteToDurable(message, { sessionId })) {
         const task = enqueueDurableChatTask({
-          message: backgroundGate.message,
+          message,
           sessionId,
           channel: 'desktop',
           source: 'desktop',
@@ -14873,21 +15341,23 @@ export function registerConsoleRoutes(
         res.json({ sessionId, text });
         return;
       }
-      const effectiveMessage = backgroundGate.action === 'beat'
-        ? `${message}${backgroundGate.steer}`
-        : message;
       // FORK collapse (staged): interactive console home chat through the gated
       // harness loop (judgeCompletion ON for desktop/Discord parity). Default-OFF
       // `home` staging surface → byte-identical to legacy until
       // CLEMMY_HARNESS_HOME=on, then live-verified + baked in.
       const response = await respondPreferHarness(
         'home',
-        { message: effectiveMessage, sessionId, channel: 'cli', userId: 'console' },
+        { message, sessionId, channel: 'cli', userId: 'console' },
         (req) => assistant.respond(req),
       );
+      if (response.stoppedReason === 'error') {
+        res.status(500).json({ error: PUBLIC_RUN_FAILURE_TEXT });
+        return;
+      }
       res.json({ sessionId, text: response.text, pendingApprovalId: response.pendingApprovalId });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      console.error('console chat failed:', err);
+      res.status(500).json({ error: PUBLIC_RUN_FAILURE_TEXT });
     }
   });
 

@@ -3,6 +3,7 @@ import type { WebClient } from '@slack/web-api';
 import type { KnownBlock, Button } from '@slack/types';
 import {
   runDiscordHarnessConversation,
+  type DurableChannelRequest,
   type DiscordHarnessTransport,
   type DisplayState,
 } from './discord-harness.js';
@@ -352,6 +353,12 @@ export async function handleSlackHarnessMessage(opts: {
   /** When present, this turn ran from the native AI-Assistant pane: use the
    *  assistant transport so run activity drives assistant.threads.setStatus. */
   setStatus?: (status: string) => Promise<unknown>;
+  /** Provider ingress binds this stable request before the shared runner may
+   *  dispatch tools. Replays either return the exact terminal or fail closed. */
+  durableRequest?: DurableChannelRequest;
+  /** Narrow control-path injection: lets Slack ingress wrap deterministic
+   *  status output in a typed accepted-source edge without posting twice. */
+  transportOverride?: DiscordHarnessTransport;
 }): Promise<void> {
   // Deterministic "status" command: a bare status-intent message is answered
   // directly from the board stores WITHOUT invoking the brain, so a channel user
@@ -361,6 +368,10 @@ export async function handleSlackHarnessMessage(opts: {
   if (isStatusCommand(opts.prompt)) {
     try {
       const text = formatBoardSummaryText(buildBoardSummary());
+      if (opts.transportOverride) {
+        await opts.transportOverride.sendInitial(text);
+        return;
+      }
       await opts.client.chat.postMessage({
         channel: opts.channelId,
         thread_ts: opts.threadTs,
@@ -401,7 +412,7 @@ export async function handleSlackHarnessMessage(opts: {
     // Attachment ingestion is best-effort; fall back to the plain prompt.
   }
 
-  const transport = opts.setStatus
+  const transport = opts.transportOverride ?? (opts.setStatus
     ? buildSlackAssistantTransport({
         client: opts.client,
         channel: opts.channelId,
@@ -412,7 +423,7 @@ export async function handleSlackHarnessMessage(opts: {
         client: opts.client,
         channel: opts.channelId,
         threadTs: opts.threadTs,
-      });
+      }));
 
   const conversationId = slackHarnessConversationId(opts.channelId, opts.threadTs);
   await runDiscordHarnessConversation({
@@ -424,5 +435,6 @@ export async function handleSlackHarnessMessage(opts: {
     transport,
     channel: 'slack',
     channelLabel: `slack:${conversationId}`,
+    durableRequest: opts.durableRequest,
   });
 }

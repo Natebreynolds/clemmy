@@ -9,7 +9,10 @@
  * unchanged. `classifyTurnText` at the bottom is the forward-looking
  * unified entry point later phases adopt.
  */
-import { stripNarratedEnvelope } from './envelope-narration.js';
+import {
+  parseNarratedEnvelope,
+  publicReplyFromNarratedEnvelope,
+} from './envelope-narration.js';
 import { listEvents, type EventRow } from './eventlog.js';
 import { isToolSurfaceProbeTool } from './tool-evidence.js';
 import { isCanonicalTopLevelToolEvent, projectCanonicalTopLevelToolEvents } from './tool-effect.js';
@@ -393,6 +396,35 @@ function parseDecisionText(text: string): OrchestratorDecisionShape | null {
     } catch { /* not a decision envelope — fall through to the marker contract */ }
   }
 
+  // Compatibility for a model that PRINTED the old decision object line by
+  // line. Preserve its field semantics before the generic plain-text fallback
+  // can misclassify the whole blob as a completed public answer. The explicit
+  // reply is the only public prose; a genuine preamble question conservatively
+  // parks the turn even if a malformed `done:` field claimed completion.
+  const narrated = parseNarratedEnvelope(trimmed);
+  if (narrated) {
+    const publicReply = publicReplyFromNarratedEnvelope(trimmed);
+    if (!publicReply) return null;
+    const rawAction = narrated.fields.nextaction?.trim().toLowerCase().replace(/[\s-]+/g, '_') ?? '';
+    const explicitAction = VALID_DECISION_ACTIONS.has(rawAction)
+      ? rawAction as OrchestratorDecisionShape['nextAction']
+      : null;
+    const asksUser = narrated.preamble.includes('?')
+      || explicitAction === 'awaiting_user_input'
+      || explicitAction === 'awaiting_approval';
+    const doneToken = narrated.fields.done?.trim().toLowerCase();
+    const nextAction = asksUser
+      ? (explicitAction === 'awaiting_approval' ? 'awaiting_approval' : 'awaiting_user_input')
+      : explicitAction ?? (doneToken === 'false' ? 'awaiting_handoff_result' : 'completed');
+    return {
+      summary: narrated.fields.summary?.trim() || deriveDecisionSummary(publicReply),
+      reply: scrubInternalNarration(publicReply) || publicReply,
+      done: nextAction === 'completed' || nextAction === 'abandoned',
+      nextAction,
+      reason: narrated.fields.reason?.trim().slice(0, 400) || 'narrated_envelope_recovered',
+    };
+  }
+
   const ask = trimmed.match(ASK_DECISION_MARKER);
   const cont = trimmed.match(CONTINUE_DECISION_MARKER);
   // A recognized zero-work punt (no explicit marker) defers to the stall path.
@@ -452,11 +484,18 @@ export function toOrchestratorDecision(value: unknown): OrchestratorDecisionShap
  * and a usable reply, otherwise the text is returned untouched.
  */
 function withoutNarratedEnvelope(decision: OrchestratorDecisionShape): OrchestratorDecisionShape {
-  const cleanedReply = typeof decision.reply === 'string'
-    ? stripNarratedEnvelope(decision.reply)
+  const replyEnvelope = typeof decision.reply === 'string'
+    ? parseNarratedEnvelope(decision.reply)
+    : null;
+  const summaryEnvelope = typeof decision.summary === 'string'
+    ? parseNarratedEnvelope(decision.summary)
+    : null;
+  const cleanedReply = replyEnvelope
+    ? publicReplyFromNarratedEnvelope(decision.reply ?? '')
     : decision.reply;
-  const cleanedSummary = typeof decision.summary === 'string'
-    ? stripNarratedEnvelope(decision.summary)
+  const cleanedSummary = summaryEnvelope
+    ? summaryEnvelope.fields.summary?.trim()
+      || (publicReplyFromNarratedEnvelope(decision.summary) ?? deriveDecisionSummary(decision.summary))
     : decision.summary;
   if (cleanedReply === decision.reply && cleanedSummary === decision.summary) return decision;
   return { ...decision, reply: cleanedReply, summary: cleanedSummary };

@@ -7,8 +7,10 @@ import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { runPostTurnHooks } from './post-turn.js';
 import { extractNamedResource } from '../../memory/focus.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
-import { appendEvent } from './eventlog.js';
+import { appendEvent, listEvents, type EventRow } from './eventlog.js';
 import { deliverableContextBlock } from '../../memory/deliverable-index.js';
+import { commitTurnOutcome } from './delivery-committer.js';
+import { turnOutcomeId, type TurnIdentity, type TurnOutcome } from './turn-outcome.js';
 
 export interface PlanFirstInput {
   input: string;
@@ -38,14 +40,15 @@ export interface PlanFirstRunInput extends PlanFirstInput {
    * rather than re-asking. Flag-gated upstream (CLEMMY_PLAN_CONTINUITY).
    */
   priorAnswers?: string;
-  /**
-   * Opt-in: callback fired for each token delta from the planner so
-   * the plan appears character-by-character to the user, not as a block.
-   */
+  /** @deprecated Planner drafts are private until validated and persisted.
+   * Retained temporarily for caller compatibility. */
   onChunk?: (delta: string) => void | Promise<void>;
   /** The request boundary already persisted and attempt-bound this exact user
    * turn. Plan-first must consume that row instead of duplicating history. */
   reuseRecordedUserInput?: boolean;
+  /** Exact accepted user_input_received sequence. Required whenever
+   * reuseRecordedUserInput is true; never inferred from session recency. */
+  sourceUserSeq?: number;
 }
 
 export interface PlanFirstResult {
@@ -316,18 +319,70 @@ export function renderPlanFirstFailureReply(): string {
   ].join('\n');
 }
 
-function surfacePlanFirstFailure(input: PlanFirstRunInput, error: string): PlanFirstResult {
-  appendEvent({
+export function commitPlanFirstOutcome(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  text: string;
+  status: 'needs_input' | 'blocked';
+  reason: string;
+  metadata?: Record<string, unknown>;
+}): void {
+  const source = exactPlanFirstSource(input.sessionId, input.sourceUserSeq);
+  const identity: TurnIdentity = {
     sessionId: input.sessionId,
-    turn: 0,
-    role: 'Clem',
-    type: 'conversation_completed',
-    data: {
-      reason: 'plan_first_failed',
-      summary: 'Planner did not finish; tool work was not started.',
-      reply: renderPlanFirstFailureReply(),
-      plannerError: error,
-    },
+    turn: source.turn,
+    sourceUserSeq: source.seq,
+  };
+  const outcome: TurnOutcome = input.status === 'needs_input'
+    ? {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'input' },
+        presentation: { kind: 'question', text: input.text },
+      }
+    : {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'blocked',
+        resumable: true,
+        presentation: { kind: 'blocked', text: input.text },
+      };
+  commitTurnOutcome(outcome, {
+    legacyReason: input.reason,
+    metadata: input.metadata,
+  });
+}
+
+function exactPlanFirstSource(sessionId: string, sourceUserSeq: number): EventRow {
+  if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
+    throw new Error('Plan-first outcome requires an exact accepted user event.');
+  }
+  const accepted = listEvents(sessionId, {
+    sinceSeq: sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  })[0];
+  if (!accepted || accepted.seq !== sourceUserSeq || accepted.sessionId !== sessionId) {
+    throw new Error('Plan-first accepted user event was not found in this session.');
+  }
+  return accepted;
+}
+
+function surfacePlanFirstFailure(
+  input: PlanFirstRunInput,
+  sourceUserSeq: number,
+  error: string,
+): PlanFirstResult {
+  commitPlanFirstOutcome({
+    sessionId: input.sessionId,
+    sourceUserSeq,
+    text: renderPlanFirstFailureReply(),
+    status: 'blocked',
+    reason: 'plan_first_failed',
   });
 
   return { surfaced: true, error };
@@ -345,14 +400,21 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     type: 'turn_started',
     data: { input: input.input.slice(0, 200), mode: 'plan_first' },
   });
-  if (!input.reuseRecordedUserInput) {
-    appendEvent({
+  let sourceUserSeq: number;
+  if (input.reuseRecordedUserInput) {
+    if (input.sourceUserSeq === undefined) {
+      throw new Error('reuseRecordedUserInput requires the exact sourceUserSeq.');
+    }
+    sourceUserSeq = exactPlanFirstSource(input.sessionId, input.sourceUserSeq).seq;
+  } else {
+    const acceptedUserInput = appendEvent({
       sessionId: input.sessionId,
       turn: 0,
       role: 'user',
       type: 'user_input_received',
       data: { text: input.input },
     });
+    sourceUserSeq = acceptedUserInput.seq;
   }
 
   try {
@@ -473,33 +535,14 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       workflowName: 'clementine-plan-first',
       groupId: input.sessionId,
     });
-    // stream: true returns a Promise<StreamedRunResult> — it MUST be awaited
-    // before iterating. The StreamedRunResult is itself async-iterable.
     const result = await runner.run(buildPlannerAgent(), buildPlannerPrompt(input.input, input.priorAnswers, memoryContext), {
       context: { sessionId: input.sessionId, turn: 0 },
       maxTurns: 8,
       toolExecution: { maxFunctionToolConcurrency: 4 },
-      stream: true,
     });
 
-    // Iterate the StreamedRunResult to surface token deltas character-by-character,
-    // so the plan appears to the user in real-time rather than as a static block.
-    // stream_token events are ephemeral (not persisted to SQLite) and flow only via onChunk callback.
-    if (input.onChunk && Symbol.asyncIterator in (result as unknown as Record<symbol, unknown>)) {
-      for await (const event of result as unknown as AsyncIterable<unknown>) {
-        const ev = event as { type?: string; data?: { type?: string; delta?: string } };
-        if (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
-          try {
-            await input.onChunk(ev.data.delta);
-          } catch {
-            // Never let consumer errors abort the stream.
-          }
-        }
-      }
-    }
-
-    // Wait for the stream to fully settle so finalOutput is populated.
-    await result.completed;
+    // Planner output is private until schema validation. This path deliberately
+    // does not request a provider stream, so no speculative delta channel exists.
     const plan = sanitizePlanOutput(result.finalOutput);
     if (!plan) {
       const message = 'planner output did not parse into a usable plan';
@@ -510,7 +553,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
         type: 'plan_first_failed',
         data: { error: message, stage: 'schema_parse' },
       });
-      return surfacePlanFirstFailure(input, message);
+      return surfacePlanFirstFailure(input, sourceUserSeq, message);
     }
 
     appendEvent({
@@ -566,6 +609,14 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
           ...(askingProposalId ? { planProposalId: askingProposalId } : {}),
         },
       });
+      commitPlanFirstOutcome({
+        sessionId: input.sessionId,
+        sourceUserSeq,
+        text: askingPlanMessage(plan),
+        status: 'needs_input',
+        reason: 'plan_first_needs_input',
+        metadata: askingProposalId ? { planProposalId: askingProposalId } : undefined,
+      });
       return { surfaced: true, ...(askingProposalId ? { proposalId: askingProposalId } : {}) };
     }
 
@@ -596,19 +647,15 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       context: 'Planner-first preflight: review the intended workflow before Clementine opens the full tool surface.',
     });
 
-    appendEvent({
+    commitPlanFirstOutcome({
       sessionId: input.sessionId,
-      turn: 0,
-      role: 'Clem',
-      type: 'conversation_completed',
-      data: {
-        reason: 'plan_first',
-        summary: `Plan ready for approval: ${plan.objective}`,
-        reply: plan.voiceMessage?.trim()
-          ? `${plan.voiceMessage.trim()}\n\n${renderPlanReply(plan, proposal.id)}`
-          : renderPlanReply(plan, proposal.id),
-        planProposalId: proposal.id,
-      },
+      sourceUserSeq,
+      text: plan.voiceMessage?.trim()
+        ? `${plan.voiceMessage.trim()}\n\n${renderPlanReply(plan, proposal.id)}`
+        : renderPlanReply(plan, proposal.id),
+      status: 'needs_input',
+      reason: 'plan_first',
+      metadata: { planProposalId: proposal.id },
     });
     return { surfaced: true, proposalId: proposal.id };
   } catch (err) {
@@ -620,6 +667,6 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       type: 'plan_first_failed',
       data: { error: message },
     });
-    return surfacePlanFirstFailure(input, message);
+    return surfacePlanFirstFailure(input, sourceUserSeq, message);
   }
 }

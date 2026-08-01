@@ -51,6 +51,22 @@ test('preflight: a structurally-broken workflow fails (hand-off language)', () =
   assert.match(r.summary, /blocking issue/);
 });
 
+test('preflight: malformed executable subgraph topology fails closed before a run', () => {
+  const r = preflightWorkflow(wf({
+    steps: [{
+      id: 'analyze',
+      prompt: 'Reduce specialist evidence.',
+      sideEffect: 'read',
+      subgraph: {
+        mode: 'read_parallel_v1',
+        specialists: [{ id: 'only-one', prompt: 'Inspect one lane.' }],
+      },
+    }],
+  }));
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(' '), /needs 2–6 specialists/);
+});
+
 test('preflight: missing run inputs are a heads-up, NOT a failure (workflow is still runnable)', () => {
   const def = wf({
     steps: [{ id: 'a', prompt: 'audit {{input.segment}}' }],

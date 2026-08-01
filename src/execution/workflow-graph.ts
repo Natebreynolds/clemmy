@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { irreversibleBoundaryViolations } from './workflow-graph-boundaries.js';
 import type {
   WorkflowStepInput,
@@ -110,6 +111,7 @@ export const WORKFLOW_GRAPH_ALLOWED_TOOLS = [
   WORKFLOW_GRAPH_CONTEXT_QUERY_TOOL,
 ] as const;
 export const WORKFLOW_GRAPH_ADDITIVE_NODE_MODE = 'additive_read_only_v3';
+export const WORKFLOW_READ_PARALLEL_SUBGRAPH_MODE = 'read_parallel_v1';
 const WORKFLOW_GRAPH_DYNAMIC_NODE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const WORKFLOW_GRAPH_RESERVED_DYNAMIC_NODE_IDS = new Set([
   '__synthesis__',
@@ -144,12 +146,68 @@ export function workflowGraphEdgeId(
   return `${type}:${source}->${target}`;
 }
 
+/**
+ * Stable runtime id for an authored specialist branch. Prefer the readable
+ * parent/specialist pair; when a long authored parent would exceed the graph's
+ * dynamic-id contract, retain readable prefixes plus a deterministic hash.
+ */
+export function workflowSubgraphSpecialistNodeId(stepId: string, specialistId: string): string {
+  const readable = `${stepId}__${specialistId}`;
+  if (!workflowGraphDynamicNodeIdError(readable)) return readable;
+  const safeParent = stepId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 20) || 'step';
+  const safeSpecialist = specialistId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 16) || 'specialist';
+  const digest = createHash('sha256').update(`${stepId}\0${specialistId}`).digest('hex').slice(0, 12);
+  return `sg_${safeParent}_${safeSpecialist}_${digest}`.slice(0, 64);
+}
+
+function readParallelSpecialists(step: WorkflowStepInput) {
+  return step.subgraph?.mode === WORKFLOW_READ_PARALLEL_SUBGRAPH_MODE
+    ? step.subgraph.specialists
+    : [];
+}
+
+export function workflowHasReadParallelSubgraph(steps: WorkflowStepInput[] | undefined | null): boolean {
+  return (steps ?? []).some((step) => readParallelSpecialists(step).length > 0);
+}
+
 export function compileWorkflowStepsToGraph(
   steps: WorkflowStepInput[] | undefined | null,
   opts: { id?: string; name?: string; version?: number; metadata?: Record<string, unknown> } = {},
 ): WorkflowGraphDefinition {
   const list = Array.isArray(steps) ? steps : [];
-  const nodes = list.map(stepToGraphNode);
+  const nodes: WorkflowGraphNode[] = [];
+  for (const step of list) {
+    nodes.push(stepToGraphNode(step));
+    for (const specialist of readParallelSpecialists(step)) {
+      const nodeId = workflowSubgraphSpecialistNodeId(step.id, specialist.id);
+      nodes.push({
+        id: nodeId,
+        type: 'step',
+        stepId: nodeId,
+        label: specialist.label?.trim() || specialist.id,
+        prompt: [
+          `You are the "${specialist.label?.trim() || specialist.id}" specialist for reducer step "${step.id}".`,
+          specialist.prompt.trim(),
+          `Return a compact, evidence-grounded result for reducer "${step.id}". Do not perform external writes or sends.`,
+        ].join('\n\n'),
+        model: specialist.model,
+        intent: specialist.intent ?? step.intent,
+        maxTurns: specialist.maxTurns,
+        inputs: step.inputs,
+        sideEffect: 'read',
+        allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS],
+        requiresApproval: false,
+        config: {
+          runtimeMode: WORKFLOW_GRAPH_ADDITIVE_NODE_MODE,
+          toolAuthority: 'result_only',
+          subgraphMode: WORKFLOW_READ_PARALLEL_SUBGRAPH_MODE,
+          subgraphRole: 'specialist',
+          parentNodeId: step.id,
+          specialistId: specialist.id,
+        },
+      });
+    }
+  }
   const edges: WorkflowGraphEdge[] = [];
   const seen = new Set<string>();
 
@@ -159,6 +217,25 @@ export function compileWorkflowStepsToGraph(
       if (seen.has(id)) continue;
       seen.add(id);
       edges.push({ id, source: dep, target: step.id, type: 'dependency' });
+    }
+    for (const specialist of readParallelSpecialists(step)) {
+      const specialistNodeId = workflowSubgraphSpecialistNodeId(step.id, specialist.id);
+      for (const dep of step.dependsOn ?? []) {
+        const id = workflowGraphEdgeId(dep, specialistNodeId, 'dependency');
+        if (seen.has(id)) continue;
+        seen.add(id);
+        edges.push({ id, source: dep, target: specialistNodeId, type: 'dependency' });
+      }
+      const joinId = workflowGraphEdgeId(specialistNodeId, step.id, 'dependency');
+      if (!seen.has(joinId)) {
+        seen.add(joinId);
+        edges.push({
+          id: joinId,
+          source: specialistNodeId,
+          target: step.id,
+          type: 'dependency',
+        });
+      }
     }
   }
 
@@ -342,9 +419,11 @@ export function applyWorkflowGraphBranchDecision(
 }
 
 function stepToGraphNode(step: WorkflowStepInput): WorkflowGraphNode {
+  const specialists = readParallelSpecialists(step);
+  const isReducer = specialists.length > 0;
   return {
     id: step.id,
-    type: 'step',
+    type: isReducer ? 'join' : 'step',
     stepId: step.id,
     label: step.id,
     prompt: step.prompt,
@@ -352,18 +431,29 @@ function stepToGraphNode(step: WorkflowStepInput): WorkflowGraphNode {
     intent: step.intent,
     tier: step.tier,
     maxTurns: step.maxTurns,
-    forEach: step.forEach,
-    deterministic: step.deterministic,
-    allowedTools: step.allowedTools,
-    sideEffect: step.sideEffect,
-    usesSkill: step.usesSkill,
-    requiresApproval: step.requiresApproval,
-    approvalPreview: step.approvalPreview,
+    forEach: isReducer ? undefined : step.forEach,
+    deterministic: isReducer ? undefined : step.deterministic,
+    allowedTools: isReducer ? [...WORKFLOW_GRAPH_ALLOWED_TOOLS] : step.allowedTools,
+    sideEffect: isReducer ? 'read' : step.sideEffect,
+    usesSkill: isReducer ? undefined : step.usesSkill,
+    requiresApproval: isReducer ? false : step.requiresApproval,
+    approvalPreview: isReducer ? undefined : step.approvalPreview,
     inputs: step.inputs,
     output: step.output,
     retryBudget: step.retryBudget,
-    loopUntil: step.loopUntil,
-    loopSafe: step.loopSafe,
+    loopUntil: isReducer ? undefined : step.loopUntil,
+    loopSafe: isReducer ? undefined : step.loopSafe,
+    ...(isReducer
+      ? {
+          config: {
+            subgraphMode: WORKFLOW_READ_PARALLEL_SUBGRAPH_MODE,
+            subgraphRole: 'reducer',
+            specialistNodeIds: specialists.map((specialist) =>
+              workflowSubgraphSpecialistNodeId(step.id, specialist.id)),
+            toolAuthority: 'result_only',
+          },
+        }
+      : {}),
   };
 }
 

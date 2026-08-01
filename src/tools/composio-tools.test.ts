@@ -1051,7 +1051,7 @@ test('asyncResultItemCount: counts items in an Apify dataset (partial-scrape che
   assert.equal(asyncResultItemCount({ status: 'SUCCEEDED' }), null, 'no item list → null (no false count)');
 });
 
-test('post-clarification long Composio receipt cannot inject a second background gate or rerun', () => {
+test('long Composio receipt keeps moving under existing authority without a lane-choice gate', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   appendEvent({
@@ -1073,15 +1073,17 @@ test('post-clarification long Composio receipt cannot inject a second background
     { context: { sessionId: sess.id } },
   );
 
-  assert.doesNotMatch(output, /offer_background|dispatch_background_task/);
-  assert.doesNotMatch(output, /Prefer handing it to the background/);
-  assert.match(output, /existing LONG-running job/);
-  assert.match(output, /do not add another background-choice gate/);
+  assert.match(output, /Continue autonomously.*existing authority/i);
+  assert.match(output, /dispatch_background_task.*report back here/i);
+  assert.match(output, /Do not ask the user to choose a lane/i);
+  assert.match(output, /do not.*stop for routing permission/i);
   assert.match(output, /do not restart or re-invoke the job/);
   assert.match(output, /run-clarified-1/);
 
   const normal = formatComposioBudgetExceededOutput(receipt, '{}');
-  assert.match(normal, /ask the user, then dispatch_background_task/);
+  assert.match(normal, /Continue autonomously.*existing authority/i);
+  assert.match(normal, /dispatch_background_task.*report back here/i);
+  assert.doesNotMatch(normal, /ask the user, then|ask the user (?:which|whether)|stop and ask/i);
 });
 
 // ─── Discovery-tax: composio_search_tools consults tool-choice memory FIRST ────

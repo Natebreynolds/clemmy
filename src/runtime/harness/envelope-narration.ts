@@ -1,5 +1,5 @@
 /**
- * Strip a NARRATED decision envelope out of a user-facing reply.
+ * Parse a NARRATED decision envelope without treating it as a reply.
  *
  * Live 2026-07-31 on 3.5.0: a user was shown Clem's internal decision object as
  * prose — a question, then `summary:`, `reply:`, `done:`, `nextAction:`,
@@ -8,25 +8,25 @@
  * and the whole blob went to the chat, so the user read Clem's bookkeeping
  * instead of Clem's answer.
  *
- * The CONTENT is not the problem — the labels are. A second live case made that
- * decisive: a fully successful run reported real verification detail under
- * `done:`, four firms needing enrichment under `nextAction:`, and read-back
- * evidence under `reason:`. Surfacing only `reply:` would have collapsed a
- * substantive report into one line and thrown the rest away. So this strips the
- * FIELD LABELS and keeps every value, in the model's own order — the message
- * stops reading like a form dump and loses nothing.
+ * These fields have different semantics. Concatenating them after deleting the
+ * labels still publishes control-plane narration, and it destroys the evidence
+ * needed to decide whether the turn completed or paused. The parser therefore
+ * preserves the fields. A compatibility helper exposes only the explicit reply
+ * plus a genuine preamble question; evidence-rich reports must be composed from
+ * the execution ledger by the public reply node.
  *
- * Display-layer only; the raw text remains in the transcript and event log.
+ * The raw text remains in the execution/audit ledger.
  *
- * Conservative by design. It requires THREE distinct contract keys at line
- * starts before it will touch anything, so ordinary prose that happens to
- * contain "summary:" or a colon-led list is never rewritten. If the envelope is
- * present but carries no usable `reply`, the original text is returned
- * unchanged — a partial parse must never blank out the only answer the user has.
+ * Conservative by design. A line-anchored `reply` plus one other decision key
+ * is already a narrated contract; combinations without `reply` require three
+ * distinct keys. Ordinary prose that happens to contain one colon-led label is
+ * never rewritten. If the envelope is present but carries no usable `reply`,
+ * the public helper fails closed rather than laundering control fields.
  */
 
 /** The orchestrator's decision-envelope fields, as the model would label them. */
 const ENVELOPE_KEYS = ['summary', 'reply', 'done', 'nextaction', 'reason'] as const;
+export type NarratedEnvelopeKey = (typeof ENVELOPE_KEYS)[number];
 
 const KEY_LINE_RE = /^[ \t>*-]*(summary|reply|done|next\s*action|nextaction|reason)\s*:\s*/i;
 
@@ -37,6 +37,8 @@ function normalizeKey(raw: string): string {
 export interface NarratedEnvelope {
   /** Every field value, in the order the model wrote them, labels removed. */
   blocks: string[];
+  /** Values keyed by their decision-contract meaning. */
+  fields: Partial<Record<NarratedEnvelopeKey, string>>;
   /** Any text that preceded the envelope (often the real question). */
   preamble: string;
   /** Distinct contract keys found, for telemetry. */
@@ -57,9 +59,10 @@ export function parseNarratedEnvelope(text: string): NarratedEnvelope | null {
     if (!ENVELOPE_KEYS.includes(key as (typeof ENVELOPE_KEYS)[number])) continue;
     if (!found.has(key)) found.set(key, i);
   }
-  // Three distinct contract fields is the evidence bar: fewer is ordinary prose
-  // that happens to use a colon.
-  if (found.size < 3) return null;
+  // `reply` is the contract's publication field, so one additional anchored
+  // decision key is sufficient evidence. Without it, retain the stricter
+  // three-key bar to avoid rewriting ordinary colon-led prose.
+  if (found.size < 3 && !(found.has('reply') && found.size >= 2)) return null;
 
   const keyLines = [...found.values()].sort((a, b) => a - b);
   const firstKeyLine = keyLines[0];
@@ -68,25 +71,48 @@ export function parseNarratedEnvelope(text: string): NarratedEnvelope | null {
   // Each field runs from its own line until the next labelled line. Values are
   // kept verbatim and in order; only the label is removed.
   const blocks: string[] = [];
+  const fields: Partial<Record<NarratedEnvelopeKey, string>> = {};
   for (let i = 0; i < keyLines.length; i++) {
     const start = keyLines[i];
     const end = i + 1 < keyLines.length ? keyLines[i + 1] : lines.length;
+    const keyMatch = KEY_LINE_RE.exec(lines[start]);
+    const key = keyMatch ? normalizeKey(keyMatch[1]) as NarratedEnvelopeKey : null;
     const head = lines[start].replace(KEY_LINE_RE, '');
     const value = [head, ...lines.slice(start + 1, end)].join('\n').trim();
-    if (value) blocks.push(value);
+    if (value) {
+      blocks.push(value);
+      if (key && ENVELOPE_KEYS.includes(key)) fields[key] = value;
+    }
   }
   if (blocks.length === 0) return null;
 
-  return { blocks, preamble, keys: [...found.keys()] };
+  return { blocks, fields, preamble, keys: [...found.keys()] };
 }
 
 /**
- * User-facing text for a reply that may narrate the envelope. Returns the input
- * unchanged when it does not. The preamble is preserved ahead of the reply,
- * because in the live case it carried the actual question to the user.
+ * Compatibility projection for a narrated envelope. Returns null for ordinary
+ * prose and for an envelope without an explicit reply. When the preamble is a
+ * question, put it last so the explanation leads naturally into the requested
+ * user decision.
+ */
+export function publicReplyFromNarratedEnvelope(text: string): string | null {
+  const parsed = parseNarratedEnvelope(text);
+  if (!parsed) return null;
+  const reply = parsed.fields.reply?.trim() ?? '';
+  if (!reply) return null;
+  if (!parsed.preamble) return reply;
+  return parsed.preamble.includes('?')
+    ? [reply, parsed.preamble].join('\n\n')
+    : [parsed.preamble, reply].join('\n\n');
+}
+
+/**
+ * Legacy API retained for callers during the publication-boundary migration.
+ * Ordinary prose remains unchanged; narrated envelopes fail closed when they
+ * do not contain an explicit reply.
  */
 export function stripNarratedEnvelope(text: string): string {
   const parsed = parseNarratedEnvelope(text);
   if (!parsed) return text;
-  return [parsed.preamble, ...parsed.blocks].filter(Boolean).join('\n\n');
+  return publicReplyFromNarratedEnvelope(text) ?? '';
 }

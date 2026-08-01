@@ -27,6 +27,8 @@ interface ViewerState {
 }
 
 const viewers = new Map<string, ViewerState>();
+type ViewerAttachListener = (sessionId: string, attachedAt: number) => void;
+const attachListeners = new Set<ViewerAttachListener>();
 
 function stateFor(sessionId: string): ViewerState {
   let state = viewers.get(sessionId);
@@ -48,6 +50,12 @@ export function attachSessionViewer(sessionId: string, now = Date.now()): (at?: 
   const state = stateFor(sessionId);
   state.count += 1;
   state.lastSeenMs = now;
+  // Terminal report-back persists this observation while a report is inside
+  // its grace window. Keep the live-view ledger independent of that policy:
+  // subscribers are best-effort and can never prevent the SSE attach.
+  for (const listener of attachListeners) {
+    try { listener(sessionId, now); } catch { /* presence signaling is best-effort */ }
+  }
   let detached = false;
   return (detachAt = Date.now()): void => {
     if (detached) return;
@@ -88,6 +96,14 @@ export function sessionViewerSeenSince(sessionId: string, sinceMs: number): bool
   if (!state) return false;
   if (state.count > 0) return true;
   return state.lastSeenMs >= sinceMs;
+}
+
+/** Observe viewer arrivals without coupling the SSE routes to report-back.
+ * Used to make "the user saw it" survive a daemon restart during the terminal
+ * grace window. */
+export function subscribeSessionViewerAttaches(listener: ViewerAttachListener): () => void {
+  attachListeners.add(listener);
+  return () => { attachListeners.delete(listener); };
 }
 
 /** Test-only reset; the ledger is process-global by design. */

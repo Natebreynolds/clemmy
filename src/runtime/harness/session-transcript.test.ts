@@ -335,11 +335,60 @@ const userMsg = (sid: string, text: string) =>
 const asstMsg = (sid: string, fields: Record<string, unknown>) =>
   appendEvent({ sessionId: sid, turn: 1, role: 'Clem', type: 'conversation_completed', data: fields });
 
+function typedTerminalData(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  text: string;
+  attemptId?: string;
+}): Record<string, unknown> {
+  const outcomeId = input.attemptId ? `brain:${input.attemptId}` : `turn:${input.sourceUserSeq}`;
+  const identity = {
+    sessionId: input.sessionId,
+    turn: 1,
+    sourceUserSeq: input.sourceUserSeq,
+    ...(input.attemptId ? { attemptId: input.attemptId } : {}),
+  };
+  return {
+    terminalKey: outcomeId,
+    sourceUserSeq: input.sourceUserSeq,
+    ...(input.attemptId ? { attemptId: input.attemptId } : { logicalTerminalVersion: 1 }),
+    presentation: {
+      version: 1,
+      id: `${outcomeId}:presentation`,
+      outcomeId,
+      audience: 'user',
+      phase: 'final',
+      identity,
+      status: 'done',
+      kind: 'answer',
+      text: input.text,
+      resumable: false,
+    },
+    turnOutcome: { version: 2, id: outcomeId, status: 'done', resumable: false },
+    reply: input.text,
+  };
+}
+
+function typedTerminal(
+  sid: string,
+  sourceUserSeq: number,
+  text: string,
+  attemptId?: string,
+) {
+  return appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: typedTerminalData({ sessionId: sid, sourceUserSeq, text, ...(attemptId ? { attemptId } : {}) }),
+  });
+}
+
 test('pulls prior turns chronologically (user → assistant → user)', () => {
   resetEventLog();
   const sid = createSession({ kind: 'chat' }).id;
   userMsg(sid, 'create a one-pager on everything that shipped');
-  asstMsg(sid, { summary: 'Built "Off Your Plate" one-pager.' });
+  asstMsg(sid, { reply: 'Built "Off Your Plate" one-pager.', summary: 'internal completion note' });
   userMsg(sid, 'I meant Clementine app releases');
   const turns = pullRecentTurnsForSession(openEventLog(), sid, 6);
   assert.deepEqual(turns.map((t) => t.who), ['user', 'assistant', 'user']);
@@ -347,14 +396,39 @@ test('pulls prior turns chronologically (user → assistant → user)', () => {
   assert.equal(turns[2].text, 'I meant Clementine app releases');
 });
 
-test('assistant text prefers reply, falls back to summary', () => {
+test('assistant history accepts public reply and never promotes internal summary', () => {
   resetEventLog();
   const sid = createSession({ kind: 'chat' }).id;
   asstMsg(sid, { summary: 'summary-only field' });
   asstMsg(sid, { summary: 'internal summary ignored', reply: 'reply wins' });
   const turns = pullRecentTurnsForSession(openEventLog(), sid, 6);
-  assert.equal(turns[0].text, 'summary-only field');
-  assert.equal(turns[1].text, 'reply wins');
+  assert.deepEqual(turns.map((turn) => turn.text), ['reply wins']);
+});
+
+test('model history uses displayText, skips synthetic inputs, and projects narrated replies', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'continue\n[PRIVATE CONTINUATION DIRECTIVE]', displayText: 'continue' },
+  });
+  appendEvent({
+    sessionId: sid,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: '[background outcome directive]', synthetic: true, source: 'outcome' },
+  });
+  asstMsg(sid, {
+    summary: 'Asked a clarifying question and parked the graph.',
+    reply: 'summary: internal bookkeeping\nreply: Which account should I use?\ndone: false',
+  });
+
+  const turns = pullRecentTurnsForSession(openEventLog(), sid, 6);
+  assert.deepEqual(turns.map((turn) => turn.text), ['continue', 'Which account should I use?']);
 });
 
 test('unpaired awaiting_user_input questions are assistant turns in replay', () => {
@@ -396,6 +470,77 @@ test('paired awaiting_user_input plus conversation_completed is not double-rende
   const turns = pullRecentTurnsForSession(openEventLog(), sid, 6);
 
   assert.deepEqual(turns.map((t) => t.text), ['Which account should I use?']);
+});
+
+test('late typed terminal A stays paired before overlapping source B', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  const sourceA = appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'request A' } });
+  const sourceB = appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'request B' } });
+  typedTerminal(sid, sourceB.seq, 'answer B');
+  typedTerminal(sid, sourceA.seq, 'answer A');
+
+  const turns = pullRecentTurnsForSession(openEventLog(), sid, 8);
+
+  assert.deepEqual(
+    turns.map((turn) => `${turn.who}:${turn.text}`),
+    ['user:request A', 'assistant:answer A', 'user:request B', 'assistant:answer B'],
+  );
+});
+
+test('active unpaired source remains last when a later overlapping source settles first', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'still-active A' } });
+  const sourceB = appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'completed B' } });
+  typedTerminal(sid, sourceB.seq, 'answer B');
+
+  const turns = pullRecentTurnsForSession(openEventLog(), sid, 8);
+
+  assert.deepEqual(
+    turns.map((turn) => `${turn.who}:${turn.text}`),
+    ['user:completed B', 'assistant:answer B', 'user:still-active A'],
+  );
+});
+
+test('awaiting-question dedupe uses exact source instead of a reused numeric turn', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  const sourceA = appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'request A' } });
+  const sourceB = appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'request B' } });
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'Which account?', sourceUserSeq: sourceA.seq },
+  });
+  typedTerminal(sid, sourceB.seq, 'Which account?');
+
+  const turns = pullRecentTurnsForSession(openEventLog(), sid, 8);
+
+  assert.equal(turns.filter((turn) => turn.who === 'assistant' && turn.text === 'Which account?').length, 2);
+  assert.deepEqual(turns.slice(0, 2).map((turn) => turn.text), ['request A', 'Which account?']);
+});
+
+test('model history keeps the earliest valid rolling-upgrade terminal and leaves audit duplicates private', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'ship the patch' } });
+  typedTerminal(sid, source.seq, 'old writer won', 'old-attempt');
+  const duplicate = asstMsg(sid, { reply: 'temporary legacy row' });
+  openEventLog().prepare('UPDATE events SET data_json = ? WHERE seq = ?').run(
+    JSON.stringify(typedTerminalData({ sessionId: sid, sourceUserSeq: source.seq, text: 'late retry lost' })),
+    duplicate.seq,
+  );
+
+  const turns = pullRecentTurnsForSession(openEventLog(), sid, 8);
+
+  assert.deepEqual(turns.map((turn) => turn.text), ['ship the patch', 'old writer won']);
+  const rawCount = openEventLog().prepare(
+    "SELECT COUNT(*) AS count FROM events WHERE session_id = ? AND type = 'conversation_completed'",
+  ).get(sid) as { count: number };
+  assert.equal(rawCount.count, 2, 'private audit rows are retained');
 });
 
 test('renderTranscriptTurns formats USER:/YOU: lines and trims long turns to 800', () => {
@@ -443,7 +588,7 @@ test('empty session → no turns → empty block (brain no-history path is byte-
 test('caps to the most recent 2*maxTurns events', () => {
   resetEventLog();
   const sid = createSession({ kind: 'chat' }).id;
-  for (let i = 0; i < 10; i++) { userMsg(sid, `u${i}`); asstMsg(sid, { summary: `a${i}` }); }
+  for (let i = 0; i < 10; i++) { userMsg(sid, `u${i}`); asstMsg(sid, { reply: `a${i}` }); }
   const turns = pullRecentTurnsForSession(openEventLog(), sid, 3);
   assert.ok(turns.length <= 6, `capped to <=2*maxTurns, got ${turns.length}`);
   assert.equal(turns[turns.length - 1].text, 'a9', 'keeps the NEWEST turns');

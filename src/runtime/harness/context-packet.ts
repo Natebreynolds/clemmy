@@ -22,12 +22,6 @@ import {
 } from './focus-projection.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import {
-  classifyTurnPreflight,
-  confirmBeatDirective,
-  recordTurnPreflightDecision,
-  type TurnPreflightPhase,
-} from './turn-control.js';
-import {
   buildProspectiveIntentionContext,
   prospectiveCaptureDirective,
 } from '../prospective-intentions.js';
@@ -102,12 +96,6 @@ export interface AgentContextPacket {
     fanoutPosture: FanoutPosture | 'unknown';
     recommendedWorkerWaveSize: number;
   };
-  /** True when the turn-control confirm-beat directive was injected (fresh
-   *  chat session + execution-shaped request). Telemetry/test surface. */
-  confirmBeatOffered: boolean;
-  /** Durable policy posture for this user turn. Unlike prompt text, `align`
-   *  is also enforced at the shared tool boundary. */
-  preflightPhase: TurnPreflightPhase;
   text: string;
 }
 
@@ -224,6 +212,9 @@ function fanoutPolicyLine(intent: MultiItemIntent, guidance: AgentSystemGuidance
 
 const STATIC_PARALLELISM_LINE =
   'Parallelism reminder: for independent batches, resolve shared tools/context once, then call run_worker with one structured packet per item in parallel or use an existing workflow forEach.';
+
+const WORKFLOW_PARALLELISM_LINE =
+  'Workflow parallelism: execute this node as one scoped unit. The runner owns topology; item-level parallel work must be represented by an authored forEach step or explicit sibling nodes before the run.';
 
 /** Lighten pure-Q&A turns (skip health probes + fan-out detection). Validated
  *  behavior is the default; CLEMMY_LIGHT_QA_TURNS=off restores the full preflight. */
@@ -581,7 +572,7 @@ function providerAccessLine(): string {
 export function buildAgentContextPacket(
   input: string,
   memory: MemoryPrimerSummary,
-  opts?: { sessionKind?: string; sessionId?: string; suppressConfirmBeat?: boolean; sourceUserSeq?: number },
+  opts?: { sessionKind?: string; sessionId?: string; sourceUserSeq?: number },
 ): AgentContextPacket {
   const complexity = classifyComplexity(input);
   // Pure-Q&A turns skip ONLY the health probes (disk + MCP I/O) — pure telemetry
@@ -639,10 +630,11 @@ export function buildAgentContextPacket(
     }
   }
 
-  // Turn-start fan-out directive (P0). Fires only for CHAT sessions: workflow
-  // steps can't restructure their own pipeline (forEach is an authoring-time
-  // decision) and workers are already a fanned-out unit, so non-chat kinds keep
-  // the static line byte-identical (zero-regression).
+  // Turn-start fan-out directive (P0). Fires only for CHAT sessions. A workflow
+  // step cannot restructure its active graph: forEach/sibling topology is an
+  // authoring-time, runner-owned decision. Give that lane truthful guidance
+  // instead of the chat reminder, which names a tool the step cannot call.
+  // Other non-chat kinds retain the static line.
   // Fan-out detection always runs — a multi-item request ("research these 8
   // companies") has no action verb but is NOT light; dropping it would lose the
   // parallelism directive. Only the health probes (below) are safe to skip on qa.
@@ -657,52 +649,13 @@ export function buildAgentContextPacket(
     (agentSystem.policy.fanoutPosture === 'block' || agentSystem.policy.fanoutPosture === 'constrain'),
   );
   const offerFanout = multiItem.isMultiItem && opts?.sessionKind === 'chat' && !fanoutBlockedByPolicy;
-  const parallelismLine = offerFanout
-    ? fanoutDirectiveLine(multiItem, recommendedWorkerWaveSize)
-    : fanoutBlockedByPolicy
-      ? fanoutPolicyLine(multiItem, agentSystem)
-      : STATIC_PARALLELISM_LINE;
-
-  // TURN-CONTROL SPINE confirm beat (legacy opt-in): operators can experiment
-  // with a conversational confirm/surface-tools/background beat. Normal
-  // operation starts a clear request immediately and leaves authorization to
-  // the real action boundary. Continuations, questions, and non-chat kinds are
-  // null even when the experiment is enabled.
-  // suppressConfirmBeat: the loop substitutes a goal OBJECTIVE for synthetic
-  // continuation/retry inputs (turn-control review) — the beat must only
-  // ever evaluate a REAL user message, never a substituted one mid-run.
-  const preflightDecision = opts?.suppressConfirmBeat
-    ? { phase: 'execute', consequential: false, reason: 'ordinary_execution' } as const
-    : classifyTurnPreflight({
-        message: input,
-        sessionId: opts?.sessionId,
-        sessionKind: opts?.sessionKind,
-        isMultiItem: multiItem.isMultiItem,
-        itemCount: multiItem.itemCount,
-        sourceUserSeq: opts?.sourceUserSeq,
-      });
-  // Persistence is execution authority, so write it only on a live chat turn
-  // with the exact accepted source row. Pure previews/context probes frequently
-  // pass a display-only session id; they do not dispatch tools and must not mint
-  // orphan event rows. runTurn always supplies this exact source identity.
-  if (
-    !opts?.suppressConfirmBeat
-    && opts?.sessionKind === 'chat'
-    && Number.isSafeInteger(opts?.sourceUserSeq)
-    && (opts?.sourceUserSeq ?? 0) > 0
-  ) {
-    recordTurnPreflightDecision(opts.sessionId, preflightDecision, opts.sourceUserSeq);
-  }
-  const confirmBeat = preflightDecision.phase === 'align'
-    ? confirmBeatDirective({
-        message: input,
-        sessionId: opts?.sessionId,
-        sessionKind: opts?.sessionKind,
-        isMultiItem: multiItem.isMultiItem,
-        itemCount: multiItem.itemCount,
-        sourceUserSeq: opts?.sourceUserSeq,
-      })
-    : null;
+  const parallelismLine = opts?.sessionKind === 'workflow'
+    ? WORKFLOW_PARALLELISM_LINE
+    : offerFanout
+      ? fanoutDirectiveLine(multiItem, recommendedWorkerWaveSize)
+      : fanoutBlockedByPolicy
+        ? fanoutPolicyLine(multiItem, agentSystem)
+        : STATIC_PARALLELISM_LINE;
 
   const lines = [
     '[AGENT CONTEXT PACKET]',
@@ -725,7 +678,6 @@ export function buildAgentContextPacket(
     healthWarnings.length > 0 ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}` : 'Health warnings: none.',
     agentSystem.text,
     parallelismLine,
-    confirmBeat,
     'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
   ].filter((line): line is string => Boolean(line));
 
@@ -760,8 +712,6 @@ export function buildAgentContextPacket(
       fanoutPosture,
       recommendedWorkerWaveSize,
     },
-    confirmBeatOffered: Boolean(confirmBeat),
-    preflightPhase: preflightDecision.phase,
     text: lines.join('\n'),
   };
 }

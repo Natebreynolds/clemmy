@@ -19,16 +19,103 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { humanHarnessText, reconstructHarnessTranscript } = await import('./transcript.js');
-const { createSession, appendEvent } = await import('./eventlog.js');
+const { createSession, appendEvent, openEventLog, listEvents } = await import('./eventlog.js');
+
+function typedTerminalData(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  text: string;
+  attemptId?: string;
+}): Record<string, unknown> {
+  const outcomeId = input.attemptId ? `brain:${input.attemptId}` : `turn:${input.sourceUserSeq}`;
+  const identity = {
+    sessionId: input.sessionId,
+    turn: 1,
+    sourceUserSeq: input.sourceUserSeq,
+    ...(input.attemptId ? { attemptId: input.attemptId } : {}),
+  };
+  return {
+    terminalKey: outcomeId,
+    sourceUserSeq: input.sourceUserSeq,
+    ...(input.attemptId ? { attemptId: input.attemptId } : { logicalTerminalVersion: 1 }),
+    presentation: {
+      version: 1,
+      id: `${outcomeId}:presentation`,
+      outcomeId,
+      audience: 'user',
+      phase: 'final',
+      identity,
+      status: 'done',
+      kind: 'answer',
+      text: input.text,
+      resumable: false,
+    },
+    turnOutcome: { version: 2, id: outcomeId, status: 'done', resumable: false },
+    reply: input.text,
+  };
+}
+
+function appendTypedTerminal(
+  sessionId: string,
+  sourceUserSeq: number,
+  text: string,
+  attemptId?: string,
+) {
+  return appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: typedTerminalData({ sessionId, sourceUserSeq, text, ...(attemptId ? { attemptId } : {}) }),
+  });
+}
 
 test('humanHarnessText unwraps strings, JSON strings, and objects', () => {
   assert.equal(humanHarnessText('plain text'), 'plain text');
   assert.equal(humanHarnessText({ reply: 'hi there' }), 'hi there');
-  assert.equal(humanHarnessText({ summary: 'a summary' }), 'a summary');
+  assert.equal(humanHarnessText({ summary: 'an internal summary' }, 'fallback'), 'fallback');
   assert.equal(humanHarnessText({ reply: 'r', summary: 's' }), 'r'); // reply preferred
   assert.equal(humanHarnessText('{"reply":"json reply"}'), 'json reply');
   assert.equal(humanHarnessText(null, 'fallback'), 'fallback');
   assert.equal(humanHarnessText('', 'fallback'), 'fallback');
+});
+
+test('humanHarnessText projects legacy narrated decisions instead of replaying control fields', () => {
+  const narrated = [
+    'Which account should I use?',
+    'summary: account discovery complete',
+    'reply: I found two connected accounts.',
+    'done: false',
+    'nextAction: awaiting_user_input',
+    'reason: the user must select the tenant',
+  ].join('\n');
+  assert.equal(
+    humanHarnessText({ reply: narrated, internalSummary: 'private judge notes' }),
+    'I found two connected accounts.\n\nWhich account should I use?',
+  );
+  assert.equal(
+    humanHarnessText('Tool call: composio_execute_tool\n{"args":{"secret":true}}', 'safe fallback'),
+    'safe fallback',
+  );
+});
+
+test('reconstructHarnessTranscript applies the public projection on reopen', () => {
+  const session = createSession({ kind: 'chat', title: 'legacy narration' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Which connection is active?' } });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      reply: 'summary: checked connections\nreply: Two are active.\ndone: true\nnextAction: completed\nreason: lookup succeeded',
+      internalSummary: 'secret execution trace',
+    },
+  });
+  assert.deepEqual(
+    reconstructHarnessTranscript(session.id).map((turn) => `${turn.role}:${turn.text}`),
+    ['user:Which connection is active?', 'assistant:Two are active.'],
+  );
 });
 
 test('reconstructHarnessTranscript orders turns and skips empty assistant turns', () => {
@@ -87,7 +174,11 @@ test('reconstructHarnessTranscript still renders a parse-exhaustion apology with
     turn: 1,
     role: 'system',
     type: 'conversation_completed',
-    data: { reason: 'no_structured_output', summary: "Clementine produced a response that couldn't be structured. Please ask again." },
+    data: {
+      reason: 'no_structured_output',
+      summary: "Clementine produced a response that couldn't be structured. Please ask again.",
+      reply: "Clementine produced a response that couldn't be structured. Please ask again.",
+    },
   });
 
   const turns = reconstructHarnessTranscript(session.id);
@@ -124,5 +215,76 @@ test('reconstructHarnessTranscript skips synthetic outcome/directive user turns'
     turns.map((t) => `${t.role}:${t.text}`),
     ['user:run the SEO check', 'assistant:You rank #3 — nice.'],
     'the real user turn + assistant reply render; both synthetic turns are hidden',
+  );
+});
+
+test('reconstructHarnessTranscript prefers displayText over model-facing accepted input', () => {
+  const session = createSession({ kind: 'chat', title: 'transformed input' });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Continue the prior execution graph.\n[PRIVATE RESUME DIRECTIVE]\nAttachment body…',
+      displayText: 'continue',
+    },
+  });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Continuing now.' } });
+  assert.deepEqual(
+    reconstructHarnessTranscript(session.id).map((turn) => turn.text),
+    ['continue', 'Continuing now.'],
+  );
+});
+
+test('reconstructHarnessTranscript renders overlapping typed turns in accepted-source order', () => {
+  const session = createSession({ kind: 'chat', title: 'overlap' });
+  const sourceA = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'request A' } });
+  const sourceB = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'request B' } });
+  appendTypedTerminal(session.id, sourceB.seq, 'answer B');
+  appendTypedTerminal(session.id, sourceA.seq, 'answer A');
+
+  assert.deepEqual(
+    reconstructHarnessTranscript(session.id).map((turn) => `${turn.role}:${turn.text}`),
+    ['user:request A', 'assistant:answer A', 'user:request B', 'assistant:answer B'],
+  );
+});
+
+test('reconstructHarnessTranscript keeps active input last after an overlapping completion', () => {
+  const session = createSession({ kind: 'chat', title: 'active overlap' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'active A' } });
+  const sourceB = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'request B' } });
+  appendTypedTerminal(session.id, sourceB.seq, 'answer B');
+
+  assert.deepEqual(
+    reconstructHarnessTranscript(session.id).map((turn) => `${turn.role}:${turn.text}`),
+    ['user:request B', 'assistant:answer B', 'user:active A'],
+  );
+});
+
+test('reconstructHarnessTranscript suppresses a historical rolling-upgrade duplicate without deleting it', () => {
+  const session = createSession({ kind: 'chat', title: 'rolling duplicate' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'ship it' } });
+  appendTypedTerminal(session.id, source.seq, 'first answer', 'legacy-attempt');
+  const duplicate = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: { reply: 'temporary legacy row' },
+  });
+  openEventLog().prepare('UPDATE events SET data_json = ? WHERE seq = ?').run(
+    JSON.stringify(typedTerminalData({ sessionId: session.id, sourceUserSeq: source.seq, text: 'late answer' })),
+    duplicate.seq,
+  );
+
+  assert.deepEqual(
+    reconstructHarnessTranscript(session.id).map((turn) => turn.text),
+    ['ship it', 'first answer'],
+  );
+  assert.equal(
+    listEvents(session.id, { types: ['conversation_completed'] }).length,
+    2,
+    'the private ledger keeps both historical rows',
   );
 });
