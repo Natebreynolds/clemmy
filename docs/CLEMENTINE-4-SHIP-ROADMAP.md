@@ -1,6 +1,6 @@
 # Clementine 4: Parallel Ship Roadmap
 
-Status: local freeze candidate and isolated Codex proof complete; controlled cloned-workflow canary pending
+Status: local freeze gates and stable-commit Codex/Claude critical and endurance proofs are green on runtime candidate `0fbf2323`; controlled cloned-workflow canary remains pending
 Date: 2026-08-01
 Immediate objective: produce a strong live-canary candidate today without claiming the unfinished parts of Clementine 4
 
@@ -26,6 +26,7 @@ Already implemented:
 - Closed-schema immutable shadow policy, deterministic graph hashes, atomic source-owned dedupe, bounded operational telemetry, and no raw prompt/session-title/classifier-noun leakage.
 - Direct-reply, retrieval, single-action, and fan-out action graph shapes; all effect authority remains deferred to the existing runtime tool boundary.
 - `read_parallel_v1` workflow topology: two to six read-only specialist nodes, one authored reducer, durable graph persistence, restart materialization, worker events, and private branch outputs.
+- Worker-result reuse is bound to work identity, never target text alone. Manifest reuse requires the exact manifest, contract version, phase, and canonical item; non-manifest replay requires the exact execution-packet key. Later contract revisions override conflicting earlier requirements while preserving only compatible evidence.
 - Create/update schemas, YAML round-trip, canonical validation/preflight, admitted-definition hashing, execution-surface change detection, creation-test topology parity, and `workflow_get` visibility for the new subgraph.
 - A sanitized Platform 49 characterization with 500 opaque records, five pages, a greater-than-32-KB artifact, a change at record 499, overlapping specialists, restart reuse, reducer-only final/report output, and a second-poll no-op.
 - A sanitized structural replay from the exact client-demo run. It exposed duplicate legacy terminal rows for one accepted source; read-side canonicalization now elects one terminal in the golden replay and public-projection suites.
@@ -42,14 +43,16 @@ Current evidence:
 - Release-focused graph/demo/effect/sales gate from the clean candidate: 167/167 passing serially; the parked experimental resolver/executor is not part of that count or release surface.
 - Shadow graph/compiler/observer and hook suites pass in isolation; the compiler benchmark is about 0.21 ms per compile.
 - Typecheck and `git diff --check` are green.
-- Immutable clean-checkout M3 evidence for code candidate `282ecb60`: full corpus 8,266 pass / 0 fail / 2 environment/build-conditional skips; post-build conditional set 42/42; journeys 5/5; release assets 40/40; proof self-tests 53/53; unified report-back 7/7; tracked hygiene green; fresh-install smoke green after its desktop-build prerequisite; and all root/mobile/console/desktop builds green.
-- Stable-commit Codex proof on `3c6186c6`: all five critical scenarios passed 89/89 checks plus the exact-brain-served backstop; the 120-item endurance manifest passed 20/20 with 120/120 durable completions, 240 checkpoints, one terminal outcome, no narration leak, and no ledger anomaly. The proof used a disposable home and proof-local provider shims; it did not mutate a real connected account.
+- Immutable clean-checkout M3 evidence for runtime candidate `0fbf2323`: full corpus 8,266 total / 8,265 pass / 0 fail / 1 deliberate platform-branch skip; post-build conditional set 42/42; release-focused gate 167/167; journeys 5/5; public hygiene 3/3; release assets 40/40; proof self-tests 53/53; unified report-back 7/7; fresh-install smoke green; and all root/mobile/console/desktop typechecks and builds green.
+- Stable-commit provider proof on runtime candidate `0fbf2323`: Codex passed 93/93 critical checks and Claude passed 93/93, each with the exact-brain-served backstop. The 120-item endurance manifest passed 21/21 on each brain with 120/120 fresh worker starts, 240 lifecycle checkpoints, zero target-only reuse, exactly one terminal, no narration leak, and no ledger anomaly. The contract-revision steering proof required 48 real worker starts, a v2 dispatch packet containing `REVALIDATED` and not `BASELINE`, and one terminal outcome. These proofs used disposable homes and proof-local provider shims; they did not mutate real connected accounts.
+- An initial parity audit rejected a false green caused by target-only worker reuse under a revised contract. The final candidate removes that shortcut and requires real worker starts plus contract-correct dispatch and output markers.
 
 Still missing for today’s final go/no-go:
 
 - Independent sanitization/provenance review of the landed demo fixture; a fixture hash alone does not prove structural equivalence to the private raw source.
-- A controlled live canary on a cloned workflow and selected chat surfaces.
-- Claude/both-brain parity proof if the release claim will include Claude; the completed stable-commit proof establishes the Codex lane only.
+- A controlled live canary on a cloned workflow and selected chat surfaces; Platform 49 itself remains untouched.
+- Exact live demo replay on every brain/surface pair included in the release claim.
+- A real Netlify/Railway deployment or connected-account effect test if the release claim includes those external mutations; the offline sales-portal acceptance does not prove them.
 
 The experimental standalone chat capability resolver/executor has been parked outside the candidate: no live chat path calls it, and carrying unused execution code would add an unsupported release surface. Today’s executable long-task guarantee is the connected workflow graph; chat turn graphs remain observation-only until a production caller, authority binding, terminal ownership, and parity gate land together.
 
@@ -254,10 +257,10 @@ git diff --check
 1. ~~Finish adversarial workflow-subgraph audit and incorporate only concrete blockers.~~ Complete; storage-slug artifact lookup and per-node `maxTurns` forwarding were repaired.
 2. ~~Rerun the graph runtime fixture after the report-back public-step projection fix.~~ Complete; 11/11 passing.
 3. ~~Merge Lane B/C acceptance evidence into the candidate.~~ Complete; the release-focused graph/demo/effect/sales gate is 167/167.
-4. ~~Run full isolated repository tests against an immutable clean checkout.~~ Complete; 8,266/0/2, with the two conditional cases covered by a post-build 42/42 run.
+4. ~~Run full isolated repository tests against an immutable clean checkout.~~ Complete on `0fbf2323`; 8,266 total / 8,265 pass / 0 fail / 1 deliberate platform-branch skip, with the build-dependent cases covered by a post-build 42/42 run.
 5. ~~Run journeys, public hygiene, release assets, report-back smoke, proof self-tests, and builds.~~ Complete and green; fresh-install smoke passed after building its required desktop bundle.
-6. Run live provider proofs only from a stable candidate commit with configured providers.
-7. Produce one go/no-go report with exact failures, no inferred green status.
+6. ~~Run live provider proofs only from a stable candidate commit with configured providers.~~ Complete on `0fbf2323`: Codex and Claude critical suites are 93/93 each, and both 120-item endurance suites are 21/21.
+7. ~~Produce one go/no-go report with exact failures, no inferred green status.~~ Complete in this evidence update; private-fixture provenance and the controlled live canary remain explicit pre-release boundaries.
 
 ## Merge checkpoints
 
@@ -331,11 +334,11 @@ git rev-parse HEAD
 npm run check:public-hygiene
 npm run proof:critical:codex
 npm run proof:endurance:codex
-npm run proof:critical
-npm run proof:fusion:codex
+npx tsx scripts/proof/run-proof.ts --brain claude --scenario long-horizon-manifest,background-steer-in-flight,restart-resume,blocked-auth-truth,capability-reconnect-resume
+CLEMMY_PROOF_LONG_HORIZON_ITEMS=120 npx tsx scripts/proof/run-proof.ts --brain claude --scenario long-horizon-manifest
 ```
 
-The proof harness rejects a dirty source tree, so `git status --short` must be empty and the evidence note must pin the printed SHA. `npm run proof:critical` runs the critical scenarios across configured brains, including Claude. A SKIP is not a pass for a brain named in the release claim; explicitly exclude an unavailable brain rather than assuming parity.
+The proof harness rejects a dirty source tree, so `git status --short` must be empty and the evidence note must pin the printed SHA. A SKIP is not a pass for a brain named in the release claim; explicitly exclude an unavailable brain rather than assuming parity. Fusion remains off for this freeze and is not inferred from the Codex/Claude results; run `npm run proof:fusion:codex` only as a separately scoped canary.
 
 ### M5 — live canary
 
