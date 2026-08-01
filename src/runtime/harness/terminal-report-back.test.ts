@@ -222,4 +222,37 @@ test('one user request pages the user once, however many terminal events it writ
   assert.equal(matches[0]!.id, `foreground-report-back-${sessionId}-${startSeq}`);
 });
 
+test('a run long enough to outgrow a read window still reports back', () => {
+  // Found by probing the new code adversarially before it shipped (2026-07-31).
+  // The first cut read the newest 2000 events and looked for the user's input
+  // inside them. A scrape making thousands of tool calls pushes its own opening
+  // message out of that window, so the run read as "not user-facing" and went
+  // silent — meaning the LONGEST runs, the ones nobody is still watching, were
+  // the exact ones that never reported. The feature would have failed on the
+  // very run that motivated it.
+  const sessionId = 'sess-very-long-run';
+  createSession({ id: sessionId, kind: 'chat', title: 'ten firms, the hard way' });
+  const start = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'find me 10 firms and put them in a spreadsheet' },
+  });
+  for (let i = 0; i < 2200; i += 1) {
+    appendEvent({ sessionId, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'firecrawl_search', callId: 'x' + i } });
+  }
+  const terminal = appendEvent({
+    sessionId, turn: 1, role: 'assistant', type: 'conversation_completed',
+    data: { reply: 'Done - 10 firms, keywords and gaps, in the sheet.' },
+  });
+
+  const facts = readTerminalRunFacts({
+    sessionId, sessionKind: 'chat', channel: null,
+    terminalSeq: terminal.seq, terminalType: 'conversation_completed',
+    terminalAt: terminal.createdAt, terminalData: terminal.data, seenByViewer: false,
+  });
+  assert.ok(facts, 'a 2200-event run is still a run');
+  assert.equal(facts.startSeq, start.seq, 'the opening message is found however far back it is');
+  assert.equal(facts.toolCalls, 2200);
+  assert.equal(decideTerminalReportBack(facts).deliver, true);
+});
+
 process.on('exit', () => { rmSync(TMP_HOME, { recursive: true, force: true }); });

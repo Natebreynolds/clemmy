@@ -41,6 +41,15 @@
  *      not parity. Only surfaces whose delivery depends on an open view (the
  *      desktop dock, mobile, the Workspace dock) can leave a result stranded.
  *
+ * KNOWN BOUND: the grace window is an in-memory timer, so a daemon restart in
+ * the ~45s between a run finishing and the decision being made loses that one
+ * report. Making it durable would mean persisting a pending-report record and
+ * reconciling it at boot — and a boot sweep cannot tell "nobody saw it" from
+ * "the timer already decided somebody did", so it would have to re-derive that
+ * too. Deliberately not built: the hole is one narrow window against a bug that
+ * used to swallow EVERY foreground run, and the machinery would cost more than
+ * it returns. Recorded here so the next person weighs it with the same numbers.
+ *
  * Kill-switch: CLEMMY_FOREGROUND_REPORT_BACK=off.
  */
 import { actionBus } from '../action-bus.js';
@@ -155,40 +164,65 @@ export function readTerminalRunFacts(input: {
   terminalSeq: number;
   terminalType: string;
   terminalAt: string;
+  /** The terminal event's own payload — supplied by the caller, which already
+   *  has it, so finding the run's outcome never costs a query. */
+  terminalData?: Record<string, unknown>;
   seenByViewer: boolean;
 }): TerminalRunFacts | null {
-  let events: EventRow[];
-  try {
-    events = listEvents(input.sessionId, { limit: 2000, desc: true });
-  } catch {
-    return null;
-  }
-  const chronological = [...events].sort((a, b) => a.seq - b.seq);
+  // The run's lower bound is the user's most recent input BEFORE the terminal.
+  // Ask for exactly that, rather than reading a slice of the session and
+  // scanning it: the first cut read the newest 2000 events and looked for the
+  // input inside them, which fails on precisely the runs this feature exists
+  // for. A scrape that makes two thousand tool calls pushes its own opening
+  // message out of that window, so startSeq stayed 0, the facts came back null,
+  // and the LONGEST runs — the ones nobody is still watching — were the only
+  // ones that never reported. Found by probing the new code against a
+  // 2200-event run before it shipped.
   let startSeq = 0;
   let startedAt = input.terminalAt;
-  for (const event of chronological) {
-    if (event.seq >= input.terminalSeq) break;
-    if (event.type === 'user_input_received') {
-      startSeq = event.seq;
-      startedAt = event.createdAt;
+  try {
+    for (const event of listEvents(input.sessionId, {
+      types: ['user_input_received'],
+      desc: true,
+      limit: 20,
+    })) {
+      if (event.seq < input.terminalSeq && event.seq > startSeq) {
+        startSeq = event.seq;
+        startedAt = event.createdAt;
+      }
     }
+  } catch {
+    return null;
   }
   // No user input before this terminal means it is not a user-facing run at all
   // (a synthetic ack, a resumed system beat) — nothing to report.
   if (startSeq === 0) return null;
 
-  const window = chronological.filter((event) => event.seq > startSeq && event.seq <= input.terminalSeq);
-  const toolCalls = window.filter((event) => event.type === 'tool_called').length;
-  const externalWrites = window.filter((event) => event.type === 'external_write_succeeded').length
-    || window.filter((event) => event.type === 'external_write' && event.data.preDispatch !== true).length;
+  // Only the event types the decision actually counts, and only from the run's
+  // own boundary forward. Bounded by the run's real work, not by the session.
+  let toolCalls = 0;
+  let confirmedWrites = 0;
+  let legacyWrites = 0;
+  try {
+    for (const event of listEvents(input.sessionId, {
+      types: ['tool_called', 'external_write', 'external_write_succeeded'],
+      sinceSeq: startSeq,
+    })) {
+      if (event.seq > input.terminalSeq) break;
+      if (event.type === 'tool_called') toolCalls += 1;
+      else if (event.type === 'external_write_succeeded') confirmedWrites += 1;
+      else if (event.data.preDispatch !== true) legacyWrites += 1;
+    }
+  } catch { /* counts stay at zero — the decision simply reads as less substantive */ }
+  const externalWrites = confirmedWrites || legacyWrites;
+
   const startedMs = Date.parse(startedAt);
   const terminalMs = Date.parse(input.terminalAt);
   const elapsedMs = Number.isFinite(startedMs) && Number.isFinite(terminalMs)
     ? Math.max(0, terminalMs - startedMs)
     : 0;
 
-  const terminalEvent = window.find((event) => event.seq === input.terminalSeq);
-  const reason = terminalEvent ? textOf(terminalEvent.data, 'reason') : '';
+  const reason = textOf(input.terminalData ?? {}, 'reason');
   const outcome: TerminalRunFacts['outcome'] = input.terminalType === 'run_failed'
     ? 'failed'
     : reason.startsWith('awaiting')
@@ -213,23 +247,27 @@ export function readTerminalRunFacts(input: {
  * report — and fall back to the durable write ledger when a turn finished
  * without prose, which is exactly what work-report.ts exists for.
  */
-export function buildTerminalReportBody(sessionId: string, terminalSeq: number, startSeq = 0): string {
-  let events: EventRow[] = [];
-  try {
-    events = listEvents(sessionId, { limit: 2000 });
-  } catch { /* fall through to the generic line */ }
-  const terminal = events.find((event) => event.seq === terminalSeq);
-  const reply = terminal ? textOf(terminal.data, 'reply', 'summary') : '';
+export function buildTerminalReportBody(input: {
+  sessionId: string;
+  terminalSeq: number;
+  startSeq: number;
+  /** The terminal event's payload. Her own words ARE the report, and the caller
+   *  already holds them — so the common case costs no query at all. The first
+   *  cut re-read the session to find this event and used an OLDEST-first slice,
+   *  so on a long run the terminal was not in the rows fetched and the real
+   *  reply was replaced by a generic line. */
+  terminalData?: Record<string, unknown>;
+}): string {
+  const reply = textOf(input.terminalData ?? {}, 'reply', 'summary');
   if (reply) return reply;
-  const evidence = events.filter((event) =>
-    event.seq > startSeq
-    && event.seq <= terminalSeq
-    && (
-      event.type === 'external_write'
-      || event.type === 'external_write_succeeded'
-      || event.type === 'external_write_failed'
-      || event.type === 'external_write_orphaned'
-    ));
+  // No prose: fall back to the durable write ledger for this run's window only.
+  let evidence: EventRow[] = [];
+  try {
+    evidence = listEvents(input.sessionId, {
+      types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
+      sinceSeq: input.startSeq,
+    }).filter((event) => event.seq <= input.terminalSeq);
+  } catch { /* fall through to the generic line */ }
   return synthesizeWorkReport(evidence) ?? 'This run finished. Open the conversation for the result.';
 }
 
@@ -322,6 +360,7 @@ export function startTerminalReportBackWatcher(options: {
           terminalSeq: event.seq,
           terminalType: event.type,
           terminalAt: event.createdAt,
+          terminalData: event.data,
           seenByViewer: sessionViewerSeenSince(event.sessionId, terminatedAtMs),
         });
         if (!facts) return;
@@ -329,7 +368,12 @@ export function startTerminalReportBackWatcher(options: {
         emitTerminalReportBack(
           facts,
           { title: session.title, userId: session.userId },
-          buildTerminalReportBody(event.sessionId, event.seq, facts.startSeq),
+          buildTerminalReportBody({
+            sessionId: event.sessionId,
+            terminalSeq: event.seq,
+            startSeq: facts.startSeq,
+            terminalData: event.data,
+          }),
         );
       } catch { /* report-back is best-effort; never break the event bus */ }
     }, graceMs);
