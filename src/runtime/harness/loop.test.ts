@@ -84,7 +84,7 @@ const { HarnessSession } = await import('./session.js');
 const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { BoundaryError } = await import('../boundary-error.js');
-const { ToolCallsLimitExceeded, harnessRunContextStorage } = await import('./brackets.js');
+const { ToolCallsLimitExceeded, harnessRunContextStorage, wrapToolForHarness } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
 const { getPlanScope } = await import('../../agents/plan-scope.js');
@@ -97,6 +97,8 @@ const { executeApprovedPendingActionCall } = await import('../../execution/pendi
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
 const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
+const { buildCallTool } = await import('../../tools/call-tool.js');
+const { _setCodeModeToolsForTests } = await import('../../tools/code-mode-tool.js');
 
 test.after(() => {
   try {
@@ -2453,6 +2455,87 @@ test('standard lane parks unresolved provider artifacts and carries exact pendin
 // park reaches the user, the model gets one continuation teaching it to
 // verify + settle ITSELF (artifact_claim_resolve / execution_reconcile_write).
 // The park stays as the fallback when the model still can't resolve.
+test('a local call_tool carrier rejection cannot manufacture ambiguity or replace a verified answer', async () => {
+  const previousBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat' });
+  const verifiedAnswer = [
+    'The most recent workspace cadence workflow run succeeded.',
+    'Evidence: its durable run record is complete and the weekday two-hour schedule is active.',
+  ].join('\n');
+  let modelSteps = 0;
+  let providerDispatches = 0;
+  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      providerDispatches += 1;
+      return 'provider must remain untouched';
+    },
+  }]]));
+  const wrappedCallTool = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
+  ) as unknown as {
+    invoke: (context: unknown, input: string, details: unknown) => Promise<unknown>;
+  };
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    modelSteps += 1;
+    if (modelSteps === 1) {
+      const refusal = await wrappedCallTool.invoke(
+        { context: { sessionId: session.id } },
+        JSON.stringify({
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            slug: 'GOOGLESHEETS_BATCH_GET',
+            args: { spreadsheet_id: 'sheet-fixture-cadence', ranges: ['Log!A1:I10'] },
+          }),
+        }),
+        { toolCall: { callId: 'call-workspace-cadence-loop-replay' } },
+      );
+      assert.match(String(refusal), /non-empty tool_slug/);
+    }
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: verifiedAnswer,
+        reply: verifiedAnswer,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+      toolCalls: 1,
+    } as never;
+  };
+
+  try {
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: session.id,
+      input: 'Find and verify the latest workspace cadence workflow run. Do not narrate tool calls.',
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(modelSteps, 1, 'a proven pre-dispatch refusal never starts a reconciliation model turn');
+    assert.equal(providerDispatches, 0);
+    assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0);
+    const [failed] = listEvents(session.id, { types: ['external_write_failed'] });
+    assert.equal(failed?.data.callId, 'call-workspace-cadence-loop-replay');
+    assert.equal(failed?.data.sourceUserSeq, listEvents(session.id, { types: ['user_input_received'] })[0]?.seq);
+    const selfResolve = listEvents(session.id, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data.kind === 'self_resolve_nudge');
+    assert.equal(selfResolve.length, 0);
+    const [terminal] = listEvents(session.id, { types: ['conversation_completed'] });
+    assert.equal(terminal?.data.reply, verifiedAnswer);
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (previousBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = previousBrackets;
+  }
+});
+
 test('an unresolved create claim first gets the SELF-RESOLVE continuation — the user beat is the fallback, not the default', async () => {
   resetEventLog();
   artifactLedger._resetArtifactLedgerForTests();
@@ -2506,6 +2589,355 @@ test('an unresolved create claim first gets the SELF-RESOLVE continuation — th
   const nudges = listEvents(sess.id, { types: ['guardrail_tripped'] })
     .filter((e) => (e.data as { kind?: string }).kind === 'self_resolve_nudge');
   assert.equal(nudges.length, 1, 'the nudge is recorded in telemetry');
+});
+
+test('artifact reconciliation cannot use a bound sibling slot to settle the unresolved logical deliverable', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const rootScopeId = `${sess.id}::turn:1`;
+  let calls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    if (calls === 1) {
+      artifactLedger.claimArtifactSlot(sess.id, {
+        kind: 'google_doc',
+        provider: 'Fixture Docs',
+        slotKey: 'google_doc:primary-report',
+        title: 'Primary report',
+        createShape: 'FIXTURE_CREATE_DOCUMENT',
+      }, 'create-primary-report', rootScopeId);
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: 'The primary report is ready.',
+          reply: 'The primary report is ready.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      } as never;
+    }
+    const siblingSlot = 'google_doc:appendix';
+    artifactLedger.claimArtifactSlot(sess.id, {
+      kind: 'google_doc',
+      provider: 'Fixture Docs',
+      slotKey: siblingSlot,
+      title: 'Appendix',
+      createShape: 'FIXTURE_CREATE_DOCUMENT',
+    }, 'create-appendix', rootScopeId);
+    artifactLedger.bindArtifactSlot(
+      sess.id,
+      siblingSlot,
+      { resourceId: 'fixture-doc-appendix' },
+      'create-appendix',
+      rootScopeId,
+    );
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'done=true / nextAction=completed',
+        reply: 'done=true / nextAction=completed',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create the primary report.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_user_input');
+  const blocked = listEvents(sess.id, { types: ['guardrail_tripped'] })
+    .find((event) => event.data.kind === 'self_reconciliation_blocked');
+  assert.equal(blocked?.data.reason, 'artifact_reconciliation_remains_unresolved');
+  const terminals = listEvents(sess.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.notEqual(terminals[0]?.data.delivered, true);
+});
+
+test('effect/artifact self-reconciliation preserves the verified public candidate when durable evidence settles', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const verifiedAnswer = [
+    'The workspace cadence report is ready and its workflow run completed successfully.',
+    'Its durable record is complete and the two-hour schedule remains active.',
+  ].join('\n');
+  let calls = 0;
+  let artifactId = '';
+  const inputs: string[] = [];
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    const input = items.at(-1) as { content?: string } | undefined;
+    if (typeof input?.content === 'string') inputs.push(input.content);
+    const sourceUserSeq = listEvents(sess.id, { types: ['user_input_received'] })[0]!.seq;
+    if (calls <= 2) {
+      if (calls === 1) {
+        const claim = artifactLedger.claimArtifactSlot(sess.id, {
+          kind: 'google_doc',
+          provider: 'Fixture Docs',
+          slotKey: 'google_doc:workspace-cadence',
+          title: 'Workspace cadence report',
+          createShape: 'FIXTURE_CREATE_DOCUMENT',
+        }, 'create-workspace-cadence-report', `${sess.id}::turn:1`);
+        artifactId = claim.artifact.id;
+        const write = {
+          sourceUserSeq,
+          callId: 'effect-reconcile-write-1',
+          actionKey: 'fixture:effect-write',
+          shapeKey: 'FIXTURE_EFFECT_WRITE',
+          targets: ['workspace-cadence'],
+          correlationFingerprint: 'workspace-cadence:summary',
+        };
+        appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'external_write', data: write });
+        appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'external_write_orphaned', data: write });
+      }
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: verifiedAnswer,
+          reply: '',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      } as never;
+    }
+    const artifactSettlement = artifactLedger.resolveUncertainArtifactClaim(
+      sess.id,
+      artifactId,
+      { kind: 'bind', resourceId: 'fixture-doc-workspace-cadence' },
+    );
+    assert.equal(artifactSettlement.ok, true);
+    appendEvent({
+      sessionId: sess.id,
+      turn: calls,
+      role: 'system',
+      type: 'external_write_succeeded',
+      data: {
+        sourceUserSeq,
+        callId: 'effect-reconcile-write-1',
+        actionKey: 'fixture:effect-write',
+        shapeKey: 'FIXTURE_EFFECT_WRITE',
+        targets: ['workspace-cadence'],
+        correlationFingerprint: 'workspace-cadence:summary',
+        reason: 'reconciled_present',
+      },
+    });
+    const internalProtocol = 'done=true / nextAction=completed';
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: internalProtocol,
+        reply: internalProtocol,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create the workspace cadence report, verify its workflow run, and give me the result.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(calls, 3, 'one missing-reply retry precedes the single reconciliation turn');
+  assert.ok(inputs.some((input) => input.includes('[self-resolve]')));
+  const terminals = listEvents(sess.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1, 'one accepted request has one public terminal');
+  assert.equal(terminals[0]?.data.reply, verifiedAnswer);
+  assert.doesNotMatch(String(terminals[0]?.data.reply), /done\s*=|nextAction\s*=/i);
+});
+
+test('a completed reconciliation turn that asks a question pauses before the saved candidate can finalize', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const savedCandidate = 'The requested report is ready.';
+  const exactQuestion = 'Which verified report should I attach to the team summary?';
+  let calls = 0;
+  let artifactId = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    if (calls === 1) {
+      const claim = artifactLedger.claimArtifactSlot(sess.id, {
+        kind: 'google_doc',
+        provider: 'Fixture Docs',
+        slotKey: 'google_doc:question-before-reconciliation',
+        title: 'Question ordering report',
+        createShape: 'FIXTURE_CREATE_DOCUMENT',
+      }, 'create-question-ordering-report', `${sess.id}::turn:1`);
+      artifactId = claim.artifact.id;
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: savedCandidate,
+          reply: savedCandidate,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      } as never;
+    }
+
+    const settlement = artifactLedger.resolveUncertainArtifactClaim(
+      sess.id,
+      artifactId,
+      { kind: 'bind', resourceId: 'fixture-doc-question-ordering' },
+    );
+    assert.equal(settlement.ok, true, 'the evidence is settled so the old ordering would falsely finalize');
+    appendEvent({
+      sessionId: sess.id,
+      turn: 2,
+      role: 'Clem',
+      type: 'awaiting_user_input',
+      data: { question: exactQuestion, source: 'ask_user_question' },
+    });
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'done=true / nextAction=completed',
+        reply: 'done=true / nextAction=completed',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create the report and attach the verified result to my team summary.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(calls, 2, 'the second completed SDK turn is the reconciliation node');
+  assert.equal(result.status, 'awaiting_user_input', 'the typed question owns the terminal boundary');
+  const terminals = listEvents(sess.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1, 'the saved completion candidate is never committed first');
+  assert.equal(terminals[0]?.data.reason, 'awaiting_user_input');
+  assert.equal(terminals[0]?.data.reply, exactQuestion);
+  assert.notEqual(terminals[0]?.data.reply, savedCandidate);
+});
+
+test('effect self-reconciliation that remains ambiguous returns one deterministic blocked terminal', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const verifiedAnswer = 'The workspace cadence workflow run completed successfully and its durable record is complete.';
+  let calls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    const sourceUserSeq = listEvents(sess.id, { types: ['user_input_received'] })[0]!.seq;
+    if (calls === 1) {
+      const write = {
+        sourceUserSeq,
+        callId: 'effect-reconcile-write-unresolved',
+        actionKey: 'fixture:effect-write',
+        shapeKey: 'FIXTURE_EFFECT_WRITE',
+        targets: ['workspace-cadence'],
+        correlationFingerprint: 'workspace-cadence:unresolved',
+      };
+      appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'external_write', data: write });
+      appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'external_write_orphaned', data: write });
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: verifiedAnswer,
+          reply: verifiedAnswer,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      } as never;
+    }
+    const internalProtocol = 'done=true / nextAction=completed';
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: internalProtocol,
+        reply: internalProtocol,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Check the latest workspace cadence workflow run and give me the verified result.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(calls, 2, 'the reconciliation attempt is bounded to one model continuation');
+  const terminals = listEvents(sess.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1, 'the ambiguous effect never gets a green terminal first');
+  assert.equal(terminals[0]?.data.reason, 'blocked');
+  assert.equal(terminals[0]?.data.delivered, false);
+  assert.match(String(terminals[0]?.data.reply), /ambiguous external-write outcome|cannot honestly confirm/i);
+  assert.doesNotMatch(String(terminals[0]?.data.reply), /done\s*=|nextAction\s*=/i);
+});
+
+test('non-reconciliation completion correction still replaces a rejected public candidate', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const rejected = 'The report is ready even though I have not created or verified it yet.';
+  const corrected = 'The report is now created and verified at /tmp/workspace-cadence-report.html.';
+  let calls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    const reply = calls === 1 ? rejected : corrected;
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: { summary: reply, reply, done: true, nextAction: 'completed', reason: null },
+      toolCalls: calls === 2 ? 1 : 0,
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create and verify the workspace cadence report.',
+    judgeCompletion: true,
+    judgeFn: async (_objective, response) => response.includes('/tmp/workspace-cadence-report.html')
+      ? { done: true, reason: 'verified artifact is present' }
+      : { done: false, reason: 'the artifact has not been created' },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(calls, 2);
+  const terminals = listEvents(sess.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0]?.data.reply, corrected);
+  assert.notEqual(terminals[0]?.data.reply, rejected);
 });
 
 // F-artifact (live 2026-07-23, the owner's own acceptance run): a BOUND claim

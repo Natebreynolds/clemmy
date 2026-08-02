@@ -54,6 +54,28 @@ function recordingTransport() {
   };
 }
 
+test('accepted channel requests persist their typed progress presentation for approval resumes', () => {
+  const session = createSession({ kind: 'chat', channel: 'discord' });
+  const active = __test__.registerActiveChannelRunForTest({
+    channel: 'discord',
+    channelId: 'chan-quiet-policy',
+    userId: 'user-quiet-policy',
+    guildId: null,
+    sessionId: session.id,
+  });
+  try {
+    const accepted = __test__.recordActiveChannelUserInputForTest(
+      active,
+      'Find the verified result.',
+      'Do not narrate your plan or tool calls. Return only the verified answer.',
+    );
+    assert.equal(accepted.data.progressPresentation, 'quiet');
+    assert.equal(__test__.progressPresentationForSessionForTest(session.id), 'quiet');
+  } finally {
+    __test__.unregisterActiveChannelRunForTest(active);
+  }
+});
+
 let durableOrdinal = 0;
 function durableProviderRequest(channelId: string, prompt: string, sessionId?: string) {
   durableOrdinal += 1;

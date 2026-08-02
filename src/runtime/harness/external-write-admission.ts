@@ -21,6 +21,32 @@ export class ExternalWritePreDispatchError extends Error {
 }
 
 /**
+ * Typed successful-return sibling of ExternalWritePreDispatchError.
+ *
+ * Some model-facing tools intentionally return a corrective payload instead
+ * of throwing so the model can repair its arguments in the same turn. The
+ * payload must remain byte-compatible for the model, while the harness still
+ * needs local proof that provider dispatch never began. Keeping that proof on
+ * a nominal class prevents provider JSON/prose from forging it.
+ */
+export class ExternalWritePreDispatchResult {
+  readonly provenNoDispatch = true;
+
+  constructor(
+    readonly output: string,
+    readonly reason = 'local_pre_dispatch_refusal',
+  ) {}
+
+  toString(): string {
+    return this.output;
+  }
+}
+
+export function unwrapExternalWritePreDispatchResult(value: unknown): unknown {
+  return value instanceof ExternalWritePreDispatchResult ? value.output : value;
+}
+
+/**
  * Cross-process serialization for the tiny read-ledger → reserve-write
  * admission window. The in-memory chain preserves cheap FIFO behavior inside
  * one runtime; a separate SQLite CAS lock closes the same race across the

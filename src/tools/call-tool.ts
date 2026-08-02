@@ -28,7 +28,11 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
 import { getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
-import { harnessRunContextStorage, ToolCallsCounter, ToolCallsLimitExceeded } from '../runtime/harness/brackets.js';
+import {
+  harnessRunContextStorage,
+  ToolCallsCounter,
+  ToolCallsLimitExceeded,
+} from '../runtime/harness/brackets.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { dispatchBatchItemTool, isMcpNamespacedTool } from './code-mode-tool.js';
 import { deriveOrchestratorDiscoveryNames } from './tool-registry.js';
@@ -41,6 +45,7 @@ import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import {
   validateIrreversibleSendPayload,
 } from '../runtime/harness/grounding-gate.js';
+import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 
 const DESCRIPTION = [
   'Invoke a built-in tool that is in the catalog but not currently one of your first-class tools. Pass the exact tool `name` (from the catalog / tool_search) and `args_json` — a JSON object string of that tool\'s arguments (use "{}" for none).',
@@ -245,6 +250,7 @@ async function nullableRequiredKeys(): Promise<Map<string, ReadonlySet<string>>>
 }
 
 function jsonResult(value: unknown): string {
+  if (value instanceof ExternalWritePreDispatchResult) return value.output;
   return typeof value === 'string' ? value : JSON.stringify(value ?? null);
 }
 
@@ -344,6 +350,14 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       name: z.string().min(1).describe('Exact tool name to invoke: a built-in from the catalog, OR a connected external MCP tool as <server>__<tool> (e.g. dataforseo__serp_organic_live_advanced).'),
       args_json: z.string().describe('JSON object string of the target tool\'s arguments. Use "{}" for no args.'),
     }),
+    // Preserve the SDK's model-visible corrective for ordinary invocation
+    // errors, but never soften the deterministic turn ceiling. A nominal cap
+    // result would cost zero calls and could be retried forever.
+    errorFunction: (_context, error) => {
+      if (error instanceof ToolCallsLimitExceeded) throw error;
+      const details = error instanceof Error ? error.toString() : String(error);
+      return `An error occurred while running the tool. Please try again. Error: ${details}`;
+    },
     // needsApproval intentionally omitted → false. Gate decisions come from the
     // INNER tool via dispatchBatchItemTool (see file header). Do NOT set this true.
     execute: async (
@@ -360,10 +374,18 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       const refuse = (payload: Record<string, unknown>): string => {
         const counter = harnessRunContextStorage.getStore()?.counter;
         if (counter) {
+          // The ceiling is terminal for this turn. Returning another nominal
+          // refusal here would cost zero calls and let the model retry forever.
           if (counter.willExceed()) throw new ToolCallsLimitExceeded(counter.limit);
           counter.increment();
         }
-        return JSON.stringify(payload);
+        // Preserve the exact JSON corrective for the model while retaining a
+        // nominal, local-only proof for the surrounding effect ledger. A
+        // provider-returned object or marker can never manufacture this class.
+        return new ExternalWritePreDispatchResult(
+          JSON.stringify(payload),
+          typeof payload.error === 'string' ? payload.error : 'call_tool_refused',
+        ) as unknown as string;
       };
       const requestedTarget = (name ?? '').trim();
       if (!requestedTarget) return refuse({ error: 'bad_request', detail: 'name is required' });

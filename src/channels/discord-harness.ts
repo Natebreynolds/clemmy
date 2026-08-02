@@ -92,6 +92,7 @@ import { turnOutcomeId, type TurnIdentity } from '../runtime/harness/turn-outcom
 import { presentationEventFromCompletionData } from '../runtime/harness/turn-outcome.js';
 import { publicUserInputText } from '../runtime/harness/public-presentation.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
+import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
 const SAFETY_TIMEOUT_MS = 35 * 60_000;
@@ -105,6 +106,45 @@ const MAX_DISCORD_MESSAGE = 1_900;
 // bot didn't die. 5 minutes balances "I see progress" against
 // "Discord channel noise."
 export const POST_EXPIRY_CHECKIN_MS = 5 * 60_000;
+
+/**
+ * Public progress is a request-scoped presentation choice, not a runtime
+ * feature gate. The audit event stream remains complete in both modes.
+ */
+export type ProgressPresentation = 'quiet' | 'compact';
+
+export function progressPresentationForPrompt(input: string): ProgressPresentation {
+  const text = input.trim();
+  if (!text) return 'compact';
+
+  // An explicit request for updates wins when a prompt contains conflicting
+  // language. We only infer quiet mode from direct presentation instructions;
+  // safety wording such as "do not guess" must not silence progress.
+  const asksForProgress = /\b(?:keep\s+me\s+updated|show\s+(?:me\s+)?(?:your\s+)?progress|progress\s+updates?)\b/i.test(text);
+  if (asksForProgress) return 'compact';
+
+  const rejectsNarration = /\b(?:do\s+not|don['’]t|without)\s+(?:narrat(?:e|ing)|describ(?:e|ing)|explain(?:ing)?|show(?:ing)?|report(?:ing)?)\b[\s\S]{0,120}\b(?:plans?|progress|steps?|tool(?:\s+calls?)?)\b/i.test(text);
+  const asksForOnlyResult = /\b(?:return|respond|reply|give\s+me)\s+only\b[\s\S]{0,160}\b(?:answers?|results?|evidence|blockers?)\b/i.test(text);
+  return rejectsNarration || asksForOnlyResult ? 'quiet' : 'compact';
+}
+
+function progressPresentationForSession(sessionId: string): ProgressPresentation {
+  const inputs = listHarnessEvents(sessionId, { types: ['user_input_received'], desc: true });
+  for (const input of inputs) {
+    const stored = input.data.progressPresentation;
+    if (stored === 'quiet' || stored === 'compact') return stored;
+    // Old sessions do not have the typed field. Reconstruct it only from the
+    // latest real request; approval-control messages must inherit past it.
+    if (input.data.source === 'channel_approval_resume') continue;
+    const displayText = typeof input.data.displayText === 'string'
+      ? input.data.displayText
+      : typeof input.data.text === 'string'
+        ? input.data.text
+        : '';
+    return progressPresentationForPrompt(displayText);
+  }
+  return 'compact';
+}
 
 function commitDiscordTerminal(input: {
   source: EventRow;
@@ -164,6 +204,7 @@ function recordActiveChannelUserInput(
   attempt: ActiveDiscordHarnessRun,
   modelText: string,
   displayText: string,
+  progressPresentation: ProgressPresentation = progressPresentationForPrompt(displayText),
 ): EventRow {
   return recordRunAttemptUserInput(attempt, {
     turn: 1,
@@ -171,6 +212,7 @@ function recordActiveChannelUserInput(
     data: {
       text: modelText,
       displayText,
+      progressPresentation,
       attemptId: attempt.attemptId,
       source: `channel:${attempt.channel}`,
     },
@@ -1586,6 +1628,7 @@ export const __test__ = {
   registerActiveChannelRunForTest: registerActiveChannelRun,
   unregisterActiveChannelRunForTest: unregisterActiveChannelRun,
   recordActiveChannelUserInputForTest: recordActiveChannelUserInput,
+  progressPresentationForSessionForTest: progressPresentationForSession,
   commitDiscordAnswerForTest: commitDiscordAnswer,
   tryHandleBackgroundItControl,
   /** Inject a fresh channel→session mapping (Step 5 typed-plan-approval tests). */
@@ -1934,6 +1977,8 @@ export interface DisplayState {
   summary: string;
   status: string;
   done: boolean;
+  /** Complete audit events, but present only generic elapsed progress when quiet. */
+  progressPresentation?: ProgressPresentation;
   // Visibility extensions — surfaced in the rolling message body so
   // the user can see what the agent is actually doing in real time.
   // Without these, long runs look identical to stuck runs.
@@ -2300,6 +2345,13 @@ function renderBody(state: DisplayState): string {
     const body = state.summary || '_done._';
     return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
   }
+  if (state.progressPresentation === 'quiet') {
+    const elapsed = formatElapsedMs(state.turnStartedAt ? Date.now() - state.turnStartedAt : 0);
+    const status = elapsed ? `_working… · ${elapsed}_` : '_working…_';
+    return status.length > MAX_DISCORD_MESSAGE
+      ? status.slice(0, MAX_DISCORD_MESSAGE - 1) + '…'
+      : status;
+  }
   // In-progress: a short status line PLUS an elapsed-time counter so
   // the user can tell "still working at 4m 12s" vs "nothing
   // happening." Tool count is included once 3+ tools have fired —
@@ -2601,6 +2653,7 @@ export async function runDiscordHarnessConversation(opts: {
   // Raw, pre-fold user text for the durable-intent decision only (parity with
   // the desktop dock, which decides on raw `input`).
   const rawPromptForIntent = opts.rawPrompt ?? opts.prompt;
+  const progressPresentation = progressPresentationForPrompt(rawPromptForIntent);
 
   const auth = await configureHarnessRuntime();
   if (!auth.ok) {
@@ -2767,7 +2820,12 @@ export async function runDiscordHarnessConversation(opts: {
     // (/goal, plan continuity, durable handoff) can publish a terminal. Looking
     // up the session's "latest" user event here is unsafe: on a fresh session
     // there is none, and on a continuation it belongs to the prior turn.
-    acceptedUserInput = recordActiveChannelUserInput(activeRun, prompt, rawPromptForIntent);
+    acceptedUserInput = recordActiveChannelUserInput(
+      activeRun,
+      prompt,
+      rawPromptForIntent,
+      progressPresentation,
+    );
     opts.durableRequest?.onSourceAccepted?.(acceptedUserInput);
   } catch (err) {
     unregisterActiveChannelRun(activeRun, 'failed');
@@ -2783,7 +2841,9 @@ export async function runDiscordHarnessConversation(opts: {
 
   let handle: DiscordHarnessReplyHandle;
   try {
-    handle = await transport.sendInitial('🍊 starting…');
+    handle = await transport.sendInitial(
+      progressPresentation === 'quiet' ? '🍊 working…' : '🍊 starting…',
+    );
   } catch (err) {
     // Couldn't even post the placeholder — nothing we can do from
     // here live; persist private diagnostics plus one stable terminal so
@@ -2819,7 +2879,14 @@ export async function runDiscordHarnessConversation(opts: {
     return;
   }
 
-  const state: DisplayState = { summary: '', status: 'starting', done: false, toolsCalled: [], toolCount: 0 };
+  const state: DisplayState = {
+    summary: '',
+    status: progressPresentation === 'quiet' ? 'working…' : 'starting',
+    done: false,
+    progressPresentation,
+    toolsCalled: [],
+    toolCount: 0,
+  };
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
   // Track which approval the LAST flush attached buttons for, so a
@@ -2846,7 +2913,8 @@ export async function runDiscordHarnessConversation(opts: {
 
   // Extract clean reply/plan text from the structured-output JSON stream
   // (raw deltas are JSON — see stream-reply.ts).
-  const liveTextStreaming = shouldStreamLiveTextToMessage(channel);
+  const liveTextStreaming = progressPresentation !== 'quiet'
+    && shouldStreamLiveTextToMessage(channel);
   const onChunk = createJsonFieldStreamer(['reply', 'objective', 'action'], (delta: string): void => {
     if (!liveTextStreaming) return;
     streamBuffer += delta;
@@ -2892,7 +2960,9 @@ export async function runDiscordHarnessConversation(opts: {
       })) {
         lastExpiryCheckInAt = Date.now();
         const tools = state.toolCount ?? 0;
-        const headline = `🍊 still working on this (${tools} tool${tools === 1 ? '' : 's'} so far)…`;
+        const headline = state.progressPresentation === 'quiet'
+          ? '🍊 still working…'
+          : `🍊 still working on this (${tools} tool${tools === 1 ? '' : 's'} so far)…`;
         try {
           await transport.sendFollowup!(headline);
         } catch (err) {
@@ -3491,6 +3561,7 @@ async function runDiscordHarnessResume(opts: {
     // interactions in this channel target the now-active session.
     bindDiscordHarnessSession({ channelId, sessionId });
   }
+  const progressPresentation = progressPresentationForSession(sessionId);
 
   if (opts.durableRequest) {
     const displayText = opts.userText?.trim()
@@ -3545,6 +3616,7 @@ async function runDiscordHarnessResume(opts: {
       data: {
         text: displayText,
         displayText,
+        progressPresentation,
         ...(!opts.userText ? { synthetic: true } : {}),
         source: 'channel_approval_resume',
         decision,
@@ -3586,7 +3658,11 @@ async function runDiscordHarnessResume(opts: {
   let handle: DiscordHarnessReplyHandle;
   try {
     handle = await transport.sendInitial(
-      decision === 'approve' ? '🍊 approved — resuming…' : '🍊 rejected — winding down…',
+      progressPresentation === 'quiet'
+        ? '🍊 working…'
+        : decision === 'approve'
+          ? '🍊 approved — resuming…'
+          : '🍊 rejected — winding down…',
     );
   } catch (err) {
     try {
@@ -3621,8 +3697,13 @@ async function runDiscordHarnessResume(opts: {
 
   const state: DisplayState = {
     summary: '',
-    status: decision === 'approve' ? 'resuming after approval' : 'cancelling',
+    status: progressPresentation === 'quiet'
+      ? 'working…'
+      : decision === 'approve'
+        ? 'resuming after approval'
+        : 'cancelling',
     done: false,
+    progressPresentation,
     toolsCalled: [],
     toolCount: 0,
   };
@@ -3633,7 +3714,10 @@ async function runDiscordHarnessResume(opts: {
   let streamBuffer = '';
   let pendingStreamFlush: NodeJS.Timeout | null = null;
 
+  const liveTextStreaming = progressPresentation !== 'quiet'
+    && shouldStreamLiveTextToMessage(channel);
   const onChunk = createJsonFieldStreamer(['reply', 'objective', 'action'], (delta: string): void => {
+    if (!liveTextStreaming) return;
     streamBuffer += delta;
     if (pendingStreamFlush) return;
     pendingStreamFlush = setTimeout(() => {
@@ -3885,6 +3969,12 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
   const data = event.data ?? {};
   switch (event.type) {
     case 'turn_started': {
+      if (!state.turnStartedAt) state.turnStartedAt = Date.now();
+      if (state.progressPresentation === 'quiet') {
+        state.currentAgent = undefined;
+        state.status = 'working…';
+        return;
+      }
       // role on a turn_started event is the agent that's starting
       // (Orchestrator, Researcher, Executor, Writer, etc.). Surface it
       // so the user sees who's running.
@@ -3893,10 +3983,16 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
         : '';
       if (role) state.currentAgent = role;
       state.status = 'thinking…';
-      if (!state.turnStartedAt) state.turnStartedAt = Date.now();
       return;
     }
     case 'tool_called': {
+      // Inner gateway rows remain in the durable event stream for diagnostics,
+      // but `accounting=transport_mirror` is explicitly not a second logical
+      // user action. Discord and Slack share this state reducer, so filtering
+      // at the presentation edge prevents both double-counting and wrapper
+      // internals replacing useful progress copy.
+      if (!isCanonicalTopLevelToolEvent(event, 'tool_called')) return;
+      if (state.progressPresentation === 'quiet') return;
       const tool = String(data.tool ?? data.name ?? 'tool');
       // Richer status line: "running: pwd && ls -la" vs the bare
       // "using run_shell_command". During a skill execution the agent
@@ -3908,18 +4004,23 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       // can't extract anything useful, it returns the bare tool name
       // — in that fallback case we still prepend "using " so the
       // user reads it as an in-progress action instead of a noun.
-      const preview = previewToolCall(tool, data.arguments);
+      const projectedProgress = typeof data.progress === 'string'
+        ? data.progress.replace(/\s+/g, ' ').trim().slice(0, 110)
+        : '';
+      const preview = projectedProgress || previewToolCall(tool, data.arguments);
       state.status = preview === tool ? `using ${tool}` : preview;
       state.toolsCalled.push(tool);
       state.toolCount += 1;
       return;
     }
     case 'handoff': {
+      if (state.progressPresentation === 'quiet') return;
       const to = String(data.to ?? data.target ?? 'sub-agent');
       state.status = `→ ${to}`;
       return;
     }
     case 'turn_ended': {
+      if (state.progressPresentation === 'quiet') return;
       // Each agent turn's output lands here. For sub-agents
       // (Researcher / Writer / Executor / etc.) that don't define an
       // outputType, `output` is the agent's plain-text reply — which
@@ -3935,6 +4036,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       return;
     }
     case 'conversation_step': {
+      if (state.progressPresentation === 'quiet') return;
       const decision = (data.decision ?? null) as { summary?: string; reply?: string | null } | null;
       // Prefer reply (user-facing text) over summary (META log). Without
       // this, a step's META summary leaks into state.summary and survives
@@ -4021,7 +4123,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       return;
     }
     case 'run_resumed': {
-      state.status = 'resuming';
+      state.status = state.progressPresentation === 'quiet' ? 'working…' : 'resuming';
       return;
     }
     case 'guardrail_tripped': {

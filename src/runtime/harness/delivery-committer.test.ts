@@ -157,6 +157,59 @@ test('invalid status/presentation combinations and narrated control text fail cl
     ].join('\n'))),
     UnsafePresentationError,
   );
+
+  assert.throws(
+    () => presentationEventForOutcome(answer(
+      'unsafe-compact',
+      'done=true  \nnextAction=completed  \nReconciliation is unnecessary.',
+    )),
+    UnsafePresentationError,
+  );
+
+  const rawJsonEnvelope = JSON.stringify({
+    summary: 'Reconciliation is unnecessary.',
+    reply: 'Reconciliation is unnecessary.',
+    done: true,
+    nextAction: 'completed',
+    reason: null,
+  });
+  assert.throws(
+    () => presentationEventForOutcome(answer('unsafe-json-envelope', rawJsonEnvelope)),
+    UnsafePresentationError,
+    'the typed write boundary rejects the same whole JSON envelope as legacy projection',
+  );
+
+  assert.equal(
+    presentationEventForOutcome(answer(
+      'safe-natural-language',
+      'The job is done. Next action: review tomorrow.',
+    )).text,
+    'The job is done. Next action: review tomorrow.',
+  );
+
+  const assignmentResult = 'summary = "Sales grew 5%"\nreason = "Higher conversion"';
+  assert.equal(
+    presentationEventForOutcome(answer('safe-assignment-result', assignmentResult)).text,
+    assignmentResult,
+  );
+
+  const configExample = '```ini\ndone=true\nnextAction=completed\n```';
+  assert.equal(
+    presentationEventForOutcome(answer('safe-config-example', configExample)).text,
+    configExample,
+  );
+
+  const prefixedJson = `Example config:\n${rawJsonEnvelope}`;
+  assert.equal(
+    presentationEventForOutcome(answer('safe-prefixed-json-example', prefixedJson)).text,
+    prefixedJson,
+  );
+
+  const fencedJson = `\`\`\`json\n${rawJsonEnvelope}\n\`\`\``;
+  assert.equal(
+    presentationEventForOutcome(answer('safe-fenced-json-example', fencedJson)).text,
+    fencedJson,
+  );
 });
 
 test('approval outcome requires and preserves an exact approval id', () => {

@@ -4,7 +4,51 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractApprovalContentPreview, describeWorkflowStepAction, presentApproval } from './approval-summary.js';
+import {
+  extractApprovalContentPreview,
+  describeWorkflowStepAction,
+  presentApproval,
+  previewToolCall,
+} from './approval-summary.js';
+
+test('previewToolCall projects a call_tool carrier as its canonical inner action', () => {
+  assert.equal(previewToolCall('call_tool', JSON.stringify({
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({
+      tool_slug: 'GOOGLESHEETS_BATCH_GET',
+      arguments: JSON.stringify({ spreadsheet_id: 'sheet-fixture', ranges: ['Log!A1:I10'] }),
+    }),
+  })), 'composio · GOOGLESHEETS_BATCH_GET');
+
+  assert.equal(previewToolCall('call_tool', {
+    name: 'run_shell_command',
+    args_json: JSON.stringify({ command: 'pwd && ls' }),
+  }), 'running: pwd && ls');
+
+  assert.equal(previewToolCall('call_tool', {
+    name: 'workflow_get',
+    args_json: JSON.stringify({ workflow_id: 'workspace-cadence' }),
+  }), 'using workflow_get');
+});
+
+test('previewToolCall safely degrades malformed and recursively nested call_tool carriers', () => {
+  assert.equal(previewToolCall('call_tool', {
+    name: 'composio_execute_tool',
+    args_json: '{not-json',
+  }), 'using composio_execute_tool');
+  assert.equal(previewToolCall('call_tool', {
+    name: 'call_tool',
+    args_json: JSON.stringify({
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_GET_VALUES' }),
+    }),
+  }), 'composio · GOOGLESHEETS_GET_VALUES');
+  assert.equal(previewToolCall('call_tool', { args_json: '{}' }), 'call_tool');
+  assert.equal(previewToolCall('call_tool', {
+    name: 'call_tool',
+    args_json: JSON.stringify({ name: 'call_tool', args_json: '{}' }),
+  }), 'call_tool');
+});
 
 test('extractApprovalContentPreview: pulls caption + image from a social-post tool call', () => {
   const p = extractApprovalContentPreview('composio_execute_tool', {

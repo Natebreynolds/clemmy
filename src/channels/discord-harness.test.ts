@@ -13,11 +13,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { EventRow } from '../runtime/harness/eventlog.js';
+import { projectHarnessEventForPublic } from '../runtime/harness/public-presentation.js';
 import {
   applyEventToState,
   isContinueCompletionReason,
   parseApprovalIntent,
   parseHarnessCommand,
+  progressPresentationForPrompt,
   toDiscordMarkdown,
   __test__,
   type DisplayState,
@@ -77,6 +79,117 @@ test('tool_called → "using <name>" when args missing', () => {
   applyEventToState(event('tool_called', { tool: 'read_file' }), s);
   assert.equal(s.status, 'using read_file');
   assert.equal(s.done, false);
+});
+
+test('transport-mirror tool events stay observable without narrating or double-counting them', () => {
+  const s = freshState();
+  applyEventToState(event('tool_called', {
+    tool: 'call_tool',
+    accounting: 'top_level',
+    canonicalCallId: 'call-workspace-cadence',
+  }), s);
+  assert.equal(s.status, 'using call_tool');
+  assert.equal(s.toolCount, 1);
+
+  applyEventToState(event('tool_called', {
+    tool: 'composio_execute_tool',
+    accounting: 'transport_mirror',
+    canonicalCallId: 'call-workspace-cadence',
+    arguments: JSON.stringify({ tool_slug: 'GOOGLESHEETS_GET_VALUES' }),
+  }), s);
+
+  assert.equal(s.status, 'using call_tool', 'the inner transport copy must not replace public progress');
+  assert.deepEqual(s.toolsCalled, ['call_tool']);
+  assert.equal(s.toolCount, 1, 'one logical action has one public count');
+});
+
+test('channel progress stays generic for unvalidated carrier names and slugs', () => {
+  const rawSecretName = event('tool_called', {
+    tool: 'call_tool',
+    accounting: 'top_level',
+    canonicalCallId: 'call-workspace-cadence',
+    arguments: JSON.stringify({
+      name: 'customer-secret-123',
+      args_json: '{}',
+    }),
+  });
+  const projectedName = projectHarnessEventForPublic(rawSecretName);
+  assert.ok(projectedName);
+  assert.equal('arguments' in projectedName.data, false, 'provider arguments remain private');
+  assert.equal(projectedName.data.progress, 'using call_tool');
+
+  const rawSecretSlug = event('tool_called', {
+    tool: 'call_tool',
+    accounting: 'top_level',
+    canonicalCallId: 'call-workspace-cadence-2',
+    arguments: JSON.stringify({
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({
+        tool_slug: 'customer-secret-456',
+        arguments: JSON.stringify({
+          spreadsheet_id: 'sheet-fixture',
+          ranges: ['Private Ledger!A1:I10'],
+        }),
+      }),
+    }),
+  });
+  const projectedSlug = projectHarnessEventForPublic(rawSecretSlug);
+  assert.ok(projectedSlug);
+  assert.equal(projectedSlug.data.progress, 'using call_tool');
+
+  const s = freshState();
+  applyEventToState(projectedName, s);
+  applyEventToState(projectedSlug, s);
+  assert.equal(s.status, 'using call_tool');
+  assert.equal(s.toolCount, 2);
+  assert.doesNotMatch(
+    JSON.stringify(s),
+    /customer-secret-123|customer-secret-456|sheet-fixture|Private Ledger/,
+  );
+});
+
+test('explicit no-narration language selects quiet request-scoped progress', () => {
+  assert.equal(progressPresentationForPrompt(
+    'Do not narrate your plan or tool calls. Return only the verified answer, evidence used, and any genuine blocker.',
+  ), 'quiet');
+  assert.equal(progressPresentationForPrompt('Keep me updated and show your progress as you work.'), 'compact');
+  assert.equal(progressPresentationForPrompt('Find the latest verified workflow run.'), 'compact');
+  assert.equal(progressPresentationForPrompt('Do not guess. Find the latest verified workflow run.'), 'compact');
+  assert.equal(progressPresentationForPrompt(
+    'Do not narrate tool calls, but keep me updated with progress.',
+  ), 'compact', 'an explicit request for updates wins conflicting wording');
+});
+
+test('quiet progress suppresses tool/step narration but preserves approval and final authority', () => {
+  const s: DisplayState = {
+    ...freshState(),
+    progressPresentation: 'quiet',
+    status: 'working…',
+  };
+  applyEventToState(event('tool_called', { tool: 'tool_search', accounting: 'top_level' }), s);
+  applyEventToState(event('handoff', { to: 'Researcher' }), s);
+  applyEventToState(event('conversation_step', {
+    step: 2,
+    decision: { reply: 'I am checking another source.' },
+  }), s);
+  assert.equal(s.status, 'working…');
+  assert.equal(s.summary, '');
+  assert.equal(s.toolCount, 0);
+
+  applyEventToState(event('approval_requested', {
+    subject: 'send the verified report',
+    approvalId: 'apr-quiet',
+  }), s);
+  assert.equal(s.done, true);
+  assert.match(s.summary, /Approval required: send the verified report/);
+
+  const finalState: DisplayState = {
+    ...freshState(),
+    progressPresentation: 'quiet',
+  };
+  applyEventToState(event('conversation_completed', { reply: 'Verified answer only.' }), finalState);
+  assert.equal(finalState.done, true);
+  assert.equal(finalState.summary, 'Verified answer only.');
 });
 
 test('tool_called → rich preview when args extract a useful field', () => {
@@ -609,6 +722,20 @@ test('renderBody: while streaming, shows a tail of the reply below the status li
   const body = __test__.renderBody(state);
   assert.match(body, /drafting/, 'status line still present');
   assert.match(body, /The answer is forming nicely\./, 'streamed reply is shown');
+});
+
+test('renderBody: quiet progress reveals no agent, tool, context, or streaming text', () => {
+  const state: DisplayState = {
+    ...freshState(),
+    progressPresentation: 'quiet',
+    currentAgent: 'Researcher',
+    status: 'composio · GOOGLESHEETS_BATCH_GET',
+    summary: 'I am checking the next range now.',
+    toolsCalled: ['call_tool'],
+    toolCount: 8,
+    contextPct: 72,
+  };
+  assert.equal(__test__.renderBody(state), '_working…_');
 });
 
 test('createDiscordBridgeChunkStreamer: extracts structured harness JSON instead of flashing raw braces', () => {

@@ -180,6 +180,7 @@ export function deriveAssistantStatus(state: DisplayState): string {
   if ((state.pendingApprovalIds && state.pendingApprovalIds.length > 0) || state.pendingApprovalId) {
     return 'is waiting for your approval…';
   }
+  if (state.progressPresentation === 'quiet') return 'is working…';
   const agent = (state.currentAgent ?? '').trim();
   const detail = (state.status ?? '').trim();
   const lastTool = state.toolsCalled && state.toolsCalled.length > 0
@@ -205,6 +206,7 @@ export function deriveAssistantStatus(state: DisplayState): string {
  * runner's per-second "still working" pulses into nothing — no flicker.
  */
 export function renderAssistantProgress(state: DisplayState): string {
+  if (state.progressPresentation === 'quiet') return '🍊 *Clem is working…*';
   const agent = (state.currentAgent ?? '').trim();
   const detail = (state.status ?? '').trim() || 'working…';
   const tools = (state.toolsCalled ?? []).map(prettyTool).filter(Boolean).slice(-8);

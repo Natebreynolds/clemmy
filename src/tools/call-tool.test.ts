@@ -28,7 +28,12 @@ const {
   _setCodeModeMcpResolverForTests,
 } = await import('./code-mode-tool.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-const { withHarnessRunContext, ToolCallsCounter, wrapToolForHarness } = await import('../runtime/harness/brackets.js');
+const {
+  withHarnessRunContext,
+  ToolCallsCounter,
+  ToolCallsLimitExceeded,
+  wrapToolForHarness,
+} = await import('../runtime/harness/brackets.js');
 const { getHotSet, _resetHotSetForTest } = await import('../agents/tool-hotset.js');
 const { resetEventLog, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const { getLocalToolSchemas } = await import('./local-runtime-tools.js');
@@ -182,6 +187,180 @@ test('unknown deferred arguments are rejected instead of silently stripped befor
 test('invalid JSON in args_json returns arg_validation with no dispatch', async () => {
   const out = JSON.parse(String(await invokeCallTool('sess-json', 'composio_execute_tool', '{not json')));
   assert.equal(out.error, 'arg_validation');
+});
+
+test('a wrapped write-shaped carrier rejection records typed no-dispatch instead of an orphan', async () => {
+  const previous = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  let providerDispatches = 0;
+  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      providerDispatches += 1;
+      return 'provider must remain untouched';
+    },
+  }]]));
+  const wrapped = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
+  ) as unknown as ToolLike;
+
+  try {
+    const rawOutput = await withHarnessRunContext(
+      { sessionId: session.id, counter: new ToolCallsCounter(10), sourceUserSeq: 41 },
+      () => wrapped.invoke!(
+        { context: { sessionId: session.id } },
+        JSON.stringify({
+          name: 'composio_execute_tool',
+          // Exact live failure shape: these are provider-action fields, not
+          // composio_execute_tool's carrier fields (tool_slug/arguments).
+          args_json: JSON.stringify({
+            slug: 'GOOGLESHEETS_BATCH_GET',
+            args: { spreadsheet_id: 'sheet-fixture', ranges: ['Log!A1:I10'] },
+          }),
+        }),
+        { toolCall: { callId: 'call-workspace-cadence-invalid-carrier' } },
+      ) as Promise<unknown>,
+    );
+    assert.equal(typeof rawOutput, 'string', 'the local proof is unwrapped before crossing the tool ABI');
+    const output = String(rawOutput);
+
+    assert.match(output, /arg_validation/);
+    assert.match(output, /non-empty tool_slug/);
+    assert.equal(providerDispatches, 0, 'validation stops before the provider boundary');
+    const failed = listEvents(session.id, { types: ['external_write_failed'] });
+    assert.equal(failed.length, 1, 'the canonical attempt receives one retry-safe settlement');
+    assert.equal(failed[0]?.data.callId, 'call-workspace-cadence-invalid-carrier');
+    assert.equal(failed[0]?.data.sourceUserSeq, 41, 'settlement remains owned by the accepted request');
+    assert.equal(failed[0]?.data.dispatch, 'not_started');
+    assert.equal(failed[0]?.data.effect, 'none');
+    assert.equal(listEvents(session.id, { types: ['external_write'] }).length, 0, 'the carrier creates no outer reservation');
+    assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0);
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (previous === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = previous;
+  }
+});
+
+test('an exhausted write-shaped carrier hard-stops without manufacturing no-dispatch evidence', async () => {
+  const previous = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const counter = new ToolCallsCounter(1);
+  counter.increment();
+  let providerDispatches = 0;
+  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      providerDispatches += 1;
+      return 'provider must remain untouched';
+    },
+  }]]));
+  const wrapped = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
+  ) as unknown as ToolLike;
+
+  try {
+    await assert.rejects(
+      () => withHarnessRunContext(
+        { sessionId: session.id, counter, sourceUserSeq: 42 },
+        () => wrapped.invoke!(
+          { context: { sessionId: session.id } },
+          JSON.stringify({
+            name: 'composio_execute_tool',
+            args_json: JSON.stringify({
+              slug: 'GOOGLESHEETS_BATCH_GET',
+              args: { spreadsheet_id: 'sheet-fixture', ranges: ['Log!A1:I10'] },
+            }),
+          }),
+          { toolCall: { callId: 'call-workspace-cadence-counter-exhausted' } },
+        ) as Promise<unknown>,
+      ),
+      ToolCallsLimitExceeded,
+    );
+    assert.equal(counter.calls, 1, 'a refused over-limit call cannot spend past the ceiling');
+    assert.equal(providerDispatches, 0, 'the provider boundary is never reached');
+    assert.equal(
+      listEvents(session.id, { types: ['external_write_failed'] }).length,
+      0,
+      'a turn-level safety ceiling is not misreported as an ordinary carrier refusal',
+    );
+    assert.equal(listEvents(session.id, { types: ['external_write'] }).length, 0);
+    assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0);
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (previous === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = previous;
+  }
+});
+
+test('an ambiguous reached write produces one inner orphan and no outer carrier duplicate', async () => {
+  const previous = {
+    brackets: process.env.HARNESS_TOOL_BRACKETS,
+    confirm: process.env.CLEMMY_CONFIRM_FIRST,
+    execution: process.env.CLEMMY_EXECUTION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  let providerDispatches = 0;
+  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      providerDispatches += 1;
+      return JSON.stringify({ error: 'provider response lost after dispatch' });
+    },
+  }]]));
+  const wrapped = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
+  ) as unknown as ToolLike;
+  const outerCallId = 'call-workspace-cadence-ambiguous-provider';
+
+  try {
+    const output = String(await withHarnessRunContext(
+      { sessionId: session.id, counter: new ToolCallsCounter(10), sourceUserSeq: 43 },
+      () => wrapped.invoke!(
+        { context: { sessionId: session.id } },
+        JSON.stringify({
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: 'GOOGLESHEETS_VALUES_UPDATE',
+            arguments: JSON.stringify({
+              spreadsheet_id: 'sheet-fixture',
+              range: 'Summary!A1',
+              values: [['August']],
+            }),
+          }),
+        }),
+        { toolCall: { callId: outerCallId } },
+      ) as Promise<unknown>,
+    ));
+
+    assert.match(output, /provider response lost after dispatch/);
+    assert.equal(providerDispatches, 1, 'the negative control must cross the provider boundary');
+    const attempts = listEvents(session.id, { types: ['external_write'] });
+    const orphans = listEvents(session.id, { types: ['external_write_orphaned'] });
+    assert.equal(attempts.length, 1, 'only the validated inner write owns a reservation');
+    assert.equal(orphans.length, 1, 'provider ambiguity remains fail-closed');
+    assert.equal(attempts[0]?.data.toolName, 'composio_execute_tool');
+    assert.equal(orphans[0]?.data.toolName, 'composio_execute_tool');
+    assert.equal(orphans[0]?.data.callId, attempts[0]?.data.callId, 'the inner attempt settles by exact id');
+    assert.notEqual(orphans[0]?.data.callId, outerCallId, 'call_tool must not author a second lifecycle');
+    assert.equal(listEvents(session.id, { types: ['external_write_failed'] }).length, 0);
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (previous.brackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = previous.brackets;
+    if (previous.confirm === undefined) delete process.env.CLEMMY_CONFIRM_FIRST;
+    else process.env.CLEMMY_CONFIRM_FIRST = previous.confirm;
+    if (previous.execution === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
+    else process.env.CLEMMY_EXECUTION_GATE = previous.execution;
+  }
 });
 
 test('deferred validation accepts omitted optional keys as well as strict-mode nulls', () => {
@@ -783,8 +962,8 @@ test('nested call_tool dispatch reuses the ambient run counter', async () => {
       async () => {
         assert.equal(String(await invoke()), 'rows');
         assert.equal(counter.calls, 1, 'the inner call consumes the ambient budget');
-        const refused = String(await invoke());
-        assert.match(refused, /tool call refused by harness|tool.call limit|exceeded/i);
+        await assert.rejects(invoke, ToolCallsLimitExceeded);
+        await assert.rejects(invoke, ToolCallsLimitExceeded);
         assert.equal(counter.calls, 1, 'a refused nested call cannot reset or consume past the shared limit');
       },
     );
@@ -827,12 +1006,14 @@ test('malformed outer call_tool envelopes consume budget and hit the loop ceilin
         assert.match(output, /invalid|error/i);
         assert.equal(counter.calls, index + 1, 'each SDK-rejected envelope consumes one attempt');
       }
-      const bounded = String(await wrapped.invoke!(
-        { context: { sessionId: session.id } },
-        '{',
-        { toolCall: { callId: 'malformed-outer-over-limit' } },
-      ));
-      assert.match(bounded, /tool call refused by harness|tool.call limit|exceeded/i);
+      await assert.rejects(
+        () => wrapped.invoke!(
+          { context: { sessionId: session.id } },
+          '{',
+          { toolCall: { callId: 'malformed-outer-over-limit' } },
+        ),
+        ToolCallsLimitExceeded,
+      );
       assert.equal(counter.calls, 3, 'the ceiling refuses without spending past its cap');
     },
   );
@@ -874,8 +1055,8 @@ test('a harness-wrapped call_tool charges the ambient budget exactly ONCE per de
 test('a FAILING call_tool dispatch still charges the budget — no zero-cost retry loop', async () => {
   // Round-2 regression: the wrapper exemption must not exempt the failure
   // paths (refusals return before the inner dispatch, which is what normally
-  // charges). Each refused invocation costs exactly 1, and the ceiling still
-  // throws once exhausted.
+  // charges). Each ordinary refusal costs exactly 1, then the hard ceiling
+  // terminates every later attempt instead of returning zero-cost results.
   const counter = new ToolCallsCounter(2);
   const wrapped = wrapToolForHarness(
     buildCallTool({ reachableBuiltinNames: new Set() }) as never,
@@ -892,8 +1073,8 @@ test('a FAILING call_tool dispatch still charges the budget — no zero-cost ret
       assert.equal(counter.calls, 1, 'a refused dispatch costs exactly one call');
       assert.equal(JSON.parse(String(await invoke())).error, 'not_reachable');
       assert.equal(counter.calls, 2);
-      const third = String(await invoke());
-      assert.match(third, /tool call refused by harness|tool.call limit|exceeded/i, 'the ceiling still bounds a failing loop');
+      await assert.rejects(invoke, ToolCallsLimitExceeded);
+      await assert.rejects(invoke, ToolCallsLimitExceeded);
       assert.equal(counter.calls, 2, 'the ceiling refuses without further spend');
     },
   );

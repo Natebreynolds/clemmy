@@ -234,7 +234,7 @@ const __rpc = (method, args) => new Promise((resolve, reject) => {
 });
 // clem.<toolName>(args) → one gated tool call, dispatched by the parent.
 const clem = new Proxy({}, { get: (_t, prop) => (args) => __rpc(String(prop), args) });
-(async () => {
+const __run = async () => {
   let __payload;
   try {
     const __ret = await (async () => { ${userProgram}\n })();
@@ -251,7 +251,13 @@ const clem = new Proxy({}, { get: (_t, prop) => (args) => __rpc(String(prop), ar
   const __done = () => process.exit(0);
   setTimeout(__done, 5000).unref?.();
   process.stdout.write(__payload, __done);
-})();
+};
+// Startup is not program idleness. Tell the parent only after the sandbox
+// runtime and its RPC stdio are initialized, and do not execute model-authored
+// code until that ordered protocol frame has flushed to the pipe. The parent
+// starts its idle deadline from this frame; the independent hard ceiling still
+// covers a loader/runtime that never becomes ready.
+process.stdout.write(JSON.stringify({ __cm: 'ready' }) + '\\n', __run);
 `;
 }
 
@@ -386,15 +392,19 @@ export async function runCodeModeProgram(
     // "legitimately waiting on a slow dispatch" (e.g. a 30-60s sub-agent).
     let inFlight = 0;
 
-    // Two deadlines: a HARD ceiling, and an IDLE deadline that resets on any
-    // observable activity (RPC traffic, progress, stderr). A program actively
-    // completing calls runs up to the ceiling; a wedged one dies in ~idleMs.
+    // Two deadlines: a HARD ceiling starts at spawn and covers sandbox startup,
+    // while the IDLE deadline starts only after the child explicitly reports
+    // that its runtime/RPC stdio are ready. Loader contention is not user-code
+    // idleness; a child that never becomes ready is still bounded by the hard
+    // ceiling. Once ready, observable activity (RPC traffic, progress, stderr)
+    // resets the idle deadline.
     const ceilingTimer = setTimeout(() => {
       finish({ ok: false, error: `code-mode program exceeded the ${timeoutMs}ms ceiling and was killed`, rpcCalls, logs, partial: partialOnFailure() });
     }, timeoutMs);
+    let ready = false;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
     const touchActivity = (): void => {
-      if (idleMs <= 0 || settled) return;
+      if (!ready || idleMs <= 0 || settled) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         if (settled) return;
@@ -405,7 +415,6 @@ export async function runCodeModeProgram(
         finish({ ok: false, error: `code-mode program was idle for ${idleMs}ms (no tool activity) and was killed`, rpcCalls, logs, partial: partialOnFailure() });
       }, idleMs);
     };
-    touchActivity();
     const dispatchQueue: Array<() => void> = [];
     // After finish(), NOTHING new may start: a queued write dispatched post-kill
     // would be a real side effect the (dead) program can never observe. Pending
@@ -433,7 +442,14 @@ export async function runCodeModeProgram(
         if (!line) continue;
         let msg: { __cm?: string; id?: number; method?: string; args?: unknown; value?: unknown; error?: string };
         try { msg = JSON.parse(line); } catch { continue; }
-        if (msg.__cm === 'rpc' && typeof msg.id === 'number' && typeof msg.method === 'string') {
+        if (msg.__cm === 'ready') {
+          // The generated child emits this exactly once. Ignore duplicates so a
+          // malformed/custom runtime cannot extend its idle budget for free.
+          if (!ready) {
+            ready = true;
+            touchActivity();
+          }
+        } else if (msg.__cm === 'rpc' && typeof msg.id === 'number' && typeof msg.method === 'string') {
           touchActivity();
           // clem.progress('…') — host-handled narration, never a tool dispatch;
           // doesn't count against the RPC budget (it IS the liveness signal).

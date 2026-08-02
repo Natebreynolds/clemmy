@@ -9,9 +9,32 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { runCodeModeProgram, cleanCodeModeStderr, type CodeModeDispatch } from './code-mode-sandbox.js';
 
 const noDispatch: CodeModeDispatch = async () => null;
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** A real executable shim lets the test delay the child *before* Node, the
+ * blocker, and program stdio initialize. That is the production race: under a
+ * loaded suite, spawn-to-first-RPC can exceed a small idle window even though
+ * the user program itself is healthy. */
+function makeDelayedNodeShim(delaySeconds: number): { nodeBin: string; cleanup: () => void } {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-codemode-startup-'));
+  const nodeBin = path.join(dir, 'delayed-node');
+  writeFileSync(
+    nodeBin,
+    `#!/bin/sh\nsleep ${delaySeconds}\nexec ${shellQuote(process.execPath)} "$@"\n`,
+    { encoding: 'utf8', mode: 0o700 },
+  );
+  chmodSync(nodeBin, 0o700);
+  return { nodeBin, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
 
 test('happy path: a program calls clem.<tool> over RPC and returns a distilled value', async () => {
   const dispatch: CodeModeDispatch = async (method, args) => {
@@ -306,6 +329,42 @@ test('failure breaker: intervening successes reset the count — a probe-and-mis
 });
 
 // ─── Strategic-wave Track 4: partial results, idle deadline, progress, concurrency ───
+
+test('idle deadline starts at child ready, not spawn (delayed sandbox startup is healthy)', {
+  skip: process.platform === 'win32' ? 'delayed executable shim requires POSIX /bin/sh' : false,
+}, async () => {
+  const shim = makeDelayedNodeShim(0.35);
+  try {
+    const r = await runCodeModeProgram(
+      'return "ready-after-startup";',
+      noDispatch,
+      // Startup deliberately exceeds idle by >3x. Pre-fix this deterministically
+      // died at 100ms; after the ready handshake, only user-program idle counts.
+      { nodeBin: shim.nodeBin, timeoutMs: 5_000, idleTimeoutMs: 100 },
+    );
+    assert.equal(r.ok, true, `startup time must not consume the idle budget (got: ${r.error ?? 'ok'})`);
+    assert.equal(r.value, 'ready-after-startup');
+  } finally {
+    shim.cleanup();
+  }
+});
+
+test('hard ceiling still starts at spawn when the sandbox never becomes ready in time', {
+  skip: process.platform === 'win32' ? 'delayed executable shim requires POSIX /bin/sh' : false,
+}, async () => {
+  const shim = makeDelayedNodeShim(0.35);
+  try {
+    const r = await runCodeModeProgram(
+      'return "too-late";',
+      noDispatch,
+      { nodeBin: shim.nodeBin, timeoutMs: 100, idleTimeoutMs: 25 },
+    );
+    assert.equal(r.ok, false, 'startup remains bounded even before the ready handshake');
+    assert.match(r.error ?? '', /100ms ceiling/, 'hard ceiling, not pre-ready idle, owns startup timeout');
+  } finally {
+    shim.cleanup();
+  }
+});
 
 test('partial results: a program killed mid-run returns what its completed calls produced', async () => {
   let n = 0;
