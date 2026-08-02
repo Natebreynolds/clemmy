@@ -261,7 +261,12 @@ const ALWAYS_READ = new Set<string>([
   'task_list',
   'execution_list',
   'execution_get',
-  'execution_create',
+  // `execution_create` is deliberately NOT here. Listing and fetching an
+  // execution are reads; CREATING one mints the durable mutation authority that
+  // later external writes point at to prove they were wrapped. Calling that a
+  // read told every telemetry and guardrail consumer the lane was free to open.
+  // It stays in NEVER_GATE_LOCAL_MEMORY above, so honest classification does not
+  // turn the gate's own escape hatch into an approval prompt.
   'goal_list',
   'tool_choice_recall',
   'user_profile_read',

@@ -146,7 +146,20 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'dispatch_background_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', description: 'Hand an AGREED, multi-step task to the reliable background runner (fire-and-forget).' },
   { name: 'draft_plan', sideEffect: 'read', tier: 'core', lanes: [], description: 'Draft a structured plan for multi-step work before executing it.' },
   { name: 'execution_complete', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', description: 'Mark a tracked execution complete after its criteria are verified. Args: id, summary.' },
-  { name: 'execution_create', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'full-extra', description: 'Create a tracked execution lane for multi-step or mutating external work.' },
+  // Creating an execution lane MINTS DURABLE MUTATION AUTHORITY: it is the
+  // record that later external writes point at to prove they were wrapped. A
+  // 'read' classification told every telemetry and guardrail consumer that
+  // opening that authority costs nothing, so a spinning turn could mint lanes
+  // freely and none of it read as mutating work. Classify it honestly as a
+  // write, with the same two overrides call_tool documents above:
+  //   needsApproval FALSE — this tool is the ESCAPE from the execution gate
+  //     (execution-gate.ts EXEMPT_TOOL_NAMES). Approval belongs to the effects
+  //     performed INSIDE the lane, never to opening it; gating it here would
+  //     deadlock every tracked execution and reintroduce a confirmation beat.
+  //   loopClass 'mutating' — repeating it does not corrupt a provider, but it
+  //     mints duplicate authority records, which is exactly the repetition the
+  //     tight guardrail thresholds exist to catch.
+  { name: 'execution_create', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'full-extra', needsApproval: false, loopClass: 'mutating', description: 'Create a tracked execution lane for multi-step or mutating external work.' },
   { name: 'execution_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', description: 'Fetch one execution by id with full context (objective, plan, next step, success criteria…' },
   { name: 'execution_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', description: 'List executions for inspection.' },
   { name: 'execution_mark_blocked', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', description: 'Mark an execution as blocked with a concrete blocker description.' },

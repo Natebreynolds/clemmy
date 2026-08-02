@@ -190,7 +190,9 @@ test('ERROR: source with no backend blocks the save', () => {
     slug: 'nob', dataSources: [{ id: 'pull' }], actions: [],
   });
   assert.equal(prep.ok, false);
-  assert.match(prep.errors.join(' '), /neither a runner nor a composio_slug/);
+  // The corrective must name all THREE supported backends, not two.
+  assert.match(prep.errors.join(' '), /declares no backend/);
+  assert.match(prep.errors.join(' '), /cli_argv/);
 });
 
 test('ERROR: runner file that is not on disk blocks the save', () => {
@@ -292,4 +294,51 @@ test('ERROR: action with no backend blocks the save', () => {
   });
   assert.equal(prep.ok, false);
   assert.match(prep.errors.join(' '), /neither a composio_slug nor a runner/);
+});
+
+// --- cli_argv schema/runtime parity ------------------------------------------
+// space_save advertises and parses data_sources[].cli_argv,
+// workspaceDataSourceSafetyError deliberately admits it, and runSource executes
+// it — but only behind the exact-argv trust grant. checkSpaceForWrite used to
+// recognise only runner|composio_slug, so a fully valid frozen CLI declaration
+// was rejected as having no backend and could never reach its one-time,
+// digest-bound approval. These fail against v3.6.2.
+
+test('cli_argv is a valid data-source backend and survives normalization', () => {
+  const prep = enforce.prepareSpaceForWrite({
+    slug: 'cliargv',
+    dataSources: [{ id: 'sf_pull', cliArgv: ['sf', 'data', 'query', '--query', 'SELECT Id FROM Opportunity'] }],
+    actions: [],
+  });
+  assert.equal(prep.ok, true, `a frozen CLI declaration must be admitted: ${prep.errors.join(' | ')}`);
+  assert.equal(prep.errors.length, 0);
+  // The exact argv must survive intact — the approval digest is bound to it.
+  assert.deepEqual(
+    prep.dataSources[0].cliArgv,
+    ['sf', 'data', 'query', '--query', 'SELECT Id FROM Opportunity'],
+  );
+});
+
+test('cli_argv is admitted for review, never vouched as safe to run unattended', async () => {
+  // Parity means the declaration reaches the trust authority, NOT that the save
+  // authorises execution. The safety policy returns no error precisely because
+  // the one-time human approval happens later, at spawn time.
+  const policy = await import('./space-execution-policy.js');
+  assert.equal(
+    policy.workspaceDataSourceSafetyError({ id: 'sf_pull', cliArgv: ['sf', 'org', 'list'] }),
+    null,
+  );
+  // And the trust tool that owns that decision is a distinct, named authority.
+  assert.equal(typeof policy.SPACE_CLI_SOURCE_TRUST_TOOL, 'string');
+  assert.ok(policy.SPACE_CLI_SOURCE_TRUST_TOOL.length > 0);
+});
+
+test('an ACTION still cannot be cli_argv-backed (no runtime can execute one)', () => {
+  const prep = enforce.prepareSpaceForWrite({
+    slug: 'cliact',
+    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }],
+    actions: [{ id: 'send', cliArgv: ['sf', 'data', 'create'] } as never],
+  });
+  assert.equal(prep.ok, false, 'actions have no cli_argv runtime; admitting one would be unrunnable');
+  assert.match(prep.errors.join(' '), /Action "send" declares neither/);
 });

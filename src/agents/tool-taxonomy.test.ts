@@ -84,8 +84,21 @@ test('classifyTool: local-side-effect tools never gate on approval', () => {
   assert.equal(classifyTool('share_plan'), 'read');
   assert.equal(classifyTool('surface_plan'), 'read');
   assert.equal(classifyTool('propose_check_in_template'), 'read');
-  assert.equal(classifyTool('execution_create'), 'read');
   assert.equal(classifyTool('workflow_run'), 'read');
+});
+
+test('execution_create classifies as a write and still never asks', () => {
+  // Not a read: creating an execution mints the durable mutation authority that
+  // later external writes point at to prove they were wrapped, so telemetry and
+  // the loop guardrail must see a write. It is ALSO the execution gate's own
+  // escape hatch, so it must never produce an approval interrupt. Those are two
+  // independent properties; the old 'read' classification bought the second by
+  // lying about the first, which made minting authority look free.
+  assert.equal(classifyTool('execution_create'), 'write');
+  assert.equal(decideToolApproval({ toolName: 'execution_create' }).needsApproval, false);
+  // Reading executions stays a read.
+  assert.equal(classifyTool('execution_get'), 'read');
+  assert.equal(classifyTool('execution_list'), 'read');
 });
 
 test('decideToolApproval: task_hygiene is local bookkeeping and does not ask', () => {

@@ -36,8 +36,31 @@ function isValidTimezone(tz: string): boolean {
   try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
 }
 
-function hasBackend(x: { runner?: string; composioSlug?: string }): boolean {
-  return Boolean((x.runner && x.runner.trim()) || (x.composioSlug && x.composioSlug.trim()));
+const nonEmpty = (value?: string): boolean => Boolean(value && value.trim());
+
+/**
+ * A data source has a backend if ANY of the three declared source kinds is
+ * present. `cli_argv` is the third: `space_save` advertises and parses it,
+ * `workspaceDataSourceSafetyError` deliberately admits it, and `runSource`
+ * executes it — but only through the exact-argv trust grant. Omitting it here
+ * rejected a fully valid frozen CLI declaration as having "neither a runner nor
+ * a composio_slug", which is why a correct declaration could never reach its
+ * one-time digest-bound approval.
+ */
+function dataSourceHasBackend(source: SpaceDataSource): boolean {
+  return nonEmpty(source.runner)
+    || nonEmpty(source.composioSlug)
+    || Boolean(source.cliArgv?.length);
+}
+
+/**
+ * Actions are deliberately NOT cli_argv-backed: `SpaceAction` declares no such
+ * field and `runSpaceAction` cannot execute one, so accepting it here would
+ * admit an action that can never run. Keep the two predicates separate rather
+ * than widening one shared shape.
+ */
+function actionHasBackend(action: SpaceAction): boolean {
+  return nonEmpty(action.runner) || nonEmpty(action.composioSlug);
 }
 
 function runnerDeclarationKey(source: Pick<SpaceDataSource, 'id' | 'runner'>): string | null {
@@ -120,8 +143,8 @@ export function checkSpaceForWrite(
   const warnings: string[] = [];
 
   for (const s of dataSources ?? []) {
-    if (!hasBackend(s)) {
-      errors.push(`Data source "${s.id}" declares neither a runner nor a composio_slug — it can't return anything. Add a runner script (under data/) or a composio_slug.`);
+    if (!dataSourceHasBackend(s)) {
+      errors.push(`Data source "${s.id}" declares no backend — it can't return anything. Give it a frozen cli_argv (a bare command plus fixed args), a provably read-only composio_slug, or a runner script under data/.`);
       continue;
     }
     if (s.runner && s.runner.trim()) {
@@ -153,7 +176,7 @@ export function checkSpaceForWrite(
   }
 
   for (const a of actions ?? []) {
-    if (!hasBackend(a)) {
+    if (!actionHasBackend(a)) {
       errors.push(`Action "${a.id}" declares neither a composio_slug nor a runner — it can't do anything. Give it the Composio tool slug to call (discover it with composio_search_tools) or a runner script.`);
       continue;
     }
