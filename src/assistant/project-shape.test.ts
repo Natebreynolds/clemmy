@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 
 import { classifyProjectShape } from './project-shape.js';
 import { classifyExternalEffectRequest } from './external-effect-taxonomy.js';
+import { classifyMessageIntent } from './message-intent.js';
 import { compileTurnGraph } from '../runtime/graph/turn-graph-compiler.js';
 
 /** The exact live prompt that regressed. */
@@ -42,10 +43,14 @@ function graphFor(input: string) {
   }).graph;
 }
 
+function shapeFor(input: string) {
+  return classifyProjectShape(input, classifyMessageIntent(input));
+}
+
 test('the exact live prompt compiles as a project with an external hosting effect', () => {
-  const shape = classifyProjectShape(LIVE_PROMPT);
+  const shape = shapeFor(LIVE_PROMPT);
   assert.equal(shape.isProject, true, 'the request that broke v3.6.2 must read as a project');
-  assert.deepEqual([...shape.signals].sort(), ['construction', 'continuity', 'sourced']);
+  assert.deepEqual([...shape.signals].sort(), ['compound', 'construction', 'continuity', 'durable_artifact', 'sourced']);
 
   // "host it somewhere my team can access" is external effect intent. In
   // v3.6.2 it sat mid-clause after ", and", where no clause-anchored rule could
@@ -68,10 +73,10 @@ test('domain-neutral paraphrases take the same project route', () => {
     'Set up a research portal from the papers I have collected and share it with the lab.',
     'Create a weekly operations report from our ticket data that runs every Monday.',
     'Put together an onboarding hub using the docs we already have, and host it for new hires.',
-    'Assemble a quarterly board pack from our finance records that we can keep reusing.',
+    'Assemble a knowledge base from our support records that we can keep reusing.',
   ];
   for (const prompt of paraphrases) {
-    const shape = classifyProjectShape(prompt);
+    const shape = shapeFor(prompt);
     assert.equal(shape.isProject, true, `must be a project: ${prompt}`);
     const graph = graphFor(prompt);
     assert.equal(graph.fastPath, 'project', `must route as project: ${prompt}`);
@@ -88,7 +93,7 @@ test('small status and read requests keep the fast path', () => {
     'Show me today’s meetings.',
   ];
   for (const prompt of smallReads) {
-    assert.equal(classifyProjectShape(prompt).isProject, false, `must stay small: ${prompt}`);
+    assert.equal(shapeFor(prompt).isProject, false, `must stay small: ${prompt}`);
     const graph = graphFor(prompt);
     assert.notEqual(graph.fastPath, 'project', `must not become a project: ${prompt}`);
   }
@@ -102,22 +107,22 @@ test('trivial constructions are not projects', () => {
     'Create a list of three ideas.',
     'Generate a title for this doc.',
   ]) {
-    assert.equal(classifyProjectShape(prompt).isProject, false, prompt);
+    assert.equal(shapeFor(prompt).isProject, false, prompt);
   }
 });
 
-test('construction alone is a task; construction plus data or continuity is a project', () => {
-  // The rule is structural and stated explicitly so it cannot drift into a
-  // keyword list: CONSTRUCTION is necessary, and one of SOURCED/CONTINUITY
-  // makes it a project.
-  const bare = classifyProjectShape('Build a login form component.');
+test('bounded builds stay inline while durable artifacts and standing operations become candidates', () => {
+  // This classifier is an early candidate hint, not the authoritative topology
+  // decision. The planner/runtime checkpoint remains responsible for promoting
+  // unfamiliar long work that the small artifact vocabulary does not know.
+  const bare = shapeFor('Build a login form component.');
   assert.equal(bare.isProject, false, 'a bounded build with no data and no continuity is a task');
 
-  const sourced = classifyProjectShape('Build a dashboard using my pipeline numbers.');
+  const sourced = shapeFor('Build a dashboard using my pipeline numbers.');
   assert.equal(sourced.isProject, true);
   assert.ok(sourced.signals.includes('sourced'));
 
-  const continued = classifyProjectShape('Build a status page and keep it updated every week.');
+  const continued = shapeFor('Build a status page and keep it updated every week.');
   assert.equal(continued.isProject, true);
   assert.ok(continued.signals.includes('continuity'));
 });
@@ -130,11 +135,11 @@ test('publication intent is recognised from any clause, not only the first', () 
   );
   assert.equal(trailing.requested, true);
 
-  // A coordinated predicate inside one clause is also reachable for publication
-  // verbs specifically, because host/deploy/publish have no local homograph.
+  // A plain coordinated predicate is intentionally NOT split here. Losing the
+  // outer clause's advisory/negation scope is more dangerous than missing an
+  // early hint; the actual deploy tool remains classified at its boundary.
   const coordinated = classifyExternalEffectRequest('Build the site and deploy it.');
-  assert.equal(coordinated.requested, true);
-  assert.ok(coordinated.kinds.includes('publication'));
+  assert.equal(coordinated.requested, false);
 });
 
 test('publication rules do not fire on local or figurative senses', () => {
@@ -142,6 +147,18 @@ test('publication rules do not fire on local or figurative senses', () => {
     'What is the host header for that request?',
     'Share your thoughts on the draft.',
     'Explain how deployment pipelines usually work.',
+    'Explain build and deploy strategies.',
+    'What is the build and deploy status?',
+    'Compare build and deploy options.',
+    'Make this available locally.',
+    'Make this available offline.',
+    'Deploy it to localhost.',
+    'Publish it to a local preview.',
+    'Host it on localhost.',
+    'Put the server live locally.',
+    'Make this method public.',
+    'Make it accessible to screen readers.',
+    'Make it available on disk.',
     'Summarize last month sales.',
   ]) {
     assert.equal(
@@ -149,5 +166,83 @@ test('publication rules do not fire on local or figurative senses', () => {
       false,
       `must not read as an external effect: ${prompt}`,
     );
+  }
+});
+
+test('shape cannot upgrade advice, status, or comparison requests into actions', () => {
+  const informational = [
+    'Explain build and deploy strategies.',
+    'Explain how to build and deploy the site.',
+    'How do I build and deploy a web app?',
+    'Should we build and deploy the site?',
+    'Research how teams build and host a service.',
+    'Did we build the dashboard?',
+    'I wonder whether we should build an app.',
+    'What is the build and deploy status?',
+    'Compare build and deploy options.',
+  ];
+  for (const prompt of informational) {
+    const graph = graphFor(prompt);
+    assert.notEqual(graph.classification.messageIntent, 'action', prompt);
+    assert.notEqual(graph.classification.route, 'act', prompt);
+    assert.equal(graph.classification.projectShaped, false, prompt);
+    assert.equal(graph.classification.externalEffectRequested, false, prompt);
+  }
+
+  // Prohibitions and declarative mentions retain the legacy conservative
+  // tool_intent route, but cannot acquire the project envelope or an external
+  // effect. The runtime must hear the constraint; it must not execute it.
+  for (const prompt of [
+    'Do not build and deploy the site.',
+    'The plan is to build an app.',
+  ]) {
+    const graph = graphFor(prompt);
+    assert.notEqual(graph.classification.messageIntent, 'action', prompt);
+    assert.equal(graph.classification.projectShaped, false, prompt);
+    assert.equal(graph.classification.externalEffectRequested, false, prompt);
+  }
+
+  // This is a real action, but its direct object is a bounded plan. Merely
+  // mentioning a web app in the plan's subject must not make the plan itself a
+  // durable build or pre-arm a deployment effect.
+  const plan = graphFor('Create a plan explaining how to build and deploy a web app.');
+  assert.equal(plan.classification.messageIntent, 'action');
+  assert.equal(plan.classification.projectShaped, false);
+  assert.equal(plan.classification.externalEffectRequested, false);
+});
+
+test('obvious durable builds route as projects while small sourced transforms stay bounded', () => {
+  for (const prompt of [
+    'Build me a web app.',
+    'Create a shareable dashboard for my team.',
+    'Implement OAuth + an admin console.',
+    'Build a dashboard from Salesforce.',
+    'Prepare a client portal.',
+    'Redesign our website.',
+    'Write a book.',
+    'Migrate our CRM.',
+    'Generate a report every Monday.',
+    'Monitor uptime and alert me when it fails.',
+    'Automate the report so it runs every week.',
+  ]) {
+    assert.equal(graphFor(prompt).fastPath, 'project', prompt);
+  }
+
+  for (const prompt of [
+    'Create a chart from my data.',
+    'Create a CSV from my report.',
+    'Create a quick summary from my data.',
+    'Write a summary about our dashboard.',
+    'Create a chart of app usage from our data.',
+    'Make the dashboard blue.',
+    'Build a site header.',
+    'Build an API endpoint.',
+    'Create a reusable checklist.',
+    'Create a monthly report.',
+    'Create a chart tracking trends.',
+    'Create a database table.',
+    'Create a CSV from my data, then sort it.',
+  ]) {
+    assert.notEqual(graphFor(prompt).fastPath, 'project', prompt);
   }
 });

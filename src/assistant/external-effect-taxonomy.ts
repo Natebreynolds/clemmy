@@ -45,11 +45,11 @@ interface ExternalEffectRule {
 const TECHNICAL_COMMUNICATION_OBJECT_SOURCE =
   'address|api|body|column|command|endpoint|field|function|helper|method|property|schema|script|subject|template|tool|type|variable';
 
-/** Publication verbs also match after a coordinator inside the same clause. */
+/** Publication verbs are matched only at the start of a direct request clause. */
 function publicationRules(bodies: readonly string[]): ExternalEffectRule[] {
   return bodies.map((body) => ({
     kind: 'publication' as const,
-    pattern: new RegExp(`^(?:.{0,160}?\\band\\s+(?:also\\s+)?)?(?:${body})`, 'i'),
+    pattern: new RegExp(`^(?:${body})`, 'i'),
   }));
 }
 
@@ -160,31 +160,34 @@ const EXTERNAL_EFFECT_RULES: readonly ExternalEffectRule[] = [
   // rather than on any product noun — no provider name is required and none is
   // privileged.
   //
-  // Unlike every family above, these also match after a COORDINATOR
-  // ("build the dashboard and deploy it"). That widening is safe precisely here
-  // because host/deploy/publish have no ordinary local homograph in imperative
-  // position, whereas "order", "follow", and "like" plainly do — which is why
-  // those stay strictly clause-anchored. Making `and` a global clause boundary
-  // would have widened all of them at once.
+  // These remain clause-anchored like every family above. Blindly splitting
+  // "and deploy" loses the outer clause's advice, question, or negation scope.
+  // A missed early publication hint is recovered when the actual effect tool
+  // is selected; a false hint could incorrectly pre-arm the whole turn.
   ...publicationRules([
     // "host it somewhere". Excludes the networking senses (host header/name).
-    String.raw`host\s+(?!(?:header|key|machine|name|names|os|process|system)\b)(?:(?:a|an|it|my|our|the|this|that|your)\s+)?\S+`,
+    String.raw`host\s+(?!(?:header|key|machine|name|names|options?|os|process|status|strateg(?:y|ies)|system)\b)(?!(?:\S+\s+){0,5}?(?:locally|offline|on\s+(?:this|the)\s+(?:computer|machine))\b)(?:(?:a|an|it|my|our|the|this|that|your)\s+)?\S+`,
     // "deploy it", "publish the report". Excludes talking ABOUT deployment.
-    String.raw`(?:deploy|publish)\s+(?!(?:docs?|documentation|guide|notes?|process|strategy)\s+(?:about|for|on)\b)(?:(?:a|an|it|my|our|the|this|that|your)\s+)?\S+`,
+    String.raw`(?:deploy|publish)\s+(?!(?:approaches?|concepts?|docs?|documentation|guide|notes?|options?|plans?|process|status|strateg(?:y|ies))\b)(?:(?:a|an|it|my|our|the|this|that|your)\s+)?\S+`,
     // "put it online", "stand it up on a server".
     String.raw`(?:put|stand)\s+(?:\S+\s+){0,6}?(?:online|live|up\s+(?:on|at)|on\s+(?:a\s+)?(?:server|the\s+(?:internet|web)))\b`,
-    // "make it available/accessible to the team".
-    String.raw`make\s+(?:\S+\s+){0,6}?(?:available|accessible|public|live)\b`,
+    // "make it public/live" or "make it available to the team". Merely
+    // making something available locally/offline is a local action, not a
+    // publication request.
+    String.raw`make\s+(?![^.!?\n;]{0,80}\b(?:locally|offline|on\s+(?:this|the)\s+(?:computer|machine))\b)(?:\S+\s+){0,6}?(?:(?:public|live|online)\b|(?:available|accessible)\b[^.!?\n;]{0,40}\b(?:for|on|to)\s+(?!(?:local(?:host)?|(?:this|the)\s+(?:computer|machine))\b)\S+)`,
     // "share it with the team" — a RESOURCE with people, not an opinion.
     String.raw`share\s+(?!(?:your|my|our|a|an|the)?\s*(?:thought|thoughts|opinion|opinions|view|views|feedback|perspective)\b)(?:\S+\s+){0,6}?\bwith\s+\S+`,
   ]),
-  {
-    kind: 'publication',
-    // The externality stated as a purpose clause instead of an imperative:
-    // "somewhere my team can access", "so the team can see it".
-    pattern: /^(?:\S+\s+){0,12}?\b(?:so|where|somewhere)\b[^.!?\n;]{0,60}\b(?:can|could)\s+(?:access|reach|see|use|view)\b/i,
-  },
 ];
+
+/** Local previews and programming visibility are not publication. These
+ * exclusions deliberately win over the verb matcher: a missed early hint is
+ * repaired at the actual tool boundary, while a false external-write intent
+ * can incorrectly arm approvals and completion receipts for the whole turn. */
+const LOCAL_PUBLICATION_RE =
+  /\b(?:127\.0\.0\.1|localhost|local(?:ly)?|offline|on\s+disk|on\s+(?:this|the)\s+(?:computer|machine)|preview|screen\s+readers?)\b/i;
+const PROGRAMMING_VISIBILITY_RE =
+  /^make\b[^.!?\n;]{0,80}\b(?:api|class|endpoint|field|function|interface|method|module|property|type|variable)\b[^.!?\n;]{0,40}\b(?:accessible|available|public)\b/i;
 
 // `, and` coordinates two independent requests exactly as `, but` and `, then`
 // already do. Without it the second imperative of "…use the data I already have
@@ -238,6 +241,10 @@ export function classifyExternalEffectRequest(text: string): ExternalEffectClass
     if (!rawClause.trim() || APPROVAL_DEFERRAL_RE.test(rawClause)) continue;
     const clause = stripDirectRequestPrefixes(rawClause);
     for (const rule of EXTERNAL_EFFECT_RULES) {
+      if (
+        rule.kind === 'publication'
+        && (LOCAL_PUBLICATION_RE.test(clause) || PROGRAMMING_VISIBILITY_RE.test(clause))
+      ) continue;
       if (rule.pattern.test(clause)) kinds.add(rule.kind);
     }
   }

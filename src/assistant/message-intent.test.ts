@@ -261,7 +261,7 @@ test('classifier returns human-readable reasons', () => {
   // The same request that also asks to DEPLOY reports the stronger, more
   // specific ground: deploying is an external effect, not merely an action
   // verb. Both remain human-readable; the effect reason simply outranks it.
-  const deployed = classifyMessageIntent('build and deploy the new dashboard');
+  const deployed = classifyMessageIntent('build the new dashboard, then deploy it');
   assert.equal(deployed.intent, 'action');
   assert.ok(deployed.reasons.length > 0);
   assert.ok(deployed.reasons.some((reason) => /external effect: publication/.test(reason)));

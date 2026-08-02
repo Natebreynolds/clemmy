@@ -61,6 +61,7 @@ const LOOKUP_CUES = [
   'who is', 'who was', 'do i have', 'have i',
   'remind me', 'tell me about', 'recall',
   'status of', 'progress on',
+  'did i', 'did we', 'did you',
 ];
 
 /**
@@ -73,6 +74,7 @@ const QUESTION_STARTERS = [
   'what', 'when', 'where', 'who', 'why', 'how',
   'show', 'list', 'find', 'do i', 'have i', 'is there', 'are there',
   'should i', 'can i', 'could i', 'would i', 'may i',
+  'did i', 'did we', 'did you', 'has the', 'has my', 'has our',
   'remind me', 'tell me', 'recall',
 ];
 
@@ -113,6 +115,7 @@ const AMBIGUOUS_ACTION_NOUNS = new Set([
 const ACTION_CUES = [
   ...MUTATION_ACTION_CUES.filter((cue) => !AMBIGUOUS_ACTION_NOUNS.has(cue)),
   'produce',
+  'prepare', 'redesign', 'author', 'assemble', 'automate', 'monitor',
   'wire up', 'wire',
   'implement', 'design', 'migrate', 'refactor', 'rewrite',
   'connect', 'integrate', 'ship', 'release',
@@ -126,13 +129,15 @@ const ACTION_CUES = [
 const READ_ONLY_OPERATION_START_RE =
   /^(?:read|review|summarize|search|research|find|list|inspect|analyze|check|look\s+up)\b/i;
 const ADVISORY_ACTION_START_RE =
-  /^(?:(?:should|can|could|would|may)\s+(?:i|we)\b|(?:would|could|can)\s+you\s+(?:recommend|advise|explain)\b|i\s+(?:might|may|could|would)\b|do\s+you\s+(?:think|recommend|believe)\b|is\s+it\s+(?:safe|wise|okay|ok|a\s+good\s+idea)\s+to\b|how\s+(?:to\b|(?:do|can|could|would|should)\s+(?:i|we|you)\b)|what\s+(?:(?:happens|would\s+happen)\s+if|(?:should|can|could|would|might|may)\s+(?:i|we|you)|do\s+you\s+(?:recommend|think|suggest))\b|(?:tell|show)\s+me\s+(?:whether|if|how)\b|(?:give\s+me|i\s+need)\s+(?:advice|guidance|recommendations?)\b|walk\s+me\s+through\s+(?:whether|if|how)\b|help\s+me\s+(?:decide|understand|choose|evaluate)\b|(?:discuss|explain|research|describe|compare|evaluate|assess|advise)\b)/i;
+  /^(?:(?:should|can|could|would|may)\s+(?:i|we)\b|(?:would|could|can)\s+you\s+(?:recommend|advise|explain)\b|i\s+(?:might|may|could|would)\b|i\s+(?:am\s+)?wonder(?:ing)?\s+(?:whether|if|how)\b|do\s+you\s+(?:think|recommend|believe)\b|is\s+it\s+(?:safe|wise|okay|ok|a\s+good\s+idea)\s+to\b|how\s+(?:to\b|(?:do|can|could|would|should)\s+(?:i|we|you)\b)|what\s+(?:(?:happens|would\s+happen)\s+if|(?:should|can|could|would|might|may)\s+(?:i|we|you)|do\s+you\s+(?:recommend|think|suggest))\b|(?:tell|show)\s+me\s+(?:whether|if|how)\b|(?:give\s+me|i\s+need)\s+(?:advice|guidance|recommendations?)\b|walk\s+me\s+through\s+(?:whether|if|how)\b|help\s+me\s+(?:decide|understand|choose|evaluate)\b|(?:discuss|explain|research|describe|compare|evaluate|assess|advise)\b)/i;
 const POLITE_ADVISORY_ACTION_START_RE =
   /^(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+)(?:(?:tell|show)\s+me\s+(?:whether|if|how)\b|walk\s+me\s+through\s+(?:whether|if|how)\b|help\s+me\s+(?:decide|understand|choose|evaluate)\b|give\s+me\s+(?:advice|guidance|recommendations?)\b|(?:explain|research|describe|compare|evaluate|assess|advise|recommend)\b)/i;
 const DIRECT_AMBIGUOUS_ACTION_RE =
   /^(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+|(?:i(?:'d| would)\s+like|i\s+want)\s+(?:you|clementine)\s+to\s+|(?:go\s+ahead\s+and|make\s+sure\s+to|let'?s)\s+)*(?:block|book|bookmark|call|charge|draft|email|label|link|log|mark|message|post|record|schedule|tag)\b/i;
 const NEGATED_ACTION_ONLY_START_RE =
   /^(?:no[,.]?\s+)?(?:please\s+)?(?:do\s+not|don't|dont|never)\b/i;
+const NON_REQUEST_ACTION_MENTION_START_RE =
+  /^(?:the\s+(?:idea|plan|proposal|strategy)\s+is\s+to\b|we(?:'re|\s+are)\s+(?:considering|discussing|thinking\s+about)\b)/i;
 
 const MULTI_PART_CUES = [
   ' and ', ' then ', ' after that', ' once you', ' while ',
@@ -255,13 +260,24 @@ export function classifyMessageIntent(message: string): IntentClassification {
   }
   if (
     NEGATED_ACTION_ONLY_START_RE.test(trimmed)
-    && !hasExplicitActionContinuation(trimmed, true)
+    && !hasExplicitActionContinuation(trimmed, false)
     && !externalEffect.requested
   ) {
     return {
       intent: 'tool_intent',
       confidence: 0.75,
       reasons: ['prohibition without a requested action'],
+    };
+  }
+  if (
+    NON_REQUEST_ACTION_MENTION_START_RE.test(trimmed)
+    && !hasExplicitActionContinuation(trimmed, false)
+    && !externalEffect.requested
+  ) {
+    return {
+      intent: 'tool_intent',
+      confidence: 0.75,
+      reasons: ['mentions a possible action without requesting it'],
     };
   }
   if (externalEffect.requested) {
@@ -289,7 +305,10 @@ export function classifyMessageIntent(message: string): IntentClassification {
   if (
     questionStart
     && lookup.count > 0
-    && !hasExplicitActionContinuation(trimmed, true)
+    // A plain "and <verb>" can remain inside the subject of a question
+    // ("what is the build and deploy status?"). Only a real clause boundary
+    // such as "then" or punctuation can hand a question off to an action.
+    && !hasExplicitActionContinuation(trimmed, false)
   ) {
     return {
       intent: 'lookup',

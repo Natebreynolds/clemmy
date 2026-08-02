@@ -288,9 +288,10 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
   const intent = input.signals?.intent ?? classifyMessageIntent(input.input);
   const externalEffect = input.signals?.externalEffect ?? classifyExternalEffectRequest(input.input);
   const multiItem = input.signals?.multiItem ?? detectMultiItemIntent(input.input);
-  const projectShape = classifyProjectShape(input.input);
-  // A project always acts: it builds something and usually publishes it.
-  const route = projectShape.isProject ? 'act' : routeFor(intent, externalEffect);
+  const projectShape = classifyProjectShape(input.input, intent);
+  // Work shape may choose an execution envelope only after intent has already
+  // selected the action route. It must never turn advice or a lookup into work.
+  const route = routeFor(intent, externalEffect);
   const fastPath = fastPathFor(route, multiItem, projectShape.isProject);
   const routeEffect = effectForRoute(route, externalEffect.requested);
   const allowedToolNames = normalizedNames(input.allowedToolNames);
