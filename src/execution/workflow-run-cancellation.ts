@@ -17,6 +17,10 @@ import {
   withWorkflowRunRecordLock,
   writeWorkflowRunRecordDurablyUnlocked,
 } from './workflow-run-record.js';
+import {
+  settleCompiledProjectRootFromRun,
+  stampCompiledProjectRootSettlement,
+} from './project-root-lifecycle.js';
 
 export interface WorkflowRunCancellationRequest {
   version: 1;
@@ -217,7 +221,7 @@ export function cancelWorkflowRunAtBoundary(input: {
   try { if (existsSync(file)) readFileSync(file, 'utf-8'); } catch { /* authoritative read below */ }
   beforeCancellationLockForTests?.();
 
-  return withWorkflowRunRecordLock(file, () => {
+  const result = withWorkflowRunRecordLock<CancelWorkflowRunResult>(file, () => {
     const current = readWorkflowRunRecordUnlocked<WorkflowRunProjection>(file);
     if (!current) return { status: 'not_found' };
     if (input.expectedWorkflow !== undefined && current.workflow !== input.expectedWorkflow) {
@@ -279,6 +283,7 @@ export function cancelWorkflowRunAtBoundary(input: {
       cancelledAt: request.requestedAt,
       finishedAt: request.requestedAt,
       error: request.reason,
+      terminalOutcome: 'cancelled',
     };
     delete next.parked;
     const reportBack = {
@@ -299,6 +304,20 @@ export function cancelWorkflowRunAtBoundary(input: {
     writeWorkflowRunRecordDurablyUnlocked(file, next);
     return { status: wasCancelled ? 'already_cancelled' : 'cancelled', request, run: next };
   });
+  // The run lock is released before the execution ledger is touched. This
+  // preserves one lock order for completion-vs-cancel races and lets an exact
+  // replay heal a crash between the two durable commits.
+  if (
+    result.status === 'cancelled'
+    || result.status === 'already_cancelled'
+    || result.status === 'already_terminal'
+  ) {
+    const settlement = settleCompiledProjectRootFromRun(file, result.run);
+    if (settlement.kind === 'settled' || settlement.kind === 'already_settled') {
+      stampCompiledProjectRootSettlement(file, settlement);
+    }
+  }
+  return result;
 }
 
 export function workflowRunCancellationRequested(runId: string): boolean {

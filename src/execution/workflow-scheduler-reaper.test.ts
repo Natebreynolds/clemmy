@@ -5,7 +5,10 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -24,6 +27,11 @@ const {
   persistWorkflowGraphSnapshot,
 } = await import('./workflow-graph-store.js');
 const { createCompiledWorkflowRunDefinitionSnapshot } = await import('./workflow-run-definition.js');
+const {
+  compiledWorkflowRunContractHash,
+  compiledWorkflowRunInputsHash,
+  compiledProjectRootTerminalDigest,
+} = await import('./compiled-project-run-contract.js');
 const {
   _setWorkflowRunReaperBeforeLockForTests,
   reapStaleWorkflowRuns,
@@ -75,18 +83,20 @@ function writeRunSidecars(runId: string): {
   return { originDir, cancellationFile, triggerReceiptFile };
 }
 
-function compiledWorkflowSlug(runId: string): string {
-  return `compiled-${createHash('sha256').update(runId).digest('hex').slice(0, 32)}`;
-}
-
-function writeCompiledRun(runId: string, record: Record<string, unknown> = {}): {
+function writeCompiledRun(label: string, record: Record<string, unknown> = {}): {
+  runId: string;
   file: string;
   workflowSlug: string;
   runDir: string;
 } {
-  const workflowSlug = compiledWorkflowSlug(runId);
+  const sourceTurnKeyHash = createHash('sha256').update(`turn:${label}`).digest('hex');
+  const workflowSlug = `compiled-${sourceTurnKeyHash.slice(0, 32)}`;
+  const rootWorkflowReceiptId = `project-turn:v2:${sourceTurnKeyHash}`;
+  const runId = `trigger-${createHash('sha256').update(rootWorkflowReceiptId).digest('hex').slice(0, 32)}`;
+  const sourceExecutionId = `exec-project-${sourceTurnKeyHash.slice(0, 32)}`;
+  const sessionId = `session-${label}`;
   const definition = {
-    name: `project-${runId}`,
+    name: `project-${createHash('sha256').update(label).digest('hex').slice(0, 16)}`,
     description: 'Retention hygiene test project',
     enabled: true,
     trigger: { manual: true },
@@ -94,16 +104,91 @@ function writeCompiledRun(runId: string, record: Record<string, unknown> = {}): 
   };
   const workflowDefinitionSnapshot = createCompiledWorkflowRunDefinitionSnapshot({
     workflowSlug,
-    sourceTurnKeyHash: createHash('sha256').update(`turn:${runId}`).digest('hex'),
+    sourceTurnKeyHash,
     definition,
     admittedAt: OLD_FINISHED_AT,
+  });
+  const inputs: Record<string, string> = {};
+  const compiledContractHash = compiledWorkflowRunContractHash({
+    sourceExecutionId,
+    sourceUserSeq: 1,
+    sourceTurnKeyHash,
+    originSessionId: sessionId,
+    workflowSlug,
+    snapshot: workflowDefinitionSnapshot,
+    inputs,
+  });
+  const suppliedReportBack = record.reportBack;
+  const { reportBack: _ignoredReportBack, ...recordOverrides } = record;
+  const reportBack = suppliedReportBack && typeof suppliedReportBack === 'object'
+    ? {
+      ...(suppliedReportBack as {
+        version: 1;
+        workflowName: string;
+        outcome: 'done' | 'blocked' | 'failed';
+        detail: string;
+        acknowledgedOriginSessionIds: string[];
+      }),
+      workflowName: definition.name,
+    }
+    : {
+      version: 1 as const,
+      workflowName: definition.name,
+      outcome: 'done' as const,
+      detail: 'Delivered terminal result',
+      acknowledgedOriginSessionIds: [sessionId, 'observer'],
+    };
+  const terminalDigest = compiledProjectRootTerminalDigest({
+      id: runId,
+      workflow: definition.name,
+      workflowSlug,
+      sourceExecutionId,
+      sourceTurnKeyHash,
+      sessionId,
+      sourceUserSeq: 1,
+      rootWorkflowReceiptId,
+      status: 'completed',
+      terminalOutcome: 'succeeded',
+      finishedAt: OLD_FINISHED_AT,
+      snapshotDefinitionHash: workflowDefinitionSnapshot.definitionHash,
+      snapshotAdmissionHash: workflowDefinitionSnapshot.admissionHash,
+      snapshotAdmittedAt: workflowDefinitionSnapshot.admittedAt,
+      compiledContractHash,
+      normalizedInputsHash: compiledWorkflowRunInputsHash(inputs),
+      mutationReceiptProtocolVersion: 1,
+      reportBack: {
+        version: reportBack.version,
+        workflowName: reportBack.workflowName,
+        outcome: reportBack.outcome,
+        detail: reportBack.detail,
+      },
   });
   return {
     file: writeRun(runId, {
       workflow: definition.name,
+      workflowSlug,
+      source: 'project_graph',
+      sourceExecutionId,
+      sourceUserSeq: 1,
+      originSessionId: sessionId,
+      triggerReceiptId: rootWorkflowReceiptId,
+      inputs,
+      compiledContractHash,
+      mutationReceiptProtocolVersion: 1,
+      terminalOutcome: 'succeeded',
       workflowDefinitionSnapshot,
-      ...record,
+      reportBack,
+      notifiedAt: OLD_FINISHED_AT,
+      reportBackAcknowledgedAt: OLD_FINISHED_AT,
+      projectExecutionSettlement: {
+        version: 1,
+        executionId: sourceExecutionId,
+        terminalDigest,
+        settledAt: OLD_FINISHED_AT,
+      },
+      ...recordOverrides,
     }),
+    runId,
     workflowSlug,
     runDir: path.join(WORKFLOWS_DIR, workflowSlug, 'runs', runId),
   };
@@ -206,16 +291,14 @@ test('reaper still removes an old terminal record whose report-back is fully ack
 });
 
 test('reaper removes terminal run sidecars and an empty catalogless compiled owner but preserves trigger receipts', () => {
-  const runId = 'compiled-retention-hygiene';
-  const { file, runDir, workflowSlug } = writeCompiledRun(runId, {
-    originSessionId: 'origin-done',
+  const { runId, file, runDir, workflowSlug } = writeCompiledRun('compiled-retention-hygiene', {
     notifiedAt: OLD_FINISHED_AT,
     reportBack: {
       version: 1,
       workflowName: 'Compiled retention hygiene',
       outcome: 'done',
       detail: 'Delivered terminal result',
-      acknowledgedOriginSessionIds: ['origin-done', 'observer'],
+      acknowledgedOriginSessionIds: ['session-compiled-retention-hygiene', 'observer'],
     },
   });
   appendWorkflowEvent(workflowSlug, runId, {
@@ -234,6 +317,50 @@ test('reaper removes terminal run sidecars and an empty catalogless compiled own
   assert.equal(existsSync(sidecars.originDir), false);
   assert.equal(existsSync(sidecars.cancellationFile), false);
   assert.equal(existsSync(sidecars.triggerReceiptFile), true, 'admission dedupe receipts have an independent lifecycle');
+});
+
+test('reaper preserves a compiled terminal until exact project-ledger settlement is marked', () => {
+  const unmarked = writeCompiledRun('compiled-unsettled', {
+    projectExecutionSettlement: undefined,
+  });
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 0 });
+  assert.equal(existsSync(unmarked.file), true);
+
+  rmSync(unmarked.file, { force: true });
+  const wrongSource = writeCompiledRun('compiled-wrong-source', {
+    source: 'workflow_run',
+  });
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 0 });
+  assert.equal(existsSync(wrongSource.file), true);
+});
+
+test('reaper fail-closes malformed project lineage even when the compiled snapshot is missing', () => {
+  const markers: Array<Record<string, unknown>> = [
+    { sourceExecutionId: 'exec-project-partial' },
+    { compiledContractHash: 'corrupt-contract' },
+    { triggerReceiptId: `project-turn:v1:${'a'.repeat(64)}` },
+    { workflowSlug: 'compiled-malformed-partial-lineage' },
+    { projectBoundAt: OLD_FINISHED_AT },
+    { projectExecutionSettlement: { version: 1 } },
+  ];
+  const files = markers.map((marker, index) => writeRun(`partial-project-${index}`, marker));
+
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: markers.length, deleted: 0 });
+  for (const file of files) {
+    assert.equal(existsSync(file), true, 'reserved crash evidence remains available for quarantine or repair');
+  }
+});
+
+test('reaper never treats a symlinked project record as canonical settlement authority', () => {
+  const compiled = writeCompiledRun('symlinked-project-root');
+  const external = path.join(TMP_HOME, 'outside-project-root.json');
+  writeFileSync(external, readFileSync(compiled.file));
+  unlinkSync(compiled.file);
+  symlinkSync(external, compiled.file);
+
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 0 });
+  assert.equal(existsSync(compiled.file), true);
+  assert.equal(existsSync(external), true);
 });
 
 test('reaper keeps all sidecars while terminal report-back remains unacknowledged', () => {
@@ -258,8 +385,7 @@ test('reaper keeps all sidecars while terminal report-back remains unacknowledge
 });
 
 test('reaper preserves compiled owner directories when call-mutation receipts survive', () => {
-  const runId = 'compiled-mutation-retention';
-  const { file, runDir } = writeCompiledRun(runId);
+  const { runId, file, runDir } = writeCompiledRun('compiled-mutation-retention');
   const mutationReceipt = path.join(runDir, 'call-mutations', 'work', 'intent.json');
   const transientArtifact = path.join(runDir, 'workspace', 'artifact.json');
   mkdirSync(path.dirname(mutationReceipt), { recursive: true });
@@ -281,8 +407,7 @@ test('reaper preserves compiled owner directories when call-mutation receipts su
 
 test('reaper never prunes a compiled owner that has catalog evidence', () => {
   for (const marker of ['directory', 'legacy'] as const) {
-    const runId = `compiled-catalog-${marker}`;
-    const { file, runDir, workflowSlug } = writeCompiledRun(runId);
+    const { runId, file, runDir, workflowSlug } = writeCompiledRun(`compiled-catalog-${marker}`);
     appendWorkflowEvent(workflowSlug, runId, {
       kind: 'step_completed',
       stepId: 'work',

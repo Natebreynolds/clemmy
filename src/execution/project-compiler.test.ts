@@ -186,11 +186,11 @@ test('an authored capability list is unioned with the structural universe', () =
   const { compiled } = graphOf({
     objective: 'o',
     nodes: [read('a', {
-      executor: { kind: 'model', instruction: 'Read the files that matter.', allowedTools: ['list_files', 'list_files'] },
+      executor: { kind: 'model', instruction: 'Inspect the installed skills.', allowedTools: ['skill_list', 'skill_list'] },
     })],
   });
   const tools = compiled.definition.steps[0].allowedTools!;
-  assert.ok(tools.includes('list_files'), 'the authored capability survives');
+  assert.ok(tools.includes('skill_list'), 'the authored capability survives');
   for (const structural of PROJECT_STRUCTURAL_TOOLS) {
     assert.ok(tools.includes(structural), `${structural} must always be present`);
   }
@@ -198,25 +198,60 @@ test('an authored capability list is unioned with the structural universe', () =
   assert.equal(new Set(tools).size, tools.length, 'deduped');
 });
 
-test('a structured call pins exactly one tool, frozen args, and that tool as its authority', () => {
-  const { compiled } = graphOf({
-    objective: 'o',
-    nodes: [{
-      id: 'fetch',
-      executor: { kind: 'structured_call', tool: 'list_files', args: { limit: 25 } },
-      effect: 'read',
-    }],
-  });
-  const step = compiled.definition.steps[0];
-  assert.deepEqual(step.call, { tool: 'list_files', args: { limit: 25 } });
-  // Work authority is exactly the called tool; the structural channels ride
-  // along so the step can still return its result.
-  assert.ok(step.allowedTools!.includes('list_files'));
-  assert.deepEqual(
-    step.allowedTools!.filter((tool) => !PROJECT_STRUCTURAL_TOOLS.includes(tool)),
-    ['list_files'],
+test('a structured built-in call cannot compile into the unrelated Composio execution adapter', () => {
+  assert.throws(
+    () => graphOf({
+      objective: 'o',
+      nodes: [{
+        id: 'fetch',
+        executor: { kind: 'structured_call', tool: 'skill_list', args: {} },
+        effect: 'read',
+      }],
+    }),
+    (error: unknown) => error instanceof ProjectPlanCompileError
+      && /no bound durable-project execution adapter/.test(error.message),
   );
-  assert.ok(step.prompt.length > 0);
+});
+
+test('compilation bites on effect-smuggling gateways and blocked step capabilities', () => {
+  for (const tool of [
+    'call_tool',
+    'composio_execute_tool',
+    'run_shell_command',
+    'write_file',
+  ]) {
+    assert.throws(
+      () => graphOf({
+        objective: 'Read one exact fact without changing anything.',
+        nodes: [read('probe', {
+          executor: { kind: 'model', instruction: 'Read the fact.', allowedTools: [tool] },
+        })],
+      }),
+      (error: unknown) => error instanceof ProjectPlanCompileError,
+      `${tool} must not compile inside a read node`,
+    );
+  }
+  for (const tool of [
+    'workflow_run',
+    'workflow_rerun_failed_items',
+    'dispatch_background_task',
+    'resume_held_task',
+    'propose_check_in_template',
+    'ask_user_question',
+    'focus_get',
+    'surface_plan',
+  ]) {
+    assert.throws(
+      () => graphOf({
+        objective: 'Use one capability available to a constrained workflow step.',
+        nodes: [read('probe', {
+          executor: { kind: 'model', instruction: 'Read the exact state.', allowedTools: [tool] },
+        })],
+      }),
+      (error: unknown) => error instanceof ProjectPlanCompileError,
+      `${tool} must be absent from the positive durable-project manifest`,
+    );
+  }
 });
 
 // ── real WorkflowDefinition compatibility ────────────────────────────────────
@@ -347,9 +382,9 @@ test('unsupported and malformed shapes fail closed with every reason', () => {
       /not one of its declared dependencies/],
     [{ objective: 'o', nodes: [read('a', { executor: { kind: 'model', instruction: 'x', allowedTools: ['*'] } })] },
       /wildcard tool authority/],
-    // A mutating structured call is refused at the same boundary as external_write.
+    // An unreviewed mutator cannot masquerade as read work.
     [{ objective: 'o', nodes: [{ id: 'c', executor: { kind: 'structured_call', tool: 'note_create' }, effect: 'read' }] },
-      /is not a canonical read/],
+      /not admitted by the durable-project capability manifest/],
     // Mutating per-item fan-out.
     [{
       objective: 'o',
@@ -384,26 +419,31 @@ test('unsupported and malformed shapes fail closed with every reason', () => {
 // ── purity ───────────────────────────────────────────────────────────────────
 
 test('the compiler makes defensive copies of plan-owned data', () => {
-  const tools = ['list_files'];
-  const args = { limit: 1 };
+  const tools = ['skill_list'];
+  const secondTools = ['skill_list'];
   const deps = ['a'];
   const compiled = compileProjectPlan({
     objective: 'o',
     nodes: [
       read('a', { executor: { kind: 'model', instruction: 'Read the listed files.', allowedTools: tools } }),
-      { id: 'b', dependsOn: deps, executor: { kind: 'structured_call', tool: 'list_files', args }, effect: 'read' },
+      read('b', {
+        dependsOn: deps,
+        executor: { kind: 'model', instruction: 'Inspect the installed skill list.', allowedTools: secondTools },
+        evidence: { type: 'object', requiredKeys: ['skills'] },
+      }),
     ],
   });
   tools.push('smuggled');
-  args.limit = 999;
+  secondTools.push('smuggled');
   deps.push('ghost');
 
   const byId = new Map(compiled.definition.steps.map((step) => [step.id, step]));
   // The authored capability survives untouched by the later mutation; the
   // structural channels ride alongside it.
-  assert.ok(byId.get('a')?.allowedTools?.includes('list_files'));
+  assert.ok(byId.get('a')?.allowedTools?.includes('skill_list'));
   assert.ok(!byId.get('a')?.allowedTools?.includes('smuggled'));
-  assert.deepEqual(byId.get('b')?.call?.args, { limit: 1 });
+  assert.ok(byId.get('b')?.allowedTools?.includes('skill_list'));
+  assert.ok(!byId.get('b')?.allowedTools?.includes('smuggled'));
   assert.deepEqual(byId.get('b')?.dependsOn, ['a']);
 });
 
@@ -415,9 +455,13 @@ test('a completely unfamiliar objective compiles with no domain-specific branch'
       read('read_zolat_manifests'),
       read('reconcile', {
         dependsOn: ['read_quorn_ledger', 'read_zolat_manifests'],
-        executor: { kind: 'model', instruction: 'Reconcile the two sources and record the differences.' },
-        effect: 'local_write',
-        evidence: { verify: { pathExists: ['reconciliation_path'] } },
+        executor: {
+          kind: 'model',
+          instruction: 'Reconcile the two sources after checking any referenced manifest files.',
+          allowedTools: ['time_slots'],
+        },
+        effect: 'read',
+        evidence: { type: 'object', requiredKeys: ['differences'] },
       }),
     ],
   };
@@ -427,9 +471,10 @@ test('a completely unfamiliar objective compiles with no domain-specific branch'
     ['read_quorn_ledger', 'read_zolat_manifests']);
   assert.equal(compiled.definition.description, invented.objective);
   assert.deepEqual(compiled.definition.trigger, { manual: true });
-  // local_write is a write with no approval theatre attached.
+  // Generic deterministic compute stays a private read node.
   const reconcile = compiled.definition.steps.find((s) => s.id === 'reconcile');
-  assert.equal(reconcile?.sideEffect, 'write');
+  assert.equal(reconcile?.sideEffect, 'read');
+  assert.ok(reconcile?.allowedTools?.includes('time_slots'));
   assert.equal(reconcile?.requiresApproval, undefined);
 });
 
@@ -472,31 +517,6 @@ test('executionRole compiles to a canonical persisted field and survives the wri
   assert.equal(prep.ok, true, prep.errors.join(' | '));
   assert.deepEqual(prep.repairs, []);
   assert.equal(JSON.stringify(prep.def), JSON.stringify(compiled.definition));
-});
-
-test('the role round-trips through the real workflow-store serializer and parser', async () => {
-  const store = await import('../memory/workflow-store.js');
-  const { compiled } = graphOf({
-    objective: 'Converge two branches and verify.',
-    nodes: [
-      read('a', { executionRole: 'specialist' }),
-      read('b', { executionRole: 'specialist' }),
-      read('join', {
-        dependsOn: ['a', 'b'],
-        executor: { kind: 'model', instruction: 'Join both branches into one result.' },
-        executionRole: 'reducer',
-      }),
-    ],
-  });
-
-  // Serialize → parse via the canonical store helpers, with no disk involved.
-  const serialized = (store as never as {
-    workflowDefinitionToFrontmatter: (def: unknown) => Record<string, unknown>;
-  }).workflowDefinitionToFrontmatter?.(compiled.definition);
-  if (!serialized) return; // helper is not exported; the writer check above covers it
-
-  const steps = (serialized as { steps?: Array<Record<string, unknown>> }).steps ?? [];
-  assert.equal(steps[0]?.execution_role, 'specialist', 'persists as snake_case');
 });
 
 test('a role never widens what a compiled step may do', () => {

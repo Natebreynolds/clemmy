@@ -606,11 +606,10 @@ export function readReduceDigest(workflowName: string, runId: string, stepId: st
 }
 
 /**
- * Offload a large cross-step CONTEXT value to the shared workspace under a
- * DETERMINISTIC per-key path, so every downstream step that depends on the same
- * upstream output points at ONE artifact (no duplicate blobs) and can read the
- * exact full value with read_file instead of a lossy inline preview. Idempotent:
- * writes the file + manifest entry once per (run, key).
+ * Offload a large cross-step CONTEXT value under an immutable content-addressed
+ * path. The digest suffix is load-bearing for fan-out: two invocations may both
+ * call their value `item`, but must never reuse stale bytes from a sibling.
+ * Same key + same content naturally reuses one verified artifact.
  */
 export function offloadContextValue(args: {
   workflowName: string;
@@ -618,20 +617,38 @@ export function offloadContextValue(args: {
   key: string;
   value: unknown;
   nowIso: string;
-}): { path: string; summary: string; bytes: number } {
-  const rel = path.join('artifacts', `context-${safeSegment(args.key, 'value')}.json`);
-  const abs = path.join(runWorkspaceDir(args.workflowName, args.runId), rel);
+}): { path: string; summary: string; bytes: number; sha256: string } {
   const serialized = safeStringify(args.value);
+  const sha256 = createHash('sha256').update(serialized).digest('hex');
+  const rel = path.join(
+    'artifacts',
+    `context-${safeSegment(args.key, 'value')}-${sha256}.json`,
+  );
   const bytes = Buffer.byteLength(serialized, 'utf-8');
   const summary = summarizeToolOutput(args.value);
+  ensureRunWorkspace(args.workflowName, args.runId);
+  const abs = path.join(runWorkspaceDir(args.workflowName, args.runId), rel);
   if (!existsSync(abs)) {
-    ensureRunWorkspace(args.workflowName, args.runId);
-    writeFileSync(abs, serialized, 'utf-8');
+    writeFileAtomicallyAndDurably(abs, serialized);
     recordArtifact(args.workflowName, args.runId, {
-      path: rel, tool: 'step-context', agent: args.key, bytes, summary, producedAt: args.nowIso,
+      path: rel,
+      tool: 'step-context',
+      agent: args.key,
+      bytes,
+      summary,
+      producedAt: args.nowIso,
+      sha256,
     });
   }
-  return { path: rel, summary, bytes };
+  // Existing content is never trusted merely because its name contains the
+  // digest. Verify before handing the reference to an invocation.
+  const existing = readFileSync(abs, 'utf-8');
+  const existingBytes = Buffer.byteLength(existing, 'utf-8');
+  const existingSha256 = createHash('sha256').update(existing).digest('hex');
+  if (existingBytes !== bytes || existingSha256 !== sha256) {
+    throw new Error(`Context artifact hash collision/corruption at ${rel}.`);
+  }
+  return { path: rel, summary, bytes, sha256 };
 }
 
 /** Persist / read the checker agent's latest report for a run (shown in the

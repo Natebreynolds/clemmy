@@ -129,6 +129,139 @@ test('runClaudeAgentSdkWorkflowStep builds a schema-bound SDK call and returns s
   assert.deepEqual(captured.outputSchema.required, ['status', 'output']);
 });
 
+test('compiled project read step gives Claude exactly its sanitized snapshot tools', async () => {
+  let captured: any;
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+    captured = options;
+    return {
+      text: '{"status":"completed","output":{"rows":3}}',
+      structuredOutput: { status: 'completed', output: { rows: 3 } },
+      sessionId: 'sdk-compiled-read-session',
+      model: 'claude-sonnet-4-6',
+      toolUses: ['mcp__clementine-local__list_files'],
+    };
+  });
+
+  const compiledReadStep = {
+    id: 'inspect_inputs',
+    prompt: 'Read the files, use skill_read, remember this, and notify the user.',
+    sideEffect: 'read' as const,
+    allowedTools: [
+      ' list_files ',
+      'workspace_artifact_query',
+      'list_files',
+      'workflow_step_result',
+      'mcp__clementine-local__workflow_step_result',
+      '*',
+      '**',
+      '',
+    ],
+    __compiledProjectRuntime: true as const,
+  };
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step: compiledReadStep as any,
+    workflowName: 'compiled-project-read',
+    prompt: compiledReadStep.prompt,
+    modelId: 'claude-sonnet-4-6',
+    sessionId: 'workflow:compiled-read:inspect_inputs',
+    fullLane: false,
+  });
+
+  assert.deepEqual(result.output, { rows: 3 });
+  assert.deepEqual(captured.allowedLocalMcpTools, ['list_files', 'workspace_artifact_query']);
+  assert.deepEqual(captured.mcpToolAllowlist, captured.allowedLocalMcpTools, 'registered local tools cannot exceed compiled authority');
+  assert.deepEqual(captured.localMcpToolUniverse, captured.allowedLocalMcpTools, 'deferred call_tool authority cannot exceed compiled authority');
+  assert.deepEqual(captured.requiredLocalMcpTools, [], 'compiled steps never infer required tools from prompt prose');
+  assert.equal(captured.nativeMcpToolScope, null, 'a local-only compiled grant cannot attach prompt-inferred native MCP servers');
+  for (const forbidden of ['skill_read', 'memory_search', 'memory_remember', 'notify_user', 'workflow_step_result']) {
+    assert.equal(captured.allowedLocalMcpTools.includes(forbidden), false, `${forbidden} was not granted by the compiled snapshot`);
+  }
+});
+
+test('a future compiled project writer cannot inherit the broad SDK worker profile', async () => {
+  let captured: any;
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+    captured = options;
+    return {
+      text: '{"status":"completed","output":{"document":"report.docx"}}',
+      structuredOutput: { status: 'completed', output: { document: 'report.docx' } },
+      sessionId: 'sdk-compiled-write-session',
+      model: 'claude-sonnet-4-6',
+      toolUses: ['mcp__clementine-local__project_artifact_write'],
+    };
+  });
+
+  const compiledWriteStep = {
+    id: 'render_report',
+    prompt: 'Use run_shell_command and write_file, then notify me when the report is ready.',
+    sideEffect: 'write' as const,
+    allowedTools: [
+      ' workspace_artifact_query ',
+      'project_artifact_write',
+      'project_artifact_write',
+      'workflow_step_result',
+    ],
+    __compiledProjectRuntime: true as const,
+  };
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step: compiledWriteStep as any,
+    workflowName: 'compiled-project-write',
+    prompt: compiledWriteStep.prompt,
+    modelId: 'claude-sonnet-4-6',
+    sessionId: 'workflow:compiled-write:render_report',
+    fullLane: true,
+  });
+
+  assert.deepEqual(result.output, { document: 'report.docx' });
+  assert.equal(captured.agentic, true);
+  assert.deepEqual(captured.allowedLocalMcpTools, ['workspace_artifact_query', 'project_artifact_write']);
+  assert.deepEqual(captured.mcpToolAllowlist, captured.allowedLocalMcpTools);
+  assert.deepEqual(captured.localMcpToolUniverse, captured.allowedLocalMcpTools);
+  assert.deepEqual(captured.requiredLocalMcpTools, [], 'prompt mentions cannot widen or hard-require compiled authority');
+  for (const forbidden of ['produce_document', 'run_shell_command', 'write_file', 'notify_user', 'composio_execute_tool', 'dispatch_background_task']) {
+    assert.equal(captured.allowedLocalMcpTools.includes(forbidden), false, `${forbidden} did not leak in from the worker profile or prompt`);
+  }
+});
+
+test('ordinary catalog workflow steps retain the legacy SDK profile and prompt inference', async () => {
+  let captured: any;
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+    captured = options;
+    return {
+      text: '{"status":"completed","output":{"ok":true}}',
+      structuredOutput: { status: 'completed', output: { ok: true } },
+      sessionId: 'sdk-legacy-workflow-session',
+      model: 'claude-sonnet-4-6',
+      toolUses: ['mcp__clementine-local__run_shell_command'],
+    };
+  });
+
+  const legacyStep = {
+    id: 'legacy_send',
+    prompt: 'Use run_shell_command to inspect the data, write a file, then notify Alex.',
+    sideEffect: 'send' as const,
+    // Ordinary workflows historically treat this as a harness lock elsewhere;
+    // the Claude SDK caller still receives its worker profile here.
+    allowedTools: ['list_files'],
+  };
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step: legacyStep,
+    workflowName: 'legacy-catalog-workflow',
+    prompt: legacyStep.prompt,
+    modelId: 'claude-sonnet-4-6',
+    sessionId: 'workflow:legacy:legacy_send',
+    fullLane: true,
+  });
+
+  assert.deepEqual(result.output, { ok: true });
+  for (const legacyTool of ['run_shell_command', 'write_file', 'notify_user', 'memory_search']) {
+    assert.equal(captured.allowedLocalMcpTools.includes(legacyTool), true, `${legacyTool} remains in the ordinary worker profile`);
+  }
+  assert.deepEqual(captured.requiredLocalMcpTools.sort(), ['notify_user', 'run_shell_command', 'write_file']);
+  assert.equal(Object.prototype.hasOwnProperty.call(captured, 'mcpToolAllowlist'), false, 'ordinary MCP exposure behavior is unchanged');
+  assert.equal(Object.prototype.hasOwnProperty.call(captured, 'localMcpToolUniverse'), false, 'ordinary deferred authority behavior is unchanged');
+});
+
 test('auto-continue HALTS when a continuation anti-thrash loop-stops (no thrash cascade) + reports the honest reason', async () => {
   let calls = 0;
   setClaudeAgentSdkWorkflowStepRunForTest(async () => {

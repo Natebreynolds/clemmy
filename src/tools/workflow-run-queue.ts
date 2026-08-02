@@ -43,6 +43,22 @@ import {
 } from '../execution/workflow-run-definition.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
 import { ExecutionStore } from '../execution/store.js';
+import {
+  settleCompiledProjectRootFromRun,
+  stampCompiledProjectRootSettlement,
+  compiledProjectRootHasSettlementMarker,
+  isCompiledProjectRootCandidate,
+} from '../execution/project-root-lifecycle.js';
+import {
+  compiledWorkflowRunContractHash,
+  compiledWorkflowRunInputsHash,
+  isReservedProjectWorkflowRunRecord,
+} from '../execution/compiled-project-run-contract.js';
+
+export {
+  compiledWorkflowRunContractHash,
+  compiledWorkflowRunInputsHash,
+} from '../execution/compiled-project-run-contract.js';
 
 /** Run-record capability marker: this execution was admitted by a runner that
  * enforces fsynced exact-call receipts for every structured mutation. */
@@ -1076,29 +1092,6 @@ function admittedWorkflowDefinition(
   };
 }
 
-export function compiledWorkflowRunContractHash(input: {
-  sourceExecutionId: string;
-  sourceUserSeq: number;
-  sourceTurnKeyHash: string;
-  originSessionId: string;
-  workflowSlug: string;
-  snapshot: CompiledWorkflowRunDefinitionSnapshot;
-  inputs: Record<string, string>;
-}): string {
-  const normalizedInputsHash = createHash('sha256').update(stableJson(input.inputs)).digest('hex');
-  return createHash('sha256').update(stableJson({
-    version: 'compiled-project-run:v1',
-    sourceExecutionId: input.sourceExecutionId,
-    sourceUserSeq: input.sourceUserSeq,
-    sourceTurnKeyHash: input.sourceTurnKeyHash,
-    originSessionId: input.originSessionId,
-    workflowSlug: input.workflowSlug,
-    definitionHash: input.snapshot.definitionHash,
-    admissionHash: input.snapshot.admissionHash,
-    normalizedInputsHash,
-  })).digest('hex');
-}
-
 function assertCompiledRunMatchesContract(input: {
   runId: string;
   triggerReceiptId: string;
@@ -1220,7 +1213,7 @@ export function queueCompiledWorkflowRun(
   const requestInputs = graphAdmission.compiledPlan.inputs;
 
   const workflowSlug = `compiled-${sourceTurnKeyHash.slice(0, 32)}`;
-  const triggerReceiptId = `project-turn:v1:${sourceTurnKeyHash}`;
+  const triggerReceiptId = `project-turn:v2:${sourceTurnKeyHash}`;
   if (graphAdmission.rootWorkflowReceiptId !== triggerReceiptId) {
     throw new Error('Persisted project graph has a mismatched root workflow receipt.');
   }
@@ -1281,6 +1274,11 @@ export function queueCompiledWorkflowRun(
 
   const readiness = checkWorkflowRunReadiness(definition, workflowSlug);
   if (!readiness.ok) {
+    executionStore.markProjectRootWorkflowReadinessBlocked({
+      sessionId,
+      sourceUserSeq,
+      reason: readiness.message,
+    });
     return {
       status: 'blocked_readiness',
       message: readiness.message,
@@ -1436,6 +1434,12 @@ export interface CompiledWorkflowBindingReconciliation {
   rejected: number;
 }
 
+/** A drain tick may heal only bounded two-ledger gaps. The cursor advances
+ * after every attempted candidate, so a stable corrupt prefix cannot starve
+ * later recoverable roots (or the independent catalog run lane). */
+const COMPILED_PROJECT_TERMINAL_HEAL_LIMIT = 32;
+let compiledProjectTerminalHealCursor = 0;
+
 /**
  * Close the only crash window in compiled-project admission.
  *
@@ -1462,7 +1466,19 @@ export function reconcileAwaitingCompiledWorkflowRunBindings(): CompiledWorkflow
   // a readiness block that later became healthy). This source list comes from
   // ExecutionStore's integrity validator; no run-record bytes participate.
   const executionStore = new ExecutionStore();
-  const unbound = executionStore.listUnboundProjectGraphSources();
+  let unbound: ReturnType<ExecutionStore['listUnboundProjectGraphSources']> = {
+    sources: [],
+    rejected: 0,
+  };
+  try {
+    unbound = executionStore.listUnboundProjectGraphSources();
+  } catch {
+    // Project admission is fail-closed when its authority ledger is corrupt,
+    // but that separate fault must not starve ordinary catalog workflows that
+    // are already durably queued. Continue to the run directory; each parked
+    // project record below will independently fail its store lookup.
+    result.rejected += 1;
+  }
   result.rejected += unbound.rejected;
   for (const source of unbound.sources) {
     result.scanned += 1;
@@ -1482,12 +1498,19 @@ export function reconcileAwaitingCompiledWorkflowRunBindings(): CompiledWorkflow
 
   let files: string[];
   try {
-    files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'));
+    files = readdirSync(WORKFLOW_RUNS_DIR)
+      .filter((entry) => entry.endsWith('.json'))
+      .sort();
   } catch {
     return result;
   }
 
-  for (const file of files) {
+  const start = files.length > 0 ? compiledProjectTerminalHealCursor % files.length : 0;
+  const fairFiles = files.length > 0
+    ? [...files.slice(start), ...files.slice(0, start)]
+    : files;
+  let terminalHealAttempts = 0;
+  for (const file of fairFiles) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     let record: Record<string, unknown>;
     try {
@@ -1495,6 +1518,34 @@ export function reconcileAwaitingCompiledWorkflowRunBindings(): CompiledWorkflow
     } catch {
       // An unreadable record cannot prove that it belongs to this protocol.
       // The ordinary runner also refuses it; leave it untouched.
+      continue;
+    }
+    if (workflowRunIsTerminal(record.status)) {
+      // Catalog terminals are the overwhelmingly common case. Do not resolve
+      // or hash their snapshots, and never open ExecutionStore for them.
+      if (!isCompiledProjectRootCandidate(record)) continue;
+      // The marker authenticates the same canonical filename and terminal
+      // digest. A proven two-ledger commit needs no replay into ExecutionStore.
+      if (compiledProjectRootHasSettlementMarker(filePath, record)) continue;
+      if (terminalHealAttempts >= COMPILED_PROJECT_TERMINAL_HEAL_LIMIT) continue;
+      terminalHealAttempts += 1;
+      const attemptedIndex = files.indexOf(file);
+      compiledProjectTerminalHealCursor = files.length > 0
+        ? (attemptedIndex + 1) % files.length
+        : 0;
+      // Heal a crash after the root run's terminal fsync but before its
+      // ExecutionStore settlement. Each record is isolated: a malformed
+      // project remains closed and cannot starve catalog workflow draining.
+      try {
+        const settlement = settleCompiledProjectRootFromRun(filePath, record);
+        if (settlement.kind === 'rejected') result.rejected += 1;
+        else if (
+          (settlement.kind === 'settled' || settlement.kind === 'already_settled')
+          && !stampCompiledProjectRootSettlement(filePath, settlement)
+        ) result.rejected += 1;
+      } catch {
+        result.rejected += 1;
+      }
       continue;
     }
     if (record.status !== 'awaiting_project_bind') continue;
@@ -1538,7 +1589,7 @@ export function queueWorkflowRun(
 ): QueueWorkflowRunResult {
   if (
     normalizedOptionalString(opts?.source) === 'project_graph'
-    || normalizedOptionalString(opts?.triggerReceiptId)?.startsWith('project-turn:v1:')
+    || normalizedOptionalString(opts?.triggerReceiptId)?.startsWith('project-turn:')
   ) {
     throw new Error('Durable project runs may only be admitted through queueCompiledWorkflowRun.');
   }
@@ -1895,11 +1946,29 @@ export function resumeWorkflowRun(
 }
 
 export interface RequeueResult {
-  status: 'queued' | 'held' | 'duplicate' | 'blocked_readiness' | 'not_found' | 'no_failed_items' | 'ambiguous';
+  status: 'queued' | 'held' | 'duplicate' | 'blocked_readiness' | 'not_found' | 'no_failed_items' | 'ambiguous' | 'project_owned';
   id?: string;
   failedItems?: Array<{ stepId: string; itemKey: string; error: string }>;
   message: string;
   readiness?: WorkflowRunReadinessCheck;
+}
+
+/**
+ * Reserve every durable-project lineage marker before any legacy/catalog
+ * recovery lookup. A corrupt or partially migrated compiled root must never be
+ * reinterpreted as today's same-named catalog workflow: that would create a
+ * second root and copy the project's private inputs into unrelated authority.
+ *
+ * Keep this in the queue layer, not only in dashboard handlers. Chat tools,
+ * self-heal, Doctor, and future callers all share these requeue helpers.
+ */
+function projectOwnedRequeueRefusal(originalRunId: string): RequeueResult {
+  return {
+    status: 'project_owned',
+    message:
+      `Run "${originalRunId}" is a durable project root. Its admitted graph owns recovery; `
+      + 'legacy catalog rerun and failed-item retry cannot create a second root.',
+  };
 }
 
 /**
@@ -1939,6 +2008,9 @@ export function requeueWorkflowFromRun(
     rec = JSON.parse(readFileSync(file, 'utf-8')) as typeof rec;
   } catch {
     return { status: 'not_found', message: 'Original run record unreadable; nothing to re-queue.' };
+  }
+  if (isReservedProjectWorkflowRunRecord(rec as Record<string, unknown>)) {
+    return projectOwnedRequeueRefusal(originalRunId);
   }
   const workflow = typeof rec.workflow === 'string' ? rec.workflow : undefined;
   if (!workflow) return { status: 'not_found', message: 'Original run record has no workflow name.' };
@@ -2178,6 +2250,9 @@ export function requeueWorkflowFailedItemsFromRun(
     rec = JSON.parse(readFileSync(file, 'utf-8')) as typeof rec;
   } catch {
     return { status: 'not_found', message: 'Original run record unreadable; no failed items to re-queue.' };
+  }
+  if (isReservedProjectWorkflowRunRecord(rec as Record<string, unknown>)) {
+    return projectOwnedRequeueRefusal(originalRunId);
   }
   const workflow = typeof rec.workflow === 'string' ? rec.workflow : undefined;
   if (!workflow) return { status: 'not_found', message: 'Original run record has no workflow name.' };

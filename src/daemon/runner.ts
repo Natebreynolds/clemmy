@@ -1734,17 +1734,30 @@ export async function startDaemon(
   // work from runs that the model forgot to close out (executions) or that
   // the gateway never got to finishRun() on (runs).
   const sweptRuns = sweepStaleRuns();
-  const sweptExecutions = sweepStaleExecutions();
+  let sweptExecutions = 0;
+  let sweptCrashed = 0;
+  let sweptBlocked = 0;
+  try {
+    sweptExecutions = sweepStaleExecutions();
+    // On boot, the heartbeat sweeper is the most important one — any
+    // execution that was mid-cycle when the previous daemon died has a
+    // stale heartbeat and the dashboard would otherwise report it as
+    // still working.
+    sweptCrashed = sweepCrashedExecutions();
+    sweptBlocked = sweepStaleBlockedExecutions();
+  } catch (err) {
+    // executions.json is an independent authority ledger. Corruption closes
+    // execution/project mutation, but must not abort daemon boot before the
+    // separately admitted workflow-run lane is armed.
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Execution ledger sweep failed closed; continuing daemon boot',
+    );
+  }
   const sweptApprovals = sweepStaleApprovals();
   const repairedDoneTasks = (getRuntimeEnv('CLEMMY_BGTASK_INTEGRITY_SWEEP', 'on') ?? 'on').toLowerCase() === 'off'
     ? { repaired: 0, ids: [] as string[] }
     : sweepInvalidDoneBackgroundTasks();
-  // On boot, the heartbeat sweeper is the most important one — any
-  // execution that was mid-cycle when the previous daemon died has a
-  // stale heartbeat and the dashboard would otherwise report it as
-  // still working.
-  const sweptCrashed = sweepCrashedExecutions();
-  const sweptBlocked = sweepStaleBlockedExecutions();
   if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0 || sweptCrashed > 0 || sweptBlocked > 0 || repairedDoneTasks.repaired > 0) {
     logger.warn(
       { sweptRuns, sweptExecutions, sweptApprovals, sweptCrashed, sweptBlocked, repairedDoneTasks },
@@ -2307,9 +2320,18 @@ export async function startDaemon(
     if (tickCount % 60 === 0) {
       await withDaemonRuntimePhase('daemon.loop.stale_record_sweep', { tickCount }, async () => {
         const sweptRuns = sweepStaleRuns();
-        const sweptExecutions = sweepStaleExecutions();
+        let sweptExecutions = 0;
+        let sweptBlocked = 0;
+        try {
+          sweptExecutions = sweepStaleExecutions();
+          sweptBlocked = sweepStaleBlockedExecutions();
+        } catch (err) {
+          logger.error(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Execution ledger sweep failed closed; continuing independent maintenance',
+          );
+        }
         const sweptApprovals = sweepStaleApprovals();
-        const sweptBlocked = sweepStaleBlockedExecutions();
         const repairedDoneTasks = (getRuntimeEnv('CLEMMY_BGTASK_INTEGRITY_SWEEP', 'on') ?? 'on').toLowerCase() === 'off'
           ? { repaired: 0, ids: [] as string[] }
           : sweepInvalidDoneBackgroundTasks();
@@ -2324,7 +2346,15 @@ export async function startDaemon(
     // 15-second units, so 20 ticks ≈ 5 min.
     if (tickCount % 20 === 0) {
       await withDaemonRuntimePhase('daemon.loop.crashed_execution_sweep', { tickCount }, async () => {
-        const sweptCrashed = sweepCrashedExecutions();
+        let sweptCrashed = 0;
+        try {
+          sweptCrashed = sweepCrashedExecutions();
+        } catch (err) {
+          logger.error(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Execution heartbeat sweep failed closed',
+          );
+        }
         if (sweptCrashed > 0) {
           logger.warn({ sweptCrashed }, 'Heartbeat sweep auto-failed crashed executions');
         }

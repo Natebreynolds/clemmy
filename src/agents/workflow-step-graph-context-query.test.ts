@@ -30,7 +30,8 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -67,13 +68,23 @@ function seedArtifact(): string {
   return target;
 }
 
+function bindingFor(target: string): { path: string; sha256: string; bytes: number } {
+  const raw = readFileSync(target, 'utf8');
+  return {
+    path: ARTIFACT_REL,
+    sha256: createHash('sha256').update(raw).digest('hex'),
+    bytes: Buffer.byteLength(raw, 'utf8'),
+  };
+}
+
 async function graphQueryTool() {
+  const target = seedArtifact();
   const agent = await buildWorkflowStepAgent({
     resultOnlyTools: true,
     graphContext: {
       workflowName: WORKFLOW,
       runId: RUN_ID,
-      allowedArtifactPaths: [ARTIFACT_REL],
+      allowedArtifacts: [bindingFor(target)],
     },
   });
   const tools = (agent as unknown as {
@@ -83,6 +94,40 @@ async function graphQueryTool() {
   assert.ok(found?.invoke, 'the graph specialist must be given a callable workspace_artifact_query');
   return found as { invoke: (ctx: unknown, input: string) => Promise<unknown> };
 }
+
+test('compiled-project exact authority replaces the generic artifact reader and never inherits notify_user', async () => {
+  const allowed = seedArtifact();
+  const workspace = runWorkspaceDir(WORKFLOW, RUN_ID);
+  const unowned = path.join(workspace, 'artifacts', 'not-owned.json');
+  writeFileSync(unowned, JSON.stringify({ rows: [{ secret: 'not event-owned' }] }), 'utf8');
+
+  const agent = await buildWorkflowStepAgent({
+    lockTools: ['workflow_step_result', 'workspace_artifact_query', 'list_files'],
+    exactTools: true,
+    graphContext: {
+      workflowName: WORKFLOW,
+      runId: RUN_ID,
+      allowedArtifacts: [bindingFor(allowed)],
+    },
+  });
+  const tools = (agent as unknown as {
+    tools: Array<{ name?: string; invoke?: (ctx: unknown, input: string) => Promise<unknown> }>;
+  }).tools;
+  assert.deepEqual(
+    tools.map((tool) => tool.name).sort(),
+    ['list_files', 'workflow_step_result', 'workspace_artifact_query'],
+    'the native lane must expose the compiled grant byte-for-byte',
+  );
+  assert.equal(tools.some((tool) => tool.name === 'notify_user'), false);
+  const query = tools.find((tool) => tool.name === 'workspace_artifact_query');
+  assert.ok(query?.invoke);
+  assert.match(String(await query.invoke({}, JSON.stringify({ path: allowed }))), /Artifact /);
+  assert.match(
+    String(await query.invoke({}, JSON.stringify({ path: unowned }))),
+    /not rendered into the active workflow step context/,
+    'same-run files that are not bound to a completed event remain unreadable',
+  );
+});
 
 /** The SDK reports schema rejection with this field-less shape. */
 const isSchemaRejection = (out: string) =>
@@ -178,4 +223,26 @@ test('filters still work when supplied, and the run-workspace boundary still hol
     /Refused:|Graph context query failed/.test(escape),
     `a path outside the run workspace must still be refused: ${escape}`,
   );
+});
+
+test('an allowed path whose bytes change after binding fails closed', async () => {
+  const absolute = seedArtifact();
+  const bound = bindingFor(absolute);
+  const agent = await buildWorkflowStepAgent({
+    resultOnlyTools: true,
+    graphContext: {
+      workflowName: WORKFLOW,
+      runId: RUN_ID,
+      allowedArtifacts: [bound],
+    },
+  });
+  const query = (agent as unknown as {
+    tools: Array<{ name?: string; invoke?: (ctx: unknown, input: string) => Promise<unknown> }>;
+  }).tools.find((toolRef) => toolRef.name === 'workspace_artifact_query');
+  assert.ok(query?.invoke);
+
+  writeFileSync(absolute, JSON.stringify({ transactions: [{ secret: 'replacement' }] }), 'utf8');
+  const out = String(await query.invoke({}, JSON.stringify({ path: absolute })));
+  assert.match(out, /byte length mismatch|SHA-256 mismatch/i);
+  assert.doesNotMatch(out, /replacement/, 'tampered bytes are never parsed or returned');
 });

@@ -35,7 +35,12 @@ const {
 const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { ExecutionStore } = await import('../execution/store.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
-const { workflowDefinitionHash } = await import('../execution/workflow-run-definition.js');
+const {
+  createCompiledWorkflowRunDefinitionSnapshot,
+  workflowDefinitionHash,
+} = await import('../execution/workflow-run-definition.js');
+const { compiledWorkflowRunContractHash } = await import('../execution/compiled-project-run-contract.js');
+const { compileProjectPlan } = await import('../execution/project-compiler.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const {
   executeWorkflowCallMutation,
@@ -61,19 +66,6 @@ function writeAuditWorkflow(enabled = true): void {
   });
 }
 
-function canonicalTestJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalTestJson).join(',')}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) =>
-    `${JSON.stringify(key)}:${canonicalTestJson(record[key])}`
-  ).join(',')}}`;
-}
-
-function canonicalTestHash(value: unknown): string {
-  return createHash('sha256').update(canonicalTestJson(value), 'utf-8').digest('hex');
-}
-
 function compiledProjectAdmissionInput(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -81,43 +73,32 @@ function compiledProjectAdmissionInput(input: {
   variant?: string;
   inputs?: Record<string, string>;
   requiredTopic?: boolean;
-  usesSkill?: string;
   omitAllowedTools?: boolean;
   allowedTools?: string[];
 }): Record<string, unknown> {
   const variant = input.variant ?? 'winner';
   const safeLabel = input.label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  const definition = {
-    name: `compiled-project-${safeLabel}`,
-    description: 'One-off durable project compiled for queue admission.',
-    enabled: true,
-    trigger: { manual: true },
-    ...(input.requiredTopic ? { inputs: { topic: { description: 'Project topic.' } } } : {}),
-    steps: [{
-      id: 'work',
-      prompt: input.requiredTopic
-        ? `Perform bounded ${variant} work for {{input.topic}}.`
-        : `Perform bounded ${variant} work.`,
-      sideEffect: 'read' as const,
-      maxTurns: 8,
-      ...(!input.omitAllowedTools
-        ? { allowedTools: input.allowedTools ?? ['workflow_step_result'] }
-        : {}),
-      ...(input.usesSkill ? { usesSkill: input.usesSkill } : {}),
-      output: { type: 'object' as const, required_keys: ['summary'] },
-    }],
-  };
+  const instruction = input.requiredTopic
+    ? `Perform bounded ${variant} work for {{input.topic}}.`
+    : `Perform bounded ${variant} work.`;
   const plan = {
-    version: 1,
+    planId: `compiled-project-${safeLabel}`,
     objective: 'Produce a durable verified deliverable.',
     nodes: [{
       id: 'work',
-      executor: 'model',
-      effect: 'read',
-      instruction: definition.steps[0].prompt,
+      executor: {
+        kind: 'model' as const,
+        instruction,
+        ...(!input.omitAllowedTools
+          ? { allowedTools: input.allowedTools ?? ['workspace_artifact_query'] }
+          : {}),
+      },
+      effect: 'read' as const,
       maxTurns: 8,
+      evidence: { type: 'object' as const, requiredKeys: ['summary'] },
     }],
   };
+  const compiled = compileProjectPlan(plan);
   return {
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
@@ -128,19 +109,13 @@ function compiledProjectAdmissionInput(input: {
     confidence: 0.95,
     reasons: ['multi-step durable work'],
     admission: {
-      turnGraphId: `turn-graph:v1:${input.sourceUserSeq}`,
-      turnGraphHash: canonicalTestHash({
-        sessionId: input.sessionId,
-        sourceUserSeq: input.sourceUserSeq,
-        kind: 'turn_graph_v1',
-      }),
       compiledPlan: {
-        version: 1,
-        compilerId: 'project_graph_v1',
-        planHash: canonicalTestHash(plan),
-        definitionHash: workflowDefinitionHash(definition),
+        version: 2,
+        compilerId: 'project_graph_v2',
+        planHash: compiled.planHash,
+        definitionHash: workflowDefinitionHash(compiled.definition),
         plan,
-        definition,
+        definition: compiled.definition,
         inputs: input.inputs ?? {},
       },
     },
@@ -152,7 +127,6 @@ function seedCompiledProject(input: {
   variant?: string;
   inputs?: Record<string, string>;
   requiredTopic?: boolean;
-  usesSkill?: string;
   omitAllowedTools?: boolean;
   allowedTools?: string[];
 }) {
@@ -180,6 +154,22 @@ function seedCompiledProject(input: {
 function runFiles(): string[] {
   try { return readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json')); }
   catch { return []; }
+}
+
+function completedCompiledRecord(record: Record<string, any>): Record<string, any> {
+  return {
+    ...record,
+    status: 'completed',
+    terminalOutcome: 'succeeded',
+    finishedAt: new Date().toISOString(),
+    reportBack: {
+      version: 1,
+      workflowName: record.workflow,
+      outcome: 'done',
+      detail: 'The exact compiled project completed.',
+      acknowledgedOriginSessionIds: [],
+    },
+  };
 }
 
 async function waitForPath(file: string, timeoutMs = 60_000): Promise<void> {
@@ -325,7 +315,7 @@ test('queueCompiledWorkflowRun: queues the persisted first winner without creati
   assert.equal(record.mutationReceiptProtocolVersion, WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION);
   const resolved = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
   assert.equal(resolved.status, 'valid');
-  if (resolved.status === 'valid') assert.equal(resolved.snapshot.version, 2);
+  if (resolved.status === 'valid') assert.equal(resolved.snapshot.version, 3);
   assert.equal(
     seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.graphAdmission?.rootWorkflowRunId,
     queued.id,
@@ -372,11 +362,7 @@ test('queueCompiledWorkflowRun: a losing planner cannot dispatch its own bytes',
 });
 
 test('queueCompiledWorkflowRun: exact replay fails closed after run-contract tampering', () => {
-  const seeded = seedCompiledProject({
-    label: 'tampered-run',
-    requiredTopic: true,
-    inputs: { topic: 'original' },
-  });
+  const seeded = seedCompiledProject({ label: 'tampered-run' });
   const queued = queueCompiledWorkflowRun({
     sessionId: seeded.sessionId,
     sourceUserSeq: seeded.sourceUserSeq,
@@ -393,34 +379,24 @@ test('queueCompiledWorkflowRun: exact replay fails closed after run-contract tam
   );
 });
 
-test('queueCompiledWorkflowRun: validation and readiness failures create no run, receipt, or root binding', () => {
-  const cases = [
-    seedCompiledProject({ label: 'missing-input', requiredTopic: true }),
-    seedCompiledProject({ label: 'missing-skill', usesSkill: 'not-installed-for-compiled-test' }),
-    seedCompiledProject({ label: 'implicit-wildcard', omitAllowedTools: true }),
-    seedCompiledProject({ label: 'prefix-wildcard', allowedTools: ['composio_*'] }),
-  ];
-  for (const seeded of cases) {
-    const result = (() => {
-      try {
-        return queueCompiledWorkflowRun({
-          sessionId: seeded.sessionId,
-          sourceUserSeq: seeded.sourceUserSeq,
-        });
-      } catch (error) {
-        return error;
-      }
-    })();
-    if (seeded === cases[1]) {
-      assert.equal((result as { status?: string }).status, 'blocked_readiness');
-    } else {
-      assert.ok(result instanceof Error);
-    }
-    assert.equal(
-      seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.graphAdmission?.rootWorkflowRunId,
-      undefined,
-    );
-  }
+test('queueCompiledWorkflowRun: implicit capability defaults are explicit while wildcard plans fail before admission', () => {
+  const defaulted = seedCompiledProject({ label: 'implicit-kernel', omitAllowedTools: true });
+  const queued = queueCompiledWorkflowRun({
+    sessionId: defaulted.sessionId,
+    sourceUserSeq: defaulted.sourceUserSeq,
+  });
+  assert.equal(queued.status, 'queued');
+  const record = JSON.parse(
+    readFileSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), 'utf-8'),
+  ) as Record<string, any>;
+  assert.ok(record.workflowDefinitionSnapshot.definition.steps[0].allowedTools.length > 0);
+  assert.equal(record.workflowDefinitionSnapshot.definition.steps[0].allowedTools.includes('*'), false);
+
+  rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+  assert.throws(
+    () => seedCompiledProject({ label: 'prefix-wildcard', allowedTools: ['composio_*'] }),
+    /unknown tool|exact|wildcard/i,
+  );
   assert.deepEqual(runFiles(), []);
 });
 
@@ -540,6 +516,21 @@ test('compiled project binding reconciler installs an admitted root when no run 
   );
 });
 
+test('compiled project recovery fails closed without starving the ordinary run lane when its ledger is corrupt', () => {
+  const executionsFile = path.join(TMP_HOME, 'state', 'executions.json');
+  mkdirSync(path.dirname(executionsFile), { recursive: true });
+  const corruptBytes = '{ "graphAdmission": [';
+  writeFileSync(executionsFile, corruptBytes, 'utf-8');
+
+  assert.deepEqual(reconcileAwaitingCompiledWorkflowRunBindings(), {
+    scanned: 0,
+    activated: 0,
+    blockedReadiness: 0,
+    rejected: 1,
+  });
+  assert.equal(readFileSync(executionsFile, 'utf-8'), corruptBytes);
+});
+
 test('compiled project binding reconciler never activates a parked record without store authority', () => {
   const runId = 'forged-awaiting-project-bind';
   const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
@@ -562,6 +553,108 @@ test('compiled project binding reconciler never activates a parked record withou
     (JSON.parse(readFileSync(runFile, 'utf-8')) as { status?: string }).status,
     'awaiting_project_bind',
   );
+});
+
+test('compiled project terminal recovery rejects a self-consistent V3 snapshot forged after admission', () => {
+  const seeded = seedCompiledProject({ label: 'forged-terminal-definition' });
+  const queued = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`);
+  const admittedRun = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, any>;
+  const admittedSnapshot = admittedRun.workflowDefinitionSnapshot;
+  const forgedSnapshot = createCompiledWorkflowRunDefinitionSnapshot({
+    workflowSlug: admittedSnapshot.workflowSlug,
+    sourceTurnKeyHash: admittedSnapshot.sourceTurnKeyHash,
+    admittedAt: admittedSnapshot.admittedAt,
+    definition: {
+      ...admittedSnapshot.definition,
+      steps: admittedSnapshot.definition.steps.map((step: Record<string, unknown>, index: number) =>
+        index === 0 ? { ...step, prompt: 'Run attacker-selected replacement work.' } : step),
+    },
+  });
+  const forgedContractHash = compiledWorkflowRunContractHash({
+    sourceExecutionId: admittedRun.sourceExecutionId,
+    sourceUserSeq: admittedRun.sourceUserSeq,
+    sourceTurnKeyHash: forgedSnapshot.sourceTurnKeyHash,
+    originSessionId: admittedRun.originSessionId,
+    workflowSlug: forgedSnapshot.workflowSlug,
+    snapshot: forgedSnapshot,
+    inputs: admittedRun.inputs,
+  });
+  writeFileSync(file, JSON.stringify(completedCompiledRecord({
+    ...admittedRun,
+    workflowDefinitionSnapshot: forgedSnapshot,
+    compiledContractHash: forgedContractHash,
+  }), null, 2), 'utf-8');
+
+  const recovery = reconcileAwaitingCompiledWorkflowRunBindings();
+  assert.equal(recovery.rejected, 1);
+  assert.equal(
+    seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)
+      ?.graphAdmission?.rootWorkflowTerminal,
+    undefined,
+  );
+  assert.equal(
+    (JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>).projectExecutionSettlement,
+    undefined,
+  );
+});
+
+test('compiled project terminal recovery rejects a valid terminal copied under the wrong filename', () => {
+  const seeded = seedCompiledProject({ label: 'copied-terminal-filename' });
+  const queued = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  const canonicalFile = path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`);
+  const terminal = completedCompiledRecord(
+    JSON.parse(readFileSync(canonicalFile, 'utf-8')) as Record<string, any>,
+  );
+  const copiedFile = path.join(WORKFLOW_RUNS_DIR, `copied-${queued.id}.json`);
+  writeFileSync(copiedFile, JSON.stringify(terminal, null, 2), 'utf-8');
+
+  const recovery = reconcileAwaitingCompiledWorkflowRunBindings();
+  assert.equal(recovery.rejected, 1);
+  assert.equal(
+    seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)
+      ?.graphAdmission?.rootWorkflowTerminal,
+    undefined,
+  );
+  assert.equal(
+    (JSON.parse(readFileSync(copiedFile, 'utf-8')) as Record<string, unknown>).projectExecutionSettlement,
+    undefined,
+  );
+});
+
+test('compiled project recovery skips a valid settlement marker without reopening ExecutionStore', () => {
+  const seeded = seedCompiledProject({ label: 'settlement-marker-short-circuit' });
+  const queued = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`);
+  const terminal = completedCompiledRecord(
+    JSON.parse(readFileSync(file, 'utf-8')) as Record<string, any>,
+  );
+  writeFileSync(file, JSON.stringify(terminal, null, 2), 'utf-8');
+  assert.equal(reconcileAwaitingCompiledWorkflowRunBindings().rejected, 0);
+  assert.equal(
+    typeof (JSON.parse(readFileSync(file, 'utf-8')) as Record<string, any>)
+      .projectExecutionSettlement?.terminalDigest,
+    'string',
+  );
+
+  // If recovery re-entered settlement, this deliberately absent source would
+  // fail. The authenticated marker makes the second scan a store-free no-op.
+  writeFileSync(path.join(TMP_HOME, 'state', 'executions.json'), '[]', 'utf-8');
+  assert.deepEqual(reconcileAwaitingCompiledWorkflowRunBindings(), {
+    scanned: 0,
+    activated: 0,
+    blockedReadiness: 0,
+    rejected: 0,
+  });
 });
 
 test('queueCompiledWorkflowRun: a V3 tombstone is authoritative only after the execution ledger was bound', () => {
@@ -621,6 +714,10 @@ test('queueCompiledWorkflowRun: concurrent same-source callers converge on one b
 test('queueWorkflowRun: cannot preempt the durable project source namespace', () => {
   assert.throws(
     () => queueWorkflowRun('audit-brief', {}, { source: 'project_graph' }),
+    /queueCompiledWorkflowRun/,
+  );
+  assert.throws(
+    () => queueWorkflowRun('audit-brief', {}, { triggerReceiptId: `project-turn:v2:${'a'.repeat(64)}` }),
     /queueCompiledWorkflowRun/,
   );
   assert.throws(
@@ -1473,6 +1570,56 @@ test('requeueWorkflowFromRun re-queues a failed run with its original inputs (bu
     sourceRunId: origId,
     reason: 'whole-run requeue',
   });
+});
+
+test('legacy requeue helpers refuse every reserved project marker before a same-name catalog collision can copy inputs', () => {
+  writeAuditWorkflow();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const markers: Array<Record<string, unknown>> = [
+    { source: 'project_graph' },
+    { source: 'project_graph', workflowDefinitionSnapshot: 'corrupt-snapshot' },
+    { sourceExecutionId: 'exec-project-partial' },
+    { compiledContractHash: 'corrupt-contract' },
+    { triggerReceiptId: `project-turn:v1:${'b'.repeat(64)}` },
+    { workflowSlug: 'compiled-malformed-partial-lineage' },
+    {
+      workflowDefinitionSnapshot: {
+        version: 2,
+        scope: 'compiled',
+        compilerId: 'project_graph_v1',
+      },
+    },
+  ];
+  const sourceFiles: string[] = [];
+  for (const [index, marker] of markers.entries()) {
+    const id = `reserved-project-requeue-${index}`;
+    sourceFiles.push(`${id}.json`);
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${id}.json`), JSON.stringify({
+      id,
+      workflow: 'audit-brief',
+      inputs: { url: `PRIVATE_PROJECT_INPUT_${index}` },
+      status: 'completed_with_errors',
+      ...marker,
+    }), 'utf-8');
+  }
+
+  const before = runFiles().sort();
+  assert.deepEqual(before, sourceFiles.sort());
+  for (const file of sourceFiles) {
+    const id = file.slice(0, -'.json'.length);
+    const wholeRun = requeueWorkflowFromRun(id);
+    const failedItems = requeueWorkflowFailedItemsFromRun(id);
+    assert.equal(wholeRun.status, 'project_owned', `${id} whole-run recovery must stay graph-owned`);
+    assert.equal(failedItems.status, 'project_owned', `${id} failed-item recovery must stay graph-owned`);
+    assert.match(wholeRun.message, /durable project root|admitted graph/i);
+  }
+
+  assert.deepEqual(runFiles().sort(), before, 'no fresh catalog run copies the project inputs');
+  assert.equal(
+    existsSync(path.join(WORKFLOW_RUNS_DIR, '.trigger-receipts')),
+    false,
+    'refusal happens before any receipt is installed',
+  );
 });
 
 test('requeueWorkflowFromRun refuses to overlap a source run that is still executing', () => {

@@ -49,6 +49,7 @@ import {
   workflowRunReportBackNeedsRetry,
   type WorkflowRunReportBackRecord,
 } from './workflow-run-report-back.js';
+import { compiledProjectRootHasSettlementMarker } from './project-root-lifecycle.js';
 
 /**
  * Workflow scheduling tick.
@@ -1101,6 +1102,10 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
         const raw = readWorkflowRunRecordUnlocked<ReapableWorkflowRunRecord>(full);
         if (!raw || !isTerminalWorkflowRunRecord(raw)) return false;
         if (hasOutstandingWorkflowRunReportBack(raw)) return false;
+        // A compiled root is the restart journal for a second durable ledger.
+        // Never delete it until an exact marker proves ExecutionStore observed
+        // the same immutable terminal digest.
+        if (!compiledProjectRootHasSettlementMarker(full, raw as unknown as Record<string, unknown>)) return false;
 
         // Prefer finishedAt; fall back to file mtime for legacy terminal records.
         const finishedMs = raw.finishedAt ? Date.parse(raw.finishedAt) : Number.NaN;

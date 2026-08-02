@@ -42,7 +42,26 @@ import {
 } from '../runtime/harness/external-write-admission.js';
 import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
 import { BoundaryError } from '../runtime/boundary-error.js';
-import { workflowDefinitionHash } from './workflow-run-definition.js';
+import {
+  createCompiledWorkflowRunDefinitionSnapshot,
+  workflowDefinitionHash,
+} from './workflow-run-definition.js';
+import { compileProjectPlan } from './project-compiler.js';
+import {
+  canonicalProjectPlan,
+  validateProjectPlan,
+  type ProjectPlan,
+} from './project-plan-ir.js';
+import {
+  isWorkflowTerminalOutcome,
+  workflowTerminalOutcomeMatchesReport,
+  type WorkflowTerminalOutcome,
+} from './workflow-terminal-outcome.js';
+import {
+  compiledProjectRootTerminalDigest,
+  compiledWorkflowRunContractHash,
+  compiledWorkflowRunInputsHash,
+} from './compiled-project-run-contract.js';
 
 const STATE_DIR = path.join(BASE_DIR, 'state');
 const EXECUTIONS_FILE = path.join(STATE_DIR, 'executions.json');
@@ -125,7 +144,7 @@ function executionsFileLock<T>(work: () => T): T {
 
 function sourceTurnKeyHash(sessionId: string, sourceUserSeq: number): string {
   return createHash('sha256')
-    .update('clementine-project-source:v1', 'utf8')
+    .update('clementine-project-source:v2', 'utf8')
     .update('\0')
     .update(sessionId, 'utf8')
     .update('\0')
@@ -206,7 +225,7 @@ function prepareCompiledPlanSnapshot(
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw new Error('Execution admission requires a complete project compiler snapshot.');
   }
-  if (input.version !== 1 || input.compilerId !== 'project_graph_v1') {
+  if (input.version !== 2 || input.compilerId !== 'project_graph_v2') {
     throw new Error('Execution admission requires a supported project compiler snapshot.');
   }
   if (!/^[a-f0-9]{64}$/.test(input.planHash)) {
@@ -216,12 +235,18 @@ function prepareCompiledPlanSnapshot(
     throw new Error('Execution admission workflow definition hash is invalid.');
   }
 
-  const plan = canonicalJsonValue(input.plan);
-  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
+  const suppliedPlan = canonicalJsonValue(input.plan);
+  if (!suppliedPlan || typeof suppliedPlan !== 'object' || Array.isArray(suppliedPlan)) {
     throw new Error('Execution admission requires a normalized project-plan object.');
   }
-  if (canonicalJsonHash(plan) !== input.planHash) {
-    throw new Error('Execution admission project-plan bytes do not match their hash.');
+  const validation = validateProjectPlan(suppliedPlan);
+  if (!validation.ok) {
+    throw new Error(`Execution admission project plan is invalid: ${validation.errors.join('; ')}`);
+  }
+  const plan = canonicalProjectPlan(suppliedPlan as unknown as ProjectPlan);
+  const compiled = compileProjectPlan(plan);
+  if (compiled.planHash !== input.planHash || canonicalJsonHash(plan) !== input.planHash) {
+    throw new Error('Execution admission project-plan bytes do not match the canonical compiler hash.');
   }
 
   const definition = canonicalJsonValue(input.definition);
@@ -230,6 +255,12 @@ function prepareCompiledPlanSnapshot(
   }
   if (workflowDefinitionHash(definition as unknown as typeof input.definition) !== input.definitionHash) {
     throw new Error('Execution admission workflow definition bytes do not match their hash.');
+  }
+  if (
+    workflowDefinitionHash(compiled.definition) !== input.definitionHash
+    || canonicalJsonHash(definition) !== canonicalJsonHash(compiled.definition)
+  ) {
+    throw new Error('Execution admission workflow definition was not produced by the declared project plan.');
   }
 
   const inputs = canonicalJsonValue(input.inputs);
@@ -241,8 +272,8 @@ function prepareCompiledPlanSnapshot(
   }
 
   const payload: ProjectGraphCompiledPlanInput = {
-    version: 1,
-    compilerId: 'project_graph_v1',
+    version: 2,
+    compilerId: 'project_graph_v2',
     planHash: input.planHash,
     definitionHash: input.definitionHash,
     plan,
@@ -497,7 +528,7 @@ function reopenCompletionClosedTasks(execution: ExecutionRecord, now: string): n
 
 function reconcileCompletedExternalWriteTruth(executions: ExecutionRecord[]): boolean {
   const candidates = executions.filter((execution) =>
-    execution.status === 'completed' && !execution.blocker
+    !execution.graphAdmission && execution.status === 'completed' && !execution.blocker
   );
   const eventsBySession = new Map<string, EventRow[]>();
   for (const execution of candidates) {
@@ -622,8 +653,6 @@ export interface CreateExecutionInput {
 }
 
 export interface GraphExecutionAdmissionInput {
-  turnGraphId: string;
-  turnGraphHash: string;
   compiledPlan: ProjectGraphCompiledPlanInput;
 }
 
@@ -674,21 +703,36 @@ function exactAcceptedHumanSource(sessionId: string, sourceUserSeq: number): Eve
   }
 }
 
+/** Hash only the immutable accepted-event identity. The observational shadow
+ * graph is useful telemetry, but its classifiers and persistence availability
+ * must never decide whether an explicitly model-authored project may run. */
+function acceptedSourceEventHash(source: EventRow): string {
+  return createHash('sha256')
+    .update('clementine-accepted-project-source:v2', 'utf8')
+    .update('\0')
+    .update(source.sessionId, 'utf8')
+    .update('\0')
+    .update(String(source.seq), 'utf8')
+    .update('\0')
+    .update(source.id, 'utf8')
+    .update('\0')
+    .update(String(source.turn), 'utf8')
+    .digest('hex');
+}
+
 function assertGraphAdmissionInput(
   sessionId: string,
   sourceUserSeq: number,
   admission: GraphExecutionAdmissionInput,
-): ProjectGraphCompiledPlanSnapshot {
-  if (!exactAcceptedHumanSource(sessionId, sourceUserSeq)) {
+): { compiledPlan: ProjectGraphCompiledPlanSnapshot; acceptedSourceHash: string } {
+  const source = exactAcceptedHumanSource(sessionId, sourceUserSeq);
+  if (!source) {
     throw new Error('A durable execution must be bound to the exact accepted human user turn.');
   }
-  if (admission.turnGraphId !== `turn-graph:v1:${sourceUserSeq}`) {
-    throw new Error('Execution admission graph id does not match its accepted source.');
-  }
-  if (!/^[a-f0-9]{64}$/.test(admission.turnGraphHash)) {
-    throw new Error('Execution admission requires a valid turn graph hash.');
-  }
-  return prepareCompiledPlanSnapshot(admission.compiledPlan);
+  return {
+    compiledPlan: prepareCompiledPlanSnapshot(admission.compiledPlan),
+    acceptedSourceHash: acceptedSourceEventHash(source),
+  };
 }
 
 function buildExecutionRecord(
@@ -737,7 +781,17 @@ export function rootWorkflowReceiptForSource(sessionId: string, sourceUserSeq: n
   if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
     throw new Error('A root workflow receipt requires an exact accepted source.');
   }
-  return `project-turn:v1:${sourceTurnKeyHash(sessionId, sourceUserSeq)}`;
+  return `project-turn:v2:${sourceTurnKeyHash(sessionId, sourceUserSeq)}`;
+}
+
+function projectRootTerminalStatusMatchesOutcome(
+  status: 'completed' | 'completed_with_errors' | 'error' | 'failed' | 'cancelled',
+  outcome: WorkflowTerminalOutcome,
+): boolean {
+  if (status === 'completed') return outcome === 'succeeded' || outcome === 'blocked';
+  if (status === 'completed_with_errors') return outcome === 'partial';
+  if (status === 'error' || status === 'failed') return outcome === 'blocked' || outcome === 'failed';
+  return outcome === 'cancelled';
 }
 
 function assertExecutionGraphAdmissionIntegrity(execution: ExecutionRecord): void {
@@ -749,12 +803,17 @@ function assertExecutionGraphAdmissionIntegrity(execution: ExecutionRecord): voi
   }
   const expectedSourceHash = sourceTurnKeyHash(execution.sessionId, sourceUserSeq as number);
   const expectedReceipt = rootWorkflowReceiptForSource(execution.sessionId, sourceUserSeq as number);
+  const acceptedSource = exactAcceptedHumanSource(execution.sessionId, sourceUserSeq as number);
+  const expectedAcceptedSourceHash = acceptedSource
+    ? acceptedSourceEventHash(acceptedSource)
+    : undefined;
   if (
-    admission.version !== 1
+    admission.version !== 2
     || admission.kind !== 'project_graph'
     || admission.sourceTurnKeyHash !== expectedSourceHash
-    || admission.turnGraphId !== `turn-graph:v1:${sourceUserSeq}`
-    || !/^[a-f0-9]{64}$/.test(admission.turnGraphHash)
+    || !/^[a-f0-9]{64}$/.test(admission.acceptedSourceHash)
+    || (expectedAcceptedSourceHash !== undefined
+      && admission.acceptedSourceHash !== expectedAcceptedSourceHash)
     || admission.rootWorkflowReceiptId !== expectedReceipt
     || typeof admission.admittedAt !== 'string'
     || !Number.isFinite(Date.parse(admission.admittedAt))
@@ -765,11 +824,77 @@ function assertExecutionGraphAdmissionIntegrity(execution: ExecutionRecord): voi
   if (admission.planHash !== compiledPlan.planHash) {
     throw new Error('Persisted project admission plan hash does not match its compiler snapshot.');
   }
-  if (
-    admission.rootWorkflowRunId !== undefined
-    && (typeof admission.rootWorkflowRunId !== 'string' || !admission.rootWorkflowRunId.trim())
-  ) {
+  const rootRunId = admission.rootWorkflowRunId;
+  if (rootRunId !== undefined && (typeof rootRunId !== 'string' || !rootRunId.trim())) {
     throw new Error('Persisted project admission has an invalid root workflow run id.');
+  }
+  const cancelledBeforeRoot = admission.cancelledBeforeRoot;
+  if (cancelledBeforeRoot !== undefined) {
+    if (
+      cancelledBeforeRoot.version !== 1
+      || rootRunId !== undefined
+      || admission.rootWorkflowTerminal !== undefined
+      || !Number.isFinite(Date.parse(cancelledBeforeRoot.finishedAt))
+      || !cancelledBeforeRoot.reason.trim()
+      || execution.status !== 'completed'
+      || execution.completedAt !== cancelledBeforeRoot.finishedAt
+      || execution.blocker !== cancelledBeforeRoot.reason
+      || execution.lastAssistantSummary !== cancelledBeforeRoot.reason
+    ) {
+      throw new Error('Persisted project admission has invalid pre-root cancellation truth.');
+    }
+    return;
+  }
+
+  if (rootRunId === undefined) {
+    if (
+      admission.rootWorkflowTerminal !== undefined
+      || (execution.status !== 'active' && execution.status !== 'blocked')
+      || execution.completedAt !== undefined
+    ) {
+      throw new Error('Unbound project admission has contradictory lifecycle truth.');
+    }
+    return;
+  }
+
+  const bindings = (execution.workflowBindings ?? []).filter((binding) => binding.runId === rootRunId);
+  const binding = bindings[0];
+  if (bindings.length !== 1 || binding.workflow !== compiledPlan.definition.name) {
+    throw new Error('Persisted project root does not have one exact workflow binding.');
+  }
+  const terminal = admission.rootWorkflowTerminal;
+  if (terminal === undefined) {
+    if (
+      execution.status !== 'active'
+      || execution.completedAt !== undefined
+      || (binding.status !== 'queued' && binding.status !== 'running')
+      || binding.terminalOutcome !== undefined
+      || binding.finishedAt !== undefined
+    ) {
+      throw new Error('Persisted project root binding is terminal or contradictory without root terminal truth.');
+    }
+    return;
+  }
+
+  const statuses = new Set(['completed', 'completed_with_errors', 'error', 'failed', 'cancelled']);
+  const outcomes = new Set(['succeeded', 'partial', 'blocked', 'failed', 'cancelled']);
+  const expectedBindingStatus = terminal.outcome === 'succeeded' ? 'completed' : 'error';
+  if (
+    terminal.version !== 1
+    || terminal.runId !== rootRunId
+    || !statuses.has(terminal.status)
+    || !outcomes.has(terminal.outcome)
+    || !Number.isFinite(Date.parse(terminal.finishedAt))
+    || !Number.isFinite(Date.parse(terminal.observedAt))
+    || !/^[a-f0-9]{64}$/.test(terminal.terminalDigest)
+    || !projectRootTerminalStatusMatchesOutcome(terminal.status, terminal.outcome)
+    || execution.status !== 'completed'
+    || execution.completedAt !== terminal.finishedAt
+    || binding.status !== expectedBindingStatus
+    || binding.terminalOutcome !== terminal.outcome
+    || binding.finishedAt !== terminal.finishedAt
+  ) {
+    throw new Error('Persisted project execution does not match its immutable root terminal truth.');
   }
 }
 
@@ -786,6 +911,14 @@ function applyExecutionUpdate(
   patch: ExecutionUpdatePatch,
 ): ExecutionRecord {
   const now = new Date().toISOString();
+  if (execution.graphAdmission) {
+    // There is no harmless generic patch here: applyExecutionUpdate also moves
+    // activity clocks and completion side effects implicitly. Graph state has
+    // dedicated, contract-checking transitions for readiness, bind, cancel,
+    // and settle; forcing every mutation through them keeps one lifecycle
+    // authority instead of maintaining a fragile forbidden-field list.
+    throw new Error('Durable project state is owned by its root workflow; generic execution updates are not permitted.');
+  }
   const {
     id: _ignoredId,
     sessionId: _ignoredSessionId,
@@ -848,7 +981,14 @@ export class ExecutionStore {
       persistReconciledExecutions(executions, sessionExecutions);
       return sessionExecutions
         .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-        .find((execution) => execution.status === 'active' || execution.status === 'blocked');
+        // Durable project graphs are advanced only by their root workflow.
+        // Returning one here would feed it into the legacy assistant/controller
+        // prompt, whose execution_update_* verbs deliberately have no graph
+        // mutation authority.
+        .find((execution) =>
+          !execution.graphAdmission
+          && (execution.status === 'active' || execution.status === 'blocked')
+        );
     });
   }
 
@@ -870,7 +1010,7 @@ export class ExecutionStore {
   createOrGetForSource(
     input: CreateOrGetExecutionForSourceInput,
   ): CreateOrGetExecutionForSourceResult {
-    const compiledPlan = assertGraphAdmissionInput(
+    const { compiledPlan, acceptedSourceHash } = assertGraphAdmissionInput(
       input.sessionId,
       input.sourceUserSeq,
       input.admission,
@@ -896,11 +1036,10 @@ export class ExecutionStore {
         const admitted = existing.graphAdmission;
         if (admitted) {
           if (
-            admitted.version !== 1
+            admitted.version !== 2
             || admitted.kind !== 'project_graph'
             || admitted.sourceTurnKeyHash !== keyHash
-            || admitted.turnGraphId !== input.admission.turnGraphId
-            || admitted.turnGraphHash !== input.admission.turnGraphHash
+            || admitted.acceptedSourceHash !== acceptedSourceHash
             || admitted.rootWorkflowReceiptId !== receiptId
           ) {
             throw new Error('Accepted source already has a different immutable project admission.');
@@ -909,6 +1048,7 @@ export class ExecutionStore {
           if (admitted.planHash !== persistedPlan.planHash) {
             throw new Error('Persisted project admission plan hash does not match its compiler snapshot.');
           }
+          assertExecutionGraphAdmissionIntegrity(existing);
           const plannerConflict = persistedPlan.snapshotHash !== compiledPlan.snapshotHash;
           let repairedControllerOwnership = false;
           if (existing.autoAdvance !== false || existing.nextReviewAt !== undefined) {
@@ -928,13 +1068,23 @@ export class ExecutionStore {
           };
         }
 
+        // Reusing the exact accepted source is safe only while the legacy
+        // execution is still live. A paused or completed row already carries
+        // an independent lifecycle decision; attaching immutable graph
+        // authority to it would admit work that bindRootWorkflowRunForSource
+        // must later refuse, leaving a permanently stranded project.
+        if (existing.status !== 'active' && existing.status !== 'blocked') {
+          throw new Error(
+            'Accepted source already belongs to a paused or terminal execution; project admission requires a live source.',
+          );
+        }
+
         const now = new Date().toISOString();
         existing.graphAdmission = {
-          version: 1,
+          version: 2,
           kind: 'project_graph',
           sourceTurnKeyHash: keyHash,
-          turnGraphId: input.admission.turnGraphId,
-          turnGraphHash: input.admission.turnGraphHash,
+          acceptedSourceHash,
           planHash: compiledPlan.planHash,
           compiledPlan,
           rootWorkflowReceiptId: receiptId,
@@ -952,8 +1102,7 @@ export class ExecutionStore {
           metadata: {
             source: 'project_graph',
             sourceUserSeq: input.sourceUserSeq,
-            turnGraphId: input.admission.turnGraphId,
-            turnGraphHash: input.admission.turnGraphHash,
+            acceptedSourceHash,
             planHash: compiledPlan.planHash,
             compiledPlanHash: compiledPlan.snapshotHash,
           },
@@ -972,11 +1121,10 @@ export class ExecutionStore {
 
       const admittedAt = new Date().toISOString();
       const execution = buildExecutionRecord({ ...input, sourceUserSeq: input.sourceUserSeq }, deterministicId, {
-        version: 1,
+        version: 2,
         kind: 'project_graph',
         sourceTurnKeyHash: keyHash,
-        turnGraphId: input.admission.turnGraphId,
-        turnGraphHash: input.admission.turnGraphHash,
+        acceptedSourceHash,
         planHash: compiledPlan.planHash,
         compiledPlan,
         rootWorkflowReceiptId: receiptId,
@@ -991,8 +1139,7 @@ export class ExecutionStore {
         metadata: {
           source: 'project_graph',
           sourceUserSeq: input.sourceUserSeq,
-          turnGraphId: input.admission.turnGraphId,
-          turnGraphHash: input.admission.turnGraphHash,
+          acceptedSourceHash,
           planHash: compiledPlan.planHash,
           compiledPlanHash: compiledPlan.snapshotHash,
         },
@@ -1065,6 +1212,133 @@ export class ExecutionStore {
     });
   }
 
+  /**
+   * Record a pre-dispatch capability block without surrendering the admitted
+   * project. Readiness recovery keeps re-entering the immutable queue contract;
+   * this state is operational truth for the user, not timeout authority.
+   */
+  markProjectRootWorkflowReadinessBlocked(input: {
+    sessionId: string;
+    sourceUserSeq: number;
+    reason: string;
+  }): ExecutionRecord {
+    const reason = clean(input.reason, 500) || 'The durable project is waiting for a required capability.';
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const matches = executions.filter((entry) =>
+        entry.sessionId === input.sessionId && entry.sourceUserSeq === input.sourceUserSeq
+      );
+      if (matches.length > 1) {
+        throw new Error('Multiple executions claim the same accepted source; readiness update failed closed.');
+      }
+      const execution = matches[0];
+      if (!execution?.graphAdmission) {
+        throw new Error('Project readiness can only update an admitted graph execution.');
+      }
+      assertExecutionGraphAdmissionIntegrity(execution);
+      // Once a root exists, its run record is the only lifecycle authority.
+      // A later environmental readiness probe cannot regress a terminal or
+      // already-running project back to a pre-dispatch blocker.
+      if (execution.graphAdmission.rootWorkflowRunId) return execution;
+      if (execution.status === 'completed' || execution.status === 'paused') return execution;
+
+      const now = new Date().toISOString();
+      execution.status = 'blocked';
+      execution.blocker = reason;
+      execution.nextStep = 'Reconnect the required capability; the durable project will retry admission automatically.';
+      execution.nextReviewAt = undefined;
+      execution.autoAdvance = false;
+      execution.updatedAt = now;
+      execution.lastActivityAt = now;
+      execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+      const activityKey = `project-readiness:${execution.graphAdmission.rootWorkflowReceiptId}`;
+      if (!execution.activity.some((item) => item.key === activityKey)) {
+        execution.activity.push({
+          id: randomUUID(),
+          key: activityKey,
+          type: 'blocked',
+          message: reason,
+          createdAt: now,
+          metadata: { source: 'project_graph', phase: 'root_readiness' },
+        });
+        execution.activity = execution.activity.slice(-60);
+      }
+      saveExecutionsUnlocked(executions);
+      return execution;
+    });
+  }
+
+  /**
+   * Linearize a Tasks-board cancellation against root binding. If no root has
+   * won, the project closes locally and a later bind is forbidden. If a root
+   * has won, return its exact identity without mutating either ledger; the
+   * caller releases this lock and cancels through the workflow boundary.
+   */
+  prepareProjectCancellation(input: {
+    executionId: string;
+    reason: string;
+  }):
+    | { kind: 'not_project'; execution: ExecutionRecord }
+    | { kind: 'already_terminal'; execution: ExecutionRecord }
+    | { kind: 'cancelled_unbound'; execution: ExecutionRecord }
+    | { kind: 'bound_root'; execution: ExecutionRecord; runId: string; workflow: string } {
+    const executionId = input.executionId.trim();
+    if (!executionId) throw new Error('Project cancellation requires an exact execution id.');
+    const reason = clean(input.reason, 500) || 'Cancelled by the user.';
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const execution = executions.find((entry) => entry.id === executionId);
+      if (!execution) throw new Error('Execution not found.');
+      if (!execution.graphAdmission) return { kind: 'not_project', execution };
+      assertExecutionGraphAdmissionIntegrity(execution);
+      const runId = execution.graphAdmission.rootWorkflowRunId;
+      if (
+        execution.status === 'completed'
+        && (!runId || execution.graphAdmission.rootWorkflowTerminal)
+      ) return { kind: 'already_terminal', execution };
+      if (runId) {
+        const workflow = execution.graphAdmission.compiledPlan.definition.name;
+        const bindings = (execution.workflowBindings ?? []).filter((binding) => binding.runId === runId);
+        if (bindings.length !== 1 || bindings[0].workflow !== workflow) {
+          throw new Error('Bound project root has no exact workflow binding; cancellation failed closed.');
+        }
+        return { kind: 'bound_root', execution, runId, workflow };
+      }
+
+      const now = new Date().toISOString();
+      execution.status = 'completed';
+      execution.completedAt = now;
+      execution.graphAdmission.cancelledBeforeRoot = {
+        version: 1,
+        finishedAt: now,
+        reason,
+      };
+      execution.blocker = reason;
+      execution.lastAssistantSummary = reason;
+      execution.nextStep = undefined;
+      execution.nextReviewAt = undefined;
+      execution.autoAdvance = false;
+      execution.updatedAt = now;
+      execution.lastActivityAt = now;
+      execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+      const activityKey = 'project:cancelled-before-root';
+      if (!execution.activity.some((item) => item.key === activityKey)) {
+        execution.activity.push({
+          id: randomUUID(),
+          key: activityKey,
+          type: 'completed',
+          message: reason,
+          createdAt: now,
+          metadata: { source: 'project_graph', terminalOutcome: 'cancelled' },
+        });
+        execution.activity = execution.activity.slice(-60);
+      }
+      closeLinkedVaultTasks(execution, now);
+      saveExecutionsUnlocked(executions);
+      return { kind: 'cancelled_unbound', execution };
+    });
+  }
+
   /** Bind the one root workflow occurrence without allowing a retry to swap it. */
   bindRootWorkflowRunForSource(input: {
     sessionId: string;
@@ -1103,12 +1377,22 @@ export class ExecutionStore {
       ) {
         throw new Error('Root workflow binding does not match the immutable compiled project plan.');
       }
-      if (execution.graphAdmission.rootWorkflowRunId && execution.graphAdmission.rootWorkflowRunId !== runId) {
+      const alreadyBoundRunId = execution.graphAdmission.rootWorkflowRunId;
+      if (alreadyBoundRunId && alreadyBoundRunId !== runId) {
         throw new Error('Accepted project source is already bound to a different root workflow run.');
       }
       const existingBinding = (execution.workflowBindings ?? []).find((binding) => binding.runId === runId);
       if (existingBinding && existingBinding.workflow !== workflow) {
         throw new Error('Root workflow run is already bound under a different workflow identity.');
+      }
+      if (!alreadyBoundRunId && execution.status !== 'active' && execution.status !== 'blocked') {
+        throw new Error('Only an active or readiness-blocked project can bind its root workflow run.');
+      }
+      if (alreadyBoundRunId && (!existingBinding || execution.graphAdmission.rootWorkflowTerminal)) {
+        if (!existingBinding) {
+          throw new Error('Persisted project root has no exact workflow binding.');
+        }
+        return execution;
       }
       const now = new Date().toISOString();
       execution.graphAdmission.rootWorkflowRunId = runId;
@@ -1120,8 +1404,13 @@ export class ExecutionStore {
           ];
       execution.autoAdvance = false;
       execution.nextReviewAt = undefined;
-      execution.nextStep = 'Durable workflow is executing the admitted project graph.';
-      execution.lastAssistantSummary = `Queued durable workflow run ${runId}.`;
+      const bindingIsTerminal = existingBinding?.status === 'completed' || existingBinding?.status === 'error';
+      if (!bindingIsTerminal && execution.status !== 'completed' && execution.status !== 'paused') {
+        execution.status = 'active';
+        execution.blocker = undefined;
+        execution.nextStep = 'Durable workflow is executing the admitted project graph.';
+        execution.lastAssistantSummary = `Queued durable workflow run ${runId}.`;
+      }
       execution.updatedAt = now;
       execution.lastActivityAt = now;
       execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
@@ -1139,6 +1428,231 @@ export class ExecutionStore {
       }
       saveExecutionsUnlocked(executions);
       return execution;
+    });
+  }
+
+  /**
+   * Couple the immutable terminal truth of one compiled root run back to its
+   * project record. Ordinary/catalog workflow runs are a no-op. Exact root,
+   * workflow, compiled definition, and binding identity must all agree before
+   * this method can settle anything.
+   */
+  settleProjectRootWorkflowRun(input: {
+    sourceExecutionId: string;
+    sessionId: string;
+    sourceUserSeq: number;
+    rootWorkflowReceiptId: string;
+    runId: string;
+    workflow: string;
+    workflowSlug: string;
+    sourceTurnKeyHash: string;
+    snapshotDefinitionHash: string;
+    snapshotAdmissionHash: string;
+    snapshotAdmittedAt: string;
+    compiledContractHash: string;
+    normalizedInputsHash: string;
+    mutationReceiptProtocolVersion: number;
+    status: 'completed' | 'completed_with_errors' | 'error' | 'failed' | 'cancelled';
+    terminalOutcome: WorkflowTerminalOutcome;
+    finishedAt: string;
+    reportBack: {
+      version: 1;
+      workflowName: string;
+      outcome: 'done' | 'blocked' | 'failed';
+      detail: string;
+    };
+    terminalDigest: string;
+    summary?: string;
+  }): { kind: 'settled' | 'already_settled'; execution: ExecutionRecord } {
+    const sourceExecutionId = input.sourceExecutionId.trim();
+    const runId = input.runId.trim();
+    const workflow = input.workflow.trim();
+    const workflowSlug = input.workflowSlug.trim();
+    const rawReportDetail = input.reportBack?.detail ?? '';
+    const reportDetail = clean(rawReportDetail, 500);
+    const reportBackKeys = input.reportBack && typeof input.reportBack === 'object'
+      ? Object.keys(input.reportBack).sort().join('\0')
+      : '';
+    if (
+      !sourceExecutionId
+      || !input.sessionId.trim()
+      || !Number.isSafeInteger(input.sourceUserSeq)
+      || input.sourceUserSeq <= 0
+      || !runId
+      || !workflow
+      || !workflowSlug
+      || !/^[a-f0-9]{64}$/.test(input.sourceTurnKeyHash)
+      || !/^[a-f0-9]{64}$/.test(input.snapshotDefinitionHash)
+      || !/^[a-f0-9]{64}$/.test(input.snapshotAdmissionHash)
+      || !Number.isFinite(Date.parse(input.snapshotAdmittedAt))
+      || !/^[a-f0-9]{64}$/.test(input.compiledContractHash)
+      || !/^[a-f0-9]{64}$/.test(input.normalizedInputsHash)
+      || input.mutationReceiptProtocolVersion !== 1
+      || !isWorkflowTerminalOutcome(input.terminalOutcome)
+      || !Number.isFinite(Date.parse(input.finishedAt))
+      || input.reportBack?.version !== 1
+      || reportBackKeys !== ['detail', 'outcome', 'version', 'workflowName'].join('\0')
+      || input.reportBack.workflowName !== workflow
+      || !reportDetail
+      || rawReportDetail !== rawReportDetail.trim()
+      || !workflowTerminalOutcomeMatchesReport(input.terminalOutcome, input.reportBack.outcome)
+      || !/^[a-f0-9]{64}$/.test(input.terminalDigest)
+    ) {
+      throw new Error('Project root settlement requires the exact source, run contract, report, and terminal truth.');
+    }
+    if (!projectRootTerminalStatusMatchesOutcome(input.status, input.terminalOutcome)) {
+      throw new Error('Project root settlement status conflicts with its terminal outcome.');
+    }
+    if (input.summary !== undefined && clean(input.summary, 500) !== reportDetail) {
+      throw new Error('Project root settlement summary conflicts with its immutable report-back detail.');
+    }
+    const detail = reportDetail;
+
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const matches = executions.filter((entry) =>
+        entry.id === sourceExecutionId
+        && entry.sessionId === input.sessionId
+        && entry.sourceUserSeq === input.sourceUserSeq
+      );
+      if (matches.length === 0) {
+        throw new Error('Project root settlement source does not exist.');
+      }
+      if (matches.length > 1) {
+        throw new Error('Multiple project executions claim the exact settlement source; settlement failed closed.');
+      }
+      const execution = matches[0];
+      assertExecutionGraphAdmissionIntegrity(execution);
+      const admission = execution.graphAdmission!;
+      const expectedWorkflowSlug = `compiled-${admission.sourceTurnKeyHash.slice(0, 32)}`;
+      const expectedSnapshot = createCompiledWorkflowRunDefinitionSnapshot({
+        workflowSlug: expectedWorkflowSlug,
+        sourceTurnKeyHash: admission.sourceTurnKeyHash,
+        definition: admission.compiledPlan.definition,
+        admittedAt: admission.admittedAt,
+      });
+      const expectedInputsHash = compiledWorkflowRunInputsHash(admission.compiledPlan.inputs);
+      const expectedContractHash = compiledWorkflowRunContractHash({
+        sourceExecutionId: execution.id,
+        sourceUserSeq: input.sourceUserSeq,
+        sourceTurnKeyHash: admission.sourceTurnKeyHash,
+        originSessionId: execution.sessionId,
+        workflowSlug: expectedWorkflowSlug,
+        snapshot: expectedSnapshot,
+        inputs: admission.compiledPlan.inputs,
+      });
+      const expectedTerminalDigest = compiledProjectRootTerminalDigest({
+        id: runId,
+        workflow,
+        workflowSlug,
+        sourceExecutionId,
+        sourceTurnKeyHash: input.sourceTurnKeyHash,
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        rootWorkflowReceiptId: input.rootWorkflowReceiptId,
+        status: input.status,
+        terminalOutcome: input.terminalOutcome,
+        finishedAt: input.finishedAt,
+        snapshotDefinitionHash: input.snapshotDefinitionHash,
+        snapshotAdmissionHash: input.snapshotAdmissionHash,
+        snapshotAdmittedAt: input.snapshotAdmittedAt,
+        compiledContractHash: input.compiledContractHash,
+        normalizedInputsHash: input.normalizedInputsHash,
+        mutationReceiptProtocolVersion: input.mutationReceiptProtocolVersion,
+        reportBack: {
+          version: 1,
+          workflowName: workflow,
+          outcome: input.reportBack.outcome,
+          detail: rawReportDetail,
+        },
+      });
+      if (
+        admission.rootWorkflowReceiptId !== input.rootWorkflowReceiptId
+        || admission.rootWorkflowRunId !== runId
+        || admission.compiledPlan.definition.name !== workflow
+        || input.sourceTurnKeyHash !== admission.sourceTurnKeyHash
+        || workflowSlug !== expectedWorkflowSlug
+        || input.snapshotDefinitionHash !== expectedSnapshot.definitionHash
+        || input.snapshotDefinitionHash !== admission.compiledPlan.definitionHash
+        || input.snapshotAdmissionHash !== expectedSnapshot.admissionHash
+        || input.snapshotAdmittedAt !== admission.admittedAt
+        || input.normalizedInputsHash !== expectedInputsHash
+        || input.compiledContractHash !== expectedContractHash
+        || input.terminalDigest !== expectedTerminalDigest
+      ) {
+        throw new Error('Project root settlement does not match the immutable admitted compiler/run contract.');
+      }
+      const bindings = (execution.workflowBindings ?? []).filter((binding) => binding.runId === runId);
+      if (bindings.length !== 1 || bindings[0].workflow !== workflow) {
+        throw new Error('Project root settlement does not match one exact workflow binding.');
+      }
+      const binding = bindings[0];
+      const successful = input.terminalOutcome === 'succeeded';
+      const bindingStatus: 'completed' | 'error' = successful ? 'completed' : 'error';
+      const existingTerminal = admission.rootWorkflowTerminal;
+      if (existingTerminal) {
+        if (
+          existingTerminal.runId !== runId
+          || existingTerminal.status !== input.status
+          || existingTerminal.outcome !== input.terminalOutcome
+          || existingTerminal.finishedAt !== input.finishedAt
+          || existingTerminal.terminalDigest !== input.terminalDigest
+          || binding.status !== bindingStatus
+          || binding.terminalOutcome !== input.terminalOutcome
+          || binding.finishedAt !== input.finishedAt
+        ) {
+          throw new Error('Project root workflow already settled with conflicting terminal truth.');
+        }
+        return { kind: 'already_settled', execution };
+      }
+      if (binding.status === 'completed' || binding.status === 'error') {
+        throw new Error('Project workflow binding is terminal without matching root terminal truth.');
+      }
+
+      const now = new Date().toISOString();
+      binding.status = bindingStatus;
+      binding.updatedAt = now;
+      binding.terminalOutcome = input.terminalOutcome;
+      binding.finishedAt = input.finishedAt;
+      admission.rootWorkflowTerminal = {
+        version: 1,
+        runId,
+        status: input.status,
+        outcome: input.terminalOutcome,
+        finishedAt: input.finishedAt,
+        observedAt: now,
+        terminalDigest: input.terminalDigest,
+      };
+      execution.status = 'completed';
+      execution.completedAt = input.finishedAt;
+      execution.nextStep = undefined;
+      execution.nextReviewAt = undefined;
+      execution.autoAdvance = false;
+      execution.blocker = successful ? undefined : detail;
+      execution.lastAssistantSummary = detail;
+      execution.updatedAt = now;
+      execution.lastActivityAt = now;
+      execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+      const activityKey = `workflow:${runId}:terminal:${input.terminalOutcome}`;
+      if (!execution.activity.some((item) => item.key === activityKey)) {
+        execution.activity.push({
+          id: randomUUID(),
+          key: activityKey,
+          type: successful ? 'workflow_completed' : 'workflow_failed',
+          message: detail,
+          createdAt: now,
+          metadata: {
+            source: 'project_graph',
+            runId,
+            workflow,
+            terminalOutcome: input.terminalOutcome,
+          },
+        });
+        execution.activity = execution.activity.slice(-60);
+      }
+      closeLinkedVaultTasks(execution, now);
+      saveExecutionsUnlocked(executions);
+      return { kind: 'settled', execution };
     });
   }
 
@@ -1167,6 +1681,12 @@ export class ExecutionStore {
       const executions = loadExecutionsUnlocked();
       const execution = executions.find((entry) => entry.id === id);
       if (!execution || execution.sessionId !== sessionId) return undefined;
+      if (execution.graphAdmission) {
+        assertExecutionGraphAdmissionIntegrity(execution);
+        throw new Error(
+          'Durable project authority is fixed to its admitted source; follow-up turns cannot be attached through legacy execution tools.',
+        );
+      }
 
       if (!execution.sourceUserSeq) {
         execution.sourceUserSeq = sourceUserSeq;
@@ -1270,7 +1790,10 @@ export class ExecutionStore {
       if (!execution) return undefined;
       let changed = false;
       const evidence = executionExternalWriteStatus(execution);
-      if (evidence.status === 'failed' || evidence.status === 'ambiguous') {
+      if (
+        !execution.graphAdmission
+        && (evidence.status === 'failed' || evidence.status === 'ambiguous')
+      ) {
         changed = applyExternalWriteTruthBlock(
           execution,
           evidence.status,
@@ -1342,6 +1865,12 @@ export function sweepStaleExecutions(staleAfterMs = 60 * 60 * 1000): number {
     const now = new Date().toISOString();
     let swept = 0;
     for (const execution of executions) {
+      // Durable project graphs are owned by their exact root workflow run.
+      // Their model nodes may legitimately run for hours (or park on an
+      // approval/capability boundary), so legacy controller wall-clock sweeps
+      // have no authority to manufacture completion for them. The root run's
+      // terminal projection settles the execution explicitly.
+      if (execution.graphAdmission) continue;
       if (execution.status !== 'active' && execution.status !== 'blocked' && execution.status !== 'paused') continue;
       const updated = Date.parse(execution.lastActivityAt || execution.updatedAt || execution.createdAt);
       if (Number.isFinite(updated) && updated > cutoff) continue;
@@ -1471,6 +2000,9 @@ export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
     const executions = loadExecutionsUnlocked();
     let swept = 0;
     for (const execution of executions) {
+      // Compiled projects do not heartbeat through the legacy execution
+      // controller. Only their bound root workflow can settle their state.
+      if (execution.graphAdmission) continue;
       if (execution.status !== 'active') continue;
       if (!execution.lastHeartbeatAt) continue;
       const heartbeatTime = Date.parse(execution.lastHeartbeatAt);
@@ -1610,6 +2142,9 @@ export function sweepStaleBlockedExecutions(staleAfterMs = 6 * 60 * 60 * 1000): 
     const executions = loadExecutionsUnlocked();
     let swept = 0;
     for (const execution of executions) {
+      // A graph can remain durably parked far longer than this controller-era
+      // timeout. Its workflow checkpoint, not elapsed wall time, is authority.
+      if (execution.graphAdmission) continue;
       if (execution.status !== 'blocked') continue;
       const updated = Date.parse(execution.updatedAt || execution.createdAt);
       if (!Number.isFinite(updated) || updated > cutoff) continue;

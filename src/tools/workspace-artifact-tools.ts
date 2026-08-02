@@ -1,4 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -50,8 +51,7 @@ function resolveAllowedArtifactPath(input: string): string {
   return real;
 }
 
-function parseJsonOrJsonl(filePath: string): unknown {
-  const raw = readFileSync(filePath, 'utf-8');
+function parseJsonOrJsonl(raw: string): unknown {
   try {
     return JSON.parse(raw);
   } catch {
@@ -145,9 +145,29 @@ export function queryWorkspaceArtifact(input: {
   offset?: number;
   limit?: number;
   max_chars?: number;
+  /** Runtime-only integrity binding for graph invocations. Deliberately absent
+   * from the MCP/model schema: the runner supplies the event-owned value. */
+  expectedSha256?: string;
+  /** Runtime-only integrity binding paired with expectedSha256. */
+  expectedBytes?: number;
 }): string {
   const filePath = resolveAllowedArtifactPath(input.path);
-  const parsed = parseJsonOrJsonl(filePath);
+  // Read exactly once, then verify and parse these same bytes. Graph callers
+  // must not verify one inode/read and query a later replacement (TOCTOU).
+  const raw = readFileSync(filePath, 'utf-8');
+  const bytes = Buffer.byteLength(raw, 'utf-8');
+  if (input.expectedBytes !== undefined && bytes !== input.expectedBytes) {
+    throw new Error(
+      `Artifact byte length mismatch: expected ${input.expectedBytes}, got ${bytes}.`,
+    );
+  }
+  if (input.expectedSha256 !== undefined) {
+    const sha256 = createHash('sha256').update(raw).digest('hex');
+    if (sha256 !== input.expectedSha256) {
+      throw new Error('Artifact SHA-256 mismatch.');
+    }
+  }
+  const parsed = parseJsonOrJsonl(raw);
   const selected = valueAtPath(parsed, input.json_path);
   const where = input.json_path?.trim() || '$';
   const fields = Array.isArray(input.fields) ? input.fields.filter((f) => typeof f === 'string' && f.trim()) : undefined;

@@ -125,6 +125,22 @@ test('A4: the structural baseline (workflow_step_result) can never be pruned awa
   for (const t of STEP_STRUCTURAL_BASELINE_TOOLS) assert.ok(kept.has(t));
 });
 
+test('compiled-project exact locks do not inherit the legacy notification or broad file baseline', () => {
+  const kept = new Set(
+    lockToolsForStep(
+      LOCK_SAMPLE,
+      ['workflow_step_result', 'workspace_artifact_query'],
+      false,
+    ).map((tool) => tool.name),
+  );
+  assert.deepEqual(
+    [...kept].sort(),
+    ['workflow_step_result', 'workspace_artifact_query'],
+  );
+  assert.equal(kept.has('notify_user'), false, 'internal nodes cannot narrate');
+  assert.equal(kept.has('read_file'), false, 'general file access must be authored explicitly');
+});
+
 test('A4: a prefix family (composio_*) keeps the gateway for a composio-locked step', () => {
   const kept = new Set(lockToolsForStep(LOCK_SAMPLE, ['composio_*']).map((t) => t.name));
   assert.ok(kept.has('composio_execute_tool'));
@@ -175,6 +191,27 @@ test('buildWorkflowStepAgent: per-step model override is honored (intent routing
 test('buildWorkflowStepAgent: structural-only lock does not attach external MCP servers', async () => {
   const agent = await buildWorkflowStepAgent({ lockTools: ['workflow_step_result'] });
   assert.equal(agent.mcpServers.length, 0);
+});
+
+test('compiled exact local names cannot collide into MCP server authority', async () => {
+  const aliasInferred = workflowStepExternalMcpScopeForLock(
+    ['time_slots'],
+    undefined,
+    ['Time Slots'],
+  );
+  assert.ok(aliasInferred, 'ordinary locked workflows retain MCP alias inference');
+
+  const agent = await buildWorkflowStepAgent({
+    lockTools: ['workflow_step_result', 'time_slots'],
+    exactTools: true,
+    mcpToolScope: aliasInferred,
+  });
+  assert.equal(agent.mcpServers.length, 0, 'exact compiled authority attaches no external server');
+  assert.deepEqual(
+    agent.tools.map((toolRef) => toolRef.name).sort(),
+    ['time_slots', 'workflow_step_result'],
+    'a colliding server cannot contribute a writer, dispatcher, discovery tool, or call gateway',
+  );
 });
 
 test('graph-added result-only authority is physical and identical on Claude and GLM routes', async () => {

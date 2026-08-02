@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import {
@@ -166,6 +167,39 @@ test('compiled workflow snapshot authenticates its catalogless scope and exact s
   assert.equal(resolved.snapshot.definition.steps[0].prompt, 'Fetch the records.');
   assert.equal(resolved.snapshot.workflowSlug, `compiled-${'a'.repeat(32)}`);
   assert.equal(resolved.snapshot.codeRevision, 'no-code');
+});
+
+test('a self-consistent pre-cut V2/project_graph_v1 compiled snapshot is unsupported', () => {
+  const current = createCompiledWorkflowRunDefinitionSnapshot({
+    workflowSlug: `compiled-${'9'.repeat(32)}`,
+    sourceTurnKeyHash: '8'.repeat(64),
+    definition: workflow(),
+    admittedAt: '2026-08-02T12:00:00.000Z',
+  });
+  const legacyAdmission = {
+    version: 2,
+    scope: 'compiled',
+    compilerId: 'project_graph_v1',
+    sourceTurnKeyHash: current.sourceTurnKeyHash,
+    workflowSlug: current.workflowSlug,
+    definitionHash: current.definitionHash,
+    codeRevision: 'no-code',
+    admittedAt: current.admittedAt,
+  };
+  const legacy = {
+    ...current,
+    ...legacyAdmission,
+    admissionHash: createHash('sha256')
+      .update(JSON.stringify(Object.fromEntries(
+        Object.entries(legacyAdmission).sort(([left], [right]) => left.localeCompare(right)),
+      )))
+      .digest('hex'),
+  };
+
+  assert.deepEqual(resolveWorkflowRunDefinitionSnapshot(legacy), {
+    status: 'invalid',
+    reason: 'unsupported snapshot version 2',
+  });
 });
 
 test('compiled workflow snapshot fails closed on scope, source, or definition tampering', () => {

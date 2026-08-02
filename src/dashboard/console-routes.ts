@@ -82,7 +82,7 @@ import {
 } from '../memory/workflow-store.js';
 import { subscribeWorkflowChanges } from '../memory/workflow-change-bus.js';
 import { extractArchitectDiff } from './architect-diff.js';
-import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflowEvents, reconstructWorkflowRunQueue } from '../execution/workflow-events.js';
+import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflowEvents, reconstructWorkflowRunQueue, type WorkflowEvent } from '../execution/workflow-events.js';
 import { normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import { getGuestRun, killGuestRun, listGuestRuns, type GuestRunJob } from '../execution/guest-run-jobs.js';
 import {
@@ -148,9 +148,10 @@ import {
 import { promoteWorkflowFromSession } from '../tools/orchestration-tools.js';
 import { resolveRealtimeVad, buildRealtimeSessionConfig, VOICE_DELIVERY_INSTRUCTIONS } from './realtime-session-config.js';
 import { ExecutionStore } from '../execution/store.js';
+import { isReservedProjectWorkflowRunRecord } from '../execution/compiled-project-run-contract.js';
 import { listOpenCheckIns, closeCheckIn } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
-import type { AssistantRequest, PendingApproval } from '../types.js';
+import type { AssistantRequest, ExecutionRecord, PendingApproval } from '../types.js';
 import { buildRealtimeVoiceInstructions } from '../assistant/voice-context.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
@@ -490,7 +491,7 @@ import {
   resumeWorkflowCatchupRun,
   skipWorkflowCatchupRun,
 } from '../execution/workflow-catchup-decision.js';
-import { resumeCapabilityBlockedWorkflowRun } from '../execution/workflow-runner.js';
+import { resolveWorkflowDefinitionForRun, resumeCapabilityBlockedWorkflowRun } from '../execution/workflow-runner.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -2117,18 +2118,100 @@ function stringField(value: unknown): string | null {
 }
 
 /**
- * A version-2 compiled project snapshot is a run-scoped execution artifact,
- * not a saved Workflow Studio catalog entry. Identify it from its admission
- * envelope rather than from a mutable display name or a `compiled-*` prefix:
- * either of those strings can collide with ordinary user-authored content.
+ * A compiled project snapshot is a run-scoped execution artifact, not a saved
+ * Workflow Studio catalog entry. Reserve every protocol generation from any
+ * durable lineage marker, including the project-only slug namespace; a mutable
+ * display name alone is never ownership evidence.
  */
 function isCompiledProjectWorkflowRunRecord(raw: Record<string, unknown>): boolean {
-  const snapshot = raw.workflowDefinitionSnapshot;
-  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
-  const row = snapshot as Record<string, unknown>;
-  return row.version === 2
-    && row.scope === 'compiled'
-    && row.compilerId === 'project_graph_v1';
+  return isReservedProjectWorkflowRunRecord(raw);
+}
+
+function hasCompiledProjectWorkflowRunMarkers(raw: Record<string, unknown>): boolean {
+  return isReservedProjectWorkflowRunRecord(raw);
+}
+
+function workflowRunRecordPathForConsole(runId: string): string | null {
+  const safe = runId.replace(/[^a-zA-Z0-9_.:-]/g, '');
+  return safe && safe === runId
+    ? path.join(WORKFLOW_RUNS_DIR, `${safe}.json`)
+    : null;
+}
+
+function refuseReservedProjectCatalogMutation(
+  res: Response,
+  raw: Record<string, unknown>,
+  operation: string,
+): boolean {
+  if (!isReservedProjectWorkflowRunRecord(raw)) return false;
+  const message = `This durable project root is owned by its admitted graph; ${operation} cannot use the legacy catalog recovery lane.`;
+  res.status(409).json({
+    ok: false,
+    error: message,
+    reason: message,
+  });
+  return true;
+}
+
+function refuseReservedProjectCatalogRead(
+  res: Response,
+  raw: Record<string, unknown>,
+): boolean {
+  if (!isReservedProjectWorkflowRunRecord(raw)) return false;
+  // Catalog views are intentionally existence-neutral for project data. The
+  // dedicated exact project surface owns its bounded trace and controls.
+  res.status(404).json({ error: 'workflow run not found' });
+  return true;
+}
+
+interface CompiledProjectConsoleRun {
+  workflowSlug: string;
+  workflowName: string;
+}
+
+/**
+ * Resolve a catalogless project control target through the same immutable root
+ * contract that guards runner execution. Lifecycle status is intentionally
+ * neutralized for this identity check: trace remains readable after terminal
+ * settlement, while the cancellation boundary owns the authoritative status
+ * race and terminal decision under its run-record lock.
+ */
+function resolveCompiledProjectConsoleRun(
+  target: string,
+  runId: string,
+  raw: Record<string, unknown>,
+  options?: { allowCatalogCollisionForCancellation?: boolean },
+): CompiledProjectConsoleRun | null {
+  if (!hasCompiledProjectWorkflowRunMarkers(raw)) return null;
+  const catalogForIdentityCheck = options?.allowCatalogCollisionForCancellation
+    ? []
+    : listWorkflows();
+  const resolved = resolveWorkflowDefinitionForRun({
+    ...raw,
+    status: 'running',
+  } as Parameters<typeof resolveWorkflowDefinitionForRun>[0], catalogForIdentityCheck);
+  if (
+    !resolved.ok
+    || resolved.definitionSource !== 'compiled_snapshot'
+    || resolved.snapshot?.version !== 3
+    || !resolved.workflow
+    || raw.id !== runId
+    || resolved.workflow.name !== target
+  ) return null;
+  return {
+    workflowSlug: resolved.workflow.name,
+    workflowName: resolved.workflow.data.name,
+  };
+}
+
+/** Compiled project traces expose execution shape, never admitted plan bytes,
+ * prompts, inputs, model/tool payloads, item keys, or step outputs. */
+function projectCompiledWorkflowTraceEvent(event: WorkflowEvent): Record<string, unknown> {
+  return {
+    t: event.t,
+    kind: event.kind,
+    ...(event.stepId ? { stepId: event.stepId } : {}),
+  };
 }
 
 const WORKFLOW_RUN_RECOVERY_BODY_KINDS = new Set([
@@ -2688,6 +2771,109 @@ interface BoardCard {
   /** Soft-deleted; only present when the board was asked for ?includeArchived=1. */
   archived?: boolean;
   raw: Record<string, unknown>;
+}
+
+/**
+ * Project executions share the legacy ExecutionRecord envelope, but their
+ * public status comes from the durable root workflow (or the cancellation
+ * marker that won before a root was installed). Never paint every terminal
+ * graph green merely because the compatibility envelope is `completed`.
+ */
+export function executionBoardProjection(execution: ExecutionRecord): {
+  column: BoardColumnId;
+  status: string;
+  progressHint: string;
+  actions: string[];
+  failureSummary?: BoardFailureSummary;
+} {
+  const graph = execution.graphAdmission;
+  if (graph) {
+    const terminalOutcome = graph.cancelledBeforeRoot
+      ? 'cancelled' as const
+      : graph.rootWorkflowTerminal?.outcome;
+    if (terminalOutcome) {
+      const fallback = terminalOutcome === 'succeeded'
+        ? 'Durable project completed successfully.'
+        : terminalOutcome === 'partial'
+          ? 'Durable project completed with partial results.'
+          : terminalOutcome === 'blocked'
+            ? 'Durable project stopped on a verified blocker.'
+            : terminalOutcome === 'failed'
+              ? 'Durable project failed.'
+              : 'Durable project was cancelled.';
+      const detail = trimConsoleTitle(
+        graph.cancelledBeforeRoot?.reason
+          || execution.lastAssistantSummary
+          || execution.blocker
+          || fallback,
+        600,
+      );
+      const failureSummary = terminalOutcome === 'partial'
+        || terminalOutcome === 'blocked'
+        || terminalOutcome === 'failed'
+        ? { failedItems: 0, retryable: false, reason: detail }
+        : undefined;
+      return {
+        column: 'done',
+        status: terminalOutcome,
+        progressHint: detail,
+        actions: [],
+        ...(failureSummary ? { failureSummary } : {}),
+      };
+    }
+
+    const column: BoardColumnId = execution.status === 'active'
+      ? 'running'
+      : execution.status === 'blocked' || execution.status === 'paused'
+        ? 'needs_you'
+        : 'done';
+    const detail = trimConsoleTitle(
+      execution.nextStep || execution.lastAssistantSummary || execution.blocker || '',
+      600,
+    );
+    return {
+      column,
+      status: execution.status,
+      progressHint: detail,
+      actions: execution.status === 'active' || execution.status === 'blocked' ? ['cancel'] : [],
+      ...(execution.status === 'blocked'
+        ? {
+            failureSummary: {
+              failedItems: 0,
+              retryable: false,
+              reason: trimConsoleTitle(
+                execution.blocker || 'The durable project is waiting on a verified blocker.',
+                600,
+              ),
+            },
+          }
+        : {}),
+    };
+  }
+
+  const column: BoardColumnId = execution.status === 'active'
+    ? 'running'
+    : execution.status === 'paused' || execution.status === 'blocked'
+      ? 'needs_you'
+      : 'done';
+  const actions: string[] = [];
+  if (execution.status === 'active' || execution.status === 'blocked') actions.push('cancel');
+  else if (execution.status === 'paused') actions.push('resume', 'cancel');
+  return {
+    column,
+    status: execution.status,
+    progressHint: execution.nextStep || execution.lastAssistantSummary || execution.blocker || '',
+    actions,
+    ...(execution.status === 'blocked'
+      ? {
+          failureSummary: {
+            failedItems: 0,
+            retryable: false,
+            reason: execution.blocker || 'This goal needs human input before Clementine continues.',
+          },
+        }
+      : {}),
+  };
 }
 
 function reportBackString(input: unknown, ...keys: string[]): string {
@@ -5659,20 +5845,31 @@ export function registerConsoleRoutes(
   // straight off disk; no run needs to be in memory.
   app.get('/api/console/workflows/:name/runs/:runId/workspace', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const runId = req.params.runId;
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) { res.status(404).json({ error: 'workflow run not found' }); return; }
+    let raw: Record<string, unknown>;
+    try { raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>; }
+    catch { res.status(404).json({ error: 'workflow run not found' }); return; }
+    if (refuseReservedProjectCatalogRead(res, raw)) return;
     const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
-    const goal = readRunGoal(entry.name, req.params.runId);
+    if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+      res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+      return;
+    }
+    const goal = readRunGoal(entry.name, runId);
     // Collapse to the latest artifact per producer, so a re-pursued step shows
     // its newest work rather than every historical write.
     const byAgent = new Map<string, import('../execution/workflow-run-workspace.js').WorkspaceArtifact>();
-    for (const a of readWorkspaceManifest(entry.name, req.params.runId)) byAgent.set(`${a.agent}:${a.tool}`, a);
+    for (const a of readWorkspaceManifest(entry.name, runId)) byAgent.set(`${a.agent}:${a.tool}`, a);
     const artifacts = Array.from(byAgent.values());
     res.json({
-      runId: req.params.runId,
+      runId,
       goal,
       artifacts,
-      totalBytes: workspaceArtifactBytes(entry.name, req.params.runId),
-      checker: readWorkspaceCheckerReport(entry.name, req.params.runId),
+      totalBytes: workspaceArtifactBytes(entry.name, runId),
+      checker: readWorkspaceCheckerReport(entry.name, runId),
     });
   });
 
@@ -5681,13 +5878,24 @@ export function registerConsoleRoutes(
   // workflow shows WHO worked. Full work-product via the /output route below.
   app.get('/api/console/workflows/:name/runs/:runId/agents', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const runId = req.params.runId;
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) { res.status(404).json({ error: 'workflow run not found' }); return; }
+    let raw: Record<string, unknown>;
+    try { raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>; }
+    catch { res.status(404).json({ error: 'workflow run not found' }); return; }
+    if (refuseReservedProjectCatalogRead(res, raw)) return;
     // Ownership check (parity with the sibling run routes): the :name must resolve
     // to a real workflow, so a runId can't be read under an arbitrary slug.
     const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
-    const runs = listSubagentRuns(req.params.runId);
+    if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+      res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+      return;
+    }
+    const runs = listSubagentRuns(runId);
     res.json({
-      runId: req.params.runId,
+      runId,
       agents: runs,
       byProvider: runs.reduce<Record<string, number>>((acc, r) => { acc[r.provider] = (acc[r.provider] ?? 0) + 1; return acc; }, {}),
     });
@@ -5696,7 +5904,19 @@ export function registerConsoleRoutes(
   // One specialized agent's full persisted work-product ("the work they did").
   app.get('/api/console/workflows/:name/runs/:runId/agents/:agentId/output', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const output = readSubagentOutput(req.params.runId, req.params.agentId);
+    const runId = req.params.runId;
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) { res.status(404).json({ error: 'workflow run not found' }); return; }
+    let raw: Record<string, unknown>;
+    try { raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>; }
+    catch { res.status(404).json({ error: 'workflow run not found' }); return; }
+    if (refuseReservedProjectCatalogRead(res, raw)) return;
+    const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
+    if (!entry || (raw.workflow !== entry.data.name && raw.workflow !== entry.name)) {
+      res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+      return;
+    }
+    const output = readSubagentOutput(runId, req.params.agentId);
     if (output === null) { res.status(404).json({ error: 'no work-product for that agent' }); return; }
     res.json({ agentId: req.params.agentId, output });
   });
@@ -5707,17 +5927,28 @@ export function registerConsoleRoutes(
   // other's work". Uses the real cross-family judge (default deps).
   app.post('/api/console/workflows/:name/runs/:runId/check', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const runId = req.params.runId;
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) { res.status(404).json({ error: 'workflow run not found' }); return; }
+    let raw: Record<string, unknown>;
+    try { raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>; }
+    catch { res.status(404).json({ error: 'workflow run not found' }); return; }
+    if (refuseReservedProjectCatalogMutation(res, raw, 'checker execution')) return;
     const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+      res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+      return;
+    }
     try {
       const report = await checkRunAgainstGoal({
         workflowName: entry.name,
-        runId: req.params.runId,
+        runId,
         objective: entry.data.goal?.objective?.trim() || entry.data.description?.trim() || `Deliver "${entry.data.name}"`,
         successCriteria: entry.data.goal?.successCriteria,
         checkedAt: new Date().toISOString(),
       });
-      writeWorkspaceCheckerReport(entry.name, req.params.runId, report);
+      writeWorkspaceCheckerReport(entry.name, runId, report);
       res.json(report);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -5727,16 +5958,17 @@ export function registerConsoleRoutes(
   app.get('/api/console/workflows/:name/runs/:runId/failed-items', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
-    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
-    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const runId = req.params.runId;
-    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-    if (!fs.existsSync(filePath)) {
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) {
       res.status(404).json({ error: 'workflow run not found' });
       return;
     }
     try {
       const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (refuseReservedProjectCatalogRead(res, raw)) return;
+      const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+      if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
       if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
         res.status(404).json({ error: 'workflow run does not belong to this workflow' });
         return;
@@ -5759,16 +5991,17 @@ export function registerConsoleRoutes(
   app.post('/api/console/workflows/:name/runs/:runId/retry-failed-items', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
-    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
-    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const runId = req.params.runId;
-    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-    if (!fs.existsSync(filePath)) {
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) {
       res.status(404).json({ error: 'workflow run not found' });
       return;
     }
     try {
       const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (refuseReservedProjectCatalogMutation(res, raw, 'failed-item retry')) return;
+      const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+      if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
       if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
         res.status(404).json({ error: 'workflow run does not belong to this workflow' });
         return;
@@ -5787,7 +6020,7 @@ export function registerConsoleRoutes(
           reason: 'retry final failed forEach items',
         }),
       });
-      res.status(result.status === 'blocked_readiness' ? 409 : 200).json({
+      res.status(result.status === 'blocked_readiness' || result.status === 'project_owned' ? 409 : 200).json({
         ok: result.status === 'queued' || result.status === 'duplicate',
         status: result.status,
         id: result.id,
@@ -5804,23 +6037,42 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
     const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
-    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const runId = req.params.runId;
-    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-    if (!fs.existsSync(filePath)) {
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) {
       res.status(404).json({ error: 'workflow run not found' });
       return;
     }
     try {
       const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-      if (raw.workflow !== entry.data.name) {
+      const compiledCandidate = hasCompiledProjectWorkflowRunMarkers(raw);
+      const compiled = compiledCandidate
+        ? resolveCompiledProjectConsoleRun(target, runId, raw, {
+            // A later catalog collision makes execution ambiguous and the
+            // runner already fails it closed, but it must never revoke the
+            // user's authority-reducing right to stop this exact ledger-bound
+            // root occurrence.
+            allowCatalogCollisionForCancellation: true,
+          })
+        : null;
+      if (compiledCandidate && !compiled) {
+        res.status(404).json({ error: 'compiled workflow run identity is invalid or ambiguous' });
+        return;
+      }
+      if (!compiled && !entry) {
+        res.status(404).json({ error: 'workflow not found' });
+        return;
+      }
+      const workflowName = compiled?.workflowName ?? entry!.data.name;
+      const workflowSlug = compiled?.workflowSlug ?? entry!.name;
+      if (!compiled && raw.workflow !== workflowName) {
         res.status(404).json({ error: 'workflow run does not belong to this workflow' });
         return;
       }
       const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
         ? req.body.reason.trim().slice(0, 500)
         : 'Cancelled from the desktop dashboard.';
-      const events = readWorkflowEvents(entry.name, runId);
+      const events = readWorkflowEvents(workflowSlug, runId);
       const alreadyCancelled = raw.status === 'cancelled' || events.some((ev) => ev.kind === 'run_cancelled');
       const alreadyFinished = ['completed', 'completed_with_errors', 'error', 'failed'].includes(String(raw.status ?? ''))
         || events.some((ev) => ev.kind === 'run_completed' || ev.kind === 'run_failed');
@@ -5832,7 +6084,7 @@ export function registerConsoleRoutes(
         runId,
         reason,
         source: 'desktop-dashboard',
-        expectedWorkflow: entry.data.name,
+        expectedWorkflow: workflowName,
       });
       if (cancellation.status === 'not_found') {
         res.status(404).json({ error: 'workflow run not found' });
@@ -5847,13 +6099,20 @@ export function registerConsoleRoutes(
         return;
       }
       if (cancellation.status === 'cancelled' && !alreadyCancelled) {
-        appendWorkflowEvent(entry.name, runId, {
+        appendWorkflowEvent(workflowSlug, runId, {
           kind: 'run_cancelled',
           error: cancellation.request.reason,
           meta: { source: 'desktop-dashboard' },
         });
       }
-      res.json({ ok: true, run: cancellation.run });
+      const responseRun = compiled
+        ? projectWorkflowRunRecord(cancellation.run) ?? {
+            id: runId,
+            workflow: workflowName,
+            status: 'cancelled',
+          }
+        : cancellation.run;
+      res.json({ ok: true, run: responseRun });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -5862,16 +6121,17 @@ export function registerConsoleRoutes(
   app.post('/api/console/workflows/:name/runs/:runId/resume-capability', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
-    const entry = listWorkflows().find((candidate) => candidate.data.name === target || candidate.name === target);
-    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const runId = req.params.runId;
-    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-    if (!fs.existsSync(filePath)) {
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) {
       res.status(404).json({ error: 'workflow run not found' });
       return;
     }
     try {
       const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (refuseReservedProjectCatalogMutation(res, raw, 'capability resume')) return;
+      const entry = listWorkflows().find((candidate) => candidate.data.name === target || candidate.name === target);
+      if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
       if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
         res.status(404).json({ error: 'workflow run does not belong to this workflow' });
         return;
@@ -5922,23 +6182,32 @@ export function registerConsoleRoutes(
   app.get('/api/console/workflows/:name/runs/:runId/graph-overlay', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
-    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
-    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const runId = req.params.runId;
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) { res.status(404).json({ error: 'workflow run not found' }); return; }
     try {
-      const events = readWorkflowEvents(entry.name, req.params.runId);
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (refuseReservedProjectCatalogRead(res, raw)) return;
+      const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+      if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+      if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+        res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      const events = readWorkflowEvents(entry.name, runId);
       const executionPlan = workflowExecutionPlanFor(entry.data, entry.name);
       const overlay = buildWorkflowRunGraphOverlay(events, {
         stepIds: entry.data.steps.map((step) => step.id),
-        harnessSessions: workflowGraphHarnessEvidence(req.params.runId),
-        launchReadiness: readWorkflowRunLaunchReadiness(req.params.runId, [entry.data.name, entry.name]),
+        harnessSessions: workflowGraphHarnessEvidence(runId),
+        launchReadiness: readWorkflowRunLaunchReadiness(runId, [entry.data.name, entry.name]),
         executionPlan,
-        recoveryIntent: readWorkflowRunRecoveryIntent(req.params.runId, [entry.data.name, entry.name]),
-        recoveryLineage: buildWorkflowRecoveryLineage(entry.name, entry.data.name, req.params.runId),
+        recoveryIntent: readWorkflowRunRecoveryIntent(runId, [entry.data.name, entry.name]),
+        recoveryLineage: buildWorkflowRecoveryLineage(entry.name, entry.data.name, runId),
       });
       const lineage = buildWorkflowGoalLineage(
         entry.name,
         entry.data.name,
-        req.params.runId,
+        runId,
         entry.data.steps.map((step) => step.id),
       );
       if (lineage.length > 1) {
@@ -5955,7 +6224,7 @@ export function registerConsoleRoutes(
         }
       }
       res.json({
-        runId: req.params.runId,
+        runId,
         workflow: entry.data.name,
         overlay,
       });
@@ -5980,17 +6249,34 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
     const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
-    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const since = typeof req.query.since === 'string' ? req.query.since : null;
     const limit = Math.max(1, Math.min(2000, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '500', 10) || 500));
     try {
-      const all = readWorkflowEvents(entry.name, req.params.runId);
+      const runId = req.params.runId;
+      const filePath = workflowRunRecordPathForConsole(runId);
+      if (!filePath) { res.status(404).json({ error: 'workflow run not found' }); return; }
+      let compiled: CompiledProjectConsoleRun | null = null;
+      if (fs.existsSync(filePath)) {
+        const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+        const compiledCandidate = hasCompiledProjectWorkflowRunMarkers(raw);
+        compiled = compiledCandidate
+          ? resolveCompiledProjectConsoleRun(target, runId, raw)
+          : null;
+        if (compiledCandidate && !compiled) {
+          res.status(404).json({ error: 'compiled workflow run identity is invalid or ambiguous' });
+          return;
+        }
+      }
+      if (!compiled && !entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+      const workflowSlug = compiled?.workflowSlug ?? entry!.name;
+      const workflowName = compiled?.workflowName ?? entry!.data.name;
+      const all = readWorkflowEvents(workflowSlug, runId);
       const filtered = since ? all.filter((ev) => ev.t > since) : all;
       const tail = filtered.length > limit ? filtered.slice(-limit) : filtered;
       res.json({
-        runId: req.params.runId,
-        workflow: entry.data.name,
-        events: tail,
+        runId,
+        workflow: workflowName,
+        events: compiled ? tail.map(projectCompiledWorkflowTraceEvent) : tail,
         count: tail.length,
         truncated: filtered.length > tail.length,
       });
@@ -10515,6 +10801,10 @@ export function registerConsoleRoutes(
     try {
       const slug = String(req.params.slug ?? '');
       const runId = String(req.params.runId ?? '');
+      const filePath = workflowRunRecordPathForConsole(runId);
+      if (!filePath || !fs.existsSync(filePath)) { res.status(404).json({ error: 'workflow run not found' }); return; }
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (refuseReservedProjectCatalogRead(res, raw)) return;
       const entry = listWorkflows().find((e) => e.name === slug || e.data.name === slug);
       if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
       const run = readWorkflowRunRecord(runId);
@@ -10893,33 +11183,23 @@ export function registerConsoleRoutes(
         if (backgroundHarnessSessionIds.has(exec.sessionId)) continue;
         const execLive = exec.status === 'active' || exec.status === 'paused' || exec.status === 'blocked';
         if (execLive && exec.sessionId && liveBgOriginSessions.has(exec.sessionId)) continue;
-        const column: BoardColumnId =
-          exec.status === 'active' ? 'running'
-            : exec.status === 'paused' || exec.status === 'blocked' ? 'needs_you'
-              : 'done';
-        const actions: string[] = [];
-        if (exec.status === 'active' || exec.status === 'blocked') actions.push('cancel');
-        else if (exec.status === 'paused') actions.push('resume', 'cancel');
-        const action = boardActionForStatus('execution', exec.status, false);
+        const projection = executionBoardProjection(exec);
+        const action = boardActionForStatus('execution', projection.status, false);
         cards.push({
           id: exec.id,
           sourceKind: 'execution',
           title: exec.title,
-          column,
-          status: exec.status,
-          progressHint: exec.nextStep || exec.lastAssistantSummary || exec.blocker || '',
+          column: projection.column,
+          status: projection.status,
+          progressHint: projection.progressHint,
           sessionId: exec.sessionId,
           ageMs: ageMs(exec.updatedAt),
           updatedAt: exec.updatedAt,
-          actions,
+          actions: projection.actions,
           primaryAction: action.primaryAction,
           continueMode: action.continueMode,
           nextSafeAction: action.nextSafeAction,
-          failureSummary: exec.status === 'blocked' ? {
-            failedItems: 0,
-            retryable: false,
-            reason: exec.blocker || 'This goal needs human input before Clementine continues.',
-          } : undefined,
+          failureSummary: projection.failureSummary,
           raw: { blocker: exec.blocker, pausedBy: exec.pausedBy, objective: exec.objective },
         });
       }
@@ -10929,8 +11209,30 @@ export function registerConsoleRoutes(
       //    these uses the run-events poll, not the session SSE (workflow steps
       //    run under per-step `workflow:<suffix>` sessions we can't address).
       for (const pending of listPendingRuns()) {
-        const workflowEntry = workflowBySlug.get(pending.workflowName) ?? workflowByDisplayName.get(pending.workflowName);
-        const recovery = workflowRunRecovery(pending.workflowName, pending.runId);
+        let reservedProjectRoot = false;
+        const pendingRecordPath = workflowRunRecordPathForConsole(pending.runId);
+        if (pendingRecordPath && fs.existsSync(pendingRecordPath)) {
+          try {
+            const raw = JSON.parse(fs.readFileSync(pendingRecordPath, 'utf-8')) as Record<string, unknown>;
+            reservedProjectRoot = isReservedProjectWorkflowRunRecord(raw);
+          } catch {
+            // A malformed queue record gets only the ordinary minimal card; no
+            // catalog recovery projection is derived from unreadable bytes.
+          }
+        }
+        const workflowEntry = reservedProjectRoot
+          ? undefined
+          : workflowBySlug.get(pending.workflowName) ?? workflowByDisplayName.get(pending.workflowName);
+        // The project ExecutionRecord card is the detailed public view. Keep a
+        // minimal root-run card for live visibility/cancellation, but do not
+        // read project event payloads or manufacture catalog retry authority.
+        const recovery = reservedProjectRoot
+          ? {
+              primaryAction: 'none' as const,
+              continueMode: 'none' as const,
+              nextSafeAction: 'Open the durable project card to review progress.',
+            }
+          : workflowRunRecovery(pending.workflowName, pending.runId);
         const column: BoardColumnId = pending.inFlightStepId ? 'running' : 'queued';
         // A parked run is waiting on a human (approval consumption), not
         // working — carrying the real state through lets the board say
@@ -11249,12 +11551,70 @@ export function registerConsoleRoutes(
     if (!exec) { res.status(404).json({ ok: false, reason: 'execution not found' }); return; }
     try {
       if (to === 'active') {
+        if (exec.graphAdmission) {
+          res.status(409).json({
+            ok: false,
+            reason: 'This durable project is owned by its root workflow and cannot be resumed through the legacy execution transition.',
+          });
+          return;
+        }
         if (exec.status !== 'paused') {
           res.status(409).json({ ok: false, reason: `Only paused work can be resumed (this is ${exec.status}).` });
           return;
         }
         const updated = store.update(exec.id, { status: 'active', pausedBy: undefined });
         res.json({ ok: true, execution: updated });
+        return;
+      }
+      if (exec.graphAdmission) {
+        const projectCancellation = store.prepareProjectCancellation({
+          executionId: exec.id,
+          reason: 'Cancelled from the Tasks board.',
+        });
+        if (projectCancellation.kind === 'already_terminal') {
+          res.json({ ok: true, execution: projectCancellation.execution });
+          return;
+        }
+        if (projectCancellation.kind === 'cancelled_unbound') {
+          res.json({ ok: true, execution: projectCancellation.execution });
+          return;
+        }
+        if (projectCancellation.kind === 'bound_root') {
+          // The store lock above is released before entering the run-record
+          // cancellation lock. The boundary publishes immutable cancellation
+          // truth and mirrors it back to this exact project execution.
+          const cancellation = cancelWorkflowRunAtBoundary({
+            runId: projectCancellation.runId,
+            reason: 'Cancelled from the Tasks board.',
+            source: 'tasks-board-execution-card',
+            expectedWorkflow: projectCancellation.workflow,
+          });
+          if (cancellation.status === 'not_found' || cancellation.status === 'workflow_mismatch') {
+            res.status(409).json({ ok: false, reason: 'the bound project root changed or is unavailable; refresh the board' });
+            return;
+          }
+          if (cancellation.status === 'already_terminal') {
+            res.status(409).json({ ok: false, reason: 'the project root is already terminal; refresh the board' });
+            return;
+          }
+          const settled = store.get(exec.id);
+          const terminal = settled?.graphAdmission?.rootWorkflowTerminal;
+          if (
+            !settled
+            || settled.status !== 'completed'
+            || terminal?.runId !== projectCancellation.runId
+            || terminal.status !== 'cancelled'
+            || terminal.outcome !== 'cancelled'
+          ) {
+            res.status(500).json({ ok: false, reason: 'the root was cancelled but project settlement is still pending' });
+            return;
+          }
+          res.json({ ok: true, execution: settled });
+          return;
+        }
+        // `not_project` is impossible for the graph admission observed above,
+        // but fail closed if persisted identity changed between reads.
+        res.status(409).json({ ok: false, reason: 'the execution identity changed; refresh the board' });
         return;
       }
       // to === 'cancelled' — ExecutionRecord has no 'cancelled'/'failed' state;
@@ -11646,16 +12006,17 @@ export function registerConsoleRoutes(
   app.post('/api/console/board/workflow/:name/runs/:runId/retry-failed-items', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
-    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
-    if (!entry) { res.status(404).json({ ok: false, reason: 'workflow not found' }); return; }
     const runId = req.params.runId;
-    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-    if (!fs.existsSync(filePath)) {
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) {
       res.status(404).json({ ok: false, reason: 'workflow run not found' });
       return;
     }
     try {
       const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (refuseReservedProjectCatalogMutation(res, raw, 'failed-item retry')) return;
+      const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+      if (!entry) { res.status(404).json({ ok: false, reason: 'workflow not found' }); return; }
       if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
         res.status(404).json({ ok: false, reason: 'workflow run does not belong to this workflow' });
         return;
@@ -11675,7 +12036,7 @@ export function registerConsoleRoutes(
           reason: 'retry final failed forEach items',
         }),
       });
-      res.status(result.status === 'blocked_readiness' ? 409 : 200).json({
+      res.status(result.status === 'blocked_readiness' || result.status === 'project_owned' ? 409 : 200).json({
         ok: result.status === 'queued' || result.status === 'duplicate',
         status: result.status,
         id: result.id,
@@ -11691,16 +12052,19 @@ export function registerConsoleRoutes(
   app.post('/api/console/board/workflow/:name/runs/:runId/resume-safe', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
-    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
-    if (!entry) { res.status(404).json({ ok: false, reason: 'workflow not found' }); return; }
     const runId = req.params.runId;
-    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-    if (!fs.existsSync(filePath)) {
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) {
       res.status(404).json({ ok: false, reason: 'workflow run not found' });
       return;
     }
+    let entry: ReturnType<typeof listWorkflows>[number];
     try {
       const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (refuseReservedProjectCatalogMutation(res, raw, 'safe rerun')) return;
+      const resolvedEntry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+      if (!resolvedEntry) { res.status(404).json({ ok: false, reason: 'workflow not found' }); return; }
+      entry = resolvedEntry;
       if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
         res.status(404).json({ ok: false, reason: 'workflow run does not belong to this workflow' });
         return;
@@ -11731,7 +12095,13 @@ export function registerConsoleRoutes(
         reason: 'safe whole-run rerun',
       }),
     });
-    res.status(result.status === 'not_found' ? 404 : result.status === 'blocked_readiness' ? 409 : 200).json({
+    res.status(
+      result.status === 'not_found'
+        ? 404
+        : result.status === 'blocked_readiness' || result.status === 'project_owned'
+          ? 409
+          : 200,
+    ).json({
       ok: result.status === 'queued' || result.status === 'duplicate',
       status: result.status,
       id: result.id,

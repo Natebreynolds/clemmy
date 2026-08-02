@@ -24,8 +24,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
   existsSync,
@@ -38,7 +38,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import type { PlanRecord } from '../types.js';
+import type { ExecutionRecord, PlanRecord } from '../types.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-store-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -49,12 +49,22 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const {
   ExecutionStore,
   rootWorkflowReceiptForSource,
+  sweepStaleExecutions,
   sweepCrashedExecutions,
   sweepStaleBlockedExecutions,
 } = await import('./store.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { TASKS_FILE, ensureTasksFile, parseTasks } = await import('../tools/shared.js');
-const { workflowDefinitionHash } = await import('./workflow-run-definition.js');
+const {
+  createCompiledWorkflowRunDefinitionSnapshot,
+  workflowDefinitionHash,
+} = await import('./workflow-run-definition.js');
+const {
+  compiledProjectRootTerminalDigest,
+  compiledWorkflowRunContractHash,
+  compiledWorkflowRunInputsHash,
+} = await import('./compiled-project-run-contract.js');
+const { compileProjectPlan } = await import('./project-compiler.js');
 const { BoundaryError } = await import('../runtime/boundary-error.js');
 const { actionBus } = await import('../runtime/action-bus.js');
 
@@ -92,20 +102,12 @@ function baseExecution(overrides: Record<string, unknown>): Record<string, unkno
   };
 }
 
-function stableJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) =>
-    `${JSON.stringify(key)}:${stableJson(record[key])}`
-  ).join(',')}}`;
-}
-
-function sha256Json(value: unknown): string {
-  return createHash('sha256').update(stableJson(value), 'utf8').digest('hex');
-}
-
-function acceptedProjectSource(label: string): { sessionId: string; sourceUserSeq: number } {
+function acceptedProjectSource(label: string): {
+  sessionId: string;
+  sourceUserSeq: number;
+  sourceId: string;
+  sourceTurn: number;
+} {
   resetEventLog();
   const sessionId = `sess-project-${label}-${Math.random().toString(36).slice(2, 8)}`;
   createSession({ id: sessionId, kind: 'chat', title: label });
@@ -120,7 +122,20 @@ function acceptedProjectSource(label: string): { sessionId: string; sourceUserSe
       source: 'desktop',
     },
   });
-  return { sessionId, sourceUserSeq: source.seq };
+  return { sessionId, sourceUserSeq: source.seq, sourceId: source.id, sourceTurn: source.turn };
+}
+
+function canonicalTestValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalTestValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([, entry]) => entry !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => [key, canonicalTestValue(entry)]));
+}
+
+function canonicalTestHash(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(canonicalTestValue(value))).digest('hex');
 }
 
 function projectExecutionInput(
@@ -129,31 +144,22 @@ function projectExecutionInput(
   variant = 'winner-a',
 ): Record<string, unknown> {
   const plan = {
-    version: 1,
+    planId: 'compiled-project-test',
     objective: 'Produce a durable verified deliverable.',
     nodes: [{
       id: 'work',
-      executor: 'model',
-      effect: 'read',
-      prompt: `Perform bounded project work for ${variant}.`,
-      budget: { maxTurns: 8, retryBudget: 1 },
+      executor: {
+        kind: 'model' as const,
+        instruction: `Perform bounded project work for ${variant}.`,
+        allowedTools: ['workspace_artifact_query'],
+      },
+      effect: 'read' as const,
+      maxTurns: 8,
+      retries: 1,
       evidence: { type: 'object', requiredKeys: ['summary'] },
     }],
   };
-  const definition = {
-    name: 'compiled-project-test',
-    description: 'One-off durable project compiled for a test.',
-    enabled: true,
-    trigger: { manual: true },
-    steps: [{
-      id: 'work',
-      prompt: `Perform bounded project work for ${variant}.`,
-      sideEffect: 'read' as const,
-      maxTurns: 8,
-      retryBudget: 1,
-      output: { type: 'object' as const, required_keys: ['summary'] },
-    }],
-  };
+  const compiled = compileProjectPlan(plan);
   return {
     sessionId,
     sourceUserSeq,
@@ -165,19 +171,99 @@ function projectExecutionInput(
     reasons: ['multi-step durable work'],
     nextReviewAt: new Date().toISOString(),
     admission: {
-      turnGraphId: `turn-graph:v1:${sourceUserSeq}`,
-      turnGraphHash: sha256Json({ sessionId, sourceUserSeq, kind: 'turn_graph_v1' }),
       compiledPlan: {
-        version: 1,
-        compilerId: 'project_graph_v1',
-        planHash: sha256Json(plan),
-        definitionHash: workflowDefinitionHash(definition),
+        version: 2,
+        compilerId: 'project_graph_v2',
+        planHash: compiled.planHash,
+        definitionHash: workflowDefinitionHash(compiled.definition),
         plan,
-        definition,
+        definition: compiled.definition,
         inputs: {},
       },
     },
   };
+}
+
+function projectRootContract(execution: ExecutionRecord): {
+  workflowSlug: string;
+  sourceTurnKeyHash: string;
+  snapshotDefinitionHash: string;
+  snapshotAdmissionHash: string;
+  snapshotAdmittedAt: string;
+  compiledContractHash: string;
+  normalizedInputsHash: string;
+  mutationReceiptProtocolVersion: 1;
+} {
+  const admission = execution.graphAdmission!;
+  const sourceUserSeq = execution.sourceUserSeq!;
+  const workflowSlug = `compiled-${admission.sourceTurnKeyHash.slice(0, 32)}`;
+  const snapshot = createCompiledWorkflowRunDefinitionSnapshot({
+    workflowSlug,
+    sourceTurnKeyHash: admission.sourceTurnKeyHash,
+    definition: admission.compiledPlan.definition,
+    admittedAt: admission.admittedAt,
+  });
+  return {
+    workflowSlug,
+    sourceTurnKeyHash: admission.sourceTurnKeyHash,
+    snapshotDefinitionHash: snapshot.definitionHash,
+    snapshotAdmissionHash: snapshot.admissionHash,
+    snapshotAdmittedAt: snapshot.admittedAt,
+    compiledContractHash: compiledWorkflowRunContractHash({
+      sourceExecutionId: execution.id,
+      sourceUserSeq,
+      sourceTurnKeyHash: admission.sourceTurnKeyHash,
+      originSessionId: execution.sessionId,
+      workflowSlug,
+      snapshot,
+      inputs: admission.compiledPlan.inputs,
+    }),
+    normalizedInputsHash: compiledWorkflowRunInputsHash(admission.compiledPlan.inputs),
+    mutationReceiptProtocolVersion: 1,
+  };
+}
+
+function projectSettlementTerminalDigest(
+  input: Omit<Parameters<typeof compiledProjectRootTerminalDigest>[0], 'id'> & {
+    runId: string;
+    summary?: string;
+  },
+): string {
+  const { runId, summary: _summary, ...terminal } = input;
+  return compiledProjectRootTerminalDigest({ id: runId, ...terminal });
+}
+
+function preCutProjectSettlementTerminalDigest(
+  input: Omit<Parameters<typeof compiledProjectRootTerminalDigest>[0], 'id'> & {
+    runId: string;
+    summary?: string;
+  },
+): string {
+  const { runId, summary: _summary, ...terminal } = input;
+  return createHash('sha256')
+    .update('clementine-project-root-terminal:v1', 'utf8')
+    .update('\0')
+    .update(JSON.stringify({
+      id: runId,
+      workflow: terminal.workflow,
+      workflowSlug: terminal.workflowSlug,
+      sourceExecutionId: terminal.sourceExecutionId,
+      sourceTurnKeyHash: terminal.sourceTurnKeyHash,
+      sessionId: terminal.sessionId,
+      sourceUserSeq: terminal.sourceUserSeq,
+      rootWorkflowReceiptId: terminal.rootWorkflowReceiptId,
+      status: terminal.status,
+      terminalOutcome: terminal.terminalOutcome,
+      finishedAt: terminal.finishedAt,
+      snapshotDefinitionHash: terminal.snapshotDefinitionHash,
+      snapshotAdmissionHash: terminal.snapshotAdmissionHash,
+      snapshotAdmittedAt: terminal.snapshotAdmittedAt,
+      compiledContractHash: terminal.compiledContractHash,
+      normalizedInputsHash: terminal.normalizedInputsHash,
+      mutationReceiptProtocolVersion: terminal.mutationReceiptProtocolVersion,
+      reportBack: terminal.reportBack,
+    }), 'utf8')
+    .digest('hex');
 }
 
 const STORE_MODULE_URL = new URL('./store.ts', import.meta.url).href;
@@ -292,22 +378,11 @@ test('createOrGetForSource persists one full immutable compiler winner', () => {
   compilerDrift.admission.compiledPlan.definitionHash = workflowDefinitionHash(
     compilerDrift.admission.compiledPlan.definition,
   );
-  const compilerDriftReplay = store.createOrGetForSource(compilerDrift as never);
-  assert.equal(compilerDriftReplay.created, false);
-  assert.equal(compilerDriftReplay.plannerConflict, true);
-  assert.equal(
-    compilerDriftReplay.execution.graphAdmission?.compiledPlan.snapshotHash,
-    first.execution.graphAdmission?.compiledPlan.snapshotHash,
-  );
-
-  const conflictingGraph = projectExecutionInput(sessionId, sourceUserSeq, 'winner-a') as {
-    admission: { turnGraphHash: string };
-  };
-  conflictingGraph.admission.turnGraphHash = 'f'.repeat(64);
   assert.throws(
-    () => store.createOrGetForSource(conflictingGraph as never),
-    /different immutable project admission/i,
+    () => store.createOrGetForSource(compilerDrift as never),
+    /was not produced by the declared project plan/i,
   );
+  assert.match(first.execution.graphAdmission?.acceptedSourceHash ?? '', /^[a-f0-9]{64}$/);
 });
 
 test('createOrGetForSource rejects synthetic sources and mismatched compiler bytes', () => {
@@ -341,6 +416,94 @@ test('createOrGetForSource rejects synthetic sources and mismatched compiler byt
     /definition bytes do not match/i,
   );
   assert.deepEqual(readExecutions(), []);
+});
+
+test('pre-cut V1 compiler input and a self-consistent V1 graph admission are quarantined from work', () => {
+  const source = acceptedProjectSource('pre-cut-v1');
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const legacyInput = projectExecutionInput(source.sessionId, source.sourceUserSeq) as Record<string, any>;
+  legacyInput.admission.compiledPlan.version = 1;
+  legacyInput.admission.compiledPlan.compilerId = 'project_graph_v1';
+  assert.throws(
+    () => store.createOrGetForSource(legacyInput as never),
+    /supported project compiler snapshot/i,
+  );
+  assert.deepEqual(readExecutions(), [], 'old compiler bytes never mint current graph authority');
+
+  const admitted = store.createOrGetForSource(
+    projectExecutionInput(source.sessionId, source.sourceUserSeq) as never,
+  );
+  const current = structuredClone(admitted.execution) as Record<string, any>;
+  const sourceTurnKeyHash = createHash('sha256')
+    .update('clementine-project-source:v1', 'utf8')
+    .update('\0')
+    .update(source.sessionId, 'utf8')
+    .update('\0')
+    .update(String(source.sourceUserSeq), 'utf8')
+    .digest('hex');
+  const acceptedSourceHash = createHash('sha256')
+    .update('clementine-accepted-project-source:v1', 'utf8')
+    .update('\0')
+    .update(source.sessionId, 'utf8')
+    .update('\0')
+    .update(String(source.sourceUserSeq), 'utf8')
+    .update('\0')
+    .update(source.sourceId, 'utf8')
+    .update('\0')
+    .update(String(source.sourceTurn), 'utf8')
+    .digest('hex');
+  const currentPlan = current.graphAdmission.compiledPlan;
+  const legacyPlanPayload = {
+    version: 1,
+    compilerId: 'project_graph_v1',
+    planHash: currentPlan.planHash,
+    definitionHash: currentPlan.definitionHash,
+    plan: currentPlan.plan,
+    definition: currentPlan.definition,
+    inputs: currentPlan.inputs,
+  };
+  current.id = `exec-project-${sourceTurnKeyHash.slice(0, 32)}`;
+  current.graphAdmission = {
+    ...current.graphAdmission,
+    version: 1,
+    sourceTurnKeyHash,
+    acceptedSourceHash,
+    compiledPlan: {
+      ...legacyPlanPayload,
+      snapshotHash: canonicalTestHash(legacyPlanPayload),
+    },
+    rootWorkflowReceiptId: `project-turn:v1:${sourceTurnKeyHash}`,
+  };
+  seedExecutions([current]);
+
+  assert.deepEqual(store.listUnboundProjectGraphSources(), { sources: [], rejected: 1 });
+  assert.throws(
+    () => store.getForSource(source.sessionId, source.sourceUserSeq),
+    /source integrity check/i,
+  );
+});
+
+test('createOrGetForSource never strands a graph on paused or completed legacy state', () => {
+  for (const status of ['paused', 'completed'] as const) {
+    const { sessionId, sourceUserSeq } = acceptedProjectSource(`legacy-${status}`);
+    const legacy = baseExecution({
+      id: `legacy-${status}`,
+      sessionId,
+      sourceUserSeq,
+      status,
+      ...(status === 'paused' ? { pauseSource: 'user' } : { completedAt: new Date().toISOString() }),
+    });
+    seedExecutions([legacy]);
+
+    assert.throws(
+      () => new ExecutionStore().createOrGetForSource(
+        projectExecutionInput(sessionId, sourceUserSeq) as never,
+      ),
+      /paused or terminal execution/i,
+    );
+    assert.deepEqual(readExecutions(), [legacy]);
+  }
 });
 
 test('corrupt executions.json repeatedly fails closed without minting project authority', () => {
@@ -384,6 +547,10 @@ test('root workflow binding requires the source receipt and immutable workflow i
     /receipt/i,
   );
   assert.throws(
+    () => bind(`project-turn:v1:${'a'.repeat(64)}`, 'run-a'),
+    /receipt/i,
+  );
+  assert.throws(
     () => bind(admitted.rootWorkflowReceiptId, 'run-a', 'another-workflow'),
     /immutable compiled project plan/i,
   );
@@ -398,6 +565,27 @@ test('root workflow binding requires the source receipt and immutable workflow i
     /different root workflow run/i,
   );
 
+  const boundRows = readExecutions();
+  const missingBinding = structuredClone(boundRows);
+  missingBinding[0].workflowBindings = [];
+  seedExecutions(missingBinding);
+  assert.throws(
+    () => store.getForSource(sessionId, sourceUserSeq),
+    /one exact workflow binding/i,
+  );
+
+  const terminalBindingWithoutRootTruth = structuredClone(boundRows) as Array<Record<string, any>>;
+  terminalBindingWithoutRootTruth[0].workflowBindings[0].status = 'completed';
+  terminalBindingWithoutRootTruth[0].workflowBindings[0].terminalOutcome = 'succeeded';
+  terminalBindingWithoutRootTruth[0].workflowBindings[0].finishedAt = new Date().toISOString();
+  seedExecutions(terminalBindingWithoutRootTruth);
+  assert.throws(
+    () => store.getForSource(sessionId, sourceUserSeq),
+    /without root terminal truth/i,
+  );
+
+  seedExecutions(boundRows);
+
   const duplicateRows = readExecutions();
   duplicateRows.push({ ...duplicateRows[0], id: 'duplicate-source-owner' });
   seedExecutions(duplicateRows);
@@ -407,7 +595,200 @@ test('root workflow binding requires the source receipt and immutable workflow i
   );
 });
 
-test('generic update cannot replace exact-source or project-admission authority', () => {
+test('compiled root terminal truth settles its exact project once and rejects conflicts', () => {
+  const { sessionId, sourceUserSeq } = acceptedProjectSource('root-settlement');
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const admitted = store.createOrGetForSource(
+    projectExecutionInput(sessionId, sourceUserSeq) as never,
+  );
+  const runId = 'run-root-settlement';
+  store.bindRootWorkflowRunForSource({
+    sessionId,
+    sourceUserSeq,
+    rootWorkflowReceiptId: admitted.rootWorkflowReceiptId,
+    runId,
+    workflow: 'compiled-project-test',
+  });
+  const boundRows = readExecutions() as Array<Record<string, any>>;
+  boundRows[0].taskBindings = [{
+    taskId: 'T-PROJECT-ROOT',
+    description: 'Finish the durable project root',
+    status: 'pending',
+    createdAt: nowMinusMinutes(5),
+  }];
+  seedExecutions(boundRows);
+  ensureTasksFile();
+  writeFileSync(
+    TASKS_FILE,
+    [
+      '---',
+      'type: tasks',
+      '---',
+      '',
+      '# Tasks',
+      '',
+      '## Pending',
+      '',
+      '- [ ] {T-PROJECT-ROOT} Finish the durable project root',
+      '',
+      '## Completed',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  const finishedAt = new Date().toISOString();
+  const reportDetail = 'The durable project completed with verified evidence.';
+  const settlementWithoutDigest = {
+    sourceExecutionId: admitted.execution.id,
+    sessionId,
+    sourceUserSeq,
+    rootWorkflowReceiptId: admitted.rootWorkflowReceiptId,
+    runId,
+    workflow: 'compiled-project-test',
+    ...projectRootContract(admitted.execution),
+    status: 'completed' as const,
+    terminalOutcome: 'succeeded' as const,
+    finishedAt,
+    reportBack: {
+      version: 1 as const,
+      workflowName: 'compiled-project-test',
+      outcome: 'done' as const,
+      detail: reportDetail,
+    },
+    summary: reportDetail,
+  };
+  const settlement = {
+    ...settlementWithoutDigest,
+    terminalDigest: projectSettlementTerminalDigest(settlementWithoutDigest),
+  };
+
+  assert.throws(
+    () => store.settleProjectRootWorkflowRun({
+      ...settlementWithoutDigest,
+      terminalDigest: preCutProjectSettlementTerminalDigest(settlementWithoutDigest),
+    }),
+    /immutable admitted compiler\/run contract/i,
+  );
+  assert.equal(store.settleProjectRootWorkflowRun(settlement).kind, 'settled');
+  assert.equal(store.settleProjectRootWorkflowRun(settlement).kind, 'already_settled');
+  const reread = store.getForSource(sessionId, sourceUserSeq)!;
+  assert.equal(reread.status, 'completed');
+  assert.equal(reread.completedAt, finishedAt);
+  assert.equal(reread.blocker, undefined);
+  assert.equal(reread.graphAdmission?.rootWorkflowTerminal?.outcome, 'succeeded');
+  assert.equal(reread.graphAdmission?.rootWorkflowTerminal?.terminalDigest, settlement.terminalDigest);
+  assert.equal(reread.workflowBindings?.[0]?.status, 'completed');
+  assert.equal(reread.workflowBindings?.[0]?.terminalOutcome, 'succeeded');
+  assert.equal(reread.taskBindings?.[0]?.status, 'completed');
+  assert.equal(
+    parseTasks(readFileSync(TASKS_FILE, 'utf-8')).find((task) => task.id === 'T-PROJECT-ROOT')?.status,
+    undefined,
+    'completed execution-owned task rows are compacted out of the human task ledger',
+  );
+  assert.equal(
+    reread.activity?.filter((item) => item.key === `workflow:${runId}:terminal:succeeded`).length,
+    1,
+  );
+  assert.throws(
+    () => store.settleProjectRootWorkflowRun({
+      ...settlement,
+      terminalDigest: 'f'.repeat(64),
+    }),
+    /immutable admitted compiler\/run contract/i,
+  );
+  const conflictingSettlement = {
+    ...settlementWithoutDigest,
+    status: 'failed' as const,
+    terminalOutcome: 'failed' as const,
+    reportBack: { ...settlement.reportBack, outcome: 'failed' as const },
+  };
+  assert.throws(
+    () => store.settleProjectRootWorkflowRun({
+      ...conflictingSettlement,
+      terminalDigest: projectSettlementTerminalDigest(conflictingSettlement),
+    }),
+    /conflicting terminal truth/i,
+  );
+  assert.throws(
+    () => store.settleProjectRootWorkflowRun({
+      ...settlement,
+      compiledContractHash: '0'.repeat(64),
+    }),
+    /compiler\/run contract/i,
+  );
+  assert.throws(
+    () => store.update(admitted.execution.id, { status: 'active' }),
+    /owned by its root workflow/i,
+  );
+});
+
+test('project cancellation linearizes against root binding and readiness clears only on a successful bind', () => {
+  const first = acceptedProjectSource('cancel-before-bind');
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const unbound = store.createOrGetForSource(
+    projectExecutionInput(first.sessionId, first.sourceUserSeq) as never,
+  );
+  const cancelled = store.prepareProjectCancellation({
+    executionId: unbound.execution.id,
+    reason: 'Cancelled before dispatch.',
+  });
+  assert.equal(cancelled.kind, 'cancelled_unbound');
+  const cancelledReadback = store.getForSource(first.sessionId, first.sourceUserSeq);
+  assert.equal(cancelledReadback?.graphAdmission?.cancelledBeforeRoot?.version, 1);
+  assert.equal(
+    cancelledReadback?.graphAdmission?.cancelledBeforeRoot?.finishedAt,
+    cancelledReadback?.completedAt,
+  );
+  assert.equal(
+    store.prepareProjectCancellation({
+      executionId: unbound.execution.id,
+      reason: 'A different replay reason cannot replace terminal truth.',
+    }).kind,
+    'already_terminal',
+  );
+  assert.throws(
+    () => store.bindRootWorkflowRunForSource({
+      sessionId: first.sessionId,
+      sourceUserSeq: first.sourceUserSeq,
+      rootWorkflowReceiptId: unbound.rootWorkflowReceiptId,
+      runId: 'late-root',
+      workflow: 'compiled-project-test',
+    }),
+    /active or readiness-blocked project/i,
+  );
+
+  const second = acceptedProjectSource('readiness-then-bind');
+  seedExecutions([]);
+  const admitted = store.createOrGetForSource(
+    projectExecutionInput(second.sessionId, second.sourceUserSeq) as never,
+  );
+  const blocked = store.markProjectRootWorkflowReadinessBlocked({
+    sessionId: second.sessionId,
+    sourceUserSeq: second.sourceUserSeq,
+    reason: 'Reconnect the exact data source.',
+  });
+  assert.equal(blocked.status, 'blocked');
+  assert.match(blocked.blocker ?? '', /Reconnect the exact data source/);
+  const bound = store.bindRootWorkflowRunForSource({
+    sessionId: second.sessionId,
+    sourceUserSeq: second.sourceUserSeq,
+    rootWorkflowReceiptId: admitted.rootWorkflowReceiptId,
+    runId: 'ready-root',
+    workflow: 'compiled-project-test',
+  });
+  assert.equal(bound.status, 'active');
+  assert.equal(bound.blocker, undefined);
+  const decision = store.prepareProjectCancellation({
+    executionId: admitted.execution.id,
+    reason: 'Stop the bound project.',
+  });
+  assert.equal(decision.kind, 'bound_root');
+  assert.equal(store.get(admitted.execution.id)?.status, 'active');
+});
+
+test('generic update cannot mutate any graph-owned execution state', () => {
   const { sessionId, sourceUserSeq } = acceptedProjectSource('immutable-update');
   seedExecutions([]);
   const store = new ExecutionStore();
@@ -416,15 +797,51 @@ test('generic update cannot replace exact-source or project-admission authority'
   );
   const originalAdmission = admitted.execution.graphAdmission;
 
-  (store.update as (id: string, patch: Record<string, unknown>) => unknown)(admitted.execution.id, {
-    id: 'replacement-id',
-    sessionId: 'replacement-session',
-    createdAt: '2000-01-01T00:00:00.000Z',
-    sourceUserSeq: 999_999,
-    sourceUserSeqs: [999_999],
-    graphAdmission: undefined,
-    nextStep: 'Safe mutable field still updates.',
+  assert.equal(
+    store.getActiveForSession(sessionId),
+    undefined,
+    'the legacy assistant/controller lane never adopts a graph-owned project',
+  );
+  const legacy = store.create({
+    sessionId,
+    title: 'Independent legacy execution',
+    objective: 'Exercise the controller lane independently.',
+    reason: 'Regression coverage.',
+    startedFromMessage: 'Track this separate task.',
+    confidence: 0.8,
+    reasons: ['legacy lane'],
   });
+  assert.equal(store.getActiveForSession(sessionId)?.id, legacy.id);
+
+  const unrelatedFollowUp = appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Do a separate follow-up.', source: 'desktop' },
+  });
+  assert.throws(
+    () => store.bindSourceUserSeq(
+      admitted.execution.id,
+      sessionId,
+      unrelatedFollowUp.seq,
+      'execution_update_step',
+    ),
+    /fixed to its admitted source/i,
+  );
+
+  assert.throws(
+    () => (store.update as (id: string, patch: Record<string, unknown>) => unknown)(admitted.execution.id, {
+      id: 'replacement-id',
+      sessionId: 'replacement-session',
+      createdAt: '2000-01-01T00:00:00.000Z',
+      sourceUserSeq: 999_999,
+      sourceUserSeqs: [999_999],
+      graphAdmission: undefined,
+      nextStep: 'Generic lifecycle mutation.',
+    }),
+    /owned by its root workflow/i,
+  );
 
   const reread = store.getForSource(sessionId, sourceUserSeq);
   assert.equal(reread?.id, admitted.execution.id);
@@ -433,7 +850,7 @@ test('generic update cannot replace exact-source or project-admission authority'
   assert.equal(reread?.sourceUserSeq, sourceUserSeq);
   assert.deepEqual(reread?.sourceUserSeqs, undefined);
   assert.deepEqual(reread?.graphAdmission, originalAdmission);
-  assert.equal(reread?.nextStep, 'Safe mutable field still updates.');
+  assert.equal(reread?.nextStep, admitted.execution.nextStep);
 });
 
 test('createOrGetForSource is linearizable across processes', async () => {
@@ -1295,6 +1712,45 @@ test('sweepStaleBlockedExecutions: active execution is NOT swept by the blocked 
   ]);
   const swept = sweepStaleBlockedExecutions();
   assert.equal(swept, 0);
+});
+
+test('legacy controller sweepers never manufacture terminal truth for durable project graphs', () => {
+  seedExecutions([
+    baseExecution({
+      id: 'graph-stale-activity',
+      graphAdmission: { kind: 'project_graph' },
+      status: 'active',
+      updatedAt: nowMinusMinutes(120),
+      lastActivityAt: nowMinusMinutes(120),
+    }),
+    baseExecution({
+      id: 'graph-stale-heartbeat',
+      graphAdmission: { kind: 'project_graph' },
+      status: 'active',
+      lastHeartbeatAt: nowMinusMinutes(30),
+      updatedAt: nowMinusMinutes(30),
+      lastActivityAt: nowMinusMinutes(30),
+    }),
+    baseExecution({
+      id: 'graph-stale-blocker',
+      graphAdmission: { kind: 'project_graph' },
+      status: 'blocked',
+      updatedAt: nowMinusMinutes(60 * 12),
+      lastActivityAt: nowMinusMinutes(60 * 12),
+    }),
+  ]);
+
+  assert.equal(sweepStaleExecutions(), 0);
+  assert.equal(sweepCrashedExecutions(), 0);
+  assert.equal(sweepStaleBlockedExecutions(), 0);
+  assert.deepEqual(
+    readExecutions().map((row) => [row.id, row.status]),
+    [
+      ['graph-stale-activity', 'active'],
+      ['graph-stale-heartbeat', 'active'],
+      ['graph-stale-blocker', 'blocked'],
+    ],
+  );
 });
 
 test('sweepers leave file on disk untouched when there is nothing to sweep', () => {

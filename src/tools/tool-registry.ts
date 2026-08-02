@@ -71,6 +71,15 @@ export type ToolTier = 'core' | 'discoverable';
  *  read-only ∪ agentic; full = read-only ∪ authoring ∪ agentic ∪ full-extra. */
 export type SdkLayer = 'read-only' | 'authoring' | 'agentic' | 'full-extra';
 export type ToolFeatureGroup = 'spaces-dock';
+/**
+ * Durable-project authority is stricter than the legacy sideEffect taxonomy.
+ * Presence means this exact built-in is both available to a constrained
+ * workflow step and reviewed as replay-safe when MODEL-INVOKED in the declared
+ * realm. It does not imply support for WorkflowStepInput.call; structured-call
+ * execution needs its own persisted adapter contract. Absence is fail-closed:
+ * planners may discover the tool but cannot put it in a compiled project node.
+ */
+export type ProjectToolEffect = 'read' | 'local_write';
 
 export interface ToolDecl {
   name: string;
@@ -96,6 +105,9 @@ export interface ToolDecl {
   readMutatedBy?: string[];
   /** Optional explicit approval override; default derives from sideEffect. */
   needsApproval?: boolean;
+  /** Exact durable-project MODEL capability/effect realm; never inferred from
+   * prose. Presence does not claim a structured-call adapter exists. */
+  projectEffect?: ProjectToolEffect;
   /** One-line summary (first sentence of the registered tool description, capped
    *  ~90 chars) — the catalog line the Codex lane reads for schema-on-demand. */
   description?: string;
@@ -173,7 +185,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'artifact_claim_resolve', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator'], loopClass: 'mutating', description: 'Resolve an unresolved provider-create claim after read-only verification: bind the found resource id (evidence-gated) or release a provably-absent claim.' },
   { name: 'focus_touch', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', description: 'Bump the last-touched time + reset the idle-confirm window for an active focus.' },
   { name: 'focus_update', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', description: 'Evolve an existing focus and optionally patch its sparse shared workstate.' },
-  { name: 'git_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Run a read-only git status in an allowed workspace directory.' },
+  { name: 'git_status', sideEffect: 'read', projectEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Run a read-only git status in an allowed workspace directory.' },
   { name: 'goal_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], loopClass: 'idempotent', description: 'List persistent goals, optionally filtered by owner or status.' },
   { name: 'goal_stale', sideEffect: 'write', tier: 'core', lanes: [], description: 'Detect or mark long-running goals that have gone stale (not updated in a while).' },
   { name: 'goal_upsert', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', description: 'Create a persistent goal when no id matches, or update the existing goal when one does — the single durable-goal write tool.' },
@@ -191,15 +203,15 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'memory_embed_backfill', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], description: 'Compute embeddings for vault chunks and/or durable facts using the active embedding provi…' },
   { name: 'memory_forget', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'], loopClass: 'mutating', description: 'Soft-delete a fact by id (sets active=0).' },
   { name: 'memory_import', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], description: 'Import ANOTHER agent\'s memory files (Claude Code memories, OpenClaw/Fermis stores, bare m…' },
-  { name: 'memory_list_facts', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'List or query durable facts as filterable JSON. Pass query for targeted lookup.' },
+  { name: 'memory_list_facts', sideEffect: 'read', projectEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'List or query durable facts as filterable JSON. Pass query for targeted lookup.' },
   { name: 'memory_pin', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], description: 'Pin a fact as a STANDING INSTRUCTION (always injected into context, exempt from the recen…' },
   { name: 'memory_read', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Read a durable memory reference (fact:<id> or policy:<id>), a key memory file, or a vault-relative markdown path.' },
-  { name: 'memory_recall', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['memory_remember', 'memory_forget'], description: 'Recall vault chunks.' },
+  { name: 'memory_recall', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['memory_remember', 'memory_forget'], description: 'Recall vault chunks.' },
   { name: 'memory_recall_all', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['memory_remember', 'memory_forget'], description: 'Recall relevant facts, notes, entities, resources, episodes, policies, and proven tools through one evidence-backed pipeline.' },
   { name: 'memory_remember', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'mutating', description: 'Record a durable fact in long-term memory.' },
   { name: 'memory_restore', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], description: 'Restore (reactivate) a soft-deleted fact by id — the inverse of memory_forget.' },
   { name: 'memory_review_instructions', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], description: 'Before a batch/irreversible external write, review the standing instructions in play.' },
-  { name: 'memory_search', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['memory_remember', 'memory_forget'], description: 'Search the local Clementine vault for relevant notes and memories.' },
+  { name: 'memory_search', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['memory_remember', 'memory_forget'], description: 'Search the local Clementine vault for relevant notes and memories.' },
   { name: 'memory_search_facts', sideEffect: 'read', tier: 'discoverable', lanes: ['sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', description: 'Semantically search durable FACTS (your long-term memory of the user, projects, standing…' },
   { name: 'memory_self_heal', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], description: 'Inspect or run the audited long-term-memory self-heal loop.' },
   { name: 'note_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', description: 'Create a new note in the vault.' },
@@ -212,7 +224,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'ping', sideEffect: 'read', tier: 'discoverable', lanes: ['sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', description: 'Basic health-check tool for the local Clementine tool runtime.' },
   { name: 'propose_check_in_template', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], description: 'Propose a NEW autonomous check-in template the user can approve.' },
   { name: 'read_file', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['write_file', 'replace_file', 'run_shell_command'], description: 'Read a file from an allowed workspace path.' },
-  { name: 'recall_tool_result', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Retrieve the full verbatim output of a prior tool call by its call_id.' },
+  { name: 'recall_tool_result', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Retrieve the full verbatim output of a prior tool call by its call_id.' },
   { name: 'request_approval', sideEffect: 'write', tier: 'core', lanes: [], loopClass: 'mutating', description: 'Pause and ask the user to approve a high-risk action or one batch of same-shape external…' },
   { name: 'resume_held_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', description: 'Resume a task the user previously asked you to HOLD (see your Current Focus "Held" list),…' },
   { name: 'run_batch', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', description: 'Deterministic batch executor for N same-shape tool calls: reason ONCE (bake every item\'s…' },
@@ -225,8 +237,8 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'set_model_role', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', description: 'Route a model ROLE to a specific model, when the user asks in chat (e.g.' },
   { name: 'set_timer', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', description: 'Schedule a one-time reminder notification ("remind me") at an exact time tonight or in N minutes, within 24 hours.' },
   { name: 'share_plan', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], description: 'Share a non-blocking working plan in the current chat before continuing.' },
-  { name: 'skill_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, description: 'List installed SKILL.md skills (Anthropic Skills format) with name + one-line description.' },
-  { name: 'skill_read', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, description: 'Load the full body of an installed SKILL.md skill into context.' },
+  { name: 'skill_list', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, description: 'List installed SKILL.md skills (Anthropic Skills format) with name + one-line description.' },
+  { name: 'skill_read', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, description: 'Load the full body of an installed SKILL.md skill into context.' },
   { name: 'source_map_upsert', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', description: 'Record WHERE a resource lives in one of the user\'s connected sources — a Drive folder, an…' },
   { name: 'space_action_prepare', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', loopClass: 'mutating', description: 'Prepare one action already declared in a Workspace for exact user approval; never dispatches directly or accepts a tool override.' },
   { name: 'space_diff', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock', loopClass: 'idempotent', description: 'Compare two retained successful observations for one Workspace data source, defaulting to current versus prior.' },
@@ -257,10 +269,10 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'tool_choice_invalidate', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'], loopClass: 'mutating', description: 'Mark the currently-recorded tool choice for an intent as broken.' },
   { name: 'tool_choice_recall', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Look up the previously-recorded tool choice for an intent (per-machine memory).' },
   { name: 'tool_choice_remember', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'], loopClass: 'mutating', description: 'Save the tool that worked for an intent so future runs skip discovery.' },
-  { name: 'tool_output_query', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode'], sdkLayer: 'read-only', codeMode: 'read', description: 'Query a slice of a large prior tool output by its call_id, without loading the whole payl…' },
+  { name: 'tool_output_query', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode'], sdkLayer: 'read-only', codeMode: 'read', description: 'Query a slice of a large prior tool output by its call_id, without loading the whole payl…' },
   { name: 'tool_search', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', description: 'Search the full built-in tool catalog by intent and get matching names, summaries, and sc…' },
   { name: 'update_agent', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Update an existing team agent.' },
-  { name: 'user_profile_read', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Read the user\'s current profile (name, role, timezone, working hours, communication prefe…' },
+  { name: 'user_profile_read', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Read the user\'s current profile (name, role, timezone, working hours, communication prefe…' },
   { name: 'workflow_apply_contract_fixes', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], description: 'Apply safe, machine-readable fixes from a workflow visual contract.' },
   { name: 'workflow_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Create a workflow.' },
   { name: 'workflow_delete', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], blockedFor: ['workflow-step', 'worker'], description: 'Permanently delete a workflow definition file.' },
@@ -296,7 +308,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'extract_structured', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Extract validated structured data from text/files/tool outputs against a JSON Schema or a cached Composio action schema — required fields verified, never invented.' },
   // Mutual availability (2026-07-21 capability audit #6): pure interval
   // algebra over attendee busy windows fetched via the calendar actions.
-  { name: 'time_slots', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Compute mutual free meeting slots from attendees\' busy intervals — exact interval algebra with working-hours/duration constraints.' },
+  { name: 'time_slots', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Compute mutual free meeting slots from attendees\' busy intervals — exact interval algebra with working-hours/duration constraints.' },
   // Employee-memory primitive (2026-07-21): durable cross-RUN state. Core +
   // available in the workflow-step/worker lanes — that's exactly where the
   // amnesia lived (an hourly scrape re-processed the same items every run).
@@ -307,10 +319,10 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'workflow_unschedule', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Disable a scheduled workflow so it stops firing, without deleting it.' },
   { name: 'workflow_update', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Patch workflow fields. If `steps` is provided it replaces the entire graph; use workflow_edit_step for one targeted prompt edit.' },
   { name: 'working_memory', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', description: 'Read, append, replace, or clear the working-memory scratchpad.' },
-  { name: 'workspace_artifact_query', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Query exact rows, fields, and pages from a JSON/JSONL run-workspace artifact.' },
+  { name: 'workspace_artifact_query', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Query exact rows, fields, and pages from a JSON/JSONL run-workspace artifact.' },
   { name: 'workspace_info', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Get detailed info about a local project including README, CLAUDE.md, manifest, and struct…' },
-  { name: 'workspace_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'List local projects found in configured workspace directories.' },
-  { name: 'workspace_roots', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'List directories Clementine is allowed to inspect or operate in.' },
+  { name: 'workspace_list', sideEffect: 'read', projectEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'List local projects found in configured workspace directories.' },
+  { name: 'workspace_roots', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'List directories Clementine is allowed to inspect or operate in.' },
   { name: 'write_file', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'write', loopClass: 'mutating', description: 'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path (content capped ~24KB/call — write big files in append:true chunks).' },
 ];
 

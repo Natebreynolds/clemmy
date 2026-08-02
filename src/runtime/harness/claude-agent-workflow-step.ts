@@ -106,6 +106,36 @@ export function requiredLocalMcpToolsForWorkflowStep(step: WorkflowStepInput, fu
   return [...out];
 }
 
+type CompiledProjectRuntimeWorkflowStep = WorkflowStepInput & {
+  /** In-memory authority marker applied only after compiled-project admission. */
+  __compiledProjectRuntime?: true;
+};
+
+function isCompiledProjectRuntimeWorkflowStep(
+  step: WorkflowStepInput,
+): step is CompiledProjectRuntimeWorkflowStep {
+  return (step as CompiledProjectRuntimeWorkflowStep).__compiledProjectRuntime === true;
+}
+
+/**
+ * A compiled project node already carries its complete local-tool authority.
+ * Re-sanitize at the provider boundary so a malformed in-memory value cannot
+ * turn an empty grant into the SDK profile default. `workflow_step_result` is
+ * deliberately absent: this lane returns through its output schema instead of
+ * dispatching that MCP tool.
+ */
+function compiledProjectAllowedLocalMcpTools(step: WorkflowStepInput): string[] {
+  if (!Array.isArray(step.allowedTools)) return [];
+  const exact = new Set<string>();
+  for (const value of step.allowedTools as unknown[]) {
+    if (typeof value !== 'string') continue;
+    const name = value.trim();
+    if (!name || name.includes('*') || (name.split('__').at(-1) ?? name) === 'workflow_step_result') continue;
+    exact.add(name);
+  }
+  return [...exact];
+}
+
 export function renderClaudeAgentWorkflowStepSystemAppend(args: {
   workflowName: string;
   step: WorkflowStepInput;
@@ -260,10 +290,20 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   parkApprovals?: boolean;
 }): Promise<ClaudeAgentSdkWorkflowStepResult> {
   const fullLane = Boolean(args.fullLane);
-  const nativeMcpToolScope = externalMcpScopeForAllowedToolLock({
-    allowed: args.step.allowedTools,
+  const compiledProjectRuntime = isCompiledProjectRuntimeWorkflowStep(args.step);
+  const allowedLocalMcpTools = compiledProjectRuntime
+    ? compiledProjectAllowedLocalMcpTools(args.step)
+    : defaultClaudeAgentSdkAllowedLocalTools(fullLane ? 'worker' : 'read_only');
+  const resolvedNativeMcpToolScope = externalMcpScopeForAllowedToolLock({
+    allowed: compiledProjectRuntime ? allowedLocalMcpTools : args.step.allowedTools,
     reason: 'Claude workflow step allowedTools lock',
   });
+  // An empty compiled grant is still an exact DENY. The generic helper uses
+  // `undefined` for "no lock requested", which is correct for legacy steps but
+  // would let prompt inference attach native MCP servers to a compiled node.
+  const nativeMcpToolScope = compiledProjectRuntime
+    ? (resolvedNativeMcpToolScope ?? null)
+    : resolvedNativeMcpToolScope;
   // Subagent visibility: a workflow STEP (and each forEach item — this runs per
   // item) IS a specialized agent. Workflow steps run the 'worker' tool profile,
   // which deliberately EXCLUDES run_worker, so the run_worker choke-point never
@@ -313,8 +353,21 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     workflowName: args.workflowName,
     stepId: args.step.id,
     systemAppend: renderClaudeAgentWorkflowStepSystemAppend({ workflowName: args.workflowName, step: args.step, fullLane }),
-    allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(fullLane ? 'worker' : 'read_only'),
-    requiredLocalMcpTools: requiredLocalMcpToolsForWorkflowStep(args.step, fullLane),
+    allowedLocalMcpTools,
+    requiredLocalMcpTools: compiledProjectRuntime
+      ? []
+      : requiredLocalMcpToolsForWorkflowStep(args.step, fullLane),
+    // Agentic SDK runs historically leave the MCP registration allowlist open
+    // because the ordinary worker profile relies on its gate chain. A compiled
+    // node is different: its snapshot is the authority, so pin both exposure
+    // and deferred-dispatch reachability to the same exact list. Keep these
+    // fields absent for catalog workflows to preserve their legacy behavior.
+    ...(compiledProjectRuntime
+      ? {
+          mcpToolAllowlist: allowedLocalMcpTools,
+          localMcpToolUniverse: allowedLocalMcpTools,
+        }
+      : {}),
     // Scope the step's NATIVE external MCP surface to what the step actually names
     // (mirrors the chat brain's request.message scoping). Without this the step
     // defaulted to allowAll → every external MCP child cold-started per step and

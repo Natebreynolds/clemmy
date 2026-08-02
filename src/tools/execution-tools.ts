@@ -83,6 +83,12 @@ function clean(value: string, maxChars = 360): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
 }
 
+function graphLifecycleOwnershipMessage(execution: ExecutionRecord, operation: string): string {
+  return `Execution ${execution.id} is a durable project graph. Its root workflow owns lifecycle; `
+    + `${operation} cannot mutate it through the legacy execution controller. `
+    + 'Use execution_get to inspect it or the exact project-root cancellation control to stop it.';
+}
+
 function executionToolCompletionObjective(execution: ExecutionRecord): string {
   return [
     `Execution title: ${execution.title}`,
@@ -504,6 +510,9 @@ export function registerExecutionTools(server: McpServer): void {
     async ({ id, nextStep, summary, retryOfCallId }) => {
       let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
+      if (e.graphAdmission) {
+        return textResult(graphLifecycleOwnershipMessage(e, 'execution_update_step'));
+      }
       if (e.status === 'completed' || e.status === 'paused') {
         return textResult(`Execution ${id} is ${e.status} — re-open it before updating.`);
       }
@@ -542,6 +551,9 @@ export function registerExecutionTools(server: McpServer): void {
     async ({ id, call_id, verdict, evidence_call_id }) => {
       let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
+      if (e.graphAdmission) {
+        return textResult(graphLifecycleOwnershipMessage(e, 'execution_reconcile_write'));
+      }
       const binding = await bindCurrentRequestToExecution(e, 'execution_reconcile_write');
       if (binding.error) return textResult(binding.error);
       e = binding.execution;
@@ -576,6 +588,9 @@ export function registerExecutionTools(server: McpServer): void {
     async ({ id, blocker }) => {
       let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
+      if (e.graphAdmission) {
+        return textResult(graphLifecycleOwnershipMessage(e, 'execution_mark_blocked'));
+      }
       if (e.status === 'completed') return textResult(`Execution ${id} is completed — nothing to block.`);
       const binding = await bindCurrentRequestToExecution(e, 'execution_mark_blocked');
       if (binding.error) return textResult(binding.error);
@@ -601,6 +616,9 @@ export function registerExecutionTools(server: McpServer): void {
     async ({ id, reason }) => {
       const e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
+      if (e.graphAdmission) {
+        return textResult(graphLifecycleOwnershipMessage(e, 'execution_pause'));
+      }
       if (e.status === 'completed') return textResult(`Execution ${id} is completed — nothing to pause.`);
       if (e.status === 'paused') return textResult(`Execution ${id} was already paused.`);
       const updated = store.update(id, {
@@ -624,6 +642,9 @@ export function registerExecutionTools(server: McpServer): void {
     async ({ id }) => {
       let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
+      if (e.graphAdmission) {
+        return textResult(graphLifecycleOwnershipMessage(e, 'execution_resume'));
+      }
       if (e.status !== 'paused') return textResult(`Execution ${id} is ${e.status} — only paused executions can be resumed.`);
       const binding = await bindCurrentRequestToExecution(e, 'execution_resume');
       if (binding.error) return textResult(binding.error);
@@ -648,7 +669,9 @@ export function registerExecutionTools(server: McpServer): void {
     },
     async ({ query, reason }) => {
       const all = store.list(200);
-      const active = all.filter((e) => e.status === 'active' || e.status === 'blocked');
+      const active = all
+        .filter((e) => !e.graphAdmission)
+        .filter((e) => e.status === 'active' || e.status === 'blocked');
       const result = pickFocusTarget(query, active);
       if (result.kind === 'none') {
         return textResult(`No active execution matches "${query}". Use execution_list to see what's in flight.`);
@@ -682,7 +705,9 @@ export function registerExecutionTools(server: McpServer): void {
     {},
     async () => {
       const all = store.list(200);
-      const paused = all.filter((e) => e.status === 'paused' && e.pausedBy === 'focus');
+      const paused = all.filter((e) =>
+        !e.graphAdmission && e.status === 'paused' && e.pausedBy === 'focus'
+      );
       if (paused.length === 0) return textResult('No focus-paused executions to resume.');
       const now = new Date().toISOString();
       const resumed: string[] = [];
@@ -708,6 +733,9 @@ export function registerExecutionTools(server: McpServer): void {
     async ({ id, summary }) => {
       let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
+      if (e.graphAdmission) {
+        return textResult(graphLifecycleOwnershipMessage(e, 'execution_complete'));
+      }
       if (e.status === 'completed') return textResult(`Execution ${id} was already completed.`);
       const binding = await bindCurrentRequestToExecution(e, 'execution_complete');
       if (binding.error) return textResult(binding.error);
@@ -774,6 +802,7 @@ export function renderActiveExecutionsForAgent(sessionId: string, maxChars = 160
   const all = store.list(40);
   const mine = all
     .filter((e) => e.sessionId === sessionId)
+    .filter((e) => !e.graphAdmission)
     .filter((e) => e.status === 'active' || e.status === 'blocked');
 
   if (mine.length === 0) return '';
@@ -796,6 +825,7 @@ export function activeExecutionCountForSession(sessionId: string): number {
   const all = store.list(40);
   return all
     .filter((e) => e.sessionId === sessionId)
+    .filter((e) => !e.graphAdmission)
     .filter((e) => e.status === 'active' || e.status === 'blocked')
     .length;
 }
@@ -803,6 +833,7 @@ export function activeExecutionCountForSession(sessionId: string): number {
 export function activeExecutionCount(limit = 40): number {
   return store
     .list(limit)
+    .filter((e) => !e.graphAdmission)
     .filter((e) => e.status === 'active' || e.status === 'blocked')
     .length;
 }

@@ -12,9 +12,9 @@ import { workflowCodeRevisionFingerprint } from './workflow-code-certification.j
  * checkpoints.
  */
 export const WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION = 1 as const;
-export const COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION = 2 as const;
+export const COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION = 3 as const;
 export const COMPILED_WORKFLOW_RUN_DEFINITION_SCOPE = 'compiled' as const;
-export const PROJECT_GRAPH_COMPILER_ID = 'project_graph_v1' as const;
+export const PROJECT_GRAPH_COMPILER_ID = 'project_graph_v2' as const;
 export const COMPILED_WORKFLOW_SLUG_RE = /^compiled-[a-f0-9]{32}$/;
 
 export interface WorkflowRunDefinitionSnapshot {

@@ -86,6 +86,7 @@ const {
   isWorkflowStepStructuralResultError,
   isWorkflowStepBrainFalloverEligible,
   _setWorkflowHarnessLoopImplsForTests,
+  _setWorkflowVoiceRewriteForTests,
   _setWorkflowCallNodeForTests,
   publishWorkflowRunTerminalForTest,
   emitParkedApprovalCardToOriginChat,
@@ -149,6 +150,7 @@ const {
   readStepOutputArtifact,
   recordItemOutput,
   recordStepOutput,
+  runWorkspaceDir,
 } = await import('./workflow-run-workspace.js');
 const { clearStepWatermark, readSeenItemKeys } = await import('./workflow-watermark-store.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
@@ -175,7 +177,14 @@ const {
 const {
   queueCompiledWorkflowRun,
 } = await import('../tools/workflow-run-queue.js');
+const {
+  compileWorkflowStepsToGraph,
+  WORKFLOW_GRAPH_ALLOWED_TOOLS,
+} = await import('./workflow-graph.js');
+const { persistWorkflowGraphSnapshot } = await import('./workflow-graph-store.js');
 const { ExecutionStore } = await import('./store.js');
+const { compileProjectPlan } = await import('./project-compiler.js');
+const { PROJECT_STRUCTURAL_TOOLS } = await import('./project-plan-ir.js');
 
 test('run definition resolution pins admitted steps across later workflow edits and fails closed on corruption', () => {
   const admitted = {
@@ -225,6 +234,83 @@ test('run definition resolution pins admitted steps across later workflow edits 
   assert.match(rejected.error ?? '', /snapshot is invalid|content does not match/i);
 });
 
+test('reserved project lineage never falls through a missing snapshot into a catalog collision', () => {
+  const catalog = [{
+    name: 'platform-49',
+    data: {
+      name: 'platform-49',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [{ id: 'must_not_run', prompt: 'This catalog step must never run for project lineage.' }],
+    },
+  }] as never;
+  const base = { workflow: 'platform-49', inputs: {} };
+
+  for (const workflowDefinitionSnapshot of [undefined, null, 'wrong-type', 42]) {
+    const rejected = resolveWorkflowDefinitionForRun({
+      ...base,
+      source: 'project_graph',
+      workflowDefinitionSnapshot,
+    } as never, catalog);
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.definitionSource, 'compiled_snapshot');
+    assert.equal(rejected.workflow, undefined);
+    assert.match(rejected.error ?? '', /No workflow step was executed/i);
+  }
+
+  for (const marker of [
+    { source: 'project_graph' },
+    { sourceExecutionId: 'exec-project-pre-cut' },
+    { compiledContractHash: 'a'.repeat(64) },
+    { triggerReceiptId: `project-turn:v1:${'b'.repeat(64)}` },
+    { workflowSlug: `compiled-${'c'.repeat(32)}` },
+  ]) {
+    const rejected = resolveWorkflowDefinitionForRun({ ...base, ...marker } as never, catalog);
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.definitionSource, 'compiled_snapshot');
+    assert.equal(rejected.workflow, undefined);
+  }
+
+  let poisonedCatalogLookups = 0;
+  const poisonedCatalog = [] as unknown as typeof catalog;
+  Object.defineProperty(poisonedCatalog, 'find', {
+    value: () => {
+      poisonedCatalogLookups += 1;
+      throw new Error('reserved lineage reached catalog lookup');
+    },
+  });
+  for (const marker of [
+    { sourceExecutionId: null },
+    { sourceExecutionId: '' },
+    { compiledContractHash: null },
+    { compiledContractHash: '' },
+    { projectBoundAt: null },
+    { projectExecutionSettlement: null },
+    { workflowSlug: 'compiled-' },
+  ]) {
+    const rejected = resolveWorkflowDefinitionForRun({ ...base, ...marker } as never, poisonedCatalog);
+    assert.equal(rejected.ok, false, JSON.stringify(marker));
+    assert.equal(rejected.definitionSource, 'compiled_snapshot', JSON.stringify(marker));
+    assert.equal(rejected.workflow, undefined, JSON.stringify(marker));
+  }
+  assert.equal(poisonedCatalogLookups, 0, 'presence-only reserved lineage fails before catalog lookup');
+
+  const invalidReservedSnapshot = resolveWorkflowDefinitionForRun({
+    ...base,
+    projectBoundAt: '',
+    workflowDefinitionSnapshot: { version: 1, definitionHash: 'malformed' },
+  } as never, poisonedCatalog);
+  assert.equal(invalidReservedSnapshot.ok, false);
+  assert.equal(invalidReservedSnapshot.definitionSource, 'compiled_snapshot');
+  assert.match(invalidReservedSnapshot.error ?? '', /snapshot is invalid.*No workflow step was executed/is);
+  assert.equal(poisonedCatalogLookups, 0, 'invalid reserved snapshots retain compiled classification before lookup');
+
+  const genuineLegacy = resolveWorkflowDefinitionForRun(base, catalog);
+  assert.equal(genuineLegacy.ok, true);
+  assert.equal(genuineLegacy.definitionSource, 'legacy_current');
+  assert.equal(genuineLegacy.workflow?.data.steps[0]?.id, 'must_not_run');
+});
+
 test('run definition resolution fails closed when authored code changes after admission', () => {
   const slug = `pinned-code-${Date.now()}`;
   const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
@@ -255,27 +341,22 @@ test('run definition resolution fails closed when authored code changes after ad
 });
 
 test('run definition resolution admits only a catalogless compiled project root', () => {
-  function canonicalJson(value: unknown): string {
-    if (value === null || typeof value !== 'object') return JSON.stringify(value);
-    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((key) =>
-      `${JSON.stringify(key)}:${canonicalJson(record[key])}`
-    ).join(',')}}`;
-  }
-  const definition = {
-    name: 'one-off-compiled-project',
-    description: 'Execute the immutable project graph.',
-    enabled: true,
-    trigger: { manual: true },
-    steps: [{
+  const plan = {
+    planId: 'one-off-compiled-project',
+    objective: 'Execute the immutable project graph.',
+    nodes: [{
       id: 'work',
-      prompt: 'Perform bounded read-only work.',
-      sideEffect: 'read' as const,
-      allowedTools: ['workflow_step_result'],
+      executor: {
+        kind: 'model' as const,
+        instruction: 'Perform bounded read-only work.',
+        allowedTools: ['workspace_artifact_query'],
+      },
+      effect: 'read' as const,
       maxTurns: 8,
     }],
   };
+  const compiled = compileProjectPlan(plan);
+  const definition = compiled.definition;
   const sessionId = `sess-compiled-project-${Date.now()}`;
   HarnessSession.create({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Compiled project source' });
   const source = appendEvent({
@@ -285,12 +366,6 @@ test('run definition resolution admits only a catalogless compiled project root'
     type: 'user_input_received',
     data: { text: 'Build the durable project.', source: 'desktop' },
   });
-  const plan = {
-    version: 1,
-    objective: 'Execute a durable project graph.',
-    nodes: [{ id: 'work', executor: 'model', effect: 'read', maxTurns: 8 }],
-  };
-  const hash = (value: unknown) => createHash('sha256').update(canonicalJson(value)).digest('hex');
   new ExecutionStore().createOrGetForSource({
     sessionId,
     sourceUserSeq: source.seq,
@@ -301,12 +376,10 @@ test('run definition resolution admits only a catalogless compiled project root'
     confidence: 0.95,
     reasons: ['durable project'],
     admission: {
-      turnGraphId: `turn-graph:v1:${source.seq}`,
-      turnGraphHash: hash({ sessionId, sourceUserSeq: source.seq }),
       compiledPlan: {
-        version: 1,
-        compilerId: 'project_graph_v1',
-        planHash: hash(plan),
+        version: 2,
+        compilerId: 'project_graph_v2',
+        planHash: compiled.planHash,
         definitionHash: workflowDefinitionHash(definition),
         plan,
         definition,
@@ -332,7 +405,7 @@ test('run definition resolution admits only a catalogless compiled project root'
   assert.equal(workflowRunnerInternalsForTest.workflowStepRunMaxTurns(runtimeStep), 8);
   assert.deepEqual(
     workflowRunnerInternalsForTest.workflowAutoApprovalTools(resolved.workflow!.data, runtimeStep),
-    ['workflow_step_result'],
+    [...PROJECT_STRUCTURAL_TOOLS],
   );
   assert.equal(
     workflowRunnerInternalsForTest.workflowStepRunMaxTurns({ ...runtimeStep, __compiledProjectRuntime: undefined } as never),
@@ -355,7 +428,7 @@ test('run definition resolution admits only a catalogless compiled project root'
     { ...rootRun, source: 'workflow_run' },
     { ...rootRun, status: 'dry_run' },
     { ...rootRun, id: 'forged-run' },
-    { ...rootRun, triggerReceiptId: 'project-turn:v1:wrong' },
+    { ...rootRun, triggerReceiptId: 'project-turn:v2:wrong' },
     { ...rootRun, compiledContractHash: '0'.repeat(64) },
     { ...rootRun, sourceUserSeq: source.seq + 1 },
     { ...rootRun, targetStepId: 'work' },
@@ -366,25 +439,228 @@ test('run definition resolution admits only a catalogless compiled project root'
     assert.equal(rejected.ok, false);
     assert.match(rejected.error ?? '', /catalogless root-run contract/i);
   }
+
+  const stableTopLevelJson = (value: Record<string, unknown>) => JSON.stringify(Object.fromEntries(
+    Object.entries(value).sort(([left], [right]) => left.localeCompare(right)),
+  ));
+  const oldInputsHash = createHash('sha256')
+    .update(stableTopLevelJson(rootRun.inputs as Record<string, unknown>))
+    .digest('hex');
+  const oldDomainContractHash = createHash('sha256').update(stableTopLevelJson({
+    version: 'compiled-project-run:v1',
+    sourceExecutionId: rootRun.sourceExecutionId,
+    sourceUserSeq: rootRun.sourceUserSeq,
+    sourceTurnKeyHash: rootRun.workflowDefinitionSnapshot.sourceTurnKeyHash,
+    originSessionId: rootRun.originSessionId,
+    workflowSlug: rootRun.workflowSlug,
+    definitionHash: rootRun.workflowDefinitionSnapshot.definitionHash,
+    admissionHash: rootRun.workflowDefinitionSnapshot.admissionHash,
+    normalizedInputsHash: oldInputsHash,
+  })).digest('hex');
+  const oldContractRejected = resolveWorkflowDefinitionForRun({
+    ...rootRun,
+    compiledContractHash: oldDomainContractHash,
+  }, []);
+  assert.equal(oldContractRejected.ok, false);
+  assert.match(oldContractRejected.error ?? '', /catalogless root-run contract/i);
+
   rmSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), { force: true });
 });
 
-test('compiled project winner drains its catalogless V2 model node once and reports back across a restart-style rescan', async () => {
-  const { compileProjectPlan } = await import('./project-compiler.js');
+test('persisted executionRole is inert until compiled admission authenticates the step', () => {
+  const resolve = workflowRunnerInternalsForTest.resolveWorkflowStepModel;
+  const roleOf = workflowRunnerInternalsForTest.authenticatedWorkflowExecutionRole;
+  const models = { models: { worker: 'worker-pin-model', brain: 'brain-pin-model' } } as never;
+  const legacy = {
+    id: 'legacy',
+    prompt: 'ordinary catalog work',
+    intent: 'design',
+    executionRole: 'specialist' as const,
+  };
+  const withoutPersistedHint = { ...legacy, executionRole: undefined };
+
+  assert.equal(roleOf(legacy as never), undefined);
+  assert.deepEqual(
+    resolve(legacy as never, models),
+    resolve(withoutPersistedHint as never, models),
+    'an ordinary catalog field cannot silently change its legacy model route',
+  );
+
+  const specialist = { ...legacy, __compiledProjectRuntime: true };
+  assert.equal(roleOf(specialist as never), 'specialist');
+  assert.equal(resolve(specialist as never, models).model, 'worker-pin-model');
+
+  for (const executionRole of ['reducer', 'brain'] as const) {
+    const converger = { ...legacy, executionRole, __compiledProjectRuntime: true };
+    assert.equal(roleOf(converger as never), executionRole);
+    assert.equal(resolve(converger as never, models).model, 'brain-pin-model');
+  }
+
+  assert.equal(
+    roleOf({ ...legacy, executionRole: undefined, __graphRuntimeRole: 'specialist' } as never),
+    'specialist',
+    'the existing read_parallel runtime marker retains its authority',
+  );
+});
+
+test('compiled public sink is selected structurally even without a role and fails closed on ambiguity', () => {
+  const sink = workflowRunnerInternalsForTest.uniqueCompiledProjectTerminalSink([
+    { id: 'left', prompt: 'left' },
+    { id: 'right', prompt: 'right' },
+    { id: 'join', prompt: 'join', dependsOn: ['left', 'right'] },
+  ] as never);
+  assert.equal(sink.id, 'join');
+  assert.throws(
+    () => workflowRunnerInternalsForTest.uniqueCompiledProjectTerminalSink([
+      { id: 'left', prompt: 'left' },
+      { id: 'right', prompt: 'right' },
+    ] as never),
+    /exactly one terminal sink; found 2.*No project output was published/i,
+  );
+});
+
+test('compiled V3 execution rejects a preexisting additive graph overlay before any unadmitted node can run', async () => {
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const sessionId = `sess-compiled-overlay-reject-${stamp}`;
+  const plan = {
+    planId: `overlay-reject-${createHash('sha256').update(stamp).digest('hex').slice(0, 16)}`,
+    objective: 'Execute the immutable project graph.',
+    nodes: [{
+      id: 'admitted_sink',
+      executor: {
+        kind: 'model' as const,
+        instruction: 'Perform bounded read-only work.',
+        allowedTools: ['workspace_artifact_query'],
+      },
+      effect: 'read' as const,
+    }],
+  };
+  const compiled = compileProjectPlan(plan);
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'chat',
+    channel: 'desktop',
+    title: 'Compiled overlay rejection source',
+  });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Run the exact admitted project.', source: 'desktop' },
+  });
+  new ExecutionStore().createOrGetForSource({
+    sessionId,
+    sourceUserSeq: source.seq,
+    title: 'Compiled overlay rejection',
+    objective: plan.objective,
+    reason: 'Exercise immutable compiled graph authority.',
+    startedFromMessage: 'Run the exact admitted project.',
+    confidence: 0.99,
+    reasons: ['compiled overlay rejection'],
+    admission: {
+      compiledPlan: {
+        version: 2,
+        compilerId: 'project_graph_v2',
+        planHash: compiled.planHash,
+        definitionHash: workflowDefinitionHash(compiled.definition),
+        plan,
+        definition: compiled.definition,
+        inputs: {},
+      },
+    },
+  });
+  const queued = queueCompiledWorkflowRun({ sessionId, sourceUserSeq: source.seq });
+  if (queued.status !== 'queued' || !queued.id) {
+    assert.fail(`expected compiled overlay run to queue, got ${queued.status}: ${queued.message}`);
+  }
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`);
+  const admitted = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
+  const graph = compileWorkflowStepsToGraph(admitted.workflowDefinitionSnapshot.definition.steps, {
+    id: `${admitted.workflowSlug}:${queued.id}`,
+    name: admitted.workflow,
+  });
+  graph.nodes.push({
+    id: 'unadmitted_probe',
+    type: 'step',
+    stepId: 'unadmitted_probe',
+    label: 'unadmitted_probe',
+    prompt: 'Return UNADMITTED-NODE-RAN.',
+    sideEffect: 'read',
+    allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS],
+    requiresApproval: false,
+    config: {
+      runtimeMode: 'additive_read_only_v3',
+      toolAuthority: 'result_only',
+    },
+  });
+  graph.edges.push({
+    id: 'dependency:admitted_sink->unadmitted_probe',
+    source: 'admitted_sink',
+    target: 'unadmitted_probe',
+    type: 'dependency',
+  });
+  // The malicious overlay has one structural sink, so a sink-count-only guard
+  // would accept it and publish the injected node. Immutable byte authority is
+  // what must reject it.
+  graph.entryNodeIds = ['admitted_sink'];
+  persistWorkflowGraphSnapshot({
+    workflowName: admitted.workflowSlug,
+    runId: queued.id,
+    graph,
+  });
+
+  let modelCalls = 0;
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    runConversation: (async () => {
+      modelCalls += 1;
+      throw new Error('UNADMITTED-NODE-RAN');
+    }) as never,
+  });
+  try {
+    await processWorkflowRuns({
+      respond: async () => {
+        modelCalls += 1;
+        throw new Error('UNADMITTED-LEGACY-NODE-RAN');
+      },
+    } as never);
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+  }
+
+  const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
+  const events = readWorkflowEvents(admitted.workflowSlug, queued.id);
+  assert.equal(modelCalls, 0, 'neither admitted nor injected model work starts after authority conflict');
+  assert.equal(terminal.status, 'error');
+  assert.equal(terminal.output, undefined, 'no public project output is published');
+  assert.equal(Object.keys(terminal.stepOutputs ?? {}).length, 0);
+  assert.match(terminal.error ?? '', /does not exactly match its admitted V3 definition/i);
+  assert.match(terminal.reportBack?.detail ?? '', /no project node was executed and no output was published/i);
+  assert.equal(events.some((event) => event.kind === 'step_started'), false);
+  assert.equal(events.some((event) => event.kind === 'run_completed'), false);
+  assert.equal(
+    events.some((event) => event.kind === 'workflow_graph_patch_applied'),
+    false,
+    'a rejected compiled overlay emits no patch-derived telemetry',
+  );
+});
+
+test('compiled project winner drains its catalogless V3 model node once and reports back across a restart-style rescan', async () => {
   const { recordStepResult } = await import('../tools/step-result-tool.js');
   const { getPlanScope } = await import('../agents/plan-scope.js');
 
   const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const sessionId = `sess-compiled-runner-e2e-${stamp}`;
   const plan = {
-    planId: `compiled-runner-e2e-${stamp}`,
+    planId: `runner-e2e-${createHash('sha256').update(stamp).digest('hex').slice(0, 16)}`,
     objective: 'Verify and summarize an already-sent message receipt.',
     nodes: [{
       id: 'verify_receipt',
       executor: {
         kind: 'model' as const,
         instruction: 'Verify the supplied receipt and return the durable result.',
-        allowedTools: ['workflow_step_result'],
+        allowedTools: ['workspace_artifact_query'],
       },
       effect: 'read' as const,
       maxTurns: 13,
@@ -414,9 +690,6 @@ test('compiled project winner drains its catalogless V2 model node once and repo
       source: 'desktop',
     },
   });
-  const turnGraphHash = createHash('sha256')
-    .update(JSON.stringify({ sessionId, sourceUserSeq: source.seq, kind: 'turn_graph_v1' }))
-    .digest('hex');
   const winner = new ExecutionStore().createOrGetForSource({
     sessionId,
     sourceUserSeq: source.seq,
@@ -427,11 +700,9 @@ test('compiled project winner drains its catalogless V2 model node once and repo
     confidence: 0.98,
     reasons: ['durable execution acceptance'],
     admission: {
-      turnGraphId: `turn-graph:v1:${source.seq}`,
-      turnGraphHash,
       compiledPlan: {
-        version: 1,
-        compilerId: 'project_graph_v1',
+        version: 2,
+        compilerId: 'project_graph_v2',
         planHash: compiled.planHash,
         definitionHash: workflowDefinitionHash(compiled.definition),
         plan,
@@ -450,13 +721,13 @@ test('compiled project winner drains its catalogless V2 model node once and repo
   const runId = queued.id;
   const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   const admitted = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
-  assert.equal(admitted.workflowDefinitionSnapshot?.version, 2);
+  assert.equal(admitted.workflowDefinitionSnapshot?.version, 3);
   assert.equal(admitted.workflowDefinitionSnapshot?.scope, 'compiled');
-  assert.equal(admitted.workflowDefinitionSnapshot?.compilerId, 'project_graph_v1');
+  assert.equal(admitted.workflowDefinitionSnapshot?.compilerId, 'project_graph_v2');
   assert.equal(admitted.workflowDefinitionSnapshot?.definition?.steps?.[0]?.maxTurns, 13);
   assert.deepEqual(
     admitted.workflowDefinitionSnapshot?.definition?.steps?.[0]?.allowedTools,
-    ['workflow_step_result'],
+    [...PROJECT_STRUCTURAL_TOOLS],
   );
   assert.equal(
     existsSync(path.join(WORKFLOWS_DIR, admitted.workflowSlug, 'SKILL.md')),
@@ -529,17 +800,25 @@ test('compiled project winner drains its catalogless V2 model node once and repo
     assert.equal(observedMaxTurns, 13, 'the compiled node budget reaches the real model loop');
     assert.deepEqual(
       observedPlanScopeTools,
-      ['workflow_step_result'],
+      [...PROJECT_STRUCTURAL_TOOLS],
       'the compiler capability list becomes the exact runtime plan scope',
     );
     assert.equal(observedMcpScope, null, 'a local-only explicit lock attaches no external MCP surface');
     assert.ok(observedAgentTools.includes('workflow_step_result'));
-    for (const forbidden of ['composio_execute_tool', 'run_shell_command', 'write_file', 'workflow_run']) {
+    for (const forbidden of ['notify_user', 'read_file', 'composio_execute_tool', 'run_shell_command', 'write_file', 'workflow_run']) {
       assert.equal(observedAgentTools.includes(forbidden), false, `${forbidden} must be absent from the locked step agent`);
     }
     assert.equal(terminal.status, 'completed');
     assert.equal(terminal.terminalOutcome, 'succeeded');
     assert.equal(typeof terminal.finishedAt, 'string');
+    assert.equal(terminal.projectExecutionSettlement?.version, 1);
+    assert.equal(terminal.projectExecutionSettlement?.executionId, winner.execution.id);
+    assert.match(terminal.projectExecutionSettlement?.terminalDigest ?? '', /^[a-f0-9]{64}$/);
+    const settledProject = new ExecutionStore().getForSource(sessionId, source.seq);
+    assert.equal(settledProject?.status, 'completed');
+    assert.equal(settledProject?.graphAdmission?.rootWorkflowTerminal?.runId, runId);
+    assert.equal(settledProject?.graphAdmission?.rootWorkflowTerminal?.outcome, 'succeeded');
+    assert.equal(settledProject?.workflowBindings?.[0]?.status, 'completed');
     assert.equal(terminal.reportBack?.outcome, 'done');
     assert.deepEqual(terminal.reportBack?.acknowledgedOriginSessionIds, [sessionId]);
     assert.equal(typeof terminal.reportBackAcknowledgedAt, 'string');
@@ -556,12 +835,38 @@ test('compiled project winner drains its catalogless V2 model node once and repo
       'the terminal result reports back to the exact source session once',
     );
 
-    // Restart-style durable rescan: the terminal run remains on disk, but a
-    // fresh drain pass must neither execute the node nor emit another report.
+    // Crash-injection at the two-ledger boundary: preserve the terminal root
+    // but remove both its settlement marker and the ExecutionStore projection.
+    // The next ordinary drain must heal from run truth without executing work
+    // or asking the user to repeat the project.
+    const executionsFile = path.join(tmp, 'state', 'executions.json');
+    const executions = JSON.parse(readFileSync(executionsFile, 'utf-8')) as Array<Record<string, any>>;
+    const execution = executions.find((entry) => entry.id === winner.execution.id)!;
+    execution.status = 'active';
+    delete execution.completedAt;
+    delete execution.graphAdmission.rootWorkflowTerminal;
+    execution.workflowBindings[0].status = 'queued';
+    delete execution.workflowBindings[0].terminalOutcome;
+    delete execution.workflowBindings[0].finishedAt;
+    writeFileSync(executionsFile, JSON.stringify(executions, null, 2), 'utf-8');
+    const unmarkedTerminal = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
+    delete unmarkedTerminal.projectExecutionSettlement;
+    writeFileSync(runFile, JSON.stringify(unmarkedTerminal, null, 2), 'utf-8');
+
+    // Restart-style durable rescan: heal settlement, but neither execute the
+    // node nor emit another report.
     await processWorkflowRuns({
       respond: async () => { throw new Error('terminal compiled run must not re-enter execution'); },
     } as never);
     assert.equal(modelLoopCalls, 1, 'a second durable drain does not repeat the model node');
+    assert.equal(
+      new ExecutionStore().getForSource(sessionId, source.seq)?.graphAdmission?.rootWorkflowTerminal?.outcome,
+      'succeeded',
+    );
+    assert.equal(
+      (JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>).projectExecutionSettlement?.executionId,
+      winner.execution.id,
+    );
     assert.equal(
       readWorkflowEvents(admitted.workflowSlug, runId)
         .filter((event) => event.kind === 'step_completed' && event.stepId === 'verify_receipt').length,
@@ -577,6 +882,316 @@ test('compiled project winner drains its catalogless V2 model node once and repo
     assert.equal(existsSync(path.join(WORKFLOWS_DIR, admitted.workflowSlug, 'SKILL.md')), false);
   } finally {
     _setWorkflowHarnessLoopImplsForTests();
+  }
+});
+
+test('compiled specialists fan out as workers while only the exact brain sink is published', async () => {
+  const { recordStepResult } = await import('../tools/step-result-tool.js');
+  const { loadNotifications } = await import('../runtime/notifications.js');
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const sessionId = `sess-compiled-role-boundary-${stamp}`;
+  const specialistIds = ['probe_north', 'probe_east', 'probe_west'];
+  const exactTerminalValue = { count: 37, url: 'https://sales.example.test/eom' };
+  const exactTerminal = JSON.stringify(exactTerminalValue);
+  const plan = {
+    planId: `role-boundary-${createHash('sha256').update(stamp).digest('hex').slice(0, 16)}`,
+    objective: 'Catalogue thrumcap density across the northern glarnix beds.',
+    nodes: [
+      ...specialistIds.map((id) => ({
+        id,
+        executor: {
+          kind: 'model' as const,
+          instruction: `Collect the private ${id} evidence.`,
+          allowedTools: ['workspace_artifact_query'],
+        },
+        effect: 'read' as const,
+        executionRole: 'specialist' as const,
+      })),
+      {
+        id: 'reduce_sales',
+        dependsOn: specialistIds,
+        executor: {
+          kind: 'model' as const,
+          instruction: 'Join all three private probes into one exact sales total.',
+          allowedTools: ['workspace_artifact_query'],
+        },
+        effect: 'read' as const,
+        executionRole: 'reducer' as const,
+      },
+      {
+        id: 'brain',
+        dependsOn: ['reduce_sales'],
+        executor: {
+          kind: 'model' as const,
+          instruction: 'Confirm the joined density model against the observations.',
+          allowedTools: ['workspace_artifact_query'],
+        },
+        effect: 'read' as const,
+        executionRole: 'brain' as const,
+        evidence: {
+          type: 'object' as const,
+          requiredKeys: ['count', 'url'],
+          nonEmpty: ['url'],
+        },
+      },
+    ],
+  };
+  const compiled = compileProjectPlan(plan);
+
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'chat',
+    channel: 'desktop',
+    title: 'Compiled role boundary source',
+  });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Build the sales result.', source: 'desktop' },
+  });
+  new ExecutionStore().createOrGetForSource({
+    sessionId,
+    sourceUserSeq: source.seq,
+    title: 'Compiled role boundary',
+    objective: plan.objective,
+    reason: 'Exercise authenticated compiled role topology.',
+    startedFromMessage: 'Build the sales result.',
+    confidence: 0.99,
+    reasons: ['compiled role acceptance'],
+    admission: {
+      compiledPlan: {
+        version: 2,
+        compilerId: 'project_graph_v2',
+        planHash: compiled.planHash,
+        definitionHash: workflowDefinitionHash(compiled.definition),
+        plan,
+        definition: compiled.definition,
+        inputs: {},
+      },
+    },
+  });
+  const queued = queueCompiledWorkflowRun({ sessionId, sourceUserSeq: source.seq });
+  if (queued.status !== 'queued' || !queued.id) {
+    assert.fail(`expected compiled run to queue, got ${queued.status}: ${queued.message}`);
+  }
+  const runId = queued.id;
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const admitted = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
+
+  let activeSpecialists = 0;
+  let maxActiveSpecialists = 0;
+  let releaseSpecialists!: () => void;
+  const allSpecialistsEntered = new Promise<void>((resolve) => { releaseSpecialists = resolve; });
+  const reducerContexts: string[] = [];
+  let voiceRewriteCalls = 0;
+  const poisonedRewrite = 'Quarter total: 999\nDashboard: https://wrong.example.test\nPRIVATE-probe_north';
+
+  _setWorkflowVoiceRewriteForTests((async () => {
+    voiceRewriteCalls += 1;
+    return { message: poisonedRewrite, nothingHappened: false };
+  }) as never);
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    runConversation: (async (options: { sessionId: string; input?: string }) => {
+      const stepId = options.sessionId.split(':').at(-1) ?? '';
+      if (specialistIds.includes(stepId)) {
+        activeSpecialists += 1;
+        maxActiveSpecialists = Math.max(maxActiveSpecialists, activeSpecialists);
+        if (activeSpecialists === specialistIds.length) releaseSpecialists();
+        await allSpecialistsEntered;
+        recordStepResult(options.sessionId, {
+          branch: stepId,
+          value: stepId === 'probe_north' ? 12 : stepId === 'probe_east' ? 10 : 15,
+          secret: `PRIVATE-${stepId}`,
+        });
+        activeSpecialists -= 1;
+      } else if (stepId === 'reduce_sales') {
+        reducerContexts.push(options.input ?? '');
+        recordStepResult(options.sessionId, {
+          total: 37,
+          reducerSecret: 'PRIVATE-reducer-only',
+        });
+      } else if (stepId === 'brain') {
+        recordStepResult(options.sessionId, exactTerminalValue);
+      } else if (stepId === 'ordinary_step') {
+        recordStepResult(options.sessionId, 'ordinary catalog result');
+      } else if (stepId === 'fail_node') {
+        throw new Error('EXACT-COMPILED-FAILURE-73');
+      } else {
+        throw new Error(`unexpected workflow step in acceptance stub: ${stepId}`);
+      }
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { summary: 'done', reply: 'done', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+
+  const ordinarySlug = `ordinary-role-control-${stamp}`;
+  const ordinaryName = `Ordinary Role Control ${stamp}`;
+  const ordinaryRunId = `ordinary-role-control-run-${stamp}`;
+  try {
+    await processWorkflowRuns({
+      respond: async () => { throw new Error('compiled nodes must use the workflow harness'); },
+    } as never);
+
+    assert.equal(maxActiveSpecialists, 3, 'all three specialist workers overlap before the reducer starts');
+    assert.equal(reducerContexts.length, 1);
+    for (const id of specialistIds) {
+      assert.match(reducerContexts[0], new RegExp(`PRIVATE-${id}`), `reducer receives ${id} through DAG context`);
+    }
+
+    const started = specialistIds.flatMap((id) =>
+      listEvents(`workflow:${runId}:${id}`, { types: ['worker_started'] }));
+    const results = specialistIds.flatMap((id) =>
+      listEvents(`workflow:${runId}:${id}`, { types: ['worker_result'] }));
+    assert.equal(started.length, 3);
+    assert.equal(results.length, 3);
+    assert.equal(started.every((event) => event.data?.lane === 'compiled_project'), true);
+    assert.equal(results.every((event) => event.data?.lane === 'compiled_project' && event.data?.ok === true), true);
+    for (const id of ['reduce_sales', 'brain']) {
+      assert.equal(listEvents(`workflow:${runId}:${id}`, { types: ['worker_started'] }).length, 0);
+      assert.equal(listEvents(`workflow:${runId}:${id}`, { types: ['worker_result'] }).length, 0);
+    }
+
+    const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
+    assert.equal(voiceRewriteCalls, 0, 'compiled success places no post-graph voice-model call');
+    assert.equal(terminal.output, exactTerminal);
+    assert.deepEqual(Object.keys(terminal.stepOutputs ?? {}), ['brain']);
+    assert.equal(terminal.stepOutputs.brain, exactTerminal);
+    assert.equal(terminal.reportBack?.detail, exactTerminal);
+    for (const privateText of [...specialistIds.map((id) => `PRIVATE-${id}`), 'PRIVATE-reducer-only']) {
+      assert.doesNotMatch(JSON.stringify({
+        output: terminal.output,
+        stepOutputs: terminal.stepOutputs,
+        reportBack: terminal.reportBack,
+      }), new RegExp(privateText));
+    }
+
+    const completionNotice = loadNotifications().find((row) => row.id === `workflow-${runId}-completed`);
+    assert.equal(completionNotice?.body, exactTerminal);
+    assert.doesNotMatch(completionNotice?.body ?? '', /PRIVATE-/);
+    const originReports = listEvents(sessionId, { types: ['user_input_received'] })
+      .filter((event) => typeof event.data?.text === 'string'
+        && event.data.text.startsWith(`[workflow run ${runId} `));
+    assert.equal(originReports.length, 1);
+    assert.match(String(originReports[0].data?.text), /"count":37/);
+    assert.match(String(originReports[0].data?.text), /https:\/\/sales\.example\.test\/eom/);
+    assert.doesNotMatch(String(originReports[0].data?.text), /PRIVATE-/);
+    const runSummary = readWorkflowEvents(admitted.workflowSlug, runId)
+      .find((event) => event.kind === 'run_summary');
+    assert.ok(runSummary);
+    assert.doesNotMatch(JSON.stringify(runSummary?.meta?.artifacts ?? {}), /PRIVATE-/);
+    assert.deepEqual((runSummary?.meta?.artifacts as { urls?: string[] })?.urls, ['https://sales.example.test/eom']);
+
+    // The failure terminal is just as model-free: no tone pass gets a chance
+    // to turn the exact runtime error into the poisoned rewrite.
+    const failureSessionId = `sess-compiled-role-failure-${stamp}`;
+    const failurePlan = {
+      planId: `role-failure-${createHash('sha256').update(stamp).digest('hex').slice(0, 16)}`,
+      objective: 'Inspect one thrumcap observation.',
+      nodes: [{
+        id: 'fail_node',
+        executor: {
+          kind: 'model' as const,
+          instruction: 'Inspect the thrumcap observation.',
+          allowedTools: ['workspace_artifact_query'],
+        },
+        effect: 'read' as const,
+      }],
+    };
+    const compiledFailure = compileProjectPlan(failurePlan);
+    HarnessSession.create({
+      id: failureSessionId,
+      kind: 'chat',
+      channel: 'desktop',
+      title: 'Compiled failure boundary source',
+    });
+    const failureSource = appendEvent({
+      sessionId: failureSessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Inspect the thrumcap.', source: 'desktop' },
+    });
+    new ExecutionStore().createOrGetForSource({
+      sessionId: failureSessionId,
+      sourceUserSeq: failureSource.seq,
+      title: 'Compiled failure boundary',
+      objective: failurePlan.objective,
+      reason: 'Exercise the compiled failure terminal.',
+      startedFromMessage: 'Inspect the thrumcap.',
+      confidence: 0.99,
+      reasons: ['compiled failure acceptance'],
+      admission: {
+        compiledPlan: {
+          version: 2,
+          compilerId: 'project_graph_v2',
+          planHash: compiledFailure.planHash,
+          definitionHash: workflowDefinitionHash(compiledFailure.definition),
+          plan: failurePlan,
+          definition: compiledFailure.definition,
+          inputs: {},
+        },
+      },
+    });
+    const queuedFailure = queueCompiledWorkflowRun({
+      sessionId: failureSessionId,
+      sourceUserSeq: failureSource.seq,
+    });
+    if (queuedFailure.status !== 'queued' || !queuedFailure.id) {
+      assert.fail(`expected compiled failure run to queue, got ${queuedFailure.status}: ${queuedFailure.message}`);
+    }
+    await processWorkflowRuns({} as never);
+    const failureTerminal = JSON.parse(
+      readFileSync(path.join(WORKFLOW_RUNS_DIR, `${queuedFailure.id}.json`), 'utf-8'),
+    ) as Record<string, any>;
+    assert.equal(failureTerminal.status, 'error');
+    assert.equal(failureTerminal.reportBack?.detail, 'EXACT-COMPILED-FAILURE-73');
+    assert.equal(voiceRewriteCalls, 0, 'compiled failure places no post-graph voice-model call');
+    assert.doesNotMatch(failureTerminal.reportBack?.detail ?? '', /999|wrong\.example|PRIVATE-/);
+
+    // Ordinary catalog control: the same persisted role field is untrusted and
+    // the existing report voice pass still runs. A partial TRY avoids unrelated
+    // target/goal judges while exercising the real terminal publication path.
+    writeWorkflow(ordinarySlug, {
+      name: ordinaryName,
+      description: 'Ordinary catalog role compatibility control.',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [{
+        id: 'ordinary_step',
+        prompt: 'Return the ordinary catalog result.',
+        sideEffect: 'read',
+        executionRole: 'specialist',
+      }],
+    });
+    mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${ordinaryRunId}.json`), JSON.stringify({
+      id: ordinaryRunId,
+      workflow: ordinaryName,
+      status: 'queued',
+      targetStepId: 'ordinary_step',
+      inputs: {},
+      createdAt: new Date().toISOString(),
+    }), 'utf-8');
+    await processWorkflowRuns({} as never);
+    const ordinaryTerminal = JSON.parse(
+      readFileSync(path.join(WORKFLOW_RUNS_DIR, `${ordinaryRunId}.json`), 'utf-8'),
+    ) as Record<string, any>;
+    assert.equal(voiceRewriteCalls, 1, 'ordinary catalog completion retains the voice rewrite');
+    assert.equal(ordinaryTerminal.reportBack?.detail, poisonedRewrite);
+    assert.equal(listEvents(`workflow:${ordinaryRunId}:ordinary_step`, { types: ['worker_started'] }).length, 0);
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+    _setWorkflowVoiceRewriteForTests(null);
+    rmSync(path.join(WORKFLOWS_DIR, ordinarySlug), { recursive: true, force: true });
   }
 });
 
@@ -1116,6 +1731,42 @@ test('pre-start missing-input workflow failure is recorded in Activity runs', as
   assert.equal(activityRun?.status, 'failed');
   assert.match(activityRun?.error ?? '', /Missing required workflow input: url/);
   assert.equal(activityRun?.events.at(-1)?.type, 'failed');
+});
+
+test('a corrupt project execution ledger cannot starve an independently admitted catalog run', async () => {
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const slug = 'catalog-drains-with-corrupt-project-ledger';
+  const workflowName = 'Catalog Drain Isolation';
+  const runId = `catalog-isolation-${Date.now()}`;
+  writeWorkflow(slug, {
+    name: workflowName,
+    description: 'Prove the workflow lane is independent from project admission state.',
+    enabled: true,
+    trigger: { manual: true },
+    inputs: { required: { description: 'Required input' } },
+    steps: [{ id: 'work', prompt: 'Use {{input.required}}.', sideEffect: 'read' }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(runFile, JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    status: 'queued',
+    inputs: {},
+    createdAt: new Date().toISOString(),
+  }), 'utf-8');
+  const executionsFile = path.join(tmp, 'state', 'executions.json');
+  mkdirSync(path.dirname(executionsFile), { recursive: true });
+  writeFileSync(executionsFile, '{ "graphAdmission": [', 'utf-8');
+
+  try {
+    await processWorkflowRuns({} as never);
+    const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as { status?: string; error?: string };
+    assert.equal(terminal.status, 'error');
+    assert.match(terminal.error ?? '', /Missing required workflow input: required/);
+  } finally {
+    rmSync(executionsFile, { force: true });
+  }
 });
 
 test('fresh workflow run records a sanitized graph snapshot event', async () => {
@@ -1775,6 +2426,69 @@ test('renderStepContextBlock offloads large upstream values to the run workspace
   assert.ok(pathMatch?.[1], 'offloaded context must include an absolute artifact path');
   const artifact = readFileSync(pathMatch[1], 'utf-8');
   assert.match(artifact, new RegExp(lastNeedle), 'artifact carries the exact full upstream payload');
+});
+
+test('compiled invocation binds artifact authority to rendered DAG dependencies only', () => {
+  const workflowName = 'dag-bound-artifact-workflow';
+  const runId = 'dag-bound-artifact-run';
+  const large = (label: string) => ({
+    rows: Array.from({ length: 260 }, (_, index) => ({
+      index,
+      value: `${label}-${index}-${'x'.repeat(80)}`,
+    })),
+  });
+  const declared = large('DECLARED');
+  const completedSibling = large('PRIVATE-SIBLING');
+  const declaredArtifact = finalizeStepOutput(
+    workflowName,
+    runId,
+    { id: 'declared_source', prompt: 'Source.' } as never,
+    declared,
+  );
+  finalizeStepOutput(
+    workflowName,
+    runId,
+    { id: 'completed_sibling', prompt: 'Sibling.' } as never,
+    completedSibling,
+  );
+
+  const invocation = workflowRunnerInternalsForTest.renderStepContextForInvocation(
+    { values: {}, upstream: { declared_source: declared } },
+    { workflowName, runId, nowIso: '2026-08-02T00:00:00.000Z' },
+  );
+  const refs = invocation.graphContext.allowedArtifacts;
+  assert.equal(refs.length, 1, 'only the dependency rendered for this invocation grants a read');
+  assert.match(refs[0].path, /step-declared_source-[a-f0-9]{64}\.json$/);
+  assert.equal(refs[0].sha256.length, 64);
+  assert.ok(refs[0].bytes > 8_000);
+  assert.doesNotMatch(JSON.stringify(refs), /completed_sibling|PRIVATE-SIBLING/);
+  assert.match(invocation.block, /"sha256": "[a-f0-9]{64}"/);
+  assert.doesNotMatch(invocation.block, /read_file/, 'compiled context advertises only its bound query helper');
+  assert.deepEqual(declaredArtifact, declared, 'context rendering never changes the completed output');
+});
+
+test('large fan-out values with the same logical key receive distinct immutable refs', () => {
+  const workflowName = 'fanout-context-addressing';
+  const runId = 'fanout-context-addressing-run';
+  const makeItem = (label: string) => ({
+    id: label,
+    body: `${label}:${'z'.repeat(9_000)}`,
+  });
+  const first = workflowRunnerInternalsForTest.renderStepContextForInvocation(
+    { values: {}, upstream: {}, item: makeItem('FIRST') },
+    { workflowName, runId, nowIso: '2026-08-02T00:00:00.000Z' },
+  );
+  const second = workflowRunnerInternalsForTest.renderStepContextForInvocation(
+    { values: {}, upstream: {}, item: makeItem('SECOND') },
+    { workflowName, runId, nowIso: '2026-08-02T00:00:01.000Z' },
+  );
+  const firstRef = first.graphContext.allowedArtifacts[0];
+  const secondRef = second.graphContext.allowedArtifacts[0];
+  assert.ok(firstRef && secondRef);
+  assert.notEqual(firstRef.path, secondRef.path);
+  assert.notEqual(firstRef.sha256, secondRef.sha256);
+  assert.match(readFileSync(path.join(runWorkspaceDir(workflowName, runId), firstRef.path), 'utf8'), /FIRST/);
+  assert.match(readFileSync(path.join(runWorkspaceDir(workflowName, runId), secondRef.path), 'utf8'), /SECOND/);
 });
 
 test('final synthesis and goal evidence render large completed outputs as queryable step artifacts', () => {
@@ -3140,13 +3854,6 @@ test('forEach restart hydrates an exact >32KB completed item before draining its
       JSON.stringify(resumed.completedItems.get('fanout')?.get('a')),
       /EXACT-ITEM-TAIL-AFTER-RESTART/,
     );
-    assert.ok(
-      workflowRunnerInternalsForTest
-        .graphContextForRun(workflowSlug, runId)
-        .allowedArtifactPaths.includes(persisted.path),
-      'a graph-added node can query the exact event-owned item artifact directly',
-    );
-
     let modelCalls = 0;
     const ctx = {
       workflow: { name: 'Exact Item Resume', steps: [] },

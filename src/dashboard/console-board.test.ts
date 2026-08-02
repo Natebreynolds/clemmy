@@ -16,6 +16,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, 
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
+import type { ExecutionRecord } from '../types.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-console-board-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -29,7 +30,7 @@ const {
   updateBackgroundTask,
 } = await import('../execution/background-tasks.js');
 const { startRun, finishRun } = await import('../runtime/run-events.js');
-const { registerConsoleRoutes } = await import('./console-routes.js');
+const { executionBoardProjection, registerConsoleRoutes } = await import('./console-routes.js');
 const { readWorkflow, writeWorkflow } = await import('../memory/workflow-store.js');
 const { fireWorkflowSystemEvent } = await import('../execution/workflow-trigger-engine.js');
 const { CRON_TRIGGERS_DIR, WORKFLOW_RUNS_DIR, updateEnvKey, clearWorkspaceProjectCache } = await import('../tools/shared.js');
@@ -105,6 +106,131 @@ function workflowRunRecords(workflowName: string): Array<Record<string, unknown>
     })
     .filter((record): record is Record<string, unknown> => Boolean(record) && record.workflow === workflowName);
 }
+
+function boardExecution(overrides: Partial<ExecutionRecord>): ExecutionRecord {
+  const now = '2026-08-02T12:00:00.000Z';
+  return {
+    id: 'exec-board-projection',
+    sessionId: 'session-board-projection',
+    title: 'Board projection',
+    objective: 'Project truthful execution state onto a Tasks-board card.',
+    reason: 'test',
+    status: 'active',
+    createdAt: now,
+    updatedAt: now,
+    lastActivityAt: now,
+    startedFromMessage: 'Show the truthful card.',
+    confidence: 1,
+    reasons: ['test'],
+    ...overrides,
+  };
+}
+
+function graphAdmission(
+  outcome?: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled',
+  cancelledBeforeRoot?: { version: 1; finishedAt: string; reason: string },
+): NonNullable<ExecutionRecord['graphAdmission']> {
+  const finishedAt = '2026-08-02T12:30:00.000Z';
+  const status = outcome === 'succeeded' || outcome === 'blocked'
+    ? 'completed'
+    : outcome === 'partial'
+      ? 'completed_with_errors'
+      : outcome === 'cancelled'
+        ? 'cancelled'
+        : 'failed';
+  return {
+    version: 2,
+    kind: 'project_graph',
+    sourceTurnKeyHash: '1'.repeat(64),
+    acceptedSourceHash: '2'.repeat(64),
+    planHash: '3'.repeat(64),
+    compiledPlan: {} as never,
+    rootWorkflowReceiptId: 'project-turn:test',
+    admittedAt: '2026-08-02T12:00:00.000Z',
+    ...(outcome
+      ? {
+          rootWorkflowRunId: 'compiled-root-test',
+          rootWorkflowTerminal: {
+            version: 1,
+            runId: 'compiled-root-test',
+            status,
+            outcome,
+            finishedAt,
+            observedAt: finishedAt,
+            terminalDigest: '4'.repeat(64),
+          },
+        }
+      : {}),
+    ...(cancelledBeforeRoot ? { cancelledBeforeRoot } : {}),
+  };
+}
+
+test('execution board projection preserves legacy cards and renders every graph terminal outcome truthfully', () => {
+  const legacy = executionBoardProjection(boardExecution({
+    id: 'legacy-paused',
+    status: 'paused',
+    blocker: 'Paused by the user.',
+  }));
+  assert.equal(legacy.status, 'paused');
+  assert.equal(legacy.column, 'needs_you');
+  assert.deepEqual(legacy.actions, ['resume', 'cancel']);
+
+  const succeeded = executionBoardProjection(boardExecution({
+    id: 'graph-succeeded',
+    status: 'completed',
+    graphAdmission: graphAdmission('succeeded'),
+    lastAssistantSummary: 'Verified project result published.',
+  }));
+  assert.equal(succeeded.status, 'succeeded');
+  assert.equal(succeeded.column, 'done');
+  assert.deepEqual(succeeded.actions, []);
+  assert.equal(succeeded.failureSummary, undefined);
+
+  const partial = executionBoardProjection(boardExecution({
+    id: 'graph-partial',
+    status: 'completed',
+    graphAdmission: graphAdmission('partial'),
+    blocker: 'Two optional records could not be verified.',
+  }));
+  assert.equal(partial.status, 'partial');
+  assert.match(partial.failureSummary?.reason ?? '', /could not be verified/i);
+
+  const longFailure = `Provider readback failed. ${'bounded '.repeat(120)}`;
+  for (const outcome of ['blocked', 'failed'] as const) {
+    const projection = executionBoardProjection(boardExecution({
+      id: `graph-${outcome}`,
+      status: 'completed',
+      graphAdmission: graphAdmission(outcome),
+      blocker: longFailure,
+    }));
+    assert.equal(projection.status, outcome);
+    assert.notEqual(projection.status, 'completed');
+    assert.equal(projection.failureSummary?.retryable, false);
+    assert.ok((projection.failureSummary?.reason.length ?? 0) <= 600);
+  }
+
+  const rootCancelled = executionBoardProjection(boardExecution({
+    id: 'graph-root-cancelled',
+    status: 'completed',
+    graphAdmission: graphAdmission('cancelled'),
+    blocker: 'Cancelled from the Tasks board.',
+  }));
+  assert.equal(rootCancelled.status, 'cancelled');
+  assert.notEqual(rootCancelled.status, 'completed');
+
+  const preRootCancelled = executionBoardProjection(boardExecution({
+    id: 'graph-pre-root-cancelled',
+    status: 'completed',
+    graphAdmission: graphAdmission(undefined, {
+      version: 1,
+      finishedAt: '2026-08-02T12:15:00.000Z',
+      reason: 'Cancelled before the durable root was installed.',
+    }),
+  }));
+  assert.equal(preRootCancelled.status, 'cancelled');
+  assert.match(preRootCancelled.progressHint, /before the durable root/i);
+  assert.deepEqual(preRootCancelled.actions, []);
+});
 
 test('GET /api/console/board normalizes every background-task status into the right column + actions', async () => {
   // Seed one task per status, driving each through the real state machine.

@@ -351,8 +351,8 @@ export interface PlanRecord {
  * recovery continue without asking a model to recreate either one.
  */
 export interface ProjectGraphCompiledPlanSnapshot {
-  version: 1;
-  compilerId: 'project_graph_v1';
+  version: 2;
+  compilerId: 'project_graph_v2';
   planHash: string;
   definitionHash: string;
   /** Hash of the complete persisted payload (plan, definition, and inputs). */
@@ -385,14 +385,16 @@ export interface ExecutionRecord {
    * accepted user turn. This is execution provenance, not tool authority: the
    * runtime still admits every effect at its actual tool boundary. */
   graphAdmission?: {
-    version: 1;
+    version: 2;
     kind: 'project_graph';
     /** Domain-separated SHA-256 of the session id and accepted source seq;
      * avoids copying private session identifiers into receipt keys while
      * retaining stable identity. */
     sourceTurnKeyHash: string;
-    turnGraphId: string;
-    turnGraphHash: string;
+    /** Domain-separated digest of the immutable accepted human event identity.
+     * Derived inside ExecutionStore; observational turn-graph classifiers are
+     * deliberately not admission authority. */
+    acceptedSourceHash: string;
     /** Hash of the first executable planner snapshot. Immutable after admit. */
     planHash: string;
     /** The actual first executable compiler output, not merely its digest. */
@@ -403,6 +405,28 @@ export interface ExecutionRecord {
     /** The single root workflow occurrence admitted for this source. Retry or
      * repair descendants keep their own explicit run lineage. */
     rootWorkflowRunId?: string;
+    /** Cancellation that linearized before the root occurrence was installed.
+     * This is terminal authority for the unbound half of the two-ledger
+     * protocol and is mutually exclusive with rootWorkflowRunId. */
+    cancelledBeforeRoot?: {
+      version: 1;
+      finishedAt: string;
+      reason: string;
+    };
+    /** Immutable terminal truth copied from that exact root run after its run
+     * record has durably published. This is the restart bridge between the
+     * workflow ledger and the project/execution ledger. */
+    rootWorkflowTerminal?: {
+      version: 1;
+      runId: string;
+      status: 'completed' | 'completed_with_errors' | 'error' | 'failed' | 'cancelled';
+      outcome: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled';
+      finishedAt: string;
+      observedAt: string;
+      /** Digest of the exact terminal run contract, outcome, and report-back
+       * envelope observed by ExecutionStore. Exact replay may not swap it. */
+      terminalDigest: string;
+    };
   };
   userId?: string;
   channel?: string;
@@ -452,6 +476,8 @@ export interface ExecutionRecord {
     status: 'queued' | 'running' | 'completed' | 'error';
     createdAt: string;
     updatedAt: string;
+    terminalOutcome?: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled';
+    finishedAt?: string;
   }>;
   delegationBindings?: Array<{
     delegationId: string;

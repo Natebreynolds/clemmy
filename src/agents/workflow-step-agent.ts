@@ -25,6 +25,7 @@ import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import { peekStepResult } from '../tools/step-result-tool.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 import { runWorkspaceDir } from '../execution/workflow-run-workspace.js';
+import { STEP_STRUCTURAL_BASELINE_TOOLS } from '../execution/workflow-step-structural-tools.js';
 import { queryWorkspaceArtifact } from '../tools/workspace-artifact-tools.js';
 
 import { harnessInputGuardrails, harnessOutputGuardrails } from '../runtime/harness/guardrails.js';
@@ -155,14 +156,7 @@ export function filterToolsForStep<T extends { name?: string }>(tools: T[]): T[]
  *  workspace context artifacts.
  *  These are structural, not "work" tools, so keeping them
  *  doesn't reopen the composio drift vector the lock exists to close. */
-export const STEP_STRUCTURAL_BASELINE_TOOLS = new Set<string>([
-  'workflow_step_result',
-  'notify_user',
-  'read_file',
-  'workspace_artifact_query',
-  'recall_tool_result',
-  'tool_output_query',
-]);
+export { STEP_STRUCTURAL_BASELINE_TOOLS };
 
 /** A step's allowedTools "locks" its surface only when explicitly set and not a
  *  wildcard. Empty / undefined / contains '*' → no lock (today's full surface). */
@@ -174,7 +168,10 @@ export function stepAllowedToolsLock(allowed?: string[] | null): boolean {
 /** Build a name predicate from an explicit allowedTools list: an entry ending
  *  in '*' is a prefix family (e.g. 'composio_*'); otherwise an exact name. The
  *  structural baseline is always allowed. */
-export function makeStepToolAllow(allowed: string[]): (name: string) => boolean {
+export function makeStepToolAllow(
+  allowed: string[],
+  includeLegacyStructuralBaseline = true,
+): (name: string) => boolean {
   const exact = new Set<string>();
   const prefixes: string[] = [];
   for (const a of allowed) {
@@ -184,16 +181,20 @@ export function makeStepToolAllow(allowed: string[]): (name: string) => boolean 
     else exact.add(t);
   }
   return (name: string) =>
-    STEP_STRUCTURAL_BASELINE_TOOLS.has(name) ||
+    (includeLegacyStructuralBaseline && STEP_STRUCTURAL_BASELINE_TOOLS.has(name)) ||
     exact.has(name) ||
     prefixes.some((p) => p.length > 0 && name.startsWith(p));
 }
 
 /** Prune the step's tool list to its explicit allowedTools family (+ baseline).
  *  No-op when allowedTools doesn't lock the surface. */
-export function lockToolsForStep<T extends { name?: string }>(tools: T[], allowed?: string[] | null): T[] {
+export function lockToolsForStep<T extends { name?: string }>(
+  tools: T[],
+  allowed?: string[] | null,
+  includeLegacyStructuralBaseline = true,
+): T[] {
   if (!stepAllowedToolsLock(allowed)) return tools;
-  const allow = makeStepToolAllow(allowed as string[]);
+  const allow = makeStepToolAllow(allowed as string[], includeLegacyStructuralBaseline);
   return tools.filter((t) => allow(typeof t?.name === 'string' ? t.name : ''));
 }
 
@@ -272,6 +273,9 @@ export interface BuildWorkflowStepAgentOptions {
    *  the agent's tool list is pruned to that family + the structural baseline,
    *  so a bound step can't drift onto composio. Omit / `['*']` → full surface. */
   lockTools?: string[] | null;
+  /** Compiled-project admission already persisted the complete authority set.
+   *  Honor it byte-for-byte; do not union the legacy report/read baseline. */
+  exactTools?: boolean;
   /**
    * Runtime-added graph prompts are intentionally graph-restricted. This is
    * stronger than an empty allowedTools array (which means "inherit the full
@@ -279,12 +283,17 @@ export interface BuildWorkflowStepAgentOptions {
    * result channel and optional run-confined artifact query are exposed.
    */
   resultOnlyTools?: boolean;
-  /** Exact run workspace boundary and event-owned artifact allowlist for a
-   * graph-added node's one read helper. */
+  /** Exact run workspace boundary and invocation-rendered artifact bindings
+   * for a graph/compiled node's one read helper. */
   graphContext?: {
     workflowName: string;
     runId: string;
-    allowedArtifactPaths: string[];
+    allowedArtifacts: Array<{
+      /** Workspace-relative path rendered into this invocation's STEP CONTEXT. */
+      path: string;
+      sha256: string;
+      bytes: number;
+    }>;
   };
   /** Per-step model override (the intent-routed worker model). Omit ⇒ the
    *  primary brain tier, byte-identical to before. The registered
@@ -305,8 +314,8 @@ function pathIsInside(parent: string, child: string): boolean {
 function buildGraphContextQueryTool(
   context: NonNullable<BuildWorkflowStepAgentOptions['graphContext']>,
 ): Tool<RuntimeContextValue> {
-  const allowedRelativePaths = new Set(
-    context.allowedArtifactPaths.map((entry) => path.normalize(entry)),
+  const allowedArtifacts = new Map(
+    context.allowedArtifacts.map((entry) => [path.normalize(entry.path), entry]),
   );
   return tool({
     name: 'workspace_artifact_query',
@@ -354,8 +363,9 @@ function buildGraphContextQueryTool(
           return `Refused: graph context reads are limited to this run workspace (${root}).`;
         }
         const workspaceRelative = path.normalize(path.relative(root, resolved));
-        if (!allowedRelativePaths.has(workspaceRelative)) {
-          return 'Refused: this artifact is not owned by a completed event in the active workflow run.';
+        const boundArtifact = allowedArtifacts.get(workspaceRelative);
+        if (!boundArtifact) {
+          return 'Refused: this artifact was not rendered into the active workflow step context.';
         }
         // `null` means "not supplied" on the wire; the query helper reads these
         // as absent-or-value, so collapse null to undefined at the boundary.
@@ -370,6 +380,8 @@ function buildGraphContextQueryTool(
           offset: absent(input.offset),
           limit: absent(input.limit),
           max_chars: absent(input.max_chars),
+          expectedSha256: boundArtifact.sha256,
+          expectedBytes: boundArtifact.bytes,
         });
         return result.length <= 50_000
           ? result
@@ -388,7 +400,17 @@ export async function buildWorkflowStepAgent(
   let lockedTools = lockToolsForStep(
     filterToolsForStep(all),
     options.lockTools,
+    !options.exactTools,
   ) as Tool<RuntimeContextValue>[];
+  if (options.exactTools) {
+    const requestedArtifactQuery = lockedTools.some((toolRef) =>
+      (toolRef as { name?: string }).name === 'workspace_artifact_query');
+    lockedTools = lockedTools.filter((toolRef) =>
+      (toolRef as { name?: string }).name !== 'workspace_artifact_query');
+    if (requestedArtifactQuery && options.graphContext) {
+      lockedTools.push(buildGraphContextQueryTool(options.graphContext));
+    }
+  }
   if (options.resultOnlyTools) {
     const resultTool = lockedTools.find((toolRef) =>
       (toolRef as { name?: string }).name === 'workflow_step_result');
@@ -398,7 +420,11 @@ export async function buildWorkflowStepAgent(
     ];
   }
   const surfaceLocked = options.resultOnlyTools || stepAllowedToolsLock(options.lockTools);
-  const externalMcpScope = options.resultOnlyTools
+  // A compiled-project grant names Clementine-local tools exactly. Never feed
+  // those names into MCP server-alias inference: a configured server named
+  // "Time Slots" must not turn the local `time_slots` grant into authority for
+  // that server's writer/dispatcher tools.
+  const externalMcpScope = options.resultOnlyTools || options.exactTools
     ? null
     : workflowStepExternalMcpScopeForLock(options.lockTools, options.mcpToolScope);
 

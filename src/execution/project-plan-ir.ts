@@ -40,6 +40,7 @@
 import { createHash } from 'node:crypto';
 
 import { TOOL_REGISTRY } from '../tools/tool-registry.js';
+import { PROJECT_STEP_STRUCTURAL_TOOL_NAMES } from './workflow-step-structural-tools.js';
 
 /**
  * Where a node's work happens.
@@ -247,16 +248,12 @@ export const PROJECT_NODE_TURN_CEILING = 64;
 export const PROJECT_NODE_DEFAULT_MAX_TURNS = 8;
 
 /**
- * The structural capability universe every workflow step already has.
+ * The private structural capability universe every compiled-project node has.
  *
- * These are the channels the runtime allows for EVERY step regardless of its
- * lock (`makeStepToolAllow`): the output channel a step needs to return at all,
- * the report channel, and the recall/artifact readers. They are declared here
- * rather than imported because this module is deliberately dependency-light —
- * importing the step-agent module pulls the whole agent/SDK graph in and closes
- * an import cycle. `project-plan-ir.test.ts` asserts this list equals
- * `STEP_STRUCTURAL_BASELINE_TOOLS` exactly, so drift breaks loudly instead of
- * silently narrowing or widening what a compiled node may do.
+ * This is intentionally smaller than the ordinary workflow-step baseline.
+ * Internal graph nodes can return a result and retrieve bounded run evidence,
+ * but they cannot notify the user. The graph-owned root lifecycle emits the
+ * single public terminal report after durable settlement.
  *
  * The compiler unions this into every node's list rather than relying on the
  * implicit allowance, because a compiled project node's `allowedTools` is also
@@ -269,14 +266,7 @@ export const PROJECT_NODE_DEFAULT_MAX_TURNS = 8;
  * per-step structural channel, so registry membership is not required of it.
  * What IS required is that no member is a mutating catalog tool.
  */
-export const PROJECT_STRUCTURAL_TOOLS: readonly string[] = Object.freeze([
-  'notify_user',
-  'read_file',
-  'recall_tool_result',
-  'tool_output_query',
-  'workflow_step_result',
-  'workspace_artifact_query',
-]);
+export const PROJECT_STRUCTURAL_TOOLS: readonly string[] = PROJECT_STEP_STRUCTURAL_TOOL_NAMES;
 
 /**
  * A node that authors no tools receives exactly the structural set: it can
@@ -287,6 +277,35 @@ export const PROJECT_DISCOVERY_KERNEL = PROJECT_STRUCTURAL_TOOLS;
 
 const REGISTRY_BY_NAME = new Map(TOOL_REGISTRY.map((decl) => [decl.name, decl]));
 
+/**
+ * Exact replay-safe artifact writers admitted by the positive registry
+ * manifest. Empty is a valid fail-closed release state: neither `write_file`
+ * (broad workspace overwrite) nor `produce_document` (timestamped duplicate
+ * output on retry) is run-bound and replay-safe today.
+ */
+export const PROJECT_LOCAL_WRITE_TOOLS: readonly string[] = Object.freeze(
+  TOOL_REGISTRY
+    .filter((declaration) => declaration.projectEffect === 'local_write')
+    .map((declaration) => declaration.name)
+    .sort(),
+);
+
+const PROJECT_LOCAL_WRITE_GUIDANCE = PROJECT_LOCAL_WRITE_TOOLS.length > 0
+  ? `choose one of: ${PROJECT_LOCAL_WRITE_TOOLS.join(', ')}`
+  : 'no replay-safe, run-bound local artifact writer is admitted in this protocol version';
+
+const PROJECT_LOCAL_WRITE_TOOL_SET = new Set(PROJECT_LOCAL_WRITE_TOOLS);
+
+/** Open-ended executors are wildcard authority even when their outer name is exact. */
+const PROJECT_GENERIC_EXECUTORS = new Set([
+  'call_tool',
+  'composio_execute_tool',
+  'pending_action_execute',
+  'run_batch',
+  'run_shell_command',
+  'run_tool_program',
+]);
+
 /** A tool the canonical registry classifies as a pure read. */
 export function toolIsCanonicalRead(name: string): boolean {
   return REGISTRY_BY_NAME.get(name)?.sideEffect === 'read';
@@ -295,6 +314,45 @@ export function toolIsCanonicalRead(name: string): boolean {
 /** A tool the canonical registry knows about at all. */
 export function toolIsCanonicallyKnown(name: string): boolean {
   return REGISTRY_BY_NAME.has(name);
+}
+
+/** A capability explicitly reviewed for durable-project model execution. */
+export function toolIsProjectStepEligible(name: string): boolean {
+  const declaration = REGISTRY_BY_NAME.get(name);
+  return declaration?.projectEffect !== undefined;
+}
+
+/** A registry write whose realm is proven local rather than merely assumed. */
+export function toolIsCanonicalLocalWrite(name: string): boolean {
+  const declaration = REGISTRY_BY_NAME.get(name);
+  return PROJECT_LOCAL_WRITE_TOOL_SET.has(name)
+    && declaration?.projectEffect === 'local_write'
+    && declaration.sideEffect === 'write';
+}
+
+function projectToolAuthorityError(
+  name: string,
+  effect: ProjectEffectClass,
+): string | null {
+  const declaration = REGISTRY_BY_NAME.get(name);
+  if (!declaration) return null; // the exact-name validator owns this error
+  if (PROJECT_GENERIC_EXECUTORS.has(name)) {
+    return `tool "${name}" is an open-ended executor; an exact outer name cannot carry wildcard inner authority`;
+  }
+  if (!toolIsProjectStepEligible(name)) {
+    return `tool "${name}" is not admitted by the durable-project capability manifest`;
+  }
+  if (effect === 'read' && declaration.projectEffect !== 'read') {
+    return `tool "${name}" is ${declaration.projectEffect}-class in the durable-project manifest but the node declares effect "read"`;
+  }
+  if (
+    effect === 'local_write'
+    && declaration.projectEffect !== 'read'
+    && !toolIsCanonicalLocalWrite(name)
+  ) {
+    return `tool "${name}" is not a replay-safe project artifact writer`;
+  }
+  return null;
 }
 
 /**
@@ -308,8 +366,50 @@ export const PROJECT_DISCOVERY_KERNEL_ERRORS: readonly string[] = Object.freeze(
     // registered per step). But if the registry DOES know it, it must still be
     // read-class — that is the check that stops a reclassification quietly
     // handing every compiled node a mutating capability.
-    if (toolIsCanonicallyKnown(name) && !toolIsCanonicalRead(name)) {
-      return [`structural tool "${name}" is no longer classified read-only`];
+    const declaration = REGISTRY_BY_NAME.get(name);
+    if (declaration && declaration.projectEffect !== 'read') {
+      return [`structural tool "${name}" is no longer admitted as a project read`];
+    }
+    return [];
+  }),
+);
+
+/**
+ * Module-level conformance for the positive manifest. The async test suite
+ * additionally proves every admitted name exists in the assembled workflow
+ * step surface; these static checks catch taxonomy drift immediately.
+ */
+export const PROJECT_TOOL_MANIFEST_ERRORS: readonly string[] = Object.freeze(
+  TOOL_REGISTRY.flatMap((declaration) => {
+    if (!declaration.projectEffect) return [];
+    const errors: string[] = [];
+    if (declaration.blockedFor?.includes('workflow-step')) {
+      errors.push(`project tool "${declaration.name}" is blocked from workflow steps`);
+    }
+    if (declaration.projectEffect === 'read' && declaration.sideEffect !== 'read') {
+      errors.push(`project read "${declaration.name}" is registry ${declaration.sideEffect}-class`);
+    }
+    if (declaration.projectEffect === 'read' && declaration.loopClass === 'mutating') {
+      errors.push(`project read "${declaration.name}" is registry mutating`);
+    }
+    if (declaration.projectEffect === 'local_write' && declaration.sideEffect !== 'write') {
+      errors.push(`project local writer "${declaration.name}" is registry ${declaration.sideEffect}-class`);
+    }
+    if (PROJECT_GENERIC_EXECUTORS.has(declaration.name)) {
+      errors.push(`open-ended executor "${declaration.name}" entered the project manifest`);
+    }
+    if (declaration.name === 'notify_user') {
+      errors.push('notify_user cannot enter an internal project-node capability manifest');
+    }
+    return errors;
+  }),
+);
+
+export const PROJECT_LOCAL_WRITE_TOOL_ERRORS: readonly string[] = Object.freeze(
+  PROJECT_LOCAL_WRITE_TOOLS.flatMap((name) => {
+    if (!toolIsCanonicallyKnown(name)) return [`local artifact tool "${name}" is not in the tool registry`];
+    if (!toolIsCanonicalLocalWrite(name)) {
+      return [`local artifact tool "${name}" is no longer an eligible, write-class workflow-step capability`];
     }
     return [];
   }),
@@ -600,8 +700,12 @@ function executionRoleErrors(nodes: readonly ProjectNode[]): string[] {
     for (const dep of node.dependsOn ?? []) dependentsOf.get(dep)?.push(node.id);
   }
 
+  const descendantsCache = new Map<string, Set<string>>();
+
   /** Every node forward-reachable from `from`, excluding itself. */
   const descendantsOf = (from: string): Set<string> => {
+    const cached = descendantsCache.get(from);
+    if (cached) return cached;
     const seen = new Set<string>();
     const queue = [...(dependentsOf.get(from) ?? [])];
     while (queue.length > 0) {
@@ -610,6 +714,7 @@ function executionRoleErrors(nodes: readonly ProjectNode[]): string[] {
       seen.add(next);
       queue.push(...(dependentsOf.get(next) ?? []));
     }
+    descendantsCache.set(from, seen);
     return seen;
   };
 
@@ -632,10 +737,21 @@ function executionRoleErrors(nodes: readonly ProjectNode[]): string[] {
     }
 
     if (role === 'reducer') {
-      const upstream = (node.dependsOn ?? []).length;
-      if (upstream < 2) {
-        errors.push(`${where} is a reducer but converges ${upstream} upstream branch(es); a reducer joins at least two.`);
+      const upstream = node.dependsOn ?? [];
+      const hasIndependentPair = upstream.some((left, index) =>
+        upstream.slice(index + 1).some((right) => (
+          !descendantsOf(left).has(right) && !descendantsOf(right).has(left)
+        )));
+      if (!hasIndependentPair) {
+        errors.push(
+          `${where} is a reducer but does not converge two independent upstream branches; `
+          + 'ancestor-related dependencies are one lineage, not fan-in.',
+        );
       }
+    }
+
+    if (role === 'brain' && (dependentsOf.get(node.id) ?? []).length > 0) {
+      errors.push(`${where} is a brain but is not the terminal project sink.`);
     }
   }
 
@@ -650,7 +766,10 @@ function executionRoleErrors(nodes: readonly ProjectNode[]): string[] {
  * the same content in a different order.
  */
 export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
-  const errors: string[] = [...PROJECT_DISCOVERY_KERNEL_ERRORS];
+  const errors: string[] = [
+    ...PROJECT_DISCOVERY_KERNEL_ERRORS,
+    ...PROJECT_LOCAL_WRITE_TOOL_ERRORS,
+  ];
 
   if (!isPlainObject(plan)) {
     return { ok: false, errors: ['Project plan must be an object.'] };
@@ -705,9 +824,29 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
           for (const tool of tools) {
             if (!toolIsCanonicallyKnown(tool)) {
               errors.push(`${where} names unknown tool "${tool}"; a capability list must be exact.`);
+              continue;
+            }
+            const authorityError = projectToolAuthorityError(tool, node.effect);
+            if (authorityError) {
+              errors.push(`${where} ${authorityError}.`);
             }
           }
+          if (
+            node.effect === 'local_write'
+            && !tools.some((tool) => toolIsCanonicalLocalWrite(tool))
+          ) {
+            errors.push(
+              `${where} declares local_write but names no proven local artifact writer; `
+              + `${PROJECT_LOCAL_WRITE_GUIDANCE}.`,
+            );
+          }
         }
+      }
+      if (node.effect === 'local_write' && tools === undefined) {
+        errors.push(
+          `${where} declares local_write but names no proven local artifact writer; `
+          + `${PROJECT_LOCAL_WRITE_GUIDANCE}.`,
+        );
       }
     } else if (executor.kind === 'structured_call') {
       if (!nonEmptyString(executor.tool)) {
@@ -716,11 +855,35 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
         errors.push(`${where} structured call tool "${executor.tool}" must be an exact name, not a pattern or template.`);
       } else if (!toolIsCanonicallyKnown(executor.tool)) {
         errors.push(`${where} structured call names unknown tool "${executor.tool}".`);
-      } else if (!toolIsCanonicalRead(executor.tool)) {
-        // A non-read structured call is the family that would need the prior
-        // approval binding the definition cannot carry, so it is refused at the
-        // same boundary as external_write rather than compiled hopefully.
-        errors.push(`${where} structured call "${executor.tool}" is not a canonical read; only read-class structured calls are supported.`);
+      } else {
+        const authorityError = projectToolAuthorityError(executor.tool, node.effect);
+        if (authorityError) errors.push(`${where} ${authorityError}.`);
+        // WorkflowStepInput.call is currently a Composio-slug adapter. Sending
+        // a registry built-in through it would compile one tool universe and
+        // execute in another (for example, `list_files` would be dispatched as
+        // a provider slug). Keep the IR shape for the protocol that adds an
+        // exact adapter field, but fail closed until that adapter is persisted
+        // and enforced by the runner.
+        errors.push(
+          `${where} structured call "${executor.tool}" has no bound durable-project execution adapter; `
+          + 'use a model executor with an exact capability manifest for now.',
+        );
+        const declaration = REGISTRY_BY_NAME.get(executor.tool)!;
+        if (
+          node.effect === 'local_write'
+          && declaration.sideEffect === 'read'
+        ) {
+          errors.push(
+            `${where} declares local_write but structured call "${executor.tool}" does not write a local artifact.`,
+          );
+        }
+        if (node.effect === 'external_write' && declaration.sideEffect !== 'read') {
+          // The IR can describe the prior binding, but WorkflowStepInput cannot
+          // persist that authority yet. Refuse the mutating call at this seam.
+          errors.push(
+            `${where} structured call "${executor.tool}" crosses an unbound write boundary; external writes are not compilable yet.`,
+          );
+        }
       }
       if (executor.args !== undefined && !isPlainObject(executor.args)) {
         errors.push(`${where} structured call args must be an object.`);
@@ -750,6 +913,9 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
           errors.push(`${where} requests an external write from a model executor; an external write must be an exact structured call.`);
         }
         errors.push(...externalWriteBindingErrors(node, where));
+        errors.push(
+          `${where} requests external_write, but the compiled workflow contract cannot persist its prior-approval and readback binding yet.`,
+        );
       }
     }
 

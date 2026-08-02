@@ -134,12 +134,15 @@ import {
   type BlockedStep,
 } from './workflow-diagnosis.js';
 import {
-  compiledWorkflowRunContractHash,
   readWorkflowRunOriginSessionIds,
   reconcileAwaitingCompiledWorkflowRunBindings,
   requeueWorkflowFromRun,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
 } from '../tools/workflow-run-queue.js';
+import {
+  compiledWorkflowRunContractHash,
+  isReservedProjectWorkflowRunRecord,
+} from './compiled-project-run-contract.js';
 import {
   cancelWorkflowRunAtBoundary,
   readWorkflowRunCancellation,
@@ -208,6 +211,10 @@ import {
   type WorkflowTerminalOutcome,
 } from './workflow-terminal-outcome.js';
 import {
+  settleCompiledProjectRootFromRun,
+  stampCompiledProjectRootSettlement,
+} from './project-root-lifecycle.js';
+import {
   isCatalogWorkflowRunDefinitionSnapshot,
   isCompiledWorkflowRunDefinitionSnapshot,
   resolveWorkflowRunDefinitionSnapshot,
@@ -269,6 +276,7 @@ let buildWorkflowOrchestratorAgentImpl: typeof buildOrchestratorAgent = buildOrc
 let runWorkflowConversationImpl: typeof runConversation = runConversation;
 let resumeWorkflowConversationImpl: typeof runConversationFromResume = runConversationFromResume;
 let configureWorkflowHarnessRuntimeImpl: typeof configureHarnessRuntime = configureHarnessRuntime;
+let rewriteWorkflowReportInVoiceImpl: typeof rewriteInClementineVoice = rewriteInClementineVoice;
 let beforeWorkflowGraphFinalizationForTests: ((input: {
   workflowName: string;
   runId: string;
@@ -290,6 +298,15 @@ export function _setWorkflowHarnessLoopImplsForTests(input: {
   runWorkflowConversationImpl = input.runConversation ?? runConversation;
   resumeWorkflowConversationImpl = input.runConversationFromResume ?? runConversationFromResume;
   configureWorkflowHarnessRuntimeImpl = input.configureRuntime ?? configureHarnessRuntime;
+}
+
+/** Narrow terminal-report seam. Production always uses the real voice pass;
+ * tests use this to prove compiled project roots never place a post-graph model
+ * call while ordinary catalog workflows retain their existing rewrite. */
+export function _setWorkflowVoiceRewriteForTests(
+  fn: typeof rewriteInClementineVoice | null,
+): void {
+  rewriteWorkflowReportInVoiceImpl = fn ?? rewriteInClementineVoice;
 }
 
 /** Deterministic race seam: production leaves this null. Tests can admit a
@@ -575,6 +592,10 @@ export interface QueuedRunRecord {
   /** Exact immutable compiled admission contract persisted by its V3 source
    * receipt. Ordinary catalog runs never carry this capability. */
   compiledContractHash?: string;
+  /** Presence-only durable-project lineage markers. Even null/corrupt values
+   * reserve the record so resolution cannot fall through to the catalog. */
+  projectBoundAt?: string | null;
+  projectExecutionSettlement?: unknown;
   /** A run descended from a missed scheduled occurrence. Execution admission
    *  permits at most one such lineage at a time. */
   catchupFire?: boolean;
@@ -858,13 +879,40 @@ interface WorkflowRunRecordWriteResult {
   publishedTerminal: boolean;
 }
 
+/**
+ * Mirror an exact compiled root's already-durable terminal truth into the
+ * project ledger. This always runs after the run-record lock is released.
+ * Store failure cannot roll back or disguise a terminal workflow; the boot
+ * reconciler observes the same immutable run again and retries the mirror.
+ */
+function bestEffortSettleCompiledProjectRoot(filePath: string, record: QueuedRunRecord): void {
+  const result = settleCompiledProjectRootFromRun(
+    filePath,
+    record as unknown as Record<string, unknown>,
+  );
+  if (result.kind === 'rejected') {
+    logger.warn(
+      { runId: record.id, error: result.reason },
+      'Compiled project root is terminal but its execution ledger is not yet settled',
+    );
+  } else if (
+    (result.kind === 'settled' || result.kind === 'already_settled')
+    && !stampCompiledProjectRootSettlement(filePath, result)
+  ) {
+    logger.warn(
+      { runId: record.id },
+      'Compiled project root settled but its run marker could not be stamped',
+    );
+  }
+}
+
 function writeRunRecord(
   filePath: string,
   record: QueuedRunRecord,
   terminalReport?: TerminalReportInput,
   admissionMutationContractSnapshot?: WorkflowMutationContractSnapshot,
 ): WorkflowRunRecordWriteResult {
-  return withWorkflowRunRecordLock(filePath, () => {
+  const written = withWorkflowRunRecordLock(filePath, () => {
     const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
     const currentStatus = typeof current?.status === 'string' ? current.status : '';
     const requestedStatus = typeof record.status === 'string' ? record.status : '';
@@ -1019,6 +1067,10 @@ function writeRunRecord(
       publishedTerminal: Boolean(terminalReport && isTerminalRunRecord(nextRecord)),
     };
   });
+  if (isTerminalRunRecord(written.record)) {
+    bestEffortSettleCompiledProjectRoot(filePath, written.record);
+  }
+  return written;
 }
 
 /** Crash-injection seam proving terminal projection + exact report envelope are
@@ -2108,9 +2160,10 @@ const WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS = parseInt(
 );
 
 function workflowHarnessEnabled(step: WorkflowStepInput): boolean {
-  // Graph-added nodes must never fall through to the legacy assistant.respond
-  // lane: that lane has no exact result-only tool-surface lock.
-  if (isGraphRuntimeWorkflowStep(step)) return true;
+  // Graph-added and authenticated compiled nodes must never fall through to
+  // the legacy assistant.respond lane: it has no exact result-only capability
+  // lock and cannot enforce the private-node publication contract.
+  if (isGraphRuntimeWorkflowStep(step) || isCompiledProjectRuntimeWorkflowStep(step)) return true;
   if ((step as unknown as { useHarness?: boolean }).useHarness === false) return false;
   return process.env.WORKFLOW_USE_HARNESS !== 'off';
 }
@@ -2163,7 +2216,8 @@ function claudeIsActiveWorkflowBrain(): boolean {
 function resolveWorkflowStepModel(step: WorkflowStepInput, workflow?: WorkflowDefinition): WorkflowStepModelRoute {
   const explicit = step.model || undefined;
   if (explicit) return { model: explicit };
-  if (isGraphRuntimeSpecialist(step)) {
+  const runtimeRole = authenticatedWorkflowExecutionRole(step);
+  if (runtimeRole === 'specialist') {
     // Compiled specialists are worker nodes, not miniature brains. Honor an
     // authored workflow worker pin first, then the user's worker/intent route.
     // The reducer remains on the normal brain path below.
@@ -2201,7 +2255,11 @@ function resolveWorkflowStepModel(step: WorkflowStepInput, workflow?: WorkflowDe
   // `model:` — pin once at authoring, every scheduled run stays cheap.
   const workflowBrain = workflow?.models?.brain?.trim();
   if (workflowBrain) return { model: workflowBrain };
-  if (workerIntentRoutingEnabled() && step.intent) {
+  // A reducer or terminal brain is convergence work, not another specialist
+  // branch. Only an authenticated in-memory runtime role can suppress ordinary
+  // intent routing; a catalog step that merely persists `executionRole` keeps
+  // the byte-identical legacy path.
+  if (runtimeRole === undefined && workerIntentRoutingEnabled() && step.intent) {
     const routed = resolveRoleModel('worker', step.intent);
     return {
       model: routed.modelId,
@@ -2558,30 +2616,36 @@ export const workflowRunnerInternalsForTest = {
   hydrateCompletedOutputArtifacts,
   runStepVerifiedAttempt,
   boundedStepOutputsForRunRecord,
-  graphContextForRun,
+  graphContextForInvocation,
+  renderStepContextForInvocation,
+  authenticatedWorkflowExecutionRole,
+  uniqueCompiledProjectTerminalSink,
 };
 
-function graphContextForRun(
+interface InvocationArtifactReference {
+  path: string;
+  sha256: string;
+  bytes: number;
+}
+
+/**
+ * Build the graph reader boundary from artifacts rendered into this physical
+ * invocation only. Completion elsewhere in the run grants no authority: a
+ * sibling branch becomes readable only after the authored DAG binds it into
+ * this step's context.
+ */
+function graphContextForInvocation(
   workflowName: string,
   runId: string,
-): { workflowName: string; runId: string; allowedArtifactPaths: string[] } {
+  allowedArtifacts: InvocationArtifactReference[],
+): { workflowName: string; runId: string; allowedArtifacts: InvocationArtifactReference[] } {
   const owner = loadWorkflowGraphSnapshotByRunId(runId)?.workflowName ?? workflowName;
-  const resume = computeResumeState(owner, runId);
-  const allowedArtifactPaths = new Set(
-    Array.from(
-      resume.completedStepArtifacts.values(),
-      (reference) => reference.path,
-    ),
-  );
-  for (const itemReferences of resume.completedItemArtifacts.values()) {
-    for (const reference of itemReferences.values()) {
-      allowedArtifactPaths.add(reference.path);
-    }
-  }
   return {
     workflowName: owner,
     runId,
-    allowedArtifactPaths: Array.from(allowedArtifactPaths),
+    allowedArtifacts: Array.from(
+      new Map(allowedArtifacts.map((reference) => [path.normalize(reference.path), reference])).values(),
+    ),
   };
 }
 
@@ -2658,6 +2722,7 @@ async function runStepViaHarness(
     role: string;
     model?: string;
     provider: string;
+    lane: 'workflow_graph' | 'compiled_project';
   } | undefined;
   let unregisterActiveAttempt = (): void => {};
   const stepAttemptWasKilled = (): boolean => {
@@ -2768,12 +2833,26 @@ async function runStepViaHarness(
     // as a structured block AFTER the prose (never replacing it). This is
     // authoritative data the step can use even if a template token typo
     // dropped a value from the prose — it cannot be falsely starved.
+    const graphOrCompiledStep = isGraphRuntimeWorkflowStep(step)
+      || isCompiledProjectRuntimeWorkflowStep(step);
+    const renderedInvocationContext = graphOrCompiledStep && stepContext
+      ? renderStepContextForInvocation(stepContext, {
+          workflowName: workflowStorageName,
+          runId: workflowRunId,
+        })
+      : null;
+    const renderedContextBlock = stepContext
+      ? renderedInvocationContext?.block
+        ?? renderStepContextBlock(stepContext, {
+          workflowName: workflowStorageName,
+          runId: workflowRunId,
+        })
+      : null;
     const message = (
-      isGraphRuntimeWorkflowStep(step)
-      || isCompiledProjectRuntimeWorkflowStep(step)
+      graphOrCompiledStep
       || useWorkflowStepAgent()
-    ) && stepContext
-      ? `${proseMessage}\n\n${renderStepContextBlock(stepContext, { workflowName: workflowStorageName, runId: workflowRunId })}`
+    ) && renderedContextBlock
+      ? `${proseMessage}\n\n${renderedContextBlock}`
       : proseMessage;
     const sourceUserEvent = recordRunAttemptUserInput(stepAttempt, {
       turn: 1,
@@ -2797,7 +2876,7 @@ async function runStepViaHarness(
     // RouterModelProvider dispatches the resolved id to its provider.
     const modelRoute = resolveWorkflowStepModel(step, workflowDefForPin);
     const stepModel = modelRoute.model;
-    if (isGraphRuntimeSpecialist(step)) {
+    if (authenticatedWorkflowExecutionRole(step) === 'specialist') {
       const runtimeStep = step as GraphRuntimeWorkflowStep;
       const role = runtimeStep.__graphRuntimeSpecialistId || step.intent || step.id;
       const item = runtimeStep.__graphRuntimeParentNodeId
@@ -2809,6 +2888,7 @@ async function runStepViaHarness(
         role,
         model: resolvedModel,
         provider: resolveEffectiveProviderForModel(resolvedModel),
+        lane: isCompiledProjectRuntimeWorkflowStep(step) ? 'compiled_project' : 'workflow_graph',
       };
       try {
         appendHarnessEvent({
@@ -2816,7 +2896,7 @@ async function runStepViaHarness(
           turn: 0,
           role: 'system',
           type: 'worker_started',
-          data: { ...graphSpecialistEvent, lane: 'workflow_graph' },
+          data: graphSpecialistEvent,
         });
       } catch { /* specialist visibility is best-effort */ }
     }
@@ -2833,6 +2913,11 @@ async function runStepViaHarness(
     };
     if (
       !isGraphRuntimeWorkflowStep(step)
+      // The standalone Claude SDK lane can now honor the compiled local-tool
+      // list exactly, but its workspace_artifact_query is still the generic
+      // allowed-root MCP tool. Keep compiled projects on the workflow agent
+      // path, where we replace that name with the run/event-bound reader.
+      && !isCompiledProjectRuntimeWorkflowStep(step)
       && stepModel
       && claudeAgentSdkWorkflowStepEnabled(stepModel)
       && workflowStepCanRunOnClaudeAgentSdk(step)
@@ -2935,10 +3020,11 @@ async function runStepViaHarness(
     }
     const route = workflowHarnessRoute(step, stepModel);
     appendWorkerRoute(workflowHarnessRouteMarker(step, stepModel, modelRoute.trace));
-    const scopedWorkflowStepAgent = isGraphRuntimeWorkflowStep(step)
-      || isCompiledProjectRuntimeWorkflowStep(step)
+    const scopedWorkflowStepAgent = graphOrCompiledStep
       || useWorkflowStepAgent();
-    const workflowMcpToolScope = scopedWorkflowStepAgent
+    const workflowMcpToolScope = isCompiledProjectRuntimeWorkflowStep(step)
+      ? null
+      : scopedWorkflowStepAgent
       ? workflowStepExternalMcpScopeForLock(step.allowedTools)
       : undefined;
     const agent = scopedWorkflowStepAgent
@@ -2946,15 +3032,17 @@ async function runStepViaHarness(
           userInput: message,
           sessionId: realSessionId,
           lockTools: step.allowedTools,
+          exactTools: isCompiledProjectRuntimeWorkflowStep(step),
           resultOnlyTools: isGraphRuntimeWorkflowStep(step),
-          ...(isGraphRuntimeWorkflowStep(step)
+          ...(graphOrCompiledStep
             ? {
                 // Creation tests do not persist a graph snapshot, so the
                 // display name cannot recover the owning run workspace there.
                 // Use the resolved storage slug for both creation-test and
                 // production graph nodes; otherwise exact artifact reads are
                 // falsely refused whenever name !== slug.
-                graphContext: graphContextForRun(workflowStorageName, workflowRunId),
+                graphContext: renderedInvocationContext?.graphContext
+                  ?? graphContextForInvocation(workflowStorageName, workflowRunId, []),
               }
             : {}),
           model: stepModel,
@@ -3228,7 +3316,7 @@ async function runStepViaHarness(
           data: {
             ...graphSpecialistEvent,
             ok: stepAttemptStatus === 'completed',
-            lane: 'workflow_graph',
+            lane: graphSpecialistEvent.lane,
           },
         });
       } catch { /* specialist visibility is best-effort */ }
@@ -5619,6 +5707,10 @@ function stepOutputArtifactRefForPrompt(
     ? path.join(runWorkspaceDir(opts.workflowName, opts.runId), workspacePath)
     : null;
   if (workspacePath && absolutePath && existsSync(absolutePath)) {
+    const sha256 = artifact.sha256;
+    const bytes = artifact.bytes;
+    if (typeof sha256 !== 'string' || typeof bytes !== 'number') return null;
+    collectInvocationArtifact(opts, { path: workspacePath, sha256, bytes });
     // Stage 3: when a shard-reduced digest exists for this step, inline it so
     // the consumer (synthesis especially) reads real compressed content
     // instead of flying blind on a shape summary + path. Bounded; the exact
@@ -5634,13 +5726,16 @@ function stepOutputArtifactRefForPrompt(
       __clementine_context_ref: true,
       present: true,
       summary: summarizeToolOutput(value),
-      bytes: Buffer.byteLength(stringifyForPrompt(value), 'utf-8'),
+      bytes,
+      sha256,
       path: absolutePath,
       workspacePath,
       ...(reduceDigest ? { reduceDigest, reducePath: reduceDigestArtifactRelPath(stepId) } : {}),
       instruction: reduceDigest
         ? 'This completed step output is too large to inline; a shard-reduced digest is in reduceDigest. Synthesize from it, and call workspace_artifact_query on this path only for exact rows/fields/pages.'
-        : 'This completed step output is present but too large to inline. Call workspace_artifact_query on this path for exact rows/fields/pages, or read_file for raw JSON.',
+        : opts.exactArtifactQueryOnly
+          ? 'This completed step output is present but too large to inline. Call workspace_artifact_query on this path for exact rows/fields/pages.'
+          : 'This completed step output is present but too large to inline. Call workspace_artifact_query on this path for exact rows/fields/pages, or read_file for raw JSON.',
     };
   }
 
@@ -5665,7 +5760,7 @@ function formatStepOutputs(
     // reducer owns the compact joined result; omitting branches here prevents
     // synthesis/final publication from paying for or exposing every private
     // intermediate twice.
-    .filter((step) => !isGraphRuntimeSpecialist(step) && stepOutputs[step.id] !== undefined)
+    .filter((step) => !isPrivateRuntimeSpecialist(step) && stepOutputs[step.id] !== undefined)
     .map((step) => {
       const out = stepOutputValueForPrompt(step.id, stepOutputs[step.id], opts);
       return `## ${step.id}\n${stringifyForPrompt(out)}`;
@@ -6267,7 +6362,7 @@ type GraphRuntimeWorkflowStep = WorkflowStepInput & {
 };
 
 type CompiledProjectRuntimeWorkflowStep = WorkflowStepInput & {
-  /** In-memory execution scope applied only after the V2 snapshot and its
+  /** In-memory execution scope applied only after the V3 snapshot and its
    * ExecutionStore root binding both validate. Never persisted or authored. */
   __compiledProjectRuntime?: true;
 };
@@ -6276,6 +6371,28 @@ function isCompiledProjectRuntimeWorkflowStep(
   step: WorkflowStepInput,
 ): step is CompiledProjectRuntimeWorkflowStep {
   return (step as CompiledProjectRuntimeWorkflowStep).__compiledProjectRuntime === true;
+}
+
+type AuthenticatedWorkflowExecutionRole = 'specialist' | 'reducer' | 'brain';
+
+/**
+ * One authority predicate for runtime role semantics.
+ *
+ * Persisted `executionRole` is inert authoring data until the exact compiled
+ * snapshot/root contract has been validated and the resolver attaches the
+ * in-memory marker. The older read_parallel runtime markers retain their
+ * behavior through this same chokepoint.
+ */
+function authenticatedWorkflowExecutionRole(
+  step: WorkflowStepInput,
+): AuthenticatedWorkflowExecutionRole | undefined {
+  const graphRole = graphRuntimeRole(step);
+  if (graphRole === 'specialist' || graphRole === 'reducer') return graphRole;
+  if (!isCompiledProjectRuntimeWorkflowStep(step)) return undefined;
+  const compiledRole = step.executionRole;
+  return compiledRole === 'specialist' || compiledRole === 'reducer' || compiledRole === 'brain'
+    ? compiledRole
+    : undefined;
 }
 
 function workflowStepRunMaxTurns(step: WorkflowStepInput): number | undefined {
@@ -6293,8 +6410,25 @@ function graphRuntimeRole(step: WorkflowStepInput): GraphRuntimeWorkflowStep['__
   return (step as GraphRuntimeWorkflowStep).__graphRuntimeRole;
 }
 
-function isGraphRuntimeSpecialist(step: WorkflowStepInput): boolean {
-  return graphRuntimeRole(step) === 'specialist';
+function isPrivateRuntimeSpecialist(step: WorkflowStepInput): boolean {
+  return authenticatedWorkflowExecutionRole(step) === 'specialist';
+}
+
+function uniqueCompiledProjectTerminalSink(steps: WorkflowStepInput[]): WorkflowStepInput {
+  const dependedOn = new Set(steps.flatMap((step) => step.dependsOn ?? []));
+  const sinks = steps.filter((step) => !dependedOn.has(step.id));
+  if (sinks.length !== 1) {
+    throw new Error(
+      `Compiled project runtime requires exactly one terminal sink; found ${sinks.length}`
+      + `${sinks.length > 0 ? ` (${sinks.map((step) => step.id).join(', ')})` : ''}. No project output was published.`,
+    );
+  }
+  return sinks[0];
+}
+
+function exactWorkflowOutputText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value) ?? String(value);
 }
 
 export interface MaterializedWorkflowGraphSteps {
@@ -6545,6 +6679,30 @@ function workflowGraphFingerprint(graph: WorkflowGraphDefinition | null): string
   return createHash('sha256').update(JSON.stringify(graph)).digest('hex');
 }
 
+/**
+ * A compiled V3 snapshot is the execution authority, while its persisted graph
+ * is only a readiness/telemetry projection. Unlike a catalog workflow's live
+ * graph, that projection may not grow. Compare the complete executable shape
+ * (including node/edge order and declared entries) against a fresh compile of
+ * the admitted steps so an additive read-only node cannot become unadmitted
+ * project work merely because it shares the run id.
+ */
+function compiledProjectGraphMatchesAdmittedSteps(
+  admittedSteps: WorkflowStepInput[],
+  graph: WorkflowGraphDefinition,
+): boolean {
+  const admittedGraph = compileWorkflowStepsToGraph(admittedSteps);
+  return JSON.stringify({
+    nodes: graph.nodes,
+    edges: graph.edges,
+    entryNodeIds: graph.entryNodeIds ?? [],
+  }) === JSON.stringify({
+    nodes: admittedGraph.nodes,
+    edges: admittedGraph.edges,
+    entryNodeIds: admittedGraph.entryNodeIds ?? [],
+  });
+}
+
 type WorkflowGraphFinalizationClaim = 'claimed' | 'graph_advanced' | 'inactive';
 
 /**
@@ -6588,6 +6746,7 @@ function loadLiveWorkflowExecutionPlan(
   authoredSteps: WorkflowStepInput[],
   workflowSlug: string,
   runId: string,
+  immutableCompiledDefinition = false,
 ): LiveWorkflowExecutionPlan {
   let snapshot = loadWorkflowGraphSnapshotByRunId(runId);
   if (!snapshot && workflowHasReadParallelSubgraph(authoredSteps)) {
@@ -6617,6 +6776,21 @@ function loadLiveWorkflowExecutionPlan(
     throw new Error(
       `Persisted workflow graph ownership mismatch for run "${runId}": expected "${workflowSlug}", found "${snapshot.workflowName}".`,
     );
+  }
+  if (immutableCompiledDefinition) {
+    if (!compiledProjectGraphMatchesAdmittedSteps(authoredSteps, snapshot.graph)) {
+      throw new Error(
+        `Persisted workflow graph for compiled project run "${runId}" does not exactly match its admitted V3 definition. `
+        + 'Dynamic overlays cannot add or alter compiled project nodes; no project node was executed and no output was published.',
+      );
+    }
+    return {
+      // Execute the authenticated snapshot bytes, never graph-materialized
+      // steps. The exact graph only supplies the identical readiness shape.
+      steps: authoredSteps,
+      graph: snapshot.graph,
+      graphFingerprint: workflowGraphFingerprint(snapshot.graph),
+    };
   }
   reconcileWorkflowGraphPatchTelemetry(snapshot);
   const materialized = materializeWorkflowGraphSteps(authoredSteps, snapshot.graph);
@@ -6648,11 +6822,25 @@ async function executeWorkflow(
   admittedCodeRevision?: string,
 ): Promise<{
   finalOutput: string;
+  publicTerminalStepId: string | null;
   forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>;
   qualityAdvisories: WorkflowQualityAdvisory[];
   executionSteps: WorkflowStepInput[];
   graphFingerprint: string | null;
 }> {
+  const compiledProjectRuntime = workflow.steps.some(isCompiledProjectRuntimeWorkflowStep);
+  if (
+    compiledProjectRuntime
+    && !workflow.steps.every(isCompiledProjectRuntimeWorkflowStep)
+  ) {
+    throw new Error('Compiled project runtime contains a mixed authenticated/unmarked step set. No project node was executed.');
+  }
+  if (compiledProjectRuntime) {
+    // Validate the admitted topology before even read-only model work starts.
+    // The same check runs again on the final live plan so an additive graph
+    // patch cannot introduce a second public sink between admission and publish.
+    uniqueCompiledProjectTerminalSink(workflow.steps);
+  }
   // Completion authorization comes from events.jsonl, while exact bytes come
   // from the event-owned immutable artifact. Missing/corrupt referenced bytes
   // are a hard durability error rather than silent compact-preview starvation.
@@ -6661,14 +6849,24 @@ async function executeWorkflow(
     workflowSlug,
     runId,
   );
-  let liveExecutionPlan = loadLiveWorkflowExecutionPlan(workflow.steps, workflowSlug, runId);
+  let liveExecutionPlan = loadLiveWorkflowExecutionPlan(
+    workflow.steps,
+    workflowSlug,
+    runId,
+    compiledProjectRuntime,
+  );
   let allExecutionSteps = liveExecutionPlan.steps;
   let executionWorkflow: WorkflowDefinition = {
     ...workflow,
     steps: allExecutionSteps,
   };
   const refreshLiveExecutionPlan = (): void => {
-    liveExecutionPlan = loadLiveWorkflowExecutionPlan(workflow.steps, workflowSlug, runId);
+    liveExecutionPlan = loadLiveWorkflowExecutionPlan(
+      workflow.steps,
+      workflowSlug,
+      runId,
+      compiledProjectRuntime,
+    );
     allExecutionSteps = liveExecutionPlan.steps;
     executionWorkflow = {
       ...workflow,
@@ -6837,7 +7035,7 @@ async function executeWorkflow(
     if (!step) {
       throw new Error(`Workflow step "${targetStepId}" not found.`);
     }
-    if (graphRuntimeRole(step) === 'reducer') {
+    if (authenticatedWorkflowExecutionRole(step) === 'reducer') {
       throw new Error(
         `Workflow step "${targetStepId}" is a read_parallel_v1 reducer and cannot be tried without its specialist dependencies. Run the workflow so the graph can execute and join the complete subgraph.`,
       );
@@ -7063,8 +7261,23 @@ async function executeWorkflow(
   // when TRY is running a single step in isolation — the step's own
   // output is the user-facing result.
   let finalOutput: string;
+  let publicTerminalStepId: string | null = null;
   const hasBlockedStepOutput = Object.values(stepOutputs).some(isBlockedStepOutput);
-  if (workflow.synthesis?.prompt && !targetStepId && !hasBlockedStepOutput) {
+  if (compiledProjectRuntime) {
+    // A compiled project already has an authored terminal node. Running an
+    // additional synthesis/rewrite model after it both spends tokens and can
+    // corrupt exact URLs, counts, ids, or leak private branch material. Select
+    // the sole sink from topology and publish its bytes verbatim.
+    const terminalSink = uniqueCompiledProjectTerminalSink(steps);
+    const terminalValue = stepOutputs[terminalSink.id];
+    if (terminalValue === undefined) {
+      throw new Error(
+        `Compiled project terminal sink "${terminalSink.id}" has no completed output. No project output was published.`,
+      );
+    }
+    finalOutput = exactWorkflowOutputText(terminalValue);
+    publicTerminalStepId = terminalSink.id;
+  } else if (workflow.synthesis?.prompt && !targetStepId && !hasBlockedStepOutput) {
     throwIfWorkflowRunCancelled(runId);
     appendWorkflowEvent(workflowSlug, runId, {
       kind: 'step_started',
@@ -7213,6 +7426,7 @@ async function executeWorkflow(
   // dashboard's recent-runs display (which expects strings).
   return {
     finalOutput,
+    publicTerminalStepId,
     forEachFailures,
     qualityAdvisories,
     executionSteps: steps,
@@ -7267,17 +7481,27 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
     // directory entirely, and readiness recovery must not require the user to
     // replay their original message. Every recovery re-enters the ordinary
     // queue contract, so malformed/conflicting bytes remain non-executable.
-    const projectBindings = reconcileAwaitingCompiledWorkflowRunBindings();
-    if (projectBindings.activated > 0) {
-      logger.info(
-        { projectBindings },
-        'Recovered compiled project run bindings after an interrupted admission',
-      );
-    }
-    if (projectBindings.rejected > 0) {
-      logger.warn(
-        { projectBindings },
-        'Compiled project binding recovery left invalid records fail-closed',
+    try {
+      const projectBindings = reconcileAwaitingCompiledWorkflowRunBindings();
+      if (projectBindings.activated > 0) {
+        logger.info(
+          { projectBindings },
+          'Recovered compiled project run bindings after an interrupted admission',
+        );
+      }
+      if (projectBindings.rejected > 0) {
+        logger.warn(
+          { projectBindings },
+          'Compiled project binding recovery left invalid records fail-closed',
+        );
+      }
+    } catch (error) {
+      // A damaged project authority ledger closes only that lane. Catalog
+      // workflow runs have independent immutable admissions and must continue
+      // draining so one corrupt subsystem cannot become a global outage.
+      logger.error(
+        { error: error instanceof Error ? error.message : String(error) },
+        'Compiled project recovery failed closed; continuing catalog workflow drain',
       );
     }
     if (!existsSync(WORKFLOW_RUNS_DIR)) return;
@@ -7838,6 +8062,17 @@ interface StepContextRenderOptions {
   workflowName: string;
   runId: string;
   nowIso?: string;
+  /** Compiled invocations have one digest-bound query helper and no broad
+   * `read_file` authority. Legacy workflow prompt wording remains unchanged. */
+  exactArtifactQueryOnly?: boolean;
+  collectArtifact?: (reference: InvocationArtifactReference) => void;
+}
+
+function collectInvocationArtifact(
+  opts: StepContextRenderOptions | undefined,
+  reference: InvocationArtifactReference,
+): void {
+  opts?.collectArtifact?.(reference);
 }
 
 function serializedContextLength(value: unknown): number {
@@ -7878,15 +8113,23 @@ function contextValueForPrompt(
       nowIso: opts.nowIso ?? new Date().toISOString(),
     });
     const absolutePath = path.join(runWorkspaceDir(opts.workflowName, opts.runId), offloaded.path);
+    collectInvocationArtifact(opts, {
+      path: offloaded.path,
+      sha256: offloaded.sha256,
+      bytes: offloaded.bytes,
+    });
     return {
       __clementine_context_ref: true,
       present: true,
       summary: offloaded.summary,
       bytes: offloaded.bytes,
+      sha256: offloaded.sha256,
       path: absolutePath,
       workspacePath: offloaded.path,
       instruction:
-        'This value is present but too large to inline. Prefer workspace_artifact_query on this path to pull exact rows/fields/pages. Use read_file with max_chars 50000 only when you need raw JSON text.',
+        opts.exactArtifactQueryOnly
+          ? 'This value is present but too large to inline. Use workspace_artifact_query on this path to pull exact rows/fields/pages.'
+          : 'This value is present but too large to inline. Prefer workspace_artifact_query on this path to pull exact rows/fields/pages. Use read_file with max_chars 50000 only when you need raw JSON text.',
     };
   } catch {
     return clipForContext(value);
@@ -7909,10 +8152,31 @@ function renderStepContextBlock(
   if (ctx.item !== undefined) payload.item = contextValueForPrompt(ctx.item, 'item', opts);
   return [
     '=== STEP CONTEXT (structured, authoritative) ===',
-    'This is real workflow data. `input` contains declared step inputs; `upstream` contains outputs from every completed dependsOn step; `project` is the required local workspace when present. Use it over prose. If a value is a __clementine_context_ref, it is present and offloaded; call workspace_artifact_query on its path for exact rows/fields/pages, or read_file for raw JSON. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.',
+    opts?.exactArtifactQueryOnly
+      ? 'This is real workflow data. `input` contains declared step inputs; `upstream` contains outputs from every completed dependsOn step; `project` is the required local workspace when present. Use it over prose. If a value is a __clementine_context_ref, it is present and offloaded; call workspace_artifact_query on its exact path for rows/fields/pages. General file reads are not available in this compiled context. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.'
+      : 'This is real workflow data. `input` contains declared step inputs; `upstream` contains outputs from every completed dependsOn step; `project` is the required local workspace when present. Use it over prose. If a value is a __clementine_context_ref, it is present and offloaded; call workspace_artifact_query on its path for exact rows/fields/pages, or read_file for raw JSON. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.',
     JSON.stringify(payload, null, 2),
     '=== END STEP CONTEXT ===',
   ].join('\n');
+}
+
+function renderStepContextForInvocation(
+  ctx: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown; project?: WorkflowStepProjectContext },
+  opts: Pick<StepContextRenderOptions, 'workflowName' | 'runId' | 'nowIso'>,
+): {
+  block: string;
+  graphContext: ReturnType<typeof graphContextForInvocation>;
+} {
+  const artifacts = new Map<string, InvocationArtifactReference>();
+  const block = renderStepContextBlock(ctx, {
+    ...opts,
+    exactArtifactQueryOnly: true,
+    collectArtifact: (reference) => artifacts.set(path.normalize(reference.path), reference),
+  });
+  return {
+    block,
+    graphContext: graphContextForInvocation(opts.workflowName, opts.runId, [...artifacts.values()]),
+  };
 }
 
 /**
@@ -8707,6 +8971,8 @@ export function resolveWorkflowDefinitionForRun(
     | 'triggerReceiptId'
     | 'originSessionId'
     | 'compiledContractHash'
+    | 'projectBoundAt'
+    | 'projectExecutionSettlement'
     | 'mutationReceiptProtocolVersion'
     | 'targetStepId'
     | 'catchupFire'
@@ -8719,23 +8985,34 @@ export function resolveWorkflowDefinitionForRun(
   >,
   workflows: WorkflowCatalogEntry[],
 ): WorkflowDefinitionForRunResolution {
+  // Use the same presence-only ownership predicate as queue, lifecycle,
+  // scheduler, and dashboard boundaries. Empty/null/corrupt reserved markers
+  // are still lineage: they fail as a malformed compiled record rather than
+  // silently manufacturing authority from a same-named catalog workflow.
+  const reservedProjectLineage = isReservedProjectWorkflowRunRecord(
+    run as unknown as Record<string, unknown>,
+  );
   const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
   if (admitted.status === 'invalid') {
-    const compiled = Boolean(
-      run.workflowDefinitionSnapshot
-      && typeof run.workflowDefinitionSnapshot === 'object'
-      && !Array.isArray(run.workflowDefinitionSnapshot)
-      && (run.workflowDefinitionSnapshot as { version?: unknown }).version === 2
-    );
     return {
       ok: false,
-      definitionSource: compiled ? 'compiled_snapshot' : 'snapshot',
-      error: `Workflow run definition snapshot is invalid: ${admitted.reason}.`,
+      definitionSource: reservedProjectLineage ? 'compiled_snapshot' : 'snapshot',
+      error: `Workflow run definition snapshot is invalid: ${admitted.reason}.`
+        + (reservedProjectLineage ? ' No workflow step was executed.' : ''),
     };
   }
   const snapshot = admitted.status === 'valid' ? admitted.snapshot : undefined;
+  if (reservedProjectLineage && (!snapshot || !isCompiledWorkflowRunDefinitionSnapshot(snapshot))) {
+    return {
+      ok: false,
+      definitionSource: 'compiled_snapshot',
+      error:
+        'Reserved compiled project lineage has no valid V3 catalogless definition snapshot. '
+        + 'No workflow step was executed.',
+    };
+  }
   if (snapshot && isCompiledWorkflowRunDefinitionSnapshot(snapshot)) {
-    const expectedReceiptId = `project-turn:v1:${snapshot.sourceTurnKeyHash}`;
+    const expectedReceiptId = `project-turn:v2:${snapshot.sourceTurnKeyHash}`;
     const expectedRunId = `trigger-${createHash('sha256').update(expectedReceiptId).digest('hex').slice(0, 32)}`;
     const expectedWorkflowSlug = `compiled-${snapshot.sourceTurnKeyHash.slice(0, 32)}`;
     const normalizedInputs = normalizeWorkflowRunInputs(run.inputs);
@@ -9377,46 +9654,55 @@ async function processOneRunFile(
     });
     if (!isResume) {
       try {
-        const graph = compileWorkflowStepsToGraph(workflow.data.steps, {
-          id: `${workflow.name}:${run.id}`,
-          name: workflow.data.name,
-          metadata: {
-            workflowSlug: workflow.name,
-            runId: run.id,
-            definitionSource: definitionResolution.definitionSource,
-            definitionHash: definitionResolution.snapshot?.definitionHash ?? null,
-            codeRevision: definitionResolution.snapshot?.codeRevision ?? null,
-          },
-        });
-        persistWorkflowGraphSnapshot({
-          workflowName: workflow.name,
-          runId: run.id,
-          graph,
-        });
-        appendWorkflowEvent(workflow.name, run.id, {
-          kind: 'workflow_graph_created',
-          meta: {
-            graph: {
-              name: graph.name,
-              entryNodeIds: graph.entryNodeIds,
-              nodes: graph.nodes.map((node) => ({
-                id: node.id,
-                type: node.type,
-                stepId: node.stepId,
-                model: node.model,
-                intent: node.intent,
-                forEach: node.forEach,
-                sideEffect: node.sideEffect,
-                usesSkill: node.usesSkill,
-                requiresApproval: node.requiresApproval,
-                deterministic: Boolean(node.deterministic),
-                subgraphRole: node.config?.subgraphRole,
-                parentNodeId: node.config?.parentNodeId,
-              })),
-              edges: graph.edges,
+        // Never overwrite an already-present graph for a compiled root before
+        // the immutable-definition validator sees it. Otherwise a malicious or
+        // stale additive overlay could be silently erased on a queued drain,
+        // hiding the authority conflict instead of failing closed.
+        const existingCompiledGraph = definitionResolution.definitionSource === 'compiled_snapshot'
+          ? loadWorkflowGraphSnapshotByRunId(run.id)
+          : null;
+        if (!existingCompiledGraph) {
+          const graph = compileWorkflowStepsToGraph(workflow.data.steps, {
+            id: `${workflow.name}:${run.id}`,
+            name: workflow.data.name,
+            metadata: {
+              workflowSlug: workflow.name,
+              runId: run.id,
+              definitionSource: definitionResolution.definitionSource,
+              definitionHash: definitionResolution.snapshot?.definitionHash ?? null,
+              codeRevision: definitionResolution.snapshot?.codeRevision ?? null,
             },
-          },
-        });
+          });
+          persistWorkflowGraphSnapshot({
+            workflowName: workflow.name,
+            runId: run.id,
+            graph,
+          });
+          appendWorkflowEvent(workflow.name, run.id, {
+            kind: 'workflow_graph_created',
+            meta: {
+              graph: {
+                name: graph.name,
+                entryNodeIds: graph.entryNodeIds,
+                nodes: graph.nodes.map((node) => ({
+                  id: node.id,
+                  type: node.type,
+                  stepId: node.stepId,
+                  model: node.model,
+                  intent: node.intent,
+                  forEach: node.forEach,
+                  sideEffect: node.sideEffect,
+                  usesSkill: node.usesSkill,
+                  requiresApproval: node.requiresApproval,
+                  deterministic: Boolean(node.deterministic),
+                  subgraphRole: node.config?.subgraphRole,
+                  parentNodeId: node.config?.parentNodeId,
+                })),
+                edges: graph.edges,
+              },
+            },
+          });
+        }
       } catch {
         // Best-effort telemetry only; graph snapshot failure must never block a run.
       }
@@ -9442,6 +9728,7 @@ async function processOneRunFile(
       }
       const {
         finalOutput,
+        publicTerminalStepId,
         forEachFailures,
         qualityAdvisories,
         executionSteps,
@@ -9499,13 +9786,27 @@ async function processOneRunFile(
       );
       const rawStepOutputs = Object.fromEntries(resume.completedSteps);
       const stepOutputs = stringifyOutputs(rawStepOutputs);
-      // Compiled specialist nodes are private reducer inputs. Public workflow
-      // output already excludes them; notification/report-back composition
-      // must use the same projection or it can re-narrate branch internals even
-      // when the canonical run output is clean.
-      const publicExecutionSteps = executionSteps.filter((step) => !isGraphRuntimeSpecialist(step));
+      const isCompiledProjectRun = definitionResolution.definitionSource === 'compiled_snapshot';
+      const compiledTerminalStep = isCompiledProjectRun
+        ? executionSteps.find((step) => step.id === publicTerminalStepId)
+        : undefined;
+      if (isCompiledProjectRun && (!publicTerminalStepId || !compiledTerminalStep)) {
+        throw new Error('Compiled project runtime did not return its unique terminal sink. No project output was published.');
+      }
+      // Compiled projects expose exactly one structurally selected sink. Every
+      // branch and reducer stays in the durable journal/workspace for resume and
+      // DAG context, but cannot enter any user-facing terminal projection.
+      const publicExecutionSteps = isCompiledProjectRun
+        ? [compiledTerminalStep!]
+        : executionSteps.filter((step) => !isPrivateRuntimeSpecialist(step));
+      const publicRawStepOutputs: Record<string, unknown> = isCompiledProjectRun
+        ? { [publicTerminalStepId!]: rawStepOutputs[publicTerminalStepId!] }
+        : rawStepOutputs;
+      const publicStepOutputs = isCompiledProjectRun
+        ? stringifyOutputs(publicRawStepOutputs)
+        : stepOutputs;
       const runRecordStepOutputs = boundedStepOutputsForRunRecord(
-        rawStepOutputs,
+        publicRawStepOutputs,
         { workflowName: workflow.name, runId: run.id },
       );
 
@@ -9513,7 +9814,10 @@ async function processOneRunFile(
       // could not finish its job. Today that still marks "completed" and
       // dumps raw JSON. Detect it, diagnose the root cause, and offer a
       // fix — instead of silently reporting a misleading success.
-      const blockedSteps = detectBlockedSteps(stepOutputs, executionSteps.map((step) => step.id));
+      const blockedSteps = detectBlockedSteps(
+        publicStepOutputs,
+        publicExecutionSteps.map((step) => step.id),
+      );
 
       // Wave 2.1 (substance gap): a read step that produced NO data while a
       // downstream step depends on it — the canonical "forEach over an empty
@@ -9529,7 +9833,7 @@ async function processOneRunFile(
       // RAW outputs (stepOutputs above is stringified → "[]"/"{}" read as non-empty).
       const emptyDeliverableReads = run.targetStepId
         ? []
-        : (() => { try { return detectEmptyDeliverableReads(executionSteps, rawStepOutputs); } catch { return []; } })();
+        : (() => { try { return detectEmptyDeliverableReads(publicExecutionSteps, publicRawStepOutputs); } catch { return []; } })();
       for (const er of emptyDeliverableReads) {
         try {
           appendWorkflowEvent(workflow.name, run.id, {
@@ -9552,19 +9856,21 @@ async function processOneRunFile(
       // so a confident-but-wrong verdict can never break a workflow that
       // actually succeeded. Skipped for partial single-step re-runs and runs
       // with no deliverable; fully fail-open.
-      const baseSuccessBody = renderSuccessBody({
-        steps: publicExecutionSteps,
-        stepOutputs,
-        finalOutput,
-        hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
-      });
+      const baseSuccessBody = isCompiledProjectRun
+        ? finalOutput
+        : renderSuccessBody({
+            steps: publicExecutionSteps,
+            stepOutputs: publicStepOutputs,
+            finalOutput,
+            hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
+          });
       // A declared pinned goal REPLACES the fuzzy target judge for this run:
       // the parked criteria are stricter and produce per-criterion evidence,
       // so double-judging would only burn a second model call.
       const declaredRunGoal = workflowRunGoal(workflow.data);
       const legacyRunGoal = declaredRunGoal ? null : deriveLegacyWorkflowRunGoal(workflow.data, inputs);
       let targetVerdict: WorkflowTargetVerdict | null = null;
-      if (!declaredRunGoal) {
+      if (!isCompiledProjectRun && !declaredRunGoal) {
         try {
           targetVerdict = await judgeWorkflowTarget({
             workflow: workflow.data,
@@ -9621,7 +9927,13 @@ async function processOneRunFile(
       // (those route to diagnosis/self-heal first — validating a half-run
       // would always fail and burn a re-pursuit attempt for nothing).
       const runGoalContractEnabled = (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
-      const runGoal = runGoalContractEnabled && declaredRunGoal && !run.targetStepId && blockedSteps.length === 0 ? declaredRunGoal : null;
+      const runGoal = !isCompiledProjectRun
+        && runGoalContractEnabled
+        && declaredRunGoal
+        && !run.targetStepId
+        && blockedSteps.length === 0
+        ? declaredRunGoal
+        : null;
       let goalVerdict: GoalValidationResult | null = null;
       let goalDecision: GoalRunDecision | null = null;
       let goalFeedbackNext = '';
@@ -9630,7 +9942,7 @@ async function processOneRunFile(
         goalVerdict = await validateGoal({
           objective: runGoal.objective,
           successCriteria: runGoal.successCriteria,
-          evidenceText: buildGoalEvidenceText(finalOutput, rawStepOutputs, { workflowName: workflow.name, runId: run.id }),
+          evidenceText: buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }),
         });
         // Verdict door (T3-B4): one canonical audit row per judge decision.
         appendWorkflowEvent(workflow.name, run.id, {
@@ -9651,7 +9963,7 @@ async function processOneRunFile(
         try {
           writeWorkspaceCheckerReport(
             workflow.name, run.id,
-            checkerReportFromVerdict(run.id, goalVerdict, Object.keys(stepOutputs), new Date().toISOString()),
+            checkerReportFromVerdict(run.id, goalVerdict, Object.keys(publicStepOutputs), new Date().toISOString()),
           );
         } catch { /* best-effort — checker persistence never affects the run */ }
         // Contract row (plan-proposals, origin kind 'workflow'): the pinned
@@ -9828,13 +10140,19 @@ async function processOneRunFile(
       // quality miss can NEVER trigger a blind re-run that doubles irreversible
       // side effects.
       const targetMissed = Boolean(targetVerdict && targetVerdict.judged && !targetVerdict.reached);
-      const hasForEachFailures = forEachFailures.length > 0;
-      const reviewRequiredAdvisory = qualityAdvisories.find(workflowAdvisoryRequiresAttention);
+      const publicForEachFailures = isCompiledProjectRun
+        ? forEachFailures.filter((failure) => failure.stepId === publicTerminalStepId)
+        : forEachFailures;
+      const publicQualityAdvisories = isCompiledProjectRun
+        ? qualityAdvisories.filter((advisory) => advisory.stepId === publicTerminalStepId)
+        : qualityAdvisories;
+      const hasForEachFailures = publicForEachFailures.length > 0;
+      const reviewRequiredAdvisory = publicQualityAdvisories.find(workflowAdvisoryRequiresAttention);
       const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures || goalMissed || Boolean(reviewRequiredAdvisory);
       const attentionReason =
         blockedSteps[0]?.reason ??
         (hasForEachFailures
-          ? `${forEachFailures.length} forEach item${forEachFailures.length === 1 ? '' : 's'} failed`
+          ? `${publicForEachFailures.length} forEach item${publicForEachFailures.length === 1 ? '' : 's'} failed`
           : goalMissed
           ? `pinned goal not met — ${goalDecision?.reason ?? 'criteria unmet'}`
           : targetMissed
@@ -9853,7 +10171,6 @@ async function processOneRunFile(
       // authorized only by the worker that actually publishes terminal truth.
       // Compute the breaker preview without mutating it so report copy remains
       // deterministic before publication.
-      const isCompiledProjectRun = definitionResolution.definitionSource === 'compiled_snapshot';
       const prospectiveConsecutiveFailures = isCompiledProjectRun
         ? (needsAttention || goalRepursuing ? 1 : 0)
         : !needsAttention && !goalRepursuing
@@ -10083,12 +10400,12 @@ async function processOneRunFile(
       // Partial-success surfacing: if any forEach items errored, lift
       // them into the user-visible notification so a "completed" run
       // can't masquerade as all-green when items quietly dropped.
-      const hasFailures = forEachFailures.length > 0;
+      const hasFailures = publicForEachFailures.length > 0;
       const failureSummary = hasFailures
-        ? `\n\n⚠️ ${forEachFailures.length} item${forEachFailures.length === 1 ? '' : 's'} failed:\n${forEachFailures
+        ? `\n\n⚠️ ${publicForEachFailures.length} item${publicForEachFailures.length === 1 ? '' : 's'} failed:\n${publicForEachFailures
             .slice(0, 5)
             .map((f) => `- ${f.stepId} · ${f.itemKey}: ${f.error.slice(0, 200)}`)
-            .join('\n')}${forEachFailures.length > 5 ? `\n(+${forEachFailures.length - 5} more)` : ''}`
+            .join('\n')}${publicForEachFailures.length > 5 ? `\n(+${publicForEachFailures.length - 5} more)` : ''}`
         : '';
 
       // Legible reporting: when steps blocked, say "needs attention" (not
@@ -10112,7 +10429,7 @@ async function processOneRunFile(
       // appended to the human body ONLY when concrete artifacts exist — and a run
       // that produced artifacts is by definition NOT a routine no-op, so this can
       // never break the quiet-day no-op silencing.
-      const runArtifacts = summarizeRunArtifacts(publicExecutionSteps, rawStepOutputs);
+      const runArtifacts = summarizeRunArtifacts(publicExecutionSteps, publicRawStepOutputs);
       const succeededBecause = (runGoal && goalDecision?.action === 'satisfied')
         ? `goal met${typeof goalVerdict?.successRatePercent === 'number' ? ` (${goalVerdict.successRatePercent}%, ${goalVerdict.criteriaMet ?? '?'}/${goalVerdict.criteriaTotal ?? '?'} criteria)` : ''}`
         : (targetVerdict?.judged && targetVerdict.reached)
@@ -10124,16 +10441,18 @@ async function processOneRunFile(
         ...runArtifacts.urls,
       ].filter(Boolean);
       const producedLine = producedItems.length > 0 ? `\n\n📦 Produced: ${producedItems.join(' · ')}` : '';
-      const successBody = `${baseSuccessBody}${producedLine}${failureSummary}${goalSummary}`;
+      const successBody = isCompiledProjectRun
+        ? baseSuccessBody
+        : `${baseSuccessBody}${producedLine}${failureSummary}${goalSummary}`;
       // Non-failing quality advisories (skill-execution misses + target-miss):
       // appended to whichever body we send so the deliverable is ALWAYS shown,
       // with a clear "review this" heads-up after it. Never replaces the body.
-      const hasAdvisories = qualityAdvisories.length > 0;
+      const hasAdvisories = publicQualityAdvisories.length > 0;
       const advisorySummary = hasAdvisories
-        ? `\n\n⚠️ Quality check (the result above is delivered — please review):\n${qualityAdvisories
+        ? `\n\n⚠️ Quality check (the result above is delivered — please review):\n${publicQualityAdvisories
             .slice(0, 5)
             .map((a) => `- ${a.note}`)
-            .join('\n')}${qualityAdvisories.length > 5 ? `\n(+${qualityAdvisories.length - 5} more)` : ''}`
+            .join('\n')}${publicQualityAdvisories.length > 5 ? `\n(+${publicQualityAdvisories.length - 5} more)` : ''}`
         : '';
       const outcome = renderLegibleOutcome({
         workflowName: workflow.data.name,
@@ -10155,23 +10474,25 @@ async function processOneRunFile(
       });
       // Single report body (escalation banner prepended when auto-heal is
       // paused), reused for the notification, dashboard preview, and chat re-entry.
-      let reportBody = `${escalationBanner}${needsAttention ? outcome.body : successBody}${advisorySummary}`;
+      let reportBody = isCompiledProjectRun && !needsAttention
+        ? finalOutput
+        : `${escalationBanner}${needsAttention ? outcome.body : successBody}${advisorySummary}`;
       // Warm the tone into Clementine's voice + let her flag a routine no-op.
       // Best-effort/fail-open: any hiccup returns the original text. We skip the
       // already-silenced echo (token-free). A no-op silences ONLY a clean,
       // scheduled (non-interactive) run — every guard below must be false.
       const interactive = Boolean(run.originSessionId);
       let runIsNoOp = false;
-      if (!stepAlreadyNotified) {
-        const lane = workflowReportLaneForOutcome({ needsAttention, advisories: qualityAdvisories });
-        const voiced = await rewriteInClementineVoice(reportBody, { workflowName: workflow.data.name, lane });
+      if (!isCompiledProjectRun && !stepAlreadyNotified) {
+        const lane = workflowReportLaneForOutcome({ needsAttention, advisories: publicQualityAdvisories });
+        const voiced = await rewriteWorkflowReportInVoiceImpl(reportBody, { workflowName: workflow.data.name, lane });
         reportBody = voiced.message;
         runIsNoOp = voiced.nothingHappened
           && !needsAttention && !hasFailures && !hasAdvisories && !autoHealPaused && !interactive;
       }
       const terminalReport = {
         workflowName: workflow.data.name,
-        outcome: workflowReportLaneForOutcome({ needsAttention, advisories: qualityAdvisories }),
+        outcome: workflowReportLaneForOutcome({ needsAttention, advisories: publicQualityAdvisories }),
         detail: reportBody,
       };
       const terminalRecord = writeRunRecord(filePath, terminalProjection, terminalReport);
@@ -10196,7 +10517,7 @@ async function processOneRunFile(
         title: runIsNoOp
           ? `Nothing new — ${workflow.data.name}`
           : hasFailures && !needsAttention
-            ? `Workflow completed with ${forEachFailures.length} failure${forEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
+            ? `Workflow completed with ${publicForEachFailures.length} failure${publicForEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
             // renderLegibleOutcome titles a no-blocked-step run "completed"; a
             // target-miss or goal-miss is needs-attention with no blocked step,
             // so title it honestly.
@@ -10217,10 +10538,10 @@ async function processOneRunFile(
         metadata: {
           workflow: workflow.data.name,
           runId: run.id,
-          forEachFailures: hasFailures ? forEachFailures : undefined,
+          forEachFailures: hasFailures ? publicForEachFailures : undefined,
           needsAttention: needsAttention || undefined,
           proposedFixId: proposedFix?.id,
-          qualityAdvisories: hasAdvisories ? qualityAdvisories : undefined,
+          qualityAdvisories: hasAdvisories ? publicQualityAdvisories : undefined,
           ...(runIsNoOp ? { noOp: true, noOpReason: 'no new items' } : {}),
         },
       });
@@ -10232,7 +10553,7 @@ async function processOneRunFile(
             ? (blockedSteps.length > 0
                 ? `Needs attention — ${blockedSteps.length} step${blockedSteps.length === 1 ? '' : 's'} blocked`
                 : `Needs attention — ${attentionReason ?? 'target not confirmed'}`)
-            : `Completed${hasFailures ? ` with ${forEachFailures.length} item failure${forEachFailures.length === 1 ? '' : 's'}` : ''}${hasAdvisories ? ` · ${qualityAdvisories.length} quality advisory${qualityAdvisories.length === 1 ? '' : 'ies'}` : ''}`,
+            : `Completed${hasFailures ? ` with ${publicForEachFailures.length} item failure${publicForEachFailures.length === 1 ? '' : 's'}` : ''}${hasAdvisories ? ` · ${publicQualityAdvisories.length} quality advisory${publicQualityAdvisories.length === 1 ? '' : 'ies'}` : ''}`,
           outputPreview: reportBody.slice(0, 800),
           needsAttention,
         });
@@ -10241,7 +10562,7 @@ async function processOneRunFile(
       // Needs-attention OR a review-required advisory → 'blocked' so Clem knows
       // to review; informational advisories still ride the body on the done
       // lane. A routine no-op never wakes the chat.
-      logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, advisories: qualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
+      logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: publicForEachFailures.length, blockedSteps: blockedSteps.length, advisories: publicQualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
       // Recoverable capability parking: the shared Composio gateway proved the
       // requested action never crossed the dispatch boundary. Preserve every
@@ -10525,8 +10846,8 @@ async function processOneRunFile(
       // never claim success or drop the `apply fix <id>` action). A user CANCEL
       // keeps the original text + is never rewritten. Failures are NEVER silenced.
       let failureBody = `${errEscalationBanner}${healBody ?? message}`;
-      if (!cancelled) {
-        failureBody = (await rewriteInClementineVoice(failureBody, { workflowName: run.workflow, lane: 'failed' })).message;
+      if (!cancelled && definitionResolution.definitionSource !== 'compiled_snapshot') {
+        failureBody = (await rewriteWorkflowReportInVoiceImpl(failureBody, { workflowName: run.workflow, lane: 'failed' })).message;
       }
       const requestedReport = { workflowName: run.workflow, outcome: 'failed' as const, detail: failureBody };
       const terminalRecord = writeRunRecord(filePath, {

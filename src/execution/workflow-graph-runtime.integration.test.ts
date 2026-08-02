@@ -233,8 +233,8 @@ test('creation test certifies the compiled specialist graph rather than the flat
   assert.match(reducerPrompts[0] ?? '', /CREATION-RISKS/);
   assert.equal(artifactQueries.length, 2);
   assert.ok(
-    artifactQueries.every((result) => result.includes(exactCreationMarker)),
-    'creation-test specialists can read exact artifacts from the slug-owned run workspace',
+    artifactQueries.every((result) => /refused.*not rendered into the active workflow step context/i.test(result)),
+    'creation-test specialists cannot read an unrelated artifact merely because it shares the run workspace',
   );
   assert.equal(maxTurnsBySession.get(`workflow:${runId}:${factsId}`), 3);
   assert.equal(maxTurnsBySession.get(`workflow:${runId}:${risksId}`), undefined);
@@ -1036,8 +1036,8 @@ test('processWorkflowRuns resumes from the persisted live graph and includes its
     'the graph query cannot read a path outside its owning run workspace',
   );
   assert.ok(
-    orphanResults.every((result) => /refused.*not owned by a completed event/i.test(result)),
-    'the graph query cannot read an orphan artifact from the artifact-before-event crash window',
+    orphanResults.every((result) => /refused.*not rendered into the active workflow step context/i.test(result)),
+    'the graph query cannot read an orphan artifact that was not bound into this node context',
   );
   assert.equal(terminal.stepOutputs?.restart_probe, marker);
   assert.match(

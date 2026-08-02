@@ -21,11 +21,21 @@ import {
   validateProjectPlan,
   PROJECT_STRUCTURAL_TOOLS,
   PROJECT_DISCOVERY_KERNEL_ERRORS,
+  PROJECT_LOCAL_WRITE_TOOLS,
+  PROJECT_LOCAL_WRITE_TOOL_ERRORS,
+  PROJECT_TOOL_MANIFEST_ERRORS,
   PROJECT_NODE_DEFAULT_MAX_TURNS,
   PROJECT_NODE_TURN_CEILING,
   type ProjectNode,
   type ProjectPlan,
 } from './project-plan-ir.js';
+import {
+  PROJECT_STEP_STRUCTURAL_TOOLS,
+  STEP_STRUCTURAL_BASELINE_TOOLS,
+} from './workflow-step-structural-tools.js';
+import { filterToolsForStep } from '../agents/workflow-step-agent.js';
+import { getCoreToolsAsync } from '../tools/registry.js';
+import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 
 const DIGEST_A = 'a'.repeat(64);
 const DIGEST_B = 'b'.repeat(64);
@@ -74,25 +84,78 @@ test('the structural universe is non-mutating and cannot dispatch', () => {
   assert.ok(!PROJECT_STRUCTURAL_TOOLS.includes('call_tool'));
   // The output channel must be present or a compiled step cannot return at all.
   assert.ok(PROJECT_STRUCTURAL_TOOLS.includes('workflow_step_result'));
+  assert.deepEqual([...PROJECT_LOCAL_WRITE_TOOL_ERRORS], [],
+    'local artifact writers must remain exact, eligible, and write-class');
+  assert.deepEqual([...PROJECT_TOOL_MANIFEST_ERRORS], [],
+    'the positive project manifest must remain internally consistent');
+  assert.equal(PROJECT_STRUCTURAL_TOOLS.includes('notify_user'), false,
+    'internal graph nodes never own a public notification channel');
+  assert.equal(PROJECT_STRUCTURAL_TOOLS.includes('read_file'), false,
+    'general workspace reads are explicit capabilities, not structure');
 });
 
-test('the structural universe matches the canonical workflow baseline exactly', async () => {
-  // Declared locally to keep this module dependency-light (importing the step
-  // agent closes an import cycle), so the equality is pinned here instead.
-  let baseline: Set<string> | null = null;
-  try {
-    ({ STEP_STRUCTURAL_BASELINE_TOOLS: baseline } =
-      await import('../agents/workflow-step-agent.js') as never);
-  } catch (err) {
-    // The shared tree currently has in-flight lifecycle work whose module graph
-    // does not resolve. That is not this module's contract to fix, and a silent
-    // pass would be worse than a loud note.
-    assert.match(String((err as Error)?.message ?? err), /Cannot find module|ERR_MODULE_NOT_FOUND/,
-      'the only acceptable reason to skip this pin is an unresolved shared module');
-    return;
+test('the project structural universe is exact and deliberately narrower than the legacy runtime baseline', () => {
+  assert.deepEqual([...PROJECT_STRUCTURAL_TOOLS].sort(), [...PROJECT_STEP_STRUCTURAL_TOOLS].sort(),
+    'the compiled-project structural set must not drift from its runtime exact-lock baseline');
+  assert.ok(STEP_STRUCTURAL_BASELINE_TOOLS.has('notify_user'),
+    'ordinary reporting workflows retain their legacy notification behavior');
+  assert.equal(PROJECT_STEP_STRUCTURAL_TOOLS.has('notify_user'), false);
+});
+
+test('every positive project capability is present on the real constrained step surface', async () => {
+  const assembled = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  const actualNames = new Set(filterToolsForStep(assembled).map((tool) => tool.name));
+  const admitted = TOOL_REGISTRY.filter((declaration) => declaration.projectEffect !== undefined);
+  assert.ok(admitted.length > 0, 'the manifest should expose a useful read/compute kernel');
+  for (const declaration of admitted) {
+    assert.ok(actualNames.has(declaration.name),
+      `${declaration.name} is declared for projects but absent from the real step surface`);
   }
-  assert.deepEqual([...PROJECT_STRUCTURAL_TOOLS].sort(), [...baseline!].sort(),
-    'the compiled-project structural set must not drift from the runtime baseline');
+  assert.deepEqual(
+    admitted.map((declaration) => declaration.name).sort(),
+    [
+      'git_status',
+      'memory_list_facts',
+      'memory_recall',
+      'memory_search',
+      'recall_tool_result',
+      'skill_list',
+      'skill_read',
+      'time_slots',
+      'tool_output_query',
+      'user_profile_read',
+      'workspace_artifact_query',
+      'workspace_list',
+      'workspace_roots',
+    ],
+    'manifest growth requires an explicit replay/realm review, never sideEffect inference',
+  );
+  assert.deepEqual([...PROJECT_LOCAL_WRITE_TOOLS], [],
+    'no current writer is both run-bound and retry-safe');
+  for (const danger of [
+    'notify_user',
+    // These otherwise read-class tools traverse broad allowed roots (including
+    // the Clementine home/run tree), bypass node-bound artifact authority, and
+    // `read_file` may dispatch converters for media. They need project-scoped
+    // runtime adapters before either can re-enter this manifest.
+    'list_files',
+    'memory_read',
+    'memory_recall_all',
+    'memory_search_facts',
+    'composio_search_tools',
+    'mcp_list_tools',
+    'tool_search',
+    'session_history',
+    'table_ops',
+    'produce_document',
+    'read_file',
+    'write_file',
+    'dispatch_background_task',
+    'workflow_rerun_failed_items',
+  ]) {
+    assert.equal(TOOL_REGISTRY.find((declaration) => declaration.name === danger)?.projectEffect, undefined,
+      `${danger} has not satisfied durable-project replay/realm requirements`);
+  }
 });
 
 // ── canonical identity ───────────────────────────────────────────────────────
@@ -103,7 +166,7 @@ test('every set-like field is canonicalized, especially dependsOn', () => {
     readNode('a'),
     readNode('join', {
       dependsOn: ['b', 'a', 'b'],
-      executor: { kind: 'model', instruction: 'Join them.', allowedTools: ['tool_search', 'tool_search', 'recall_tool_result'] },
+      executor: { kind: 'model', instruction: 'Join them.', allowedTools: ['skill_list', 'skill_list', 'recall_tool_result'] },
       evidence: {
         requiredKeys: ['z', 'a', 'z'],
         nonEmpty: ['b', 'a'],
@@ -116,7 +179,7 @@ test('every set-like field is canonicalized, especially dependsOn', () => {
   const join = canon.nodes.find((node) => node.id === 'join')!;
   assert.deepEqual(join.dependsOn, ['a', 'b'], 'deduped and sorted');
   assert.deepEqual((join.executor as { allowedTools?: string[] }).allowedTools,
-    ['recall_tool_result', 'tool_search']);
+    ['recall_tool_result', 'skill_list']);
   assert.deepEqual(join.evidence?.requiredKeys, ['a', 'z']);
   assert.deepEqual(join.evidence?.nonEmpty, ['a', 'b']);
   assert.deepEqual(join.evidence?.verify?.pathExists, ['p', 'q']);
@@ -143,17 +206,17 @@ test('dependency permutations produce an identical plan hash', () => {
 
 test('capability and evidence ordering are sets too, not meaning', () => {
   const one = plan([readNode('a', {
-    executor: { kind: 'model', instruction: 'i', allowedTools: ['tool_search', 'recall_tool_result'] },
+    executor: { kind: 'model', instruction: 'i', allowedTools: ['skill_list', 'recall_tool_result'] },
     evidence: { requiredKeys: ['x', 'y'] },
   })]);
   const two = plan([readNode('a', {
-    executor: { kind: 'model', instruction: 'i', allowedTools: ['recall_tool_result', 'tool_search'] },
+    executor: { kind: 'model', instruction: 'i', allowedTools: ['recall_tool_result', 'skill_list'] },
     evidence: { requiredKeys: ['y', 'x'] },
   })]);
   assert.equal(projectPlanHash(one), projectPlanHash(two));
 
   const wider = plan([readNode('a', {
-    executor: { kind: 'model', instruction: 'i', allowedTools: ['tool_search', 'recall_tool_result', 'list_files'] },
+    executor: { kind: 'model', instruction: 'i', allowedTools: ['skill_list', 'recall_tool_result', 'time_slots'] },
     evidence: { requiredKeys: ['x', 'y'] },
   })]);
   assert.notEqual(projectPlanHash(one), projectPlanHash(wider), 'adding a capability is a real change');
@@ -191,23 +254,71 @@ test('a named capability list must be exact and known to the registry', () => {
   );
   assert.equal(
     validateProjectPlan(plan([readNode('a', {
-      executor: { kind: 'model', instruction: 'x', allowedTools: ['tool_search'] },
+      executor: { kind: 'model', instruction: 'x', allowedTools: ['skill_list'] },
     })])).ok,
     true,
   );
 });
 
-test('a structured call needs one exact, known, read-class tool', () => {
+test('model capabilities cannot disguise a write or open-ended executor as read work', () => {
+  const withTool = (tool: string, effect: ProjectNode['effect'] = 'read'): ProjectPlan =>
+    plan([readNode('a', {
+      effect,
+      executor: { kind: 'model', instruction: 'Do the bounded work.', allowedTools: [tool] },
+    })]);
+
+  for (const tool of [
+    'call_tool',
+    'composio_execute_tool',
+    'pending_action_execute',
+    'run_batch',
+    'run_shell_command',
+    'run_tool_program',
+  ]) {
+    assert.match(errorsOf(withTool(tool)), /open-ended executor/,
+      `${tool} must not become wildcard inner authority`);
+  }
+  assert.match(errorsOf(withTool('write_file')), /not admitted by the durable-project capability manifest/);
+
+  for (const blocked of [
+    'workflow_run',
+    'workflow_rerun_failed_items',
+    'dispatch_background_task',
+    'resume_held_task',
+    'ask_user_question',
+    'focus_get',
+    'surface_plan',
+    'draft_plan',
+    'propose_check_in_template',
+  ]) {
+    assert.match(errorsOf(withTool(blocked)), /not admitted by the durable-project capability manifest/,
+      `${blocked} must fail closed unless independently reviewed and admitted`);
+  }
+
+  const localWithoutWriter = plan([readNode('a', { effect: 'local_write' })]);
+  assert.match(errorsOf(localWithoutWriter), /names no proven local artifact writer/);
+  assert.match(errorsOf(withTool('write_file', 'local_write')), /not admitted by the durable-project capability manifest/,
+    'broad workspace overwrite is not a run-bound artifact contract');
+  assert.match(errorsOf(withTool('produce_document', 'local_write')), /not admitted by the durable-project capability manifest/,
+    'timestamped document output is not retry-idempotent yet');
+});
+
+test('a structured call needs one exact tool whose effect realm matches the node', () => {
   const call = (tool: string): ProjectPlan =>
     plan([{ id: 'c', executor: { kind: 'structured_call', tool }, effect: 'read' }]);
   assert.match(errorsOf(call('  ')), /requires an exact tool name/);
   assert.match(errorsOf(call('SOME_*')), /must be an exact name, not a pattern or template/);
   assert.match(errorsOf(call('{{tool}}')), /must be an exact name, not a pattern or template/);
   assert.match(errorsOf(call('definitely_not_a_tool')), /names unknown tool/);
-  // A mutating structured call is the family that would need the binding the
-  // definition cannot carry, so it is refused at the same boundary.
-  assert.match(errorsOf(call('note_create')), /is not a canonical read/);
-  assert.equal(validateProjectPlan(call('list_files')).ok, true);
+  assert.match(errorsOf(call('note_create')), /not admitted by the durable-project capability manifest/);
+  assert.match(errorsOf(call('list_files')), /no bound durable-project execution adapter/,
+    'a registry built-in must not be misrouted through the Composio call adapter');
+  assert.match(
+    errorsOf(plan([{
+      id: 'not_a_write', executor: { kind: 'structured_call', tool: 'list_files' }, effect: 'local_write',
+    }])),
+    /does not write a local artifact/,
+  );
 });
 
 // ── budgets ──────────────────────────────────────────────────────────────────
@@ -268,8 +379,8 @@ test('convergence is reachability, not adjacency: a -> {b,c} -> {d,e} -> f is va
     readNode('a'),
     readNode('b', { dependsOn: ['a'] }),
     readNode('c', { dependsOn: ['a'] }),
-    readNode('d', { dependsOn: ['b', 'c'] }),
-    readNode('e', { dependsOn: ['b', 'c'] }),
+    readNode('d', { dependsOn: ['b'] }),
+    readNode('e', { dependsOn: ['c'] }),
     readNode('f', { dependsOn: ['d', 'e'] }),
   ]);
   assert.equal(validateProjectPlan(deep).ok, true, errorsOf(deep));
@@ -573,7 +684,33 @@ test('executionRole is a hint that must be structurally honest', () => {
       readNode('mid', { dependsOn: ['a', 'b'] }),
       readNode('sink', { dependsOn: ['mid'], executionRole: 'reducer' }),
     ])),
-    /is a reducer but converges 1 upstream branch/,
+    /does not converge two independent upstream branches/,
+  );
+  // Listing both an ancestor and its descendant is still one lineage.
+  assert.match(
+    errorsOf(plan([
+      readNode('a'),
+      readNode('b', { dependsOn: ['a'] }),
+      readNode('sink', { dependsOn: ['a', 'b'], executionRole: 'reducer' }),
+    ])),
+    /ancestor-related dependencies are one lineage/,
+  );
+  // A brain is the terminal verification/synthesis node, never an
+  // intermediate label that could silently change model routing.
+  assert.match(
+    errorsOf(plan([
+      readNode('brain_early', { executionRole: 'brain' }),
+      readNode('sink', { dependsOn: ['brain_early'] }),
+    ])),
+    /brain but is not the terminal project sink/,
+  );
+  assert.match(
+    errorsOf(plan([
+      readNode('a', { executionRole: 'brain' }),
+      readNode('b'),
+      readNode('sink', { dependsOn: ['a', 'b'], executionRole: 'brain' }),
+    ])),
+    /brain but is not the terminal project sink/,
   );
   // An unknown role is refused rather than guessed.
   assert.match(

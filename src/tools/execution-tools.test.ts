@@ -15,7 +15,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ExecutionRecord } from '../types.js';
@@ -27,9 +27,14 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const {
   pickFocusTarget,
   registerExecutionTools,
+  renderActiveExecutionsForAgent,
+  activeExecutionCountForSession,
   _setExecutionToolCompletionJudgeForTests,
 } = await import('./execution-tools.js');
 const { ExecutionStore } = await import('../execution/store.js');
+const { compileProjectPlan } = await import('../execution/project-compiler.js');
+const { canonicalProjectPlan } = await import('../execution/project-plan-ir.js');
+const { workflowDefinitionHash } = await import('../execution/workflow-run-definition.js');
 const {
   appendEvent,
   createSession,
@@ -86,6 +91,54 @@ function createTrackedExecution(overrides: Partial<Parameters<InstanceType<typeo
     nextStep: 'Send report and capture receipt',
     ...overrides,
   });
+}
+
+function createGraphExecution(sessionId: string, label: string) {
+  createSession({ id: sessionId, kind: 'chat', title: `graph ${label}` });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: `Run durable graph ${label}.` },
+  });
+  const plan = canonicalProjectPlan({
+    planId: `tool-graph-${label}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 48),
+    objective: `Complete durable graph ${label} with verified evidence.`,
+    nodes: [{
+      id: 'finish',
+      executor: {
+        kind: 'model',
+        instruction: 'Produce the verified project result.',
+        allowedTools: ['workspace_artifact_query'],
+      },
+      effect: 'read',
+      maxTurns: 4,
+      evidence: { type: 'object', requiredKeys: ['summary'], nonEmpty: ['summary'] },
+    }],
+  });
+  const compiled = compileProjectPlan(plan);
+  return new ExecutionStore().createOrGetForSource({
+    sessionId,
+    sourceUserSeq: source.seq,
+    title: `Durable graph ${label}`,
+    objective: `Complete durable graph ${label} with verified evidence.`,
+    reason: 'test graph',
+    startedFromMessage: `Run durable graph ${label}.`,
+    confidence: 1,
+    reasons: ['test'],
+    admission: {
+      compiledPlan: {
+        version: 2,
+        compilerId: 'project_graph_v2',
+        planHash: compiled.planHash,
+        definitionHash: workflowDefinitionHash(compiled.definition),
+        plan,
+        definition: compiled.definition,
+        inputs: {},
+      },
+    },
+  }).execution;
 }
 
 function registeredToolHandlers(): Map<string, (args: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>> {
@@ -177,6 +230,113 @@ test('pickFocusTarget: records with undefined title/objective are skipped, not c
   const result = pickFocusTarget('social', records);
   assert.equal(result.kind, 'match');
   if (result.kind === 'match') assert.equal(result.target.id, 'good');
+});
+
+test('legacy execution mutation tools refuse graph-owned lifecycle before binding or store mutation', async () => {
+  const suffix = Math.random().toString(36).slice(2, 10);
+  const sessionId = `sess-graph-mutations-${suffix}`;
+  const graph = createGraphExecution(sessionId, `mutations-${suffix}`);
+  const followUp = appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Try to mutate that durable project from this later request.' },
+  });
+  const before = readFileSync(EXECUTIONS_FILE, 'utf-8');
+  let judgeCalls = 0;
+  _setExecutionToolCompletionJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { done: true, reason: 'must never run for a graph-owned record' };
+  });
+  const handlers = registeredToolHandlers();
+  const calls: Array<[string, Record<string, unknown>]> = [
+    ['execution_update_step', { id: graph.id, nextStep: 'Try a legacy update.' }],
+    ['execution_reconcile_write', {
+      id: graph.id,
+      call_id: 'graph-write',
+      verdict: 'absent',
+      evidence_call_id: 'graph-read',
+    }],
+    ['execution_mark_blocked', { id: graph.id, blocker: 'Try a legacy blocker.' }],
+    ['execution_pause', { id: graph.id, reason: 'Try a legacy pause.' }],
+    ['execution_resume', { id: graph.id }],
+    ['execution_complete', { id: graph.id, summary: 'Try a legacy completion.' }],
+  ];
+
+  for (const [name, args] of calls) {
+    const handler = handlers.get(name);
+    assert.ok(handler, `${name} should be registered`);
+    const result = await withHarnessRunContext(
+      {
+        sessionId,
+        sourceUserSeq: followUp.seq,
+        counter: new ToolCallsCounter(20),
+      },
+      () => handler(args),
+    );
+    assert.match(result.content[0].text, /durable project graph/i, name);
+    assert.match(result.content[0].text, /root workflow owns lifecycle/i, name);
+  }
+
+  assert.equal(judgeCalls, 0, 'legacy completion validation never runs for a graph');
+  assert.equal(
+    readFileSync(EXECUTIONS_FILE, 'utf-8'),
+    before,
+    'none of the refusals binds the source request or changes graph state',
+  );
+});
+
+test('focus, clear-focus, and autonomy context operate on legacy executions while a graph is active', async () => {
+  const suffix = Math.random().toString(36).slice(2, 10);
+  const sessionId = `sess-graph-focus-${suffix}`;
+  const graph = createGraphExecution(sessionId, `focus-${suffix}`);
+  const store = new ExecutionStore();
+  const target = store.create({
+    sessionId,
+    title: `Legacy focus target ${suffix}`,
+    objective: 'Advance the exact legacy execution selected by the user.',
+    reason: 'focus test',
+    startedFromMessage: 'Focus this legacy execution.',
+    confidence: 1,
+    reasons: ['test'],
+    nextStep: 'Advance the selected legacy lane.',
+  });
+  const other = store.create({
+    sessionId,
+    title: `Legacy focus sibling ${suffix}`,
+    objective: 'Remain independently pausable by the legacy focus controller.',
+    reason: 'focus test',
+    startedFromMessage: 'Track another legacy execution.',
+    confidence: 1,
+    reasons: ['test'],
+    nextStep: 'Wait while the other legacy lane is focused.',
+  });
+  const handlers = registeredToolHandlers();
+  const focus = handlers.get('execution_focus')!;
+  const clear = handlers.get('execution_clear_focus')!;
+
+  const result = await focus({ query: target.id });
+  assert.match(result.content[0].text, /Paused 1 other execution/i);
+  assert.equal(store.get(target.id)?.status, 'active');
+  assert.equal(store.get(other.id)?.status, 'paused');
+  assert.equal(store.get(other.id)?.pausedBy, 'focus');
+  assert.equal(store.get(graph.id)?.status, 'active', 'focus never attempts to pause the graph');
+
+  const graphFocus = await focus({ query: graph.id });
+  assert.match(graphFocus.content[0].text, /No active execution matches/i);
+  assert.equal(store.get(graph.id)?.status, 'active');
+
+  const rendered = renderActiveExecutionsForAgent(sessionId);
+  assert.match(rendered, new RegExp(target.id));
+  assert.doesNotMatch(rendered, new RegExp(graph.id));
+  assert.equal(activeExecutionCountForSession(sessionId), 1);
+
+  const cleared = await clear({});
+  assert.match(cleared.content[0].text, /Resumed 1 focus-paused execution/i);
+  assert.equal(store.get(other.id)?.status, 'active');
+  assert.equal(store.get(graph.id)?.status, 'active');
+  assert.equal(activeExecutionCountForSession(sessionId), 2);
 });
 
 test('execution_create accepts natural criteria arrays and preserves the full audit trail', async () => {
