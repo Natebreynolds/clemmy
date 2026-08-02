@@ -4,8 +4,8 @@
  *
  * A read-only planner emits this; `project-compiler.ts` turns it into ordinary
  * `WorkflowDefinition` steps. Nothing here executes, and nothing here can grant
- * authority: a plan may *request* an external effect, but the runtime tool
- * boundary remains the only thing that can permit one.
+ * authority: a plan may *request* an effect, but the runtime tool boundary
+ * remains the only thing that can permit one.
  *
  * WHY AN IR AT ALL
  *
@@ -17,39 +17,37 @@
  *
  * WHAT MAKES THIS GENERIC
  *
- * Node *instances* carry specific assignments ("read the opportunity records
- * closing this month"). Node *semantics* never do. There is no notion here of a
- * dashboard, a report, a deploy, a provider, or an app. A node is:
+ * Node *instances* carry specific assignments ("read the records closing this
+ * month"). Node *semantics* never do. There is no notion here of any product,
+ * provider, or artifact kind. A node is:
  *
  *   a dependency position, an executor, an effect class, an evidence contract,
  *   an approval disposition, a retry/turn budget, and optionally a fan-out
  *   source.
  *
  * Those seven axes are deliberately INDEPENDENT. Collapsing any two of them is
- * how domain assumptions get smuggled in — "this is a deploy node, therefore it
- * needs approval, therefore it is last" bakes a use case into the topology.
- * Here, effect class does not imply position, executor does not imply effect,
- * and approval is a separate declaration that validation cross-checks rather
- * than infers.
+ * how domain assumptions get smuggled in — "this is a publish node, therefore
+ * it needs approval, therefore it is last" bakes a use case into the topology.
  *
- * WHAT VALIDATION IS FOR
+ * IDENTITY IS CANONICAL, NOT AUTHORED
  *
- * Every rule below rejects a plan that would be UNSAFE OR UNRUNNABLE, never one
- * that is merely unfamiliar. An objective this module has never seen must
- * compile exactly like a familiar one; there is no vocabulary to be unfamiliar
- * *to*. Validation fails closed on: identity collisions, dangling or cyclic
- * dependencies, unbounded budgets, fan-out from a source that was never
- * declared, structured calls with no exact tool, external effects with no
- * verification, wildcard tool authority, and approval/effect contradictions.
+ * Set-like fields (the node list, dependencies, capability lists, evidence
+ * paths) carry no order. They are canonicalized once, and everything
+ * downstream — the hash, the compiled definition, the definition hash — is
+ * derived from the canonical form. Two plans that differ only in how their
+ * author happened to order a set are the same plan, byte for byte.
  */
 import { createHash } from 'node:crypto';
+
+import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 
 /**
  * Where a node's work happens.
  *
  * `read` touches nothing outside this machine. `local_write` produces durable
  * local artifacts. `external_write` asks to change state the user does not own
- * exclusively. The class is a REQUEST, never a permission.
+ * exclusively. The class is a REQUEST, never a permission — and see
+ * `ExternalWriteBinding` for why `external_write` currently cannot compile.
  */
 export type ProjectEffectClass = 'read' | 'local_write' | 'external_write';
 
@@ -63,9 +61,11 @@ export type ProjectApprovalDisposition = 'not_required' | 'required';
 export type ProjectContractType = 'string' | 'number' | 'boolean' | 'object' | 'array';
 
 /**
- * What this node must be able to SHOW for its result to count. Mirrors the
- * runtime's existing output contract so the compiler can hand it straight
- * through rather than inventing a second evidence language.
+ * What this node must be able to SHOW for its result to count.
+ *
+ * Validated deeply, because a contract is only worth the strictness of its
+ * weakest field: `[null]`, `['']`, `['a..b']`, and a bare item count are all
+ * shapes that LOOK like evidence and prove nothing.
  */
 export interface ProjectEvidenceContract {
   type?: ProjectContractType;
@@ -73,7 +73,12 @@ export interface ProjectEvidenceContract {
   requiredKeys?: string[];
   /** Dot-paths whose value must be non-empty. */
   nonEmpty?: string[];
-  /** Dot-path → minimum array length. */
+  /**
+   * Dot-path → minimum array length.
+   *
+   * Deliberately never sufficient on its own: an array of N empty objects
+   * satisfies a length bound while proving nothing about content.
+   */
   minItems?: Record<string, number>;
   /** Concrete handles checked for real existence, not just shape. */
   verify?: {
@@ -86,12 +91,12 @@ export interface ProjectEvidenceContract {
 /**
  * How the node does its work.
  *
- * `model` is reasoning under a bounded turn budget. `structured_call` is an
- * exact, pre-named tool invocation with no model turn at all — the planner
- * already knows the tool and its arguments, so the runtime should not spend a
- * turn rediscovering them. Which one a node uses says nothing about its effect
- * class: a structured call can be a pure read, and a model node can request an
- * external write.
+ * `model` is reasoning under a bounded turn budget and an EXPLICIT capability
+ * list. `structured_call` is an exact, pre-named tool invocation with frozen
+ * arguments and no model turn at all.
+ *
+ * Which one a node uses says nothing about its effect class: a structured call
+ * can be a pure read, and a model node can request a local write.
  */
 export type ProjectExecutor =
   | {
@@ -99,8 +104,12 @@ export type ProjectExecutor =
     /** The node's assignment. Specific by nature; the runtime treats it as opaque. */
     instruction: string;
     /**
-     * Optional narrowing of the node's tool surface. Omitted means "inherit
-     * whatever the workflow already allows" — it never means "everything".
+     * Exact capability list for this node.
+     *
+     * Omitting it does NOT mean "no tools" — downstream, an omitted or empty
+     * list is legacy wildcard authority. So the compiler always emits an
+     * explicit, non-empty list: either this one, or the read-only discovery
+     * kernel for a node that only reasons over evidence already collected.
      */
     allowedTools?: string[];
   }
@@ -108,6 +117,8 @@ export type ProjectExecutor =
     kind: 'structured_call';
     /** Exact tool identifier. Never a pattern, never templated. */
     tool: string;
+    /** Frozen arguments. Templating into upstream outputs is allowed; the
+     *  SHAPE is fixed at plan time. */
     args?: Record<string, unknown>;
     /** Optional human-readable note; carries no execution meaning. */
     instruction?: string;
@@ -128,6 +139,41 @@ export interface ProjectFanOut {
   newOnly?: boolean;
 }
 
+/**
+ * Everything an external provider write would have to prove BEFORE it runs.
+ *
+ * This type exists to state the requirement precisely rather than gesture at
+ * it. It is deliberately not satisfiable by prose: an approval must name the
+ * exact operation, the account/resource it acts on, the destination, a digest
+ * of the exact arguments, and the plan digest it was granted against — and the
+ * readback must be a real provider observation, not a local path or URL string.
+ *
+ * `WorkflowStepInput` has no field that carries any of this. `requiresApproval`
+ * is a boolean, `approvalPreview` is display text, and a mutation receipt is
+ * EXECUTION evidence recorded after dispatch, not prior authority. So the
+ * compiler refuses `external_write` outright instead of encoding authority in a
+ * preview string. See `project-compiler.ts`.
+ */
+export interface ExternalWriteBinding {
+  /** Exact provider operation this approval was granted for. */
+  operation: string;
+  /** Account or resource identity the operation acts on. */
+  accountRef: string;
+  /** Destination identity (site, container, record set, …). */
+  target: string;
+  /** Digest of the exact frozen arguments. */
+  argumentsDigest: string;
+  /** Plan digest this approval was granted against. */
+  planDigest: string;
+  /** The approval that already exists. Never minted by a plan. */
+  priorApprovalId: string;
+  /** Independent provider readback proving the write landed. */
+  readback: {
+    operation: string;
+    expect: ProjectEvidenceContract;
+  };
+}
+
 export interface ProjectNode {
   /** Stable identity. Becomes the workflow step id, so it must round-trip. */
   id: string;
@@ -140,19 +186,21 @@ export interface ProjectNode {
   evidence?: ProjectEvidenceContract;
   /** Omitted is not "no": the compiler derives the safe default per effect. */
   approval?: ProjectApprovalDisposition;
-  /** Shown on the approval card. Required when approval is required. */
+  /** Shown on the approval card. Never carries authority. */
   approvalPreview?: string;
+  /** Required for `external_write`; see ExternalWriteBinding. */
+  externalWrite?: ExternalWriteBinding;
   /** Additional attempts after the first failure. */
   retries?: number;
-  /** Model turns this node may spend. Bounded well under the safety ceiling. */
+  /** Model turns THIS node may spend. Per node, never a project horizon. */
   maxTurns?: number;
   fanOut?: ProjectFanOut;
 }
 
 export interface ProjectPlan {
   /**
-   * Stable identifier for this plan's lineage. Used to derive a deterministic
-   * workflow name. Omitted = derived from the plan hash.
+   * Stable identity for this plan's lineage; becomes the workflow name.
+   * Must already BE its slug — see `planIdError`.
    */
   planId?: string;
   /** What the user asked for, in their terms. Opaque to this module. */
@@ -161,25 +209,74 @@ export interface ProjectPlan {
 }
 
 /**
- * The hard per-node turn ceiling. Matches the runtime's own upper bound so a
- * plan can never author a node the harness would refuse to run.
+ * Hard PER-NODE turn ceiling.
+ *
+ * This bounds one node's model turns. It is NOT a whole-project horizon and it
+ * is NOT the harness `toolCallsPerTurn` limit — a project may contain many
+ * nodes each budgeted up to this value, which is exactly how long work stays
+ * resumable instead of dying inside one turn.
  */
 export const PROJECT_NODE_TURN_CEILING = 64;
 
 /**
  * Default turns per node — deliberately far below the ceiling.
  *
- * The point of splitting a project into nodes is that each one is small. A node
- * that genuinely needs dozens of turns is a node that should have been several
- * nodes, so the default stays tight and an author must ask for more in the
- * open, where validation can see it.
+ * A node that genuinely needs dozens of turns is a node that should have been
+ * several nodes, so the default stays tight and an author must ask for more in
+ * the open, where validation can see it.
  */
 export const PROJECT_NODE_DEFAULT_MAX_TURNS = 8;
 
-/** Wildcard tool authority is never expressible in a plan. */
-const WILDCARD_TOOL = '*';
+/**
+ * Read-only capability kernel for a model node that names no tools.
+ *
+ * A node given only this can look up what exists, re-read a clipped tool
+ * output, and page its upstream artifacts — it cannot dispatch a new provider
+ * call. That is a real node class (reduction, verification, synthesis over
+ * evidence already collected). Any node that must DISPATCH has to name its
+ * tools, because a kernel that could reach anything would be wildcard
+ * authority wearing a smaller word.
+ *
+ * Every member is proven read-class against the canonical registry below.
+ */
+export const PROJECT_DISCOVERY_KERNEL: readonly string[] = Object.freeze([
+  'recall_tool_result',
+  'tool_output_query',
+  'tool_search',
+  'workspace_artifact_query',
+]);
 
+const REGISTRY_BY_NAME = new Map(TOOL_REGISTRY.map((decl) => [decl.name, decl]));
+
+/** A tool the canonical registry classifies as a pure read. */
+export function toolIsCanonicalRead(name: string): boolean {
+  return REGISTRY_BY_NAME.get(name)?.sideEffect === 'read';
+}
+
+/** A tool the canonical registry knows about at all. */
+export function toolIsCanonicallyKnown(name: string): boolean {
+  return REGISTRY_BY_NAME.has(name);
+}
+
+/**
+ * The kernel is only usable if the registry still agrees every member is a
+ * read. Proven once at module load so a registry change that reclassifies a
+ * kernel tool breaks loudly here rather than quietly widening node authority.
+ */
+export const PROJECT_DISCOVERY_KERNEL_ERRORS: readonly string[] = Object.freeze(
+  PROJECT_DISCOVERY_KERNEL.flatMap((name) => {
+    if (!toolIsCanonicallyKnown(name)) return [`discovery kernel tool "${name}" is not in the tool registry`];
+    if (!toolIsCanonicalRead(name)) return [`discovery kernel tool "${name}" is no longer classified read-only`];
+    return [];
+  }),
+);
+
+const WILDCARD_TOOL = '*';
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+/** A planId must already be a safe slug: no transformation, no ambiguity. */
+const PLAN_ID_RE = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/;
+/** Dot/bracket path into an output. No empty segments, no traversal. */
+const DOT_PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*$/;
 
 export interface ProjectPlanValidation {
   ok: boolean;
@@ -194,10 +291,6 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-/**
- * Effect classes that reach outside this machine and therefore may never run
- * unattended on a plan's say-so.
- */
 function effectIsExternal(effect: ProjectEffectClass): boolean {
   return effect === 'external_write';
 }
@@ -207,17 +300,149 @@ export function defaultApprovalFor(effect: ProjectEffectClass): ProjectApprovalD
   return effectIsExternal(effect) ? 'required' : 'not_required';
 }
 
+/** Why this planId is unusable, or null. */
+export function planIdError(planId: unknown): string | null {
+  if (!nonEmptyString(planId)) return 'planId must be a non-empty string.';
+  const trimmed = planId.trim();
+  if (!PLAN_ID_RE.test(trimmed)) {
+    return `planId "${trimmed}" is not a safe identity; use lowercase letters, digits and inner dashes (max 48), already in slug form.`;
+  }
+  return null;
+}
+
 /**
- * Does this evidence contract actually verify something concrete?
+ * Sorted, de-duplicated copy of a set-like string list.
  *
- * Shape alone is not verification: `{required_keys: ['url']}` is satisfied by
- * `{url: ''}`. An external effect must name a handle whose real existence is
- * checked, which is exactly what `verify` is for.
+ * Deliberately does NOT coerce. An earlier version mapped entries through
+ * String(), which turned `[null]` into `["null"]` — a perfectly valid-looking
+ * dot-path — so canonicalization laundered invalid input past validation.
+ * Anything that is not already a clean list of strings is returned untouched,
+ * so the validator sees exactly what the author wrote and can reject it.
  */
-function evidenceVerifiesConcretely(evidence: ProjectEvidenceContract | undefined): boolean {
-  const verify = evidence?.verify;
-  if (!verify) return false;
-  return (verify.pathExists?.length ?? 0) > 0 || (verify.urlPresent?.length ?? 0) > 0;
+function canonicalStringSet(values: readonly unknown[]): unknown[] {
+  if (!values.every((entry) => typeof entry === 'string')) return [...values];
+  return [...new Set(values as string[])].sort();
+}
+
+/**
+ * Canonicalize every set-like field.
+ *
+ * The node list is a set keyed by id; dependencies, capability lists, and
+ * evidence path lists are all sets. `args` and `minItems` are objects, whose
+ * key order is normalized by the canonical encoder rather than here — their
+ * VALUES are author payload and are never rewritten.
+ */
+export function canonicalProjectPlan(plan: ProjectPlan): ProjectPlan {
+  const canonicalEvidence = (evidence?: ProjectEvidenceContract): ProjectEvidenceContract | undefined => {
+    if (!isPlainObject(evidence)) return evidence;
+    const next: ProjectEvidenceContract = { ...evidence };
+    if (Array.isArray(evidence.requiredKeys)) next.requiredKeys = canonicalStringSet(evidence.requiredKeys) as string[];
+    if (Array.isArray(evidence.nonEmpty)) next.nonEmpty = canonicalStringSet(evidence.nonEmpty) as string[];
+    if (isPlainObject(evidence.verify)) {
+      const verify = evidence.verify as NonNullable<ProjectEvidenceContract['verify']>;
+      next.verify = {
+        ...(Array.isArray(verify.pathExists) ? { pathExists: canonicalStringSet(verify.pathExists) as string[] } : {}),
+        ...(Array.isArray(verify.urlPresent) ? { urlPresent: canonicalStringSet(verify.urlPresent) as string[] } : {}),
+      };
+    }
+    return next;
+  };
+
+  const nodes = [...(plan.nodes ?? [])]
+    .sort((a, b) => String(a?.id ?? '').localeCompare(String(b?.id ?? '')))
+    .map((node) => {
+      if (!isPlainObject(node)) return node;
+      const next: ProjectNode = { ...node };
+      if (Array.isArray(node.dependsOn)) next.dependsOn = canonicalStringSet(node.dependsOn) as string[];
+      const executor = node.executor as ProjectExecutor | undefined;
+      if (executor && executor.kind === 'model' && Array.isArray(executor.allowedTools)) {
+        next.executor = { ...executor, allowedTools: canonicalStringSet(executor.allowedTools) as string[] };
+      }
+      const evidence = canonicalEvidence(node.evidence);
+      if (evidence !== undefined) next.evidence = evidence;
+      return next;
+    });
+  return { ...plan, nodes };
+}
+
+/** Deep validation of one evidence contract. Returns error fragments. */
+function evidenceErrors(evidence: ProjectEvidenceContract | undefined, where: string): string[] {
+  if (evidence === undefined) return [];
+  if (!isPlainObject(evidence)) return [`${where} evidence must be an object.`];
+  const errors: string[] = [];
+
+  const pathList = (values: unknown, field: string): void => {
+    if (values === undefined) return;
+    if (!Array.isArray(values) || values.length === 0) {
+      errors.push(`${where} evidence.${field} must be a non-empty array of dot-paths.`);
+      return;
+    }
+    for (const entry of values) {
+      if (!nonEmptyString(entry)) {
+        errors.push(`${where} evidence.${field} contains a non-string or empty entry.`);
+      } else if (!DOT_PATH_RE.test(entry.trim())) {
+        errors.push(`${where} evidence.${field} entry "${String(entry)}" is not a valid dot-path.`);
+      }
+    }
+  };
+
+  if (evidence.verify !== undefined && !isPlainObject(evidence.verify)) {
+    errors.push(`${where} evidence.verify must be an object.`);
+  }
+
+  pathList(evidence.requiredKeys, 'requiredKeys');
+  pathList(evidence.nonEmpty, 'nonEmpty');
+  if (isPlainObject(evidence.verify)) {
+    pathList(evidence.verify.pathExists, 'verify.pathExists');
+    pathList(evidence.verify.urlPresent, 'verify.urlPresent');
+  }
+
+  if (evidence.minItems !== undefined) {
+    if (!isPlainObject(evidence.minItems)) {
+      errors.push(`${where} evidence.minItems must be an object of dot-path → count.`);
+    } else {
+      for (const [key, count] of Object.entries(evidence.minItems)) {
+        if (!DOT_PATH_RE.test(key)) errors.push(`${where} evidence.minItems key "${key}" is not a valid dot-path.`);
+        if (!Number.isSafeInteger(count) || (count as number) < 0) {
+          errors.push(`${where} evidence.minItems["${key}"] must be a non-negative integer.`);
+        }
+      }
+    }
+  }
+  if (evidence.type !== undefined
+    && !['string', 'number', 'boolean', 'object', 'array'].includes(evidence.type as string)) {
+    errors.push(`${where} evidence.type is not a supported contract type.`);
+  }
+  return errors;
+}
+
+/** Deep validation of an external-write binding, when one is supplied. */
+function externalWriteBindingErrors(node: ProjectNode, where: string): string[] {
+  const binding = node.externalWrite;
+  if (binding === undefined) {
+    return [`${where} requests an external write without an externalWrite binding (operation, accountRef, target, argumentsDigest, planDigest, priorApprovalId, readback).`];
+  }
+  if (!isPlainObject(binding)) return [`${where} externalWrite must be an object.`];
+  const errors: string[] = [];
+  for (const field of ['operation', 'accountRef', 'target', 'argumentsDigest', 'planDigest', 'priorApprovalId'] as const) {
+    if (!nonEmptyString(binding[field])) errors.push(`${where} externalWrite.${field} is required.`);
+  }
+  for (const field of ['argumentsDigest', 'planDigest'] as const) {
+    if (nonEmptyString(binding[field]) && !/^[a-f0-9]{64}$/.test(binding[field].trim())) {
+      errors.push(`${where} externalWrite.${field} must be a sha256 digest.`);
+    }
+  }
+  if (!isPlainObject(binding.readback) || !nonEmptyString(binding.readback?.operation)) {
+    errors.push(`${where} externalWrite.readback.operation is required — a provider observation, not a local handle.`);
+  } else {
+    errors.push(...evidenceErrors(binding.readback.expect, `${where} externalWrite.readback`));
+    const expect = binding.readback.expect;
+    const provesContent = (expect?.requiredKeys?.length ?? 0) > 0 || (expect?.nonEmpty?.length ?? 0) > 0;
+    if (!provesContent) {
+      errors.push(`${where} externalWrite.readback.expect must assert content, not merely a shape or a count.`);
+    }
+  }
+  return errors;
 }
 
 /** Depth-first cycle detection over the declared dependency edges. */
@@ -253,38 +478,101 @@ function findCycle(nodes: readonly ProjectNode[]): string[] | null {
 }
 
 /**
+ * Topology invariants that keep a multi-branch project joinable and readable.
+ *
+ * These are shape rules, not domain rules: they say a project must converge,
+ * never what it must converge ON.
+ */
+function topologyErrors(nodes: readonly ProjectNode[]): string[] {
+  const errors: string[] = [];
+  const ids = nodes.map((node) => node.id);
+  const dependentsOf = new Map<string, string[]>(ids.map((id) => [id, []]));
+  for (const node of nodes) {
+    for (const dep of node.dependsOn ?? []) {
+      dependentsOf.get(dep)?.push(node.id);
+    }
+  }
+
+  // One unambiguous terminal sink. A second sink is either an orphan branch
+  // whose result nothing consumes, or two candidate answers with no rule for
+  // which one the project actually produced. A single-node project is exempt:
+  // it has nothing to converge.
+  const sinks = ids.filter((id) => (dependentsOf.get(id) ?? []).length === 0);
+  if (nodes.length > 1 && sinks.length !== 1) {
+    errors.push(
+      `Project must converge on exactly one terminal node; found ${sinks.length} (${sinks.join(', ')}). `
+      + 'Add a reducer or verification sink that consumes every open branch.',
+    );
+  }
+
+  // Static fan-out must be joined. Any node with two or more direct dependents
+  // has branched; some later node must consume two or more of those branches.
+  for (const [source, dependents] of dependentsOf) {
+    if (dependents.length < 2) continue;
+    const branchSet = new Set(dependents);
+    const joined = nodes.some((node) =>
+      (node.dependsOn ?? []).filter((dep) => branchSet.has(dep)).length >= 2);
+    if (!joined) {
+      errors.push(
+        `Fan-out from "${source}" into ${dependents.length} branches (${[...dependents].sort().join(', ')}) has no fan-in; `
+        + 'add one reducer node that depends on those branches.',
+      );
+    }
+  }
+
+  // A dynamic per-item node releases ONE aggregate. More than one direct
+  // dependent would fork per-item results into competing consumers with no
+  // defined aggregation point; zero would strand them.
+  for (const node of nodes) {
+    if (!node.fanOut) continue;
+    const dependents = dependentsOf.get(node.id) ?? [];
+    if (dependents.length !== 1) {
+      errors.push(
+        `Dynamic node "${node.id}" must release its aggregate to exactly one downstream reducer; found ${dependents.length}.`,
+      );
+    }
+  }
+
+  return errors;
+}
+
+/**
  * Validate a plan. Returns EVERY problem rather than the first, so an author
  * fixes one plan instead of discovering one error per attempt.
+ *
+ * Validation runs on the CANONICAL plan, so a caller cannot pass by presenting
+ * the same content in a different order.
  */
 export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
-  const errors: string[] = [];
+  const errors: string[] = [...PROJECT_DISCOVERY_KERNEL_ERRORS];
 
   if (!isPlainObject(plan)) {
     return { ok: false, errors: ['Project plan must be an object.'] };
   }
-  const candidate = plan as Partial<ProjectPlan>;
+  const draft = plan as Partial<ProjectPlan>;
 
-  if (!nonEmptyString(candidate.objective)) {
+  if (!nonEmptyString(draft.objective)) {
     errors.push('Project plan requires a non-empty objective.');
   }
-  if (candidate.planId !== undefined && !nonEmptyString(candidate.planId)) {
-    errors.push('Project plan planId, when present, must be a non-empty string.');
+  if (draft.planId !== undefined) {
+    const idError = planIdError(draft.planId);
+    if (idError) errors.push(idError);
   }
-  if (!Array.isArray(candidate.nodes) || candidate.nodes.length === 0) {
+  if (!Array.isArray(draft.nodes) || draft.nodes.length === 0) {
     errors.push('Project plan requires at least one node.');
     return { ok: false, errors };
   }
+  if (!draft.nodes.every((node) => isPlainObject(node))) {
+    errors.push('Every project node must be an object.');
+    return { ok: false, errors };
+  }
 
-  const nodes = candidate.nodes as ProjectNode[];
+  const nodes = canonicalProjectPlan(draft as ProjectPlan).nodes;
   const seen = new Set<string>();
 
   for (const [index, node] of nodes.entries()) {
-    const where = nonEmptyString(node?.id) ? `node "${node.id}"` : `node at index ${index}`;
+    const where = nonEmptyString(node.id) ? `node "${node.id}"` : `node at index ${index}`;
 
-    if (!isPlainObject(node)) {
-      errors.push(`${where} must be an object.`);
-      continue;
-    }
     if (!nonEmptyString(node.id) || !ID_RE.test(node.id)) {
       errors.push(`${where} needs an id of letters, digits, dashes or underscores (max 64).`);
     } else if (seen.has(node.id)) {
@@ -303,20 +591,30 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
       }
       const tools = executor.allowedTools;
       if (tools !== undefined) {
-        if (!Array.isArray(tools) || tools.some((tool) => !nonEmptyString(tool))) {
-          errors.push(`${where} allowedTools must be a list of non-empty tool names.`);
+        if (!Array.isArray(tools) || tools.length === 0 || tools.some((tool) => !nonEmptyString(tool))) {
+          errors.push(`${where} allowedTools, when present, must be a non-empty list of tool names.`);
         } else if (tools.includes(WILDCARD_TOOL)) {
           errors.push(`${where} may not request wildcard tool authority ("${WILDCARD_TOOL}").`);
+        } else {
+          for (const tool of tools) {
+            if (!toolIsCanonicallyKnown(tool)) {
+              errors.push(`${where} names unknown tool "${tool}"; a capability list must be exact.`);
+            }
+          }
         }
       }
     } else if (executor.kind === 'structured_call') {
-      // An exact call is the whole point of this executor: a templated or
-      // pattern tool name would put tool SELECTION back inside the runtime,
-      // which is what the structured lane exists to avoid.
       if (!nonEmptyString(executor.tool)) {
         errors.push(`${where} structured call requires an exact tool name.`);
       } else if (/[*{}]|\s/.test(executor.tool)) {
         errors.push(`${where} structured call tool "${executor.tool}" must be an exact name, not a pattern or template.`);
+      } else if (!toolIsCanonicallyKnown(executor.tool)) {
+        errors.push(`${where} structured call names unknown tool "${executor.tool}".`);
+      } else if (!toolIsCanonicalRead(executor.tool)) {
+        // A non-read structured call is the family that would need the prior
+        // approval binding the definition cannot carry, so it is refused at the
+        // same boundary as external_write rather than compiled hopefully.
+        errors.push(`${where} structured call "${executor.tool}" is not a canonical read; only read-class structured calls are supported.`);
       }
       if (executor.args !== undefined && !isPlainObject(executor.args)) {
         errors.push(`${where} structured call args must be an object.`);
@@ -334,17 +632,18 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
       if (approval !== undefined && approval !== 'required' && approval !== 'not_required') {
         errors.push(`${where} approval must be required or not_required.`);
       } else if (effectIsExternal(effect) && approval === 'not_required') {
-        // A plan cannot waive the human. This is the contradiction that would
-        // otherwise let a planner hand itself unattended external authority.
         errors.push(`${where} requests an external write but declares approval not_required; a plan cannot waive approval.`);
       } else if (!effectIsExternal(effect) && approval === 'required') {
-        // Equally a contradiction: there is no external boundary to approve,
-        // so the pause would be theatre and would train users to click through.
+        // No external boundary to approve: the pause would be theatre and would
+        // train users to click through the ones that matter.
         errors.push(`${where} declares approval required but its effect (${effect}) crosses no external boundary.`);
       }
 
-      if (effectIsExternal(effect) && !evidenceVerifiesConcretely(node.evidence)) {
-        errors.push(`${where} requests an external write without verification evidence; declare evidence.verify.pathExists or evidence.verify.urlPresent.`);
+      if (effectIsExternal(effect)) {
+        if (isPlainObject(executor) && (executor as { kind?: string }).kind !== 'structured_call') {
+          errors.push(`${where} requests an external write from a model executor; an external write must be an exact structured call.`);
+        }
+        errors.push(...externalWriteBindingErrors(node, where));
       }
     }
 
@@ -352,12 +651,14 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
       errors.push(`${where} approvalPreview, when present, must be a non-empty string.`);
     }
 
-    // --- budgets ------------------------------------------------------------
+    errors.push(...evidenceErrors(node.evidence, where));
+
+    // --- budgets (each node independently) ----------------------------------
     if (node.maxTurns !== undefined) {
       if (!Number.isSafeInteger(node.maxTurns) || node.maxTurns <= 0) {
         errors.push(`${where} maxTurns must be a positive integer.`);
       } else if (node.maxTurns > PROJECT_NODE_TURN_CEILING) {
-        errors.push(`${where} maxTurns ${node.maxTurns} exceeds the ${PROJECT_NODE_TURN_CEILING}-turn safety ceiling; split the work into more nodes.`);
+        errors.push(`${where} maxTurns ${node.maxTurns} exceeds the ${PROJECT_NODE_TURN_CEILING}-turn per-node ceiling; split the work into more nodes.`);
       }
     }
     if (node.retries !== undefined && (!Number.isSafeInteger(node.retries) || node.retries < 0)) {
@@ -378,20 +679,27 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
       if (!isPlainObject(node.fanOut) || !nonEmptyString(node.fanOut.fromNode)) {
         errors.push(`${where} fanOut requires a fromNode.`);
       } else if (!(node.dependsOn ?? []).includes(node.fanOut.fromNode)) {
-        // Fanning out over a node this one does not wait for would iterate a
-        // value that may not exist yet.
         errors.push(`${where} fans out from "${node.fanOut.fromNode}", which is not one of its declared dependencies.`);
       }
-      if (node.fanOut && node.fanOut.path !== undefined && !nonEmptyString(node.fanOut.path)) {
-        errors.push(`${where} fanOut path, when present, must be a non-empty dot-path.`);
+      if (isPlainObject(node.fanOut) && node.fanOut.path !== undefined) {
+        if (!nonEmptyString(node.fanOut.path)) {
+          errors.push(`${where} fanOut path, when present, must be a non-empty dot-path.`);
+        } else if (!DOT_PATH_RE.test(node.fanOut.path.trim())) {
+          errors.push(`${where} fanOut path "${node.fanOut.path}" is not a valid dot-path.`);
+        }
+      }
+      // Per-item work that mutates has no per-item approval or receipt story in
+      // this IR, so it is refused rather than silently fanned out.
+      if (node.effect !== 'read') {
+        errors.push(`${where} fans out with effect "${node.effect}"; only read-class per-item work is supported.`);
       }
     }
   }
 
   // --- graph-level ----------------------------------------------------------
-  const declared = new Set(nodes.filter((node) => nonEmptyString(node?.id)).map((node) => node.id));
+  const declared = new Set(nodes.filter((node) => nonEmptyString(node.id)).map((node) => node.id));
   for (const node of nodes) {
-    if (!nonEmptyString(node?.id)) continue;
+    if (!nonEmptyString(node.id)) continue;
     for (const dep of node.dependsOn ?? []) {
       if (nonEmptyString(dep) && !declared.has(dep)) {
         errors.push(`Node "${node.id}" depends on "${dep}", which no node declares.`);
@@ -402,8 +710,14 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
     }
   }
 
-  const cycle = findCycle(nodes.filter((node) => nonEmptyString(node?.id)));
+  const wellFormed = nodes.filter((node) => nonEmptyString(node.id));
+  const cycle = findCycle(wellFormed);
   if (cycle) errors.push(`Project plan has a dependency cycle: ${cycle.join(' -> ')}.`);
+
+  // Topology only means anything once the edges are sound.
+  const edgesSound = !cycle
+    && wellFormed.every((node) => (node.dependsOn ?? []).every((dep) => declared.has(dep)));
+  if (edgesSound) errors.push(...topologyErrors(wellFormed));
 
   return { ok: errors.length === 0, errors };
 }
@@ -411,9 +725,8 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
 /**
  * Canonical JSON: object keys sorted recursively, `undefined` dropped.
  *
- * Two plans that differ only in key order are the same plan, so they must hash
- * identically and compile identically. Array order is preserved — a list is
- * data, not formatting.
+ * Array order is preserved here; set-like arrays are already normalized by
+ * `canonicalProjectPlan` before this ever sees them.
  */
 export function canonicalPlanJson(value: unknown): string {
   const encode = (input: unknown): string => {
@@ -429,34 +742,11 @@ export function canonicalPlanJson(value: unknown): string {
 }
 
 /**
- * Normalize the SET-valued parts of a plan so two plans that mean the same
- * thing have one representation.
- *
- * A plan's node list is a set keyed by id — the topology lives in `dependsOn`,
- * not in array position, and the compiler re-orders topologically anyway. The
- * same is true of `dependsOn` itself: waiting on [a, b] and on [b, a] is the
- * same constraint. Those two are normalized.
- *
- * Nothing else is. `args`, `requiredKeys`, `nonEmpty`, and `allowedTools` are
- * left exactly as authored, because ordering there can carry meaning and
- * silently rewriting an author's payload would be a worse bug than an
- * order-sensitive hash.
- */
-export function canonicalProjectPlan(plan: ProjectPlan): ProjectPlan {
-  const nodes = [...plan.nodes]
-    .sort((a, b) => String(a?.id ?? '').localeCompare(String(b?.id ?? '')))
-    .map((node) => ({
-      ...node,
-      ...(node?.dependsOn ? { dependsOn: [...node.dependsOn].sort() } : {}),
-    }));
-  return { ...plan, nodes };
-}
-
-/**
  * Deterministic content hash of a plan's MEANING.
  *
- * Key order, node order, and dependency order never change the hash; any change
- * to ids, dependencies, executors, effects, evidence, approval, or budgets does.
+ * Key order, node order, dependency order, capability order, and evidence path
+ * order never change the hash; any change to ids, edges, executors, effects,
+ * evidence content, approval, or budgets does.
  */
 export function projectPlanHash(plan: ProjectPlan): string {
   return createHash('sha256')
@@ -468,8 +758,8 @@ export function projectPlanHash(plan: ProjectPlan): string {
  * Deterministic execution order: dependencies first, ties broken by id.
  *
  * This orders the STEP LIST for stable output. It is explicitly not a schedule:
- * the runtime graph decides readiness from edges, so three independent nodes
- * stay concurrently ready no matter where they land in this list.
+ * the runtime graph decides readiness from edges, so independent nodes stay
+ * concurrently ready no matter where they land in this list.
  */
 export function topologicalNodeOrder(nodes: readonly ProjectNode[]): ProjectNode[] {
   const byId = new Map(nodes.map((node) => [node.id, node]));
