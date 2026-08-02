@@ -1457,6 +1457,27 @@ export function reconcileAwaitingCompiledWorkflowRunBindings(): CompiledWorkflow
     blockedReadiness: 0,
     rejected: 0,
   };
+  // Recover the earlier half of the protocol first: graph admission already
+  // won durably, but no run file exists yet (process death before queueing, or
+  // a readiness block that later became healthy). This source list comes from
+  // ExecutionStore's integrity validator; no run-record bytes participate.
+  const executionStore = new ExecutionStore();
+  const unbound = executionStore.listUnboundProjectGraphSources();
+  result.rejected += unbound.rejected;
+  for (const source of unbound.sources) {
+    result.scanned += 1;
+    try {
+      const recovered = queueCompiledWorkflowRun({
+        sessionId: source.sessionId,
+        sourceUserSeq: source.sourceUserSeq,
+      });
+      if (recovered.status === 'blocked_readiness') result.blockedReadiness += 1;
+      else result.activated += 1;
+    } catch {
+      result.rejected += 1;
+    }
+  }
+
   if (!existsSync(WORKFLOW_RUNS_DIR)) return result;
 
   let files: string[];

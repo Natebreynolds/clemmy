@@ -643,6 +643,19 @@ export interface CreateOrGetExecutionForSourceResult {
   rootWorkflowReceiptId: string;
 }
 
+export interface UnboundProjectGraphSource {
+  executionId: string;
+  sessionId: string;
+  sourceUserSeq: number;
+}
+
+export interface UnboundProjectGraphSourceScan {
+  sources: UnboundProjectGraphSource[];
+  /** Active graph records whose persisted provenance failed validation. They
+   * are never returned as candidates and therefore remain non-executable. */
+  rejected: number;
+}
+
 function exactAcceptedHumanSource(sessionId: string, sourceUserSeq: number): EventRow | null {
   if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return null;
   try {
@@ -1007,6 +1020,48 @@ export class ExecutionStore {
       const execution = matches[0];
       if (execution) assertExecutionGraphAdmissionIntegrity(execution);
       return execution;
+    });
+  }
+
+  /**
+   * Find durable project admissions that have not installed their one root
+   * run yet. This is the pre-run half of crash/readiness recovery: unlike the
+   * legacy due-execution controller, it returns only exact, integrity-checked
+   * graph sources and never advances them itself.
+   */
+  listUnboundProjectGraphSources(): UnboundProjectGraphSourceScan {
+    return executionsFileLock(() => {
+      const sources: UnboundProjectGraphSource[] = [];
+      let rejected = 0;
+      for (const execution of loadExecutionsUnlocked()) {
+        if (!execution.graphAdmission) continue;
+        // Paused or terminal executions are an explicit stop boundary. A
+        // restart reconciler may not silently revive them merely because their
+        // root was never installed.
+        if (execution.status !== 'active' && execution.status !== 'blocked') continue;
+        try {
+          assertExecutionGraphAdmissionIntegrity(execution);
+        } catch {
+          rejected += 1;
+          continue;
+        }
+        if (execution.graphAdmission.rootWorkflowRunId) continue;
+        if (!Number.isSafeInteger(execution.sourceUserSeq) || (execution.sourceUserSeq ?? 0) <= 0) {
+          rejected += 1;
+          continue;
+        }
+        sources.push({
+          executionId: execution.id,
+          sessionId: execution.sessionId,
+          sourceUserSeq: execution.sourceUserSeq as number,
+        });
+      }
+      sources.sort((left, right) => (
+        left.sessionId.localeCompare(right.sessionId)
+        || left.sourceUserSeq - right.sourceUserSeq
+        || left.executionId.localeCompare(right.executionId)
+      ));
+      return { sources, rejected };
     });
   }
 

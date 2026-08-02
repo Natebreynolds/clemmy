@@ -512,6 +512,34 @@ test('compiled project binding reconciler heals an interrupted admission without
   );
 });
 
+test('compiled project binding reconciler installs an admitted root when no run directory survived', () => {
+  const seeded = seedCompiledProject({ label: 'pre-run-crash-recovery' });
+  rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+
+  assert.equal(
+    seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.graphAdmission?.rootWorkflowRunId,
+    undefined,
+  );
+  assert.deepEqual(reconcileAwaitingCompiledWorkflowRunBindings(), {
+    scanned: 1,
+    activated: 1,
+    blockedReadiness: 0,
+    rejected: 0,
+  });
+
+  const rebound = seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq);
+  assert.equal(typeof rebound?.graphAdmission?.rootWorkflowRunId, 'string');
+  const runFile = path.join(
+    WORKFLOW_RUNS_DIR,
+    `${rebound?.graphAdmission?.rootWorkflowRunId}.json`,
+  );
+  assert.equal(existsSync(runFile), true);
+  assert.equal(
+    (JSON.parse(readFileSync(runFile, 'utf-8')) as { status?: string }).status,
+    'queued',
+  );
+});
+
 test('compiled project binding reconciler never activates a parked record without store authority', () => {
   const runId = 'forged-awaiting-project-bind';
   const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);

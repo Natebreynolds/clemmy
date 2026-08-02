@@ -7259,10 +7259,28 @@ function boundedStepOutputsForRunRecord(
 let workflowDrainInFlight = false;
 
 export async function processWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
-  if (!existsSync(WORKFLOW_RUNS_DIR)) return;
   if (workflowDrainInFlight) return;
   workflowDrainInFlight = true;
   try {
+    // Finish both halves of the project queue's two-phase install before the
+    // runs-directory existence check. A graph admission can predate that
+    // directory entirely, and readiness recovery must not require the user to
+    // replay their original message. Every recovery re-enters the ordinary
+    // queue contract, so malformed/conflicting bytes remain non-executable.
+    const projectBindings = reconcileAwaitingCompiledWorkflowRunBindings();
+    if (projectBindings.activated > 0) {
+      logger.info(
+        { projectBindings },
+        'Recovered compiled project run bindings after an interrupted admission',
+      );
+    }
+    if (projectBindings.rejected > 0) {
+      logger.warn(
+        { projectBindings },
+        'Compiled project binding recovery left invalid records fail-closed',
+      );
+    }
+    if (!existsSync(WORKFLOW_RUNS_DIR)) return;
     await drainWorkflowRuns(assistant);
   } finally {
     workflowDrainInFlight = false;
@@ -8009,23 +8027,6 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
 }
 
 async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
-  // Finish the project queue's two-phase install before selecting runnable
-  // records. Recovery re-enters queueCompiledWorkflowRun, so only the exact
-  // immutable ExecutionStore winner can move out of awaiting_project_bind;
-  // forged/conflicting bytes stay deliberately invisible to this drain.
-  const projectBindings = reconcileAwaitingCompiledWorkflowRunBindings();
-  if (projectBindings.activated > 0) {
-    logger.info(
-      { projectBindings },
-      'Recovered compiled project run bindings after an interrupted admission',
-    );
-  }
-  if (projectBindings.rejected > 0) {
-    logger.warn(
-      { projectBindings },
-      'Compiled project binding recovery left invalid records fail-closed',
-    );
-  }
   const workflows = listWorkflows();
   const eligible: WorkflowDrainCandidate[] = [];
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
