@@ -1425,6 +1425,91 @@ export function queueCompiledWorkflowRun(
   };
 }
 
+export interface CompiledWorkflowBindingReconciliation {
+  /** Records observed in the deliberately non-executable install state. */
+  scanned: number;
+  /** Exact first-winner contracts that were bound and made runnable. */
+  activated: number;
+  /** Valid contracts that remain closed only because capability readiness is blocked. */
+  blockedReadiness: number;
+  /** Malformed, forged, or conflicting records left closed for operator review. */
+  rejected: number;
+}
+
+/**
+ * Close the only crash window in compiled-project admission.
+ *
+ * A project run is installed as `awaiting_project_bind`, then its immutable
+ * source receipt is bound in ExecutionStore, and only then is the same record
+ * activated. A process death between those writes must not require the user to
+ * repeat their message. This scan re-enters the normal queue admission path,
+ * which reloads the persisted first winner and revalidates every contract byte;
+ * it never trusts the parked record to grant itself authority.
+ *
+ * Invalid records stay in the non-drainable state. The caller receives counts
+ * for operational telemetry, but no recovery branch weakens the queue's normal
+ * source, receipt, catalog-collision, readiness, or definition checks.
+ */
+export function reconcileAwaitingCompiledWorkflowRunBindings(): CompiledWorkflowBindingReconciliation {
+  const result: CompiledWorkflowBindingReconciliation = {
+    scanned: 0,
+    activated: 0,
+    blockedReadiness: 0,
+    rejected: 0,
+  };
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return result;
+
+  let files: string[];
+  try {
+    files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'));
+  } catch {
+    return result;
+  }
+
+  for (const file of files) {
+    const filePath = path.join(WORKFLOW_RUNS_DIR, file);
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+    } catch {
+      // An unreadable record cannot prove that it belongs to this protocol.
+      // The ordinary runner also refuses it; leave it untouched.
+      continue;
+    }
+    if (record.status !== 'awaiting_project_bind') continue;
+    result.scanned += 1;
+
+    const sessionId = normalizedOptionalString(record.originSessionId);
+    const sourceUserSeq = record.sourceUserSeq;
+    if (
+      record.source !== 'project_graph'
+      || !sessionId
+      || !Number.isSafeInteger(sourceUserSeq)
+      || (sourceUserSeq as number) <= 0
+    ) {
+      result.rejected += 1;
+      continue;
+    }
+
+    try {
+      const recovered = queueCompiledWorkflowRun({
+        sessionId,
+        sourceUserSeq: sourceUserSeq as number,
+      });
+      if (recovered.status === 'blocked_readiness') {
+        result.blockedReadiness += 1;
+        continue;
+      }
+      const current = JSON.parse(readFileSync(filePath, 'utf-8')) as { status?: unknown };
+      if (current.status === 'awaiting_project_bind') result.rejected += 1;
+      else result.activated += 1;
+    } catch {
+      result.rejected += 1;
+    }
+  }
+  return result;
+}
+
 export function queueWorkflowRun(
   name: string,
   normalizedInputs: Record<string, string>,

@@ -21,6 +21,7 @@ process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 
 const {
   queueCompiledWorkflowRun,
+  reconcileAwaitingCompiledWorkflowRunBindings,
   queueWorkflowRun,
   queueWorkflowDryRun,
   resumeWorkflowRun,
@@ -475,6 +476,63 @@ test('queueCompiledWorkflowRun: recovers the crash window between run install, r
   assert.equal(
     seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.graphAdmission?.rootWorkflowRunId,
     queued.id,
+  );
+});
+
+test('compiled project binding reconciler heals an interrupted admission without a user-request replay', () => {
+  const seeded = seedCompiledProject({ label: 'boot-binding-recovery' });
+  const queued = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`);
+  const record = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(runFile, JSON.stringify({ ...record, status: 'awaiting_project_bind' }), 'utf-8');
+
+  const executionsFile = path.join(TMP_HOME, 'state', 'executions.json');
+  const executions = JSON.parse(readFileSync(executionsFile, 'utf-8')) as Array<Record<string, any>>;
+  const sourceExecution = executions.find((entry) => entry.id === seeded.admitted.execution.id)!;
+  delete sourceExecution.graphAdmission.rootWorkflowRunId;
+  sourceExecution.workflowBindings = [];
+  writeFileSync(executionsFile, JSON.stringify(executions, null, 2), 'utf-8');
+
+  assert.deepEqual(reconcileAwaitingCompiledWorkflowRunBindings(), {
+    scanned: 1,
+    activated: 1,
+    blockedReadiness: 0,
+    rejected: 0,
+  });
+  assert.equal(
+    (JSON.parse(readFileSync(runFile, 'utf-8')) as { status?: string }).status,
+    'queued',
+  );
+  assert.equal(
+    seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.graphAdmission?.rootWorkflowRunId,
+    queued.id,
+  );
+});
+
+test('compiled project binding reconciler never activates a parked record without store authority', () => {
+  const runId = 'forged-awaiting-project-bind';
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(runFile, JSON.stringify({
+    id: runId,
+    status: 'awaiting_project_bind',
+    source: 'project_graph',
+    originSessionId: 'no-admitted-source',
+    sourceUserSeq: 999_999,
+  }), 'utf-8');
+
+  assert.deepEqual(reconcileAwaitingCompiledWorkflowRunBindings(), {
+    scanned: 1,
+    activated: 0,
+    blockedReadiness: 0,
+    rejected: 1,
+  });
+  assert.equal(
+    (JSON.parse(readFileSync(runFile, 'utf-8')) as { status?: string }).status,
+    'awaiting_project_bind',
   );
 });
 

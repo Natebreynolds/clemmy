@@ -136,6 +136,7 @@ import {
 import {
   compiledWorkflowRunContractHash,
   readWorkflowRunOriginSessionIds,
+  reconcileAwaitingCompiledWorkflowRunBindings,
   requeueWorkflowFromRun,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
 } from '../tools/workflow-run-queue.js';
@@ -8008,6 +8009,23 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
 }
 
 async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
+  // Finish the project queue's two-phase install before selecting runnable
+  // records. Recovery re-enters queueCompiledWorkflowRun, so only the exact
+  // immutable ExecutionStore winner can move out of awaiting_project_bind;
+  // forged/conflicting bytes stay deliberately invisible to this drain.
+  const projectBindings = reconcileAwaitingCompiledWorkflowRunBindings();
+  if (projectBindings.activated > 0) {
+    logger.info(
+      { projectBindings },
+      'Recovered compiled project run bindings after an interrupted admission',
+    );
+  }
+  if (projectBindings.rejected > 0) {
+    logger.warn(
+      { projectBindings },
+      'Compiled project binding recovery left invalid records fail-closed',
+    );
+  }
   const workflows = listWorkflows();
   const eligible: WorkflowDrainCandidate[] = [];
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
