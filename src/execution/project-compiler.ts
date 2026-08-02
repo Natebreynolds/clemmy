@@ -57,7 +57,7 @@ import {
   projectPlanHash,
   topologicalNodeOrder,
   validateProjectPlan,
-  PROJECT_DISCOVERY_KERNEL,
+  PROJECT_STRUCTURAL_TOOLS,
   PROJECT_NODE_DEFAULT_MAX_TURNS,
   PROJECT_NODE_TURN_CEILING,
   type ProjectEffectClass,
@@ -148,14 +148,17 @@ function forEachExpression(node: ProjectNode): string | undefined {
  * new provider call.
  */
 function allowedToolsFor(node: ProjectNode): string[] {
-  if (node.executor.kind === 'model' && node.executor.allowedTools?.length) {
-    return [...node.executor.allowedTools];
-  }
-  if (node.executor.kind === 'structured_call') {
-    // The step's authority is exactly the one tool it calls.
-    return [node.executor.tool];
-  }
-  return [...PROJECT_DISCOVERY_KERNEL];
+  // The structural channels are always present. The runtime already permits
+  // them for every step, but a compiled project node's allowedTools is ALSO its
+  // auto-approval scope, so leaving them implicit would give a step a tool it
+  // may use yet must stop to approve — and would leave a node that authored no
+  // tools with an empty list, which downstream reads as legacy wildcard
+  // authority rather than as "nothing".
+  const authored = node.executor.kind === 'structured_call'
+    // A structured call's work authority is exactly the one tool it invokes.
+    ? [node.executor.tool]
+    : (node.executor.allowedTools ?? []);
+  return [...new Set([...PROJECT_STRUCTURAL_TOOLS, ...authored])].sort();
 }
 
 function compileNode(node: ProjectNode): WorkflowStepInput {
@@ -196,6 +199,9 @@ function compileNode(node: ProjectNode): WorkflowStepInput {
   }
 
   if (node.retries !== undefined) step.retryBudget = node.retries;
+  // A scheduling hint only — it travels with the step so the topology survives
+  // restart, and grants nothing.
+  if (node.executionRole !== undefined) step.executionRole = node.executionRole;
 
   return step;
 }

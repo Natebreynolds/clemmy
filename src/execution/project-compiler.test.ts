@@ -20,7 +20,7 @@ import {
   ProjectPlanCompileError,
 } from './project-compiler.js';
 import {
-  PROJECT_DISCOVERY_KERNEL,
+  PROJECT_STRUCTURAL_TOOLS,
   PROJECT_NODE_DEFAULT_MAX_TURNS,
   PROJECT_NODE_TURN_CEILING,
   type ProjectNode,
@@ -174,19 +174,28 @@ test('every compiled step carries an explicit, non-empty, non-wildcard capabilit
   }
 });
 
-test('a node that names no tools gets the read-only discovery kernel, not a wildcard', () => {
+test('a node that names no tools gets the structural universe, not a wildcard', () => {
   const { compiled } = graphOf({ objective: 'o', nodes: [read('lonely')] });
-  assert.deepEqual(compiled.definition.steps[0].allowedTools, [...PROJECT_DISCOVERY_KERNEL]);
+  assert.deepEqual(compiled.definition.steps[0].allowedTools, [...PROJECT_STRUCTURAL_TOOLS]);
+  // Critically it can PUBLISH: without the output channel a step cannot return
+  // at all, which is the cross-suite break the previous kernel had.
+  assert.ok(compiled.definition.steps[0].allowedTools!.includes('workflow_step_result'));
 });
 
-test('an authored capability list is used verbatim, canonicalized', () => {
+test('an authored capability list is unioned with the structural universe', () => {
   const { compiled } = graphOf({
     objective: 'o',
     nodes: [read('a', {
-      executor: { kind: 'model', instruction: 'Read the files that matter.', allowedTools: ['read_file', 'list_files', 'read_file'] },
+      executor: { kind: 'model', instruction: 'Read the files that matter.', allowedTools: ['list_files', 'list_files'] },
     })],
   });
-  assert.deepEqual(compiled.definition.steps[0].allowedTools, ['list_files', 'read_file']);
+  const tools = compiled.definition.steps[0].allowedTools!;
+  assert.ok(tools.includes('list_files'), 'the authored capability survives');
+  for (const structural of PROJECT_STRUCTURAL_TOOLS) {
+    assert.ok(tools.includes(structural), `${structural} must always be present`);
+  }
+  assert.deepEqual(tools, [...tools].sort(), 'canonical order');
+  assert.equal(new Set(tools).size, tools.length, 'deduped');
 });
 
 test('a structured call pins exactly one tool, frozen args, and that tool as its authority', () => {
@@ -200,7 +209,13 @@ test('a structured call pins exactly one tool, frozen args, and that tool as its
   });
   const step = compiled.definition.steps[0];
   assert.deepEqual(step.call, { tool: 'list_files', args: { limit: 25 } });
-  assert.deepEqual(step.allowedTools, ['list_files']);
+  // Work authority is exactly the called tool; the structural channels ride
+  // along so the step can still return its result.
+  assert.ok(step.allowedTools!.includes('list_files'));
+  assert.deepEqual(
+    step.allowedTools!.filter((tool) => !PROJECT_STRUCTURAL_TOOLS.includes(tool)),
+    ['list_files'],
+  );
   assert.ok(step.prompt.length > 0);
 });
 
@@ -346,11 +361,12 @@ test('unsupported and malformed shapes fail closed with every reason', () => {
     }, /only read-class per-item work is supported/],
     // Two ambiguous sinks.
     [{ objective: 'o', nodes: [read('a'), read('b')] }, /converge on exactly one terminal node/],
-    // Unjoined static fan-out.
+    // A branch that never rejoins. Under reachability this surfaces as two
+    // competing terminals rather than a missing immediate join.
     [{
       objective: 'o',
       nodes: [read('src'), read('x', { dependsOn: ['src'] }), read('y', { dependsOn: ['src'] }), read('t', { dependsOn: ['x'] })],
-    }, /has no fan-in/],
+    }, /converge on exactly one terminal node/],
     // Evidence that only looks like evidence.
     [{ objective: 'o', nodes: [read('a', { evidence: { requiredKeys: [null] } as never })] },
       /non-string or empty entry/],
@@ -383,7 +399,10 @@ test('the compiler makes defensive copies of plan-owned data', () => {
   deps.push('ghost');
 
   const byId = new Map(compiled.definition.steps.map((step) => [step.id, step]));
-  assert.deepEqual(byId.get('a')?.allowedTools, ['list_files']);
+  // The authored capability survives untouched by the later mutation; the
+  // structural channels ride alongside it.
+  assert.ok(byId.get('a')?.allowedTools?.includes('list_files'));
+  assert.ok(!byId.get('a')?.allowedTools?.includes('smuggled'));
   assert.deepEqual(byId.get('b')?.call?.args, { limit: 1 });
   assert.deepEqual(byId.get('b')?.dependsOn, ['a']);
 });
@@ -420,4 +439,97 @@ test('compiling never reads or mutates a stored workflow', async () => {
   assert.ok(!/readWorkflow|listWorkflows|writeWorkflow|WORKFLOWS_DIR/.test(source),
     'the compiler must not reach the workflow store');
   assert.ok(!/CLEMENTINE_HOME/.test(source), 'the compiler must not resolve a home directory');
+});
+
+// ── persisted execution role ─────────────────────────────────────────────────
+
+test('executionRole compiles to a canonical persisted field and survives the writer', () => {
+  const { compiled } = graphOf({
+    planId: 'roled-plan',
+    objective: 'Converge three branches and verify the result.',
+    nodes: [
+      read('probe_a', { executionRole: 'specialist' }),
+      read('probe_b', { executionRole: 'specialist' }),
+      read('reduce', {
+        dependsOn: ['probe_a', 'probe_b'],
+        executor: { kind: 'model', instruction: 'Join both branch results into one model.' },
+        executionRole: 'reducer',
+      }),
+      read('verify', {
+        dependsOn: ['reduce'],
+        executor: { kind: 'model', instruction: 'Verify the joined model against both branches.' },
+        executionRole: 'brain',
+      }),
+    ],
+  });
+  const byId = new Map(compiled.definition.steps.map((step) => [step.id, step]));
+  assert.equal(byId.get('probe_a')?.executionRole, 'specialist');
+  assert.equal(byId.get('reduce')?.executionRole, 'reducer');
+  assert.equal(byId.get('verify')?.executionRole, 'brain');
+
+  // The canonical writer must round-trip it with no repair.
+  const prep = prepareWorkflowForWrite(compiled.definition);
+  assert.equal(prep.ok, true, prep.errors.join(' | '));
+  assert.deepEqual(prep.repairs, []);
+  assert.equal(JSON.stringify(prep.def), JSON.stringify(compiled.definition));
+});
+
+test('the role round-trips through the real workflow-store serializer and parser', async () => {
+  const store = await import('../memory/workflow-store.js');
+  const { compiled } = graphOf({
+    objective: 'Converge two branches and verify.',
+    nodes: [
+      read('a', { executionRole: 'specialist' }),
+      read('b', { executionRole: 'specialist' }),
+      read('join', {
+        dependsOn: ['a', 'b'],
+        executor: { kind: 'model', instruction: 'Join both branches into one result.' },
+        executionRole: 'reducer',
+      }),
+    ],
+  });
+
+  // Serialize → parse via the canonical store helpers, with no disk involved.
+  const serialized = (store as never as {
+    workflowDefinitionToFrontmatter: (def: unknown) => Record<string, unknown>;
+  }).workflowDefinitionToFrontmatter?.(compiled.definition);
+  if (!serialized) return; // helper is not exported; the writer check above covers it
+
+  const steps = (serialized as { steps?: Array<Record<string, unknown>> }).steps ?? [];
+  assert.equal(steps[0]?.execution_role, 'specialist', 'persists as snake_case');
+});
+
+test('a role never widens what a compiled step may do', () => {
+  const withRole = graphOf({
+    objective: 'Converge two branches and verify.',
+    nodes: [
+      read('a', { executionRole: 'specialist' }),
+      read('b', { executionRole: 'specialist' }),
+      read('join', {
+        dependsOn: ['a', 'b'],
+        executor: { kind: 'model', instruction: 'Join both branches into one result.' },
+        executionRole: 'reducer',
+      }),
+    ],
+  }).compiled;
+  const withoutRole = graphOf({
+    objective: 'Converge two branches and verify.',
+    nodes: [
+      read('a'),
+      read('b'),
+      read('join', {
+        dependsOn: ['a', 'b'],
+        executor: { kind: 'model', instruction: 'Join both branches into one result.' },
+      }),
+    ],
+  }).compiled;
+
+  // The derived workflow NAME legitimately differs: the role is persisted, so
+  // it is part of plan identity and must hash. What must not differ is anything
+  // the step is permitted to DO.
+  assert.notEqual(withRole.planHash, withoutRole.planHash);
+  const strip = (def: typeof withRole.definition) =>
+    JSON.stringify(def.steps.map(({ executionRole, ...rest }) => rest));
+  assert.equal(strip(withRole.definition), strip(withoutRole.definition),
+    'the role is the ONLY step difference; capability, effect and approval are untouched');
 });

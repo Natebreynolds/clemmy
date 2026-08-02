@@ -409,3 +409,82 @@ test('origin: dev round-trips and workflowOrigin classifies smoke names without 
   assert.equal(workflowOrigin({ name: 'devsmoke-chain' }), 'dev');
   assert.equal(workflowOrigin({ name: 'daily-standup-email' }), 'user');
 });
+
+// ── compiled-project execution role ──────────────────────────────────────────
+// A compiled project's topology must survive restart exactly as planned, so the
+// role is persisted. It is a scheduling / model-profile hint ONLY: capability
+// stays in allowedTools and effect in sideEffect, both untouched here.
+
+test('executionRole survives the YAML round-trip and persists as snake_case', () => {
+  writeWorkflow('role-round-trip', {
+    name: 'role-round-trip',
+    description: 'Converge two branches and verify the result.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'a', prompt: 'Collect the first branch of evidence.', sideEffect: 'read', executionRole: 'specialist' },
+      { id: 'b', prompt: 'Collect the second branch of evidence.', sideEffect: 'read', executionRole: 'specialist' },
+      { id: 'join', prompt: 'Join both branches into one result.', dependsOn: ['a', 'b'], sideEffect: 'read', executionRole: 'reducer' },
+      { id: 'verify', prompt: 'Verify the joined result against both branches.', dependsOn: ['join'], sideEffect: 'read', executionRole: 'brain' },
+    ],
+  });
+
+  const back = readWorkflow('role-round-trip')!;
+  assert.ok(back);
+  const byId = new Map(back.data.steps.map((step) => [step.id, step]));
+  assert.equal(byId.get('a')?.executionRole, 'specialist');
+  assert.equal(byId.get('join')?.executionRole, 'reducer');
+  assert.equal(byId.get('verify')?.executionRole, 'brain');
+
+  // Persisted form is snake_case, matching side_effect beside it.
+  const raw = readFileSync(path.join(WORKFLOWS_DIR, 'role-round-trip', 'SKILL.md'), 'utf-8');
+  assert.match(raw, /execution_role: specialist/);
+  assert.match(raw, /execution_role: reducer/);
+  assert.match(raw, /execution_role: brain/);
+});
+
+test('a hand-authored snake_case role is accepted; an unknown role is dropped, not guessed', () => {
+  const dir = path.join(WORKFLOWS_DIR, 'role-hand-authored');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'SKILL.md'), [
+    '---',
+    'name: role-hand-authored',
+    'description: Hand-authored roles.',
+    'enabled: true',
+    'trigger:',
+    '  manual: true',
+    'steps:',
+    '  - id: a',
+    '    prompt: Collect the first branch of evidence.',
+    '    execution_role: specialist',
+    '  - id: b',
+    '    prompt: Collect the second branch of evidence.',
+    '    execution_role: wizard',
+    '---',
+    '',
+  ].join('\n'), 'utf-8');
+
+  const back = readWorkflow('role-hand-authored')!;
+  const byId = new Map(back.data.steps.map((step) => [step.id, step]));
+  assert.equal(byId.get('a')?.executionRole, 'specialist');
+  // An unrecognized role would silently change which model profile a node runs
+  // under, so it is dropped rather than passed through.
+  assert.equal(byId.get('b')?.executionRole, undefined);
+});
+
+test('a role never implies capability or effect', () => {
+  writeWorkflow('role-grants-nothing', {
+    name: 'role-grants-nothing',
+    description: 'A roled step grants nothing extra.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'only', prompt: 'Do the one bounded thing this step exists for.', sideEffect: 'read', executionRole: 'brain' },
+    ],
+  });
+  const step = readWorkflow('role-grants-nothing')!.data.steps[0];
+  assert.equal(step.executionRole, 'brain');
+  assert.equal(step.allowedTools, undefined, 'a role adds no capability');
+  assert.equal(step.requiresApproval, undefined, 'a role adds no approval');
+  assert.equal(step.sideEffect, 'read', 'a role does not change effect class');
+});

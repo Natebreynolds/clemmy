@@ -61,6 +61,23 @@ export type ProjectApprovalDisposition = 'not_required' | 'required';
 export type ProjectContractType = 'string' | 'number' | 'boolean' | 'object' | 'array';
 
 /**
+ * The shape a node occupies in the project, as a scheduling / model-profile
+ * hint.
+ *
+ * `specialist` is one branch of a fan-out; `reducer` converges two or more
+ * branches; `brain` is the terminal verification or synthesis node.
+ *
+ * A role grants NOTHING. It carries no tool, no mutation authority, and no
+ * approval — capability lives in `allowedTools` and effect in `effect`, both
+ * validated independently. Keeping the role on its own axis is what stops it
+ * becoming a back door: "this is a brain node, therefore it may reach more"
+ * is exactly the inference this type must never license.
+ *
+ * Roles are DECLARED by the planner and never inferred from prompt wording.
+ */
+export type ProjectExecutionRole = 'specialist' | 'reducer' | 'brain';
+
+/**
  * What this node must be able to SHOW for its result to count.
  *
  * Validated deeply, because a contract is only worth the strictness of its
@@ -194,6 +211,8 @@ export interface ProjectNode {
   retries?: number;
   /** Model turns THIS node may spend. Per node, never a project horizon. */
   maxTurns?: number;
+  /** Scheduling / model-profile hint. Grants no authority; see the type. */
+  executionRole?: ProjectExecutionRole;
   fanOut?: ProjectFanOut;
 }
 
@@ -228,23 +247,43 @@ export const PROJECT_NODE_TURN_CEILING = 64;
 export const PROJECT_NODE_DEFAULT_MAX_TURNS = 8;
 
 /**
- * Read-only capability kernel for a model node that names no tools.
+ * The structural capability universe every workflow step already has.
  *
- * A node given only this can look up what exists, re-read a clipped tool
- * output, and page its upstream artifacts — it cannot dispatch a new provider
- * call. That is a real node class (reduction, verification, synthesis over
- * evidence already collected). Any node that must DISPATCH has to name its
- * tools, because a kernel that could reach anything would be wildcard
- * authority wearing a smaller word.
+ * These are the channels the runtime allows for EVERY step regardless of its
+ * lock (`makeStepToolAllow`): the output channel a step needs to return at all,
+ * the report channel, and the recall/artifact readers. They are declared here
+ * rather than imported because this module is deliberately dependency-light —
+ * importing the step-agent module pulls the whole agent/SDK graph in and closes
+ * an import cycle. `project-plan-ir.test.ts` asserts this list equals
+ * `STEP_STRUCTURAL_BASELINE_TOOLS` exactly, so drift breaks loudly instead of
+ * silently narrowing or widening what a compiled node may do.
  *
- * Every member is proven read-class against the canonical registry below.
+ * The compiler unions this into every node's list rather than relying on the
+ * implicit allowance, because a compiled project node's `allowedTools` is also
+ * its auto-approval scope — leaving the channels implicit would hand a step a
+ * tool it may use but must still stop to approve, and would leave a node with
+ * no authored tools holding an EMPTY list, which downstream reads as legacy
+ * wildcard authority rather than as "nothing".
+ *
+ * `workflow_step_result` is intentionally not a catalog tool: it is a
+ * per-step structural channel, so registry membership is not required of it.
+ * What IS required is that no member is a mutating catalog tool.
  */
-export const PROJECT_DISCOVERY_KERNEL: readonly string[] = Object.freeze([
+export const PROJECT_STRUCTURAL_TOOLS: readonly string[] = Object.freeze([
+  'notify_user',
+  'read_file',
   'recall_tool_result',
   'tool_output_query',
-  'tool_search',
+  'workflow_step_result',
   'workspace_artifact_query',
 ]);
+
+/**
+ * A node that authors no tools receives exactly the structural set: it can
+ * reason, read back its upstream artifacts, and publish a result — but cannot
+ * dispatch a new provider call.
+ */
+export const PROJECT_DISCOVERY_KERNEL = PROJECT_STRUCTURAL_TOOLS;
 
 const REGISTRY_BY_NAME = new Map(TOOL_REGISTRY.map((decl) => [decl.name, decl]));
 
@@ -264,9 +303,14 @@ export function toolIsCanonicallyKnown(name: string): boolean {
  * kernel tool breaks loudly here rather than quietly widening node authority.
  */
 export const PROJECT_DISCOVERY_KERNEL_ERRORS: readonly string[] = Object.freeze(
-  PROJECT_DISCOVERY_KERNEL.flatMap((name) => {
-    if (!toolIsCanonicallyKnown(name)) return [`discovery kernel tool "${name}" is not in the tool registry`];
-    if (!toolIsCanonicalRead(name)) return [`discovery kernel tool "${name}" is no longer classified read-only`];
+  PROJECT_STRUCTURAL_TOOLS.flatMap((name) => {
+    // A structural channel need not be a catalog tool (workflow_step_result is
+    // registered per step). But if the registry DOES know it, it must still be
+    // read-class — that is the check that stops a reclassification quietly
+    // handing every compiled node a mutating capability.
+    if (toolIsCanonicallyKnown(name) && !toolIsCanonicalRead(name)) {
+      return [`structural tool "${name}" is no longer classified read-only`];
+    }
     return [];
   }),
 );
@@ -478,10 +522,20 @@ function findCycle(nodes: readonly ProjectNode[]): string[] | null {
 }
 
 /**
- * Topology invariants that keep a multi-branch project joinable and readable.
+ * Topology invariants, expressed as REACHABILITY rather than adjacency.
  *
- * These are shape rules, not domain rules: they say a project must converge,
- * never what it must converge ON.
+ * The previous version demanded that an immediate child join every sibling,
+ * which is a template, not an invariant: it rejected perfectly sound graphs
+ * that converge further downstream (a → {b,c} → {d,e} → f). What actually
+ * matters is that the project has ONE answer and that no work is stranded —
+ * both of which are reachability questions:
+ *
+ *   - exactly one terminal sink, and
+ *   - every node can reach it.
+ *
+ * That is deliberately weaker than the old rule and strictly more correct. It
+ * still rejects an orphan branch (its own sink) and two competing answers, and
+ * it never prescribes a shape.
  */
 function topologyErrors(nodes: readonly ProjectNode[]): string[] {
   const errors: string[] = [];
@@ -493,43 +547,95 @@ function topologyErrors(nodes: readonly ProjectNode[]): string[] {
     }
   }
 
-  // One unambiguous terminal sink. A second sink is either an orphan branch
-  // whose result nothing consumes, or two candidate answers with no rule for
-  // which one the project actually produced. A single-node project is exempt:
-  // it has nothing to converge.
   const sinks = ids.filter((id) => (dependentsOf.get(id) ?? []).length === 0);
   if (nodes.length > 1 && sinks.length !== 1) {
     errors.push(
-      `Project must converge on exactly one terminal node; found ${sinks.length} (${sinks.join(', ')}). `
-      + 'Add a reducer or verification sink that consumes every open branch.',
+      `Project must converge on exactly one terminal node; found ${sinks.length} (${[...sinks].sort().join(', ')}). `
+      + 'Add a reducer or verification sink that every open branch reaches.',
     );
+    return errors;
   }
 
-  // Static fan-out must be joined. Any node with two or more direct dependents
-  // has branched; some later node must consume two or more of those branches.
-  for (const [source, dependents] of dependentsOf) {
-    if (dependents.length < 2) continue;
-    const branchSet = new Set(dependents);
-    const joined = nodes.some((node) =>
-      (node.dependsOn ?? []).filter((dep) => branchSet.has(dep)).length >= 2);
-    if (!joined) {
+  const sink = sinks[0];
+  if (nodes.length > 1 && sink) {
+    // Forward reachability from every node to the single sink. A node that
+    // cannot reach it is stranded work, whatever its depth.
+    const reachesSink = new Set<string>([sink]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const node of nodes) {
+        if (reachesSink.has(node.id)) continue;
+        if ((dependentsOf.get(node.id) ?? []).some((child) => reachesSink.has(child))) {
+          reachesSink.add(node.id);
+          grew = true;
+        }
+      }
+    }
+    const stranded = ids.filter((id) => !reachesSink.has(id)).sort();
+    if (stranded.length > 0) {
       errors.push(
-        `Fan-out from "${source}" into ${dependents.length} branches (${[...dependents].sort().join(', ')}) has no fan-in; `
-        + 'add one reducer node that depends on those branches.',
+        `Nodes ${stranded.join(', ')} never reach the terminal node "${sink}"; `
+        + 'every branch must feed the project\'s single result.',
       );
     }
   }
 
-  // A dynamic per-item node releases ONE aggregate. More than one direct
-  // dependent would fork per-item results into competing consumers with no
-  // defined aggregation point; zero would strand them.
+  return errors;
+}
+
+/**
+ * Execution-role invariants.
+ *
+ * A role is a hint, so these check only that the hint is STRUCTURALLY honest —
+ * a node calling itself a reducer that joins nothing would mislead whatever
+ * picks a model profile for it.
+ */
+function executionRoleErrors(nodes: readonly ProjectNode[]): string[] {
+  const errors: string[] = [];
+  const ids = nodes.map((node) => node.id);
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const dependentsOf = new Map<string, string[]>(ids.map((id) => [id, []]));
   for (const node of nodes) {
-    if (!node.fanOut) continue;
-    const dependents = dependentsOf.get(node.id) ?? [];
-    if (dependents.length !== 1) {
-      errors.push(
-        `Dynamic node "${node.id}" must release its aggregate to exactly one downstream reducer; found ${dependents.length}.`,
-      );
+    for (const dep of node.dependsOn ?? []) dependentsOf.get(dep)?.push(node.id);
+  }
+
+  /** Every node forward-reachable from `from`, excluding itself. */
+  const descendantsOf = (from: string): Set<string> => {
+    const seen = new Set<string>();
+    const queue = [...(dependentsOf.get(from) ?? [])];
+    while (queue.length > 0) {
+      const next = queue.shift()!;
+      if (seen.has(next)) continue;
+      seen.add(next);
+      queue.push(...(dependentsOf.get(next) ?? []));
+    }
+    return seen;
+  };
+
+  for (const node of nodes) {
+    const role = node.executionRole;
+    if (role === undefined) continue;
+    if (role !== 'specialist' && role !== 'reducer' && role !== 'brain') {
+      errors.push(`node "${node.id}" executionRole must be specialist, reducer, or brain.`);
+      continue;
+    }
+    const where = `node "${node.id}"`;
+
+    if (role === 'specialist') {
+      const dependents = dependentsOf.get(node.id) ?? [];
+      if (dependents.length === 0) {
+        errors.push(`${where} is a specialist but is terminal; a specialist is one branch, not the answer.`);
+      } else if (![...descendantsOf(node.id)].some((id) => byId.get(id)?.executionRole === 'reducer')) {
+        errors.push(`${where} is a specialist but reaches no reducer; a branch must be joined by one.`);
+      }
+    }
+
+    if (role === 'reducer') {
+      const upstream = (node.dependsOn ?? []).length;
+      if (upstream < 2) {
+        errors.push(`${where} is a reducer but converges ${upstream} upstream branch(es); a reducer joins at least two.`);
+      }
     }
   }
 
@@ -664,6 +770,10 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
     if (node.retries !== undefined && (!Number.isSafeInteger(node.retries) || node.retries < 0)) {
       errors.push(`${where} retries must be a non-negative integer.`);
     }
+    if (node.executionRole !== undefined
+      && !['specialist', 'reducer', 'brain'].includes(node.executionRole as string)) {
+      errors.push(`${where} executionRole must be specialist, reducer, or brain.`);
+    }
 
     // --- dependencies -------------------------------------------------------
     if (node.dependsOn !== undefined) {
@@ -688,8 +798,10 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
           errors.push(`${where} fanOut path "${node.fanOut.path}" is not a valid dot-path.`);
         }
       }
-      // Per-item work that mutates has no per-item approval or receipt story in
-      // this IR, so it is refused rather than silently fanned out.
+      // A dynamic aggregate is an ordinary node output: how many consumers it
+      // has is a reachability question, handled by topologyErrors. Per-item
+      // work that MUTATES is different — it has no per-item approval or receipt
+      // story in this IR, so it is refused rather than silently fanned out.
       if (node.effect !== 'read') {
         errors.push(`${where} fans out with effect "${node.effect}"; only read-class per-item work is supported.`);
       }
@@ -717,7 +829,10 @@ export function validateProjectPlan(plan: unknown): ProjectPlanValidation {
   // Topology only means anything once the edges are sound.
   const edgesSound = !cycle
     && wellFormed.every((node) => (node.dependsOn ?? []).every((dep) => declared.has(dep)));
-  if (edgesSound) errors.push(...topologyErrors(wellFormed));
+  if (edgesSound) {
+    errors.push(...topologyErrors(wellFormed));
+    errors.push(...executionRoleErrors(wellFormed));
+  }
 
   return { ok: errors.length === 0, errors };
 }

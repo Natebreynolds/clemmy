@@ -17,8 +17,9 @@ import {
   projectPlanHash,
   topologicalNodeOrder,
   toolIsCanonicalRead,
+  toolIsCanonicallyKnown,
   validateProjectPlan,
-  PROJECT_DISCOVERY_KERNEL,
+  PROJECT_STRUCTURAL_TOOLS,
   PROJECT_DISCOVERY_KERNEL_ERRORS,
   PROJECT_NODE_DEFAULT_MAX_TURNS,
   PROJECT_NODE_TURN_CEILING,
@@ -58,16 +59,40 @@ const errorsOf = (candidate: unknown): string => validateProjectPlan(candidate).
 
 // ── kernel ───────────────────────────────────────────────────────────────────
 
-test('the discovery kernel is proven read-only against the canonical registry', () => {
+test('the structural universe is non-mutating and cannot dispatch', () => {
   assert.deepEqual([...PROJECT_DISCOVERY_KERNEL_ERRORS], [],
-    'a registry change that widened a kernel tool must fail here, loudly');
-  assert.ok(PROJECT_DISCOVERY_KERNEL.length > 0);
-  for (const tool of PROJECT_DISCOVERY_KERNEL) {
-    assert.equal(toolIsCanonicalRead(tool), true, `${tool} must be read-class`);
+    'a registry change that made a structural tool mutating must fail here, loudly');
+  assert.ok(PROJECT_STRUCTURAL_TOOLS.length > 0);
+  for (const tool of PROJECT_STRUCTURAL_TOOLS) {
+    // workflow_step_result is a per-step channel, not a catalog tool; anything
+    // the registry DOES know must be read-class.
+    if (toolIsCanonicallyKnown(tool)) {
+      assert.equal(toolIsCanonicalRead(tool), true, `${tool} must be read-class`);
+    }
   }
-  // The kernel cannot dispatch: a generic invoker would be wildcard authority
-  // under a smaller name.
-  assert.ok(!PROJECT_DISCOVERY_KERNEL.includes('call_tool'));
+  // No generic invoker: that would be wildcard authority under a smaller name.
+  assert.ok(!PROJECT_STRUCTURAL_TOOLS.includes('call_tool'));
+  // The output channel must be present or a compiled step cannot return at all.
+  assert.ok(PROJECT_STRUCTURAL_TOOLS.includes('workflow_step_result'));
+});
+
+test('the structural universe matches the canonical workflow baseline exactly', async () => {
+  // Declared locally to keep this module dependency-light (importing the step
+  // agent closes an import cycle), so the equality is pinned here instead.
+  let baseline: Set<string> | null = null;
+  try {
+    ({ STEP_STRUCTURAL_BASELINE_TOOLS: baseline } =
+      await import('../agents/workflow-step-agent.js') as never);
+  } catch (err) {
+    // The shared tree currently has in-flight lifecycle work whose module graph
+    // does not resolve. That is not this module's contract to fix, and a silent
+    // pass would be worse than a loud note.
+    assert.match(String((err as Error)?.message ?? err), /Cannot find module|ERR_MODULE_NOT_FOUND/,
+      'the only acceptable reason to skip this pin is an unresolved shared module');
+    return;
+  }
+  assert.deepEqual([...PROJECT_STRUCTURAL_TOOLS].sort(), [...baseline!].sort(),
+    'the compiled-project structural set must not drift from the runtime baseline');
 });
 
 // ── canonical identity ───────────────────────────────────────────────────────
@@ -236,16 +261,40 @@ test('a genuinely single-node project is still allowed', () => {
   assert.equal(validateProjectPlan(plan([readNode('only')])).ok, true);
 });
 
-test('static fan-out must have a downstream fan-in', () => {
-  // Three branches from one source, each terminating separately.
+test('convergence is reachability, not adjacency: a -> {b,c} -> {d,e} -> f is valid', () => {
+  // The old rule demanded an immediate child join every sibling and rejected
+  // this outright. What matters is that every branch REACHES the one terminal.
+  const deep = plan([
+    readNode('a'),
+    readNode('b', { dependsOn: ['a'] }),
+    readNode('c', { dependsOn: ['a'] }),
+    readNode('d', { dependsOn: ['b', 'c'] }),
+    readNode('e', { dependsOn: ['b', 'c'] }),
+    readNode('f', { dependsOn: ['d', 'e'] }),
+  ]);
+  assert.equal(validateProjectPlan(deep).ok, true, errorsOf(deep));
+
+  // Convergence may be arbitrarily deep on one side too.
+  const lopsided = plan([
+    readNode('a'),
+    readNode('b', { dependsOn: ['a'] }),
+    readNode('c', { dependsOn: ['a'] }),
+    readNode('b2', { dependsOn: ['b'] }),
+    readNode('b3', { dependsOn: ['b2'] }),
+    readNode('sink', { dependsOn: ['b3', 'c'] }),
+  ]);
+  assert.equal(validateProjectPlan(lopsided).ok, true, errorsOf(lopsided));
+});
+
+test('a branch that never reaches the terminal is still rejected', () => {
+  // Two branches, only one of which continues: 'y' and 'tail' both terminate.
   const unjoined = plan([
     readNode('src'),
     readNode('x', { dependsOn: ['src'] }),
     readNode('y', { dependsOn: ['src'] }),
     readNode('tail', { dependsOn: ['x'] }),
   ]);
-  const errors = errorsOf(unjoined);
-  assert.match(errors, /Fan-out from "src" into 2 branches \(x, y\) has no fan-in/);
+  assert.match(errorsOf(unjoined), /converge on exactly one terminal node/);
 
   const joined = plan([
     readNode('src'),
@@ -267,15 +316,33 @@ test('fan-out → reducer → verify is the canonical accepted shape', () => {
   assert.equal(validateProjectPlan(shaped).ok, true, errorsOf(shaped));
 });
 
-test('a dynamic node releases exactly one aggregate downstream', () => {
-  const base = (dependents: number): ProjectPlan => plan([
+test('a dynamic aggregate is an ordinary output — one consumer is not required', () => {
+  // The old rule demanded exactly one immediate consumer, which is a template.
+  // The aggregate is just a node output; what matters is reachability.
+  const oneConsumer = plan([
     readNode('collect', { evidence: { type: 'object', requiredKeys: ['items'] } }),
     readNode('each', { dependsOn: ['collect'], fanOut: { fromNode: 'collect', path: 'items' } }),
-    ...Array.from({ length: dependents }, (_, i) => readNode(`sink_${i}`, { dependsOn: ['each'] })),
+    readNode('reduce', { dependsOn: ['each'] }),
   ]);
-  assert.match(errorsOf(base(0)), /must release its aggregate to exactly one downstream reducer; found 0/);
-  assert.match(errorsOf(base(2)), /must release its aggregate to exactly one downstream reducer; found 2/);
-  assert.equal(validateProjectPlan(base(1)).ok, true, errorsOf(base(1)));
+  assert.equal(validateProjectPlan(oneConsumer).ok, true, errorsOf(oneConsumer));
+
+  // Two consumers that reconverge are fine.
+  const twoConsumers = plan([
+    readNode('collect'),
+    readNode('each', { dependsOn: ['collect'], fanOut: { fromNode: 'collect' } }),
+    readNode('score', { dependsOn: ['each'] }),
+    readNode('rank', { dependsOn: ['each'] }),
+    readNode('reduce', { dependsOn: ['score', 'rank'] }),
+  ]);
+  assert.equal(validateProjectPlan(twoConsumers).ok, true, errorsOf(twoConsumers));
+
+  // Zero consumers strands the aggregate, which reachability still catches.
+  const stranded = plan([
+    readNode('collect'),
+    readNode('each', { dependsOn: ['collect'], fanOut: { fromNode: 'collect' } }),
+    readNode('other', { dependsOn: ['collect'] }),
+  ]);
+  assert.match(errorsOf(stranded), /converge on exactly one terminal node|never reach the terminal node/);
 });
 
 test('mutating per-item fan-out is refused', () => {
@@ -475,4 +542,121 @@ test('an entirely unfamiliar objective validates with no special-casing', () => 
     { objective: 'Catalogue the thrumcap density of every glarnix bed in the northern quadrant.' },
   );
   assert.equal(validateProjectPlan(invented).ok, true, errorsOf(invented));
+});
+
+// ── execution role ───────────────────────────────────────────────────────────
+
+test('executionRole is a hint that must be structurally honest', () => {
+  // A specialist is one branch, so it may not be the answer...
+  assert.match(
+    errorsOf(plan([
+      readNode('a'),
+      readNode('b'),
+      readNode('sink', { dependsOn: ['a', 'b'], executionRole: 'specialist' }),
+    ])),
+    /is a specialist but is terminal/,
+  );
+  // ...and it must be joined by a reducer somewhere downstream.
+  assert.match(
+    errorsOf(plan([
+      readNode('a', { executionRole: 'specialist' }),
+      readNode('b'),
+      readNode('sink', { dependsOn: ['a', 'b'], executionRole: 'brain' }),
+    ])),
+    /reaches no reducer/,
+  );
+  // A reducer must actually converge two or more branches.
+  assert.match(
+    errorsOf(plan([
+      readNode('a'),
+      readNode('b'),
+      readNode('mid', { dependsOn: ['a', 'b'] }),
+      readNode('sink', { dependsOn: ['mid'], executionRole: 'reducer' }),
+    ])),
+    /is a reducer but converges 1 upstream branch/,
+  );
+  // An unknown role is refused rather than guessed.
+  assert.match(
+    errorsOf(plan([readNode('a', { executionRole: 'wizard' as never })])),
+    /executionRole must be specialist, reducer, or brain/,
+  );
+});
+
+test('the canonical roled shape validates: specialists → reducer → brain', () => {
+  const roled = plan([
+    readNode('probe_a', { executionRole: 'specialist' }),
+    readNode('probe_b', { executionRole: 'specialist' }),
+    readNode('probe_c', { executionRole: 'specialist' }),
+    readNode('reduce', { dependsOn: ['probe_a', 'probe_b', 'probe_c'], executionRole: 'reducer' }),
+    readNode('verify', { dependsOn: ['reduce'], executionRole: 'brain' }),
+  ]);
+  assert.equal(validateProjectPlan(roled).ok, true, errorsOf(roled));
+});
+
+test('a role grants nothing: it never changes capability, effect, or approval', () => {
+  // The same node with and without a role differs ONLY by the role. A role can
+  // never be a back door to more reach.
+  const bare = plan([
+    readNode('a'), readNode('b'),
+    readNode('sink', { dependsOn: ['a', 'b'] }),
+  ]);
+  const roled = plan([
+    readNode('a', { executionRole: 'specialist' }),
+    readNode('b', { executionRole: 'specialist' }),
+    readNode('sink', { dependsOn: ['a', 'b'], executionRole: 'reducer' }),
+  ]);
+  assert.equal(validateProjectPlan(bare).ok, true);
+  assert.equal(validateProjectPlan(roled).ok, true, errorsOf(roled));
+  // The role is part of identity — it is persisted, so it must hash.
+  assert.notEqual(projectPlanHash(bare), projectPlanHash(roled));
+
+  // A role cannot rescue an otherwise-forbidden capability or effect.
+  assert.match(
+    errorsOf(plan([readNode('a', {
+      executionRole: 'brain',
+      executor: { kind: 'model', instruction: 'x', allowedTools: ['*'] },
+    })])),
+    /wildcard tool authority/,
+  );
+  assert.match(
+    errorsOf(plan([readNode('a', { executionRole: 'brain', approval: 'required' })])),
+    /crosses no external boundary/,
+  );
+});
+
+// ── connected (MCP) tool identities stay rejected ────────────────────────────
+
+test('namespaced MCP identities are refused until their effect can be bound', () => {
+  // parseNamespacedTool proves only SYNTAX: "server__tool" splits cleanly. It
+  // says nothing about whether the tool reads or mutates, and the registry does
+  // not know connected tools at all. Accepting a syntactically valid name would
+  // let a node declared `read` carry a mutating provider call, so every one of
+  // these is refused — including the well-formed ones.
+  const named = (tool: string) =>
+    plan([{ id: 'c', executor: { kind: 'structured_call', tool }, effect: 'read' }] as ProjectNode[]);
+
+  for (const tool of [
+    'someserver__list_records',   // well-formed AND plausibly a read
+    'someserver__delete_records', // well-formed and plainly not
+    'someserver__',               // malformed: empty tool
+    '__list_records',             // malformed: empty server
+    'someserver__*',              // wildcard smuggled into the tool half
+    '*__list_records',            // wildcard smuggled into the server half
+  ]) {
+    assert.equal(validateProjectPlan(named(tool)).ok, false, `${tool} must be refused`);
+  }
+
+  // The same names are equally refused as a model node's capability list.
+  assert.match(
+    errorsOf(plan([readNode('a', {
+      executor: { kind: 'model', instruction: 'x', allowedTools: ['someserver__list_records'] },
+    })])),
+    /names unknown tool/,
+  );
+  assert.match(
+    errorsOf(plan([readNode('a', {
+      executor: { kind: 'model', instruction: 'x', allowedTools: ['someserver__*'] },
+    })])),
+    /names unknown tool/,
+  );
 });

@@ -169,6 +169,20 @@ export interface WorkflowStepInput {
    */
   sideEffect?: 'read' | 'write' | 'send';
   /**
+   * Scheduling / model-profile hint for a compiled project node.
+   *
+   * `specialist` is one branch of a fan-out, `reducer` converges two or more
+   * branches, `brain` is the terminal verification/synthesis node. It is a HINT
+   * ONLY: it grants no tool, no mutation authority, and no approval. Capability
+   * stays entirely in `allowedTools` and effect stays in `sideEffect`, so a role
+   * can never widen what a step may do — it only describes the shape the step
+   * occupies so a runtime can pick a model profile for it.
+   *
+   * Persisted (and therefore canonical) because a project's topology must
+   * survive restart exactly as planned. Serialized as `execution_role`.
+   */
+  executionRole?: 'specialist' | 'reducer' | 'brain';
+  /**
    * Reference to an installed skill — directory name under
    * ~/.clementine-next/skills/<usesSkill>/. When set, the runner loads
    * the skill's SKILL.md body and injects it ahead of this step's
@@ -788,6 +802,16 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
         ? step.side_effect
         : typeof step.sideEffect === 'string' ? step.sideEffect : '';
       if (se === 'read' || se === 'write' || se === 'send') result.sideEffect = se;
+      // Compiled-project execution role. Accept snake_case or camelCase; an
+      // unrecognized value is dropped rather than guessed, because a wrong role
+      // would silently change which model profile a node runs under.
+      const roleRaw = typeof step.execution_role === 'string'
+        ? step.execution_role
+        : typeof step.executionRole === 'string' ? step.executionRole : '';
+      const role = roleRaw.trim();
+      if (role === 'specialist' || role === 'reducer' || role === 'brain') {
+        result.executionRole = role;
+      }
       // Typed step contract (P0). Pure passthrough — structure is
       // validated/consumed by the binder + validator, not here.
       if (step.inputs && typeof step.inputs === 'object' && !Array.isArray(step.inputs)) {
@@ -1026,6 +1050,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       // SF overdue-meetings 2026-06-11) and parked them on crash-resume.
       // Dropping a declared 'read' on rewrite would resurrect that trap.
       if (s.sideEffect) out.side_effect = s.sideEffect;
+      if (s.executionRole) out.execution_role = s.executionRole;
       if (s.loopUntil) {
         out.loop_until = {
           ...(s.loopUntil.maxAttempts !== undefined ? { max_attempts: s.loopUntil.maxAttempts } : {}),
