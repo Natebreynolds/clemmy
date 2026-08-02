@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 
 /**
  * Tests for usesSkill injection on workflow steps.
@@ -167,7 +168,14 @@ const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { readWorkflowRunRecord } = await import('./workflow-run-record.js');
-const { createWorkflowRunDefinitionSnapshot } = await import('./workflow-run-definition.js');
+const {
+  createWorkflowRunDefinitionSnapshot,
+  workflowDefinitionHash,
+} = await import('./workflow-run-definition.js');
+const {
+  queueCompiledWorkflowRun,
+} = await import('../tools/workflow-run-queue.js');
+const { ExecutionStore } = await import('./store.js');
 
 test('run definition resolution pins admitted steps across later workflow edits and fails closed on corruption', () => {
   const admitted = {
@@ -244,6 +252,121 @@ test('run definition resolution fails closed when authored code changes after ad
   );
   assert.equal(rejected.ok, false);
   assert.match(rejected.error ?? '', /code changed after this run was admitted/i);
+});
+
+test('run definition resolution admits only a catalogless compiled project root', () => {
+  function canonicalJson(value: unknown): string {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(record[key])}`
+    ).join(',')}}`;
+  }
+  const definition = {
+    name: 'one-off-compiled-project',
+    description: 'Execute the immutable project graph.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'work',
+      prompt: 'Perform bounded read-only work.',
+      sideEffect: 'read' as const,
+      allowedTools: ['workflow_step_result'],
+      maxTurns: 8,
+    }],
+  };
+  const sessionId = `sess-compiled-project-${Date.now()}`;
+  HarnessSession.create({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Compiled project source' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Build the durable project.', source: 'desktop' },
+  });
+  const plan = {
+    version: 1,
+    objective: 'Execute a durable project graph.',
+    nodes: [{ id: 'work', executor: 'model', effect: 'read', maxTurns: 8 }],
+  };
+  const hash = (value: unknown) => createHash('sha256').update(canonicalJson(value)).digest('hex');
+  new ExecutionStore().createOrGetForSource({
+    sessionId,
+    sourceUserSeq: source.seq,
+    title: 'Compiled project',
+    objective: 'Execute a durable project graph.',
+    reason: 'Long-horizon accepted source.',
+    startedFromMessage: 'Build the durable project.',
+    confidence: 0.95,
+    reasons: ['durable project'],
+    admission: {
+      turnGraphId: `turn-graph:v1:${source.seq}`,
+      turnGraphHash: hash({ sessionId, sourceUserSeq: source.seq }),
+      compiledPlan: {
+        version: 1,
+        compilerId: 'project_graph_v1',
+        planHash: hash(plan),
+        definitionHash: workflowDefinitionHash(definition),
+        plan,
+        definition,
+        inputs: {},
+      },
+    },
+  });
+  const queued = queueCompiledWorkflowRun({ sessionId, sourceUserSeq: source.seq });
+  assert.equal(queued.status, 'queued');
+  const rootRun = JSON.parse(
+    readFileSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), 'utf-8'),
+  );
+  const workflowSlug = rootRun.workflowSlug as string;
+
+  const resolved = resolveWorkflowDefinitionForRun(rootRun, []);
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.definitionSource, 'compiled_snapshot');
+  assert.equal(resolved.currentWorkflow, undefined);
+  assert.equal(resolved.workflow?.name, workflowSlug);
+  assert.equal(resolved.workflow?.data.steps[0].prompt, 'Perform bounded read-only work.');
+  const runtimeStep = resolved.workflow!.data.steps[0];
+  assert.equal((runtimeStep as { __compiledProjectRuntime?: boolean }).__compiledProjectRuntime, true);
+  assert.equal(workflowRunnerInternalsForTest.workflowStepRunMaxTurns(runtimeStep), 8);
+  assert.deepEqual(
+    workflowRunnerInternalsForTest.workflowAutoApprovalTools(resolved.workflow!.data, runtimeStep),
+    ['workflow_step_result'],
+  );
+  assert.equal(
+    workflowRunnerInternalsForTest.workflowStepRunMaxTurns({ ...runtimeStep, __compiledProjectRuntime: undefined } as never),
+    undefined,
+    'ordinary catalog steps keep their legacy run budget behavior',
+  );
+
+  for (const status of ['running', 'finalizing'] as const) {
+    assert.equal(resolveWorkflowDefinitionForRun({ ...rootRun, status }, []).ok, true);
+  }
+
+  const collision = resolveWorkflowDefinitionForRun(rootRun, [{
+    name: workflowSlug,
+    data: { ...definition, name: 'Catalog collision' },
+  }] as never);
+  assert.equal(collision.ok, false);
+  assert.match(collision.error ?? '', /catalogless root-run contract/i);
+
+  for (const invalid of [
+    { ...rootRun, source: 'workflow_run' },
+    { ...rootRun, status: 'dry_run' },
+    { ...rootRun, id: 'forged-run' },
+    { ...rootRun, triggerReceiptId: 'project-turn:v1:wrong' },
+    { ...rootRun, compiledContractHash: '0'.repeat(64) },
+    { ...rootRun, sourceUserSeq: source.seq + 1 },
+    { ...rootRun, targetStepId: 'work' },
+    { ...rootRun, requeuedFromRunId: 'older-run' },
+    { ...rootRun, originSessionId: '' },
+  ]) {
+    const rejected = resolveWorkflowDefinitionForRun(invalid, []);
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.error ?? '', /catalogless root-run contract/i);
+  }
+  rmSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), { force: true });
 });
 
 test('SIGKILL after terminal publication cannot leave status without its exact report envelope', async () => {

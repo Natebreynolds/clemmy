@@ -12,6 +12,10 @@ import { workflowCodeRevisionFingerprint } from './workflow-code-certification.j
  * checkpoints.
  */
 export const WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION = 1 as const;
+export const COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION = 2 as const;
+export const COMPILED_WORKFLOW_RUN_DEFINITION_SCOPE = 'compiled' as const;
+export const PROJECT_GRAPH_COMPILER_ID = 'project_graph_v1' as const;
+export const COMPILED_WORKFLOW_SLUG_RE = /^compiled-[a-f0-9]{32}$/;
 
 export interface WorkflowRunDefinitionSnapshot {
   version: typeof WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION;
@@ -26,10 +30,32 @@ export interface WorkflowRunDefinitionSnapshot {
   definition: WorkflowDefinition;
 }
 
+/**
+ * Immutable one-off workflow admitted directly from a durable project plan.
+ * Unlike a version-1 catalog snapshot, this definition is intentionally
+ * catalogless: no SKILL.md may be created or consulted for its execution.
+ */
+export interface CompiledWorkflowRunDefinitionSnapshot {
+  version: typeof COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION;
+  scope: typeof COMPILED_WORKFLOW_RUN_DEFINITION_SCOPE;
+  compilerId: typeof PROJECT_GRAPH_COMPILER_ID;
+  sourceTurnKeyHash: string;
+  workflowSlug: string;
+  definitionHash: string;
+  codeRevision: 'no-code';
+  admissionHash: string;
+  admittedAt: string;
+  definition: WorkflowDefinition;
+}
+
+export type AnyWorkflowRunDefinitionSnapshot =
+  | WorkflowRunDefinitionSnapshot
+  | CompiledWorkflowRunDefinitionSnapshot;
+
 export type WorkflowRunDefinitionSnapshotResolution =
   | { status: 'absent' }
   | { status: 'invalid'; reason: string }
-  | { status: 'valid'; snapshot: WorkflowRunDefinitionSnapshot };
+  | { status: 'valid'; snapshot: AnyWorkflowRunDefinitionSnapshot };
 
 /** JSON-compatible canonicalization: object key order never changes the hash,
  * while array order (notably workflow step order) remains significant. */
@@ -60,10 +86,97 @@ function workflowAdmissionHash(input: {
   definitionHash: string;
   codeRevision: string;
   admittedAt: string;
+  scope?: string;
+  compilerId?: string;
+  sourceTurnKeyHash?: string;
 }): string {
   return createHash('sha256')
     .update(JSON.stringify(canonicalize(input)))
     .digest('hex');
+}
+
+function compiledWorkflowUnsupportedCodeReason(definition: WorkflowDefinition): string | null {
+  for (const step of definition.steps ?? []) {
+    if (step.deterministic) {
+      return `compiled workflow step "${step.id}" references a deterministic runner`;
+    }
+    if (step.loopUntil?.probe) {
+      return `compiled workflow step "${step.id}" references a deterministic loop probe`;
+    }
+  }
+  return null;
+}
+
+function compiledWorkflowTriggerIsManualOnly(definition: WorkflowDefinition): boolean {
+  const trigger = definition.trigger;
+  return trigger?.manual === true
+    && trigger.schedule === undefined
+    && trigger.timezone === undefined
+    && trigger.webhookPath === undefined
+    && trigger.events === undefined;
+}
+
+export function isCompiledWorkflowRunDefinitionSnapshot(
+  value: AnyWorkflowRunDefinitionSnapshot,
+): value is CompiledWorkflowRunDefinitionSnapshot {
+  return value.version === COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION
+    && 'scope' in value
+    && value.scope === COMPILED_WORKFLOW_RUN_DEFINITION_SCOPE;
+}
+
+export function isCatalogWorkflowRunDefinitionSnapshot(
+  value: AnyWorkflowRunDefinitionSnapshot,
+): value is WorkflowRunDefinitionSnapshot {
+  return value.version === WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION;
+}
+
+export function createCompiledWorkflowRunDefinitionSnapshot(input: {
+  workflowSlug: string;
+  sourceTurnKeyHash: string;
+  definition: WorkflowDefinition;
+  admittedAt?: string;
+}): CompiledWorkflowRunDefinitionSnapshot {
+  const workflowSlug = input.workflowSlug.trim();
+  if (!COMPILED_WORKFLOW_SLUG_RE.test(workflowSlug)) {
+    throw new Error('Compiled workflow definition snapshot requires a reserved compiled workflow slug.');
+  }
+  const sourceTurnKeyHash = input.sourceTurnKeyHash.trim();
+  if (!/^[a-f0-9]{64}$/.test(sourceTurnKeyHash)) {
+    throw new Error('Compiled workflow definition snapshot requires an exact source-turn hash.');
+  }
+  const admittedAt = input.admittedAt ?? new Date().toISOString();
+  if (!Number.isFinite(Date.parse(admittedAt))) {
+    throw new Error('Compiled workflow definition snapshot requires a valid admission timestamp.');
+  }
+  const definition = cloneDefinition(input.definition);
+  if (!definition.enabled || !compiledWorkflowTriggerIsManualOnly(definition)) {
+    throw new Error('Compiled workflows must be enabled and manual-only.');
+  }
+  const unsupportedCode = compiledWorkflowUnsupportedCodeReason(definition);
+  if (unsupportedCode) throw new Error(`${unsupportedCode}; run-scoped code bundles are not supported.`);
+  const definitionHash = workflowDefinitionHash(definition);
+  const codeRevision = 'no-code' as const;
+  return {
+    version: COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION,
+    scope: COMPILED_WORKFLOW_RUN_DEFINITION_SCOPE,
+    compilerId: PROJECT_GRAPH_COMPILER_ID,
+    sourceTurnKeyHash,
+    workflowSlug,
+    definitionHash,
+    codeRevision,
+    admissionHash: workflowAdmissionHash({
+      version: COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION,
+      scope: COMPILED_WORKFLOW_RUN_DEFINITION_SCOPE,
+      compilerId: PROJECT_GRAPH_COMPILER_ID,
+      sourceTurnKeyHash,
+      workflowSlug,
+      definitionHash,
+      codeRevision,
+      admittedAt,
+    }),
+    admittedAt,
+    definition,
+  };
 }
 
 export function createWorkflowRunDefinitionSnapshot(
@@ -135,6 +248,95 @@ export function workflowDefinitionMatchesScheduledCatchupSnapshot(
   return workflowDefinitionHash(normalized) === snapshot.definitionHash;
 }
 
+function resolveCompiledWorkflowRunDefinitionSnapshot(
+  value: Record<string, unknown>,
+): WorkflowRunDefinitionSnapshotResolution {
+  const candidate = value as unknown as Partial<CompiledWorkflowRunDefinitionSnapshot>;
+  if (candidate.scope !== COMPILED_WORKFLOW_RUN_DEFINITION_SCOPE) {
+    return { status: 'invalid', reason: 'compiled snapshot scope is invalid' };
+  }
+  if (candidate.compilerId !== PROJECT_GRAPH_COMPILER_ID) {
+    return { status: 'invalid', reason: 'compiled snapshot compiler is unsupported' };
+  }
+  if (
+    typeof candidate.sourceTurnKeyHash !== 'string'
+    || !/^[a-f0-9]{64}$/.test(candidate.sourceTurnKeyHash)
+  ) {
+    return { status: 'invalid', reason: 'compiled snapshot source-turn hash is invalid' };
+  }
+  if (
+    typeof candidate.workflowSlug !== 'string'
+    || !COMPILED_WORKFLOW_SLUG_RE.test(candidate.workflowSlug)
+  ) {
+    return { status: 'invalid', reason: 'compiled snapshot workflow slug is invalid' };
+  }
+  if (typeof candidate.admittedAt !== 'string' || !Number.isFinite(Date.parse(candidate.admittedAt))) {
+    return { status: 'invalid', reason: 'admission timestamp is invalid' };
+  }
+  if (
+    typeof candidate.definitionHash !== 'string'
+    || !/^[a-f0-9]{64}$/.test(candidate.definitionHash)
+  ) {
+    return { status: 'invalid', reason: 'definition hash is invalid' };
+  }
+  if (candidate.codeRevision !== 'no-code') {
+    return { status: 'invalid', reason: 'compiled snapshot code revision must be no-code' };
+  }
+  if (
+    typeof candidate.admissionHash !== 'string'
+    || !/^[a-f0-9]{64}$/.test(candidate.admissionHash)
+  ) {
+    return { status: 'invalid', reason: 'admission hash is invalid' };
+  }
+  const expectedAdmissionHash = workflowAdmissionHash({
+    version: COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION,
+    scope: COMPILED_WORKFLOW_RUN_DEFINITION_SCOPE,
+    compilerId: PROJECT_GRAPH_COMPILER_ID,
+    sourceTurnKeyHash: candidate.sourceTurnKeyHash,
+    workflowSlug: candidate.workflowSlug,
+    definitionHash: candidate.definitionHash,
+    codeRevision: candidate.codeRevision,
+    admittedAt: candidate.admittedAt,
+  });
+  if (candidate.admissionHash !== expectedAdmissionHash) {
+    return { status: 'invalid', reason: 'compiled admission metadata does not match its hash' };
+  }
+  const definition = candidate.definition;
+  if (
+    !definition
+    || typeof definition !== 'object'
+    || Array.isArray(definition)
+    || typeof definition.name !== 'string'
+    || !definition.name.trim()
+    || !Array.isArray(definition.steps)
+  ) {
+    return { status: 'invalid', reason: 'workflow definition is malformed' };
+  }
+  if (!definition.enabled || !compiledWorkflowTriggerIsManualOnly(definition)) {
+    return { status: 'invalid', reason: 'compiled workflow definition is not enabled and manual-only' };
+  }
+  const unsupportedCode = compiledWorkflowUnsupportedCodeReason(definition);
+  if (unsupportedCode) return { status: 'invalid', reason: unsupportedCode };
+  if (workflowDefinitionHash(definition) !== candidate.definitionHash) {
+    return { status: 'invalid', reason: 'definition content does not match its admission hash' };
+  }
+  return {
+    status: 'valid',
+    snapshot: {
+      version: COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION,
+      scope: COMPILED_WORKFLOW_RUN_DEFINITION_SCOPE,
+      compilerId: PROJECT_GRAPH_COMPILER_ID,
+      sourceTurnKeyHash: candidate.sourceTurnKeyHash,
+      workflowSlug: candidate.workflowSlug,
+      definitionHash: candidate.definitionHash,
+      codeRevision: 'no-code',
+      admissionHash: candidate.admissionHash,
+      admittedAt: candidate.admittedAt,
+      definition: cloneDefinition(definition),
+    },
+  };
+}
+
 /**
  * Validate an untrusted run-record value, including its content hash. A present
  * but corrupt snapshot is never treated like a legacy run: falling back to the
@@ -146,6 +348,10 @@ export function resolveWorkflowRunDefinitionSnapshot(
   if (value === undefined || value === null) return { status: 'absent' };
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { status: 'invalid', reason: 'snapshot is not an object' };
+  }
+  const version = (value as { version?: unknown }).version;
+  if (version === COMPILED_WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION) {
+    return resolveCompiledWorkflowRunDefinitionSnapshot(value as Record<string, unknown>);
   }
   const candidate = value as Partial<WorkflowRunDefinitionSnapshot>;
   if (candidate.version !== WORKFLOW_RUN_DEFINITION_SNAPSHOT_VERSION) {

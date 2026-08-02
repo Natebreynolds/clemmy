@@ -134,6 +134,7 @@ import {
   type BlockedStep,
 } from './workflow-diagnosis.js';
 import {
+  compiledWorkflowRunContractHash,
   readWorkflowRunOriginSessionIds,
   requeueWorkflowFromRun,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
@@ -206,11 +207,14 @@ import {
   type WorkflowTerminalOutcome,
 } from './workflow-terminal-outcome.js';
 import {
+  isCatalogWorkflowRunDefinitionSnapshot,
+  isCompiledWorkflowRunDefinitionSnapshot,
   resolveWorkflowRunDefinitionSnapshot,
   workflowCodeRevisionMatchesSnapshot,
   workflowDefinitionMatchesSnapshotIgnoringEnabled,
-  type WorkflowRunDefinitionSnapshot,
+  type AnyWorkflowRunDefinitionSnapshot,
 } from './workflow-run-definition.js';
+import { ExecutionStore } from './store.js';
 import {
   readWorkflowRunRecord,
   readWorkflowRunRecordSnapshot,
@@ -563,6 +567,13 @@ export interface QueuedRunRecord {
   workflow: string;
   inputs?: Record<string, string>;
   status?: string;
+  /** Durable project execution that owns a catalogless compiled root run. */
+  sourceExecutionId?: string;
+  /** Exact accepted human event sequence that owns the project admission. */
+  sourceUserSeq?: number;
+  /** Exact immutable compiled admission contract persisted by its V3 source
+   * receipt. Ordinary catalog runs never carry this capability. */
+  compiledContractHash?: string;
   /** A run descended from a missed scheduled occurrence. Execution admission
    *  permits at most one such lineage at a time. */
   catchupFire?: boolean;
@@ -2278,6 +2289,11 @@ function workflowAutoApprovalTools(workflow: WorkflowDefinition, step: WorkflowS
   if (isGraphRuntimeWorkflowStep(step)) {
     return [...WORKFLOW_GRAPH_ALLOWED_TOOLS];
   }
+  if (isCompiledProjectRuntimeWorkflowStep(step)) {
+    // A compiled project node carries an exact per-node capability list. An
+    // omitted/empty list must never inherit the legacy catalog wildcard.
+    return [...new Set((step.allowedTools ?? []).filter((tool) => tool.trim() && tool !== '*'))];
+  }
   if (step.allowedTools && step.allowedTools.length > 0) {
     return step.allowedTools;
   }
@@ -2531,6 +2547,8 @@ export const workflowRunnerInternalsForTest = {
   resolveWorkflowStepModel,
   workflowStepCanRunOnClaudeAgentSdk,
   workflowStepUsesFullClaudeLane,
+  workflowAutoApprovalTools,
+  workflowStepRunMaxTurns,
   shouldUseDeclarativeStepApproval,
   exactApprovedSendTools,
   workflowHarnessRouteMarker,
@@ -2749,7 +2767,11 @@ async function runStepViaHarness(
     // as a structured block AFTER the prose (never replacing it). This is
     // authoritative data the step can use even if a template token typo
     // dropped a value from the prose — it cannot be falsely starved.
-    const message = (isGraphRuntimeWorkflowStep(step) || useWorkflowStepAgent()) && stepContext
+    const message = (
+      isGraphRuntimeWorkflowStep(step)
+      || isCompiledProjectRuntimeWorkflowStep(step)
+      || useWorkflowStepAgent()
+    ) && stepContext
       ? `${proseMessage}\n\n${renderStepContextBlock(stepContext, { workflowName: workflowStorageName, runId: workflowRunId })}`
       : proseMessage;
     const sourceUserEvent = recordRunAttemptUserInput(stepAttempt, {
@@ -2912,7 +2934,9 @@ async function runStepViaHarness(
     }
     const route = workflowHarnessRoute(step, stepModel);
     appendWorkerRoute(workflowHarnessRouteMarker(step, stepModel, modelRoute.trace));
-    const scopedWorkflowStepAgent = isGraphRuntimeWorkflowStep(step) || useWorkflowStepAgent();
+    const scopedWorkflowStepAgent = isGraphRuntimeWorkflowStep(step)
+      || isCompiledProjectRuntimeWorkflowStep(step)
+      || useWorkflowStepAgent();
     const workflowMcpToolScope = scopedWorkflowStepAgent
       ? workflowStepExternalMcpScopeForLock(step.allowedTools)
       : undefined;
@@ -2937,6 +2961,7 @@ async function runStepViaHarness(
         })
       : await buildWorkflowOrchestratorAgentImpl({ userInput: message, sessionId: realSessionId, model: stepModel });
     let result: RunConversationResult;
+    const scopedMaxTurns = workflowStepRunMaxTurns(step);
     if (session.loadInterruptState() || approvalRegistry.hasPending(realSessionId)) {
       result = {
         sessionId: realSessionId,
@@ -2956,8 +2981,8 @@ async function runStepViaHarness(
         // Specialist budgets are authored execution semantics. Keep this
         // narrow to graph-runtime nodes so introducing read_parallel_v1 does
         // not silently change legacy workflow-step budgeting.
-        ...(isGraphRuntimeWorkflowStep(step) && step.maxTurns !== undefined
-          ? { maxTurns: step.maxTurns }
+        ...(scopedMaxTurns !== undefined
+          ? { maxTurns: scopedMaxTurns }
           : {}),
         // P2-10: bound the step on the harness path too. The legacy path passes
         // this (see below); without it a harness step fell back to the 120-min
@@ -6240,6 +6265,24 @@ type GraphRuntimeWorkflowStep = WorkflowStepInput & {
   __graphRuntimeSpecialistId?: string;
 };
 
+type CompiledProjectRuntimeWorkflowStep = WorkflowStepInput & {
+  /** In-memory execution scope applied only after the V2 snapshot and its
+   * ExecutionStore root binding both validate. Never persisted or authored. */
+  __compiledProjectRuntime?: true;
+};
+
+function isCompiledProjectRuntimeWorkflowStep(
+  step: WorkflowStepInput,
+): step is CompiledProjectRuntimeWorkflowStep {
+  return (step as CompiledProjectRuntimeWorkflowStep).__compiledProjectRuntime === true;
+}
+
+function workflowStepRunMaxTurns(step: WorkflowStepInput): number | undefined {
+  return (isGraphRuntimeWorkflowStep(step) || isCompiledProjectRuntimeWorkflowStep(step))
+    ? step.maxTurns
+    : undefined;
+}
+
 function isGraphRuntimeWorkflowStep(step: WorkflowStepInput): step is GraphRuntimeWorkflowStep {
   const runtime = step as GraphRuntimeWorkflowStep;
   return runtime.__graphRuntimeAdded === true || runtime.__graphRuntimeRole !== undefined;
@@ -7553,6 +7596,7 @@ function legacyScheduledCatchupIdentity(run: QueuedRunRecord): LegacyScheduledCa
   const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
   if (
     admitted.status !== 'valid'
+    || !isCatalogWorkflowRunDefinitionSnapshot(admitted.snapshot)
     || admitted.snapshot.definition.name.trim() !== run.workflow.trim()
   ) return null;
   const workflowSlug = admitted.snapshot.workflowSlug;
@@ -8618,8 +8662,8 @@ interface WorkflowDefinitionForRunResolution {
   ok: boolean;
   workflow?: WorkflowCatalogEntry;
   currentWorkflow?: WorkflowCatalogEntry;
-  definitionSource: 'snapshot' | 'legacy_current';
-  snapshot?: WorkflowRunDefinitionSnapshot;
+  definitionSource: 'snapshot' | 'compiled_snapshot' | 'legacy_current';
+  snapshot?: AnyWorkflowRunDefinitionSnapshot;
   error?: string;
 }
 
@@ -8630,18 +8674,172 @@ interface WorkflowDefinitionForRunResolution {
  * do not strand runs queued before this protocol shipped.
  */
 export function resolveWorkflowDefinitionForRun(
-  run: Pick<QueuedRunRecord, 'workflow' | 'workflowDefinitionSnapshot'>,
+  run: Pick<
+    QueuedRunRecord,
+    | 'id'
+    | 'workflow'
+    | 'inputs'
+    | 'workflowSlug'
+    | 'workflowDefinitionSnapshot'
+    | 'status'
+    | 'source'
+    | 'sourceExecutionId'
+    | 'sourceUserSeq'
+    | 'triggerReceiptId'
+    | 'originSessionId'
+    | 'compiledContractHash'
+    | 'mutationReceiptProtocolVersion'
+    | 'targetStepId'
+    | 'catchupFire'
+    | 'catchupDisposition'
+    | 'catchupOccurrenceAtMs'
+    | 'requeuedFromRunId'
+    | 'retryFailedItemsFromRunId'
+    | 'selfHealAttempt'
+    | 'goalAttempt'
+  >,
   workflows: WorkflowCatalogEntry[],
 ): WorkflowDefinitionForRunResolution {
   const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
   if (admitted.status === 'invalid') {
+    const compiled = Boolean(
+      run.workflowDefinitionSnapshot
+      && typeof run.workflowDefinitionSnapshot === 'object'
+      && !Array.isArray(run.workflowDefinitionSnapshot)
+      && (run.workflowDefinitionSnapshot as { version?: unknown }).version === 2
+    );
     return {
       ok: false,
-      definitionSource: 'snapshot',
+      definitionSource: compiled ? 'compiled_snapshot' : 'snapshot',
       error: `Workflow run definition snapshot is invalid: ${admitted.reason}.`,
     };
   }
   const snapshot = admitted.status === 'valid' ? admitted.snapshot : undefined;
+  if (snapshot && isCompiledWorkflowRunDefinitionSnapshot(snapshot)) {
+    const expectedReceiptId = `project-turn:v1:${snapshot.sourceTurnKeyHash}`;
+    const expectedRunId = `trigger-${createHash('sha256').update(expectedReceiptId).digest('hex').slice(0, 32)}`;
+    const expectedWorkflowSlug = `compiled-${snapshot.sourceTurnKeyHash.slice(0, 32)}`;
+    const normalizedInputs = normalizeWorkflowRunInputs(run.inputs);
+    let expectedContractHash = '';
+    if (
+      run.sourceExecutionId?.trim()
+      && run.originSessionId?.trim()
+      && Number.isSafeInteger(run.sourceUserSeq)
+      && (run.sourceUserSeq ?? 0) > 0
+    ) {
+      expectedContractHash = compiledWorkflowRunContractHash({
+        sourceExecutionId: run.sourceExecutionId.trim(),
+        sourceUserSeq: run.sourceUserSeq as number,
+        sourceTurnKeyHash: snapshot.sourceTurnKeyHash,
+        originSessionId: run.originSessionId.trim(),
+        workflowSlug: snapshot.workflowSlug,
+        snapshot,
+        inputs: normalizedInputs,
+      });
+    }
+    let durableProjectAuthority = false;
+    try {
+      const sourceExecution = run.originSessionId?.trim() && Number.isSafeInteger(run.sourceUserSeq)
+        ? new ExecutionStore().getForSource(run.originSessionId.trim(), run.sourceUserSeq as number)
+        : undefined;
+      const graphAdmission = sourceExecution?.graphAdmission;
+      const persistedInputs = normalizeWorkflowRunInputs(graphAdmission?.compiledPlan.inputs);
+      const persistedContractHash = sourceExecution && graphAdmission && run.originSessionId?.trim()
+        ? compiledWorkflowRunContractHash({
+            sourceExecutionId: sourceExecution.id,
+            sourceUserSeq: run.sourceUserSeq as number,
+            sourceTurnKeyHash: graphAdmission.sourceTurnKeyHash,
+            originSessionId: run.originSessionId.trim(),
+            workflowSlug: snapshot.workflowSlug,
+            snapshot,
+            inputs: persistedInputs,
+          })
+        : '';
+      durableProjectAuthority = Boolean(
+        sourceExecution
+        && graphAdmission
+        && sourceExecution.id === run.sourceExecutionId
+        && sourceExecution.sessionId === run.originSessionId?.trim()
+        && sourceExecution.sourceUserSeq === run.sourceUserSeq
+        && graphAdmission.sourceTurnKeyHash === snapshot.sourceTurnKeyHash
+        && graphAdmission.rootWorkflowReceiptId === expectedReceiptId
+        && graphAdmission.rootWorkflowRunId === run.id
+        && graphAdmission.admittedAt === snapshot.admittedAt
+        && graphAdmission.compiledPlan.definitionHash === snapshot.definitionHash
+        && graphAdmission.compiledPlan.definition.name === snapshot.definition.name
+        && persistedContractHash === run.compiledContractHash
+      );
+    } catch {
+      durableProjectAuthority = false;
+    }
+    const forbiddenLineage = Boolean(
+      run.targetStepId
+      || run.catchupFire
+      || run.catchupDisposition
+      || run.catchupOccurrenceAtMs !== undefined
+      || run.requeuedFromRunId
+      || run.retryFailedItemsFromRunId
+      || (run.selfHealAttempt ?? 0) > 0
+      || (run.goalAttempt ?? 0) > 0
+    );
+    const catalogCollision = workflows.find((entry) =>
+      entry.name === snapshot.workflowSlug
+      || entry.data.name === snapshot.workflowSlug
+      || entry.name === snapshot.definition.name
+      || entry.data.name === snapshot.definition.name
+    );
+    if (
+      run.workflow !== snapshot.definition.name
+      || run.id !== expectedRunId
+      || snapshot.workflowSlug !== expectedWorkflowSlug
+      || run.workflowSlug !== snapshot.workflowSlug
+      || run.source !== 'project_graph'
+      || !run.sourceExecutionId?.trim()
+      || !/^[A-Za-z0-9_.:-]{1,256}$/.test(run.sourceExecutionId.trim())
+      || !Number.isSafeInteger(run.sourceUserSeq)
+      || (run.sourceUserSeq ?? 0) <= 0
+      || run.triggerReceiptId !== expectedReceiptId
+      || !run.originSessionId?.trim()
+      || run.compiledContractHash !== expectedContractHash
+      || run.mutationReceiptProtocolVersion !== WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION
+      || !durableProjectAuthority
+      || (
+        run.status !== undefined
+        && run.status !== 'queued'
+        && run.status !== 'running'
+        && run.status !== 'finalizing'
+      )
+      || forbiddenLineage
+      || catalogCollision
+    ) {
+      return {
+        ok: false,
+        definitionSource: 'compiled_snapshot',
+        snapshot,
+        error:
+          'Compiled project workflow admission does not match its catalogless root-run contract. '
+          + 'No workflow step was executed.',
+      };
+    }
+    return {
+      ok: true,
+      workflow: {
+        name: snapshot.workflowSlug,
+        dir: '',
+        filePath: '',
+        layout: 'directory',
+        data: {
+          ...snapshot.definition,
+          steps: snapshot.definition.steps.map((step) => ({
+            ...step,
+            __compiledProjectRuntime: true,
+          } as CompiledProjectRuntimeWorkflowStep)),
+        },
+      },
+      definitionSource: 'compiled_snapshot',
+      snapshot,
+    };
+  }
   const currentWorkflow = workflows.find((entry) =>
     entry.data.name === run.workflow
     || entry.name === run.workflow
@@ -8660,6 +8858,13 @@ export function resolveWorkflowDefinitionForRun(
       workflow: currentWorkflow,
       currentWorkflow,
       definitionSource: 'legacy_current',
+    };
+  }
+  if (!isCatalogWorkflowRunDefinitionSnapshot(snapshot)) {
+    return {
+      ok: false,
+      definitionSource: 'snapshot',
+      error: 'Workflow run definition snapshot has an unsupported execution scope.',
     };
   }
   if (!workflowCodeRevisionMatchesSnapshot(snapshot)) {
@@ -8710,7 +8915,14 @@ async function processOneRunFile(
     const definitionResolution = resolveWorkflowDefinitionForRun(run, workflows);
     const workflow = definitionResolution.workflow;
     const currentWorkflow = definitionResolution.currentWorkflow;
-    if (!definitionResolution.ok || !workflow || !currentWorkflow) {
+    if (
+      !definitionResolution.ok
+      || !workflow
+      || (
+        definitionResolution.definitionSource !== 'compiled_snapshot'
+        && !currentWorkflow
+      )
+    ) {
       const message = definitionResolution.error ?? `Workflow not found: "${run.workflow}".`;
       const report = { workflowName: run.workflow, outcome: 'failed' as const, detail: message };
       const terminalRecord = writeRunRecord(filePath, {
@@ -8820,15 +9032,19 @@ async function processOneRunFile(
       }
       let activationCompatible = true;
       let activationBlockedReason = '';
-      if (result.pass && definitionResolution.snapshot) {
-        const latest = readWorkflow(definitionResolution.snapshot.workflowSlug);
+      const catalogSnapshot = definitionResolution.snapshot
+        && isCatalogWorkflowRunDefinitionSnapshot(definitionResolution.snapshot)
+        ? definitionResolution.snapshot
+        : undefined;
+      if (result.pass && catalogSnapshot) {
+        const latest = readWorkflow(catalogSnapshot.workflowSlug);
         if (!latest) {
           activationCompatible = false;
           activationBlockedReason = 'the workflow was deleted while its creation test was running';
-        } else if (!workflowDefinitionMatchesSnapshotIgnoringEnabled(definitionResolution.snapshot, latest.data)) {
+        } else if (!workflowDefinitionMatchesSnapshotIgnoringEnabled(catalogSnapshot, latest.data)) {
           activationCompatible = false;
           activationBlockedReason = 'the workflow definition changed while its creation test was running';
-        } else if (!workflowCodeRevisionMatchesSnapshot(definitionResolution.snapshot, latest.data)) {
+        } else if (!workflowCodeRevisionMatchesSnapshot(catalogSnapshot, latest.data)) {
           activationCompatible = false;
           activationBlockedReason = 'the workflow code changed while its creation test was running';
         }
@@ -8866,11 +9082,11 @@ async function processOneRunFile(
         try {
           const latest = readWorkflow(workflow.name);
           if (
-            !definitionResolution.snapshot
+            !catalogSnapshot
             || (
               latest
-              && workflowDefinitionMatchesSnapshotIgnoringEnabled(definitionResolution.snapshot, latest.data)
-              && workflowCodeRevisionMatchesSnapshot(definitionResolution.snapshot, latest.data)
+              && workflowDefinitionMatchesSnapshotIgnoringEnabled(catalogSnapshot, latest.data)
+              && workflowCodeRevisionMatchesSnapshot(catalogSnapshot, latest.data)
             )
           ) {
             writeWorkflowAndSyncTriggers(workflow.name, { ...(latest?.data ?? workflow.data), enabled: true });
@@ -8912,7 +9128,11 @@ async function processOneRunFile(
     // TRY (single-step) runs bypass the workflow enabled gate — they're
     // explicit dashboard actions on a draft. Full runs still require
     // the workflow to be approved.
-    if (!run.targetStepId && !currentWorkflow.data.enabled) {
+    if (
+      !run.targetStepId
+      && definitionResolution.definitionSource !== 'compiled_snapshot'
+      && !currentWorkflow?.data.enabled
+    ) {
       const message = `Workflow "${workflow.data.name}" is disabled — approve/enable it before it can run.`;
       const report = { workflowName: workflow.data.name, outcome: 'failed' as const, detail: message };
       const terminalRecord = writeRunRecord(filePath, {
@@ -8948,7 +9168,9 @@ async function processOneRunFile(
     }
 
     if (!run.targetStepId) {
-      const prep = prepareWorkflowForWrite(workflow.data);
+      const prep = definitionResolution.definitionSource === 'compiled_snapshot'
+        ? { ok: true as const, def: workflow.data, repairs: [] as string[] }
+        : prepareWorkflowForWrite(workflow.data);
       if (prep.ok && prep.repairs.length > 0) {
         let repairAuthorized = false;
         let graphRebased = false;
@@ -9461,6 +9683,16 @@ async function processOneRunFile(
           unsafeStepId: runUnsafeToRepursue(workflow.data.steps, new Set(resume.completedSteps.keys())),
           chronicallyFailing: shouldStopAutoHeal(workflow.name),
         });
+        if (
+          definitionResolution.definitionSource === 'compiled_snapshot'
+          && goalDecision.action === 'repursue'
+        ) {
+          goalDecision = {
+            action: 'escalate',
+            reason:
+              'goal unmet in a one-off compiled project run — the durable project controller must patch or resume the admitted graph',
+          };
+        }
         if (goalDecision.action === 'repursue') {
           // ONLY a fresh 'queued' run counts as a re-pursuit. A 'duplicate'
           // (an identical run already queued — e.g. the next scheduled fire)
@@ -9540,7 +9772,11 @@ async function processOneRunFile(
       );
       let diagnosis: WorkflowDiagnosis | null = null;
       let proposedFix: ProposedFix | null = null;
-      if (diagnosableBlocks.length > 0 && selfHealEnabled()) {
+      if (
+        definitionResolution.definitionSource !== 'compiled_snapshot'
+        && diagnosableBlocks.length > 0
+        && selfHealEnabled()
+      ) {
         // RSH-5 (fix memory): if a fix PROVABLY resolved this same failure
         // signature before, hand it to the Doctor as a strong hint.
         let priorFix: { fixKind: string; fixDescription: string; fixJson?: string } | undefined;
@@ -9598,10 +9834,14 @@ async function processOneRunFile(
       // authorized only by the worker that actually publishes terminal truth.
       // Compute the breaker preview without mutating it so report copy remains
       // deterministic before publication.
-      const prospectiveConsecutiveFailures = !needsAttention && !goalRepursuing
-        ? 0
-        : getConsecutiveFailures(workflow.name) + 1;
+      const isCompiledProjectRun = definitionResolution.definitionSource === 'compiled_snapshot';
+      const prospectiveConsecutiveFailures = isCompiledProjectRun
+        ? (needsAttention || goalRepursuing ? 1 : 0)
+        : !needsAttention && !goalRepursuing
+          ? 0
+          : getConsecutiveFailures(workflow.name) + 1;
       const recordPublishedOutcomeLearning = (): void => {
+        if (definitionResolution.definitionSource === 'compiled_snapshot') return;
         recordWorkflowOutcome(
           workflow.name,
           !needsAttention && !goalRepursuing,
@@ -9683,7 +9923,9 @@ async function processOneRunFile(
           } catch { /* best-effort */ }
         }
       };
-      const autoHealPaused = needsAttention && prospectiveConsecutiveFailures >= escalateThreshold();
+      const autoHealPaused = !isCompiledProjectRun
+        && needsAttention
+        && prospectiveConsecutiveFailures >= escalateThreshold();
       const escalationBanner = autoHealPaused
         ? `⚠️ "${workflow.data.name}" has failed ${prospectiveConsecutiveFailures} runs in a row — auto-heal is PAUSED to stop wasting tokens. Review the blocked step(s) below; if a recent auto-fix caused this, revert it with \`revert heal <id>\`. It resumes automatically after one clean run, and (for a scheduled workflow) consider disabling it until fixed.\n\n`
         : '';
@@ -9776,7 +10018,7 @@ async function processOneRunFile(
             logger.warn({ runId: run.id, err: err instanceof Error ? err.message : String(err) }, 'self-heal auto-revert failed (backup may already be gone)');
           }
         }
-        const healed = (healReverted || autoHealPaused) ? null : await tryAutoHealAndRequeue({
+        const healed = (isCompiledProjectRun || healReverted || autoHealPaused) ? null : await tryAutoHealAndRequeue({
           run,
           workflowSlug: workflow.name,
           // Auto-heal rewrites the durable authored definition. A run-local
@@ -10208,7 +10450,11 @@ async function processOneRunFile(
       const requestedCancellation = cancelled;
       // Preview the post-failure count without mutating the advisory ledger.
       // The real update happens only after an error terminal state wins.
-      const prospectiveFailureCount = cancelled ? 0 : getConsecutiveFailures(workflow.name) + 1;
+      const prospectiveFailureCount = cancelled
+        ? 0
+        : definitionResolution.definitionSource === 'compiled_snapshot'
+          ? 1
+          : getConsecutiveFailures(workflow.name) + 1;
       const errEscalationBanner = prospectiveFailureCount >= escalateThreshold()
         ? `⚠️ "${workflow.data.name}" has failed ${prospectiveFailureCount} runs in a row — please check it (and, for a scheduled workflow, consider disabling it until fixed). It resumes normal handling after one clean run.\n\n`
         : '';
@@ -10221,7 +10467,11 @@ async function processOneRunFile(
       let healTitle: string | undefined;
       let healBody: string | undefined;
       let healFixId: string | null = null;
-      if (!cancelled && selfHealEnabled()) {
+      if (
+        definitionResolution.definitionSource !== 'compiled_snapshot'
+        && !cancelled
+        && selfHealEnabled()
+      ) {
         try {
           const cv = findContractViolationStep(readWorkflowEvents(workflow.name, run.id));
           if (cv) {
@@ -10293,7 +10543,9 @@ async function processOneRunFile(
         return;
       }
       attemptWorkflowRunReportBack(filePath);
-      if (!cancelled) recordWorkflowOutcome(workflow.name, false, message);
+      if (!cancelled && definitionResolution.definitionSource !== 'compiled_snapshot') {
+        recordWorkflowOutcome(workflow.name, false, message);
+      }
       logger[cancelled ? 'info' : 'error']({ err: error, file }, cancelled ? 'Workflow run cancelled' : 'Workflow run failed');
       appendWorkflowEvent(workflow.name, run.id, { kind: cancelled ? 'run_cancelled' : 'run_failed', error: message });
       addNotification({

@@ -16,6 +16,7 @@ import {
   type WorkflowRunReadinessCheck,
 } from './workflow-run-readiness.js';
 import {
+  isCatalogWorkflowRunDefinitionSnapshot,
   resolveWorkflowRunDefinitionSnapshot,
   workflowCodeRevisionMatchesSnapshot,
   workflowDefinitionMatchesScheduledCatchupSnapshot,
@@ -107,7 +108,9 @@ function workflowSlugFromRecord(record: WorkflowCatchupRunRecord): string | unde
   const direct = nonEmptyString(record.workflowSlug);
   if (direct) return direct;
   const resolved = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
-  return resolved.status === 'valid' ? resolved.snapshot.workflowSlug : undefined;
+  return resolved.status === 'valid' && isCatalogWorkflowRunDefinitionSnapshot(resolved.snapshot)
+    ? resolved.snapshot.workflowSlug
+    : undefined;
 }
 
 function recordMatchesExpectedWorkflow(
@@ -286,7 +289,10 @@ export function resumeWorkflowCatchupRun(
       };
     }
     const admitted = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
-    if (admitted.status !== 'valid') {
+    if (
+      admitted.status !== 'valid'
+      || !isCatalogWorkflowRunDefinitionSnapshot(admitted.snapshot)
+    ) {
       return {
         status: 'definition_conflict',
         runId: input.runId,

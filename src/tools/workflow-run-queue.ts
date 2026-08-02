@@ -16,13 +16,14 @@ import {
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from './shared.js';
-import { listWorkflows } from '../memory/workflow-store.js';
+import { listWorkflows, type WorkflowDefinition } from '../memory/workflow-store.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import { computeResumeState, listFinalFailedItems } from '../execution/workflow-events.js';
 import { checkWorkflowRunReadiness, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import {
   buildWorkflowMutationContractSnapshot,
   isWorkflowMutationContractSnapshot,
+  prepareWorkflowForWrite,
   workflowStepMutationReceiptContract,
   type WorkflowMutationContractSnapshot,
 } from '../execution/workflow-enforce.js';
@@ -32,9 +33,16 @@ import {
 } from '../execution/workflow-call-receipts.js';
 import { withWorkflowRunRecordLock } from '../execution/workflow-run-record.js';
 import {
+  createCompiledWorkflowRunDefinitionSnapshot,
   createWorkflowRunDefinitionSnapshot,
+  isCompiledWorkflowRunDefinitionSnapshot,
+  resolveWorkflowRunDefinitionSnapshot,
+  workflowDefinitionHash,
+  type CompiledWorkflowRunDefinitionSnapshot,
   type WorkflowRunDefinitionSnapshot,
 } from '../execution/workflow-run-definition.js';
+import { preflightWorkflow } from '../execution/workflow-preflight.js';
+import { ExecutionStore } from '../execution/store.js';
 
 /** Run-record capability marker: this execution was admitted by a runner that
  * enforces fsynced exact-call receipts for every structured mutation. */
@@ -174,10 +182,14 @@ function workflowRunFile(runId: string): string {
 }
 
 interface TriggerReceiptMarker {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   receiptId: string;
   runId: string;
   recordedAt: string;
+  /** V3 binds a durable project-source receipt to the exact immutable
+   * compiled run contract. This survives ordinary terminal-run retention, so
+   * a later retry cannot reuse the source turn with different plan bytes. */
+  compiledContractHash?: string;
 }
 
 function readWorkflowTriggerReceiptMarker(receiptId: string): TriggerReceiptMarker | null {
@@ -192,10 +204,15 @@ function readWorkflowTriggerReceiptMarker(receiptId: string): TriggerReceiptMark
     throw new Error(`Trigger receipt acceptance marker ${normalizedReceiptId} is corrupt.`, { cause: err });
   }
   if (
-    (marker.version !== 1 && marker.version !== 2)
+    (marker.version !== 1 && marker.version !== 2 && marker.version !== 3)
     || marker.receiptId !== normalizedReceiptId
     || typeof marker.runId !== 'string'
     || typeof marker.recordedAt !== 'string'
+    || (marker.version === 3 && (
+      typeof marker.compiledContractHash !== 'string'
+      || !/^[a-f0-9]{64}$/.test(marker.compiledContractHash)
+    ))
+    || (marker.version !== 3 && marker.compiledContractHash !== undefined)
   ) {
     throw new Error(`Trigger receipt acceptance marker ${normalizedReceiptId} has an invalid shape.`);
   }
@@ -210,7 +227,7 @@ export function readWorkflowTriggerReceiptAcceptance(receiptId: string): string 
   const marker = readWorkflowTriggerReceiptMarker(receiptId);
   if (!marker) return null;
   const runFile = workflowRunFile(marker.runId);
-  if (!existsSync(runFile)) return marker.version === 2 ? marker.runId : null;
+  if (!existsSync(runFile)) return marker.version === 2 || marker.version === 3 ? marker.runId : null;
   try {
     const run = JSON.parse(readFileSync(runFile, 'utf-8')) as { id?: unknown };
     if (run.id !== marker.runId) {
@@ -244,19 +261,38 @@ export function readWorkflowTriggerReceiptAcceptance(receiptId: string): string 
 /** Persist an immutable receipt-to-run marker. New queue records are installed
  * before this marker; a retry can recover that crash window from the receipt id
  * embedded in the immutable initial run record. */
-function persistWorkflowTriggerReceiptAcceptance(receiptId: string, runId: string): string {
+function persistWorkflowTriggerReceiptAcceptance(
+  receiptId: string,
+  runId: string,
+  compiledContractHash?: string,
+): string {
   const existing = readWorkflowTriggerReceiptMarker(receiptId);
-  if (existing) return existing.runId;
+  if (existing) {
+    if (
+      compiledContractHash
+      && (existing.version !== 3 || existing.compiledContractHash !== compiledContractHash)
+    ) {
+      throw new Error(`Trigger receipt ${receiptId} is already bound to a different compiled run contract.`);
+    }
+    return existing.runId;
+  }
   const markerFile = triggerReceiptAcceptanceFile(receiptId);
   const installed = writeNewRunFileDurably(markerFile, {
-    version: 2,
+    version: compiledContractHash ? 3 : 2,
     receiptId,
     runId,
     recordedAt: new Date().toISOString(),
+    ...(compiledContractHash ? { compiledContractHash } : {}),
   });
   if (!installed) {
     const winner = readWorkflowTriggerReceiptMarker(receiptId);
     if (!winner) throw new Error(`Trigger receipt ${receiptId} lost its atomic run binding.`);
+    if (
+      compiledContractHash
+      && (winner.version !== 3 || winner.compiledContractHash !== compiledContractHash)
+    ) {
+      throw new Error(`Trigger receipt ${receiptId} raced with a different compiled run contract.`);
+    }
     return winner.runId;
   }
   return runId;
@@ -760,6 +796,21 @@ export interface QueueWorkflowRunResult {
   readiness?: WorkflowRunReadinessCheck;
 }
 
+/**
+ * Narrow admission capability for a one-off workflow compiled from one
+ * already-admitted human source turn. It intentionally exposes none of the
+ * catalog queue's scheduler, TRY, retry, catch-up, self-heal, or requeue
+ * controls: a compiled root may be born exactly once and only the durable
+ * project controller may advance its later checkpoints.
+ */
+export interface QueueCompiledWorkflowRunRequest {
+  /** Exact human source already admitted by ExecutionStore. All compiler
+   * bytes, inputs, provenance, and timestamps are reloaded from its immutable
+   * first-winner graph admission; callers cannot supply or override them. */
+  sessionId: string;
+  sourceUserSeq: number;
+}
+
 export type WorkflowRunRecoveryIntentKind =
   | 'step_try'
   | 'failed_items'
@@ -1025,11 +1076,366 @@ function admittedWorkflowDefinition(
   };
 }
 
+export function compiledWorkflowRunContractHash(input: {
+  sourceExecutionId: string;
+  sourceUserSeq: number;
+  sourceTurnKeyHash: string;
+  originSessionId: string;
+  workflowSlug: string;
+  snapshot: CompiledWorkflowRunDefinitionSnapshot;
+  inputs: Record<string, string>;
+}): string {
+  const normalizedInputsHash = createHash('sha256').update(stableJson(input.inputs)).digest('hex');
+  return createHash('sha256').update(stableJson({
+    version: 'compiled-project-run:v1',
+    sourceExecutionId: input.sourceExecutionId,
+    sourceUserSeq: input.sourceUserSeq,
+    sourceTurnKeyHash: input.sourceTurnKeyHash,
+    originSessionId: input.originSessionId,
+    workflowSlug: input.workflowSlug,
+    definitionHash: input.snapshot.definitionHash,
+    admissionHash: input.snapshot.admissionHash,
+    normalizedInputsHash,
+  })).digest('hex');
+}
+
+function assertCompiledRunMatchesContract(input: {
+  runId: string;
+  triggerReceiptId: string;
+  sourceExecutionId: string;
+  sourceUserSeq: number;
+  sourceTurnKeyHash: string;
+  originSessionId: string;
+  workflowSlug: string;
+  snapshot: CompiledWorkflowRunDefinitionSnapshot;
+  inputs: Record<string, string>;
+  contractHash: string;
+}): string {
+  const file = workflowRunFile(input.runId);
+  let record: Record<string, unknown>;
+  try {
+    record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(`Compiled workflow run ${input.runId} is unreadable.`, { cause: err });
+  }
+  const resolution = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
+  if (
+    record.id !== input.runId
+    || record.triggerReceiptId !== input.triggerReceiptId
+    || record.source !== 'project_graph'
+    || record.sourceExecutionId !== input.sourceExecutionId
+    || record.sourceUserSeq !== input.sourceUserSeq
+    || record.originSessionId !== input.originSessionId
+    || record.workflow !== input.snapshot.definition.name
+    || record.workflowSlug !== input.workflowSlug
+    || record.compiledContractHash !== input.contractHash
+    || record.mutationReceiptProtocolVersion !== WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION
+    || record.targetStepId !== undefined
+    || record.catchupFire !== undefined
+    || record.catchupDisposition !== undefined
+    || record.catchupOccurrenceAtMs !== undefined
+    || record.requeuedFromRunId !== undefined
+    || record.retryFailedItemsFromRunId !== undefined
+    || record.selfHealAttempt !== undefined
+    || record.goalAttempt !== undefined
+    || stableJson(normalizeWorkflowRunInputs(
+      record.inputs && typeof record.inputs === 'object' && !Array.isArray(record.inputs)
+        ? record.inputs as Record<string, string>
+        : {},
+    )) !== stableJson(input.inputs)
+    || resolution.status !== 'valid'
+    || !isCompiledWorkflowRunDefinitionSnapshot(resolution.snapshot)
+    || resolution.snapshot.sourceTurnKeyHash !== input.sourceTurnKeyHash
+    || resolution.snapshot.workflowSlug !== input.workflowSlug
+    || resolution.snapshot.definitionHash !== input.snapshot.definitionHash
+    || resolution.snapshot.admissionHash !== input.snapshot.admissionHash
+  ) {
+    throw new Error(
+      `Compiled workflow receipt ${input.triggerReceiptId} is already attached to different run bytes; refusing to reuse it.`,
+    );
+  }
+  return typeof record.status === 'string' ? record.status : 'queued';
+}
+
+function activateBoundCompiledWorkflowRun(runId: string, contractHash: string): void {
+  const file = workflowRunFile(runId);
+  withWorkflowRunRecordLock(file, () => {
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+    } catch (err) {
+      throw new Error(`Compiled workflow run ${runId} is unreadable during project binding.`, { cause: err });
+    }
+    if (record.id !== runId || record.compiledContractHash !== contractHash) {
+      throw new Error(`Compiled workflow run ${runId} changed before project binding.`);
+    }
+    if (record.status === 'awaiting_project_bind') {
+      writeRunFileDurably(file, {
+        ...record,
+        status: 'queued',
+        projectBoundAt: new Date().toISOString(),
+      });
+      return;
+    }
+    if (
+      record.status === 'queued'
+      || record.status === 'running'
+      || record.status === 'finalizing'
+      || workflowRunIsTerminal(record.status)
+    ) return;
+    throw new Error(`Compiled workflow run ${runId} has an invalid project-binding state.`);
+  });
+}
+
+/**
+ * Queue a catalogless, immutable workflow compiled from a durable project.
+ * The source-turn receipt is the idempotency authority: retries either recover
+ * the exact accepted record or fail closed when any definition/input/origin
+ * byte changed. No workflow catalog entry or SKILL.md is created.
+ */
+export function queueCompiledWorkflowRun(
+  request: QueueCompiledWorkflowRunRequest,
+): QueueWorkflowRunResult {
+  const sessionId = normalizedOptionalString(request.sessionId);
+  const sourceUserSeq = request.sourceUserSeq;
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
+    throw new Error('A compiled workflow run requires an exact admitted human source.');
+  }
+  const executionStore = new ExecutionStore();
+  const sourceExecution = executionStore.getForSource(sessionId, sourceUserSeq);
+  const graphAdmission = sourceExecution?.graphAdmission;
+  if (
+    !sourceExecution
+    || !graphAdmission
+    || sourceExecution.sessionId !== sessionId
+    || sourceExecution.sourceUserSeq !== sourceUserSeq
+  ) {
+    throw new Error('No durable project graph is admitted for this exact human source.');
+  }
+  const sourceExecutionId = sourceExecution.id;
+  const sourceTurnKeyHash = graphAdmission.sourceTurnKeyHash;
+  const originSessionId = sourceExecution.sessionId;
+  const admittedAt = graphAdmission.admittedAt;
+  const requestDefinition = graphAdmission.compiledPlan.definition;
+  const requestInputs = graphAdmission.compiledPlan.inputs;
+
+  const workflowSlug = `compiled-${sourceTurnKeyHash.slice(0, 32)}`;
+  const triggerReceiptId = `project-turn:v1:${sourceTurnKeyHash}`;
+  if (graphAdmission.rootWorkflowReceiptId !== triggerReceiptId) {
+    throw new Error('Persisted project graph has a mismatched root workflow receipt.');
+  }
+  const originalDefinitionHash = workflowDefinitionHash(requestDefinition);
+  if (originalDefinitionHash !== graphAdmission.compiledPlan.definitionHash) {
+    throw new Error('Persisted project compiler definition does not match its admission hash.');
+  }
+  const prepared = prepareWorkflowForWrite(requestDefinition);
+  if (!prepared.ok) {
+    throw new Error(`Compiled workflow preflight rejected its definition: ${prepared.errors.join('; ')}`);
+  }
+  if (
+    prepared.repairs.length > 0
+    || workflowDefinitionHash(prepared.def) !== originalDefinitionHash
+  ) {
+    throw new Error(
+      `Compiled workflow definitions must arrive canonical and repair-free: ${prepared.repairs.join('; ')}`,
+    );
+  }
+  const definition = prepared.def;
+  for (const step of definition.steps) {
+    if (step.call || step.deterministic) continue;
+    const allowedTools = step.allowedTools?.map((tool) => tool.trim()).filter(Boolean) ?? [];
+    if (
+      allowedTools.length === 0
+      || allowedTools.some((tool) => tool.includes('*'))
+    ) {
+      throw new Error(
+        `Compiled model step "${step.id}" requires an explicit non-wildcard tool capability list.`,
+      );
+    }
+  }
+  const normalizedInputs = normalizeWorkflowRunInputs(requestInputs);
+  if (stableJson(normalizedInputs) !== stableJson(requestInputs)) {
+    throw new Error('Persisted project compiler inputs are not canonical workflow inputs.');
+  }
+  const missingInputs = missingWorkflowRunInputs(definition, normalizedInputs);
+  if (missingInputs.length > 0) {
+    throw new Error(`Compiled workflow run is missing required inputs: ${missingInputs.join(', ')}.`);
+  }
+  const preflight = preflightWorkflow(definition, normalizedInputs);
+  if (!preflight.ok || preflight.missingInputs.length > 0) {
+    throw new Error(
+      `Compiled workflow preflight failed: ${[...preflight.errors, ...preflight.missingInputs.map((key) => `missing ${key}`)].join('; ')}`,
+    );
+  }
+
+  const catalogCollision = listWorkflows().find((entry) =>
+    entry.name === workflowSlug
+    || entry.data.name === workflowSlug
+    || entry.name === definition.name
+    || entry.data.name === definition.name);
+  if (catalogCollision) {
+    throw new Error(
+      `Compiled workflow identity collides with catalog workflow "${catalogCollision.name}"; refusing ambiguous execution.`,
+    );
+  }
+
+  const readiness = checkWorkflowRunReadiness(definition, workflowSlug);
+  if (!readiness.ok) {
+    return {
+      status: 'blocked_readiness',
+      message: readiness.message,
+      readiness,
+    };
+  }
+  const snapshot = createCompiledWorkflowRunDefinitionSnapshot({
+    workflowSlug,
+    sourceTurnKeyHash,
+    definition,
+    admittedAt,
+  });
+  const contractHash = compiledWorkflowRunContractHash({
+    sourceExecutionId,
+    sourceUserSeq,
+    sourceTurnKeyHash,
+    originSessionId,
+    workflowSlug,
+    snapshot,
+    inputs: normalizedInputs,
+  });
+  const runId = deterministicTriggerRunId(triggerReceiptId);
+  const contract = {
+    runId,
+    triggerReceiptId,
+    sourceExecutionId,
+    sourceUserSeq,
+    sourceTurnKeyHash,
+    originSessionId,
+    workflowSlug,
+    snapshot,
+    inputs: normalizedInputs,
+    contractHash,
+  };
+  const bindAndActivate = (): void => {
+    executionStore.bindRootWorkflowRunForSource({
+      sessionId,
+      sourceUserSeq,
+      rootWorkflowReceiptId: triggerReceiptId,
+      runId,
+      workflow: definition.name,
+    });
+    if (existsSync(workflowRunFile(runId))) {
+      activateBoundCompiledWorkflowRun(runId, contractHash);
+    }
+  };
+
+  const marker = readWorkflowTriggerReceiptMarker(triggerReceiptId);
+  if (marker) {
+    if (
+      marker.version !== 3
+      || marker.runId !== runId
+      || marker.compiledContractHash !== contractHash
+    ) {
+      throw new Error(`Project source receipt ${triggerReceiptId} is already bound to a different run contract.`);
+    }
+    const runStillExists = existsSync(workflowRunFile(runId));
+    if (runStillExists) {
+      assertCompiledRunMatchesContract(contract);
+    } else if (graphAdmission.rootWorkflowRunId !== runId) {
+      throw new Error(
+        `Project source receipt ${triggerReceiptId} has no retained run and was never bound by the execution ledger.`,
+      );
+    }
+    bindAndActivate();
+    const accepted = readWorkflowTriggerReceiptAcceptance(triggerReceiptId);
+    if (accepted !== runId) {
+      throw new Error(`Project source receipt ${triggerReceiptId} lost its accepted run binding.`);
+    }
+    attachOriginSessionIdsToRun(runId, [originSessionId]);
+    return {
+      status: 'duplicate',
+      id: runId,
+      readiness,
+      message: `This durable project source was already accepted as compiled workflow run ${runId}; no duplicate was queued.`,
+    };
+  }
+
+  const receiptRun = findWorkflowRunByTriggerReceiptId(triggerReceiptId);
+  if (receiptRun) {
+    if (receiptRun.id !== runId) {
+      throw new Error(`Project source receipt ${triggerReceiptId} is attached to an unexpected workflow run.`);
+    }
+    assertCompiledRunMatchesContract(contract);
+    const bound = persistWorkflowTriggerReceiptAcceptance(triggerReceiptId, runId, contractHash);
+    if (bound !== runId || readWorkflowTriggerReceiptAcceptance(triggerReceiptId) !== runId) {
+      throw new Error(`Project source receipt ${triggerReceiptId} could not recover its durable run binding.`);
+    }
+    bindAndActivate();
+    attachOriginSessionIdsToRun(runId, [originSessionId]);
+    return {
+      status: 'duplicate',
+      id: runId,
+      readiness,
+      message: `Recovered the already-queued compiled workflow run ${runId}; no duplicate was created.`,
+    };
+  }
+
+  const createdAt = new Date().toISOString();
+  const runRecord: Record<string, unknown> = {
+    id: runId,
+    workflow: definition.name,
+    workflowSlug,
+    inputs: normalizedInputs,
+    // Two-phase admission: the drain does not recognize this state. Only after
+    // ExecutionStore durably binds the exact first-winner source does the
+    // queue atomically flip this same record to `queued`.
+    status: 'awaiting_project_bind',
+    source: 'project_graph',
+    sourceExecutionId,
+    triggerReceiptId,
+    originSessionId,
+    mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+    workflowDefinitionSnapshot: snapshot,
+    compiledContractHash: contractHash,
+    sourceUserSeq,
+    readiness: workflowRunReadinessSnapshot(readiness),
+    createdAt,
+  };
+  ensureDir(WORKFLOW_RUNS_DIR);
+  const installed = writeNewRunFileDurably(workflowRunFile(runId), runRecord);
+  if (!installed) assertCompiledRunMatchesContract(contract);
+  const bound = persistWorkflowTriggerReceiptAcceptance(triggerReceiptId, runId, contractHash);
+  if (bound !== runId || readWorkflowTriggerReceiptAcceptance(triggerReceiptId) !== runId) {
+    throw new Error(`Project source receipt ${triggerReceiptId} changed ownership during queue installation.`);
+  }
+  bindAndActivate();
+  if (!installed) {
+    attachOriginSessionIdsToRun(runId, [originSessionId]);
+    return {
+      status: 'duplicate',
+      id: runId,
+      readiness,
+      message: `Compiled workflow run ${runId} was already accepted; no duplicate was queued.`,
+    };
+  }
+  return {
+    status: 'queued',
+    id: runId,
+    readiness,
+    message: `Queued durable project graph "${definition.name}" as compiled workflow run ${runId}.`,
+  };
+}
+
 export function queueWorkflowRun(
   name: string,
   normalizedInputs: Record<string, string>,
   opts?: QueueWorkflowRunOptions,
 ): QueueWorkflowRunResult {
+  if (
+    normalizedOptionalString(opts?.source) === 'project_graph'
+    || normalizedOptionalString(opts?.triggerReceiptId)?.startsWith('project-turn:v1:')
+  ) {
+    throw new Error('Durable project runs may only be admitted through queueCompiledWorkflowRun.');
+  }
   if (opts?.dedupe === false || normalizedOptionalString(opts?.triggerReceiptId)) {
     return queueWorkflowRunUnlocked(name, normalizedInputs, opts);
   }

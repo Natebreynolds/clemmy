@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import {
+  createCompiledWorkflowRunDefinitionSnapshot,
   createWorkflowRunDefinitionSnapshot,
+  isCatalogWorkflowRunDefinitionSnapshot,
+  isCompiledWorkflowRunDefinitionSnapshot,
   resolveWorkflowRunDefinitionSnapshot,
   workflowDefinitionMatchesSnapshotIgnoringEnabled,
   workflowDefinitionMatchesScheduledCatchupSnapshot,
@@ -143,4 +146,102 @@ test('scheduled catch-up compatibility ignores admission controls but pins execu
       call: { tool: 'composio_gmail_search', args: { query: 'newer than:1d' } },
     }],
   }), false);
+});
+
+test('compiled workflow snapshot authenticates its catalogless scope and exact source', () => {
+  const definition = workflow();
+  const snapshot = createCompiledWorkflowRunDefinitionSnapshot({
+    workflowSlug: `compiled-${'a'.repeat(32)}`,
+    sourceTurnKeyHash: 'b'.repeat(64),
+    definition,
+    admittedAt: '2026-08-02T12:00:00.000Z',
+  });
+  definition.steps[0].prompt = 'Edited after compiled admission.';
+
+  const resolved = resolveWorkflowRunDefinitionSnapshot(snapshot);
+  assert.equal(resolved.status, 'valid');
+  if (resolved.status !== 'valid') return;
+  assert.equal(isCompiledWorkflowRunDefinitionSnapshot(resolved.snapshot), true);
+  assert.equal(isCatalogWorkflowRunDefinitionSnapshot(resolved.snapshot), false);
+  assert.equal(resolved.snapshot.definition.steps[0].prompt, 'Fetch the records.');
+  assert.equal(resolved.snapshot.workflowSlug, `compiled-${'a'.repeat(32)}`);
+  assert.equal(resolved.snapshot.codeRevision, 'no-code');
+});
+
+test('compiled workflow snapshot fails closed on scope, source, or definition tampering', () => {
+  const create = () => createCompiledWorkflowRunDefinitionSnapshot({
+    workflowSlug: `compiled-${'c'.repeat(32)}`,
+    sourceTurnKeyHash: 'd'.repeat(64),
+    definition: workflow(),
+    admittedAt: '2026-08-02T12:00:00.000Z',
+  });
+
+  const badScope = create() as typeof create extends () => infer T ? T : never;
+  (badScope as { scope: string }).scope = 'catalog';
+  assert.deepEqual(resolveWorkflowRunDefinitionSnapshot(badScope), {
+    status: 'invalid',
+    reason: 'compiled snapshot scope is invalid',
+  });
+
+  const badSource = create();
+  badSource.sourceTurnKeyHash = 'e'.repeat(64);
+  assert.deepEqual(resolveWorkflowRunDefinitionSnapshot(badSource), {
+    status: 'invalid',
+    reason: 'compiled admission metadata does not match its hash',
+  });
+
+  const badDefinition = create();
+  badDefinition.definition.steps[0].prompt = 'Tampered compiled instructions.';
+  assert.deepEqual(resolveWorkflowRunDefinitionSnapshot(badDefinition), {
+    status: 'invalid',
+    reason: 'definition content does not match its admission hash',
+  });
+});
+
+test('compiled workflow snapshots reject unsafe slugs and unbundled executable code', () => {
+  assert.throws(
+    () => createCompiledWorkflowRunDefinitionSnapshot({
+      workflowSlug: '../compiled-project',
+      sourceTurnKeyHash: 'f'.repeat(64),
+      definition: workflow(),
+    }),
+    /reserved compiled workflow slug/i,
+  );
+
+  const deterministic = workflow();
+  deterministic.steps[0].deterministic = { runner: 'scripts/transform.mjs' };
+  assert.throws(
+    () => createCompiledWorkflowRunDefinitionSnapshot({
+      workflowSlug: `compiled-${'1'.repeat(32)}`,
+      sourceTurnKeyHash: '2'.repeat(64),
+      definition: deterministic,
+    }),
+    /deterministic runner.*run-scoped code bundles/i,
+  );
+
+  const probe = workflow();
+  probe.steps[0].loopUntil = {
+    maxAttempts: 2,
+    probe: { runner: 'check.mjs' },
+    until: { type: 'object', required_keys: ['done'] },
+  };
+  assert.throws(
+    () => createCompiledWorkflowRunDefinitionSnapshot({
+      workflowSlug: `compiled-${'3'.repeat(32)}`,
+      sourceTurnKeyHash: '4'.repeat(64),
+      definition: probe,
+    }),
+    /deterministic loop probe.*run-scoped code bundles/i,
+  );
+});
+
+test('compiled workflow snapshots require an enabled manual-only definition', () => {
+  assert.throws(
+    () => createCompiledWorkflowRunDefinitionSnapshot({
+      workflowSlug: `compiled-${'5'.repeat(32)}`,
+      sourceTurnKeyHash: '6'.repeat(64),
+      definition: { ...workflow(), trigger: { schedule: '0 * * * *' } },
+    }),
+    /enabled and manual-only/i,
+  );
 });

@@ -20,6 +20,7 @@ process.env.HOME = TMP_HOME;
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 
 const {
+  queueCompiledWorkflowRun,
   queueWorkflowRun,
   queueWorkflowDryRun,
   resumeWorkflowRun,
@@ -31,6 +32,9 @@ const {
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
 } = await import('./workflow-run-queue.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
+const { ExecutionStore } = await import('../execution/store.js');
+const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const { workflowDefinitionHash } = await import('../execution/workflow-run-definition.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const {
   executeWorkflowCallMutation,
@@ -54,6 +58,122 @@ function writeAuditWorkflow(enabled = true): void {
       { id: 'blast_two', prompt: 'Run the second read-only analysis.', dependsOn: ['normalize'], forEach: 'normalize', sideEffect: 'read' },
     ],
   });
+}
+
+function canonicalTestJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalTestJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalTestJson(record[key])}`
+  ).join(',')}}`;
+}
+
+function canonicalTestHash(value: unknown): string {
+  return createHash('sha256').update(canonicalTestJson(value), 'utf-8').digest('hex');
+}
+
+function compiledProjectAdmissionInput(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  label: string;
+  variant?: string;
+  inputs?: Record<string, string>;
+  requiredTopic?: boolean;
+  usesSkill?: string;
+  omitAllowedTools?: boolean;
+  allowedTools?: string[];
+}): Record<string, unknown> {
+  const variant = input.variant ?? 'winner';
+  const safeLabel = input.label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const definition = {
+    name: `compiled-project-${safeLabel}`,
+    description: 'One-off durable project compiled for queue admission.',
+    enabled: true,
+    trigger: { manual: true },
+    ...(input.requiredTopic ? { inputs: { topic: { description: 'Project topic.' } } } : {}),
+    steps: [{
+      id: 'work',
+      prompt: input.requiredTopic
+        ? `Perform bounded ${variant} work for {{input.topic}}.`
+        : `Perform bounded ${variant} work.`,
+      sideEffect: 'read' as const,
+      maxTurns: 8,
+      ...(!input.omitAllowedTools
+        ? { allowedTools: input.allowedTools ?? ['workflow_step_result'] }
+        : {}),
+      ...(input.usesSkill ? { usesSkill: input.usesSkill } : {}),
+      output: { type: 'object' as const, required_keys: ['summary'] },
+    }],
+  };
+  const plan = {
+    version: 1,
+    objective: 'Produce a durable verified deliverable.',
+    nodes: [{
+      id: 'work',
+      executor: 'model',
+      effect: 'read',
+      instruction: definition.steps[0].prompt,
+      maxTurns: 8,
+    }],
+  };
+  return {
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    title: 'Durable project',
+    objective: 'Produce a durable verified deliverable.',
+    reason: 'Accepted as a long-horizon project.',
+    startedFromMessage: 'Build the durable project.',
+    confidence: 0.95,
+    reasons: ['multi-step durable work'],
+    admission: {
+      turnGraphId: `turn-graph:v1:${input.sourceUserSeq}`,
+      turnGraphHash: canonicalTestHash({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        kind: 'turn_graph_v1',
+      }),
+      compiledPlan: {
+        version: 1,
+        compilerId: 'project_graph_v1',
+        planHash: canonicalTestHash(plan),
+        definitionHash: workflowDefinitionHash(definition),
+        plan,
+        definition,
+        inputs: input.inputs ?? {},
+      },
+    },
+  };
+}
+
+function seedCompiledProject(input: {
+  label: string;
+  variant?: string;
+  inputs?: Record<string, string>;
+  requiredTopic?: boolean;
+  usesSkill?: string;
+  omitAllowedTools?: boolean;
+  allowedTools?: string[];
+}) {
+  resetEventLog();
+  const sessionId = `sess-compiled-${input.label}-${Math.random().toString(36).slice(2, 8)}`;
+  createSession({ id: sessionId, kind: 'chat', title: input.label });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Build the durable project.', source: 'desktop' },
+  });
+  const sourceUserSeq = source.seq;
+  const admissionInput = compiledProjectAdmissionInput({
+    sessionId,
+    sourceUserSeq,
+    ...input,
+  });
+  const store = new ExecutionStore();
+  const admitted = store.createOrGetForSource(admissionInput as never);
+  return { sessionId, sourceUserSeq, admissionInput, store, admitted };
 }
 
 function runFiles(): string[] {
@@ -103,6 +223,38 @@ function launchQueueChild(
   });
 }
 
+function launchCompiledQueueChild(
+  sessionId: string,
+  sourceUserSeq: number,
+  resultFile: string,
+) {
+  const childCode = `
+    import { writeFileSync } from 'node:fs';
+    const mod = await import(process.env.CLEM_QUEUE_MODULE_URL);
+    try {
+      const result = mod.queueCompiledWorkflowRun({
+        sessionId: process.env.CLEM_COMPILED_SESSION,
+        sourceUserSeq: Number(process.env.CLEM_COMPILED_SOURCE_SEQ),
+      });
+      writeFileSync(process.env.CLEM_QUEUE_RESULT, JSON.stringify(result));
+    } catch (error) {
+      writeFileSync(process.env.CLEM_QUEUE_RESULT, JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    }
+  `;
+  return spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', childCode], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLEMENTINE_HOME: TMP_HOME,
+      CLEM_QUEUE_MODULE_URL: QUEUE_MODULE_URL,
+      CLEM_COMPILED_SESSION: sessionId,
+      CLEM_COMPILED_SOURCE_SEQ: String(sourceUserSeq),
+      CLEM_QUEUE_RESULT: resultFile,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
 function launchReaperChild(
   resultFile: string,
   beforeLockReady: string,
@@ -140,6 +292,256 @@ function launchReaperChild(
 beforeEach(() => {
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+  rmSync(path.join(TMP_HOME, 'state', 'executions.json'), { force: true });
+});
+
+test('queueCompiledWorkflowRun: requires the immutable ExecutionStore admission', () => {
+  assert.throws(
+    () => queueCompiledWorkflowRun({ sessionId: 'fabricated-session', sourceUserSeq: 1 }),
+    /No durable project graph is admitted/i,
+  );
+  assert.deepEqual(runFiles(), []);
+});
+
+test('queueCompiledWorkflowRun: queues the persisted first winner without creating a catalog workflow', () => {
+  const seeded = seedCompiledProject({ label: 'first-winner' });
+  const queued = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  assert.equal(queued.status, 'queued');
+  assert.ok(queued.id);
+  assert.equal(runFiles().length, 1);
+
+  const record = JSON.parse(
+    readFileSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), 'utf-8'),
+  ) as Record<string, any>;
+  assert.equal(record.status, 'queued');
+  assert.equal(record.source, 'project_graph');
+  assert.equal(record.sourceExecutionId, seeded.admitted.execution.id);
+  assert.equal(record.sourceUserSeq, seeded.sourceUserSeq);
+  assert.equal(record.originSessionId, seeded.sessionId);
+  assert.equal(record.mutationReceiptProtocolVersion, WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION);
+  const resolved = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
+  assert.equal(resolved.status, 'valid');
+  if (resolved.status === 'valid') assert.equal(resolved.snapshot.version, 2);
+  assert.equal(
+    seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.graphAdmission?.rootWorkflowRunId,
+    queued.id,
+  );
+  assert.equal(
+    existsSync(path.join(WORKFLOWS_DIR, String(record.workflowSlug), 'SKILL.md')),
+    false,
+  );
+
+  const replay = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  assert.equal(replay.status, 'duplicate');
+  assert.equal(replay.id, queued.id);
+  assert.equal(runFiles().length, 1);
+  assert.equal(
+    seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.workflowBindings
+      ?.filter((binding) => binding.runId === queued.id).length,
+    1,
+  );
+});
+
+test('queueCompiledWorkflowRun: a losing planner cannot dispatch its own bytes', () => {
+  const seeded = seedCompiledProject({ label: 'planner-race', variant: 'winner' });
+  const losingInput = compiledProjectAdmissionInput({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+    label: 'planner-race',
+    variant: 'loser',
+  });
+  const losing = seeded.store.createOrGetForSource(losingInput as never);
+  assert.equal(losing.plannerConflict, true);
+
+  const queued = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  const record = JSON.parse(
+    readFileSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), 'utf-8'),
+  ) as Record<string, any>;
+  assert.match(record.workflowDefinitionSnapshot.definition.steps[0].prompt, /winner/);
+  assert.doesNotMatch(record.workflowDefinitionSnapshot.definition.steps[0].prompt, /loser/);
+});
+
+test('queueCompiledWorkflowRun: exact replay fails closed after run-contract tampering', () => {
+  const seeded = seedCompiledProject({
+    label: 'tampered-run',
+    requiredTopic: true,
+    inputs: { topic: 'original' },
+  });
+  const queued = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`);
+  const original = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, any>;
+  writeFileSync(file, JSON.stringify({ ...original, inputs: { topic: 'tampered' } }), 'utf-8');
+  assert.throws(
+    () => queueCompiledWorkflowRun({
+      sessionId: seeded.sessionId,
+      sourceUserSeq: seeded.sourceUserSeq,
+    }),
+    /different run bytes/i,
+  );
+});
+
+test('queueCompiledWorkflowRun: validation and readiness failures create no run, receipt, or root binding', () => {
+  const cases = [
+    seedCompiledProject({ label: 'missing-input', requiredTopic: true }),
+    seedCompiledProject({ label: 'missing-skill', usesSkill: 'not-installed-for-compiled-test' }),
+    seedCompiledProject({ label: 'implicit-wildcard', omitAllowedTools: true }),
+    seedCompiledProject({ label: 'prefix-wildcard', allowedTools: ['composio_*'] }),
+  ];
+  for (const seeded of cases) {
+    const result = (() => {
+      try {
+        return queueCompiledWorkflowRun({
+          sessionId: seeded.sessionId,
+          sourceUserSeq: seeded.sourceUserSeq,
+        });
+      } catch (error) {
+        return error;
+      }
+    })();
+    if (seeded === cases[1]) {
+      assert.equal((result as { status?: string }).status, 'blocked_readiness');
+    } else {
+      assert.ok(result instanceof Error);
+    }
+    assert.equal(
+      seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.graphAdmission?.rootWorkflowRunId,
+      undefined,
+    );
+  }
+  assert.deepEqual(runFiles(), []);
+});
+
+test('queueCompiledWorkflowRun: catalog identity collision fails before root admission', () => {
+  const seeded = seedCompiledProject({ label: 'catalog-collision' });
+  const definition = seeded.admitted.execution.graphAdmission!.compiledPlan.definition;
+  writeWorkflow(definition.name, {
+    ...definition,
+    description: 'Authored catalog workflow with the same identity.',
+  });
+  assert.throws(
+    () => queueCompiledWorkflowRun({
+      sessionId: seeded.sessionId,
+      sourceUserSeq: seeded.sourceUserSeq,
+    }),
+    /collides with catalog workflow/i,
+  );
+  assert.deepEqual(runFiles(), []);
+  assert.equal(
+    seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.graphAdmission?.rootWorkflowRunId,
+    undefined,
+  );
+});
+
+test('queueCompiledWorkflowRun: recovers the crash window between run install, receipt, binding, and activation', () => {
+  const seeded = seedCompiledProject({ label: 'crash-recovery' });
+  const queued = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`);
+  const record = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(runFile, JSON.stringify({ ...record, status: 'awaiting_project_bind' }), 'utf-8');
+  rmSync(path.join(WORKFLOW_RUNS_DIR, '.trigger-receipts'), { recursive: true, force: true });
+
+  const executionsFile = path.join(TMP_HOME, 'state', 'executions.json');
+  const executions = JSON.parse(readFileSync(executionsFile, 'utf-8')) as Array<Record<string, any>>;
+  const sourceExecution = executions.find((entry) => entry.id === seeded.admitted.execution.id)!;
+  delete sourceExecution.graphAdmission.rootWorkflowRunId;
+  sourceExecution.workflowBindings = [];
+  writeFileSync(executionsFile, JSON.stringify(executions, null, 2), 'utf-8');
+
+  const recovered = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  assert.equal(recovered.status, 'duplicate');
+  assert.equal(recovered.id, queued.id);
+  assert.equal(
+    (JSON.parse(readFileSync(runFile, 'utf-8')) as { status: string }).status,
+    'queued',
+  );
+  assert.equal(
+    seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq)?.graphAdmission?.rootWorkflowRunId,
+    queued.id,
+  );
+});
+
+test('queueCompiledWorkflowRun: a V3 tombstone is authoritative only after the execution ledger was bound', () => {
+  const seeded = seedCompiledProject({ label: 'retained-tombstone' });
+  const queued = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  rmSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), { force: true });
+
+  const retainedReplay = queueCompiledWorkflowRun({
+    sessionId: seeded.sessionId,
+    sourceUserSeq: seeded.sourceUserSeq,
+  });
+  assert.equal(retainedReplay.status, 'duplicate');
+  assert.equal(retainedReplay.id, queued.id);
+
+  const executionsFile = path.join(TMP_HOME, 'state', 'executions.json');
+  const executions = JSON.parse(readFileSync(executionsFile, 'utf-8')) as Array<Record<string, any>>;
+  delete executions.find((entry) => entry.id === seeded.admitted.execution.id)!.graphAdmission.rootWorkflowRunId;
+  writeFileSync(executionsFile, JSON.stringify(executions, null, 2), 'utf-8');
+  assert.throws(
+    () => queueCompiledWorkflowRun({
+      sessionId: seeded.sessionId,
+      sourceUserSeq: seeded.sourceUserSeq,
+    }),
+    /no retained run and was never bound/i,
+  );
+});
+
+test('queueCompiledWorkflowRun: concurrent same-source callers converge on one bound root', async () => {
+  const seeded = seedCompiledProject({ label: 'concurrent-source' });
+  const resultA = path.join(TMP_HOME, `compiled-a-${Date.now()}.json`);
+  const resultB = path.join(TMP_HOME, `compiled-b-${Date.now()}.json`);
+  const children = [
+    launchCompiledQueueChild(seeded.sessionId, seeded.sourceUserSeq, resultA),
+    launchCompiledQueueChild(seeded.sessionId, seeded.sourceUserSeq, resultB),
+  ];
+  const exits = await Promise.all(children.map((child) => once(child, 'close')));
+  assert.deepEqual(exits.map(([code]) => code), [0, 0]);
+  const results = [resultA, resultB].map((file) =>
+    JSON.parse(readFileSync(file, 'utf-8')) as { status?: string; id?: string; error?: string });
+  assert.deepEqual(results.map((result) => result.error), [undefined, undefined]);
+  assert.deepEqual(results.map((result) => result.status).sort(), ['duplicate', 'queued']);
+  assert.equal(results[0].id, results[1].id);
+  assert.equal(runFiles().length, 1);
+  const persisted = seeded.store.getForSource(seeded.sessionId, seeded.sourceUserSeq);
+  assert.equal(persisted?.graphAdmission?.rootWorkflowRunId, results[0].id);
+  assert.equal(
+    persisted?.workflowBindings?.filter((binding) => binding.runId === results[0].id).length,
+    1,
+  );
+  rmSync(resultA, { force: true });
+  rmSync(resultB, { force: true });
+});
+
+test('queueWorkflowRun: cannot preempt the durable project source namespace', () => {
+  assert.throws(
+    () => queueWorkflowRun('audit-brief', {}, { source: 'project_graph' }),
+    /queueCompiledWorkflowRun/,
+  );
+  assert.throws(
+    () => queueWorkflowRun('audit-brief', {}, { triggerReceiptId: `project-turn:v1:${'a'.repeat(64)}` }),
+    /queueCompiledWorkflowRun/,
+  );
+  assert.deepEqual(runFiles(), []);
 });
 
 test('queueWorkflowRun: writes a queued run and dedupes identical inputs', () => {
