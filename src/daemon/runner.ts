@@ -75,7 +75,7 @@ import {
 } from '../memory/maintenance.js';
 import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decision.js';
-import { reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
+import { migrateToolChoicesToCanonicalProcedures, reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
 import { reapDeadSkillChoices } from '../memory/skill-choice-store.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
@@ -200,6 +200,14 @@ type ReadOpenAiApiKeyFn = typeof getOpenAiApiKey;
 
 export function bootModelWarmupEnabled(): boolean {
   return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BOOT_WARMUP', 'off') ?? 'off').trim());
+}
+
+/** Emergency recovery switch for machines with pathological/managed PATHs.
+ * Normal discovery remains on-demand even when boot warming is disabled. */
+export function cliDiscoveryWarmupEnabled(): boolean {
+  return !/^(0|false|off|no)$/i.test(
+    (getRuntimeEnv('CLEMMY_CLI_DISCOVERY_WARMUP', 'on') ?? 'on').trim(),
+  );
 }
 
 export async function resolveBootModelWarmupGate(
@@ -1522,6 +1530,22 @@ export async function startDaemon(
   );
   ensureDir(CRON_PROGRESS_DIR);
   const state = loadState();
+  // Canonical tool-memory migration is an explicit boot phase. Never hide it
+  // behind list/recall/pre-warm: those hot paths must remain read-only. A
+  // durable marker makes normal restarts a single marker read, while v3.6
+  // installs that already carry deterministic links are adopted without
+  // rewriting their alias/procedure corpus.
+  try {
+    const migrated = migrateToolChoicesToCanonicalProcedures();
+    if (migrated.aliasesLinked > 0 || migrated.proceduresCreated > 0) {
+      logger.info(migrated, 'Migrated legacy tool-choice aliases to canonical procedures');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Canonical tool-procedure migration failed (legacy aliases remain readable)',
+    );
+  }
   // Surface "we missed N scheduled runs while you were offline" BEFORE
   // any other startup work so the user has the bad news first. Safe to
   // call even on first boot (no-op without a previous heartbeat).
@@ -1800,33 +1824,6 @@ export async function startDaemon(
       'Approval reaper failed to start (continuing without periodic expiry)',
     );
   }
-
-  // Warm the CLI-discovery cache in the background so the first agent
-  // call to local_cli_list and the first dashboard render of the Local
-  // CLIs card don't pay the full $PATH-walk-and-probe cost (5–30s on a
-  // typical dev machine). Errors are non-fatal — the cache will rebuild
-  // on demand if this fails.
-  //
-  // DEFERRED + cache-respecting. The scan forks a storm of `--version`
-  // probes (6-way, 2s timeout each) that saturates the single Node event
-  // loop. Fired immediately at boot it starves the FIRST dashboard
-  // render: the first /meetings/recall/recent fetch (a ~5ms file read)
-  // was observed queued behind it for ~31s, so the Meetings panel looked
-  // blank/hung. Pushing it past the initial-render window — and using
-  // getOrRefreshScan, which skips the scan entirely when a recent scan is
-  // still fresh (10-min TTL, so rapid restarts pay nothing) — keeps first
-  // paint responsive while the cache is still warm long before any CLI
-  // feature is used. unref() so the timer never holds the process open.
-  const CLI_WARM_DELAY_MS = 10_000;
-  const cliWarmTimer = setTimeout(() => {
-    void warmCliScan().catch((err) => {
-      logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'Initial CLI discovery scan failed (will retry on demand)',
-      );
-    });
-  }, CLI_WARM_DELAY_MS);
-  cliWarmTimer.unref?.();
 
   // Notification delivery runs on its OWN cadence, independent of the
   // main loop. The main loop can park for 30+ min on a long cron job
@@ -2137,6 +2134,25 @@ export async function startDaemon(
   await options.onReady?.();
   setDaemonRuntimePhase('daemon.boot.ready', { ingressReady: Boolean(options.onReady) });
   logger.info('Daemon loop started');
+
+  // Warm CLI discovery only after ingress has crossed its readiness boundary.
+  // A production PATH can contain thousands of version-managed executables;
+  // even though the scanner now yields asynchronously, boot liveness and
+  // channel connection always take precedence over speculative cache work.
+  // Disabling this optimization never removes CLI tools: the same discovery
+  // runs on demand when a user or agent asks for them.
+  if (cliDiscoveryWarmupEnabled()) {
+    const CLI_WARM_DELAY_MS = 10_000;
+    const cliWarmTimer = setTimeout(() => {
+      void warmCliScan().catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Initial CLI discovery scan failed (will retry on demand)',
+        );
+      });
+    }, CLI_WARM_DELAY_MS);
+    cliWarmTimer.unref?.();
+  }
 
   // Stagger monitor runs — don't run them every 15s tick
   let tickCount = 0;

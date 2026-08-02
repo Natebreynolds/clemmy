@@ -60,9 +60,17 @@ function validOwner(fileName: string, value: unknown): value is LockOwner {
   return Number.isSafeInteger(owner.pid)
     && (owner.pid ?? 0) > 0
     && typeof owner.token === 'string'
-    && owner.token.length > 0
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(owner.token)
     && typeof owner.acquiredAt === 'string'
+    && ownerPidFromFileName(fileName) === owner.pid
     && fileName === `owner-${owner.pid}-${owner.token}.json`;
+}
+
+function ownerPidFromFileName(fileName: string): number | undefined {
+  const match = /^owner-([1-9]\d*)-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/.exec(fileName);
+  if (!match) return undefined;
+  const pid = Number.parseInt(match[1], 10);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
 function pidIsAlive(pid: number): boolean {
@@ -70,13 +78,23 @@ function pidIsAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
+    // ESRCH is the only affirmative dead-process signal. Permission errors and
+    // unknown platform failures stay fail-closed as potentially live owners.
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
 
-function lockTimeoutMs(): number {
-  const override = Number.parseInt(process.env.CLEMENTINE_TEST_RUN_RECORD_LOCK_TIMEOUT_MS ?? '', 10);
-  return Number.isFinite(override) && override > 0 ? override : 10_000;
+function lockTimeoutMs(callOverride?: number): number {
+  if (callOverride !== undefined) {
+    return Number.isFinite(callOverride) && callOverride >= 0 ? callOverride : 10_000;
+  }
+  const envOverride = Number.parseInt(process.env.CLEMENTINE_TEST_RUN_RECORD_LOCK_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(envOverride) && envOverride > 0 ? envOverride : 10_000;
+}
+
+export interface WorkflowRunRecordLockOptions {
+  /** Zero performs one safe acquisition/reclamation attempt without sleeping. */
+  timeoutMs?: number;
 }
 
 function waitForTestBarrier(readyEnv: string, releaseEnv: string): void {
@@ -112,7 +130,11 @@ function release(
  * lock timeout. Terminal state, cancellation, and report acknowledgement are
  * correctness boundaries: unavailable serialization must fail closed.
  */
-export function withWorkflowRunRecordLock<T>(filePath: string, work: () => T): T {
+export function withWorkflowRunRecordLock<T>(
+  filePath: string,
+  work: () => T,
+  options: WorkflowRunRecordLockOptions = {},
+): T {
   const key = path.resolve(filePath);
   const held = heldLocks.get(key);
   if (held) {
@@ -125,135 +147,191 @@ export function withWorkflowRunRecordLock<T>(filePath: string, work: () => T): T
   const ownerToken = randomUUID();
   const lockDir = lockDirectory(key);
   const ownerFile = path.join(lockDir, `owner-${process.pid}-${ownerToken}.json`);
-  const deadline = Date.now() + lockTimeoutMs();
+  // Publish a complete, fsynced owner record with one rename only after mkdir
+  // wins the lock generation. A crash can now leave an empty lock directory or
+  // an ignored sibling staging file, never a visible zero-byte owner that every
+  // future daemon must treat as ambiguous forever.
+  const ownerStagingFile = `${lockDir}.owner-${process.pid}-${ownerToken}.${randomUUID()}.tmp`;
+  const ownerRecord = JSON.stringify({
+    pid: process.pid,
+    token: ownerToken,
+    acquiredAt: new Date().toISOString(),
+  });
+  let ownerStaged = false;
+  let publishedGeneration: DirectoryIdentity | undefined;
+  const ensureOwnerStaged = (): void => {
+    if (ownerStaged) return;
+    let fd: number | undefined;
+    try {
+      fd = openSync(ownerStagingFile, 'wx', 0o600);
+      writeFileSync(fd, ownerRecord, 'utf-8');
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      ownerStaged = true;
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* best effort */ }
+      }
+      if (!ownerStaged) {
+        try { unlinkSync(ownerStagingFile); } catch { /* best effort */ }
+      }
+    }
+  };
+  const deadline = Date.now() + lockTimeoutMs(options.timeoutMs);
+  const maxAcquisitionAttempts = options.timeoutMs === 0 ? 3 : Number.POSITIVE_INFINITY;
+  let acquisitionAttempts = 0;
   let acquiredGeneration: DirectoryIdentity | undefined;
 
-  while (!acquiredGeneration) {
-    try {
-      mkdirSync(lockDir, { mode: 0o700 });
-      const createdGeneration = directoryIdentity(lockDir);
-      waitForTestBarrier(
-        'CLEMENTINE_TEST_RUN_RECORD_LOCK_MKDIR_READY',
-        'CLEMENTINE_TEST_RUN_RECORD_LOCK_MKDIR_RELEASE',
-      );
-      let fd: number | undefined;
-      try {
-        fd = openSync(ownerFile, 'wx', 0o600);
-        writeFileSync(fd, JSON.stringify({
-          pid: process.pid,
-          token: ownerToken,
-          acquiredAt: new Date().toISOString(),
-        }), 'utf-8');
-        fsyncSync(fd);
-        closeSync(fd);
-        fd = undefined;
-      } finally {
-        if (fd !== undefined) {
-          try { closeSync(fd); } catch { /* best effort */ }
-        }
-      }
-      if (process.platform !== 'win32') {
-        const dirFd = openSync(lockDir, 'r');
-        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-      }
-      let ownsCreatedGeneration = false;
-      try {
-        const entries = readdirSync(lockDir);
-        ownsCreatedGeneration = sameDirectoryIdentity(createdGeneration, directoryIdentity(lockDir))
-          && entries.length === 1
-          && entries[0] === path.basename(ownerFile);
-      } catch { /* pathname generation disappeared */ }
-      if (!ownsCreatedGeneration) {
-        try { unlinkSync(ownerFile); } catch { /* token belongs to a vanished generation */ }
-        continue;
-      }
-      acquiredGeneration = createdGeneration;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') continue;
-      if (code !== 'EEXIST') throw err;
-
-      let observedGeneration: DirectoryIdentity;
-      let owners: string[];
-      let entries: string[];
-      try {
-        observedGeneration = directoryIdentity(lockDir);
-        entries = readdirSync(lockDir);
-        owners = entries.filter((entry) => entry.startsWith('owner-'));
-      } catch {
-        continue;
-      }
-      let observedOwnerFile: string | undefined;
-      let ownerPid: number | undefined;
-      let corruptEvidence: string | undefined;
-      const unexpectedEntries = entries.filter((entry) => !entry.startsWith('owner-'));
-      if (unexpectedEntries.length > 0) {
-        corruptEvidence = `unexpected lock entries (${unexpectedEntries.join(', ')})`;
-      } else if (owners.length > 1) {
-        corruptEvidence = `multiple owner records (${owners.join(', ')})`;
-      } else if (owners.length === 1) {
-        observedOwnerFile = path.join(lockDir, owners[0]);
-        try {
-          const parsed = JSON.parse(readFileSync(observedOwnerFile, 'utf-8')) as unknown;
-          if (validOwner(owners[0], parsed)) ownerPid = parsed.pid;
-          else corruptEvidence = `invalid owner record ${owners[0]}`;
-        } catch (ownerErr) {
-          if ((ownerErr as NodeJS.ErrnoException).code === 'ENOENT') continue;
-          corruptEvidence = `unreadable owner record ${owners[0]}`;
-        }
-      }
-
-      let ageMs: number;
-      try { ageMs = Date.now() - statSync(lockDir).mtimeMs; } catch { continue; }
-      const deadOwner = ownerPid !== undefined && !pidIsAlive(ownerPid);
-      const abandonedBeforeOwnerWrite = entries.length === 0 && ageMs >= EMPTY_LOCK_RECLAIM_MS;
-      if (deadOwner || abandonedBeforeOwnerWrite) {
-        waitForTestBarrier(
-          'CLEMENTINE_TEST_RUN_RECORD_LOCK_STALE_READY',
-          'CLEMENTINE_TEST_RUN_RECORD_LOCK_STALE_RELEASE',
-        );
-        try {
-          if (!sameDirectoryIdentity(observedGeneration, directoryIdentity(lockDir))) continue;
-        } catch { continue; }
-        if (observedOwnerFile) {
-          try {
-            // The pathname contains the exact observed generation token. If a
-            // competing reclaimer already removed it, ENOENT means this waiter
-            // must stop; it never unlinks a successor's different owner token.
-            unlinkSync(observedOwnerFile);
-          } catch {
-            continue;
-          }
-        }
-        try {
-          if (!sameDirectoryIdentity(observedGeneration, directoryIdentity(lockDir))) continue;
-          rmdirSync(lockDir);
-        } catch { /* another reclaimer or a successor generation won */ }
-        continue;
-      }
-
-      if (Date.now() >= deadline) {
-        if (corruptEvidence) {
-          throw new Error(
-            `Workflow run record lock for ${path.basename(key)} has ${corruptEvidence}; refusing unsafe reclamation.`,
-          );
-        }
+  try {
+    while (!acquiredGeneration) {
+      acquisitionAttempts += 1;
+      if (acquisitionAttempts > maxAcquisitionAttempts) {
         throw new Error(`Timed out acquiring workflow run record lock for ${path.basename(key)}.`);
       }
-      sleepSync(LOCK_RETRY_MS);
-    }
-  }
+      try {
+        mkdirSync(lockDir, { mode: 0o700 });
+        const createdGeneration = directoryIdentity(lockDir);
+        waitForTestBarrier(
+          'CLEMENTINE_TEST_RUN_RECORD_LOCK_MKDIR_READY',
+          'CLEMENTINE_TEST_RUN_RECORD_LOCK_MKDIR_RELEASE',
+        );
+        ensureOwnerStaged();
+        renameSync(ownerStagingFile, ownerFile);
+        ownerStaged = false;
+        publishedGeneration = createdGeneration;
+        if (process.platform !== 'win32') {
+          const dirFd = openSync(lockDir, 'r');
+          try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+        }
+        let ownsCreatedGeneration = false;
+        try {
+          const entries = readdirSync(lockDir);
+          ownsCreatedGeneration = sameDirectoryIdentity(createdGeneration, directoryIdentity(lockDir))
+            && entries.length === 1
+            && entries[0] === path.basename(ownerFile);
+        } catch { /* pathname generation disappeared */ }
+        if (!ownsCreatedGeneration) {
+          try {
+            unlinkSync(ownerFile);
+            publishedGeneration = undefined;
+          } catch { /* token belongs to a vanished generation */ }
+          continue;
+        }
+        acquiredGeneration = createdGeneration;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') continue;
+        if (code !== 'EEXIST') throw err;
 
-  waitForTestBarrier(
-    'CLEMENTINE_TEST_RUN_RECORD_LOCK_OWNED_READY',
-    'CLEMENTINE_TEST_RUN_RECORD_LOCK_OWNED_RELEASE',
-  );
-  heldLocks.set(key, { depth: 1, token });
-  try {
-    return work();
+        let observedGeneration: DirectoryIdentity;
+        let owners: string[];
+        let entries: string[];
+        try {
+          observedGeneration = directoryIdentity(lockDir);
+          entries = readdirSync(lockDir);
+          owners = entries.filter((entry) => entry.startsWith('owner-'));
+        } catch {
+          continue;
+        }
+        let observedOwnerFile: string | undefined;
+        let ownerPid: number | undefined;
+        let legacyIncompleteOwner = false;
+        let corruptEvidence: string | undefined;
+        const unexpectedEntries = entries.filter((entry) => !entry.startsWith('owner-'));
+        if (unexpectedEntries.length > 0) {
+          corruptEvidence = `unexpected lock entries (${unexpectedEntries.join(', ')})`;
+        } else if (owners.length > 1) {
+          corruptEvidence = `multiple owner records (${owners.join(', ')})`;
+        } else if (owners.length === 1) {
+          observedOwnerFile = path.join(lockDir, owners[0]);
+          const encodedOwnerPid = ownerPidFromFileName(owners[0]);
+          try {
+            const parsed = JSON.parse(readFileSync(observedOwnerFile, 'utf-8')) as unknown;
+            if (validOwner(owners[0], parsed)) ownerPid = parsed.pid;
+            else {
+              try {
+                if (encodedOwnerPid !== undefined && statSync(observedOwnerFile).size === 0) {
+                  ownerPid = encodedOwnerPid;
+                  legacyIncompleteOwner = true;
+                }
+              } catch { /* exact owner disappeared; generation will be retried */ }
+              corruptEvidence = `invalid owner record ${owners[0]}`;
+            }
+          } catch (ownerErr) {
+            if ((ownerErr as NodeJS.ErrnoException).code === 'ENOENT') continue;
+            try {
+              if (encodedOwnerPid !== undefined && statSync(observedOwnerFile).size === 0) {
+                ownerPid = encodedOwnerPid;
+                legacyIncompleteOwner = true;
+              }
+            } catch { /* keep ambiguous evidence fail-closed */ }
+            corruptEvidence = `unreadable owner record ${owners[0]}`;
+          }
+        }
+
+        let ageMs: number;
+        try { ageMs = Date.now() - statSync(lockDir).mtimeMs; } catch { continue; }
+        const deadOwner = ownerPid !== undefined
+          && !pidIsAlive(ownerPid)
+          && (!corruptEvidence || ageMs >= EMPTY_LOCK_RECLAIM_MS);
+        const abandonedLegacyIncompleteOwner = legacyIncompleteOwner && ageMs >= EMPTY_LOCK_RECLAIM_MS;
+        const abandonedBeforeOwnerWrite = entries.length === 0 && ageMs >= EMPTY_LOCK_RECLAIM_MS;
+        if (deadOwner || abandonedLegacyIncompleteOwner || abandonedBeforeOwnerWrite) {
+          waitForTestBarrier(
+            'CLEMENTINE_TEST_RUN_RECORD_LOCK_STALE_READY',
+            'CLEMENTINE_TEST_RUN_RECORD_LOCK_STALE_RELEASE',
+          );
+          try {
+            if (!sameDirectoryIdentity(observedGeneration, directoryIdentity(lockDir))) continue;
+          } catch { continue; }
+          if (observedOwnerFile) {
+            try {
+              // The pathname contains the exact observed generation token. If a
+              // competing reclaimer already removed it, ENOENT means this waiter
+              // must stop; it never unlinks a successor's different owner token.
+              unlinkSync(observedOwnerFile);
+            } catch {
+              continue;
+            }
+          }
+          try {
+            if (!sameDirectoryIdentity(observedGeneration, directoryIdentity(lockDir))) continue;
+            rmdirSync(lockDir);
+          } catch { /* another reclaimer or a successor generation won */ }
+          continue;
+        }
+
+        if (Date.now() >= deadline) {
+          if (corruptEvidence) {
+            throw new Error(
+              `Workflow run record lock for ${path.basename(key)} has ${corruptEvidence}; refusing unsafe reclamation.`,
+            );
+          }
+          throw new Error(`Timed out acquiring workflow run record lock for ${path.basename(key)}.`);
+        }
+        sleepSync(LOCK_RETRY_MS);
+      }
+    }
+
+    waitForTestBarrier(
+      'CLEMENTINE_TEST_RUN_RECORD_LOCK_OWNED_READY',
+      'CLEMENTINE_TEST_RUN_RECORD_LOCK_OWNED_RELEASE',
+    );
+    heldLocks.set(key, { depth: 1, token });
+    try {
+      return work();
+    } finally {
+      heldLocks.delete(key);
+      release(lockDir, ownerFile, ownerToken, acquiredGeneration);
+    }
   } finally {
-    heldLocks.delete(key);
-    release(lockDir, ownerFile, ownerToken, acquiredGeneration);
+    if (!acquiredGeneration && publishedGeneration) {
+      release(lockDir, ownerFile, ownerToken, publishedGeneration);
+    }
+    if (ownerStaged) {
+      try { unlinkSync(ownerStagingFile); } catch { /* best-effort orphan cleanup */ }
+    }
   }
 }
 
@@ -297,4 +375,40 @@ export function writeWorkflowRunRecordDurablyUnlocked(
 /** Test/diagnostic read serialized with every correctness-critical writer. */
 export function readWorkflowRunRecord<T extends object>(filePath: string): T | null {
   return withWorkflowRunRecordLock(filePath, () => readWorkflowRunRecordUnlocked<T>(filePath));
+}
+
+/**
+ * Atomic point-in-time read for broad maintenance inventory. Record writers
+ * publish with rename, so a scan sees the complete old or complete new value;
+ * any later mutation still takes the strict lock and re-reads authoritative
+ * state. This path deliberately never creates, fsyncs, waits on, or reclaims a
+ * lock while enumerating a potentially large workflow corpus.
+ */
+export function readWorkflowRunRecordSnapshot<T extends object>(filePath: string): T | null {
+  try { return readWorkflowRunRecordUnlocked<T>(filePath); }
+  catch { return null; }
+}
+
+export interface WorkflowRunRecordTryRead<T extends object> {
+  acquired: boolean;
+  record: T | null;
+}
+
+/**
+ * Maintenance-scan read that never sleeps on the daemon event loop. A busy or
+ * ambiguous record is skipped for this tick and retried by the next one.
+ */
+export function tryReadWorkflowRunRecord<T extends object>(filePath: string): WorkflowRunRecordTryRead<T> {
+  try {
+    return {
+      acquired: true,
+      record: withWorkflowRunRecordLock(
+        filePath,
+        () => readWorkflowRunRecordUnlocked<T>(filePath),
+        { timeoutMs: 0 },
+      ),
+    };
+  } catch {
+    return { acquired: false, record: null };
+  }
 }

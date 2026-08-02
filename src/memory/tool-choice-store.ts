@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR } from '../config.js';
@@ -160,6 +160,8 @@ export interface RememberToolChoiceInput {
 
 const TOOL_CHOICES_ROOT = path.join(BASE_DIR, 'memory', 'tool-choices');
 const TOOL_PROCEDURES_ROOT = path.join(BASE_DIR, 'memory', 'tool-procedures');
+export const CANONICAL_PROCEDURE_MIGRATION_MARKER = '.canonical-procedure-migration-v1.json';
+const CANONICAL_PROCEDURE_MIGRATION_VERSION = 1;
 
 function machineDir(): string {
   return path.join(TOOL_CHOICES_ROOT, getMachineId());
@@ -179,6 +181,42 @@ function ensureProcedureMachineDir(): string {
   const dir = procedureMachineDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function canonicalProcedureMigrationMarkerPath(machineId = getMachineId()): string {
+  return path.join(TOOL_PROCEDURES_ROOT, machineId, CANONICAL_PROCEDURE_MIGRATION_MARKER);
+}
+
+function canonicalProcedureMigrationCompleted(machineId: string): boolean {
+  const markerPath = canonicalProcedureMigrationMarkerPath(machineId);
+  if (!existsSync(markerPath)) return false;
+  try {
+    const marker = JSON.parse(readFileSync(markerPath, 'utf-8')) as Record<string, unknown>;
+    return marker.version === CANONICAL_PROCEDURE_MIGRATION_VERSION && marker.machineId === machineId;
+  } catch {
+    return false;
+  }
+}
+
+function markCanonicalProcedureMigrationCompleted(
+  machineId: string,
+  report: ToolProcedureMigrationReport,
+): void {
+  const dir = ensureProcedureMachineDir();
+  const markerPath = canonicalProcedureMigrationMarkerPath(machineId);
+  const temporaryPath = path.join(dir, `.${CANONICAL_PROCEDURE_MIGRATION_MARKER}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify({
+      version: CANONICAL_PROCEDURE_MIGRATION_VERSION,
+      machineId,
+      completedAt: new Date().toISOString(),
+      report,
+    }, null, 2)}\n`, { encoding: 'utf-8', mode: 0o600 });
+    renameSync(temporaryPath, markerPath);
+  } catch (err) {
+    try { unlinkSync(temporaryPath); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
 }
 
 /** Slugify a free-form intent string for use as a filename. Conservative — preserves dots. */
@@ -684,16 +722,61 @@ export interface ToolProcedureMigrationReport {
   quarantinedAliases: number;
 }
 
-const migratedMachines = new Set<string>();
+function canonicalMigrationAlreadyApplied(
+  record: ToolChoiceRecord,
+  procedure: ToolProcedureRecord | null,
+  status: ToolProcedureAliasStatus,
+): procedure is ToolProcedureRecord {
+  if (!record.choice || !procedure) return false;
+  if (
+    record.procedureId !== procedure.procedureId
+    || record.procedureKey !== procedure.procedureKey
+    || record.aliasStatus !== status
+  ) return false;
+  const choice = procedure.choice;
+  if (
+    !choice
+    || choice.kind !== record.choice.kind
+    || choice.identifier !== record.choice.identifier
+    || (choice.accountIdentity ?? '') !== (record.choice.accountIdentity ?? '')
+  ) return false;
+  const migratedAlias = procedure.aliases.find(
+    (alias) => slugifyIntent(alias.intent) === slugifyIntent(record.intent),
+  );
+  if (!migratedAlias || migratedAlias.status !== status) return false;
+  const identity: CanonicalToolProcedureIdentity = {
+    procedureId: procedure.procedureId,
+    procedureKey: procedure.procedureKey,
+    provider: procedure.provider,
+    operationHash: procedure.operationHash,
+  };
+  if (!procedure.evidence.some((evidence) => evidence.evidenceId === migrationEvidenceId(record, identity))) {
+    return false;
+  }
+  if (status === 'quarantined') {
+    const syntheticIntent = nativeMcpCanonicalIntent(record.choice.identifier);
+    if (!procedure.aliases.some(
+      (alias) => alias.status === 'active' && slugifyIntent(alias.intent) === slugifyIntent(syntheticIntent),
+    )) return false;
+  }
+  return true;
+}
 
-/** Additive, idempotent migration. Original intent files remain in place and
- * gain only procedure-link metadata; canonical files own shared counters.
- * Existing duplicated broadcast counters are merged with max(), never summed. */
+/** Explicit additive migration. Read/list/pre-warm paths never invoke this.
+ * A durable per-machine marker makes every later daemon start a read-only
+ * marker check; the marker is written atomically only after the full migration
+ * succeeds. Original intent files remain in place and gain only procedure-link
+ * metadata; canonical files own shared counters. Existing duplicated broadcast
+ * counters are merged with max(), never summed. */
 export function migrateToolChoicesToCanonicalProcedures(): ToolProcedureMigrationReport {
   const machineId = getMachineId();
   const report: ToolProcedureMigrationReport = { aliasesScanned: 0, aliasesLinked: 0, proceduresCreated: 0, quarantinedAliases: 0 };
+  if (canonicalProcedureMigrationCompleted(machineId)) return report;
   const dir = machineDir();
-  if (!existsSync(dir)) { migratedMachines.add(machineId); return report; }
+  if (!existsSync(dir)) {
+    markCanonicalProcedureMigrationCompleted(machineId, report);
+    return report;
+  }
   const records = readdirSync(dir)
     .filter((name) => name.endsWith('.md'))
     .map((name) => parseRecordRaw(path.join(dir, name)))
@@ -730,6 +813,10 @@ export function migrateToolChoicesToCanonicalProcedures(): ToolProcedureMigratio
     const quarantined = looksLikeLegacyObjectiveAlias(rec);
     const status: ToolProcedureAliasStatus = quarantined ? 'quarantined' : 'active';
     if (quarantined) report.quarantinedAliases += 1;
+    // v3.6 may already have completed this exact migration before durable
+    // markers existed. Recognize its deterministic link/evidence instead of
+    // rewriting every alias and procedure once more during the upgrade.
+    if (canonicalMigrationAlreadyApplied(rec, linkedProcedure, status)) continue;
     const aliases: ToolProcedureAlias[] = [{
       intent: rec.intent,
       description: rec.description,
@@ -778,13 +865,8 @@ export function migrateToolChoicesToCanonicalProcedures(): ToolProcedureMigratio
     });
     report.aliasesLinked += 1;
   }
-  migratedMachines.add(machineId);
+  markCanonicalProcedureMigrationCompleted(machineId, report);
   return report;
-}
-
-function ensureCanonicalMigration(): void {
-  const machineId = getMachineId();
-  if (!migratedMachines.has(machineId)) migrateToolChoicesToCanonicalProcedures();
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -828,8 +910,6 @@ function isFailingChoice(record: ToolChoiceRecord | null | undefined): boolean {
 export function recallToolChoice(intent: string): ToolChoiceRecord | null {
   const slug = slugifyIntent(intent);
   if (!slug) return null;
-
-  ensureCanonicalMigration();
 
   const exactPath = path.join(machineDir(), `${slug}.md`);
   const exact = parseRecord(exactPath);
@@ -978,7 +1058,6 @@ export function intentSlugError(intent: string): string | null {
 }
 
 export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRecord {
-  ensureCanonicalMigration();
   const slugError = intentSlugError(input.intent);
   if (slugError) {
     emitToolChoiceEvent('remember_rejected_failed', input.intent.slice(0, 80), 'sentence_slug');
@@ -1156,7 +1235,6 @@ export function invalidateToolChoice(
   reason: string,
   opts: { automatic?: boolean } = {},
 ): ToolChoiceRecord | null {
-  ensureCanonicalMigration();
   const existing = parseRecord(filePathFor(intent));
   if (!existing) return null;
   // Idempotent: already invalidated (choice null) → no-op success, no re-emit.
@@ -1233,7 +1311,6 @@ export function invalidateToolChoice(
  * north-star recall-hit-rate metric.
  */
 export function peekToolChoice(intent: string): ToolChoiceRecord | null {
-  ensureCanonicalMigration();
   return parseRecord(filePathFor(intent));
 }
 
@@ -1249,7 +1326,6 @@ export function peekToolChoice(intent: string): ToolChoiceRecord | null {
  */
 export function deleteToolChoice(intent: string): boolean {
   try {
-    ensureCanonicalMigration();
     const fp = filePathFor(intent);
     const raw = parseRecordRaw(fp);
     let procedureId = raw?.procedureId;
@@ -1311,7 +1387,6 @@ export function forgetMatching(pattern: string): string[] {
  * Most production consumers should use listToolChoices(), which projects one
  * record per canonical procedure. */
 export function listToolChoiceAliases(): ToolChoiceRecord[] {
-  ensureCanonicalMigration();
   const dir = machineDir();
   if (!existsSync(dir)) return [];
   const out: ToolChoiceRecord[] = [];
@@ -1324,7 +1399,6 @@ export function listToolChoiceAliases(): ToolChoiceRecord[] {
 }
 
 export function listToolProcedures(): ToolProcedureRecord[] {
-  ensureCanonicalMigration();
   const dir = procedureMachineDir();
   if (!existsSync(dir)) return [];
   const out: ToolProcedureRecord[] = [];
@@ -2272,7 +2346,6 @@ export function updateToolProcedureOutcome(
   intent?: string,
 ): ToolProcedureRecord | null {
   if (!isProceduralOutcomesEnabled() || !procedureId) return null;
-  ensureCanonicalMigration();
   const procedure = parseProcedure(procedureFilePath(procedureId));
   if (!procedure?.choice) return null;
   return recordOutcomeOnProcedure(procedure, outcome, intent);
@@ -2282,7 +2355,6 @@ export function updateToolProcedureOutcome(
  * consumed by computeChoiceScore or any ranking path. */
 export function recordToolProcedureImpression(procedureId: string): ToolProcedureRecord | null {
   if (!procedureId) return null;
-  ensureCanonicalMigration();
   const procedure = parseProcedure(procedureFilePath(procedureId));
   if (!procedure) return null;
   const now = new Date().toISOString();
@@ -2323,7 +2395,6 @@ export function beginToolProcedureUse(
   intent: string,
   sessionId?: string,
 ): { useId: string; procedureId: string } | null {
-  ensureCanonicalMigration();
   const record = peekToolChoice(intent) ?? recallToolChoice(intent);
   if (!record?.choice || !record.procedureId) return null;
   return beginToolProcedureUseById(record.procedureId, record.intent, sessionId);
@@ -2334,7 +2405,6 @@ export function beginToolProcedureUseById(
   intent: string,
   sessionId?: string,
 ): { useId: string; procedureId: string } | null {
-  ensureCanonicalMigration();
   const procedure = parseProcedure(procedureFilePath(procedureId));
   if (!procedure?.choice) return null;
   pruneProcedureUses();
@@ -2374,7 +2444,6 @@ export function _resetToolProcedureUsesForTests(): void {
  */
 export function updateToolChoiceOutcome(intent: string, outcome: ProceduralOutcome): ToolChoiceRecord | null {
   if (!isProceduralOutcomesEnabled()) return null;
-  ensureCanonicalMigration();
   const existing = parseRecord(filePathFor(intent));
   if (!existing || !existing.choice) return null;
   if (existing.procedureId) {

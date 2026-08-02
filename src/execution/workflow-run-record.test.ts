@@ -9,11 +9,16 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { withWorkflowRunRecordLock } from './workflow-run-record.js';
+import {
+  readWorkflowRunRecordSnapshot,
+  tryReadWorkflowRunRecord,
+  withWorkflowRunRecordLock,
+} from './workflow-run-record.js';
 
 const MODULE_URL = new URL('./workflow-run-record.ts', import.meta.url).href;
 const CHILD_CODE = String.raw`
@@ -108,6 +113,93 @@ test('two stale reclaimers cannot delete a successor lock generation', async () 
   }
 });
 
+test('legacy zero-byte owner with an exact dead-pid token is reclaimed without waiting', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-run-record-zero-owner-'));
+  const file = path.join(root, 'legacy.json');
+  const lockDir = `${file}.record-lock`;
+  const token = '00000000-0000-4000-8000-000000000000';
+  try {
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, `owner-2147483647-${token}.json`), '', 'utf-8');
+    const staleAt = new Date(Date.now() - 6_000);
+    utimesSync(lockDir, staleAt, staleAt);
+
+    const startedAt = Date.now();
+    const result = tryReadWorkflowRunRecord<Record<string, unknown>>(file);
+    assert.equal(result.acquired, true);
+    assert.equal(result.record, null);
+    assert.ok(Date.now() - startedAt < 500, 'dead legacy owner should heal in the first acquisition attempt');
+    assert.equal(existsSync(lockDir), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('nonblocking read preserves a zero-byte owner whose exact pid is still live', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-run-record-live-zero-owner-'));
+  const file = path.join(root, 'live.json');
+  const lockDir = `${file}.record-lock`;
+  const token = '00000000-0000-4000-8000-000000000000';
+  const ownerFile = path.join(lockDir, `owner-${process.pid}-${token}.json`);
+  try {
+    writeFileSync(file, JSON.stringify({ status: 'completed' }), 'utf-8');
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(ownerFile, '', 'utf-8');
+    const startedAt = Date.now();
+    assert.deepEqual(
+      readWorkflowRunRecordSnapshot(file),
+      { status: 'completed' },
+      'broad inventory reads the atomically published record without touching its live lock',
+    );
+    const result = tryReadWorkflowRunRecord<Record<string, unknown>>(file);
+    assert.equal(result.acquired, false);
+    assert.ok(Date.now() - startedAt < 500, 'maintenance read must never synchronously wait behind a live owner');
+    assert.equal(existsSync(ownerFile), true, 'ambiguous live-owner evidence remains fail-closed');
+    assert.equal(readFileSync(ownerFile, 'utf-8'), '');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('stale zero-byte owner is reclaimable even when its pid has been reused', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-run-record-reused-pid-'));
+  const file = path.join(root, 'reused.json');
+  const lockDir = `${file}.record-lock`;
+  const token = '00000000-0000-4000-8000-000000000000';
+  try {
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, `owner-${process.pid}-${token}.json`), '', 'utf-8');
+    const staleAt = new Date(Date.now() - 6_000);
+    utimesSync(lockDir, staleAt, staleAt);
+
+    const result = tryReadWorkflowRunRecord<Record<string, unknown>>(file);
+    assert.equal(result.acquired, true);
+    assert.equal(existsSync(lockDir), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('nonzero malformed owner stays fail-closed even with an exact dead-pid filename', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-run-record-malformed-exact-owner-'));
+  const file = path.join(root, 'malformed.json');
+  const lockDir = `${file}.record-lock`;
+  const token = '00000000-0000-4000-8000-000000000000';
+  const ownerFile = path.join(lockDir, `owner-2147483647-${token}.json`);
+  try {
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(ownerFile, '{}', 'utf-8');
+    const staleAt = new Date(Date.now() - 60_000);
+    utimesSync(lockDir, staleAt, staleAt);
+
+    const result = tryReadWorkflowRunRecord<Record<string, unknown>>(file);
+    assert.equal(result.acquired, false);
+    assert.equal(readFileSync(ownerFile, 'utf-8'), '{}');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('malformed or multiple run-record lock owners fail closed', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'clem-run-record-corrupt-'));
   const file = path.join(root, 'corrupt.json');
@@ -155,6 +247,11 @@ test('a creator refuses a directory generation with an unexpected extra entry', 
   });
   try {
     await waitForFile(ready);
+    assert.deepEqual(
+      readdirSync(`${file}.record-lock`),
+      [],
+      'a crash after mkdir can leave only the recognized empty-generation state, never a partial owner',
+    );
     writeFileSync(path.join(`${file}.record-lock`, 'unexpected-entry'), 'corrupt evidence', 'utf-8');
     writeFileSync(release, 'continue', 'utf-8');
     const [code] = await once(child, 'close') as [number | null];

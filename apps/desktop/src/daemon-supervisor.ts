@@ -214,6 +214,25 @@ export function shouldDeferHungRestartForIpcHeartbeat(
     && priorDeferrals < maxDeferrals;
 }
 
+/**
+ * Turn a terminal readiness error into a rejection only after any still-live
+ * daemon has completed the supervisor's normal stop/reap path. Electron's
+ * showErrorBox is synchronous on macOS; rejecting first lets the caller enter
+ * that modal while stdout, stderr, and IPC pipes are still attached to a live
+ * child, which can deadlock both processes once pipe buffers fill.
+ *
+ * An already-exited daemon needs no second stop. Besides avoiding redundant
+ * work, this preserves the existing crash/restart schedule established by the
+ * child's exit handler.
+ */
+export async function settleTerminalReadinessFailure(
+  supervisor: Pick<DaemonSupervisor, 'isRunning' | 'stop'>,
+  error: Error,
+): Promise<never> {
+  if (supervisor.isRunning()) await supervisor.stop();
+  throw error;
+}
+
 function formatIpcHeartbeatAge(ageMs: number | null): string {
   if (ageMs === null || !Number.isFinite(ageMs)) return 'none';
   return `${Math.round(ageMs / 1000)}s`;
@@ -343,7 +362,8 @@ export class DaemonSupervisor {
   }
 
   /** Start (or restart) the daemon. Resolves when the daemon's minimal
-   *  health route answers, rejects after READINESS_TIMEOUT_MS. */
+   *  health route answers. A terminal readiness failure rejects only after
+   *  any still-live child has completed stop/reap. */
   async start(): Promise<{ port: number; url: string }> {
     if (this.child) {
       // Already running — return the existing ready promise.
@@ -542,6 +562,7 @@ export class DaemonSupervisor {
 
     // Probe the dashboard URL until it answers — the daemon takes a
     // moment to boot the webhook server.
+    const rejectReady = this.readyReject;
     void this.waitForReady().then(
       (info) => {
         this.restartAttempts = 0;
@@ -550,7 +571,13 @@ export class DaemonSupervisor {
         this.emit({ type: 'ready', port: info.port, url: info.url });
         this.startLivenessWatchdog();
       },
-      (err) => this.readyReject?.(err),
+      (err: unknown) => {
+        const readinessError = err instanceof Error ? err : new Error(String(err));
+        void settleTerminalReadinessFailure(this, readinessError)
+          .catch((settledError: unknown) => {
+            rejectReady?.(settledError instanceof Error ? settledError : readinessError);
+          });
+      },
     );
 
     return this.readyPromise;

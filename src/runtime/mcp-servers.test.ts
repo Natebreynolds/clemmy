@@ -4,7 +4,7 @@
  * Scoped external MCP bases: a named scope must not construct the all-external
  * base first and filter afterward, because that cold-starts unrelated servers.
  */
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, beforeEach, test } from 'node:test';
@@ -262,6 +262,45 @@ test('prewarm selection defaults to none when multiple external servers have no 
     allowedServerSlugs: [],
     reason: 'no remembered MCP server and multiple/no configured servers',
   });
+});
+
+test('prewarm selection reads legacy tool memory without triggering canonical migration writes', () => {
+  const machineId = 'machine-mcp-servers-test';
+  const legacyDir = path.join(TMP_HOME, 'memory', 'tool-choices', machineId);
+  const procedureDir = path.join(TMP_HOME, 'memory', 'tool-procedures', machineId);
+  mkdirSync(legacyDir, { recursive: true });
+  const legacyPath = path.join(legacyDir, 'dataforseo-serp.md');
+  writeFileSync(legacyPath, [
+    '---',
+    'intent: dataforseo serp',
+    'choice:',
+    '  kind: mcp',
+    '  identifier: dataforseo__serp_organic_live_advanced',
+    '  testedAt: 2026-07-01T00:00:00.000Z',
+    '  successCount: 4',
+    'fallbacks: []',
+    '---',
+    '# legacy alias',
+    '',
+  ].join('\n'));
+  const old = new Date('2004-04-04T00:00:00.000Z');
+  utimesSync(legacyPath, old, old);
+  const contentsBefore = readFileSync(legacyPath, 'utf-8');
+  const mtimeBefore = statSync(legacyPath).mtimeMs;
+  const proceduresBefore = existsSync(procedureDir) ? readdirSync(procedureDir).sort() : [];
+
+  assert.deepEqual(resolveMcpPrewarmSelection({ mode: 'on' }), {
+    mode: 'scoped',
+    allowedServerSlugs: ['dataforseo'],
+    reason: 'remembered/single-server scoped prewarm',
+  });
+  assert.equal(readFileSync(legacyPath, 'utf-8'), contentsBefore);
+  assert.equal(statSync(legacyPath).mtimeMs, mtimeBefore);
+  assert.deepEqual(
+    existsSync(procedureDir) ? readdirSync(procedureDir).sort() : [],
+    proceduresBefore,
+    'prewarm must not create canonical procedures or a migration marker',
+  );
 });
 
 test('prewarm selection warms the single configured external server without falling back to all', () => {

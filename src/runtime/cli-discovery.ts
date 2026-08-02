@@ -1,4 +1,6 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync } from 'node:fs';
+import { readdir, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -101,11 +103,15 @@ export function readCachedScan(): CliScanResult | undefined {
   }
 }
 
-function writeCachedScan(result: CliScanResult): void {
+async function writeCachedScan(result: CliScanResult): Promise<void> {
   ensureDir();
-  const tmp = `${SCAN_FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(result, null, 2), 'utf-8');
-  renameSync(tmp, SCAN_FILE);
+  const tmp = `${SCAN_FILE}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(result, null, 2), 'utf-8');
+    await rename(tmp, SCAN_FILE);
+  } finally {
+    await unlink(tmp).catch(() => undefined);
+  }
 }
 
 /**
@@ -143,6 +149,61 @@ export function scanPath(): { command: string; path: string }[] {
       } catch {
         continue;
       }
+    }
+  }
+
+  return Array.from(seen.entries())
+    .map(([command, p]) => ({ command, path: p }))
+    .sort((a, b) => a.command.localeCompare(b.command));
+}
+
+/**
+ * Event-loop-safe PATH inventory used by daemon/dashboard warmup.
+ *
+ * The synchronous scanner remains exported for small explicit diagnostics, but
+ * production warmup can encounter thousands of executables across version
+ * managers and managed volumes. Performing every readdir/stat on the daemon's
+ * main thread made the liveness route, Discord, and Slack stop together. Keep
+ * PATH precedence deterministic while moving filesystem waits off that thread.
+ */
+export async function scanPathAsync(): Promise<{ command: string; path: string }[]> {
+  const PATH = augmentPath(process.env.PATH);
+  const dirs = PATH.split(path.delimiter).filter(Boolean);
+  const seen = new Map<string, string>();
+  const STAT_CONCURRENCY = 32;
+
+  for (const dir of dirs) {
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      continue;
+    }
+
+    const candidates = entries.filter((entry) => (
+      !seen.has(entry)
+      && !entry.startsWith('.')
+      && !/\.(so|dylib|dll|a|o)$/.test(entry)
+    ));
+    for (let offset = 0; offset < candidates.length; offset += STAT_CONCURRENCY) {
+      const batch = candidates.slice(offset, offset + STAT_CONCURRENCY);
+      const inspected = await Promise.all(batch.map(async (entry) => {
+        const full = path.join(dir, entry);
+        try {
+          const details = await stat(full);
+          return details.isFile() && Boolean(details.mode & 0o111)
+            ? { command: entry, path: full }
+            : null;
+        } catch {
+          return null;
+        }
+      }));
+      for (const item of inspected) {
+        if (item && !seen.has(item.command)) seen.set(item.command, item.path);
+      }
+      // Promise completions can remain continuously ready on a hot filesystem;
+      // yield a macrotask so already-accepted health/channel work gets a turn.
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
     }
   }
 
@@ -396,7 +457,11 @@ export function _resetCltDetectionCache(): void {
   cltInstalledCache = undefined;
 }
 
-export function resolveSafeCliProbe(command: string, resolved: string): SafeCliProbe {
+function resolveSafeCliProbeWithRealTarget(
+  command: string,
+  resolved: string,
+  realTarget: string,
+): SafeCliProbe {
   // STRUCTURAL GUARD (2026-07-07): a binary that RESOLVES into an MDM /
   // device-management / system-library location is an IT-deployed enforcement
   // tool, NOT a developer CLI — probing it (even `--version`) can open its
@@ -405,9 +470,6 @@ export function resolveSafeCliProbe(command: string, resolved: string): SafeCliP
   // /Library/Management/super/super opened github.com/Macjutsu/super/wiki on
   // every probe. Follow the symlink target, not just the launch path, so a
   // /usr/local/bin shim into /Library/Management is still caught.
-  const realTarget = ((): string => {
-    try { return realpathSync(resolved); } catch { return resolved; }
-  })();
   if (MANAGEMENT_ENFORCEMENT_TOOLS.has(command)
       || /^\/Library\/(Management|Application Support\/(JAMF|Addigy|Kandji|Mosyle)|PrivilegedHelperTools)\//i.test(realTarget)
       || /^\/Library\/Management\//i.test(resolved)) {
@@ -475,6 +537,18 @@ export function resolveSafeCliProbe(command: string, resolved: string): SafeCliP
     path: resolved,
     reason: 'Skipped macOS Command Line Tools stub to avoid opening the system installer.',
   };
+}
+
+export function resolveSafeCliProbe(command: string, resolved: string): SafeCliProbe {
+  let realTarget = resolved;
+  try { realTarget = realpathSync(resolved); } catch { /* use the resolved path */ }
+  return resolveSafeCliProbeWithRealTarget(command, resolved, realTarget);
+}
+
+async function resolveSafeCliProbeAsync(command: string, resolved: string): Promise<SafeCliProbe> {
+  let realTarget = resolved;
+  try { realTarget = await realpath(resolved); } catch { /* use the resolved path */ }
+  return resolveSafeCliProbeWithRealTarget(command, resolved, realTarget);
 }
 
 export function findSafeCliCommand(command: string): SafeCliProbe | null {
@@ -559,22 +633,43 @@ function whichOnPath(command: string): string | undefined {
  *
  * The legacy concurrency option remains accepted for API compatibility.
  */
-export async function fullScan(opts: { concurrency?: number } = {}): Promise<CliScanResult> {
+let fullScanInFlight: Promise<CliScanResult> | undefined;
+
+async function performFullScan(opts: { concurrency?: number } = {}): Promise<CliScanResult> {
   void opts;
-  const detected = scanPath();
-  const clis: CliEntry[] = detected.flatMap(({ command, path: executablePath }) => {
-    const safe = resolveSafeCliProbe(command, executablePath);
-    if (safe.skipped) return [];
-    return [{ command, path: safe.path, isLikelyCli: true }];
-  });
+  const detected = await scanPathAsync();
+  const clis: CliEntry[] = [];
+  const FILTER_BATCH_SIZE = 32;
+  for (let offset = 0; offset < detected.length; offset += FILTER_BATCH_SIZE) {
+    const batch = detected.slice(offset, offset + FILTER_BATCH_SIZE);
+    const safeBatch = await Promise.all(batch.map(async ({ command, path: executablePath }) => ({
+      command,
+      safe: await resolveSafeCliProbeAsync(command, executablePath),
+    })));
+    for (const { command, safe } of safeBatch) {
+      if (!safe.skipped) clis.push({ command, path: safe.path, isLikelyCli: true });
+    }
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+  }
 
   const result: CliScanResult = {
     detected,
     clis,
     scannedAt: new Date().toISOString(),
   };
-  writeCachedScan(result);
+  await writeCachedScan(result);
   return result;
+}
+
+/** All callers join one metadata walk/cache publication per daemon process. */
+export function fullScan(opts: { concurrency?: number } = {}): Promise<CliScanResult> {
+  if (fullScanInFlight) return fullScanInFlight;
+  const scan = performFullScan(opts);
+  const tracked = scan.finally(() => {
+    if (fullScanInFlight === tracked) fullScanInFlight = undefined;
+  });
+  fullScanInFlight = tracked;
+  return tracked;
 }
 
 /**

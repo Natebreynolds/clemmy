@@ -17,7 +17,12 @@ process.env.DISCORD_ENABLED = 'false';
 process.env.SLACK_ENABLED = 'false';
 process.env.WEBHOOK_ENABLED = 'false';
 
-const { bootAuthSetupSatisfied, bootModelWarmupEnabled, resolveBootModelWarmupGate } = await import('./runner.js');
+const {
+  bootAuthSetupSatisfied,
+  bootModelWarmupEnabled,
+  cliDiscoveryWarmupEnabled,
+  resolveBootModelWarmupGate,
+} = await import('./runner.js');
 
 const RUNNER_SOURCE = readFileSync(new URL('./runner.ts', import.meta.url), 'utf-8');
 const INDEX_SOURCE = readFileSync(new URL('../index.ts', import.meta.url), 'utf-8');
@@ -97,6 +102,23 @@ test('boot model warmup is explicit opt-in', () => {
   } finally {
     if (prior === undefined) delete process.env.CLEMMY_BOOT_WARMUP;
     else process.env.CLEMMY_BOOT_WARMUP = prior;
+  }
+});
+
+test('CLI discovery warmup is default-on but has an explicit recovery switch', () => {
+  const prior = process.env.CLEMMY_CLI_DISCOVERY_WARMUP;
+  try {
+    delete process.env.CLEMMY_CLI_DISCOVERY_WARMUP;
+    assert.equal(cliDiscoveryWarmupEnabled(), true);
+    process.env.CLEMMY_CLI_DISCOVERY_WARMUP = 'off';
+    assert.equal(cliDiscoveryWarmupEnabled(), false);
+    process.env.CLEMMY_CLI_DISCOVERY_WARMUP = '0';
+    assert.equal(cliDiscoveryWarmupEnabled(), false);
+    process.env.CLEMMY_CLI_DISCOVERY_WARMUP = 'on';
+    assert.equal(cliDiscoveryWarmupEnabled(), true);
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_CLI_DISCOVERY_WARMUP;
+    else process.env.CLEMMY_CLI_DISCOVERY_WARMUP = prior;
   }
 });
 
@@ -212,11 +234,13 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   const [readyCall] = readyCalls;
   assert.ok(ts.isAwaitExpression(readyCall.parent), 'the readiness hook must finish before boot proceeds');
 
+  const canonicalToolMigration = callsNamed(startDaemon, 'migrateToolChoicesToCanonicalProcedures');
   const orphanFence = callsNamed(startDaemon, 'interruptOrphanedRunAttemptsAtBoot');
   const approvalDrain = callsNamed(startDaemon, 'startChatApprovalResume');
   const genericChatRecovery = callsNamed(startDaemon, 'reportInterruptedChatRuns');
   const terminalReportBack = callsNamed(startDaemon, 'startTerminalReportBackWatcher');
   for (const [label, calls] of [
+    ['canonical tool-memory migration', canonicalToolMigration],
     ['orphan fencing', orphanFence],
     ['approval drain', approvalDrain],
     ['generic chat recovery', genericChatRecovery],
@@ -231,6 +255,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   assert.equal(laneRegistrations.length, 1, 'workflow recovery lane must be registered once during boot');
 
   const orderedBootNodes = [
+    canonicalToolMigration[0],
     orphanFence[0],
     approvalDrain[0],
     genericChatRecovery[0],
@@ -241,7 +266,14 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   assert.deepEqual(
     [...orderedBootNodes].sort((left, right) => left.getStart() - right.getStart()),
     orderedBootNodes,
-    'boot must fence, drain exact approvals, recover generic chats, arm report-back, register lanes, then release ingress',
+    'boot must migrate explicitly, fence, drain exact approvals, recover generic chats, arm report-back, register lanes, then release ingress',
+  );
+
+  const cliWarmCalls = callsNamed(startDaemon, 'warmCliScan');
+  assert.equal(cliWarmCalls.length, 1, 'CLI discovery warmup must be scheduled once');
+  assert.ok(
+    cliWarmCalls[0].getStart() > readyCall.getStart(),
+    'speculative CLI discovery must not start until ingress readiness succeeds',
   );
 });
 
