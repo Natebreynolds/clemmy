@@ -98,6 +98,124 @@ test('raw model/control events and untrusted stream deltas have no public event'
   );
 });
 
+test('transport mirrors remain in the audit ledger but never enter the public event plane', () => {
+  const canonical = projectHarnessEventForPublic(event('tool_called', {
+    tool: 'call_tool',
+    callId: 'call-workspace-cadence',
+    canonicalCallId: 'call-workspace-cadence',
+    accounting: 'top_level',
+  }));
+  assert.ok(canonical);
+  assert.equal(canonical.data.tool, 'call_tool');
+
+  assert.equal(projectHarnessEventForPublic(event('tool_called', {
+    tool: 'composio_execute_tool',
+    callId: 'batch-workspace-cadence',
+    canonicalCallId: 'call-workspace-cadence',
+    accounting: 'transport_mirror',
+  })), null);
+  assert.equal(projectHarnessEventForPublic(event('tool_returned', {
+    tool: 'composio_execute_tool',
+    callId: 'batch-workspace-cadence',
+    canonicalCallId: 'call-workspace-cadence',
+    accounting: 'transport_mirror',
+  })), null);
+});
+
+test('public tool progress never derives identity from model-supplied carrier arguments', () => {
+  const shellCarrier = projectHarnessEventForPublic(event('tool_called', {
+    tool: 'call_tool',
+    accounting: 'top_level',
+    arguments: JSON.stringify({
+      name: 'customer-secret-123',
+      args_json: JSON.stringify({ command: 'deploy --token bearer-secret-123' }),
+    }),
+  }));
+  assert.ok(shellCarrier);
+  assert.equal(shellCarrier.data.progress, 'using call_tool');
+  assert.equal('arguments' in shellCarrier.data, false);
+  assert.doesNotMatch(
+    JSON.stringify(shellCarrier.data),
+    /customer-secret-123|bearer-secret-123|deploy --token/,
+  );
+
+  const composioCarrier = projectHarnessEventForPublic(event('tool_called', {
+    tool: 'call_tool',
+    accounting: 'top_level',
+    arguments: JSON.stringify({
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({
+        tool_slug: 'customer-secret-456',
+        arguments: JSON.stringify({ spreadsheet_id: 'sheet-fixture' }),
+      }),
+    }),
+  }));
+  assert.ok(composioCarrier);
+  assert.equal(composioCarrier.data.progress, 'using call_tool');
+  assert.equal('arguments' in composioCarrier.data, false);
+  assert.doesNotMatch(JSON.stringify(composioCarrier.data), /customer-secret-456|sheet-fixture/);
+
+  const directComposio = projectHarnessEventForPublic(event('tool_called', {
+    tool: 'composio_execute_tool',
+    accounting: 'top_level',
+    arguments: JSON.stringify({ tool_slug: 'customer-secret-789' }),
+  }));
+  assert.ok(directComposio);
+  assert.equal(directComposio.data.progress, 'using composio_execute_tool');
+  assert.doesNotMatch(JSON.stringify(directComposio.data), /customer-secret-789/);
+});
+
+test('compact decision assignments are internal protocol, not public prose', () => {
+  const liveLeak = 'done=true  \nnextAction=completed  \nReconciliation is unnecessary.';
+  assert.equal(publicReplyText(liveLeak, 'safe fallback'), 'safe fallback');
+  const rawJsonEnvelope = JSON.stringify({
+    summary: 'Reconciliation is unnecessary.',
+    reply: 'Reconciliation is unnecessary.',
+    done: true,
+    nextAction: 'completed',
+    reason: null,
+  });
+  assert.equal(
+    publicReplyText(rawJsonEnvelope, 'safe fallback'),
+    'Reconciliation is unnecessary.',
+    'the legacy JSON adapter projects only the usable reply field',
+  );
+  assert.equal(
+    publicReplyText(JSON.stringify({ done: true, nextAction: 'completed' }), 'safe fallback'),
+    'safe fallback',
+    'a whole JSON decision without a public reply remains control output',
+  );
+  assert.equal(
+    publicReplyText('The job is done. Next action: review tomorrow.', 'safe fallback'),
+    'The job is done. Next action: review tomorrow.',
+    'ordinary prose remains displayable',
+  );
+  const assignments = 'summary = "Sales grew 5%"\nreason = "Higher conversion"';
+  assert.equal(
+    publicReplyText(assignments, 'safe fallback'),
+    assignments,
+    'legitimate assignment-style results remain displayable',
+  );
+  const fencedConfig = '```ini\ndone=true\nnextAction=completed\n```';
+  assert.equal(
+    publicReplyText(fencedConfig, 'safe fallback'),
+    fencedConfig,
+    'an explicitly fenced config example is public code, not a control envelope',
+  );
+  const prefixedJson = `Example config:\n${rawJsonEnvelope}`;
+  assert.equal(
+    publicReplyText(prefixedJson, 'safe fallback'),
+    prefixedJson,
+    'an explanatory prefix makes the JSON an example rather than an envelope',
+  );
+  const fencedJson = `\`\`\`json\n${rawJsonEnvelope}\n\`\`\``;
+  assert.equal(
+    publicReplyText(fencedJson, 'safe fallback'),
+    fencedJson,
+    'fenced JSON remains displayable code',
+  );
+});
+
 test('accepted user turns project the human display text, not model-facing directives', () => {
   const projected = projectHarnessEventForPublic(event('user_input_received', {
     text: 'Continue the prior graph.\n[INTERNAL CONTINUATION DIRECTIVE]\nFull attachment contents…',
@@ -234,7 +352,8 @@ test('public event batches preserve durable sequence cursors while dropping priv
     { ...event('conversation_completed', { reply: 'Done.' }), seq: 5 },
   ]);
   assert.deepEqual(projected.map((row) => row.seq), [4, 5]);
-  assert.deepEqual(projected[0].data, { tool: 'search' });
+  assert.deepEqual(projected[0].data, { tool: 'search', progress: 'using search' });
+  assert.doesNotMatch(JSON.stringify(projected[0].data), /secret/);
 });
 
 test('public replay elects the earliest valid terminal across rolling-upgrade keys', () => {

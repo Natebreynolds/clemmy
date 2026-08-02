@@ -604,6 +604,82 @@ test('fresh external-write evidence is bound to the current user sequence and ne
   );
 });
 
+test('a corrected inner write is not poisoned by a proven local call_tool refusal', () => {
+  const localCarrierRefusal = {
+    seq: 6,
+    type: 'external_write_failed',
+    data: {
+      sourceUserSeq: 5,
+      callId: 'outer-malformed-carrier',
+      toolName: 'call_tool',
+      shapeKey: 'call_tool',
+      dispatch: 'not_started',
+      effect: 'none',
+      preDispatch: true,
+    },
+  };
+  const correctedReservation = {
+    seq: 7,
+    type: 'external_write',
+    data: {
+      sourceUserSeq: 5,
+      callId: 'inner-provider-write',
+      toolName: 'composio_execute_tool',
+      actionKey: 'googlesheets:update',
+      targets: ['sheet-fixture:Summary!A1'],
+      preDispatch: true,
+    },
+  };
+  const correctedReceipt = {
+    seq: 8,
+    type: 'external_write_succeeded',
+    data: {
+      sourceUserSeq: 5,
+      callId: 'inner-provider-write',
+      toolName: 'composio_execute_tool',
+      actionKey: 'googlesheets:update',
+      targets: ['sheet-fixture:Summary!A1'],
+    },
+  };
+
+  assert.equal(
+    freshExternalWriteEvidenceStatus([localCarrierRefusal], 5),
+    'missing',
+    'a proven local carrier refusal is audit evidence, not a provider failure',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      localCarrierRefusal,
+      correctedReservation,
+      correctedReceipt,
+    ], 5),
+    'confirmed',
+    'the acknowledged inner provider write governs completion',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([{
+      ...localCarrierRefusal,
+      data: {
+        ...localCarrierRefusal.data,
+        toolName: 'composio_execute_tool',
+      },
+    }], 5),
+    'failed',
+    'the same no-dispatch markers on a genuine provider attempt still fail closed',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([{
+      ...localCarrierRefusal,
+      data: {
+        ...localCarrierRefusal.data,
+        preDispatch: false,
+      },
+    }], 5),
+    'failed',
+    'an incompletely proven carrier failure remains negative evidence',
+  );
+});
+
 test('a pre-dispatch reservation is ambiguous until its exact call settles successfully', () => {
   const reservation = {
     seq: 6,

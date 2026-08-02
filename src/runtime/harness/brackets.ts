@@ -13,10 +13,12 @@ import {
   canonicalExternalWriteActionKey,
   consumeExternalWriteRetryAuthorization,
   ExternalWritePreDispatchError,
+  ExternalWritePreDispatchResult,
   externalWriteAdmissionKey,
   externalWriteDuplicateIdentityKeys,
   externalWriteSemanticFingerprint,
   uncompensatedExternalWriteEvents,
+  unwrapExternalWritePreDispatchResult,
   withExternalWriteAdmissionLock,
 } from './external-write-admission.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
@@ -1616,6 +1618,14 @@ function recordExternalWriteSettlement(
 ): 'external_write_succeeded' | 'external_write_failed' | 'external_write_orphaned' | undefined {
   if (!sessionId || !callId) return undefined;
 
+  // call_tool is a transport carrier, not a second provider boundary. A
+  // validated inner tool owns its own reservation/settlement lifecycle. The
+  // only outer lifecycle we author is the nominal early-refusal result, where
+  // no inner tool existed and local code can prove dispatch never started.
+  if (toolName === 'call_tool' && !(result instanceof ExternalWritePreDispatchResult)) {
+    return undefined;
+  }
+
   let shapeKey: string | undefined;
   let targets: string[] = [];
   let irreversible = false;
@@ -1640,6 +1650,7 @@ function recordExternalWriteSettlement(
   }
 
   const trustedNotStarted = result instanceof ExternalWritePreDispatchError
+    || result instanceof ExternalWritePreDispatchResult
     || (
       shellOutcome?.dispatch === 'not_started'
       && shellOutcome.effect === 'none'
@@ -1693,10 +1704,13 @@ function recordExternalWriteSettlement(
             reason: String(
               result instanceof Error
                 ? result.message
+                : result instanceof ExternalWritePreDispatchResult
+                  ? result.output
                 : typeof result === 'string'
                   ? result
                   : 'provider result did not carry a trusted clean acknowledgement',
             ).replace(/\s+/g, ' ').slice(0, 240),
+            ...(trustedNotStarted ? { dispatch: 'not_started', effect: 'none', preDispatch: true } : {}),
           }
         : {}),
     },
@@ -3269,13 +3283,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
           shellOutcome,
           invokeCallId,
         );
-        recordPublishIfSucceeded(tool.name, parsedInput, result, shellOutcome);
-        creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, result, shellOutcome);
+        const outwardResult = unwrapExternalWritePreDispatchResult(result);
+        recordPublishIfSucceeded(tool.name, parsedInput, outwardResult, shellOutcome);
+        creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, outwardResult, shellOutcome);
         // Poll-vs-loop discrimination: record the result fingerprint so the
         // exact-args guardrail can tell a progressing status poll from a
         // genuine loop (live 2026-07-23).
-        if (ctx) { try { noteGuardrailToolResult(guardrailScopeKey(ctx), tool.name, parsedInput, result); } catch { /* advisory */ } }
-        return result;
+        if (ctx) { try { noteGuardrailToolResult(guardrailScopeKey(ctx), tool.name, parsedInput, outwardResult); } catch { /* advisory */ } }
+        return outwardResult;
       }, (err) => {
         const shellOutcome = tool.name === 'run_shell_command'
           ? takeShellExecutionOutcome(invokeCallId)
@@ -3471,10 +3486,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
       shellOutcome,
       executeCallId,
     );
-    recordPublishIfSucceeded(tool.name, input, result, shellOutcome);
-    creditRecallFromToolResult(ctx?.sessionId, tool.name, input, result, shellOutcome);
-    if (fanoutNudge && typeof result === 'string') return `${result}\n\n${fanoutNudge}`;
-    return result;
+    const outwardResult = unwrapExternalWritePreDispatchResult(result);
+    recordPublishIfSucceeded(tool.name, input, outwardResult, shellOutcome);
+    creditRecallFromToolResult(ctx?.sessionId, tool.name, input, outwardResult, shellOutcome);
+    if (fanoutNudge && typeof outwardResult === 'string') return `${outwardResult}\n\n${fanoutNudge}`;
+    return outwardResult;
     // NOTE: A tool-return truncator used to live here as part of
     // Primitive 6 (v0.5.18 plan). Removed 2026-05-24 because hooks.ts
     // `clipToolResult` + `writeToolOutput` + `clipOldToolResults`
@@ -3497,7 +3513,6 @@ export function softToolError(err: unknown): string | null {
     err instanceof MissingExecutionWrapError ||
     err instanceof ConfirmFirstRequiredError ||
     err instanceof ToolGuardrailBlocked ||
-    err instanceof ToolCallsLimitExceeded ||
     err instanceof GroundingCheckFailedError ||
     err instanceof RecipientSetIntegrityError ||
     err instanceof GoalFidelityCheckFailedError ||

@@ -336,6 +336,25 @@ function externalWriteIsPreDispatch(event: SequencedEvidenceEvent): boolean {
   return externalWriteEventData(event).preDispatch === true;
 }
 
+/**
+ * `call_tool` is only a local transport carrier. Its typed pre-dispatch
+ * refusal is useful audit evidence, but it is not a failed provider action and
+ * therefore must not poison completion after the model corrects the carrier
+ * envelope and the validated inner write succeeds.
+ *
+ * Keep this predicate deliberately strict: a provider tool (or a carrier row
+ * missing any part of the trusted no-dispatch proof) remains negative evidence.
+ */
+function isProvenLocalCarrierRefusal(event: SequencedEvidenceEvent): boolean {
+  if (event.type !== 'external_write_failed') return false;
+  const data = externalWriteEventData(event);
+  const toolName = firstEvidenceText(data, ['toolName', 'tool']);
+  return toolName === 'call_tool'
+    && data.dispatch === 'not_started'
+    && data.effect === 'none'
+    && data.preDispatch === true;
+}
+
 function firstEvidenceText(data: Record<string, unknown>, keys: readonly string[]): string {
   for (const key of keys) {
     const value = data[key];
@@ -552,6 +571,9 @@ export function freshExternalWriteEvidenceStatus(
   const current = events.filter((event) =>
     event.seq > firstSourceUserSeq
     && eventBelongsToSourceUserSeq(event, acceptedSourceUserSeqs)
+    // Retain this row in the durable audit log, but exclude it from provider
+    // completion truth. The validated inner tool owns that lifecycle.
+    && !isProvenLocalCarrierRefusal(event)
   );
   const outcomes = resolveCurrentExternalWriteAttempts(current);
   if (outcomes.some((attempt) => attempt.state === 'ambiguous')) return 'ambiguous';

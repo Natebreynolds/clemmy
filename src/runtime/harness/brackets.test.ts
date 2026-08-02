@@ -124,14 +124,20 @@ test('harnessToolBracketsEnabled: DEFAULT-ON (keystone flip) with =off kill-swit
   }
 });
 
-test('softToolError: a recoverable gate throw → soft string; escalation/unknown → null (propagate)', () => {
+test('softToolError: a recoverable gate throw → soft string; hard ceilings/unknown → null (propagate)', () => {
   // Step 1 of the gate-unification: this shared helper is the SINGLE disposition
   // for both the invoke and the legacy execute wrappers, so a gate throw can no
   // longer crash the run purely because a tool used `execute` instead of `invoke`.
-  const soft = softToolError(new ToolCallsLimitExceeded(5));
+  const soft = softToolError(new OrphanedWriteRetryError({
+    toolName: 'composio_execute_tool',
+    shapeKey: 'OUTLOOK_SEND_EMAIL',
+    target: 'recipient@example.com',
+  }));
   assert.equal(typeof soft, 'string');
   assert.match(soft as string, /Tool call refused by harness/);
-  // A plain Error (an unknown bug) and a generic non-Error MUST propagate.
+  // A hard budget ceiling, plain Error (unknown bug), and generic non-Error
+  // MUST propagate to the turn controller.
+  assert.equal(softToolError(new ToolCallsLimitExceeded(5)), null);
   assert.equal(softToolError(new Error('boom')), null);
   assert.equal(softToolError({ statusCode: 500 }), null);
 });

@@ -26,6 +26,8 @@ import {
   type PresentationEvent,
 } from './turn-outcome.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
+import { looksLikeCompactDecisionProtocol } from './presentation-hygiene.js';
+import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 
 const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'turn_ended',
@@ -42,7 +44,7 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 const DECISION_KEYS = new Set(['summary', 'reply', 'done', 'nextaction', 'reason']);
-const RAW_PROTOCOL_RE = /(?:<\/?(?:analysis|reasoning|invoke|tool_call)\b|\[tool\s*:|"tool_call"\s*:|"nextAction"\s*:)/i;
+const RAW_TOOL_OR_REASONING_PROTOCOL_RE = /(?:<\/?(?:analysis|reasoning|invoke|tool_call)\b|\[tool\s*:|"tool_call"\s*:)/i;
 const SAFE_TERMINAL_FALLBACK = 'I finished the turn, but the final reply was not safe to display. Please ask me to continue.';
 export const PUBLIC_RUN_FAILURE_TEXT = 'Something went wrong on that turn. Please try again; the technical details are available in the activity log.';
 export const PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT =
@@ -95,12 +97,20 @@ function projectReplyText(value: unknown, fallback: string, depth: number): stri
   const candidate = text(value);
   if (!candidate) return fallback;
 
+  // Preserve the compatibility contract for a whole legacy JSON decision that
+  // carries a usable public reply. A decision object without one remains
+  // private control output. The shared detector is deliberately
+  // whole-envelope/fence-aware, so examples remain public.
   const fromJson = jsonReply(candidate);
   if (fromJson !== null) return projectReplyText(fromJson, fallback, depth + 1);
+  if (looksLikeCompactDecisionProtocol(candidate)) return fallback;
   if (parseNarratedEnvelope(candidate)) {
     return projectReplyText(publicReplyFromNarratedEnvelope(candidate), fallback, depth + 1);
   }
-  if (RAW_PROTOCOL_RE.test(candidate) || looksLikeToolCallShape(candidate)) return fallback;
+  if (
+    RAW_TOOL_OR_REASONING_PROTOCOL_RE.test(candidate)
+    || looksLikeToolCallShape(candidate)
+  ) return fallback;
   return candidate;
 }
 
@@ -319,6 +329,33 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
   };
 }
 
+const PUBLIC_TOOL_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/;
+
+function firstString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function publicToolIdentifier(value: unknown): string {
+  const candidate = typeof value === 'string' ? value.trim() : '';
+  return PUBLIC_TOOL_IDENTIFIER_RE.test(candidate) ? candidate : '';
+}
+
+/**
+ * One privacy-safe public progress label. The canonical top-level tool name is
+ * runtime-owned event metadata; call_tool's target name and Composio slug are
+ * model-supplied arguments and therefore stay private until a future producer
+ * can attach a separately validated public identity. Shape-checking an argument
+ * is not validation: secrets, paths, and queries can all look identifier-like.
+ */
+function publicToolProgressLabel(toolValue: unknown): string {
+  const tool = publicToolIdentifier(toolValue);
+  if (!tool) return 'using a tool';
+  return `using ${tool}`.slice(0, 110);
+}
+
 function projectData(event: EventRow): Record<string, unknown> | null {
   const data = event.data ?? {};
   switch (event.type) {
@@ -365,8 +402,14 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       // Projecting this row as well races that terminal live and disappears on
       // replay because transcripts intentionally consume only completions.
       return null;
-    case 'tool_called':
-      return selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'batchMode', 'accounting']);
+    case 'tool_called': {
+      const tool = firstString(data.tool, data.toolName, data.name) || 'tool';
+      const progress = publicToolProgressLabel(tool);
+      return {
+        ...selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'batchMode', 'accounting']),
+        ...(progress ? { progress } : {}),
+      };
+    }
     case 'tool_returned':
       return selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'ok', 'success', 'batchMode', 'accounting']);
     case 'handoff':
@@ -419,6 +462,10 @@ function projectData(event: EventRow): Record<string, unknown> | null {
 /** Project one raw harness row into the public chat event plane. */
 export function projectHarnessEventForPublic(event: EventRow): EventRow | null {
   if (PRIVATE_EVENT_TYPES.has(event.type)) return null;
+  if (
+    (event.type === 'tool_called' || event.type === 'tool_returned')
+    && !isCanonicalTopLevelToolEvent(event)
+  ) return null;
   let data: Record<string, unknown> | null;
   try { data = projectData(event); } catch { return null; }
   if (data === null) return null;

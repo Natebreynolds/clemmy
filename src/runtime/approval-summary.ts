@@ -419,10 +419,26 @@ export function extractApprovalContentPreview(
  * already-parsed object — both are common shapes at call sites.
  */
 export function previewToolCall(toolName: string, argsRaw: unknown): string {
+  return previewToolCallAtDepth(toolName, argsRaw, 0);
+}
+
+function previewToolCallAtDepth(toolName: string, argsRaw: unknown, depth: number): string {
   const args = parseArgs(argsRaw);
   if (!args) return toolName;
   const MAX = 70;
   switch (toolName) {
+    case 'call_tool': {
+      // call_tool is a transport carrier, not the action the user cares about.
+      // Project its canonical inner target into public progress so a Composio
+      // call reads "composio · SLUG" instead of "using call_tool". Keep the
+      // recursion bounded because nested carriers are valid input, including a
+      // malformed self-carrier that must never recurse forever.
+      const target = pickString(args, ['name']).trim();
+      if (!target || depth >= 4) return toolName;
+      const innerPreview = previewToolCallAtDepth(target, args.args_json, depth + 1);
+      if (innerPreview !== target) return innerPreview;
+      return target === toolName ? toolName : `using ${trim(target, MAX - 6)}`;
+    }
     case 'run_shell_command':
     case 'shell': {
       const command = pickString(args, ['command', 'cmd']);

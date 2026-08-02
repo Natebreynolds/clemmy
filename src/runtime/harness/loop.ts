@@ -1045,6 +1045,123 @@ function freshExternalWriteGapReason(status: Exclude<FreshExternalWriteEvidenceS
   return 'there is no external-write receipt after the user event that owns this request; historical execution summaries and receipts do not count';
 }
 
+interface SelfReconciliationArtifactRequirement {
+  id: string;
+  slotKey: string;
+  kind: RunArtifact['kind'];
+  provider: string;
+}
+
+interface EffectArtifactSelfReconciliation {
+  publicText: string | null;
+  originalDecision: OrchestratorDecisionShape;
+  originTurn: number;
+  objective: string;
+  artifactRequirements: SelfReconciliationArtifactRequirement[];
+  ambiguousExternalWrite: boolean;
+  externalWriteRequiredByObjective: boolean;
+  completionVerdict: ObjectiveJudgeVerdict | null;
+  skipDeliveryGate: boolean;
+}
+
+interface SelfReconciliationAssessment {
+  status: 'settled' | 'ambiguous' | 'failed';
+  reason: string;
+  publicText: string;
+  externalWriteStatus?: FreshExternalWriteEvidenceStatus;
+}
+
+/**
+ * Decide from durable evidence only whether a self-reconciliation turn made
+ * the ORIGINAL public candidate safe to release. The recovery model's prose
+ * is deliberately absent from this contract: it may settle evidence, but it
+ * cannot become a second author of the accepted turn's public answer.
+ */
+function assessEffectArtifactSelfReconciliation(input: {
+  sessionId: string;
+  sourceUserSeq: number | undefined;
+  recovery: EffectArtifactSelfReconciliation;
+}): SelfReconciliationAssessment {
+  if (input.recovery.artifactRequirements.length > 0) {
+    let state: StandardArtifactTerminalState | null = null;
+    try { state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq); } catch { state = null; }
+    if (!state) {
+      return {
+        status: 'failed',
+        reason: 'artifact_reconciliation_has_no_bound_result',
+        publicText: 'I could not confirm the artifact after read-only reconciliation. The original create claim is no longer enough to prove a deliverable exists, and no bound replacement is recorded, so I cannot call this complete.',
+      };
+    }
+    for (const required of input.recovery.artifactRequirements) {
+      const exact = state.artifacts.find((artifact) => artifact.id === required.id);
+      const boundEquivalent = state.artifacts.find((artifact) =>
+        artifact.slotKey === required.slotKey
+        && artifact.kind === required.kind
+        && artifact.provider === required.provider
+        && artifact.status === 'bound');
+      if (exact?.status === 'bound' || boundEquivalent) continue;
+      if (exact || state.artifacts.some((artifact) =>
+        artifact.slotKey === required.slotKey
+        && artifact.kind === required.kind
+        && artifact.provider === required.provider)) {
+        return {
+          status: 'ambiguous',
+          reason: 'artifact_reconciliation_remains_unresolved',
+          publicText: 'I cannot honestly confirm the artifact yet: its create outcome remains unresolved after the read-only reconciliation attempt. I did not create another replacement or treat the recovery reply as proof.',
+        };
+      }
+      return {
+        status: 'failed',
+        reason: 'artifact_reconciliation_found_no_deliverable',
+        publicText: 'I could not confirm the artifact after read-only reconciliation. No bound artifact or verified replacement is recorded, so the original success answer cannot be published as complete.',
+      };
+    }
+  }
+
+  const externalWriteStatus = requestFreshExternalWriteStatus(
+    input.sessionId,
+    input.sourceUserSeq,
+  );
+  // Re-read the whole request ledger even for an artifact-only nudge: a
+  // recovery turn that accidentally introduced a new maybe-landed write must
+  // never become green merely because the original artifact was bound.
+  if (
+    externalWriteStatus === 'ambiguous'
+    || (input.recovery.ambiguousExternalWrite && externalWriteStatus === 'missing')
+  ) {
+      return {
+        status: 'ambiguous',
+        reason: 'external_write_reconciliation_remains_ambiguous',
+        publicText: 'I cannot honestly confirm this external write: the exact target remains ambiguous after the read-only reconciliation attempt. I did not repeat the write, and I did not treat the recovery reply as proof.',
+        externalWriteStatus,
+      };
+  }
+  if (externalWriteStatus === 'failed' && input.recovery.externalWriteRequiredByObjective) {
+    return {
+      status: 'failed',
+      reason: 'external_write_reconciliation_proved_incomplete',
+      publicText: 'The reconciliation did not confirm the requested external write. It is recorded as absent or failed, so the original success answer cannot be published as complete.',
+      externalWriteStatus,
+    };
+  }
+
+  if (!input.recovery.publicText) {
+    return {
+      status: 'failed',
+      reason: 'reconciliation_has_no_safe_public_candidate',
+      publicText: 'The uncertainty was reconciled, but the original turn did not produce a safe user-facing answer. I will not expose the internal recovery response as the result.',
+    };
+  }
+  return {
+    status: 'settled',
+    reason: 'effect_artifact_reconciliation_settled',
+    publicText: input.recovery.publicText,
+    ...(input.recovery.ambiguousExternalWrite || externalWriteStatus !== 'missing'
+      ? { externalWriteStatus }
+      : {}),
+  };
+}
+
 /** An explicit user-memory candidate is persisted to the crash-safe intake
  * ledger before the model answers. That durable receipt is completion evidence
  * for a terse "Noted." even when the model correctly makes zero tool calls. */
@@ -3033,6 +3150,10 @@ async function runConversationCore(
   let objectiveJudgeContinuations = 0;
   let claimGroundingNudged = false;
   let selfResolveNudged = false;
+  // Set only by the effect/artifact self-resolve node. The next model turn is
+  // an evidence reconciler, not a new public-answer author; its durable
+  // settlements decide whether this saved candidate may ship.
+  let effectArtifactSelfReconciliation: EffectArtifactSelfReconciliation | null = null;
   let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
   let totalToolCalls = 0;
   let meaningfulToolEvidence = false;
@@ -3292,8 +3413,8 @@ async function runConversationCore(
 
     // ask_user_question is a terminal tool contract even when a provider
     // reports the SDK turn itself as "completed". Honor the durable pause
-    // before parsing prose, running completion validation, or starting a
-    // recovery turn.
+    // before reconciliation, prose parsing, completion validation, or any
+    // other terminal path.
     const completedTurnQuestion = turnResult.status === 'completed'
       ? awaitingUserQuestionThisTurn(options.sessionId, turnResult.turn)
       : null;
@@ -3313,6 +3434,149 @@ async function runConversationCore(
         lastDecision,
         lastTurn,
       };
+    }
+
+    // The one turn after the effect/artifact self-resolve nudge is a typed
+    // reconciliation node. It may append read-back evidence and exact ledger
+    // settlements, but its prose is private control output. Resolve the saved
+    // public candidate from durable state before parsing that prose so compact
+    // protocol (`done=true / nextAction=...`) can never replace the answer.
+    if (turnResult.status === 'completed' && effectArtifactSelfReconciliation) {
+      const recovery = effectArtifactSelfReconciliation;
+      const assessment = assessEffectArtifactSelfReconciliation({
+        sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        recovery,
+      });
+      if (assessment.status !== 'settled') {
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: {
+            kind: 'self_reconciliation_blocked',
+            status: assessment.status,
+            reason: assessment.reason,
+            sourceUserSeq: activeSourceUserSeq ?? null,
+            originTurn: recovery.originTurn,
+            externalWriteStatus: assessment.externalWriteStatus ?? null,
+          },
+        });
+        // Keep the established artifact retry contract: an exact unresolved
+        // create parks as needs-input with its artifact IDs/options. External
+        // write ambiguity has no equivalent safe retry, so it stays blocked.
+        if (assessment.reason === 'artifact_reconciliation_remains_unresolved') {
+          const parked = parkForPendingStandardArtifacts({
+            sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
+            turn: turnResult.turn,
+            steps: stepIndex,
+            summary: assessment.publicText,
+            internalSummary: recovery.originalDecision.summary,
+            reply: recovery.publicText,
+            lastDecision: recovery.originalDecision,
+            lastTurn,
+          });
+          if (parked) return parked;
+        }
+        const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
+        const publicPresentation = commitStandardBlockedTerminal({
+          sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          turn: turnResult.turn,
+          text: assessment.publicText,
+          legacyReason: 'blocked',
+          metadata: {
+            steps: stepIndex,
+            blockedReason: assessment.reason,
+            reconciliationOriginTurn: recovery.originTurn,
+            reconciliationStatus: assessment.status,
+            ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
+          },
+        });
+        return {
+          sessionId: options.sessionId,
+          status: 'awaiting_user_input',
+          steps: stepIndex,
+          lastDecision: recovery.originalDecision,
+          lastTurn,
+          publicPresentation,
+        };
+      }
+
+      const deliveryGateRan = verifyDeliveredEnabled()
+        && !recovery.skipDeliveryGate
+        && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn);
+      const delivery: DeliveryVerdict = deliveryGateRan
+        ? await verifyDelivered(recovery.objective, assessment.publicText, {
+          judgeFn: recovery.completionVerdict
+            ? async () => recovery.completionVerdict as ObjectiveJudgeVerdict
+            : objectiveJudge,
+        })
+        : { delivered: true, status: 'completed' };
+      if (deliveryGateRan) {
+        recordVerdictEvent(options.sessionId, turnResult.turn, {
+          door: 'delivery',
+          pass: delivery.delivered,
+          reason: delivery.reason,
+          failedOpen: delivery.verification?.failedOpen,
+          selfJudge: delivery.verification?.selfJudge,
+          ...(delivery.blockerType ? { detail: { blockerType: delivery.blockerType } } : {}),
+        });
+      }
+      if (delivery.verification) completionVerification = delivery.verification;
+      if (!delivery.delivered) {
+        const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
+        const publicPresentation = commitStandardBlockedTerminal({
+          sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          turn: turnResult.turn,
+          text: assessment.publicText,
+          legacyReason: 'blocked',
+          metadata: {
+            steps: stepIndex,
+            blockedReason: delivery.reason ?? 'saved_public_candidate_not_delivered',
+            reconciliationOriginTurn: recovery.originTurn,
+            reconciliationStatus: assessment.status,
+            ...(completionVerification ? { verification: completionVerification } : {}),
+            ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
+          },
+        });
+        return {
+          sessionId: options.sessionId,
+          status: 'awaiting_user_input',
+          steps: stepIndex,
+          lastDecision: recovery.originalDecision,
+          lastTurn,
+          publicPresentation,
+        };
+      }
+
+      return finalizeStandardConversation({
+        sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        turn: turnResult.turn,
+        eventData: {
+          steps: stepIndex,
+          reason: 'effect_artifact_reconciled',
+          summary: assessment.publicText,
+          reply: assessment.publicText,
+          internalSummary: recovery.originalDecision.summary,
+          internalReply: recovery.originalDecision.reply ?? null,
+          delivered: true,
+          reconciliationOriginTurn: recovery.originTurn,
+          reconciliationStatus: assessment.status,
+          ...(completionVerification ? { verification: completionVerification } : {}),
+        },
+        result: {
+          sessionId: options.sessionId,
+          status: 'completed',
+          steps: stepIndex,
+          lastDecision: recovery.originalDecision,
+          lastTurn,
+        },
+      });
     }
 
     // Any non-completed status propagates immediately. The conversation
@@ -4769,7 +5033,7 @@ async function runConversationCore(
                 + 'Verify YOURSELF now — read the provider back (a list/get/search for the exact title or id), then settle with artifact_claim_resolve: bind the found resource id, or mark it absent and create ONCE more.',
               );
             }
-            let writeStatus: string = 'missing';
+            let writeStatus: FreshExternalWriteEvidenceStatus = 'missing';
             try { writeStatus = requestFreshExternalWriteStatus(options.sessionId, activeSourceUserSeq); } catch { writeStatus = 'missing'; }
             if (writeStatus === 'ambiguous') {
               parts.push(
@@ -4777,20 +5041,50 @@ async function runConversationCore(
               );
             }
             if (parts.length === 0) return null;
-            return `[self-resolve] Do NOT hand this uncertainty to the user. ${parts.join(' ')} `
-              + 'Only if the verification read itself fails should you stop — and then explain in your own words exactly what you checked and what remains unknown.';
+            return {
+              directive: `[self-resolve] Do NOT hand this uncertainty to the user. ${parts.join(' ')} `
+                + 'Only if the verification read itself fails should you stop — and then explain in your own words exactly what you checked and what remains unknown.',
+              artifactRequirements: unresolved.map((artifact) => ({
+                id: artifact.id,
+                slotKey: artifact.slotKey,
+                kind: artifact.kind,
+                provider: artifact.provider,
+              })),
+              ambiguousExternalWrite: writeStatus === 'ambiguous',
+            };
           } catch { return null; }
         })();
         if (selfResolve) {
           selfResolveNudged = true;
           objectiveJudgeContinuations += 1;
+          let publicCandidate = publicReplyText(decision.reply, '')
+            || publicReplyText(decision.summary, '');
+          if (!publicCandidate) {
+            try { publicCandidate = synthesizeTurnReport(options.sessionId, activeSourceUserSeq) ?? ''; } catch { publicCandidate = ''; }
+          }
+          const candidateNotes = [goalUnmetNote, outputGroundingNote]
+            .filter((note) => note && note.trim());
+          if (publicCandidate && candidateNotes.length > 0) {
+            publicCandidate = `${publicCandidate}\n\n${candidateNotes.join('\n\n')}`;
+          }
+          effectArtifactSelfReconciliation = {
+            publicText: publicCandidate || null,
+            originalDecision: { ...decision },
+            originTurn: turnResult.turn,
+            objective,
+            artifactRequirements: selfResolve.artifactRequirements,
+            ambiguousExternalWrite: selfResolve.ambiguousExternalWrite,
+            externalWriteRequiredByObjective: objectiveRequiresFreshExternalWrite(objective),
+            completionVerdict: objectiveJudgeVerdictThisTurn,
+            skipDeliveryGate: goalSatisfiedThisTurn,
+          };
           try {
             safeAppend({
               sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'guardrail_tripped',
               data: { kind: 'self_resolve_nudge', reason: 'unresolved claim/ambiguous write settled by the model, not the user' },
             });
           } catch { /* telemetry must never block */ }
-          nextInput = selfResolve;
+          nextInput = selfResolve.directive;
           continue;
         }
       }

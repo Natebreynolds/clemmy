@@ -12,6 +12,7 @@
  */
 import { parseNarratedEnvelope } from './envelope-narration.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
+import { looksLikeCompactDecisionProtocol } from './presentation-hygiene.js';
 
 export type TurnOutcomeStatus = 'done' | 'needs_input' | 'blocked' | 'failed' | 'cancelled';
 
@@ -174,7 +175,9 @@ export function assertPublicPresentationText(value: string): string {
   const text = value.trim();
   if (!text) throw new UnsafePresentationError('empty');
   if (looksLikeToolCallShape(text)) throw new UnsafePresentationError('tool_protocol');
-  if (parseNarratedEnvelope(text)) throw new UnsafePresentationError('decision_envelope');
+  if (parseNarratedEnvelope(text) || looksLikeCompactDecisionProtocol(text)) {
+    throw new UnsafePresentationError('decision_envelope');
+  }
   return text;
 }
 

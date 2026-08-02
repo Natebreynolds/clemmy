@@ -86,6 +86,18 @@ test('agent + detail, detail-only, agent-only, tool, and idle all render sensibl
   assert.equal(deriveAssistantStatus(state({})), 'is thinking…');
 });
 
+test('quiet request policy keeps Slack status and in-message progress generic', () => {
+  const quiet = state({
+    progressPresentation: 'quiet',
+    currentAgent: 'Researcher',
+    status: 'composio · GOOGLESHEETS_BATCH_GET',
+    toolsCalled: ['call_tool'],
+    toolCount: 9,
+  });
+  assert.equal(deriveAssistantStatus(quiet), 'is working…');
+  assert.equal(renderAssistantProgress(quiet), '🍊 *Clem is working…*');
+});
+
 test('status lines are bounded (Slack status is a short line)', () => {
   const long = 'x'.repeat(400);
   assert.ok(deriveAssistantStatus(state({ status: long })).length <= 100);
