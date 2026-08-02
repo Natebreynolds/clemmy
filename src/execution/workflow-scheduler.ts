@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   closeSync,
   existsSync,
@@ -6,6 +7,8 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -13,13 +16,17 @@ import {
 import path from 'node:path';
 import pino from 'pino';
 import { CRON_RUNS_DIR, WORKFLOW_RUNS_DIR, ensureDir } from '../tools/shared.js';
+import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { reapRunEventDir } from './workflow-events.js';
 import {
   deleteWorkflowGraphSnapshotByRunId,
   loadWorkflowGraphSnapshotByRunId,
 } from './workflow-graph-store.js';
-import { resolveWorkflowRunDefinitionSnapshot } from './workflow-run-definition.js';
+import {
+  isCompiledWorkflowRunDefinitionSnapshot,
+  resolveWorkflowRunDefinitionSnapshot,
+} from './workflow-run-definition.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
@@ -997,6 +1004,82 @@ function canonicalWorkflowSlugForReap(
   return current?.name ?? reference;
 }
 
+const WORKFLOW_RUN_ORIGINS_DIR = path.join(WORKFLOW_RUNS_DIR, '.run-origins');
+const WORKFLOW_RUN_CANCELLATIONS_DIR = path.join(WORKFLOW_RUNS_DIR, '.cancellations');
+
+function workflowRunSidecarKey(runId: string): string {
+  return createHash('sha256').update(runId).digest('hex');
+}
+
+/** Remove immutable observer/cancellation evidence only after the canonical
+ * terminal record has passed the acknowledged-report-back retention gate.
+ * Trigger acceptance receipts live under a different, deliberately untouched
+ * root (`.trigger-receipts`). */
+function reapWorkflowRunSidecars(runId: string): boolean {
+  const key = workflowRunSidecarKey(runId);
+  try {
+    rmSync(path.join(WORKFLOW_RUN_ORIGINS_DIR, key), { recursive: true, force: true });
+    rmSync(path.join(WORKFLOW_RUN_CANCELLATIONS_DIR, `${key}.json`), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function workflowCatalogMarkerExists(workflowSlug: string): boolean {
+  return existsSync(path.join(WORKFLOWS_DIR, workflowSlug, 'SKILL.md'))
+    || existsSync(path.join(WORKFLOWS_DIR, `${workflowSlug}.md`))
+    || existsSync(path.join(WORKFLOWS_DIR, `${workflowSlug}.md.bak`));
+}
+
+/** Remove one directory only when it is empty. A concurrent creator winning
+ * the check/rmdir race is preservation, not a retention failure. */
+function removeDirectoryIfEmpty(dir: string): boolean {
+  try {
+    if (readdirSync(dir).length > 0) return true;
+    rmdirSync(dir);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTEMPTY';
+  }
+}
+
+/** Catalogless compiled workflows have no SKILL.md to own their run tree.
+ * Once their last retention-bound run is gone, remove only empty `runs/` and
+ * owner directories. A surviving run directory means reapRunEventDir retained
+ * correctness-critical call-mutation receipts, so the owner must remain. */
+function pruneEmptyCataloglessCompiledOwner(
+  record: ReapableWorkflowRunRecord,
+  workflowSlug: string,
+  runId: string,
+): boolean {
+  const admitted = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
+  if (
+    admitted.status !== 'valid'
+    || !isCompiledWorkflowRunDefinitionSnapshot(admitted.snapshot)
+    || admitted.snapshot.workflowSlug !== workflowSlug
+  ) return true;
+
+  if (workflowCatalogMarkerExists(workflowSlug)) return true;
+
+  const ownerDir = path.join(WORKFLOWS_DIR, workflowSlug);
+  const runsDir = path.join(ownerDir, 'runs');
+  const runDir = path.join(runsDir, runId);
+
+  // `reapRunEventDir` leaves the run directory behind only to preserve the
+  // call-mutations ledger. Never collapse its parents while it remains.
+  if (existsSync(path.join(runDir, 'call-mutations'))) return true;
+  if (existsSync(runDir) && !removeDirectoryIfEmpty(runDir)) return false;
+  if (existsSync(runDir)) return true;
+
+  if (!removeDirectoryIfEmpty(runsDir)) return false;
+  // Recheck catalog evidence at the final owner-removal boundary. A catalog
+  // file created concurrently always wins over hygiene.
+  if (workflowCatalogMarkerExists(workflowSlug)) return true;
+  return removeDirectoryIfEmpty(ownerDir);
+}
+
 export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return { scanned: 0, deleted: 0 };
   let files: string[];
@@ -1032,7 +1115,9 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
         // record. Any cleanup failure leaves that record reachable for a later
         // retry instead of stranding graph/events under a lost display name.
         if (!reapRunEventDir(workflowSlug, runId)) return false;
+        if (!pruneEmptyCataloglessCompiledOwner(raw, workflowSlug, runId)) return false;
         deleteWorkflowGraphSnapshotByRunId(runId);
+        if (!reapWorkflowRunSidecars(runId)) return false;
         unlinkSync(full);
         return true;
       });

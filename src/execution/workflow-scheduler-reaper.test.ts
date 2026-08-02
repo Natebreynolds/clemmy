@@ -1,5 +1,6 @@
 import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -22,6 +23,7 @@ const {
   loadWorkflowGraphSnapshotByRunId,
   persistWorkflowGraphSnapshot,
 } = await import('./workflow-graph-store.js');
+const { createCompiledWorkflowRunDefinitionSnapshot } = await import('./workflow-run-definition.js');
 const {
   _setWorkflowRunReaperBeforeLockForTests,
   reapStaleWorkflowRuns,
@@ -46,9 +48,71 @@ function writeRun(runId: string, record: Record<string, unknown>): string {
   return file;
 }
 
+function sidecarKey(runId: string): string {
+  return createHash('sha256').update(runId).digest('hex');
+}
+
+function writeRunSidecars(runId: string): {
+  originDir: string;
+  cancellationFile: string;
+  triggerReceiptFile: string;
+} {
+  const key = sidecarKey(runId);
+  const originDir = path.join(WORKFLOW_RUNS_DIR, '.run-origins', key);
+  const cancellationFile = path.join(WORKFLOW_RUNS_DIR, '.cancellations', `${key}.json`);
+  const triggerReceiptFile = path.join(WORKFLOW_RUNS_DIR, '.trigger-receipts', `${key}.json`);
+  mkdirSync(originDir, { recursive: true });
+  mkdirSync(path.dirname(cancellationFile), { recursive: true });
+  mkdirSync(path.dirname(triggerReceiptFile), { recursive: true });
+  writeFileSync(path.join(originDir, 'observer.json'), JSON.stringify({
+    version: 1,
+    runId,
+    originSessionId: 'observer',
+    recordedAt: OLD_FINISHED_AT,
+  }), 'utf-8');
+  writeFileSync(cancellationFile, '{"requested":true}', 'utf-8');
+  writeFileSync(triggerReceiptFile, '{"accepted":true}', 'utf-8');
+  return { originDir, cancellationFile, triggerReceiptFile };
+}
+
+function compiledWorkflowSlug(runId: string): string {
+  return `compiled-${createHash('sha256').update(runId).digest('hex').slice(0, 32)}`;
+}
+
+function writeCompiledRun(runId: string, record: Record<string, unknown> = {}): {
+  file: string;
+  workflowSlug: string;
+  runDir: string;
+} {
+  const workflowSlug = compiledWorkflowSlug(runId);
+  const definition = {
+    name: `project-${runId}`,
+    description: 'Retention hygiene test project',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'work', prompt: 'Do the work', sideEffect: 'read' as const }],
+  };
+  const workflowDefinitionSnapshot = createCompiledWorkflowRunDefinitionSnapshot({
+    workflowSlug,
+    sourceTurnKeyHash: createHash('sha256').update(`turn:${runId}`).digest('hex'),
+    definition,
+    admittedAt: OLD_FINISHED_AT,
+  });
+  return {
+    file: writeRun(runId, {
+      workflow: definition.name,
+      workflowDefinitionSnapshot,
+      ...record,
+    }),
+    workflowSlug,
+    runDir: path.join(WORKFLOWS_DIR, workflowSlug, 'runs', runId),
+  };
+}
+
 beforeEach(() => {
   _setWorkflowRunReaperBeforeLockForTests();
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+  rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
 });
 
 test.after(() => {
@@ -139,6 +203,104 @@ test('reaper still removes an old terminal record whose report-back is fully ack
 
   assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 1 });
   assert.equal(existsSync(file), false);
+});
+
+test('reaper removes terminal run sidecars and an empty catalogless compiled owner but preserves trigger receipts', () => {
+  const runId = 'compiled-retention-hygiene';
+  const { file, runDir, workflowSlug } = writeCompiledRun(runId, {
+    originSessionId: 'origin-done',
+    notifiedAt: OLD_FINISHED_AT,
+    reportBack: {
+      version: 1,
+      workflowName: 'Compiled retention hygiene',
+      outcome: 'done',
+      detail: 'Delivered terminal result',
+      acknowledgedOriginSessionIds: ['origin-done', 'observer'],
+    },
+  });
+  appendWorkflowEvent(workflowSlug, runId, {
+    kind: 'step_completed',
+    stepId: 'work',
+    output: 'durable result',
+  });
+  const sidecars = writeRunSidecars(runId);
+
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 1 });
+
+  assert.equal(existsSync(file), false);
+  assert.equal(existsSync(runDir), false);
+  assert.equal(existsSync(path.join(WORKFLOWS_DIR, workflowSlug, 'runs')), false);
+  assert.equal(existsSync(path.join(WORKFLOWS_DIR, workflowSlug)), false);
+  assert.equal(existsSync(sidecars.originDir), false);
+  assert.equal(existsSync(sidecars.cancellationFile), false);
+  assert.equal(existsSync(sidecars.triggerReceiptFile), true, 'admission dedupe receipts have an independent lifecycle');
+});
+
+test('reaper keeps all sidecars while terminal report-back remains unacknowledged', () => {
+  const runId = 'pending-sidecar-retention';
+  const file = writeRun(runId, {
+    originSessionId: 'origin-pending',
+    reportBack: {
+      version: 1,
+      workflowName: 'Retention Workflow',
+      outcome: 'done',
+      detail: 'Still awaiting delivery',
+      acknowledgedOriginSessionIds: [],
+    },
+  });
+  const sidecars = writeRunSidecars(runId);
+
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 0 });
+  assert.equal(existsSync(file), true);
+  assert.equal(existsSync(sidecars.originDir), true);
+  assert.equal(existsSync(sidecars.cancellationFile), true);
+  assert.equal(existsSync(sidecars.triggerReceiptFile), true);
+});
+
+test('reaper preserves compiled owner directories when call-mutation receipts survive', () => {
+  const runId = 'compiled-mutation-retention';
+  const { file, runDir } = writeCompiledRun(runId);
+  const mutationReceipt = path.join(runDir, 'call-mutations', 'work', 'intent.json');
+  const transientArtifact = path.join(runDir, 'workspace', 'artifact.json');
+  mkdirSync(path.dirname(mutationReceipt), { recursive: true });
+  mkdirSync(path.dirname(transientArtifact), { recursive: true });
+  writeFileSync(mutationReceipt, '{"state":"committed"}', 'utf-8');
+  writeFileSync(transientArtifact, '{"large":true}', 'utf-8');
+  const sidecars = writeRunSidecars(runId);
+
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 1 });
+
+  assert.equal(existsSync(file), false);
+  assert.equal(existsSync(mutationReceipt), true);
+  assert.equal(existsSync(transientArtifact), false);
+  assert.equal(existsSync(runDir), true, 'the retained mutation ledger keeps its ownership path reachable');
+  assert.equal(existsSync(sidecars.originDir), false);
+  assert.equal(existsSync(sidecars.cancellationFile), false);
+  assert.equal(existsSync(sidecars.triggerReceiptFile), true);
+});
+
+test('reaper never prunes a compiled owner that has catalog evidence', () => {
+  for (const marker of ['directory', 'legacy'] as const) {
+    const runId = `compiled-catalog-${marker}`;
+    const { file, runDir, workflowSlug } = writeCompiledRun(runId);
+    appendWorkflowEvent(workflowSlug, runId, {
+      kind: 'step_completed',
+      stepId: 'work',
+      output: 'durable result',
+    });
+    const ownerDir = path.join(WORKFLOWS_DIR, workflowSlug);
+    const catalogFile = marker === 'directory'
+      ? path.join(ownerDir, 'SKILL.md')
+      : path.join(WORKFLOWS_DIR, `${workflowSlug}.md`);
+    mkdirSync(path.dirname(catalogFile), { recursive: true });
+    writeFileSync(catalogFile, '# Catalog evidence', 'utf-8');
+
+    assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 1 });
+    assert.equal(existsSync(file), false);
+    assert.equal(existsSync(runDir), false);
+    assert.equal(existsSync(path.join(ownerDir, 'runs')), true, `${marker} catalog owner keeps its run parent`);
+    assert.equal(existsSync(ownerDir), true, `${marker} catalog owner is not retention-pruned`);
+  }
 });
 
 test('reaper resolves the canonical graph-owner slug and retains only mutation receipts', () => {
