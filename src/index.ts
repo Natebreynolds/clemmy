@@ -38,6 +38,7 @@ import { runSetupWizard } from './setup/setup.js';
 import { PLUGINS_DIR } from './plugins/loader.js';
 import { getConfiguredDiscordInstallInfo } from './channels/discord-install.js';
 import { readMemoryIndexStatus, rebuildVaultIndex } from './memory/indexer.js';
+import { migrateToolChoicesToCanonicalProcedures } from './memory/tool-choice-store.js';
 import { collectHarnessAudit } from './dashboard/harness-audit.js';
 import {
   prepareLocalTranscriptionRuntime,
@@ -678,6 +679,21 @@ async function main(): Promise<void> {
     registerShutdownHandlers(async () => {
       await shutdownLocalTranscriptionRuntime();
     });
+    // Standalone webhook/Discord/Slack are full mutating runtimes even though
+    // they do not enter startDaemon. Keep canonical migration at the explicit
+    // singleton-owned runtime boundary so their recall hot paths stay read-only
+    // without leaving pre-v3.6 aliases permanently unattributed.
+    try {
+      const migrated = migrateToolChoicesToCanonicalProcedures();
+      if (migrated.aliasesLinked > 0 || migrated.proceduresCreated > 0) {
+        logger.info(migrated, 'Migrated legacy tool-choice aliases to canonical procedures');
+      }
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Canonical tool-procedure migration failed (legacy aliases remain readable)',
+      );
+    }
   }
   const assistant = new ClementineAssistant(createRuntimeFromConfig());
 

@@ -10,6 +10,7 @@ import {
   formatHungRestartDiagnostic,
   isDaemonIpcHeartbeatMessage,
   normalizeDaemonIpcHeartbeatMessage,
+  settleTerminalReadinessFailure,
   shouldDeferHungRestartForIpcHeartbeat,
 } from './daemon-supervisor.js';
 
@@ -88,4 +89,44 @@ test('shouldDeferHungRestartForIpcHeartbeat defers only for a fresh heartbeat', 
   assert.equal(shouldDeferHungRestartForIpcHeartbeat(Number.NaN, 30_000, 0, 2), false);
   assert.equal(shouldDeferHungRestartForIpcHeartbeat(1000, 30_000, 1, 2), true);
   assert.equal(shouldDeferHungRestartForIpcHeartbeat(1000, 30_000, 2, 2), false);
+});
+
+test('terminal readiness failure rejects only after a live daemon is stopped and reaped', async () => {
+  const events: string[] = [];
+  let releaseStop: (() => void) | undefined;
+  const stopFinished = new Promise<void>((resolve) => {
+    releaseStop = () => {
+      events.push('stop-finished');
+      resolve();
+    };
+  });
+  const expected = new Error('readiness timed out');
+  const failure = settleTerminalReadinessFailure({
+    isRunning: () => true,
+    stop: async () => {
+      events.push('stop-started');
+      await stopFinished;
+    },
+  }, expected);
+  void failure.catch(() => { events.push('failure-reported'); });
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ['stop-started']);
+
+  releaseStop?.();
+  await assert.rejects(failure, (err: unknown) => err === expected);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ['stop-started', 'stop-finished', 'failure-reported']);
+});
+
+test('terminal readiness failure does not disturb an already-reaped daemon', async () => {
+  let stopCalls = 0;
+  const expected = new Error('daemon exited before ready');
+
+  await assert.rejects(settleTerminalReadinessFailure({
+    isRunning: () => false,
+    stop: async () => { stopCalls += 1; },
+  }, expected), (err: unknown) => err === expected);
+
+  assert.equal(stopCalls, 0);
 });

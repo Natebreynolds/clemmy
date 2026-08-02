@@ -86,11 +86,17 @@ test('standalone mutating ingress claims the foreground lease before constructin
 
   const claims = callsNamed(standaloneBranch[0].thenStatement, 'claimForegroundDaemonLease');
   const shutdownRegistrations = callsNamed(standaloneBranch[0].thenStatement, 'registerShutdownHandlers');
+  const canonicalMigrations = callsNamed(
+    standaloneBranch[0].thenStatement,
+    'migrateToolChoicesToCanonicalProcedures',
+  );
   assert.equal(claims.length, 1, 'standalone ingress must claim the singleton lease once');
   assert.equal(shutdownRegistrations.length, 1, 'standalone ingress must register normal shutdown handling once');
+  assert.equal(canonicalMigrations.length, 1, 'standalone ingress must run canonical migration once');
   assert.ok(
-    claims[0].getStart() < shutdownRegistrations[0].getStart(),
-    'shutdown handling is registered only after the lease is acquired',
+    claims[0].getStart() < shutdownRegistrations[0].getStart()
+      && shutdownRegistrations[0].getStart() < canonicalMigrations[0].getStart(),
+    'shutdown and explicit migration run only after the singleton lease is acquired',
   );
 
   const assistantConstruction = descendants(
@@ -108,9 +114,9 @@ test('standalone mutating ingress claims the foreground lease before constructin
     });
   assert.equal(listenerCalls.length, 3, 'all three standalone listener branches must remain present');
   assert.ok(
-    shutdownRegistrations[0].getStart() < assistantConstruction.getStart()
+    canonicalMigrations[0].getStart() < assistantConstruction.getStart()
       && listenerCalls.every((call) => assistantConstruction.getStart() < call.getStart()),
-    'lease and shutdown admission must precede assistant construction and every standalone listener',
+    'lease, shutdown, and migration must precede assistant construction and every standalone listener',
   );
 });
 

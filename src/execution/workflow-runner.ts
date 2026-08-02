@@ -213,6 +213,7 @@ import {
 } from './workflow-run-definition.js';
 import {
   readWorkflowRunRecord,
+  readWorkflowRunRecordSnapshot,
   readWorkflowRunRecordUnlocked,
   withWorkflowRunRecordLock,
   writeWorkflowRunRecordDurablyUnlocked,
@@ -785,6 +786,12 @@ interface ParkedRunState {
 function readRunRecord(filePath: string): QueuedRunRecord | null {
   try { return readWorkflowRunRecord<QueuedRunRecord>(filePath); }
   catch { return null; }
+}
+
+/** Broad timer/boot scans retry on their next tick instead of synchronously
+ * starving every channel behind a contended or ambiguous record lock. */
+function readRunRecordForScan(filePath: string): QueuedRunRecord | null {
+  return readWorkflowRunRecordSnapshot<QueuedRunRecord>(filePath);
 }
 
 /** A run fired by the TIME-BASED scheduler (no human present to approve). The
@@ -7303,7 +7310,7 @@ export function reapCapabilityBlockedRuns(nowMs: number = Date.now()): number {
   let resumed = 0;
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
-    const run = readRunRecord(filePath);
+    const run = readRunRecordForScan(filePath);
     if (
       !run
       || run.status !== 'blocked_capability'
@@ -7358,7 +7365,7 @@ export function reapResolvedParkedRuns(): void {
   }
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
-    const run = readRunRecord(filePath);
+    const run = readRunRecordForScan(filePath);
     if (!run || run.status !== 'parked' || !run.parked) continue;
     const watched = run.parked.parkedSteps.flatMap((s) => s.approvalIds).filter((id) => id.trim().length > 0);
     // Orphaned-park terminalization (2026-07-21 break-scenario C / audit A4
@@ -7961,7 +7968,7 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
   const eligible: WorkflowDrainCandidate[] = [];
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
-    let run = readRunRecord(filePath);
+    let run = readRunRecordForScan(filePath);
     if (!run) continue;
     // One-time upgrade bridge: legacy versions wrote a missed schedule
     // directly as queued. Freeze only a pristine original scheduler record,
@@ -7988,7 +7995,7 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
       && workflowRunReportBackRetryDue(run)
     ) {
       attemptWorkflowRunReportBack(filePath);
-      run = readRunRecord(filePath) ?? run;
+      run = readRunRecordForScan(filePath) ?? run;
     }
     // A cancelled run never enters processOneRunFile (skipped just below), so
     // notify it here once before dropping it — otherwise a queued-then-cancelled

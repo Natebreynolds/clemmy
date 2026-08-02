@@ -13,7 +13,17 @@
  * Phase A of the intent-based tool dispatch plan
  * (/Users/example/.claude/plans/intent-based-tool-dispatch.md).
  */
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -51,6 +61,7 @@ const {
   listToolChoiceAliases,
   listToolProcedures,
   migrateToolChoicesToCanonicalProcedures,
+  CANONICAL_PROCEDURE_MIGRATION_MARKER,
   recordToolProcedureImpression,
   beginToolProcedureUseById,
   completeToolProcedureUse,
@@ -827,6 +838,140 @@ function switchTestMachine(machineId: string): void {
   writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), `${machineId}\n`);
   resetMachineIdCacheForTests();
 }
+
+interface FileSnapshot {
+  relativePath: string;
+  contents: string;
+  mtimeMs: number;
+}
+
+function snapshotFiles(root: string): FileSnapshot[] {
+  if (!existsSync(root)) return [];
+  const files: FileSnapshot[] = [];
+  const visit = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const filePath = path.join(dir, entry.name);
+      if (entry.isDirectory()) visit(filePath);
+      else if (entry.isFile()) {
+        files.push({
+          relativePath: path.relative(root, filePath),
+          contents: readFileSync(filePath, 'utf-8'),
+          mtimeMs: statSync(filePath).mtimeMs,
+        });
+      }
+    }
+  };
+  visit(root);
+  return files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+}
+
+test('legacy tool-choice read/list paths are canonical-store read-only', () => {
+  const machineId = 'machine-read-only-legacy';
+  switchTestMachine(machineId);
+  const legacyDir = path.join(TMP_HOME, 'memory', 'tool-choices', machineId);
+  const procedureDir = path.join(TMP_HOME, 'memory', 'tool-procedures', machineId);
+  mkdirSync(legacyDir, { recursive: true });
+  const aliasPath = path.join(legacyDir, 'notion-search.md');
+  writeFileSync(aliasPath, [
+    '---',
+    'intent: notion search',
+    'choice:',
+    '  kind: mcp',
+    '  identifier: notion__search_pages',
+    '  testedAt: 2026-07-01T00:00:00.000Z',
+    'fallbacks: []',
+    '---',
+    '# legacy alias',
+    '',
+  ].join('\n'));
+  const old = new Date('2001-01-01T00:00:00.000Z');
+  utimesSync(aliasPath, old, old);
+  const before = snapshotFiles(legacyDir);
+
+  assert.equal(listToolChoiceAliases().length, 1);
+  assert.equal(listToolProcedures().length, 0);
+  assert.equal(listToolChoices().length, 1);
+  assert.equal(peekToolChoice('notion search')?.choice?.identifier, 'notion__search_pages');
+  assert.equal(recallToolChoice('notion search')?.choice?.identifier, 'notion__search_pages');
+
+  assert.deepEqual(snapshotFiles(legacyDir), before, 'reads must not rewrite legacy aliases');
+  assert.equal(existsSync(procedureDir), false, 'reads must not create canonical storage or a migration marker');
+});
+
+test('canonical migration completion is durable and a second boot performs zero writes', () => {
+  const machineId = 'machine-durable-canonical-migration';
+  switchTestMachine(machineId);
+  const legacyDir = path.join(TMP_HOME, 'memory', 'tool-choices', machineId);
+  const procedureDir = path.join(TMP_HOME, 'memory', 'tool-procedures', machineId);
+  mkdirSync(legacyDir, { recursive: true });
+  writeFileSync(path.join(legacyDir, 'salesforce-query.md'), [
+    '---',
+    'intent: salesforce query',
+    'choice:',
+    '  kind: composio',
+    '  identifier: SALESFORCE_QUERY_RECORDS',
+    '  testedAt: 2026-07-01T00:00:00.000Z',
+    'fallbacks: []',
+    '---',
+    '# legacy alias',
+    '',
+  ].join('\n'));
+
+  const first = migrateToolChoicesToCanonicalProcedures();
+  assert.equal(first.aliasesLinked, 1);
+  const markerPath = path.join(procedureDir, CANONICAL_PROCEDURE_MIGRATION_MARKER);
+  assert.equal(existsSync(markerPath), true, 'successful migration commits its durable marker');
+  const old = new Date('2002-02-02T00:00:00.000Z');
+  for (const root of [legacyDir, procedureDir]) {
+    for (const file of snapshotFiles(root)) utimesSync(path.join(root, file.relativePath), old, old);
+  }
+  const aliasesBefore = snapshotFiles(legacyDir);
+  const proceduresBefore = snapshotFiles(procedureDir);
+
+  const second = migrateToolChoicesToCanonicalProcedures();
+  assert.deepEqual(second, { aliasesScanned: 0, aliasesLinked: 0, proceduresCreated: 0, quarantinedAliases: 0 });
+  assert.deepEqual(snapshotFiles(legacyDir), aliasesBefore, 'second boot must not rewrite aliases');
+  assert.deepEqual(snapshotFiles(procedureDir), proceduresBefore, 'second boot must not rewrite procedures or its marker');
+});
+
+test('v3.6 pre-migrated links adopt the durable marker without rewriting the corpus', () => {
+  const machineId = 'machine-pre-marker-canonical-migration';
+  switchTestMachine(machineId);
+  const legacyDir = path.join(TMP_HOME, 'memory', 'tool-choices', machineId);
+  const procedureDir = path.join(TMP_HOME, 'memory', 'tool-procedures', machineId);
+  mkdirSync(legacyDir, { recursive: true });
+  writeFileSync(path.join(legacyDir, 'outlook-list.md'), [
+    '---',
+    'intent: outlook list',
+    'choice:',
+    '  kind: composio',
+    '  identifier: OUTLOOK_LIST_MESSAGES',
+    '  testedAt: 2026-07-01T00:00:00.000Z',
+    'fallbacks: []',
+    '---',
+    '# legacy alias',
+    '',
+  ].join('\n'));
+  migrateToolChoicesToCanonicalProcedures();
+  rmSync(path.join(procedureDir, CANONICAL_PROCEDURE_MIGRATION_MARKER));
+  const old = new Date('2003-03-03T00:00:00.000Z');
+  for (const root of [legacyDir, procedureDir]) {
+    for (const file of snapshotFiles(root)) utimesSync(path.join(root, file.relativePath), old, old);
+  }
+  const aliasesBefore = snapshotFiles(legacyDir);
+  const proceduresBefore = snapshotFiles(procedureDir);
+
+  const adopted = migrateToolChoicesToCanonicalProcedures();
+  assert.equal(adopted.aliasesScanned, 1);
+  assert.equal(adopted.aliasesLinked, 0, 'already-linked v3.6 aliases need no rewrite');
+  assert.deepEqual(snapshotFiles(legacyDir), aliasesBefore);
+  assert.deepEqual(
+    snapshotFiles(procedureDir).filter((file) => file.relativePath.endsWith('.md')),
+    proceduresBefore,
+    'only the durable marker is added; canonical procedure files remain byte/mtime identical',
+  );
+  assert.equal(existsSync(path.join(procedureDir, CANONICAL_PROCEDURE_MIGRATION_MARKER)), true);
+});
 
 test('canonical procedures collapse intent aliases without multiplying historical broadcast counters', () => {
   switchTestMachine('machine-canonical-migration');

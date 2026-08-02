@@ -13,7 +13,7 @@
  */
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -163,6 +163,53 @@ test('fullScan inventories PATH executables without running them', async () => {
     assert.equal(entry.isLikelyCli, true);
     assert.equal(entry.probedAt, undefined);
     assert.equal(entry.version, undefined);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
+});
+
+test('fullScan yields the event loop while walking PATH metadata', async () => {
+  const binDir = path.join(testHome, 'yielding-scan-bin');
+  mkdirSync(binDir, { recursive: true });
+  writeExecutable(path.join(binDir, 'yielding-cli'), "printf 'yielding-cli 1.0\\n'");
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = binDir;
+  let immediateRan = false;
+  setImmediate(() => { immediateRan = true; });
+  try {
+    const result = await fullScan();
+    assert.equal(immediateRan, true, 'accepted health/channel callbacks must run during a PATH scan');
+    assert.ok(result.clis.some((entry) => entry.command === 'yielding-cli'));
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
+});
+
+test('concurrent full scans single-flight and publish one cache without temp-file races', async () => {
+  const binDir = path.join(testHome, 'concurrent-scan-bin');
+  mkdirSync(binDir, { recursive: true });
+  writeExecutable(path.join(binDir, 'concurrent-cli'), "printf 'concurrent-cli 1.0\\n'");
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = binDir;
+  try {
+    const scans = await Promise.all([
+      fullScan(),
+      fullScan(),
+      fullScan(),
+      fullScan(),
+    ]);
+    assert.ok(scans.every((scan) => scan.clis.some((entry) => entry.command === 'concurrent-cli')));
+    assert.ok(scans.every((scan) => scan === scans[0]), 'all concurrent callers join the same scan result');
+    const stateDir = path.join(testHome, 'state');
+    assert.deepEqual(
+      readdirSync(stateDir).filter((entry) => entry.startsWith('cli-scan.json.') && entry.endsWith('.tmp')),
+      [],
+      'atomic cache publication cleans every unique temp file',
+    );
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
