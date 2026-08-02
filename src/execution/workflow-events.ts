@@ -14,7 +14,7 @@ import {
 import path from 'node:path';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
-import type { WorkflowStepInput } from '../memory/workflow-store.js';
+import { listWorkflows, type WorkflowStepInput } from '../memory/workflow-store.js';
 import type {
   ItemOutputArtifactReference,
   StepOutputArtifactReference,
@@ -749,15 +749,16 @@ function terminalRunRecordStatus(runId: string): boolean {
   }
 }
 
-/** Every workflow name that has a runs/ directory — the set the self-improvement
- *  proposer walks to mine per-workflow run history. */
+/** Authored catalog workflow slugs that have a runs/ directory — the set the
+ *  self-improvement proposer may mine. Catalogless run owners (for example an
+ *  immutable project graph compiled for one run) deliberately remain visible
+ *  to listPendingRuns() for recovery, but must never become workflow-edit
+ *  targets merely because their durable event directory shares this root. */
 export function listWorkflowNamesWithRuns(): string[] {
   if (!existsSync(WORKFLOWS_DIR)) return [];
-  const out: string[] = [];
-  for (const name of readdirSync(WORKFLOWS_DIR)) {
-    if (existsSync(path.join(WORKFLOWS_DIR, name, 'runs'))) out.push(name);
-  }
-  return out;
+  return listWorkflows()
+    .map((entry) => entry.name)
+    .filter((name) => existsSync(path.join(WORKFLOWS_DIR, name, 'runs')));
 }
 
 /** Recent run ids for a workflow, newest-first by directory mtime, capped. The

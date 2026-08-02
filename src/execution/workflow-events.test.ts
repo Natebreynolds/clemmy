@@ -36,8 +36,9 @@ import os from 'node:os';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-events-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
-const { appendWorkflowEvent, readWorkflowEvents, computeResumeState, listFinalFailedItems, listPendingRuns, reapRunEventDir, reconstructWorkflowRunQueue } =
+const { appendWorkflowEvent, readWorkflowEvents, computeResumeState, listFinalFailedItems, listPendingRuns, listWorkflowNamesWithRuns, reapRunEventDir, reconstructWorkflowRunQueue } =
   await import('./workflow-events.js');
+const { writeWorkflow } = await import('../memory/workflow-store.js');
 type TestStep = { id: string; prompt: string; forEach?: string; dependsOn?: string[] };
 const asSteps = (s: TestStep[]): Parameters<typeof reconstructWorkflowRunQueue>[2] => s as unknown as Parameters<typeof reconstructWorkflowRunQueue>[2];
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
@@ -396,6 +397,46 @@ test('listPendingRuns excludes terminal runs and includes in-flight', () => {
   const flights = pending.map((p) => `${p.workflowName}/${p.runId}`);
   assert.ok(flights.includes('in-flight/rflight'), 'still-running run with a running record is pending');
   assert.ok(!flights.includes('done/rdone'), 'completed run is not pending');
+});
+
+test('workflow-history mining excludes catalogless run owners without hiding them from recovery', () => {
+  const authoredSlug = 'mining-authored-workflow';
+  const authoredRunId = 'mining-authored-run';
+  writeWorkflow(authoredSlug, {
+    name: 'Mining Authored Workflow',
+    description: 'An authored workflow whose history may be mined.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'inspect', prompt: 'Inspect the durable result.' }],
+  });
+  appendWorkflowEvent(authoredSlug, authoredRunId, { kind: 'run_started' });
+
+  const cataloglessSlug = 'compiled-0123456789abcdef0123456789abcdef';
+  const cataloglessRunId = 'mining-catalogless-run';
+  appendWorkflowEvent(cataloglessSlug, cataloglessRunId, { kind: 'run_started' });
+  appendWorkflowEvent(cataloglessSlug, cataloglessRunId, { kind: 'step_started', stepId: 'research' });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${cataloglessRunId}.json`),
+    JSON.stringify({
+      id: cataloglessRunId,
+      workflow: 'One-off compiled project',
+      workflowSlug: cataloglessSlug,
+      status: 'running',
+      source: 'project_graph',
+    }),
+    'utf-8',
+  );
+
+  const mineable = listWorkflowNamesWithRuns();
+  assert.ok(mineable.includes(authoredSlug), 'authored catalog history remains mineable');
+  assert.ok(!mineable.includes(cataloglessSlug), 'a runs/ directory alone never creates a workflow-edit target');
+
+  const pending = listPendingRuns().map((run) => `${run.workflowName}/${run.runId}`);
+  assert.ok(
+    pending.includes(`${cataloglessSlug}/${cataloglessRunId}`),
+    'catalogless in-flight work remains visible to crash recovery',
+  );
 });
 
 test('listPendingRuns excludes a run whose queue record is MISSING (reaped orphan) — P0-2', () => {

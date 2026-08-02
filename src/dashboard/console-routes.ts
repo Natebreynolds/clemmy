@@ -2116,6 +2116,21 @@ function stringField(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null;
 }
 
+/**
+ * A version-2 compiled project snapshot is a run-scoped execution artifact,
+ * not a saved Workflow Studio catalog entry. Identify it from its admission
+ * envelope rather than from a mutable display name or a `compiled-*` prefix:
+ * either of those strings can collide with ordinary user-authored content.
+ */
+function isCompiledProjectWorkflowRunRecord(raw: Record<string, unknown>): boolean {
+  const snapshot = raw.workflowDefinitionSnapshot;
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
+  const row = snapshot as Record<string, unknown>;
+  return row.version === 2
+    && row.scope === 'compiled'
+    && row.compilerId === 'project_graph_v1';
+}
+
 const WORKFLOW_RUN_RECOVERY_BODY_KINDS = new Set([
   'step_try',
   'failed_items',
@@ -2178,6 +2193,51 @@ function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRe
       || workflowTerminalOutcomeNeedsAttention(terminalOutcome),
     ...(terminalOutcome ? { terminalOutcome } : {}),
     ...(recoveryIntent ? { recoveryIntent } : {}),
+  };
+}
+
+function projectWorkflowCapabilityBlock(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, maxChars] of [
+    ['stepId', 160],
+    ['tool', 200],
+    ['toolkit', 160],
+    ['reason', 500],
+    ['message', 1_000],
+    ['retryAt', 80],
+    ['state', 40],
+  ] as const) {
+    const value = stringField(row[key]);
+    if (value) out[key] = value.slice(0, maxChars);
+  }
+  if (typeof row.retryCount === 'number' && Number.isFinite(row.retryCount)) {
+    out.retryCount = Math.max(0, Math.trunc(row.retryCount));
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Whitelisted Workflow Studio run-history projection. Never return the raw
+ * queue record: it can contain compiled definitions, prompts, inputs, step
+ * outputs, and other execution-only context. */
+function projectWorkflowRunRecord(raw: Record<string, unknown>): Record<string, unknown> | null {
+  const summary = normalizeWorkflowRunRecord(raw);
+  if (!summary) return null;
+  const capabilityBlock = projectWorkflowCapabilityBlock(raw.capabilityBlock);
+  return {
+    id: summary.id,
+    workflow: summary.workflow,
+    status: summary.status,
+    createdAt: summary.createdAt,
+    startedAt: summary.startedAt,
+    finishedAt: summary.finishedAt,
+    source: summary.source,
+    targetStepId: summary.targetStepId,
+    needsAttention: summary.needsAttention,
+    error: summary.error ? summary.error.slice(0, 2_000) : null,
+    ...(summary.terminalOutcome ? { terminalOutcome: summary.terminalOutcome } : {}),
+    ...(capabilityBlock ? { capabilityBlock } : {}),
   };
 }
 
@@ -2337,6 +2397,7 @@ function readWorkflowRunRecords(): WorkflowRunRecordSummary[] {
     if (!file.endsWith('.json')) continue;
     try {
       const raw = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
+      if (isCompiledProjectWorkflowRunRecord(raw)) continue;
       const normalized = normalizeWorkflowRunRecord(raw);
       if (normalized) records.push(normalized);
     } catch {
@@ -4606,9 +4667,18 @@ export function registerConsoleRoutes(
       const workflows = listWorkflows()
         .filter((entry) => workflowOrigin(entry.data) !== 'dev')
         .sort((a, b) => a.data.name.localeCompare(b.data.name));
-      const runRecords = readWorkflowRunRecords();
-      const pending = listPendingRuns();
-      const workflowNameBySlug = new Map(workflows.map((entry) => [entry.name, entry.data.name]));
+      const workflowByIdentity = new Map<string, (typeof workflows)[number]>();
+      for (const entry of workflows) {
+        workflowByIdentity.set(entry.name, entry);
+        workflowByIdentity.set(entry.data.name, entry);
+      }
+      // Workflow Home is a catalog surface. Orphaned named records and
+      // run-scoped compiled projects remain available in generic Tasks and
+      // activity, but cannot become phantom saved workflows here.
+      const runRecords = readWorkflowRunRecords()
+        .filter((run) => workflowByIdentity.has(run.workflow));
+      const pending = listPendingRuns()
+        .filter((run) => workflowByIdentity.has(run.workflowName));
       const activeByRunId = new Map<string, {
         workflowName: string;
         workflowSlug: string | null;
@@ -4619,9 +4689,10 @@ export function registerConsoleRoutes(
       }>();
 
       for (const run of pending) {
+        const entry = workflowByIdentity.get(run.workflowName)!;
         activeByRunId.set(run.runId, {
-          workflowName: workflowNameBySlug.get(run.workflowName) ?? run.workflowName,
-          workflowSlug: run.workflowName,
+          workflowName: entry.data.name,
+          workflowSlug: entry.name,
           runId: run.runId,
           status: 'running',
           lastEventAt: run.lastEventAt ?? null,
@@ -4636,9 +4707,10 @@ export function registerConsoleRoutes(
           && run.status !== 'parked'
         ) continue;
         if (activeByRunId.has(run.id)) continue;
+        const entry = workflowByIdentity.get(run.workflow)!;
         activeByRunId.set(run.id, {
-          workflowName: run.workflow,
-          workflowSlug: null,
+          workflowName: entry.data.name,
+          workflowSlug: entry.name,
           runId: run.id,
           status: run.status,
           lastEventAt: run.startedAt ?? run.createdAt,
@@ -5431,15 +5503,16 @@ export function registerConsoleRoutes(
   });
 
   /**
-   * Recent runs for a single workflow. Reads from
-   * ~/.clementine-next/workflows/runs/ and filters by workflow name.
-   * The runs dir holds one JSON per run with shape:
-   *   { id, workflow, inputs, status, createdAt, source,
-   *     completedAt?, output?, error? }
+   * Recent catalog-owned runs for a single saved workflow. Raw queue records
+   * are reduced to a safe summary; definitions, prompts, inputs, and step
+   * outputs stay on disk and run-scoped compiled projects stay out of Studio.
    */
   app.get('/api/console/workflows/:name/runs', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const workflowName = req.params.name;
+    const target = req.params.name;
+    const entry = listWorkflows().find((candidate) => candidate.data.name === target || candidate.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const workflowIdentities = new Set([entry.name, entry.data.name]);
     const limit = Math.max(1, Math.min(50, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '20', 10) || 20));
     try {
       if (!fs.existsSync(WORKFLOW_RUNS_DIR)) {
@@ -5451,7 +5524,11 @@ export function registerConsoleRoutes(
       for (const file of files) {
         try {
           const data = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
-          if (data.workflow === workflowName) runs.push(data);
+          if (isCompiledProjectWorkflowRunRecord(data)) continue;
+          const workflow = stringField(data.workflow);
+          if (!workflow || !workflowIdentities.has(workflow)) continue;
+          const projected = projectWorkflowRunRecord(data);
+          if (projected) runs.push(projected);
         } catch { /* skip malformed */ }
       }
       runs.sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
