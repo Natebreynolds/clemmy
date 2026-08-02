@@ -253,7 +253,17 @@ test('memoryBudgetFor: tool_intent loads moderate context', () => {
 // ─── reasons ───────────────────────────────────────────────────
 
 test('classifier returns human-readable reasons', () => {
-  const r = classifyMessageIntent('build and deploy the new dashboard');
-  assert.ok(r.reasons.length > 0);
-  assert.ok(r.reasons.some((reason) => /action verbs/.test(reason)));
+  // A plain action states the verbs it saw.
+  const plain = classifyMessageIntent('build the new dashboard');
+  assert.ok(plain.reasons.length > 0);
+  assert.ok(plain.reasons.some((reason) => /action verbs/.test(reason)));
+
+  // The same request that also asks to DEPLOY reports the stronger, more
+  // specific ground: deploying is an external effect, not merely an action
+  // verb. Both remain human-readable; the effect reason simply outranks it.
+  const deployed = classifyMessageIntent('build and deploy the new dashboard');
+  assert.equal(deployed.intent, 'action');
+  assert.ok(deployed.reasons.length > 0);
+  assert.ok(deployed.reasons.some((reason) => /external effect: publication/.test(reason)));
+  assert.ok(deployed.confidence >= plain.confidence);
 });

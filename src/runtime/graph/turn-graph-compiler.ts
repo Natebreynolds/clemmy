@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { ProactivityPolicySnapshot } from '../../agents/proactivity-policy.js';
+import { classifyProjectShape } from '../../assistant/project-shape.js';
 import {
   classifyExternalEffectRequest,
   type ExternalEffectClassification,
@@ -164,8 +165,17 @@ function routeFor(intent: IntentClassification, externalEffect: ExternalEffectCl
   return 'direct_reply';
 }
 
-function fastPathFor(route: TurnGraphRoute, multiItem: MultiItemIntent): TurnGraphFastPath {
+function fastPathFor(
+  route: TurnGraphRoute,
+  multiItem: MultiItemIntent,
+  projectShaped: boolean,
+): TurnGraphFastPath {
   if (route === 'direct_reply') return 'direct_reply';
+  // A project outranks the single/fan-out action split even when it names one
+  // deliverable: "one dashboard" is still bounded-node, durable work. Reading
+  // it as a single action is exactly how the live regression ended up trying to
+  // serve a whole project inside one chat turn.
+  if (projectShaped) return 'project';
   if (route === 'retrieve') return 'single_retrieval';
   return multiItem.isMultiItem ? 'fanout_action' : 'single_action';
 }
@@ -278,8 +288,10 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
   const intent = input.signals?.intent ?? classifyMessageIntent(input.input);
   const externalEffect = input.signals?.externalEffect ?? classifyExternalEffectRequest(input.input);
   const multiItem = input.signals?.multiItem ?? detectMultiItemIntent(input.input);
-  const route = routeFor(intent, externalEffect);
-  const fastPath = fastPathFor(route, multiItem);
+  const projectShape = classifyProjectShape(input.input);
+  // A project always acts: it builds something and usually publishes it.
+  const route = projectShape.isProject ? 'act' : routeFor(intent, externalEffect);
+  const fastPath = fastPathFor(route, multiItem, projectShape.isProject);
   const routeEffect = effectForRoute(route, externalEffect.requested);
   const allowedToolNames = normalizedNames(input.allowedToolNames);
   const excludedToolNames = normalizedNames(input.excludedToolNames) ?? [];
@@ -429,6 +441,8 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
       confidence: Number(Math.max(0, Math.min(1, intent.confidence)).toFixed(3)),
       route,
       externalEffectRequested: externalEffect.requested,
+      projectShaped: projectShape.isProject,
+      projectSignals: [...projectShape.signals].sort(),
       externalEffectKinds,
       multiItem: {
         detected: multiItem.isMultiItem,

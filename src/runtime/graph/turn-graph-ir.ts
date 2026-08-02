@@ -35,7 +35,10 @@ export type TurnGraphFastPath =
   | 'direct_reply'
   | 'single_retrieval'
   | 'single_action'
-  | 'fanout_action';
+  | 'fanout_action'
+  /** Project-shaped work: too large for one chat turn, must compile to a
+   *  durable execution with bounded nodes rather than a single action. */
+  | 'project';
 
 export type TurnGraphNodeKind =
   | 'turn_accepted'
@@ -167,6 +170,9 @@ export interface TurnGraphIR {
     confidence: number;
     route: TurnGraphRoute;
     externalEffectRequested: boolean;
+    /** Structural project verdict — see assistant/project-shape.ts. */
+    projectShaped: boolean;
+    projectSignals: string[];
     externalEffectKinds: ExternalEffectKind[];
     multiItem: {
       detected: boolean;

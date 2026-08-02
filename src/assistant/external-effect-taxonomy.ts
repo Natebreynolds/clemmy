@@ -29,7 +29,8 @@ export type ExternalEffectKind =
   | 'work_item_change'
   | 'poll_vote'
   | 'flight_check_in'
-  | 'calendar_change';
+  | 'calendar_change'
+  | 'publication';
 
 export interface ExternalEffectClassification {
   requested: boolean;
@@ -43,6 +44,14 @@ interface ExternalEffectRule {
 
 const TECHNICAL_COMMUNICATION_OBJECT_SOURCE =
   'address|api|body|column|command|endpoint|field|function|helper|method|property|schema|script|subject|template|tool|type|variable';
+
+/** Publication verbs also match after a coordinator inside the same clause. */
+function publicationRules(bodies: readonly string[]): ExternalEffectRule[] {
+  return bodies.map((body) => ({
+    kind: 'publication' as const,
+    pattern: new RegExp(`^(?:.{0,160}?\\band\\s+(?:also\\s+)?)?(?:${body})`, 'i'),
+  }));
+}
 
 const EXTERNAL_EFFECT_RULES: readonly ExternalEffectRule[] = [
   {
@@ -143,10 +152,47 @@ const EXTERNAL_EFFECT_RULES: readonly ExternalEffectRule[] = [
     kind: 'calendar_change',
     pattern: /^(?:add|create|put|save|schedule)\b[^.!?\n;]{0,120}\b(?:in|into|on|to)\s+(?:(?:my|our|the|your)\s+)?calendar\b/i,
   },
+  // PUBLICATION — making something available beyond this machine.
+  //
+  // Hosting, publishing, and deploying are external effects by their nature:
+  // they stand a resource up somewhere other people can reach, on an account
+  // that is not free to mutate. These key on the VERB plus an externality cue
+  // rather than on any product noun — no provider name is required and none is
+  // privileged.
+  //
+  // Unlike every family above, these also match after a COORDINATOR
+  // ("build the dashboard and deploy it"). That widening is safe precisely here
+  // because host/deploy/publish have no ordinary local homograph in imperative
+  // position, whereas "order", "follow", and "like" plainly do — which is why
+  // those stay strictly clause-anchored. Making `and` a global clause boundary
+  // would have widened all of them at once.
+  ...publicationRules([
+    // "host it somewhere". Excludes the networking senses (host header/name).
+    String.raw`host\s+(?!(?:header|key|machine|name|names|os|process|system)\b)(?:(?:a|an|it|my|our|the|this|that|your)\s+)?\S+`,
+    // "deploy it", "publish the report". Excludes talking ABOUT deployment.
+    String.raw`(?:deploy|publish)\s+(?!(?:docs?|documentation|guide|notes?|process|strategy)\s+(?:about|for|on)\b)(?:(?:a|an|it|my|our|the|this|that|your)\s+)?\S+`,
+    // "put it online", "stand it up on a server".
+    String.raw`(?:put|stand)\s+(?:\S+\s+){0,6}?(?:online|live|up\s+(?:on|at)|on\s+(?:a\s+)?(?:server|the\s+(?:internet|web)))\b`,
+    // "make it available/accessible to the team".
+    String.raw`make\s+(?:\S+\s+){0,6}?(?:available|accessible|public|live)\b`,
+    // "share it with the team" — a RESOURCE with people, not an opinion.
+    String.raw`share\s+(?!(?:your|my|our|a|an|the)?\s*(?:thought|thoughts|opinion|opinions|view|views|feedback|perspective)\b)(?:\S+\s+){0,6}?\bwith\s+\S+`,
+  ]),
+  {
+    kind: 'publication',
+    // The externality stated as a purpose clause instead of an imperative:
+    // "somewhere my team can access", "so the team can see it".
+    pattern: /^(?:\S+\s+){0,12}?\b(?:so|where|somewhere)\b[^.!?\n;]{0,60}\b(?:can|could)\s+(?:access|reach|see|use|view)\b/i,
+  },
 ];
 
+// `, and` coordinates two independent requests exactly as `, but` and `, then`
+// already do. Without it the second imperative of "…use the data I already have
+// connected, and host it somewhere my team can access" stays buried mid-clause,
+// where the clause-anchored rules above can never reach it — so a request that
+// plainly asks for external hosting classified as no external effect at all.
 const CLAUSE_BOUNDARY_RE =
-  /(?:[.!?\n;]+|,\s*(?:but|however|instead|then)\s+|\b(?:and\s+then|but|then)\s+)/i;
+  /(?:[.!?\n;]+|,\s*(?:and|but|however|instead|then)\s+|\b(?:and\s+then|but|then)\s+)/i;
 
 const ACKNOWLEDGEMENT_PREFIX_RE =
   /^(?:ok|okay|cool|got\s+it|sounds\s+good|thanks|thank\s+you|nice|perfect|sweet|awesome)\b[\s,:—–-]*/i;
