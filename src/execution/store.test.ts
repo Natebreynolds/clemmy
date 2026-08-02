@@ -24,7 +24,18 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import type { PlanRecord } from '../types.js';
@@ -35,9 +46,17 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 // the state dir exists before any code path tries to write.
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
-const { ExecutionStore, sweepCrashedExecutions, sweepStaleBlockedExecutions } = await import('./store.js');
+const {
+  ExecutionStore,
+  rootWorkflowReceiptForSource,
+  sweepCrashedExecutions,
+  sweepStaleBlockedExecutions,
+} = await import('./store.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { TASKS_FILE, ensureTasksFile, parseTasks } = await import('../tools/shared.js');
+const { workflowDefinitionHash } = await import('./workflow-run-definition.js');
+const { BoundaryError } = await import('../runtime/boundary-error.js');
+const { actionBus } = await import('../runtime/action-bus.js');
 
 const EXECUTIONS_FILE = path.join(TMP_HOME, 'state', 'executions.json');
 
@@ -73,8 +92,485 @@ function baseExecution(overrides: Record<string, unknown>): Record<string, unkno
   };
 }
 
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) =>
+    `${JSON.stringify(key)}:${stableJson(record[key])}`
+  ).join(',')}}`;
+}
+
+function sha256Json(value: unknown): string {
+  return createHash('sha256').update(stableJson(value), 'utf8').digest('hex');
+}
+
+function acceptedProjectSource(label: string): { sessionId: string; sourceUserSeq: number } {
+  resetEventLog();
+  const sessionId = `sess-project-${label}-${Math.random().toString(36).slice(2, 8)}`;
+  createSession({ id: sessionId, kind: 'chat', title: label });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Build the durable project.',
+      displayText: 'Build the durable project.',
+      source: 'desktop',
+    },
+  });
+  return { sessionId, sourceUserSeq: source.seq };
+}
+
+function projectExecutionInput(
+  sessionId: string,
+  sourceUserSeq: number,
+  variant = 'winner-a',
+): Record<string, unknown> {
+  const plan = {
+    version: 1,
+    objective: 'Produce a durable verified deliverable.',
+    nodes: [{
+      id: 'work',
+      executor: 'model',
+      effect: 'read',
+      prompt: `Perform bounded project work for ${variant}.`,
+      budget: { maxTurns: 8, retryBudget: 1 },
+      evidence: { type: 'object', requiredKeys: ['summary'] },
+    }],
+  };
+  const definition = {
+    name: 'compiled-project-test',
+    description: 'One-off durable project compiled for a test.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'work',
+      prompt: `Perform bounded project work for ${variant}.`,
+      sideEffect: 'read' as const,
+      maxTurns: 8,
+      retryBudget: 1,
+      output: { type: 'object' as const, required_keys: ['summary'] },
+    }],
+  };
+  return {
+    sessionId,
+    sourceUserSeq,
+    title: 'Durable project',
+    objective: 'Produce a durable verified deliverable.',
+    reason: 'Accepted as a long-horizon project.',
+    startedFromMessage: 'Build the durable project.',
+    confidence: 0.95,
+    reasons: ['multi-step durable work'],
+    nextReviewAt: new Date().toISOString(),
+    admission: {
+      turnGraphId: `turn-graph:v1:${sourceUserSeq}`,
+      turnGraphHash: sha256Json({ sessionId, sourceUserSeq, kind: 'turn_graph_v1' }),
+      compiledPlan: {
+        version: 1,
+        compilerId: 'project_graph_v1',
+        planHash: sha256Json(plan),
+        definitionHash: workflowDefinitionHash(definition),
+        plan,
+        definition,
+        inputs: {},
+      },
+    },
+  };
+}
+
+const STORE_MODULE_URL = new URL('./store.ts', import.meta.url).href;
+const ADMISSION_CHILD_CODE = String.raw`
+  import { writeFileSync } from 'node:fs';
+  const mod = await import(process.env.CLEM_STORE_MODULE_URL);
+  writeFileSync(process.env.CLEM_STORE_READY, 'ready', 'utf8');
+  try {
+    const input = JSON.parse(process.env.CLEM_STORE_INPUT);
+    const result = new mod.ExecutionStore().createOrGetForSource(input);
+    writeFileSync(process.env.CLEM_STORE_RESULT, JSON.stringify({
+      created: result.created,
+      id: result.execution.id,
+      receipt: result.rootWorkflowReceiptId,
+      snapshotHash: result.execution.graphAdmission?.compiledPlan?.snapshotHash,
+    }));
+  } catch (error) {
+    writeFileSync(process.env.CLEM_STORE_RESULT, JSON.stringify({
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+`;
+
+function launchAdmissionChild(input: unknown, readyFile: string, resultFile: string): ChildProcess {
+  return spawn(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '--eval', ADMISSION_CHILD_CODE],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        CLEMENTINE_HOME: TMP_HOME,
+        CLEM_STORE_MODULE_URL: STORE_MODULE_URL,
+        CLEM_STORE_INPUT: JSON.stringify(input),
+        CLEM_STORE_READY: readyFile,
+        CLEM_STORE_RESULT: resultFile,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+}
+
+async function waitForPath(file: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(file)) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
+test('createOrGetForSource persists one full immutable compiler winner', () => {
+  const { sessionId, sourceUserSeq } = acceptedProjectSource('first-winner');
+  seedExecutions([]);
+  const store = new ExecutionStore();
+
+  const first = store.createOrGetForSource(
+    projectExecutionInput(sessionId, sourceUserSeq, 'winner-a') as never,
+  );
+  const replay = store.createOrGetForSource(
+    projectExecutionInput(sessionId, sourceUserSeq, 'winner-a') as never,
+  );
+  const losingPlanner = store.createOrGetForSource(
+    projectExecutionInput(sessionId, sourceUserSeq, 'loser-b') as never,
+  );
+
+  assert.equal(first.created, true);
+  assert.equal(first.plannerConflict, false);
+  assert.equal(first.execution.autoAdvance, false);
+  assert.equal(first.execution.nextReviewAt, undefined);
+  assert.equal(store.listDue().some((row) => row.id === first.execution.id), false);
+  assert.equal(replay.created, false);
+  assert.equal(replay.plannerConflict, false);
+  assert.equal(losingPlanner.created, false);
+  assert.equal(losingPlanner.plannerConflict, true);
+  assert.equal(replay.execution.id, first.execution.id);
+  assert.equal(losingPlanner.execution.id, first.execution.id);
+  assert.equal(
+    losingPlanner.execution.graphAdmission?.compiledPlan.snapshotHash,
+    first.execution.graphAdmission?.compiledPlan.snapshotHash,
+    'the losing planner receives the persisted winner rather than its own bytes',
+  );
+  assert.equal(
+    losingPlanner.execution.graphAdmission?.compiledPlan.definition.steps[0]?.prompt,
+    'Perform bounded project work for winner-a.',
+  );
+  assert.equal(first.rootWorkflowReceiptId, replay.rootWorkflowReceiptId);
+  assert.equal(first.rootWorkflowReceiptId, first.execution.graphAdmission?.rootWorkflowReceiptId);
+  assert.equal(
+    readExecutions().filter((row) =>
+      row.sessionId === sessionId && row.sourceUserSeq === sourceUserSeq
+    ).length,
+    1,
+  );
+  assert.equal(
+    first.execution.activity?.filter((row) => row.key.startsWith('project-admitted:')).length,
+    1,
+  );
+
+  const compilerDrift = projectExecutionInput(sessionId, sourceUserSeq, 'winner-a') as {
+    admission: {
+      compiledPlan: {
+        definition: ReturnType<typeof JSON.parse>;
+        definitionHash: string;
+      };
+    };
+  };
+  compilerDrift.admission.compiledPlan.definition.steps[0].prompt = 'Different compiler output for the same plan.';
+  compilerDrift.admission.compiledPlan.definitionHash = workflowDefinitionHash(
+    compilerDrift.admission.compiledPlan.definition,
+  );
+  const compilerDriftReplay = store.createOrGetForSource(compilerDrift as never);
+  assert.equal(compilerDriftReplay.created, false);
+  assert.equal(compilerDriftReplay.plannerConflict, true);
+  assert.equal(
+    compilerDriftReplay.execution.graphAdmission?.compiledPlan.snapshotHash,
+    first.execution.graphAdmission?.compiledPlan.snapshotHash,
+  );
+
+  const conflictingGraph = projectExecutionInput(sessionId, sourceUserSeq, 'winner-a') as {
+    admission: { turnGraphHash: string };
+  };
+  conflictingGraph.admission.turnGraphHash = 'f'.repeat(64);
+  assert.throws(
+    () => store.createOrGetForSource(conflictingGraph as never),
+    /different immutable project admission/i,
+  );
+});
+
+test('createOrGetForSource rejects synthetic sources and mismatched compiler bytes', () => {
+  resetEventLog();
+  const sessionId = `sess-project-synthetic-${Math.random().toString(36).slice(2, 8)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'synthetic project source' });
+  const synthetic = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'AUTO_RESUME_DIRECTIVE', synthetic: true },
+  });
+  seedExecutions([]);
+  const input = projectExecutionInput(sessionId, synthetic.seq) as {
+    admission: { compiledPlan: { definitionHash: string } };
+  };
+  assert.throws(
+    () => new ExecutionStore().createOrGetForSource(input as never),
+    /exact accepted human user turn/i,
+  );
+  assert.deepEqual(readExecutions(), []);
+
+  const accepted = acceptedProjectSource('tampered-definition');
+  const tampered = projectExecutionInput(accepted.sessionId, accepted.sourceUserSeq) as {
+    admission: { compiledPlan: { definitionHash: string } };
+  };
+  tampered.admission.compiledPlan.definitionHash = '0'.repeat(64);
+  assert.throws(
+    () => new ExecutionStore().createOrGetForSource(tampered as never),
+    /definition bytes do not match/i,
+  );
+  assert.deepEqual(readExecutions(), []);
+});
+
+test('corrupt executions.json repeatedly fails closed without minting project authority', () => {
+  const { sessionId, sourceUserSeq } = acceptedProjectSource('corrupt');
+  const input = projectExecutionInput(sessionId, sourceUserSeq);
+  const corruptBytes = '{ "id": "torn", "graphAdmission": [';
+  writeFileSync(EXECUTIONS_FILE, corruptBytes, 'utf-8');
+
+  for (let retry = 0; retry < 2; retry += 1) {
+    assert.throws(
+      () => new ExecutionStore().createOrGetForSource(input as never),
+      (error: unknown) => error instanceof BoundaryError && error.kind === 'state.read_corrupted',
+    );
+    assert.equal(readFileSync(EXECUTIONS_FILE, 'utf-8'), corruptBytes);
+  }
+  assert.equal(
+    readdirSync(path.dirname(EXECUTIONS_FILE))
+      .some((name) => name.startsWith('executions.json.') && name.endsWith('.tmp')),
+    false,
+  );
+});
+
+test('root workflow binding requires the source receipt and immutable workflow identity', () => {
+  const { sessionId, sourceUserSeq } = acceptedProjectSource('root-binding');
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const admitted = store.createOrGetForSource(
+    projectExecutionInput(sessionId, sourceUserSeq) as never,
+  );
+  const bind = (rootWorkflowReceiptId: string, runId: string, workflow = 'compiled-project-test') =>
+    store.bindRootWorkflowRunForSource({
+      sessionId,
+      sourceUserSeq,
+      rootWorkflowReceiptId,
+      runId,
+      workflow,
+    });
+
+  assert.throws(
+    () => bind(rootWorkflowReceiptForSource(sessionId, sourceUserSeq + 1), 'run-a'),
+    /receipt/i,
+  );
+  assert.throws(
+    () => bind(admitted.rootWorkflowReceiptId, 'run-a', 'another-workflow'),
+    /immutable compiled project plan/i,
+  );
+  assert.equal(store.getForSource(sessionId, sourceUserSeq)?.graphAdmission?.rootWorkflowRunId, undefined);
+
+  const first = bind(admitted.rootWorkflowReceiptId, 'run-a');
+  const replay = bind(admitted.rootWorkflowReceiptId, 'run-a');
+  assert.equal(first.graphAdmission?.rootWorkflowRunId, 'run-a');
+  assert.equal(replay.workflowBindings?.filter((row) => row.runId === 'run-a').length, 1);
+  assert.throws(
+    () => bind(admitted.rootWorkflowReceiptId, 'run-b'),
+    /different root workflow run/i,
+  );
+
+  const duplicateRows = readExecutions();
+  duplicateRows.push({ ...duplicateRows[0], id: 'duplicate-source-owner' });
+  seedExecutions(duplicateRows);
+  assert.throws(
+    () => bind(admitted.rootWorkflowReceiptId, 'run-a'),
+    /multiple executions claim the same accepted source/i,
+  );
+});
+
+test('generic update cannot replace exact-source or project-admission authority', () => {
+  const { sessionId, sourceUserSeq } = acceptedProjectSource('immutable-update');
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const admitted = store.createOrGetForSource(
+    projectExecutionInput(sessionId, sourceUserSeq) as never,
+  );
+  const originalAdmission = admitted.execution.graphAdmission;
+
+  (store.update as (id: string, patch: Record<string, unknown>) => unknown)(admitted.execution.id, {
+    id: 'replacement-id',
+    sessionId: 'replacement-session',
+    createdAt: '2000-01-01T00:00:00.000Z',
+    sourceUserSeq: 999_999,
+    sourceUserSeqs: [999_999],
+    graphAdmission: undefined,
+    nextStep: 'Safe mutable field still updates.',
+  });
+
+  const reread = store.getForSource(sessionId, sourceUserSeq);
+  assert.equal(reread?.id, admitted.execution.id);
+  assert.equal(reread?.sessionId, sessionId);
+  assert.equal(reread?.createdAt, admitted.execution.createdAt);
+  assert.equal(reread?.sourceUserSeq, sourceUserSeq);
+  assert.deepEqual(reread?.sourceUserSeqs, undefined);
+  assert.deepEqual(reread?.graphAdmission, originalAdmission);
+  assert.equal(reread?.nextStep, 'Safe mutable field still updates.');
+});
+
+test('createOrGetForSource is linearizable across processes', async () => {
+  const { sessionId, sourceUserSeq } = acceptedProjectSource('race');
+  const input = projectExecutionInput(sessionId, sourceUserSeq);
+  seedExecutions([baseExecution({ id: 'unrelated-sentinel', sessionId: 'sess-unrelated' })]);
+
+  const lockFile = `${EXECUTIONS_FILE}.lock`;
+  const readyA = path.join(TMP_HOME, 'admission-a.ready');
+  const readyB = path.join(TMP_HOME, 'admission-b.ready');
+  const resultA = path.join(TMP_HOME, 'admission-a.json');
+  const resultB = path.join(TMP_HOME, 'admission-b.json');
+  writeFileSync(lockFile, `${process.pid}:${Date.now()}`, 'utf-8');
+
+  const childA = launchAdmissionChild(input, readyA, resultA);
+  const childB = launchAdmissionChild(input, readyB, resultB);
+  try {
+    await Promise.all([waitForPath(readyA), waitForPath(readyB)]);
+    rmSync(lockFile, { force: true });
+    const [[codeA], [codeB]] = await Promise.all([
+      once(childA, 'close') as Promise<[number | null]>,
+      once(childB, 'close') as Promise<[number | null]>,
+    ]);
+    assert.equal(codeA, 0);
+    assert.equal(codeB, 0);
+
+    const outcomes = [resultA, resultB].map((file) =>
+      JSON.parse(readFileSync(file, 'utf-8')) as {
+        created?: boolean;
+        id?: string;
+        receipt?: string;
+        snapshotHash?: string;
+        error?: string;
+      }
+    );
+    assert.deepEqual(outcomes.map((row) => row.created).sort(), [false, true]);
+    assert.equal(new Set(outcomes.map((row) => row.id)).size, 1);
+    assert.equal(new Set(outcomes.map((row) => row.receipt)).size, 1);
+    assert.equal(new Set(outcomes.map((row) => row.snapshotHash)).size, 1);
+    assert.ok(outcomes.every((row) => !row.error));
+
+    const persisted = readExecutions();
+    assert.equal(
+      persisted.filter((row) =>
+        row.sessionId === sessionId && row.sourceUserSeq === sourceUserSeq
+      ).length,
+      1,
+    );
+    assert.ok(persisted.some((row) => row.id === 'unrelated-sentinel'));
+  } finally {
+    rmSync(lockFile, { force: true });
+    if (childA.exitCode === null) childA.kill('SIGKILL');
+    if (childB.exitCode === null) childB.kill('SIGKILL');
+  }
+});
+
+test('ExecutionStore creates its lock and ledger on a completely fresh home', async () => {
+  const freshHome = mkdtempSync(path.join(os.tmpdir(), 'clemmy-store-fresh-home-'));
+  const resultFile = path.join(freshHome, 'result.json');
+  const childCode = String.raw`
+    import { writeFileSync } from 'node:fs';
+    try {
+      const mod = await import(process.env.CLEM_STORE_MODULE_URL);
+      const execution = new mod.ExecutionStore().create({
+        sessionId: 'fresh-home-session',
+        title: 'Fresh home execution',
+        objective: 'Prove first-write lock creation.',
+        reason: 'test',
+        startedFromMessage: 'start',
+        confidence: 1,
+        reasons: ['test'],
+      });
+      writeFileSync(process.env.CLEM_STORE_RESULT, JSON.stringify({ id: execution.id }));
+    } catch (error) {
+      writeFileSync(process.env.CLEM_STORE_RESULT, JSON.stringify({
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  `;
+  const child = spawn(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '--eval', childCode],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        CLEMENTINE_HOME: freshHome,
+        CLEM_STORE_MODULE_URL: STORE_MODULE_URL,
+        CLEM_STORE_RESULT: resultFile,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+  try {
+    const [code] = await once(child, 'close') as [number | null];
+    assert.equal(code, 0);
+    const result = JSON.parse(readFileSync(resultFile, 'utf-8')) as { id?: string; error?: string };
+    assert.equal(result.error, undefined);
+    assert.ok(result.id);
+    assert.equal(existsSync(path.join(freshHome, 'state', 'executions.json')), true);
+  } finally {
+    if (child.exitCode === null) child.kill('SIGKILL');
+    rmSync(freshHome, { recursive: true, force: true });
+  }
+});
+
+test('sweep publishes after persistence so a synchronous listener update is not overwritten', () => {
+  seedExecutions([
+    baseExecution({
+      id: 'listener-reentry',
+      sessionId: 'sess-listener-reentry',
+      status: 'active',
+      lastHeartbeatAt: nowMinusMinutes(10),
+      updatedAt: nowMinusMinutes(10),
+      lastActivityAt: nowMinusMinutes(10),
+      activity: [],
+    }),
+  ]);
+  const store = new ExecutionStore();
+  const unsubscribe = actionBus.subscribe((event) => {
+    if (event.kind !== 'execution.transitioned' || event.executionId !== 'listener-reentry') return;
+    store.addActivity({
+      executionId: event.executionId,
+      key: 'listener-observed-durable-transition',
+      type: 'status',
+      message: 'Listener observed the persisted transition.',
+    });
+  });
+  try {
+    assert.equal(sweepCrashedExecutions(), 1);
+  } finally {
+    unsubscribe();
+  }
+  const reread = store.get('listener-reentry');
+  assert.equal(reread?.status, 'completed');
+  assert.ok(reread?.activity?.some((row) => row.key.startsWith('sweep-crashed-')));
+  assert.ok(reread?.activity?.some((row) => row.key === 'listener-observed-durable-transition'));
 });
 
 test('ExecutionStore.update closes linked vault task rows when an execution completes', () => {

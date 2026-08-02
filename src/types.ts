@@ -1,3 +1,5 @@
+import type { WorkflowDefinition } from './memory/workflow-store.js';
+
 export interface Models {
   fast: string;
   primary: string;
@@ -343,6 +345,26 @@ export interface PlanRecord {
   steps: PlanStep[];
 }
 
+/**
+ * Full first-winner compiler output persisted before a durable project is
+ * queued. Keeping the normalized plan and emitted definition here lets crash
+ * recovery continue without asking a model to recreate either one.
+ */
+export interface ProjectGraphCompiledPlanSnapshot {
+  version: 1;
+  compilerId: 'project_graph_v1';
+  planHash: string;
+  definitionHash: string;
+  /** Hash of the complete persisted payload (plan, definition, and inputs). */
+  snapshotHash: string;
+  /** Versioned normalized project-plan IR. Validated by the project compiler
+   * before admission; kept unknown here to avoid making the core record type
+   * depend on a particular planner implementation. */
+  plan: unknown;
+  definition: WorkflowDefinition;
+  inputs: Record<string, string>;
+}
+
 export interface ExecutionRecord {
   id: string;
   sessionId: string;
@@ -359,6 +381,29 @@ export interface ExecutionRecord {
    * evidence from unrelated conversation turns.
    */
   sourceUserSeqs?: number[];
+  /** Immutable admission contract for a durable graph compiled from one exact
+   * accepted user turn. This is execution provenance, not tool authority: the
+   * runtime still admits every effect at its actual tool boundary. */
+  graphAdmission?: {
+    version: 1;
+    kind: 'project_graph';
+    /** Domain-separated SHA-256 of the session id and accepted source seq;
+     * avoids copying private session identifiers into receipt keys while
+     * retaining stable identity. */
+    sourceTurnKeyHash: string;
+    turnGraphId: string;
+    turnGraphHash: string;
+    /** Hash of the first executable planner snapshot. Immutable after admit. */
+    planHash: string;
+    /** The actual first executable compiler output, not merely its digest. */
+    compiledPlan: ProjectGraphCompiledPlanSnapshot;
+    /** Stable trigger receipt for the only root workflow occurrence. */
+    rootWorkflowReceiptId: string;
+    admittedAt: string;
+    /** The single root workflow occurrence admitted for this source. Retry or
+     * repair descendants keep their own explicit run lineage. */
+    rootWorkflowRunId?: string;
+  };
   userId?: string;
   channel?: string;
   title: string;

@@ -1,8 +1,22 @@
-import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
-import type { ExecutionRecord, PlanRecord } from '../types.js';
+import type {
+  ExecutionRecord,
+  PlanRecord,
+  ProjectGraphCompiledPlanSnapshot,
+} from '../types.js';
 import { isUserFacingExecution } from './scope.js';
 import { actionBus } from '../runtime/action-bus.js';
 import { addNotification } from '../runtime/notifications.js';
@@ -26,6 +40,9 @@ import {
   canonicalExternalWriteActionKey,
   uncompensatedExternalWriteEvents,
 } from '../runtime/harness/external-write-admission.js';
+import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
+import { BoundaryError } from '../runtime/boundary-error.js';
+import { workflowDefinitionHash } from './workflow-run-definition.js';
 
 const STATE_DIR = path.join(BASE_DIR, 'state');
 const EXECUTIONS_FILE = path.join(STATE_DIR, 'executions.json');
@@ -46,21 +63,209 @@ function ensureStateDir(): void {
   }
 }
 
-function loadExecutions(): ExecutionRecord[] {
+function loadExecutionsUnlocked(): ExecutionRecord[] {
   ensureStateDir();
   if (!existsSync(EXECUTIONS_FILE)) return [];
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(EXECUTIONS_FILE, 'utf-8'));
-    if (!Array.isArray(parsed)) return [];
-    return parsed as ExecutionRecord[];
-  } catch {
-    return [];
+    parsed = JSON.parse(readFileSync(EXECUTIONS_FILE, 'utf-8'));
+  } catch (cause) {
+    throw new BoundaryError({
+      kind: 'state.read_corrupted',
+      retryable: false,
+      userMessage: 'The execution ledger is unreadable. Restore or repair it before starting more work.',
+      operatorMessage: `Execution state is corrupt at ${EXECUTIONS_FILE}; refusing to replace it or admit new project authority.`,
+      context: { filePath: EXECUTIONS_FILE },
+      cause,
+    });
+  }
+  if (!Array.isArray(parsed)) {
+    throw new BoundaryError({
+      kind: 'state.read_corrupted',
+      retryable: false,
+      userMessage: 'The execution ledger has an invalid shape. Restore or repair it before starting more work.',
+      operatorMessage: `Execution state at ${EXECUTIONS_FILE} is corrupt; expected an array.`,
+      context: { filePath: EXECUTIONS_FILE },
+    });
+  }
+  return parsed as ExecutionRecord[];
+}
+
+/** Crash-safe replacement. Call only while holding executionsFileLock(). */
+function saveExecutionsUnlocked(executions: ExecutionRecord[]): void {
+  ensureStateDir();
+  const temp = `${EXECUTIONS_FILE}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(temp, 'wx', 0o600);
+    writeFileSync(fd, JSON.stringify(executions, null, 2), 'utf-8');
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temp, EXECUTIONS_FILE);
+    if (process.platform !== 'win32') {
+      const dirFd = openSync(STATE_DIR, 'r');
+      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    }
+  } catch (err) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best-effort cleanup */ }
+    }
+    try { unlinkSync(temp); } catch { /* best-effort cleanup */ }
+    throw err;
   }
 }
 
-function saveExecutions(executions: ExecutionRecord[]): void {
+function executionsFileLock<T>(work: () => T): T {
+  // The lock file is a sibling of executions.json, so a truly fresh home must
+  // create the state directory before attempting the atomic `wx` lock.
   ensureStateDir();
-  writeFileSync(EXECUTIONS_FILE, JSON.stringify(executions, null, 2), 'utf-8');
+  return withFileLockSyncStrict(EXECUTIONS_FILE, work);
+}
+
+function sourceTurnKeyHash(sessionId: string, sourceUserSeq: number): string {
+  return createHash('sha256')
+    .update('clementine-project-source:v1', 'utf8')
+    .update('\0')
+    .update(sessionId, 'utf8')
+    .update('\0')
+    .update(String(sourceUserSeq), 'utf8')
+    .digest('hex');
+}
+
+function deterministicSourceExecutionId(sessionId: string, sourceUserSeq: number): string {
+  return `exec-project-${sourceTurnKeyHash(sessionId, sourceUserSeq).slice(0, 32)}`;
+}
+
+type JsonPrimitive = null | boolean | number | string;
+type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+/** Normalize untrusted compiler output to the exact JSON bytes that can be
+ * persisted. Object keys are sorted, undefined object fields are omitted, and
+ * non-JSON/cyclic values fail closed instead of changing underneath a hash. */
+function canonicalJsonValue(
+  value: unknown,
+  seen = new Set<object>(),
+  location = '$',
+): JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error(`Compiled project data at ${location} is not finite JSON.`);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new Error(`Compiled project data at ${location} is cyclic.`);
+    seen.add(value);
+    try {
+      return value.map((entry, index) => {
+        if (entry === undefined) {
+          throw new Error(`Compiled project data at ${location}[${index}] contains undefined.`);
+        }
+        return canonicalJsonValue(entry, seen, `${location}[${index}]`);
+      });
+    } finally {
+      seen.delete(value);
+    }
+  }
+  if (typeof value === 'object') {
+    if (seen.has(value)) throw new Error(`Compiled project data at ${location} is cyclic.`);
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error(`Compiled project data at ${location} is not a plain JSON object.`);
+    }
+    seen.add(value);
+    try {
+      const record = value as Record<string, unknown>;
+      const out: Record<string, JsonValue> = {};
+      for (const key of Object.keys(record).sort()) {
+        if (record[key] === undefined) continue;
+        out[key] = canonicalJsonValue(record[key], seen, `${location}.${key}`);
+      }
+      return out;
+    } finally {
+      seen.delete(value);
+    }
+  }
+  throw new Error(`Compiled project data at ${location} is not JSON-serializable.`);
+}
+
+function canonicalJsonHash(value: unknown): string {
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalJsonValue(value)), 'utf8')
+    .digest('hex');
+}
+
+export type ProjectGraphCompiledPlanInput = Omit<
+  ProjectGraphCompiledPlanSnapshot,
+  'snapshotHash'
+>;
+
+function prepareCompiledPlanSnapshot(
+  input: ProjectGraphCompiledPlanInput,
+): ProjectGraphCompiledPlanSnapshot {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('Execution admission requires a complete project compiler snapshot.');
+  }
+  if (input.version !== 1 || input.compilerId !== 'project_graph_v1') {
+    throw new Error('Execution admission requires a supported project compiler snapshot.');
+  }
+  if (!/^[a-f0-9]{64}$/.test(input.planHash)) {
+    throw new Error('Execution admission plan hash is invalid.');
+  }
+  if (!/^[a-f0-9]{64}$/.test(input.definitionHash)) {
+    throw new Error('Execution admission workflow definition hash is invalid.');
+  }
+
+  const plan = canonicalJsonValue(input.plan);
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
+    throw new Error('Execution admission requires a normalized project-plan object.');
+  }
+  if (canonicalJsonHash(plan) !== input.planHash) {
+    throw new Error('Execution admission project-plan bytes do not match their hash.');
+  }
+
+  const definition = canonicalJsonValue(input.definition);
+  if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
+    throw new Error('Execution admission requires a compiled workflow definition object.');
+  }
+  if (workflowDefinitionHash(definition as unknown as typeof input.definition) !== input.definitionHash) {
+    throw new Error('Execution admission workflow definition bytes do not match their hash.');
+  }
+
+  const inputs = canonicalJsonValue(input.inputs);
+  if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs)) {
+    throw new Error('Execution admission workflow inputs must be a string map.');
+  }
+  if (Object.values(inputs).some((value) => typeof value !== 'string')) {
+    throw new Error('Execution admission workflow inputs must contain only strings.');
+  }
+
+  const payload: ProjectGraphCompiledPlanInput = {
+    version: 1,
+    compilerId: 'project_graph_v1',
+    planHash: input.planHash,
+    definitionHash: input.definitionHash,
+    plan,
+    definition: definition as unknown as typeof input.definition,
+    inputs: inputs as Record<string, string>,
+  };
+  return {
+    ...payload,
+    snapshotHash: canonicalJsonHash(payload),
+  };
+}
+
+function assertPersistedCompiledPlanSnapshot(
+  value: ProjectGraphCompiledPlanSnapshot | undefined,
+): ProjectGraphCompiledPlanSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Persisted project admission is missing its compiler snapshot.');
+  }
+  const prepared = prepareCompiledPlanSnapshot(value);
+  if (value.snapshotHash !== prepared.snapshotHash) {
+    throw new Error('Persisted project compiler snapshot failed its integrity check.');
+  }
+  return prepared;
 }
 
 function clean(value: string, maxChars = 220): string {
@@ -348,7 +553,7 @@ function persistReconciledExecutions(
   const changed = reconcileCompletedExternalWriteTruth(candidates);
   if (!changed) return false;
   try {
-    saveExecutions(allExecutions);
+    saveExecutionsUnlocked(allExecutions);
   } catch {
     // Preserve the parsed truth-reconciled view for this read. A transient
     // persistence failure must not turn explicit negative evidence green.
@@ -416,74 +621,470 @@ export interface CreateExecutionInput {
   autoAdvance?: boolean;
 }
 
+export interface GraphExecutionAdmissionInput {
+  turnGraphId: string;
+  turnGraphHash: string;
+  compiledPlan: ProjectGraphCompiledPlanInput;
+}
+
+export interface CreateOrGetExecutionForSourceInput extends Omit<CreateExecutionInput, 'sourceUserSeq'> {
+  sourceUserSeq: number;
+  admission: GraphExecutionAdmissionInput;
+}
+
+export interface CreateOrGetExecutionForSourceResult {
+  execution: ExecutionRecord;
+  created: boolean;
+  /** A competing planner proposed different bytes after another process had
+   * already admitted the immutable winner. Callers must dispatch `execution`'s
+   * persisted compiledPlan, never their losing input. */
+  plannerConflict: boolean;
+  /** Stable queue receipt for the one root workflow occurrence. */
+  rootWorkflowReceiptId: string;
+}
+
+function exactAcceptedHumanSource(sessionId: string, sourceUserSeq: number): EventRow | null {
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return null;
+  try {
+    return listHarnessEvents(sessionId, {
+      sinceSeq: sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    }).find((event) =>
+      event.seq === sourceUserSeq
+      && event.sessionId === sessionId
+      && event.role === 'user'
+      && event.data.synthetic !== true
+    ) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function assertGraphAdmissionInput(
+  sessionId: string,
+  sourceUserSeq: number,
+  admission: GraphExecutionAdmissionInput,
+): ProjectGraphCompiledPlanSnapshot {
+  if (!exactAcceptedHumanSource(sessionId, sourceUserSeq)) {
+    throw new Error('A durable execution must be bound to the exact accepted human user turn.');
+  }
+  if (admission.turnGraphId !== `turn-graph:v1:${sourceUserSeq}`) {
+    throw new Error('Execution admission graph id does not match its accepted source.');
+  }
+  if (!/^[a-f0-9]{64}$/.test(admission.turnGraphHash)) {
+    throw new Error('Execution admission requires a valid turn graph hash.');
+  }
+  return prepareCompiledPlanSnapshot(admission.compiledPlan);
+}
+
+function buildExecutionRecord(
+  input: CreateExecutionInput,
+  id: string = randomUUID(),
+  graphAdmission?: ExecutionRecord['graphAdmission'],
+): ExecutionRecord {
+  const now = new Date().toISOString();
+  return {
+    id,
+    sessionId: input.sessionId,
+    ...(Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
+      ? { sourceUserSeq: input.sourceUserSeq }
+      : {}),
+    ...(graphAdmission ? { graphAdmission } : {}),
+    userId: input.userId,
+    channel: input.channel,
+    title: clean(input.title, 120),
+    objective: clean(input.objective, 600),
+    reason: clean(input.reason, 400),
+    status: 'active',
+    createdAt: now,
+    updatedAt: now,
+    lastActivityAt: now,
+    startedFromMessage: clean(input.startedFromMessage, 500),
+    planId: input.planId,
+    nextStep: input.nextStep ? clean(input.nextStep, 220) : undefined,
+    successCriteria: input.successCriteria ? clean(input.successCriteria, 800) : undefined,
+    lastAssistantSummary: input.lastAssistantSummary ? clean(input.lastAssistantSummary, 400) : undefined,
+    nextReviewAt: graphAdmission ? undefined : input.nextReviewAt,
+    blocker: input.blocker ? clean(input.blocker, 220) : undefined,
+    // A project graph is owned by its durable workflow runner. It must never
+    // race the legacy execution controller, including in the crash window
+    // between compiler admission and root-run queue reconciliation.
+    autoAdvance: graphAdmission ? false : input.autoAdvance !== false,
+    taskBindings: [],
+    workflowBindings: [],
+    delegationBindings: [],
+    activity: [],
+    confidence: Math.max(0, Math.min(1, input.confidence)),
+    reasons: input.reasons.map((item) => clean(item, 140)).filter(Boolean).slice(0, 8),
+  };
+}
+
+export function rootWorkflowReceiptForSource(sessionId: string, sourceUserSeq: number): string {
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
+    throw new Error('A root workflow receipt requires an exact accepted source.');
+  }
+  return `project-turn:v1:${sourceTurnKeyHash(sessionId, sourceUserSeq)}`;
+}
+
+function assertExecutionGraphAdmissionIntegrity(execution: ExecutionRecord): void {
+  const admission = execution.graphAdmission;
+  if (!admission) return;
+  const sourceUserSeq = execution.sourceUserSeq;
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
+    throw new Error('Persisted project admission has no exact accepted source.');
+  }
+  const expectedSourceHash = sourceTurnKeyHash(execution.sessionId, sourceUserSeq as number);
+  const expectedReceipt = rootWorkflowReceiptForSource(execution.sessionId, sourceUserSeq as number);
+  if (
+    admission.version !== 1
+    || admission.kind !== 'project_graph'
+    || admission.sourceTurnKeyHash !== expectedSourceHash
+    || admission.turnGraphId !== `turn-graph:v1:${sourceUserSeq}`
+    || !/^[a-f0-9]{64}$/.test(admission.turnGraphHash)
+    || admission.rootWorkflowReceiptId !== expectedReceipt
+    || typeof admission.admittedAt !== 'string'
+    || !Number.isFinite(Date.parse(admission.admittedAt))
+  ) {
+    throw new Error('Persisted project admission failed its source integrity check.');
+  }
+  const compiledPlan = assertPersistedCompiledPlanSnapshot(admission.compiledPlan);
+  if (admission.planHash !== compiledPlan.planHash) {
+    throw new Error('Persisted project admission plan hash does not match its compiler snapshot.');
+  }
+  if (
+    admission.rootWorkflowRunId !== undefined
+    && (typeof admission.rootWorkflowRunId !== 'string' || !admission.rootWorkflowRunId.trim())
+  ) {
+    throw new Error('Persisted project admission has an invalid root workflow run id.');
+  }
+}
+
+export type ExecutionUpdatePatch = Partial<Omit<
+  ExecutionRecord,
+  'id' | 'createdAt' | 'sessionId' | 'sourceUserSeq' | 'sourceUserSeqs' | 'graphAdmission'
+>>;
+
+/** Apply a normal mutable-field patch to a record already loaded under the
+ * execution file lock. Exact identity and graph authority are stripped again
+ * at runtime so JavaScript/legacy callers cannot bypass the TypeScript shape. */
+function applyExecutionUpdate(
+  execution: ExecutionRecord,
+  patch: ExecutionUpdatePatch,
+): ExecutionRecord {
+  const now = new Date().toISOString();
+  const {
+    id: _ignoredId,
+    sessionId: _ignoredSessionId,
+    createdAt: _ignoredCreatedAt,
+    sourceUserSeq: _ignoredSourceUserSeq,
+    sourceUserSeqs: _ignoredSourceUserSeqs,
+    graphAdmission: _ignoredGraphAdmission,
+    ...safePatch
+  } = patch as Partial<ExecutionRecord>;
+  Object.assign(execution, safePatch, {
+    updatedAt: now,
+    lastActivityAt: patch.lastActivityAt ?? now,
+  });
+  if (patch.status === 'completed') {
+    const evidence = executionExternalWriteStatus(execution);
+    if (
+      !execution.blocker
+      && (evidence.status === 'failed' || evidence.status === 'ambiguous')
+    ) {
+      applyExternalWriteTruthBlock(execution, evidence.status, evidence.latestNegativeSeq);
+    } else if (execution.status === 'completed') {
+      execution.completedAt = now;
+      closeLinkedVaultTasks(execution, now);
+    }
+  }
+  return execution;
+}
+
 export class ExecutionStore {
   list(limit = 20, status?: ExecutionRecord['status']): ExecutionRecord[] {
-    const executions = loadExecutions();
-    const select = () => executions
-      .filter((execution) => !status || execution.status === status)
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-      .slice(0, limit);
-    // Reconcile only records that can actually be returned. If a selected
-    // completion reopens, select again to backfill a status-filtered page.
-    for (let pass = 0; pass <= executions.length; pass += 1) {
-      const selected = select();
-      if (!persistReconciledExecutions(executions, selected)) return selected;
-    }
-    return select();
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const select = () => executions
+        .filter((execution) => !status || execution.status === status)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+        .slice(0, limit);
+      // Reconcile only records that can actually be returned. If a selected
+      // completion reopens, select again to backfill a status-filtered page.
+      for (let pass = 0; pass <= executions.length; pass += 1) {
+        const selected = select();
+        if (!persistReconciledExecutions(executions, selected)) return selected;
+      }
+      return select();
+    });
   }
 
   get(id: string): ExecutionRecord | undefined {
-    const executions = loadExecutions();
-    const execution = executions.find((entry) => entry.id === id);
-    if (execution) persistReconciledExecutions(executions, [execution]);
-    return execution;
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const execution = executions.find((entry) => entry.id === id);
+      if (execution) persistReconciledExecutions(executions, [execution]);
+      return execution;
+    });
   }
 
   getActiveForSession(sessionId: string): ExecutionRecord | undefined {
-    const executions = loadExecutions();
-    const sessionExecutions = executions.filter((execution) => execution.sessionId === sessionId);
-    persistReconciledExecutions(executions, sessionExecutions);
-    return sessionExecutions
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-      .find((execution) => execution.status === 'active' || execution.status === 'blocked');
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const sessionExecutions = executions.filter((execution) => execution.sessionId === sessionId);
+      persistReconciledExecutions(executions, sessionExecutions);
+      return sessionExecutions
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+        .find((execution) => execution.status === 'active' || execution.status === 'blocked');
+    });
   }
 
   create(input: CreateExecutionInput): ExecutionRecord {
-    const executions = loadExecutions();
-    const now = new Date().toISOString();
-    const execution: ExecutionRecord = {
-      id: randomUUID(),
-      sessionId: input.sessionId,
-      ...(Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
-        ? { sourceUserSeq: input.sourceUserSeq }
-        : {}),
-      userId: input.userId,
-      channel: input.channel,
-      title: clean(input.title, 120),
-      objective: clean(input.objective, 600),
-      reason: clean(input.reason, 400),
-      status: 'active',
-      createdAt: now,
-      updatedAt: now,
-      lastActivityAt: now,
-      startedFromMessage: clean(input.startedFromMessage, 500),
-      planId: input.planId,
-      nextStep: input.nextStep ? clean(input.nextStep, 220) : undefined,
-      successCriteria: input.successCriteria ? clean(input.successCriteria, 800) : undefined,
-      lastAssistantSummary: input.lastAssistantSummary ? clean(input.lastAssistantSummary, 400) : undefined,
-      nextReviewAt: input.nextReviewAt,
-      blocker: input.blocker ? clean(input.blocker, 220) : undefined,
-      autoAdvance: input.autoAdvance !== false,
-      taskBindings: [],
-      workflowBindings: [],
-      delegationBindings: [],
-      activity: [],
-      confidence: Math.max(0, Math.min(1, input.confidence)),
-      reasons: input.reasons.map((item) => clean(item, 140)).filter(Boolean).slice(0, 8),
-    };
-    executions.push(execution);
-    saveExecutions(executions);
-    return execution;
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const execution = buildExecutionRecord(input);
+      executions.push(execution);
+      saveExecutionsUnlocked(executions);
+      return execution;
+    });
+  }
+
+  /**
+   * Linearizable project admission for one exact accepted human turn. Every
+   * process derives the same id and queue receipt; the first persisted graph
+   * and plan digests are immutable on replay.
+   */
+  createOrGetForSource(
+    input: CreateOrGetExecutionForSourceInput,
+  ): CreateOrGetExecutionForSourceResult {
+    const compiledPlan = assertGraphAdmissionInput(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.admission,
+    );
+    const keyHash = sourceTurnKeyHash(input.sessionId, input.sourceUserSeq);
+    const deterministicId = deterministicSourceExecutionId(input.sessionId, input.sourceUserSeq);
+    const receiptId = rootWorkflowReceiptForSource(input.sessionId, input.sourceUserSeq);
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const exact = executions.filter((entry) =>
+        entry.sessionId === input.sessionId && entry.sourceUserSeq === input.sourceUserSeq
+      );
+      if (exact.length > 1) {
+        throw new Error('Multiple executions already claim the same accepted source; project admission failed closed.');
+      }
+      const idOwner = executions.find((entry) => entry.id === deterministicId);
+      if (idOwner && !exact.includes(idOwner)) {
+        throw new Error('Deterministic execution id is already owned by another accepted source.');
+      }
+
+      const existing = exact[0];
+      if (existing) {
+        const admitted = existing.graphAdmission;
+        if (admitted) {
+          if (
+            admitted.version !== 1
+            || admitted.kind !== 'project_graph'
+            || admitted.sourceTurnKeyHash !== keyHash
+            || admitted.turnGraphId !== input.admission.turnGraphId
+            || admitted.turnGraphHash !== input.admission.turnGraphHash
+            || admitted.rootWorkflowReceiptId !== receiptId
+          ) {
+            throw new Error('Accepted source already has a different immutable project admission.');
+          }
+          const persistedPlan = assertPersistedCompiledPlanSnapshot(admitted.compiledPlan);
+          if (admitted.planHash !== persistedPlan.planHash) {
+            throw new Error('Persisted project admission plan hash does not match its compiler snapshot.');
+          }
+          const plannerConflict = persistedPlan.snapshotHash !== compiledPlan.snapshotHash;
+          let repairedControllerOwnership = false;
+          if (existing.autoAdvance !== false || existing.nextReviewAt !== undefined) {
+            existing.autoAdvance = false;
+            existing.nextReviewAt = undefined;
+            repairedControllerOwnership = true;
+          }
+          if (repairedControllerOwnership) {
+            existing.updatedAt = new Date().toISOString();
+            saveExecutionsUnlocked(executions);
+          }
+          return {
+            execution: existing,
+            created: false,
+            plannerConflict,
+            rootWorkflowReceiptId: admitted.rootWorkflowReceiptId,
+          };
+        }
+
+        const now = new Date().toISOString();
+        existing.graphAdmission = {
+          version: 1,
+          kind: 'project_graph',
+          sourceTurnKeyHash: keyHash,
+          turnGraphId: input.admission.turnGraphId,
+          turnGraphHash: input.admission.turnGraphHash,
+          planHash: compiledPlan.planHash,
+          compiledPlan,
+          rootWorkflowReceiptId: receiptId,
+          admittedAt: now,
+        };
+        existing.autoAdvance = false;
+        existing.nextReviewAt = undefined;
+        existing.activity = Array.isArray(existing.activity) ? existing.activity : [];
+        existing.activity.push({
+          id: randomUUID(),
+          key: `project-admitted:${keyHash}`,
+          type: 'status',
+          message: 'Bound this execution to the exact accepted project turn.',
+          createdAt: now,
+          metadata: {
+            source: 'project_graph',
+            sourceUserSeq: input.sourceUserSeq,
+            turnGraphId: input.admission.turnGraphId,
+            turnGraphHash: input.admission.turnGraphHash,
+            planHash: compiledPlan.planHash,
+            compiledPlanHash: compiledPlan.snapshotHash,
+          },
+        });
+        existing.activity = existing.activity.slice(-60);
+        existing.updatedAt = now;
+        existing.lastActivityAt = now;
+        saveExecutionsUnlocked(executions);
+        return {
+          execution: existing,
+          created: false,
+          plannerConflict: false,
+          rootWorkflowReceiptId: receiptId,
+        };
+      }
+
+      const admittedAt = new Date().toISOString();
+      const execution = buildExecutionRecord({ ...input, sourceUserSeq: input.sourceUserSeq }, deterministicId, {
+        version: 1,
+        kind: 'project_graph',
+        sourceTurnKeyHash: keyHash,
+        turnGraphId: input.admission.turnGraphId,
+        turnGraphHash: input.admission.turnGraphHash,
+        planHash: compiledPlan.planHash,
+        compiledPlan,
+        rootWorkflowReceiptId: receiptId,
+        admittedAt,
+      });
+      execution.activity = [{
+        id: randomUUID(),
+        key: `project-admitted:${keyHash}`,
+        type: 'status',
+        message: 'Admitted a durable project execution for this accepted turn.',
+        createdAt: admittedAt,
+        metadata: {
+          source: 'project_graph',
+          sourceUserSeq: input.sourceUserSeq,
+          turnGraphId: input.admission.turnGraphId,
+          turnGraphHash: input.admission.turnGraphHash,
+          planHash: compiledPlan.planHash,
+          compiledPlanHash: compiledPlan.snapshotHash,
+        },
+      }];
+      executions.push(execution);
+      saveExecutionsUnlocked(executions);
+      return {
+        execution,
+        created: true,
+        plannerConflict: false,
+        rootWorkflowReceiptId: receiptId,
+      };
+    });
+  }
+
+  getForSource(sessionId: string, sourceUserSeq: number): ExecutionRecord | undefined {
+    if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return undefined;
+    return executionsFileLock(() => {
+      const matches = loadExecutionsUnlocked().filter((entry) =>
+        entry.sessionId === sessionId && entry.sourceUserSeq === sourceUserSeq
+      );
+      if (matches.length > 1) {
+        throw new Error('Multiple executions claim the same accepted source; project lookup failed closed.');
+      }
+      const execution = matches[0];
+      if (execution) assertExecutionGraphAdmissionIntegrity(execution);
+      return execution;
+    });
+  }
+
+  /** Bind the one root workflow occurrence without allowing a retry to swap it. */
+  bindRootWorkflowRunForSource(input: {
+    sessionId: string;
+    sourceUserSeq: number;
+    rootWorkflowReceiptId: string;
+    runId: string;
+    workflow: string;
+  }): ExecutionRecord {
+    const expectedReceiptId = rootWorkflowReceiptForSource(input.sessionId, input.sourceUserSeq);
+    if (input.rootWorkflowReceiptId !== expectedReceiptId) {
+      throw new Error('Root workflow binding receipt does not match its exact accepted source.');
+    }
+    const runId = input.runId.trim();
+    const workflow = input.workflow.trim();
+    if (!runId || !workflow) throw new Error('Root workflow binding requires a run id and workflow name.');
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const matches = executions.filter((entry) =>
+        entry.sessionId === input.sessionId && entry.sourceUserSeq === input.sourceUserSeq
+      );
+      if (matches.length > 1) {
+        throw new Error('Multiple executions claim the same accepted source; root workflow binding failed closed.');
+      }
+      const execution = matches[0];
+      if (!execution?.graphAdmission) {
+        throw new Error('Root workflow binding requires an admitted project execution.');
+      }
+      assertExecutionGraphAdmissionIntegrity(execution);
+      if (execution.graphAdmission.rootWorkflowReceiptId !== expectedReceiptId) {
+        throw new Error('Persisted project admission has a different root workflow receipt.');
+      }
+      const persistedPlan = assertPersistedCompiledPlanSnapshot(execution.graphAdmission.compiledPlan);
+      if (
+        execution.graphAdmission.planHash !== persistedPlan.planHash
+        || workflow !== persistedPlan.definition.name
+      ) {
+        throw new Error('Root workflow binding does not match the immutable compiled project plan.');
+      }
+      if (execution.graphAdmission.rootWorkflowRunId && execution.graphAdmission.rootWorkflowRunId !== runId) {
+        throw new Error('Accepted project source is already bound to a different root workflow run.');
+      }
+      const existingBinding = (execution.workflowBindings ?? []).find((binding) => binding.runId === runId);
+      if (existingBinding && existingBinding.workflow !== workflow) {
+        throw new Error('Root workflow run is already bound under a different workflow identity.');
+      }
+      const now = new Date().toISOString();
+      execution.graphAdmission.rootWorkflowRunId = runId;
+      execution.workflowBindings = existingBinding
+        ? execution.workflowBindings
+        : [
+            ...(execution.workflowBindings ?? []),
+            { runId, workflow, status: 'queued', createdAt: now, updatedAt: now },
+          ];
+      execution.autoAdvance = false;
+      execution.nextReviewAt = undefined;
+      execution.nextStep = 'Durable workflow is executing the admitted project graph.';
+      execution.lastAssistantSummary = `Queued durable workflow run ${runId}.`;
+      execution.updatedAt = now;
+      execution.lastActivityAt = now;
+      execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+      const activityKey = `workflow:${runId}:queued`;
+      if (!execution.activity.some((item) => item.key === activityKey)) {
+        execution.activity.push({
+          id: randomUUID(),
+          key: activityKey,
+          type: 'workflow_queued',
+          message: `Queued durable root workflow "${clean(workflow, 120)}".`,
+          createdAt: now,
+          metadata: { source: 'project_graph', runId, workflow },
+        });
+        execution.activity = execution.activity.slice(-60);
+      }
+      saveExecutionsUnlocked(executions);
+      return execution;
+    });
   }
 
   /**
@@ -502,53 +1103,48 @@ export class ExecutionStore {
       || !Number.isSafeInteger(sourceUserSeq)
       || sourceUserSeq <= 0
     ) return undefined;
+    // Event rows are append-only. Resolve this outside the execution lock so
+    // event-log and execution-ledger locks never acquire one another in the
+    // opposite order.
+    if (!exactAcceptedHumanSource(sessionId, sourceUserSeq)) return undefined;
 
-    const executions = loadExecutions();
-    const execution = executions.find((entry) => entry.id === id);
-    if (!execution || execution.sessionId !== sessionId) return undefined;
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const execution = executions.find((entry) => entry.id === id);
+      if (!execution || execution.sessionId !== sessionId) return undefined;
 
-    let ownsExactUserRow = false;
-    try {
-      ownsExactUserRow = listHarnessEvents(sessionId, {
-        sinceSeq: Math.max(0, sourceUserSeq - 1),
-        types: ['user_input_received'],
-      }).some((event) => event.seq === sourceUserSeq);
-    } catch {
-      return undefined;
-    }
-    if (!ownsExactUserRow) return undefined;
-
-    if (!execution.sourceUserSeq) {
-      execution.sourceUserSeq = sourceUserSeq;
-    } else if (execution.sourceUserSeq !== sourceUserSeq) {
-      execution.sourceUserSeqs = [...new Set([
-        ...(execution.sourceUserSeqs ?? []),
-        sourceUserSeq,
-      ])].sort((left, right) => left - right);
-    }
-
-    execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
-    const activityKey = `source-user-bound:${sourceUserSeq}`;
-    if (!execution.activity.some((item) => item.key === activityKey)) {
-      const now = new Date().toISOString();
-      execution.activity.push({
-        id: randomUUID(),
-        key: activityKey,
-        type: 'status',
-        message: clean('Linked this exact follow-up request to the execution audit trail.', 500),
-        createdAt: now,
-        metadata: {
-          source: 'explicit_execution_tool',
-          sourceTool: clean(sourceTool, 80),
+      if (!execution.sourceUserSeq) {
+        execution.sourceUserSeq = sourceUserSeq;
+      } else if (execution.sourceUserSeq !== sourceUserSeq) {
+        execution.sourceUserSeqs = [...new Set([
+          ...(execution.sourceUserSeqs ?? []),
           sourceUserSeq,
-        },
-      });
-      execution.activity = execution.activity.slice(-60);
-      execution.updatedAt = now;
-      execution.lastActivityAt = now;
-    }
-    saveExecutions(executions);
-    return execution;
+        ])].sort((left, right) => left - right);
+      }
+
+      execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+      const activityKey = `source-user-bound:${sourceUserSeq}`;
+      if (!execution.activity.some((item) => item.key === activityKey)) {
+        const now = new Date().toISOString();
+        execution.activity.push({
+          id: randomUUID(),
+          key: activityKey,
+          type: 'status',
+          message: clean('Linked this exact follow-up request to the execution audit trail.', 500),
+          createdAt: now,
+          metadata: {
+            source: 'explicit_execution_tool',
+            sourceTool: clean(sourceTool, 80),
+            sourceUserSeq,
+          },
+        });
+        execution.activity = execution.activity.slice(-60);
+        execution.updatedAt = now;
+        execution.lastActivityAt = now;
+      }
+      saveExecutionsUnlocked(executions);
+      return execution;
+    });
   }
 
   addActivity(input: {
@@ -558,28 +1154,31 @@ export class ExecutionStore {
     message: string;
     metadata?: Record<string, unknown>;
   }): ExecutionRecord | undefined {
-    const executions = loadExecutions();
-    const execution = executions.find((entry) => entry.id === input.executionId);
-    if (!execution) return undefined;
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const execution = executions.find((entry) => entry.id === input.executionId);
+      if (!execution) return undefined;
 
-    execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
-    if (execution.activity.some((item) => item.key === input.key)) {
+      execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+      if (execution.activity.some((item) => item.key === input.key)) {
+        return execution;
+      }
+
+      const now = new Date().toISOString();
+      execution.activity.push({
+        id: randomUUID(),
+        key: input.key,
+        type: input.type,
+        message: clean(input.message, 500),
+        createdAt: now,
+        metadata: input.metadata,
+      });
+      execution.activity = execution.activity.slice(-60);
+      execution.updatedAt = now;
+      execution.lastActivityAt = now;
+      saveExecutionsUnlocked(executions);
       return execution;
-    }
-
-    execution.activity.push({
-      id: randomUUID(),
-      key: input.key,
-      type: input.type,
-      message: clean(input.message, 500),
-      createdAt: new Date().toISOString(),
-      metadata: input.metadata,
     });
-    execution.activity = execution.activity.slice(-60);
-    execution.updatedAt = new Date().toISOString();
-    execution.lastActivityAt = new Date().toISOString();
-    saveExecutions(executions);
-    return execution;
   }
 
   recentActivity(executionId: string, limit = 10): NonNullable<ExecutionRecord['activity']> {
@@ -589,30 +1188,19 @@ export class ExecutionStore {
       .slice(0, limit);
   }
 
-  update(id: string, patch: Partial<Omit<ExecutionRecord, 'id' | 'createdAt' | 'sessionId'>>): ExecutionRecord | undefined {
-    const executions = loadExecutions();
-    const execution = executions.find((entry) => entry.id === id);
-    if (!execution) return undefined;
+  update(
+    id: string,
+    patch: ExecutionUpdatePatch,
+  ): ExecutionRecord | undefined {
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const execution = executions.find((entry) => entry.id === id);
+      if (!execution) return undefined;
 
-    const now = new Date().toISOString();
-    Object.assign(execution, patch, {
-      updatedAt: now,
-      lastActivityAt: patch.lastActivityAt ?? now,
+      applyExecutionUpdate(execution, patch);
+      saveExecutionsUnlocked(executions);
+      return execution;
     });
-    if (patch.status === 'completed') {
-      const evidence = executionExternalWriteStatus(execution);
-      if (
-        !execution.blocker
-        && (evidence.status === 'failed' || evidence.status === 'ambiguous')
-      ) {
-        applyExternalWriteTruthBlock(execution, evidence.status, evidence.latestNegativeSeq);
-      } else if (execution.status === 'completed') {
-        execution.completedAt = now;
-        closeLinkedVaultTasks(execution, now);
-      }
-    }
-    saveExecutions(executions);
-    return execution;
   }
 
   /**
@@ -621,57 +1209,66 @@ export class ExecutionStore {
    * No model or completion judge participates in this decision.
    */
   reconcileExternalWriteTruth(id: string): ExecutionExternalWriteTruth | undefined {
-    const executions = loadExecutions();
-    const execution = executions.find((entry) => entry.id === id);
-    if (!execution) return undefined;
-    let changed = false;
-    const evidence = executionExternalWriteStatus(execution);
-    if (evidence.status === 'failed' || evidence.status === 'ambiguous') {
-      changed = applyExternalWriteTruthBlock(
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const execution = executions.find((entry) => entry.id === id);
+      if (!execution) return undefined;
+      let changed = false;
+      const evidence = executionExternalWriteStatus(execution);
+      if (evidence.status === 'failed' || evidence.status === 'ambiguous') {
+        changed = applyExternalWriteTruthBlock(
+          execution,
+          evidence.status,
+          evidence.latestNegativeSeq,
+        ) || changed;
+      }
+      if (changed) saveExecutionsUnlocked(executions);
+      return {
+        status: evidence.status,
+        confirmedActionKeys: evidence.confirmedActionKeys,
         execution,
-        evidence.status,
-        evidence.latestNegativeSeq,
-      ) || changed;
-    }
-    if (changed) saveExecutions(executions);
-    return {
-      status: evidence.status,
-      confirmedActionKeys: evidence.confirmedActionKeys,
-      execution,
-    };
+      };
+    });
   }
 
   listDue(now = new Date(), limit = 20): ExecutionRecord[] {
-    return loadExecutions().filter((execution) => {
-      if (execution.autoAdvance === false) return false;
-      if (!isUserFacingExecution(execution)) return false;
-      if (execution.status !== 'active' && execution.status !== 'blocked') return false;
-      if (!execution.nextReviewAt) return true;
-      return new Date(execution.nextReviewAt).getTime() <= now.getTime();
-    })
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-      .slice(0, limit);
+    return executionsFileLock(() => loadExecutionsUnlocked().filter((execution) => {
+        if (execution.graphAdmission) return false;
+        if (execution.autoAdvance === false) return false;
+        if (!isUserFacingExecution(execution)) return false;
+        if (execution.status !== 'active' && execution.status !== 'blocked') return false;
+        if (!execution.nextReviewAt) return true;
+        return new Date(execution.nextReviewAt).getTime() <= now.getTime();
+      })
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+        .slice(0, limit));
   }
 
   syncWithPlan(executionId: string, plan?: PlanRecord): ExecutionRecord | undefined {
-    const execution = this.get(executionId);
-    if (!execution) return undefined;
-    if (!plan) return execution;
+    return executionsFileLock(() => {
+      const executions = loadExecutionsUnlocked();
+      const execution = executions.find((entry) => entry.id === executionId);
+      if (!execution) return undefined;
+      persistReconciledExecutions(executions, [execution]);
+      if (!plan) return execution;
 
-    const activeStep = plan.steps.find((step) => step.status === 'in_progress');
-    const allDone = plan.steps.length > 0 && plan.steps.every((step) => step.status === 'done');
-    return this.update(executionId, {
-      planId: plan.id,
-      nextStep: activeStep?.text ?? execution.nextStep,
-      status: execution.status,
-      blocker: execution.blocker,
-      lastAssistantSummary: execution.lastAssistantSummary,
-      ...(allDone && execution.status !== 'completed'
-        ? {
-            nextStep: 'Validate completion evidence for the finished plan.',
-            nextReviewAt: new Date().toISOString(),
-          }
-        : {}),
+      const activeStep = plan.steps.find((step) => step.status === 'in_progress');
+      const allDone = plan.steps.length > 0 && plan.steps.every((step) => step.status === 'done');
+      applyExecutionUpdate(execution, {
+        planId: plan.id,
+        nextStep: activeStep?.text ?? execution.nextStep,
+        status: execution.status,
+        blocker: execution.blocker,
+        lastAssistantSummary: execution.lastAssistantSummary,
+        ...(allDone && execution.status !== 'completed'
+          ? {
+              nextStep: 'Validate completion evidence for the finished plan.',
+              nextReviewAt: new Date().toISOString(),
+            }
+          : {}),
+      });
+      saveExecutionsUnlocked(executions);
+      return execution;
     });
   }
 }
@@ -684,35 +1281,37 @@ export class ExecutionStore {
  * dashboard reports phantom in-flight work. Returns the number swept.
  */
 export function sweepStaleExecutions(staleAfterMs = 60 * 60 * 1000): number {
-  const cutoff = Date.now() - staleAfterMs;
-  const executions = loadExecutions();
-  const now = new Date().toISOString();
-  let swept = 0;
-  for (const execution of executions) {
-    if (execution.status !== 'active' && execution.status !== 'blocked' && execution.status !== 'paused') continue;
-    const updated = Date.parse(execution.lastActivityAt || execution.updatedAt || execution.createdAt);
-    if (Number.isFinite(updated) && updated > cutoff) continue;
-    const note = `Auto-closed: no activity for ${Math.round(staleAfterMs / 60000)}m (stale-execution sweep).`;
-    execution.status = 'completed';
-    execution.updatedAt = now;
-    execution.lastActivityAt = now;
-    execution.blocker = note;
-    execution.lastAssistantSummary = execution.lastAssistantSummary
-      ? `${execution.lastAssistantSummary} | ${note}`
-      : note;
-    execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
-    execution.activity.push({
-      id: randomUUID(),
-      key: `sweep-${Date.now()}`,
-      type: 'status',
-      message: note,
-      createdAt: now,
-    });
-    execution.activity = execution.activity.slice(-60);
-    swept += 1;
-  }
-  if (swept > 0) saveExecutions(executions);
-  return swept;
+  return executionsFileLock(() => {
+    const cutoff = Date.now() - staleAfterMs;
+    const executions = loadExecutionsUnlocked();
+    const now = new Date().toISOString();
+    let swept = 0;
+    for (const execution of executions) {
+      if (execution.status !== 'active' && execution.status !== 'blocked' && execution.status !== 'paused') continue;
+      const updated = Date.parse(execution.lastActivityAt || execution.updatedAt || execution.createdAt);
+      if (Number.isFinite(updated) && updated > cutoff) continue;
+      const note = `Auto-closed: no activity for ${Math.round(staleAfterMs / 60000)}m (stale-execution sweep).`;
+      execution.status = 'completed';
+      execution.updatedAt = now;
+      execution.lastActivityAt = now;
+      execution.blocker = note;
+      execution.lastAssistantSummary = execution.lastAssistantSummary
+        ? `${execution.lastAssistantSummary} | ${note}`
+        : note;
+      execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+      execution.activity.push({
+        id: randomUUID(),
+        key: `sweep-${Date.now()}`,
+        type: 'status',
+        message: note,
+        createdAt: now,
+      });
+      execution.activity = execution.activity.slice(-60);
+      swept += 1;
+    }
+    if (swept > 0) saveExecutionsUnlocked(executions);
+    return swept;
+  });
 }
 
 export function renderExecutionSummary(execution: ExecutionRecord): string {
@@ -725,11 +1324,21 @@ export function renderExecutionSummary(execution: ExecutionRecord): string {
   return parts.join(' | ');
 }
 
+interface FailedExecutionTransitionNotice {
+  executionId: string;
+  title: string;
+  previousStatus: ExecutionRecord['status'];
+  reason: string;
+  activityKey: string;
+  createdAt: string;
+  userFacing: boolean;
+}
+
 function transitionToFailed(
   execution: ExecutionRecord,
   reason: string,
   activityKey: string,
-): ExecutionRecord {
+): FailedExecutionTransitionNotice {
   const now = new Date().toISOString();
   const previousStatus = execution.status;
   execution.status = 'completed'; // ExecutionRecord status doesn't have 'failed' — keep 'completed' semantically + use blocker for reason
@@ -749,31 +1358,40 @@ function transitionToFailed(
   });
   execution.activity = execution.activity.slice(-60);
 
-  // Tell the live rail this transition happened so the user sees it.
-  actionBus.emit({
-    kind: 'execution.transitioned',
+  return {
     executionId: execution.id,
     title: execution.title,
-    previousState: previousStatus,
+    previousStatus,
+    reason,
+    activityKey,
+    createdAt: now,
+    userFacing: isUserFacingExecution(execution),
+  };
+}
+
+/** Publish only after the failed transition is durable and the execution-file
+ * lock has been released. Synchronous listeners may safely write the store. */
+function publishFailedExecutionTransition(notice: FailedExecutionTransitionNotice): void {
+  actionBus.emit({
+    kind: 'execution.transitioned',
+    executionId: notice.executionId,
+    title: notice.title,
+    previousState: notice.previousStatus,
     nextState: 'completed',
-    summary: reason,
+    summary: notice.reason,
   });
 
-  // Surface a notification so the user finds out without staring at
-  // the dashboard. Skip noisy notifications for non-user-facing
-  // executions (background plumbing the user never asked about).
-  if (isUserFacingExecution(execution)) {
+  if (notice.userFacing) {
     addNotification({
-      id: `${Date.now()}-execution-${execution.id}-${activityKey}`,
+      id: `${Date.now()}-execution-${notice.executionId}-${notice.activityKey}`,
       kind: 'execution',
-      title: `Execution stopped: ${execution.title}`,
-      body: reason,
-      createdAt: now,
+      title: `Execution stopped: ${notice.title}`,
+      body: notice.reason,
+      createdAt: notice.createdAt,
       read: false,
-      metadata: { executionId: execution.id, sweepKey: activityKey },
+      metadata: { executionId: notice.executionId, sweepKey: notice.activityKey },
     });
   }
-  return execution;
 }
 
 /**
@@ -792,20 +1410,22 @@ function transitionToFailed(
  * fallback for those.
  */
 export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
-  const cutoff = Date.now() - staleAfterMs;
-  const executions = loadExecutions();
-  let swept = 0;
-  for (const execution of executions) {
-    if (execution.status !== 'active') continue;
-    if (!execution.lastHeartbeatAt) continue;
-    const heartbeatTime = Date.parse(execution.lastHeartbeatAt);
-    if (!Number.isFinite(heartbeatTime) || heartbeatTime > cutoff) continue;
-    const recordActivityTimes = [execution.lastActivityAt, execution.updatedAt]
-      .map((value) => Date.parse(value || ''))
-      .filter(Number.isFinite);
-    const recentRecordActivity = recordActivityTimes.length > 0 ? Math.max(...recordActivityTimes) : NaN;
-    if (Number.isFinite(recentRecordActivity) && recentRecordActivity > cutoff) continue;
-    if (hasRecentHarnessActivity(execution.sessionId, cutoff)) continue;
+  const notices: FailedExecutionTransitionNotice[] = [];
+  const swept = executionsFileLock(() => {
+    const cutoff = Date.now() - staleAfterMs;
+    const executions = loadExecutionsUnlocked();
+    let swept = 0;
+    for (const execution of executions) {
+      if (execution.status !== 'active') continue;
+      if (!execution.lastHeartbeatAt) continue;
+      const heartbeatTime = Date.parse(execution.lastHeartbeatAt);
+      if (!Number.isFinite(heartbeatTime) || heartbeatTime > cutoff) continue;
+      const recordActivityTimes = [execution.lastActivityAt, execution.updatedAt]
+        .map((value) => Date.parse(value || ''))
+        .filter(Number.isFinite);
+      const recentRecordActivity = recordActivityTimes.length > 0 ? Math.max(...recordActivityTimes) : NaN;
+      if (Number.isFinite(recentRecordActivity) && recentRecordActivity > cutoff) continue;
+      if (hasRecentHarnessActivity(execution.sessionId, cutoff)) continue;
     // v0.5.19 Bug F fix — pause-aware sweep. If the execution's session
     // is legitimately parked on a user prompt (pending approval, recent
     // awaiting_user_input event from F4/Bug C), the heartbeat going
@@ -816,9 +1436,9 @@ export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
     // Same architecture pattern as P0-2 (per-tool timeout during
     // approval wait, fixed v0.5.5 via withTimeout's isPaused check).
     // Honors CLEMMY_SWEEP_AWARE_OF_PAUSES=off to revert.
-    if (isExecutionLegitimatelyIdle(execution)) {
-      continue;
-    }
+      if (isExecutionLegitimatelyIdle(execution)) {
+        continue;
+      }
     // v0.5.64 — schedule-aware sweep. The controller schedules the NEXT review
     // up to 15-60 min out (controller.ts `nextReviewAt: plusMinutes(30/60)`),
     // and the heartbeat only ticks when an execution actually RUNS a cycle. So
@@ -831,13 +1451,13 @@ export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
     // stalled" (observed 2026-06-03: a send-emails execution scheduled
     // nextReviewAt=+30m, swept at +7m, so the send never ran).
     // Honors CLEMMY_SWEEP_HONOR_NEXT_REVIEW=off to revert.
-    if ((process.env.CLEMMY_SWEEP_HONOR_NEXT_REVIEW ?? 'on').toLowerCase() !== 'off' && execution.nextReviewAt) {
-      const nextReview = Date.parse(execution.nextReviewAt);
-      if (Number.isFinite(nextReview) && nextReview > Date.now()) continue;
-    }
-    const ageMinutes = Math.round((Date.now() - heartbeatTime) / 60000);
-    transitionToFailed(
-      execution,
+      if ((process.env.CLEMMY_SWEEP_HONOR_NEXT_REVIEW ?? 'on').toLowerCase() !== 'off' && execution.nextReviewAt) {
+        const nextReview = Date.parse(execution.nextReviewAt);
+        if (Number.isFinite(nextReview) && nextReview > Date.now()) continue;
+      }
+      const ageMinutes = Math.round((Date.now() - heartbeatTime) / 60000);
+      notices.push(transitionToFailed(
+        execution,
       // Honest framing: a stale heartbeat could be (a) the daemon
       // actually crashed, or (b) the daemon was alive but didn't tick
       // this execution's controller for too long (busy with a long
@@ -846,12 +1466,15 @@ export function sweepCrashedExecutions(staleAfterMs = 5 * 60 * 1000): number {
       // case (b) — sent users hunting for a crash that wasn't there.
       // Observed 2026-05-24 with a synthesis execution that starved
       // while the daemon was alive and processing Discord.
-      `Controller heartbeat stalled for ${ageMinutes}m — the execution stopped getting controller cycles (the daemon may have been busy on other work or restarted).`,
-      `sweep-crashed-${Date.now()}`,
-    );
-    swept += 1;
-  }
-  if (swept > 0) saveExecutions(executions);
+        `Controller heartbeat stalled for ${ageMinutes}m — the execution stopped getting controller cycles (the daemon may have been busy on other work or restarted).`,
+        `sweep-crashed-${Date.now()}`,
+      ));
+      swept += 1;
+    }
+    if (swept > 0) saveExecutionsUnlocked(executions);
+    return swept;
+  });
+  for (const notice of notices) publishFailedExecutionTransition(notice);
   return swept;
 }
 
@@ -926,21 +1549,26 @@ function hasRecentHarnessActivity(sessionId: string, cutoff: number): boolean {
  * CHANGED) so a stuck blocker actually times out. Default 6 hours.
  */
 export function sweepStaleBlockedExecutions(staleAfterMs = 6 * 60 * 60 * 1000): number {
-  const cutoff = Date.now() - staleAfterMs;
-  const executions = loadExecutions();
-  let swept = 0;
-  for (const execution of executions) {
-    if (execution.status !== 'blocked') continue;
-    const updated = Date.parse(execution.updatedAt || execution.createdAt);
-    if (!Number.isFinite(updated) || updated > cutoff) continue;
-    const ageHours = Math.round((Date.now() - updated) / 3600000);
-    transitionToFailed(
-      execution,
-      `Blocked for ${ageHours}h with no resolution — auto-failed; retry from the dashboard if still relevant.`,
-      `sweep-blocked-${Date.now()}`,
-    );
-    swept += 1;
-  }
-  if (swept > 0) saveExecutions(executions);
+  const notices: FailedExecutionTransitionNotice[] = [];
+  const swept = executionsFileLock(() => {
+    const cutoff = Date.now() - staleAfterMs;
+    const executions = loadExecutionsUnlocked();
+    let swept = 0;
+    for (const execution of executions) {
+      if (execution.status !== 'blocked') continue;
+      const updated = Date.parse(execution.updatedAt || execution.createdAt);
+      if (!Number.isFinite(updated) || updated > cutoff) continue;
+      const ageHours = Math.round((Date.now() - updated) / 3600000);
+      notices.push(transitionToFailed(
+        execution,
+        `Blocked for ${ageHours}h with no resolution — auto-failed; retry from the dashboard if still relevant.`,
+        `sweep-blocked-${Date.now()}`,
+      ));
+      swept += 1;
+    }
+    if (swept > 0) saveExecutionsUnlocked(executions);
+    return swept;
+  });
+  for (const notice of notices) publishFailedExecutionTransition(notice);
   return swept;
 }
