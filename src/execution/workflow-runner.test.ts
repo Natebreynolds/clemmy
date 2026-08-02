@@ -286,7 +286,6 @@ test('reserved project lineage never falls through a missing snapshot into a cat
     { compiledContractHash: '' },
     { projectBoundAt: null },
     { projectExecutionSettlement: null },
-    { workflowSlug: 'compiled-' },
   ]) {
     const rejected = resolveWorkflowDefinitionForRun({ ...base, ...marker } as never, poisonedCatalog);
     assert.equal(rejected.ok, false, JSON.stringify(marker));
@@ -309,6 +308,29 @@ test('reserved project lineage never falls through a missing snapshot into a cat
   assert.equal(genuineLegacy.ok, true);
   assert.equal(genuineLegacy.definitionSource, 'legacy_current');
   assert.equal(genuineLegacy.workflow?.data.steps[0]?.id, 'must_not_run');
+
+  const ordinaryCompiledPrefix = {
+    name: 'compiled-existing',
+    data: {
+      name: 'Compiled Existing',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [{ id: 'ordinary_step', prompt: 'Run this ordinary catalog workflow.' }],
+    },
+  };
+  const ordinarySnapshot = createWorkflowRunDefinitionSnapshot(
+    ordinaryCompiledPrefix.name,
+    ordinaryCompiledPrefix.data,
+    '2026-08-02T12:30:00.000Z',
+  );
+  const ordinaryResolved = resolveWorkflowDefinitionForRun({
+    workflow: ordinaryCompiledPrefix.data.name,
+    workflowSlug: ordinaryCompiledPrefix.name,
+    workflowDefinitionSnapshot: ordinarySnapshot,
+  } as never, [ordinaryCompiledPrefix] as never);
+  assert.equal(ordinaryResolved.ok, true);
+  assert.equal(ordinaryResolved.definitionSource, 'snapshot');
+  assert.equal(ordinaryResolved.workflow?.data.steps[0]?.id, 'ordinary_step');
 });
 
 test('run definition resolution fails closed when authored code changes after admission', () => {

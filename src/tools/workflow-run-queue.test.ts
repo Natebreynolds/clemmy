@@ -1581,7 +1581,7 @@ test('legacy requeue helpers refuse every reserved project marker before a same-
     { sourceExecutionId: 'exec-project-partial' },
     { compiledContractHash: 'corrupt-contract' },
     { triggerReceiptId: `project-turn:v1:${'b'.repeat(64)}` },
-    { workflowSlug: 'compiled-malformed-partial-lineage' },
+    { workflowSlug: `compiled-${'c'.repeat(32)}` },
     {
       workflowDefinitionSnapshot: {
         version: 2,

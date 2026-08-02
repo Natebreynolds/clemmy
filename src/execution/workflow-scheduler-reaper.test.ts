@@ -339,7 +339,7 @@ test('reaper fail-closes malformed project lineage even when the compiled snapsh
     { sourceExecutionId: 'exec-project-partial' },
     { compiledContractHash: 'corrupt-contract' },
     { triggerReceiptId: `project-turn:v1:${'a'.repeat(64)}` },
-    { workflowSlug: 'compiled-malformed-partial-lineage' },
+    { workflowSlug: `compiled-${'d'.repeat(32)}` },
     { projectBoundAt: OLD_FINISHED_AT },
     { projectExecutionSettlement: { version: 1 } },
   ];

@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import type { CompiledWorkflowRunDefinitionSnapshot } from './workflow-run-definition.js';
+import {
+  COMPILED_WORKFLOW_SLUG_RE,
+  type CompiledWorkflowRunDefinitionSnapshot,
+} from './workflow-run-definition.js';
 import type {
   WorkflowReportOutcome,
   WorkflowTerminalOutcome,
@@ -34,7 +37,11 @@ export function isReservedProjectWorkflowRunRecord(record: Record<string, unknow
     || record.sourceExecutionId !== undefined
     || record.compiledContractHash !== undefined
     || triggerReceiptId.startsWith('project-turn:')
-    || workflowSlug.startsWith('compiled-')
+    // Slug-only ownership is reserved only for the exact generated namespace.
+    // Ordinary catalog workflows have historically been allowed to use names
+    // such as `compiled-existing`; every stronger project marker above remains
+    // fail-closed even when its slug is missing or malformed.
+    || COMPILED_WORKFLOW_SLUG_RE.test(workflowSlug)
     || record.projectBoundAt !== undefined
     || record.projectExecutionSettlement !== undefined;
 }
