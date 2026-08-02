@@ -369,6 +369,217 @@ test('run definition resolution admits only a catalogless compiled project root'
   rmSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), { force: true });
 });
 
+test('compiled project winner drains its catalogless V2 model node once and reports back across a restart-style rescan', async () => {
+  const { compileProjectPlan } = await import('./project-compiler.js');
+  const { recordStepResult } = await import('../tools/step-result-tool.js');
+  const { getPlanScope } = await import('../agents/plan-scope.js');
+
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const sessionId = `sess-compiled-runner-e2e-${stamp}`;
+  const plan = {
+    planId: `compiled-runner-e2e-${stamp}`,
+    objective: 'Verify and summarize an already-sent message receipt.',
+    nodes: [{
+      id: 'verify_receipt',
+      executor: {
+        kind: 'model' as const,
+        instruction: 'Verify the supplied receipt and return the durable result.',
+        allowedTools: ['workflow_step_result'],
+      },
+      effect: 'read' as const,
+      maxTurns: 13,
+      evidence: {
+        type: 'object' as const,
+        requiredKeys: ['sent', 'messageId', 'summary'],
+        nonEmpty: ['messageId', 'summary'],
+      },
+    }],
+  };
+  const compiled = compileProjectPlan(plan);
+
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'chat',
+    channel: 'desktop',
+    title: 'Compiled project runner acceptance',
+  });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Verify the sent-message receipt as a durable project.',
+      displayText: 'Verify the sent-message receipt as a durable project.',
+      source: 'desktop',
+    },
+  });
+  const turnGraphHash = createHash('sha256')
+    .update(JSON.stringify({ sessionId, sourceUserSeq: source.seq, kind: 'turn_graph_v1' }))
+    .digest('hex');
+  const winner = new ExecutionStore().createOrGetForSource({
+    sessionId,
+    sourceUserSeq: source.seq,
+    title: 'Compiled project runner acceptance',
+    objective: plan.objective,
+    reason: 'Accepted as bounded durable project work.',
+    startedFromMessage: 'Verify the sent-message receipt as a durable project.',
+    confidence: 0.98,
+    reasons: ['durable execution acceptance'],
+    admission: {
+      turnGraphId: `turn-graph:v1:${source.seq}`,
+      turnGraphHash,
+      compiledPlan: {
+        version: 1,
+        compilerId: 'project_graph_v1',
+        planHash: compiled.planHash,
+        definitionHash: workflowDefinitionHash(compiled.definition),
+        plan,
+        definition: compiled.definition,
+        inputs: {},
+      },
+    },
+  });
+  assert.equal(winner.created, true);
+  assert.equal(winner.plannerConflict, false);
+
+  const queued = queueCompiledWorkflowRun({ sessionId, sourceUserSeq: source.seq });
+  if (queued.status !== 'queued' || !queued.id) {
+    assert.fail(`expected compiled run to queue, got ${queued.status}: ${queued.message}`);
+  }
+  const runId = queued.id;
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const admitted = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
+  assert.equal(admitted.workflowDefinitionSnapshot?.version, 2);
+  assert.equal(admitted.workflowDefinitionSnapshot?.scope, 'compiled');
+  assert.equal(admitted.workflowDefinitionSnapshot?.compilerId, 'project_graph_v1');
+  assert.equal(admitted.workflowDefinitionSnapshot?.definition?.steps?.[0]?.maxTurns, 13);
+  assert.deepEqual(
+    admitted.workflowDefinitionSnapshot?.definition?.steps?.[0]?.allowedTools,
+    ['workflow_step_result'],
+  );
+  assert.equal(
+    existsSync(path.join(WORKFLOWS_DIR, admitted.workflowSlug, 'SKILL.md')),
+    false,
+    'the catalogless run must not author a workflow skill',
+  );
+  assert.equal(
+    existsSync(path.join(WORKFLOWS_DIR, compiled.workflowName, 'SKILL.md')),
+    false,
+    'the compiler display identity must not be persisted as a catalog skill either',
+  );
+
+  let modelLoopCalls = 0;
+  let observedMaxTurns: number | undefined;
+  let observedPlanScopeTools: string[] | undefined;
+  let observedMcpScope: unknown = 'not-observed';
+  let observedAgentTools: string[] = [];
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    runConversation: (async (options: {
+      agent: { tools?: Array<{ name?: string }> };
+      sessionId: string;
+      maxTurns?: number;
+      mcpToolScope?: unknown;
+    }) => {
+      modelLoopCalls += 1;
+      observedMaxTurns = options.maxTurns;
+      observedPlanScopeTools = getPlanScope(options.sessionId)?.allowedTools;
+      observedMcpScope = options.mcpToolScope;
+      observedAgentTools = (options.agent.tools ?? [])
+        .map((tool) => tool.name ?? '')
+        .filter(Boolean)
+        .sort();
+      const receiptUrls = Array.from(
+        { length: 6 },
+        (_, index) => `https://example.test/receipt-${index}-${'a'.repeat(80)}`,
+      );
+      recordStepResult(options.sessionId, {
+        sent: true,
+        messageId: `receipt-${stamp}`,
+        // Keep this structured value below the workspace-offload threshold so
+        // the deterministic receipt proof remains visible to terminal checks,
+        // while its de-duplicated artifact line puts the human report above
+        // the optional voice-rewrite threshold. This acceptance stubs only the
+        // execution model loop and must not call an unrelated judge/tone model.
+        summary: `Receipt verified. ${receiptUrls.join(' ')} ${'x'.repeat(7_100)}`,
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          summary: 'Receipt verified.',
+          reply: 'Receipt verified.',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+
+  try {
+    await processWorkflowRuns({
+      respond: async () => { throw new Error('compiled model nodes must use the workflow harness'); },
+    } as never);
+
+    const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
+    assert.equal(modelLoopCalls, 1);
+    assert.equal(observedMaxTurns, 13, 'the compiled node budget reaches the real model loop');
+    assert.deepEqual(
+      observedPlanScopeTools,
+      ['workflow_step_result'],
+      'the compiler capability list becomes the exact runtime plan scope',
+    );
+    assert.equal(observedMcpScope, null, 'a local-only explicit lock attaches no external MCP surface');
+    assert.ok(observedAgentTools.includes('workflow_step_result'));
+    for (const forbidden of ['composio_execute_tool', 'run_shell_command', 'write_file', 'workflow_run']) {
+      assert.equal(observedAgentTools.includes(forbidden), false, `${forbidden} must be absent from the locked step agent`);
+    }
+    assert.equal(terminal.status, 'completed');
+    assert.equal(terminal.terminalOutcome, 'succeeded');
+    assert.equal(typeof terminal.finishedAt, 'string');
+    assert.equal(terminal.reportBack?.outcome, 'done');
+    assert.deepEqual(terminal.reportBack?.acknowledgedOriginSessionIds, [sessionId]);
+    assert.equal(typeof terminal.reportBackAcknowledgedAt, 'string');
+    assert.equal(
+      readWorkflowEvents(admitted.workflowSlug, runId)
+        .filter((event) => event.kind === 'step_completed' && event.stepId === 'verify_receipt').length,
+      1,
+    );
+    assert.equal(
+      listEvents(sessionId, { types: ['user_input_received'] })
+        .filter((event) => typeof event.data?.text === 'string'
+          && event.data.text.startsWith(`[workflow run ${runId} `)).length,
+      1,
+      'the terminal result reports back to the exact source session once',
+    );
+
+    // Restart-style durable rescan: the terminal run remains on disk, but a
+    // fresh drain pass must neither execute the node nor emit another report.
+    await processWorkflowRuns({
+      respond: async () => { throw new Error('terminal compiled run must not re-enter execution'); },
+    } as never);
+    assert.equal(modelLoopCalls, 1, 'a second durable drain does not repeat the model node');
+    assert.equal(
+      readWorkflowEvents(admitted.workflowSlug, runId)
+        .filter((event) => event.kind === 'step_completed' && event.stepId === 'verify_receipt').length,
+      1,
+    );
+    assert.equal(
+      listEvents(sessionId, { types: ['user_input_received'] })
+        .filter((event) => typeof event.data?.text === 'string'
+          && event.data.text.startsWith(`[workflow run ${runId} `)).length,
+      1,
+      'restart-style report-back remains idempotent',
+    );
+    assert.equal(existsSync(path.join(WORKFLOWS_DIR, admitted.workflowSlug, 'SKILL.md')), false);
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+  }
+});
+
 test('SIGKILL after terminal publication cannot leave status without its exact report envelope', async () => {
   const runId = `terminal-envelope-crash-${Date.now()}`;
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
