@@ -264,11 +264,27 @@ test('isMutatingExternalWrite: unknown external actions fail closed on every ext
 
 // ─── isMutatingExternalWrite — exempt slug patterns ──────────────
 
-test('isMutatingExternalWrite: DATAFORSEO_CREATE_SERP_TASK_POST is exempt (task creation, not user data)', () => {
-  assert.equal(
-    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST' }),
-    false,
-  );
+test('isMutatingExternalWrite: structural DataForSEO research jobs and polls are reads on every carrier', () => {
+  for (const toolSlug of [
+    'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST',
+    'DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID',
+    'DATAFORSEO_SERP_GOOGLE_ORGANIC_TASKS_READY',
+    'DATAFORSEO_LABS_GOOGLE_KEYWORDS_FOR_SITE',
+    'DATAFORSEO_BACKLINKS_SUMMARY_LIVE',
+  ]) {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: toolSlug }),
+      false,
+      toolSlug,
+    );
+  }
+  for (const toolName of [
+    'cx_dataforseo_serp_google_organic_live_advanced',
+    'mcp__dataforseo__DATAFORSEO_LABS_GOOGLE_KEYWORDS_FOR_SITE',
+    'mcp__dataforseo__DATAFORSEO_BACKLINKS_SUMMARY_LIVE',
+  ]) {
+    assert.equal(isMutatingExternalWrite(toolName, {}), false, toolName);
+  }
 });
 
 test('isMutatingExternalWrite: FIRECRAWL_SCRAPE is exempt (external read, not mutation)', () => {
@@ -289,6 +305,12 @@ test('isMutatingExternalWrite: explicit mutations cannot borrow a provider read-
   for (const toolSlug of [
     'DATAFORSEO_DELETE_ACCOUNT',
     'DATAFORSEO_PUBLISH_REPORT',
+    'DATAFORSEO_SET_CREDENTIALS',
+    'DATAFORSEO_ENABLE_WEBHOOK',
+    'DATAFORSEO_ARCHIVE_REPORT',
+    'DATAFORSEO_SERP_SET_WEBHOOK',
+    'DATAFORSEO_ACCOUNT_SNAPSHOT',
+    'DATAFORSEO_ACCOUNT_SERP_SNAPSHOT',
     'FIRECRAWL_SCRAPE_AND_PUBLISH',
     'FIRECRAWL_CRAWL_AND_DELETE',
   ]) {
@@ -301,6 +323,9 @@ test('isMutatingExternalWrite: explicit mutations cannot borrow a provider read-
   for (const toolName of [
     'mcp__dataforseo__delete_account',
     'mcp__dataforseo__publish_report',
+    'mcp__dataforseo__set_credentials',
+    'mcp__dataforseo__enable_webhook',
+    'mcp__dataforseo__archive_report',
     'mcp__firecrawl__scrape_and_publish',
     'mcp__firecrawl__crawl_and_delete',
   ]) {

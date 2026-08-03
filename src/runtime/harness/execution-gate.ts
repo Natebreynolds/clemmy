@@ -33,6 +33,7 @@
 
 import {
   composioSlugIsReadOnly,
+  dataForSeoResearchActionIsReadOnly,
   isReadOnlyCallAction,
 } from '../../integrations/composio/slug-effect.js';
 
@@ -102,14 +103,11 @@ function providerReadJobIsExempt(
   mutationParts: readonly string[],
 ): boolean {
   if (DATAFORSEO_READ_JOB_FAMILY.test(normalizedAction)) {
-    // DataForSEO's synchronous research endpoints are reads. Its TASK_POST
-    // endpoints enqueue the same research job, so CREATE/POST are transport
-    // vocabulary there rather than user-data mutations. No other affirmative
-    // mutation may borrow that exemption.
-    if (mutationParts.length === 0) return true;
-    const taskPost = /(?:^|_)TASKS?_POST$/.test(normalizedAction);
-    return taskPost
-      && mutationParts.every((part) => part === 'CREATE' || part === 'POST');
+    // The shared provider classifier recognizes only structural SERP/LABS/
+    // BACKLINKS research shapes and their terminal TASK_POST transport. It owns
+    // the complete write vocabulary, so SET/ENABLE/ARCHIVE and future unfamiliar
+    // DataForSEO actions cannot exploit this gate's smaller legacy verb set.
+    return dataForSeoResearchActionIsReadOnly(normalizedAction);
   }
 
   if (FIRECRAWL_READ_JOB_FAMILY.test(normalizedAction)) {

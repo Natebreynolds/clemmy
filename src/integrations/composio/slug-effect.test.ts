@@ -6,6 +6,10 @@ test('provider-side research jobs remain reads', () => {
   for (const slug of [
     'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST',
     'DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID',
+    'DATAFORSEO_SERP_GOOGLE_ORGANIC_TASKS_READY',
+    'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED',
+    'DATAFORSEO_LABS_GOOGLE_KEYWORDS_FOR_SITE',
+    'DATAFORSEO_BACKLINKS_SUMMARY_LIVE',
     'FIRECRAWL_SCRAPE',
     'FIRECRAWL_BATCH_SCRAPE',
     'FIRECRAWL_SEARCH_WEB',
@@ -13,6 +17,22 @@ test('provider-side research jobs remain reads', () => {
   ]) {
     assert.equal(classifyComposioSlugEffect(slug), 'read', slug);
   }
+});
+
+test('DataForSEO family membership never exempts mutations or unfamiliar actions', () => {
+  for (const slug of [
+    'DATAFORSEO_SET_CREDENTIALS',
+    'DATAFORSEO_ENABLE_WEBHOOK',
+    'DATAFORSEO_ARCHIVE_REPORT',
+    'DATAFORSEO_SERP_SET_WEBHOOK',
+  ]) {
+    assert.equal(composioSlugEffectEvidence(slug), 'write', slug);
+    assert.equal(classifyComposioSlugEffect(slug), 'external_write', slug);
+  }
+  assert.equal(composioSlugEffectEvidence('DATAFORSEO_ACCOUNT_SNAPSHOT'), 'unknown');
+  assert.equal(classifyComposioSlugEffect('DATAFORSEO_ACCOUNT_SNAPSHOT'), 'external_write');
+  assert.equal(composioSlugEffectEvidence('DATAFORSEO_ACCOUNT_SERP_SNAPSHOT'), 'unknown');
+  assert.equal(classifyComposioSlugEffect('DATAFORSEO_ACCOUNT_SERP_SNAPSHOT'), 'external_write');
 });
 
 test('evidence grade: pure noun endpoints are unknown; verb slugs are affirmative', () => {

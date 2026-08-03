@@ -41,6 +41,42 @@ function actionTokens(value: string): string[] {
     .filter(Boolean);
 }
 
+const DATAFORSEO_RESEARCH_NAMESPACES: ReadonlySet<string> = new Set([
+  'SERP',
+  'LABS',
+  'BACKLINK',
+  'BACKLINKS',
+]);
+
+/** DataForSEO exposes research through both synchronous reads and provider-side
+ * TASK_POST jobs. Exempt only those structural research namespaces: the old
+ * `DATAFORSEO_*` blanket let unfamiliar mutations such as SET_CREDENTIALS and
+ * ENABLE_WEBHOOK bypass every external-write boundary. CREATE/POST are read-job
+ * transport vocabulary only for a terminal TASK(S)_POST shape; every other
+ * affirmative write token wins. */
+export function dataForSeoResearchActionIsReadOnly(slug: string | null | undefined): boolean {
+  const upper = String(slug ?? '')
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toUpperCase();
+  if (!/^DATAFORSEO_(?:DATAFORSEO_)?/.test(upper)) return false;
+  const tokens = actionTokens(upper);
+  while (tokens[0] === 'DATAFORSEO') tokens.shift();
+  const namespaceIndex = tokens.findIndex((token) => DATAFORSEO_RESEARCH_NAMESPACES.has(token));
+  const structurallyResearch = namespaceIndex === 0
+    || (
+      namespaceIndex === 1
+      && (READ_ACTIONS.has(tokens[0] ?? '') || tokens[0] === 'CREATE')
+    );
+  if (!structurallyResearch) return false;
+
+  const writeTokens = tokens.filter((token) => WRITE_ACTIONS.has(token));
+  if (writeTokens.length === 0) return true;
+  const taskPost = tokens.at(-1) === 'POST'
+    && tokens.some((token) => token === 'TASK' || token === 'TASKS');
+  return taskPost && writeTokens.every((token) => token === 'CREATE' || token === 'POST');
+}
+
 /** `CALL` is ambiguous: it can be the action (place a call) or the object being
  * read (`GONG_GET_CALL_TRANSCRIPT`). A concrete read verb wins only when CALL
  * is the sole write-shaped token. Mixed actions such as FIND_OR_CREATE_CALL
@@ -92,14 +128,14 @@ export function composioSlugEffectEvidence(slug: string | null | undefined): Com
   const upper = String(slug ?? '').trim().toUpperCase();
   if (!upper) return 'unknown';
 
-  if (
-    upper.startsWith('DATAFORSEO_')
-    || /^FIRECRAWL_(BATCH_)?(?:SCRAPE|MAP|SEARCH|CRAWL)(?:_|$)/.test(upper)
-  ) {
+  if (dataForSeoResearchActionIsReadOnly(upper)) {
     return 'read';
   }
 
   const tokens = actionTokens(upper);
+  if (/^FIRECRAWL_(BATCH_)?(?:SCRAPE|MAP|SEARCH|CRAWL)(?:_|$)/.test(upper)) {
+    return 'read';
+  }
   // EPHEMERAL COMPUTE (live 2026-07-24): "CREATE" + a compute noun creates no
   // durable external state — OPENAI_CREATE_CHAT_COMPLETION produces a model
   // RESPONSE, not a record. Treating it as a write dragged the execution-wrap
