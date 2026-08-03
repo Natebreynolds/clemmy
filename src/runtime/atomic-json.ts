@@ -30,15 +30,18 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
-  statSync,
   unlinkSync,
+  writeFileSync,
   writeSync,
 } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BoundaryError } from './boundary-error.js';
@@ -52,29 +55,91 @@ import { BoundaryError } from './boundary-error.js';
  */
 const inProcessLocks = new Map<string, Promise<void>>();
 
+interface HeldFileLockScope {
+  filePath: string;
+  active: boolean;
+  parent?: HeldFileLockScope;
+}
+
+const heldFileLocks = new AsyncLocalStorage<HeldFileLockScope>();
+
 async function acquireInProcessLock(key: string): Promise<() => void> {
   const previous = inProcessLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  inProcessLocks.set(key, previous.then(() => current));
+  const tail = previous.then(() => current);
+  inProcessLocks.set(key, tail);
   await previous;
   return () => {
     release();
     // Best-effort cleanup so the Map doesn't grow unbounded across
     // long-lived processes that touch many different files.
-    if (inProcessLocks.get(key) === previous.then(() => current)) {
+    if (inProcessLocks.get(key) === tail) {
       inProcessLocks.delete(key);
     }
   };
 }
 
+function assertFileLockIsNotReentrant(filePath: string): void {
+  let scope = heldFileLocks.getStore();
+  while (scope) {
+    if (scope.active && scope.filePath === filePath) break;
+    scope = scope.parent;
+  }
+  if (!scope) return;
+  throw new BoundaryError({
+    kind: 'state.write_failed',
+    retryable: false,
+    userMessage: `Couldn't safely re-enter the write lock on ${path.basename(filePath)}.`,
+    operatorMessage: `file lock is not re-entrant: ${filePath}`,
+    context: { filePath, reason: 'non_reentrant_lock' },
+  });
+}
+
+async function runWithHeldFileLockAsync<T>(
+  filePath: string,
+  work: () => Promise<T> | T,
+): Promise<T> {
+  const scope: HeldFileLockScope = {
+    filePath,
+    active: true,
+    parent: heldFileLocks.getStore(),
+  };
+  return heldFileLocks.run(scope, async () => {
+    try {
+      return await work();
+    } finally {
+      // Detached async descendants retain this scope object. Marking it
+      // inactive prevents a callback that runs after release from being
+      // mistaken for recursive ownership.
+      scope.active = false;
+    }
+  });
+}
+
+function runWithHeldFileLockSync<T>(filePath: string, work: () => T): T {
+  const scope: HeldFileLockScope = {
+    filePath,
+    active: true,
+    parent: heldFileLocks.getStore(),
+  };
+  return heldFileLocks.run(scope, () => {
+    try {
+      return work();
+    } finally {
+      scope.active = false;
+    }
+  });
+}
+
 /**
- * Cross-process advisory lock via a `<path>.lock` file holding the
- * owner PID + ctime. Other processes see the file and back off; if
- * the holder's PID is dead OR the lock is older than `STALE_LOCK_MS`,
- * the next acquire steals it (the previous owner crashed).
+ * Cross-process advisory lock via a `<path>.lock` file holding a unique owner
+ * lease (`pid:startedAt:token`). Other processes see the file and back off. A
+ * valid live PID is never evicted merely because the lease is old: a slow
+ * durable write is preferable to split-brain writers. Dead owners are reaped;
+ * malformed legacy lock files are reaped only after `STALE_LOCK_MS`.
  *
  * This is advisory — nothing prevents a misbehaving process from
  * writing the file directly. The daemon and CLI both go through this
@@ -84,8 +149,83 @@ const STALE_LOCK_MS = 60_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_MAX_WAIT_MS = 10_000;
 
+interface FileGeneration {
+  dev: bigint;
+  ino: bigint;
+}
+
+interface FileLockLease extends FileGeneration {
+  ownerToken: string;
+}
+
+interface FileLockSnapshot extends FileLockLease {
+  ctimeMs: number;
+}
+
+interface FileLockDeletionGuard extends FileLockLease {
+  path: string;
+  ticket: number;
+}
+
+interface DeletionGuardMarker {
+  path: string;
+  ownerToken: string;
+  ownerPid: number;
+  ticket?: number;
+}
+
 function lockFilePath(filePath: string): string {
   return `${filePath}.lock`;
+}
+
+function sameFileGeneration(
+  left: FileGeneration,
+  right: FileGeneration | null,
+): boolean {
+  return right !== null && left.dev === right.dev && left.ino === right.ino;
+}
+
+function readFileLockSnapshot(lockPath: string): FileLockSnapshot | null {
+  let fd: number | undefined;
+  try {
+    fd = openSync(lockPath, 'r');
+    const stat = fstatSync(fd, { bigint: true });
+    if (!stat.isFile()) return null;
+    return {
+      ownerToken: readFileSync(fd, 'utf-8'),
+      dev: stat.dev,
+      ino: stat.ino,
+      ctimeMs: Number(stat.ctimeMs),
+    };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+const UUID_TOKEN_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+const OWNER_TOKEN_PATTERN = new RegExp(`^([1-9]\\d*):([1-9]\\d*)(?::(${UUID_TOKEN_PATTERN}))?$`, 'i');
+
+function createOwnerToken(): string {
+  return `${process.pid}:${Date.now()}:${randomUUID()}`;
+}
+
+function lockOwnerPid(ownerToken: string): number | null {
+  // Accept the exact historic `pid:startedAt` lease and the current
+  // `pid:startedAt:uuid` lease. Prefix parsing is unsafe: e.g. `1garbage`
+  // otherwise becomes a forever-live PID 1 lock instead of malformed state.
+  const match = OWNER_TOKEN_PATTERN.exec(ownerToken);
+  if (!match) return null;
+  const pid = Number(match[1]);
+  const startedAt = Number(match[2]);
+  return Number.isSafeInteger(pid)
+    && pid > 0
+    && Number.isSafeInteger(startedAt)
+    && startedAt > 0
+    ? pid
+    : null;
 }
 
 function isPidAlive(pid: number): boolean {
@@ -99,60 +239,320 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-function tryAcquireFileLock(filePath: string): boolean {
-  const lockPath = lockFilePath(filePath);
-  const ownerToken = `${process.pid}:${Date.now()}`;
+function lockSnapshotIsStale(snapshot: FileLockSnapshot): boolean {
+  const ownerPid = lockOwnerPid(snapshot.ownerToken);
+  if (ownerPid !== null) return !isPidAlive(ownerPid);
+  return Date.now() - snapshot.ctimeMs > STALE_LOCK_MS;
+}
+
+/** Deterministic cross-process seam for the stale-observation/reclaim race. */
+function waitAfterStaleLockObservationForTest(): void {
+  const marker = process.env.CLEMENTINE_TEST_FILE_LOCK_STALE_OBSERVED_MARKER;
+  if (!marker) return;
+  const markerFd = openSync(marker, 'w');
+  try { writeSync(markerFd, `${process.pid}\n`); } finally { closeSync(markerFd); }
+  const release = process.env.CLEMENTINE_TEST_FILE_LOCK_STALE_OBSERVED_RELEASE;
+  if (!release) return;
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  while (!existsSync(release)) Atomics.wait(wait, 0, 0, 10);
+}
+
+/** Deterministic seam at the decisive check-to-unlink boundary. */
+function waitAfterDeletionGuardValidationForTest(): void {
+  const marker = process.env.CLEMENTINE_TEST_FILE_LOCK_DELETE_VALIDATED_MARKER;
+  if (!marker) return;
+  const markerFd = openSync(marker, 'w');
+  try { writeSync(markerFd, `${process.pid}\n`); } finally { closeSync(markerFd); }
+  const release = process.env.CLEMENTINE_TEST_FILE_LOCK_DELETE_VALIDATED_RELEASE;
+  if (!release) return;
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  while (!existsSync(release)) Atomics.wait(wait, 0, 0, 10);
+}
+
+function deletionGuardStillOwned(guard: FileLockDeletionGuard): boolean {
+  const current = readFileLockSnapshot(guard.path);
+  return current !== null
+    && current.ownerToken === guard.ownerToken
+    && sameFileGeneration(guard, current);
+}
+
+function deletionGuardOwnerParts(ownerToken: string): {
+  pid: number;
+  startedAt: number;
+  token: string;
+} {
+  const match = OWNER_TOKEN_PATTERN.exec(ownerToken);
+  if (!match?.[3]) throw new Error('Internal error: deletion guard owner token is malformed.');
+  return { pid: Number(match[1]), startedAt: Number(match[2]), token: match[3] };
+}
+
+function deletionGuardPrefixes(lockPath: string): { choose: string; ticket: string } {
+  const basename = path.basename(lockPath);
+  return {
+    choose: `${basename}.reclaim-choose.`,
+    ticket: `${basename}.reclaim-ticket.`,
+  };
+}
+
+function parseDeletionGuardMarker(
+  directory: string,
+  name: string,
+  prefixes: { choose: string; ticket: string },
+): DeletionGuardMarker | null {
+  let ticket: number | undefined;
+  let ownerText: string;
+  if (name.startsWith(prefixes.choose)) {
+    ownerText = name.slice(prefixes.choose.length);
+  } else if (name.startsWith(prefixes.ticket)) {
+    const rest = name.slice(prefixes.ticket.length);
+    const dot = rest.indexOf('.');
+    if (dot <= 0) return null;
+    ticket = Number(rest.slice(0, dot));
+    if (!Number.isSafeInteger(ticket) || ticket <= 0) return null;
+    ownerText = rest.slice(dot + 1);
+  } else {
+    return null;
+  }
+
+  const ownerMatch = new RegExp(`^([1-9]\\d*)\\.([1-9]\\d*)\\.(${UUID_TOKEN_PATTERN})$`, 'i')
+    .exec(ownerText);
+  if (!ownerMatch) return null;
+  const ownerPid = Number(ownerMatch[1]);
+  const startedAt = Number(ownerMatch[2]);
+  if (!Number.isSafeInteger(ownerPid) || !Number.isSafeInteger(startedAt)) return null;
+  return {
+    path: path.join(directory, name),
+    ownerToken: `${ownerPid}:${startedAt}:${ownerMatch[3]}`,
+    ownerPid,
+    ...(ticket === undefined ? {} : { ticket }),
+  };
+}
+
+function listDeletionGuardMarkers(lockPath: string): DeletionGuardMarker[] {
+  const directory = path.dirname(lockPath);
+  const prefixes = deletionGuardPrefixes(lockPath);
+  let names: string[];
   try {
-    // 'wx' fails if the file already exists — atomic create.
-    const fd = openSync(lockPath, 'wx');
-    try {
-      writeSync(fd, ownerToken);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    return true;
+    names = readdirSync(directory);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-    // Existing lock — check whether it's stale.
-    try {
-      const existing = readFileSync(lockPath, 'utf-8');
-      const [pidStr] = existing.split(':');
-      const ownerPid = Number.parseInt(pidStr ?? '', 10);
-      const lockStat = statSync(lockPath);
-      const age = Date.now() - lockStat.ctimeMs;
-      const ownerDead = Number.isFinite(ownerPid) && !isPidAlive(ownerPid);
-      if (ownerDead || age > STALE_LOCK_MS) {
-        // Steal the stale lock. The race between unlink+open is
-        // tolerated — if another process steals first, this open
-        // returns EEXIST again and we retry from the top.
-        try {
-          unlinkSync(lockPath);
-        } catch {
-          /* lock vanished between stat and unlink — fine */
-        }
-        return tryAcquireFileLock(filePath);
-      }
-    } catch {
-      /* lock file disappeared between EEXIST and stat — retry */
-    }
-    return false;
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+  return names.flatMap((name) => {
+    const marker = parseDeletionGuardMarker(directory, name, prefixes);
+    return marker ? [marker] : [];
+  });
+}
+
+function createDeletionGuardMarker(markerPath: string, ownerToken: string): FileLockLease {
+  let fd: number | undefined;
+  try {
+    fd = openSync(markerPath, 'wx', 0o600);
+    writeFileSync(fd, ownerToken, 'utf-8');
+    const stat = fstatSync(fd, { bigint: true });
+    return { ownerToken, dev: stat.dev, ino: stat.ino };
+  } catch (err) {
+    // The marker name carries an unguessable UUID and is never reused. Cleaning
+    // our own failed create cannot erase another contender's generation.
+    try { unlinkSync(markerPath); } catch { /* best effort */ }
+    throw err;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
-function releaseFileLock(filePath: string): void {
+function removeUniqueDeletionGuardMarker(markerPath: string): void {
+  try { unlinkSync(markerPath); } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+}
+
+/**
+ * Lamport bakery ticket for canonical lock deletion. Every marker pathname is
+ * immutable and UUID-scoped, so dead contenders can be ignored/cleaned without
+ * ever unlinking a newer owner's pathname. A live chooser or lower ticket is
+ * never evicted by age. This avoids both the check-then-unlink race of a fixed
+ * `.reclaim` file and filesystem hard-link requirements.
+ */
+function tryAcquireDeletionGuard(lockPath: string): FileLockDeletionGuard | null {
+  const ownerToken = createOwnerToken();
+  const owner = deletionGuardOwnerParts(ownerToken);
+  const prefixes = deletionGuardPrefixes(lockPath);
+  const directory = path.dirname(lockPath);
+  const ownerName = `${owner.pid}.${owner.startedAt}.${owner.token}`;
+  const choosingPath = path.join(directory, `${prefixes.choose}${ownerName}`);
+  createDeletionGuardMarker(choosingPath, ownerToken);
+
+  let guard: FileLockDeletionGuard | null = null;
   try {
-    unlinkSync(lockFilePath(filePath));
+    const existingTickets = listDeletionGuardMarkers(lockPath)
+      .filter((marker) => marker.ticket !== undefined && isPidAlive(marker.ownerPid));
+    const maxTicket = existingTickets.reduce(
+      (max, marker) => Math.max(max, marker.ticket ?? 0),
+      0,
+    );
+    if (maxTicket >= Number.MAX_SAFE_INTEGER) {
+      throw new Error(`Deletion guard ticket space exhausted for ${lockPath}`);
+    }
+    const ticket = maxTicket + 1;
+    const ticketPath = path.join(directory, `${prefixes.ticket}${ticket}.${ownerName}`);
+    const lease = createDeletionGuardMarker(ticketPath, ownerToken);
+    guard = { path: ticketPath, ticket, ...lease };
+    removeUniqueDeletionGuardMarker(choosingPath);
+
+    const markers = listDeletionGuardMarkers(lockPath);
+    let blocked = false;
+    for (const marker of markers) {
+      const live = isPidAlive(marker.ownerPid);
+      if (!live) {
+        // UUID-scoped names are never reused, so dead-marker cleanup has no
+        // stale-observer-versus-replacement pathname race.
+        try { removeUniqueDeletionGuardMarker(marker.path); } catch { /* hygiene only */ }
+        continue;
+      }
+      if (marker.ticket === undefined) {
+        blocked = true;
+        continue;
+      }
+      if (
+        marker.path !== guard.path
+        && (marker.ticket < guard.ticket
+          || (marker.ticket === guard.ticket && marker.ownerToken < guard.ownerToken))
+      ) blocked = true;
+    }
+    if (blocked || !deletionGuardStillOwned(guard)) {
+      releaseDeletionGuard(guard);
+      guard = null;
+      return null;
+    }
+    return guard;
+  } catch (err) {
+    if (guard) {
+      try { releaseDeletionGuard(guard); } catch { /* preserve acquisition error */ }
+    }
+    throw err;
+  } finally {
+    try { removeUniqueDeletionGuardMarker(choosingPath); } catch { /* own unique marker */ }
+  }
+}
+
+function releaseDeletionGuard(guard: FileLockDeletionGuard): void {
+  // A compliant contender never revokes this live PID's guard. Token + inode
+  // still prevent a late finally block from deleting a replacement pathname.
+  if (!deletionGuardStillOwned(guard)) return;
+  removeUniqueDeletionGuardMarker(guard.path);
+}
+
+function tryReapStaleFileLock(
+  lockPath: string,
+  observed: FileLockSnapshot,
+): void {
+  const guard = tryAcquireDeletionGuard(lockPath);
+  if (!guard) return;
+  try {
+    const current = readFileLockSnapshot(lockPath);
+    const currentOwnerPid = current ? lockOwnerPid(current.ownerToken) : null;
+    const currentIsStillStale = current
+      ? (currentOwnerPid !== null
+          ? !isPidAlive(currentOwnerPid)
+          : Date.now() - observed.ctimeMs > STALE_LOCK_MS)
+      : false;
+    if (
+      !current
+      || current.ownerToken !== observed.ownerToken
+      || !sameFileGeneration(observed, current)
+      || !currentIsStillStale
+      || !deletionGuardStillOwned(guard)
+    ) return;
+    waitAfterDeletionGuardValidationForTest();
+    unlinkSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  } finally {
+    releaseDeletionGuard(guard);
+  }
+}
+
+function tryAcquireFileLock(filePath: string): FileLockLease | null {
+  const lockPath = lockFilePath(filePath);
+  const ownerToken = createOwnerToken();
+  let fd: number | undefined;
+  try {
+    // 'wx' fails if the file already exists — atomic create.
+    fd = openSync(lockPath, 'wx');
+    writeFileSync(fd, ownerToken, 'utf-8');
+    fsyncSync(fd);
+    const stat = fstatSync(fd, { bigint: true });
+    return { ownerToken, dev: stat.dev, ino: stat.ino };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    const observed = readFileLockSnapshot(lockPath);
+    if (observed && lockSnapshotIsStale(observed)) {
+      waitAfterStaleLockObservationForTest();
+      tryReapStaleFileLock(lockPath, observed);
+    }
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function releaseFileLockOwned(filePath: string, lease: FileLockLease): void {
+  const lockPath = lockFilePath(filePath);
+  const deadline = Date.now() + LOCK_MAX_WAIT_MS;
+  while (true) {
+    const current = readFileLockSnapshot(lockPath);
+    if (
+      !current
+      || current.ownerToken !== lease.ownerToken
+      || !sameFileGeneration(lease, current)
+    ) return;
+
+    const guard = tryAcquireDeletionGuard(lockPath);
+    if (!guard) {
+      if (Date.now() >= deadline) return;
+      sleepSync(LOCK_RETRY_MS);
+      continue;
+    }
+    try {
+      const guarded = readFileLockSnapshot(lockPath);
+      if (
+        guarded
+        && guarded.ownerToken === lease.ownerToken
+        && sameFileGeneration(lease, guarded)
+        && deletionGuardStillOwned(guard)
+      ) {
+        waitAfterDeletionGuardValidationForTest();
+        unlinkSync(lockPath);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    } finally {
+      releaseDeletionGuard(guard);
+    }
+    return;
+  }
+}
+
+function releaseFileLock(filePath: string, lease: FileLockLease): void {
+  try {
+    releaseFileLockOwned(filePath, lease);
   } catch {
-    /* lock already gone — fine */
+    // The critical section may already have durably committed. Reporting that
+    // operation as failed solely because post-commit lock cleanup hit an
+    // unsupported/transient filesystem operation invites a duplicate retry.
+    // Leave the canonical lease in place (fail closed); a process restart makes
+    // its PID stale and the normal generation-safe reaper can recover it.
   }
 }
 
 export async function withFileLock<T>(filePath: string, work: () => Promise<T> | T): Promise<T> {
+  assertFileLockIsNotReentrant(filePath);
   const inProcessRelease = await acquireInProcessLock(filePath);
   const startedAt = Date.now();
   try {
-    while (!tryAcquireFileLock(filePath)) {
+    let lease = tryAcquireFileLock(filePath);
+    while (!lease) {
       if (Date.now() - startedAt > LOCK_MAX_WAIT_MS) {
         throw new BoundaryError({
           kind: 'state.write_failed',
@@ -163,11 +563,12 @@ export async function withFileLock<T>(filePath: string, work: () => Promise<T> |
         });
       }
       await new Promise<void>((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+      lease = tryAcquireFileLock(filePath);
     }
     try {
-      return await work();
+      return await runWithHeldFileLockAsync(filePath, work);
     } finally {
-      releaseFileLock(filePath);
+      releaseFileLock(filePath, lease);
     }
   } finally {
     inProcessRelease();
@@ -198,16 +599,17 @@ const SYNC_LOCK_MAX_WAIT_MS = 2_000;
  * never block a hot turn on a stuck lock.
  */
 export function withFileLockSync<T>(filePath: string, work: () => T): T {
+  assertFileLockIsNotReentrant(filePath);
   const startedAt = Date.now();
-  let locked = tryAcquireFileLock(filePath);
-  while (!locked && Date.now() - startedAt < SYNC_LOCK_MAX_WAIT_MS) {
+  let lease = tryAcquireFileLock(filePath);
+  while (!lease && Date.now() - startedAt < SYNC_LOCK_MAX_WAIT_MS) {
     sleepSync(LOCK_RETRY_MS);
-    locked = tryAcquireFileLock(filePath);
+    lease = tryAcquireFileLock(filePath);
   }
   try {
-    return work();
+    return runWithHeldFileLockSync(filePath, work);
   } finally {
-    if (locked) releaseFileLock(filePath);
+    if (lease) releaseFileLock(filePath, lease);
   }
 }
 
@@ -217,9 +619,10 @@ export function withFileLockSync<T>(filePath: string, work: () => T): T {
  * a timeout is surfaced so callers can retry without risking a lost update.
  */
 export function withFileLockSyncStrict<T>(filePath: string, work: () => T): T {
+  assertFileLockIsNotReentrant(filePath);
   const startedAt = Date.now();
-  let locked = tryAcquireFileLock(filePath);
-  while (!locked) {
+  let lease = tryAcquireFileLock(filePath);
+  while (!lease) {
     if (Date.now() - startedAt > LOCK_MAX_WAIT_MS) {
       throw new BoundaryError({
         kind: 'state.write_failed',
@@ -230,12 +633,12 @@ export function withFileLockSyncStrict<T>(filePath: string, work: () => T): T {
       });
     }
     sleepSync(LOCK_RETRY_MS);
-    locked = tryAcquireFileLock(filePath);
+    lease = tryAcquireFileLock(filePath);
   }
   try {
-    return work();
+    return runWithHeldFileLockSync(filePath, work);
   } finally {
-    releaseFileLock(filePath);
+    releaseFileLock(filePath, lease);
   }
 }
 
