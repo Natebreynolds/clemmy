@@ -72,8 +72,17 @@ test('rows deep-link to the exact trace identity when one exists', () => {
   })]);
   assert.equal(
     liveAgentTarget(row),
-    '/tasks?select=session+1&attemptId=attempt%3A1&runScopeId=scope%3A1',
+    '/tasks?select=run-1&attemptId=attempt%3A1&runScopeId=scope%3A1',
   );
+});
+
+test('rows sharing a reusable session still target their own unique board cards', () => {
+  const rows = liveAgentRows([
+    card({ id: 'exec-new', sessionId: 'shared-session', ageMs: 1_000 }),
+    card({ id: 'exec-old', sessionId: 'shared-session', ageMs: 60_000 }),
+  ]);
+  assert.equal(liveAgentTarget(rows[0]), '/tasks?select=exec-new');
+  assert.equal(liveAgentTarget(rows[1]), '/tasks?select=exec-old');
 });
 
 test('labels: update recency is honest and source kinds speak product language, not plumbing', () => {

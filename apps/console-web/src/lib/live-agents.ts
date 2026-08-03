@@ -95,10 +95,11 @@ export function liveAgentBadgeCount(cards: BoardCard[]): number {
   return liveAgentRows(cards).length;
 }
 
-/** Exact Tasks target for a row. Canonical runs carry attempt/scope identity;
- * other sources still land on their best board-card or session selector. */
+/** Exact Tasks target for a row. The board-card id is unique while session ids
+ * are intentionally reusable across attempts, so every in-page row selects its
+ * own card and carries lineage only as an additional fail-closed constraint. */
 export function liveAgentTarget(row: LiveAgentRow): string {
-  const select = row.sessionId || row.card.id;
+  const select = row.card.id || row.sessionId || row.id;
   const params = new URLSearchParams({ select });
   if (row.card.attemptId) params.set('attemptId', row.card.attemptId);
   if (row.card.runScopeId) params.set('runScopeId', row.card.runScopeId);
