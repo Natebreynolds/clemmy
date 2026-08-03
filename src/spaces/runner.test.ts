@@ -563,7 +563,10 @@ test('failed approved refresh reports a safe async Outcome while raw diagnostics
   assert.equal(approvalRegistry.resolve(approvalId!, 'approved', 'safe-failure-test').ok, true);
 
   let outcome: ReturnType<typeof eventlog.listEvents>[number] | undefined;
-  const deadline = Date.now() + 3_000;
+  // The process-wide corpus runs many child-process suites concurrently; the
+  // approved runner can be scheduler-starved even though the async outcome is
+  // healthy. This is a polling guard, not a three-second product SLA.
+  const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     outcome = eventlog.listEvents(`space-${slug}`, { types: ['user_input_received'] })
       .find((event) => (
