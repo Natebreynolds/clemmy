@@ -110,7 +110,9 @@ const {
   createWorkflowOriginGroupCloseAuthority,
   createWorkflowOriginGroupClosedBatchReceipt,
   finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchAdmission,
   recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupCloseIntent,
   recordWorkflowOriginGroupClosedBatch,
   workflowOriginSourceGroupId,
 } = await import('../../execution/workflow-origin-group.js');
@@ -8434,6 +8436,7 @@ test('closed workflow batch recovers after a crash before seal while prepared-on
   const first = appendPreparedAsyncWorkflowDispatch({ source: crashSource, runId: 'closed-crash-run-a' });
   const second = appendPreparedAsyncWorkflowDispatch({ source: crashSource, runId: 'closed-crash-run-b' });
   const closeAuthority = createWorkflowOriginGroupCloseAuthority([first, second]);
+  recordWorkflowOriginGroupCloseIntent(closeAuthority);
   appendEvent({
     sessionId: crashSession.id,
     turn: crashSource.turn,
@@ -8442,6 +8445,23 @@ test('closed workflow batch recovers after a crash before seal while prepared-on
     parentEventId: crashSource.id,
     data: { ...closeAuthority },
   });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'closed-crash-late-run.json'), JSON.stringify({
+    id: 'closed-crash-late-run',
+    workflow: 'test-workflow',
+    status: 'awaiting_chat_dispatch_seal',
+  }), 'utf-8');
+  assert.throws(
+    () => recordWorkflowChatDispatchAdmission(createWorkflowChatDispatchPreparationAuthority({
+      runId: 'closed-crash-late-run',
+      observer: {
+        sessionId: crashSource.sessionId,
+        sourceUserSeq: crashSource.seq,
+        replyTarget: TEST_ASYNC_REPLY_TARGET,
+      },
+      queueRequestDigest: createHash('sha256').update('closed-crash-late-request').digest('hex'),
+    })),
+    /membership is already closing and cannot be widened/,
+  );
   // Simulated crash: the event-ledger close won, but no filesystem close,
   // seal, activation, or public dispatch was written by the foreground path.
   assert.equal(listEventsForConv(crashSession.id, { types: ['async_work_dispatched'] }).length, 0);
@@ -8465,6 +8485,68 @@ test('closed workflow batch recovers after a crash before seal while prepared-on
     JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, 'prepared-only-held-run.json'), 'utf-8')).status,
     'awaiting_chat_dispatch_seal',
     'the unrelated prepared-only group remains held after global recovery',
+  );
+});
+
+test('close-fence crash before the SQLite event is driven into ordinary restart recovery', async () => {
+  resetEventLog();
+  const { reconcileClosedWorkflowDispatchBatches } = await import('./loop.js');
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactHumanSourceData('recover the fenced workflow batch'),
+  });
+  const prepared = appendPreparedAsyncWorkflowDispatch({
+    source,
+    runId: 'close-fence-before-event-run',
+  });
+  const authority = createWorkflowOriginGroupCloseAuthority([prepared]);
+  recordWorkflowOriginGroupCloseIntent(authority);
+  assert.equal(
+    listEventsForConv(session.id, { types: ['async_work_dispatch_batch_closed'] }).length,
+    0,
+    'simulated crash occurs after the filesystem fence but before SQLite append',
+  );
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'close-fence-late-run.json'), JSON.stringify({
+    id: 'close-fence-late-run',
+    workflow: 'test-workflow',
+    status: 'awaiting_chat_dispatch_seal',
+  }), 'utf-8');
+  assert.throws(
+    () => recordWorkflowChatDispatchAdmission(createWorkflowChatDispatchPreparationAuthority({
+      runId: 'close-fence-late-run',
+      observer: {
+        sessionId: source.sessionId,
+        sourceUserSeq: source.seq,
+        replyTarget: TEST_ASYNC_REPLY_TARGET,
+      },
+      queueRequestDigest: createHash('sha256').update('close-fence-late-request').digest('hex'),
+    })),
+    /membership is already closing and cannot be widened/,
+  );
+
+  const recovered = reconcileClosedWorkflowDispatchBatches();
+  assert.equal(recovered.rejected, 0);
+  assert.equal(recovered.examined, 1);
+  assert.equal(recovered.finalized, 1);
+  assert.equal(recovered.published, 1);
+  assert.equal(
+    listEventsForConv(session.id, { types: ['async_work_dispatch_batch_closed'] }).length,
+    1,
+  );
+  assert.deepEqual(
+    listEventsForConv(session.id, { types: ['async_work_dispatched'] })[0].data.runIds,
+    ['close-fence-before-event-run'],
+  );
+  assert.equal(
+    JSON.parse(readFileSync(
+      path.join(WORKFLOW_RUNS_DIR, 'close-fence-before-event-run.json'),
+      'utf-8',
+    )).status,
+    'queued',
   );
 });
 

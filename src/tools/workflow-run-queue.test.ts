@@ -27,17 +27,21 @@ const {
   requeueWorkflowFromRun,
   requeueWorkflowFailedItemsFromRun,
   queueWorkflowCreationTest,
+  createWorkflowChatDispatchPreparationAuthority,
   createWorkflowChatDispatchPreparedReceipt,
   createWorkflowOriginGroupCloseAuthority,
   createWorkflowOriginGroupClosedBatchReceipt,
   finalizeWorkflowOriginGroupClosedBatch,
   recordWorkflowChatDispatchPreparation,
+  recordWorkflowChatDispatchAdmission,
   recordWorkflowOriginGroupClosedBatch,
   readWorkflowTriggerReceiptAcceptance,
   readWorkflowRunOriginRecords,
   readWorkflowRunOriginSessionIds,
   readPendingWorkflowChatDispatchOwnership,
   workflowRunOriginObserverId,
+  workflowChatDispatchQueueRequestDigest,
+  workflowOriginSourceGroupId,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
 } = await import('./workflow-run-queue.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
@@ -1170,6 +1174,167 @@ test('queueWorkflowRun: preparation failure leaves a fresh exact run non-executa
   assert.equal(retry.id, held.id);
   assert.ok(retry.chatDispatchPreparation);
   assert.equal(readWorkflowRunOriginRecords(held.id).length, 0);
+});
+
+test('queueWorkflowRun: pre-callback staging owns a shared run without source-inline fields', () => {
+  const inputs = { url: 'https://shared-pre-callback-owner.example' };
+  const shared = queueWorkflowRun('audit-brief', inputs);
+  assert.equal(shared.status, 'queued');
+  const identity = {
+    sessionId: 'sess-shared-pre-callback-owner',
+    sourceUserSeq: 4401,
+    replyTarget: { type: 'origin_chat' as const },
+  };
+  assert.throws(() => queueWorkflowRun('audit-brief', inputs, {
+    originSessionId: identity.sessionId,
+    originObserver: identity,
+    prepareChatDispatch: () => {
+      assert.deepEqual(readPendingWorkflowChatDispatchOwnership(identity), {
+        sourceGroupId: workflowOriginSourceGroupId(identity),
+        originSessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        phase: 'prepared',
+        runIds: [shared.id],
+        runStatuses: { [shared.id!]: 'queued' },
+      });
+      throw new Error('injected callback crash after admission stage');
+    },
+  }), /injected callback crash after admission stage/);
+  const durable = JSON.parse(
+    readFileSync(path.join(WORKFLOW_RUNS_DIR, `${shared.id}.json`), 'utf-8'),
+  ) as Record<string, unknown>;
+  assert.equal(durable.chatDispatchSourceGroupId, undefined);
+  assert.deepEqual(readPendingWorkflowChatDispatchOwnership(identity)?.runIds, [shared.id]);
+});
+
+test('queueWorkflowRun: an open prepared request reuses its terminal shared run after another group activates', () => {
+  const inputs = { url: 'https://terminal-shared-open-group.example' };
+  const firstSource = {
+    sessionId: 'sess-open-source-a',
+    sourceUserSeq: 4501,
+    replyTarget: { type: 'origin_chat' as const },
+  };
+  const sharingSource = {
+    sessionId: 'sess-sharing-source-b',
+    sourceUserSeq: 4502,
+    replyTarget: { type: 'origin_chat' as const },
+  };
+  const first = queueWorkflowRun('audit-brief', inputs, {
+    originSessionId: firstSource.sessionId,
+    originObserver: firstSource,
+    prepareChatDispatch: durablePreparationCallback(),
+  });
+  const shared = queueWorkflowRun('audit-brief', inputs, {
+    originSessionId: sharingSource.sessionId,
+    originObserver: sharingSource,
+    prepareChatDispatch: durablePreparationCallback(),
+  });
+  assert.equal(shared.id, first.id);
+  closeAndActivateQueueGroup([shared.chatDispatchPreparation!]);
+  const file = path.join(WORKFLOW_RUNS_DIR, `${first.id}.json`);
+  const active = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({
+    ...active,
+    status: 'completed',
+    finishedAt: new Date().toISOString(),
+  }), 'utf-8');
+
+  const replay = queueWorkflowRun('audit-brief', inputs, {
+    originSessionId: firstSource.sessionId,
+    originObserver: firstSource,
+    prepareChatDispatch: () => assert.fail('open prepared replay must reuse its durable receipt'),
+  });
+  assert.equal(replay.status, 'duplicate');
+  assert.equal(replay.id, first.id);
+  assert.equal(runFiles().length, 1, 'terminal status cannot fork a second held run');
+  closeAndActivateQueueGroup([replay.chatDispatchPreparation!]);
+});
+
+test('queueWorkflowRun: stale optimistic duplicate redirects to the group-canonical admission owner', async (t) => {
+  writeAuditWorkflow();
+  const inputs = { url: 'https://group-canonical-redirect.example' };
+  const optimistic = queueWorkflowRun('audit-brief', inputs);
+  assert.equal(optimistic.status, 'queued');
+  const identity = {
+    sessionId: 'sess-group-canonical-redirect',
+    sourceUserSeq: 4601,
+    replyTarget: { type: 'origin_chat' as const },
+  };
+  const prefix = path.join(TMP_HOME, 'exact-canonical-redirect');
+  const ready = `${prefix}-ready`;
+  const release = `${prefix}-release`;
+  const resultFile = `${prefix}-result.json`;
+  for (const file of [ready, release, resultFile]) rmSync(file, { force: true });
+  const childCode = `
+    import { writeFileSync } from 'node:fs';
+    const mod = await import(process.env.CLEM_QUEUE_MODULE_URL);
+    try {
+      const identity = JSON.parse(process.env.CLEM_EXACT_IDENTITY);
+      const result = mod.queueWorkflowRun('audit-brief', JSON.parse(process.env.CLEM_EXACT_INPUTS), {
+        originSessionId: identity.sessionId,
+        originObserver: identity,
+        prepareChatDispatch: (authority) => mod.recordWorkflowChatDispatchPreparation(
+          mod.createWorkflowChatDispatchPreparedReceipt(authority, {
+            eventId: 'redirect-prepared-event',
+            eventSeq: 4601001,
+            preparedAt: '2027-01-01T00:00:00.000Z',
+          }),
+        ),
+      });
+      writeFileSync(process.env.CLEM_QUEUE_RESULT, JSON.stringify(result));
+    } catch (error) {
+      writeFileSync(process.env.CLEM_QUEUE_RESULT, JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    }
+  `;
+  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', childCode], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLEMENTINE_HOME: TMP_HOME,
+      CLEM_QUEUE_MODULE_URL: QUEUE_MODULE_URL,
+      CLEM_QUEUE_RESULT: resultFile,
+      CLEM_EXACT_IDENTITY: JSON.stringify(identity),
+      CLEM_EXACT_INPUTS: JSON.stringify(inputs),
+      CLEMENTINE_TEST_EXACT_ADMISSION_LOOKUP_READY: ready,
+      CLEMENTINE_TEST_EXACT_ADMISSION_LOOKUP_RELEASE: release,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => {
+    if (child.exitCode === null) child.kill('SIGKILL');
+    for (const file of [ready, release, resultFile]) rmSync(file, { force: true });
+  });
+  const closed = once(child, 'close');
+  await waitForPath(ready);
+
+  const canonicalRunId = 'group-canonical-redirect-run';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${canonicalRunId}.json`), JSON.stringify({
+    id: canonicalRunId,
+    workflow: 'audit-brief',
+    inputs,
+    status: 'completed',
+    createdAt: new Date().toISOString(),
+  }), 'utf-8');
+  const queueRequestDigest = workflowChatDispatchQueueRequestDigest({
+    workflowName: 'audit-brief',
+    normalizedInputs: { ...inputs, website: inputs.url },
+  });
+  recordWorkflowChatDispatchAdmission(createWorkflowChatDispatchPreparationAuthority({
+    runId: canonicalRunId,
+    observer: identity,
+    queueRequestDigest,
+  }));
+  writeFileSync(release, 'release', 'utf-8');
+  await closed;
+  const result = JSON.parse(readFileSync(resultFile, 'utf-8')) as {
+    id?: string;
+    status?: string;
+    error?: string;
+  };
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 'duplicate');
+  assert.equal(result.id, canonicalRunId);
+  assert.notEqual(result.id, optimistic.id);
 });
 
 test('queueWorkflowRun: a returned event receipt without its run pin cannot claim preparation', () => {

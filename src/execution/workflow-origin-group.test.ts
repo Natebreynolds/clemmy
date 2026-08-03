@@ -21,9 +21,12 @@ const {
   readActiveExactWorkflowRunOriginRecords,
   readActiveWorkflowOriginGroup,
   readWorkflowOriginGroupClosedBatch,
+  readWorkflowOriginGroupCloseIntent,
   readWorkflowOriginGroupSettlement,
   readWorkflowOriginGroupTombstone,
+  recordWorkflowChatDispatchAdmission,
   recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupCloseIntent,
   recordWorkflowOriginGroupClosedBatch,
   recordWorkflowOriginGroupSettlement,
   reconcileActivatedWorkflowOriginGroups,
@@ -347,6 +350,32 @@ test('closed batch rejects a proper subset of the durable preparation index', ()
   assert.equal(readWorkflowOriginGroupClosedBatch(authority.sourceGroupId), null);
 });
 
+test('close intent cannot exclude a staged callback-crash owner and then freezes later admission', () => {
+  writeRun('run-staged-before-callback');
+  writeRun('run-already-prepared');
+  const stagedReceipt = prepared('run-staged-before-callback', observer, 'run-staged-before-callback', false);
+  recordWorkflowChatDispatchAdmission(stagedReceipt);
+  const alreadyPrepared = prepared('run-already-prepared');
+
+  assert.throws(
+    () => recordWorkflowOriginGroupCloseIntent(
+      createWorkflowOriginGroupCloseAuthority([alreadyPrepared]),
+    ),
+    /excludes or conflicts with a staged admission|complete ordered preparation index matches/,
+  );
+  const recoveredPrepared = recordWorkflowChatDispatchPreparation(stagedReceipt);
+  const authority = createWorkflowOriginGroupCloseAuthority([recoveredPrepared, alreadyPrepared]);
+  assert.equal(recordWorkflowOriginGroupCloseIntent(authority).closeDigest, authority.closeDigest);
+  assert.equal(readWorkflowOriginGroupCloseIntent(authority.sourceGroupId)?.closeDigest, authority.closeDigest);
+
+  writeRun('run-after-close-fence');
+  const late = prepared('run-after-close-fence', observer, 'run-after-close-fence', false);
+  assert.throws(
+    () => recordWorkflowChatDispatchAdmission(late),
+    /membership is already closing and cannot be widened/,
+  );
+});
+
 test('conflicting source, target, membership, and request ownership fail closed', () => {
   writeRun('run-conflict-a');
   writeRun('run-conflict-b');
@@ -505,6 +534,96 @@ test('compaction installs its replay tombstone before removing bulky authority a
     activateWorkflowOriginGroup(active.sealed, testPublicationBarrier).activation.activationDigest,
     active.activation.activationDigest,
   );
+});
+
+test('compaction refuses to erase a malformed close fence', () => {
+  writeRun('run-malformed-fence', 'completed');
+  const receipt = prepared('run-malformed-fence');
+  const active = finalizeWorkflowOriginGroupClosedBatch(
+    closeGroup([receipt]).receipt.sourceGroupId,
+    testPublicationBarrier,
+  );
+  const settlement = settleGroup(active);
+  acknowledgeRun('run-malformed-fence', active.sealed.observerId, undefined, settlement.settlementDigest);
+  const groupKey = createHash('sha256').update(active.sealed.sourceGroupId).digest('hex');
+  const dir = path.join(WORKFLOW_RUNS_DIR, '.origin-groups', groupKey);
+  const fence = path.join(dir, 'closing.json');
+  writeFileSync(fence, '{"version":1,"corrupt":true}', 'utf-8');
+
+  assert.throws(
+    () => compactSettledWorkflowOriginGroup(active.sealed.sourceGroupId),
+    /close authority is invalid/,
+  );
+  assert.equal(readWorkflowOriginGroupTombstone(active.sealed.sourceGroupId), null);
+  assert.equal(existsSync(fence), true);
+  assert.equal(existsSync(path.join(dir, 'closed.json')), true);
+});
+
+test('compaction refuses to erase a valid but conflicting close fence', () => {
+  writeRun('run-conflicting-fence-a', 'completed');
+  writeRun('run-conflicting-fence-b', 'completed');
+  const receipts = [prepared('run-conflicting-fence-a'), prepared('run-conflicting-fence-b')];
+  const active = finalizeWorkflowOriginGroupClosedBatch(
+    closeGroup(receipts).receipt.sourceGroupId,
+    testPublicationBarrier,
+  );
+  const settlement = settleGroup(active);
+  acknowledgeRun('run-conflicting-fence-a', active.sealed.observerId, undefined, settlement.settlementDigest);
+  acknowledgeRun('run-conflicting-fence-b', active.sealed.observerId, undefined, settlement.settlementDigest);
+  const groupKey = createHash('sha256').update(active.sealed.sourceGroupId).digest('hex');
+  const dir = path.join(WORKFLOW_RUNS_DIR, '.origin-groups', groupKey);
+  const fence = path.join(dir, 'closing.json');
+  const conflicting = createWorkflowOriginGroupCloseAuthority([receipts[0]]);
+  writeFileSync(fence, JSON.stringify(conflicting), 'utf-8');
+
+  assert.throws(
+    () => compactSettledWorkflowOriginGroup(active.sealed.sourceGroupId),
+    /conflicting immutable close intent/,
+  );
+  assert.equal(readWorkflowOriginGroupTombstone(active.sealed.sourceGroupId), null);
+  assert.equal(readWorkflowOriginGroupCloseIntent(active.sealed.sourceGroupId)?.closeDigest, conflicting.closeDigest);
+  assert.equal(existsSync(path.join(dir, 'closed.json')), true);
+});
+
+test('compaction replay refuses to erase corrupt staged admission evidence after tombstone wins', () => {
+  writeRun('run-corrupt-staged-compaction', 'completed');
+  const unindexed = prepared(
+    'run-corrupt-staged-compaction',
+    observer,
+    'run-corrupt-staged-compaction',
+    false,
+  );
+  recordWorkflowChatDispatchAdmission(unindexed);
+  const receipt = recordWorkflowChatDispatchPreparation(unindexed);
+  const active = finalizeWorkflowOriginGroupClosedBatch(
+    closeGroup([receipt]).receipt.sourceGroupId,
+    testPublicationBarrier,
+  );
+  const settlement = settleGroup(active);
+  acknowledgeRun(
+    'run-corrupt-staged-compaction',
+    active.sealed.observerId,
+    undefined,
+    settlement.settlementDigest,
+  );
+  assert.throws(
+    () => compactSettledWorkflowOriginGroup(active.sealed.sourceGroupId, {
+      failAfterTombstoneForTest: true,
+    }),
+    /after durable tombstone/,
+  );
+  const groupKey = createHash('sha256').update(active.sealed.sourceGroupId).digest('hex');
+  const dir = path.join(WORKFLOW_RUNS_DIR, '.origin-groups', groupKey);
+  const admissionFile = path.join(dir, 'admissions', `${receipt.queueRequestDigest}.json`);
+  writeFileSync(admissionFile, '{"version":1,"corrupt":true}', 'utf-8');
+
+  assert.throws(
+    () => compactSettledWorkflowOriginGroup(active.sealed.sourceGroupId),
+    /preparation authority is invalid/,
+  );
+  assert.ok(readWorkflowOriginGroupTombstone(active.sealed.sourceGroupId));
+  assert.equal(existsSync(admissionFile), true);
+  assert.equal(existsSync(path.join(dir, 'closed.json')), true);
 });
 
 test('compaction requires every present member ack but treats a missing member record as already reaped', () => {

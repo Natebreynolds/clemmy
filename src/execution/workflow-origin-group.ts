@@ -200,6 +200,10 @@ function closedGroupFile(groupId: string): string {
   return path.join(groupDir(groupId), 'closed.json');
 }
 
+function closingGroupFile(groupId: string): string {
+  return path.join(groupDir(groupId), 'closing.json');
+}
+
 function settledGroupFile(groupId: string): string {
   return path.join(groupDir(groupId), 'settlement.json');
 }
@@ -210,6 +214,10 @@ function compactedGroupFile(groupId: string): string {
 
 function groupPreparedDir(groupId: string): string {
   return path.join(groupDir(groupId), 'prepared');
+}
+
+function groupAdmissionsDir(groupId: string): string {
+  return path.join(groupDir(groupId), 'admissions');
 }
 
 function groupAuthorityLockFile(groupId: string): string {
@@ -261,6 +269,19 @@ export interface WorkflowChatDispatchPreparedReceipt extends WorkflowChatDispatc
   preparedEventSeq: number;
   preparedAt: string;
   receiptDigest: string;
+}
+
+/** Create-only queue-side ownership written before the trusted preparation
+ * callback. The preparation authority is already a complete canonical binding
+ * of source + request + target to one run, so no mutable staging fields are
+ * needed. */
+export type WorkflowChatDispatchAdmission = WorkflowChatDispatchPreparationAuthority;
+
+export interface WorkflowChatDispatchAdmissionLookup {
+  runId: string;
+  queueRequestDigest: string;
+  preparedReceipt?: WorkflowChatDispatchPreparedReceipt;
+  phase: 'admitted' | 'prepared' | 'closing' | 'closed';
 }
 
 export interface WorkflowOriginGroupMember {
@@ -616,6 +637,94 @@ function samePreparedReceipt(
     && left.receiptDigest === right.receiptDigest;
 }
 
+function samePreparationAuthority(
+  left: WorkflowChatDispatchPreparationAuthority,
+  right: WorkflowChatDispatchPreparationAuthority,
+): boolean {
+  return left.sourceGroupId === right.sourceGroupId
+    && left.observerId === right.observerId
+    && left.originSessionId === right.originSessionId
+    && left.sourceUserSeq === right.sourceUserSeq
+    && left.runId === right.runId
+    && left.queueRequestDigest === right.queueRequestDigest
+    && left.replyTargetDigest === right.replyTargetDigest
+    && sameExactOriginDeliveryTarget(left.replyTarget, right.replyTarget)
+    && left.preparationDigest === right.preparationDigest;
+}
+
+function admissionFile(sourceGroupId: string, queueRequestDigest: string): string {
+  if (!isDigest(queueRequestDigest)) {
+    throw new Error('workflow chat dispatch admission request digest is invalid');
+  }
+  return path.join(groupAdmissionsDir(sourceGroupId), `${queueRequestDigest}.json`);
+}
+
+/** Read the create-only pre-callback queue ownership for one source group.
+ * Unknown names and malformed records are corruption, not permission to close
+ * or reap around evidence that may still own a canonical run. */
+export function readWorkflowChatDispatchAdmissions(
+  sourceGroupId: string,
+): WorkflowChatDispatchAdmission[] {
+  const id = nonEmptyString(sourceGroupId);
+  if (!id) throw new Error('workflow origin group id is required for admission lookup');
+  const dir = groupAdmissionsDir(id);
+  if (!existsSync(dir)) return [];
+  const entries = readdirSync(dir).sort();
+  if (entries.some((entry) => !/^[a-f0-9]{64}\.json$/.test(entry))) {
+    throw new Error(`Workflow origin group ${id} admission index contains unknown evidence.`);
+  }
+  return entries.map((entry) => {
+    const admission = decodePreparationAuthority(
+      readJson(path.join(dir, entry), `Workflow origin group ${id} admission`),
+    );
+    if (
+      admission.sourceGroupId !== id
+      || entry !== `${admission.queueRequestDigest}.json`
+    ) {
+      throw new Error(`Workflow origin group ${id} has a mismatched admission index.`);
+    }
+    return admission;
+  });
+}
+
+interface LegacyInlineWorkflowChatDispatchAdmission {
+  runId: string;
+  queueRequestDigest: string;
+}
+
+/** Compatibility authority for bytes created before the create-only admission
+ * index. Only records that explicitly name this group participate. */
+function readLegacyInlineWorkflowChatDispatchAdmissions(
+  sourceGroupId: string,
+): LegacyInlineWorkflowChatDispatchAdmission[] {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return [];
+  const admissions: LegacyInlineWorkflowChatDispatchAdmission[] = [];
+  for (const entry of readdirSync(WORKFLOW_RUNS_DIR).filter((name) => name.endsWith('.json')).sort()) {
+    let value: unknown;
+    try {
+      value = readJson(path.join(WORKFLOW_RUNS_DIR, entry), `Workflow run ${entry}`);
+    } catch {
+      continue;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const raw = value as Record<string, unknown>;
+    if (raw.chatDispatchSourceGroupId !== sourceGroupId) continue;
+    const runId = validRunId(raw.id);
+    if (
+      !runId
+      || entry !== `${runId}.json`
+      || !isDigest(raw.chatDispatchQueueRequestDigest)
+    ) {
+      throw new Error(`Workflow origin group ${sourceGroupId} has invalid inline admission authority.`);
+    }
+    admissions.push({
+      runId,
+      queueRequestDigest: raw.chatDispatchQueueRequestDigest,
+    });
+  }
+  return admissions;
+}
+
 function preparedReceiptFile(dir: string, receiptDigest: string): string {
   if (!isDigest(receiptDigest)) throw new Error('workflow preparation receipt digest is invalid');
   return path.join(dir, `${receiptDigest}.json`);
@@ -638,8 +747,12 @@ export function readIndexedWorkflowChatDispatchPreparations(
   if (!id) throw new Error('workflow origin group id is required');
   const dir = groupPreparedDir(id);
   if (!existsSync(dir)) return [];
+  const entries = readdirSync(dir).sort();
+  if (entries.some((entry) => !/^[a-f0-9]{64}\.json$/.test(entry))) {
+    throw new Error(`Workflow origin group ${id} prepared index contains unknown evidence.`);
+  }
   const receipts: WorkflowChatDispatchPreparedReceipt[] = [];
-  for (const file of readdirSync(dir).filter((entry) => entry.endsWith('.json')).sort()) {
+  for (const file of entries) {
     const receipt = decodeWorkflowChatDispatchPreparedReceipt(
       readJson(path.join(dir, file), `Workflow origin group ${id} preparation`),
     );
@@ -652,9 +765,189 @@ export function readIndexedWorkflowChatDispatchPreparations(
     || left.preparedEventId.localeCompare(right.preparedEventId));
 }
 
+/** One durable authority serializes source-group admission with membership
+ * close. Queue callers acquire a run lock first; close/recovery callers hold
+ * only this group lock and must release it before activation touches runs. */
+export function withWorkflowOriginGroupAuthorityLock<T>(
+  sourceGroupId: string,
+  work: () => T,
+): T {
+  const id = nonEmptyString(sourceGroupId);
+  if (!id) throw new Error('workflow origin group id is required for authority locking');
+  return withWorkflowRunRecordLock(groupAuthorityLockFile(id), work);
+}
+
+function preparedReceiptForMember(
+  sourceGroupId: string,
+  member: WorkflowOriginGroupMember,
+): WorkflowChatDispatchPreparedReceipt {
+  const closed = readWorkflowOriginGroupClosedBatch(sourceGroupId);
+  const prepared = (closed?.preparedReceipts ?? readIndexedWorkflowChatDispatchPreparations(sourceGroupId))
+    .find((candidate) => candidate.receiptDigest === member.receiptDigest);
+  if (
+    !prepared
+    || prepared.runId !== member.runId
+    || prepared.queueRequestDigest !== member.queueRequestDigest
+  ) {
+    throw new Error(`Workflow origin group ${sourceGroupId} lost a member's durable preparation.`);
+  }
+  return prepared;
+}
+
+/** Resolve every durable generation of queue admission, including legacy
+ * inline pre-pin records. Closed membership wins, then the close fence, then
+ * open staging/preparation evidence. Conflicting owners fail closed. */
+export function workflowOriginGroupAdmissionForRequest(
+  sourceGroupId: string,
+  queueRequestDigest: string,
+  replyTarget: ExactOriginDeliveryTarget,
+): WorkflowChatDispatchAdmissionLookup | null {
+  const id = nonEmptyString(sourceGroupId);
+  const target = normalizeExactOriginDeliveryTarget(replyTarget);
+  if (!id || !isDigest(queueRequestDigest) || !target) {
+    throw new Error('workflow origin group admission lookup requires source, request, and reply target');
+  }
+  return withWorkflowOriginGroupAuthorityLock(id, () => {
+    const sealed = readWorkflowOriginGroup(id);
+    const closed = sealed ? null : readWorkflowOriginGroupClosedBatch(id);
+    const immutable = sealed ?? closed?.receipt;
+    if (immutable) {
+      if (!sameExactOriginDeliveryTarget(immutable.replyTarget, target)) {
+        throw new Error('workflow origin group is closed to a different immutable reply target');
+      }
+      const member = immutable.members.find(
+        (candidate) => candidate.queueRequestDigest === queueRequestDigest,
+      );
+      if (!member) {
+        throw new Error('workflow origin group membership is already closed and cannot be widened');
+      }
+      return {
+        runId: member.runId,
+        queueRequestDigest,
+        preparedReceipt: preparedReceiptForMember(id, member),
+        phase: 'closed',
+      };
+    }
+
+    const closing = readWorkflowOriginGroupCloseIntent(id);
+    if (closing) {
+      if (!sameExactOriginDeliveryTarget(closing.replyTarget, target)) {
+        throw new Error('workflow origin group is closing to a different immutable reply target');
+      }
+      const member = closing.members.find(
+        (candidate) => candidate.queueRequestDigest === queueRequestDigest,
+      );
+      if (!member) {
+        throw new Error('workflow origin group membership is already closing and cannot be widened');
+      }
+      return {
+        runId: member.runId,
+        queueRequestDigest,
+        preparedReceipt: preparedReceiptForMember(id, member),
+        phase: 'closing',
+      };
+    }
+
+    const admissions = readWorkflowChatDispatchAdmissions(id);
+    const prepared = readIndexedWorkflowChatDispatchPreparations(id);
+    for (const authority of [...admissions, ...prepared]) {
+      if (!sameExactOriginDeliveryTarget(authority.replyTarget, target)) {
+        throw new Error('workflow origin group has a different immutable reply target');
+      }
+    }
+    const ownerRunIds = new Set<string>();
+    for (const authority of admissions) {
+      if (authority.queueRequestDigest === queueRequestDigest) ownerRunIds.add(authority.runId);
+    }
+    for (const receipt of prepared) {
+      if (receipt.queueRequestDigest === queueRequestDigest) ownerRunIds.add(receipt.runId);
+    }
+    // The global legacy scan is only needed when the indexed protocol has no
+    // owner. New/retried admissions stay O(group evidence), while old
+    // callback-crash bytes remain recoverable.
+    if (ownerRunIds.size === 0) {
+      for (const authority of readLegacyInlineWorkflowChatDispatchAdmissions(id)) {
+        if (authority.queueRequestDigest === queueRequestDigest) ownerRunIds.add(authority.runId);
+      }
+    }
+    if (ownerRunIds.size > 1) {
+      throw new Error('workflow origin group request digest is bound to conflicting admitted runs');
+    }
+    const runId = [...ownerRunIds][0];
+    if (!runId) return null;
+    const receipts = prepared.filter(
+      (candidate) => candidate.runId === runId
+        && candidate.queueRequestDigest === queueRequestDigest,
+    );
+    if (
+      receipts.length > 1
+      && receipts.some((candidate) => !samePreparedReceipt(candidate, receipts[0]))
+    ) {
+      throw new Error('workflow origin group request has conflicting prepared receipts');
+    }
+    return {
+      runId,
+      queueRequestDigest,
+      ...(receipts[0] ? { preparedReceipt: receipts[0] } : {}),
+      phase: receipts[0] ? 'prepared' : 'admitted',
+    };
+  });
+}
+
+/** Install the canonical source/request→run binding before invoking any
+ * external preparation callback. Failure after this point is recovered by
+ * retrying the same run, never by allocating a sibling. */
+export function recordWorkflowChatDispatchAdmission(
+  authorityInput: WorkflowChatDispatchPreparationAuthority,
+): WorkflowChatDispatchAdmission {
+  const authority = decodePreparationAuthority(authorityInput);
+  return withWorkflowRunRecordLock(runFile(authority.runId), () => (
+    withWorkflowOriginGroupAuthorityLock(authority.sourceGroupId, () => {
+      const runRecordFile = runFile(authority.runId);
+      if (!existsSync(runRecordFile)) {
+        throw new Error(`Workflow run ${authority.runId} disappeared before chat-dispatch admission.`);
+      }
+      const rawRun = readJson(runRecordFile, `Workflow run ${authority.runId}`);
+      if (!rawRun || typeof rawRun !== 'object' || Array.isArray(rawRun)
+        || (rawRun as Record<string, unknown>).id !== authority.runId) {
+        throw new Error(`Workflow run ${authority.runId} changed identity before chat-dispatch admission.`);
+      }
+      const existing = workflowOriginGroupAdmissionForRequest(
+        authority.sourceGroupId,
+        authority.queueRequestDigest,
+        authority.replyTarget,
+      );
+      if (existing) {
+        if (existing.runId !== authority.runId) {
+          throw new Error('workflow chat dispatch admission has a different canonical run owner');
+        }
+        const staged = readWorkflowChatDispatchAdmissions(authority.sourceGroupId)
+          .find((candidate) => candidate.queueRequestDigest === authority.queueRequestDigest);
+        if (staged && !samePreparationAuthority(staged, authority)) {
+          throw new Error('workflow chat dispatch admission has conflicting canonical authority');
+        }
+        if (staged) return staged;
+        // A close fence is already the stronger immutable owner. Open
+        // inline-only compatibility evidence is deliberately promoted below
+        // so all new retries gain the dedicated staging + reaper protocol.
+        if (existing.phase === 'closing' || existing.phase === 'closed') return authority;
+      }
+      const file = admissionFile(authority.sourceGroupId, authority.queueRequestDigest);
+      if (createJsonDurably(file, authority)) return authority;
+      const winner = decodePreparationAuthority(
+        readJson(file, `Workflow origin group ${authority.sourceGroupId} admission`),
+      );
+      if (!samePreparationAuthority(winner, authority)) {
+        throw new Error('workflow chat dispatch admission has a conflicting durable winner');
+      }
+      return winner;
+    })
+  ));
+}
+
 /** Queue-side durable index and retention pin. This runs only after the trusted
- * event callback returned a verified receipt; callback failure therefore
- * creates neither exact authority nor a pending-observer pin. */
+ * event callback returned a verified receipt. The earlier admission record
+ * remains the recovery/retention owner if the callback fails. */
 export function recordWorkflowChatDispatchPreparation(
   receiptInput: WorkflowChatDispatchPreparedReceipt,
 ): WorkflowChatDispatchPreparedReceipt {
@@ -681,6 +974,19 @@ export function recordWorkflowChatDispatchPreparation(
         );
         if (!admitted || !samePreparedReceipt(admitted, receipt)) {
           throw new Error('workflow origin group batch is closed and cannot admit a later preparation');
+        }
+      }
+      const closing = readWorkflowOriginGroupCloseIntent(receipt.sourceGroupId);
+      if (closing) {
+        const member = closing.members.find(
+          (candidate) => candidate.receiptDigest === receipt.receiptDigest,
+        );
+        if (
+          !member
+          || member.runId !== receipt.runId
+          || member.queueRequestDigest !== receipt.queueRequestDigest
+        ) {
+          throw new Error('workflow origin group is closing and cannot admit a later preparation');
         }
       }
       // Pin first: a process crash may omit the group index until replay, but a
@@ -1019,6 +1325,207 @@ function sameCloseReceipt(
     && left.closeReceiptDigest === right.closeReceiptDigest;
 }
 
+function sameCloseAuthority(
+  left: WorkflowOriginGroupCloseAuthority,
+  right: WorkflowOriginGroupCloseAuthority,
+): boolean {
+  return left.sourceGroupId === right.sourceGroupId
+    && left.observerId === right.observerId
+    && left.originSessionId === right.originSessionId
+    && left.sourceUserSeq === right.sourceUserSeq
+    && left.replyTargetDigest === right.replyTargetDigest
+    && sameExactOriginDeliveryTarget(left.replyTarget, right.replyTarget)
+    && left.closeDigest === right.closeDigest
+    && left.members.length === right.members.length
+    && left.members.every((member, index) => sameMember(member, right.members[index]));
+}
+
+function validateCloseAgainstAdmissionEvidence(
+  authority: WorkflowOriginGroupCloseAuthority,
+): WorkflowChatDispatchPreparedReceipt[] {
+  const indexed = readIndexedWorkflowChatDispatchPreparations(authority.sourceGroupId);
+  const indexedGroup = normalizePreparedGroup(indexed);
+  if (
+    indexedGroup.members.length !== authority.members.length
+    || !indexedGroup.members.every((member, index) => sameMember(member, authority.members[index]))
+  ) {
+    throw new Error('workflow origin group cannot close until its complete ordered preparation index matches');
+  }
+  const memberByRequest = new Map(
+    authority.members.map((member) => [member.queueRequestDigest, member]),
+  );
+  for (const admission of readWorkflowChatDispatchAdmissions(authority.sourceGroupId)) {
+    const member = memberByRequest.get(admission.queueRequestDigest);
+    if (
+      !member
+      || member.runId !== admission.runId
+      || member.preparationDigest !== admission.preparationDigest
+      || admission.observerId !== authority.observerId
+      || admission.replyTargetDigest !== authority.replyTargetDigest
+      || !sameExactOriginDeliveryTarget(admission.replyTarget, authority.replyTarget)
+    ) {
+      throw new Error('workflow origin group close excludes or conflicts with a staged admission');
+    }
+    const prepared = indexed.find(
+      (candidate) => candidate.receiptDigest === member.receiptDigest,
+    );
+    if (!prepared || prepared.runId !== admission.runId) {
+      throw new Error('workflow origin group cannot close while an admission lacks exact preparation evidence');
+    }
+  }
+  for (const admission of readLegacyInlineWorkflowChatDispatchAdmissions(authority.sourceGroupId)) {
+    const member = memberByRequest.get(admission.queueRequestDigest);
+    if (!member || member.runId !== admission.runId) {
+      throw new Error('workflow origin group close excludes or conflicts with inline admission authority');
+    }
+  }
+  return authority.members.map((member) => {
+    const prepared = indexed.find((candidate) => candidate.receiptDigest === member.receiptDigest);
+    if (!prepared) throw new Error('workflow origin group close lost an indexed preparation');
+    return prepared;
+  });
+}
+
+function validateCompactedAdmissionEvidence(
+  tombstone: WorkflowOriginGroupTombstone,
+): void {
+  const authority = decodeWorkflowOriginGroupCloseAuthority(closeReceiptFromTombstone(tombstone));
+  const memberByRequest = new Map(
+    authority.members.map((member) => [member.queueRequestDigest, member]),
+  );
+  for (const admission of readWorkflowChatDispatchAdmissions(authority.sourceGroupId)) {
+    const member = memberByRequest.get(admission.queueRequestDigest);
+    if (
+      !member
+      || member.runId !== admission.runId
+      || member.preparationDigest !== admission.preparationDigest
+      || admission.observerId !== authority.observerId
+      || admission.replyTargetDigest !== authority.replyTargetDigest
+      || !sameExactOriginDeliveryTarget(admission.replyTarget, authority.replyTarget)
+    ) {
+      throw new Error('workflow origin group tombstone cannot erase conflicting admission evidence');
+    }
+  }
+  for (const admission of readLegacyInlineWorkflowChatDispatchAdmissions(authority.sourceGroupId)) {
+    const member = memberByRequest.get(admission.queueRequestDigest);
+    if (!member || member.runId !== admission.runId) {
+      throw new Error('workflow origin group tombstone conflicts with inline admission authority');
+    }
+  }
+}
+
+/** Read the durable membership fence installed before the event-ledger close
+ * append. A direct fence may coexist with later closed/tombstone projections,
+ * but its canonical bytes must continue to agree. */
+export function readWorkflowOriginGroupCloseIntent(
+  sourceGroupId: string,
+): WorkflowOriginGroupCloseAuthority | null {
+  const id = nonEmptyString(sourceGroupId);
+  if (!id) throw new Error('workflow origin group id is required for close-intent lookup');
+  const file = closingGroupFile(id);
+  if (!existsSync(file)) return null;
+  const intent = decodeWorkflowOriginGroupCloseAuthority(
+    readJson(file, `Workflow origin group ${id} close intent`),
+  );
+  if (intent.sourceGroupId !== id) {
+    throw new Error(`Workflow origin group ${id} close intent has a mismatched identity.`);
+  }
+  const tombstone = readWorkflowOriginGroupTombstone(id);
+  if (tombstone) {
+    const compacted = decodeWorkflowOriginGroupCloseAuthority(closeReceiptFromTombstone(tombstone));
+    if (!sameCloseAuthority(intent, compacted)) {
+      throw new Error(`Workflow origin group ${id} has conflicting close-intent and compacted authority.`);
+    }
+  }
+  return intent;
+}
+
+/** Bounded restart driver input for the crash seam where the filesystem fence
+ * won but the SQLite close event did not. */
+export function listWorkflowOriginGroupCloseIntents(
+  limit = 200,
+): WorkflowOriginGroupCloseAuthority[] {
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error('workflow origin group close-intent limit must be positive');
+  }
+  if (!existsSync(WORKFLOW_ORIGIN_GROUPS_DIR)) return [];
+  const intents: WorkflowOriginGroupCloseAuthority[] = [];
+  for (const entry of readdirSync(WORKFLOW_ORIGIN_GROUPS_DIR).sort()) {
+    if (intents.length >= limit) break;
+    const file = path.join(WORKFLOW_ORIGIN_GROUPS_DIR, entry, 'closing.json');
+    if (!existsSync(file)) continue;
+    const intent = decodeWorkflowOriginGroupCloseAuthority(
+      readJson(file, `Workflow origin group ${entry} close intent`),
+    );
+    if (groupDir(intent.sourceGroupId) !== path.dirname(file)) {
+      throw new Error('workflow origin group close intent is stored under a mismatched group directory');
+    }
+    const tombstone = readWorkflowOriginGroupTombstone(intent.sourceGroupId);
+    if (tombstone) {
+      const compacted = decodeWorkflowOriginGroupCloseAuthority(closeReceiptFromTombstone(tombstone));
+      if (!sameCloseAuthority(intent, compacted)) {
+        throw new Error('workflow origin group close intent conflicts with its compacted authority');
+      }
+      continue;
+    }
+    const closedFile = closedGroupFile(intent.sourceGroupId);
+    if (existsSync(closedFile)) {
+      const closed = decodeDurableClosedBatch(
+        readJson(closedFile, `Workflow origin group ${intent.sourceGroupId} closed batch`),
+      );
+      if (!sameCloseAuthority(intent, closed.receipt)) {
+        throw new Error('workflow origin group close intent conflicts with its closed batch');
+      }
+      continue;
+    }
+    intents.push(intent);
+  }
+  return intents;
+}
+
+/** Install a create-only close fence after revalidating that every staged or
+ * legacy inline owner has an exact prepared receipt inside the winning set. */
+export function recordWorkflowOriginGroupCloseIntent(
+  authorityInput: WorkflowOriginGroupCloseAuthority,
+): WorkflowOriginGroupCloseAuthority {
+  const authority = decodeWorkflowOriginGroupCloseAuthority(authorityInput);
+  return withWorkflowOriginGroupAuthorityLock(authority.sourceGroupId, () => {
+    const existingIntent = readWorkflowOriginGroupCloseIntent(authority.sourceGroupId);
+    if (existingIntent && !sameCloseAuthority(existingIntent, authority)) {
+      throw new Error('workflow origin group already has a conflicting immutable close intent');
+    }
+    const tombstone = readWorkflowOriginGroupTombstone(authority.sourceGroupId);
+    if (tombstone) {
+      const compacted = decodeWorkflowOriginGroupCloseAuthority(closeReceiptFromTombstone(tombstone));
+      if (!sameCloseAuthority(compacted, authority)) {
+        throw new Error('workflow origin group already has a conflicting compacted close authority');
+      }
+      return compacted;
+    }
+    const closedFile = closedGroupFile(authority.sourceGroupId);
+    if (existsSync(closedFile)) {
+      const closed = decodeDurableClosedBatch(
+        readJson(closedFile, `Workflow origin group ${authority.sourceGroupId} closed batch`),
+      );
+      if (!sameCloseAuthority(closed.receipt, authority)) {
+        throw new Error('workflow origin group already has a conflicting immutable closed batch');
+      }
+      return decodeWorkflowOriginGroupCloseAuthority(closed.receipt);
+    }
+    validateCloseAgainstAdmissionEvidence(authority);
+    if (existingIntent) return existingIntent;
+    const file = closingGroupFile(authority.sourceGroupId);
+    if (createJsonDurably(file, authority)) return authority;
+    const winner = decodeWorkflowOriginGroupCloseAuthority(
+      readJson(file, `Workflow origin group ${authority.sourceGroupId} close intent`),
+    );
+    if (!sameCloseAuthority(winner, authority)) {
+      throw new Error('workflow origin group already has a conflicting immutable close intent');
+    }
+    return winner;
+  });
+}
+
 function decodeDurableClosedBatch(value: unknown): DurableWorkflowOriginGroupClosedBatch {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('durable workflow origin group closed batch is invalid');
@@ -1100,6 +1607,10 @@ export function recordWorkflowOriginGroupClosedBatch(input: {
     throw new Error('workflow origin group close receipt does not match its supplied prepared receipts');
   }
   return withWorkflowRunRecordLock(groupAuthorityLockFile(receipt.sourceGroupId), () => {
+    const intent = recordWorkflowOriginGroupCloseIntent(receipt);
+    if (!sameCloseAuthority(intent, receipt)) {
+      throw new Error('workflow origin group close receipt conflicts with its durable close intent');
+    }
     const tombstone = readWorkflowOriginGroupTombstone(receipt.sourceGroupId);
     if (tombstone) {
       const compacted = readWorkflowOriginGroupClosedBatch(receipt.sourceGroupId);
@@ -1115,19 +1626,13 @@ export function recordWorkflowOriginGroupClosedBatch(input: {
       }
       return compacted;
     }
-    const indexed = readIndexedWorkflowChatDispatchPreparations(receipt.sourceGroupId);
-    const indexedGroup = normalizePreparedGroup(indexed);
+    const preparedReceipts = validateCloseAgainstAdmissionEvidence(receipt);
     if (
-      indexedGroup.members.length !== receipt.members.length
-      || !indexedGroup.members.every((member, index) => sameMember(member, receipt.members[index]))
+      preparedReceipts.length !== supplied.receipts.length
+      || !preparedReceipts.every((prepared, index) => samePreparedReceipt(prepared, supplied.receipts[index]))
     ) {
-      throw new Error('workflow origin group cannot close until its complete ordered preparation index matches');
+      throw new Error('workflow origin group close supplied receipts conflict with its durable preparation index');
     }
-    const preparedReceipts = receipt.members.map((member) => {
-      const prepared = indexed.find((candidate) => candidate.receiptDigest === member.receiptDigest);
-      if (!prepared) throw new Error('workflow origin group close lost an indexed preparation');
-      return prepared;
-    });
     const candidate: DurableWorkflowOriginGroupClosedBatch = {
       version: ORIGIN_GROUP_VERSION,
       receipt,
@@ -1339,7 +1844,8 @@ export function workflowOriginGroupMemberForRequest(
 ): WorkflowOriginGroupMember | null {
   const sealed = readWorkflowOriginGroup(sourceGroupId);
   const closed = sealed ? null : readWorkflowOriginGroupClosedBatch(sourceGroupId);
-  const authority = sealed ?? closed?.receipt;
+  const closing = sealed || closed ? null : readWorkflowOriginGroupCloseIntent(sourceGroupId);
+  const authority = sealed ?? closed?.receipt ?? closing;
   if (!authority) return null;
   const target = normalizeExactOriginDeliveryTarget(replyTarget);
   if (!target || !sameExactOriginDeliveryTarget(authority.replyTarget, target)) {
@@ -2109,20 +2615,30 @@ function sameWorkflowOriginGroupTombstone(
 }
 
 function removeCompactedWorkflowOriginGroupFiles(sourceGroupId: string): void {
-  const preparedDir = groupPreparedDir(sourceGroupId);
-  if (existsSync(preparedDir)) {
-    const entries = readdirSync(preparedDir).sort();
-    if (entries.some((entry) => !entry.endsWith('.json'))) {
-      throw new Error(`Workflow origin group ${sourceGroupId} prepared index contains unknown evidence.`);
+  const tombstone = readWorkflowOriginGroupTombstone(sourceGroupId);
+  if (!tombstone) {
+    throw new Error(`Workflow origin group ${sourceGroupId} cannot remove authority before its tombstone.`);
+  }
+  validateCompactedAdmissionEvidence(tombstone);
+  for (const [dir, label] of [
+    [groupPreparedDir(sourceGroupId), 'prepared'],
+    [groupAdmissionsDir(sourceGroupId), 'admission'],
+  ] as const) {
+    if (existsSync(dir)) {
+      const entries = readdirSync(dir).sort();
+      if (entries.some((entry) => !/^[a-f0-9]{64}\.json$/.test(entry))) {
+        throw new Error(`Workflow origin group ${sourceGroupId} ${label} index contains unknown evidence.`);
+      }
+      for (const entry of entries) unlinkSync(path.join(dir, entry));
+      if (process.platform !== 'win32') {
+        const fd = openSync(dir, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      }
+      rmdirSync(dir);
     }
-    for (const entry of entries) unlinkSync(path.join(preparedDir, entry));
-    if (process.platform !== 'win32') {
-      const fd = openSync(preparedDir, 'r');
-      try { fsyncSync(fd); } finally { closeSync(fd); }
-    }
-    rmdirSync(preparedDir);
   }
   for (const file of [
+    closingGroupFile(sourceGroupId),
     closedGroupFile(sourceGroupId),
     sealedGroupFile(sourceGroupId),
     activatedGroupFile(sourceGroupId),
@@ -2154,6 +2670,10 @@ export function compactSettledWorkflowOriginGroup(
   return withWorkflowRunRecordLock(groupAuthorityLockFile(id), () => {
     const existing = readWorkflowOriginGroupTombstone(id);
     if (existing) {
+      // A crash after tombstone installation may leave the original fence.
+      // Decode/compare it before any cleanup; malformed or conflicting bytes
+      // are never silently erased by replay compaction.
+      readWorkflowOriginGroupCloseIntent(id);
       if (options.failAfterTombstoneForTest) {
         throw new Error('Injected workflow origin group compaction crash after durable tombstone.');
       }
@@ -2176,6 +2696,11 @@ export function compactSettledWorkflowOriginGroup(
     const settlement = decodeWorkflowOriginGroupSettlementReceipt(
       readJson(settlementFile, `Workflow origin group ${id} settlement`),
     );
+    const closeIntent = recordWorkflowOriginGroupCloseIntent(closed.receipt);
+    if (!sameCloseAuthority(closeIntent, closed.receipt)) {
+      throw new Error(`Workflow origin group ${id} has conflicting close-fence authority for compaction.`);
+    }
+    validateCloseAgainstAdmissionEvidence(closed.receipt);
     const active: ActiveWorkflowOriginGroup = {
       sealed,
       activation,
@@ -2660,6 +3185,87 @@ function runRecordAcknowledgesOriginObserver(
  * Active authority remains pending until the target-bound group settlement is
  * compacted into its replay tombstone. Settlement alone is insufficient: a
  * sibling may not yet own its per-run projection. */
+export function workflowRunsWithPendingChatDispatchAdmissions(): ReadonlySet<string> {
+  const pending = new Set<string>();
+  if (!existsSync(WORKFLOW_ORIGIN_GROUPS_DIR)) return pending;
+  for (const groupEntry of readdirSync(WORKFLOW_ORIGIN_GROUPS_DIR).sort()) {
+    const dir = path.join(WORKFLOW_ORIGIN_GROUPS_DIR, groupEntry, 'admissions');
+    if (!existsSync(dir)) continue;
+    const entries = readdirSync(dir).sort();
+    if (entries.some((entry) => !/^[a-f0-9]{64}\.json$/.test(entry))) {
+      throw new Error('workflow chat dispatch admission index contains unknown evidence');
+    }
+    for (const entry of entries) {
+      const admission = decodePreparationAuthority(
+        readJson(path.join(dir, entry), 'Workflow chat dispatch admission retention evidence'),
+      );
+      if (
+        groupDir(admission.sourceGroupId) !== path.dirname(dir)
+        || entry !== `${admission.queueRequestDigest}.json`
+      ) {
+        throw new Error('workflow chat dispatch admission retention evidence has a mismatched identity');
+      }
+      const active = readActiveWorkflowOriginGroup(admission.sourceGroupId);
+      if (active) {
+        const member = active.sealed.members.find(
+          (candidate) => candidate.queueRequestDigest === admission.queueRequestDigest,
+        );
+        if (
+          !member
+          || member.runId !== admission.runId
+          || member.preparationDigest !== admission.preparationDigest
+        ) {
+          throw new Error('workflow chat dispatch admission is outside its active source group');
+        }
+        if (!workflowRunHasRecordedChatDispatchPreparation(admission.runId, member.receiptDigest)) {
+          throw new Error('active workflow chat dispatch admission lost its preparation pin');
+        }
+        continue;
+      }
+      pending.add(admission.runId);
+    }
+  }
+  return pending;
+}
+
+/** Destructive callers invoke this while holding the canonical run lock. It is
+ * intentionally a fresh read rather than relying on an optimistic pass-wide
+ * snapshot: queue admission uses the same run lock before staging. */
+export function workflowRunHasPendingChatDispatchAdmission(runId: string): boolean {
+  const id = validRunId(runId);
+  if (!id) throw new Error('workflow run id is invalid for admission retention lookup');
+  return workflowRunsWithPendingChatDispatchAdmissions().has(id);
+}
+
+/** Compatibility hold for canonical run records created before the dedicated
+ * admission index. An active exact membership resolves the inline owner;
+ * otherwise the record is the only restart path and cannot be reaped. */
+export function workflowRunHasPendingInlineChatDispatchAdmission(
+  runId: string,
+  runRecord: Record<string, unknown>,
+): boolean {
+  const id = validRunId(runId);
+  if (!id || runRecord.id !== id) {
+    throw new Error('workflow run identity is invalid for inline admission lookup');
+  }
+  const sourceGroup = runRecord.chatDispatchSourceGroupId;
+  const requestDigest = runRecord.chatDispatchQueueRequestDigest;
+  if (sourceGroup === undefined && requestDigest === undefined) return false;
+  const sourceGroupId = nonEmptyString(sourceGroup);
+  if (!sourceGroupId || !isDigest(requestDigest)) {
+    throw new Error(`Workflow run ${id} has invalid inline chat dispatch admission authority.`);
+  }
+  const active = readActiveWorkflowOriginGroup(sourceGroupId);
+  if (!active) return true;
+  const member = active.sealed.members.find(
+    (candidate) => candidate.queueRequestDigest === requestDigest,
+  );
+  if (!member || member.runId !== id) {
+    throw new Error(`Workflow run ${id} has inline admission outside its active source group.`);
+  }
+  return false;
+}
+
 export function workflowRunHasPendingChatDispatchPreparation(runId: string): boolean {
   const id = validRunId(runId);
   if (!id) throw new Error('workflow run id is invalid for pending preparation lookup');

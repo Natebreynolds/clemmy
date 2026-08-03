@@ -52,7 +52,10 @@ import {
 import { compiledProjectRootHasSettlementMarker } from './project-root-lifecycle.js';
 import {
   cleanupSettledWorkflowRunChatDispatchPreparations,
+  workflowRunHasPendingChatDispatchAdmission,
+  workflowRunHasPendingInlineChatDispatchAdmission,
   workflowRunHasPendingChatDispatchPreparation,
+  workflowRunsWithPendingChatDispatchAdmissions,
 } from './workflow-origin-group.js';
 
 /**
@@ -1102,6 +1105,14 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   } catch {
     return { scanned: 0, deleted: 0 };
   }
+  let pendingAdmissionRunIds: ReadonlySet<string>;
+  try {
+    pendingAdmissionRunIds = workflowRunsWithPendingChatDispatchAdmissions();
+  } catch {
+    // Unknown or corrupt staging can own any terminal canonical run. Refuse
+    // the entire destructive pass until that durable evidence is repaired.
+    return { scanned: files.length, deleted: 0 };
+  }
   const cutoffMs = Date.now() - RUN_RETENTION_DAYS * 24 * 60 * 60 * 1000;
   let deleted = 0;
   for (const file of files) {
@@ -1120,7 +1131,15 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
         // this same record lock is held, so deletion must consult that pin
         // before removing any evidence needed to close the dispatch batch.
         // Corrupt pins throw and fail closed through the outer catch.
-        if (workflowRunHasPendingChatDispatchPreparation(runId)) return false;
+        if (
+          pendingAdmissionRunIds.has(runId)
+          || workflowRunHasPendingChatDispatchAdmission(runId)
+          || workflowRunHasPendingInlineChatDispatchAdmission(
+            runId,
+            raw as unknown as Record<string, unknown>,
+          )
+          || workflowRunHasPendingChatDispatchPreparation(runId)
+        ) return false;
         if (hasOutstandingWorkflowRunReportBack(raw)) return false;
         // A compiled root is the restart journal for a second durable ledger.
         // Never delete it until an exact marker proves ExecutionStore observed

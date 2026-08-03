@@ -58,16 +58,19 @@ import {
   createWorkflowChatDispatchPreparationAuthority,
   decodeWorkflowChatDispatchPreparedReceipt,
   normalizeWorkflowRunOriginObserver,
+  recordWorkflowChatDispatchAdmission,
   readActiveWorkflowOriginGroup,
   readActiveExactWorkflowRunOriginRecords,
   readIndexedWorkflowChatDispatchPreparations,
+  readWorkflowChatDispatchAdmissions,
   readWorkflowOriginGroup,
   readWorkflowOriginGroupClosedBatch,
   workflowChatDispatchQueueRequestDigest,
-  workflowOriginGroupMemberForRequest,
+  workflowOriginGroupAdmissionForRequest,
   workflowOriginSourceGroupId,
   workflowRunHasRecordedChatDispatchPreparation,
   workflowRunOriginObserverId,
+  withWorkflowOriginGroupAuthorityLock,
   type ExactWorkflowRunOriginRecord,
   type WorkflowChatDispatchPreparationAuthority,
   type WorkflowChatDispatchPreparedReceipt,
@@ -79,14 +82,20 @@ export {
   activateWorkflowOriginGroup,
   cleanupSettledWorkflowRunChatDispatchPreparations,
   compactSettledWorkflowOriginGroup,
+  createWorkflowChatDispatchPreparationAuthority,
   createWorkflowChatDispatchPreparedReceipt,
   createWorkflowOriginGroupCloseAuthority,
   createWorkflowOriginGroupClosedBatchReceipt,
   createWorkflowOriginGroupSettlementReceipt,
   finalizeWorkflowOriginGroupClosedBatch,
+  listWorkflowOriginGroupCloseIntents,
   readIndexedWorkflowChatDispatchPreparations,
+  readWorkflowChatDispatchAdmissions,
+  readWorkflowOriginGroupCloseIntent,
   readWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchAdmission,
   recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupCloseIntent,
   recordWorkflowOriginGroupClosedBatch,
   reconcileActivatedWorkflowOriginGroups,
   recoverClosedWorkflowOriginGroups,
@@ -100,6 +109,7 @@ export {
   sealWorkflowOriginGroup,
   verifyActiveWorkflowOriginMembership,
   workflowChatDispatchQueueRequestDigest,
+  workflowOriginGroupAdmissionForRequest,
   workflowOriginGroupMemberForRequest,
   workflowOriginSourceGroupId,
   workflowRunHasPendingChatDispatchPreparation,
@@ -429,6 +439,16 @@ function waitAfterDedupeLockMkdirForTest(): void {
 function waitAfterDedupeLockOwnershipForTest(): void {
   const ready = process.env.CLEMENTINE_TEST_DEDUPE_LOCK_OWNED_READY;
   const release = process.env.CLEMENTINE_TEST_DEDUPE_LOCK_OWNED_RELEASE;
+  if (!ready || !release) return;
+  writeFileSync(ready, 'ready', 'utf-8');
+  while (!existsSync(release)) Atomics.wait(WORKFLOW_RUN_DEDUPE_WAIT, 0, 0, 10);
+}
+
+/** Deterministic stale-read seam: admission may acquire a different canonical
+ * owner after the optimistic duplicate/group reads but before the run lock. */
+function waitAfterExactChatDispatchLookupForTest(): void {
+  const ready = process.env.CLEMENTINE_TEST_EXACT_ADMISSION_LOOKUP_READY;
+  const release = process.env.CLEMENTINE_TEST_EXACT_ADMISSION_LOOKUP_RELEASE;
   if (!ready || !release) return;
   writeFileSync(ready, 'ready', 'utf-8');
   while (!existsSync(release)) Atomics.wait(WORKFLOW_RUN_DEDUPE_WAIT, 0, 0, 10);
@@ -801,82 +821,95 @@ export function readPendingWorkflowChatDispatchOwnership(
     throw new Error('pending workflow chat dispatch ownership requires an exact source identity');
   }
   const sourceGroupId = workflowOriginSourceGroupId({ sessionId: originSessionId, sourceUserSeq });
-  if (readActiveWorkflowOriginGroup(sourceGroupId)) return null;
+  return withWorkflowOriginGroupAuthorityLock(sourceGroupId, () => {
+    if (readActiveWorkflowOriginGroup(sourceGroupId)) return null;
 
-  const indexed = readIndexedWorkflowChatDispatchPreparations(sourceGroupId);
-  const candidateRunIds = new Set<string>();
-  for (const receipt of indexed) {
-    if (
-      receipt.sourceGroupId !== sourceGroupId
-      || receipt.originSessionId !== originSessionId
-      || receipt.sourceUserSeq !== sourceUserSeq
-    ) {
-      throw new Error(`Workflow origin group ${sourceGroupId} has preparation evidence for another source.`);
+    const indexed = readIndexedWorkflowChatDispatchPreparations(sourceGroupId);
+    const admitted = readWorkflowChatDispatchAdmissions(sourceGroupId);
+    const candidateRunIds = new Set<string>();
+    for (const admission of admitted) {
+      if (
+        admission.sourceGroupId !== sourceGroupId
+        || admission.originSessionId !== originSessionId
+        || admission.sourceUserSeq !== sourceUserSeq
+      ) {
+        throw new Error(`Workflow origin group ${sourceGroupId} has admission evidence for another source.`);
+      }
+      candidateRunIds.add(admission.runId);
     }
-    if (!workflowRunHasRecordedChatDispatchPreparation(receipt.runId, receipt.receiptDigest)) {
-      throw new Error(`Workflow origin group ${sourceGroupId} lost run ${receipt.runId}'s preparation pin.`);
+    for (const receipt of indexed) {
+      if (
+        receipt.sourceGroupId !== sourceGroupId
+        || receipt.originSessionId !== originSessionId
+        || receipt.sourceUserSeq !== sourceUserSeq
+      ) {
+        throw new Error(`Workflow origin group ${sourceGroupId} has preparation evidence for another source.`);
+      }
+      if (!workflowRunHasRecordedChatDispatchPreparation(receipt.runId, receipt.receiptDigest)) {
+        throw new Error(`Workflow origin group ${sourceGroupId} lost run ${receipt.runId}'s preparation pin.`);
+      }
+      candidateRunIds.add(receipt.runId);
     }
-    candidateRunIds.add(receipt.runId);
-  }
 
-  if (existsSync(WORKFLOW_RUNS_DIR)) {
-    for (const entry of readdirSync(WORKFLOW_RUNS_DIR).filter((file) => file.endsWith('.json')).sort()) {
-      const file = path.join(WORKFLOW_RUNS_DIR, entry);
+    if (existsSync(WORKFLOW_RUNS_DIR)) {
+      for (const entry of readdirSync(WORKFLOW_RUNS_DIR).filter((file) => file.endsWith('.json')).sort()) {
+        const file = path.join(WORKFLOW_RUNS_DIR, entry);
+        let run: Record<string, unknown>;
+        try {
+          const parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+          run = parsed as Record<string, unknown>;
+        } catch {
+          // An unreadable unrelated run cannot be attributed to this source. An
+          // indexed member is validated again below and therefore still fails
+          // closed if its own canonical record is unreadable.
+          continue;
+        }
+        if (run.chatDispatchSourceGroupId !== sourceGroupId) continue;
+        const runId = normalizedOptionalString(run.id);
+        if (!runId || entry !== `${runId}.json`) {
+          throw new Error(`Workflow origin group ${sourceGroupId} has a mismatched canonical held run.`);
+        }
+        if (!/^[a-f0-9]{64}$/.test(String(run.chatDispatchQueueRequestDigest ?? ''))) {
+          throw new Error(`Workflow origin group ${sourceGroupId} run ${runId} lost its queue request authority.`);
+        }
+        candidateRunIds.add(runId);
+      }
+    }
+
+    if (candidateRunIds.size === 0) return null;
+    const runIds = [...candidateRunIds].sort();
+    const runStatuses: Record<string, string> = {};
+    for (const runId of runIds) {
+      const file = workflowRunFile(runId);
+      if (!existsSync(file)) {
+        throw new Error(`Workflow origin group ${sourceGroupId} references missing run ${runId}.`);
+      }
       let run: Record<string, unknown>;
       try {
         const parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error('record is not an object');
+        }
         run = parsed as Record<string, unknown>;
-      } catch {
-        // An unreadable unrelated run cannot be attributed to this source. An
-        // indexed member is validated again below and therefore still fails
-        // closed if its own canonical record is unreadable.
-        continue;
+      } catch (err) {
+        throw new Error(`Workflow origin group ${sourceGroupId} has unreadable run ${runId}.`, { cause: err });
       }
-      if (run.chatDispatchSourceGroupId !== sourceGroupId) continue;
-      const runId = normalizedOptionalString(run.id);
-      if (!runId || entry !== `${runId}.json`) {
-        throw new Error(`Workflow origin group ${sourceGroupId} has a mismatched canonical held run.`);
+      const status = normalizedOptionalString(run.status);
+      if (run.id !== runId || !status) {
+        throw new Error(`Workflow origin group ${sourceGroupId} has invalid run ${runId}.`);
       }
-      if (!/^[a-f0-9]{64}$/.test(String(run.chatDispatchQueueRequestDigest ?? ''))) {
-        throw new Error(`Workflow origin group ${sourceGroupId} run ${runId} lost its queue request authority.`);
-      }
-      candidateRunIds.add(runId);
+      runStatuses[runId] = status;
     }
-  }
-
-  if (candidateRunIds.size === 0) return null;
-  const runIds = [...candidateRunIds].sort();
-  const runStatuses: Record<string, string> = {};
-  for (const runId of runIds) {
-    const file = workflowRunFile(runId);
-    if (!existsSync(file)) {
-      throw new Error(`Workflow origin group ${sourceGroupId} references missing run ${runId}.`);
-    }
-    let run: Record<string, unknown>;
-    try {
-      const parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error('record is not an object');
-      }
-      run = parsed as Record<string, unknown>;
-    } catch (err) {
-      throw new Error(`Workflow origin group ${sourceGroupId} has unreadable run ${runId}.`, { cause: err });
-    }
-    const status = normalizedOptionalString(run.status);
-    if (run.id !== runId || !status) {
-      throw new Error(`Workflow origin group ${sourceGroupId} has invalid run ${runId}.`);
-    }
-    runStatuses[runId] = status;
-  }
-  return {
-    sourceGroupId,
-    originSessionId,
-    sourceUserSeq,
-    phase: readWorkflowOriginGroupClosedBatch(sourceGroupId) ? 'closed' : 'prepared',
-    runIds,
-    runStatuses,
-  };
+    return {
+      sourceGroupId,
+      originSessionId,
+      sourceUserSeq,
+      phase: readWorkflowOriginGroupClosedBatch(sourceGroupId) ? 'closed' : 'prepared',
+      runIds,
+      runStatuses,
+    };
+  });
 }
 
 export function assertNoPendingWorkflowChatDispatchOwnership(
@@ -1962,6 +1995,111 @@ function prepareExactChatDispatch(
   });
 }
 
+interface ExactChatDispatchAdmissionResult {
+  id: string;
+  runStatus: string;
+  chatDispatchPreparation?: WorkflowChatDispatchPreparedReceipt;
+  installed: boolean;
+  collision?: boolean;
+}
+
+/** Complete exact admission under the canonical run→group lock order. The
+ * group lock spans owner revalidation, optional fresh-run installation,
+ * create-only staging, callback event append, and receipt indexing. */
+function admitAndPrepareExactChatDispatch(input: {
+  candidateRunId: string;
+  observer: WorkflowRunOriginObserver;
+  queueRequestDigest: string;
+  callback: QueueWorkflowRunOptions['prepareChatDispatch'];
+  buildFreshRecord?: (runId: string) => Record<string, unknown>;
+  acceptExistingCandidate?: boolean;
+}): ExactChatDispatchAdmissionResult {
+  let runId = input.candidateRunId;
+  let buildFreshRecord = input.buildFreshRecord;
+  for (let redirects = 0; redirects < 4; redirects += 1) {
+    const file = workflowRunFile(runId);
+    const result = withWorkflowRunRecordLock(file, () => (
+      withWorkflowOriginGroupAuthorityLock(
+        workflowOriginSourceGroupId(input.observer),
+        (): ExactChatDispatchAdmissionResult | { redirect: string } => {
+          const existing = workflowOriginGroupAdmissionForRequest(
+            workflowOriginSourceGroupId(input.observer),
+            input.queueRequestDigest,
+            input.observer.replyTarget,
+          );
+          if (existing && existing.runId !== runId) {
+            return { redirect: existing.runId };
+          }
+
+          let installed = false;
+          if (!existsSync(file)) {
+            if (!buildFreshRecord) {
+              throw new Error(`Workflow chat dispatch admission references missing run ${runId}.`);
+            }
+            installed = writeNewRunFileDurably(file, buildFreshRecord(runId));
+            if (!installed) return {
+              id: runId,
+              runStatus: 'collision',
+              installed: false,
+              collision: true,
+            };
+          } else if (buildFreshRecord && !input.acceptExistingCandidate && !existing) {
+            return {
+              id: runId,
+              runStatus: 'collision',
+              installed: false,
+              collision: true,
+            };
+          }
+
+          const durableRun = JSON.parse(readFileSync(file, 'utf-8')) as {
+            id?: unknown;
+            status?: unknown;
+          };
+          if (durableRun.id !== runId) {
+            throw new Error(`Workflow run ${runId} changed identity during chat dispatch admission.`);
+          }
+          if (existing?.preparedReceipt) {
+            return {
+              id: runId,
+              runStatus: typeof durableRun.status === 'string' ? durableRun.status : 'accepted',
+              chatDispatchPreparation: existing.preparedReceipt,
+              installed,
+            };
+          }
+          const authority = createWorkflowChatDispatchPreparationAuthority({
+            runId,
+            observer: input.observer,
+            queueRequestDigest: input.queueRequestDigest,
+          });
+          recordWorkflowChatDispatchAdmission(authority);
+          const chatDispatchPreparation = prepareExactChatDispatch(
+            runId,
+            input.observer,
+            input.queueRequestDigest,
+            input.callback,
+          );
+          return {
+            id: runId,
+            runStatus: typeof durableRun.status === 'string' ? durableRun.status : 'accepted',
+            chatDispatchPreparation,
+            installed,
+          };
+        },
+      )
+    ));
+    if ('redirect' in result) {
+      runId = result.redirect;
+      // A group-canonical redirect is immutable existing authority. Never use
+      // the optimistic candidate's fresh builder to resurrect a reaped member.
+      buildFreshRecord = undefined;
+      continue;
+    }
+    return result;
+  }
+  throw new Error('workflow chat dispatch admission changed canonical owner repeatedly');
+}
+
 function queueWorkflowRunUnlocked(
   name: string,
   normalizedInputs: Record<string, string>,
@@ -2025,47 +2163,56 @@ function queueWorkflowRunUnlocked(
   let admittedChatDispatchPreparation: WorkflowChatDispatchPreparedReceipt | undefined;
   if (originObserver && queueRequestDigest) {
     const sourceGroupId = workflowOriginSourceGroupId(originObserver);
-    const sealedMember = workflowOriginGroupMemberForRequest(
+    const admittedOwner = workflowOriginGroupAdmissionForRequest(
       sourceGroupId,
       queueRequestDigest,
       originObserver.replyTarget,
     );
-    if (sealedMember) {
-      const closed = readWorkflowOriginGroupClosedBatch(sourceGroupId);
-      const admitted = closed?.preparedReceipts.find(
-        (receipt) => receipt.receiptDigest === sealedMember.receiptDigest,
-      );
-      if (
-        !admitted
-        || admitted.runId !== sealedMember.runId
-        || admitted.queueRequestDigest !== queueRequestDigest
-      ) {
-        throw new Error(`Closed workflow origin group ${sourceGroupId} has no matching durable preparation.`);
-      }
-      admittedChatDispatchPreparation = admitted;
-      const memberFile = workflowRunFile(sealedMember.runId);
+    if (admittedOwner) {
+      admittedChatDispatchPreparation = admittedOwner.preparedReceipt;
+      const memberFile = workflowRunFile(admittedOwner.runId);
       if (!existsSync(memberFile)) {
-        throw new Error(`Sealed workflow origin group references missing run ${sealedMember.runId}.`);
+        throw new Error(`Workflow origin group admission references missing run ${admittedOwner.runId}.`);
       }
       const member = JSON.parse(readFileSync(memberFile, 'utf-8')) as { id?: unknown; status?: unknown };
-      if (member.id !== sealedMember.runId) {
-        throw new Error(`Sealed workflow origin group member ${sealedMember.runId} has a mismatched run record.`);
+      if (member.id !== admittedOwner.runId) {
+        throw new Error(`Workflow origin group member ${admittedOwner.runId} has a mismatched run record.`);
       }
       duplicate = {
-        id: sealedMember.runId,
+        id: admittedOwner.runId,
         status: typeof member.status === 'string' ? member.status : 'accepted',
       };
     }
   }
+  if (originObserver && queueRequestDigest) waitAfterExactChatDispatchLookupForTest();
   // Exact source authority is installed only by whole-group activation. Never
   // project it into the mutable inline legacy origin fields or V1 sidecars.
   const origins = originObserver
     ? []
     : normalizeOriginSessionIds(explicitPrimaryOrigin, opts?.originSessionIds);
   if (duplicate) {
+    const exactDuplicateAdmission = originObserver && queueRequestDigest && !admittedChatDispatchPreparation
+      ? admitAndPrepareExactChatDispatch({
+          candidateRunId: duplicate.id,
+          observer: originObserver,
+          queueRequestDigest,
+          callback: opts?.prepareChatDispatch,
+        })
+      : undefined;
+    if (exactDuplicateAdmission) {
+      duplicate = {
+        id: exactDuplicateAdmission.id,
+        status: exactDuplicateAdmission.runStatus,
+      };
+    }
     if (triggerReceiptId) {
       const bound = persistWorkflowTriggerReceiptAcceptance(triggerReceiptId, duplicate.id);
       if (bound !== duplicate.id) {
+        if (originObserver) {
+          throw new Error(
+            `Trigger receipt ${triggerReceiptId} conflicts with exact chat admission run ${duplicate.id}.`,
+          );
+        }
         const accepted = readWorkflowTriggerReceiptAcceptance(triggerReceiptId);
         if (!accepted) {
           throw new Error(
@@ -2076,13 +2223,11 @@ function queueWorkflowRunUnlocked(
       }
     }
     const chatDispatchPreparation = originObserver && queueRequestDigest
-      ? admittedChatDispatchPreparation ?? prepareExactChatDispatch(
-          duplicate.id,
-          originObserver,
-          queueRequestDigest,
-          opts?.prepareChatDispatch,
-        )
+      ? admittedChatDispatchPreparation ?? exactDuplicateAdmission?.chatDispatchPreparation
       : undefined;
+    if (originObserver && queueRequestDigest && !chatDispatchPreparation) {
+      throw new Error('workflow chat dispatch admission completed without a prepared receipt');
+    }
     attachWorkflowRunOriginsToRun(duplicate.id, origins);
     return {
       status: 'duplicate',
@@ -2225,15 +2370,33 @@ function queueWorkflowRunUnlocked(
     ...(retryFailedItems ? retryFailedItems : {}),
   });
   let id: string;
+  let exactAdmission: ExactChatDispatchAdmissionResult | undefined;
   if (triggerReceiptId) {
     id = triggerBoundRunId ?? deterministicTriggerRunId(triggerReceiptId);
+    const triggerCandidateRunId = id;
     const runFile = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
     const runRecord = buildRunRecord(id);
-    const installed = writeNewRunFileDurably(runFile, runRecord);
-    if (!installed) {
+    const installed = originObserver && queueRequestDigest
+      ? (() => {
+          exactAdmission = admitAndPrepareExactChatDispatch({
+            candidateRunId: id,
+            observer: originObserver,
+            queueRequestDigest,
+            callback: opts?.prepareChatDispatch,
+            buildFreshRecord: buildRunRecord,
+            acceptExistingCandidate: true,
+          });
+          if (!exactAdmission.chatDispatchPreparation) {
+            throw new Error('workflow chat dispatch trigger admission completed without a prepared receipt');
+          }
+          id = exactAdmission.id;
+          return exactAdmission.installed;
+        })()
+      : writeNewRunFileDurably(runFile, runRecord);
+    if (!installed && !(originObserver && exactAdmission && id !== triggerCandidateRunId)) {
       let existingReceiptId: unknown;
       try {
-        existingReceiptId = (JSON.parse(readFileSync(runFile, 'utf-8')) as { triggerReceiptId?: unknown }).triggerReceiptId;
+        existingReceiptId = (JSON.parse(readFileSync(workflowRunFile(id), 'utf-8')) as { triggerReceiptId?: unknown }).triggerReceiptId;
       } catch (err) {
         throw new Error(`Existing workflow run ${id} is unreadable during trigger recovery.`, { cause: err });
       }
@@ -2251,13 +2414,16 @@ function queueWorkflowRunUnlocked(
     }
     if (!installed) {
       const chatDispatchPreparation = originObserver && queueRequestDigest
-        ? prepareExactChatDispatch(
-            id,
-            originObserver,
+        ? exactAdmission?.chatDispatchPreparation ?? admitAndPrepareExactChatDispatch({
+            candidateRunId: id,
+            observer: originObserver,
             queueRequestDigest,
-            opts?.prepareChatDispatch,
-          )
+            callback: opts?.prepareChatDispatch,
+          }).chatDispatchPreparation
         : undefined;
+      if (originObserver && queueRequestDigest && !chatDispatchPreparation) {
+        throw new Error('workflow chat dispatch trigger retry completed without a prepared receipt');
+      }
       attachWorkflowRunOriginsToRun(id, origins);
       return {
         status: 'duplicate',
@@ -2267,6 +2433,27 @@ function queueWorkflowRunUnlocked(
         message: `Trigger receipt ${triggerReceiptId} was already accepted by workflow run ${id}; no duplicate was queued.`,
       };
     }
+  } else if (originObserver && queueRequestDigest) {
+    let admitted: ExactChatDispatchAdmissionResult | undefined;
+    for (let attempt = 0; attempt < RANDOM_RUN_ID_INSTALL_ATTEMPTS; attempt += 1) {
+      admitted = admitAndPrepareExactChatDispatch({
+        candidateRunId: createRunId(opts?.idPrefix),
+        observer: originObserver,
+        queueRequestDigest,
+        callback: opts?.prepareChatDispatch,
+        buildFreshRecord: buildRunRecord,
+      });
+      if (!admitted.collision) break;
+      admitted = undefined;
+    }
+    if (!admitted) {
+      throw new Error(`Could not allocate a fresh workflow run id after ${RANDOM_RUN_ID_INSTALL_ATTEMPTS} create-only attempts.`);
+    }
+    if (!admitted.chatDispatchPreparation) {
+      throw new Error('workflow chat dispatch admission completed without a prepared receipt');
+    }
+    exactAdmission = admitted;
+    id = admitted.id;
   } else {
     id = installFreshRandomRunRecord(opts?.idPrefix, buildRunRecord).id;
   }
@@ -2274,15 +2461,20 @@ function queueWorkflowRunUnlocked(
   // durable. Failure intentionally leaves that fresh record held and installs
   // no active observer; a retry dedupes back to it and retries preparation.
   const chatDispatchPreparation = originObserver && queueRequestDigest
-    ? prepareExactChatDispatch(
-        id,
-        originObserver,
+    ? exactAdmission?.chatDispatchPreparation ?? admitAndPrepareExactChatDispatch({
+        candidateRunId: id,
+        observer: originObserver,
         queueRequestDigest,
-        opts?.prepareChatDispatch,
-      )
+        callback: opts?.prepareChatDispatch,
+      }).chatDispatchPreparation
     : undefined;
+  if (originObserver && queueRequestDigest && !chatDispatchPreparation) {
+    throw new Error('workflow chat dispatch admission completed without a prepared receipt');
+  }
   return {
-    status: catchupHold || originObserver ? 'held' : 'queued',
+    status: originObserver && exactAdmission && !exactAdmission.installed
+      ? 'duplicate'
+      : catchupHold || originObserver ? 'held' : 'queued',
     id,
     ...(chatDispatchPreparation ? { chatDispatchPreparation } : {}),
     ...(readiness ? { readiness } : {}),

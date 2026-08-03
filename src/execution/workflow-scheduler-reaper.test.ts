@@ -43,6 +43,7 @@ const {
   createWorkflowOriginGroupCloseAuthority,
   createWorkflowOriginGroupClosedBatchReceipt,
   finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchAdmission,
   recordWorkflowChatDispatchPreparation,
   recordWorkflowOriginGroupClosedBatch,
   workflowChatDispatchQueueRequestDigest,
@@ -316,6 +317,49 @@ test('reaper revalidates under the record lock after a terminal scan races pendi
   assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 0 });
   assert.equal(seamCalls, 1);
   assert.equal(existsSync(file), true);
+});
+
+test('reaper revalidates staged ownership after its optimistic scan for an acknowledged shared terminal', () => {
+  const runId = 'late-staged-shared-terminal';
+  const file = writeRun(runId, {
+    originSessionId: 'already-settled-origin',
+    notifiedAt: OLD_FINISHED_AT,
+    reportBack: {
+      version: 1,
+      workflowName: 'Retention Workflow',
+      outcome: 'done',
+      detail: 'The prior observer is fully settled.',
+      acknowledgedOriginSessionIds: ['already-settled-origin'],
+    },
+  });
+  const admission = createWorkflowChatDispatchPreparationAuthority({
+    runId,
+    observer: {
+      sessionId: 'new-unresolved-source',
+      sourceUserSeq: 4101,
+      replyTarget: { type: 'origin_chat' },
+    },
+    queueRequestDigest: workflowChatDispatchQueueRequestDigest({
+      workflowName: 'Retention Workflow',
+      normalizedInputs: {},
+    }),
+  });
+  let staged = 0;
+  _setWorkflowRunReaperBeforeLockForTests((candidate) => {
+    if (candidate !== file) return;
+    staged += 1;
+    recordWorkflowChatDispatchAdmission(admission);
+  });
+
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 0 });
+  assert.equal(staged, 1);
+  assert.equal(existsSync(file), true);
+  const durable = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  assert.equal(
+    durable.chatDispatchSourceGroupId,
+    undefined,
+    'a shared run has no new-source inline field; the dedicated stage is the only hold',
+  );
 });
 
 test('reaper preserves an old terminal duplicate while its exact chat dispatch is prepared but unsettled', () => {

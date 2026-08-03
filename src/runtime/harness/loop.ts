@@ -210,9 +210,13 @@ import {
   createWorkflowOriginGroupCloseAuthority,
   createWorkflowOriginGroupClosedBatchReceipt,
   finalizeWorkflowOriginGroupClosedBatch,
+  listWorkflowOriginGroupCloseIntents,
   readActiveWorkflowOriginGroup,
   reconcileActivatedWorkflowOriginGroups,
+  recordWorkflowOriginGroupCloseIntent,
   recordWorkflowOriginGroupClosedBatch,
+  withWorkflowOriginGroupAuthorityLock,
+  workflowOriginSourceGroupId,
   type ActiveWorkflowOriginGroup,
   type WorkflowChatDispatchPreparationAuthority,
   type WorkflowChatDispatchPreparedReceipt,
@@ -2358,24 +2362,57 @@ function closePreparedWorkflowDispatchBatch(
   const source = listEvents(sessionId, { types: ['user_input_received'] })
     .find((event) => event.seq === sourceUserSeq);
   if (!source || source.role !== 'user' || source.data.synthetic === true) return null;
-  const existing = listEvents(sessionId, { types: ['async_work_dispatch_batch_closed'] })
-    .filter((event) => event.data.sourceUserSeq === sourceUserSeq);
-  if (existing.length > 1) {
-    throw new Error('workflow source group has ambiguous durable close winners');
-  }
-  let closeEvent = existing[0];
-  if (!closeEvent) {
-    const prepared = preparedWorkflowDispatchReceipts({ sessionId, sourceUserSeq });
-    if (prepared.length === 0) return null;
-    const authority = createWorkflowOriginGroupCloseAuthority(prepared);
-    closeEvent = appendAsyncWorkDispatchBatchClosedOnce({
-      sessionId,
-      turn: source.turn,
-      sourceUserSeq,
-      data: { ...authority },
-    }).event;
-  }
-  return materializeClosedWorkflowDispatchBatch(closeEvent);
+  const sourceGroupId = workflowOriginSourceGroupId({ sessionId, sourceUserSeq });
+  return withWorkflowOriginGroupAuthorityLock(sourceGroupId, () => {
+    const existing = listEvents(sessionId, { types: ['async_work_dispatch_batch_closed'] })
+      .filter((event) => event.data.sourceUserSeq === sourceUserSeq);
+    if (existing.length > 1) {
+      throw new Error('workflow source group has ambiguous durable close winners');
+    }
+    let closeEvent = existing[0];
+    if (!closeEvent) {
+      const prepared = preparedWorkflowDispatchReceipts({ sessionId, sourceUserSeq });
+      if (prepared.length === 0) return null;
+      const authority = createWorkflowOriginGroupCloseAuthority(prepared);
+      // The create-only filesystem fence closes membership before SQLite is
+      // touched. This lock remains held through the close event and closed
+      // projection, so admission lands wholly before or wholly after it.
+      recordWorkflowOriginGroupCloseIntent(authority);
+      closeEvent = appendAsyncWorkDispatchBatchClosedOnce({
+        sessionId,
+        turn: source.turn,
+        sourceUserSeq,
+        data: { ...authority },
+      }).event;
+    }
+    return materializeClosedWorkflowDispatchBatch(closeEvent);
+  });
+}
+
+function recoverWorkflowOriginGroupCloseIntentEvent(
+  authority: WorkflowOriginGroupCloseAuthority,
+): void {
+  withWorkflowOriginGroupAuthorityLock(authority.sourceGroupId, () => {
+    const source = listEvents(authority.originSessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === authority.sourceUserSeq);
+    if (!source || source.role !== 'user' || source.data.synthetic === true) {
+      throw new Error('workflow origin group close intent lost its accepted source');
+    }
+    const existing = listEvents(authority.originSessionId, {
+      types: ['async_work_dispatch_batch_closed'],
+    }).filter((event) => event.data.sourceUserSeq === authority.sourceUserSeq);
+    if (existing.length > 1) {
+      throw new Error('workflow source group has ambiguous durable close winners');
+    }
+    if (existing.length === 0) {
+      appendAsyncWorkDispatchBatchClosedOnce({
+        sessionId: authority.originSessionId,
+        turn: source.turn,
+        sourceUserSeq: authority.sourceUserSeq,
+        data: { ...authority },
+      });
+    }
+  });
 }
 
 function finalizePreparedWorkflowDispatches(
@@ -2445,9 +2482,9 @@ export interface ReconcileClosedWorkflowDispatchBatchesResult {
   rejected: number;
 }
 
-/** Recover a crash after the private close node won but before activation or
- * public dispatch. Prepared-only groups are deliberately absent from this
- * bounded global query and remain held. */
+/** Recover a crash after either the filesystem close fence or private close
+ * node won but before activation/public dispatch. Unfenced prepared-only
+ * groups remain deliberately absent and held. */
 export function reconcileClosedWorkflowDispatchBatches(
   limit = 200,
 ): ReconcileClosedWorkflowDispatchBatchesResult {
@@ -2457,6 +2494,21 @@ export function reconcileClosedWorkflowDispatchBatches(
     published: 0,
     rejected: 0,
   };
+  // A crash can occur after the membership fence fsync but before the SQLite
+  // event append. Drive those bounded intents into the ordinary event-ledger
+  // replay path first; already-closed/compacted groups are filtered by the
+  // origin-group store and cannot starve this scan.
+  try {
+    for (const intent of listWorkflowOriginGroupCloseIntents(limit)) {
+      try {
+        recoverWorkflowOriginGroupCloseIntentEvent(intent);
+      } catch {
+        result.rejected += 1;
+      }
+    }
+  } catch {
+    result.rejected += 1;
+  }
   for (const closeEvent of listPendingAsyncWorkDispatchBatchClosedEvents(limit)) {
     result.examined += 1;
     try {
