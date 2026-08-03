@@ -2,6 +2,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 export interface ToolOutputContext {
   sessionId?: string;
+  /** Exact accepted user event that owns this tool call. Async dispatch tools
+   * use this together with sessionId so two requests in one chat remain
+   * distinct durable observers of the work they started. */
+  sourceUserSeq?: number;
   /** One active model/tool run. Behavioral counters must never leak across
    * separate user turns in the same durable session. */
   runScopeId?: string;
@@ -45,6 +49,19 @@ export function sessionIdFromRunContext(context: unknown): string | undefined {
   return typeof sessionId === 'string' && sessionId ? sessionId : undefined;
 }
 
+/** Exact accepted user event carried by the SDK RunContext. Keep this beside
+ * the session extractor so local-runtime tools receive the same source
+ * authority as in-process/stdin MCP tools. */
+export function sourceUserSeqFromRunContext(context: unknown): number | undefined {
+  if (!context || typeof context !== 'object') return undefined;
+  const runtimeContext = (context as { context?: unknown }).context;
+  if (!runtimeContext || typeof runtimeContext !== 'object') return undefined;
+  const sourceUserSeq = (runtimeContext as { sourceUserSeq?: unknown }).sourceUserSeq;
+  return Number.isSafeInteger(sourceUserSeq) && Number(sourceUserSeq) > 0
+    ? Number(sourceUserSeq)
+    : undefined;
+}
+
 export function runScopeIdFromRunContext(context: unknown): string | undefined {
   if (context && typeof context === 'object') {
     const runtimeContext = (context as { context?: unknown }).context;
@@ -78,6 +95,7 @@ export function toolOutputContextFromSdk(
 ): ToolOutputContext {
   return {
     sessionId: sessionIdFromRunContext(runContext),
+    sourceUserSeq: sourceUserSeqFromRunContext(runContext),
     runScopeId: runScopeIdFromRunContext(runContext),
     callId: callIdFromToolDetails(details),
     toolName,

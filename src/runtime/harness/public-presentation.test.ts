@@ -4,6 +4,7 @@ import type { EventRow, EventType } from './eventlog.js';
 import {
   projectHarnessEventForPublic,
   projectHarnessEventsForPublic,
+  publicAsyncWorkDispatchedData,
   publicCompletionText,
   publicReplyText,
 } from './public-presentation.js';
@@ -84,6 +85,11 @@ test('raw model/control events and untrusted stream deltas have no public event'
   assert.equal(projectHarnessEventForPublic(event('guardrail_tripped', { prompt: 'private corrective text' })), null);
   assert.equal(projectHarnessEventForPublic(event('stream_token', { delta: 'private draft' })), null);
   assert.equal(
+    projectHarnessEventForPublic(event('async_work_dispatch_batch_closed', { runIds: ['private-run'] })),
+    null,
+    'workflow batch membership remains private until the active dispatch projection wins',
+  );
+  assert.equal(
     projectHarnessEventForPublic(event('run_failed', {
       error: 'HTTP 500 provider-secret-response-body',
       reason: 'provider_failure',
@@ -96,6 +102,91 @@ test('raw model/control events and untrusted stream deltas have no public event'
     null,
     'new event types fail closed until explicitly projected',
   );
+});
+
+test('async workflow dispatch projects only validated deterministic receipt data', () => {
+  const replyTargetDigest = 'a'.repeat(64);
+  const sourceGroupId = `workflow-origin-group-v1:${'b'.repeat(64)}`;
+  const sourceGroupDigest = 'c'.repeat(64);
+  const raw = event('async_work_dispatched', {
+    version: 2,
+    kind: 'workflow_run_group',
+    status: 'dispatched',
+    sourceUserSeq: 41,
+    sourceGroupId,
+    sourceGroupDigest,
+    runIds: ['run-safe-41'],
+    dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}`,
+    replyTargetDigest,
+    replyTarget: { type: 'slack_channel', channelId: 'C-private', threadTs: '123.456' },
+    callId: 'private-call-id',
+    text: 'model-authored prose must not win',
+  });
+  const projected = projectHarnessEventForPublic(raw);
+  assert.ok(projected);
+  assert.deepEqual(projected.data, {
+    version: 2,
+    kind: 'workflow_run_group',
+    status: 'dispatched',
+    sourceUserSeq: 41,
+    sourceGroupId,
+    sourceGroupDigest,
+    runIds: ['run-safe-41'],
+    dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}`,
+    replyTargetDigest,
+    text: 'Started — I’ll post the result here when it’s ready.',
+  });
+  assert.equal('callId' in projected.data, false);
+  assert.equal('replyTarget' in projected.data, false, 'the exact transport target stays private');
+});
+
+test('async dispatch projection rejects prose, malformed identity, and mismatched keys', () => {
+  assert.equal(publicAsyncWorkDispatchedData({ text: 'I started it.' }), null);
+  const sourceGroupId = `workflow-origin-group-v1:${'b'.repeat(64)}`;
+  const sourceGroupDigest = 'c'.repeat(64);
+  assert.equal(publicAsyncWorkDispatchedData({
+    version: 2,
+    kind: 'workflow_run_group',
+    status: 'dispatched',
+    sourceUserSeq: 9,
+    sourceGroupId,
+    sourceGroupDigest,
+    runIds: ['unsafe run id'],
+    dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}`,
+    replyTargetDigest: 'a'.repeat(64),
+  }), null);
+  assert.equal(projectHarnessEventForPublic(event('async_work_dispatched', {
+    version: 2,
+    kind: 'workflow_run_group',
+    status: 'dispatched',
+    sourceUserSeq: 9,
+    sourceGroupId,
+    sourceGroupDigest,
+    runIds: ['run-9'],
+    dispatchKey: `workflow_source_group:${sourceGroupId}:${'d'.repeat(64)}`,
+    replyTargetDigest: 'a'.repeat(64),
+  })), null);
+  assert.equal(publicAsyncWorkDispatchedData({
+    version: 2,
+    kind: 'workflow_run_group',
+    status: 'dispatched',
+    sourceUserSeq: 9,
+    sourceGroupId,
+    sourceGroupDigest,
+    runIds: ['run-9'],
+    dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}`,
+  }), null, 'destination digest is load-bearing');
+  assert.equal(publicAsyncWorkDispatchedData({
+    version: 2,
+    kind: 'workflow_run_group',
+    status: 'dispatched',
+    sourceUserSeq: 9,
+    sourceGroupId,
+    sourceGroupDigest,
+    runIds: ['run-9'],
+    dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}`,
+    replyTargetDigest: 'A'.repeat(64),
+  }), null, 'digest must be canonical lower-case SHA-256');
 });
 
 test('transport mirrors remain in the audit ledger but never enter the public event plane', () => {

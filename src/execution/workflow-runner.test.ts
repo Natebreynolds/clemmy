@@ -97,6 +97,9 @@ const {
   workflowCapabilityRetryDelayMs,
   reapCapabilityBlockedRuns,
   resumeCapabilityBlockedWorkflowRun,
+  latestWorkflowNotifyUserPresentation,
+  mergeWorkflowPresentationContribution,
+  scrubWorkflowTerminalPresentation,
 } = await import('./workflow-runner.js');
 // The workflow watcher would otherwise place a REAL judge call from any
 // multi-step test run (live OAuth tokens make the judge reachable on dev
@@ -118,6 +121,60 @@ test('callToolSideEffectClass: telephony + comm-object dispatches are SEND (vali
   assert.equal(callToolSideEffectClass('OUTLOOK_CREATE_DRAFT'), 'write');
   assert.equal(callToolSideEffectClass('VAPI_GET_CALL'), 'read');
   assert.equal(callToolSideEffectClass('TWILIO_LIST_CALLS'), 'read');
+});
+
+test('exact notify_user presentation is deterministic, bounded, redacted, and drops a receipt-only wrapper', () => {
+  const body = `Authored result is ready. api_key=do-not-publish-this-value ${'x'.repeat(2_000)}`;
+  const publicBody = latestWorkflowNotifyUserPresentation({
+    runId: 'run-notify-public-projection',
+    notifications: [{
+      id: 'notify-public-projection',
+      kind: 'workflow',
+      title: 'Result',
+      body,
+      createdAt: '2026-08-03T12:00:00.000Z',
+      read: false,
+      silent: true,
+      metadata: {
+        source: 'notify_user_tool',
+        workflowRunId: 'run-notify-public-projection',
+        exactOriginTerminalAuthority: true,
+      },
+    }],
+  });
+  assert.ok(publicBody);
+  assert.match(publicBody, /Authored result is ready/);
+  assert.match(publicBody, /api_key=\[REDACTED\]/);
+  assert.doesNotMatch(publicBody, /do-not-publish-this-value/);
+  assert.ok(publicBody.length <= 1_800);
+  assert.equal(
+    mergeWorkflowPresentationContribution(
+      publicBody,
+      'Notification queued: 1800000000000-tool-notify',
+      ['1800000000000-tool-notify'],
+    ),
+    publicBody,
+    'the local queue receipt is execution evidence, not user-facing result prose',
+  );
+});
+
+test('derived workflow terminal presentation scrubs credential assignments before publication', () => {
+  const bearer = 'Bearer eyJhbGciOiJIUzI1NiJ9.private-terminal-secret';
+  const derived = [
+    'Provider readback succeeded.',
+    `Authorization: ${bearer}`,
+    'refresh_token=terminal-refresh-secret',
+  ].join('\n');
+  const publicBody = scrubWorkflowTerminalPresentation(derived);
+  assert.match(publicBody, /Provider readback succeeded/);
+  assert.match(publicBody, /Authorization: \[REDACTED\]/);
+  assert.match(publicBody, /refresh_token=\[REDACTED\]/);
+  assert.doesNotMatch(publicBody, /private-terminal-secret|terminal-refresh-secret/);
+  assert.equal(
+    mergeWorkflowPresentationContribution(null, derived),
+    publicBody,
+    'the derived-only exact terminal uses the same scrubbed public projection',
+  );
 });
 
 test('blocked workflow nodes propagate through dependents without cancelling independent branches', () => {
@@ -158,6 +215,7 @@ const {
   resetEventLog,
   listEvents,
   appendEvent,
+  appendAsyncWorkDispatchBatchClosedOnce,
   getLatestRunAttempt,
   isKillRequested,
 } = await import('../runtime/harness/eventlog.js');
@@ -176,6 +234,13 @@ const {
 } = await import('./workflow-run-definition.js');
 const {
   queueCompiledWorkflowRun,
+  queueWorkflowRun,
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupClosedBatch,
 } = await import('../tools/workflow-run-queue.js');
 const {
   compileWorkflowStepsToGraph,
@@ -911,6 +976,65 @@ test('compiled specialists fan out as workers while only the exact brain sink is
   const { recordStepResult } = await import('../tools/step-result-tool.js');
   const { loadNotifications } = await import('../runtime/notifications.js');
   const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { registerAutonomyActionTools } = await import('../tools/autonomy-action-tools.js');
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  type NotifyResult = { content?: Array<{ text?: string }> };
+  type NotifyHandler = (input: Record<string, unknown>) => Promise<NotifyResult>;
+  const autonomyHandlers = new Map<string, NotifyHandler>();
+  registerAutonomyActionTools({
+    tool(name: string, _description: string, _schema: unknown, handler: NotifyHandler) {
+      autonomyHandlers.set(name, handler);
+    },
+  } as never);
+  const notifyUser = autonomyHandlers.get('notify_user');
+  assert.ok(notifyUser);
+  const prepareExactDispatch = (source: {
+    sessionId: string;
+    seq: number;
+    turn: number;
+    id: string;
+  }) => (authority: Parameters<typeof createWorkflowChatDispatchPreparedReceipt>[0]) => {
+    const prepared = appendEvent({
+      sessionId: source.sessionId,
+      turn: source.turn,
+      role: 'system',
+      type: 'async_work_dispatch_prepared',
+      parentEventId: source.id,
+      data: { ...authority },
+    });
+    return recordWorkflowChatDispatchPreparation(
+      createWorkflowChatDispatchPreparedReceipt(authority, {
+        eventId: prepared.id,
+        eventSeq: prepared.seq,
+        preparedAt: prepared.createdAt,
+      }),
+    );
+  };
+  const closeAndActivatePreparedRun = (
+    queued: ReturnType<typeof queueWorkflowRun>,
+    source: { sessionId: string; seq: number; turn: number },
+  ): void => {
+    assert.ok(queued.chatDispatchPreparation, 'exact fixture must return durable preparation evidence');
+    const closeAuthority = createWorkflowOriginGroupCloseAuthority([queued.chatDispatchPreparation]);
+    const closeEvent = appendAsyncWorkDispatchBatchClosedOnce({
+      sessionId: source.sessionId,
+      turn: source.turn,
+      sourceUserSeq: source.seq,
+      data: { ...closeAuthority },
+    }).event;
+    const closeReceipt = createWorkflowOriginGroupClosedBatchReceipt(closeAuthority, {
+      eventId: closeEvent.id,
+      eventSeq: closeEvent.seq,
+      closedAt: closeEvent.createdAt,
+    });
+    recordWorkflowOriginGroupClosedBatch({
+      receipt: closeReceipt,
+      preparedReceipts: [queued.chatDispatchPreparation],
+    });
+    finalizeWorkflowOriginGroupClosedBatch(closeAuthority.sourceGroupId, {
+      beforeMemberRelease: () => {},
+    });
+  };
   const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const sessionId = `sess-compiled-role-boundary-${stamp}`;
   const specialistIds = ['probe_north', 'probe_east', 'probe_west'];
@@ -1010,6 +1134,7 @@ test('compiled specialists fan out as workers while only the exact brain sink is
   const reducerContexts: string[] = [];
   let voiceRewriteCalls = 0;
   const poisonedRewrite = 'Quarter total: 999\nDashboard: https://wrong.example.test\nPRIVATE-probe_north';
+  const authoredNotifyBody = 'Platform 49 is current: no new qualified accounts appeared, and the tracker refresh completed.';
 
   _setWorkflowVoiceRewriteForTests((async () => {
     voiceRewriteCalls += 1;
@@ -1040,6 +1165,23 @@ test('compiled specialists fan out as workers while only the exact brain sink is
         recordStepResult(options.sessionId, exactTerminalValue);
       } else if (stepId === 'ordinary_step') {
         recordStepResult(options.sessionId, 'ordinary catalog result');
+      } else if (stepId === 'notify_step') {
+        const workflowRunId = options.sessionId.split(':')[1];
+        if (!workflowRunId) throw new Error('notify acceptance fixture could not resolve its workflow run id');
+        const result = await withToolOutputContext({
+          workflowRunId,
+          sessionId: options.sessionId,
+          stepId,
+        }, () => notifyUser!({
+          title: 'Platform 49 review complete',
+          body: authoredNotifyBody,
+          kind: 'workflow',
+        }));
+        const receipt = result.content?.find((item) => typeof item.text === 'string')?.text;
+        if (!receipt) throw new Error('notify_user acceptance fixture returned no receipt');
+        // Deliberately persist only the local queue receipt as the step result.
+        // The authored body exists solely in notify_user's durable record.
+        recordStepResult(options.sessionId, receipt);
       } else if (stepId === 'fail_node') {
         throw new Error('EXACT-COMPILED-FAILURE-73');
       } else {
@@ -1058,6 +1200,8 @@ test('compiled specialists fan out as workers while only the exact brain sink is
   const ordinarySlug = `ordinary-role-control-${stamp}`;
   const ordinaryName = `Ordinary Role Control ${stamp}`;
   const ordinaryRunId = `ordinary-role-control-run-${stamp}`;
+  const notifySlug = `exact-notify-presentation-${stamp}`;
+  const notifyName = `Exact Notify Presentation ${stamp}`;
   try {
     await processWorkflowRuns({
       respond: async () => { throw new Error('compiled nodes must use the workflow harness'); },
@@ -1210,10 +1354,138 @@ test('compiled specialists fan out as workers while only the exact brain sink is
     assert.equal(voiceRewriteCalls, 1, 'ordinary catalog completion retains the voice rewrite');
     assert.equal(ordinaryTerminal.reportBack?.detail, poisonedRewrite);
     assert.equal(listEvents(`workflow:${ordinaryRunId}:ordinary_step`, { types: ['worker_started'] }).length, 0);
+    const ordinaryNotice = loadNotifications().find((row) => row.id === `workflow-${ordinaryRunId}-completed`);
+    assert.notEqual(ordinaryNotice?.silent, true, 'scheduled/no-origin completion retains external notification delivery');
+
+    // An ordinary catalog workflow becomes single-reply/model-free only when
+    // it has a real exact v2 source observer. This is deliberately NOT keyed
+    // from originSessionId, so the scheduled control above and legacy v1
+    // origins retain their existing path.
+    const exactOrdinarySessionId = `sess-ordinary-exact-${stamp}`;
+    HarnessSession.create({
+      id: exactOrdinarySessionId,
+      kind: 'chat',
+      channel: 'desktop',
+      title: 'Ordinary exact observer control',
+    });
+    const exactOrdinarySource = appendEvent({
+      sessionId: exactOrdinarySessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Run the ordinary exact-observer control.', source: 'desktop' },
+    });
+    const exactOrdinary = queueWorkflowRun(ordinaryName, {}, {
+      targetStepId: 'ordinary_step',
+      originSessionId: exactOrdinarySessionId,
+      originObserver: {
+        sessionId: exactOrdinarySessionId,
+        sourceUserSeq: exactOrdinarySource.seq,
+        replyTarget: { type: 'origin_chat' },
+      },
+      prepareChatDispatch: prepareExactDispatch(exactOrdinarySource),
+    });
+    assert.equal(exactOrdinary.status, 'held');
+    assert.ok(exactOrdinary.id);
+    closeAndActivatePreparedRun(exactOrdinary, exactOrdinarySource);
+    await processWorkflowRuns({} as never);
+    const exactOrdinaryTerminal = JSON.parse(
+      readFileSync(path.join(WORKFLOW_RUNS_DIR, `${exactOrdinary.id}.json`), 'utf-8'),
+    ) as Record<string, any>;
+    assert.equal(voiceRewriteCalls, 1, 'exact-observer completion makes no second voice-model call');
+    assert.match(exactOrdinaryTerminal.reportBack?.detail ?? '', /ordinary catalog result/i);
+    assert.doesNotMatch(exactOrdinaryTerminal.reportBack?.detail ?? '', /999|wrong\.example|PRIVATE-/);
+    const exactOrdinaryNotice = loadNotifications()
+      .find((row) => row.id === `workflow-${exactOrdinary.id}-completed`);
+    assert.equal(
+      exactOrdinaryNotice?.silent,
+      true,
+      'global completion is dashboard evidence only; exact-origin terminal owns the one external reply',
+    );
+
+    // Biting end-to-end contribution check: the step result contains no
+    // meaningful business answer at all, only notify_user's local queue id.
+    // The exact-origin terminal must recover the authored body from the
+    // correlated durable notification without a second voice-model pass.
+    writeWorkflow(notifySlug, {
+      name: notifyName,
+      description: 'Exact notify_user presentation contribution acceptance.',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [{
+        id: 'notify_step',
+        prompt: 'Send the completed Platform 49 review to the user through notify_user.',
+        sideEffect: 'read',
+      }],
+    });
+    const notifySessionId = `sess-exact-notify-${stamp}`;
+    HarnessSession.create({
+      id: notifySessionId,
+      kind: 'chat',
+      channel: 'desktop',
+      title: 'Exact notify presentation source',
+    });
+    const notifySource = appendEvent({
+      sessionId: notifySessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'What changed in Platform 49?', source: 'desktop' },
+    });
+    const notifyRun = queueWorkflowRun(notifyName, {}, {
+      targetStepId: 'notify_step',
+      originSessionId: notifySessionId,
+      originObserver: {
+        sessionId: notifySessionId,
+        sourceUserSeq: notifySource.seq,
+        replyTarget: { type: 'origin_chat' },
+      },
+      prepareChatDispatch: prepareExactDispatch(notifySource),
+    });
+    assert.equal(notifyRun.status, 'held');
+    assert.ok(notifyRun.id);
+    closeAndActivatePreparedRun(notifyRun, notifySource);
+    await processWorkflowRuns({} as never);
+
+    const notifyTerminalRecord = JSON.parse(
+      readFileSync(path.join(WORKFLOW_RUNS_DIR, `${notifyRun.id}.json`), 'utf-8'),
+    ) as Record<string, any>;
+    assert.equal(voiceRewriteCalls, 1, 'notify contribution reaches the terminal without a voice-model call');
+    assert.equal(notifyTerminalRecord.reportBack?.detail, authoredNotifyBody);
+    assert.doesNotMatch(
+      notifyTerminalRecord.reportBack?.detail ?? '',
+      /Notification queued:|notify_step|tool-notify/i,
+      'the execution receipt cannot replace or narrate beside the authored result',
+    );
+    const notifyRows = loadNotifications();
+    const authoredIntermediate = notifyRows.find((row) =>
+      row.metadata?.source === 'notify_user_tool'
+      && row.metadata?.workflowRunId === notifyRun.id);
+    assert.equal(authoredIntermediate?.body, authoredNotifyBody);
+    assert.equal(
+      authoredIntermediate?.silent,
+      true,
+      'the intermediate notify_user record is dashboard-only under exact terminal authority',
+    );
+    const notifyCompletion = notifyRows.find((row) => row.id === `workflow-${notifyRun.id}-completed`);
+    assert.equal(notifyCompletion?.body, authoredNotifyBody);
+    assert.equal(notifyCompletion?.silent, true, 'the global completion fan-out is also suppressed');
+
+    const sourceTerminals = listEvents(notifySessionId, { types: ['conversation_completed'] })
+      .filter((event) => event.data.sourceUserSeq === notifySource.seq);
+    assert.equal(sourceTerminals.length, 1, 'the original source receives exactly one terminal');
+    assert.equal(sourceTerminals[0].data.reply, authoredNotifyBody);
+    assert.equal(
+      listEvents(notifySessionId, { types: ['user_input_received'] })
+        .filter((event) => event.data.synthetic === true).length,
+      0,
+      'exact workflow delivery uses no synthetic outcome turn',
+    );
   } finally {
     _setWorkflowHarnessLoopImplsForTests();
     _setWorkflowVoiceRewriteForTests(null);
     rmSync(path.join(WORKFLOWS_DIR, ordinarySlug), { recursive: true, force: true });
+    rmSync(path.join(WORKFLOWS_DIR, notifySlug), { recursive: true, force: true });
   }
 });
 

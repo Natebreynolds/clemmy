@@ -131,7 +131,15 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
         // handler itself can observe a superseded SDK query.
         assertDispatchLeaseCurrent(dispatchLease);
         return withToolOutputContext(
-          { sessionId, runScopeId, toolName, ...(workflowRunId ? { workflowRunId } : {}), ...(workflowName ? { workflowName } : {}), ...(stepId ? { stepId } : {}) },
+          {
+            sessionId,
+            ...(sourceUserSeq ? { sourceUserSeq } : {}),
+            runScopeId,
+            toolName,
+            ...(workflowRunId ? { workflowRunId } : {}),
+            ...(workflowName ? { workflowName } : {}),
+            ...(stepId ? { stepId } : {}),
+          },
           // Also establish the harness run context so tools that read it for the
           // active session (execution_create / execution_* / plan / goal, etc.)
           // resolve CLEMENTINE_MCP_SESSION_ID instead of failing with "requires a

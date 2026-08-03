@@ -33,9 +33,23 @@ const {
   compiledProjectRootTerminalDigest,
 } = await import('./compiled-project-run-contract.js');
 const {
+  _setWorkflowRunReaperAfterCanonicalUnlinkForTests,
   _setWorkflowRunReaperBeforeLockForTests,
   reapStaleWorkflowRuns,
 } = await import('./workflow-scheduler.js');
+const {
+  createWorkflowChatDispatchPreparationAuthority,
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupClosedBatch,
+  workflowChatDispatchQueueRequestDigest,
+  workflowRunHasPendingChatDispatchPreparation,
+} = await import('./workflow-origin-group.js');
+const { recordAndAttemptWorkflowRunReportBack } = await import('./workflow-run-report-back.js');
+const { appendEvent, createSession } = await import('../runtime/harness/eventlog.js');
 
 const OLD_FINISHED_AT = new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000).toISOString();
 
@@ -54,6 +68,48 @@ function writeRun(runId: string, record: Record<string, unknown>): string {
     ...record,
   }), 'utf-8');
   return file;
+}
+
+let exactPreparationSeq = 20_000;
+
+function activateExactOriginGroup(
+  runIds: readonly string[],
+  originSessionId: string,
+  sourceUserSeq: number,
+): void {
+  const receipts = runIds.map((runId) => {
+    const authority = createWorkflowChatDispatchPreparationAuthority({
+      runId,
+      observer: {
+        sessionId: originSessionId,
+        sourceUserSeq,
+        replyTarget: { type: 'origin_chat' },
+      },
+      queueRequestDigest: workflowChatDispatchQueueRequestDigest({
+        workflowName: 'Retention Workflow',
+        normalizedInputs: { runId },
+      }),
+    });
+    exactPreparationSeq += 1;
+    return recordWorkflowChatDispatchPreparation(createWorkflowChatDispatchPreparedReceipt(authority, {
+      eventId: `reaper-prepared-${exactPreparationSeq}`,
+      eventSeq: exactPreparationSeq,
+      preparedAt: new Date(1_800_000_000_000 + exactPreparationSeq).toISOString(),
+    }));
+  });
+  const closeAuthority = createWorkflowOriginGroupCloseAuthority(receipts);
+  exactPreparationSeq += 1;
+  recordWorkflowOriginGroupClosedBatch({
+    receipt: createWorkflowOriginGroupClosedBatchReceipt(closeAuthority, {
+      eventId: `reaper-closed-${exactPreparationSeq}`,
+      eventSeq: exactPreparationSeq,
+      closedAt: new Date(1_800_000_000_000 + exactPreparationSeq).toISOString(),
+    }),
+    preparedReceipts: receipts,
+  });
+  finalizeWorkflowOriginGroupClosedBatch(closeAuthority.sourceGroupId, {
+    beforeMemberRelease: () => {},
+  });
 }
 
 function sidecarKey(runId: string): string {
@@ -195,12 +251,14 @@ function writeCompiledRun(label: string, record: Record<string, unknown> = {}): 
 }
 
 beforeEach(() => {
+  _setWorkflowRunReaperAfterCanonicalUnlinkForTests();
   _setWorkflowRunReaperBeforeLockForTests();
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
 });
 
 test.after(() => {
+  _setWorkflowRunReaperAfterCanonicalUnlinkForTests();
   _setWorkflowRunReaperBeforeLockForTests();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -260,6 +318,75 @@ test('reaper revalidates under the record lock after a terminal scan races pendi
   assert.equal(existsSync(file), true);
 });
 
+test('reaper preserves an old terminal duplicate while its exact chat dispatch is prepared but unsettled', () => {
+  const runId = 'prepared-terminal-duplicate';
+  const file = writeRun(runId, {});
+  const authority = createWorkflowChatDispatchPreparationAuthority({
+    runId,
+    observer: {
+      sessionId: 'prepared-terminal-session',
+      sourceUserSeq: 41,
+      replyTarget: { type: 'origin_chat' },
+    },
+    queueRequestDigest: workflowChatDispatchQueueRequestDigest({
+      workflowName: 'Retention Workflow',
+      normalizedInputs: {},
+    }),
+  });
+  const receipt = createWorkflowChatDispatchPreparedReceipt(authority, {
+    eventId: 'prepared-terminal-event',
+    eventSeq: 42,
+    preparedAt: new Date().toISOString(),
+  });
+  recordWorkflowChatDispatchPreparation(receipt);
+
+  assert.equal(workflowRunHasPendingChatDispatchPreparation(runId), true);
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 0 });
+  assert.equal(existsSync(file), true, 'dispatch evidence survives until the exact group terminal is acknowledged');
+});
+
+test('reaper retains every settled group member until all per-run projections can compact', () => {
+  const originSessionId = 'partial-settlement-retention-origin';
+  createSession({
+    id: originSessionId,
+    kind: 'chat',
+    channel: 'desktop',
+    metadata: {},
+  });
+  const source = appendEvent({
+    sessionId: originSessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Run both old reviews and report once.' },
+  });
+  const runA = 'partial-settlement-retention-a';
+  const runB = 'partial-settlement-retention-b';
+  const fileA = writeRun(runA, { originSessionId });
+  const fileB = writeRun(runB, { originSessionId });
+  activateExactOriginGroup([runA, runB], originSessionId, source.seq);
+
+  assert.equal(recordAndAttemptWorkflowRunReportBack(fileB, {
+    workflowName: 'Retention Workflow B',
+    outcome: 'done',
+    detail: 'B checkpointed first but has no settlement projection yet.',
+  }), false);
+  assert.equal(recordAndAttemptWorkflowRunReportBack(fileA, {
+    workflowName: 'Retention Workflow A',
+    outcome: 'done',
+    detail: 'A completed the reducer and projected the shared settlement.',
+  }), true);
+
+  assert.equal(
+    workflowRunHasPendingChatDispatchPreparation(runA),
+    true,
+    'bare group settlement is not retention-ready while B lacks its projection',
+  );
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 2, deleted: 0 });
+  assert.equal(existsSync(fileA), true, 'the early acknowledged member remains a reducer input');
+  assert.equal(existsSync(fileB), true, 'the unprojected member remains retryable');
+});
+
 test('reaper preserves a run when its admitted canonical owner evidence is corrupt', () => {
   const file = writeRun('corrupt-canonical-owner', {
     workflowDefinitionSnapshot: {
@@ -317,6 +444,35 @@ test('reaper removes terminal run sidecars and an empty catalogless compiled own
   assert.equal(existsSync(sidecars.originDir), false);
   assert.equal(existsSync(sidecars.cancellationFile), false);
   assert.equal(existsSync(sidecars.triggerReceiptFile), true, 'admission dedupe receipts have an independent lifecycle');
+});
+
+test('post-unlink hygiene failure cannot resurrect a canonical run or become a false reap failure', () => {
+  const runId = 'durable-unlink-before-hygiene';
+  const file = writeRun(runId, {
+    originSessionId: 'durable-unlink-origin',
+    notifiedAt: OLD_FINISHED_AT,
+    reportBack: {
+      version: 1,
+      workflowName: 'Retention Workflow',
+      outcome: 'done',
+      detail: 'Already delivered before retention.',
+      acknowledgedOriginSessionIds: ['durable-unlink-origin', 'observer'],
+    },
+  });
+  const sidecars = writeRunSidecars(runId);
+  let seamCalls = 0;
+  _setWorkflowRunReaperAfterCanonicalUnlinkForTests((candidate) => {
+    if (candidate !== file) return;
+    seamCalls += 1;
+    throw new Error('simulated crash before post-unlink hygiene');
+  });
+
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 1 });
+  assert.equal(seamCalls, 1);
+  assert.equal(existsSync(file), false, 'the fsynced canonical deletion remains the reap authority');
+  assert.equal(existsSync(sidecars.originDir), true, 'a crash leaves only harmless orphaned exact authority');
+  assert.equal(existsSync(sidecars.cancellationFile), true, 'post-unlink hygiene is explicitly best-effort');
+  assert.equal(existsSync(sidecars.triggerReceiptFile), true);
 });
 
 test('reaper preserves a compiled terminal until exact project-ledger settlement is marked', () => {
@@ -457,7 +613,7 @@ test('reaper resolves the canonical graph-owner slug and retains only mutation r
   assert.ok(loadWorkflowGraphSnapshotByRunId(runId));
   assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 1 });
 
-  assert.equal(existsSync(file), false, 'the terminal run record is reaped last');
+  assert.equal(existsSync(file), false, 'the canonical record disappears after run-owned graph cleanup');
   assert.equal(loadWorkflowGraphSnapshotByRunId(runId), null, 'the graph snapshot shares the run retention lifecycle');
   assert.equal(existsSync(path.join(runDir, 'events.jsonl')), false);
   assert.equal(existsSync(path.join(runDir, 'workspace')), false, 'large workspace artifacts do not leak past retention');

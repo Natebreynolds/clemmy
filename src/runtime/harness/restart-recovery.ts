@@ -43,6 +43,12 @@ import {
   type TurnOutcome,
 } from './turn-outcome.js';
 import { addNotification } from '../notifications.js';
+import {
+  readActiveWorkflowOriginGroup,
+  readPendingWorkflowChatDispatchOwnership,
+  workflowOriginSourceGroupId,
+  type PendingWorkflowChatDispatchOwnership,
+} from '../../tools/workflow-run-queue.js';
 
 function enabled(): boolean {
   return (process.env.CLEMMY_CHAT_RESTART_RECOVERY ?? 'on').toLowerCase() !== 'off';
@@ -75,6 +81,47 @@ export type ResumeDispatcher = (
   directive: string,
   sourceUserSeq: number,
 ) => Promise<void>;
+
+/** Distinguish an ordinary resume failure from the narrow crash window where
+ * the resumed turn durably transferred this exact source to an activated
+ * workflow group, then threw before its Promise resolved. The loop owns the
+ * canonical cross-store verifier; import it lazily to avoid a static cycle
+ * (`loop` already imports this recovery module).
+ *
+ * An active group without exactly one verified public edge is ambiguous, not
+ * permission to publish a foreground failure terminal. Throw so the caller
+ * leaves the original marker armed for deterministic reconciliation. */
+async function transferredWorkflowDispatchForSource(
+  identity: TurnIdentity,
+): Promise<{ sourceGroupId: string; sourceGroupDigest: string; runIds: string[] } | null> {
+  const sourceGroupId = workflowOriginSourceGroupId({
+    sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+  });
+  const active = readActiveWorkflowOriginGroup(sourceGroupId);
+  if (!active) return null;
+  const { verifiedWorkflowRunDispatchReceipts } = await import('./loop.js');
+  const receipts = verifiedWorkflowRunDispatchReceipts(
+    identity.sessionId,
+    identity.turn,
+    identity.sourceUserSeq,
+  );
+  if (
+    receipts.length !== 1
+    || receipts[0].sourceGroupId !== active.sealed.sourceGroupId
+    || receipts[0].sourceGroupDigest !== active.sealed.sourceGroupDigest
+    || receipts[0].sourceUserSeq !== identity.sourceUserSeq
+  ) {
+    throw new Error(
+      `Activated workflow dispatch ${sourceGroupId} has no exact public source edge.`,
+    );
+  }
+  return {
+    sourceGroupId: receipts[0].sourceGroupId,
+    sourceGroupDigest: receipts[0].sourceGroupDigest,
+    runIds: [...receipts[0].runIds],
+  };
+}
 
 export const AUTO_RESUME_DIRECTIVE = [
   'The previous run in this session was interrupted by a daemon restart and has been automatically resumed.',
@@ -167,9 +214,20 @@ export function markRunInFlight(sessionId: string, on: boolean): void {
 export function clearRunInFlightAfterTerminal(
   sessionId: string,
   ownerAttemptId?: string,
+  sourceUserSeq?: number,
 ): boolean {
   if (!enabled()) return false;
   try {
+    // A terminal candidate must never erase the only coarse owner of a queue
+    // admission that has not reached immutable source-group activation. The
+    // loop supplies the exact accepted source; missing/corrupt queue evidence
+    // fails closed by returning false.
+    if (sourceUserSeq !== undefined && readPendingWorkflowChatDispatchOwnership({
+      sessionId,
+      sourceUserSeq,
+    })) {
+      return false;
+    }
     const owner = ownerAttemptId?.trim() || null;
     const result = openEventLog().prepare(
       `UPDATE sessions
@@ -194,6 +252,8 @@ export function clearRunInFlightAfterTerminal(
 
 const INTERRUPTED_REPLY =
   'This run was interrupted by a restart before it finished. Reply `continue` to pick up where it left off.';
+const PREPARED_DISPATCH_HELD_REPLY =
+  'This run was interrupted after background work was admitted but before its dispatch could be finalized. Reply `continue` to resume the same accepted work safely.';
 const STOPPED_REPLY =
   'This run was stopped as requested. A restart happened before it could finish shutting down, but it will not resume.';
 const REPLAY_PRIMER_PREFIX = '[restart-recovery]';
@@ -220,6 +280,12 @@ export interface RestartRecoveryRecord {
    * and only reconciled the stale attempt/marker left by the crash. */
   terminalReconciled: boolean;
   terminalEventSeq?: number;
+  /** Durable non-executable queue ownership that prevented this scan from
+   * publishing a manual terminal or clearing the interrupted source marker. */
+  preparedDispatchOwnershipPreserved: boolean;
+  preparedDispatchSourceGroupId?: string;
+  preparedDispatchPhase?: PendingWorkflowChatDispatchOwnership['phase'];
+  preparedDispatchRunIds: string[];
   /** Why auto-resume did NOT run (for the boot log / forensics). */
   autoResumeSkipped?: 'disabled' | 'no_dispatcher' | 'external_write' | 'too_old' | 'boot_cap' | 'user_stopped' | 'identity_missing';
   errors: string[];
@@ -461,6 +527,8 @@ export function recoverInterruptedChatRuns(
       decisionRecorded: false,
       autoResumed: false,
       terminalReconciled: false,
+      preparedDispatchOwnershipPreserved: false,
+      preparedDispatchRunIds: [],
       errors: [],
     };
 
@@ -474,6 +542,25 @@ export function recoverInterruptedChatRuns(
       // external-write/age checks still decide whether resume is safe.
     }
     const recoveryIdentity = recoveryTurnIdentity(row.id, interruptedAttempt);
+    let pendingDispatchOwnership: PendingWorkflowChatDispatchOwnership | null = null;
+    if (recoveryIdentity) {
+      try {
+        pendingDispatchOwnership = readPendingWorkflowChatDispatchOwnership(recoveryIdentity);
+        if (pendingDispatchOwnership) {
+          record.preparedDispatchOwnershipPreserved = true;
+          record.preparedDispatchSourceGroupId = pendingDispatchOwnership.sourceGroupId;
+          record.preparedDispatchPhase = pendingDispatchOwnership.phase;
+          record.preparedDispatchRunIds = [...pendingDispatchOwnership.runIds];
+        }
+      } catch (err) {
+        // Queue authority is part of the no-terminal/no-clear proof. If it
+        // cannot be read exactly, preserve the marker for a later recovery
+        // pass instead of orphaning potentially admitted work.
+        record.errors.push(`prepared_dispatch_check: ${err instanceof Error ? err.message : String(err)}`);
+        records.push(record);
+        continue;
+      }
+    }
 
     // The brain can commit its exact public terminal and then die before its
     // finally block settles the attempt or clears runInFlight. The terminal is
@@ -493,6 +580,15 @@ export function recoverInterruptedChatRuns(
     // the turn inert for a later scan. Dispatching when the no-replay check is
     // unavailable could duplicate a completed mutation or answer.
     if (terminalCheckFailed) {
+      records.push(record);
+      continue;
+    }
+    if (committedTerminal && pendingDispatchOwnership) {
+      // This is contradictory legacy/crash evidence: a manual terminal cannot
+      // supersede an admitted source group that never activated. Retain both
+      // the exact marker and attempt so a repair can resume/finalize the same
+      // accepted source; never turn the earlier terminal into orphan authority.
+      record.errors.push('terminal_reconcile: terminal coexists with unactivated workflow dispatch ownership');
       records.push(record);
       continue;
     }
@@ -591,6 +687,10 @@ export function recoverInterruptedChatRuns(
           snapshotItemsBefore: record.snapshotItemsBefore,
           snapshotItemsAfter: record.snapshotItemsAfter,
           lastResponseIdPresent: record.lastResponseIdPresent,
+          preparedDispatchOwnershipPreserved: record.preparedDispatchOwnershipPreserved,
+          preparedDispatchSourceGroupId: record.preparedDispatchSourceGroupId ?? null,
+          preparedDispatchPhase: record.preparedDispatchPhase ?? null,
+          preparedDispatchRunIds: record.preparedDispatchRunIds,
         },
       });
       record.decisionRecorded = true;
@@ -600,10 +700,40 @@ export function recoverInterruptedChatRuns(
 
     // Commit user-facing text only for an honest terminal. Automatic recovery
     // remains nonterminal until the resumed brain reports its real outcome.
-    const noticeReply = userStopped ? STOPPED_REPLY : INTERRUPTED_REPLY;
-    const noticeReason = userStopped ? 'stopped_before_restart' : 'interrupted_by_restart';
+    const noticeReply = pendingDispatchOwnership
+      ? PREPARED_DISPATCH_HELD_REPLY
+      : userStopped
+        ? STOPPED_REPLY
+        : INTERRUPTED_REPLY;
+    const noticeReason = pendingDispatchOwnership
+      ? 'prepared_workflow_dispatch_interrupted'
+      : userStopped
+        ? 'stopped_before_restart'
+        : 'interrupted_by_restart';
     try {
-      if (!willAutoResume && recoveryIdentity) {
+      if (!willAutoResume && recoveryIdentity && pendingDispatchOwnership) {
+        // A needs-input TurnOutcome is terminal for this accepted source. It
+        // cannot be committed while a pre-activation queue member still owns
+        // that same source, because the next boot would reconcile the terminal
+        // and erase the only restart handle. Publish guidance as nonterminal
+        // pause state and retain the original marker/attempt instead.
+        appendEvent({
+          sessionId: row.id,
+          turn: recoveryIdentity.turn,
+          role: 'system',
+          type: 'run_paused',
+          data: {
+            reason: noticeReason,
+            interruptedAt: since,
+            sourceUserSeq: recoveryIdentity.sourceUserSeq,
+            sourceGroupId: pendingDispatchOwnership.sourceGroupId,
+            phase: pendingDispatchOwnership.phase,
+            runIds: pendingDispatchOwnership.runIds,
+            resumable: true,
+            guidance: noticeReply,
+          },
+        });
+      } else if (!willAutoResume && recoveryIdentity) {
         commitRestartRecoveryTerminal(
           recoveryIdentity,
           userStopped ? 'stopped' : 'continue',
@@ -668,6 +798,9 @@ export function recoverInterruptedChatRuns(
             sessionId: row.id,
             reason: noticeReason,
             replayPrepared: record.replayPrepared,
+            preparedDispatchOwnershipPreserved: record.preparedDispatchOwnershipPreserved,
+            preparedDispatchSourceGroupId: record.preparedDispatchSourceGroupId,
+            preparedDispatchRunIds: record.preparedDispatchRunIds,
           },
         });
         notified += 1;
@@ -677,7 +810,7 @@ export function recoverInterruptedChatRuns(
       }
     }
 
-    if (!willAutoResume) {
+    if (!willAutoResume && !pendingDispatchOwnership) {
       try {
         sess.clearRunInFlight();
         record.markerCleared = true;
@@ -686,7 +819,7 @@ export function recoverInterruptedChatRuns(
       }
     }
 
-    if (userStopped) {
+    if (userStopped && !pendingDispatchOwnership) {
       try {
         if (interruptedAttempt) finishRunAttempt(interruptedAttempt, 'cancelled');
         else clearKill(row.id);
@@ -699,7 +832,8 @@ export function recoverInterruptedChatRuns(
     // the same accepted source and clears it only after its real terminal is
     // durable; this closes both clear→dispatch and accept→marker crash windows.
     // Fire-and-forget: boot must not block on model turns. A dispatch failure
-    // commits the manual continue terminal before clearing recovery ownership.
+    // commits the manual continue terminal only when no unactivated workflow
+    // admission still owns this exact source.
     if (willAutoResume && dispatchResume && recoveryIdentity) {
       autoResumes += 1;
       record.autoResumed = true;
@@ -708,7 +842,7 @@ export function recoverInterruptedChatRuns(
         sessionId,
         AUTO_RESUME_DIRECTIVE,
         recoveryIdentity.sourceUserSeq,
-      ).catch((error: unknown) => {
+      ).catch(async (error: unknown) => {
         try {
           // Raw dispatch diagnostics remain private; the user-facing terminal
           // is stable constant copy committed through the typed boundary.
@@ -727,23 +861,79 @@ export function recoverInterruptedChatRuns(
           });
         } catch { /* diagnostics are private and best-effort */ }
         try {
-          commitRestartRecoveryTerminal(
-            recoveryIdentity,
-            'continue',
-            INTERRUPTED_REPLY,
-            'interrupted_by_restart',
-          );
-          const failedSession = HarnessSession.load(sessionId);
-          failedSession?.clearRunInFlight();
-          addNotification({
-            id: `${now()}-chat-resume-failed-${sessionId}`,
-            kind: 'system',
-            title: 'Automatic resume failed — a chat task needs you',
-            body: `${INTERRUPTED_REPLY} (session ${sessionId})`,
-            createdAt: new Date(now()).toISOString(),
-            read: false,
-            metadata: { sessionId, reason: 'auto_resume_failed' },
-          });
+          const failedOwnership = readPendingWorkflowChatDispatchOwnership(recoveryIdentity);
+          const transferredDispatch = failedOwnership
+            ? null
+            : await transferredWorkflowDispatchForSource(recoveryIdentity);
+          const failedReply = failedOwnership
+            ? PREPARED_DISPATCH_HELD_REPLY
+            : INTERRUPTED_REPLY;
+          if (failedOwnership) {
+            appendEvent({
+              sessionId,
+              turn: recoveryIdentity.turn,
+              role: 'system',
+              type: 'run_paused',
+              data: {
+                reason: 'prepared_workflow_dispatch_resume_failed',
+                sourceUserSeq: recoveryIdentity.sourceUserSeq,
+                sourceGroupId: failedOwnership.sourceGroupId,
+                phase: failedOwnership.phase,
+                runIds: failedOwnership.runIds,
+                resumable: true,
+                guidance: failedReply,
+              },
+            });
+          } else if (transferredDispatch) {
+            // The dispatcher Promise failed after the immutable background edge
+            // won. That is successful ownership transfer, not permission to
+            // publish a competing foreground terminal or clear its restart
+            // marker. The workflow's real terminal will report back normally.
+            appendEvent({
+              sessionId,
+              turn: recoveryIdentity.turn,
+              role: 'system',
+              type: 'run_resumed',
+              data: {
+                reason: 'workflow_dispatch_transferred_after_resume_error',
+                sourceUserSeq: recoveryIdentity.sourceUserSeq,
+                sourceGroupId: transferredDispatch.sourceGroupId,
+                sourceGroupDigest: transferredDispatch.sourceGroupDigest,
+                runIds: transferredDispatch.runIds,
+                resumable: true,
+              },
+            });
+          } else {
+            commitRestartRecoveryTerminal(
+              recoveryIdentity,
+              'continue',
+              failedReply,
+              'interrupted_by_restart',
+            );
+            const failedSession = HarnessSession.load(sessionId);
+            failedSession?.clearRunInFlight();
+          }
+          if (!transferredDispatch) {
+            addNotification({
+              id: `${now()}-chat-resume-failed-${sessionId}`,
+              kind: 'system',
+              title: 'Automatic resume failed — a chat task needs you',
+              body: `${failedReply} (session ${sessionId})`,
+              createdAt: new Date(now()).toISOString(),
+              read: false,
+              metadata: {
+                sessionId,
+                reason: failedOwnership
+                  ? 'prepared_workflow_dispatch_resume_failed'
+                  : 'auto_resume_failed',
+                ...(failedOwnership ? {
+                  preparedDispatchOwnershipPreserved: true,
+                  preparedDispatchSourceGroupId: failedOwnership.sourceGroupId,
+                  preparedDispatchRunIds: failedOwnership.runIds,
+                } : {}),
+              },
+            });
+          }
         } catch {
           // Terminal commit failed: the still-armed marker is the durable retry
           // owner. Never replace that invariant with a live-only banner.

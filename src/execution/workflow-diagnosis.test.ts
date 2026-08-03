@@ -212,6 +212,38 @@ test('humanizeStepOutput renders bookkeeping as a terse status line, not JSON', 
   assert.doesNotMatch(out, /[{}]/); // no JSON braces
 });
 
+test('humanizeStepOutput projects nested result facts instead of treating an array length as a business count', () => {
+  const out = humanizeStepOutput(JSON.stringify({
+    url: 'https://example.test/tracker',
+    leads: [{
+      finding: 'No new Platform 4.9 items or replies since the prior run.',
+      detail: 'The tracker and Workspace were refreshed.',
+    }],
+  }));
+  assert.match(out, /No new Platform 4\.9 items/);
+  assert.match(out, /tracker and Workspace were refreshed/);
+  assert.match(out, /https:\/\/example\.test\/tracker/);
+  assert.doesNotMatch(out, /leads:\s*1/i);
+  assert.doesNotMatch(out, /[{}]/);
+});
+
+test('humanizeStepOutput never projects credential-shaped fields or their benign-looking descendants', () => {
+  const out = humanizeStepOutput({
+    finding: 'Connected source verified.',
+    apiToken: 'do-not-render',
+    nested: { secret: 'also-do-not-render', detail: 'Readback succeeded.' },
+    credentials: {
+      detail: 'credential-descendant-must-not-render',
+      url: 'https://credential-owner.example.test/private',
+    },
+    auth: [{ summary: 'auth-descendant-must-not-render' }],
+  });
+  assert.match(out, /Connected source verified/);
+  assert.match(out, /Readback succeeded/);
+  assert.doesNotMatch(out, /do-not-render/);
+  assert.doesNotMatch(out, /credential-descendant|credential-owner|auth-descendant/);
+});
+
 test('renderSuccessBody prefers synthesis prose, else humanizes steps (no JSON dump)', () => {
   // with synthesis
   assert.equal(

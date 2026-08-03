@@ -42,7 +42,11 @@ import {
   type RunAttemptRef,
   type SessionRow,
 } from '../runtime/harness/eventlog.js';
-import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import {
+  runConversation,
+  runConversationFromResume,
+  verifiedWorkflowRunDispatchReceipts,
+} from '../runtime/harness/loop.js';
 import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
 import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../runtime/harness/claude-agent-brain.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
@@ -90,9 +94,16 @@ import { isStatusCommand, buildBoardSummary, formatBoardSummaryText } from '../d
 import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity } from '../runtime/harness/turn-outcome.js';
 import { presentationEventFromCompletionData } from '../runtime/harness/turn-outcome.js';
-import { publicUserInputText } from '../runtime/harness/public-presentation.js';
+import {
+  publicAsyncWorkDispatchedData,
+  publicUserInputText,
+} from '../runtime/harness/public-presentation.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
+import {
+  exactOriginDeliveryTargetDigest,
+  exactOriginDeliveryTargetFromSessionSnapshot,
+} from '../runtime/exact-origin-delivery.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
 const SAFETY_TIMEOUT_MS = 35 * 60_000;
@@ -200,12 +211,30 @@ function clearChannelRunMarkerIfIdle(sessionId: string, ownerAttemptId?: string)
   clearRunInFlightAfterTerminal(sessionId, ownerAttemptId);
 }
 
+function exactChannelReplyAuthority(channel: string, channelId: string): {
+  originReplyTarget: NonNullable<ReturnType<typeof exactOriginDeliveryTargetFromSessionSnapshot>>;
+  originReplyTargetDigest: string;
+} {
+  const originReplyTarget = exactOriginDeliveryTargetFromSessionSnapshot({
+    channel,
+    metadata: { channelId },
+  });
+  if (!originReplyTarget) {
+    throw new Error(`channel ${channel}:${channelId} has no exact reply target`);
+  }
+  return {
+    originReplyTarget,
+    originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget),
+  };
+}
+
 function recordActiveChannelUserInput(
   attempt: ActiveDiscordHarnessRun,
   modelText: string,
   displayText: string,
   progressPresentation: ProgressPresentation = progressPresentationForPrompt(displayText),
 ): EventRow {
+  const replyAuthority = exactChannelReplyAuthority(attempt.channel, attempt.channelId);
   return recordRunAttemptUserInput(attempt, {
     turn: 1,
     role: 'user',
@@ -215,6 +244,7 @@ function recordActiveChannelUserInput(
       progressPresentation,
       attemptId: attempt.attemptId,
       source: `channel:${attempt.channel}`,
+      ...replyAuthority,
     },
   }, { armRunInFlight: true });
 }
@@ -338,6 +368,40 @@ function exactDiscordTerminal(source: EventRow): { event: EventRow; text: string
   return null;
 }
 
+function exactDiscordAsyncDispatch(source: EventRow): {
+  event: EventRow;
+  text: string;
+  runIds: string[];
+  sourceGroupId: string;
+} | null {
+  const verifiedEventIds = new Set(
+    verifiedWorkflowRunDispatchReceipts(source.sessionId, source.turn, source.seq)
+      .map((receipt) => receipt.eventId),
+  );
+  for (const event of listHarnessEvents(source.sessionId, { types: ['async_work_dispatched'], desc: true })) {
+    const dispatch = publicAsyncWorkDispatchedData(event.data);
+    if (!dispatch || !verifiedEventIds.has(event.id) || dispatch.sourceUserSeq !== source.seq) continue;
+    return {
+      event,
+      text: dispatch.text,
+      runIds: [...dispatch.runIds],
+      sourceGroupId: dispatch.sourceGroupId,
+    };
+  }
+  return null;
+}
+
+type AcceptedChannelOutcome =
+  | { kind: 'terminal'; event: EventRow; text: string }
+  | { kind: 'dispatched'; event: EventRow; text: string; runIds: string[]; sourceGroupId: string };
+
+function acceptedChannelOutcome(source: EventRow): AcceptedChannelOutcome | null {
+  const terminal = exactDiscordTerminal(source);
+  if (terminal) return { kind: 'terminal', ...terminal };
+  const dispatched = exactDiscordAsyncDispatch(source);
+  return dispatched ? { kind: 'dispatched', ...dispatched } : null;
+}
+
 function acceptedSourceForDurableRun(input: {
   sessionId: string;
   runId: string;
@@ -392,8 +456,14 @@ function acceptDurableApprovalControl(input: {
     ) {
       throw new Error(`durable approval run ${input.durableRequest.runId} is bound to a different decision`);
     }
-    const terminal = exactDiscordTerminal(prior.source);
-    if (terminal) return { ...prior, replayText: terminal.text };
+    const outcome = acceptedChannelOutcome(prior.source);
+    if (outcome) {
+      if (prior.attempt) {
+        try { finishRunAttempt(prior.attempt, 'completed'); } catch { /* durable outcome wins */ }
+        clearChannelRunMarkerIfIdle(input.sessionId, prior.attempt.attemptId);
+      }
+      return { ...prior, replayText: outcome.text };
+    }
     const failed = commitDiscordTerminal({
       source: prior.source,
       text: PUBLIC_CHANNEL_FAILURE_TEXT,
@@ -1630,6 +1700,8 @@ export const __test__ = {
   recordActiveChannelUserInputForTest: recordActiveChannelUserInput,
   progressPresentationForSessionForTest: progressPresentationForSession,
   commitDiscordAnswerForTest: commitDiscordAnswer,
+  acceptedChannelOutcome,
+  applyEventToAcceptedChannelState,
   tryHandleBackgroundItControl,
   /** Inject a fresh channel→session mapping (Step 5 typed-plan-approval tests). */
   setChannelSessionForTest(channelId: string, sessionId: string): void {
@@ -1977,6 +2049,8 @@ export interface DisplayState {
   summary: string;
   status: string;
   done: boolean;
+  /** Foreground transport released; the logical user intent is still pending. */
+  asyncWorkDispatched?: { sourceUserSeq: number; runIds: string[]; sourceGroupId: string };
   /** Complete audit events, but present only generic elapsed progress when quiet. */
   progressPresentation?: ProgressPresentation;
   // Visibility extensions — surfaced in the rolling message body so
@@ -2337,6 +2411,10 @@ async function refreshPendingApprovalDisplay(state: DisplayState, sessionId: str
 }
 
 function renderBody(state: DisplayState): string {
+  if (state.asyncWorkDispatched) {
+    const body = state.summary || '_running in the background._';
+    return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
+  }
   // Done states (final reply / approval / awaiting input) show ONLY
   // the summary — no progress noise. The summary already carries the
   // user-facing message, the approval prompt, or the awaiting-input
@@ -2526,6 +2604,9 @@ export function toDiscordMarkdown(text: string): string {
  * summary.
  */
 function renderFullBody(state: DisplayState): string {
+  if (state.asyncWorkDispatched) {
+    return state.summary ? toDiscordMarkdown(state.summary) : '_running in the background._';
+  }
   // Plain text, not a `> ` blockquote: Discord only blockquotes the FIRST
   // line, so a multi-line reply rendered as a quote looked broken (line 1
   // greyed, the rest normal). Run the reply through toDiscordMarkdown so
@@ -2779,13 +2860,13 @@ export async function runDiscordHarnessConversation(opts: {
     });
     if (prior) {
       opts.durableRequest.onSourceAccepted?.(prior.source);
-      const terminal = exactDiscordTerminal(prior.source);
-      if (terminal) {
+      const outcome = acceptedChannelOutcome(prior.source);
+      if (outcome) {
         if (prior.attempt) {
-          try { finishRunAttempt(prior.attempt, 'completed'); } catch { /* terminal wins */ }
+          try { finishRunAttempt(prior.attempt, 'completed'); } catch { /* durable outcome wins */ }
           clearChannelRunMarkerIfIdle(session.id, prior.attempt.attemptId);
         }
-        await transport.sendInitial(terminal.text);
+        await transport.sendInitial(outcome.text);
         return;
       }
       const failed = commitDiscordTerminal({
@@ -3024,7 +3105,7 @@ export async function runDiscordHarnessConversation(opts: {
   const finalFlush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
-    await refreshPendingApprovalDisplay(state, session.id);
+    if (!state.asyncWorkDispatched) await refreshPendingApprovalDisplay(state, session.id);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
     const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
@@ -3161,8 +3242,8 @@ export async function runDiscordHarnessConversation(opts: {
     unsubscribe = actionBus.subscribe((bus) => {
       if (bus.kind !== 'harness.public_event') return;
       if (bus.sessionId !== session.id) return;
-      applyEventToState(bus.event, state);
-      if (state.done) {
+      if (!applyEventToAcceptedChannelState(bus.event, acceptedUserInput, state)) return;
+      if (state.done || state.asyncWorkDispatched) {
         void settle();
         return;
       }
@@ -3344,15 +3425,18 @@ export async function runDiscordHarnessConversation(opts: {
   try {
     await finished;
   } finally {
-    const terminal = listHarnessEvents(session.id, { types: ['conversation_completed'], desc: true })
-      .find((event) => event.data.sourceUserSeq === acceptedUserInput.seq);
+    const outcome = acceptedChannelOutcome(acceptedUserInput);
     const finalStatus = getHarnessSession(session.id)?.status === 'cancelled'
       ? 'cancelled'
-      : terminal
+      : outcome
         ? 'completed'
         : 'failed';
     unregisterActiveChannelRun(activeRun, finalStatus);
-    if (terminal) {
+    if (outcome) {
+      // `completed` here closes the foreground provider attempt. For a
+      // dispatch, async_work_dispatched remains the nonterminal logical edge;
+      // the outer Slack/Discord inbox may mark its ACK `replied` without
+      // claiming the workflow itself has completed.
       clearChannelRunMarkerIfIdle(session.id, activeRun.attemptId);
     }
   }
@@ -3580,13 +3664,13 @@ async function runDiscordHarnessResume(opts: {
       if (sourceApprovalId !== approvalId || sourceDecision !== decision) {
         throw new Error(`durable approval run ${opts.durableRequest.runId} is bound to a different decision`);
       }
-      const terminal = exactDiscordTerminal(prior.source);
-      if (terminal) {
+      const outcome = acceptedChannelOutcome(prior.source);
+      if (outcome) {
         if (prior.attempt) {
-          try { finishRunAttempt(prior.attempt, 'completed'); } catch { /* terminal wins */ }
+          try { finishRunAttempt(prior.attempt, 'completed'); } catch { /* durable outcome wins */ }
           clearChannelRunMarkerIfIdle(sessionId, prior.attempt.attemptId);
         }
-        await transport.sendInitial(terminal.text);
+        await transport.sendInitial(outcome.text);
         return;
       }
       const failed = commitDiscordTerminal({
@@ -3610,6 +3694,7 @@ async function runDiscordHarnessResume(opts: {
   try {
     const displayText = opts.userText?.trim()
       || `${decision === 'approve' ? 'Approve' : 'Reject'}${approvalId ? ` ${approvalId}` : ''}`;
+    const replyAuthority = exactChannelReplyAuthority(channel, channelId);
     acceptedApprovalInput = recordRunAttemptUserInput(resumeAttempt, {
       turn: 0,
       role: 'user',
@@ -3617,11 +3702,15 @@ async function runDiscordHarnessResume(opts: {
         text: displayText,
         displayText,
         progressPresentation,
-        ...(!opts.userText ? { synthetic: true } : {}),
+        // A provider approval button is a human control edge even when its
+        // display text is generated. Internal outcome relays remain synthetic
+        // and cannot acquire this exact source authority.
+        humanControl: opts.userText ? 'typed_approval' : 'provider_approval_action',
         source: 'channel_approval_resume',
         decision,
         ...(approvalId ? { approvalId } : {}),
         attemptId: resumeAttempt.attemptId,
+        ...replyAuthority,
       },
     }, { armRunInFlight: true });
     opts.durableRequest?.onSourceAccepted?.(acceptedApprovalInput);
@@ -3752,7 +3841,7 @@ async function runDiscordHarnessResume(opts: {
   const finalFlush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
-    await refreshPendingApprovalDisplay(state, sessionId);
+    if (!state.asyncWorkDispatched) await refreshPendingApprovalDisplay(state, sessionId);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
     const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
@@ -3808,8 +3897,8 @@ async function runDiscordHarnessResume(opts: {
     unsubscribe = actionBus.subscribe((bus) => {
       if (bus.kind !== 'harness.public_event') return;
       if (bus.sessionId !== sessionId) return;
-      applyEventToState(bus.event, state);
-      if (state.done) {
+      if (!applyEventToAcceptedChannelState(bus.event, acceptedApprovalInput, state)) return;
+      if (state.done || state.asyncWorkDispatched) {
         void settle();
         return;
       }
@@ -3873,10 +3962,9 @@ async function runDiscordHarnessResume(opts: {
   })();
 
   await finished;
-  const terminal = listHarnessEvents(sessionId, { types: ['conversation_completed'], desc: true })
-    .find((event) => event.data.sourceUserSeq === acceptedApprovalInput.seq);
-  try { finishRunAttempt(resumeAttempt, terminal ? 'completed' : 'failed'); } catch { /* best effort */ }
-  if (terminal) {
+  const outcome = acceptedChannelOutcome(acceptedApprovalInput);
+  try { finishRunAttempt(resumeAttempt, outcome ? 'completed' : 'failed'); } catch { /* best effort */ }
+  if (outcome) {
     clearChannelRunMarkerIfIdle(sessionId, resumeAttempt.attemptId);
   }
 }
@@ -3965,9 +4053,68 @@ export async function handleDiscordHarnessMessage(
  * state. Exported for unit tests; the Discord live-edit loop just
  * applies it and schedules a debounced flush.
  */
+type AsyncDispatchAuthorityVerifier = (
+  event: EventRow,
+  acceptedSource: Pick<EventRow, 'sessionId' | 'seq' | 'turn'>,
+) => boolean;
+
+function asyncDispatchEventHasExactAuthority(
+  event: EventRow,
+  acceptedSource: Pick<EventRow, 'sessionId' | 'seq' | 'turn'>,
+): boolean {
+  return verifiedWorkflowRunDispatchReceipts(
+    acceptedSource.sessionId,
+    acceptedSource.turn,
+    acceptedSource.seq,
+  ).some((receipt) => receipt.eventId === event.id);
+}
+
+function applyEventToAcceptedChannelState(
+  event: EventRow,
+  acceptedSource: Pick<EventRow, 'sessionId' | 'seq' | 'turn'>,
+  state: DisplayState,
+  verifyAsyncDispatch: AsyncDispatchAuthorityVerifier = asyncDispatchEventHasExactAuthority,
+): boolean {
+  if (event.type === 'conversation_completed') {
+    // A chat session is reusable and can have overlapping physical work. The
+    // public projector retains the terminal's canonical logical owner; only
+    // that exact source may settle this request's Discord/Slack placeholder.
+    const ownsPlaceholder = event.sessionId === acceptedSource.sessionId
+      && (event.data.sourceUserSeq === acceptedSource.seq
+        || event.data.terminalKey === `turn:${acceptedSource.seq}`);
+    if (!ownsPlaceholder) return false;
+  } else if (event.type === 'async_work_dispatched') {
+    const dispatch = publicAsyncWorkDispatchedData(event.data);
+    if (
+      !dispatch
+      || event.sessionId !== acceptedSource.sessionId
+      || dispatch.sourceUserSeq !== acceptedSource.seq
+      || !verifyAsyncDispatch(event, acceptedSource)
+    ) return false;
+  }
+  applyEventToState(event, state);
+  return true;
+}
+
 export function applyEventToState(event: EventRow, state: DisplayState): void {
   const data = event.data ?? {};
   switch (event.type) {
+    case 'async_work_dispatched': {
+      const dispatch = publicAsyncWorkDispatchedData(data);
+      if (!dispatch) return;
+      state.summary = dispatch.text;
+      state.status = 'running in background';
+      state.asyncWorkDispatched = {
+        sourceUserSeq: dispatch.sourceUserSeq,
+        runIds: [...dispatch.runIds],
+        sourceGroupId: dispatch.sourceGroupId,
+      };
+      state.pendingApprovalId = undefined;
+      state.pendingApprovalIds = undefined;
+      state.pendingApprovalEditable = undefined;
+      state.done = false;
+      return;
+    }
     case 'turn_started': {
       if (!state.turnStartedAt) state.turnStartedAt = Date.now();
       if (state.progressPresentation === 'quiet') {
@@ -4144,6 +4291,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       return;
     }
     case 'conversation_completed': {
+      state.asyncWorkDispatched = undefined;
       // Render priority: explicit `reply` (the user-facing message) over
       // `summary` (which loop.ts now also stuffs the reply into when
       // present, but defense-in-depth — if a producer somewhere forgets

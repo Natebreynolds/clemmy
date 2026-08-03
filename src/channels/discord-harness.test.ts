@@ -192,6 +192,96 @@ test('quiet progress suppresses tool/step narration but preserves approval and f
   assert.equal(finalState.summary, 'Verified answer only.');
 });
 
+test('a foreign terminal cannot settle the current Discord/Slack placeholder', () => {
+  const accepted = event('user_input_received', { text: 'current request' });
+  accepted.seq = 41;
+  const state = freshState();
+
+  const foreign = event('conversation_completed', {
+    reply: 'late answer for another request',
+    sourceUserSeq: 40,
+    terminalKey: 'turn:40',
+  });
+  assert.equal(__test__.applyEventToAcceptedChannelState(foreign, accepted, state), false);
+  assert.equal(state.done, false, 'foreign completion leaves this placeholder subscribed');
+  assert.equal(state.summary, '', 'foreign completion cannot overwrite this request');
+
+  const owned = event('conversation_completed', {
+    reply: 'answer for the current request',
+    sourceUserSeq: accepted.seq,
+    terminalKey: `turn:${accepted.seq}`,
+  });
+  assert.equal(__test__.applyEventToAcceptedChannelState(owned, accepted, state), true);
+  assert.equal(state.done, true);
+  assert.equal(state.summary, 'answer for the current request');
+});
+
+test('async dispatch releases only its exact placeholder with a compact deterministic ACK', () => {
+  const accepted = event('user_input_received', { text: 'current request' });
+  accepted.seq = 52;
+  const state = freshState();
+  state.currentAgent = 'Orchestrator';
+  state.toolsCalled = ['workflow_run'];
+  state.toolCount = 7;
+
+  const dispatchEvent = (sourceUserSeq: number, runId: string): EventRow => {
+    const sourceGroupId = `workflow-origin-group-v1:${'b'.repeat(64)}`;
+    const sourceGroupDigest = 'c'.repeat(64);
+    return event('async_work_dispatched', {
+      version: 2,
+      kind: 'workflow_run_group',
+      status: 'dispatched',
+      sourceUserSeq,
+      sourceGroupId,
+      sourceGroupDigest,
+      runIds: [runId],
+      dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}`,
+      replyTargetDigest: 'a'.repeat(64),
+    });
+  };
+  assert.equal(
+    __test__.applyEventToAcceptedChannelState(
+      dispatchEvent(51, 'run-foreign'),
+      accepted,
+      state,
+      () => true,
+    ),
+    false,
+  );
+  assert.equal(state.asyncWorkDispatched, undefined);
+
+  assert.equal(
+    __test__.applyEventToAcceptedChannelState(
+      dispatchEvent(accepted.seq, 'run-owned'),
+      accepted,
+      state,
+    ),
+    false,
+    'a typed row without matching durable observer authority cannot release the placeholder',
+  );
+
+  assert.equal(
+    __test__.applyEventToAcceptedChannelState(
+      dispatchEvent(accepted.seq, 'run-owned'),
+      accepted,
+      state,
+      () => true,
+    ),
+    true,
+  );
+  assert.equal(state.done, false, 'async dispatch is not a logical conversation terminal');
+  assert.deepEqual(state.asyncWorkDispatched, {
+    sourceUserSeq: accepted.seq,
+    runIds: ['run-owned'],
+    sourceGroupId: `workflow-origin-group-v1:${'b'.repeat(64)}`,
+  });
+  const expected = 'Started — I’ll post the result here when it’s ready.';
+  assert.equal(state.summary, expected);
+  assert.equal(__test__.renderBody(state), expected);
+  assert.equal(__test__.renderFullBody(state), expected);
+  assert.doesNotMatch(__test__.renderFullBody(state), /Orchestrator|Tools used|7 tools|working/i);
+});
+
 test('tool_called → rich preview when args extract a useful field', () => {
   // v0.5.5: 7-call run_shell_command sequences during skill execution
   // used to show "using run_shell_command" 7 times — useless to the

@@ -30,6 +30,9 @@ import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, reapStaleBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks } from '../execution/background-tasks.js';
 import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRuns } from '../execution/workflow-runner.js';
+import {
+  registerWorkflowRunDrainKick,
+} from '../execution/workflow-origin-group.js';
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { processComposioJobWatchTick } from '../integrations/composio/job-watcher.js';
@@ -40,6 +43,10 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import {
+  reconcileActivatedWorkflowDispatchGroups,
+  reconcileClosedWorkflowDispatchBatches,
+} from '../runtime/harness/loop.js';
 import { fireDueTimers } from '../runtime/timers.js';
 import { syncProspectiveIntentions } from '../runtime/prospective-sync.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
@@ -99,23 +106,44 @@ import {
   ensureDir,
 } from '../tools/shared.js';
 import {
+  bindNotificationDeliveryPlan,
   addNotification,
   getNotificationDestinationsForRecord,
   getNotification,
   isDeliveryJobStale,
   listQueuedNotificationDeliveries,
   markNotificationRead,
-  replaceQueuedNotificationDeliveries,
+  recoverCorruptedNotificationDeliveryQueue,
+  registerNotificationDeliveryKick,
   reapStaleNotifications,
+  settleQueuedNotificationDeliveryPass,
   updateNotificationDeliveryStatus,
+  notificationDestinationAuthorityDigest,
+  type NotificationDestination,
   type NotificationRecord,
 } from '../runtime/notifications.js';
 import { deliverNotificationToDestination } from '../runtime/notification-delivery.js';
+import {
+  exactOriginDeliveryTarget,
+  hasExactOriginDeliveryMode,
+  hasExpectedExactOriginDeliveryReceipt,
+} from '../runtime/exact-origin-delivery.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import type { AssistantResponse } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.daemon' });
 const STATE_FILE = path.join(path.dirname(CRON_RUNS_DIR), 'daemon-state.json');
+
+let deliverNotificationToDestinationImpl: typeof deliverNotificationToDestination =
+  deliverNotificationToDestination;
+
+/** Narrow delivery seam for crash/restart tests. Production always uses the
+ * real provider dispatcher. */
+export function _setNotificationDeliveryForTests(
+  fn: typeof deliverNotificationToDestination | null,
+): void {
+  deliverNotificationToDestinationImpl = fn ?? deliverNotificationToDestination;
+}
 
 interface CronJobRecord {
   name: string;
@@ -1292,6 +1320,10 @@ function staleApprovalNotificationReason(
 }
 
 export async function processNotificationDeliveries(assistant: ClementineAssistant): Promise<void> {
+  // A corrupt queue is quarantined behind a durable recovery marker. Rebuild
+  // it from retained notification carriers before taking the worker snapshot;
+  // ordinary reads/settlement are intentionally unable to clear that marker.
+  recoverCorruptedNotificationDeliveryQueue();
   const queue = listQueuedNotificationDeliveries();
   if (queue.length === 0) return;
 
@@ -1300,19 +1332,60 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
   let droppedStale = 0;
   let deliveredThisTick = 0;
   const nowMs = Date.now();
-  for (const job of queue) {
+  for (const observedJob of queue) {
+    // Keep `queue` as an immutable optimistic-CAS snapshot. Every mutation in
+    // this pass lands on a detached job so settlement can detect a concurrent
+    // same-id requeue as well as preserve newly appended jobs.
+    const job = {
+      ...observedJob,
+      completedDestinationIds: [...(observedJob.completedDestinationIds ?? [])],
+      failedDestinationIds: [...(observedJob.failedDestinationIds ?? [])],
+      attemptCountByDestination: { ...(observedJob.attemptCountByDestination ?? {}) },
+      nextAttemptAtByDestination: { ...(observedJob.nextAttemptAtByDestination ?? {}) },
+      lastErrorByDestination: { ...(observedJob.lastErrorByDestination ?? {}) },
+    };
     const notification = getNotification(job.notificationId);
     if (!notification) {
+      // Queue membership is durable evidence that a carrier existed. A
+      // corrupt notifications.json generation may temporarily make it
+      // unreadable; preserving the exact cursor lets a stable producer retry
+      // restore it. Dropping the job here would turn store corruption into a
+      // false delivery acknowledgement.
+      nextQueue.push(job);
       continue;
     }
+
+    // Queue bytes are only retry cursors, never authority to widen a local
+    // Activity record into an external disclosure. This also removes legacy
+    // or manually forged jobs for silent failure diagnostics.
+    if (notification.silent) {
+      continue;
+    }
+
+    const exactTarget = exactOriginDeliveryTarget(notification);
+    const pendingExactExternalDelivery = Boolean(
+      hasExactOriginDeliveryMode(notification)
+      && exactTarget
+      && exactTarget.type !== 'origin_chat'
+      && !hasExpectedExactOriginDeliveryReceipt(notification),
+    );
+    const observedRetryGeneration = notification.deliveryRetryRequestedAt ?? null;
+    const updateObservedNotification = (
+      patch: Parameters<typeof updateNotificationDeliveryStatus>[1],
+    ) => updateNotificationDeliveryStatus(notification.id, patch, {
+      expectedDeliveryRetryRequestedAt: observedRetryGeneration,
+    });
 
     if (isNoDestinationsSetupNotification(notification)) {
       // Legacy queue hygiene: older builds created this setup warning as a
       // normal push notification. It exists because there is no external route,
       // so keep it in Activity but never deliver or retry it externally.
-      updateNotificationDeliveryStatus(notification.id, {
+      updateObservedNotification({
         deliveredAt: notification.deliveredAt,
         deliveryError: 'Skipped: no-destination setup notification is dashboard-only',
+        ...(notification.deliveryPlan
+          ? { deliveryPlanCompletedAt: new Date(nowMs).toISOString() }
+          : {}),
       });
       continue;
     }
@@ -1321,11 +1394,20 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
     // dropped rather than delivered. This is what stops a long-deferred
     // backlog from flooding the moment a destination is finally configured
     // (2026-06-05 incident). The notification itself stays in Activity.
-    if (isDeliveryJobStale(job.queuedAt, nowMs, DELIVERY_MAX_AGE_MS)) {
+    const durableQueuedAt = notification.deliveryRetryRequestedAt
+      ?? notification.deliveryAdmissionPendingAt
+      ?? notification.createdAt;
+    if (
+      !pendingExactExternalDelivery
+      && isDeliveryJobStale(durableQueuedAt, nowMs, DELIVERY_MAX_AGE_MS)
+    ) {
       droppedStale += 1;
-      updateNotificationDeliveryStatus(notification.id, {
+      updateObservedNotification({
         deliveredAt: notification.deliveredAt,
         deliveryError: `Dropped: undelivered for over ${Math.round(DELIVERY_MAX_AGE_MS / 3_600_000)}h`,
+        ...(notification.deliveryPlan
+          ? { deliveryPlanCompletedAt: new Date(nowMs).toISOString() }
+          : {}),
       });
       continue;
     }
@@ -1333,9 +1415,12 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
     const staleApprovalReason = staleApprovalNotificationReason(notification, assistant);
     if (staleApprovalReason) {
       markNotificationRead(notification.id);
-      updateNotificationDeliveryStatus(notification.id, {
+      updateObservedNotification({
         deliveredAt: notification.deliveredAt,
         deliveryError: `Skipped stale approval notification: ${staleApprovalReason}`,
+        ...(notification.deliveryPlan
+          ? { deliveryPlanCompletedAt: new Date(nowMs).toISOString() }
+          : {}),
       });
       logger.info({
         notificationId: notification.id,
@@ -1367,7 +1452,7 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
         ...(job.nextAttemptAtByDestination ?? {}),
         [NO_DESTINATION_RETRY_KEY]: new Date(nowMs + NO_DESTINATION_RETRY_MS).toISOString(),
       };
-      updateNotificationDeliveryStatus(notification.id, {
+      updateObservedNotification({
         deliveredAt: notification.deliveredAt,
         deliveryError: 'Deferred: no notification destinations configured',
       });
@@ -1383,27 +1468,103 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
       continue;
     }
 
+    const plannedCarrier = bindNotificationDeliveryPlan(
+      notification.id,
+      destinations,
+    );
+    const plannedIds = plannedCarrier?.deliveryPlan?.destinationIds;
+    if (!plannedIds || plannedIds.length === 0) {
+      updateObservedNotification({
+        deliveredAt: notification.deliveredAt,
+        deliveryError: 'Deferred: notification delivery plan could not be bound durably',
+      });
+      nextQueue.push(job);
+      continue;
+    }
+    const destinationById = new Map(destinations.map((destination) => [destination.id, destination]));
+    const deliveryDestinations = plannedIds.map((destinationId) => {
+        const destination = destinationById.get(destinationId);
+        if (!destination) return undefined;
+        const admittedDigest = plannedCarrier.deliveryPlan
+          ?.destinationAuthorityDigests[destinationId];
+        return admittedDigest === notificationDestinationAuthorityDigest(destination)
+          ? destination
+          : undefined;
+      });
+    const boundDestinations = deliveryDestinations.filter(
+      (destination): destination is NotificationDestination => destination !== undefined,
+    );
+    const unavailableDestinationIds = plannedIds.filter(
+      (_destinationId, index) => deliveryDestinations[index] === undefined,
+    );
+
+    // Crash reconciliation: notifications.json is the sole provider-success
+    // ledger; the queue is only a retry cursor. A valid-shaped but stale queue
+    // must never claim that a destination succeeded without a carrier receipt.
+    const validDestinationIds = new Set(plannedIds);
+    const completed = new Set<string>();
+    for (const durableReceipt of notification.deliveredDestinations ?? []) {
+      if (validDestinationIds.has(durableReceipt)) completed.add(durableReceipt);
+    }
+    const attemptCountByDestination = {
+      ...(notification.deliveryAttemptCountByDestination ?? {}),
+    };
+    const failed = new Set(pendingExactExternalDelivery
+      ? []
+      : plannedIds.filter(
+          (destinationId) => (attemptCountByDestination[destinationId] ?? 0) >= DELIVERY_MAX_ATTEMPTS,
+        ));
+    job.completedDestinationIds = [...completed];
+
     // Per-tick send cap: once this pass has delivered DELIVERY_MAX_PER_TICK
     // notifications, defer the rest to the next 15s tick so a large (but
     // fresh) burst trickles out instead of arriving as one wall. Stale jobs
     // were already dropped above, so this only paces legitimate volume.
-    if (deliveredThisTick >= DELIVERY_MAX_PER_TICK) {
+    const hasOutstandingDestination = plannedIds.some(
+      (destinationId) => !completed.has(destinationId) && !failed.has(destinationId),
+    );
+    if (deliveredThisTick >= DELIVERY_MAX_PER_TICK && hasOutstandingDestination) {
       nextQueue.push(job);
       continue;
     }
 
     const now = new Date();
-    const completed = new Set(job.completedDestinationIds ?? []);
-    const failed = new Set(job.failedDestinationIds ?? []);
-    const attemptCountByDestination = { ...(job.attemptCountByDestination ?? {}) };
-    const nextAttemptAtByDestination = { ...(job.nextAttemptAtByDestination ?? {}) };
-    const lastErrorByDestination = { ...(job.lastErrorByDestination ?? {}) };
+    const nextAttemptAtByDestination = {
+      ...(notification.deliveryNextAttemptAtByDestination ?? {}),
+    };
+    const lastErrorByDestination = {
+      ...(notification.deliveryLastErrorByDestination ?? {}),
+    };
     delete nextAttemptAtByDestination[NO_DESTINATION_RETRY_KEY];
-    const successfulDestinations: string[] = [];
+    const successfulDestinationIds: string[] = [];
     let lastError = '';
-    let attemptedThisPass = 0;
 
-    for (const destination of destinations) {
+    // Missing or authority-mismatched destinations fail independently. They
+    // never receive bytes, but they also cannot block unrelated admitted
+    // routes from delivering. Exact-origin terminals remain live indefinitely;
+    // ordinary destinations eventually surface a durable terminal failure.
+    for (const destinationId of unavailableDestinationIds) {
+      if (completed.has(destinationId) || failed.has(destinationId)) continue;
+      const nextAttemptAt = nextAttemptAtByDestination[destinationId];
+      if (nextAttemptAt && new Date(nextAttemptAt).getTime() > now.getTime()) continue;
+      attemptCountByDestination[destinationId] = (attemptCountByDestination[destinationId] ?? 0) + 1;
+      const message = 'Bound destination is unavailable or its route authority changed';
+      lastError = message;
+      lastErrorByDestination[destinationId] = message;
+      if (
+        !pendingExactExternalDelivery
+        && attemptCountByDestination[destinationId] >= DELIVERY_MAX_ATTEMPTS
+      ) {
+        failed.add(destinationId);
+      } else {
+        const retryDelayMinutes = Math.min(60, 2 ** (attemptCountByDestination[destinationId] - 1));
+        nextAttemptAtByDestination[destinationId] = new Date(
+          now.getTime() + retryDelayMinutes * 60_000,
+        ).toISOString();
+      }
+    }
+
+    for (const destination of boundDestinations) {
       if (completed.has(destination.id) || failed.has(destination.id)) {
         continue;
       }
@@ -1413,27 +1574,52 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
         continue;
       }
 
-      attemptedThisPass += 1;
       attemptCountByDestination[destination.id] = (attemptCountByDestination[destination.id] ?? 0) + 1;
 
       try {
-        await deliverNotificationToDestination(notification, destination);
-        completed.add(destination.id);
-        delete nextAttemptAtByDestination[destination.id];
-        delete lastErrorByDestination[destination.id];
-        successfulDestinations.push(destination.name);
+        await deliverNotificationToDestinationImpl(notification, destination);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         lastError = message;
         lastErrorByDestination[destination.id] = message;
 
-        if (attemptCountByDestination[destination.id] >= DELIVERY_MAX_ATTEMPTS) {
+        if (
+          !pendingExactExternalDelivery
+          && attemptCountByDestination[destination.id] >= DELIVERY_MAX_ATTEMPTS
+        ) {
           failed.add(destination.id);
         } else {
           const retryDelayMinutes = Math.min(60, 2 ** (attemptCountByDestination[destination.id] - 1));
           nextAttemptAtByDestination[destination.id] = new Date(now.getTime() + retryDelayMinutes * 60_000).toISOString();
         }
+        updateObservedNotification({
+          deliveryAttempts: Object.values(attemptCountByDestination)
+            .reduce((sum, value) => sum + value, 0),
+          deliveryError: message,
+          deliveryAttemptCountByDestination: attemptCountByDestination,
+          deliveryNextAttemptAtByDestination: nextAttemptAtByDestination,
+          deliveryLastErrorByDestination: lastErrorByDestination,
+        });
+        continue;
       }
+
+      completed.add(destination.id);
+      delete nextAttemptAtByDestination[destination.id];
+      delete lastErrorByDestination[destination.id];
+      successfulDestinationIds.push(destination.id);
+      // Persist each provider success before attempting the next destination.
+      // If A succeeds and the process dies while B is in flight, restart
+      // reconciliation skips A instead of sending it twice. A ledger write
+      // failure propagates rather than being mislabeled as a provider failure.
+      updateObservedNotification({
+        deliveredAt: new Date().toISOString(),
+        deliveryAttempts: Object.values(attemptCountByDestination)
+          .reduce((sum, value) => sum + value, 0),
+        deliveredDestinations: [destination.id],
+        deliveryAttemptCountByDestination: attemptCountByDestination,
+        deliveryNextAttemptAtByDestination: nextAttemptAtByDestination,
+        deliveryLastErrorByDestination: lastErrorByDestination,
+      });
     }
 
     job.completedDestinationIds = [...completed];
@@ -1444,28 +1630,52 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
 
     // Count toward the per-tick cap only when this job actually pushed a
     // message out — deferred/retry-waiting jobs don't burn the budget.
-    if (successfulDestinations.length > 0) deliveredThisTick += 1;
+    if (successfulDestinationIds.length > 0) deliveredThisTick += 1;
 
-    const allDestinationIds = destinations.map((destination) => destination.id);
+    // Settlement is defined by the immutable admission-time plan, not just
+    // the subset whose route authority is still available in this process.
+    // Otherwise one unchanged leg can complete the whole carrier while a
+    // changed or temporarily unavailable leg is silently forgotten.
+    const allDestinationIds = plannedIds;
     const terminal = allDestinationIds.every((id) => completed.has(id) || failed.has(id));
     const totalAttempts = Object.values(attemptCountByDestination).reduce((sum, value) => sum + value, 0);
 
-    updateNotificationDeliveryStatus(notification.id, {
-      deliveredAt: successfulDestinations.length > 0 ? new Date().toISOString() : notification.deliveredAt,
+    const terminalCarrier = updateObservedNotification({
+      deliveredAt: successfulDestinationIds.length > 0 ? new Date().toISOString() : notification.deliveredAt,
       deliveryAttempts: totalAttempts,
       deliveryError: lastError || (failed.size > 0 ? 'One or more destinations permanently failed' : undefined),
-      deliveredDestinations: successfulDestinations,
+      deliveredDestinations: successfulDestinationIds,
+      deliveryAttemptCountByDestination: attemptCountByDestination,
+      deliveryNextAttemptAtByDestination: nextAttemptAtByDestination,
+      deliveryLastErrorByDestination: lastErrorByDestination,
+      ...(terminal ? { deliveryPlanCompletedAt: new Date().toISOString() } : {}),
     });
 
     if (terminal) {
+      const retryGenerationStillCurrent = Boolean(
+        terminalCarrier
+        && (terminalCarrier.deliveryRetryRequestedAt ?? null) === observedRetryGeneration,
+      );
       // Reports-back (P1): a notification that exhausted its retries to one
       // or more destinations must NOT vanish silently — that is the single
       // worst outcome per the north star. Surface a follow-up so the user
       // knows delivery failed and how to fix it. Guard against an alert
       // about a failed alert looping forever: a delivery-failure alert that
       // itself fails does not spawn another.
-      if (failed.size > 0 && !notification.metadata?.deliveryFailureAlert) {
+      if (
+        retryGenerationStillCurrent
+        && failed.size > 0
+        && !notification.metadata?.deliveryFailureAlert
+      ) {
         try {
+          const exactOriginFailure = hasExactOriginDeliveryMode(notification);
+          const routeAuthorityFailure = [...failed].some(
+            (destinationId) => unavailableDestinationIds.includes(destinationId),
+          );
+          // Failure alerts quote original-derived content. A route or account
+          // can change while a provider call is awaiting, so there is no safe
+          // post-failure external authority to bind here. Keep every such
+          // diagnostic in the local Activity surface only.
           addNotification({
             id: `delivery-failed-${notification.id}`,
             kind: 'system',
@@ -1473,10 +1683,13 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
             body: `Couldn't deliver "${notification.title}" after ${DELIVERY_MAX_ATTEMPTS} attempts to ${failed.size} destination${failed.size === 1 ? '' : 's'}: ${lastError || 'unknown error'}. Re-check the destination (e.g. your Discord webhook) in Console → Settings, or add another — the original message is still in Activity.`,
             createdAt: new Date().toISOString(),
             read: false,
+            silent: true,
             metadata: {
               deliveryFailureAlert: true,
               failedNotificationId: notification.id,
               failedDestinationIds: [...failed],
+              ...(exactOriginFailure ? { exactOriginDeliveryFailure: true } : {}),
+              ...(routeAuthorityFailure ? { routeAuthorityFailure: true } : {}),
             },
           });
         } catch { /* best-effort; the failure is also on the notification record */ }
@@ -1487,7 +1700,7 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
     nextQueue.push(job);
   }
 
-  replaceQueuedNotificationDeliveries(nextQueue);
+  settleQueuedNotificationDeliveryPass(queue, nextQueue);
   emitNoDestinationsPromptIfNeeded(deferredCount);
   if (droppedStale > 0) {
     logger.warn({ droppedStale, maxAgeHours: Math.round(DELIVERY_MAX_AGE_MS / 3_600_000) },
@@ -1694,6 +1907,32 @@ export async function startDaemon(
   if (autoResumed > 0) {
     logger.warn({ autoResumed }, 'Auto-resumed interrupted background tasks on boot');
   }
+  // Settle workflow dispatch authority before generic interrupted-chat
+  // recovery is allowed to resume a model. A crash after batch_closed (or
+  // activation) already has a reducer-only continuation; starting a fresh
+  // model first could publish a competing terminal for the same user source.
+  try {
+    const recovered = reconcileClosedWorkflowDispatchBatches();
+    if (recovered.finalized > 0 || recovered.published > 0) {
+      logger.info(recovered, 'Recovered closed workflow dispatch batches before chat restart recovery');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Boot closed workflow dispatch reconcile failed',
+    );
+  }
+  try {
+    const recovered = reconcileActivatedWorkflowDispatchGroups();
+    if (recovered.membersReleased > 0) {
+      logger.info(recovered, 'Recovered activated workflow groups before chat restart recovery');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Boot activated workflow dispatch reconcile failed',
+    );
+  }
   // Chat runs execute in-process with no resumer; a restart mid-run would
   // otherwise die SILENTLY. Surface each interrupted chat run, and — when the
   // interrupted turn provably made no external writes — RESUME it automatically
@@ -1847,20 +2086,35 @@ export async function startDaemon(
   // An in-flight guard prevents overlap when a single delivery pass
   // is unusually slow.
   let deliveryInFlight = false;
-  const deliveryTimer = setInterval(() => {
-    if (deliveryInFlight) return;
+  let deliveryRerunRequested = false;
+  const drainNotificationDeliveries = (phase: 'timer' | 'kick'): void => {
+    if (deliveryInFlight) {
+      deliveryRerunRequested = true;
+      return;
+    }
     deliveryInFlight = true;
-    withDaemonRuntimePhase('daemon.timer.notification_delivery', {}, () => processNotificationDeliveries(assistant))
+    withDaemonRuntimePhase(`daemon.${phase}.notification_delivery`, {}, () => processNotificationDeliveries(assistant))
       .catch((err) => {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
-          'Independent notification delivery tick failed',
+          `${phase === 'kick' ? 'Immediate' : 'Independent'} notification delivery failed`,
         );
       })
       .finally(() => {
         deliveryInFlight = false;
+        if (deliveryRerunRequested) {
+          deliveryRerunRequested = false;
+          setImmediate(() => drainNotificationDeliveries('kick'));
+        }
       });
-  }, 15_000);
+  };
+  registerNotificationDeliveryKick(() => {
+    setImmediate(() => drainNotificationDeliveries('kick'));
+  });
+  // Boot recovery owns already-persisted queue/admission/corruption state; it
+  // cannot rely on a fresh addNotification kick after restart.
+  setImmediate(() => drainNotificationDeliveries('kick'));
+  const deliveryTimer = setInterval(() => drainNotificationDeliveries('timer'), 15_000);
   deliveryTimer.unref?.();
 
   // Background tasks should not wait behind the main daemon loop.
@@ -2118,6 +2372,30 @@ export async function startDaemon(
   if (workflowRunLane) {
     const drainWorkflowRunsTick = () => {
       withDaemonRuntimePhase('daemon.timer.workflow_runs', {}, async () => {
+        // A crash after the foreground close node but before source-group
+        // activation/publication leaves every member safely held. Rebuild that
+        // exact frozen batch from the event ledger before ordinary activation
+        // reconciliation or queue draining.
+        try {
+          const recovered = reconcileClosedWorkflowDispatchBatches();
+          if (recovered.finalized > 0 || recovered.published > 0) {
+            logger.info(recovered, 'Recovered closed workflow dispatch batches');
+          }
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Closed workflow dispatch reconcile failed');
+        }
+        // A process may die after the complete source-group activation receipt
+        // wins but before every held member is released. Reconcile that narrow
+        // durable window before scanning executable runs; groups without the
+        // full receipt remain held and invisible.
+        try {
+          const recovered = reconcileActivatedWorkflowDispatchGroups();
+          if (recovered.membersReleased > 0) {
+            logger.info(recovered, 'Recovered activated workflow source-group members');
+          }
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow source-group reconcile failed');
+        }
         // P0 parking: re-admit any run whose approvals have resolved (no-op
         // when WORKFLOW_APPROVAL_PARKING is off) BEFORE draining, so a freed
         // parked run is picked up in the same tick. setImmediate below also
@@ -2133,6 +2411,9 @@ export async function startDaemon(
         );
       });
     };
+    registerWorkflowRunDrainKick(() => {
+      setImmediate(drainWorkflowRunsTick);
+    });
     setImmediate(drainWorkflowRunsTick);
     const workflowRunTimer = setInterval(drainWorkflowRunsTick, 15_000);
     workflowRunTimer.unref?.();
@@ -2238,6 +2519,22 @@ export async function startDaemon(
       // (no-op when WORKFLOW_APPROVAL_PARKING is off). Keeps parking
       // correct even when the independent run lane is disabled.
       await withDaemonRuntimePhase('daemon.loop.workflow_runs_inline', { tickCount }, async () => {
+        try {
+          const recovered = reconcileClosedWorkflowDispatchBatches();
+          if (recovered.finalized > 0 || recovered.published > 0) {
+            logger.info(recovered, 'Recovered closed workflow dispatch batches');
+          }
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Closed workflow dispatch inline reconcile failed');
+        }
+        try {
+          const recovered = reconcileActivatedWorkflowDispatchGroups();
+          if (recovered.membersReleased > 0) {
+            logger.info(recovered, 'Recovered activated workflow source-group members');
+          }
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow source-group inline reconcile failed');
+        }
         try { reapResolvedParkedRuns(); } catch (err) {
           logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns inline tick failed');
         }

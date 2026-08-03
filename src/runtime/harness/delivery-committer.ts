@@ -23,6 +23,7 @@ import {
   type TurnOutcome,
   type TurnOutcomeStatus,
 } from './turn-outcome.js';
+import { assertNoPendingWorkflowChatDispatchOwnership } from '../../tools/workflow-run-queue.js';
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -303,6 +304,14 @@ export function commitTurnOutcome(
 ): DeliveryCommitResult {
   const proposed = presentationEventForOutcome(outcome);
   assertExactAcceptedSource(proposed.identity);
+  // A prepared/held workflow admission is durable accepted work, not an error
+  // or needs-input terminal. Until immutable group activation transfers that
+  // ownership to the background daemon, no brain/bridge may publish a terminal
+  // winner for the same source and erase its only restart handle.
+  assertNoPendingWorkflowChatDispatchOwnership({
+    sessionId: proposed.identity.sessionId,
+    sourceUserSeq: proposed.identity.sourceUserSeq,
+  });
   const data = completionDataForTurnOutcome(outcome, options);
   const terminal = appendTerminalEventOnce({
     sessionId: proposed.identity.sessionId,

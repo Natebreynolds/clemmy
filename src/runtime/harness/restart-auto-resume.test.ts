@@ -7,10 +7,11 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/clemmy-test-auto-resume';
 process.env.CLEMENTINE_HOME = TEST_HOME;
+process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 
 const {
   appendEvent,
@@ -23,7 +24,24 @@ const {
   resetEventLog,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { recoverInterruptedChatRuns, markRunInFlight, AUTO_RESUME_DIRECTIVE } = await import('./restart-recovery.js');
+const {
+  clearRunInFlightAfterTerminal,
+  recoverInterruptedChatRuns,
+  markRunInFlight,
+  AUTO_RESUME_DIRECTIVE,
+} = await import('./restart-recovery.js');
+const {
+  createWorkflowChatDispatchPreparedReceipt,
+  queueWorkflowRun,
+  readPendingWorkflowChatDispatchOwnership,
+  recordWorkflowChatDispatchPreparation,
+} = await import('../../tools/workflow-run-queue.js');
+const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
+const { writeWorkflow } = await import('../../memory/workflow-store.js');
+const { finalizePreparedWorkflowDispatchForSource } = await import('./loop.js');
+const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
+
+const TEST_ORIGIN_REPLY_TARGET = { type: 'origin_chat' } as const;
 
 beforeEach(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -41,6 +59,146 @@ function interruptedChatSession(): string {
   });
   markRunInFlight(sess.id, true); // never cleared = killed mid-run
   return sess.id;
+}
+
+function interruptedPreparedWorkflowSession(since: string): {
+  sessionId: string;
+  sourceUserSeq: number;
+  attemptId: string;
+  runId: string;
+} {
+  const sess = HarnessSession.create({ kind: 'chat', title: 'prepared workflow interrupted' });
+  const attempt = beginRunAttempt(sess.id, { runId: `restart-prepared:${sess.id}` });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: {
+      text: 'Run the admitted background workflow.',
+      originReplyTarget: TEST_ORIGIN_REPLY_TARGET,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(TEST_ORIGIN_REPLY_TARGET),
+    },
+  });
+  sess.setRunInFlight(since);
+  writeWorkflow('restart-prepared-only', {
+    name: 'restart-prepared-only',
+    description: 'A bounded restart ownership fixture.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'work', prompt: 'Perform the admitted read-only work.', sideEffect: 'read' }],
+  });
+  const queued = queueWorkflowRun('restart-prepared-only', {}, {
+    originSessionId: sess.id,
+    originObserver: {
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      replyTarget: { type: 'origin_chat' },
+    },
+    prepareChatDispatch: (authority) => {
+      const prepared = appendEvent({
+        sessionId: sess.id,
+        turn: source.turn,
+        role: 'system',
+        type: 'async_work_dispatch_prepared',
+        parentEventId: source.id,
+        data: { ...authority },
+      });
+      return recordWorkflowChatDispatchPreparation(
+        createWorkflowChatDispatchPreparedReceipt(authority, {
+          eventId: prepared.id,
+          eventSeq: prepared.seq,
+          preparedAt: prepared.createdAt,
+        }),
+      );
+    },
+  });
+  assert.equal(queued.status, 'held');
+  assert.ok(queued.id);
+  return {
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    attemptId: attempt.attemptId,
+    runId: queued.id,
+  };
+}
+
+for (const scenario of [
+  {
+    label: 'auto-resume disabled',
+    skipped: 'disabled' as const,
+    ageMs: 60_000,
+    configure: (_sessionId: string) => { process.env.CLEMMY_CHAT_AUTO_RESUME = 'off'; },
+  },
+  {
+    label: 'interruption too old',
+    skipped: 'too_old' as const,
+    ageMs: 3 * 60 * 60_000,
+    configure: (_sessionId: string) => {},
+  },
+  {
+    label: 'external write blocks replay',
+    skipped: 'external_write' as const,
+    ageMs: 60_000,
+    configure: (sessionId: string) => {
+      appendEvent({
+        sessionId,
+        turn: 1,
+        role: 'system',
+        type: 'external_write',
+        data: { tool: 'composio_execute_tool', callId: `prepared-write:${sessionId}` },
+      });
+    },
+  },
+]) {
+  test(`prepared-only workflow ownership survives restart when ${scenario.label}`, async () => {
+    const nowMs = Date.now();
+    const since = new Date(nowMs - scenario.ageMs).toISOString();
+    const fixture = interruptedPreparedWorkflowSession(since);
+    scenario.configure(fixture.sessionId);
+    const dispatched: string[] = [];
+
+    const summary = recoverInterruptedChatRuns(
+      () => nowMs,
+      async (sessionId) => { dispatched.push(sessionId); },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(summary.recovered, 1);
+    assert.deepEqual(dispatched, []);
+    assert.equal(summary.records[0]?.autoResumeSkipped, scenario.skipped);
+    assert.equal(summary.records[0]?.preparedDispatchOwnershipPreserved, true);
+    assert.deepEqual(summary.records[0]?.preparedDispatchRunIds, [fixture.runId]);
+    assert.equal(summary.records[0]?.markerCleared, false);
+    assert.ok(HarnessSession.load(fixture.sessionId)?.runInFlightSince(), 'chat ownership remains armed');
+    assert.equal(getLatestRunAttempt(fixture.sessionId)?.status, 'active', 'the exact source attempt remains actionable');
+    assert.equal(
+      clearRunInFlightAfterTerminal(
+        fixture.sessionId,
+        fixture.attemptId,
+        fixture.sourceUserSeq,
+      ),
+      false,
+      'ordinary terminal cleanup cannot cross the pending queue ownership',
+    );
+    assert.equal(
+      JSON.parse(readFileSync(`${WORKFLOW_RUNS_DIR}/${fixture.runId}.json`, 'utf-8')).status,
+      'awaiting_chat_dispatch_seal',
+    );
+    assert.deepEqual(
+      readPendingWorkflowChatDispatchOwnership({
+        sessionId: fixture.sessionId,
+        sourceUserSeq: fixture.sourceUserSeq,
+      })?.runIds,
+      [fixture.runId],
+    );
+    assert.equal(
+      listEvents(fixture.sessionId, { types: ['conversation_completed'] }).length,
+      0,
+      'manual recovery guidance is nonterminal while admitted work owns the source',
+    );
+    const paused = listEvents(fixture.sessionId, { types: ['run_paused'] }).at(-1);
+    assert.equal(paused?.data.reason, 'prepared_workflow_dispatch_interrupted');
+    assert.deepEqual(paused?.data.runIds, [fixture.runId]);
+  });
 }
 
 test('a clean interrupted run is auto-resumed with nonterminal progress only', async () => {
@@ -412,4 +570,69 @@ test('a FAILED dispatch falls back to the manual banner + a notification', async
     .find((event) => event.data.phase === 'dispatch_failed');
   assert.equal(privateFailure?.data.error, 'brain unavailable');
   assert.doesNotMatch(JSON.stringify(last), /brain unavailable/);
+});
+
+test('a dispatch rejection after exact workflow activation preserves transferred ownership', async () => {
+  const nowMs = Date.now();
+  const fixture = interruptedPreparedWorkflowSession(
+    new Date(nowMs - 60_000).toISOString(),
+  );
+  let finalizedRunIds: string[] = [];
+
+  const summary = recoverInterruptedChatRuns(
+    () => nowMs,
+    async (sessionId, _directive, sourceUserSeq) => {
+      assert.equal(sessionId, fixture.sessionId);
+      assert.equal(sourceUserSeq, fixture.sourceUserSeq);
+      const finalized = finalizePreparedWorkflowDispatchForSource(sessionId, sourceUserSeq);
+      assert.ok(finalized, 'the resumed source activates its exact prepared workflow group');
+      finalizedRunIds = [...finalized.receipt.runIds];
+      throw new Error('provider failed after durable workflow dispatch transfer');
+    },
+  );
+  assert.equal(summary.records[0]?.autoResumed, true);
+
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const transferred = listEvents(fixture.sessionId, { types: ['run_resumed'] })
+      .some((event) => event.data.reason === 'workflow_dispatch_transferred_after_resume_error');
+    if (transferred) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  assert.deepEqual(finalizedRunIds, [fixture.runId]);
+  assert.equal(
+    readPendingWorkflowChatDispatchOwnership({
+      sessionId: fixture.sessionId,
+      sourceUserSeq: fixture.sourceUserSeq,
+    }),
+    null,
+    'activation transferred ownership out of the pending preparation state',
+  );
+  assert.equal(
+    listEvents(fixture.sessionId, { types: ['conversation_completed'] }).length,
+    0,
+    'the rejected foreground Promise cannot publish a competing terminal',
+  );
+  assert.ok(
+    HarnessSession.load(fixture.sessionId)?.runInFlightSince(),
+    'restart ownership remains armed until the background workflow settles',
+  );
+  assert.equal(
+    getLatestRunAttempt(fixture.sessionId)?.status,
+    'active',
+    'the exact accepted source attempt remains active',
+  );
+  assert.equal(
+    JSON.parse(readFileSync(`${WORKFLOW_RUNS_DIR}/${fixture.runId}.json`, 'utf-8')).status,
+    'queued',
+    'the activated workflow member is executable',
+  );
+  const transferred = listEvents(fixture.sessionId, { types: ['run_resumed'] })
+    .find((event) => event.data.reason === 'workflow_dispatch_transferred_after_resume_error');
+  assert.ok(transferred);
+  assert.equal(transferred.data.sourceUserSeq, fixture.sourceUserSeq);
+  assert.deepEqual(transferred.data.runIds, [fixture.runId]);
+  const privateFailure = listEvents(fixture.sessionId, { types: ['restart_recovery_decision'] })
+    .find((event) => event.data.phase === 'dispatch_failed');
+  assert.equal(privateFailure?.data.error, 'provider failed after durable workflow dispatch transfer');
 });

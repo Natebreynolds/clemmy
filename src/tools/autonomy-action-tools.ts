@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { addNotification } from '../runtime/notifications.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
-import { appendEvent } from '../runtime/harness/eventlog.js';
+import { appendEvent, getSession } from '../runtime/harness/eventlog.js';
 import { answerCheckIn, closeCheckIn, createCheckIn, listOpenCheckIns, validateCheckInQuestion } from '../agents/check-ins.js';
 import { proposeCheckInTemplate } from '../agents/check-in-proposals.js';
 import { maybeSelfServeBounce } from '../agents/self-serve-gate.js';
@@ -10,6 +10,7 @@ import { surfacePlan } from '../agents/plan-proposals.js';
 import { PlanSchema, type Plan } from '../agents/planner.js';
 import { textResult } from './shared.js';
 import { getRuntimeEnv } from '../config.js';
+import { readWorkflowRunOriginRecords } from './workflow-run-queue.js';
 
 function planCritiqueEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_PLAN_CRITIQUE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
@@ -107,6 +108,61 @@ function renderSharedPlan(plan: Plan, message?: string): string {
     .join('\n');
 }
 
+/** Exact-observer workflows have a single terminal reply authority. A
+ * notify_user call inside one remains durable dashboard evidence, but it must
+ * not independently fan out before the exact-origin terminal is committed.
+ * An absent/readable legacy sidecar retains legacy delivery. An unreadable
+ * sidecar fails closed because it may hide a private exact recipient. */
+export type WorkflowRunNotificationAuthorityState = 'none' | 'exact' | 'corrupt';
+
+export function workflowRunNotificationAuthorityState(
+  workflowRunId: string | undefined,
+): WorkflowRunNotificationAuthorityState {
+  if (!workflowRunId) return 'none';
+  try {
+    return readWorkflowRunOriginRecords(workflowRunId).some((record) => record.version === 2)
+      ? 'exact'
+      : 'none';
+  } catch {
+    return 'corrupt';
+  }
+}
+
+function nonEmptyMetadataString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+/** Resolve workflow identity from explicit tool attribution first, then the
+ * durable workflow-step session. The session lookup covers the direct Codex
+ * workflow lane where the local tool wrapper carries only sessionId; it also
+ * avoids making colon-delimited display ids the primary identity protocol. */
+export function workflowNotificationAttribution(input: {
+  sessionId?: string;
+  workflowRunId?: string;
+  stepId?: string;
+}): { workflowRunId?: string; stepId?: string } {
+  let durableRunId: string | undefined;
+  let durableStepId: string | undefined;
+  if (input.sessionId) {
+    try {
+      const metadata = getSession(input.sessionId)?.metadata;
+      durableRunId = nonEmptyMetadataString(metadata?.workflowRunId);
+      durableStepId = nonEmptyMetadataString(metadata?.stepId);
+    } catch {
+      // The explicit attribution and legacy session fallback remain usable.
+    }
+  }
+  const parsedRunId = input.sessionId?.startsWith('workflow:')
+    ? nonEmptyMetadataString(input.sessionId.split(':')[1])
+    : undefined;
+  const workflowRunId = nonEmptyMetadataString(input.workflowRunId) ?? durableRunId ?? parsedRunId;
+  const stepId = nonEmptyMetadataString(input.stepId) ?? durableStepId;
+  return {
+    ...(workflowRunId ? { workflowRunId } : {}),
+    ...(stepId ? { stepId } : {}),
+  };
+}
+
 export function registerAutonomyActionTools(server: McpServer): void {
   server.tool(
     'notify_user',
@@ -115,26 +171,37 @@ export function registerAutonomyActionTools(server: McpServer): void {
       title: z.string().min(1).max(140),
       body: z.string().min(1).max(2000),
       kind: z.enum(['system', 'approval', 'execution', 'workflow', 'cron']).optional(),
-	    },
-	    async ({ title, body, kind }) => {
-	      const id = `${Date.now()}-tool-notify`;
-	      const notificationKind = kind === 'approval' || kind === 'execution' || kind === 'workflow' || kind === 'cron'
-	        ? kind
-	        : 'system';
-	      const ctx = getToolOutputContext();
-	      const workflowRunId =
-	        ctx?.sessionId && ctx.sessionId.startsWith('workflow:')
-	          ? ctx.sessionId.split(':')[1]
-	          : undefined;
-	      addNotification({
-	        id,
-	        kind: notificationKind,
+    },
+    async ({ title, body, kind }) => {
+      const id = `${Date.now()}-tool-notify`;
+      const notificationKind = kind === 'approval' || kind === 'execution' || kind === 'workflow' || kind === 'cron'
+        ? kind
+        : 'system';
+      const ctx = getToolOutputContext();
+      const attribution = workflowNotificationAttribution({
+        sessionId: ctx?.sessionId,
+        workflowRunId: ctx?.workflowRunId,
+        stepId: ctx?.stepId,
+      });
+      const workflowRunId = attribution.workflowRunId;
+      const notificationAuthorityState = workflowRunNotificationAuthorityState(workflowRunId);
+      const suppressExternalDelivery = notificationAuthorityState !== 'none';
+      addNotification({
+        id,
+        kind: notificationKind,
         title,
         body,
         createdAt: new Date().toISOString(),
         read: false,
+        ...(suppressExternalDelivery ? { silent: true } : {}),
         metadata: workflowRunId
-          ? { source: 'notify_user_tool', workflowRunId }
+          ? {
+              source: 'notify_user_tool',
+              workflowRunId,
+              ...(attribution.stepId ? { workflowStepId: attribution.stepId } : {}),
+              ...(notificationAuthorityState === 'exact' ? { exactOriginTerminalAuthority: true } : {}),
+              ...(notificationAuthorityState === 'corrupt' ? { originObserverAuthorityUnreadable: true } : {}),
+            }
           : { source: 'notify_user_tool' },
       });
       return textResult(`Notification queued: ${id}`);

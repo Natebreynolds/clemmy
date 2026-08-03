@@ -54,6 +54,82 @@ import {
   compiledWorkflowRunInputsHash,
   isReservedProjectWorkflowRunRecord,
 } from '../execution/compiled-project-run-contract.js';
+import {
+  createWorkflowChatDispatchPreparationAuthority,
+  decodeWorkflowChatDispatchPreparedReceipt,
+  normalizeWorkflowRunOriginObserver,
+  readActiveWorkflowOriginGroup,
+  readActiveExactWorkflowRunOriginRecords,
+  readIndexedWorkflowChatDispatchPreparations,
+  readWorkflowOriginGroup,
+  readWorkflowOriginGroupClosedBatch,
+  workflowChatDispatchQueueRequestDigest,
+  workflowOriginGroupMemberForRequest,
+  workflowOriginSourceGroupId,
+  workflowRunHasRecordedChatDispatchPreparation,
+  workflowRunOriginObserverId,
+  type ExactWorkflowRunOriginRecord,
+  type WorkflowChatDispatchPreparationAuthority,
+  type WorkflowChatDispatchPreparedReceipt,
+  type WorkflowRunOriginIdentity,
+  type WorkflowRunOriginObserver,
+} from '../execution/workflow-origin-group.js';
+
+export {
+  activateWorkflowOriginGroup,
+  cleanupSettledWorkflowRunChatDispatchPreparations,
+  compactSettledWorkflowOriginGroup,
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  createWorkflowOriginGroupSettlementReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  readIndexedWorkflowChatDispatchPreparations,
+  readWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupClosedBatch,
+  reconcileActivatedWorkflowOriginGroups,
+  recoverClosedWorkflowOriginGroups,
+  registerWorkflowRunDrainKick,
+  readActiveWorkflowOriginGroup,
+  readActiveWorkflowOriginGroupForRun,
+  readWorkflowOriginGroup,
+  readWorkflowOriginGroupSettlement,
+  readWorkflowOriginGroupTombstone,
+  recordWorkflowOriginGroupSettlement,
+  sealWorkflowOriginGroup,
+  verifyActiveWorkflowOriginMembership,
+  workflowChatDispatchQueueRequestDigest,
+  workflowOriginGroupMemberForRequest,
+  workflowOriginSourceGroupId,
+  workflowRunHasPendingChatDispatchPreparation,
+  workflowRunHasChatDispatchPreparationAuthority,
+  workflowRunHasRecordedChatDispatchPreparation,
+  workflowRunOriginObserverId,
+} from '../execution/workflow-origin-group.js';
+export type {
+  ActiveWorkflowOriginGroup,
+  CompactWorkflowOriginGroupOptions,
+  DurableWorkflowOriginGroupClosedBatch,
+  ExactWorkflowRunOriginRecord,
+  RecoverClosedWorkflowOriginGroupsResult,
+  SealedWorkflowOriginGroup,
+  WorkflowChatDispatchPreparationAuthority,
+  WorkflowChatDispatchPreparedReceipt,
+  WorkflowOriginGroupActivationReceipt,
+  WorkflowOriginGroupCloseAuthority,
+  WorkflowOriginGroupClosedBatchReceipt,
+  WorkflowOriginGroupMember,
+  WorkflowOriginGroupPublicDispatch,
+  WorkflowOriginGroupSettlementReceipt,
+  WorkflowOriginGroupSettlementTerminalInput,
+  WorkflowOriginGroupTerminalIdentity,
+  WorkflowOriginGroupTerminalStatus,
+  WorkflowOriginGroupTombstone,
+  ReconcileActivatedWorkflowOriginGroupsResult,
+  WorkflowRunOriginIdentity,
+  WorkflowRunOriginObserver,
+} from '../execution/workflow-origin-group.js';
 
 export {
   compiledWorkflowRunContractHash,
@@ -623,6 +699,9 @@ export function findDuplicateQueuedWorkflowRun(
   opts?: {
     targetStepId?: string;
     retryFailedItems?: QueueWorkflowRunOptions['retryFailedItems'];
+    /** Only an exact source with a preparation callback can eventually release
+     * this state. Legacy/scheduled callers must not inherit an orphan hold. */
+    includeAwaitingChatDispatchSeal?: boolean;
   },
 ): { id: string; status: string } | null {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return null;
@@ -644,7 +723,12 @@ export function findDuplicateQueuedWorkflowRun(
         retryFailedItemKeys?: unknown;
       };
       const status = typeof parsed.status === 'string' ? parsed.status : 'queued';
-      if (status !== 'queued' && status !== 'running' && status !== 'finalizing') continue;
+      if (
+        (status !== 'awaiting_chat_dispatch_seal' || opts?.includeAwaitingChatDispatchSeal !== true)
+        && status !== 'queued'
+        && status !== 'running'
+        && status !== 'finalizing'
+      ) continue;
       if (parsed.workflow !== workflowName) continue;
       // A requeue-from-run must never see its own SOURCE run as the duplicate
       // (the source is still status:'running' on disk when a goal re-pursuit
@@ -665,6 +749,141 @@ export function findDuplicateQueuedWorkflowRun(
     }
   }
   return null;
+}
+
+export interface PendingWorkflowChatDispatchOwnership {
+  sourceGroupId: string;
+  originSessionId: string;
+  sourceUserSeq: number;
+  phase: 'prepared' | 'closed';
+  runIds: string[];
+  runStatuses: Record<string, string>;
+}
+
+/** Typed control-plane signal: the accepted chat source is not terminally
+ * reducible because one or more workflow admissions still depend on its
+ * pre-activation recovery ownership. Public bridges must preserve the marker
+ * and attempt when this crosses their boundary; it is not a provider failure. */
+export class PendingWorkflowChatDispatchOwnershipError extends Error {
+  readonly ownership: PendingWorkflowChatDispatchOwnership;
+
+  constructor(ownership: PendingWorkflowChatDispatchOwnership) {
+    super(
+      `Workflow dispatch group ${ownership.sourceGroupId} still owns held run(s) ${ownership.runIds.join(', ')}.`,
+    );
+    this.name = 'PendingWorkflowChatDispatchOwnershipError';
+    this.ownership = ownership;
+  }
+}
+
+/**
+ * Read the queue ownership that still prevents an exact chat source from
+ * becoming terminal. A fresh exact run is installed non-executable before its
+ * private prepared-event callback runs, so this deliberately combines both
+ * durable evidence shapes:
+ *
+ * - the source-group preparation index (including preparations attached to a
+ *   duplicate legacy/live run); and
+ * - canonical run records born with this sourceGroupId (including the narrow
+ *   crash window before the preparation index was installed).
+ *
+ * Once activation wins, the immutable source group/background daemon owns the
+ * work and the coarse foreground marker may be released. Before activation,
+ * callers must preserve source ownership. Corrupt attributable evidence throws
+ * so terminal/marker cleanup can fail closed.
+ */
+export function readPendingWorkflowChatDispatchOwnership(
+  identity: WorkflowRunOriginIdentity,
+): PendingWorkflowChatDispatchOwnership | null {
+  const originSessionId = normalizedOptionalString(identity.sessionId);
+  const sourceUserSeq = identity.sourceUserSeq;
+  if (!originSessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
+    throw new Error('pending workflow chat dispatch ownership requires an exact source identity');
+  }
+  const sourceGroupId = workflowOriginSourceGroupId({ sessionId: originSessionId, sourceUserSeq });
+  if (readActiveWorkflowOriginGroup(sourceGroupId)) return null;
+
+  const indexed = readIndexedWorkflowChatDispatchPreparations(sourceGroupId);
+  const candidateRunIds = new Set<string>();
+  for (const receipt of indexed) {
+    if (
+      receipt.sourceGroupId !== sourceGroupId
+      || receipt.originSessionId !== originSessionId
+      || receipt.sourceUserSeq !== sourceUserSeq
+    ) {
+      throw new Error(`Workflow origin group ${sourceGroupId} has preparation evidence for another source.`);
+    }
+    if (!workflowRunHasRecordedChatDispatchPreparation(receipt.runId, receipt.receiptDigest)) {
+      throw new Error(`Workflow origin group ${sourceGroupId} lost run ${receipt.runId}'s preparation pin.`);
+    }
+    candidateRunIds.add(receipt.runId);
+  }
+
+  if (existsSync(WORKFLOW_RUNS_DIR)) {
+    for (const entry of readdirSync(WORKFLOW_RUNS_DIR).filter((file) => file.endsWith('.json')).sort()) {
+      const file = path.join(WORKFLOW_RUNS_DIR, entry);
+      let run: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+        run = parsed as Record<string, unknown>;
+      } catch {
+        // An unreadable unrelated run cannot be attributed to this source. An
+        // indexed member is validated again below and therefore still fails
+        // closed if its own canonical record is unreadable.
+        continue;
+      }
+      if (run.chatDispatchSourceGroupId !== sourceGroupId) continue;
+      const runId = normalizedOptionalString(run.id);
+      if (!runId || entry !== `${runId}.json`) {
+        throw new Error(`Workflow origin group ${sourceGroupId} has a mismatched canonical held run.`);
+      }
+      if (!/^[a-f0-9]{64}$/.test(String(run.chatDispatchQueueRequestDigest ?? ''))) {
+        throw new Error(`Workflow origin group ${sourceGroupId} run ${runId} lost its queue request authority.`);
+      }
+      candidateRunIds.add(runId);
+    }
+  }
+
+  if (candidateRunIds.size === 0) return null;
+  const runIds = [...candidateRunIds].sort();
+  const runStatuses: Record<string, string> = {};
+  for (const runId of runIds) {
+    const file = workflowRunFile(runId);
+    if (!existsSync(file)) {
+      throw new Error(`Workflow origin group ${sourceGroupId} references missing run ${runId}.`);
+    }
+    let run: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('record is not an object');
+      }
+      run = parsed as Record<string, unknown>;
+    } catch (err) {
+      throw new Error(`Workflow origin group ${sourceGroupId} has unreadable run ${runId}.`, { cause: err });
+    }
+    const status = normalizedOptionalString(run.status);
+    if (run.id !== runId || !status) {
+      throw new Error(`Workflow origin group ${sourceGroupId} has invalid run ${runId}.`);
+    }
+    runStatuses[runId] = status;
+  }
+  return {
+    sourceGroupId,
+    originSessionId,
+    sourceUserSeq,
+    phase: readWorkflowOriginGroupClosedBatch(sourceGroupId) ? 'closed' : 'prepared',
+    runIds,
+    runStatuses,
+  };
+}
+
+export function assertNoPendingWorkflowChatDispatchOwnership(
+  identity: WorkflowRunOriginIdentity,
+): void {
+  const ownership = readPendingWorkflowChatDispatchOwnership(identity);
+  if (ownership) throw new PendingWorkflowChatDispatchOwnershipError(ownership);
 }
 
 function normalizeOriginSessionIds(...values: unknown[]): string[] {
@@ -756,53 +975,116 @@ function workflowRunOriginDir(runId: string): string {
   return path.join(WORKFLOW_RUN_ORIGINS_DIR, key);
 }
 
+export interface LegacyWorkflowRunOriginRecord {
+  version: 1;
+  runId: string;
+  originSessionId: string;
+  recordedAt?: string;
+}
+
+export type WorkflowRunOriginRecord =
+  | LegacyWorkflowRunOriginRecord
+  | ExactWorkflowRunOriginRecord;
+function decodeLegacyWorkflowRunOriginRecord(value: unknown, runId: string): LegacyWorkflowRunOriginRecord | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Workflow run ${runId} has an invalid origin observer marker.`);
+  }
+  const marker = value as Record<string, unknown>;
+  const originSessionId = normalizedOptionalString(marker.originSessionId);
+  if (marker.runId !== runId || !originSessionId) {
+    throw new Error(`Workflow run ${runId} has an invalid origin observer marker.`);
+  }
+  if (marker.version === 2) return null;
+  if (marker.version !== 1) {
+    throw new Error(`Workflow run ${runId} has an unknown origin observer marker version.`);
+  }
+  return {
+    version: 1,
+    runId,
+    originSessionId,
+    ...(typeof marker.recordedAt === 'string' ? { recordedAt: marker.recordedAt } : {}),
+  };
+}
+
 /** Read immutable observer sidecars. Duplicate queue requests append these
  * instead of rewriting the live run record and racing the runner's status
  * checkpoint. */
-export function readWorkflowRunOriginSessionIds(runId: string): string[] {
+export function readWorkflowRunOriginRecords(runId: string): WorkflowRunOriginRecord[] {
   const dir = workflowRunOriginDir(runId);
-  if (!existsSync(dir)) return [];
-  const origins: string[] = [];
-  for (const file of readdirSync(dir).filter((entry) => entry.endsWith('.json')).sort()) {
-    let marker: { version?: unknown; runId?: unknown; originSessionId?: unknown };
-    try {
-      marker = JSON.parse(readFileSync(path.join(dir, file), 'utf-8')) as typeof marker;
-    } catch (err) {
-      throw new Error(`Workflow run ${runId} has a corrupt origin observer marker.`, { cause: err });
+  const origins: WorkflowRunOriginRecord[] = [];
+  if (existsSync(dir)) {
+    for (const file of readdirSync(dir).filter((entry) => entry.endsWith('.json')).sort()) {
+      let marker: unknown;
+      try {
+        marker = JSON.parse(readFileSync(path.join(dir, file), 'utf-8'));
+      } catch (err) {
+        throw new Error(`Workflow run ${runId} has a corrupt origin observer marker.`, { cause: err });
+      }
+      const legacy = decodeLegacyWorkflowRunOriginRecord(marker, runId);
+      if (legacy) origins.push(legacy);
     }
-    if (marker.version !== 1 || marker.runId !== runId || typeof marker.originSessionId !== 'string') {
-      throw new Error(`Workflow run ${runId} has an invalid origin observer marker.`);
-    }
-    origins.push(marker.originSessionId);
   }
-  return normalizeOriginSessionIds(origins);
+  // V2 markers are deliberately invisible until every sealed group member has
+  // activated and the create-only group activation receipt is durable.
+  return [...origins, ...readActiveExactWorkflowRunOriginRecords(runId)];
 }
 
-function attachOriginSessionIdsToRun(runId: string, origins: string[]): void {
-  if (origins.length === 0) return;
+export function readWorkflowRunOriginSessionIds(runId: string): string[] {
+  return normalizeOriginSessionIds(
+    readWorkflowRunOriginRecords(runId).map((record) => record.originSessionId),
+  );
+}
+
+function attachWorkflowRunOriginsToRun(
+  runId: string,
+  origins: string[],
+): void {
+  const legacyOrigins = normalizeOriginSessionIds(origins);
+  if (legacyOrigins.length === 0) return;
   const safe = runId.replace(/[^a-zA-Z0-9_.:-]/g, '');
   const file = path.join(WORKFLOW_RUNS_DIR, `${safe}.json`);
-  if (!safe || safe !== runId) return;
+  if (!safe || safe !== runId) {
+    return;
+  }
   // Retention makes its final pending-report decision and unlinks this run
   // under the same record lock. Keep the canonical-record existence check and
   // immutable observer installation in that critical section: otherwise a
   // reaper can observe every known origin acknowledged, then delete the run
   // immediately after this sidecar appears and strand the late observer.
   withWorkflowRunRecordLock(file, () => {
-    if (!existsSync(file)) return;
+    if (!existsSync(file)) {
+      return;
+    }
     const dir = workflowRunOriginDir(runId);
     ensureDir(dir);
-    for (const originSessionId of normalizeOriginSessionIds(origins)) {
-      const key = createHash('sha256').update(originSessionId).digest('hex');
-      const installed = writeNewRunFileDurably(path.join(dir, `${key}.json`), {
+    const recordedAt = new Date().toISOString();
+    const records: WorkflowRunOriginRecord[] = [
+      ...legacyOrigins.map((originSessionId): LegacyWorkflowRunOriginRecord => ({
         version: 1,
         runId,
         originSessionId,
-        recordedAt: new Date().toISOString(),
-      });
-      if (!installed) continue;
+        recordedAt,
+      })),
+    ];
+    for (const record of records) {
+      const markerFile = path.join(dir, `${createHash('sha256').update(record.originSessionId).digest('hex')}.json`);
+      const installed = writeNewRunFileDurably(markerFile, { ...record });
+      if (installed) continue;
+      let winner: LegacyWorkflowRunOriginRecord | null;
+      try {
+        winner = decodeLegacyWorkflowRunOriginRecord(JSON.parse(readFileSync(markerFile, 'utf-8')), runId);
+      } catch (err) {
+        throw new Error(`Workflow run ${runId} has an unreadable origin observer winner.`, { cause: err });
+      }
+      if (!winner || winner.originSessionId !== record.originSessionId) {
+        throw new Error(`Workflow run ${runId} has a conflicting origin observer winner.`);
+      }
     }
   });
+}
+
+function attachOriginSessionIdsToRun(runId: string, origins: string[]): void {
+  attachWorkflowRunOriginsToRun(runId, origins);
 }
 
 export interface QueueWorkflowRunResult {
@@ -810,6 +1092,9 @@ export interface QueueWorkflowRunResult {
   id?: string;
   message: string;
   readiness?: WorkflowRunReadinessCheck;
+  /** Present only for an exact chat dispatch. The loop must seal every receipt
+   * from the accepted source and activate that group before acknowledging it. */
+  chatDispatchPreparation?: WorkflowChatDispatchPreparedReceipt;
 }
 
 /**
@@ -903,6 +1188,15 @@ export interface QueueWorkflowRunOptions {
    *  Written into the run record so the runner re-enters it on a terminal
    *  state. Omit for scheduled/cron/dashboard/webhook runs (notification-only). */
   originSessionId?: string;
+  /** Exact accepted source behind an ordinary chat dispatch. This augments the
+   * legacy API surface, but exact runs do not install legacy origin authority. */
+  originObserver?: WorkflowRunOriginObserver;
+  /** Trusted synchronous graph-ledger writer. It must durably append the
+   * private preparation event and return its canonical receipt. A Promise is
+   * rejected because queue admission cannot outrun this durability boundary. */
+  prepareChatDispatch?: (
+    authority: WorkflowChatDispatchPreparationAuthority,
+  ) => WorkflowChatDispatchPreparedReceipt;
   /** Additional origin chats that requested/observed the same queued/running
    *  work. Backwards-compatible with originSessionId; used only when duplicate
    *  queue requests should also report back to the current chat. */
@@ -1604,6 +1898,70 @@ export function queueWorkflowRun(
   );
 }
 
+function prepareExactChatDispatch(
+  runId: string,
+  observer: WorkflowRunOriginObserver,
+  queueRequestDigest: string,
+  callback: QueueWorkflowRunOptions['prepareChatDispatch'],
+): WorkflowChatDispatchPreparedReceipt {
+  if (typeof callback !== 'function') {
+    throw new Error('exact workflow origin observer requires a synchronous trusted prepareChatDispatch callback');
+  }
+  const file = workflowRunFile(runId);
+  return withWorkflowRunRecordLock(file, () => {
+    if (!existsSync(file)) {
+      throw new Error(`Workflow run ${runId} disappeared before chat dispatch preparation.`);
+    }
+    const durableRun = JSON.parse(readFileSync(file, 'utf-8')) as { id?: unknown };
+    if (durableRun.id !== runId) {
+      throw new Error(`Workflow run ${runId} changed identity before chat dispatch preparation.`);
+    }
+    const authority = createWorkflowChatDispatchPreparationAuthority({
+      runId,
+      observer,
+      queueRequestDigest,
+    });
+    const expected = {
+      preparationDigest: authority.preparationDigest,
+      sourceGroupId: authority.sourceGroupId,
+      observerId: authority.observerId,
+      originSessionId: authority.originSessionId,
+      sourceUserSeq: authority.sourceUserSeq,
+      runId: authority.runId,
+      queueRequestDigest: authority.queueRequestDigest,
+      replyTargetDigest: authority.replyTargetDigest,
+    };
+    const callbackAuthority = Object.freeze({
+      ...authority,
+      replyTarget: Object.freeze({ ...authority.replyTarget }),
+    });
+    // The production callback appends/fsyncs the private event and installs
+    // its durable preparation pin before returning. Holding the same record
+    // lock used by retention makes that one linearized admission operation.
+    const candidate = callback(callbackAuthority) as WorkflowChatDispatchPreparedReceipt | Promise<unknown>;
+    if (candidate && typeof (candidate as { then?: unknown }).then === 'function') {
+      throw new Error('prepareChatDispatch must synchronously return its durable prepared-event receipt');
+    }
+    const receipt = decodeWorkflowChatDispatchPreparedReceipt(candidate);
+    if (
+      receipt.preparationDigest !== expected.preparationDigest
+      || receipt.sourceGroupId !== expected.sourceGroupId
+      || receipt.observerId !== expected.observerId
+      || receipt.originSessionId !== expected.originSessionId
+      || receipt.sourceUserSeq !== expected.sourceUserSeq
+      || receipt.runId !== expected.runId
+      || receipt.queueRequestDigest !== expected.queueRequestDigest
+      || receipt.replyTargetDigest !== expected.replyTargetDigest
+    ) {
+      throw new Error('prepareChatDispatch returned a receipt for different canonical authority');
+    }
+    if (!workflowRunHasRecordedChatDispatchPreparation(runId, receipt.receiptDigest)) {
+      throw new Error('prepareChatDispatch returned before its durable run preparation pin was installed');
+    }
+    return receipt;
+  });
+}
+
 function queueWorkflowRunUnlocked(
   name: string,
   normalizedInputs: Record<string, string>,
@@ -1639,9 +1997,71 @@ function queueWorkflowRunUnlocked(
       : findDuplicateQueuedWorkflowRun(name, normalizedInputs, opts?.excludeRunId, {
         targetStepId: opts?.targetStepId,
         retryFailedItems: opts?.retryFailedItems,
+        includeAwaitingChatDispatchSeal: opts?.originObserver !== undefined,
       });
   }
-  const origins = normalizeOriginSessionIds(opts?.originSessionId, opts?.originSessionIds);
+  const originObserver = normalizeWorkflowRunOriginObserver(opts?.originObserver);
+  const explicitPrimaryOrigin = normalizedOptionalString(opts?.originSessionId);
+  if (originObserver && explicitPrimaryOrigin && originObserver.sessionId !== explicitPrimaryOrigin) {
+    throw new Error('workflow origin observer sessionId must match originSessionId');
+  }
+  if (originObserver && opts?.dedupe === false) {
+    throw new Error('exact workflow chat dispatch cannot disable canonical run deduplication');
+  }
+  if (originObserver && catchupHold) {
+    throw new Error('exact workflow chat dispatch cannot share scheduler catch-up admission');
+  }
+  if (originObserver && typeof opts?.prepareChatDispatch !== 'function') {
+    throw new Error('exact workflow origin observer requires a synchronous trusted prepareChatDispatch callback');
+  }
+  const queueRequestDigest = originObserver
+    ? workflowChatDispatchQueueRequestDigest({
+        workflowName: name,
+        normalizedInputs: normalizeWorkflowRunInputs(normalizedInputs),
+        targetStepId: opts?.targetStepId,
+        retryFailedItemsKey: retryFailedItemsKey(opts?.retryFailedItems),
+      })
+    : undefined;
+  let admittedChatDispatchPreparation: WorkflowChatDispatchPreparedReceipt | undefined;
+  if (originObserver && queueRequestDigest) {
+    const sourceGroupId = workflowOriginSourceGroupId(originObserver);
+    const sealedMember = workflowOriginGroupMemberForRequest(
+      sourceGroupId,
+      queueRequestDigest,
+      originObserver.replyTarget,
+    );
+    if (sealedMember) {
+      const closed = readWorkflowOriginGroupClosedBatch(sourceGroupId);
+      const admitted = closed?.preparedReceipts.find(
+        (receipt) => receipt.receiptDigest === sealedMember.receiptDigest,
+      );
+      if (
+        !admitted
+        || admitted.runId !== sealedMember.runId
+        || admitted.queueRequestDigest !== queueRequestDigest
+      ) {
+        throw new Error(`Closed workflow origin group ${sourceGroupId} has no matching durable preparation.`);
+      }
+      admittedChatDispatchPreparation = admitted;
+      const memberFile = workflowRunFile(sealedMember.runId);
+      if (!existsSync(memberFile)) {
+        throw new Error(`Sealed workflow origin group references missing run ${sealedMember.runId}.`);
+      }
+      const member = JSON.parse(readFileSync(memberFile, 'utf-8')) as { id?: unknown; status?: unknown };
+      if (member.id !== sealedMember.runId) {
+        throw new Error(`Sealed workflow origin group member ${sealedMember.runId} has a mismatched run record.`);
+      }
+      duplicate = {
+        id: sealedMember.runId,
+        status: typeof member.status === 'string' ? member.status : 'accepted',
+      };
+    }
+  }
+  // Exact source authority is installed only by whole-group activation. Never
+  // project it into the mutable inline legacy origin fields or V1 sidecars.
+  const origins = originObserver
+    ? []
+    : normalizeOriginSessionIds(explicitPrimaryOrigin, opts?.originSessionIds);
   if (duplicate) {
     if (triggerReceiptId) {
       const bound = persistWorkflowTriggerReceiptAcceptance(triggerReceiptId, duplicate.id);
@@ -1655,10 +2075,19 @@ function queueWorkflowRunUnlocked(
         duplicate = { id: accepted, status: 'accepted' };
       }
     }
-    attachOriginSessionIdsToRun(duplicate.id, origins);
+    const chatDispatchPreparation = originObserver && queueRequestDigest
+      ? admittedChatDispatchPreparation ?? prepareExactChatDispatch(
+          duplicate.id,
+          originObserver,
+          queueRequestDigest,
+          opts?.prepareChatDispatch,
+        )
+      : undefined;
+    attachWorkflowRunOriginsToRun(duplicate.id, origins);
     return {
       status: 'duplicate',
       id: duplicate.id,
+      ...(chatDispatchPreparation ? { chatDispatchPreparation } : {}),
       message: catchupHold
         ? `This missed schedule occurrence for "${name}" was already accepted as workflow run ${duplicate.id}; no duplicate was created. Its existing Resume or Skip decision remains authoritative.`
         : `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs — it's running in the background and will report back here when it finishes. No duplicate was queued; just tell the user it's already on it. (Only call workflow_run_status if the user explicitly asks for a progress check.)`,
@@ -1756,7 +2185,11 @@ function queueWorkflowRunUnlocked(
     id: runId,
     workflow: name,
     inputs: normalizedInputs,
-    status: catchupHold ? 'awaiting_catchup_decision' : 'queued',
+    status: catchupHold
+      ? 'awaiting_catchup_decision'
+      : originObserver
+        ? 'awaiting_chat_dispatch_seal'
+        : 'queued',
     ...(opts?.catchupFire ? { catchupFire: true } : {}),
     ...(opts?.catchupFire && catchupOccurrenceAtMs !== undefined ? { catchupOccurrenceAtMs } : {}),
     ...(workflowSlug ? { workflowSlug } : {}),
@@ -1777,6 +2210,10 @@ function queueWorkflowRunUnlocked(
     ...(requeuedFromRunId ? { requeuedFromRunId } : {}),
     ...(recoveryIntent ? { recoveryIntent } : {}),
     ...(readinessSnapshot ? { readiness: readinessSnapshot } : {}),
+    ...(originObserver ? {
+      chatDispatchSourceGroupId: workflowOriginSourceGroupId(originObserver),
+      chatDispatchQueueRequestDigest: queueRequestDigest,
+    } : {}),
     // Only written when present: no origin means notification-only, while
     // chat-dispatched runs can re-enter their originating session on finish.
     ...(origin ? { originSessionId: origin } : {}),
@@ -1813,10 +2250,19 @@ function queueWorkflowRunUnlocked(
       throw new Error(`Trigger receipt ${triggerReceiptId} lost ownership while installing workflow run ${id}.`);
     }
     if (!installed) {
-      attachOriginSessionIdsToRun(id, origins);
+      const chatDispatchPreparation = originObserver && queueRequestDigest
+        ? prepareExactChatDispatch(
+            id,
+            originObserver,
+            queueRequestDigest,
+            opts?.prepareChatDispatch,
+          )
+        : undefined;
+      attachWorkflowRunOriginsToRun(id, origins);
       return {
         status: 'duplicate',
         id,
+        ...(chatDispatchPreparation ? { chatDispatchPreparation } : {}),
         ...(readiness ? { readiness } : {}),
         message: `Trigger receipt ${triggerReceiptId} was already accepted by workflow run ${id}; no duplicate was queued.`,
       };
@@ -1824,12 +2270,26 @@ function queueWorkflowRunUnlocked(
   } else {
     id = installFreshRandomRunRecord(opts?.idPrefix, buildRunRecord).id;
   }
+  // The preparation callback runs only after the non-executable record is
+  // durable. Failure intentionally leaves that fresh record held and installs
+  // no active observer; a retry dedupes back to it and retries preparation.
+  const chatDispatchPreparation = originObserver && queueRequestDigest
+    ? prepareExactChatDispatch(
+        id,
+        originObserver,
+        queueRequestDigest,
+        opts?.prepareChatDispatch,
+      )
+    : undefined;
   return {
-    status: catchupHold ? 'held' : 'queued',
+    status: catchupHold || originObserver ? 'held' : 'queued',
     id,
+    ...(chatDispatchPreparation ? { chatDispatchPreparation } : {}),
     ...(readiness ? { readiness } : {}),
     message: catchupHold
       ? `Held missed schedule for "${name}" (run ${id}) — no workflow step will run until the user chooses Resume. They may also Skip it without performing any work.`
+      : originObserver
+        ? `Prepared "${name}" (run ${id}) for this chat. It remains non-executable until the complete source dispatch group is durably sealed and activated.`
       : `Queued "${name}" (run ${id}) — it is now running in the BACKGROUND. `
         + `Tell the user it's running and that you'll report back here when it finishes; the outcome is delivered to this chat automatically on completion. `
         + `Do NOT wait, poll, or call workflow_run_status, and do NOT do the workflow's work yourself — you're free to take the user's next request right now. `

@@ -17,6 +17,18 @@ const {
   buildLocalToolErrorFunction,
   buildScopedLocalToolSearch,
 } = await import('./local-runtime-tools.js');
+const { toolOutputContextFromSdk } = await import('../runtime/harness/tool-output-context.js');
+
+test('OpenAI local-runtime context preserves the exact accepted source turn', () => {
+  const context = toolOutputContextFromSdk(
+    'workflow_run',
+    new RunContext({ sessionId: 'local-source-authority', sourceUserSeq: 73 }),
+    { toolCall: { call_id: 'call-source-authority' } },
+  );
+  assert.equal(context.sessionId, 'local-source-authority');
+  assert.equal(context.sourceUserSeq, 73);
+  assert.equal(context.callId, 'call-source-authority');
+});
 
 test('invalid tool input returns the violated paths and a tool_search pointer, never a blind retry prompt', async () => {
   const { z } = await import('zod');

@@ -16,7 +16,6 @@ import { pathToFileURL } from 'node:url';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-wf-queue-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
-process.env.HOME = TMP_HOME;
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 
 const {
@@ -28,8 +27,17 @@ const {
   requeueWorkflowFromRun,
   requeueWorkflowFailedItemsFromRun,
   queueWorkflowCreationTest,
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupClosedBatch,
   readWorkflowTriggerReceiptAcceptance,
+  readWorkflowRunOriginRecords,
   readWorkflowRunOriginSessionIds,
+  readPendingWorkflowChatDispatchOwnership,
+  workflowRunOriginObserverId,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
 } = await import('./workflow-run-queue.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
@@ -154,6 +162,42 @@ function seedCompiledProject(input: {
 function runFiles(): string[] {
   try { return readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json')); }
   catch { return []; }
+}
+
+let preparedEventSeq = 50_000;
+const durablePreparationReceipts = new Map<
+  string,
+  ReturnType<typeof createWorkflowChatDispatchPreparedReceipt>
+>();
+function durablePreparationCallback() {
+  return (authority: Parameters<typeof createWorkflowChatDispatchPreparedReceipt>[0]) => {
+    const existing = durablePreparationReceipts.get(authority.preparationDigest);
+    if (existing) return recordWorkflowChatDispatchPreparation(existing);
+    preparedEventSeq += 1;
+    const receipt = recordWorkflowChatDispatchPreparation(createWorkflowChatDispatchPreparedReceipt(authority, {
+      eventId: `queue-prepared-${preparedEventSeq}`,
+      eventSeq: preparedEventSeq,
+      preparedAt: new Date(1_800_000_000_000 + preparedEventSeq).toISOString(),
+    }));
+    durablePreparationReceipts.set(authority.preparationDigest, receipt);
+    return receipt;
+  };
+}
+
+function closeAndActivateQueueGroup(
+  preparations: NonNullable<ReturnType<typeof queueWorkflowRun>['chatDispatchPreparation']>[],
+) {
+  preparedEventSeq += 1;
+  const authority = createWorkflowOriginGroupCloseAuthority(preparations);
+  const receipt = createWorkflowOriginGroupClosedBatchReceipt(authority, {
+    eventId: `queue-close-${preparedEventSeq}`,
+    eventSeq: preparedEventSeq,
+    closedAt: new Date(1_800_100_000_000 + preparedEventSeq).toISOString(),
+  });
+  recordWorkflowOriginGroupClosedBatch({ receipt, preparedReceipts: preparations });
+  return finalizeWorkflowOriginGroupClosedBatch(authority.sourceGroupId, {
+    beforeMemberRelease: () => {},
+  });
 }
 
 function completedCompiledRecord(record: Record<string, any>): Record<string, any> {
@@ -281,6 +325,7 @@ function launchReaperChild(
 }
 
 beforeEach(() => {
+  durablePreparationReceipts.clear();
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
   rmSync(path.join(TMP_HOME, 'state', 'executions.json'), { force: true });
@@ -1041,6 +1086,224 @@ test('queueWorkflowRun: writes originSessionId when provided (Gap E)', () => {
   assert.equal(rec.originSessionId, 'sess-chat-1');
 });
 
+test('queueWorkflowRun: exact origin is held without legacy authority until its group activates', () => {
+  const identity = {
+    sessionId: 'sess-chat-exact',
+    sourceUserSeq: 41,
+    replyTarget: { type: 'origin_chat' as const },
+  };
+  const queued = queueWorkflowRun('audit-brief', { url: 'https://exact-source.example' }, {
+    originSessionId: identity.sessionId,
+    originObserver: identity,
+    prepareChatDispatch: durablePreparationCallback(),
+  });
+  assert.equal(queued.status, 'held');
+  assert.ok(queued.chatDispatchPreparation);
+
+  const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
+  assert.equal(rec.status, 'awaiting_chat_dispatch_seal');
+  assert.ok(!('originSessionId' in rec), 'exact source is never projected into inline legacy authority');
+  assert.deepEqual(readWorkflowRunOriginRecords(queued.id!), [], 'prepared authority remains private');
+  assert.deepEqual(readPendingWorkflowChatDispatchOwnership(identity), {
+    sourceGroupId: queued.chatDispatchPreparation!.sourceGroupId,
+    originSessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+    phase: 'prepared',
+    runIds: [queued.id],
+    runStatuses: { [queued.id!]: 'awaiting_chat_dispatch_seal' },
+  });
+
+  const { sealed } = closeAndActivateQueueGroup([queued.chatDispatchPreparation!]);
+  assert.equal(
+    readPendingWorkflowChatDispatchOwnership(identity),
+    null,
+    'durable activation transfers ownership away from the coarse foreground marker',
+  );
+  const exact = readWorkflowRunOriginRecords(queued.id!)[0];
+  assert.equal(exact?.version, 2);
+  if (exact?.version !== 2) assert.fail('exact observer record was not persisted as v2');
+  assert.equal(exact.runId, queued.id);
+  assert.equal(exact.observerId, workflowRunOriginObserverId(identity));
+  assert.equal(exact.originSessionId, identity.sessionId);
+  assert.equal(exact.sourceUserSeq, identity.sourceUserSeq);
+  assert.deepEqual(exact.replyTarget, identity.replyTarget);
+  assert.match(exact.replyTargetDigest, /^[a-f0-9]{64}$/);
+  assert.equal(exact.sourceGroupId, sealed.sourceGroupId);
+  assert.equal(exact.sourceGroupDigest, sealed.sourceGroupDigest);
+  assert.ok(Date.parse(exact.recordedAt) > 0);
+  assert.equal(JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8')).status, 'queued');
+});
+
+test('queueWorkflowRun: preparation failure leaves a fresh exact run non-executable with no observer', () => {
+  const identity = {
+    sessionId: 'sess-preparation-failure',
+    sourceUserSeq: 44,
+    replyTarget: { type: 'origin_chat' as const },
+  };
+  assert.throws(() => queueWorkflowRun('audit-brief', { url: 'https://prepare-failure.example' }, {
+    originSessionId: identity.sessionId,
+    originObserver: identity,
+    prepareChatDispatch: () => {
+      throw new Error('injected event fsync failure');
+    },
+  }), /injected event fsync failure/);
+  const [file] = runFiles();
+  const held = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8'));
+  assert.equal(held.status, 'awaiting_chat_dispatch_seal');
+  assert.ok(!('originSessionId' in held));
+  assert.deepEqual(readWorkflowRunOriginRecords(held.id), []);
+  assert.deepEqual(readPendingWorkflowChatDispatchOwnership(identity), {
+    sourceGroupId: held.chatDispatchSourceGroupId,
+    originSessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+    phase: 'prepared',
+    runIds: [held.id],
+    runStatuses: { [held.id]: 'awaiting_chat_dispatch_seal' },
+  }, 'the pre-prepared-event crash window still has recoverable queue ownership');
+
+  const retry = queueWorkflowRun('audit-brief', { url: 'https://prepare-failure.example' }, {
+    originSessionId: identity.sessionId,
+    originObserver: identity,
+    prepareChatDispatch: durablePreparationCallback(),
+  });
+  assert.equal(retry.status, 'duplicate');
+  assert.equal(retry.id, held.id);
+  assert.ok(retry.chatDispatchPreparation);
+  assert.equal(readWorkflowRunOriginRecords(held.id).length, 0);
+});
+
+test('queueWorkflowRun: a returned event receipt without its run pin cannot claim preparation', () => {
+  const identity = {
+    sessionId: 'sess-preparation-missing-pin',
+    sourceUserSeq: 144,
+    replyTarget: { type: 'origin_chat' as const },
+  };
+  assert.throws(() => queueWorkflowRun('audit-brief', { url: 'https://prepare-missing-pin.example' }, {
+    originSessionId: identity.sessionId,
+    originObserver: identity,
+    prepareChatDispatch: (authority) => createWorkflowChatDispatchPreparedReceipt(authority, {
+      eventId: 'event-without-pin',
+      eventSeq: 144_001,
+      preparedAt: new Date(1_800_000_144_001).toISOString(),
+    }),
+  }), /before its durable run preparation pin was installed/);
+  const [file] = runFiles();
+  const held = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8'));
+  assert.equal(held.status, 'awaiting_chat_dispatch_seal');
+  assert.deepEqual(readWorkflowRunOriginRecords(held.id), []);
+});
+
+test('queueWorkflowRun: preparation failure cannot attach an observer to a duplicate live run', () => {
+  const original = queueWorkflowRun('audit-brief', { url: 'https://duplicate-prepare-failure.example' });
+  assert.equal(original.status, 'queued');
+  assert.throws(() => queueWorkflowRun('audit-brief', { url: 'https://duplicate-prepare-failure.example' }, {
+    originSessionId: 'sess-duplicate-prepare-failure',
+    originObserver: {
+      sessionId: 'sess-duplicate-prepare-failure',
+      sourceUserSeq: 46,
+      replyTarget: { type: 'origin_chat' },
+    },
+    prepareChatDispatch: () => {
+      throw new Error('duplicate preparation fsync failed');
+    },
+  }), /duplicate preparation fsync failed/);
+  assert.deepEqual(readWorkflowRunOriginRecords(original.id!), []);
+  const record = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${original.id}.json`), 'utf-8'));
+  assert.equal(record.status, 'queued');
+  assert.ok(!('originSessionId' in record));
+});
+
+test('queueWorkflowRun: a legacy caller does not inherit an orphan exact-source hold', () => {
+  const inputs = { url: 'https://orphan-exact-hold.example' };
+  assert.throws(() => queueWorkflowRun('audit-brief', inputs, {
+    originSessionId: 'sess-orphan-exact-hold',
+    originObserver: {
+      sessionId: 'sess-orphan-exact-hold',
+      sourceUserSeq: 47,
+      replyTarget: { type: 'origin_chat' },
+    },
+    prepareChatDispatch: () => {
+      throw new Error('orphaned before preparation receipt');
+    },
+  }), /orphaned before preparation receipt/);
+  const heldFile = runFiles()[0];
+  const held = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, heldFile), 'utf-8'));
+  assert.equal(held.status, 'awaiting_chat_dispatch_seal');
+
+  const legacy = queueWorkflowRun('audit-brief', inputs, { originSessionId: 'sess-legacy' });
+  assert.equal(legacy.status, 'queued');
+  assert.notEqual(legacy.id, held.id);
+});
+
+test('queueWorkflowRun: an admitted source target is immutable at group seal', () => {
+  const sessionId = 'sess-target-immutable';
+  const inputs = { url: 'https://immutable-target.example' };
+  const admitted = queueWorkflowRun('audit-brief', inputs, {
+    originSessionId: sessionId,
+    originObserver: {
+      sessionId,
+      sourceUserSeq: 45,
+      replyTarget: { type: 'discord_channel', channelId: 'channel-a' },
+    },
+    prepareChatDispatch: durablePreparationCallback(),
+  });
+  assert.equal(admitted.status, 'held');
+  closeAndActivateQueueGroup([admitted.chatDispatchPreparation!]);
+  assert.throws(() => queueWorkflowRun('audit-brief', inputs, {
+    originSessionId: sessionId,
+    originObserver: {
+      sessionId,
+      sourceUserSeq: 45,
+      replyTarget: { type: 'discord_channel', channelId: 'channel-b' },
+    },
+    prepareChatDispatch: durablePreparationCallback(),
+  }), /closed to a different immutable reply target/);
+});
+
+test('queueWorkflowRun: two exact runs for one source activate as one ordered group and replay dedupes', () => {
+  const sessionId = 'sess-chat-two-intents';
+  const identity = {
+    sessionId,
+    sourceUserSeq: 51,
+    replyTarget: { type: 'discord_channel' as const, channelId: 'channel-at-admission' },
+  };
+  const first = queueWorkflowRun('audit-brief', { url: 'https://two-intents-a.example' }, {
+    originSessionId: sessionId,
+    originObserver: identity,
+    prepareChatDispatch: durablePreparationCallback(),
+  });
+  const second = queueWorkflowRun('audit-brief', { url: 'https://two-intents-b.example' }, {
+    originSessionId: sessionId,
+    originObserver: identity,
+    prepareChatDispatch: durablePreparationCallback(),
+  });
+  assert.equal(first.status, 'held');
+  assert.equal(second.status, 'held');
+  assert.notEqual(first.id, second.id);
+  const { sealed } = closeAndActivateQueueGroup([
+    first.chatDispatchPreparation!,
+    second.chatDispatchPreparation!,
+  ]);
+  assert.deepEqual(sealed.members.map((member) => member.runId), [first.id, second.id]);
+  assert.equal(readWorkflowRunOriginRecords(first.id!).length, 1);
+  assert.equal(readWorkflowRunOriginRecords(second.id!).length, 1);
+
+  const firstFile = path.join(WORKFLOW_RUNS_DIR, `${first.id}.json`);
+  const firstTerminal = JSON.parse(readFileSync(firstFile, 'utf-8'));
+  writeFileSync(firstFile, JSON.stringify({ ...firstTerminal, status: 'completed' }), 'utf-8');
+
+  const replay = queueWorkflowRun('audit-brief', { url: 'https://two-intents-a.example' }, {
+    originSessionId: sessionId,
+    originObserver: identity,
+    prepareChatDispatch: () => {
+      assert.fail('a closed source-group replay must reuse its durable preparation');
+    },
+  });
+  assert.equal(replay.status, 'duplicate');
+  assert.equal(replay.id, first.id);
+  assert.equal(readWorkflowRunOriginRecords(first.id!).length, 1, 'same exact observer installs once');
+});
+
 test('queueWorkflowRun: duplicate attaches the current origin so report-back can still land here', () => {
   const first = queueWorkflowRun('audit-brief', { url: 'https://site.example' });
   assert.equal(first.status, 'queued');
@@ -1051,6 +1314,10 @@ test('queueWorkflowRun: duplicate attaches the current origin so report-back can
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
   assert.ok(!('originSessionId' in rec), 'live run record is not rewritten by a duplicate observer');
   assert.deepEqual(readWorkflowRunOriginSessionIds(first.id!), ['sess-chat-dup']);
+  assert.deepEqual(readWorkflowRunOriginRecords(first.id!).map((record) => ({
+    version: record.version,
+    originSessionId: record.originSessionId,
+  })), [{ version: 1, originSessionId: 'sess-chat-dup' }], 'legacy session-only markers remain readable');
 });
 
 test('queueWorkflowRun: duplicate preserves primary origin and adds secondary origin observers', () => {

@@ -38,7 +38,12 @@
  *     richer event log instead. `onToolActivity` / `onReasoning` are relayed
  *     best-effort from harness events for legacy progress surfaces.
  */
-import { runConversation } from './loop.js';
+import { runConversation, verifiedWorkflowRunDispatchReceipts } from './loop.js';
+import {
+  PendingWorkflowChatDispatchOwnershipError,
+  readPendingWorkflowChatDispatchOwnership,
+  type PendingWorkflowChatDispatchOwnership,
+} from '../../tools/workflow-run-queue.js';
 import { buildOrchestratorAgent } from '../../agents/orchestrator.js';
 import { executionLaneToolSearchEnabled } from '../../agents/tool-catalog.js';
 import { configureHarnessRuntime } from './codex-client.js';
@@ -76,6 +81,7 @@ import type { AssistantRequest, AssistantResponse, AssistantRouteDiagnostics, To
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
+  publicAsyncWorkDispatchedData,
   publicCompletionText,
   publicReplyText,
 } from './public-presentation.js';
@@ -626,6 +632,90 @@ function responseForCommittedTerminal(
   };
 }
 
+function exactAsyncDispatchForSource(source: EventRow): ReturnType<typeof publicAsyncWorkDispatchedData> {
+  const verifiedEventIds = new Set(
+    verifiedWorkflowRunDispatchReceipts(source.sessionId, source.turn, source.seq)
+      .map((receipt) => receipt.eventId),
+  );
+  for (const event of listEvents(source.sessionId, { types: ['async_work_dispatched'], desc: true })) {
+    const dispatch = publicAsyncWorkDispatchedData(event.data);
+    if (
+      dispatch
+      && verifiedEventIds.has(event.id)
+      && event.role === 'system'
+      && event.seq > source.seq
+      && event.turn === source.turn
+      && dispatch.sourceUserSeq === source.seq
+    ) return dispatch;
+  }
+  return null;
+}
+
+const RESTART_OWNED_WORKFLOW_DISPATCH_REPLY =
+  'Background work was admitted for this request, but its dispatch still needs exact recovery before it can run. I preserved the original request and will resume that same work rather than creating a replacement.';
+
+type RestartOwnedWorkflowDispatchState =
+  | { kind: 'pending'; ownership: PendingWorkflowChatDispatchOwnership }
+  | { kind: 'unreadable' };
+
+function restartOwnedWorkflowDispatchState(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): RestartOwnedWorkflowDispatchState | null {
+  try {
+    const ownership = readPendingWorkflowChatDispatchOwnership(input);
+    return ownership ? { kind: 'pending', ownership } : null;
+  } catch {
+    // The source-group store is part of the no-terminal proof. An unreadable
+    // attributable state must retain restart ownership instead of falling
+    // through to the bridge's ordinary failed-terminal reducer.
+    return { kind: 'unreadable' };
+  }
+}
+
+function restartOwnedWorkflowDispatchResponse(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  sourceTurn: number;
+  state: RestartOwnedWorkflowDispatchState;
+  transport: string;
+}): AssistantResponse {
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: input.sourceTurn,
+    role: 'system',
+    type: 'run_paused',
+    data: {
+      reason: input.state.kind === 'pending'
+        ? 'prepared_workflow_dispatch_restart_owned'
+        : 'prepared_workflow_dispatch_ownership_unreadable',
+      sourceUserSeq: input.sourceUserSeq,
+      resumable: true,
+      ...(input.state.kind === 'pending' ? {
+        sourceGroupId: input.state.ownership.sourceGroupId,
+        phase: input.state.ownership.phase,
+        runIds: input.state.ownership.runIds,
+      } : {}),
+      guidance: RESTART_OWNED_WORKFLOW_DISPATCH_REPLY,
+    },
+  });
+  return {
+    text: RESTART_OWNED_WORKFLOW_DISPATCH_REPLY,
+    sessionId: input.sessionId,
+    stoppedReason: 'awaiting-input',
+    raw: {
+      transport: input.transport,
+      asyncWork: {
+        status: 'restart_owned',
+        ...(input.state.kind === 'pending' ? {
+          sourceGroupId: input.state.ownership.sourceGroupId,
+          runIds: [...input.state.ownership.runIds],
+        } : { evidence: 'unreadable' }),
+      },
+    },
+  };
+}
+
 function commitBridgeBlockedTerminal(input: {
   request: AssistantRequest;
   turn: AcceptedRecoveryTurn;
@@ -741,6 +831,7 @@ export async function respondViaHarness(
 
   const detachProgressRelay = attachLegacyProgressRelay(request);
   let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'failed';
+  let preserveRequestAttemptOwnership = false;
   try {
     const modelForRun = opts.modelOverride ?? (config.honorModel && request.model ? request.model : undefined);
     const agent = await buildAgentImpl({
@@ -839,6 +930,31 @@ export async function respondViaHarness(
       || publicReplyText(result.lastDecision?.reply, '');
 
     switch (result.status) {
+      case 'dispatched': {
+        const dispatch = exactAsyncDispatchForSource(sourceUserEvent);
+        if (!dispatch) {
+          throw new Error('Harness returned dispatched without exact durable dispatch authority.');
+        }
+        return withRouteDiagnostics({
+          text: dispatch.text,
+          sessionId,
+          // This closes only the synchronous provider request. The durable
+          // async_work_dispatched event remains the nonterminal logical edge.
+          stoppedReason: 'success',
+          turnsUsed: result.lastTurn,
+          raw: {
+            asyncWork: {
+              status: dispatch.status,
+              kind: dispatch.kind,
+              runIds: [...dispatch.runIds],
+              sourceGroupId: dispatch.sourceGroupId,
+              sourceGroupDigest: dispatch.sourceGroupDigest,
+              sourceUserSeq: dispatch.sourceUserSeq,
+              dispatchKey: dispatch.dispatchKey,
+            },
+          },
+        }, routeForHarness(surface, request, opts.modelOverride));
+      }
       case 'completed': {
         // Parse-exhaustion DEAD turn (retries burned, apology text, near-zero
         // tool work) → re-run ONCE on the next brain instead of shipping the
@@ -1000,6 +1116,29 @@ export async function respondViaHarness(
     }
   } catch (err) {
     if (err instanceof AgentRuntimeCancelledError) throw err;
+    const signaledOwnership = err instanceof PendingWorkflowChatDispatchOwnershipError
+      && err.ownership.originSessionId === sourceUserEvent.sessionId
+      && err.ownership.sourceUserSeq === sourceUserEvent.seq
+      ? { kind: 'pending' as const, ownership: err.ownership }
+      : null;
+    const restartOwned = signaledOwnership ?? restartOwnedWorkflowDispatchState({
+      sessionId: sourceUserEvent.sessionId,
+      sourceUserSeq: sourceUserEvent.seq,
+    });
+    if (restartOwned) {
+      // This is admitted-but-not-activated work, not a failed model turn. Keep
+      // both the atomic in-flight marker and the active run_attempt row intact;
+      // restart recovery will reuse this exact source and queue record.
+      preserveRequestAttemptOwnership = true;
+      const response = restartOwnedWorkflowDispatchResponse({
+        sessionId: sourceUserEvent.sessionId,
+        sourceUserSeq: sourceUserEvent.seq,
+        sourceTurn: sourceUserEvent.turn,
+        state: restartOwned,
+        transport: 'openai_agents_harness',
+      });
+      return withRouteDiagnostics(response, routeForHarness(surface, request, opts.modelOverride));
+    }
     requestAttemptStatus = 'failed';
     // A hard provider/runtime error is reduced at the same durable public
     // boundary as every other terminal. Raw exception text remains in private
@@ -1036,7 +1175,9 @@ export async function respondViaHarness(
   } finally {
     detachProgressRelay();
     if (cancelPoll) clearInterval(cancelPoll);
-    try { finishRunAttempt(requestAttempt, requestAttemptStatus); } catch { /* attempt telemetry must not mask the response */ }
+    if (!preserveRequestAttemptOwnership) {
+      try { finishRunAttempt(requestAttempt, requestAttemptStatus); } catch { /* attempt telemetry must not mask the response */ }
+    }
     if (requestAttemptStatus === 'cancelled') {
       try { clearKill(sessionId, requestAttempt); } catch { /* best effort */ }
     }
@@ -1137,6 +1278,41 @@ export async function respondPreferHarness(
       } catch { /* telemetry only */ }
       return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
     } catch (err) {
+      let restartOwnershipDetected = false;
+      try {
+        const turn = ensureAcceptedRecoveryTurn(surface, request);
+        const signaledOwnership = err instanceof PendingWorkflowChatDispatchOwnershipError
+          && err.ownership.originSessionId === request.sessionId
+          && err.ownership.sourceUserSeq === turn.sourceUserSeq
+          ? { kind: 'pending' as const, ownership: err.ownership }
+          : null;
+        const restartOwned = signaledOwnership ?? restartOwnedWorkflowDispatchState({
+          sessionId: request.sessionId,
+          sourceUserSeq: turn.sourceUserSeq,
+        });
+        if (restartOwned) {
+          restartOwnershipDetected = true;
+          const response = restartOwnedWorkflowDispatchResponse({
+            sessionId: request.sessionId,
+            sourceUserSeq: turn.sourceUserSeq,
+            sourceTurn: turn.sourceTurn,
+            state: restartOwned,
+            transport: 'claude_agent_sdk_brain',
+          });
+          return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
+        }
+      } catch (ownershipErr) {
+        if (restartOwnershipDetected || err instanceof PendingWorkflowChatDispatchOwnershipError) {
+          // Even the nonterminal pause audit could not be persisted. Never
+          // reinterpret the typed ownership signal as permission to commit a
+          // failed terminal; the brain's armed marker remains the retry owner.
+          bridgeLogger.error({
+            surface,
+            err: ownershipErr instanceof Error ? ownershipErr.message : String(ownershipErr),
+          }, 'could not persist restart-owned workflow dispatch pause');
+          throw new Error(PUBLIC_RUN_FAILURE_TEXT);
+        }
+      }
       const recovered = await recoverChatBrainFailure(surface, request, err, detach, recoveryBaseline);
       if (recovered) return recovered;
       try {

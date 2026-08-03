@@ -73,8 +73,8 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
+import { acceptedSourceOutcome } from '../runtime/harness/accepted-source-outcome.js';
 import {
-  presentationEventFromCompletionData,
   turnOutcomeId,
   type TurnIdentity,
 } from '../runtime/harness/turn-outcome.js';
@@ -948,19 +948,6 @@ function bindSlackInboundAcceptedSource(
   });
 }
 
-function exactSlackInboundTerminal(source: EventRow): string | undefined {
-  for (const event of listHarnessEvents(source.sessionId, { types: ['conversation_completed'], desc: true })) {
-    if (event.data.sourceUserSeq !== source.seq && event.data.terminalKey !== `turn:${source.seq}`) continue;
-    try {
-      const presentation = presentationEventFromCompletionData(event.data);
-      if (presentation?.identity.sourceUserSeq === source.seq) return presentation.text;
-    } catch {
-      return undefined;
-    }
-  }
-  return undefined;
-}
-
 function slackInboundIdentity(source: EventRow): TurnIdentity {
   return { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq };
 }
@@ -1011,8 +998,8 @@ function settleSlackInboundAttempt(
 }
 
 /** A stale provider retry with an already-bound logical source is never a new
- * execution request. Replay its exact terminal, or close an unsettled source
- * with one stable failure so a write that landed before a crash cannot repeat. */
+ * execution request. Replay its exact terminal or verified workflow dispatch;
+ * only a source with neither authority closes with a stable failure. */
 async function replayOrFailClosedSlackInbound(input: {
   ingress: SlackInboundIngress;
   prompt: string;
@@ -1027,8 +1014,8 @@ async function replayOrFailClosedSlackInbound(input: {
     throw new InboundIdentityConflictError('Slack provider id is bound to a different accepted input');
   }
   bindSlackInboundAcceptedSource(input.ingress, source);
-  const terminal = exactSlackInboundTerminal(source);
-  const text = terminal ?? commitSlackInboundTerminal({
+  const durable = acceptedSourceOutcome(source);
+  const text = durable?.presentation.text ?? commitSlackInboundTerminal({
     source,
     text: PUBLIC_CHANNEL_FAILURE_TEXT,
     status: 'failed',
@@ -1037,7 +1024,7 @@ async function replayOrFailClosedSlackInbound(input: {
   settleSlackInboundAttempt(
     source.sessionId,
     input.ingress.identity.runId,
-    terminal ? 'completed' : 'failed',
+    durable ? 'completed' : 'failed',
   );
   await input.transport.sendInitial(text);
   completeInbound({ ...input.ingress.inboxKey, runId: input.ingress.identity.runId, status: 'replied' });
@@ -1093,8 +1080,10 @@ function acceptSlackControlTurn(input: {
       runId: prior.runId,
       startedAt: prior.startedAt,
     };
-    const terminal = exactSlackInboundTerminal(source);
-    if (terminal) return { source, attempt, replayText: terminal };
+    const terminal = acceptedSourceOutcome(source);
+    if (terminal?.kind === 'terminal') {
+      return { source, attempt, replayText: terminal.presentation.text };
+    }
     return {
       source,
       attempt,
@@ -1320,8 +1309,37 @@ async function dispatchInbound(opts: {
     logger.error({ err, ...ingress.inboxKey }, 'Slack message handling failed');
     let failureText = PUBLIC_CHANNEL_FAILURE_TEXT;
     if (acceptedSource) {
+      const durable = acceptedSourceOutcome(acceptedSource);
+      if (durable) {
+        try {
+          settleSlackInboundAttempt(
+            acceptedSource.sessionId,
+            ingress.identity.runId,
+            durable.kind === 'terminal'
+              && (durable.presentation.status === 'failed' || durable.presentation.status === 'blocked')
+              ? 'failed'
+              : 'completed',
+          );
+        } catch { /* the durable source outcome remains authoritative */ }
+        try {
+          await transport.sendInitial(durable.presentation.text);
+          completeInbound({
+            ...ingress.inboxKey,
+            runId: ingress.identity.runId,
+            status: 'replied',
+          });
+        } catch (deliveryError) {
+          completeInbound({
+            ...ingress.inboxKey,
+            runId: ingress.identity.runId,
+            status: 'failed',
+            error: deliveryError instanceof Error ? deliveryError.message : String(deliveryError),
+          });
+        }
+        return;
+      }
       try {
-        failureText = exactSlackInboundTerminal(acceptedSource) ?? commitSlackInboundTerminal({
+        failureText = commitSlackInboundTerminal({
           source: acceptedSource,
           text: PUBLIC_CHANNEL_FAILURE_TEXT,
           status: 'failed',

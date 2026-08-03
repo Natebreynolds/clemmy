@@ -1,6 +1,6 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   BASE_DIR,
   DISCORD_BOT_TOKEN,
@@ -13,6 +13,7 @@ import {
 } from '../config.js';
 import { actionBus } from './action-bus.js';
 import { withFileLockSyncStrict } from './atomic-json.js';
+import { readWorkflowOriginGroupSettlement } from '../execution/workflow-origin-group.js';
 import {
   exactOriginDeliveryTarget,
   expectedExactOriginDeliveryReceipt,
@@ -150,6 +151,10 @@ const NOTIFICATION_STATE_DIR = path.join(BASE_DIR, 'state');
 const NOTIFICATION_STATE_LOCK_FILE = path.join(NOTIFICATION_STATE_DIR, 'notification-state');
 const NOTIFICATIONS_FILE = path.join(NOTIFICATION_STATE_DIR, 'notifications.json');
 const DESTINATIONS_FILE = path.join(NOTIFICATION_STATE_DIR, 'notification-destinations.json');
+const DESTINATIONS_RECOVERY_FILE = path.join(
+  NOTIFICATION_STATE_DIR,
+  'notification-destinations.recovery-required.json',
+);
 const DELIVERY_QUEUE_FILE = path.join(NOTIFICATION_STATE_DIR, 'notification-delivery-queue.json');
 const DELIVERY_QUEUE_RECOVERY_FILE = path.join(
   NOTIFICATION_STATE_DIR,
@@ -161,7 +166,6 @@ const NOTIFICATIONS_RECOVERY_FILE = path.join(
 );
 const MAX_STORED_NOTIFICATIONS = 1000;
 const PROACTIVE_DEDUPE_WINDOW_MS = 6 * 60 * 60 * 1000;
-const EXACT_RECEIPT_OBSERVATION_GRACE_MS = 24 * 60 * 60 * 1000;
 
 let notificationStateLockDepth = 0;
 
@@ -240,6 +244,29 @@ export interface NotificationRecord {
   deliveryAttempts?: number;
   deliveryError?: string;
   deliveredDestinations?: string[];
+  /** Immutable first-resolved destination set for generic multi-destination
+   * delivery. It prevents recovery from widening an old notification to a
+   * destination connected later. */
+  deliveryPlan?: {
+    version: 1;
+    destinationIds: string[];
+    /** SHA-256 over the route-bearing bytes for each destination id. The
+     * digest keeps credentials out of the carrier while preventing a later
+     * same-id configuration edit from redirecting already-admitted work. */
+    destinationAuthorityDigests: Record<string, string>;
+    boundAt: string;
+  };
+  /** Durable terminal marker for the bound plan (successes and exhausted
+   * destinations). Without it, queue reconstruction must retain the cursor. */
+  deliveryPlanCompletedAt?: string;
+  /** Provider retry evidence lives with the carrier. Queue rows are cursors,
+   * never authority to manufacture success or permanent failure. */
+  deliveryAttemptCountByDestination?: Record<string, number>;
+  deliveryNextAttemptAtByDestination?: Record<string, string>;
+  deliveryLastErrorByDestination?: Record<string, string>;
+  /** Explicit user retry generation. Unlike a queue cursor timestamp, this is
+   * carrier authority to give an old generic notification a fresh age window. */
+  deliveryRetryRequestedAt?: string;
   /** First durable observation of an exact provider receipt. Observation is
    * not settlement; the pending marker below owns that crash window. */
   exactDeliveryReceiptObservedAt?: string;
@@ -248,6 +275,9 @@ export interface NotificationRecord {
   exactDeliveryReceiptSettlementPendingAt?: string;
   /** Immutable settlement generation that consumed the provider receipt. */
   exactDeliveryReceiptSettlementDigest?: string;
+  /** Source-group authority that owns the settlement digest above. Retention
+   * revalidates both fields against durable group evidence before pruning. */
+  exactDeliveryReceiptSettlementSourceGroupId?: string;
   /**
    * Durable notification -> delivery-queue admission journal. It is written in
    * the notification generation before the queue generation and removed only
@@ -306,6 +336,92 @@ function uniqueStrings(items: string[]): string[] {
   return [...new Set(items.filter(Boolean))];
 }
 
+function canonicalJsonValue(value: unknown): unknown {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (Array.isArray(value)) return value.map((entry) => canonicalJsonValue(entry));
+  if (value && typeof value === 'object') {
+    const source = value as Record<string, unknown>;
+    const canonical: Record<string, unknown> = {};
+    for (const key of Object.keys(source).sort()) {
+      if (source[key] !== undefined) canonical[key] = canonicalJsonValue(source[key]);
+    }
+    return canonical;
+  }
+  return null;
+}
+
+/** Non-reversible identity for the bytes that decide where a provider sends.
+ * Cosmetic fields (name/createdAt) are intentionally excluded. */
+export function notificationDestinationAuthorityDigest(
+  destination: NotificationDestination,
+): string {
+  const providerAccountAuthorityDigest = (
+    destination.type === 'slack_channel' || destination.type === 'slack_user'
+  )
+    ? createHash('sha256')
+        .update(`clementine-slack-bot-account:v1\0${SLACK_BOT_TOKEN}`)
+        .digest('hex')
+    : null;
+  const authority = {
+    id: destination.id,
+    type: destination.type,
+    enabled: destination.enabled,
+    url: destination.url ?? null,
+    channelId: destination.channelId ?? null,
+    threadTs: destination.threadTs ?? null,
+    guildId: destination.guildId ?? null,
+    userId: destination.userId ?? null,
+    pushEndpoint: destination.pushEndpoint ?? null,
+    pushP256dh: destination.pushP256dh ?? null,
+    pushAuth: destination.pushAuth ?? null,
+    apnsDeviceToken: destination.apnsDeviceToken ?? null,
+    providerAccountAuthorityDigest,
+  };
+  return createHash('sha256')
+    .update(`clementine-notification-destination-authority:v1\0${JSON.stringify(authority)}`)
+    .digest('hex');
+}
+
+function exactNotificationAuthorityDigest(item: NotificationRecord): string | undefined {
+  if (!hasExactOriginDeliveryMode(item)) return undefined;
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalJsonValue({
+      id: item.id,
+      kind: item.kind,
+      title: item.title,
+      body: item.body,
+      silent: item.silent === true,
+      metadata: item.metadata ?? {},
+    })))
+    .digest('hex');
+}
+
+function createNotificationDeliveryPlan(
+  destinations: readonly NotificationDestination[],
+  boundAt = new Date().toISOString(),
+): NonNullable<NotificationRecord['deliveryPlan']> | undefined {
+  const normalizedById = new Map<string, NotificationDestination>();
+  for (const destination of destinations) {
+    const destinationId = typeof destination?.id === 'string' ? destination.id.trim() : '';
+    if (!destinationId || normalizedById.has(destinationId)) return undefined;
+    normalizedById.set(destinationId, { ...destination, id: destinationId });
+  }
+  if (normalizedById.size === 0) return undefined;
+  const destinationIds = [...normalizedById.keys()];
+  return {
+    version: 1,
+    destinationIds,
+    destinationAuthorityDigests: Object.fromEntries(
+      [...normalizedById.entries()].map(([destinationId, destination]) => [
+        destinationId,
+        notificationDestinationAuthorityDigest(destination),
+      ]),
+    ),
+    boundAt,
+  };
+}
+
 /**
  * A delivery job is "stale" once it has sat undelivered longer than
  * maxAgeMs. Jobs defer in the queue while no destination is configured
@@ -326,6 +442,16 @@ export function isDeliveryJobStale(queuedAt: string, nowMs: number, maxAgeMs: nu
 function validNotificationRecord(value: unknown): value is NotificationRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const item = value as Record<string, unknown>;
+  const validRecordValues = (
+    candidate: unknown,
+    validate: (entry: unknown) => boolean,
+  ): boolean => {
+    if (candidate === undefined) return true;
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+    return Object.entries(candidate).every(
+      ([key, entry]) => key.trim().length > 0 && validate(entry),
+    );
+  };
   if (
     typeof item.id !== 'string'
     || item.id.trim().length === 0
@@ -339,6 +465,33 @@ function validNotificationRecord(value: unknown): value is NotificationRecord {
     || typeof item.createdAt !== 'string'
     || typeof item.read !== 'boolean'
   ) return false;
+  if (item.deliveryPlan !== undefined) {
+    if (!item.deliveryPlan || typeof item.deliveryPlan !== 'object' || Array.isArray(item.deliveryPlan)) {
+      return false;
+    }
+    const plan = item.deliveryPlan as Record<string, unknown>;
+    const destinationIds = Array.isArray(plan.destinationIds)
+      ? plan.destinationIds
+      : [];
+    const digests = plan.destinationAuthorityDigests;
+    if (
+      Object.keys(plan).length !== 4
+      || plan.version !== 1
+      || !Array.isArray(plan.destinationIds)
+      || destinationIds.length === 0
+      || destinationIds.some((id) => typeof id !== 'string' || id.trim().length === 0)
+      || new Set(destinationIds).size !== destinationIds.length
+      || !digests
+      || typeof digests !== 'object'
+      || Array.isArray(digests)
+      || Object.keys(digests).length !== destinationIds.length
+      || destinationIds.some((id) => !/^[a-f0-9]{64}$/.test(
+        (digests as Record<string, unknown>)[String(id)] as string,
+      ))
+      || typeof plan.boundAt !== 'string'
+      || !Number.isFinite(Date.parse(plan.boundAt))
+    ) return false;
+  }
   if (
     item.metadata !== undefined
     && (!item.metadata || typeof item.metadata !== 'object' || Array.isArray(item.metadata))
@@ -354,7 +507,10 @@ function validNotificationRecord(value: unknown): value is NotificationRecord {
     'exactDeliveryReceiptObservedAt',
     'exactDeliveryReceiptSettlementPendingAt',
     'exactDeliveryReceiptSettlementDigest',
+    'exactDeliveryReceiptSettlementSourceGroupId',
     'deliveryAdmissionPendingAt',
+    'deliveryPlanCompletedAt',
+    'deliveryRetryRequestedAt',
   ] as const) {
     if (item[key] !== undefined && typeof item[key] !== 'string') return false;
   }
@@ -366,9 +522,45 @@ function validNotificationRecord(value: unknown): value is NotificationRecord {
     'exactDeliveryReceiptObservedAt',
     'exactDeliveryReceiptSettlementPendingAt',
     'deliveryAdmissionPendingAt',
+    'deliveryPlanCompletedAt',
+    'deliveryRetryRequestedAt',
   ] as const) {
     if (item[key] !== undefined && !Number.isFinite(Date.parse(item[key] as string))) return false;
   }
+  if (item.deliveryPlanCompletedAt !== undefined && item.deliveryPlan === undefined) return false;
+  if (!validRecordValues(
+    item.deliveryAttemptCountByDestination,
+    (entry) => typeof entry === 'number' && Number.isSafeInteger(entry) && entry >= 0,
+  )) return false;
+  if (!validRecordValues(
+    item.deliveryNextAttemptAtByDestination,
+    (entry) => typeof entry === 'string' && Number.isFinite(Date.parse(entry)),
+  )) return false;
+  if (!validRecordValues(
+    item.deliveryLastErrorByDestination,
+    (entry) => typeof entry === 'string',
+  )) return false;
+  const observedAt = item.exactDeliveryReceiptObservedAt;
+  const settlementPendingAt = item.exactDeliveryReceiptSettlementPendingAt;
+  const settlementDigest = item.exactDeliveryReceiptSettlementDigest;
+  const settlementSourceGroupId = item.exactDeliveryReceiptSettlementSourceGroupId;
+  if (
+    (settlementPendingAt !== undefined || settlementDigest !== undefined || settlementSourceGroupId !== undefined)
+    && observedAt === undefined
+  ) return false;
+  if (
+    settlementPendingAt !== undefined
+    && (settlementPendingAt !== observedAt || settlementDigest !== undefined)
+  ) return false;
+  if (settlementDigest !== undefined && settlementPendingAt !== undefined) return false;
+  if (
+    (settlementSourceGroupId !== undefined && settlementDigest === undefined)
+    || (typeof settlementSourceGroupId === 'string' && settlementSourceGroupId.trim().length === 0)
+  ) return false;
+  if (
+    observedAt !== undefined
+    && !hasExpectedExactOriginDeliveryReceipt(value as NotificationRecord)
+  ) return false;
   return (item.deliveryAttempts === undefined
       || (typeof item.deliveryAttempts === 'number' && Number.isFinite(item.deliveryAttempts)))
     && (item.silent === undefined || typeof item.silent === 'boolean');
@@ -388,11 +580,28 @@ function notificationsRequireRecovery(): boolean {
   return existsSync(NOTIFICATIONS_RECOVERY_FILE);
 }
 
+function hasUniqueNotificationIds(
+  items: readonly { id?: unknown }[],
+): boolean {
+  const ids = items.map((item) => item.id);
+  return ids.every((id) => typeof id === 'string')
+    && new Set(ids as string[]).size === ids.length;
+}
+
+function hasUniqueDeliveryJobIds(
+  items: readonly { notificationId?: unknown }[],
+): boolean {
+  const ids = items.map((item) => item.notificationId);
+  return ids.every((id) => typeof id === 'string')
+    && new Set(ids as string[]).size === ids.length;
+}
+
 function loadNotificationsUnlocked(): NotificationRecord[] {
   const result = loadJsonResilient<NotificationRecord[]>(NOTIFICATIONS_FILE, [], {
     beforeQuarantine: ensureNotificationsRecoveryMarker,
     validate: (value): value is NotificationRecord[] => Array.isArray(value)
-      && value.every(validNotificationRecord),
+      && value.every(validNotificationRecord)
+      && hasUniqueNotificationIds(value),
   });
   if (result.corrupted) {
     pendingCorruptionSignals.add(NOTIFICATIONS_FILE);
@@ -405,13 +614,149 @@ export function loadNotifications(): NotificationRecord[] {
   return withNotificationStateLock(() => loadNotificationsUnlocked());
 }
 
+function validNotificationDestination(value: unknown): value is NotificationDestination {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  const validType = item.type === 'generic_webhook'
+    || item.type === 'discord_webhook'
+    || item.type === 'discord_channel'
+    || item.type === 'discord_user'
+    || item.type === 'slack_webhook'
+    || item.type === 'slack_channel'
+    || item.type === 'slack_user'
+    || item.type === 'web_push'
+    || item.type === 'apns'
+    || item.type === 'desktop';
+  if (
+    typeof item.id !== 'string'
+    || item.id.trim().length === 0
+    || typeof item.name !== 'string'
+    || item.name.trim().length === 0
+    || !validType
+    || typeof item.enabled !== 'boolean'
+    || typeof item.createdAt !== 'string'
+    || !Number.isFinite(Date.parse(item.createdAt))
+  ) return false;
+  for (const key of [
+    'url',
+    'channelId',
+    'threadTs',
+    'guildId',
+    'userId',
+    'pushEndpoint',
+    'pushP256dh',
+    'pushAuth',
+    'deviceId',
+    'apnsDeviceToken',
+  ] as const) {
+    if (item[key] !== undefined && typeof item[key] !== 'string') return false;
+  }
+  if (
+    item.pushExpirationTime !== undefined
+    && item.pushExpirationTime !== null
+    && (typeof item.pushExpirationTime !== 'number' || !Number.isFinite(item.pushExpirationTime))
+  ) return false;
+  switch (item.type) {
+    case 'generic_webhook':
+    case 'discord_webhook':
+    case 'slack_webhook':
+      return typeof item.url === 'string' && item.url.trim().length > 0;
+    case 'discord_channel':
+    case 'slack_channel':
+      return typeof item.channelId === 'string' && item.channelId.trim().length > 0;
+    case 'discord_user':
+    case 'slack_user':
+      return typeof item.userId === 'string' && item.userId.trim().length > 0;
+    case 'web_push':
+      return typeof item.pushEndpoint === 'string' && item.pushEndpoint.trim().length > 0
+        && typeof item.pushP256dh === 'string' && item.pushP256dh.trim().length > 0
+        && typeof item.pushAuth === 'string' && item.pushAuth.trim().length > 0;
+    case 'apns':
+      return typeof item.apnsDeviceToken === 'string' && item.apnsDeviceToken.trim().length > 0;
+    case 'desktop':
+      return true;
+  }
+  return false;
+}
+
+function ensureDestinationsRecoveryMarker(): void {
+  if (!existsSync(DESTINATIONS_RECOVERY_FILE)) {
+    atomicWriteJson(DESTINATIONS_RECOVERY_FILE, {
+      version: 1,
+      detectedAt: new Date().toISOString(),
+      destinationsFile: path.basename(DESTINATIONS_FILE),
+    });
+  }
+}
+
+function clearDestinationsRecoveryMarkerDurably(): void {
+  if (!existsSync(DESTINATIONS_RECOVERY_FILE)) return;
+  unlinkSync(DESTINATIONS_RECOVERY_FILE);
+  if (process.platform !== 'win32') {
+    const directoryFd = openSync(NOTIFICATION_STATE_DIR, 'r');
+    try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+  }
+}
+
+function destinationsRequireRecovery(): boolean {
+  return existsSync(DESTINATIONS_RECOVERY_FILE);
+}
+
 function loadDestinationsUnlocked(): NotificationDestination[] {
-  const result = loadJsonResilient<NotificationDestination[]>(DESTINATIONS_FILE, []);
-  if (result.corrupted) pendingCorruptionSignals.add(DESTINATIONS_FILE);
+  const result = loadJsonResilient<NotificationDestination[]>(DESTINATIONS_FILE, [], {
+    beforeQuarantine: ensureDestinationsRecoveryMarker,
+    validate: (value): value is NotificationDestination[] => Array.isArray(value)
+      && value.every(validNotificationDestination)
+      && hasUniqueNotificationIds(value),
+  });
+  if (result.corrupted) {
+    pendingCorruptionSignals.add(DESTINATIONS_FILE);
+    ensureDestinationsRecoveryMarker();
+    return result.value;
+  }
+  // A recovery marker plus a newly restored, structurally valid canonical
+  // file is an explicit operator repair. Code paths below refuse to overwrite
+  // an unknown generation, so only external restoration can reach this state.
+  if (destinationsRequireRecovery() && existsSync(DESTINATIONS_FILE)) {
+    clearDestinationsRecoveryMarkerDurably();
+  }
   return result.value;
 }
 
+function validNotificationDeliveryJob(value: unknown): value is NotificationDeliveryJob {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  const stringArray = (candidate: unknown): boolean => candidate === undefined
+    || (Array.isArray(candidate) && candidate.every((entry) => typeof entry === 'string'));
+  const recordValues = (
+    candidate: unknown,
+    validate: (entry: unknown) => boolean,
+  ): boolean => {
+    if (candidate === undefined) return true;
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+    return Object.entries(candidate).every(
+      ([key, entry]) => key.trim().length > 0 && validate(entry),
+    );
+  };
+  return typeof item.notificationId === 'string'
+    && item.notificationId.trim().length > 0
+    && typeof item.queuedAt === 'string'
+    && stringArray(item.completedDestinationIds)
+    && stringArray(item.failedDestinationIds)
+    && recordValues(
+      item.attemptCountByDestination,
+      (entry) => typeof entry === 'number' && Number.isSafeInteger(entry) && entry >= 0,
+    )
+    && recordValues(item.nextAttemptAtByDestination, (entry) => typeof entry === 'string')
+    && recordValues(item.lastErrorByDestination, (entry) => typeof entry === 'string');
+}
+
 function saveDestinationsUnlocked(items: NotificationDestination[]): void {
+  if (destinationsRequireRecovery()) {
+    throw new Error(
+      'Notification destinations require recovery; restore the quarantined catalog before editing routes.',
+    );
+  }
   atomicWriteJson(DESTINATIONS_FILE, items);
 }
 
@@ -428,14 +773,8 @@ function loadDeliveryQueueUnlocked(): { items: NotificationDeliveryJob[]; corrup
   const result = loadJsonResilient<NotificationDeliveryJob[]>(DELIVERY_QUEUE_FILE, [], {
     beforeQuarantine: ensureRecoveryMarker,
     validate: (value): value is NotificationDeliveryJob[] => Array.isArray(value)
-      && value.every((item) => Boolean(
-        item
-        && typeof item === 'object'
-        && !Array.isArray(item)
-        && typeof (item as NotificationDeliveryJob).notificationId === 'string'
-        && (item as NotificationDeliveryJob).notificationId.trim()
-        && typeof (item as NotificationDeliveryJob).queuedAt === 'string',
-      )),
+      && value.every(validNotificationDeliveryJob)
+      && hasUniqueDeliveryJobIds(value),
   });
   if (result.corrupted) {
     pendingCorruptionSignals.add(DELIVERY_QUEUE_FILE);
@@ -507,16 +846,35 @@ function notificationDeliveryQueuedAt(item: NotificationRecord): string {
   return typeof item.createdAt === 'string' ? item.createdAt : '';
 }
 
-function exactReceiptNeedsRetention(item: NotificationRecord, nowMs: number): boolean {
-  if (!hasExpectedExactOriginDeliveryReceipt(item)) return false;
+function hasVerifiedExactReceiptSettlement(item: NotificationRecord): boolean {
+  const expectedReceipt = expectedExactOriginDeliveryReceipt(item);
+  const sourceGroupId = item.exactDeliveryReceiptSettlementSourceGroupId;
+  const settlementDigest = item.exactDeliveryReceiptSettlementDigest;
   if (
-    typeof item.exactDeliveryReceiptSettlementPendingAt === 'string'
-    && item.exactDeliveryReceiptSettlementPendingAt.trim().length > 0
-  ) return true;
-  if (/^[a-f0-9]{64}$/.test(item.exactDeliveryReceiptSettlementDigest ?? '')) return false;
-  const observedAt = Date.parse(item.exactDeliveryReceiptObservedAt ?? '');
-  if (!Number.isFinite(observedAt)) return true;
-  return observedAt > nowMs || nowMs - observedAt < EXACT_RECEIPT_OBSERVATION_GRACE_MS;
+    !expectedReceipt
+    || !sourceGroupId
+    || !/^[a-f0-9]{64}$/.test(settlementDigest ?? '')
+  ) return false;
+  try {
+    const settlement = readWorkflowOriginGroupSettlement(sourceGroupId);
+    return Boolean(
+      settlement
+      && settlement.sourceGroupId === sourceGroupId
+      && settlement.settlementDigest === settlementDigest
+      && settlement.notificationId === item.id
+      && settlement.exactDeliveryReceipt === expectedReceipt,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function exactReceiptNeedsRetention(item: NotificationRecord, _nowMs: number): boolean {
+  // Every valid exact target remains lossless before provider delivery, while
+  // settlement is pending, and after any forged/stale local digest. Only the
+  // independently decoded immutable group authority may release it.
+  if (!expectedExactOriginDeliveryReceipt(item)) return false;
+  return !hasVerifiedExactReceiptSettlement(item);
 }
 
 function deliveryAdmissionNeedsRetention(item: NotificationRecord): boolean {
@@ -610,10 +968,14 @@ function isDuplicateApprovalNotification(existing: NotificationRecord, next: Not
 }
 
 function isTerminalOriginChatPushEligible(item: NotificationRecord): boolean {
-  return item.metadata?.reportBackTargetType === 'origin_chat'
-    && item.metadata?.terminalReportBack === true
-    && (process.env.CLEMMY_REPORTBACK_PUSH ?? 'on').toLowerCase() !== 'off'
-    && loadDestinationsUnlocked().some((entry) => entry.enabled && entry.type === 'web_push');
+  if (
+    item.metadata?.reportBackTargetType !== 'origin_chat'
+    || item.metadata?.terminalReportBack !== true
+    || (process.env.CLEMMY_REPORTBACK_PUSH ?? 'on').toLowerCase() === 'off'
+  ) return false;
+  const destinations = loadDestinationsUnlocked();
+  return destinationsRequireRecovery()
+    || destinations.some((entry) => entry.enabled && entry.type === 'web_push');
 }
 
 function shouldQueueNotificationDelivery(item: NotificationRecord): boolean {
@@ -632,6 +994,9 @@ function notificationNeedsDeliveryQueue(item: NotificationRecord): boolean {
   if (!shouldQueueNotificationDelivery(item)) return false;
   if (hasExactOriginDeliveryMode(item)) {
     return !hasExpectedExactOriginDeliveryReceipt(item);
+  }
+  if (item.deliveryPlan) {
+    return !Number.isFinite(Date.parse(item.deliveryPlanCompletedAt ?? ''));
   }
   const isOriginChatReport = item.metadata?.reportBackTargetType === 'origin_chat';
   if (item.deliveredAt && !isOriginChatReport) return false;
@@ -705,6 +1070,18 @@ export function addNotification(item: NotificationRecord): void {
       ? items.find((existing) => existing.id === item.id)
       : undefined;
     if (existingWithId) {
+      // A stable exact-origin id is immutable authority, not merely a dedupe
+      // hint. Reject a conflicting candidate before any repair, requeue, or
+      // delivery kick: otherwise a wrong-target carrier could be pushed as a
+      // side effect and only then be diagnosed by its graph owner.
+      const existingExactAuthority = exactNotificationAuthorityDigest(existingWithId);
+      const candidateExactAuthority = exactNotificationAuthorityDigest(item);
+      if (
+        (existingExactAuthority !== undefined || candidateExactAuthority !== undefined)
+        && existingExactAuthority !== candidateExactAuthority
+      ) {
+        return { emit: false, kick: false };
+      }
       // Repair a partially persisted exact origin-chat acknowledgement on a
       // stable-ID retry. External exact targets are repaired by re-queuing until
       // their precise receipt exists; origin_chat has no outbound worker leg.
@@ -754,6 +1131,20 @@ export function addNotification(item: NotificationRecord): void {
     }
 
     const shouldQueue = notificationNeedsDeliveryQueue(item);
+    if (shouldQueue && !item.deliveryPlan) {
+      // Freeze route authority in the same carrier generation as admission,
+      // before a configuration edit can reuse an id for a different owner.
+      // Catalog corruption/temporary read failure must not prevent the result
+      // body itself from becoming durable; an unbound queued carrier retries
+      // resolution after authority is restored.
+      try {
+        item.deliveryPlan = createNotificationDeliveryPlan(
+          getNotificationDestinationsForRecord(item),
+        );
+      } catch {
+        item.deliveryPlan = undefined;
+      }
+    }
     if (shouldQueue) item.deliveryAdmissionPendingAt = new Date().toISOString();
     items.push(item);
     saveNotificationsUnlocked(items, {
@@ -1068,9 +1459,26 @@ export function observeExactNotificationDeliveryReceipt(
 export function finalizeExactNotificationDeliveryReceiptSettlement(
   id: string,
   expectedReceipt: string,
+  sourceGroupId: string,
   settlementDigest: string,
 ): NotificationRecord | undefined {
-  if (!/^[a-f0-9]{64}$/.test(settlementDigest)) return undefined;
+  if (
+    typeof sourceGroupId !== 'string'
+    || sourceGroupId.trim().length === 0
+    || !/^[a-f0-9]{64}$/.test(settlementDigest)
+  ) return undefined;
+  try {
+    const settlement = readWorkflowOriginGroupSettlement(sourceGroupId);
+    if (
+      !settlement
+      || settlement.sourceGroupId !== sourceGroupId
+      || settlement.settlementDigest !== settlementDigest
+      || settlement.notificationId !== id
+      || settlement.exactDeliveryReceipt !== expectedReceipt
+    ) return undefined;
+  } catch {
+    return undefined;
+  }
   return withNotificationStateLock(() => {
     const items = loadNotificationsUnlocked();
     const item = items.find((entry) => entry.id === id);
@@ -1088,10 +1496,16 @@ export function finalizeExactNotificationDeliveryReceiptSettlement(
       && item.exactDeliveryReceiptSettlementDigest !== settlementDigest
     ) return undefined;
     if (
+      item.exactDeliveryReceiptSettlementSourceGroupId !== undefined
+      && item.exactDeliveryReceiptSettlementSourceGroupId !== sourceGroupId
+    ) return undefined;
+    if (
       item.exactDeliveryReceiptSettlementDigest !== settlementDigest
+      || item.exactDeliveryReceiptSettlementSourceGroupId !== sourceGroupId
       || item.exactDeliveryReceiptSettlementPendingAt !== undefined
     ) {
       item.exactDeliveryReceiptSettlementDigest = settlementDigest;
+      item.exactDeliveryReceiptSettlementSourceGroupId = sourceGroupId;
       delete item.exactDeliveryReceiptSettlementPendingAt;
       saveNotificationsUnlocked(items);
     }
@@ -1099,14 +1513,62 @@ export function finalizeExactNotificationDeliveryReceiptSettlement(
   });
 }
 
+/** Bind the first non-empty provider destination set before any send begins.
+ * A later configuration change cannot widen or redirect an admitted carrier. */
+export function bindNotificationDeliveryPlan(
+  id: string,
+  destinations: readonly NotificationDestination[],
+): NotificationRecord | undefined {
+  const plan = createNotificationDeliveryPlan(destinations);
+  if (!plan) return undefined;
+  return withNotificationStateLock(() => {
+    const items = loadNotificationsUnlocked();
+    const item = items.find((entry) => entry.id === id);
+    if (!item) return undefined;
+    if (item.deliveryPlan) return item;
+    item.deliveryPlan = plan;
+    saveNotificationsUnlocked(items);
+    return item;
+  });
+}
+
 export function updateNotificationDeliveryStatus(
   id: string,
-  patch: Partial<Pick<NotificationRecord, 'deliveredAt' | 'deliveryAttempts' | 'deliveryError' | 'deliveredDestinations'>>,
+  patch: Partial<Pick<
+    NotificationRecord,
+    | 'deliveredAt'
+    | 'deliveryAttempts'
+    | 'deliveryError'
+    | 'deliveredDestinations'
+    | 'deliveryPlanCompletedAt'
+    | 'deliveryAttemptCountByDestination'
+    | 'deliveryNextAttemptAtByDestination'
+    | 'deliveryLastErrorByDestination'
+  >>,
+  options: { expectedDeliveryRetryRequestedAt?: string | null } = {},
 ): NotificationRecord | undefined {
   return withNotificationStateLock(() => {
     const items = loadNotificationsUnlocked();
     const item = items.find((entry) => entry.id === id);
     if (!item) return undefined;
+    if (
+      Object.prototype.hasOwnProperty.call(options, 'expectedDeliveryRetryRequestedAt')
+      && (item.deliveryRetryRequestedAt ?? null) !== options.expectedDeliveryRetryRequestedAt
+    ) {
+      // A manual retry won while this worker was awaiting provider I/O. Keep a
+      // genuine provider success receipt (so it is never sent twice), but do
+      // not let stale attempt/backoff/completion bytes overwrite the new
+      // generation that the retry action just admitted.
+      if (patch.deliveredDestinations && patch.deliveredDestinations.length > 0) {
+        item.deliveredDestinations = uniqueStrings([
+          ...(Array.isArray(item.deliveredDestinations) ? item.deliveredDestinations : []),
+          ...patch.deliveredDestinations,
+        ]);
+        if (patch.deliveredAt) item.deliveredAt = patch.deliveredAt;
+        saveNotificationsUnlocked(items);
+      }
+      return item;
+    }
     if (patch.deliveredDestinations) {
       item.deliveredDestinations = uniqueStrings([
         ...(Array.isArray(item.deliveredDestinations) ? item.deliveredDestinations : []),
@@ -1371,10 +1833,36 @@ export function settleQueuedNotificationDeliveryPass(
 
 export function requeueNotificationDelivery(notificationId: string): void {
   withNotificationStateLock(() => {
-    const queue = loadDeliveryQueueUnlocked().items;
+    const queueSnapshot = loadDeliveryQueueUnlocked();
+    if (queueSnapshot.corrupted) {
+      throw new Error('Notification delivery queue requires explicit corruption recovery.');
+    }
+    const notifications = loadNotificationsUnlocked();
+    const carrier = notifications.find((item) => item.id === notificationId);
+    if (!carrier) throw new Error(`Notification ${notificationId} does not exist.`);
+    if (carrier.silent || !shouldQueueNotificationDelivery(carrier)) {
+      throw new Error(
+        `Notification ${notificationId} is local-only and cannot be queued for external delivery.`,
+      );
+    }
+    const requestedAt = new Date().toISOString();
+    carrier.deliveryAttempts = 0;
+    delete carrier.deliveryError;
+    delete carrier.deliveryAttemptCountByDestination;
+    delete carrier.deliveryNextAttemptAtByDestination;
+    delete carrier.deliveryLastErrorByDestination;
+    delete carrier.deliveryPlanCompletedAt;
+    carrier.deliveryRetryRequestedAt = requestedAt;
+    carrier.deliveryAdmissionPendingAt = requestedAt;
+    saveNotificationsUnlocked(notifications, {
+      queue: queueSnapshot.items,
+      extraProtectedIds: [notificationId],
+    });
+
+    const queue = queueSnapshot.items;
     const existing = queue.find((item) => item.notificationId === notificationId);
     if (existing) {
-      existing.queuedAt = new Date().toISOString();
+      existing.queuedAt = requestedAt;
       existing.completedDestinationIds = [];
       existing.failedDestinationIds = [];
       existing.attemptCountByDestination = {};
@@ -1383,7 +1871,7 @@ export function requeueNotificationDelivery(notificationId: string): void {
     } else {
       queue.push({
         notificationId,
-        queuedAt: new Date().toISOString(),
+        queuedAt: requestedAt,
         completedDestinationIds: [],
         failedDestinationIds: [],
         attemptCountByDestination: {},
@@ -1392,8 +1880,10 @@ export function requeueNotificationDelivery(notificationId: string): void {
       });
     }
     saveDeliveryQueueUnlocked(queue);
-    compactNotificationsUnlocked(queue);
+    delete carrier.deliveryAdmissionPendingAt;
+    saveNotificationsUnlocked(notifications, { queue });
   });
+  requestNotificationDeliveryKick();
 }
 
 /**
@@ -1461,7 +1951,9 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
     // Kill-switch CLEMMY_REPORTBACK_PUSH=off.
     if (metadata.terminalReportBack === true
       && (process.env.CLEMMY_REPORTBACK_PUSH ?? 'on').toLowerCase() !== 'off') {
-      return listNotificationDestinations().filter((e) => e.enabled && e.type === 'web_push');
+      const destinations = listNotificationDestinations();
+      if (destinationsRequireRecovery()) return [];
+      return destinations.filter((e) => e.enabled && e.type === 'web_push');
     }
     return [];
   }
@@ -1480,6 +1972,10 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
         createdAt: notification.createdAt,
       }];
   const configured = listNotificationDestinations().filter((entry) => entry.enabled);
+  // A quarantined catalog is unknown authority, not an empty configuration.
+  // Never bind/send fallback-only routes until a valid canonical catalog has
+  // been explicitly restored.
+  if (destinationsRequireRecovery()) return [];
   const explicitDiscordUserId = typeof metadata.discordUserId === 'string' ? metadata.discordUserId : '';
   const explicitDiscordChannelId = typeof metadata.discordChannelId === 'string' ? metadata.discordChannelId : '';
   const explicitSlackUserId = typeof metadata.slackUserId === 'string' ? metadata.slackUserId : '';

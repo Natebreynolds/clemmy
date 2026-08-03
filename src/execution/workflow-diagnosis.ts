@@ -32,6 +32,7 @@ import pino from 'pino';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { STATE_DIR } from '../memory/db.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
+import { isSecretLikeKey } from '../runtime/security.js';
 import { readWorkflow, type WorkflowDefinition, type WorkflowStepInput, type WorkflowStepInputBinding, type WorkflowStepOutputContract } from '../memory/workflow-store.js';
 import { prepareWorkflowUpdateForWrite, renderReadinessHold } from './workflow-authoring.js';
 import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
@@ -1026,6 +1027,8 @@ export function humanizeStepOutput(raw: unknown): string {
     const v = obj[key];
     if (typeof v === 'string' && v.trim()) return v.trim();
   }
+  const structuredResult = renderStructuredResult(obj);
+  if (structuredResult) return structuredResult;
   // No human-readable field — this is a bookkeeping result (the step's
   // real content already went out via notify_user). Render a terse status
   // line with any obvious count metrics, NOT raw JSON.
@@ -1037,6 +1040,110 @@ export function humanizeStepOutput(raw: unknown): string {
     }
   }
   return metrics.length ? `${status} — ${metrics.slice(0, 6).join(', ')}` : status;
+}
+
+const STRUCTURED_RESULT_TEXT_KEYS = new Set([
+  'finding',
+  'detail',
+  'description',
+  'result',
+  'outcome',
+  'answer',
+  'reason',
+  'recommendation',
+  'nextaction',
+  'note',
+  'title',
+  'name',
+]);
+const STRUCTURED_RESULT_URL_KEY = /(?:^|_)(?:url|uri|link)$/i;
+const STRUCTURED_RESULT_SENSITIVE_KEY = /(?:password|secret|token|authorization|credential|cookie|private.?key|api.?key)/i;
+const MAX_STRUCTURED_RESULT_LINES = 8;
+const MAX_STRUCTURED_RESULT_CHARS = 1_800;
+
+function boundedResultLine(value: string): string | null {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (!compact) return null;
+  return compact.length > 700 ? `${compact.slice(0, 699).trimEnd()}…` : compact;
+}
+
+/**
+ * Deterministically project user-meaningful facts from a structured step
+ * result. Array length is deliberately NOT interpreted as business meaning:
+ * one `leads` item may itself say "no new leads". The result's authored human
+ * fields remain authority; explicit numeric count fields are only a fallback.
+ */
+function renderStructuredResult(root: Record<string, unknown>): string | null {
+  const lines: string[] = [];
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const visited = new Set<object>();
+
+  const add = (value: string): void => {
+    if (lines.length >= MAX_STRUCTURED_RESULT_LINES) return;
+    const bounded = boundedResultLine(value);
+    if (!bounded) return;
+    const key = bounded.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    lines.push(bounded);
+  };
+
+  const sensitiveKey = (key: string): boolean =>
+    isSecretLikeKey(key) || STRUCTURED_RESULT_SENSITIVE_KEY.test(key);
+
+  const visit = (
+    value: unknown,
+    parentKey = '',
+    depth = 0,
+    sensitiveAncestor = false,
+  ): void => {
+    if (depth > 4 || lines.length >= MAX_STRUCTURED_RESULT_LINES || value === null || value === undefined) return;
+    // A credential/auth container taints its whole subtree. A benign-looking
+    // descendant key such as `detail`, `summary`, or `url` must never regain
+    // public presentation authority merely because its immediate key is safe.
+    const tainted = sensitiveAncestor || (parentKey.length > 0 && sensitiveKey(parentKey));
+    if (tainted) return;
+    if (typeof value === 'string') {
+      if (STRUCTURED_RESULT_TEXT_KEYS.has(parentKey.toLowerCase()) || STRUCTURED_RESULT_URL_KEY.test(parentKey)) {
+        add(value);
+      }
+      return;
+    }
+    if (typeof value !== 'object') return;
+    if (visited.has(value)) return;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, MAX_STRUCTURED_RESULT_LINES)) visit(item, parentKey, depth + 1);
+      return;
+    }
+
+    const record = value as Record<string, unknown>;
+    // Preserve authored result prose before walking nested containers. This
+    // makes a finding/detail pair lead its supporting URL instead of exposing
+    // object key order as a presentation decision.
+    for (const [key, child] of Object.entries(record)) {
+      if (sensitiveKey(key) || typeof child !== 'string') continue;
+      if (STRUCTURED_RESULT_TEXT_KEYS.has(key.toLowerCase())) add(child);
+    }
+    for (const [key, child] of Object.entries(record)) {
+      if (sensitiveKey(key) || typeof child !== 'string') continue;
+      if (STRUCTURED_RESULT_URL_KEY.test(key)) urls.push(child);
+    }
+    for (const [key, child] of Object.entries(record)) {
+      if (sensitiveKey(key)) continue;
+      if (child && typeof child === 'object') visit(child, key, depth + 1, tainted);
+    }
+  };
+
+  visit(root);
+  for (const url of urls) add(url);
+  if (lines.length === 0) return null;
+  let rendered = lines.join('\n');
+  if (rendered.length > MAX_STRUCTURED_RESULT_CHARS) {
+    rendered = `${rendered.slice(0, MAX_STRUCTURED_RESULT_CHARS - 1).trimEnd()}…`;
+  }
+  return rendered;
 }
 
 /**

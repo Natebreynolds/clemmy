@@ -6,6 +6,8 @@ import { clearRunInFlightAfterTerminal } from './restart-recovery.js';
 import { uncompensatedExternalWriteEvents } from './external-write-admission.js';
 import {
   acceptUserInputForRun,
+  appendAsyncWorkDispatchBatchClosedOnce,
+  appendAsyncWorkDispatchedOnce,
   appendEvent,
   clearKill,
   getActiveRunAttempt,
@@ -14,9 +16,9 @@ import {
   getSession,
   isKillRequested,
   listEvents,
+  listPendingAsyncWorkDispatchBatchClosedEvents,
   openEventLog,
   recentToolOutputs,
-  resolveToolOutputForAuthority,
   resolveToolOutputsForAuthority,
   searchToolOutputs,
   type AppendEventInput,
@@ -69,7 +71,11 @@ import { boundedAttemptResultIsTerminal, judgeObjectiveComplete, shouldRunObject
 import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import { synthesizeTurnReport } from './work-report.js';
-import { PUBLIC_RUN_FAILURE_TEXT, publicReplyText } from './public-presentation.js';
+import {
+  PUBLIC_RUN_FAILURE_TEXT,
+  publicAsyncWorkDispatchedData,
+  publicReplyText,
+} from './public-presentation.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import {
   turnOutcomeId,
@@ -199,6 +205,25 @@ import { judgeAmbiguousStallReply, stallIsJudgeAmbiguous } from './stall-judge.j
 export type { StallSignal, StallInfo } from './turn-decision.js';
 import { peekStepResult, recordStepResultFromTranscript } from '../../tools/step-result-tool.js';
 import { pairTransportMirrorToolCalls, projectCanonicalTopLevelToolEvents } from './tool-effect.js';
+import {
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  readActiveWorkflowOriginGroup,
+  reconcileActivatedWorkflowOriginGroups,
+  recordWorkflowOriginGroupClosedBatch,
+  type ActiveWorkflowOriginGroup,
+  type WorkflowChatDispatchPreparationAuthority,
+  type WorkflowChatDispatchPreparedReceipt,
+  type WorkflowOriginGroupCloseAuthority,
+  type WorkflowOriginGroupClosedBatchReceipt,
+} from '../../execution/workflow-origin-group.js';
+import { workflowOriginReplyTargetForSource } from '../workflow-origin-authority.js';
+import {
+  exactOriginDeliveryTargetDigest,
+  sameExactOriginDeliveryTarget,
+} from '../exact-origin-delivery.js';
 
 /**
  * Wrap appendEvent so a transient SQLite write failure (lock, disk
@@ -554,6 +579,10 @@ function reduceStandardConversationTerminal(input: {
   let outcome: TurnOutcome;
   let legacyReason: string;
   switch (result.status) {
+    case 'dispatched':
+      // A durable async edge is deliberately nonterminal. Callers must release
+      // the foreground transport without manufacturing a TurnOutcome.
+      throw new Error('An async dispatch cannot be reduced as a conversation terminal.');
     case 'completed': {
       let text = publicReplyText(result.lastDecision?.reply, '')
         || publicReplyText(result.lastDecision?.summary, '');
@@ -1904,6 +1933,7 @@ export interface OrchestratorDecisionShape {
 
 export type RunConversationStatus =
   | 'completed'
+  | 'dispatched'
   | 'awaiting_user_input'
   | 'awaiting_approval'
   | 'killed'
@@ -2125,69 +2155,450 @@ function estimateAgentToolPromptComponents(agent: Agent<any, any>): Record<strin
 const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
 
-/**
- * Async-dispatch completion shape: a successful `workflow_run` dispatch this
- * turn IS the deliverable. The run executes in the daemon and re-enters this
- * chat with its outcome on completion (workflow_run's originSessionId
- * report-back), so judging the reply against the workflow's EVENTUAL artifact
- * can only produce a false NOT-finished — which forces pointless
- * workflow_run_status polling between dispatch and report-back (2026-06-12:
- * 6 junk "still running" turns on a 3-minute run). Detection is exact: the
- * queue tool's own success message, fetched from the tool-output store for the
- * canonical top-level call made in THIS turn. That may be `workflow_run`
- * directly or its schema-on-demand `call_tool` carrier; authority stays on the
- * outer call id whose lifecycle and exact output are durable. Fail-closed to
- * judging as before.
- */
-export function dispatchedBackgroundWorkflowRun(sessionId: string, turn: number): boolean {
-  try {
-    const calls = listEvents(sessionId, { types: ['tool_called'] })
-      .filter((ev) => ev.turn === turn
-        && effectiveCalledToolName(ev.data) === 'workflow_run');
-    for (const call of calls) {
-      const callId = (call.data as { callId?: unknown } | undefined)?.callId;
-      if (typeof callId !== 'string' || !callId) continue;
-      const resolution = resolveToolOutputForAuthority(sessionId, callId);
-      if (resolution.status !== 'ok') continue;
-      const output = resolution.record.output;
-      if (/running in the BACKGROUND/i.test(output)) return true;
+/** Exact authority projected from a trusted producer's durable graph event. */
+export interface VerifiedWorkflowRunDispatchReceipt {
+  sourceGroupId: string;
+  sourceGroupDigest: string;
+  runIds: string[];
+  sourceUserSeq: number;
+  turn: number;
+  eventId: string;
+  replyTargetDigest: string;
+}
+
+export interface FinalizedWorkflowRunDispatch {
+  receipt: VerifiedWorkflowRunDispatchReceipt;
+  event: EventRow;
+  presentation: NonNullable<ReturnType<typeof publicAsyncWorkDispatchedData>>;
+}
+
+function preparedWorkflowDispatchReceipts(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): WorkflowChatDispatchPreparedReceipt[] {
+  const source = listEvents(input.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === input.sourceUserSeq);
+  const sourceTarget = workflowOriginReplyTargetForSource(input);
+  if (!source || source.role !== 'user' || source.data.synthetic === true || !sourceTarget) return [];
+  const receipts: WorkflowChatDispatchPreparedReceipt[] = [];
+  const seen = new Set<string>();
+  for (const event of listEvents(input.sessionId, { types: ['async_work_dispatch_prepared'] })) {
+    if (
+      event.role !== 'system'
+      || event.turn !== source.turn
+      || event.parentEventId !== source.id
+      || event.data.originSessionId !== input.sessionId
+      || event.data.sourceUserSeq !== input.sourceUserSeq
+    ) continue;
+    const receipt = createWorkflowChatDispatchPreparedReceipt(
+      event.data as unknown as WorkflowChatDispatchPreparationAuthority,
+      { eventId: event.id, eventSeq: event.seq, preparedAt: event.createdAt },
+    );
+    if (
+      receipt.replyTargetDigest !== exactOriginDeliveryTargetDigest(sourceTarget)
+      || !sameExactOriginDeliveryTarget(receipt.replyTarget, sourceTarget)
+    ) {
+      throw new Error('workflow dispatch preparation disagrees with its accepted source target');
     }
-  } catch { /* fail toward running the judge */ }
-  return false;
+    if (seen.has(receipt.receiptDigest)) continue;
+    seen.add(receipt.receiptDigest);
+    receipts.push(receipt);
+  }
+  return receipts;
+}
+
+function activeDispatchMatchesProjection(
+  active: ActiveWorkflowOriginGroup,
+  dispatch: NonNullable<ReturnType<typeof publicAsyncWorkDispatchedData>>,
+): boolean {
+  const expected = active.publicDispatch;
+  return dispatch.version === expected.version
+    && dispatch.kind === expected.kind
+    && dispatch.status === expected.status
+    && dispatch.sourceUserSeq === expected.sourceUserSeq
+    && dispatch.sourceGroupId === expected.sourceGroupId
+    && dispatch.sourceGroupDigest === expected.sourceGroupDigest
+    && dispatch.dispatchKey === expected.dispatchKey
+    && dispatch.replyTargetDigest === expected.replyTargetDigest
+    && dispatch.runIds.length === expected.runIds.length
+    && dispatch.runIds.every((runId, index) => runId === expected.runIds[index]);
+}
+
+function persistActiveWorkflowDispatch(
+  source: EventRow,
+  active: ActiveWorkflowOriginGroup,
+): EventRow {
+  const event = appendAsyncWorkDispatchedOnce({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    sourceUserSeq: active.publicDispatch.sourceUserSeq,
+    sourceGroupId: active.publicDispatch.sourceGroupId,
+    data: {
+      ...active.publicDispatch,
+      // Private crash-recovery route; the public projector drops this field.
+      replyTarget: active.sealed.replyTarget,
+    },
+  }).event;
+  const dispatch = publicAsyncWorkDispatchedData(event.data);
+  if (
+    !dispatch
+    || event.role !== 'system'
+    || event.turn !== source.turn
+    || event.parentEventId !== source.id
+    || !activeDispatchMatchesProjection(active, dispatch)
+  ) {
+    throw new Error('active workflow source group did not persist its public dispatch');
+  }
+  return event;
+}
+
+function acceptedSourceForActiveWorkflowDispatch(
+  active: ActiveWorkflowOriginGroup,
+): EventRow {
+  const sessionId = active.sealed.originSessionId;
+  const sourceUserSeq = active.sealed.sourceUserSeq;
+  const source = listEvents(sessionId, {
+    sinceSeq: sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  })
+    .find((event) => event.seq === sourceUserSeq);
+  const sourceTarget = workflowOriginReplyTargetForSource({ sessionId, sourceUserSeq });
+  if (
+    !source
+    || source.role !== 'user'
+    || source.data.synthetic === true
+    || !sourceTarget
+    || active.publicDispatch.sourceUserSeq !== sourceUserSeq
+    || active.publicDispatch.sourceGroupId !== active.sealed.sourceGroupId
+    || active.publicDispatch.sourceGroupDigest !== active.sealed.sourceGroupDigest
+    || active.publicDispatch.replyTargetDigest !== active.sealed.replyTargetDigest
+    || !sameExactOriginDeliveryTarget(sourceTarget, active.sealed.replyTarget)
+  ) {
+    throw new Error('active workflow source group lost its exact accepted source authority');
+  }
+  return source;
+}
+
+function persistActiveWorkflowDispatchFromAuthority(
+  active: ActiveWorkflowOriginGroup,
+): EventRow {
+  return persistActiveWorkflowDispatch(acceptedSourceForActiveWorkflowDispatch(active), active);
+}
+
+function materializeClosedWorkflowDispatchBatch(
+  event: EventRow,
+): {
+  source: EventRow;
+  receipt: WorkflowOriginGroupClosedBatchReceipt;
+} {
+  const authority = event.data as unknown as WorkflowOriginGroupCloseAuthority;
+  const source = listEvents(event.sessionId, { types: ['user_input_received'] })
+    .find((candidate) => candidate.seq === authority.sourceUserSeq);
+  const sourceTarget = workflowOriginReplyTargetForSource({
+    sessionId: event.sessionId,
+    sourceUserSeq: authority.sourceUserSeq,
+  });
+  if (
+    event.type !== 'async_work_dispatch_batch_closed'
+    || event.role !== 'system'
+    || !source
+    || source.role !== 'user'
+    || source.data.synthetic === true
+    || event.turn !== source.turn
+    || event.parentEventId !== source.id
+    || event.seq <= source.seq
+    || authority.originSessionId !== event.sessionId
+    || !sourceTarget
+    || authority.replyTargetDigest !== exactOriginDeliveryTargetDigest(sourceTarget)
+    || !sameExactOriginDeliveryTarget(authority.replyTarget, sourceTarget)
+  ) {
+    throw new Error('workflow dispatch batch close is not bound to its exact accepted source');
+  }
+  const receipt = createWorkflowOriginGroupClosedBatchReceipt(authority, {
+    eventId: event.id,
+    eventSeq: event.seq,
+    closedAt: event.createdAt,
+  });
+  if (receipt.members.some((member) => member.preparedEventSeq >= event.seq)) {
+    throw new Error('workflow dispatch batch close contains a preparation outside its causal prefix');
+  }
+  const available = preparedWorkflowDispatchReceipts({
+    sessionId: event.sessionId,
+    sourceUserSeq: authority.sourceUserSeq,
+  });
+  const byDigest = new Map(available.map((prepared) => [prepared.receiptDigest, prepared]));
+  const preparedReceipts = receipt.members.map((member) => {
+    const prepared = byDigest.get(member.receiptDigest);
+    if (
+      !prepared
+      || prepared.runId !== member.runId
+      || prepared.preparedEventId !== member.preparedEventId
+      || prepared.preparedEventSeq !== member.preparedEventSeq
+    ) {
+      throw new Error('workflow dispatch batch close lost one of its exact prepared events');
+    }
+    return prepared;
+  });
+  recordWorkflowOriginGroupClosedBatch({ receipt, preparedReceipts });
+  return { source, receipt };
 }
 
 /**
- * A successful workflow_run queue receipt closes the foreground chat turn even
- * when the model selects the legacy `awaiting_handoff_result` enum. The daemon,
- * not another foreground model turn, owns the remaining work and will deliver
- * its terminal report back to the originating chat.
- *
- * This is deliberately receipt-backed and turn-local. Text such as "running in
- * the background" without the workflow_run success output cannot reach this
- * path, so the narration-deferral guard remains strict for phantom handoffs.
+ * Freeze every workflow prepared during one complete foreground SDK
+ * invocation. This runs only after runTurn/resumePendingApproval returned, so
+ * all model↔tool cycles in that invocation have ended. Outer judge/stall
+ * continuations must not widen the source group after durable async ownership
+ * transfers at this boundary.
  */
-function settleQueuedWorkflowDecision(
+function closePreparedWorkflowDispatchBatch(
+  sessionId: string,
+  sourceUserSeq: number,
+): { source: EventRow; receipt: WorkflowOriginGroupClosedBatchReceipt } | null {
+  const source = listEvents(sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === sourceUserSeq);
+  if (!source || source.role !== 'user' || source.data.synthetic === true) return null;
+  const existing = listEvents(sessionId, { types: ['async_work_dispatch_batch_closed'] })
+    .filter((event) => event.data.sourceUserSeq === sourceUserSeq);
+  if (existing.length > 1) {
+    throw new Error('workflow source group has ambiguous durable close winners');
+  }
+  let closeEvent = existing[0];
+  if (!closeEvent) {
+    const prepared = preparedWorkflowDispatchReceipts({ sessionId, sourceUserSeq });
+    if (prepared.length === 0) return null;
+    const authority = createWorkflowOriginGroupCloseAuthority(prepared);
+    closeEvent = appendAsyncWorkDispatchBatchClosedOnce({
+      sessionId,
+      turn: source.turn,
+      sourceUserSeq,
+      data: { ...authority },
+    }).event;
+  }
+  return materializeClosedWorkflowDispatchBatch(closeEvent);
+}
+
+function finalizePreparedWorkflowDispatches(
+  sessionId: string,
+  sourceUserSeq: number,
+): VerifiedWorkflowRunDispatchReceipt[] {
+  const source = listEvents(sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === sourceUserSeq);
+  if (!source || source.role !== 'user' || source.data.synthetic === true) return [];
+  const alreadyActive = verifiedWorkflowRunDispatchReceipts(sessionId, source.turn, sourceUserSeq);
+  if (alreadyActive.length > 0) return alreadyActive;
+  const closed = closePreparedWorkflowDispatchBatch(sessionId, sourceUserSeq);
+  if (!closed) return [];
+  finalizeWorkflowOriginGroupClosedBatch(closed.receipt.sourceGroupId, {
+    // Executability is downstream of presentation authority. The activation
+    // receipt may win privately, but its members remain held unless this exact
+    // public edge commits; a thrown append is replayed from the closed batch.
+    beforeMemberRelease: (active) => {
+      persistActiveWorkflowDispatch(source, active);
+    },
+  });
+  const verified = verifiedWorkflowRunDispatchReceipts(sessionId, source.turn, sourceUserSeq);
+  if (verified.length !== 1) {
+    throw new Error('workflow source group activated without one exact public dispatch');
+  }
+  return verified;
+}
+
+/** Shared post-SDK reducer for every interactive brain lane. A provider run
+ * may emit any narration or control shape after workflow_run, but the durable
+ * prepared receipts own the transition: close the complete SDK invocation,
+ * activate its immutable member set, and return the one nonterminal public
+ * dispatch edge. No caller may manufacture a terminal from the model result
+ * once this reducer succeeds. */
+export function finalizePreparedWorkflowDispatchForSource(
+  sessionId: string,
+  sourceUserSeq: number,
+): FinalizedWorkflowRunDispatch | null {
+  const receipts = finalizePreparedWorkflowDispatches(sessionId, sourceUserSeq);
+  if (receipts.length === 0) return null;
+  if (receipts.length !== 1) {
+    throw new Error('workflow source must resolve to exactly one immutable public dispatch');
+  }
+  const receipt = receipts[0];
+  const event = listEvents(sessionId, { types: ['async_work_dispatched'] })
+    .find((candidate) => candidate.id === receipt.eventId);
+  const presentation = event ? publicAsyncWorkDispatchedData(event.data) : null;
+  if (
+    !event
+    || !presentation
+    || presentation.sourceUserSeq !== sourceUserSeq
+    || presentation.sourceGroupId !== receipt.sourceGroupId
+    || presentation.sourceGroupDigest !== receipt.sourceGroupDigest
+    || presentation.replyTargetDigest !== receipt.replyTargetDigest
+    || presentation.runIds.length !== receipt.runIds.length
+    || !presentation.runIds.every((runId, index) => runId === receipt.runIds[index])
+  ) {
+    throw new Error('workflow source group lost its exact nonterminal public presentation');
+  }
+  return { receipt, event, presentation };
+}
+
+export interface ReconcileClosedWorkflowDispatchBatchesResult {
+  examined: number;
+  finalized: number;
+  published: number;
+  rejected: number;
+}
+
+/** Recover a crash after the private close node won but before activation or
+ * public dispatch. Prepared-only groups are deliberately absent from this
+ * bounded global query and remain held. */
+export function reconcileClosedWorkflowDispatchBatches(
+  limit = 200,
+): ReconcileClosedWorkflowDispatchBatchesResult {
+  const result: ReconcileClosedWorkflowDispatchBatchesResult = {
+    examined: 0,
+    finalized: 0,
+    published: 0,
+    rejected: 0,
+  };
+  for (const closeEvent of listPendingAsyncWorkDispatchBatchClosedEvents(limit)) {
+    result.examined += 1;
+    try {
+      const closed = materializeClosedWorkflowDispatchBatch(closeEvent);
+      const wasActive = readActiveWorkflowOriginGroup(closed.receipt.sourceGroupId) !== null;
+      finalizeWorkflowOriginGroupClosedBatch(closed.receipt.sourceGroupId, {
+        beforeMemberRelease: (active) => {
+          persistActiveWorkflowDispatch(closed.source, active);
+        },
+      });
+      if (!wasActive) result.finalized += 1;
+      result.published += 1;
+    } catch {
+      result.rejected += 1;
+    }
+  }
+  return result;
+}
+
+/** Recover an activation receipt that won before its held members were
+ * released. The origin-group store owns the filesystem replay, while this
+ * harness wrapper supplies the required cross-store publication barrier from
+ * the immutable accepted source. A missing or conflicting public edge keeps
+ * every member held and retryable. */
+export function reconcileActivatedWorkflowDispatchGroups(): ReturnType<
+  typeof reconcileActivatedWorkflowOriginGroups
+> {
+  return reconcileActivatedWorkflowOriginGroups({
+    beforeMemberRelease: (active) => {
+      persistActiveWorkflowDispatchFromAuthority(active);
+    },
+  });
+}
+
+/**
+ * Resolve every workflow dispatch owned by one accepted logical source. The
+ * trusted workflow_run producer writes this event only after durable queue
+ * admission and exact-origin binding. Tool output and model prose are not part
+ * of authority and may change freely without altering this graph edge.
+ */
+export function verifiedWorkflowRunDispatchReceipts(
   sessionId: string,
   turn: number,
-  decision: OrchestratorDecisionShape | null,
-): OrchestratorDecisionShape | null {
-  if (
-    !decision
-    || decision.nextAction !== 'awaiting_handoff_result'
-    || !dispatchedBackgroundWorkflowRun(sessionId, turn)
-  ) {
-    return decision;
+  sourceUserSeq?: number,
+): VerifiedWorkflowRunDispatchReceipt[] {
+  try {
+    const sources = listEvents(sessionId, { types: ['user_input_received'] });
+    const isHumanSource = (event: EventRow): boolean => (
+      event.role === 'user' && event.data.synthetic !== true
+    );
+    const exactSource = sourceUserSeq
+      ? sources.find((event) => event.seq === sourceUserSeq)
+      : null;
+    if (sourceUserSeq && (!exactSource || !isHumanSource(exactSource))) return [];
+    const dispatchEvents = listEvents(sessionId, { types: ['async_work_dispatched'] });
+    const winnerCounts = new Map<number, number>();
+    for (const event of dispatchEvents) {
+      const claimedSourceSeq = event.data.sourceUserSeq;
+      if (!Number.isSafeInteger(claimedSourceSeq) || Number(claimedSourceSeq) <= 0) continue;
+      const source = sources.find((candidate) => candidate.seq === claimedSourceSeq);
+      if (
+        !source
+        || !isHumanSource(source)
+        || event.role !== 'system'
+        || event.turn !== source.turn
+        || event.parentEventId !== source.id
+      ) continue;
+      const count = (winnerCounts.get(Number(claimedSourceSeq)) ?? 0) + 1;
+      winnerCounts.set(Number(claimedSourceSeq), count);
+      if (count > 1) return [];
+    }
+    const receipts = new Map<string, VerifiedWorkflowRunDispatchReceipt>();
+    for (const event of dispatchEvents) {
+      if (event.role !== 'system') continue;
+      const dispatch = publicAsyncWorkDispatchedData(event.data);
+      if (!dispatch) continue;
+      const source = exactSource
+        ?? sources.find((candidate) => (
+          candidate.seq === dispatch.sourceUserSeq && isHumanSource(candidate)
+        ));
+      if (!source || event.seq <= source.seq || event.turn !== source.turn) continue;
+      if (sourceUserSeq && dispatch.sourceUserSeq !== sourceUserSeq) continue;
+      if (!sourceUserSeq && event.turn !== turn) continue;
+      if (event.parentEventId !== source.id) continue;
+      const sourceTarget = workflowOriginReplyTargetForSource({
+        sessionId,
+        sourceUserSeq: dispatch.sourceUserSeq,
+      });
+      if (!sourceTarget || dispatch.replyTargetDigest !== exactOriginDeliveryTargetDigest(sourceTarget)) continue;
+      const active = readActiveWorkflowOriginGroup(dispatch.sourceGroupId);
+      if (
+        !active
+        || active.sealed.originSessionId !== sessionId
+        || active.sealed.sourceUserSeq !== dispatch.sourceUserSeq
+        || !sameExactOriginDeliveryTarget(active.sealed.replyTarget, sourceTarget)
+        || !activeDispatchMatchesProjection(active, dispatch)
+      ) continue;
+      const key = dispatch.dispatchKey;
+      if (receipts.has(key)) return [];
+      receipts.set(key, {
+        sourceGroupId: dispatch.sourceGroupId,
+        sourceGroupDigest: dispatch.sourceGroupDigest,
+        runIds: [...dispatch.runIds],
+        sourceUserSeq: dispatch.sourceUserSeq,
+        turn: event.turn,
+        eventId: event.id,
+        replyTargetDigest: dispatch.replyTargetDigest,
+      });
+    }
+    return [...receipts.values()];
+  } catch {
+    return []; // missing or ambiguous authority preserves the legacy fail-closed path
   }
-  const reply = decision.reply?.trim()
-    || decision.summary?.trim()
-    || 'The workflow is running in the background. I’ll report back here when it finishes.';
+}
+
+/** Back-compatible predicate for gates that only need to know if one exists. */
+export function dispatchedBackgroundWorkflowRun(
+  sessionId: string,
+  turn: number,
+  sourceUserSeq?: number,
+): boolean {
+  return verifiedWorkflowRunDispatchReceipts(sessionId, turn, sourceUserSeq).length > 0;
+}
+
+function recordAsyncWorkflowDispatch(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  receipts: VerifiedWorkflowRunDispatchReceipt[];
+  steps: number;
+  lastDecision?: OrchestratorDecisionShape;
+  lastTurn: number;
+}): RunConversationResult {
+  if (input.receipts.length === 0
+    || input.receipts.some((receipt) => receipt.sourceUserSeq !== input.sourceUserSeq)) {
+    throw new Error('Cannot release foreground without exact async dispatch authority.');
+  }
   return {
-    ...decision,
-    summary: decision.summary?.trim() || reply,
-    reply,
-    done: true,
-    nextAction: 'completed',
-    reason: 'queued_workflow_owns_continuation',
+    sessionId: input.sessionId,
+    status: 'dispatched',
+    steps: input.steps,
+    lastDecision: input.lastDecision,
+    lastTurn: input.lastTurn,
   };
 }
 
@@ -3008,22 +3419,29 @@ export async function runConversation(
     },
     surface: 'direct',
   });
-  let terminalSettled = false;
+  let foregroundReleased = false;
   try {
     const result = await runConversationCore({
       ...options,
       sourceUserSeq,
       reuseRecordedUserInput: true,
     });
+    if (result.status === 'dispatched') {
+      // The exact async_work_dispatched row remains the pending logical edge.
+      // This releases only the coarse foreground marker; provider inbox rows
+      // may become `replied` once their compact dispatch ACK is delivered.
+      foregroundReleased = true;
+      return result;
+    }
     const reduced = reduceStandardConversationTerminal({ result, sourceUserSeq });
     if (reduced.completedReason) return reduced;
-    terminalSettled = Boolean(reduced.publicPresentation);
+    foregroundReleased = Boolean(reduced.publicPresentation);
     emitRuntimeTerminalEvent(options.sessionId, reduced);
     refreshTerminalWorkingMemory(options.sessionId);
     return reduced;
   } finally {
-    if (terminalSettled) {
-      clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId);
+    if (foregroundReleased) {
+      clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId, sourceUserSeq);
     }
   }
 }
@@ -3341,6 +3759,26 @@ async function runConversationCore(
       options.sessionId,
       turnResult.turn,
     );
+
+    // A verified queue receipt transfers ownership to the durable workflow
+    // graph. This check precedes model-status/prose handling on purpose: a
+    // successful effect cannot be undone by a malformed handoff narration.
+    if (activeSourceUserSeq) {
+      const dispatch = finalizePreparedWorkflowDispatchForSource(
+        options.sessionId,
+        activeSourceUserSeq,
+      );
+      if (dispatch) {
+        return recordAsyncWorkflowDispatch({
+          sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          receipts: [dispatch.receipt],
+          steps: stepIndex,
+          lastDecision,
+          lastTurn,
+        });
+      }
+    }
 
     // W1a — chat step-boundary brain fallover. A deferred transient model/codex
     // error (infraTransientKind set, ask NOT yet written) → re-attempt on the next
@@ -3704,14 +4142,6 @@ async function runConversationCore(
         reason: 'dispatch_handoff_reply',
       };
     }
-    // Structured twin of the prose salvage above. A real workflow queue receipt
-    // means the foreground turn is finished; `awaiting_handoff_result` now
-    // refers to the daemon's automatic report-back, not another model turn.
-    decision = settleQueuedWorkflowDecision(
-      options.sessionId,
-      turnResult.turn,
-      decision,
-    );
     lastDecision = decision ?? lastDecision;
 
     captureWorkflowStepResultTranscript({
@@ -6778,6 +7208,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     context: {
       sessionId: options.sessionId,
       turn,
+      ...(sourceUserSeq ? { sourceUserSeq } : {}),
     },
     maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
     callModelInputFilter: modelInputFilter,
@@ -7372,7 +7803,11 @@ export async function resumePendingApproval(
   }
 
   const opts: Record<string, unknown> = {
-    context: { sessionId: options.sessionId, turn },
+    context: {
+      sessionId: options.sessionId,
+      turn,
+      ...(resumeSourceUserSeq ? { sourceUserSeq: resumeSourceUserSeq } : {}),
+    },
     maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
     // Match runTurn(): SDK 0.11.5 can execute many function tools in
     // parallel. Keep resumed approval runs on the same bounded local
@@ -7590,22 +8025,26 @@ export async function runConversationFromResume(opts: {
     },
     surface: 'approval_resume',
   });
-  let terminalSettled = false;
+  let foregroundReleased = false;
   try {
     const result = await runConversationFromResumeCore({ ...opts, sourceUserSeq });
+    if (result.status === 'dispatched') {
+      foregroundReleased = true;
+      return result;
+    }
     const reduced = reduceStandardConversationTerminal({
       result,
       sourceUserSeq,
       approvalIdHint: opts.approvalId,
     });
     if (reduced.completedReason) return reduced;
-    terminalSettled = Boolean(reduced.publicPresentation);
+    foregroundReleased = Boolean(reduced.publicPresentation);
     emitRuntimeTerminalEvent(opts.sessionId, reduced);
     refreshTerminalWorkingMemory(opts.sessionId);
     return reduced;
   } finally {
-    if (terminalSettled) {
-      clearRunInFlightAfterTerminal(opts.sessionId, opts.runAttemptId);
+    if (foregroundReleased) {
+      clearRunInFlightAfterTerminal(opts.sessionId, opts.runAttemptId, sourceUserSeq);
     }
   }
 }
@@ -7722,6 +8161,20 @@ async function runConversationFromResumeCore(opts: {
 
   if (activeSourceUserSeq) {
     resolveArtifactRunScopeId(opts.sessionId, opts.sessionId, activeSourceUserSeq);
+    const dispatch = finalizePreparedWorkflowDispatchForSource(
+      opts.sessionId,
+      activeSourceUserSeq,
+    );
+    if (dispatch) {
+      return recordAsyncWorkflowDispatch({
+        sessionId: opts.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        receipts: [dispatch.receipt],
+        steps: 1,
+        lastDecision,
+        lastTurn,
+      });
+    }
   }
 
   const firstCompletedQuestion = firstResult.status === 'completed'
@@ -7756,11 +8209,7 @@ async function runConversationFromResumeCore(opts: {
     };
   }
 
-  let decision = settleQueuedWorkflowDecision(
-    opts.sessionId,
-    firstResult.turn,
-    toOrchestratorDecision(firstResult.finalOutput),
-  );
+  let decision = toOrchestratorDecision(firstResult.finalOutput);
   lastDecision = decision ?? lastDecision;
 
   // If reject was the decision, treat it as "done — we cancelled
@@ -8157,6 +8606,20 @@ async function runConversationFromResumeCore(opts: {
         `${opts.sessionId}::turn:${turnResult.turn}`,
         activeSourceUserSeq,
       );
+      const dispatch = finalizePreparedWorkflowDispatchForSource(
+        opts.sessionId,
+        activeSourceUserSeq,
+      );
+      if (dispatch) {
+        return recordAsyncWorkflowDispatch({
+          sessionId: opts.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          receipts: [dispatch.receipt],
+          steps: stepIndex,
+          lastDecision,
+          lastTurn,
+        });
+      }
     }
     // UNATTENDED infra self-heal (parity with runConversation): a transient infra
     // error / tool-timeout on this resumed workflow/background step auto-retries
@@ -8196,11 +8659,7 @@ async function runConversationFromResumeCore(opts: {
         error: turnResult.error,
       };
     }
-    decision = settleQueuedWorkflowDecision(
-      opts.sessionId,
-      turnResult.turn,
-      toOrchestratorDecision(turnResult.finalOutput),
-    );
+    decision = toOrchestratorDecision(turnResult.finalOutput);
     lastDecision = decision ?? lastDecision;
 
     captureWorkflowStepResultTranscript({

@@ -3,13 +3,23 @@ import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { BASE_DIR } from '../../config.js';
 import { actionBus } from '../action-bus.js';
 import { mirrorEventToOperational } from './eventlog-operational-mirror.js';
 import { AUDIT_MIRRORED_EVENT_TYPES, appendAuditRecord } from '../audit-ledger.js';
-import { projectHarnessEventForPublic } from './public-presentation.js';
+import {
+  projectHarnessEventForPublic,
+  publicAsyncWorkDispatchedData,
+} from './public-presentation.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
+import {
+  exactOriginDeliveryTargetDigest,
+  exactOriginDeliveryTargetFromSessionSnapshot,
+  normalizeExactOriginDeliveryTarget,
+  sameExactOriginDeliveryTarget,
+} from '../exact-origin-delivery.js';
 
 /**
  * Event log — the spine of the 0.3 harness.
@@ -84,6 +94,20 @@ export const EVENT_TYPES = [
   // two runTurn() calls inside the same runConversation(). The
   // OrchestratorDecision drives whether the loop recurses.
   'conversation_step',
+  // Private half of the source-group workflow handoff. One row proves a
+  // trusted workflow_run producer prepared a held queue member for the exact
+  // accepted human source. It is never projected to chat; the loop seals and
+  // activates the complete source group before publishing one dispatch ACK.
+  'async_work_dispatch_prepared',
+  // Durable foreground-release boundary for an exact workflow source group.
+  // This freezes the complete ordered set of prepared members before any run
+  // can become executable. Prepared-only groups remain held across restarts.
+  'async_work_dispatch_batch_closed',
+  // Typed nonterminal boundary: an exact workflow_run tool receipt handed
+  // continuing ownership to the background workflow daemon. The foreground
+  // model/transport may release, but this accepted logical intent remains
+  // pending until the workflow's separately sourced outcome reports back.
+  'async_work_dispatched',
   // A brain stopped without a safe structured outcome. This is execution-graph
   // state only: the bridge may recover on another brain, then commits exactly
   // one public terminal for the accepted user turn.
@@ -1937,10 +1961,263 @@ export function appendTurnGraphEventOnce(input: {
 }
 
 /**
+ * Atomically close one accepted source's private workflow-dispatch batch.
+ *
+ * The close row is the graph boundary between the foreground SDK invocation
+ * and source-group activation. An existing winner is returned unchanged so a
+ * retry cannot widen or replace the member set after foreground ownership was
+ * released.
+ */
+export function appendAsyncWorkDispatchBatchClosedOnce(input: {
+  sessionId: string;
+  turn: number;
+  sourceUserSeq: number;
+  data: Record<string, unknown>;
+}): { event: EventRow; inserted: boolean } {
+  if (!input.sessionId || !Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) {
+    throw new Error('workflow dispatch batch close requires an accepted sourceUserSeq');
+  }
+  if (
+    input.data.originSessionId !== input.sessionId
+    || input.data.sourceUserSeq !== input.sourceUserSeq
+  ) {
+    throw new Error('workflow dispatch batch close payload disagrees with its accepted source');
+  }
+  const db = openEventLog();
+  const append = db.transaction((): { row: RawEventRow; inserted: boolean } => {
+    const source = db.prepare(
+      `SELECT events.*, sessions.kind AS session_kind
+         FROM events
+         JOIN sessions ON sessions.id = events.session_id
+        WHERE events.session_id = ?
+          AND events.seq = ?
+          AND events.type = 'user_input_received'
+        LIMIT 1`,
+    ).get(input.sessionId, input.sourceUserSeq) as (RawEventRow & { session_kind: SessionKind }) | undefined;
+    if (
+      !source
+      || source.session_kind !== 'chat'
+      || source.role !== 'user'
+      || source.turn !== input.turn
+    ) {
+      throw new Error('workflow dispatch batch close source is not the exact accepted chat user turn');
+    }
+    const sourceData = JSON.parse(source.data_json) as Record<string, unknown>;
+    if (sourceData.synthetic === true) {
+      throw new Error('synthetic input cannot close a workflow dispatch batch');
+    }
+
+    const priorRows = db.prepare(
+      `SELECT * FROM events
+        WHERE session_id = ?
+          AND type = 'async_work_dispatch_batch_closed'
+          AND json_extract(data_json, '$.sourceUserSeq') = ?
+        ORDER BY seq ASC
+        LIMIT 2`,
+    ).all(input.sessionId, input.sourceUserSeq) as RawEventRow[];
+    if (priorRows.length > 1) {
+      throw new Error('workflow dispatch batch has ambiguous close winners');
+    }
+    const prior = priorRows[0];
+    if (prior) {
+      if (prior.turn !== source.turn || prior.parent_event_id !== source.id) {
+        throw new Error('existing workflow dispatch batch close does not belong to its accepted source');
+      }
+      return { row: prior, inserted: false };
+    }
+
+    const id = randomUUID();
+    const now = nowIso();
+    db.prepare(
+      `INSERT INTO events
+         (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+       VALUES (?, ?, ?, 'system', 'async_work_dispatch_batch_closed', ?, ?, ?)`,
+    ).run(
+      id,
+      input.sessionId,
+      input.turn,
+      source.id,
+      JSON.stringify(input.data),
+      now,
+    );
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+    return {
+      row: db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow,
+      inserted: true,
+    };
+  });
+
+  const winner = append.immediate();
+  const event = rowToEvent(winner.row);
+  return winner.inserted
+    ? { event: publishPersistedEvent(event), inserted: true }
+    : { event, inserted: false };
+}
+
+/** Atomically publish or reuse the single public dispatch winner for one
+ * immutable source group. Foreground completion and daemon recovery may race;
+ * the SQLite transaction serializes them and rejects any byte-level authority
+ * conflict instead of emitting two transport ACKs. */
+export function appendAsyncWorkDispatchedOnce(input: {
+  sessionId: string;
+  turn: number;
+  sourceUserSeq: number;
+  sourceGroupId: string;
+  data: Record<string, unknown>;
+}): { event: EventRow; inserted: boolean } {
+  const publicDispatch = publicAsyncWorkDispatchedData(input.data);
+  if (
+    !input.sessionId
+    || !Number.isSafeInteger(input.sourceUserSeq)
+    || input.sourceUserSeq <= 0
+    || !input.sourceGroupId
+    || input.data.sourceUserSeq !== input.sourceUserSeq
+    || input.data.sourceGroupId !== input.sourceGroupId
+    || !publicDispatch
+    || publicDispatch.sourceUserSeq !== input.sourceUserSeq
+    || publicDispatch.sourceGroupId !== input.sourceGroupId
+  ) {
+    throw new Error('workflow public dispatch requires one exact source-group identity');
+  }
+  const db = openEventLog();
+  const append = db.transaction((): { row: RawEventRow; inserted: boolean } => {
+    const source = db.prepare(
+      `SELECT events.*, sessions.kind AS session_kind
+         FROM events
+         JOIN sessions ON sessions.id = events.session_id
+        WHERE events.session_id = ?
+          AND events.seq = ?
+          AND events.type = 'user_input_received'
+        LIMIT 1`,
+    ).get(input.sessionId, input.sourceUserSeq) as (RawEventRow & { session_kind: SessionKind }) | undefined;
+    if (
+      !source
+      || source.session_kind !== 'chat'
+      || source.role !== 'user'
+      || source.turn !== input.turn
+    ) {
+      throw new Error('workflow public dispatch source is not the exact accepted chat user turn');
+    }
+    const sourceData = JSON.parse(source.data_json) as Record<string, unknown>;
+    if (sourceData.synthetic === true) {
+      throw new Error('synthetic input cannot own a workflow public dispatch');
+    }
+    const sourceTarget = normalizeExactOriginDeliveryTarget(sourceData.originReplyTarget);
+    const dispatchTarget = normalizeExactOriginDeliveryTarget(input.data.replyTarget);
+    if (
+      !sourceTarget
+      || !dispatchTarget
+      || !sameExactOriginDeliveryTarget(sourceTarget, dispatchTarget)
+      || sourceData.originReplyTargetDigest !== exactOriginDeliveryTargetDigest(sourceTarget)
+      || input.data.replyTargetDigest !== exactOriginDeliveryTargetDigest(sourceTarget)
+    ) {
+      throw new Error('workflow public dispatch target disagrees with its accepted source');
+    }
+    const priorRows = db.prepare(
+      `SELECT * FROM events
+        WHERE session_id = ?
+          AND type = 'async_work_dispatched'
+          AND json_extract(data_json, '$.sourceUserSeq') = ?
+        ORDER BY seq ASC
+        LIMIT 2`,
+    ).all(input.sessionId, input.sourceUserSeq) as RawEventRow[];
+    if (priorRows.length > 1) {
+      throw new Error('workflow public dispatch has ambiguous durable winners');
+    }
+    const prior = priorRows[0];
+    if (prior) {
+      const priorData = JSON.parse(prior.data_json) as Record<string, unknown>;
+      if (
+        prior.role !== 'system'
+        || prior.turn !== source.turn
+        || prior.parent_event_id !== source.id
+        || !isDeepStrictEqual(priorData, input.data)
+      ) {
+        throw new Error('workflow public dispatch has a conflicting durable winner');
+      }
+      return { row: prior, inserted: false };
+    }
+
+    const id = randomUUID();
+    const now = nowIso();
+    db.prepare(
+      `INSERT INTO events
+         (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+       VALUES (?, ?, ?, 'system', 'async_work_dispatched', ?, ?, ?)`,
+    ).run(
+      id,
+      input.sessionId,
+      input.turn,
+      source.id,
+      JSON.stringify(input.data),
+      now,
+    );
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+    return {
+      row: db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow,
+      inserted: true,
+    };
+  });
+
+  const winner = append.immediate();
+  const event = rowToEvent(winner.row);
+  return winner.inserted
+    ? { event: publishPersistedEvent(event), inserted: true }
+    : { event, inserted: false };
+}
+
+/**
  * Atomically insert-or-reuse an accepted user input and establish chat restart
  * ownership. This is the no-attempt twin of recordRunAttemptUserInput, used by
  * direct runConversation callers such as the CLI.
  */
+function acceptedUserDataWithOriginSnapshot(
+  db: Database.Database,
+  sessionId: string,
+  role: string,
+  rawData: Record<string, unknown>,
+): Record<string, unknown> {
+  if (role !== 'user' || rawData.synthetic === true) return rawData;
+  const explicitTargetPresent = Object.prototype.hasOwnProperty.call(rawData, 'originReplyTarget')
+    || Object.prototype.hasOwnProperty.call(rawData, 'originReplyTargetDigest');
+  const explicitTarget = normalizeExactOriginDeliveryTarget(rawData.originReplyTarget);
+  const explicitDigest = typeof rawData.originReplyTargetDigest === 'string'
+    ? rawData.originReplyTargetDigest
+    : '';
+  if (
+    explicitTargetPresent
+    && (!explicitTarget || explicitDigest !== exactOriginDeliveryTargetDigest(explicitTarget))
+  ) {
+    throw new Error('accepted user source has invalid explicit origin reply authority');
+  }
+  const sessionSnapshot = db.prepare(
+    'SELECT kind, channel, metadata_json FROM sessions WHERE id = ?',
+  ).get(sessionId) as {
+    kind?: unknown;
+    channel?: unknown;
+    metadata_json?: unknown;
+  } | undefined;
+  if (sessionSnapshot?.kind !== 'chat') return rawData;
+  let metadata: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(String(sessionSnapshot.metadata_json ?? '{}')) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      metadata = parsed as Record<string, unknown>;
+    }
+  } catch { /* invalid session metadata fails to bind an exact route */ }
+  const target = explicitTarget ?? exactOriginDeliveryTargetFromSessionSnapshot({
+    channel: typeof sessionSnapshot.channel === 'string' ? sessionSnapshot.channel : null,
+    metadata,
+  });
+  return target
+    ? {
+        ...rawData,
+        originReplyTarget: target,
+        originReplyTargetDigest: exactOriginDeliveryTargetDigest(target),
+      }
+    : rawData;
+}
+
 export function acceptUserInputForRun(
   input: Omit<AppendEventInput, 'type'>,
   options: { existingEventSeq?: number } = {},
@@ -1948,7 +2225,6 @@ export function acceptUserInputForRun(
   const db = openEventLog();
   const id = randomUUID();
   const now = nowIso();
-  const data = JSON.stringify(input.data ?? {});
   const shouldArm = (process.env.CLEMMY_CHAT_RESTART_RECOVERY ?? 'on').toLowerCase() !== 'off';
   const tx = db.transaction((): { event: EventRow; inserted: boolean } => {
     const armAcceptedChat = (): void => {
@@ -1976,6 +2252,12 @@ export function acceptUserInputForRun(
       return { event: rowToEvent(existing), inserted: false };
     }
 
+    const acceptedData = acceptedUserDataWithOriginSnapshot(
+      db,
+      input.sessionId,
+      input.role,
+      input.data ?? {},
+    );
     db.prepare(
       `INSERT INTO events
          (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
@@ -1986,7 +2268,7 @@ export function acceptUserInputForRun(
       input.turn,
       input.role,
       input.parentEventId ?? null,
-      data,
+      JSON.stringify(acceptedData),
       now,
     );
     const inserted = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
@@ -2020,7 +2302,6 @@ export function recordRunAttemptUserInput(
   const db = openEventLog();
   const id = randomUUID();
   const now = nowIso();
-  const data = JSON.stringify(input.data ?? {});
   const shouldArmRunInFlight = options.armRunInFlight === true
     && (process.env.CLEMMY_CHAT_RESTART_RECOVERY ?? 'on').toLowerCase() !== 'off';
   const tx = db.transaction((): { event: EventRow; inserted: boolean } => {
@@ -2059,6 +2340,14 @@ export function recordRunAttemptUserInput(
       armAcceptedChat();
       return { event: rowToEvent(existing), inserted: false };
     }
+
+    const acceptedData = acceptedUserDataWithOriginSnapshot(
+      db,
+      attempt.sessionId,
+      input.role,
+      input.data ?? {},
+    );
+    const data = JSON.stringify(acceptedData);
 
     db.prepare(
       `INSERT INTO events
@@ -2193,6 +2482,32 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
   // back, so reverse the result. The caller can post-reverse if they
   // truly want newest-first.
   return options.desc ? mapped.reverse() : mapped;
+}
+
+/**
+ * Bounded global recovery query for workflow batches that crossed the durable
+ * foreground close boundary but have no public dispatch winner yet. Oldest
+ * first lets repeated daemon ticks drain an arbitrarily large backlog without
+ * loading unrelated event payloads or every session into memory.
+ */
+export function listPendingAsyncWorkDispatchBatchClosedEvents(limit = 200): EventRow[] {
+  const boundedLimit = Number.isSafeInteger(limit) ? Math.max(1, Math.min(limit, 500)) : 200;
+  const rows = openEventLog().prepare(
+    `SELECT closed.*
+       FROM events AS closed
+      WHERE closed.type = 'async_work_dispatch_batch_closed'
+        AND NOT EXISTS (
+          SELECT 1
+            FROM events AS published
+           WHERE published.session_id = closed.session_id
+             AND published.type = 'async_work_dispatched'
+             AND json_extract(published.data_json, '$.sourceGroupId') = json_extract(closed.data_json, '$.sourceGroupId')
+             AND json_extract(published.data_json, '$.sourceUserSeq') = json_extract(closed.data_json, '$.sourceUserSeq')
+        )
+      ORDER BY closed.seq ASC
+      LIMIT ?`,
+  ).all(boundedLimit) as RawEventRow[];
+  return rows.map(rowToEvent);
 }
 
 /** Return the newest logical provider-level tool call without relying on a

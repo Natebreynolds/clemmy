@@ -36,6 +36,7 @@ const {
   listNotifications,
   listQueuedNotificationDeliveries,
   observeExactNotificationDeliveryReceipt,
+  reapStaleNotifications,
   recoverCorruptedNotificationDeliveryQueue,
   settleQueuedNotificationDeliveryPass,
 } = await import('./notifications.js');
@@ -149,7 +150,7 @@ test('two processes cannot enter the same stale notification generation or lose 
   }
 });
 
-test('count pruning retains every queued record and an unobserved exact receipt, then returns to the cap after settlement', () => {
+test('count pruning retains queued records and rejects a forged local exact-settlement digest', () => {
   const now = Date.now();
   const exactId = 'retention-exact-unobserved';
   const exactTarget = { type: 'discord_channel', channelId: 'C_RETENTION_EXACT' } as const;
@@ -224,19 +225,33 @@ test('count pruning retains every queued record and an unobserved exact receipt,
   assert.ok(observed?.exactDeliveryReceiptObservedAt, 'precise settlement observation is durable');
   assert.ok(observed?.exactDeliveryReceiptSettlementPendingAt, 'observation remains pending settlement');
   const settlementDigest = 'a'.repeat(64);
-  const finalized = finalizeExactNotificationDeliveryReceiptSettlement(
+  assert.equal(finalizeExactNotificationDeliveryReceiptSettlement(
     exactId,
     exactReceipt,
+    'missing-workflow-origin-group',
     settlementDigest,
-  );
-  assert.equal(finalized?.exactDeliveryReceiptSettlementDigest, settlementDigest);
-  assert.equal(finalized?.exactDeliveryReceiptSettlementPendingAt, undefined);
+  ), undefined, 'a digest without durable group authority cannot release the receipt');
+  assert.ok(getNotification(exactId)?.exactDeliveryReceiptSettlementPendingAt);
+
+  // A valid-shaped local digest is not settlement authority. Without the
+  // independently durable group receipt it must remain retention-protected.
+  const stored = JSON.parse(readFileSync(NOTIFICATIONS_FILE, 'utf-8')) as typeof retained;
+  const storedExact = stored.find((item) => item.id === exactId);
+  assert.ok(storedExact);
+  storedExact.exactDeliveryReceiptSettlementDigest = settlementDigest;
+  storedExact.exactDeliveryReceiptSettlementSourceGroupId = 'missing-workflow-origin-group';
+  delete storedExact.exactDeliveryReceiptSettlementPendingAt;
+  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify(stored, null, 2));
 
   const observedQueue = listQueuedNotificationDeliveries();
   settleQueuedNotificationDeliveryPass(observedQueue, []);
   const settled = listNotifications(2_000);
-  assert.equal(settled.length, 1_000, 'settled evidence compacts back to the normal bound');
-  assert.equal(settled.some((item) => item.id === exactId), false, 'expired observed receipt becomes prunable');
+  assert.equal(settled.length, 1_000, 'the store still compacts ordinary rows to its normal bound');
+  assert.equal(
+    settled.some((item) => item.id === exactId),
+    true,
+    'forged settlement bytes cannot make the exact carrier prunable',
+  );
   assert.deepEqual(listQueuedNotificationDeliveries(), []);
 });
 
@@ -360,6 +375,152 @@ test('boot recovery rebuilds an undelivered legacy carrier when the old queue fi
     createdAt,
     'reconstruction preserves backlog age instead of making old work fresh',
   );
+});
+
+test('an old unreceipted exact terminal survives hygiene before a missing queue is rebuilt', () => {
+  const target = { type: 'slack_channel', channelId: 'C0EXACTOLD' } as const;
+  const exact = {
+    id: 'old-exact-before-queue-rebuild',
+    kind: 'workflow' as const,
+    title: 'Old exact terminal',
+    body: 'This exact result still belongs to its admitted Slack channel.',
+    createdAt: new Date(Date.now() - 31 * 24 * 60 * 60_000).toISOString(),
+    read: false,
+    metadata: exactOriginDeliveryMetadata(target),
+  };
+  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify([exact]));
+  try { unlinkSync(DELIVERY_QUEUE_FILE); } catch { /* already absent */ }
+
+  const reaped = reapStaleNotifications(Date.now());
+  assert.equal(reaped.purged, 0, 'boot hygiene cannot outrun exact delivery recovery');
+  assert.equal(getNotification(exact.id)?.id, exact.id);
+  assert.deepEqual(recoverCorruptedNotificationDeliveryQueue(), {
+    recovered: true,
+    queued: 1,
+  });
+  assert.equal(listQueuedNotificationDeliveries()[0]?.notificationId, exact.id);
+});
+
+test('malformed nested queue cursors are quarantined before they can poison carrier arithmetic', () => {
+  const carrier = {
+    id: 'malformed-cursor-carrier',
+    kind: 'workflow' as const,
+    title: 'Durable carrier',
+    body: 'The carrier must remain readable while its retry cursor is rebuilt.',
+    createdAt: new Date().toISOString(),
+    read: false,
+  };
+  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify([carrier], null, 2));
+  writeFileSync(DELIVERY_QUEUE_FILE, JSON.stringify([{
+    notificationId: carrier.id,
+    queuedAt: carrier.createdAt,
+    completedDestinationIds: [],
+    failedDestinationIds: [],
+    attemptCountByDestination: { desktop: 'oops-not-a-number' },
+    nextAttemptAtByDestination: {},
+    lastErrorByDestination: {},
+  }], null, 2));
+
+  assert.deepEqual(listQueuedNotificationDeliveries(), []);
+  assert.ok(existsSync(DELIVERY_QUEUE_RECOVERY_FILE));
+  assert.equal(getNotification(carrier.id)?.id, carrier.id);
+  assert.equal(existsSync(NOTIFICATIONS_RECOVERY_FILE), false);
+  assert.deepEqual(recoverCorruptedNotificationDeliveryQueue(), {
+    recovered: true,
+    queued: 1,
+  });
+  const rebuilt = listQueuedNotificationDeliveries()[0];
+  assert.equal(rebuilt?.notificationId, carrier.id);
+  assert.deepEqual(rebuilt?.attemptCountByDestination, {});
+  assert.equal(existsSync(DELIVERY_QUEUE_RECOVERY_FILE), false);
+});
+
+test('duplicate carrier and queue identities are quarantined instead of choosing an arbitrary row', () => {
+  const carrier = {
+    id: 'duplicate-authority-carrier',
+    kind: 'workflow' as const,
+    title: 'One stable authority',
+    body: 'Only one row may own this id.',
+    createdAt: new Date().toISOString(),
+    read: false,
+  };
+  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify([carrier, { ...carrier }]));
+  writeFileSync(DELIVERY_QUEUE_FILE, '[]');
+
+  assert.deepEqual(listNotifications(10), []);
+  assert.ok(existsSync(NOTIFICATIONS_RECOVERY_FILE), 'duplicate carriers require explicit recovery');
+
+  unlinkSync(NOTIFICATIONS_RECOVERY_FILE);
+  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify([carrier]));
+  const duplicateJob = {
+    notificationId: carrier.id,
+    queuedAt: carrier.createdAt,
+    completedDestinationIds: [],
+    failedDestinationIds: [],
+    attemptCountByDestination: {},
+    nextAttemptAtByDestination: {},
+    lastErrorByDestination: {},
+  };
+  writeFileSync(DELIVERY_QUEUE_FILE, JSON.stringify([duplicateJob, { ...duplicateJob }]));
+
+  assert.deepEqual(listQueuedNotificationDeliveries(), []);
+  assert.ok(existsSync(DELIVERY_QUEUE_RECOVERY_FILE), 'duplicate cursors cannot enter CAS maps');
+  assert.deepEqual(recoverCorruptedNotificationDeliveryQueue(), {
+    recovered: true,
+    queued: 1,
+  });
+  assert.equal(listQueuedNotificationDeliveries()[0]?.notificationId, carrier.id);
+});
+
+test('a legacy settled exact carrier without source-group association loads and remains protected', () => {
+  const target = { type: 'discord_channel', channelId: 'C_LEGACY_SETTLED' } as const;
+  const receipt = exactOriginDeliveryDestinationId(target);
+  assert.ok(receipt);
+  const observedAt = new Date(Date.now() - 31 * 24 * 60 * 60_000).toISOString();
+  const carrier = {
+    id: 'legacy-settled-without-source-group',
+    kind: 'workflow' as const,
+    title: 'Legacy exact settlement',
+    body: 'Upgrade must retain this until real group authority backfills its source.',
+    createdAt: observedAt,
+    read: false,
+    deliveredAt: observedAt,
+    deliveredDestinations: [receipt],
+    exactDeliveryReceiptObservedAt: observedAt,
+    exactDeliveryReceiptSettlementDigest: 'c'.repeat(64),
+    metadata: exactOriginDeliveryMetadata(target),
+  };
+  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify([carrier]));
+  writeFileSync(DELIVERY_QUEUE_FILE, '[]');
+
+  assert.equal(getNotification(carrier.id)?.id, carrier.id);
+  assert.equal(existsSync(NOTIFICATIONS_RECOVERY_FILE), false, 'legacy shape is upgrade-compatible');
+  assert.equal(reapStaleNotifications(Date.now()).purged, 0);
+  assert.equal(getNotification(carrier.id)?.id, carrier.id, 'unverified legacy digest cannot release retention');
+});
+
+test('a settlement digest without exact receipt observation is impossible carrier state', () => {
+  const target = { type: 'discord_channel', channelId: 'C_FAKE_SETTLEMENT' } as const;
+  const receipt = exactOriginDeliveryDestinationId(target);
+  assert.ok(receipt);
+  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify([{
+    id: 'fake-settled-carrier',
+    kind: 'workflow',
+    title: 'Impossible settlement',
+    body: 'A random digest must not release unobserved provider evidence.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    deliveredDestinations: [receipt],
+    exactDeliveryReceiptSettlementDigest: 'b'.repeat(64),
+    metadata: exactOriginDeliveryMetadata(target),
+  }]));
+  writeFileSync(DELIVERY_QUEUE_FILE, '[]');
+
+  assert.equal(getNotification('fake-settled-carrier'), undefined);
+  assert.ok(existsSync(NOTIFICATIONS_RECOVERY_FILE));
+
+  unlinkSync(NOTIFICATIONS_RECOVERY_FILE);
+  writeFileSync(NOTIFICATIONS_FILE, '[]');
 });
 
 test('the exported observation API cannot accept a string as a delivered receipt array', () => {

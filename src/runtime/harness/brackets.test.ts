@@ -24,6 +24,7 @@ import assert from 'node:assert/strict';
 // Dynamic imports — see eventlog.test.ts for why.
 const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput, listEvents } = await import('./eventlog.js');
 const { formatRecallableToolText } = await import('./tool-output-format.js');
+const { getToolOutputContext } = await import('./tool-output-context.js');
 const {
   assertNotKilled,
   KillRequested,
@@ -655,6 +656,61 @@ test('wrapToolForHarness: forwards the execute call when flag is on', async () =
     assert.deepEqual(receivedInput, { value: 42 });
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prev;
+  }
+});
+
+test('wrapToolForHarness: invoke and execute expose the exact sourceUserSeq to tool output context', async () => {
+  const prev = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Run my workflow.' },
+  });
+  const seen: Array<{ path: string; sessionId?: string; sourceUserSeq?: number }> = [];
+  try {
+    const executeTool = wrapToolForHarness({
+      name: 'memory_search',
+      execute: async () => {
+        const context = getToolOutputContext();
+        seen.push({ path: 'execute', sessionId: context?.sessionId, sourceUserSeq: context?.sourceUserSeq });
+        return 'ok';
+      },
+    });
+    const invokeTool = wrapToolForHarness({
+      name: 'memory_search',
+      invoke: async () => {
+        const context = getToolOutputContext();
+        seen.push({ path: 'invoke', sessionId: context?.sessionId, sourceUserSeq: context?.sourceUserSeq });
+        return 'ok';
+      },
+    } as never) as unknown as {
+      invoke: (runContext: unknown, input: unknown, details: unknown) => Promise<unknown>;
+    };
+    await withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: `${session.id}::turn:1`,
+      counter: new ToolCallsCounter(4),
+    }, async () => {
+      await executeTool.execute!({ query: 'one' }, { context: { sessionId: session.id } });
+      await invokeTool.invoke(
+        { context: { sessionId: session.id } },
+        JSON.stringify({ query: 'two' }),
+        { toolCall: { callId: 'source-lineage-invoke' } },
+      );
+    });
+    assert.deepEqual(seen, [
+      { path: 'execute', sessionId: session.id, sourceUserSeq: source.seq },
+      { path: 'invoke', sessionId: session.id, sourceUserSeq: source.seq },
+    ]);
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prev;
   }
 });
 

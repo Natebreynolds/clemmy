@@ -68,11 +68,11 @@ export type ActionEvent =
       session?: HarnessSessionSignal;
     }
   | {
-      // Reliability invariant (v0.4.20+): every CodexNativeRuntime.run
-      // terminates with EXACTLY ONE of `runtime.completed` or
-      // `runtime.failed`. Subscribers (Discord, dashboard, ops log)
-      // can be sure that "no terminal event" means "the run is still
-      // in flight" — never "the run died silently."
+      // Reliability invariant (v0.4.20+): every terminal
+      // CodexNativeRuntime.run emits exactly one of `runtime.completed` or
+      // `runtime.failed`. A typed async_work_dispatched handoff intentionally
+      // emits neither: its foreground transport is released while the durable
+      // workflow edge remains logically in flight.
       //
       // The Recent Errors dashboard panel listens for runtime.failed.
       kind: 'runtime.failed';

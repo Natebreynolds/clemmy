@@ -22,6 +22,7 @@ import path from 'node:path';
 import { SessionStore } from '../memory/session-store.js';
 import { HarnessSession } from './harness/session.js';
 import { appendEvent, getSession as getHarnessSession, listEvents, type EventRow } from './harness/eventlog.js';
+import type { RunConversationOptions } from './harness/loop.js';
 import { appendGoalLedgerForSession } from '../agents/plan-proposals.js';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import pino from 'pino';
@@ -443,33 +444,74 @@ async function fireProactiveReportTurn(sessionId: string, outcome: Outcome, ctx:
   // receives the directive via runConversation's `input`; passing
   // reuseRecordedUserInput stops the loop from re-logging it as a plain
   // (un-flagged) user turn. Best-effort — the surrounding catch covers it.
-  appendEvent({
+  await runRecordedProactiveReportTurn({
     sessionId,
+    directive,
+    outcome,
+    ctx,
+    conversationOptions: {
+      agent,
+      judgeCompletion: false,
+      falloverModelIds: fallover.falloverModelIds,
+      rebuildAgentForBrain: fallover.rebuildAgentForBrain,
+    },
+  }, runConversation);
+}
+
+type ProactiveReportConversationOptions = Omit<
+  RunConversationOptions,
+  'sessionId' | 'input' | 'reuseRecordedUserInput' | 'sourceUserSeq'
+>;
+
+/**
+ * Accept the synthetic directive before starting its model turn and bind that
+ * turn to the exact row returned by appendEvent. Looking up the session's
+ * latest input inside runConversation is unsafe: a concurrent human message
+ * can arrive between these two operations and must remain a different turn.
+ */
+async function runRecordedProactiveReportTurn(
+  input: {
+    sessionId: string;
+    directive: string;
+    outcome: Pick<Outcome, 'status'>;
+    ctx: Pick<DeliverContext, 'sourceLabel' | 'sourceId'>;
+    conversationOptions: ProactiveReportConversationOptions;
+  },
+  runConversationImpl: (options: RunConversationOptions) => Promise<unknown>,
+): Promise<EventRow> {
+  const directiveSource = appendEvent({
+    sessionId: input.sessionId,
     turn: 0,
     role: 'user',
     type: 'user_input_received',
     data: {
-      text: directive,
+      text: input.directive,
       synthetic: true,
       source: 'outcome',
-      sourceLabel: ctx.sourceLabel,
-      sourceId: ctx.sourceId,
-      status: outcome.status,
+      sourceLabel: input.ctx.sourceLabel,
+      sourceId: input.ctx.sourceId,
+      status: input.outcome.status,
       deliveryPhase: 'directive',
     },
   });
-  await runConversation({
-    agent, sessionId, input: directive, judgeCompletion: false,
+  await runConversationImpl({
+    ...input.conversationOptions,
+    sessionId: input.sessionId,
+    input: input.directive,
     reuseRecordedUserInput: true,
-    falloverModelIds: fallover.falloverModelIds,
-    rebuildAgentForBrain: fallover.rebuildAgentForBrain,
+    sourceUserSeq: directiveSource.seq,
   });
+  return directiveSource;
 }
 
 let fireProactiveReportTurnImpl: typeof fireProactiveReportTurn = fireProactiveReportTurn;
 export function setProactiveReportFireForTest(fn: typeof fireProactiveReportTurn | null): void {
   fireProactiveReportTurnImpl = fn ?? fireProactiveReportTurn;
 }
+
+export const __test__ = {
+  runRecordedProactiveReportTurn,
+};
 
 // ---------------------------------------------------------------------------
 // Deferred proactive reports (2026-07-21): a proactive report that finds its

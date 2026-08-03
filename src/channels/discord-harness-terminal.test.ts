@@ -5,9 +5,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-discord-terminal-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -23,10 +24,20 @@ const {
   tryHandleHarnessApprovalReply,
   UnboundDurableApprovalReplyError,
 } = await import('./discord-harness.js');
-const { createSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const { appendEvent, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
-const { bindInboundSource, claimInbound, getInbound } = await import('./inbox-store.js');
+const { bindInboundSource, claimInbound, completeInbound, getInbound } = await import('./inbox-store.js');
+const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const {
+  createWorkflowChatDispatchPreparationAuthority,
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupClosedBatch,
+} = await import('../execution/workflow-origin-group.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -34,6 +45,62 @@ test.after(() => {
 
 function terminalEvents(sessionId: string) {
   return listEvents(sessionId, { types: ['conversation_completed'] });
+}
+
+function appendActiveWorkflowDispatch(source: import('../runtime/harness/eventlog.js').EventRow, runId: string) {
+  const replyTarget = source.data.originReplyTarget as { type: 'discord_channel'; channelId: string };
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'test-workflow',
+    status: 'awaiting_chat_dispatch_seal',
+  }), 'utf-8');
+  const authority = createWorkflowChatDispatchPreparationAuthority({
+    runId,
+    observer: { sessionId: source.sessionId, sourceUserSeq: source.seq, replyTarget },
+    queueRequestDigest: createHash('sha256').update(`terminal-test:${runId}`).digest('hex'),
+  });
+  const prepared = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_prepared',
+    parentEventId: source.id,
+    data: { ...authority },
+  });
+  const receipt = recordWorkflowChatDispatchPreparation(createWorkflowChatDispatchPreparedReceipt(authority, {
+    eventId: prepared.id,
+    eventSeq: prepared.seq,
+    preparedAt: prepared.createdAt,
+  }));
+  const closeAuthority = createWorkflowOriginGroupCloseAuthority([receipt]);
+  const closed = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_batch_closed',
+    parentEventId: source.id,
+    data: { ...closeAuthority },
+  });
+  recordWorkflowOriginGroupClosedBatch({
+    receipt: createWorkflowOriginGroupClosedBatchReceipt(closeAuthority, {
+      eventId: closed.id,
+      eventSeq: closed.seq,
+      closedAt: closed.createdAt,
+    }),
+    preparedReceipts: [receipt],
+  });
+  const active = finalizeWorkflowOriginGroupClosedBatch(receipt.sourceGroupId, {
+    beforeMemberRelease: () => {},
+  });
+  return appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatched',
+    parentEventId: source.id,
+    data: { ...active.publicDispatch, replyTarget: active.sealed.replyTarget },
+  });
 }
 
 function recordingTransport() {
@@ -70,7 +137,42 @@ test('accepted channel requests persist their typed progress presentation for ap
       'Do not narrate your plan or tool calls. Return only the verified answer.',
     );
     assert.equal(accepted.data.progressPresentation, 'quiet');
+    assert.deepEqual(accepted.data.originReplyTarget, {
+      type: 'discord_channel',
+      channelId: 'chan-quiet-policy',
+    });
+    assert.match(String(accepted.data.originReplyTargetDigest), /^[a-f0-9]{64}$/);
     assert.equal(__test__.progressPresentationForSessionForTest(session.id), 'quiet');
+  } finally {
+    __test__.unregisterActiveChannelRunForTest(active);
+  }
+});
+
+test('accepted Slack source freezes the active thread even if session metadata was rebound', () => {
+  const session = createSession({
+    kind: 'chat',
+    channel: 'slack',
+    metadata: { channelId: 'C0NEWERBINDING' },
+  });
+  const active = __test__.registerActiveChannelRunForTest({
+    channel: 'slack',
+    channelId: 'C0ORIGINAL:1785763575.123456',
+    userId: 'U-source',
+    guildId: 'T-team',
+    sessionId: session.id,
+  });
+  try {
+    const accepted = __test__.recordActiveChannelUserInputForTest(
+      active,
+      'Run it here.',
+      'Run it here.',
+    );
+    assert.deepEqual(accepted.data.originReplyTarget, {
+      type: 'slack_channel',
+      channelId: 'C0ORIGINAL',
+      threadTs: '1785763575.123456',
+    });
+    assert.match(String(accepted.data.originReplyTargetDigest), /^[a-f0-9]{64}$/);
   } finally {
     __test__.unregisterActiveChannelRunForTest(active);
   }
@@ -113,6 +215,43 @@ function typedTerminalStatus(sessionId: string): string | undefined {
   const terminal = terminalEvents(sessionId)[0];
   return (terminal?.data.turnOutcome as { status?: string } | undefined)?.status;
 }
+
+test('provider replied means dispatch ACK delivered while the exact logical edge remains pending', () => {
+  const session = createSession({ kind: 'chat', channel: 'discord' });
+  const provider = durableProviderRequest('chan-dispatch-ack', 'run the report', session.id);
+  const active = __test__.registerActiveChannelRunForTest({
+    channel: 'discord',
+    channelId: 'chan-dispatch-ack',
+    userId: 'user-dispatch-ack',
+    guildId: null,
+    sessionId: session.id,
+    runId: provider.durableRequest.runId,
+  });
+  try {
+    const accepted = __test__.recordActiveChannelUserInputForTest(active, 'run the report', 'run the report');
+    provider.durableRequest.onSourceAccepted(accepted);
+    appendActiveWorkflowDispatch(accepted, 'workflow-run-ack');
+
+    const outcome = __test__.acceptedChannelOutcome(accepted);
+    assert.equal(outcome?.kind, 'dispatched');
+    assert.equal(outcome?.text, 'Started — I’ll post the result here when it’s ready.');
+    assert.equal(terminalEvents(session.id).length, 0);
+
+    // The provider row accounts for ingress/ACK delivery, not logical work
+    // completion. The durable async event is still the pending report-back edge.
+    completeInbound({
+      channel: provider.channel,
+      sourceMessageId: provider.sourceMessageId,
+      status: 'replied',
+      runId: provider.durableRequest.runId,
+    });
+    assert.equal(getInbound(provider.channel, provider.sourceMessageId)?.status, 'replied');
+    assert.equal(listEvents(session.id, { types: ['async_work_dispatched'] }).length, 1);
+    assert.equal(terminalEvents(session.id).length, 0);
+  } finally {
+    __test__.unregisterActiveChannelRunForTest(active, 'completed');
+  }
+});
 
 test('fresh Discord /goal outcome owns the newly accepted user turn', () => {
   const session = createSession({ kind: 'chat', channel: 'discord' });

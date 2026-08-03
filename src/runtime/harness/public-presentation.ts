@@ -37,6 +37,8 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'cross_session_prefix',
   'agent_context_packet',
   'turn_graph_compiled',
+  'async_work_dispatch_prepared',
+  'async_work_dispatch_batch_closed',
   'turn_memory_primer',
   'guardrail_tripped',
   'stuck_detected',
@@ -137,6 +139,70 @@ function selected(data: Record<string, unknown>, keys: readonly string[]): Recor
     if (data[key] !== undefined) out[key] = data[key];
   }
   return out;
+}
+
+const PUBLIC_WORKFLOW_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
+const PUBLIC_SHA256_DIGEST_RE = /^[a-f0-9]{64}$/;
+
+export interface PublicAsyncWorkDispatchedData extends Record<string, unknown> {
+  version: 2;
+  kind: 'workflow_run_group';
+  status: 'dispatched';
+  sourceUserSeq: number;
+  sourceGroupId: string;
+  sourceGroupDigest: string;
+  runIds: string[];
+  dispatchKey: string;
+  /** Immutable digest of the exact destination captured at queue admission. */
+  replyTargetDigest: string;
+  /** Deterministic runtime copy. Model prose never enters this field. */
+  text: string;
+}
+
+/** Validate and project the only public async-dispatch shape. */
+export function publicAsyncWorkDispatchedData(
+  data: Record<string, unknown>,
+): PublicAsyncWorkDispatchedData | null {
+  const sourceUserSeq = data.sourceUserSeq;
+  const sourceGroupId = typeof data.sourceGroupId === 'string' ? data.sourceGroupId.trim() : '';
+  const sourceGroupDigest = typeof data.sourceGroupDigest === 'string'
+    ? data.sourceGroupDigest.trim()
+    : '';
+  const runIds = Array.isArray(data.runIds)
+    ? data.runIds.map((runId) => typeof runId === 'string' ? runId.trim() : '')
+    : [];
+  const replyTargetDigest = typeof data.replyTargetDigest === 'string'
+    ? data.replyTargetDigest.trim()
+    : '';
+  if (
+    data.version !== 2
+    || data.kind !== 'workflow_run_group'
+    || data.status !== 'dispatched'
+    || !Number.isSafeInteger(sourceUserSeq)
+    || Number(sourceUserSeq) <= 0
+    || !/^workflow-origin-group-v1:[a-f0-9]{64}$/.test(sourceGroupId)
+    || !PUBLIC_SHA256_DIGEST_RE.test(sourceGroupDigest)
+    || runIds.length === 0
+    || runIds.some((runId) => !PUBLIC_WORKFLOW_RUN_ID_RE.test(runId))
+    || new Set(runIds).size !== runIds.length
+    || !PUBLIC_SHA256_DIGEST_RE.test(replyTargetDigest)
+  ) return null;
+  const dispatchKey = `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}`;
+  if (data.dispatchKey !== dispatchKey) return null;
+  return {
+    version: 2,
+    kind: 'workflow_run_group',
+    status: 'dispatched',
+    sourceUserSeq: Number(sourceUserSeq),
+    sourceGroupId,
+    sourceGroupDigest,
+    runIds,
+    dispatchKey,
+    replyTargetDigest,
+    text: runIds.length === 1
+      ? 'Started — I’ll post the result here when it’s ready.'
+      : `Started ${runIds.length} workflows — I’ll post one combined result here when they’re ready.`,
+  };
 }
 
 function pendingActionProjection(value: unknown): Record<string, unknown> | undefined {
@@ -376,6 +442,8 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     }
     case 'conversation_completed':
       return terminalData(data, event.sessionId);
+    case 'async_work_dispatched':
+      return publicAsyncWorkDispatchedData(data);
     case 'awaiting_user_input': {
       const question = publicReplyText(data.question, 'I need your input before I can continue.');
       return {

@@ -4,7 +4,8 @@
  */
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -14,6 +15,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 
 const { __test__ } = await import('./slack.js');
 const {
+  appendEvent,
   beginRunAttempt,
   createSession,
   listEvents,
@@ -22,6 +24,19 @@ const {
 } = await import('../runtime/harness/eventlog.js');
 const { completeInbound, getInbound } = await import('./inbox-store.js');
 const { PUBLIC_CHANNEL_FAILURE_TEXT } = await import('./public-failure.js');
+const { publicAsyncWorkDispatchedData } = await import('../runtime/harness/public-presentation.js');
+const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const {
+  createWorkflowChatDispatchPreparationAuthority,
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupClosedBatch,
+} = await import('../execution/workflow-origin-group.js');
 
 after(() => {
   resetEventLog();
@@ -42,6 +57,80 @@ function fakeSlackClient() {
     },
   };
   return { client, posts };
+}
+
+function appendActiveWorkflowDispatch(
+  source: import('../runtime/harness/eventlog.js').EventRow,
+  runId: string,
+) {
+  const replyTarget = source.data.originReplyTarget as import('../runtime/exact-origin-delivery.js').ExactOriginDeliveryTarget;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'slack-dispatch-test',
+    status: 'awaiting_chat_dispatch_seal',
+  }), 'utf-8');
+  const authority = createWorkflowChatDispatchPreparationAuthority({
+    runId,
+    observer: { sessionId: source.sessionId, sourceUserSeq: source.seq, replyTarget },
+    queueRequestDigest: createHash('sha256').update(`slack-dispatch:${runId}`).digest('hex'),
+  });
+  const prepared = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_prepared',
+    parentEventId: source.id,
+    data: { ...authority },
+  });
+  const receipt = recordWorkflowChatDispatchPreparation(createWorkflowChatDispatchPreparedReceipt(authority, {
+    eventId: prepared.id,
+    eventSeq: prepared.seq,
+    preparedAt: prepared.createdAt,
+  }));
+  const closeAuthority = createWorkflowOriginGroupCloseAuthority([receipt]);
+  const closed = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_batch_closed',
+    parentEventId: source.id,
+    data: { ...closeAuthority },
+  });
+  recordWorkflowOriginGroupClosedBatch({
+    receipt: createWorkflowOriginGroupClosedBatchReceipt(closeAuthority, {
+      eventId: closed.id,
+      eventSeq: closed.seq,
+      closedAt: closed.createdAt,
+    }),
+    preparedReceipts: [receipt],
+  });
+  const active = finalizeWorkflowOriginGroupClosedBatch(receipt.sourceGroupId, {
+    beforeMemberRelease: () => {},
+  });
+  return appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatched',
+    parentEventId: source.id,
+    data: { ...active.publicDispatch, replyTarget: active.sealed.replyTarget },
+  });
+}
+
+function commitAnswerForSource(
+  source: import('../runtime/harness/eventlog.js').EventRow,
+  text: string,
+) {
+  const identity = { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+  return commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text },
+  }, { legacyReason: 'slack_dispatch_test_terminal' });
 }
 
 test('Slack stale retry after accepted-source crash fails closed with one source and one terminal', async () => {
@@ -141,4 +230,103 @@ test('Slack provider id payload conflict fails before source acceptance or work'
   assert.equal(receipt?.runId, original.identity.runId);
   assert.equal(receipt?.sourceUserSeq, undefined);
   assert.equal(receipt?.attempts, 1);
+});
+
+test('Slack stale retry replays a verified workflow dispatch without stealing its later terminal', async () => {
+  resetEventLog();
+  const channelId = 'C0ASYNCREPLAY';
+  const sourceMessageId = '1785000002.000100';
+  const userId = 'U0ASYNCREPLAY';
+  const prompt = 'prepare the long sales analysis and post it back here';
+  const ingress = __test__.claimSlackInboundRequest({
+    channelId,
+    sourceMessageId,
+    userId,
+    prompt,
+  });
+  const session = createSession({
+    id: 'sess-slack-verified-dispatch-replay',
+    kind: 'chat',
+    channel: 'slack',
+    userId,
+    metadata: { source: 'slack', channelId },
+  });
+  const crashedAttempt = beginRunAttempt(session.id, { runId: ingress.identity.runId });
+  const accepted = recordRunAttemptUserInput(crashedAttempt, {
+    turn: 1,
+    role: 'user',
+    data: {
+      text: prompt,
+      displayText: prompt,
+      source: 'slack',
+      runId: ingress.identity.runId,
+      attemptId: crashedAttempt.attemptId,
+    },
+  }, { armRunInFlight: true });
+  __test__.bindSlackInboundAcceptedSource(ingress, accepted);
+  const dispatch = appendActiveWorkflowDispatch(accepted, 'workflow-slack-verified-dispatch');
+  const expectedAck = publicAsyncWorkDispatchedData(dispatch.data)?.text;
+  assert.ok(expectedAck);
+  completeInbound({
+    ...ingress.inboxKey,
+    runId: ingress.identity.runId,
+    status: 'failed',
+    error: 'transport process exited after durable dispatch',
+  });
+
+  const { client, posts } = fakeSlackClient();
+  await __test__.dispatchInbound({
+    client: client as never,
+    channelId,
+    userId,
+    ts: sourceMessageId,
+    prompt,
+  });
+
+  assert.equal(posts.length, 1);
+  assert.equal(String(posts[0].text), expectedAck);
+  assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 1);
+  assert.equal(listEvents(session.id, { types: ['async_work_dispatched'] }).length, 1);
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 0,
+    'a dispatch acknowledgement is not the conversation terminal');
+  assert.equal(getInbound(ingress.inboxKey.channel, sourceMessageId)?.status, 'replied');
+
+  const committed = commitAnswerForSource(accepted, 'The sales analysis is ready.');
+  assert.equal(committed.inserted, true, 'the workflow result retains first-terminal authority');
+  assert.equal(committed.presentation.text, 'The sales analysis is ready.');
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+});
+
+test('Slack replied duplicate is inert at the shouldProcess boundary', async () => {
+  resetEventLog();
+  const channelId = 'C0REPLIEDINERT';
+  const sourceMessageId = '1785000003.000100';
+  const userId = 'U0REPLIEDINERT';
+  const prompt = 'this provider delivery was already answered';
+  const ingress = __test__.claimSlackInboundRequest({
+    channelId,
+    sourceMessageId,
+    userId,
+    prompt,
+  });
+  completeInbound({
+    ...ingress.inboxKey,
+    runId: ingress.identity.runId,
+    status: 'replied',
+  });
+  const { client, posts } = fakeSlackClient();
+
+  await __test__.dispatchInbound({
+    client: client as never,
+    channelId,
+    userId,
+    ts: sourceMessageId,
+    prompt,
+  });
+
+  assert.equal(posts.length, 0, 'replied duplicates never enter commands, model, tools, or transport');
+  const receipt = getInbound(ingress.inboxKey.channel, sourceMessageId);
+  assert.equal(receipt?.status, 'replied');
+  assert.equal(receipt?.attempts, 1);
+  assert.equal(receipt?.sourceUserSeq, undefined);
 });

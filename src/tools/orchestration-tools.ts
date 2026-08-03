@@ -71,7 +71,24 @@ import { listFinalFailedItems } from '../execution/workflow-events.js';
 import { queueWorkflowRun, queueWorkflowCreationTest, requeueWorkflowFailedItemsFromRun } from './workflow-run-queue.js';
 import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
-import { listEvents, getSession } from '../runtime/harness/eventlog.js';
+import {
+  appendEvent,
+  listEvents,
+  getSession,
+  type AppendEventInput,
+  type EventRow,
+} from '../runtime/harness/eventlog.js';
+import { workflowOriginReplyTargetForSource } from '../runtime/workflow-origin-authority.js';
+import {
+  exactOriginDeliveryTargetDigest,
+  sameExactOriginDeliveryTarget,
+} from '../runtime/exact-origin-delivery.js';
+import {
+  createWorkflowChatDispatchPreparedReceipt,
+  recordWorkflowChatDispatchPreparation,
+  type WorkflowChatDispatchPreparationAuthority,
+  type WorkflowChatDispatchPreparedReceipt,
+} from '../execution/workflow-origin-group.js';
 import {
   resolveWorkflowName,
   workflowNamesEqual,
@@ -129,6 +146,86 @@ export interface AuthoredWorkflowResult {
   boundNotes: string[];
   advisories: string[];
   gaps: ReturnType<typeof analyzeWorkflowGaps>;
+}
+
+type WorkflowDispatchEventAppender = (input: AppendEventInput) => EventRow;
+let appendWorkflowDispatchEvent: WorkflowDispatchEventAppender = appendEvent;
+
+/** Test seam for proving a queue success cannot become a safe ACK when the
+ * load-bearing graph event fails to persist. */
+export function _setWorkflowDispatchEventAppenderForTests(
+  appender?: WorkflowDispatchEventAppender | null,
+): void {
+  appendWorkflowDispatchEvent = appender ?? appendEvent;
+}
+
+function prepareWorkflowChatDispatch(
+  authority: WorkflowChatDispatchPreparationAuthority,
+): WorkflowChatDispatchPreparedReceipt {
+  const source = listEvents(authority.originSessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === authority.sourceUserSeq);
+  const sourceTarget = workflowOriginReplyTargetForSource({
+    sessionId: authority.originSessionId,
+    sourceUserSeq: authority.sourceUserSeq,
+  });
+  if (
+    !source
+    || source.role !== 'user'
+    || source.data.synthetic === true
+    || !sourceTarget
+    || authority.replyTargetDigest !== exactOriginDeliveryTargetDigest(sourceTarget)
+    || !sameExactOriginDeliveryTarget(authority.replyTarget, sourceTarget)
+  ) {
+    throw new Error('workflow dispatch preparation is not bound to an exact accepted human source');
+  }
+  const evidenceFor = (event: EventRow) => ({
+    eventId: event.id,
+    eventSeq: event.seq,
+    preparedAt: event.createdAt,
+  });
+  const existing = listEvents(authority.originSessionId, { types: ['async_work_dispatch_prepared'] })
+    .find((event) => (
+      event.data.sourceGroupId === authority.sourceGroupId
+      && event.data.runId === authority.runId
+    ));
+  if (existing) {
+    const winner = createWorkflowChatDispatchPreparedReceipt(
+      existing.data as unknown as WorkflowChatDispatchPreparationAuthority,
+      evidenceFor(existing),
+    );
+    if (
+      existing.role !== 'system'
+      || existing.turn !== source.turn
+      || existing.parentEventId !== source.id
+      || winner.preparationDigest !== authority.preparationDigest
+    ) {
+      throw new Error('workflow dispatch preparation has a conflicting durable winner');
+    }
+    return recordWorkflowChatDispatchPreparation(winner);
+  }
+
+  const event = appendWorkflowDispatchEvent({
+    sessionId: authority.originSessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_prepared',
+    parentEventId: source.id,
+    // Private graph authority. Public projection rejects this event type.
+    data: { ...authority },
+  });
+  const persisted = createWorkflowChatDispatchPreparedReceipt(
+    event.data as unknown as WorkflowChatDispatchPreparationAuthority,
+    evidenceFor(event),
+  );
+  if (
+    event.role !== 'system'
+    || event.turn !== source.turn
+    || event.parentEventId !== source.id
+    || persisted.preparationDigest !== authority.preparationDigest
+  ) {
+    throw new Error('workflow dispatch preparation did not persist with its exact source identity');
+  }
+  return recordWorkflowChatDispatchPreparation(persisted);
 }
 
 /**
@@ -1443,8 +1540,41 @@ export function registerOrchestrationTools(server: McpServer): void {
       // terminal state (in-context report-back, in ADDITION to the global
       // notification). toolCtx is the agent's tool-output context resolved
       // above; absent for non-chat callers → notification-only.
-      const queued = queueWorkflowRun(canonicalName, normalizedInputs, { originSessionId: toolCtx?.sessionId });
-      if (queued.id && (queued.status === 'queued' || queued.status === 'duplicate')) {
+      const exactOrigin = toolCtx?.sessionId
+        && Number.isSafeInteger(toolCtx.sourceUserSeq)
+        && (toolCtx.sourceUserSeq ?? 0) > 0
+        ? { sessionId: toolCtx.sessionId, sourceUserSeq: toolCtx.sourceUserSeq as number }
+        : undefined;
+      const exactSource = exactOrigin
+        ? listEvents(exactOrigin.sessionId, { types: ['user_input_received'] })
+            .find((event) => event.seq === exactOrigin.sourceUserSeq)
+        : undefined;
+      const replyTarget = exactOrigin
+        ? workflowOriginReplyTargetForSource(exactOrigin)
+        : null;
+      if (exactOrigin && (!exactSource || !replyTarget)) {
+        return textResult(
+          `Workflow "${canonicalName}" was not queued because this chat's exact report-back target could not be bound safely.`,
+        );
+      }
+      const originObserver = exactOrigin && replyTarget
+        ? { ...exactOrigin, replyTarget }
+        : undefined;
+      const queued = queueWorkflowRun(canonicalName, normalizedInputs, {
+        ...(originObserver
+          ? {
+              originObserver,
+              prepareChatDispatch: prepareWorkflowChatDispatch,
+            }
+          : { originSessionId: toolCtx?.sessionId }),
+      });
+      const acceptedDispatch = Boolean(queued.chatDispatchPreparation)
+        || queued.status === 'queued'
+        || queued.status === 'duplicate';
+      if (acceptedDispatch && !queued.id) {
+        throw new Error('workflow queue accepted a run without returning its durable run id');
+      }
+      if (queued.id && acceptedDispatch && !queued.chatDispatchPreparation) {
         linkFocusActionForSession(toolCtx?.sessionId, {
           id: queued.id,
           label: canonicalName,

@@ -8,7 +8,9 @@
  */
 import { test, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 const TEST_HOME = '/tmp/clemmy-test-respond-bridge';
 process.env.CLEMENTINE_HOME = TEST_HOME;
@@ -27,6 +29,8 @@ const {
   appendEvent,
   beginRunAttempt,
   createSession,
+  finishRunAttempt,
+  getLatestRunAttempt,
   getSession,
   listEvents,
   recordRunAttemptUserInput,
@@ -34,6 +38,11 @@ const {
 } = await import('./eventlog.js');
 // eslint-disable-next-line import/first
 const { AgentRuntimeCancelledError } = await import('../provider.js');
+// eslint-disable-next-line import/first
+const {
+  respondViaClaudeAgentSdkBrain,
+  setClaudeAgentSdkBrainRunForTest,
+} = await import('./claude-agent-brain.js');
 // eslint-disable-next-line import/first
 const { ClaudeSdkCapacityExhaustedError, ClaudeSdkProviderOverloadError } = await import('./claude-agent-sdk.js');
 // eslint-disable-next-line import/first
@@ -44,6 +53,37 @@ const { actionBus } = await import('../action-bus.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
 // eslint-disable-next-line import/first
 const { HarnessSession } = await import('./session.js');
+// eslint-disable-next-line import/first
+const { commitTurnOutcome } = await import('./delivery-committer.js');
+// eslint-disable-next-line import/first
+const { turnOutcomeId } = await import('./turn-outcome.js');
+// eslint-disable-next-line import/first
+const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
+// eslint-disable-next-line import/first
+const {
+  queueWorkflowRun,
+  workflowChatDispatchQueueRequestDigest,
+} = await import('../../tools/workflow-run-queue.js');
+// eslint-disable-next-line import/first
+const { writeWorkflow } = await import('../../memory/workflow-store.js');
+// eslint-disable-next-line import/first
+const {
+  clearRunInFlightAfterTerminal,
+  recoverInterruptedChatRuns,
+} = await import('./restart-recovery.js');
+// eslint-disable-next-line import/first
+const { finalizePreparedWorkflowDispatchForSource } = await import('./loop.js');
+// eslint-disable-next-line import/first
+const {
+  createWorkflowChatDispatchPreparationAuthority,
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupClosedBatch,
+  workflowOriginSourceGroupId,
+} = await import('../../execution/workflow-origin-group.js');
 
 const FAKE_AGENT = {} as never;
 const okConfigure = (async () => ({ ok: true })) as never;
@@ -58,8 +98,65 @@ function fakeRun(result: Record<string, unknown>): never {
   })) as never;
 }
 
+function appendActiveWorkflowDispatch(source: import('./eventlog.js').EventRow, runId: string): void {
+  const replyTarget = source.data.originReplyTarget as { type: 'origin_chat' };
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'test-workflow',
+    status: 'awaiting_chat_dispatch_seal',
+  }), 'utf-8');
+  const authority = createWorkflowChatDispatchPreparationAuthority({
+    runId,
+    observer: { sessionId: source.sessionId, sourceUserSeq: source.seq, replyTarget },
+    queueRequestDigest: createHash('sha256').update(`bridge-test:${runId}`).digest('hex'),
+  });
+  const prepared = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_prepared',
+    parentEventId: source.id,
+    data: { ...authority },
+  });
+  const receipt = recordWorkflowChatDispatchPreparation(createWorkflowChatDispatchPreparedReceipt(authority, {
+    eventId: prepared.id,
+    eventSeq: prepared.seq,
+    preparedAt: prepared.createdAt,
+  }));
+  const closeAuthority = createWorkflowOriginGroupCloseAuthority([receipt]);
+  const closed = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_batch_closed',
+    parentEventId: source.id,
+    data: { ...closeAuthority },
+  });
+  recordWorkflowOriginGroupClosedBatch({
+    receipt: createWorkflowOriginGroupClosedBatchReceipt(closeAuthority, {
+      eventId: closed.id,
+      eventSeq: closed.seq,
+      closedAt: closed.createdAt,
+    }),
+    preparedReceipts: [receipt],
+  });
+  const active = finalizeWorkflowOriginGroupClosedBatch(receipt.sourceGroupId, {
+    beforeMemberRelease: () => {},
+  });
+  appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatched',
+    parentEventId: source.id,
+    data: { ...active.publicDispatch, replyTarget: active.sealed.replyTarget },
+  });
+}
+
 beforeEach(() => {
   resetEventLog();
+  setClaudeAgentSdkBrainRunForTest(null);
   capabilityHealth._resetHarnessCapabilityHealthForTest();
   _setBridgeImplsForTests({});
   delete process.env.CLEMMY_HARNESS_WEBHOOK;
@@ -72,6 +169,7 @@ beforeEach(() => {
   delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   delete process.env.CLEMMY_BRAIN_FALLOVER;
+  delete process.env.CLEMMY_CHAT_AUTO_RESUME;
   delete process.env.MODEL_ROUTING_MODE;
   delete process.env.BYO_MODEL_BASE_URL;
   delete process.env.BYO_MODEL_API_KEY;
@@ -83,6 +181,7 @@ beforeEach(() => {
 });
 
 after(() => {
+  setClaudeAgentSdkBrainRunForTest(null);
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
@@ -1425,6 +1524,305 @@ test('respondViaHarness: completed maps to AssistantResponse with reply preferre
   const session = getSession('bridge-t5');
   assert.ok(session, 'harness session created');
   assert.equal(session?.kind, 'chat', 'webhook surface creates a chat-kind session');
+});
+
+test('respondViaHarness: typed async dispatch returns a deterministic ACK without a false terminal', async () => {
+  const sessionId = 'bridge-typed-dispatch';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number }) => {
+      const source = listEvents(opts.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === opts.sourceUserSeq);
+      assert.ok(source);
+      appendActiveWorkflowDispatch(source, 'bridge-run-123');
+      return {
+        sessionId: opts.sessionId,
+        status: 'dispatched',
+        steps: 1,
+        lastTurn: 1,
+      };
+    }) as never,
+  });
+
+  const response = await respondViaHarness('home', {
+    message: 'Run the saved workflow.',
+    sessionId,
+    channel: 'desktop',
+  });
+  assert.equal(
+    response.text,
+    'Started — I’ll post the result here when it’s ready.',
+  );
+  assert.equal(response.stoppedReason, 'success', 'the synchronous provider request delivered its ACK');
+  const publicDispatch = listEvents(sessionId, { types: ['async_work_dispatched'] })[0];
+  assert.match(String(publicDispatch.data.sourceGroupId), /^workflow-origin-group-v1:[a-f0-9]{64}$/);
+  assert.deepEqual((response.raw as { asyncWork?: unknown }).asyncWork, {
+    status: 'dispatched',
+    kind: 'workflow_run_group',
+    runIds: ['bridge-run-123'],
+    sourceGroupId: publicDispatch.data.sourceGroupId,
+    sourceGroupDigest: publicDispatch.data.sourceGroupDigest,
+    sourceUserSeq: listEvents(sessionId, { types: ['user_input_received'] })[0].seq,
+    dispatchKey: publicDispatch.data.dispatchKey,
+  });
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
+});
+
+test('respondViaHarness: restart-owned held admission never becomes a failed terminal and resumes the same run', async () => {
+  const sessionId = 'bridge-restart-owned-dispatch';
+  const workflowName = 'restart-owned-bridge-workflow';
+  const runId = 'bridge-restart-owned-run';
+  rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+  writeWorkflow(workflowName, {
+    name: workflowName,
+    description: 'Restart-owned bridge recovery fixture.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'work', prompt: 'Perform the admitted read-only work.', sideEffect: 'read' }],
+  });
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number }) => {
+      const source = listEvents(opts.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === opts.sourceUserSeq);
+      assert.ok(source);
+      const sourceGroupId = workflowOriginSourceGroupId({
+        sessionId: source.sessionId,
+        sourceUserSeq: source.seq,
+      });
+      mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+      writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+        id: runId,
+        workflow: workflowName,
+        inputs: {},
+        status: 'awaiting_chat_dispatch_seal',
+        createdAt: new Date().toISOString(),
+        chatDispatchSourceGroupId: sourceGroupId,
+        chatDispatchQueueRequestDigest: workflowChatDispatchQueueRequestDigest({
+          workflowName,
+          normalizedInputs: {},
+        }),
+      }), 'utf-8');
+
+      // This is the real public terminal boundary, not a synthetic thrown
+      // fixture. The committer emits the typed restart-owned control signal
+      // because the queue record won before its preparation callback/event.
+      const identity = {
+        sessionId: source.sessionId,
+        turn: source.turn,
+        sourceUserSeq: source.seq,
+      };
+      commitTurnOutcome({
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'failed',
+        resumable: false,
+        presentation: { kind: 'error', text: PUBLIC_RUN_FAILURE_TEXT },
+      });
+      assert.fail('held workflow ownership must reject a failed terminal');
+    }) as never,
+  });
+
+  const response = await respondViaHarness('home', {
+    message: 'Run the restart-owned workflow.',
+    sessionId,
+    channel: 'desktop',
+  });
+  const source = listEvents(sessionId, { types: ['user_input_received'] })[0];
+  const attempt = getLatestRunAttempt(sessionId);
+  assert.ok(attempt);
+  assert.equal(response.stoppedReason, 'awaiting-input');
+  assert.match(response.text, /preserved the original request/i);
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
+  assert.equal(listEvents(sessionId, { types: ['run_paused'] }).at(-1)?.data.reason,
+    'prepared_workflow_dispatch_restart_owned');
+  assert.ok(HarnessSession.load(sessionId)?.runInFlightSince(), 'the atomic chat marker remains armed');
+  assert.equal(attempt.status, 'active', 'the bridge does not settle the restart-owned attempt as failed');
+  assert.equal(
+    JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')).status,
+    'awaiting_chat_dispatch_seal',
+  );
+
+  const reusedRunIds: string[] = [];
+  process.env.CLEMMY_CHAT_AUTO_RESUME = 'on';
+  const summary = recoverInterruptedChatRuns(
+    () => Date.now() + 1_000,
+    async (recoveredSessionId, _directive, sourceUserSeq) => {
+      assert.equal(recoveredSessionId, sessionId);
+      assert.equal(sourceUserSeq, source.seq);
+      const replyTarget = source.data.originReplyTarget as { type: 'origin_chat' };
+      const retried = queueWorkflowRun(workflowName, {}, {
+        originSessionId: sessionId,
+        originObserver: { sessionId, sourceUserSeq, replyTarget },
+        prepareChatDispatch: (authority) => {
+          const prepared = appendEvent({
+            sessionId,
+            turn: source.turn,
+            role: 'system',
+            type: 'async_work_dispatch_prepared',
+            parentEventId: source.id,
+            data: { ...authority },
+          });
+          return recordWorkflowChatDispatchPreparation(
+            createWorkflowChatDispatchPreparedReceipt(authority, {
+              eventId: prepared.id,
+              eventSeq: prepared.seq,
+              preparedAt: prepared.createdAt,
+            }),
+          );
+        },
+      });
+      assert.equal(retried.status, 'duplicate');
+      assert.equal(retried.id, runId);
+      reusedRunIds.push(retried.id!);
+      const dispatch = finalizePreparedWorkflowDispatchForSource(sessionId, sourceUserSeq);
+      assert.deepEqual(dispatch?.presentation.runIds, [runId]);
+      assert.equal(
+        clearRunInFlightAfterTerminal(sessionId, attempt.attemptId, sourceUserSeq),
+        true,
+        'activation transfers ownership before the original marker is released',
+      );
+      finishRunAttempt(attempt, 'completed');
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  delete process.env.CLEMMY_CHAT_AUTO_RESUME;
+
+  assert.equal(summary.records[0]?.autoResumed, true);
+  assert.deepEqual(reusedRunIds, [runId], 'restart dedupes to the already-admitted canonical run');
+  assert.equal(
+    readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).length,
+    1,
+    'recovery does not create a replacement run',
+  );
+  assert.equal(
+    JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')).status,
+    'queued',
+  );
+  assert.equal(listEvents(sessionId, { types: ['async_work_dispatched'] }).length, 1);
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
+  assert.equal(HarnessSession.load(sessionId)?.runInFlightSince(), null);
+  assert.equal(getLatestRunAttempt(sessionId)?.status, 'completed');
+});
+
+test('respondPreferHarness: Claude wrapper preserves a record-before-preparation admission for exact restart', async () => {
+  const sessionId = 'claude-bridge-restart-owned-dispatch';
+  const workflowName = 'claude-restart-owned-bridge-workflow';
+  const runId = 'claude-bridge-restart-owned-run';
+  rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+  writeWorkflow(workflowName, {
+    name: workflowName,
+    description: 'Claude restart-owned bridge recovery fixture.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'work', prompt: 'Perform the admitted read-only work.', sideEffect: 'read' }],
+  });
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    claudeAgentBrain: respondViaClaudeAgentSdkBrain,
+  });
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    assert.equal(options.sessionId, sessionId);
+    assert.ok(options.sourceUserSeq);
+    const source = listEvents(sessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === options.sourceUserSeq);
+    assert.ok(source);
+    mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+      id: runId,
+      workflow: workflowName,
+      inputs: {},
+      status: 'awaiting_chat_dispatch_seal',
+      createdAt: new Date().toISOString(),
+      chatDispatchSourceGroupId: workflowOriginSourceGroupId({
+        sessionId,
+        sourceUserSeq: source.seq,
+      }),
+      chatDispatchQueueRequestDigest: workflowChatDispatchQueueRequestDigest({
+        workflowName,
+        normalizedInputs: {},
+      }),
+    }), 'utf-8');
+    throw new Error('provider disconnected after the run record won but before preparation callback');
+  });
+
+  try {
+    const response = await respondPreferHarness('home', {
+      message: 'Run the Claude restart-owned workflow.',
+      sessionId,
+      channel: 'desktop',
+    }, async () => {
+      assert.fail('restart-owned Claude work cannot fall through to legacy');
+    });
+    const source = listEvents(sessionId, { types: ['user_input_received'] })[0];
+    const attempt = getLatestRunAttempt(sessionId);
+    assert.ok(source && attempt);
+    assert.equal(response.stoppedReason, 'awaiting-input');
+    assert.match(response.text, /preserved the original request/i);
+    assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
+    assert.equal(listEvents(sessionId, { types: ['conversation_failed'] }).length, 0);
+    assert.ok(HarnessSession.load(sessionId)?.runInFlightSince());
+    assert.equal(attempt.status, 'active', 'the inner Claude wrapper keeps exact attempt ownership active');
+
+    const reusedRunIds: string[] = [];
+    process.env.CLEMMY_CHAT_AUTO_RESUME = 'on';
+    const summary = recoverInterruptedChatRuns(
+      () => Date.now() + 1_000,
+      async (recoveredSessionId, _directive, sourceUserSeq) => {
+        assert.equal(recoveredSessionId, sessionId);
+        assert.equal(sourceUserSeq, source.seq);
+        const replyTarget = source.data.originReplyTarget as { type: 'origin_chat' };
+        const retried = queueWorkflowRun(workflowName, {}, {
+          originSessionId: sessionId,
+          originObserver: { sessionId, sourceUserSeq, replyTarget },
+          prepareChatDispatch: (authority) => {
+            const prepared = appendEvent({
+              sessionId,
+              turn: source.turn,
+              role: 'system',
+              type: 'async_work_dispatch_prepared',
+              parentEventId: source.id,
+              data: { ...authority },
+            });
+            return recordWorkflowChatDispatchPreparation(
+              createWorkflowChatDispatchPreparedReceipt(authority, {
+                eventId: prepared.id,
+                eventSeq: prepared.seq,
+                preparedAt: prepared.createdAt,
+              }),
+            );
+          },
+        });
+        assert.equal(retried.status, 'duplicate');
+        assert.equal(retried.id, runId);
+        reusedRunIds.push(retried.id!);
+        const dispatch = finalizePreparedWorkflowDispatchForSource(sessionId, sourceUserSeq);
+        assert.deepEqual(dispatch?.presentation.runIds, [runId]);
+        assert.equal(clearRunInFlightAfterTerminal(
+          sessionId,
+          attempt.attemptId,
+          sourceUserSeq,
+        ), true);
+        finishRunAttempt(attempt, 'completed');
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(summary.records[0]?.autoResumed, true);
+    assert.deepEqual(reusedRunIds, [runId]);
+    assert.equal(listEvents(sessionId, { types: ['async_work_dispatched'] }).length, 1);
+    assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
+    assert.equal(HarnessSession.load(sessionId)?.runInFlightSince(), null);
+    assert.equal(getLatestRunAttempt(sessionId)?.status, 'completed');
+  } finally {
+    delete process.env.CLEMMY_CHAT_AUTO_RESUME;
+    setClaudeAgentSdkBrainRunForTest(null);
+  }
 });
 
 test('respondViaHarness: standard runner never receives the user transport callback', async () => {

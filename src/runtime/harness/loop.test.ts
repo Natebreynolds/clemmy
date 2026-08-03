@@ -21,6 +21,8 @@
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-harness-loop-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -66,7 +68,7 @@ process.env.HARNESS_TOOL_BRACKETS = 'off';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@openai/agents';
 
 const {
@@ -74,8 +76,11 @@ const {
   requestKill,
   listEvents,
   createSession,
+  appendAsyncWorkDispatchedOnce,
   appendEvent,
+  closeEventLog,
   openEventLog,
+  getSession,
   writeToolOutput,
   beginRunAttempt,
   finishRunAttempt,
@@ -97,8 +102,142 @@ const { executeApprovedPendingActionCall } = await import('../../execution/pendi
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
 const { runtimeToolAccountingMetadata } = await import('./tool-effect.js');
 const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
+const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
+const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
+const {
+  createWorkflowChatDispatchPreparationAuthority,
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupClosedBatch,
+  workflowOriginSourceGroupId,
+} = await import('../../execution/workflow-origin-group.js');
+
+const TEST_ASYNC_REPLY_TARGET = { type: 'origin_chat' } as const;
+const TEST_ASYNC_REPLY_TARGET_DIGEST = exactOriginDeliveryTargetDigest(TEST_ASYNC_REPLY_TARGET);
+
+function exactHumanSourceData(text: string): Record<string, unknown> {
+  return {
+    text,
+    originReplyTarget: TEST_ASYNC_REPLY_TARGET,
+    originReplyTargetDigest: TEST_ASYNC_REPLY_TARGET_DIGEST,
+  };
+}
+
+function appendPreparedAsyncWorkflowDispatch(input: {
+  source: import('./eventlog.js').EventRow;
+  runId: string;
+}): import('../../execution/workflow-origin-group.js').WorkflowChatDispatchPreparedReceipt {
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${input.runId}.json`), JSON.stringify({
+    id: input.runId,
+    workflow: 'test-workflow',
+    status: 'awaiting_chat_dispatch_seal',
+  }), 'utf-8');
+  const authority = createWorkflowChatDispatchPreparationAuthority({
+    runId: input.runId,
+    observer: {
+      sessionId: input.source.sessionId,
+      sourceUserSeq: input.source.seq,
+      replyTarget: TEST_ASYNC_REPLY_TARGET,
+    },
+    queueRequestDigest: createHash('sha256')
+      .update(`test-queue-request:${input.runId}`)
+      .digest('hex'),
+  });
+  const prepared = appendEvent({
+    sessionId: input.source.sessionId,
+    turn: input.source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_prepared',
+    parentEventId: input.source.id,
+    data: { ...authority },
+  });
+  return recordWorkflowChatDispatchPreparation(createWorkflowChatDispatchPreparedReceipt(authority, {
+    eventId: prepared.id,
+    eventSeq: prepared.seq,
+    preparedAt: prepared.createdAt,
+  }));
+}
+
+function appendCommittedAsyncWorkflowDispatch(input: {
+  source: import('./eventlog.js').EventRow;
+  runId: string;
+}): import('./eventlog.js').EventRow {
+  const active = activatePreparedAsyncWorkflowDispatch(input);
+  return appendEvent({
+    sessionId: input.source.sessionId,
+    turn: input.source.turn,
+    role: 'system',
+    type: 'async_work_dispatched',
+    parentEventId: input.source.id,
+    data: { ...active.publicDispatch, replyTarget: active.sealed.replyTarget },
+  });
+}
+
+function activatePreparedAsyncWorkflowDispatch(input: {
+  source: import('./eventlog.js').EventRow;
+  runId: string;
+}): import('../../execution/workflow-origin-group.js').ActiveWorkflowOriginGroup {
+  const receipt = appendPreparedAsyncWorkflowDispatch(input);
+  const authority = createWorkflowOriginGroupCloseAuthority([receipt]);
+  const closedEvent = appendEvent({
+    sessionId: input.source.sessionId,
+    turn: input.source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_batch_closed',
+    parentEventId: input.source.id,
+    data: { ...authority },
+  });
+  const closedReceipt = createWorkflowOriginGroupClosedBatchReceipt(authority, {
+    eventId: closedEvent.id,
+    eventSeq: closedEvent.seq,
+    closedAt: closedEvent.createdAt,
+  });
+  recordWorkflowOriginGroupClosedBatch({
+    receipt: closedReceipt,
+    preparedReceipts: [receipt],
+  });
+  return finalizeWorkflowOriginGroupClosedBatch(receipt.sourceGroupId, {
+    beforeMemberRelease: () => {},
+  });
+}
+
+async function appendPublicWorkflowDispatchInChild(input: Record<string, unknown>): Promise<{
+  id: string;
+  inserted: boolean;
+}> {
+  const eventlogModuleUrl = new URL('./eventlog.ts', import.meta.url).href;
+  const encodedInput = Buffer.from(JSON.stringify(input), 'utf-8').toString('base64url');
+  const script = `
+    const eventlog = await import(process.env.CLEM_EVENTLOG_MODULE_URL);
+    const input = JSON.parse(Buffer.from(process.env.CLEM_PUBLIC_DISPATCH_INPUT, 'base64url').toString('utf-8'));
+    const result = eventlog.appendAsyncWorkDispatchedOnce(input);
+    process.stdout.write(JSON.stringify({ id: result.event.id, inserted: result.inserted }));
+  `;
+  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLEMENTINE_HOME: TMP_HOME,
+      CLEM_EVENTLOG_MODULE_URL: eventlogModuleUrl,
+      CLEM_PUBLIC_DISPATCH_INPUT: encodedInput,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout?.on('data', (chunk) => { stdout += String(chunk); });
+  child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
+  const [code] = await once(child, 'close') as [number | null];
+  assert.equal(code, 0, stderr || stdout);
+  return JSON.parse(stdout) as { id: string; inserted: boolean };
+}
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
 const { buildCallTool } = await import('../../tools/call-tool.js');
+const { actionBus } = await import('../action-bus.js');
 
 function seedArtifactVerification(sessionId: string, callId: string, resourceId: string): void {
   const called = appendEvent({
@@ -7816,10 +7955,13 @@ test('isCodexAuthRevoked: a real revoke marker is terminal; a BARE model 401 is 
 
 // ─── 2026-06-12: async workflow dispatch is a complete deliverable ───────────
 
-test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, not other turns/tools', async () => {
+test('dispatchedBackgroundWorkflowRun: trusts only the typed producer event, never receipt copy', async () => {
   const { dispatchedBackgroundWorkflowRun } = await import('./loop.js');
   const { writeToolOutput } = await import('./eventlog.js');
   const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: exactHumanSourceData('run x'),
+  });
 
   // No calls at all → false.
   assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 1), false);
@@ -7832,13 +7974,19 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
   writeToolOutput({
     sessionId: sess.id, callId: 'call_wfrun_1', tool: 'workflow_run',
     invocationNonce: 'queued-success',
-    output: 'Queued "x" (run 123-abc) — it is now running in the BACKGROUND. Tell the user…',
+    output: 'SUCCESS COPY MAY CHANGE ARBITRARILY WITHOUT CONTROL AUTHORITY.',
   });
   appendEvent({
     sessionId: sess.id, turn: 1, role: 'tool', type: 'tool_returned',
     parentEventId: queuedCall.id,
     data: { tool: 'workflow_run', callId: 'call_wfrun_1', ok: true },
   });
+  assert.equal(
+    dispatchedBackgroundWorkflowRun(sess.id, 1, source.seq),
+    false,
+    'even successful-looking tool lifecycle data cannot manufacture dispatch authority',
+  );
+  appendCommittedAsyncWorkflowDispatch({ source, runId: '123-abc' });
   assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 1), true, 'queued dispatch this turn is detected');
   assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 2), false, 'a different turn does not inherit the dispatch');
 
@@ -7846,6 +7994,9 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
   // schema. The carrier's OUTER lifecycle owns the exact inner result, so the
   // detector must unwrap its target while retaining the outer call id.
   const carrier = createSession({ kind: 'chat' });
+  const carrierSource = appendEvent({
+    sessionId: carrier.id, turn: 1, role: 'user', type: 'user_input_received', data: exactHumanSourceData('run carrier'),
+  });
   const carrierArgs = JSON.stringify({
     name: 'workflow_run',
     args_json: JSON.stringify({ name: 'carrier-workflow' }),
@@ -7866,6 +8017,7 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
     parentEventId: carrierCall.id,
     data: { tool: 'call_tool', callId: 'call_carrier_queued', effect: 'read', ok: true },
   });
+  appendCommittedAsyncWorkflowDispatch({ source: carrierSource, runId: 'carrier-123' });
   assert.equal(
     dispatchedBackgroundWorkflowRun(carrier.id, 1),
     true,
@@ -7876,6 +8028,9 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
   // computed from the full payload before clipping, so a >8 KB carrier remains
   // settleable without treating its preview as an authority-bearing payload.
   const largeCarrier = createSession({ kind: 'chat' });
+  const largeCarrierSource = appendEvent({
+    sessionId: largeCarrier.id, turn: 1, role: 'user', type: 'user_input_received', data: exactHumanSourceData('run large carrier'),
+  });
   const largeCarrierArgs = JSON.stringify({
     name: 'workflow_run',
     args_json: JSON.stringify({
@@ -7916,6 +8071,7 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
       ok: true,
     },
   });
+  appendCommittedAsyncWorkflowDispatch({ source: largeCarrierSource, runId: 'carrier-large-123' });
   assert.equal(
     dispatchedBackgroundWorkflowRun(largeCarrier.id, 1),
     true,
@@ -8037,9 +8193,19 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
   );
 });
 
-test('runConversation: a receipt-backed structured workflow handoff parks after one turn without polling', async () => {
+test('runConversation: a receipt-backed workflow handoff records a nonterminal dispatch and releases foreground', async () => {
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'chat' });
+  const sess = HarnessSession.create({ kind: 'chat', channel: 'desktop' });
+  const memoryPath = workingMemoryPathForSession(sess.id);
+  mkdirSync(path.dirname(memoryPath), { recursive: true });
+  writeFileSync(memoryPath, 'DISPATCH-MUST-NOT-REFRESH', 'utf-8');
+  const runtimeTerminals: string[] = [];
+  const unsubscribe = actionBus.subscribe((event) => {
+    if (
+      (event.kind === 'runtime.completed' || event.kind === 'runtime.failed')
+      && event.sessionId === sess.id
+    ) runtimeTerminals.push(event.kind);
+  });
   let runs = 0;
   const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
     runs += 1;
@@ -8058,13 +8224,7 @@ test('runConversation: a receipt-backed structured workflow handoff parks after 
       tool,
       details,
     );
-    const receipt =
-      'Queued "social-manager-rc" (run run-123) — it is now running in the BACKGROUND. '
-      + 'Its outcome will be delivered to this chat automatically.';
-    // Mirror the SDK lifecycle, not just its start notification. Settlement
-    // authority requires the durable parented call/return pair; omitting the
-    // return made this fixture unlike production and turned a failed assertion
-    // into an effectively-unbounded continuation loop.
+    const receipt = 'Queue accepted. This display copy is deliberately unrelated to dispatch parsing.';
     (runner as unknown as EventEmitter).emit(
       'agent_tool_end',
       runContext,
@@ -8073,6 +8233,8 @@ test('runConversation: a receipt-backed structured workflow handoff parks after 
       receipt,
       details,
     );
+    const accepted = listEventsForConv(sess.id, { types: ['user_input_received'] })[0];
+    appendPreparedAsyncWorkflowDispatch({ source: accepted, runId: 'run-123' });
     return {
       history: items,
       lastResponseId: undefined,
@@ -8087,25 +8249,33 @@ test('runConversation: a receipt-backed structured workflow handoff parks after 
   };
 
   const result = await runConversation({
-    agent: makeAgentStub(),
-    sessionId: sess.id,
-    input: 'run the social-manager workflow',
-    // Fail fast if exact receipt settlement ever regresses again. This test is
-    // about a one-turn handoff, not the long-horizon conversation budget.
-    maxSteps: 2,
-    makeRunner: makeRunnerStub,
-    runRunner,
-    judgeFn: async () => {
-      throw new Error('a queued workflow must not invoke the completion judge');
-    },
-  });
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'run the social-manager workflow',
+      // Fail fast if exact receipt settlement ever regresses again. This test is
+      // about a one-turn handoff, not the long-horizon conversation budget.
+      maxSteps: 2,
+      makeRunner: makeRunnerStub,
+      runRunner,
+      judgeFn: async () => {
+        throw new Error('a queued workflow must not invoke the completion judge');
+      },
+    });
+  unsubscribe();
 
-  assert.equal(result.status, 'completed');
+  assert.equal(result.status, 'dispatched');
   assert.equal(result.steps, 1);
   assert.equal(runs, 1, 'the foreground model is not called again while the daemon owns the run');
-  assert.equal(result.lastDecision?.done, true);
-  assert.equal(result.lastDecision?.nextAction, 'completed');
-  assert.equal(result.lastDecision?.reason, 'queued_workflow_owns_continuation');
+  assert.equal(result.publicPresentation, undefined, 'dispatch is not a conversation terminal');
+  const dispatches = listEventsForConv(sess.id, { types: ['async_work_dispatched'] });
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0].data.sourceUserSeq, listEventsForConv(sess.id, { types: ['user_input_received'] })[0].seq);
+  assert.deepEqual(dispatches[0].data.runIds, ['run-123']);
+  assert.match(String(dispatches[0].data.dispatchKey), /^workflow_source_group:/);
+  assert.equal(listEventsForConv(sess.id, { types: ['conversation_completed'] }).length, 0);
+  assert.deepEqual(runtimeTerminals, [], 'a pending async edge emits no runtime terminal');
+  assert.equal(readFileSync(memoryPath, 'utf-8'), 'DISPATCH-MUST-NOT-REFRESH');
+  assert.equal('__run_in_flight' in (getSession(sess.id)?.metadata ?? {}), false, 'foreground marker is released');
   assert.equal(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length, 0);
   const calls = listEventsForConv(sess.id, { types: ['tool_called'] });
   assert.deepEqual(
@@ -8117,7 +8287,7 @@ test('runConversation: a receipt-backed structured workflow handoff parks after 
 
 test('runConversation: schema-on-demand workflow handoff settles from the exact call_tool carrier', async () => {
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'chat' });
+  const sess = HarnessSession.create({ kind: 'chat', channel: 'desktop' });
   let runs = 0;
   const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
     runs += 1;
@@ -8141,6 +8311,8 @@ test('runConversation: schema-on-demand workflow handoff settles from the exact 
     (runner as unknown as EventEmitter).emit(
       'agent_tool_end', runContext, { name: 'Orchestrator' }, tool, receipt, details,
     );
+    const accepted = listEventsForConv(sess.id, { types: ['user_input_received'] })[0];
+    appendPreparedAsyncWorkflowDispatch({ source: accepted, runId: 'run-carrier-123' });
     return {
       history: items,
       lastResponseId: undefined,
@@ -8166,12 +8338,210 @@ test('runConversation: schema-on-demand workflow handoff settles from the exact 
     },
   });
 
-  assert.equal(result.status, 'completed');
+  assert.equal(result.status, 'dispatched');
   assert.equal(result.steps, 1);
   assert.equal(runs, 1);
-  assert.equal(result.lastDecision?.reason, 'queued_workflow_owns_continuation');
+  assert.equal(listEventsForConv(sess.id, { types: ['conversation_completed'] }).length, 0);
+  assert.deepEqual(
+    listEventsForConv(sess.id, { types: ['async_work_dispatched'] })[0]?.data.runIds,
+    ['run-carrier-123'],
+  );
   const calls = listEventsForConv(sess.id, { types: ['tool_called'] });
   assert.deepEqual(calls.map((event) => event.data.tool), ['call_tool']);
+});
+
+test('runConversation: one source seals multi-workflow fan-out into one public dispatch', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat', channel: 'desktop' });
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Run both saved reviews.',
+    maxSteps: 2,
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items) => {
+      const source = listEventsForConv(sess.id, { types: ['user_input_received'] })[0];
+      appendPreparedAsyncWorkflowDispatch({ source, runId: 'fanout-run-a' });
+      appendPreparedAsyncWorkflowDispatch({ source, runId: 'fanout-run-b' });
+      return {
+        history: items,
+        finalOutput: {
+          summary: 'Both reviews were prepared.',
+          reply: 'Both reviews are starting.',
+          done: false,
+          nextAction: 'awaiting_handoff_result',
+          reason: 'Waiting for their durable report-backs.',
+        },
+      } as never;
+    },
+    judgeFn: async () => {
+      throw new Error('an activated source group must not invoke the completion judge');
+    },
+  });
+
+  assert.equal(result.status, 'dispatched');
+  const prepared = listEventsForConv(sess.id, { types: ['async_work_dispatch_prepared'] });
+  const closed = listEventsForConv(sess.id, { types: ['async_work_dispatch_batch_closed'] });
+  const publicDispatches = listEventsForConv(sess.id, { types: ['async_work_dispatched'] });
+  assert.equal(prepared.length, 2);
+  assert.equal(closed.length, 1, 'the complete foreground SDK invocation closes exactly once');
+  assert.deepEqual(
+    (closed[0].data.members as Array<{ runId: string }>).map((member) => member.runId),
+    ['fanout-run-a', 'fanout-run-b'],
+    'the close node freezes every prepared member in durable event order',
+  );
+  assert.equal(publicDispatches.length, 1, 'the transport receives one ACK for the complete source group');
+  assert.deepEqual(publicDispatches[0].data.runIds, ['fanout-run-a', 'fanout-run-b']);
+  for (const runId of ['fanout-run-a', 'fanout-run-b']) {
+    const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')) as {
+      status?: string;
+    };
+    assert.equal(run.status, 'queued', `${runId} becomes executable only after whole-group activation`);
+  }
+});
+
+test('closed workflow batch recovers after a crash before seal while prepared-only work stays held', async () => {
+  resetEventLog();
+  const { reconcileClosedWorkflowDispatchBatches } = await import('./loop.js');
+
+  const preparedOnlySession = createSession({ kind: 'chat' });
+  const preparedOnlySource = appendEvent({
+    sessionId: preparedOnlySession.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactHumanSourceData('prepare but do not release'),
+  });
+  appendPreparedAsyncWorkflowDispatch({
+    source: preparedOnlySource,
+    runId: 'prepared-only-held-run',
+  });
+  const untouched = reconcileClosedWorkflowDispatchBatches();
+  assert.equal(untouched.examined, 0, 'recovery never infers a close from preparation alone');
+  assert.equal(
+    JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, 'prepared-only-held-run.json'), 'utf-8')).status,
+    'awaiting_chat_dispatch_seal',
+  );
+
+  const crashSession = createSession({ kind: 'chat' });
+  const crashSource = appendEvent({
+    sessionId: crashSession.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactHumanSourceData('release both after restart'),
+  });
+  const first = appendPreparedAsyncWorkflowDispatch({ source: crashSource, runId: 'closed-crash-run-a' });
+  const second = appendPreparedAsyncWorkflowDispatch({ source: crashSource, runId: 'closed-crash-run-b' });
+  const closeAuthority = createWorkflowOriginGroupCloseAuthority([first, second]);
+  appendEvent({
+    sessionId: crashSession.id,
+    turn: crashSource.turn,
+    role: 'system',
+    type: 'async_work_dispatch_batch_closed',
+    parentEventId: crashSource.id,
+    data: { ...closeAuthority },
+  });
+  // Simulated crash: the event-ledger close won, but no filesystem close,
+  // seal, activation, or public dispatch was written by the foreground path.
+  assert.equal(listEventsForConv(crashSession.id, { types: ['async_work_dispatched'] }).length, 0);
+
+  const recovered = reconcileClosedWorkflowDispatchBatches();
+  assert.equal(recovered.rejected, 0);
+  assert.equal(recovered.finalized, 1);
+  assert.equal(recovered.published, 1);
+  assert.deepEqual(
+    listEventsForConv(crashSession.id, { types: ['async_work_dispatched'] })[0].data.runIds,
+    ['closed-crash-run-a', 'closed-crash-run-b'],
+  );
+  for (const runId of ['closed-crash-run-a', 'closed-crash-run-b']) {
+    assert.equal(
+      JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')).status,
+      'queued',
+      `${runId} is released only after the exact closed batch is reconstructed`,
+    );
+  }
+  assert.equal(
+    JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, 'prepared-only-held-run.json'), 'utf-8')).status,
+    'awaiting_chat_dispatch_seal',
+    'the unrelated prepared-only group remains held after global recovery',
+  );
+});
+
+test('public dispatch publication failure keeps activated work held until restart recovery publishes its ACK', async () => {
+  resetEventLog();
+  const {
+    finalizePreparedWorkflowDispatchForSource,
+    reconcileActivatedWorkflowDispatchGroups,
+    reconcileClosedWorkflowDispatchBatches,
+  } = await import('./loop.js');
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactHumanSourceData('run the restart-safe report'),
+  });
+  const runId = 'dispatch-publication-failure-run';
+  appendPreparedAsyncWorkflowDispatch({ source, runId });
+
+  openEventLog().exec(`
+    CREATE TRIGGER reject_async_work_dispatched_test
+    BEFORE INSERT ON events
+    WHEN NEW.type = 'async_work_dispatched'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected persistent public dispatch failure');
+    END;
+  `);
+  try {
+    assert.throws(
+      () => finalizePreparedWorkflowDispatchForSource(session.id, source.seq),
+      /injected persistent public dispatch failure/,
+    );
+    assert.equal(
+      listEventsForConv(session.id, { types: ['async_work_dispatch_batch_closed'] }).length,
+      1,
+      'the immutable batch close remains the restart recovery owner',
+    );
+    assert.equal(listEventsForConv(session.id, { types: ['async_work_dispatched'] }).length, 0);
+    assert.equal(
+      JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')).status,
+      'awaiting_chat_dispatch_seal',
+      'work cannot execute before its public nonterminal ACK is durable',
+    );
+
+    const stillFailing = reconcileClosedWorkflowDispatchBatches();
+    assert.equal(stillFailing.rejected, 1, 'a persistent store failure remains retryable');
+    assert.equal(listEventsForConv(session.id, { types: ['async_work_dispatched'] }).length, 0);
+    const heldRecovery = reconcileActivatedWorkflowDispatchGroups();
+    assert.equal(
+      heldRecovery.membersReleased,
+      0,
+      'the partial-activation reducer cannot bypass missing public dispatch authority',
+    );
+    assert.equal(
+      JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')).status,
+      'awaiting_chat_dispatch_seal',
+    );
+  } finally {
+    openEventLog().exec('DROP TRIGGER IF EXISTS reject_async_work_dispatched_test');
+  }
+
+  // Reopen the SQLite handle to model a new daemon process, then replay the
+  // exact closed batch. Recovery must publish once before releasing work.
+  closeEventLog();
+  const recovered = reconcileClosedWorkflowDispatchBatches();
+  assert.equal(recovered.rejected, 0);
+  assert.equal(recovered.published, 1);
+  assert.equal(listEventsForConv(session.id, { types: ['async_work_dispatched'] }).length, 1);
+  assert.equal(
+    JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')).status,
+    'queued',
+  );
+  const dispatch = finalizePreparedWorkflowDispatchForSource(session.id, source.seq);
+  assert.ok(dispatch, 'the recovered source returns its deterministic nonterminal ACK');
+  assert.deepEqual(dispatch.presentation.runIds, [runId]);
 });
 
 test('runConversation: an incomplete workflow lifecycle fails closed at its bounded activation', async () => {
@@ -8224,7 +8594,330 @@ test('runConversation: an incomplete workflow lifecycle fails closed at its boun
   assert.equal(result.status, 'limit_exceeded');
   assert.equal(result.limitKind, 'max_steps');
   assert.equal(runs, 2);
-  assert.notEqual(result.lastDecision?.reason, 'queued_workflow_owns_continuation');
+  assert.equal(listEventsForConv(sess.id, { types: ['async_work_dispatched'] }).length, 0);
+});
+
+test('runConversation: a pre-preparation held admission cannot become a terminal or lose chat ownership', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat', channel: 'desktop' });
+  const runId = 'pre-preparation-held-boundary-run';
+
+  await assert.rejects(
+    () => runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Run the restart-safe background task.',
+      maxSteps: 1,
+      makeRunner: makeRunnerStub,
+      runRunner: async (_runner, _agent, items) => {
+        const source = listEventsForConv(sess.id, { types: ['user_input_received'] })[0];
+        mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+        writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+          id: runId,
+          workflow: 'restart-safe-background-task',
+          inputs: {},
+          status: 'awaiting_chat_dispatch_seal',
+          createdAt: new Date().toISOString(),
+          chatDispatchSourceGroupId: workflowOriginSourceGroupId({
+            sessionId: sess.id,
+            sourceUserSeq: source.seq,
+          }),
+          chatDispatchQueueRequestDigest: createHash('sha256')
+            .update('pre-preparation-held-boundary-request')
+            .digest('hex'),
+        }), 'utf-8');
+        // Model/provider completion after the queue record write simulates the
+        // callback/event crash seam. Without the foreground ownership barrier,
+        // this ordinary answer would incorrectly win conversation_completed.
+        return {
+          history: items,
+          finalOutput: {
+            summary: 'The background task could not be started.',
+            reply: 'The background task could not be started.',
+            done: true,
+            nextAction: 'completed',
+          },
+        } as never;
+      },
+    }),
+    /still owns held run\(s\).*pre-preparation-held-boundary-run/i,
+  );
+
+  assert.equal(listEventsForConv(sess.id, { types: ['conversation_completed'] }).length, 0);
+  assert.equal(listEventsForConv(sess.id, { types: ['async_work_dispatched'] }).length, 0);
+  assert.ok('__run_in_flight' in (getSession(sess.id)?.metadata ?? {}), 'the exact chat source remains restart-owned');
+  assert.equal(
+    JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')).status,
+    'awaiting_chat_dispatch_seal',
+  );
+});
+
+test('verified workflow receipts are isolated to their exact accepted source', async () => {
+  resetEventLog();
+  const { verifiedWorkflowRunDispatchReceipts } = await import('./loop.js');
+  const sess = createSession({ kind: 'chat' });
+  const sourceA = appendEvent({
+    sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: exactHumanSourceData('A'),
+  });
+  const sourceB = appendEvent({
+    sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: exactHumanSourceData('B'),
+  });
+  const called = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'tool_called',
+    data: { tool: 'workflow_run', callId: 'call-owned-by-a', sourceUserSeq: sourceA.seq },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call-owned-by-a',
+    invocationNonce: 'nonce-owned-by-a',
+    tool: 'workflow_run',
+    output: 'Queued "owned-a" (run run-owned-a) — it is now running in the BACKGROUND.',
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      tool: 'workflow_run',
+      callId: 'call-owned-by-a',
+      invocationNonce: 'nonce-owned-by-a',
+      sourceUserSeq: sourceA.seq,
+      ok: true,
+    },
+  });
+  appendCommittedAsyncWorkflowDispatch({ source: sourceA, runId: 'run-owned-a' });
+
+  assert.deepEqual(verifiedWorkflowRunDispatchReceipts(sess.id, 1, sourceB.seq), []);
+  assert.deepEqual(
+    verifiedWorkflowRunDispatchReceipts(sess.id, 1, sourceA.seq)
+      .flatMap((receipt) => receipt.runIds),
+    ['run-owned-a'],
+  );
+});
+
+test('verified workflow receipts fail closed without exact active group authority', async () => {
+  resetEventLog();
+  const { verifiedWorkflowRunDispatchReceipts } = await import('./loop.js');
+
+  const missing = createSession({ kind: 'chat' });
+  const missingSource = appendEvent({
+    sessionId: missing.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactHumanSourceData('missing active authority'),
+  });
+  const missingGroupId = `workflow-origin-group-v1:${'a'.repeat(64)}`;
+  const missingGroupDigest = 'b'.repeat(64);
+  appendEvent({
+    sessionId: missing.id,
+    turn: missingSource.turn,
+    role: 'system',
+    type: 'async_work_dispatched',
+    parentEventId: missingSource.id,
+    data: {
+      version: 2,
+      kind: 'workflow_run_group',
+      status: 'dispatched',
+      sourceUserSeq: missingSource.seq,
+      sourceGroupId: missingGroupId,
+      sourceGroupDigest: missingGroupDigest,
+      runIds: ['missing-active-run'],
+      dispatchKey: `workflow_source_group:${missingGroupId}:${missingGroupDigest}`,
+      replyTargetDigest: TEST_ASYNC_REPLY_TARGET_DIGEST,
+      replyTarget: TEST_ASYNC_REPLY_TARGET,
+    },
+  });
+  assert.deepEqual(
+    verifiedWorkflowRunDispatchReceipts(missing.id, 1, missingSource.seq),
+    [],
+    'a well-shaped public row cannot manufacture missing durable activation authority',
+  );
+
+  const mismatched = createSession({ kind: 'chat' });
+  const mismatchedSource = appendEvent({
+    sessionId: mismatched.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactHumanSourceData('mismatched active authority'),
+  });
+  const mismatchedActive = activatePreparedAsyncWorkflowDispatch({
+    source: mismatchedSource,
+    runId: 'mismatched-active-run',
+  });
+  appendEvent({
+    sessionId: mismatched.id,
+    turn: mismatchedSource.turn,
+    role: 'system',
+    type: 'async_work_dispatched',
+    parentEventId: mismatchedSource.id,
+    data: {
+      ...mismatchedActive.publicDispatch,
+      replyTargetDigest: 'c'.repeat(64),
+      replyTarget: mismatchedActive.sealed.replyTarget,
+    },
+  });
+  assert.deepEqual(
+    verifiedWorkflowRunDispatchReceipts(mismatched.id, 1, mismatchedSource.seq),
+    [],
+    'a public projection whose target digest disagrees with its active group is rejected',
+  );
+
+  const corrupt = createSession({ kind: 'chat' });
+  const corruptSource = appendEvent({
+    sessionId: corrupt.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactHumanSourceData('corrupt active authority'),
+  });
+  appendCommittedAsyncWorkflowDispatch({ source: corruptSource, runId: 'corrupt-active-run' });
+  assert.equal(
+    verifiedWorkflowRunDispatchReceipts(corrupt.id, 1, corruptSource.seq).length,
+    1,
+    'fixture begins with complete active authority',
+  );
+  rmSync(
+    path.join(
+      WORKFLOW_RUNS_DIR,
+      '.run-origins',
+      createHash('sha256').update('corrupt-active-run').digest('hex'),
+    ),
+    { recursive: true, force: true },
+  );
+  assert.deepEqual(
+    verifiedWorkflowRunDispatchReceipts(corrupt.id, 1, corruptSource.seq),
+    [],
+    'missing exact member sidecars invalidate the public dispatch instead of falling back to prose',
+  );
+
+  const duplicate = createSession({ kind: 'chat' });
+  const duplicateSource = appendEvent({
+    sessionId: duplicate.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactHumanSourceData('duplicate public winner'),
+  });
+  const firstWinner = appendCommittedAsyncWorkflowDispatch({
+    source: duplicateSource,
+    runId: 'duplicate-public-winner-run',
+  });
+  assert.equal(verifiedWorkflowRunDispatchReceipts(duplicate.id, 1, duplicateSource.seq).length, 1);
+  appendEvent({
+    sessionId: duplicate.id,
+    turn: duplicateSource.turn,
+    role: 'system',
+    type: 'async_work_dispatched',
+    parentEventId: duplicateSource.id,
+    data: { ...firstWinner.data },
+  });
+  assert.deepEqual(
+    verifiedWorkflowRunDispatchReceipts(duplicate.id, 1, duplicateSource.seq),
+    [],
+    'even byte-identical duplicate public winners are ambiguous and fail closed',
+  );
+});
+
+test('public workflow dispatch elects one atomic winner across competing processes', async () => {
+  resetEventLog();
+  const { verifiedWorkflowRunDispatchReceipts } = await import('./loop.js');
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactHumanSourceData('race foreground and daemon publication'),
+  });
+  const active = activatePreparedAsyncWorkflowDispatch({
+    source,
+    runId: 'atomic-public-dispatch-run',
+  });
+  const input = {
+    sessionId: source.sessionId,
+    turn: source.turn,
+    sourceUserSeq: source.seq,
+    sourceGroupId: active.publicDispatch.sourceGroupId,
+    data: {
+      ...active.publicDispatch,
+      replyTarget: active.sealed.replyTarget,
+    },
+  };
+  const winners = await Promise.all([
+    appendPublicWorkflowDispatchInChild(input),
+    appendPublicWorkflowDispatchInChild(input),
+  ]);
+  assert.equal(new Set(winners.map((winner) => winner.id)).size, 1, 'both processes observe one event id');
+  assert.deepEqual(
+    winners.map((winner) => winner.inserted).sort(),
+    [false, true],
+    'one process inserts and the competing recovery path reuses it',
+  );
+  assert.equal(listEventsForConv(sess.id, { types: ['async_work_dispatched'] }).length, 1);
+  assert.equal(verifiedWorkflowRunDispatchReceipts(sess.id, 1, source.seq).length, 1);
+  assert.throws(
+    () => appendAsyncWorkDispatchedOnce({
+      ...input,
+      data: { ...input.data, runIds: ['conflicting-public-run'] },
+    }),
+    /conflicting durable winner/,
+    'the winner cannot be replaced by a different valid-looking public payload',
+  );
+});
+
+test('workflow handoff prose without a durable queue receipt remains fail-closed', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do the background work',
+    maxSteps: 1,
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items) => ({
+      history: items,
+      finalOutput: {
+        summary: 'Running in the background.',
+        reply: 'I will report back when it finishes.',
+        done: false,
+        nextAction: 'awaiting_handoff_result',
+        reason: 'model prose only',
+      },
+    } as never),
+  });
+  assert.notEqual(result.status, 'dispatched');
+  assert.equal(listEventsForConv(sess.id, { types: ['async_work_dispatched'] }).length, 0);
+});
+
+test('ordinary completion still commits exactly one terminal and no async edge', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'answer normally',
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items) => ({
+      history: items,
+      finalOutput: {
+        summary: 'Normal answer.',
+        reply: 'Normal answer.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never),
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(listEventsForConv(sess.id, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(listEventsForConv(sess.id, { types: ['async_work_dispatched'] }).length, 0);
 });
 
 test('speed: a hanging embeddings provider cannot gate model dispatch (fire-and-forget recall vector)', async () => {

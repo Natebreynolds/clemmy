@@ -9,6 +9,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 
 const { createClementineMcpServer } = await import('./mcp-server.js');
 const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+const { getToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
 const {
   activateDispatchLease,
@@ -103,7 +104,10 @@ test('in-process MCP handlers inherit the exact SDK source turn', async () => {
     async () => ({
       content: [{
         type: 'text' as const,
-        text: JSON.stringify({ sourceUserSeq: harnessRunContextStorage.getStore()?.sourceUserSeq ?? null }),
+        text: JSON.stringify({
+          harnessSourceUserSeq: harnessRunContextStorage.getStore()?.sourceUserSeq ?? null,
+          toolSourceUserSeq: getToolOutputContext()?.sourceUserSeq ?? null,
+        }),
       }],
     }),
   );
@@ -111,7 +115,10 @@ test('in-process MCP handlers inherit the exact SDK source turn', async () => {
     handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
   }>;
   const result = await registered.source_authority_probe.handler({});
-  assert.deepEqual(JSON.parse(result.content[0].text), { sourceUserSeq: 91 });
+  assert.deepEqual(JSON.parse(result.content[0].text), {
+    harnessSourceUserSeq: 91,
+    toolSourceUserSeq: 91,
+  });
 });
 
 test('in-process MCP refuses a superseded SDK attempt before entering its handler', async () => {

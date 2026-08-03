@@ -50,6 +50,10 @@ import {
   type WorkflowRunReportBackRecord,
 } from './workflow-run-report-back.js';
 import { compiledProjectRootHasSettlementMarker } from './project-root-lifecycle.js';
+import {
+  cleanupSettledWorkflowRunChatDispatchPreparations,
+  workflowRunHasPendingChatDispatchPreparation,
+} from './workflow-origin-group.js';
 
 /**
  * Workflow scheduling tick.
@@ -953,6 +957,7 @@ interface ReapableWorkflowRunRecord extends WorkflowRunReportBackRecord {
 }
 
 let beforeRunRecordReapLockForTests: ((filePath: string) => void) | undefined;
+let afterCanonicalRunUnlinkForTests: ((filePath: string) => void) | undefined;
 
 /** Deterministic race seam: runs after directory enumeration and immediately
  * before the authoritative per-record lock/read. */
@@ -960,6 +965,14 @@ export function _setWorkflowRunReaperBeforeLockForTests(
   hook?: (filePath: string) => void,
 ): void {
   beforeRunRecordReapLockForTests = hook;
+}
+
+/** Deterministic crash seam after the canonical pathname removal is durable but
+ * before best-effort sidecar/preparation hygiene runs. */
+export function _setWorkflowRunReaperAfterCanonicalUnlinkForTests(
+  hook?: (filePath: string) => void,
+): void {
+  afterCanonicalRunUnlinkForTests = hook;
 }
 
 function isTerminalWorkflowRunRecord(record: ReapableWorkflowRunRecord): boolean {
@@ -1101,6 +1114,13 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
         // acknowledgement. An optimistic scan can never delete their successor.
         const raw = readWorkflowRunRecordUnlocked<ReapableWorkflowRunRecord>(full);
         if (!raw || !isTerminalWorkflowRunRecord(raw)) return false;
+        const runId = file.replace(/\.json$/, '');
+        // A chat turn may attach fresh exact-origin authority to an old
+        // terminal duplicate. Preparation installs its retention pin while
+        // this same record lock is held, so deletion must consult that pin
+        // before removing any evidence needed to close the dispatch batch.
+        // Corrupt pins throw and fail closed through the outer catch.
+        if (workflowRunHasPendingChatDispatchPreparation(runId)) return false;
         if (hasOutstandingWorkflowRunReportBack(raw)) return false;
         // A compiled root is the restart journal for a second durable ledger.
         // Never delete it until an exact marker proves ExecutionStore observed
@@ -1112,21 +1132,55 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
         const ageRef = Number.isFinite(finishedMs) ? finishedMs : statSync(full).mtimeMs;
         if (ageRef >= cutoffMs) return false;
 
-        const runId = file.replace(/\.json$/, '');
         const workflowSlug = canonicalWorkflowSlugForReap(raw, runId);
         if (!workflowSlug) return false;
 
-        // Clean subordinate state before unlinking the sole run ownership
-        // record. Any cleanup failure leaves that record reachable for a later
-        // retry instead of stranding graph/events under a lost display name.
+        // Resolve and remove run-owned graph/event state while the canonical
+        // record still owns its storage identity. Exact routing sidecars and
+        // preparation pins deliberately survive this phase.
         if (!reapRunEventDir(workflowSlug, runId)) return false;
         if (!pruneEmptyCataloglessCompiledOwner(raw, workflowSlug, runId)) return false;
         deleteWorkflowGraphSnapshotByRunId(runId);
-        if (!reapWorkflowRunSidecars(runId)) return false;
+
+        // The canonical pathname must be durably absent before either exact
+        // authority form can be removed. A crash before this fsync leaves a
+        // live run with its sidecar/pin; a crash after it leaves only harmless
+        // orphaned hygiene evidence, never a live run eligible for legacy
+        // report-back fallback.
         unlinkSync(full);
+        fsyncParentDirectory(full);
         return true;
       });
-      if (reaped) deleted += 1;
+      if (!reaped) continue;
+
+      deleted += 1;
+      const runId = file.replace(/\.json$/, '');
+      try {
+        afterCanonicalRunUnlinkForTests?.(full);
+      } catch (err) {
+        // Models a process death at the durable-unlink boundary. The canonical
+        // deletion already won, so retained sidecars/pins are safe orphaned
+        // evidence and must not make the deletion appear to have failed.
+        logger.warn(
+          { runId, err: err instanceof Error ? err.message : String(err) },
+          'Workflow run was reaped; deferred post-unlink authority hygiene',
+        );
+        continue;
+      }
+
+      if (!reapWorkflowRunSidecars(runId)) {
+        logger.warn({ runId }, 'Workflow run was reaped; exact-origin sidecar hygiene will need a later sweep');
+      }
+      try {
+        // This helper owns its run-record lock, so it intentionally runs only
+        // after the canonical reaper critical section has released.
+        cleanupSettledWorkflowRunChatDispatchPreparations(runId);
+      } catch (err) {
+        logger.warn(
+          { runId, err: err instanceof Error ? err.message : String(err) },
+          'Workflow run was reaped; preparation-pin hygiene will need a later sweep',
+        );
+      }
     } catch {
       // Unreadable / disappeared — skip.
     }

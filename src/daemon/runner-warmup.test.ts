@@ -57,6 +57,13 @@ function callsNamed(root: ts.Node, name: string): ts.CallExpression[] {
   );
 }
 
+function nearestContainingFunction(node: ts.Node): ts.SignatureDeclaration | undefined {
+  for (let current = node.parent; current; current = current.parent) {
+    if (ts.isFunctionLike(current)) return current;
+  }
+  return undefined;
+}
+
 function namedFunction(sourceFile: ts.SourceFile, name: string): ts.FunctionDeclaration {
   const functions = descendants(
     sourceFile,
@@ -237,27 +244,42 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   const canonicalToolMigration = callsNamed(startDaemon, 'migrateToolChoicesToCanonicalProcedures');
   const orphanFence = callsNamed(startDaemon, 'interruptOrphanedRunAttemptsAtBoot');
   const approvalDrain = callsNamed(startDaemon, 'startChatApprovalResume');
+  const closedDispatchRecovery = callsNamed(startDaemon, 'reconcileClosedWorkflowDispatchBatches')
+    .filter((call) => nearestContainingFunction(call) === startDaemon);
+  const activatedDispatchRecovery = callsNamed(startDaemon, 'reconcileActivatedWorkflowDispatchGroups')
+    .filter((call) => nearestContainingFunction(call) === startDaemon);
   const genericChatRecovery = callsNamed(startDaemon, 'reportInterruptedChatRuns');
   const terminalReportBack = callsNamed(startDaemon, 'startTerminalReportBackWatcher');
   for (const [label, calls] of [
     ['canonical tool-memory migration', canonicalToolMigration],
     ['orphan fencing', orphanFence],
     ['approval drain', approvalDrain],
+    ['closed workflow dispatch recovery', closedDispatchRecovery],
+    ['activated workflow dispatch recovery', activatedDispatchRecovery],
     ['generic chat recovery', genericChatRecovery],
     ['terminal report-back', terminalReportBack],
   ] as const) {
     assert.equal(calls.length, 1, `${label} must have one boot registration`);
   }
 
-  const laneRegistrations = callsNamed(startDaemon, 'setImmediate').filter((call) =>
-    call.arguments.some((argument) => ts.isIdentifier(argument) && argument.text === 'drainWorkflowRunsTick')
-  );
+  const laneRegistrations = callsNamed(startDaemon, 'setImmediate').filter((call) => (
+    call.arguments.some(
+      (argument) => ts.isIdentifier(argument) && argument.text === 'drainWorkflowRunsTick',
+    )
+    // The drain-kick latency hook also schedules this function, but from its
+    // own nested callback after new work arrives. Count only calls whose
+    // nearest lexical function is startDaemon itself: a second direct boot
+    // registration remains in this set and makes the exact-one assertion bite.
+    && nearestContainingFunction(call) === startDaemon
+  ));
   assert.equal(laneRegistrations.length, 1, 'workflow recovery lane must be registered once during boot');
 
   const orderedBootNodes = [
     canonicalToolMigration[0],
     orphanFence[0],
     approvalDrain[0],
+    closedDispatchRecovery[0],
+    activatedDispatchRecovery[0],
     genericChatRecovery[0],
     terminalReportBack[0],
     laneRegistrations[0],
@@ -266,7 +288,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   assert.deepEqual(
     [...orderedBootNodes].sort((left, right) => left.getStart() - right.getStart()),
     orderedBootNodes,
-    'boot must migrate explicitly, fence, drain exact approvals, recover generic chats, arm report-back, register lanes, then release ingress',
+    'boot must migrate, fence, drain approvals, settle workflow dispatch, recover generic chats, arm report-back, register lanes, then release ingress',
   );
 
   const cliWarmCalls = callsNamed(startDaemon, 'warmCliScan');

@@ -12,12 +12,14 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
 import type { ToolChoiceRecord } from '../memory/tool-choice-store.js';
-const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices, draftToDefinition, commitAuthoredWorkflow, bindDiscussedToolkitsIntoSteps, autoTagStepsWithModelRoleIntents } = await import('./orchestration-tools.js');
+const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices, draftToDefinition, commitAuthoredWorkflow, bindDiscussedToolkitsIntoSteps, autoTagStepsWithModelRoleIntents, _setWorkflowDispatchEventAppenderForTests } = await import('./orchestration-tools.js');
 const { traceToWorkflowDraft } = await import('../execution/trace-to-workflow.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 const { fireWorkflowSystemEvent } = await import('../execution/workflow-trigger-engine.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
+const { readWorkflowRunOriginRecords } = await import('./workflow-run-queue.js');
+const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
 
 type ToolResult = { content: Array<{ type: 'text'; text: string }> };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
@@ -145,6 +147,7 @@ test.after(() => {
 
 beforeEach(() => {
   resetState();
+  _setWorkflowDispatchEventAppenderForTests();
 });
 
 test('workflow_run rejects missing required legacy template inputs without queueing', async () => {
@@ -1575,7 +1578,7 @@ test('workflow_get notes a deterministic step whose runner file is missing (does
 // conversation — if anyone reintroduces a conversation-text gate on the run
 // path, they fail.
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-const { createSession: createJourneySession, appendEvent: appendJourneyEvent } = await import('../runtime/harness/eventlog.js');
+const { createSession: createJourneySession, appendEvent: appendJourneyEvent, listEvents: listJourneyEvents } = await import('../runtime/harness/eventlog.js');
 const { createFocus, getActiveFocus, getFocusWorkstate } = await import('../memory/focus.js');
 
 function writeSlackUpdatesWorkflow(): void {
@@ -1586,6 +1589,16 @@ function writeSlackUpdatesWorkflow(): void {
     trigger: { manual: true },
     steps: [{ id: 'post_update', prompt: 'Compose and post the team activity update.' }],
   });
+}
+
+const TEST_ORIGIN_CHAT_TARGET = { type: 'origin_chat' } as const;
+
+function exactOriginChatSourceData(text: string): Record<string, unknown> {
+  return {
+    text,
+    originReplyTarget: TEST_ORIGIN_CHAT_TARGET,
+    originReplyTargetDigest: exactOriginDeliveryTargetDigest(TEST_ORIGIN_CHAT_TARGET),
+  };
 }
 
 test('journey: assistant proposes by name → user says "yes please" → the run QUEUES', async () => {
@@ -1599,6 +1612,190 @@ test('journey: assistant proposes by name → user says "yes please" → the run
     workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
   const text = resultText(result);
   assert.match(text, /Queued "team-activity-slack-updates"/, `confirmed run must queue, got: ${text.slice(0, 200)}`);
+});
+
+test('workflow_run holds exact chat work behind a durable source-bound preparation', async () => {
+  writeSlackUpdatesWorkflow();
+  const session = createJourneySession({ kind: 'chat', channel: 'desktop', title: 'exact lineage journey' });
+  const accepted = appendJourneyEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactOriginChatSourceData('Run the team activity workflow.'),
+  });
+
+  const result = await withToolOutputContext({
+    sessionId: session.id,
+    sourceUserSeq: accepted.seq,
+    callId: 'exact-lineage-run',
+  }, () => workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
+  assert.match(resultText(result), /Prepared "team-activity-slack-updates"/);
+
+  const [runFile] = workflowRunFiles();
+  assert.ok(runFile);
+  const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFile), 'utf-8')) as {
+    id: string;
+    status?: string;
+    originSessionId?: string;
+  };
+  assert.equal(run.status, 'awaiting_chat_dispatch_seal');
+  assert.equal(run.originSessionId, undefined, 'exact chat authority never leaks into the legacy inline route');
+  const exact = readWorkflowRunOriginRecords(run.id).filter((record) => record.version === 2);
+  assert.equal(exact.length, 0, 'v2 observer becomes visible only after whole-group activation');
+  const prepared = listJourneyEvents(session.id, { types: ['async_work_dispatch_prepared'] });
+  assert.equal(prepared.length, 1);
+  assert.equal(prepared[0].turn, accepted.turn);
+  assert.equal(prepared[0].parentEventId, accepted.id);
+  assert.equal(prepared[0].data.originSessionId, session.id);
+  assert.equal(prepared[0].data.sourceUserSeq, accepted.seq);
+  assert.equal(prepared[0].data.runId, run.id);
+  assert.deepEqual(prepared[0].data.replyTarget, TEST_ORIGIN_CHAT_TARGET);
+  assert.equal(listJourneyEvents(session.id, { types: ['async_work_dispatched'] }).length, 0);
+});
+
+test('identical exact workflow_run retries reuse one stable private preparation receipt', async () => {
+  writeSlackUpdatesWorkflow();
+  const session = createJourneySession({ kind: 'chat', channel: 'desktop', title: 'exact retry journey' });
+  const accepted = appendJourneyEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactOriginChatSourceData('Run it once.'),
+  });
+  const invoke = () => withToolOutputContext({
+    sessionId: session.id,
+    sourceUserSeq: accepted.seq,
+    callId: 'exact-retry-run',
+  }, () => workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
+
+  await invoke();
+  const first = listJourneyEvents(session.id, { types: ['async_work_dispatch_prepared'] });
+  assert.equal(first.length, 1);
+  await invoke();
+  const afterRetry = listJourneyEvents(session.id, { types: ['async_work_dispatch_prepared'] });
+  assert.equal(workflowRunFiles().length, 1, 'retry dedupes to the held canonical run');
+  assert.equal(afterRetry.length, 1, 'retry cannot mint a second event-seq receipt for one member');
+  assert.equal(afterRetry[0].id, first[0].id);
+  assert.equal(afterRetry[0].seq, first[0].seq);
+  assert.equal(afterRetry[0].createdAt, first[0].createdAt);
+});
+
+test('workflow_run fails before queue when an exact chat target cannot be snapshotted', async () => {
+  writeSlackUpdatesWorkflow();
+  const session = createJourneySession({
+    kind: 'chat',
+    channel: 'discord',
+    title: 'unbound exact target',
+    metadata: {},
+  });
+  const accepted = appendJourneyEvent({
+    sessionId: session.id,
+    turn: 3,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Run it here.' },
+  });
+
+  const result = await withToolOutputContext({
+    sessionId: session.id,
+    sourceUserSeq: accepted.seq,
+    callId: 'unbound-target-run',
+  }, () => workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
+  assert.match(resultText(result), /not queued.*exact report-back target/i);
+  assert.deepEqual(workflowRunFiles(), []);
+  assert.equal(listJourneyEvents(session.id, { types: ['async_work_dispatched'] }).length, 0);
+});
+
+test('workflow_run rejects a synthetic source even when it carries target-shaped data', async () => {
+  writeSlackUpdatesWorkflow();
+  const session = createJourneySession({ kind: 'chat', channel: 'desktop', title: 'synthetic exact source' });
+  const accepted = appendJourneyEvent({
+    sessionId: session.id,
+    turn: 3,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      ...exactOriginChatSourceData('Synthetic continuation.'),
+      synthetic: true,
+    },
+  });
+
+  const result = await withToolOutputContext({
+    sessionId: session.id,
+    sourceUserSeq: accepted.seq,
+    callId: 'synthetic-target-run',
+  }, () => workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
+  assert.match(resultText(result), /not queued.*exact report-back target/i);
+  assert.deepEqual(workflowRunFiles(), []);
+  assert.equal(listJourneyEvents(session.id, { types: ['async_work_dispatched'] }).length, 0);
+});
+
+test('workflow_run accepts a source-bound human approval resume and preserves its route', async () => {
+  writeSlackUpdatesWorkflow();
+  const session = createJourneySession({ kind: 'chat', channel: 'desktop', title: 'approval resume source' });
+  const accepted = appendJourneyEvent({
+    sessionId: session.id,
+    turn: 3,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      ...exactOriginChatSourceData('Approve apr-route.'),
+      source: 'channel_approval_resume',
+      humanControl: 'provider_approval_action',
+      approvalId: 'apr-route',
+      decision: 'approve',
+    },
+  });
+
+  const result = await withToolOutputContext({
+    sessionId: session.id,
+    sourceUserSeq: accepted.seq,
+    callId: 'approved-route-run',
+  }, () => workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
+  assert.match(resultText(result), /Prepared "team-activity-slack-updates"/);
+  const [runFile] = workflowRunFiles();
+  assert.ok(runFile);
+  const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFile), 'utf-8')) as { id: string };
+  assert.equal(readWorkflowRunOriginRecords(run.id).filter((record) => record.version === 2).length, 0);
+  const [prepared] = listJourneyEvents(session.id, { types: ['async_work_dispatch_prepared'] });
+  assert.equal(prepared?.data.sourceUserSeq, accepted.seq);
+  assert.deepEqual(prepared?.data.replyTarget, TEST_ORIGIN_CHAT_TARGET);
+  assert.equal(listJourneyEvents(session.id, { types: ['async_work_dispatched'] }).length, 0);
+});
+
+test('workflow_run never returns a safe ACK when its typed dispatch event cannot persist', async () => {
+  writeSlackUpdatesWorkflow();
+  const session = createJourneySession({ kind: 'chat', channel: 'desktop', title: 'event persistence failure' });
+  const accepted = appendJourneyEvent({
+    sessionId: session.id,
+    turn: 4,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactOriginChatSourceData('Run the workflow.'),
+  });
+  _setWorkflowDispatchEventAppenderForTests(() => {
+    throw new Error('fixture dispatch event fsync failure');
+  });
+  try {
+    await assert.rejects(
+      withToolOutputContext({
+        sessionId: session.id,
+        sourceUserSeq: accepted.seq,
+        callId: 'event-failure-run',
+      }, () => workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' })),
+      /fixture dispatch event fsync failure/,
+    );
+  } finally {
+    _setWorkflowDispatchEventAppenderForTests();
+  }
+  assert.equal(workflowRunFiles().length, 1, 'a retryable non-executable queue record remains durable');
+  const [heldFile] = workflowRunFiles();
+  const held = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, heldFile), 'utf-8')) as { status?: string };
+  assert.equal(held.status, 'awaiting_chat_dispatch_seal', 'event failure cannot orphan executable work');
+  assert.equal(listJourneyEvents(session.id, { types: ['async_work_dispatch_prepared'] }).length, 0);
+  assert.equal(listJourneyEvents(session.id, { types: ['async_work_dispatched'] }).length, 0);
 });
 
 // Note: the informed confirm-ONCE beat lives at the BRAIN level (clem-rubric

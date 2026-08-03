@@ -21,6 +21,10 @@ import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import {
+  acceptedSourceOutcome,
+  type AcceptedSourceOutcome,
+} from '../runtime/harness/accepted-source-outcome.js';
+import {
   beginRunAttempt,
   createSession as createHarnessSession,
   finishRunAttempt,
@@ -38,7 +42,6 @@ import {
   publicUserInputText,
 } from '../runtime/harness/public-presentation.js';
 import {
-  presentationEventFromCompletionData,
   turnOutcomeId,
   type PresentationEvent,
   type TurnIdentity,
@@ -434,24 +437,6 @@ function commitGatewayTerminal(input: {
   });
 }
 
-function exactGatewayTerminal(source: EventRow): { event: EventRow; presentation: PresentationEvent } | null {
-  const terminalKey = `turn:${source.seq}`;
-  for (const event of listHarnessEvents(source.sessionId, {
-    types: ['conversation_completed'],
-    desc: true,
-  })) {
-    if (event.data.terminalKey !== terminalKey && event.data.sourceUserSeq !== source.seq) continue;
-    try {
-      const presentation = presentationEventFromCompletionData(event.data);
-      if (presentation?.identity.sourceUserSeq === source.seq) return { event, presentation };
-    } catch {
-      // A contradictory typed row is not replayable public authority.
-      return null;
-    }
-  }
-  return null;
-}
-
 function gatewayResponseFromTerminal(
   terminal: { event: EventRow; presentation: PresentationEvent },
   runId: string,
@@ -479,6 +464,21 @@ function gatewayResponseFromTerminal(
     ...(event.data.route && typeof event.data.route === 'object'
       ? { route: event.data.route as AssistantRouteDiagnostics }
       : {}),
+  };
+}
+
+function gatewayResponseFromDispatch(
+  dispatch: Extract<AcceptedSourceOutcome, { kind: 'dispatched' }>,
+  runId: string,
+  details: Pick<GatewayResponse, 'turnsUsed' | 'route'> = {},
+): GatewayResponse {
+  return {
+    text: dispatch.presentation.text,
+    sessionId: dispatch.event.sessionId,
+    runId,
+    stoppedReason: 'success',
+    ...(details.turnsUsed !== undefined ? { turnsUsed: details.turnsUsed } : {}),
+    ...(details.route ? { route: details.route } : {}),
   };
 }
 
@@ -872,7 +872,7 @@ export class ClementineGateway {
       throw new Error(PUBLIC_RUN_FAILURE_TEXT);
     }
 
-    const replay = exactGatewayTerminal(accepted.source);
+    const replay = acceptedSourceOutcome(accepted.source);
     if (replay) {
       request.onAcceptedTurn?.({ source: accepted.source, attempt: accepted.attempt });
       if (accepted.attempt) {
@@ -880,16 +880,22 @@ export class ClementineGateway {
       } else {
         clearGatewayRunMarkerIfIdle(request.sessionId);
       }
-      const response = gatewayResponseFromTerminal(replay, run.id);
+      const response = replay.kind === 'terminal'
+        ? gatewayResponseFromTerminal(replay, run.id)
+        : gatewayResponseFromDispatch(replay, run.id);
       finishRun(run.id, {
-        status: replay.presentation.status === 'cancelled'
-          ? 'cancelled'
-          : replay.presentation.status === 'failed' || replay.presentation.status === 'blocked'
-            ? 'failed'
-            : replay.presentation.needs?.kind === 'approval'
-              ? 'awaiting_approval'
-              : 'completed',
-        message: 'Replayed the durable gateway turn outcome.',
+        status: replay.kind === 'dispatched'
+          ? 'queued'
+          : replay.presentation.status === 'cancelled'
+            ? 'cancelled'
+            : replay.presentation.status === 'failed' || replay.presentation.status === 'blocked'
+              ? 'failed'
+              : replay.presentation.needs?.kind === 'approval'
+                ? 'awaiting_approval'
+                : 'completed',
+        message: replay.kind === 'dispatched'
+          ? 'Replayed the durable workflow dispatch acknowledgement.'
+          : 'Replayed the durable gateway turn outcome.',
         outputPreview: response.text,
         queuedTaskId: response.queuedTaskId,
         pendingApprovalId: response.pendingApprovalId,
@@ -1043,6 +1049,23 @@ export class ClementineGateway {
         onToolActivity: request.onToolActivity,
       }, (req) => this.assistant.respond(req));
       const route = recordGatewayRoute(run.id, response, request.model);
+      const dispatched = acceptedSourceOutcome(accepted.source);
+      if (dispatched?.kind === 'dispatched') {
+        // The foreground bridge has handed this accepted source to the durable
+        // workflow graph. Its acknowledgement closes only this physical HTTP /
+        // mobile request; the workflow reducer still owns the one later public
+        // conversation terminal for the logical turn.
+        try { settleGatewayAttempt(activeAttempt, 'completed'); } catch { /* bridge may already have settled it */ }
+        finishRun(run.id, {
+          status: 'queued',
+          message: 'Workflow dispatch accepted; awaiting its durable terminal.',
+          outputPreview: dispatched.presentation.text,
+        });
+        return gatewayResponseFromDispatch(dispatched, run.id, {
+          turnsUsed: response.turnsUsed,
+          route,
+        });
+      }
       const committed = commitGatewayTerminal({
         source: accepted.source,
         status: terminalStatusForResponse(response),
@@ -1109,6 +1132,40 @@ export class ClementineGateway {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       logger.error({ err: detail, sessionId: request.sessionId, runId: run.id }, 'accepted gateway turn failed');
+      const durable = acceptedSourceOutcome(accepted.source);
+      if (durable) {
+        try {
+          settleGatewayAttempt(
+            activeAttempt,
+            durable.kind === 'terminal'
+              && (durable.presentation.status === 'failed' || durable.presentation.status === 'blocked')
+              ? 'failed'
+              : durable.kind === 'terminal' && durable.presentation.status === 'cancelled'
+                ? 'cancelled'
+                : 'completed',
+          );
+        } catch { /* the durable source outcome remains authoritative */ }
+        const response = durable.kind === 'terminal'
+          ? gatewayResponseFromTerminal(durable, run.id)
+          : gatewayResponseFromDispatch(durable, run.id);
+        finishRun(run.id, {
+          status: durable.kind === 'dispatched'
+            ? 'queued'
+            : durable.presentation.status === 'cancelled'
+              ? 'cancelled'
+              : durable.presentation.status === 'failed' || durable.presentation.status === 'blocked'
+                ? 'failed'
+                : durable.presentation.needs?.kind === 'approval'
+                  ? 'awaiting_approval'
+                  : 'completed',
+          message: durable.kind === 'dispatched'
+            ? 'Workflow dispatch survived a foreground transport failure.'
+            : 'Recovered the durable gateway turn outcome after a foreground failure.',
+          outputPreview: response.text,
+          pendingApprovalId: response.pendingApprovalId,
+        });
+        return response;
+      }
       finishRun(run.id, {
         status: 'failed',
         message: detail,

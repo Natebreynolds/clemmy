@@ -9,6 +9,7 @@ import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript, DEFAULT_MAX_OUTPUT_BYTES,
 } from '../runtime/sandboxed-script.js';
 import pino from 'pino';
+import { redactSensitiveText } from '../runtime/security.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel, DEFAULT_CODEX_MODEL } from '../config.js';
 import { isProviderCapacityExhausted } from '../shared/provider-capacity.js';
@@ -40,7 +41,11 @@ import {
 import { runBoundedPool } from './bounded-pool.js';
 import { resolveWorkflowRunConcurrency } from './workflow-run-concurrency.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
-import { addNotification, loadNotifications } from '../runtime/notifications.js';
+import {
+  addNotification,
+  loadNotifications,
+  type NotificationRecord,
+} from '../runtime/notifications.js';
 import { addRunEvent, startRun, finishRun, getRun } from '../runtime/run-events.js';
 import { WORKFLOW_RUNS_DIR, listWorkspaceProjects } from '../tools/shared.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
@@ -134,6 +139,7 @@ import {
   type BlockedStep,
 } from './workflow-diagnosis.js';
 import {
+  readWorkflowRunOriginRecords,
   readWorkflowRunOriginSessionIds,
   reconcileAwaitingCompiledWorkflowRunBindings,
   requeueWorkflowFromRun,
@@ -336,7 +342,8 @@ export function _setAfterStepArtifactPersistForTests(
  * workflow (a step that called notify_user) already surfaced a user-facing
  * message for this run; delivering the runner completion too would double-post
  * to Discord. Correlation is strictly by runId (race-safe across concurrent
- * drains). A needs-attention run ALWAYS delivers — reports-back is never silenced.
+ * drains). This legacy echo rule never silences needs-attention; exact v2
+ * terminal authority is evaluated separately at publication time.
  */
 export function shouldSilenceCompletionEcho(opts: {
   needsAttention: boolean;
@@ -349,6 +356,104 @@ export function shouldSilenceCompletionEcho(opts: {
       n.metadata?.source === 'notify_user_tool' &&
       n.metadata?.workflowRunId === opts.runId,
   );
+}
+
+/** The latest authored notify_user body is a presentation contribution, not
+ * merely a side effect. Exact-origin workflows silence that intermediate
+ * notification, so their source reducer must carry its text into the one final
+ * reply or the workflow's deliberately authored result disappears. */
+function workflowNotifyUserPresentationCandidates(input: {
+  runId: string;
+  notifications: NotificationRecord[];
+}): NotificationRecord[] {
+  return input.notifications
+    .filter((notification) =>
+      notification.metadata?.source === 'notify_user_tool'
+      && notification.metadata?.workflowRunId === input.runId
+      && notification.metadata?.exactOriginTerminalAuthority === true
+      && typeof notification.body === 'string'
+      && notification.body.trim().length > 0)
+    .sort((left, right) =>
+      left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+}
+
+export function latestWorkflowNotifyUserPresentation(input: {
+  runId: string;
+  notifications: NotificationRecord[];
+}): string | null {
+  const candidates = workflowNotifyUserPresentationCandidates(input);
+  const authored = candidates.at(-1)?.body.trim();
+  if (!authored) return null;
+  // notify_user is user-facing by definition, but its body still crosses a
+  // durable public boundary here. Apply the same credential scrub used by
+  // other public projections and keep this contribution below the exact
+  // origin terminal's 1,800-character transport budget. This is deterministic
+  // and does not spend another model turn.
+  const publicBody = scrubWorkflowTerminalPresentation(authored);
+  if (!publicBody) return null;
+  const maxChars = 1_800;
+  return publicBody.length <= maxChars
+    ? publicBody
+    : `${publicBody.slice(0, maxChars - 1).trimEnd()}…`;
+}
+
+/** Deterministic final public-boundary scrub for workflow-derived prose.
+ * Structured projection removes secret-owned branches before rendering; this
+ * second layer catches credential assignments or bearer material authored in
+ * otherwise public fields and in model-written terminal prose. */
+export function scrubWorkflowTerminalPresentation(value: string): string {
+  return redactSensitiveText(value).trim();
+}
+
+export function mergeWorkflowPresentationContribution(
+  authored: string | null,
+  derived: string,
+  notificationReceiptIds: readonly string[] = [],
+): string {
+  const publicAuthored = authored ? scrubWorkflowTerminalPresentation(authored) : null;
+  const publicDerived = scrubWorkflowTerminalPresentation(derived);
+  if (!publicAuthored) return publicDerived;
+  // The local tool's return value is an execution receipt, not content. When
+  // it is the only derived output, publishing it beside the authored body
+  // leaks harness narration into chat and wastes the scarce terminal budget.
+  // Compare only projections constructed from durable notification ids; this
+  // is typed receipt identity, not a prose classifier.
+  const receiptProjections = new Set(notificationReceiptIds.flatMap((id) => [
+    `Notification queued: ${id}`,
+    `**notify_user**: Notification queued: ${id}`,
+  ]));
+  if (receiptProjections.has(derived.trim())) {
+    return publicAuthored;
+  }
+  const normalize = (value: string): string => value.replace(/\s+/g, ' ').trim().toLowerCase();
+  const authoredKey = normalize(publicAuthored);
+  const derivedKey = normalize(publicDerived);
+  if (!derivedKey || authoredKey.includes(derivedKey)) return publicAuthored;
+  if (derivedKey.includes(authoredKey)) return publicDerived;
+  return `${publicAuthored}\n\n${publicDerived}`;
+}
+
+/**
+ * Exact observers own one accepted human source, so their terminal result is
+ * delivered by the exact-origin report-back outbox rather than the runner's
+ * global notification fan-out. Read this at terminal publication time (not
+ * run admission): another chat can attach an exact observer while a long run
+ * is already executing. An absent/empty readable sidecar preserves the legacy
+ * route; a corrupt sidecar fails closed because it may hide a private exact
+ * recipient and cannot safely authorize global fan-out.
+ */
+export type WorkflowRunOriginObserverState = 'none' | 'exact' | 'corrupt';
+
+export function workflowRunOriginObserverState(runId: string): WorkflowRunOriginObserverState {
+  try {
+    return readWorkflowRunOriginRecords(runId).some((record) => record.version === 2)
+      ? 'exact'
+      : 'none';
+  } catch {
+    // A present-but-unreadable marker may contain an exact private recipient.
+    // Never reinterpret that uncertainty as permission to use global fan-out.
+    return 'corrupt';
+  }
 }
 
 /**
@@ -9856,14 +9961,31 @@ async function processOneRunFile(
       // so a confident-but-wrong verdict can never break a workflow that
       // actually succeeded. Skipped for partial single-step re-runs and runs
       // with no deliverable; fully fail-open.
-      const baseSuccessBody = isCompiledProjectRun
+      const originObserverState = workflowRunOriginObserverState(run.id);
+      const terminalNotifications = loadNotifications();
+      const authoredNotifyPresentation = latestWorkflowNotifyUserPresentation({
+        runId: run.id,
+        notifications: terminalNotifications,
+      });
+      const authoredNotifyReceiptIds = workflowNotifyUserPresentationCandidates({
+        runId: run.id,
+        notifications: terminalNotifications,
+      }).map((notification) => notification.id);
+      const derivedSuccessBody = scrubWorkflowTerminalPresentation(isCompiledProjectRun
         ? finalOutput
         : renderSuccessBody({
             steps: publicExecutionSteps,
             stepOutputs: publicStepOutputs,
             finalOutput,
             hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
-          });
+          }));
+      const baseSuccessBody = originObserverState === 'exact'
+        ? mergeWorkflowPresentationContribution(
+            authoredNotifyPresentation,
+            derivedSuccessBody,
+            authoredNotifyReceiptIds,
+          )
+        : derivedSuccessBody;
       // A declared pinned goal REPLACES the fuzzy target judge for this run:
       // the parked criteria are stricter and produce per-criterion evidence,
       // so double-judging would only burn a second model call.
@@ -10465,30 +10587,37 @@ async function processOneRunFile(
       // double-post to Discord: once from the step, once from this runner
       // completion. When the run SUCCEEDED and a step already surfaced a
       // user-facing notification for THIS run, make the runner's completion
-      // dashboard-only (silent) to avoid the duplicate. A needs-attention run
-      // ALWAYS delivers — reports-back must never be silenced.
+      // dashboard-only (silent) to avoid the duplicate. The legacy echo rule
+      // still delivers needs-attention; an exact v2 observer is the separate
+      // authority that makes any global terminal card dashboard-only.
       const stepAlreadyNotified = shouldSilenceCompletionEcho({
         needsAttention,
         runId: run.id,
-        notifications: loadNotifications(),
+        notifications: terminalNotifications,
       });
+      const hasExactOriginObserver = originObserverState === 'exact';
+      const suppressGlobalTerminal = originObserverState !== 'none';
       // Single report body (escalation banner prepended when auto-heal is
       // paused), reused for the notification, dashboard preview, and chat re-entry.
       let reportBody = isCompiledProjectRun && !needsAttention
         ? finalOutput
         : `${escalationBanner}${needsAttention ? outcome.body : successBody}${advisorySummary}`;
+      reportBody = scrubWorkflowTerminalPresentation(reportBody);
       // Warm the tone into Clementine's voice + let her flag a routine no-op.
       // Best-effort/fail-open: any hiccup returns the original text. We skip the
       // already-silenced echo (token-free). A no-op silences ONLY a clean,
       // scheduled (non-interactive) run — every guard below must be false.
-      const interactive = Boolean(run.originSessionId);
+      // Exact v2 observer authority is the generic interactive-workflow
+      // signal. Keep the legacy primary-origin bit only for the old no-op
+      // behavior; it must not gain exact-delivery or model-skip semantics.
+      const interactiveForNoOpCompatibility = hasExactOriginObserver || Boolean(run.originSessionId);
       let runIsNoOp = false;
-      if (!isCompiledProjectRun && !stepAlreadyNotified) {
+      if (!isCompiledProjectRun && !stepAlreadyNotified && !suppressGlobalTerminal) {
         const lane = workflowReportLaneForOutcome({ needsAttention, advisories: publicQualityAdvisories });
         const voiced = await rewriteWorkflowReportInVoiceImpl(reportBody, { workflowName: workflow.data.name, lane });
-        reportBody = voiced.message;
+        reportBody = scrubWorkflowTerminalPresentation(voiced.message);
         runIsNoOp = voiced.nothingHappened
-          && !needsAttention && !hasFailures && !hasAdvisories && !autoHealPaused && !interactive;
+          && !needsAttention && !hasFailures && !hasAdvisories && !autoHealPaused && !interactiveForNoOpCompatibility;
       }
       const terminalReport = {
         workflowName: workflow.data.name,
@@ -10534,7 +10663,8 @@ async function processOneRunFile(
         // Advisories must reach the user — never silence a run that has one.
         // A chronic-failure escalation must also always deliver. A routine
         // no-op goes dashboard-only (recorded + auditable, no Discord/push).
-        silent: (stepAlreadyNotified || runIsNoOp) && !hasAdvisories && !autoHealPaused,
+        silent: suppressGlobalTerminal
+          || ((stepAlreadyNotified || runIsNoOp) && !hasAdvisories && !autoHealPaused),
         metadata: {
           workflow: workflow.data.name,
           runId: run.id,
@@ -10844,10 +10974,19 @@ async function processOneRunFile(
       }
       // Warm the failure tone too (fail-open, lane:'failed' so the rewrite can
       // never claim success or drop the `apply fix <id>` action). A user CANCEL
-      // keeps the original text + is never rewritten. Failures are NEVER silenced.
-      let failureBody = `${errEscalationBanner}${healBody ?? message}`;
-      if (!cancelled && definitionResolution.definitionSource !== 'compiled_snapshot') {
-        failureBody = (await rewriteWorkflowReportInVoiceImpl(failureBody, { workflowName: run.workflow, lane: 'failed' })).message;
+      // keeps the original text + is never rewritten. An exact v2 observer
+      // owns failure delivery too, so only that run's global card is silent.
+      let failureBody = scrubWorkflowTerminalPresentation(`${errEscalationBanner}${healBody ?? message}`);
+      const originObserverState = workflowRunOriginObserverState(run.id);
+      const suppressGlobalTerminal = originObserverState !== 'none';
+      if (
+        !cancelled
+        && definitionResolution.definitionSource !== 'compiled_snapshot'
+        && !suppressGlobalTerminal
+      ) {
+        failureBody = scrubWorkflowTerminalPresentation(
+          (await rewriteWorkflowReportInVoiceImpl(failureBody, { workflowName: run.workflow, lane: 'failed' })).message,
+        );
       }
       const requestedReport = { workflowName: run.workflow, outcome: 'failed' as const, detail: failureBody };
       const terminalRecord = writeRunRecord(filePath, {
@@ -10898,6 +11037,7 @@ async function processOneRunFile(
         body: failureBody,
         createdAt: new Date().toISOString(),
         read: false,
+        ...(suppressGlobalTerminal ? { silent: true } : {}),
         metadata: {
           workflow: run.workflow,
           runId: run.id,

@@ -64,7 +64,12 @@ import { renderProvenSkillForPrompt } from '../../memory/skill-choice-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput, projectCommandsLineForInput } from './context-packet.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { publicReplyText } from './public-presentation.js';
+import { finalizePreparedWorkflowDispatchForSource } from './loop.js';
 import { commitTurnOutcome } from './delivery-committer.js';
+import {
+  PendingWorkflowChatDispatchOwnershipError,
+  readPendingWorkflowChatDispatchOwnership,
+} from '../../tools/workflow-run-queue.js';
 import { turnOutcomeId, type TurnIdentity, type TurnOutcome } from './turn-outcome.js';
 import { markRunInFlight } from './restart-recovery.js';
 import { actionBus } from '../action-bus.js';
@@ -1354,12 +1359,38 @@ export async function respondViaClaudeAgentSdkBrain(
     },
   };
   let status: 'completed' | 'cancelled' | 'failed' = 'failed';
+  let preserveAttemptOwnership = false;
   try {
     const response = await respondViaClaudeAgentSdkBrainAttempt(surface, scopedRequest, attempt);
     status = response.stoppedReason === 'cancelled' ? 'cancelled' : 'completed';
     return response;
+  } catch (err) {
+    const acceptedSource = routeAcceptedSource ?? getRunAttemptSourceUserEvent(attempt);
+    if (
+      err instanceof PendingWorkflowChatDispatchOwnershipError
+      && acceptedSource
+      && err.ownership.originSessionId === acceptedSource.sessionId
+      && err.ownership.sourceUserSeq === acceptedSource.seq
+    ) {
+      preserveAttemptOwnership = true;
+    } else if (acceptedSource) {
+      try {
+        preserveAttemptOwnership = readPendingWorkflowChatDispatchOwnership({
+          sessionId: acceptedSource.sessionId,
+          sourceUserSeq: acceptedSource.seq,
+        }) !== null;
+      } catch {
+        // The ownership ledger participates in the no-terminal proof. An
+        // unreadable exact-source state cannot authorize this inner wrapper
+        // to settle the attempt before the outer bridge/restart reconciler.
+        preserveAttemptOwnership = true;
+      }
+    }
+    throw err;
   } finally {
-    try { finishRunAttempt(attempt, status); } catch { /* attempt telemetry must not mask the response */ }
+    if (!preserveAttemptOwnership) {
+      try { finishRunAttempt(attempt, status); } catch { /* attempt telemetry must not mask the response */ }
+    }
     if (status === 'cancelled') {
       try { clearKill(sessionId, attempt); } catch { /* best effort */ }
     }
@@ -1950,9 +1981,37 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   let artifactVerificationPending: RunArtifact[] = [];
   let logicalRunScopeId: string | undefined;
   let graphApprovalId: string | undefined;
+  const finalizedWorkflowDispatchResponse = (): AssistantResponse | null => {
+    const dispatch = finalizePreparedWorkflowDispatchForSource(sessionId, userInputEvent.seq);
+    if (!dispatch) return null;
+    // This clears only the foreground chat attempt. The public dispatch row is
+    // deliberately nonterminal; the workflow reducer owns the later exact
+    // terminal and provider delivery.
+    markRunInFlight(sessionId, false);
+    return {
+      text: dispatch.presentation.text,
+      sessionId,
+      stoppedReason: 'success',
+      turnsUsed: 1,
+      raw: {
+        transport: 'claude_agent_sdk_brain',
+        asyncWork: {
+          status: dispatch.presentation.status,
+          kind: dispatch.presentation.kind,
+          runIds: [...dispatch.presentation.runIds],
+          sourceGroupId: dispatch.presentation.sourceGroupId,
+          sourceGroupDigest: dispatch.presentation.sourceGroupDigest,
+          sourceUserSeq: dispatch.presentation.sourceUserSeq,
+          dispatchKey: dispatch.presentation.dispatchKey,
+        },
+      },
+    };
+  };
   let result: ClaudeAgentSdkRunResult;
   try {
     result = await runWithSalvage({ prompt: request.message, ...runOptions });
+    const initialDispatch = finalizedWorkflowDispatchResponse();
+    if (initialDispatch) return initialDispatch;
     logicalRunScopeId = result.artifactRunScopeId;
     const resultIsAwaitingInput = (): boolean =>
       result.stoppedReason === 'awaiting-input' || result.stoppedReason === 'pending-approval';
@@ -2024,6 +2083,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           `Do NOT describe tools. INVOKE the real tool now to do this: "${turnObjective}". Then reply with the actual result.`,
         ...runOptions,
       });
+      const retryDispatch = finalizedWorkflowDispatchResponse();
+      if (retryDispatch) return retryDispatch;
       continuationsUsed += 1; // a continuation was spent (a parse stumble → null still cost a query())
       if (retry) {
         result = mergeClaudeRunEvidence(result, retry);
@@ -2045,6 +2106,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           `Just do exactly what the user asked: "${turnObjective}". Use the relevant tools and reply with the real result.`,
         ...runOptions,
       });
+      const retryDispatch = finalizedWorkflowDispatchResponse();
+      if (retryDispatch) return retryDispatch;
       continuationsUsed += 1;
       if (retry) {
         result = mergeClaudeRunEvidence(result, retry);
@@ -2177,6 +2240,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             `Otherwise continue now and FINISH it — produce the concrete artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
           ...runOptions,
         });
+        const continuationDispatch = finalizedWorkflowDispatchResponse();
+        if (continuationDispatch) return continuationDispatch;
         continuationsUsed += 1;
         if (!contResult) break; // parse stumble on a continuation → keep the prior good result
         result = mergeClaudeRunEvidence(result, contResult);
@@ -2243,6 +2308,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             + 'Do NOT redo items already completed above — do the REMAINING ones. Produce the concrete results (data/artifact), and do not stop to ask.',
           ...runOptions,
         });
+        const continuationDispatch = finalizedWorkflowDispatchResponse();
+        if (continuationDispatch) return continuationDispatch;
         autoContinues += 1;
         if (!cont) break; // a parse stumble on a continuation → keep the prior partial
         continuationLedger = [...continuationLedger, ...(cont.toolCallLedger ?? [])];
@@ -2299,6 +2366,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           // work already done.
           result = priorSkillResult;
         }
+        const dispatch = finalizedWorkflowDispatchResponse();
+        if (dispatch) return dispatch;
       }
     }
 
@@ -2350,6 +2419,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             });
           } catch { /* telemetry best-effort */ }
         }
+        const verificationDispatch = finalizedWorkflowDispatchResponse();
+        if (verificationDispatch) return verificationDispatch;
         if (verification) {
           const merged = mergeClaudeRunEvidence(priorResult, verification);
           // Verification is internal QA. Keep the original user-facing result
@@ -2425,6 +2496,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     artifactVerificationPending = logicalRunScopeId
       ? listUnverifiedRunArtifacts(sessionId, logicalRunScopeId)
       : [];
+    const finalDispatch = finalizedWorkflowDispatchResponse();
+    if (finalDispatch) return finalDispatch;
   } catch (err) {
     // Keep the marker armed for propagated model-work failures. The bridge may
     // safely recover on another brain or reduce the error to a typed terminal;
@@ -2433,6 +2506,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // failure — return a clean stopped reply instead of a raw error bubbling
     // to the chat surface. Only when the kill row is actually set (a caller's
     // own shouldCancel keeps its existing propagation semantics).
+    const committedDispatch = finalizedWorkflowDispatchResponse();
+    if (committedDispatch) return committedDispatch;
     if (err instanceof AgentRuntimeCancelledError) {
       try {
         appendEvent({ sessionId, turn: 0, role: 'system', type: 'kill_requested', data: { reason: 'during run (sdk lane)', attemptId: attempt.attemptId } });

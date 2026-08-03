@@ -7,7 +7,8 @@
  */
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -28,9 +29,27 @@ const {
   resetEventLog,
 } = await import('../runtime/harness/eventlog.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
-const { presentationEventFromCompletionData } = await import('../runtime/harness/turn-outcome.js');
-const { PUBLIC_RUN_FAILURE_TEXT, publicUserInputText } = await import('../runtime/harness/public-presentation.js');
+const {
+  presentationEventFromCompletionData,
+  turnOutcomeId,
+} = await import('../runtime/harness/turn-outcome.js');
+const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+const {
+  PUBLIC_RUN_FAILURE_TEXT,
+  publicAsyncWorkDispatchedData,
+  publicUserInputText,
+} = await import('../runtime/harness/public-presentation.js');
 const { getRun } = await import('../runtime/run-events.js');
+const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const {
+  createWorkflowChatDispatchPreparationAuthority,
+  createWorkflowChatDispatchPreparedReceipt,
+  createWorkflowOriginGroupCloseAuthority,
+  createWorkflowOriginGroupClosedBatchReceipt,
+  finalizeWorkflowOriginGroupClosedBatch,
+  recordWorkflowChatDispatchPreparation,
+  recordWorkflowOriginGroupClosedBatch,
+} = await import('../execution/workflow-origin-group.js');
 const {
   createBackgroundTask,
   getBackgroundTask,
@@ -50,6 +69,80 @@ test.after(() => {
   delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
+
+function appendActiveWorkflowDispatch(
+  source: import('../runtime/harness/eventlog.js').EventRow,
+  runId: string,
+) {
+  const replyTarget = source.data.originReplyTarget as import('../runtime/exact-origin-delivery.js').ExactOriginDeliveryTarget;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'gateway-dispatch-test',
+    status: 'awaiting_chat_dispatch_seal',
+  }), 'utf-8');
+  const authority = createWorkflowChatDispatchPreparationAuthority({
+    runId,
+    observer: { sessionId: source.sessionId, sourceUserSeq: source.seq, replyTarget },
+    queueRequestDigest: createHash('sha256').update(`gateway-dispatch:${runId}`).digest('hex'),
+  });
+  const prepared = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_prepared',
+    parentEventId: source.id,
+    data: { ...authority },
+  });
+  const receipt = recordWorkflowChatDispatchPreparation(createWorkflowChatDispatchPreparedReceipt(authority, {
+    eventId: prepared.id,
+    eventSeq: prepared.seq,
+    preparedAt: prepared.createdAt,
+  }));
+  const closeAuthority = createWorkflowOriginGroupCloseAuthority([receipt]);
+  const closed = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_batch_closed',
+    parentEventId: source.id,
+    data: { ...closeAuthority },
+  });
+  recordWorkflowOriginGroupClosedBatch({
+    receipt: createWorkflowOriginGroupClosedBatchReceipt(closeAuthority, {
+      eventId: closed.id,
+      eventSeq: closed.seq,
+      closedAt: closed.createdAt,
+    }),
+    preparedReceipts: [receipt],
+  });
+  const active = finalizeWorkflowOriginGroupClosedBatch(receipt.sourceGroupId, {
+    beforeMemberRelease: () => {},
+  });
+  return appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatched',
+    parentEventId: source.id,
+    data: { ...active.publicDispatch, replyTarget: active.sealed.replyTarget },
+  });
+}
+
+function commitAnswerForSource(
+  source: import('../runtime/harness/eventlog.js').EventRow,
+  text: string,
+) {
+  const identity = { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+  return commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text },
+  }, { legacyReason: 'gateway_dispatch_test_terminal' });
+}
 
 test('bare continue after an awaiting_continue completion is rewritten with prior summary context', async () => {
   const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Mobile loop' });
@@ -504,4 +597,87 @@ test('gateway returns and records model route diagnostics', async () => {
   const routeEvent = run?.events.find((event) => event.message.startsWith('Model route:'));
   assert.equal(routeEvent?.data?.routeKind, 'legacy');
   assert.equal(routeEvent?.data?.requestedModel, 'claude-sonnet-5');
+});
+
+test('gateway keeps verified workflow dispatch nonterminal across replay until the real result wins', async () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Gateway async dispatch' });
+  const runId = 'run-gateway-verified-async-dispatch';
+  let respondCalls = 0;
+  let dispatchText = '';
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string; sourceUserSeq?: number }) => {
+      respondCalls += 1;
+      const source = listEvents(req.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === req.sourceUserSeq);
+      assert.ok(source, 'gateway passes the exact pre-accepted source to its responder');
+      const dispatch = appendActiveWorkflowDispatch(source, 'workflow-gateway-verified-async');
+      dispatchText = publicAsyncWorkDispatchedData(dispatch.data)?.text ?? '';
+      return {
+        // The transport reducer must use durable dispatch authority, not this
+        // replaceable executor proposal, for its public acknowledgement.
+        text: 'model-authored acknowledgement must not become the terminal',
+        sessionId: req.sessionId,
+      };
+    },
+  } as never);
+  const request = {
+    message: 'analyze these results and post the answer here',
+    sessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile' as const,
+    runId,
+    failClosedOnUnsettledReplay: true,
+  };
+
+  const first = await gateway.handleMessage(request);
+  const replay = await gateway.handleMessage(request);
+
+  assert.ok(dispatchText);
+  assert.equal(first.text, dispatchText);
+  assert.equal(replay.text, dispatchText);
+  assert.equal(first.stoppedReason, 'success');
+  assert.equal(replay.stoppedReason, 'success');
+  assert.equal(respondCalls, 1, 'provider replay must not dispatch the model or workflow twice');
+  assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 1);
+  assert.equal(listEvents(session.id, { types: ['async_work_dispatched'] }).length, 1);
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 0,
+    'dispatch acknowledgement closes the physical request but not the logical turn');
+  assert.equal(getRun(runId)?.status, 'queued');
+
+  const [source] = listEvents(session.id, { types: ['user_input_received'] });
+  commitAnswerForSource(source, 'The background report is ready.');
+  const completedReplay = await gateway.handleMessage(request);
+  assert.equal(completedReplay.text, 'The background report is ready.');
+  assert.equal(respondCalls, 1);
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(getRun(runId)?.status, 'completed');
+});
+
+test('gateway preserves a verified dispatch when the foreground responder throws afterward', async () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Gateway dispatch race' });
+  const runId = 'run-gateway-dispatch-then-throw';
+  let dispatchText = '';
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string; sourceUserSeq?: number }) => {
+      const source = listEvents(req.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === req.sourceUserSeq);
+      assert.ok(source);
+      const dispatch = appendActiveWorkflowDispatch(source, 'workflow-gateway-dispatch-then-throw');
+      dispatchText = publicAsyncWorkDispatchedData(dispatch.data)?.text ?? '';
+      throw new Error('foreground socket closed after durable dispatch');
+    },
+  } as never);
+
+  const response = await gateway.handleMessage({
+    message: 'check this dataset for anomalies',
+    sessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile',
+    runId,
+  });
+
+  assert.equal(response.text, dispatchText);
+  assert.equal(response.stoppedReason, 'success');
+  assert.equal(getRun(runId)?.status, 'queued');
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 0);
 });

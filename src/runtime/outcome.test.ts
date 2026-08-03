@@ -24,6 +24,7 @@ const {
   deliverOutcomeWithAcknowledgement,
   outcomePrefix,
   renderProactiveOutcomeDirective,
+  __test__: outcomeTest,
 } = await import('./outcome.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const { appendEvent, createSession, listEvents } = await import('./harness/eventlog.js');
@@ -120,6 +121,44 @@ test('proactive failed directive never erases partial success or replays committ
   assert.match(directive, /completed work, saved artifacts, or committed actions/i);
   assert.match(directive, /never imply that proven work disappeared/i);
   assert.match(directive, /do not re-run/i);
+});
+
+test('proactive report turn stays bound to its appended directive when a newer human input arrives', async () => {
+  const sessionId = 'sess-proactive-source-owner';
+  createSession({ id: sessionId, kind: 'chat', channel: 'discord' });
+
+  let observedSourceUserSeq: number | undefined;
+  let observedReuseRecordedInput: boolean | undefined;
+  let competingHumanSeq: number | undefined;
+  const directiveSource = await outcomeTest.runRecordedProactiveReportTurn({
+    sessionId,
+    directive: 'Relay the verified workflow result now.',
+    outcome: { status: 'done' },
+    ctx: { sourceLabel: 'workflow run', sourceId: 'wf-source-owner' },
+    conversationOptions: {
+      agent: {} as never,
+      judgeCompletion: false,
+    },
+  }, async (options) => {
+    // Reproduce the ownership race: another input becomes latest after the
+    // directive is accepted but before runConversation starts its work.
+    competingHumanSeq = appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'What is the status now?' },
+    }).seq;
+    observedSourceUserSeq = options.sourceUserSeq;
+    observedReuseRecordedInput = options.reuseRecordedUserInput;
+  });
+
+  assert.notEqual(competingHumanSeq, directiveSource.seq, 'the human input is a distinct, newer source');
+  assert.equal(observedSourceUserSeq, directiveSource.seq, 'the proactive turn owns the exact directive row, not latest input');
+  assert.equal(observedReuseRecordedInput, true);
+  assert.equal(directiveSource.data.synthetic, true);
+  assert.equal(directiveSource.data.source, 'outcome');
+  assert.equal(directiveSource.data.deliveryPhase, 'directive');
 });
 
 test('outcomePrefix matches the idempotency/UI-detect prefix exactly', () => {

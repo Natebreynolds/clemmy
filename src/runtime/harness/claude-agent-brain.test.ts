@@ -61,6 +61,58 @@ const {
 } = await import('../prospective-intentions.js');
 const pendingActions = await import('./pending-actions.js');
 const approvalRegistry = await import('./approval-registry.js');
+const {
+  createWorkflowChatDispatchPreparationAuthority,
+  createWorkflowChatDispatchPreparedReceipt,
+  recordWorkflowChatDispatchPreparation,
+  workflowChatDispatchQueueRequestDigest,
+} = await import('../../execution/workflow-origin-group.js');
+const { workflowOriginReplyTargetForSource } = await import('../workflow-origin-authority.js');
+const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
+
+function installPreparedClaudeWorkflowDispatch(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  runId: string;
+}): void {
+  const source = listEvents(input.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === input.sourceUserSeq);
+  assert.ok(source);
+  const replyTarget = workflowOriginReplyTargetForSource(input);
+  assert.ok(replyTarget);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${input.runId}.json`), JSON.stringify({
+    id: input.runId,
+    workflow: 'claude-dispatch-fixture',
+    status: 'awaiting_chat_dispatch_seal',
+    createdAt: new Date().toISOString(),
+  }), 'utf-8');
+  const authority = createWorkflowChatDispatchPreparationAuthority({
+    runId: input.runId,
+    observer: {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      replyTarget,
+    },
+    queueRequestDigest: workflowChatDispatchQueueRequestDigest({
+      workflowName: 'claude-dispatch-fixture',
+      normalizedInputs: {},
+    }),
+  });
+  const event = appendEvent({
+    sessionId: input.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_prepared',
+    parentEventId: source.id,
+    data: { ...authority },
+  });
+  recordWorkflowChatDispatchPreparation(createWorkflowChatDispatchPreparedReceipt(authority, {
+    eventId: event.id,
+    eventSeq: event.seq,
+    preparedAt: event.createdAt,
+  }));
+}
 
 beforeEach(() => {
   resetEventLog();
@@ -100,6 +152,90 @@ after(() => {
   setClaudeAgentSdkBrainUnifiedPrimerForTest(null);
   closeProspectiveIntentionsDbForTest();
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('Claude brain closes a prepared workflow batch as a nonterminal dispatch before judge or narration', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'on';
+  const sessionId = 'claude-workflow-dispatch-graph';
+  const runId = 'claude-workflow-dispatch-run';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'dispatch graph' });
+  let judgeCalls = 0;
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judgeCalls += 1;
+    return { done: false, reason: 'the eventual workflow result is not available yet' };
+  });
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    assert.equal(options.sessionId, sessionId);
+    assert.ok(options.sourceUserSeq);
+    installPreparedClaudeWorkflowDispatch({
+      sessionId,
+      sourceUserSeq: options.sourceUserSeq!,
+      runId,
+    });
+    return {
+      text: 'I kicked it off and will report back when it finishes.',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-test',
+      toolUses: ['mcp__clementine-local__workflow_run'],
+      successfulToolUses: ['workflow_run'],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Run the saved review workflow.',
+    sessionId,
+    channel: 'desktop',
+  });
+
+  assert.equal(response.text, 'Started — I’ll post the result here when it’s ready.');
+  assert.equal(response.stoppedReason, 'success');
+  assert.equal(judgeCalls, 0, 'eventual workflow work never enters the foreground completion judge');
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
+  assert.equal(listEvents(sessionId, { types: ['async_work_dispatch_batch_closed'] }).length, 1);
+  const dispatches = listEvents(sessionId, { types: ['async_work_dispatched'] });
+  assert.equal(dispatches.length, 1);
+  assert.deepEqual(dispatches[0].data.runIds, [runId]);
+  const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')) as {
+    status?: string;
+  };
+  assert.equal(run.status, 'queued');
+  assert.deepEqual((response.raw as { asyncWork?: { runIds?: string[] } }).asyncWork?.runIds, [runId]);
+});
+
+test('Claude brain preserves a prepared workflow handoff when the provider throws after workflow_run', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'claude-workflow-dispatch-provider-error';
+  const runId = 'claude-workflow-dispatch-provider-error-run';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'dispatch provider error' });
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    assert.ok(options.sourceUserSeq);
+    installPreparedClaudeWorkflowDispatch({
+      sessionId,
+      sourceUserSeq: options.sourceUserSeq!,
+      runId,
+    });
+    throw new Error('provider disconnected after workflow_run returned');
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Run the saved review workflow.',
+    sessionId,
+    channel: 'desktop',
+  });
+
+  assert.equal(response.text, 'Started — I’ll post the result here when it’s ready.');
+  assert.equal(response.stoppedReason, 'success');
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
+  assert.equal(listEvents(sessionId, { types: ['conversation_failed'] }).length, 0);
+  assert.equal(listEvents(sessionId, { types: ['async_work_dispatch_batch_closed'] }).length, 1);
+  const dispatches = listEvents(sessionId, { types: ['async_work_dispatched'] });
+  assert.equal(dispatches.length, 1);
+  assert.deepEqual(dispatches[0].data.runIds, [runId]);
+  const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8')) as {
+    status?: string;
+  };
+  assert.equal(run.status, 'queued');
 });
 
 test('JIT monotonic floor: the per-session advertised tool set only GROWS (cache-stable), never shrinks', () => {

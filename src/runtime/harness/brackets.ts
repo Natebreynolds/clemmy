@@ -3392,6 +3392,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         const ac = new AbortController();
         const start = () => Promise.resolve(withToolOutputContext({
           sessionId: ctx?.sessionId,
+          sourceUserSeq: ctx?.sourceUserSeq,
           runScopeId: ctx ? guardrailScopeKey(ctx) : undefined,
           callId: invokeCallId,
           toolName: tool.name,
@@ -3637,6 +3638,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       const ac = new AbortController();
       const start = () => Promise.resolve(withToolOutputContext({
         sessionId: ctx?.sessionId,
+        sourceUserSeq: ctx?.sourceUserSeq,
         runScopeId: ctx ? guardrailScopeKey(ctx) : undefined,
         callId: executeCallId,
         toolName: tool.name,
