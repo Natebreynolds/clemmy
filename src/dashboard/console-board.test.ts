@@ -3328,6 +3328,7 @@ test('guest CLI runs surface as board cards with a working kill endpoint and dra
   const h = await boot();
   try {
     const job = startGuestRun({ harness: 'claude', project: 'guest-fixture', prompt: '/seo-audit example.com' });
+    await new Promise((resolve) => setTimeout(resolve, 10));
     child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'WebFetch', input: {} }] } })}\n`));
 
     const board = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: BoardCard[] };
@@ -3338,6 +3339,8 @@ test('guest CLI runs surface as board cards with a working kill endpoint and dra
     assert.deepEqual(card!.actions, ['cancel']);
     assert.equal(card!.cancelEndpoint, `/api/console/guest-runs/${encodeURIComponent(job.id)}/kill`);
     assert.equal(card!.raw.guestRunId, job.id);
+    assert.equal(card!.updatedAt, getGuestRun(job.id)?.lastEventAt, 'active-card recency follows the latest event, not start time');
+    assert.ok(card!.ageMs < 5_000, 'a healthy long-lived run can still show a fresh update');
 
     // Drawer feed: the per-run endpoint serves the narration tail.
     const feed = await (await fetch(`${h.url}/api/console/guest-runs/${job.id}`)).json() as { events: string[]; status: string };

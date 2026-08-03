@@ -11336,6 +11336,7 @@ export function registerConsoleRoutes(
       for (const run of listGuestRuns()) {
         const running = run.status === 'running';
         const lastEvent = run.events[run.events.length - 1] ?? '';
+        const guestUpdatedAt = run.completedAt ?? run.lastEventAt ?? run.startedAt;
         cards.push({
           id: `guest:${run.id}`,
           sourceKind: 'guest',
@@ -11350,8 +11351,8 @@ export function registerConsoleRoutes(
                 : 'Finished with no file changes.')
               : (run.error || run.status),
           sessionId: null,
-          ageMs: ageMs(run.startedAt),
-          updatedAt: run.completedAt ?? run.startedAt,
+          ageMs: ageMs(guestUpdatedAt),
+          updatedAt: guestUpdatedAt,
           actions: running ? ['cancel'] : [],
           cancelEndpoint: running ? `/api/console/guest-runs/${encodeURIComponent(run.id)}/kill` : undefined,
           primaryAction: 'none',
