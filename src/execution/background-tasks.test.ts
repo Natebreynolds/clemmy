@@ -3405,3 +3405,85 @@ test('reapStaleBackgroundTasks: week-idle finished + parked auto-archive WITH a 
   assert.equal(restored.archiveReason, undefined, 'restore clears the auto-archive note');
   assert.equal(staleTaskKind(restored, Date.parse(restored.updatedAt) + 1000), null);
 });
+
+test('corrections that never reach a boundary stop and surface instead of looping', () => {
+  // The 2026-08-03 incident. The Google Sheet was written and verified two
+  // minutes in; the task then queued contract versions 11 through 16, every one
+  // of them saying "the write succeeded, finish now", and not one was ever
+  // applied — a wedged turn never reaches the boundary that consumes a
+  // revision. With a 90-minute wall clock as the only other exit, Discord
+  // showed a hang on work that was already done.
+  const task = createBackgroundTask({
+    title: 'Scrape SEO data into a sheet',
+    prompt: 'Find firms, scrape SEO data, create a google sheet.',
+    originSessionId: 'sess-stall-incident',
+  });
+  updateBackgroundTask(task.id, { status: 'running' });
+
+  // First correction: ordinary. A turn is in flight and will pick it up.
+  const first = reviseBackgroundTaskContract(task.id, { instruction: 'Finish from the saved Sheets receipt.' });
+  assert.equal(first?.status, 'running');
+  assert.equal(first?.pendingContractRevision?.version, 2);
+  assert.match(first?.lastCheckInMessage ?? '', /next model boundary/i);
+
+  // Each later correction DISCOVERS that the previous one was never consumed.
+  // One or two such discoveries are still ordinary — a turn can legitimately be
+  // mid-flight — so the task keeps going.
+  const second = reviseBackgroundTaskContract(task.id, { instruction: 'Stop waiting on the manifest.' });
+  assert.equal(second?.status, 'running');
+  assert.equal(second?.contractVersion, 3);
+  assert.equal(second?.undeliveredContractRevisions, 1);
+
+  const third = reviseBackgroundTaskContract(task.id, { instruction: 'Revalidate and report the sheet URL.' });
+  assert.equal(third?.status, 'running');
+  assert.equal(third?.undeliveredContractRevisions, 2);
+
+  // Three confirmed-undelivered in a row: the boundary is not coming, so the
+  // task stops adding to the pile and surfaces instead.
+  const fourth = reviseBackgroundTaskContract(task.id, { instruction: 'Finish solely from saved evidence.' });
+  assert.equal(fourth?.status, 'blocked', 'undelivered corrections kept looping');
+  assert.match(fourth?.error ?? '', /never applied/i);
+  assert.match(fourth?.error ?? '', /already completed is preserved/i);
+  assert.match(fourth?.lastCheckInMessage ?? '', /never reached a model boundary/i);
+  // The instruction is still recorded — the user's intent is not discarded
+  // just because it could not be delivered.
+  assert.equal(fourth?.contractRevisions?.some((r) => /Finish solely/.test(r.instruction)), true);
+});
+
+test('a steered task never trips the undelivered limit', () => {
+  // Delivery resets the streak, so a task that is genuinely being corrected can
+  // be corrected indefinitely. The limit measures corrections that go nowhere,
+  // not corrections in total — otherwise steering a long job would kill it.
+  const task = createBackgroundTask({
+    title: 'Steered work',
+    prompt: 'Do the thing.',
+    originSessionId: 'sess-steered',
+  });
+  updateBackgroundTask(task.id, { status: 'running' });
+
+  for (let round = 0; round < 6; round += 1) {
+    const revised = reviseBackgroundTaskContract(task.id, { instruction: `Adjust the approach, round ${round}.` });
+    assert.equal(revised?.status, 'running', `round ${round} blocked a task that was being delivered to`);
+    // Simulate the worker reaching its boundary and consuming the revision.
+    updateBackgroundTask(task.id, { pendingContractRevision: undefined, undeliveredContractRevisions: 0 });
+  }
+  const final = getBackgroundTask(task.id);
+  assert.equal(final?.status, 'running');
+  assert.equal(final?.contractVersion, 7);
+});
+
+test('a parked task is re-queued rather than counted as undelivered', () => {
+  // Parked statuses take the requeue branch, which is a real delivery path —
+  // those corrections land, so they must never accumulate toward the limit.
+  const task = createBackgroundTask({
+    title: 'Parked work',
+    prompt: 'Do the thing.',
+    originSessionId: 'sess-parked',
+  });
+  updateBackgroundTask(task.id, { status: 'blocked' });
+  for (let round = 0; round < 4; round += 1) {
+    const revised = reviseBackgroundTaskContract(task.id, { instruction: `Try again, round ${round}.` });
+    assert.equal(revised?.status, 'pending', `round ${round} did not re-queue a parked task`);
+    updateBackgroundTask(task.id, { status: 'blocked' });
+  }
+});

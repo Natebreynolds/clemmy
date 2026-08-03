@@ -172,6 +172,8 @@ export interface BackgroundTaskRecord {
   contractVersion?: number;
   contractRevisions?: BackgroundTaskContractRevision[];
   pendingContractRevision?: BackgroundTaskContractRevision;
+  /** Consecutive corrections queued without any reaching a model boundary. */
+  undeliveredContractRevisions?: number;
   userId?: string;
   channel?: string;
   reportBackTarget?: BackgroundReportBackTarget;
@@ -1584,10 +1586,32 @@ export function updateBackgroundTask(id: string, patch: BackgroundTaskPatch): Ba
 }
 
 /**
+ * How many corrections may stack up UNDELIVERED before the task stops and says so.
+ *
+ * A revision is only consumed when a new worker turn begins
+ * (`markPendingContractRevisionApplied`). A task wedged inside one turn never
+ * reaches that boundary, so each new correction simply overwrites the last
+ * `pendingContractRevision` and changes nothing. Live 2026-08-03: contract
+ * versions 11 through 16 all said the same thing — "the Sheets write succeeded,
+ * finish now" — and not one of them was ever applied. The work had completed at
+ * minute two; the run had a 90-minute wall clock and no other exit, so from
+ * Discord it looked like a hang on work that was already done.
+ *
+ * Three is deliberate. One undelivered revision is ordinary — a turn is mid
+ * flight and will pick it up. Three in a row means the boundary is not coming,
+ * and continuing to queue a fourth is the loop, not a remedy.
+ */
+const UNDELIVERED_CONTRACT_REVISION_LIMIT = 3;
+
+/**
  * Append a user course-correction without rewriting the original task or
  * discarding progress. Running work is allowed to reach its current response
  * boundary, then the stale-contract response is preserved as partial evidence
  * and the same task/session is re-queued on the new version.
+ *
+ * When corrections stop being delivered, this stops queueing them and blocks
+ * the task instead — a stuck task that reports is recoverable; a stuck task
+ * that silently grinds is the failure the user actually experiences.
  */
 export function reviseBackgroundTaskContract(
   id: string,
@@ -1615,6 +1639,29 @@ export function reviseBackgroundTaskContract(
       };
       const requeueParked = ['blocked', 'awaiting_approval', 'awaiting_input', 'awaiting_continue']
         .includes(task.status);
+
+      // A correction already waiting means the previous one was never consumed.
+      // Count the streak, and when it is clear the boundary is not coming, stop
+      // adding to it: block the task so it surfaces with whatever it has, rather
+      // than queueing revisions into a turn that cannot read them until the
+      // wall clock expires.
+      const undelivered = task.pendingContractRevision && !requeueParked
+        ? (task.undeliveredContractRevisions ?? 1) + 1
+        : 0;
+      if (undelivered >= UNDELIVERED_CONTRACT_REVISION_LIMIT) {
+        return {
+          status: 'blocked' as const,
+          undeliveredContractRevisions: undelivered,
+          contractRevisions: [...(task.contractRevisions ?? []), revision].slice(-50),
+          lastCheckInAt: queuedAt,
+          lastCheckInMessage:
+            `Stopped after ${undelivered} course corrections that never reached a model boundary.`,
+          error:
+            `This task stopped accepting corrections: ${undelivered} in a row were queued and never `
+            + 'applied, so it was going nowhere. Any work already completed is preserved above — '
+            + 'check it before re-running, because the last instruction may already be satisfied.',
+        };
+      }
       if (task.status === 'awaiting_approval') supersededApprovalId = task.pendingApprovalId;
       return {
         ...(requeueParked
@@ -1633,6 +1680,7 @@ export function reviseBackgroundTaskContract(
         contractVersion: nextVersion,
         contractRevisions: [...(task.contractRevisions ?? []), revision].slice(-50),
         pendingContractRevision: revision,
+        undeliveredContractRevisions: undelivered,
         lastCheckInAt: queuedAt,
         lastCheckInMessage: `Course correction queued as contract v${nextVersion}; current work will reconcile at the next model boundary.`,
       };
@@ -1702,6 +1750,10 @@ function tryMarkPendingContractRevisionApplied(task: BackgroundTaskRecord): Back
       && latest.pendingContractRevision?.version === pending.version,
     (latest) => ({
       pendingContractRevision: undefined,
+      // Delivery happened, so the streak resets. The counter measures
+      // consecutive UNDELIVERED corrections, not corrections in total — a task
+      // that is genuinely being steered should never trip the limit.
+      undeliveredContractRevisions: 0,
       contractRevisions: (latest.contractRevisions ?? []).map((revision) => (
         revision.version <= pending.version && !revision.appliedAt
           ? { ...revision, appliedAt: nowIso() }
