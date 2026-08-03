@@ -15,6 +15,8 @@ import {
   describeCarrierRefusal,
   normalizeComposioCarrierInput,
   parseLegacyInvocationTemplate,
+  composioSlugIsDispatchable,
+  normalizeComposioArgsPayload,
   serializeComposioCarrier,
   stripVolatileConnectionArgs,
   COMPOSIO_CARRIER_CONTRACT,
@@ -215,4 +217,64 @@ test('the adapter reads nothing and reaches nowhere', async () => {
   for (const forbidden of ['process.env', 'readFileSync', 'fetch(', 'BASE_DIR']) {
     assert.equal(source.includes(forbidden), false, `adapter references ${forbidden}`);
   }
+});
+
+// ── a call that cannot dispatch is never a write ─────────────────────────────
+
+test('a template token is refused before it can earn a write reservation', () => {
+  // Live 2026-08-03: the model emitted `tool_slug: "PLACEHOLDER"` — a template
+  // it never filled in, because it had selected a carrier whose schema it never
+  // received. That string is non-empty, so schema validation passed; it carries
+  // no read verb, so effect classification called it an external write; a
+  // reservation was taken and orphaned when the call could not dispatch. Three
+  // of five writes in that run were orphans of exactly this kind, and the
+  // unsettled ledger is what left the task unable to finish completed work.
+  for (const token of [
+    'PLACEHOLDER', 'placeholder', 'TODO', 'FIXME', 'EXAMPLE', 'SLUG',
+    'TOOL_SLUG', 'YOUR_SLUG_HERE', 'ACTION', 'NONE', 'UNKNOWN', 'TBD',
+  ]) {
+    assert.equal(composioSlugIsDispatchable(token), false, `"${token}" was treated as dispatchable`);
+    const result = refused({ tool_slug: token, arguments: JSON.stringify(ARGS) });
+    assert.match(result.error, /not an action slug/);
+    assert.deepEqual(result.violations, ['tool_slug']);
+    assert.equal(result.repair, null, 'a repair was invented for a slug that cannot exist');
+  }
+});
+
+test('a bare or malformed token cannot be a slug; a real one can', () => {
+  // Structural, not an allow-list: no toolkit is named, so a provider connected
+  // tomorrow needs no change here.
+  for (const bad of ['GOOGLESHEETS', 'sheets', 'update', '{{slug}}', '<SLUG>', 'FOO...BAR', '  ', '_LEADING', 'TRAILING_']) {
+    assert.equal(composioSlugIsDispatchable(bad), false, `"${bad}" was treated as dispatchable`);
+  }
+  for (const good of [
+    'GOOGLESHEETS_VALUES_UPDATE',
+    'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+    'APIFY_RUN_ACTOR',
+    'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    'HUBSPOT_LIST_CONTACTS_PAGE',
+  ]) {
+    assert.equal(composioSlugIsDispatchable(good), true, `"${good}" was refused`);
+    assert.equal(normalizeComposioCarrierInput({ tool_slug: good, arguments: null }).ok, true);
+  }
+});
+
+test('the args-only normalizer needs no slug at all', () => {
+  // Callers that already hold a slug must never invent one to reach the shared
+  // normalizer — a synthetic slug is a lie that could escape into a refusal
+  // message, or into a dispatch.
+  const ok = normalizeComposioArgsPayload(JSON.stringify(ARGS));
+  assert.equal(ok.ok, true);
+  if (ok.ok) assert.deepEqual(ok.args, ARGS);
+
+  const fromObject = normalizeComposioArgsPayload(ARGS);
+  assert.equal(fromObject.ok, true);
+  if (fromObject.ok) assert.ok(fromObject.adapted.includes('arguments_object_serialized'));
+
+  const cleaned = normalizeComposioArgsPayload({ ...ARGS, connected_account_id: 'ca_x' });
+  assert.equal(cleaned.ok, true);
+  if (cleaned.ok) assert.equal('connected_account_id' in cleaned.args, false);
+
+  const bad = normalizeComposioArgsPayload('{ not json');
+  assert.equal(bad.ok, false);
 });

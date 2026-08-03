@@ -87,6 +87,46 @@ export interface SerializedComposioCarrier {
 const CARRIER_SLUG_FIELD = 'tool_slug';
 const CARRIER_ARGS_FIELD = 'arguments';
 
+/**
+ * A Composio action slug names a toolkit AND an action, so it always contains a
+ * separator: GOOGLESHEETS_VALUES_UPDATE, OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW,
+ * APIFY_RUN_ACTOR. A single bare token cannot be one.
+ */
+const COMPOSIO_SLUG_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/;
+
+/**
+ * Template tokens a model emits when it is composing a call it cannot complete
+ * — typically because it selected a carrier whose schema it never received.
+ *
+ * Live 2026-08-03: `tool_slug: "PLACEHOLDER"` was dispatched verbatim. It is a
+ * non-empty string, so schema validation passed; it has no read verb, so effect
+ * classification called it an external write; a write reservation was taken and
+ * then orphaned when the call could not possibly dispatch. Three of five writes
+ * in that run were orphans of this kind, and the unsettled ledger is what left
+ * the task unable to finish work it had already completed.
+ */
+const PLACEHOLDER_SLUG_TOKENS = new Set([
+  'PLACEHOLDER', 'TODO', 'FIXME', 'EXAMPLE', 'SLUG', 'TOOL_SLUG', 'ACTION',
+  'YOUR_SLUG_HERE', 'ACTION_SLUG', 'TOOL', 'NONE', 'NULL', 'UNKNOWN', 'TBD',
+]);
+
+/**
+ * Could this string possibly name a real action?
+ *
+ * A structural check, not an allow-list: no provider or toolkit is named here,
+ * so a toolkit connected tomorrow needs no change. The point is narrow — a call
+ * that cannot dispatch must never be treated as an external write, because a
+ * reservation for an impossible call is pure ledger debt that something later
+ * has to reconcile.
+ */
+export function composioSlugIsDispatchable(slug: string | null | undefined): boolean {
+  const upper = String(slug ?? '').trim().toUpperCase();
+  if (!upper) return false;
+  if (PLACEHOLDER_SLUG_TOKENS.has(upper)) return false;
+  if (upper.includes('{{') || upper.includes('<') || upper.includes('...')) return false;
+  return COMPOSIO_SLUG_RE.test(upper);
+}
+
 /** Keys callers have been observed to reach for instead of `tool_slug`. */
 const SLUG_DRIFT_KEYS = ['slug', 'toolSlug', 'tool', 'action', 'tool_name', 'name'];
 /** Keys callers have been observed to reach for instead of `arguments`. */
@@ -294,7 +334,19 @@ export function normalizeComposioCarrierInput(raw: unknown): CarrierNormalizatio
     }
     return refuse(`${CARRIER_SLUG_FIELD} is required and must be a non-empty string`, [CARRIER_SLUG_FIELD]);
   }
-  slug = slug.trim();
+  const toolSlug = slug.trim();
+
+  // A slug that cannot name a real action is refused HERE — before effect
+  // classification, before any write reservation, before dispatch. Refusing
+  // late is what produced orphaned ledger entries for calls that never had a
+  // chance of running.
+  if (!composioSlugIsDispatchable(toolSlug)) {
+    return refuse(
+      `"${toolSlug}" is not an action slug — it must name a toolkit and an action, `
+      + 'like TOOLKIT_ACTION_NAME. Search for the exact slug before calling',
+      [CARRIER_SLUG_FIELD],
+    );
+  }
 
   // ── the arguments ──────────────────────────────────────────────────────────
   const payload = readArgsPayload(raw);
@@ -311,7 +363,31 @@ export function normalizeComposioCarrierInput(raw: unknown): CarrierNormalizatio
     return refuse(violations.join('; '), violations);
   }
 
-  return { ok: true, canonical: { toolSlug: slug as string, args }, adapted };
+  return { ok: true, canonical: { toolSlug, args }, adapted };
+}
+
+/**
+ * Normalize ONLY the arguments payload, for callers that already hold a slug.
+ *
+ * Exists so no caller has to invent a slug to reach the shared normalizer —
+ * a synthetic one would be a lie that could escape into a refusal message or,
+ * worse, a dispatch.
+ */
+export function normalizeComposioArgsPayload(
+  value: unknown,
+): { ok: true; args: Record<string, unknown>; adapted: CarrierAdaptation[] } | CarrierNormalizationError {
+  // The input IS the payload, always. Peeking for a wrapping `arguments` key
+  // would make `{ arguments: ... }` ambiguous between "a payload with a field
+  // called arguments" and "a carrier envelope" — and guessing wrong silently
+  // drops every other field.
+  const payload = readArgsPayload({ [CARRIER_ARGS_FIELD]: value });
+  if (payload.violation) return refuse(payload.violation, [CARRIER_ARGS_FIELD]);
+  const { args, stripped } = stripVolatileConnectionArgs(payload.args);
+  return {
+    ok: true,
+    args,
+    adapted: stripped ? [...payload.adapted, 'connection_id_stripped'] : payload.adapted,
+  };
 }
 
 /**

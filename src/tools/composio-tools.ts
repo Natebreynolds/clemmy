@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 
 import {
   describeCarrierRefusal,
-  normalizeComposioCarrierInput,
+  normalizeComposioArgsPayload,
 } from './composio-carrier.js';
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -2261,18 +2261,12 @@ export function runComposioExecuteWithGatewayForTest(
  * refused with the authoritative contract attached rather than a bare
  * "invalid" the caller can only respond to by guessing again.
  */
-function parseArgumentsJson(
-  value: string | null | undefined,
-  toolSlug?: string,
-): Record<string, unknown> {
-  const normalized = normalizeComposioCarrierInput({
-    tool_slug: toolSlug ?? 'PLACEHOLDER_SLUG',
-    arguments: value ?? null,
-  });
+function parseArgumentsJson(value: string | null | undefined): Record<string, unknown> {
+  const normalized = normalizeComposioArgsPayload(value ?? null);
   if (!normalized.ok) {
     throw new Error(describeCarrierRefusal(normalized));
   }
-  return normalized.canonical.args;
+  return normalized.args;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
