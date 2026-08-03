@@ -156,6 +156,7 @@ export function registerExtractStructuredTools(server: McpServer, extractorOverr
           const resolution = resolveToolOutputForAuthority(sessionId, args.call_id!.trim());
           if (resolution.status === 'ambiguous') return textResult(`ERROR: call id "${args.call_id}" was reused by ${resolution.invocationCount} invocations; pass a fresh unique call id.`);
           if (resolution.status === 'missing') return textResult(`ERROR: no stored output for call id "${args.call_id}" in this session.`);
+          if (resolution.status === 'failed') return textResult(`ERROR: stored output for call id "${args.call_id}" cannot be used because ${resolution.reason}. Re-run the source read.`);
           if (resolution.record.truncatedAtWrite) {
             return textResult(
               `ERROR: stored output for call id "${args.call_id}" is incomplete (${resolution.record.contentBytes} original bytes exceeded the durable output cap), so extract_structured will not validate an object from a prefix. `

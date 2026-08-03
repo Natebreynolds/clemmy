@@ -87,3 +87,56 @@ test('reused call id contributes zero authority instead of its stale longest out
     'the old canonical roster cannot authorize a later send after id reuse',
   );
 });
+
+test('a failed provider read and its request echo contribute zero trusted authority', () => {
+  const called = appendEvent({
+    sessionId: S,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: 'provider_search', callId: 'failed-provider-read', effect: 'read' },
+  });
+  writeToolOutput({
+    sessionId: S,
+    callId: 'failed-provider-read',
+    invocationNonce: 'nonce-failed-provider-read',
+    tool: 'provider_search',
+    output: JSON.stringify({
+      successful: false,
+      error: 'not found',
+      request: { to: ['fake-one@example.com', 'fake-two@example.com'] },
+    }),
+  });
+  appendEvent({
+    sessionId: S,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: 'provider_search', callId: 'failed-provider-read', effect: 'read', ok: false },
+  });
+
+  assert.equal(
+    gatherTrustedEvidence(S).some((source) => source.id === 'failed-provider-read'),
+    false,
+    'an exact but failed lifecycle can never authorize downstream fields',
+  );
+});
+
+test('structured request echoes are pruned from an otherwise successful provider response', () => {
+  addToolOutput(
+    'successful-with-echo',
+    'provider_search',
+    'read',
+    JSON.stringify({
+      successful: true,
+      request: { to: ['echo-only@example.com'] },
+      data: { rows: [{ email: 'returned@example.com' }] },
+    }),
+  );
+
+  const source = gatherTrustedEvidence(S).find((row) => row.id === 'successful-with-echo');
+  assert.ok(source);
+  assert.doesNotMatch(source.text, /echo-only@example\.com/);
+  assert.match(source.text, /returned@example\.com/);
+});

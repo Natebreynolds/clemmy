@@ -129,6 +129,10 @@ function resolveOne(sessionId: string, ref: ToolOutputRef, trustedCallIds: Set<s
     errors.push(`$fromToolOutput: no tool output found for call_id "${ref.callId}" in this session`);
     return undefined;
   }
+  if (resolution.status === 'failed') {
+    errors.push(`$fromToolOutput: output for "${ref.callId}" cannot authorize a field because ${resolution.reason}`);
+    return undefined;
+  }
   const row = resolution.record;
   const parsed = pruneProviderRequestEchoes(parseParkedOutput(row.output));
   if (parsed === undefined) {

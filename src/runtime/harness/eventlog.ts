@@ -8,6 +8,7 @@ import { actionBus } from '../action-bus.js';
 import { mirrorEventToOperational } from './eventlog-operational-mirror.js';
 import { AUDIT_MIRRORED_EVENT_TYPES, appendAuditRecord } from '../audit-ledger.js';
 import { projectHarnessEventForPublic } from './public-presentation.js';
+import { toolOutputLooksSuccessful } from './tool-evidence.js';
 
 /**
  * Event log — the spine of the 0.3 harness.
@@ -3557,6 +3558,7 @@ export type AuthorityToolOutputResolution =
       effect: string | null;
     }
   | { status: 'missing' }
+  | { status: 'failed'; reason: string }
   | { status: 'ambiguous'; invocationCount: number; reason?: string };
 
 interface DurableToolOutputOccurrence {
@@ -3564,11 +3566,40 @@ interface DurableToolOutputOccurrence {
   returned: EventRow;
   tool: string;
   effect: string | null;
+  /** Explicit terminal success when the transport supplied it. Older SDK
+   * lifecycle rows legitimately omit this field and remain null. */
+  explicitOk: boolean | null;
 }
 
 function authorityEventString(event: EventRow, field: 'callId' | 'tool' | 'effect'): string {
   const value = event.data[field];
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function durableReturnExplicitOk(returned: EventRow): boolean | null {
+  const data = returned.data;
+  for (const field of ['ok', 'successful', 'success'] as const) {
+    const value = data[field];
+    if (value === false) return false;
+  }
+  if (data.failed === true || data.error === true) return false;
+  if (typeof data.error === 'string' && data.error.trim()) return false;
+  if (Array.isArray(data.errors) && data.errors.length > 0) return false;
+  for (const field of ['ok', 'successful', 'success'] as const) {
+    if (data[field] === true) return true;
+  }
+  return null;
+}
+
+function authorityOutputFailureReason(
+  record: ToolOutputRecord,
+  occurrence: DurableToolOutputOccurrence | null,
+): string | null {
+  if (occurrence?.explicitOk === false) return 'durable tool lifecycle explicitly failed';
+  if (!toolOutputLooksSuccessful(record.output, occurrence?.explicitOk ?? undefined)) {
+    return 'stored tool output is failure-shaped';
+  }
+  return null;
 }
 
 /** Resolve one call-id occurrence only when the durable lifecycle itself is
@@ -3632,6 +3663,7 @@ function durableToolOutputOccurrence(
       returned,
       tool: callTool,
       effect: callEffect || null,
+      explicitOk: durableReturnExplicitOk(returned),
     },
     callCount: 1,
     returnCount: 1,
@@ -3666,12 +3698,16 @@ export function resolveToolOutputForAuthority(
     // hook-only invocation may have reused the call id without writing a nonce,
     // and the lone row can be stale authority from the earlier call.
     if (lifecycle.callCount === 0 && lifecycle.returnCount === 0) {
+      const failureReason = authorityOutputFailureReason(invocations[0], null);
+      if (failureReason) return { status: 'failed', reason: failureReason };
       return { status: 'ok', record: invocations[0], source: 'exact', effect: null };
     }
     if (
       lifecycle.occurrence
       && outputFallsWithinOccurrence(invocations[0], lifecycle.occurrence)
     ) {
+      const failureReason = authorityOutputFailureReason(invocations[0], lifecycle.occurrence);
+      if (failureReason) return { status: 'failed', reason: failureReason };
       return {
         status: 'ok',
         record: invocations[0],
@@ -3696,6 +3732,8 @@ export function resolveToolOutputForAuthority(
     && (lifecycle.occurrence.effect === 'read' || lifecycle.occurrence.effect === 'compute')
     && outputFallsWithinOccurrence(legacy, lifecycle.occurrence)
   ) {
+    const failureReason = authorityOutputFailureReason(legacy, lifecycle.occurrence);
+    if (failureReason) return { status: 'failed', reason: failureReason };
     return {
       status: 'ok',
       record: legacy,

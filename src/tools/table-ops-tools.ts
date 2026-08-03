@@ -56,6 +56,7 @@ function loadSide(
     const resolution = resolveToolOutputForAuthority(sessionId, input.callId.trim());
     if (resolution.status === 'ambiguous') throw new Error(`call id "${input.callId}" was reused by ${resolution.invocationCount} invocations — pass a fresh unique call id.`);
     if (resolution.status === 'missing') throw new Error(`no stored output for call id "${input.callId}" in this session — check the id (it appears in the tool result footer).`);
+    if (resolution.status === 'failed') throw new Error(`stored output for call id "${input.callId}" cannot be used because ${resolution.reason} — re-run the source read.`);
     if (resolution.record.truncatedAtWrite) {
       throw new Error(
         `stored output for call id "${input.callId}" is incomplete (${resolution.record.contentBytes} original bytes exceeded the durable output cap), so table_ops will not compute totals from a prefix. `

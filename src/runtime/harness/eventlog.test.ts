@@ -1436,6 +1436,69 @@ test('authority fallback admits one provable legacy read occurrence', () => {
   assert.equal(resolution.record.output, 'one durable legacy result');
 });
 
+test('authority resolution rejects an exact read whose lifecycle or provider envelope failed', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const addFailedRead = (
+    callId: string,
+    output: string,
+    returnedData: Record<string, unknown>,
+  ) => {
+    const called = appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'executor',
+      type: 'tool_called',
+      data: { callId, tool: 'provider_search', effect: 'read' },
+    });
+    writeToolOutput({
+      sessionId: sess.id,
+      callId,
+      invocationNonce: `nonce-${callId}`,
+      tool: 'provider_search',
+      output,
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'executor',
+      type: 'tool_returned',
+      parentEventId: called.id,
+      data: { callId, tool: 'provider_search', effect: 'read', ...returnedData },
+    });
+  };
+
+  addFailedRead(
+    'failed-lifecycle',
+    JSON.stringify({ data: { rows: [{ email: 'request-echo@example.com' }] } }),
+    { ok: false },
+  );
+  addFailedRead(
+    'failed-envelope',
+    JSON.stringify({ successful: false, error: 'not found', request: { to: ['fake@example.com'] } }),
+    { ok: true },
+  );
+  addFailedRead(
+    'partial-success',
+    JSON.stringify({ successful: true, data: { rows: [{ id: 'row-1' }] }, warning: 'partial page' }),
+    { ok: true },
+  );
+
+  assert.deepEqual(
+    resolveToolOutputForAuthority(sess.id, 'failed-lifecycle'),
+    { status: 'failed', reason: 'durable tool lifecycle explicitly failed' },
+  );
+  assert.deepEqual(
+    resolveToolOutputForAuthority(sess.id, 'failed-envelope'),
+    { status: 'failed', reason: 'stored tool output is failure-shaped' },
+  );
+  assert.equal(
+    resolveToolOutputForAuthority(sess.id, 'partial-success').status,
+    'ok',
+    'a successful partial page remains usable evidence instead of being over-classified',
+  );
+});
+
 test('authority fallback rejects reused zero-v19 call ids instead of selecting stale longest bytes', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

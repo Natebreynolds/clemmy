@@ -94,6 +94,38 @@ test('reused call id cannot let an old roster authorize a current recipient set'
   assert.notEqual(result.sourceId, 'reused-roster');
 });
 
+test('a failed provider read cannot authorize recipients echoed from its request', () => {
+  const session = createSession({ kind: 'chat' });
+  const echoed = ['fake-one@example.com', 'fake-two@example.com'];
+  const called = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: 'provider_search', callId: 'failed-roster', effect: 'read' },
+  });
+  writeToolOutput({
+    sessionId: session.id,
+    callId: 'failed-roster',
+    invocationNonce: 'nonce-failed-roster',
+    tool: 'provider_search',
+    output: JSON.stringify({ successful: false, error: 'not found', request: { to: echoed } }),
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: 'provider_search', callId: 'failed-roster', effect: 'read', ok: false },
+  });
+
+  const result = evaluateRecipientSetIntegrity(session.id, outgoing(echoed));
+  assert.equal(result.action, 'block');
+  assert.deepEqual(result.unsupportedRecipients, [...echoed].sort());
+  assert.notEqual(result.sourceId, 'failed-roster');
+});
+
 test('does not let a pending-action echo validate its own recipient payload', () => {
   const session = createSession({ kind: 'chat' });
   addReadSource(session.id, 'pending-echo', 'pending_action_get', wrong);

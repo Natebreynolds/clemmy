@@ -1,4 +1,5 @@
 import { listEvents, recentToolOutputs, resolveToolOutputsForAuthority } from './eventlog.js';
+import { pruneProviderRequestEchoes } from './provider-read-evidence.js';
 
 /**
  * The ONE shared trusted-evidence ledger for a session.
@@ -30,7 +31,8 @@ export interface TrustedSource {
   /** Runtime effect of the producing tool ('read' | 'compute' | ...), or null
    *  for a user message / legacy row with no effect metadata. */
   effect: string | null;
-  /** The raw source text a field extractor runs against. */
+  /** Provider-response text a field extractor runs against. Structured request
+   * echoes are removed before this value can authorize a downstream field. */
   text: string;
   kind: 'user' | 'tool';
 }
@@ -39,6 +41,16 @@ export interface GatherTrustedEvidenceOptions {
   /** Max recent tool outputs to consider (default 40, matching the legacy
    *  recipient gate). User messages are always included. */
   toolOutputLimit?: number;
+}
+
+function trustedToolEvidenceText(output: string): string {
+  const trimmed = output.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return output;
+  try {
+    return JSON.stringify(pruneProviderRequestEchoes(JSON.parse(trimmed) as unknown));
+  } catch {
+    return output;
+  }
 }
 
 export function gatherTrustedEvidence(
@@ -64,7 +76,13 @@ export function gatherTrustedEvidence(
     const tool = output.tool;
     if (ECHO_TOOL_RE.test(tool ?? '')) continue;
     if (typeof output.output === 'string' && output.output.length > 0) {
-      sources.push({ id: output.callId, tool, effect: output.effect, text: output.output, kind: 'tool' });
+      sources.push({
+        id: output.callId,
+        tool,
+        effect: output.effect,
+        text: trustedToolEvidenceText(output.output),
+        kind: 'tool',
+      });
     }
   }
   return sources;

@@ -55,6 +55,7 @@ export function registerFileQueryTools(server: McpServer): void {
           const resolution = resolveToolOutputForAuthority(sessionId, call_id!.trim());
           if (resolution.status === 'ambiguous') return textResult(`ERROR: call id "${call_id}" was reused by ${resolution.invocationCount} invocations; pass a fresh unique call id.`);
           if (resolution.status === 'missing') return textResult(`ERROR: no stored output for call id "${call_id}" in this session.`);
+          if (resolution.status === 'failed') return textResult(`ERROR: stored output for call id "${call_id}" cannot be used because ${resolution.reason}. Re-run the source read.`);
           if (resolution.record.truncatedAtWrite) {
             return textResult(
               `ERROR: stored output for call id "${call_id}" is incomplete (${resolution.record.contentBytes} original bytes exceeded the durable output cap), so file_query will not report matches or misses from a prefix. `
