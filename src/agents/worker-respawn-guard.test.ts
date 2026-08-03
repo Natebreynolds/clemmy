@@ -22,6 +22,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { normalizeWorkerItemKey, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } = await import('./worker-respawn-guard.js');
+const { workerPacketKey } = await import('./worker-job-packet.js');
 const { resetEventLog, createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
 const { summarizeFanoutCoverage } = await import('../runtime/harness/fanout-ledger.js');
 
@@ -115,6 +116,40 @@ test('workerAlreadyCompletedForPacket: an ok result for THIS packet is detected 
   // Fail-open on empty/missing key — never blocks a first spawn.
   assert.equal(workerAlreadyCompletedForPacket(sid, ''), false);
   assert.equal(workerAlreadyCompletedForPacket(sid, null), false);
+});
+
+test('upgrade restart preserves the historical key and reuses a completed legacy packet', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'execution' });
+  const legacyPacket = {
+    objective: 'legacy objective',
+    item: 'account-1',
+    resolvedTools: 'none needed',
+    // Deliberately absent: packets persisted before the typed external MCP
+    // lease shipped have no externalMcpToolNames property at all.
+    context: 'legacy context',
+    instructions: 'do it',
+    expectedOutput: '{}',
+    intent: null,
+  };
+  const keyAfterUpgrade = workerPacketKey(legacyPacket);
+  assert.equal(
+    keyAfterUpgrade,
+    '1071x0l-7vfxcd',
+    'pinned digest from the pre-typed-lease workerPacketKey implementation',
+  );
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'system',
+    type: 'worker_result',
+    data: { item: legacyPacket.item, ok: true, packetKey: '1071x0l-7vfxcd' },
+  });
+  assert.equal(
+    workerAlreadyCompletedForPacket(sess.id, keyAfterUpgrade),
+    true,
+    'a daemon upgrade/restart must not re-dispatch a legacy completed worker',
+  );
 });
 
 test('workerAlreadyCompletedForPacket: a pre-Stage-1 worker_result with NO packetKey never matches (forward-only)', () => {

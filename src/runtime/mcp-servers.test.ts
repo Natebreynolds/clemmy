@@ -142,6 +142,28 @@ test('multiple tool-pattern scopes for the same server set reuse one scoped base
   assert.equal(state.allExternalBaseCreated, false);
 });
 
+test('per-server caps and exact tool leases produce distinct cached views in either order', async () => {
+  const scope = (tool: string, cap: number) => ({
+    reason: `packet ${tool} cap ${cap}`,
+    allowedServerSlugs: ['dataforseo'],
+    allowedToolNames: [`dataforseo__${tool}`],
+    maxTools: 8,
+    serverMaxTools: { dataforseo: cap },
+  });
+  getOrCreateExternalMcpServers(scope('ranked_keywords', 1));
+  getOrCreateExternalMcpServers(scope('ranked_keywords', 3));
+  getOrCreateExternalMcpServers(scope('keywords_for_site', 3));
+  assert.equal(mcpServersTestHooks.cacheState().scopedExternalViewKeys.length, 3);
+
+  await invalidateConfiguredMcpServers();
+  invalidateMcpServerDiscoveryCache();
+  writeMcpServers();
+  getOrCreateExternalMcpServers(scope('keywords_for_site', 3));
+  getOrCreateExternalMcpServers(scope('ranked_keywords', 3));
+  getOrCreateExternalMcpServers(scope('ranked_keywords', 1));
+  assert.equal(mcpServersTestHooks.cacheState().scopedExternalViewKeys.length, 3);
+});
+
 test('a named scope without maxTools still creates its scoped base', () => {
   getOrCreateExternalMcpServers({
     reason: 'exact workflow lock without a cap',
@@ -187,9 +209,40 @@ test('scoped callTool dispatches only an exact member of the selected list', asy
   assert.equal(listCalls, 1, 'the exact advertised membership is cached for dispatch');
 });
 
+test('scoped callTool accepts the MCP carrier but dispatches the advertised server__tool identity', async () => {
+  const dispatched: Array<{ toolName: string; args: Record<string, unknown> | null }> = [];
+  const base = {
+    cacheToolsList: true,
+    name: 'fake-carrier-base',
+    async connect() {},
+    async close() {},
+    async listTools() {
+      return [{ name: 'dataforseo__read_serp', description: 'read' }];
+    },
+    async callTool(toolName: string, args: Record<string, unknown> | null) {
+      dispatched.push({ toolName, args });
+      return [{ type: 'text', text: 'ok' }];
+    },
+    async invalidateToolsCache() {},
+  };
+  const scoped = mcpServersTestHooks.scopedView(base as never, {
+    reason: 'exact typed worker lease',
+    allowedServerSlugs: ['dataforseo'],
+    allowedToolNames: ['mcp__dataforseo__read_serp'],
+    maxTools: 1,
+  });
+
+  await scoped.callTool('mcp__dataforseo__read_serp', { keyword: 'clementine' });
+
+  assert.deepEqual(dispatched, [{
+    toolName: 'dataforseo__read_serp',
+    args: { keyword: 'clementine' },
+  }]);
+});
+
 test('exact on-demand tool dispatch reuses only its server-scoped base', () => {
   const shim = getOrCreateExternalMcpServerForTool(
-    'dataforseo__dataforseo_labs_google_keyword_suggestions',
+    'mcp__dataforseo__dataforseo_labs_google_keyword_suggestions',
   );
   assert.match(shim.name, /mcp/i);
   const state = mcpServersTestHooks.cacheState();

@@ -422,13 +422,15 @@ test('run_worker requires a structured parent-planned job packet', async () => {
 
   assert.ok(runWorker, 'expected run_worker on orchestrator surface');
   assert.match(runWorker.description ?? '', /structured parent-planned job packet/);
-  assert.match(runWorker.description ?? '', /exact resolved tool slugs/);
+  assert.match(runWorker.description ?? '', /typed exact `externalMcpToolNames` array/);
+  assert.match(runWorker.description ?? '', /resolvedTools carries schemas\/commands\/instructions but does not widen that lease/);
   // 2026-07-21 deterministic fan-out: `items` (nullable) joined the packet and
   // `item` became nullable — strict mode keeps both in `required` with null types.
   assert.deepEqual(runWorker.parameters?.required, [
     'objective',
     'item',
     'resolvedTools',
+    'externalMcpToolNames',
     'context',
     'instructions',
     'expectedOutput',
@@ -493,6 +495,7 @@ test('orchestrator run_worker refuses a quantified successful subset before disp
     item: null,
     items: Array.from({ length: 7 }, (_, index) => `prospect-${index + 1}`),
     resolvedTools: 'none needed',
+    externalMcpToolNames: null,
     context: 'Fictional prospect identifiers.',
     instructions: 'Return one compact observation per assigned prospect.',
     expectedOutput: 'prospect id | observation',
@@ -634,6 +637,7 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       objective: 'Generate one design variation for the parent batch.',
       item: 'landing page hero',
       resolvedTools: 'none needed',
+      externalMcpToolNames: null,
       context: 'Use the supplied brand brief.',
       instructions: 'Return one compact design direction.',
       expectedOutput: 'One sentence or ERROR: <reason>.',
@@ -843,6 +847,7 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
       objective: 'Produce one fictional SEO note.',
       item: 'Auric & Vale Law',
       resolvedTools: 'none needed',
+      externalMcpToolNames: null,
       context: 'This is fictional.',
       instructions: 'Return one concise sentence.',
       expectedOutput: 'One sentence or ERROR: <reason>.',
@@ -924,6 +929,7 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
       objective: 'Design one report section using the taste skill.',
       item: 'report hero',
       resolvedTools: 'skill_read',
+      externalMcpToolNames: null,
       context: 'Use the installed taste skill.',
       instructions: 'Call skill_read before writing the design.',
       expectedOutput: 'One compact design direction.',
@@ -979,6 +985,7 @@ test('run_worker emits worker_result ok=false when an already-capped item is ref
     objective: 'Research one firm.',
     item: 'Firm A - firm-a.example',
     resolvedTools: 'none needed',
+    externalMcpToolNames: null,
     context: 'Prior worker capped.',
     instructions: 'Do not retry capped work.',
     expectedOutput: 'One sentence or ERROR: <reason>.',

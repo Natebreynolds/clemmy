@@ -1,5 +1,13 @@
 import { z } from 'zod';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
+import { canonicalMcpToolIdentity } from '../runtime/mcp-tool-authority.js';
+
+const ExternalMcpToolNamesSchema = z
+  .array(z.string().regex(
+    /^(?:mcp__)?[A-Za-z0-9._-]+__[A-Za-z0-9._-]+$/,
+    'must be one exact server__tool or mcp__server__tool identity',
+  ))
+  .max(32);
 
 export const WorkerManifestDescriptorSchema = z.object({
   id: z
@@ -62,6 +70,10 @@ export const WorkerToolInputSchema = z.object({
     .string()
     .min(1)
     .describe('Exact tool slugs, CLI commands, schemas, or "none needed". The parent must resolve shared tools before fan-out.'),
+  externalMcpToolNames: ExternalMcpToolNamesSchema
+    .nullable()
+    .optional()
+    .describe('Typed exact external MCP capability lease (`server__tool`). Populate for every external MCP tool the worker may call; use null when none are needed. Prose in resolvedTools never widens this list.'),
   context: z
     .string()
     .min(1)
@@ -100,6 +112,11 @@ export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
  * is driving.
  */
 export const WorkerToolCallSchema = WorkerToolInputSchema.extend({
+  // New live calls must state external authority explicitly. The base packet
+  // remains optional for durable pre-upgrade packets recovered from disk.
+  externalMcpToolNames: ExternalMcpToolNamesSchema
+    .nullable()
+    .describe('Required typed exact external MCP capability lease. Use [] or null for no external MCP.'),
   item: z
     .string()
     .min(1)
@@ -207,10 +224,22 @@ export function workerPacketKey(input: WorkerToolInput): string {
   // false-skip (adversarial review F2). Two independent rolling hashes (djb2 +
   // FNV-1a) concatenated give a ~64-bit digest — a 32-bit key is too thin an
   // identity for an idempotency-of-external-writes decision across 100s of items.
+  const typedExternalNames = input.externalMcpToolNames ?? [];
+  const externalMcpLeaseKey = typedExternalNames.length === 0
+    ? 'external-mcp:typed-none'
+    : `external-mcp:typed:${JSON.stringify([...new Set(typedExternalNames
+        .map((name) => canonicalMcpToolIdentity(name) ?? `invalid:${name.trim().toLowerCase()}`))]
+        .sort())}`;
   const fields = [
     input.objective,
     input.item,
     input.resolvedTools,
+    // Migration invariant: packets persisted before typed leases existed have
+    // `externalMcpToolNames === undefined`. Their packet key is durable
+    // idempotency authority, so preserve the historical byte serialization
+    // exactly (no placeholder field). New typed calls add an explicit
+    // discriminator; null/[] are intentionally equivalent local-only leases.
+    ...(input.externalMcpToolNames === undefined ? [] : [externalMcpLeaseKey]),
     input.context,
     input.instructions,
     input.expectedOutput,
@@ -280,6 +309,7 @@ export function buildWorkerJobPrompt(inputOrOptions: WorkerToolInput | WorkerToo
     'You are executing ONE item from a parent-planned fan-out. Treat this packet as authoritative.',
     '',
     'Execution rules:',
+    '- externalMcpToolNames is the exact external MCP capability lease. Use only those names; []/null means no external MCP. Tool names mentioned only in prose, examples, or prohibitions are not authority.',
     '- If this packet names a target list / recipient set / sheet / doc / resource (in item, context, or instructions), that is the parent-pinned binding target. Act on EXACTLY those values — do NOT re-discover, search for, or substitute a different list (e.g. do not run a "find/search/list" tool to locate a list the parent already named).',
     '- Use the exact resolvedTools when they are listed. Do not call composio_search_tools, composio_list_tools, local_cli_list, or broad discovery for a capability already resolved by the parent.',
     '- If resolvedTools says "none needed" or omits a capability that is truly required, do the smallest possible discovery for that missing capability only.',

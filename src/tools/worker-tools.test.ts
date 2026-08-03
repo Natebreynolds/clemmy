@@ -119,6 +119,7 @@ const packet = (item: string) => ({
   objective: `Research the SEO posture of ${item} for the parent fan-out batch.`,
   item,
   resolvedTools: 'none needed',
+  externalMcpToolNames: null,
   context: `Prospect: ${item}. Use only the facts in this packet.`,
   instructions: 'Return the compact summary; if the item fails, the final line must start with ERROR:.',
   expectedOutput: 'One line: domain authority + top keyword, or ERROR: <reason>.',

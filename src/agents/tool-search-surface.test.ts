@@ -147,6 +147,16 @@ test('execute-now work lets the primary model act without an agent-as-tool plann
   }));
   assert.equal(namesOf(direct).has('draft_plan'), false);
 
+  const directBatch = await withFlag('on', () => buildOrchestratorAgent({
+    userInput: 'Research these 10 firms now, create the end-of-month report, and verify every result.',
+    allowToolJit: true,
+  }));
+  assert.equal(
+    namesOf(directBatch).has('draft_plan'),
+    false,
+    'multi-item execution uses worker topology, not a second planning model',
+  );
+
   const collaborative = await withFlag('on', () => buildOrchestratorAgent({
     userInput: 'Before changing anything, compare the approaches and make a plan for the deployment.',
     allowToolJit: true,

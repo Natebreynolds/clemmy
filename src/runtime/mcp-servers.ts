@@ -9,6 +9,7 @@ import { filterMcpToolsForScope } from './mcp-tool-filter.js';
 import {
   mcpServerAliasMatches,
   mcpToolAllowedByScope,
+  stripMcpToolCarrier,
 } from './mcp-tool-authority.js';
 import { rankToolsBySemantic, semanticToolRankEnabled } from './mcp-tool-rank.js';
 import { isEmbeddingsEnabled } from '../memory/embeddings.js';
@@ -298,9 +299,15 @@ function scopeCacheKey(scope: McpToolScope): string {
   return JSON.stringify({
     allowAll: !!scope.allowAll,
     allowedServerSlugs: [...(scope.allowedServerSlugs ?? [])].sort(),
+    allowedToolNames: scope.allowedToolNames === undefined
+      ? null
+      : [...scope.allowedToolNames].sort(),
     toolPatterns: [...(scope.toolPatterns ?? [])].sort(),
     priorityKeywords: [...(scope.priorityKeywords ?? [])].sort(),
     maxTools: scope.maxTools ?? null,
+    serverMaxTools: Object.fromEntries(
+      Object.entries(scope.serverMaxTools ?? {}).sort(([left], [right]) => left.localeCompare(right)),
+    ),
   });
 }
 
@@ -341,6 +348,7 @@ function createScopedExternalShim(
       return listScopedTools();
     },
     async callTool(toolName, args) {
+      const executableToolName = stripMcpToolCarrier(toolName);
       // Models can remember or guess a namespaced tool that was not advertised
       // this turn. Treat the filtered list as executable authority too: server
       // slug/pattern checks reject cheaply, while exact membership also
@@ -349,10 +357,10 @@ function createScopedExternalShim(
         throw new Error(`external MCP tool is outside this turn's scope: ${toolName}`);
       }
       if (!selectedToolNames) await listScopedTools();
-      if (!selectedToolNames?.has(toolName)) {
+      if (!selectedToolNames?.has(executableToolName)) {
         throw new Error(`external MCP tool was not selected for this turn: ${toolName}`);
       }
-      return base.callTool(toolName, args);
+      return base.callTool(executableToolName, args);
     },
     async invalidateToolsCache() {
       selectedToolNames = null;
@@ -582,7 +590,8 @@ export function getOrCreateExternalMcpServerForTool(
   toolName: string,
   scope?: McpToolScope | null,
 ): MCPServer {
-  const parsed = parseNamespacedTool(toolName);
+  const executableToolName = stripMcpToolCarrier(toolName);
+  const parsed = parseNamespacedTool(executableToolName);
   if (!parsed) throw new Error(`Malformed namespaced MCP tool name: "${toolName}".`);
   if (scope !== undefined) {
     if (!mcpToolAllowedByScope(toolName, scope)) {

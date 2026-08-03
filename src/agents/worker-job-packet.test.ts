@@ -13,6 +13,7 @@ const validPacket = {
     'Draft write later: OUTLOOK_CREATE_DRAFT',
     'Schema: target:string, location_name:string, language_name:string',
   ].join('\n'),
+  externalMcpToolNames: null,
   context: 'Use the parent-provided firm/domain and Acme outbound memory rules. No other firms are in scope.',
   instructions: 'Read-only SEO research in this worker. Do not send email. Return ERROR if the SEO tool cannot provide data after one retry.',
   expectedOutput: 'JSON object with firm, domain, seoFindings, emailAngle, sources, or final line ERROR: <reason>.',
@@ -93,9 +94,42 @@ test('workerPacketKey: changing ANY material field yields a distinct key (a real
   assert.notEqual(workerPacketKey({ ...validPacket, item: `${validPacket.item} (different)` }), base);
   assert.notEqual(workerPacketKey({ ...validPacket, instructions: `${validPacket.instructions} Also do X.` }), base);
   assert.notEqual(workerPacketKey({ ...validPacket, resolvedTools: 'a_different_tool' }), base);
+  assert.notEqual(workerPacketKey({ ...validPacket, externalMcpToolNames: undefined }), base);
+  assert.notEqual(workerPacketKey({ ...validPacket, externalMcpToolNames: ['firecrawl__scrape'] }), base);
   assert.notEqual(workerPacketKey({ ...validPacket, objective: 'A different objective entirely for this item.' }), base);
   assert.notEqual(workerPacketKey({ ...validPacket, context: 'Different source facts.' }), base);
   assert.notEqual(workerPacketKey({ ...validPacket, expectedOutput: 'A different shape.' }), base);
+});
+
+test('typed external MCP lease is exact, required on live calls, and separate from prose', () => {
+  assert.equal(WorkerToolCallSchema.safeParse({ ...validPacket, externalMcpToolNames: undefined }).success, false);
+  assert.equal(WorkerToolCallSchema.safeParse({ ...validPacket, externalMcpToolNames: ['firecrawl'] }).success, false);
+  assert.equal(WorkerToolCallSchema.safeParse({ ...validPacket, externalMcpToolNames: ['do not use firecrawl__delete'] }).success, false);
+  const parsed = WorkerToolCallSchema.parse({
+    ...validPacket,
+    resolvedTools: 'Do not use dataforseo__delete; use the supplied read schema.',
+    externalMcpToolNames: ['dataforseo__ranked_keywords'],
+  });
+  assert.deepEqual(parsed.externalMcpToolNames, ['dataforseo__ranked_keywords']);
+  assert.match(buildWorkerJobPrompt(parsed), /prose, examples, or prohibitions are not authority/);
+});
+
+test('workerPacketKey canonicalizes semantically identical typed leases without collapsing legacy fallback', () => {
+  assert.equal(
+    workerPacketKey({ ...validPacket, externalMcpToolNames: null }),
+    workerPacketKey({ ...validPacket, externalMcpToolNames: [] }),
+    'null and [] both mean typed local-only authority',
+  );
+  assert.equal(
+    workerPacketKey({ ...validPacket, externalMcpToolNames: ['firecrawl__scrape'] }),
+    workerPacketKey({ ...validPacket, externalMcpToolNames: ['mcp__FIRECRAWL__SCRAPE'] }),
+    'transport carrier and case aliases share one exact capability identity',
+  );
+  assert.notEqual(
+    workerPacketKey({ ...validPacket, externalMcpToolNames: undefined }),
+    workerPacketKey({ ...validPacket, externalMcpToolNames: null }),
+    'durable legacy prose fallback remains authority-distinct from typed deny',
+  );
 });
 
 test('workerPacketKey: length-prefixing defeats the field-boundary collision (adversarial review F2)', () => {

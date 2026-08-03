@@ -54,3 +54,46 @@ test('MCP authority enforces server and tool-pattern scope on guessed names', ()
     'generic MCP/server suffixes preserve the canonical server identity',
   );
 });
+
+test('exact MCP authority never admits a substring sibling', () => {
+  const scope = {
+    reason: 'compiled worker packet',
+    allowedServerSlugs: ['dataforseo'],
+    allowedToolNames: ['dataforseo__dataforseo_labs_google_ranked_keywords'],
+    maxTools: 8,
+  };
+  assert.equal(
+    mcpToolAllowedByScope('dataforseo__dataforseo_labs_google_ranked_keywords', scope),
+    true,
+  );
+  assert.equal(
+    mcpToolAllowedByScope('dataforseo__archive_dataforseo_labs_google_ranked_keywords_history', scope),
+    false,
+  );
+  assert.equal(mcpToolAllowedByScope('mcp__dataforseo__dataforseo_labs_google_ranked_keywords', scope), true);
+  assert.equal(mcpToolAllowedByScope('mcp__dataforseo__archive_dataforseo_labs_google_ranked_keywords_history', scope), false);
+});
+
+test('an explicitly empty exact MCP allowlist denies the whole admitted server', () => {
+  assert.equal(mcpToolAllowedByScope('dataforseo__delete_everything', {
+    reason: 'typed packet says no external tools',
+    allowedServerSlugs: ['dataforseo'],
+    allowedToolNames: [],
+    maxTools: 8,
+  }), false);
+});
+
+test('exact MCP authority does not collapse distinct configured namespace aliases', () => {
+  const scope = {
+    reason: 'compiled exact Notion server lease',
+    allowedServerSlugs: ['notion-mcp'],
+    allowedToolNames: ['notion-mcp__read_page'],
+    maxTools: 1,
+  };
+  assert.equal(mcpToolAllowedByScope('mcp__notion-mcp__read_page', scope), true);
+  assert.equal(
+    mcpToolAllowedByScope('mcp__notion-server__read_page', scope),
+    false,
+    'generic -mcp/-server lookup aliases are not exact capability identity',
+  );
+});

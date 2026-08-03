@@ -1,6 +1,11 @@
 import { discoverMcpServers } from '../runtime/mcp-config.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
-import { mcpServerAliasMatches } from '../runtime/mcp-tool-authority.js';
+import {
+  canonicalMcpToolIdentity,
+  mcpServerAliasMatches,
+  stripMcpToolCarrier,
+} from '../runtime/mcp-tool-authority.js';
+import { parseNamespacedTool } from '../runtime/mcp-namespace-shim.js';
 
 function scopeLockEnabled(allowed?: string[] | null): boolean {
   if (!allowed || allowed.length === 0) return false;
@@ -14,6 +19,43 @@ function slugifyMcpServerName(name: string): string {
     .replace(/^_+|_+$/g, '')
     .replace(/_{2,}/g, '_');
   return slug || 'server';
+}
+
+type ExactToolResolution =
+  | { status: 'resolved'; identity: string; serverSlug: string }
+  | { status: 'missing' | 'ambiguous' | 'malformed' };
+
+/** Resolve a packet spelling to ONE concrete configured namespace.
+ *
+ * Exact advertised namespace spelling wins. A friendly generic alias is
+ * accepted only when it identifies exactly one configured server. This is the
+ * compile-time seam where aliases belong: after resolution, the returned tool
+ * identity retains the concrete namespace so two live servers such as
+ * `notion-mcp` and `notion-server` can never satisfy one another's lease.
+ */
+function resolveConfiguredExactToolIdentity(
+  rawToolName: string,
+  configuredServerNames: string[],
+): ExactToolResolution {
+  if (!canonicalMcpToolIdentity(rawToolName)) return { status: 'malformed' };
+  const parsed = parseNamespacedTool(stripMcpToolCarrier(rawToolName));
+  if (!parsed) return { status: 'malformed' };
+  const requestedServer = parsed.serverSlug.trim().toLowerCase();
+  const configured = configuredServerNames.map((name) => ({
+    slug: slugifyMcpServerName(name),
+  }));
+  const direct = configured.filter((entry) => entry.slug === requestedServer);
+  const candidates = direct.length > 0
+    ? direct
+    : configured.filter((entry) => mcpServerAliasMatches(entry.slug, requestedServer));
+  if (candidates.length === 0) return { status: 'missing' };
+  if (candidates.length !== 1) return { status: 'ambiguous' };
+  const serverSlug = candidates[0]!.slug;
+  return {
+    status: 'resolved',
+    serverSlug,
+    identity: `${serverSlug}__${parsed.toolName.trim().toLowerCase()}`,
+  };
 }
 
 function normalizeMcpAlias(value: string): string {
@@ -125,11 +167,77 @@ export function externalMcpScopeFromResolvedTools(
   serverNames?: string[],
 ): McpToolScope | null {
   const allowed = candidatesFromResolvedTools(resolvedTools);
-  return externalMcpScopeForAllowedToolLock({
+  const configured = serverNames
+    ?? discoverMcpServers().filter((server) => server.enabled).map((server) => server.name);
+  const scope = externalMcpScopeForAllowedToolLock({
     allowed,
-    serverNames,
+    serverNames: configured,
     reason: 'worker resolvedTools external MCP lock',
-  }) ?? null;
+  });
+  if (!scope) return null;
+  const resolutions = allowed.map((name) => resolveConfiguredExactToolIdentity(name, configured));
+  // A namespaced alias that maps to multiple live servers is not authority.
+  // Unconfigured names in prose remain harmless local labels and are ignored.
+  if (resolutions.some((resolution) => resolution.status === 'ambiguous')) return null;
+  const resolved = resolutions.filter(
+    (resolution): resolution is Extract<ExactToolResolution, { status: 'resolved' }> =>
+      resolution.status === 'resolved',
+  );
+  const allowedToolNames = [...new Set(resolved.map((resolution) => resolution.identity))].sort();
+  return {
+    ...scope,
+    ...(allowedToolNames.length > 0
+      ? { allowedServerSlugs: [...new Set(resolved.map((resolution) => resolution.serverSlug))].sort() }
+      : {}),
+    ...(allowedToolNames.length > 0 ? { allowedToolNames } : {}),
+  };
+}
+
+/** Compile a typed packet lease without tokenizing prose. Every element must be
+ * one exact canonical external identity; one malformed element fails closed. */
+export function externalMcpScopeFromExactToolNames(
+  toolNames: string[] | null | undefined,
+  serverNames?: string[],
+): McpToolScope | null {
+  const requested = toolNames ?? [];
+  if (requested.length === 0) return null;
+  const configured = serverNames
+    ?? discoverMcpServers().filter((server) => server.enabled).map((server) => server.name);
+  const resolved = requested.map((name) => resolveConfiguredExactToolIdentity(name, configured));
+  // Every typed element is authority-bearing. Unknown, malformed, or ambiguous
+  // entries fail the packet closed instead of silently widening/dropping it.
+  if (resolved.some((resolution) => resolution.status !== 'resolved')) return null;
+  const exact = resolved as Array<Extract<ExactToolResolution, { status: 'resolved' }>>;
+  const allowedServerSlugs = [...new Set(exact.map((resolution) => resolution.serverSlug))].sort();
+  const allowedToolNames = [...new Set(exact.map((resolution) => resolution.identity))].sort();
+  return {
+    reason: 'worker typed exact external MCP lease',
+    allowedServerSlugs,
+    allowedToolNames,
+    maxTools: allowedToolNames.length,
+  };
+}
+
+/** Resolve the immutable external capability lease for one worker packet.
+ * Runtime `null` is an explicit deny; only `undefined` inherits the scope that
+ * existed when the parent agent was constructed. Kept pure so this authority
+ * rule is pinned independently of SDK agent construction. */
+export function workerPacketMcpToolScope(args: {
+  buildScope: McpToolScope | null | undefined;
+  runtimeScope: McpToolScope | null | undefined;
+  resolvedTools: string | null | undefined;
+  externalMcpToolNames?: string[] | null;
+  serverNames?: string[];
+}): McpToolScope | null | undefined {
+  const parentScope = args.runtimeScope !== undefined ? args.runtimeScope : args.buildScope;
+  const hasTypedLease = args.externalMcpToolNames !== undefined;
+  return intersectExternalMcpToolScopes(
+    parentScope,
+    hasTypedLease
+      ? externalMcpScopeFromExactToolNames(args.externalMcpToolNames, args.serverNames)
+      : externalMcpScopeFromResolvedTools(args.resolvedTools, args.serverNames),
+    'orchestrator worker parent/packet external MCP intersection',
+  );
 }
 
 function optionalCapMin(...values: Array<number | undefined>): number | undefined {
@@ -182,6 +290,11 @@ export function intersectExternalMcpToolScopes(
   if (parent === undefined) return child;
   if (child === undefined) return parent;
 
+  const parentHasExact = parent.allowedToolNames !== undefined;
+  const childHasExact = child.allowedToolNames !== undefined;
+  if ((parentHasExact && parent.allowedToolNames!.length === 0)
+    || (childHasExact && child.allowedToolNames!.length === 0)) return null;
+
   const parentBroad = parent.allowAll === true || parent.failOpenCandidate === true;
   const childBroad = child.allowAll === true || child.failOpenCandidate === true;
   let allowedServerSlugs: string[] | undefined;
@@ -207,6 +320,23 @@ export function intersectExternalMcpToolScopes(
     : childBroad
       ? parent.toolPatterns
       : intersectPatterns(parent.toolPatterns, child.toolPatterns);
+  const parentExact = [...new Set(parent.allowedToolNames ?? [])];
+  const childExact = [...new Set(child.allowedToolNames ?? [])];
+  const allowedToolNames = parentBroad
+    ? childExact
+    : childBroad
+      ? parentExact
+      : parentExact.length > 0 && childExact.length > 0
+        ? childExact.filter((candidate) => {
+            const identity = canonicalMcpToolIdentity(candidate);
+            return Boolean(identity && parentExact.some((entry) => canonicalMcpToolIdentity(entry) === identity));
+          })
+        : childExact.length > 0
+          ? childExact
+          : parentExact;
+  if (!parentBroad && !childBroad && parentExact.length > 0 && childExact.length > 0 && allowedToolNames.length === 0) {
+    return null;
+  }
   const maxTools = optionalCapMin(parent.maxTools, child.maxTools);
   const priorityKeywords = [...new Set([
     ...(parent.priorityKeywords ?? []),
@@ -227,6 +357,7 @@ export function intersectExternalMcpToolScopes(
       ? (parent.allowAll && child.allowAll ? { allowAll: true } : { failOpenCandidate: true })
       : { allowedServerSlugs: [...new Set(allowedServerSlugs ?? [])].sort() }),
     ...(toolPatterns && toolPatterns.length > 0 ? { toolPatterns } : {}),
+    ...(allowedToolNames.length > 0 ? { allowedToolNames: [...new Set(allowedToolNames)].sort() } : {}),
     ...(priorityKeywords.length > 0 ? { priorityKeywords } : {}),
     ...(maxTools !== undefined ? { maxTools } : {}),
     ...(Object.keys(serverMaxTools).length > 0 ? { serverMaxTools } : {}),

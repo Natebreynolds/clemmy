@@ -24,8 +24,9 @@ import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, type WorkerToolInput } from './worker-job-packet.js';
 import { normalizeWorkerOutput } from './worker-output.js';
 import {
+  externalMcpScopeFromExactToolNames,
   externalMcpScopeFromResolvedTools,
-  intersectExternalMcpToolScopes,
+  workerPacketMcpToolScope,
 } from './external-mcp-scope-lock.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 
@@ -151,7 +152,9 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope | 
   const externalMcpScope = options.mcpToolScope !== undefined
     ? options.mcpToolScope
     : (options.workerInput
-        ? externalMcpScopeFromResolvedTools(options.workerInput.resolvedTools)
+        ? options.workerInput.externalMcpToolNames !== undefined
+          ? externalMcpScopeFromExactToolNames(options.workerInput.externalMcpToolNames)
+          : externalMcpScopeFromResolvedTools(options.workerInput.resolvedTools)
         : null);
   let workerCatalogBlock = '';
   if (workerSlimToolsEnabled()) {
@@ -277,12 +280,12 @@ export async function runCrossProviderWorker(
   sourceUserSeq?: number,
   mcpToolScope?: McpToolScope | null,
 ): Promise<CrossProviderWorkerResult> {
-  const packetMcpToolScope = externalMcpScopeFromResolvedTools(input.resolvedTools);
-  const effectiveMcpToolScope = intersectExternalMcpToolScopes(
-    mcpToolScope,
-    packetMcpToolScope,
-    'cross-provider worker parent/packet external MCP intersection',
-  );
+  const effectiveMcpToolScope = workerPacketMcpToolScope({
+    buildScope: mcpToolScope,
+    runtimeScope: undefined,
+    resolvedTools: input.resolvedTools,
+    externalMcpToolNames: input.externalMcpToolNames,
+  });
   const worker = await buildWorkerAgent({
     model: modelId,
     workerInput: input,

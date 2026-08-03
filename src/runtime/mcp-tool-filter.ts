@@ -1,7 +1,11 @@
 import type { MCPServer } from '@openai/agents';
 import { parseNamespacedTool } from './mcp-namespace-shim.js';
 import type { McpToolScope } from './mcp-tool-scope.js';
-import { mcpServerAliasMatches } from './mcp-tool-authority.js';
+import {
+  canonicalMcpToolIdentity,
+  mcpServerAliasMatches,
+  stripMcpToolCarrier,
+} from './mcp-tool-authority.js';
 
 type MCPTool = Awaited<ReturnType<MCPServer['listTools']>>[number];
 type RankedTool = { tool: MCPTool; index: number; score: number; serverSlug: string | null };
@@ -22,7 +26,7 @@ function compilePatterns(patterns: string[] | undefined): RegExp[] {
  * semantic ranker (mcp-tool-rank) embeds the SAME text the filter keyword-scores.
  */
 export function toolHaystack(tool: MCPTool): string {
-  const parsed = parseNamespacedTool(tool.name);
+  const parsed = parseNamespacedTool(stripMcpToolCarrier(tool.name));
   return [
     tool.name,
     parsed?.serverSlug ?? '',
@@ -64,13 +68,19 @@ function scoreTool(
   return score;
 }
 
-function toolMatchesScope(tool: MCPTool, scope: McpToolScope, patterns: RegExp[]): boolean {
+function toolMatchesScope(
+  tool: MCPTool,
+  scope: McpToolScope,
+  patterns: RegExp[],
+  exactNames: ReadonlySet<string>,
+  exactAuthority: boolean,
+): boolean {
   if (scope.allowAll) return true;
   // Fail-open: match every connected server's tools (no slug/pattern gate); the
   // maxTools cap below still bounds the surface, and __unavailable stubs are
   // de-prioritized by scoreTool so real tools win the cap.
   if (scope.failOpenCandidate) return true;
-  const parsed = parseNamespacedTool(tool.name);
+  const parsed = parseNamespacedTool(stripMcpToolCarrier(tool.name));
   const allowedSlugs = scope.allowedServerSlugs ?? [];
   if (allowedSlugs.length > 0 && (!parsed || !allowedSlugs.some(
     (allowed) => mcpServerAliasMatches(parsed.serverSlug, allowed),
@@ -81,11 +91,19 @@ function toolMatchesScope(tool: MCPTool, scope: McpToolScope, patterns: RegExp[]
     return false;
   }
 
+  // Preserve the server's non-executable diagnostic sentinel even for an exact
+  // packet lease; otherwise a cold connector looks like an unexplained empty
+  // tool surface. Dispatch authority still rejects guessed real siblings.
+  if (parsed?.toolName === 'unavailable') return true;
+
+  if (exactAuthority) {
+    const identity = canonicalMcpToolIdentity(tool.name);
+    if (!identity || !exactNames.has(identity)) return false;
+  }
+
   // If a server is selected and no tool pattern was provided, include the
   // whole server surface. Intent resolvers should use this sparingly.
   if (patterns.length === 0) return true;
-
-  if (parsed?.toolName === 'unavailable') return true;
 
   const haystack = toolHaystack(tool);
   return patterns.some((pattern) => pattern.test(haystack));
@@ -106,7 +124,16 @@ export function filterMcpToolsForScope(
   if ((scope.maxTools ?? 0) <= 0 && (scope.allowedServerSlugs?.length ?? 0) === 0) return [];
 
   const patterns = compilePatterns(scope.toolPatterns);
-  const matched = tools.filter((tool) => toolMatchesScope(tool, scope, patterns));
+  const exactNames = new Set((scope.allowedToolNames ?? [])
+    .map(canonicalMcpToolIdentity)
+    .filter((value): value is string => Boolean(value)));
+  const matched = tools.filter((tool) => toolMatchesScope(
+    tool,
+    scope,
+    patterns,
+    exactNames,
+    scope.allowedToolNames !== undefined,
+  ));
   const hasServerCaps = Object.keys(scope.serverMaxTools ?? {}).length > 0;
   if (!hasServerCaps && (!scope.maxTools || matched.length <= scope.maxTools)) return matched;
 
@@ -115,7 +142,7 @@ export function filterMcpToolsForScope(
       tool,
       index,
       score: scoreTool(tool, scope.priorityKeywords, semanticScores),
-      serverSlug: parseNamespacedTool(tool.name)?.serverSlug ?? null,
+      serverSlug: parseNamespacedTool(stripMcpToolCarrier(tool.name))?.serverSlug ?? null,
     }))
     .sort((a, b) => (b.score - a.score) || (a.index - b.index));
 

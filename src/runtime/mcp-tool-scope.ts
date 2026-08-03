@@ -15,6 +15,12 @@ export interface McpToolScope {
    */
   allowedServerSlugs?: string[];
   /**
+   * Canonical exact external tool identities (`server__tool`). When present,
+   * this is an authority allowlist, not a ranking hint: descriptions and
+   * substring-confusable sibling names cannot satisfy it.
+   */
+  allowedToolNames?: string[];
+  /**
    * Regex sources matched against the namespaced tool name, original tool
    * name, and description.
    */

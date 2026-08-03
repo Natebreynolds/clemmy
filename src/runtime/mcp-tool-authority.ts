@@ -20,6 +20,32 @@ export function mcpServerAliasMatches(actualSlug: string, allowedAlias: string):
   return actual.length > 0 && allowed.length > 0 && actual === allowed;
 }
 
+/** Stable exact namespace identity used by packet capability leases.
+ *
+ * The `mcp__` prefix is only an SDK transport carrier and case is not material,
+ * but the advertised server namespace itself stays exact. Generic server-name
+ * aliases (`foo`, `foo-mcp`, `foo-server`) are useful while resolving a packet
+ * against the configured catalog; they are NOT authority-equal after that
+ * resolution. Otherwise two distinct live servers with alias-confusable names
+ * could satisfy the same exact lease, with list order deciding which endpoint
+ * actually ran.
+ */
+export function canonicalMcpToolIdentity(toolName: string): string | null {
+  // Claude/MCP catalogs commonly spell the carrier as `mcp__server__tool`.
+  // `mcp` is transport, not the server identity.
+  const normalized = toolName.trim().replace(/^mcp__/i, '');
+  if (!/^[A-Za-z0-9._-]+__[A-Za-z0-9._-]+$/.test(normalized)) return null;
+  const parsed = parseNamespacedTool(normalized);
+  if (!parsed) return null;
+  const server = parsed.serverSlug.trim().toLowerCase();
+  const tool = parsed.toolName.trim().toLowerCase();
+  return server && tool ? `${server}__${tool}` : null;
+}
+
+export function stripMcpToolCarrier(toolName: string): string {
+  return toolName.trim().replace(/^mcp__/i, '');
+}
+
 /**
  * MCP scope is an authority boundary, not merely an advertisement hint.
  *
@@ -35,7 +61,8 @@ export function mcpToolAllowedByScope(
   if (scope === undefined) return true;
   if (scope === null) return false;
 
-  const parsed = parseNamespacedTool(toolName);
+  const normalizedToolName = stripMcpToolCarrier(toolName);
+  const parsed = parseNamespacedTool(normalizedToolName);
   if (!parsed) return false;
   if (scope.maxTools === 0) return false;
   if (scope.allowAll) return true;
@@ -47,6 +74,15 @@ export function mcpToolAllowedByScope(
     mcpServerAliasMatches(parsed.serverSlug, raw));
   if (!serverAllowed) return false;
 
+  const exactAuthority = scope.allowedToolNames !== undefined;
+  const exactNames = new Set((scope.allowedToolNames ?? [])
+    .map(canonicalMcpToolIdentity)
+    .filter((value): value is string => Boolean(value)));
+  if (exactAuthority) {
+    const identity = canonicalMcpToolIdentity(toolName);
+    if (!identity || !exactNames.has(identity)) return false;
+  }
+
   const patterns = (scope.toolPatterns ?? []).flatMap((source) => {
     try {
       return [new RegExp(source, 'i')];
@@ -55,7 +91,7 @@ export function mcpToolAllowedByScope(
     }
   });
   if (patterns.length === 0) return true;
-  const haystack = `${toolName} ${parsed.serverSlug} ${parsed.toolName}`;
+  const haystack = `${normalizedToolName} ${parsed.serverSlug} ${parsed.toolName}`;
   return patterns.some((pattern) => pattern.test(haystack));
 }
 

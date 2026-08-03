@@ -19,6 +19,9 @@ import { buildPlannerTool } from './planner.js';
 // approval surface of its own (sticky approvals from the parent cover
 // composio writes); it just does one job and returns.
 import { buildWorkerAgent } from './sub-agents.js';
+import {
+  workerPacketMcpToolScope,
+} from './external-mcp-scope-lock.js';
 import { harnessInstructions } from './harness-context.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
@@ -919,9 +922,9 @@ export function recentPriorUserInputsForScope(
  * a capable orchestrator and does not benefit from paying an agent-as-tool
  * planning loop before work begins.
  *
- * Batch/large review stays eligible because the confirm-first gate can require
- * an inspectable plan. No-input construction keeps the tool for autonomous and
- * compatibility callers that do not provide turn text.
+ * Batch size is execution topology, not planning intent: run_worker/workManifest
+ * already own it, while approvals and receipts remain at effect boundaries.
+ * No-input construction keeps the tool for autonomous/compatibility callers.
  */
 export function shouldExposePlannerTool(
   userInput: string | null | undefined,
@@ -938,8 +941,7 @@ export function shouldExposePlannerTool(
     || /\b(?:how|what) (?:should|would|could) (?:we|i|you)\b/.test(text)
     || /\b(?:do not|don't|dont|without) (?:start|execute|build|change|write|send|deploy)\b/.test(text)
   ) return true;
-  return /\b(?:batch|bulk|long[- ]horizon|multi[- ]session|dozens?|hundreds?|thousands?)\b/.test(text)
-    || /\b(?:send|write|update|create|post|publish|delete)\b[\s\S]{0,80}\b(?:all|every|\d{2,})\b/.test(text);
+  return false;
 }
 
 /**
@@ -1056,10 +1058,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         options.sessionId ? recentConversationTextsForFanout(options.sessionId, options.userInput) : priorUserInputs,
       )
     : undefined;
-  const plannerTool = (
-    shouldExposePlannerTool(options.userInput)
-    || Boolean(multiItem?.isMultiItem)
-  )
+  const plannerTool = shouldExposePlannerTool(options.userInput)
     ? buildPlannerTool()
     : null;
   const codeModeMandate = codeModeMandateDirective({
@@ -1121,7 +1120,41 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     }
   }
 
-  const worker = await buildWorkerAgent({ mcpToolScope });
+  // Worker agents are lazy and keyed by their exact packet capability lease.
+  // The old eager singleton paid worker construction on every ordinary chat
+  // and, more importantly, froze workers to the parent turn's broad/selected
+  // MCP view while ignoring the exact resolvedTools packet. A live 10-item SEO
+  // fan-out could therefore name three proven tools yet reach only one.
+  type BuiltWorkerAgent = Awaited<ReturnType<typeof buildWorkerAgent>>;
+  const workerAgentCache = new Map<string, Promise<BuiltWorkerAgent>>();
+  const workerAgentForPacket = async (
+    input: WorkerToolInput,
+    model: string,
+  ): Promise<{ agent: BuiltWorkerAgent; scope: McpToolScope | null | undefined }> => {
+    const scope = workerPacketMcpToolScope({
+      buildScope: mcpToolScope,
+      runtimeScope: harnessRunContextStorage.getStore()?.mcpToolScope,
+      resolvedTools: input.resolvedTools,
+      externalMcpToolNames: input.externalMcpToolNames,
+    });
+    const scopeKey = scope === undefined
+      ? 'scope:inherit'
+      : scope === null
+        ? 'scope:deny'
+        : `scope:exact:${JSON.stringify(scope)}`;
+    const key = `${model}\0${scopeKey}`;
+    let pending = workerAgentCache.get(key);
+    if (!pending) {
+      pending = buildWorkerAgent({ model, workerInput: input, mcpToolScope: scope });
+      workerAgentCache.set(key, pending);
+    }
+    try {
+      return { agent: await pending, scope };
+    } catch (error) {
+      if (workerAgentCache.get(key) === pending) workerAgentCache.delete(key);
+      throw error;
+    }
+  };
   // FIX 1.2 — bound each worker to its own turn budget so a thrashing worker
   // self-terminates cheaply (the SDK soft-converts MaxTurnsExceeded to a string
   // result, so a capped worker NEVER throws into the parent batch — siblings
@@ -1146,7 +1179,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const runWorkerToolDescription = [
       'Spawn stateless Workers over 1..N items using a structured parent-planned job packet. For 2+ independent same-shape items, pass them ALL in `items` in ONE call — the harness runs them as a concurrency-bounded pool with an honest per-item ledger (scrape, classify, summarize, fetch, transform, create N records, send N messages with different bodies).',
       'Each worker gets its own isolated context — use this to keep your own context from ballooning over hundreds of items, and to run the work concurrently instead of sequentially.',
-      'Input: one packet (objective, resolvedTools, context, instructions, expectedOutput) that applies to every item, plus `items` (the full list) or `item` (a single identifier). You must include exact resolved tool slugs/commands/schemas, source rows/URLs, instructions, and expected output. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet. Include intent when the items should use a user-configured worker category such as design, writing, research, code, or analysis.',
+      'Input: one packet (objective, resolvedTools, externalMcpToolNames, context, instructions, expectedOutput) that applies to every item, plus `items` (the full list) or `item` (a single identifier). Put every external MCP capability in the typed exact `externalMcpToolNames` array (`server__tool`); resolvedTools carries schemas/commands/instructions but does not widen that lease. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet. Include intent when the items should use a user-configured worker category such as design, writing, research, code, or analysis.',
       'When to use: 3+ independent items of the same kind. The Worker returns a tight result you aggregate. TRIP-WIRE: if you catch yourself about to call the same research/enrichment/read/write tool a 3rd time for a DIFFERENT item in one turn, STOP and fan the REMAINING items out with run_worker instead of looping serially (serial piles every item\'s payload into your context and is exactly what tripped the loop guard and got the last batch cancelled).',
       'On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
       'For durable multi-wave or multi-phase work, include workManifest. Its phases are per-item worker stages; exclude parent-only ranking, merge, final synthesis, and reporting. Declare the canonical item universe and graph on the first wave; reconcile later labels (for example sheet rows) back to those ids with aliases. The harness checkpoints logical progress and refuses accidental scope inflation before spawning workers.',
@@ -1341,6 +1374,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     payload: string,
     det: any,
     maxTurnsForItem: number,
+    mcpToolScopeOverride?: McpToolScope | null,
   ): Promise<unknown> => {
     const parent = harnessRunContextStorage.getStore();
     const sessionId = parent?.sessionId ?? extractSessionId(ctx) ?? '';
@@ -1350,7 +1384,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         sessionId,
         counter,
         ...(parent?.sourceUserSeq ? { sourceUserSeq: parent.sourceUserSeq } : {}),
-        ...(parent?.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
+        ...(mcpToolScopeOverride !== undefined
+          ? { mcpToolScope: mcpToolScopeOverride }
+          : parent?.mcpToolScope !== undefined
+            ? { mcpToolScope: parent.mcpToolScope }
+            : {}),
         ...(parent?.dispatchLease ? { dispatchLease: parent.dispatchLease } : {}),
         ...(parent?.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
         ...(workerThrashGuardEnabled()
@@ -1787,7 +1825,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           if (!runContext) throw new Error('run_worker requires an SDK run context');
           try {
             assertWorkerMayStart();
-            const output = await invokeWorkerWithOwnBudget(worker.clone({ model: next.modelId }).asTool(fbOptions), runContext, JSON.stringify(input), details, resolveWorkerMaxTurns(input.intent, workerMaxTurns));
+            const scopedWorker = await workerAgentForPacket(input, next.modelId);
+            const output = await invokeWorkerWithOwnBudget(
+              scopedWorker.agent.asTool(fbOptions),
+              runContext,
+              JSON.stringify(input),
+              details,
+              resolveWorkerMaxTurns(input.intent, workerMaxTurns),
+              scopedWorker.scope,
+            );
             recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), next.modelId);
             appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
             return await reduceReturn(output);
@@ -1820,18 +1866,24 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // build-time default) bypassed repairByoRoutedModelId, so telemetry showed
       // the repair while the actual provider call still 400'd (live 2026-07-22,
       // 12/12 workers dead on gpt-5.4 -> z.ai).
-      const workerForCall = worker.clone({ model: workerModel });
-      // Intent-aware cap on the nested lane too (non-Claude worker setups). asTool
-      // captures runOptions at BUILD time, so rebuild per-call with the resolved
-      // cap rather than reusing the build-time-baked runWorkerAsToolOptions.
-      const nestedAsToolOptions = workerThrashGuardEnabled()
-        ? { ...runWorkerAsToolOptions, runOptions: { maxTurns: resolveWorkerMaxTurns(input.intent, workerMaxTurns) } }
-        : runWorkerAsToolOptions;
-      const nestedWorkerTool = workerForCall.asTool(nestedAsToolOptions);
       if (!runContext) throw new Error('run_worker requires an SDK run context');
       try {
+        const scopedWorker = await workerAgentForPacket(input, workerModel);
+        // Intent-aware cap on the nested lane too (non-Claude worker setups).
+        // asTool captures runOptions at BUILD time, so rebuild per call.
+        const nestedAsToolOptions = workerThrashGuardEnabled()
+          ? { ...runWorkerAsToolOptions, runOptions: { maxTurns: resolveWorkerMaxTurns(input.intent, workerMaxTurns) } }
+          : runWorkerAsToolOptions;
+        const nestedWorkerTool = scopedWorker.agent.asTool(nestedAsToolOptions);
         assertWorkerMayStart();
-        const output = await invokeWorkerWithOwnBudget(nestedWorkerTool, runContext, JSON.stringify(input), details, resolveWorkerMaxTurns(input.intent, workerMaxTurns));
+        const output = await invokeWorkerWithOwnBudget(
+          nestedWorkerTool,
+          runContext,
+          JSON.stringify(input),
+          details,
+          resolveWorkerMaxTurns(input.intent, workerMaxTurns),
+          scopedWorker.scope,
+        );
         recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), workerModel);
         appendWorkerResultFromOutput(output, { model: workerModel, toolUses: [] });
         return await reduceReturn(output);
