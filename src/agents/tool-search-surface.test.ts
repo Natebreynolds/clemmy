@@ -140,7 +140,7 @@ test('ON: an excluded tool is absent from both first-class and deferred reachabi
   assert.doesNotMatch(catalog, new RegExp(`\\b${CATALOG_ONLY_WHEN_ON}\\b`));
 });
 
-test('execute-now work stays direct while consequential turns retain confirm-first recovery', async () => {
+test('draft_plan recovery stays reachable without making batch shape a planning trigger', async () => {
   const consequentialDirect = await withFlag('on', () => buildOrchestratorAgent({
     userInput: 'Create one disposable Netlify site, deploy the supplied sentinel page, and verify the live URL.',
     allowToolJit: true,
@@ -167,8 +167,8 @@ test('execute-now work stays direct while consequential turns retain confirm-fir
   }));
   assert.equal(
     namesOf(safeAggregate).has('draft_plan'),
-    false,
-    'read-only aggregate work keeps the lean direct surface and uses worker topology if useful',
+    true,
+    'read-only aggregate work retains recovery; the tool description prevents invocation for topology alone',
   );
 
   const collaborative = await withFlag('on', () => buildOrchestratorAgent({
@@ -178,7 +178,7 @@ test('execute-now work stays direct while consequential turns retain confirm-fir
   assert.equal(namesOf(collaborative).has('draft_plan'), true);
 });
 
-test('old planning language does not tax a later read-only turn', async () => {
+test('recovery reachability cannot depend on current wording or stale planning language', async () => {
   const session = createSession({ kind: 'chat' });
   appendEvent({
     sessionId: session.id,
@@ -192,7 +192,25 @@ test('old planning language does not tax a later read-only turn', async () => {
     userInput: 'Great, summarize the current live URL status.',
     allowToolJit: true,
   }));
-  assert.equal(namesOf(agent).has('draft_plan'), false);
+  assert.equal(namesOf(agent).has('draft_plan'), true);
+
+  for (const userInput of [
+    'yes',
+    'Run my email flow.',
+    'Contact everyone on the list.',
+    'Reach out to all prospects.',
+    'hello there',
+  ]) {
+    const wordingAgent = await withFlag('on', () => buildOrchestratorAgent({
+      userInput,
+      allowToolJit: true,
+    }));
+    assert.equal(
+      namesOf(wordingAgent).has('draft_plan'),
+      true,
+      `recovery tool missing for: ${userInput}`,
+    );
+  }
 });
 
 test('explicit local-memory-only turns load a bounded read surface and honor no-memory-write', async () => {
@@ -211,6 +229,7 @@ test('explicit local-memory-only turns load a bounded read surface and honor no-
   }));
   const names = namesOf(agent);
   assert.ok(names.has('memory_read'));
+  assert.ok(names.has('draft_plan'), 'confirm-first recovery is structural even on a bounded memory turn');
   assert.ok(names.has('ask_user_question'), 'ambiguity recovery remains available');
   for (const forbidden of ['memory_remember', 'focus_clear', 'workflow_run', 'run_worker', 'request_approval']) {
     assert.equal(names.has(forbidden), false, `${forbidden} is outside a read-only local-memory turn`);

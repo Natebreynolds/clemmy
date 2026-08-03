@@ -23,7 +23,6 @@ import {
   workerPacketMcpToolScope,
 } from './external-mcp-scope-lock.js';
 import { harnessInstructions } from './harness-context.js';
-import { classifyTurnIntent } from '../runtime/harness/turn-intent.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
@@ -918,38 +917,6 @@ export function recentPriorUserInputsForScope(
 }
 
 /**
- * A second model should plan only when planning is itself part of the user's
- * conversational need. A precise "go build/do/deploy this" request already has
- * a capable orchestrator and does not benefit from paying an agent-as-tool
- * planning loop before work begins.
- *
- * Batch size is execution topology, not a reason to invoke the planner. Every
- * consequential action turn still needs the tool structurally reachable:
- * CONFIRM_FIRST_REQUIRED may ask the parent to open a reviewed scope after an
- * irreversible-write threshold. Reuse the shared generic turn-intent signal
- * instead of inventing an all/every/bulk prompt classifier here. Exposure is
- * not invocation; the planner description keeps ordinary execution direct.
- * No-input construction keeps the tool for autonomous/compatibility callers.
- */
-export function shouldExposePlannerTool(
-  userInput: string | null | undefined,
-): boolean {
-  const current = (userInput ?? '').trim();
-  if (!current) return true;
-  // Let the current turn decide whether the user wants planning. Carrying old
-  // "how should we..." language forward made a later "do it" turn pay for a
-  // planner it neither requested nor needed. Conversation-aware batch/fan-out
-  // detection remains separate below and can still expose the planner.
-  const text = current.toLowerCase();
-  if (
-    /\b(?:plan|planning|roadmap|strategy|strategize|brainstorm|compare (?:the )?(?:options|approaches)|talk (?:it )?through|think (?:it )?through|proposal)\b/.test(text)
-    || /\b(?:how|what) (?:should|would|could) (?:we|i|you)\b/.test(text)
-    || /\b(?:do not|don't|dont|without) (?:start|execute|build|change|write|send|deploy)\b/.test(text)
-  ) return true;
-  return classifyTurnIntent(current) === 'action';
-}
-
-/**
  * The immediately preceding assistant proposal for multi-item/fan-out
  * detection. The item count often lives in that proposal ("run research on
  * these 18 firms?"), but arbitrary older user/assistant turns are not safe
@@ -1063,9 +1030,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         options.sessionId ? recentConversationTextsForFanout(options.sessionId, options.userInput) : priorUserInputs,
       )
     : undefined;
-  const plannerTool = shouldExposePlannerTool(options.userInput)
-    ? buildPlannerTool()
-    : null;
+  // `draft_plan` is both an optional planning affordance and the recovery path
+  // when CONFIRM_FIRST_REQUIRED asks the parent to surface a reviewed batch
+  // scope. It must therefore remain structurally reachable on every turn.
+  // Wording classifiers are intentionally advisory and may have false
+  // negatives; none of them may remove a safety-recovery capability. Tool
+  // availability does not invoke the Planner — its description keeps ordinary
+  // Q&A and direct execution in the primary loop.
+  const plannerTool = buildPlannerTool();
   const codeModeMandate = codeModeMandateDirective({
     mcpServersInScope: mcpToolScope.allowedServerSlugs?.length ?? 0,
     allowAllMcp: !!mcpToolScope.allowAll,
@@ -2148,9 +2120,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     focusInput: options.userInput ?? undefined,
   });
   const structuralTools = localMemoryScope
-    ? [buildAskUserQuestionTool()]
+    ? [plannerTool, buildAskUserQuestionTool()]
     : [
-        ...(plannerTool ? [plannerTool] : []),
+        plannerTool,
         buildRequestApprovalTool(),
         buildAskUserQuestionTool(),
         runWorkerTool,
