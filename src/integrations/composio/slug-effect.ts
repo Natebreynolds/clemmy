@@ -77,6 +77,22 @@ export function dataForSeoResearchActionIsReadOnly(slug: string | null | undefin
   return taskPost && writeTokens.every((token) => token === 'CREATE' || token === 'POST');
 }
 
+const FIRECRAWL_READ_JOB_FAMILY = /^FIRECRAWL_(?:FIRECRAWL_)?(?:BATCH_)?(?:SCRAPE|MAP|SEARCH|CRAWL)(?:_|$)/;
+
+/** Firecrawl's scrape/map/search/crawl actions are external reads, including
+ * BATCH_SCRAPE provider jobs. Family membership alone is not authority to
+ * downgrade a mutation: mixed names such as SCRAPE_AND_PUBLISH and
+ * CRAWL_AND_DELETE must retain their external-write effect everywhere this
+ * shared classifier is consumed (approval, retries, and dispatch). */
+export function firecrawlResearchActionIsReadOnly(slug: string | null | undefined): boolean {
+  const upper = String(slug ?? '')
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toUpperCase();
+  if (!FIRECRAWL_READ_JOB_FAMILY.test(upper)) return false;
+  return !actionTokens(upper).some((token) => WRITE_ACTIONS.has(token));
+}
+
 /** `CALL` is ambiguous: it can be the action (place a call) or the object being
  * read (`GONG_GET_CALL_TRANSCRIPT`). A concrete read verb wins only when CALL
  * is the sole write-shaped token. Mixed actions such as FIND_OR_CREATE_CALL
@@ -133,7 +149,7 @@ export function composioSlugEffectEvidence(slug: string | null | undefined): Com
   }
 
   const tokens = actionTokens(upper);
-  if (/^FIRECRAWL_(BATCH_)?(?:SCRAPE|MAP|SEARCH|CRAWL)(?:_|$)/.test(upper)) {
+  if (firecrawlResearchActionIsReadOnly(upper)) {
     return 'read';
   }
   // EPHEMERAL COMPUTE (live 2026-07-24): "CREATE" + a compute noun creates no

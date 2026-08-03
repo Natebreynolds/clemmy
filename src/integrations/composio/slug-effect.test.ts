@@ -35,6 +35,18 @@ test('DataForSEO family membership never exempts mutations or unfamiliar actions
   assert.equal(classifyComposioSlugEffect('DATAFORSEO_ACCOUNT_SERP_SNAPSHOT'), 'external_write');
 });
 
+test('Firecrawl read-job family membership never exempts an explicit mutation', () => {
+  for (const slug of [
+    'FIRECRAWL_SCRAPE_AND_PUBLISH',
+    'FIRECRAWL_CRAWL_AND_DELETE',
+    'FIRECRAWL_MAP_AND_SAVE',
+    'FIRECRAWL_SEARCH_AND_SEND',
+  ]) {
+    assert.equal(composioSlugEffectEvidence(slug), 'write', slug);
+    assert.equal(classifyComposioSlugEffect(slug), 'external_write', slug);
+  }
+});
+
 test('evidence grade: pure noun endpoints are unknown; verb slugs are affirmative', () => {
   // Pure noun endpoints carry NO action verb — genuinely unknown, so a caller's
   // declared sideEffect is the best signal (an existing declared-read workflow

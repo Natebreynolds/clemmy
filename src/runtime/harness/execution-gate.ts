@@ -34,6 +34,7 @@
 import {
   composioSlugIsReadOnly,
   dataForSeoResearchActionIsReadOnly,
+  firecrawlResearchActionIsReadOnly,
   isReadOnlyCallAction,
 } from '../../integrations/composio/slug-effect.js';
 
@@ -100,7 +101,6 @@ const EXEMPT_COMPOSIO_SLUG_PATTERNS: RegExp[] = [
 
 function providerReadJobIsExempt(
   normalizedAction: string,
-  mutationParts: readonly string[],
 ): boolean {
   if (DATAFORSEO_READ_JOB_FAMILY.test(normalizedAction)) {
     // The shared provider classifier recognizes only structural SERP/LABS/
@@ -111,9 +111,9 @@ function providerReadJobIsExempt(
   }
 
   if (FIRECRAWL_READ_JOB_FAMILY.test(normalizedAction)) {
-    // BATCH_SCRAPE is still a provider-side read job. DELETE/PUBLISH/etc. in
-    // the same action are real mutations and must reach the write boundary.
-    return mutationParts.every((part) => part === 'BATCH');
+    // Use the same complete write vocabulary as approval, retries, and
+    // dispatch. The gate's smaller legacy set cannot safely own this seam.
+    return firecrawlResearchActionIsReadOnly(normalizedAction);
   }
 
   return false;
@@ -350,7 +350,7 @@ function canonicalExternalActionWriteClassification(action: string | undefined):
   const knownMutation = parts.some((part) => MUTATING_VERBS.has(part))
     || isIrreversibleSendSlug(action);
   const mutationParts = parts.filter((part) => MUTATING_VERBS.has(part));
-  if (providerReadJobIsExempt(normalized, mutationParts)) {
+  if (providerReadJobIsExempt(normalized)) {
     return { mutating: false, classificationKnown: true };
   }
   // A candidate in one of these provider families reached here only because
