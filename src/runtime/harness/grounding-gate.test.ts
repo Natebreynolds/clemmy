@@ -17,7 +17,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { resetEventLog, createSession, writeToolOutput } = await import('./eventlog.js');
+const { appendEvent, resetEventLog, createSession, writeToolOutput } = await import('./eventlog.js');
 const {
   argsHaveSendTarget,
   isMeaningfulPayloadValue,
@@ -40,6 +40,26 @@ const {
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
+
+function writeAuthoritativeOutput(input: Parameters<typeof writeToolOutput>[0]): void {
+  const effect = 'read';
+  const called = appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect },
+  });
+  writeToolOutput({ ...input, invocationNonce: input.invocationNonce ?? `nonce-${input.callId}` });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect, result: 'stored separately' },
+  });
+}
 
 // ─── extractTargetKeys ────────────────────────────────────────────
 
@@ -297,7 +317,7 @@ test('evaluateGrounding: client-data contradiction blocks; consistent payload al
   _resetGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
   // Seed the CORRECT extraction artifact for the target.
-  writeToolOutput({
+  writeAuthoritativeOutput({
     sessionId: sess.id,
     callId: 'call_extract_fixture',
     tool: 'run_worker',
@@ -342,11 +362,51 @@ test('evaluateGrounding: client-data contradiction blocks; consistent payload al
   }
 });
 
+test('evaluateGrounding: reused call id drops stale target bytes before the write judge', async () => {
+  resetEventLog();
+  _resetGroundingStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  writeAuthoritativeOutput({
+    sessionId: sess.id,
+    callId: 'reused-target',
+    tool: 'salesforce_query',
+    output: 'Old contact alice@example.com is in Denver.',
+  });
+  const later = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: 'salesforce_query', callId: 'reused-target', effect: 'read' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: later.id,
+    data: { tool: 'salesforce_query', callId: 'reused-target', effect: 'read', result: 'FAILED' },
+  });
+  let judged = false;
+  _setGroundingJudgeForTests(async () => {
+    judged = true;
+    return { grounded: true, reason: 'stale source should not reach judge' };
+  });
+  try {
+    const result = await evaluateGrounding(sess.id, 'outlook_send_email', { to: 'alice@example.com' });
+    assert.equal(result.action, 'allow');
+    assert.equal(judged, false);
+    assert.deepEqual(result.sourceCallIds, []);
+  } finally {
+    _setGroundingJudgeForTests(null);
+  }
+});
+
 test('evaluateGrounding: judge infra error fails open', async () => {
   resetEventLog();
   _resetGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
-  writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'run_worker', output: 'research about target@firm.example' });
+  writeAuthoritativeOutput({ sessionId: sess.id, callId: 'c1', tool: 'run_worker', output: 'research about target@firm.example' });
   _setGroundingJudgeForTests(async () => { throw new Error('model down'); });
   try {
     const r = await evaluateGrounding(sess.id, 'composio_execute_tool', { arguments: JSON.stringify({ to_email: 'target@firm.example' }) });

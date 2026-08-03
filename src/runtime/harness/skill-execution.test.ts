@@ -19,8 +19,34 @@ import assert from 'node:assert/strict';
 const { resetEventLog, createSession, appendEvent, writeToolOutput } = await import('./eventlog.js');
 const { gatherSessionSkills, sessionReadAnySkill, summarizeToolCallsForJudge, extractInvokedScripts, skillExecutionShortfall, skillBodyExecutionShortfall } = await import('./skill-execution.js');
 
+const skillCallEventIds = new Map<string, string>();
+
 function skillRead(sessionId: string, callId: string, name: string): void {
-  appendEvent({ sessionId, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'skill_read', callId, arguments: JSON.stringify({ name }) } });
+  const event = appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'agent',
+    type: 'tool_called',
+    data: { tool: 'skill_read', callId, effect: 'read', arguments: JSON.stringify({ name }) },
+  });
+  skillCallEventIds.set(`${sessionId}\0${callId}`, event.id);
+}
+function skillOutput(sessionId: string, callId: string, output: string): void {
+  writeToolOutput({
+    sessionId,
+    callId,
+    tool: 'skill_read',
+    output,
+    invocationNonce: `skill-read-test:${callId}`,
+  });
+  appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'agent',
+    type: 'tool_returned',
+    parentEventId: skillCallEventIds.get(`${sessionId}\0${callId}`),
+    data: { tool: 'skill_read', callId, effect: 'read', ok: true },
+  });
 }
 function shellRun(sessionId: string, command: string): void {
   appendEvent({ sessionId, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'run_shell_command', callId: `c-${Math.abs(command.length)}-${command.slice(0, 4)}`, arguments: JSON.stringify({ command }) } });
@@ -33,7 +59,7 @@ function loadScriptSkill(sessionId: string, callId: string, name: string, script
   skillRead(sessionId, callId, name);
   const body = `Act 2 — build:\n${scripts.map((s, i) => `${i + 1}. Run \`src/${s}\` to produce the artifact.`).join('\n')}\nValidation is **Mandatory**.`;
   const loc = dir ? `Skill location on disk: ${dir}\n\n` : '';
-  writeToolOutput({ sessionId, callId, tool: 'skill_read', output: `# ${name}\n\n${loc}manifest\n\ncrib\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\n${body}` });
+  skillOutput(sessionId, callId, `# ${name}\n\n${loc}manifest\n\ncrib\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\n${body}`);
 }
 
 test('skillExecutionShortfall: a script-backed skill with ZERO prescribed scripts run → shortfall (hand-rolled deliverable)', () => {
@@ -122,7 +148,7 @@ test('skillExecutionShortfall: a pure-reference skill (no bundled scripts) is ne
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   skillRead(sess.id, 'c1', 'voice-guide');
-  writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'skill_read', output: '# voice-guide\n\nm\n\nc\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\nWrite in a warm, concise voice. No em dashes.' });
+  skillOutput(sess.id, 'c1', '# voice-guide\n\nm\n\nc\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\nWrite in a warm, concise voice. No em dashes.');
   assert.equal(skillExecutionShortfall(sess.id), null, 'no prescribed scripts → nothing to enforce');
 });
 
@@ -135,7 +161,7 @@ test('gatherSessionSkills returns un-clipped bodies with the skill_read envelope
     '', '=== HOW TO RUN THIS SKILL ===', 'This skill is a PROCEDURE…',
     '', '---', 'Step 1: generate hero imagery.\nStep 2: build the site.\nStep 3: deploy.',
   ].join('\n');
-  writeToolOutput({ sessionId: sess.id, callId: 'call_s1', tool: 'skill_read', output: fullReturn });
+  skillOutput(sess.id, 'call_s1', fullReturn);
 
   const skills = gatherSessionSkills(sess.id);
   assert.equal(skills.length, 1);
@@ -150,7 +176,7 @@ test('gatherSessionSkills keeps a body that itself contains --- dividers (first-
   const sess = createSession({ kind: 'chat' });
   skillRead(sess.id, 'c1', 'multi-section');
   const body = 'Phase 1: do X.\n\n---\n\nPhase 2: do Y.\n\n---\n\nPhase 3: deploy.';
-  writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'skill_read', output: `# multi-section\n\nmanifest\n\ncrib\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\n${body}` });
+  skillOutput(sess.id, 'c1', `# multi-section\n\nmanifest\n\ncrib\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\n${body}`);
   const skills = gatherSessionSkills(sess.id);
   assert.equal(skills.length, 1);
   assert.match(skills[0].body, /Phase 1/);
@@ -161,9 +187,9 @@ test('gatherSessionSkills dedupes repeated reads of the same skill', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   skillRead(sess.id, 'c1', 'taste-skill');
-  writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'skill_read', output: '#taste\n---\nbody A' });
+  skillOutput(sess.id, 'c1', '#taste\n---\nbody A');
   skillRead(sess.id, 'c2', 'taste-skill');
-  writeToolOutput({ sessionId: sess.id, callId: 'c2', tool: 'skill_read', output: '#taste\n---\nbody B' });
+  skillOutput(sess.id, 'c2', '#taste\n---\nbody B');
   assert.equal(gatherSessionSkills(sess.id).length, 1);
 });
 

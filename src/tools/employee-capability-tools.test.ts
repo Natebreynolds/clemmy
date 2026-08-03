@@ -19,6 +19,8 @@ const { registerDocumentProduceTools } = await import('./document-produce-tools.
 const { chunkText, scoreChunks } = await import('./file-query-core.js');
 const { registerFileQueryTools } = await import('./file-query-tools.js');
 const { parseBusy, mergeIntervals, computeFreeSlots, registerTimeSlotsTools } = await import('./time-slots-tools.js');
+const { createSession, writeToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('../runtime/harness/eventlog.js');
+const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 
 test.after(() => rmSync(TMP, { recursive: true, force: true }));
 
@@ -102,6 +104,29 @@ test('file_query tool reads a text file and returns ranked passages; corrective 
   const miss = JSON.parse(textOf(await handler({ query: 'zebra migration', file })));
   assert.deepEqual(miss.hits, []);
   assert.match(miss.note, /lexical/);
+});
+
+test('file_query refuses a >2MB parked prefix instead of falsely missing a tail passage', async () => {
+  const handler = capture(registerFileQueryTools as never);
+  const sess = createSession({ kind: 'chat' });
+  const marker = 'TAIL_SECRET_NEEDLE_9Q8Z';
+  const source = `${'ordinary filler words\n'.repeat(110_000)}${marker}\n`;
+  assert.ok(Buffer.byteLength(source) > TOOL_OUTPUT_MAX_BYTES, 'fixture must cross the durable output cap');
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_truncated_document',
+    tool: 'provider_read_document',
+    output: source,
+    invocationNonce: 'nonce-truncated-document',
+  });
+
+  const out = textOf(await withToolOutputContext({ sessionId: sess.id }, () =>
+    handler({ query: 'TAIL SECRET NEEDLE 9Q8Z', call_id: 'call_truncated_document' })));
+  assert.match(out, /^ERROR:/);
+  assert.match(out, /incomplete/);
+  assert.match(out, /will not report matches or misses from a prefix/);
+  assert.match(out, /Re-read\/page|stage the full result/);
+  assert.doesNotMatch(out, /No passage matched/, 'a known-incomplete source must never produce a definitive miss');
 });
 
 // ── time_slots ───────────────────────────────────────────────────────

@@ -100,6 +100,32 @@ test('MCP tools are allowed in-sandbox even when local writes are OFF (gated by 
   }
 });
 
+test('code-mode MCP carrier calls resolve and dispatch under the executable server__tool identity', async () => {
+  const resolved: string[] = [];
+  const dispatched: string[] = [];
+  _setCodeModeMcpResolverForTests((toolName) => {
+    resolved.push(toolName);
+    return {
+      listTools: async () => [{ name: 'dataforseo__read_serp' }],
+      callTool: async (name) => {
+        dispatched.push(name);
+        return [{ type: 'text', text: 'ok' }];
+      },
+    };
+  });
+  try {
+    await dispatchCodeModeTool(
+      'mcp__dataforseo__read_serp',
+      { keyword: 'clementine' },
+      'sess-code-mode-carrier',
+    );
+    assert.deepEqual(resolved, ['dataforseo__read_serp']);
+    assert.deepEqual(dispatched, ['dataforseo__read_serp']);
+  } finally {
+    _setCodeModeMcpResolverForTests(null);
+  }
+});
+
 test('local-only scope is a hard code-mode authority wall before discovery or provider dispatch', async () => {
   const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
   let discoveryCalls = 0;
@@ -265,9 +291,37 @@ test('normalizeCodeModeToolResult: Composio warning-prefixed FAILED banners beco
   assert.match(out.error ?? '', /exceeds grid limits/);
 });
 
+test('normalizeCodeModeToolResult: a >2MB parked exact result fails closed instead of exposing its prefix', async () => {
+  const { createSession, writeToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('../runtime/harness/eventlog.js');
+  const sess = createSession({ kind: 'chat' });
+  const full = `group,value\n${'a,1\n'.repeat(600_000)}`;
+  assert.ok(Buffer.byteLength(full) > TOOL_OUTPUT_MAX_BYTES, 'fixture must cross the durable output cap');
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_truncated_code_mode_result',
+    tool: 'provider_list_rows',
+    output: full,
+    invocationNonce: 'nonce-truncated-code-mode-result',
+  });
+
+  const out = normalizeCodeModeToolResult(
+    'provider_list_rows',
+    { modelVisible: 'structured clipped preview' },
+    { sessionId: sess.id, callId: 'call_truncated_code_mode_result' },
+  ) as { ok?: boolean; error?: string; error_kind?: string; truncated_at_write?: boolean; result_handle?: string };
+  assert.equal(out.ok, false);
+  assert.equal(out.error_kind, 'truncated_tool_output');
+  assert.equal(out.truncated_at_write, true);
+  assert.equal(out.result_handle, 'call_truncated_code_mode_result');
+  assert.match(out.error ?? '', /will not consume the parked prefix/);
+  assert.match(out.error ?? '', /Re-read\/page|stage the full result/);
+  assert.equal('group' in out, false, 'no partial provider data escapes in the normalized object');
+});
+
 test('code-mode wrapper never appends harness advisories to structured Composio results', async () => {
   const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
   const { _resetAllTrackersForTests } = await import('../runtime/harness/tool-guardrail.js');
+  const { createSession } = await import('../runtime/harness/eventlog.js');
   const prevWrites = process.env.CLEMMY_CODE_MODE_WRITES;
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.CLEMMY_CODE_MODE_WRITES = 'on';
@@ -284,7 +338,7 @@ test('code-mode wrapper never appends harness advisories to structured Composio 
     }],
   ]) as never);
   try {
-    const sid = 'workflow:code-mode-wrapper:tracker';
+    const sid = createSession({ kind: 'chat' }).id;
     const counter = new ToolCallsCounter(100);
     for (let i = 1; i <= 4; i += 1) {
       const result = await dispatchCodeModeTool(
@@ -366,6 +420,7 @@ const VALID_WORKER_SPEC = {
   objective: 'Summarize the sentiment of one review',
   item: 'review-42',
   resolvedTools: 'none needed',
+  externalMcpToolNames: null,
   context: 'Review text: "great product, fast shipping"',
   instructions: 'Return one word: positive, negative, or neutral.',
   expectedOutput: '{ "sentiment": "positive|negative|neutral" }',
@@ -415,6 +470,62 @@ test('clem.run_worker: invalid spec returns a structured error (no dispatch)', a
   assert.match(out.error ?? '', /invalid spec/);
 });
 
+test('clem.run_worker: live calls cannot recover external authority from resolvedTools when the typed lease is omitted or inherited', async () => {
+  const { dispatchCodeModeTool, _setCodeModeWorkerRunnerForTests } = await import('./code-mode-tool.js');
+  const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  let dispatches = 0;
+  _setCodeModeWorkerRunnerForTests(async () => {
+    dispatches += 1;
+    return { text: 'should-not-run', model: 'x' };
+  });
+  const { externalMcpToolNames: _lease, ...withoutLease } = VALID_WORKER_SPEC;
+  const proseOnly = {
+    ...withoutLease,
+    resolvedTools: 'Use dataforseo__read_serp for this worker.',
+  };
+  const inheritedLease = Object.assign(
+    Object.create({ externalMcpToolNames: ['dataforseo__read_serp'] }) as Record<string, unknown>,
+    proseOnly,
+  );
+  try {
+    for (const [label, spec] of [['omitted', proseOnly], ['inherited', inheritedLease]] as const) {
+      const out = await dispatchCodeModeTool(
+        'run_worker',
+        spec,
+        `sess-live-lease-${label}`,
+        new ToolCallsCounter(100),
+      ) as { ok: boolean; error?: string };
+      assert.equal(out.ok, false, `${label} lease must be refused`);
+      assert.match(out.error ?? '', /externalMcpToolNames.*required/);
+    }
+    assert.equal(dispatches, 0, 'invalid live calls never reach the worker runner');
+  } finally {
+    _setCodeModeWorkerRunnerForTests(null);
+  }
+});
+
+test('clem.run_worker: exact typed MCP lease reaches the worker unchanged', async () => {
+  const { dispatchCodeModeTool, _setCodeModeWorkerRunnerForTests } = await import('./code-mode-tool.js');
+  const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  let receivedLease: unknown = 'not-called';
+  _setCodeModeWorkerRunnerForTests(async (input) => {
+    receivedLease = input.externalMcpToolNames;
+    return { text: 'ok', model: 'x' };
+  });
+  try {
+    const out = await dispatchCodeModeTool(
+      'run_worker',
+      { ...VALID_WORKER_SPEC, externalMcpToolNames: ['mcp__dataforseo__read_serp'] },
+      'sess-live-exact-lease',
+      new ToolCallsCounter(100),
+    ) as { ok: boolean };
+    assert.equal(out.ok, true);
+    assert.deepEqual(receivedLease, ['mcp__dataforseo__read_serp']);
+  } finally {
+    _setCodeModeWorkerRunnerForTests(null);
+  }
+});
+
 test('clem.run_worker: kill-switch CLEMMY_CODE_MODE_WORKERS=off disables it', async () => {
   const { dispatchCodeModeTool } = await import('./code-mode-tool.js');
   const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
@@ -443,7 +554,7 @@ test('a PROGRAM can fetch then fan out clem.run_worker on the result (the north-
       `const found = await clem.memory_search({ q: 'x' });
        const out = [];
        for (const item of found.items) {
-         const w = await clem.run_worker({ objective: 'judge one item here', item, resolvedTools: 'none needed', context: 'ctx', instructions: 'do it', expectedOutput: '{}', intent: null });
+         const w = await clem.run_worker({ objective: 'judge one item here', item, resolvedTools: 'none needed', externalMcpToolNames: null, context: 'ctx', instructions: 'do it', expectedOutput: '{}', intent: null });
          out.push(w.ok ? w.text : ('ERR:' + w.error));
        }
        return { verdicts: out };`,

@@ -19,7 +19,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { resetEventLog, createSession, writeToolOutput } = await import('./eventlog.js');
+const { appendEvent, resetEventLog, createSession, writeToolOutput } = await import('./eventlog.js');
 const {
   extractNumericClaims,
   extractNumbersFromText,
@@ -34,6 +34,26 @@ const {
 } = await import('./output-grounding-gate.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
+
+function writeAuthoritativeOutput(input: Parameters<typeof writeToolOutput>[0]): void {
+  const effect = 'read';
+  const called = appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect },
+  });
+  writeToolOutput({ ...input, invocationNonce: input.invocationNonce ?? `nonce-${input.callId}` });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect, result: 'stored separately' },
+  });
+}
 
 // ─── extractNumericClaims (pure) ──────────────────────────────────
 
@@ -111,7 +131,7 @@ test('evaluateOutputGrounding: contradiction BOUNCES, escalates on repeat; no ju
   _resetOutputGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
   // Source: spend by campaign sums to $11,000 (and labels include "spend"/"campaign").
-  writeToolOutput({
+  writeAuthoritativeOutput({
     sessionId: sess.id,
     callId: 'call_spend',
     tool: 'composio_execute_tool',
@@ -148,11 +168,51 @@ test('evaluateOutputGrounding: contradiction BOUNCES, escalates on repeat; no ju
   }
 });
 
+test('evaluateOutputGrounding: reused call id never certifies a stale figure', async () => {
+  resetEventLog();
+  _resetOutputGroundingStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  writeAuthoritativeOutput({
+    sessionId: sess.id,
+    callId: 'reused-spend',
+    tool: 'dataforseo',
+    output: 'Audit ad spend across campaigns was $24.5K.',
+  });
+  const later = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: 'dataforseo', callId: 'reused-spend', effect: 'read' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: later.id,
+    data: { tool: 'dataforseo', callId: 'reused-spend', effect: 'read', result: 'FAILED' },
+  });
+  let judged = false;
+  _setOutputGroundingJudgeForTests(async () => {
+    judged = true;
+    return { verdict: 'grounded', reason: 'stale source should never reach judge', offending: [] };
+  });
+  try {
+    const result = await evaluateOutputGrounding(sess.id, 'Audit ad spend across campaigns was $24.5K.');
+    assert.equal(result.action, 'allow', 'no current evidence remains, so the advisory gate stays non-blocking');
+    assert.equal(judged, false, 'stale bytes never reach deterministic or model grounding');
+    assert.deepEqual(result.sourceCallIds, []);
+  } finally {
+    _setOutputGroundingJudgeForTests(null);
+  }
+});
+
 test('evaluateOutputGrounding: judge OUTAGE with ungrounded residual figures fails to ADVISORY (not silent allow), kill-switch restores fail-open', async () => {
   resetEventLog();
   _resetOutputGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
-  writeToolOutput({
+  writeAuthoritativeOutput({
     sessionId: sess.id,
     callId: 'call_spend',
     tool: 'composio_execute_tool',
@@ -178,7 +238,7 @@ test('evaluateOutputGrounding: no-plausible-source figure is ADVISORY, not a blo
   resetEventLog();
   _resetOutputGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
-  writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'dataforseo', output: 'organic traffic estimate for the domain: 8,000 sessions/mo' });
+  writeAuthoritativeOutput({ sessionId: sess.id, callId: 'c1', tool: 'dataforseo', output: 'organic traffic estimate for the domain: 8,000 sessions/mo' });
   _setOutputGroundingJudgeForTests(async () => ({
     verdict: 'unverifiable',
     offending: [{ figure: '47%', kind: 'no_source', note: 'no conversion-rate source' }],
@@ -211,7 +271,7 @@ test('evaluateOutputGrounding: no-figures and no-sources ALLOW; a judge error wi
 
   // Judge infra error WITH an ungrounded residual figure → ADVISORY by default
   // (surface it, don't silently pass). Kill-switch restores the old fail-open.
-  writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'x', output: 'spend campaign data totalling 11000' });
+  writeAuthoritativeOutput({ sessionId: sess.id, callId: 'c1', tool: 'x', output: 'spend campaign data totalling 11000' });
   _setOutputGroundingJudgeForTests(async () => { throw new Error('model down'); });
   const judgeErr = await evaluateOutputGrounding(sess.id, 'Spend was $24.5K across campaigns.', { kind: 'chat' });
   assert.equal(judgeErr.action, 'advisory');
@@ -235,7 +295,7 @@ test('evaluateOutputGrounding: a figure recalled from consolidated MEMORY is gro
   createSession({ id: sessionId, kind: 'chat', title: 'memory grounding' });
   // ONE unrelated tool output so the session isn't empty (an empty session
   // short-circuits before source assembly on some paths).
-  writeToolOutput({ sessionId, callId: 'c-1', tool: 'composio_execute_tool', output: 'Apify actor list: google-search-scraper, ads-transparency' });
+  writeAuthoritativeOutput({ sessionId, callId: 'c-1', tool: 'composio_execute_tool', output: 'Apify actor list: google-search-scraper, ads-transparency' });
   let judgeCalls = 0;
   _setOutputGroundingJudgeForTests(async () => {
     judgeCalls += 1;
@@ -292,7 +352,7 @@ test('deferCommit (#2.4 leak fix): an eagerly-evaluated bounce does NOT persist 
   resetEventLog();
   _resetOutputGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
-  writeToolOutput({
+  writeAuthoritativeOutput({
     sessionId: sess.id, callId: 'call_spend', tool: 'composio_execute_tool',
     output: 'Ad spend by campaign: Alpha $4,000; Bravo $4,000; Charlie $3,000. Total $11,000.',
   });

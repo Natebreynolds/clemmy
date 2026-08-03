@@ -42,7 +42,7 @@
  * false-positive bounces). Until then `=off` is the kill-switch.
  */
 import { getRuntimeEnv } from '../../config.js';
-import { searchToolOutputs, recentToolOutputs } from './eventlog.js';
+import { searchToolOutputs, recentToolOutputs, resolveToolOutputsForAuthority } from './eventlog.js';
 import { rankSources, type GroundingSource } from './grounding-gate.js';
 import { searchFactsByText } from '../../memory/facts.js';
 
@@ -468,7 +468,10 @@ export async function evaluateOutputGrounding(
     const merged = new Map<string, { callId: string; tool: string | null; output: string; createdAt: string }>();
     for (const r of byLabel) merged.set(r.callId, r);
     if (merged.size < 2) for (const r of recentToolOutputs(sessionId, { limit: 8 })) merged.set(r.callId, r);
-    sources = rankSources([...merged.values()], { limit: 8 });
+    sources = rankSources(
+      resolveToolOutputsForAuthority(sessionId, [...merged.values()], { readOrComputeOnly: true }),
+      { limit: 8 },
+    );
   } catch {
     return { action: 'allow', reason: 'source retrieval failed — fail open', figures: [], sourceCallIds: [] };
   }

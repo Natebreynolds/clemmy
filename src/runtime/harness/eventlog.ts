@@ -1158,6 +1158,90 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     },
   },
+  {
+    // One verified/success settlement per exact pre-dispatch reservation. New
+    // writers carry settlementKey; historical rows remain untouched so an
+    // additive upgrade never rewrites ambiguous external-effect history.
+    version: 18,
+    sql: '',
+    backfill: (db) => {
+      // Partially recovered/legacy fixtures can legitimately carry a newer
+      // schema_version row while the canonical event table is absent. Keep the
+      // additive migration tolerant, matching the guarded v7/v17 indexes.
+      const hasEvents = Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'`,
+      ).get());
+      if (hasEvents) {
+        db.exec(`
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_events_external_write_settlement_key
+            ON events(session_id, type, json_extract(data_json, '$.settlementKey'))
+            WHERE type = 'external_write_succeeded'
+              AND json_extract(data_json, '$.settlementKey') IS NOT NULL;
+        `);
+      }
+      const hasArtifacts = Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_artifacts'`,
+      ).get());
+      if (!hasArtifacts) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(run_artifacts)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      for (const [name, declaration] of [
+        ['external_write_event_id', 'external_write_event_id TEXT'],
+        ['external_write_action_key', 'external_write_action_key TEXT'],
+        ['external_write_tool_name', 'external_write_tool_name TEXT'],
+      ] as const) {
+        if (!columns.has(name)) db.exec(`ALTER TABLE run_artifacts ADD COLUMN ${declaration}`);
+      }
+    },
+  },
+  {
+    // Exact settlement/readback bytes need invocation identity stronger than an
+    // SDK call id. Keep them in a parallel nonce-keyed store so concurrent or
+    // reused call ids cannot overwrite one another, while the legacy call-id
+    // recall store retains its backwards-compatible longest-output behavior.
+    // v19 is deliberately separate: local canary databases ran an earlier v18
+    // while this patch was under review.
+    version: 19,
+    sql: `
+      CREATE TABLE IF NOT EXISTS tool_output_invocations (
+        session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        call_id             TEXT NOT NULL,
+        invocation_nonce    TEXT NOT NULL,
+        tool                TEXT,
+        output_full         TEXT NOT NULL,
+        content_bytes       INTEGER NOT NULL,
+        truncated_at_write  INTEGER NOT NULL DEFAULT 0,
+        created_at          TEXT NOT NULL,
+        PRIMARY KEY (session_id, call_id, invocation_nonce)
+      );
+      CREATE INDEX IF NOT EXISTS idx_tool_output_invocations_session
+        ON tool_output_invocations(session_id, created_at);
+    `,
+  },
+  {
+    // Authority lookups sit on completion, grounding, artifact verification,
+    // and memory-write boundaries.  A long-horizon session can contain tens of
+    // thousands of tool events, so resolving one call id must not deserialize
+    // the entire session.  Index the durable SDK presentation id directly.
+    version: 20,
+    sql: '',
+    backfill: (db) => {
+      // Upgrade rehearsals intentionally construct only the table relevant to
+      // the historical version under test. Keep that compatibility while a
+      // real harness database (which always has events) gets the hot-path index.
+      const hasEvents = Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'`,
+      ).get());
+      if (!hasEvents) return;
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_events_tool_lifecycle_call
+          ON events(session_id, type, json_extract(data_json, '$.callId'), seq)
+          WHERE type IN ('tool_called', 'tool_returned');
+      `);
+    },
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
@@ -3134,6 +3218,9 @@ export interface WriteToolOutputInput {
   callId: string;
   tool?: string | null;
   output: string;
+  /** Exact harness invocation identity. When present, the bytes are also stored
+   * under (session, call, nonce) for settlement/readback evidence. */
+  invocationNonce?: string | null;
 }
 
 /**
@@ -3143,23 +3230,16 @@ export interface WriteToolOutputInput {
  * truncated_at_write marker — distinct from the per-turn `[clipped: ...]`
  * stub Layer 1 emits.
  *
- * Idempotent on conflict: `(session_id, call_id)` is the primary key
- * and we INSERT OR REPLACE so a duplicate tool_returned event (e.g.
- * after a retry) cleanly overwrites the row.
+ * Idempotent on conflict: `(session_id, call_id)` remains the legacy recall key
+ * and keeps the longest representation. Nonce-bearing formatter writes also
+ * replace the exact row for THAT invocation; other invocations and later
+ * nonce-less hook writes cannot overwrite those evidence bytes.
  */
 export function writeToolOutput(input: WriteToolOutputInput): void {
   const db = openEventLog();
   const original = input.output;
   const originalBytes = Buffer.byteLength(original, 'utf8');
-
-  const existing = db.prepare(
-    `SELECT content_bytes
-       FROM tool_outputs
-      WHERE session_id = ? AND call_id = ?`,
-  ).get(input.sessionId, input.callId) as { content_bytes: number } | undefined;
-  if (existing && existing.content_bytes > originalBytes) {
-    return;
-  }
+  const invocationNonce = input.invocationNonce?.trim() || null;
 
   let stored = original;
   let truncated = false;
@@ -3172,19 +3252,49 @@ export function writeToolOutput(input: WriteToolOutputInput): void {
     }
     truncated = true;
   }
-  db.prepare(
-    `INSERT OR REPLACE INTO tool_outputs
-       (session_id, call_id, tool, output_full, content_bytes, truncated_at_write, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    input.sessionId,
-    input.callId,
-    input.tool ?? null,
-    stored,
-    originalBytes,
-    truncated ? 1 : 0,
-    nowIso(),
-  );
+  const createdAt = nowIso();
+  const tx = db.transaction(() => {
+    // Keep the canonical recall row's longest representation with one SQLite
+    // conflict decision. A read-before-write check races across daemon/worker
+    // processes and can let a later compact hook overwrite a larger result.
+    db.prepare(
+      `INSERT INTO tool_outputs
+         (session_id, call_id, tool, output_full, content_bytes, truncated_at_write, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id, call_id) DO UPDATE SET
+         tool = excluded.tool,
+         output_full = excluded.output_full,
+         content_bytes = excluded.content_bytes,
+         truncated_at_write = excluded.truncated_at_write,
+         created_at = excluded.created_at
+       WHERE excluded.content_bytes >= tool_outputs.content_bytes`,
+    ).run(
+      input.sessionId,
+      input.callId,
+      input.tool ?? null,
+      stored,
+      originalBytes,
+      truncated ? 1 : 0,
+      createdAt,
+    );
+    if (invocationNonce) {
+      db.prepare(
+        `INSERT OR REPLACE INTO tool_output_invocations
+           (session_id, call_id, invocation_nonce, tool, output_full, content_bytes, truncated_at_write, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        input.sessionId,
+        input.callId,
+        invocationNonce,
+        input.tool ?? null,
+        stored,
+        originalBytes,
+        truncated ? 1 : 0,
+        createdAt,
+      );
+    }
+  });
+  tx();
 }
 
 /**
@@ -3274,10 +3384,36 @@ export function reapStaleToolOutputs(maxAgeDays?: number): number {
   const ttl = maxAgeDays ?? (env ? Math.max(1, Math.min(365, Number(env))) : 14);
   if (!Number.isFinite(ttl) || ttl <= 0) return 0;
   const db = openEventLog();
-  const result = db
-    .prepare(`DELETE FROM tool_outputs WHERE created_at < datetime('now', ?)`)
-    .run(`-${Math.floor(ttl)} days`);
-  return result.changes;
+  const cutoff = `-${Math.floor(ttl)} days`;
+  const reap = db.transaction(() => {
+    const canonical = db
+      .prepare(`DELETE FROM tool_outputs WHERE created_at < datetime('now', ?)`)
+      .run(cutoff).changes;
+    // v19's nonce-keyed rows hold the same full payload bytes as the canonical
+    // recall store and need the same bounded retention.  Preserve evidence for
+    // a write reservation that still has no terminal child: reconciliation of
+    // a genuinely uncertain provider write is more important than reclaiming
+    // those few rows, while every settled/read-only invocation remains bounded.
+    const exact = db.prepare(`
+      DELETE FROM tool_output_invocations
+       WHERE tool_output_invocations.created_at < datetime('now', ?)
+         AND NOT EXISTS (
+           SELECT 1
+             FROM events AS reserved
+            WHERE reserved.session_id = tool_output_invocations.session_id
+              AND reserved.type = 'external_write'
+              AND json_extract(reserved.data_json, '$.callId') = tool_output_invocations.call_id
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM events AS settled
+                 WHERE settled.parent_event_id = reserved.id
+                   AND settled.type IN ('external_write_succeeded', 'external_write_failed')
+              )
+         )
+    `).run(cutoff).changes;
+    return canonical + exact;
+  });
+  return reap();
 }
 
 /**
@@ -3349,6 +3485,261 @@ export function getToolOutput(sessionId: string, callId: string): ToolOutputReco
     tool: row.tool,
     createdAt: row.created_at,
   };
+}
+
+export function getToolOutputForInvocation(
+  sessionId: string,
+  callId: string,
+  invocationNonce: string,
+): ToolOutputRecord | null {
+  const row = openEventLog().prepare(
+    `SELECT output_full, content_bytes, truncated_at_write, tool, created_at
+       FROM tool_output_invocations
+      WHERE session_id = ? AND call_id = ? AND invocation_nonce = ?`,
+  ).get(sessionId, callId, invocationNonce) as {
+    output_full: string;
+    content_bytes: number;
+    truncated_at_write: number;
+    tool: string | null;
+    created_at: string;
+  } | undefined;
+  if (!row) return null;
+  return {
+    output: row.output_full,
+    contentBytes: row.content_bytes,
+    truncatedAtWrite: row.truncated_at_write === 1,
+    tool: row.tool,
+    createdAt: row.created_at,
+  };
+}
+
+export interface ToolOutputInvocationRecord extends ToolOutputRecord {
+  invocationNonce: string;
+}
+
+/** All exact invocations that reused one SDK call id. Callers that need
+ * evidence authority must require exactly one row; the canonical call-id store
+ * is intentionally unsuitable because it keeps the longest presentation. */
+export function listToolOutputInvocations(
+  sessionId: string,
+  callId: string,
+): ToolOutputInvocationRecord[] {
+  const rows = openEventLog().prepare(
+    `SELECT invocation_nonce, output_full, content_bytes, truncated_at_write, tool, created_at
+       FROM tool_output_invocations
+      WHERE session_id = ? AND call_id = ?
+      ORDER BY created_at ASC, invocation_nonce ASC`,
+  ).all(sessionId, callId) as Array<{
+    invocation_nonce: string;
+    output_full: string;
+    content_bytes: number;
+    truncated_at_write: number;
+    tool: string | null;
+    created_at: string;
+  }>;
+  return rows.map((row) => ({
+    invocationNonce: row.invocation_nonce,
+    output: row.output_full,
+    contentBytes: row.content_bytes,
+    truncatedAtWrite: row.truncated_at_write === 1,
+    tool: row.tool,
+    createdAt: row.created_at,
+  }));
+}
+
+export type AuthorityToolOutputResolution =
+  | {
+      status: 'ok';
+      record: ToolOutputRecord;
+      source: 'exact' | 'legacy';
+      /** Effect proven by the sole parented lifecycle. Detached exact rows have
+       * no effect authority and therefore expose null. */
+      effect: string | null;
+    }
+  | { status: 'missing' }
+  | { status: 'ambiguous'; invocationCount: number; reason?: string };
+
+interface DurableToolOutputOccurrence {
+  call: EventRow;
+  returned: EventRow;
+  tool: string;
+  effect: string | null;
+}
+
+function authorityEventString(event: EventRow, field: 'callId' | 'tool' | 'effect'): string {
+  const value = event.data[field];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/** Resolve one call-id occurrence only when the durable lifecycle itself is
+ * unambiguous. A call id is an SDK presentation identifier, not invocation
+ * identity: retries may reuse it. `parent_event_id` is therefore part of the
+ * proof, not optional telemetry. */
+function durableToolOutputOccurrence(
+  sessionId: string,
+  callId: string,
+): {
+  occurrence: DurableToolOutputOccurrence | null;
+  callCount: number;
+  returnCount: number;
+  reason?: string;
+} {
+  const events = openEventLog().prepare(`
+    SELECT seq, id, session_id, turn, role, type, parent_event_id, data_json, created_at
+      FROM events
+     WHERE session_id = ?
+       AND type IN ('tool_called', 'tool_returned')
+       AND json_extract(data_json, '$.callId') = ?
+     ORDER BY seq ASC
+  `).all(sessionId, callId).map((row) => rowToEvent(row as RawEventRow));
+  const calls = events.filter((event) =>
+    event.type === 'tool_called' && authorityEventString(event, 'callId') === callId
+  );
+  const returns = events.filter((event) =>
+    event.type === 'tool_returned' && authorityEventString(event, 'callId') === callId
+  );
+  if (calls.length !== 1 || returns.length !== 1) {
+    return {
+      occurrence: null,
+      callCount: calls.length,
+      returnCount: returns.length,
+      reason: `durable lifecycle has ${calls.length} call record(s) and ${returns.length} return record(s)`,
+    };
+  }
+  const call = calls[0];
+  const returned = returns[0];
+  const callTool = authorityEventString(call, 'tool');
+  const returnTool = authorityEventString(returned, 'tool');
+  const callEffect = authorityEventString(call, 'effect');
+  const returnEffect = authorityEventString(returned, 'effect');
+  if (
+    returned.parentEventId !== call.id
+    || returned.seq <= call.seq
+    || !callTool
+    || callTool !== returnTool
+    || callEffect !== returnEffect
+  ) {
+    return {
+      occurrence: null,
+      callCount: 1,
+      returnCount: 1,
+      reason: 'durable call/return identity does not form one matching parented occurrence',
+    };
+  }
+  return {
+    occurrence: {
+      call,
+      returned,
+      tool: callTool,
+      effect: callEffect || null,
+    },
+    callCount: 1,
+    returnCount: 1,
+  };
+}
+
+function outputFallsWithinOccurrence(
+  record: ToolOutputRecord,
+  occurrence: DurableToolOutputOccurrence,
+): boolean {
+  return record.tool === occurrence.tool
+    && record.createdAt >= occurrence.call.createdAt
+    && record.createdAt <= occurrence.returned.createdAt;
+}
+
+/** Resolve bytes for a value that may authorize a later action. Reporting and
+ * recall may intentionally use the canonical longest row; authority consumers
+ * must use this function so a reused call id can never select stale bytes. */
+export function resolveToolOutputForAuthority(
+  sessionId: string,
+  callId: string,
+): AuthorityToolOutputResolution {
+  const invocations = listToolOutputInvocations(sessionId, callId);
+  if (invocations.length > 1) {
+      return { status: 'ambiguous', invocationCount: invocations.length };
+  }
+  const lifecycle = durableToolOutputOccurrence(sessionId, callId);
+  if (invocations.length === 1) {
+    // Detached/internal formatter paths do not always have SDK lifecycle events.
+    // One nonce row is still exact in that case. But once ANY durable lifecycle
+    // exists, it must prove precisely one matching occurrence. Otherwise a later
+    // hook-only invocation may have reused the call id without writing a nonce,
+    // and the lone row can be stale authority from the earlier call.
+    if (lifecycle.callCount === 0 && lifecycle.returnCount === 0) {
+      return { status: 'ok', record: invocations[0], source: 'exact', effect: null };
+    }
+    if (
+      lifecycle.occurrence
+      && outputFallsWithinOccurrence(invocations[0], lifecycle.occurrence)
+    ) {
+      return {
+        status: 'ok',
+        record: invocations[0],
+        source: 'exact',
+        effect: lifecycle.occurrence.effect,
+      };
+    }
+    return {
+      status: 'ambiguous',
+      invocationCount: Math.max(1, lifecycle.callCount, lifecycle.returnCount),
+      reason: lifecycle.reason ?? 'exact output does not match the sole durable invocation',
+    };
+  }
+  const legacy = getToolOutput(sessionId, callId);
+  if (!legacy) return { status: 'missing' };
+  // Migrated pre-v19 rows have no nonce. They retain authority only when one
+  // parented lifecycle pair proves the producer was the same READ/COMPUTE tool
+  // and the longest-wins row was actually written inside that occurrence.
+  // Anything less would let a reused id promote stale provider bytes.
+  if (
+    lifecycle.occurrence
+    && (lifecycle.occurrence.effect === 'read' || lifecycle.occurrence.effect === 'compute')
+    && outputFallsWithinOccurrence(legacy, lifecycle.occurrence)
+  ) {
+    return {
+      status: 'ok',
+      record: legacy,
+      source: 'legacy',
+      effect: lifecycle.occurrence.effect,
+    };
+  }
+  return {
+    status: 'ambiguous',
+    invocationCount: Math.max(1, lifecycle.callCount, lifecycle.returnCount),
+    reason: lifecycle.reason ?? 'legacy output lacks one matching read/compute lifecycle occurrence',
+  };
+}
+
+export interface AuthorityToolOutputRecord extends ToolOutputRecord {
+  callId: string;
+  effect: string | null;
+}
+
+/** Convert presentation/search rows into evidence rows.  Candidate bytes are
+ * never trusted: each call id is re-resolved to its exact durable invocation,
+ * and reused/ambiguous ids disappear.  With `readOrComputeOnly`, a detached
+ * formatter row or write/send confirmation also disappears. */
+export function resolveToolOutputsForAuthority(
+  sessionId: string,
+  candidates: readonly { callId: string }[],
+  options: { readOrComputeOnly?: boolean } = {},
+): AuthorityToolOutputRecord[] {
+  const resolved: AuthorityToolOutputRecord[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const callId = candidate.callId.trim();
+    if (!callId || seen.has(callId)) continue;
+    seen.add(callId);
+    const authority = resolveToolOutputForAuthority(sessionId, callId);
+    if (authority.status !== 'ok') continue;
+    if (
+      options.readOrComputeOnly
+      && authority.effect !== 'read'
+      && authority.effect !== 'compute'
+    ) continue;
+    resolved.push({ callId, ...authority.record, effect: authority.effect });
+  }
+  return resolved;
 }
 
 // ─── v0.5.19 F6 — tool-guardrail state persistence ────────────────

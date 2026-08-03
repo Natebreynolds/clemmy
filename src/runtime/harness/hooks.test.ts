@@ -236,7 +236,7 @@ test('tool_called and tool_returned correlate via callId', () => {
   assert.equal(returned[0].data.result, 'ok');
 });
 
-test('tool hooks expose inner provider effects and dedupe lifecycle replay by call id', () => {
+test('tool hooks expose inner provider effects and dedupe duplicate open notifications', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const stub = makeStub();
@@ -262,6 +262,48 @@ test('tool hooks expose inner provider effects and dedupe lifecycle replay by ca
   assert.equal(called[0].data.effect, 'external_write');
   assert.equal(returned[0].data.toolSlug, 'HUBSPOT_FIND_OR_CREATE_CONTACT');
   assert.equal(returned[0].data.effect, 'external_write');
+});
+
+test('tool hooks admit a later occurrence that legitimately reuses a closed call id', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  const first = { toolCall: { callId: 'call_reused', arguments: '{"query":"first"}' } };
+  const second = { toolCall: { callId: 'call_reused', arguments: '{"query":"second"}' } };
+
+  stub.emit('agent_tool_start', ctx(sess.id), { name: 'executor' }, { name: 'query_workspace_artifact' }, first);
+  stub.emit('agent_tool_end', ctx(sess.id), { name: 'executor' }, { name: 'query_workspace_artifact' }, 'first result', first);
+  stub.emit('agent_tool_start', ctx(sess.id), { name: 'executor' }, { name: 'query_workspace_artifact' }, second);
+  stub.emit('agent_tool_end', ctx(sess.id), { name: 'executor' }, { name: 'query_workspace_artifact' }, 'second result', second);
+
+  const called = listEvents(sess.id, { types: ['tool_called'] });
+  const returned = listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(called.length, 2);
+  assert.equal(returned.length, 2);
+  assert.equal(returned[0].parentEventId, called[0].id);
+  assert.equal(returned[1].parentEventId, called[1].id);
+  assert.equal(returned[0].data.result, 'first result');
+  assert.equal(returned[1].data.result, 'second result');
+});
+
+test('tool hooks suppress an exact closed lifecycle notification replay', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  const details = { toolCall: { callId: 'call_exact_replay', arguments: '{}' } };
+
+  for (let replay = 0; replay < 2; replay++) {
+    stub.emit('agent_tool_start', ctx(sess.id), { name: 'executor' }, { name: 'read_file' }, details);
+    stub.emit('agent_tool_end', ctx(sess.id), { name: 'executor' }, { name: 'read_file' }, 'same result', details);
+  }
+
+  const called = listEvents(sess.id, { types: ['tool_called'] });
+  const returned = listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(called.length, 1);
+  assert.equal(returned.length, 1);
+  assert.equal(returned[0].parentEventId, called[0].id);
 });
 
 test('large tool_returned result uses recall_tool_result marker when callId present', () => {

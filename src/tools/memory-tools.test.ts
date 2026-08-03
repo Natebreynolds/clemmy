@@ -41,6 +41,28 @@ test.beforeEach(() => {
   rmSync(path.join(TMP_HOME, 'state', 'memory-recall-trace.jsonl'), { force: true });
 });
 
+function writeAuthoritativeToolOutput(
+  input: Parameters<typeof writeToolOutput>[0],
+  effect: 'read' | 'compute' | 'external_write' = 'read',
+): void {
+  const called = appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect },
+  });
+  writeToolOutput({ ...input, invocationNonce: input.invocationNonce ?? `nonce-${input.callId}` });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect, result: 'stored separately' },
+  });
+}
+
 const fact = (over: Partial<{ id: number; kind: string; pinned: boolean; content: string }>) => ({
   id: 42,
   kind: 'user',
@@ -316,7 +338,7 @@ test('memory_remember rejects unnamed entities and drops identifiers absent from
 test('memory_remember inherits the harness session and binds an exact roster to its source tool output', async () => {
   const session = createSession({ kind: 'chat' });
   const content = 'My team includes Avery Rowan (avery.rowan@example.com) and Blair Solis (blair.solis@example.com).';
-  writeToolOutput({
+  writeAuthoritativeToolOutput({
     sessionId: session.id,
     callId: 'sf-team-query',
     tool: 'composio_execute_tool',
@@ -347,22 +369,61 @@ test('memory_remember inherits the harness session and binds an exact roster to 
   assert.match(evidence[0]?.excerpt ?? '', /blair\.solis@example\.com/);
 });
 
+test('memory_remember cannot infer or copy stale evidence from a reused call id', async () => {
+  const session = createSession({ kind: 'chat' });
+  const content = 'My team includes Alice (alice@example.com) and Bob (bob@example.com).';
+  writeAuthoritativeToolOutput({
+    sessionId: session.id,
+    callId: 'reused-memory-source',
+    tool: 'salesforce_query',
+    output: JSON.stringify({ records: [
+      { name: 'Alice', email: 'alice@example.com' },
+      { name: 'Bob', email: 'bob@example.com' },
+    ] }),
+  });
+  const later = appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: 'salesforce_query', callId: 'reused-memory-source', effect: 'read' },
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: later.id,
+    data: { tool: 'salesforce_query', callId: 'reused-memory-source', effect: 'read', result: 'FAILED' },
+  });
+
+  const handler = registeredToolHandlers().get('memory_remember');
+  assert.ok(handler);
+  await harnessRunContextStorage.run(
+    { sessionId: session.id, counter: new ToolCallsCounter(10) },
+    () => handler!({ kind: 'project', content }),
+  );
+  const row = openMemoryDb().prepare(`
+    SELECT id, derived_from_call_id, source_path
+      FROM consolidated_facts WHERE content = ?
+  `).get(content) as { id: number; derived_from_call_id: string | null; source_path: string | null };
+  assert.equal(row.derived_from_call_id, null);
+  assert.equal(row.source_path, null);
+  assert.ok(
+    getFactEvidence(row.id).every((evidence) => evidence.sourceUri !== `tool://${session.id}/reused-memory-source`),
+    'the stale roster is never copied into durable fact evidence',
+  );
+});
+
 test('memory_remember never treats an external-write confirmation as roster source evidence', async () => {
   const session = createSession({ kind: 'chat' });
   const content = 'My team includes Dana Smith (dana.smith@example.com) and Riley Jones (riley.jones@example.com).';
-  writeToolOutput({
+  writeAuthoritativeToolOutput({
     sessionId: session.id,
     callId: 'outlook-send-confirmation',
     tool: 'OUTLOOK_CREATE_EVENT',
     output: JSON.stringify({ attendees: ['dana.smith@example.com', 'riley.jones@example.com'], status: 'sent' }),
-  });
-  appendEvent({
-    sessionId: session.id,
-    turn: 1,
-    role: 'tool',
-    type: 'tool_returned',
-    data: { callId: 'outlook-send-confirmation', tool: 'OUTLOOK_CREATE_EVENT', effect: 'external_write' },
-  });
+  }, 'external_write');
   const handler = registeredToolHandlers().get('memory_remember');
   assert.ok(handler);
 

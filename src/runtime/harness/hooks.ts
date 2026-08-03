@@ -246,13 +246,31 @@ export function attachEventLogHooks(
   const getTurn = options.getTurn ?? (() => 0);
   const maxResultChars = options.maxResultChars ?? 8000;
   const maxOutputChars = options.maxOutputChars ?? 4000;
+  // SDK call ids are presentation identifiers, not globally unique invocation
+  // identities. Scope correlation to the harness session and keep only the
+  // currently-open occurrence. A closed id may legitimately be reused by a
+  // retry; permanent `seen call id` sets used to erase that later lifecycle.
   const callIdToCalledEventId = new Map<string, string>();
   const callIdToAccounting = new Map<string, { effect: RuntimeToolEffect; toolSlug?: string }>();
-  const seenToolCallIds = new Set<string>();
-  const seenToolReturnIds = new Set<string>();
+  const activeToolCallKeys = new Set<string>();
+  const closedToolCallKeys = new Set<string>();
+  // The SDK can replay the exact same lifecycle notification. Object identity
+  // distinguishes that replay from a real later occurrence carrying the same
+  // call id and fresh notification objects.
+  const seenToolStartNotifications = new WeakSet<object>();
+  const seenToolEndNotifications = new WeakSet<object>();
   // run_worker item label captured at tool-start (args live on the START
   // event) for the fan-out ledger's failure report; read+cleared at tool-end.
   const callIdToWorkerItem = new Map<string, string | null>();
+
+  const lifecycleKey = (sessionId: string, callId: string): string =>
+    `${sessionId}\u0000${callId}`;
+
+  const notificationIdentity = (details: ToolDetails | undefined): object | null => {
+    const toolCall = details?.toolCall;
+    if (toolCall && typeof toolCall === 'object') return toolCall;
+    return details && typeof details === 'object' ? details : null;
+  };
 
   const onAgentStart = (...args: unknown[]) => {
     const [runContext, agent] = args as [unknown, NamedAgent | undefined];
@@ -313,8 +331,15 @@ export function attachEventLogHooks(
     const sessionId = options.getSessionId(runContext);
     if (!sessionId) return;
     const callId = callIdFromDetails(details);
-    if (callId && seenToolCallIds.has(callId)) return;
-    if (callId) seenToolCallIds.add(callId);
+    const key = callId ? lifecycleKey(sessionId, callId) : null;
+    const notification = notificationIdentity(details);
+    if (notification && seenToolStartNotifications.has(notification)) return;
+    if (key && activeToolCallKeys.has(key)) {
+      // Duplicate start for the open occurrence. Remember this notification as
+      // consumed so a later replay of the same object also remains a no-op.
+      if (notification) seenToolStartNotifications.add(notification);
+      return;
+    }
     const accounting = runtimeToolAccountingMetadata(tool?.name ?? '', details?.toolCall?.arguments);
     let event: EventRow;
     try {
@@ -338,11 +363,14 @@ export function attachEventLogHooks(
       // Best-effort: never let an event-log write blow up the run.
       return;
     }
-    if (callId) {
-      callIdToCalledEventId.set(callId, event.id);
-      callIdToAccounting.set(callId, accounting);
+    if (notification) seenToolStartNotifications.add(notification);
+    if (key) {
+      closedToolCallKeys.delete(key);
+      activeToolCallKeys.add(key);
+      callIdToCalledEventId.set(key, event.id);
+      callIdToAccounting.set(key, accounting);
       if (tool?.name === 'run_worker' && fanoutLedgerEnabled()) {
-        callIdToWorkerItem.set(callId, workerItemFromDetails(details));
+        callIdToWorkerItem.set(key, workerItemFromDetails(details));
       }
     }
   };
@@ -358,13 +386,19 @@ export function attachEventLogHooks(
     const sessionId = options.getSessionId(runContext);
     if (!sessionId) return;
     const callId = callIdFromDetails(details);
-    if (callId && seenToolReturnIds.has(callId)) return;
-    if (callId) seenToolReturnIds.add(callId);
-    const parentEventId = callId ? callIdToCalledEventId.get(callId) : undefined;
-    if (callId) callIdToCalledEventId.delete(callId);
-    const accounting = (callId ? callIdToAccounting.get(callId) : undefined)
+    const key = callId ? lifecycleKey(sessionId, callId) : null;
+    const notification = notificationIdentity(details);
+    if (notification && seenToolEndNotifications.has(notification)) return;
+    if (key && !activeToolCallKeys.has(key) && closedToolCallKeys.has(key)) {
+      if (notification) seenToolEndNotifications.add(notification);
+      return;
+    }
+    if (notification) seenToolEndNotifications.add(notification);
+    const parentEventId = key ? callIdToCalledEventId.get(key) : undefined;
+    if (key) callIdToCalledEventId.delete(key);
+    const accounting = (key ? callIdToAccounting.get(key) : undefined)
       ?? runtimeToolAccountingMetadata(tool?.name ?? '', details?.toolCall?.arguments);
-    if (callId) callIdToAccounting.delete(callId);
+    if (key) callIdToAccounting.delete(key);
     // Normalize the result to a string up front. The SDK *usually* hands us a
     // string, but a tool (or a worker via Agent.asTool) can return an
     // object/array/error. Previously the lossless write + clip footer were
@@ -437,7 +471,7 @@ export function attachEventLogHooks(
     if (fanoutLedgerEnabled() && tool?.name === 'run_worker' && callId) {
       try {
         const ok = !/^\s*ERROR:/i.test(resultStr ?? '');
-        const item = callIdToWorkerItem.get(callId) ?? workerItemFromDetails(details);
+        const item = (key ? callIdToWorkerItem.get(key) : undefined) ?? workerItemFromDetails(details);
         recordWorkerResult({
           sessionId,
           callId,
@@ -461,13 +495,13 @@ export function attachEventLogHooks(
           turn: getTurn(runContext),
           role: 'system',
           type: 'worker_capped',
-          data: { callId: callId ?? null, item: callIdToWorkerItem.get(callId ?? '') ?? workerItemFromDetails(details) },
+          data: { callId: callId ?? null, item: (key ? callIdToWorkerItem.get(key) : undefined) ?? workerItemFromDetails(details) },
         });
       } catch {
         // telemetry is best-effort
       }
     }
-    if (callId) callIdToWorkerItem.delete(callId);
+    if (key) callIdToWorkerItem.delete(key);
     try {
       appendEvent({
         sessionId,
@@ -493,6 +527,10 @@ export function attachEventLogHooks(
       });
     } catch {
       // see onToolStart
+    }
+    if (key) {
+      activeToolCallKeys.delete(key);
+      closedToolCallKeys.add(key);
     }
     // Evolving procedural memory: if this call was a HARD failure of a
     // remembered tool, self-correct (invalidate the stale memo so the next run

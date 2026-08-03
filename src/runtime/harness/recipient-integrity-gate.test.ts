@@ -26,12 +26,26 @@ function outgoing(addresses: string[]): unknown {
 }
 
 function addReadSource(sessionId: string, callId: string, tool: string, addresses: string[]): void {
-  writeToolOutput({ sessionId, callId, tool, output: JSON.stringify({ members: addresses.map((email) => ({ email })) }) });
+  const called = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool, callId, effect: 'read' },
+  });
+  writeToolOutput({
+    sessionId,
+    callId,
+    invocationNonce: `nonce-${callId}`,
+    tool,
+    output: JSON.stringify({ members: addresses.map((email) => ({ email })) }),
+  });
   appendEvent({
     sessionId,
     turn: 1,
     role: 'tool',
     type: 'tool_returned',
+    parentEventId: called.id,
     data: { tool, callId, effect: 'read', result: 'stored separately' },
   });
 }
@@ -53,6 +67,31 @@ test('blocks a three-correct plus five-fabricated substitution', () => {
   const result = evaluateRecipientSetIntegrity(session.id, outgoing(wrong));
   assert.equal(result.action, 'block');
   assert.deepEqual(result.unsupportedRecipients, wrong.slice(3).sort());
+});
+
+test('reused call id cannot let an old roster authorize a current recipient set', () => {
+  const session = createSession({ kind: 'chat' });
+  addReadSource(session.id, 'reused-roster', 'composio_execute_tool', correct);
+  const later = appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'reused-roster', effect: 'read' },
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: later.id,
+    data: { tool: 'composio_execute_tool', callId: 'reused-roster', effect: 'read', result: 'FAILED' },
+  });
+
+  const result = evaluateRecipientSetIntegrity(session.id, outgoing(correct));
+  assert.equal(result.action, 'block');
+  assert.deepEqual(result.unsupportedRecipients, [...correct].sort());
+  assert.notEqual(result.sourceId, 'reused-roster');
 });
 
 test('does not let a pending-action echo validate its own recipient payload', () => {

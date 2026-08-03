@@ -1,7 +1,8 @@
 import { getRuntimeEnv } from '../../config.js';
-import { getToolOutput } from './eventlog.js';
+import { resolveToolOutputForAuthority } from './eventlog.js';
 import { parseShellToolOutput } from '../../tools/code-mode-tool.js';
 import { gatherTrustedEvidence } from './trusted-evidence.js';
+import { pruneProviderRequestEchoes } from './provider-read-evidence.js';
 
 /** Kill-switch for the dispatch-time resolution wiring (the primitive itself is
  *  always available). Default ON, but a no-op for any call without the syntax. */
@@ -119,12 +120,17 @@ function resolveOne(sessionId: string, ref: ToolOutputRef, trustedCallIds: Set<s
     errors.push(`$fromToolOutput: "${ref.callId}" is not a trusted read/compute result in this session — a reference must bind from grounded evidence, not a write/send output or an unknown call`);
     return undefined;
   }
-  const row = getToolOutput(sessionId, ref.callId);
-  if (!row) {
+  const resolution = resolveToolOutputForAuthority(sessionId, ref.callId);
+  if (resolution.status === 'ambiguous') {
+    errors.push(`$fromToolOutput: call_id "${ref.callId}" was reused by ${resolution.invocationCount} invocations — a call-id-only reference cannot choose between stale and current provider bytes`);
+    return undefined;
+  }
+  if (resolution.status === 'missing') {
     errors.push(`$fromToolOutput: no tool output found for call_id "${ref.callId}" in this session`);
     return undefined;
   }
-  const parsed = parseParkedOutput(row.output);
+  const row = resolution.record;
+  const parsed = pruneProviderRequestEchoes(parseParkedOutput(row.output));
   if (parsed === undefined) {
     errors.push(`$fromToolOutput: output for "${ref.callId}" is not JSON — cannot resolve a reference from it`);
     return undefined;

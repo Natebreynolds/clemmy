@@ -44,7 +44,7 @@ import {
   claimApprovedResendConsent,
   hasApprovedResendConsent,
 } from './approval-registry.js';
-import { searchToolOutputs } from './eventlog.js';
+import { searchToolOutputs, resolveToolOutputsForAuthority } from './eventlog.js';
 
 // ─────────────────────────────────────────────────────────────────
 // Config + pure classification
@@ -586,7 +586,11 @@ export async function evaluateGrounding(
   }
   let sources: GroundingSource[] = [];
   try {
-    sources = rankSources(searchToolOutputs(sessionId, targets, { limit: 12 }));
+    sources = rankSources(resolveToolOutputsForAuthority(
+      sessionId,
+      searchToolOutputs(sessionId, targets, { limit: 12 }),
+      { readOrComputeOnly: true },
+    ));
   } catch {
     return { action: 'allow', reason: 'source retrieval failed — fail open', targets, sourceCallIds: [] };
   }

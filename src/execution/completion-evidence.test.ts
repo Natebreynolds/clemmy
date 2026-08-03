@@ -198,3 +198,35 @@ test('completion evidence excludes failed receipts and stays globally bounded', 
   assert.doesNotMatch(evidence, /disk full/);
   assert.ok(evidence.length <= 7_000, `expected bounded evidence, got ${evidence.length} chars`);
 });
+
+test('completion evidence refuses a reused call id instead of certifying stale success bytes', () => {
+  const events = [
+    event(1, 'tool_called', {
+      tool: 'composio_execute_tool',
+      toolSlug: 'GOOGLESHEETS_BATCH_GET',
+      callId: 'reused-read',
+      accounting: 'top_level',
+      arguments: JSON.stringify({ tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: { ranges: ['Old!A1'] } }),
+      effect: 'read',
+    }),
+    event(2, 'tool_returned', {
+      tool: 'composio_execute_tool',
+      toolSlug: 'GOOGLESHEETS_BATCH_GET',
+      callId: 'reused-read',
+      accounting: 'top_level',
+      ok: true,
+      effect: 'read',
+      preview: '{"successful":true,"data":{"values":[["stale success"]]}}',
+    }),
+  ];
+
+  const evidence = recentExecutionToolEvidence({
+    sessionId: 'completion-evidence-session',
+    createdAt: '2026-07-25T19:00:00.000Z',
+  }, {
+    listEventsFn: () => events,
+    resolveToolOutputForAuthorityFn: () => ({ status: 'ambiguous', invocationCount: 2 }),
+  });
+
+  assert.equal(evidence, '');
+});

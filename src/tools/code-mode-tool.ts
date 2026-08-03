@@ -28,13 +28,13 @@ import {
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
-import { appendEvent, getToolOutput, writeToolOutput } from '../runtime/harness/eventlog.js';
+import { appendEvent, resolveToolOutputForAuthority, writeToolOutput } from '../runtime/harness/eventlog.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { deriveCodeModeSets } from './tool-registry.js';
 import { runCodeModeProgram, cleanCodeModeStderr, type CodeModeResult } from './code-mode-sandbox.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
-import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
+import { mcpToolAllowedByScope, stripMcpToolCarrier } from '../runtime/mcp-tool-authority.js';
 // NB: getCoreTools is reached via DYNAMIC import in realToolsByName() — a static
 // import would form a registry ↔ code-mode-tool cycle (registry exposes
 // buildCodeModeTool). The dynamic import resolves at first dispatch, by when the
@@ -250,8 +250,20 @@ export function normalizeCodeModeToolResult(
   out: unknown,
   opts: { sessionId?: string; callId?: string } = {},
 ): unknown {
+  const resolution = opts.sessionId && opts.callId
+    ? resolveToolOutputForAuthority(opts.sessionId, opts.callId)
+    : null;
+  const parked = resolution?.status === 'ok' ? resolution.record : null;
+  if (parked?.truncatedAtWrite) {
+    return {
+      ok: false,
+      error_kind: 'truncated_tool_output',
+      error: `Tool result "${opts.callId}" is incomplete (${parked.contentBytes} original bytes exceeded the durable output cap), so code mode will not consume the parked prefix. Re-read/page the provider source until every page is present, or stage the full result as a file and read that artifact.`,
+      truncated_at_write: true,
+      ...(opts.callId ? { result_handle: opts.callId } : {}),
+    };
+  }
   if (out == null || typeof out !== 'string') return out ?? null;
-  const parked = opts.sessionId && opts.callId ? getToolOutput(opts.sessionId, opts.callId) : null;
   const raw = parked?.output ?? out;
   const shell = method === 'run_shell_command' || /^\s*exit_code:\s*/i.test(raw)
     ? parseShellToolOutput(raw, { callId: parked ? opts.callId : undefined, truncatedAtWrite: parked?.truncatedAtWrite })
@@ -433,7 +445,20 @@ async function dispatchCodeModeWorker(args: unknown, sessionId: string, counter?
     }
     programWorkerCounts.set(counter, used + 1);
   }
-  const parsed = WorkerToolInputSchema.safeParse(args);
+  const hasOwnExternalMcpLease = typeof args === 'object'
+    && args !== null
+    && !Array.isArray(args)
+    && Object.prototype.hasOwnProperty.call(args, 'externalMcpToolNames');
+  if (!hasOwnExternalMcpLease) {
+    return { ok: false, error: 'run_worker: invalid spec — externalMcpToolNames: required typed exact external MCP capability lease; use null or [] when none are needed' };
+  }
+  // Derive this at dispatch time, not module initialization: worker packet
+  // recovery has an existing ESM cycle through the tool registry, and eagerly
+  // touching the imported schema can observe its binding before initialization.
+  // Durable recovery keeps using the optional base schema; new live calls do not.
+  const parsed = WorkerToolInputSchema
+    .required({ externalMcpToolNames: true })
+    .safeParse(args);
   if (!parsed.success) {
     return { ok: false, error: `run_worker: invalid spec — ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}` };
   }
@@ -692,6 +717,7 @@ async function dispatchCodeModeMcpTool(
   batchItem?: boolean,
   scopeOverride?: McpToolScope | null,
 ): Promise<unknown> {
+  const executableMethod = stripMcpToolCarrier(method);
   const scope = scopeOverride !== undefined
     ? scopeOverride
     : harnessRunContextStorage.getStore()?.mcpToolScope;
@@ -703,14 +729,14 @@ async function dispatchCodeModeMcpTool(
   }
   let shim: ExternalMcpShim | null;
   if (externalMcpResolverForTest) {
-    shim = externalMcpResolverForTest(method, scope);
+    shim = externalMcpResolverForTest(executableMethod, scope);
   } else {
     const {
       getOrCreateExternalMcpServerForTool,
       getOrCreateExternalMcpServers,
     } = await import('../runtime/mcp-servers.js');
     shim = (scope === undefined
-      ? getOrCreateExternalMcpServerForTool(method)
+      ? getOrCreateExternalMcpServerForTool(executableMethod)
       : getOrCreateExternalMcpServers(scope ?? {
           reason: 'explicit no-external-tools scope',
           allowedServerSlugs: [],
@@ -733,7 +759,7 @@ async function dispatchCodeModeMcpTool(
       ...(certifiedBatch ? { certifiedBatch } : {}),
       ...(batchItem ? { batchItem: true } : {}),
     },
-    () => shim.callTool(method, argObj),
+    () => shim.callTool(executableMethod, argObj),
   );
 }
 

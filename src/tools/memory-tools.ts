@@ -24,7 +24,7 @@ import { getFactEvidence, syncMemoryPolicyForFact } from '../memory/temporal-mem
 import { compileWordMatcher } from '../memory/word-match.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
-import { listEvents, recentToolOutputs } from '../runtime/harness/eventlog.js';
+import { recentToolOutputs, resolveToolOutputsForAuthority } from '../runtime/harness/eventlog.js';
 
 /** Live results below this count mean recall came back thin enough to open
  *  the archive (cold tier). At or above it, retired facts stay retired. */
@@ -395,18 +395,12 @@ function inferRememberedToolSource(sessionId: string | undefined, content: strin
   const identifiers = Array.from(new Set((content.match(EXACT_MEMORY_IDENTIFIER_RE) ?? []).map((value) => value.toLowerCase())));
   if (identifiers.length === 0) return null;
   try {
-    const effectsByCall = new Map<string, string>();
-    for (const event of listEvents(sessionId, { types: ['tool_returned'] })) {
-      const callId = typeof event.data.callId === 'string' ? event.data.callId : '';
-      const effect = typeof event.data.effect === 'string' ? event.data.effect : '';
-      if (callId && effect) effectsByCall.set(callId, effect);
-    }
-    const source = recentToolOutputs(sessionId, { limit: 30 })
+    const source = resolveToolOutputsForAuthority(
+      sessionId,
+      recentToolOutputs(sessionId, { limit: 30 }),
+      { readOrComputeOnly: true },
+    )
       .filter((row) => !MEMORY_SOURCE_ECHO_RE.test(row.tool ?? ''))
-      .filter((row) => {
-        const effect = effectsByCall.get(row.callId);
-        return !effect || effect === 'read' || effect === 'compute';
-      })
       .find((row) => {
         const outputIdentifiers = new Set(
           (row.output.match(EXACT_MEMORY_IDENTIFIER_RE) ?? []).map((value) => value.toLowerCase()),

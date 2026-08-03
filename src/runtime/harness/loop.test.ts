@@ -98,6 +98,31 @@ const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js')
 const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
 const { buildCallTool } = await import('../../tools/call-tool.js');
+
+function seedArtifactVerification(sessionId: string, callId: string, resourceId: string): void {
+  const called = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { callId, tool: 'fixture_provider_get', effect: 'read' },
+  });
+  writeToolOutput({
+    sessionId,
+    callId,
+    invocationNonce: `nonce-${callId}`,
+    tool: 'fixture_provider_get',
+    output: JSON.stringify({ resource: { id: resourceId } }),
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { callId, tool: 'fixture_provider_get', effect: 'read', result: 'stored separately' },
+  });
+}
 const { _setCodeModeToolsForTests } = await import('../../tools/code-mode-tool.js');
 
 test.after(() => {
@@ -2713,10 +2738,15 @@ test('effect/artifact self-reconciliation preserves the verified public candidat
         },
       } as never;
     }
+    seedArtifactVerification(sess.id, 'verify-workspace-cadence', 'fixture-doc-workspace-cadence');
     const artifactSettlement = artifactLedger.resolveUncertainArtifactClaim(
       sess.id,
       artifactId,
-      { kind: 'bind', resourceId: 'fixture-doc-workspace-cadence' },
+      {
+        kind: 'bind',
+        resourceId: 'fixture-doc-workspace-cadence',
+        verificationCallId: 'verify-workspace-cadence',
+      },
     );
     assert.equal(artifactSettlement.ok, true);
     appendEvent({
@@ -2797,10 +2827,15 @@ test('a completed reconciliation turn that asks a question pauses before the sav
       } as never;
     }
 
+    seedArtifactVerification(sess.id, 'verify-question-ordering', 'fixture-doc-question-ordering');
     const settlement = artifactLedger.resolveUncertainArtifactClaim(
       sess.id,
       artifactId,
-      { kind: 'bind', resourceId: 'fixture-doc-question-ordering' },
+      {
+        kind: 'bind',
+        resourceId: 'fixture-doc-question-ordering',
+        verificationCallId: 'verify-question-ordering',
+      },
     );
     assert.equal(settlement.ok, true, 'the evidence is settled so the old ordering would falsely finalize');
     appendEvent({
@@ -7402,28 +7437,68 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
   assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 1), false);
 
   // A queued dispatch on turn 1.
-  appendEvent({
+  const queuedCall = appendEvent({
     sessionId: sess.id, turn: 1, role: 'system', type: 'tool_called',
     data: { tool: 'workflow_run', callId: 'call_wfrun_1', arguments: '{"name":"x"}' },
   });
   writeToolOutput({
     sessionId: sess.id, callId: 'call_wfrun_1', tool: 'workflow_run',
+    invocationNonce: 'queued-success',
     output: 'Queued "x" (run 123-abc) — it is now running in the BACKGROUND. Tell the user…',
+  });
+  appendEvent({
+    sessionId: sess.id, turn: 1, role: 'tool', type: 'tool_returned',
+    parentEventId: queuedCall.id,
+    data: { tool: 'workflow_run', callId: 'call_wfrun_1', ok: true },
   });
   assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 1), true, 'queued dispatch this turn is detected');
   assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 2), false, 'a different turn does not inherit the dispatch');
 
   // A workflow_run whose output is NOT a queue success (e.g. validation refusal) → false.
   const sess2 = createSession({ kind: 'chat' });
-  appendEvent({
+  const refusedCall = appendEvent({
     sessionId: sess2.id, turn: 1, role: 'system', type: 'tool_called',
     data: { tool: 'workflow_run', callId: 'call_wfrun_2', arguments: '{"name":"y"}' },
   });
   writeToolOutput({
     sessionId: sess2.id, callId: 'call_wfrun_2', tool: 'workflow_run',
+    invocationNonce: 'refused-dispatch',
     output: 'Workflow "y" is disabled.',
   });
+  appendEvent({
+    sessionId: sess2.id, turn: 1, role: 'tool', type: 'tool_returned',
+    parentEventId: refusedCall.id,
+    data: { tool: 'workflow_run', callId: 'call_wfrun_2', ok: false },
+  });
   assert.equal(dispatchedBackgroundWorkflowRun(sess2.id, 1), false, 'a refused dispatch still gets judged');
+
+  // Reused SDK ids cannot let an older queue success settle a later/refused
+  // dispatch. Two exact invocation rows make the authority deliberately
+  // ambiguous even though the legacy longest-output slot contains success.
+  const sess3 = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess3.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { tool: 'workflow_run', callId: 'call_wfrun_reused', arguments: '{"name":"z"}' },
+  });
+  writeToolOutput({
+    sessionId: sess3.id,
+    callId: 'call_wfrun_reused',
+    invocationNonce: 'older-success',
+    tool: 'workflow_run',
+    output: 'Queued "z" (run stale) — it is now running in the BACKGROUND. Tell the user…',
+  });
+  writeToolOutput({
+    sessionId: sess3.id,
+    callId: 'call_wfrun_reused',
+    invocationNonce: 'current-refusal',
+    tool: 'workflow_run',
+    output: 'Workflow "z" is disabled.',
+  });
+  assert.equal(
+    dispatchedBackgroundWorkflowRun(sess3.id, 1),
+    false,
+    'a reused call id cannot inherit an older queue receipt',
+  );
 });
 
 test('runConversation: a receipt-backed structured workflow handoff parks after one turn without polling', async () => {

@@ -1738,7 +1738,7 @@ test('replayFailedReflections re-runs failed receipts from durable tool_outputs 
     setReflectionExtractorPauseForTest(null);
     // Seed the durable raw exactly as the harness does at tool return.
     try { createHarnessSession({ id: input.sessionId, kind: 'chat' }); } catch { /* may exist */ }
-    writeToolOutput({ sessionId: input.sessionId, callId: input.callId, tool: input.tool, output: input.output });
+    writeToolOutput({ sessionId: input.sessionId, callId: input.callId, invocationNonce: `nonce-${input.callId}`, tool: input.tool, output: input.output });
     // First pass fails (extractor down) → failed receipt.
     _testOnly_setReflectionExtractor(async () => { extractorCalls += 1; return null; });
     assert.equal((await reflectOnToolReturn(input)).skipped, 'extractor_failed');
@@ -1778,7 +1778,7 @@ test('replayFailedReflections reclaims a stale processing lease from durable too
   try {
     setReflectionExtractorPauseForTest(null);
     try { createHarnessSession({ id: input.sessionId, kind: 'chat' }); } catch { /* may exist */ }
-    writeToolOutput({ sessionId: input.sessionId, callId: input.callId, tool: input.tool, output: input.output });
+    writeToolOutput({ sessionId: input.sessionId, callId: input.callId, invocationNonce: `nonce-${input.callId}`, tool: input.tool, output: input.output });
     const inputHash = createHash('sha256')
       .update(input.tool)
       .update('\0')
@@ -1813,6 +1813,73 @@ test('replayFailedReflections reclaims a stale processing lease from durable too
     _testOnly_setReflectionExtractor(null);
     setReflectionExtractorPauseForTest(null);
     if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+  }
+});
+
+test('replayFailedReflections never feeds stale longest bytes to the extractor after call-id reuse', async () => {
+  resetMemoryDb();
+  const { replayFailedReflections, setReflectionExtractorPauseForTest } = await import('./reflection.js');
+  const {
+    appendEvent: appendHarnessEvent,
+    createSession: createHarnessSession,
+    writeToolOutput: writeHarnessOutput,
+  } = await import('../runtime/harness/eventlog.js');
+  const sessionId = 'sess-reflection-reused';
+  const callId = 'call-reflection-reused';
+  createHarnessSession({ id: sessionId, kind: 'chat' });
+  const first = appendHarnessEvent({
+    sessionId, turn: 1, role: 'tool', type: 'tool_called',
+    data: { callId, tool: 'salesforce_query', effect: 'read' },
+  });
+  writeHarnessOutput({
+    sessionId,
+    callId,
+    invocationNonce: 'nonce-reflection-old',
+    tool: 'salesforce_query',
+    output: 'STALE_SUCCESS Alice and Bob are the current account owners. '.repeat(80),
+  });
+  appendHarnessEvent({
+    sessionId, turn: 1, role: 'tool', type: 'tool_returned', parentEventId: first.id,
+    data: { callId, tool: 'salesforce_query', effect: 'read', result: 'ok' },
+  });
+  const second = appendHarnessEvent({
+    sessionId, turn: 2, role: 'tool', type: 'tool_called',
+    data: { callId, tool: 'salesforce_query', effect: 'read' },
+  });
+  appendHarnessEvent({
+    sessionId, turn: 2, role: 'tool', type: 'tool_returned', parentEventId: second.id,
+    data: { callId, tool: 'salesforce_query', effect: 'read', result: 'CURRENT_FAILURE' },
+  });
+  openMemoryDb().prepare(`
+    INSERT INTO memory_reflection_receipts
+      (session_id, call_id, input_hash, status, attempts, first_seen_at, last_attempt_at, last_error)
+    VALUES (?, ?, ?, 'failed', 1, ?, ?, 'extractor_failed')
+  `).run(
+    sessionId,
+    callId,
+    createHash('sha256').update('current-failure').digest('hex'),
+    '2026-08-02T10:00:00.000Z',
+    '2026-08-02T10:00:00.000Z',
+  );
+  let extractorCalls = 0;
+  try {
+    setReflectionExtractorPauseForTest(null);
+    _testOnly_setReflectionExtractor(async () => {
+      extractorCalls += 1;
+      return { facts: [], entities: [], pointers: [] };
+    });
+    assert.deepEqual(await replayFailedReflections(), { scanned: 1, replayed: 0, rawGone: 1 });
+    assert.equal(extractorCalls, 0);
+    assert.equal(
+      (openMemoryDb().prepare(`
+        SELECT last_error FROM memory_reflection_receipts
+         WHERE session_id = ? AND call_id = ?
+      `).get(sessionId, callId) as { last_error: string }).last_error,
+      'raw_ambiguous',
+    );
+  } finally {
+    _testOnly_setReflectionExtractor(null);
+    setReflectionExtractorPauseForTest(null);
   }
 });
 

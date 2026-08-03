@@ -12,11 +12,11 @@ import {
   getLatestCanonicalTopLevelToolEvent,
   getLatestRunAttempt,
   getSession,
-  getToolOutput,
   isKillRequested,
   listEvents,
   openEventLog,
   recentToolOutputs,
+  resolveToolOutputForAuthority,
   searchToolOutputs,
   type AppendEventInput,
   type EventRow,
@@ -2110,7 +2110,9 @@ export function dispatchedBackgroundWorkflowRun(sessionId: string, turn: number)
     for (const call of calls) {
       const callId = (call.data as { callId?: unknown } | undefined)?.callId;
       if (typeof callId !== 'string' || !callId) continue;
-      const output = getToolOutput(sessionId, callId)?.output ?? '';
+      const resolution = resolveToolOutputForAuthority(sessionId, callId);
+      if (resolution.status !== 'ok') continue;
+      const output = resolution.record.output;
       if (/running in the BACKGROUND/i.test(output)) return true;
     }
   } catch { /* fail toward running the judge */ }

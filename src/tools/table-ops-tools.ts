@@ -4,10 +4,10 @@
  * primitive: reconcile / diff / join / dedupe / tally).
  *
  * Context-efficiency contract: inputs can come from a prior tool call's
- * PARKED FULL OUTPUT (`left_call_id`) or a staged file (`left_file`), so a
+ * lossless PARKED OUTPUT (`left_call_id`) or a staged file (`left_file`), so a
  * 10k-row sheet read is reconciled WITHOUT the rows ever entering model
- * context (the visible read was digest-clipped at 12k bytes; the park kept
- * everything). Results over the inline cap spill to a staged JSONL file
+ * context (the visible read was digest-clipped at 12k bytes; the park keeps
+ * every byte up to its durable cap and fails closed beyond it). Results over the inline cap spill to a staged JSONL file
  * whose path chains straight back in as `left_file` — or onward to an
  * upload via the file pipeline.
  */
@@ -17,7 +17,7 @@ import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
-import { getToolOutput } from '../runtime/harness/eventlog.js';
+import { resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { textResult } from './shared.js';
 import {
@@ -53,9 +53,16 @@ function loadSide(
   if (input.callId?.trim()) {
     const sessionId = getToolOutputContext()?.sessionId;
     if (!sessionId) throw new Error(`${side}_call_id needs a live session context — pass ${side}_rows or ${side}_file instead.`);
-    const stored = getToolOutput(sessionId, input.callId.trim());
-    if (!stored) throw new Error(`no stored output for call id "${input.callId}" in this session — check the id (it appears in the tool result footer).`);
-    return loadTableFromText(stored.output, { path: input.path });
+    const resolution = resolveToolOutputForAuthority(sessionId, input.callId.trim());
+    if (resolution.status === 'ambiguous') throw new Error(`call id "${input.callId}" was reused by ${resolution.invocationCount} invocations — pass a fresh unique call id.`);
+    if (resolution.status === 'missing') throw new Error(`no stored output for call id "${input.callId}" in this session — check the id (it appears in the tool result footer).`);
+    if (resolution.record.truncatedAtWrite) {
+      throw new Error(
+        `stored output for call id "${input.callId}" is incomplete (${resolution.record.contentBytes} original bytes exceeded the durable output cap), so table_ops will not compute totals from a prefix. `
+        + 'Re-read/page the provider source until every page is present, or stage the full result as a file and pass it as left_file/right_file.',
+      );
+    }
+    return loadTableFromText(resolution.record.output, { path: input.path });
   }
   const filePath = path.resolve(input.file!.trim());
   const stat = statSync(filePath);
@@ -92,7 +99,7 @@ export function registerTableOpsTools(server: McpServer): void {
     'table_ops',
     [
       'Deterministic table operations over lists/rows — diff, intersect, join, dedupe, aggregate (group+count/sum/avg/min/max), select (filter/project/limit). Use this instead of eyeballing rows in context: it is exact at any size.',
-      'Inputs: pass ONE source per side — inline rows (JSON array / JSONL / CSV / TSV string), a PRIOR TOOL CALL id (left_call_id — operates on the parked FULL output even when your visible copy was truncated), or a staged file path (left_file).',
+      'Inputs: pass ONE source per side — inline rows (JSON array / JSONL / CSV / TSV string), a PRIOR TOOL CALL id (left_call_id — operates on the lossless parked output even when the model-visible copy was clipped), or a staged file path (left_file). A provider result that exceeded the durable cap fails closed; page/re-read it or stage the full result as a file.',
       'key = comma-separated column name(s) to match on (string compare is trimmed + case-insensitive — email-friendly).',
       'Examples: who is in the CRM but not the sheet → op:diff, left_call_id:<crm read>, right_call_id:<sheet read>, key:email. Dedupe sheet rows → op:dedupe, key:email. Tally by owner → op:aggregate, group_by:owner.',
       'Large results spill to a JSONL file whose filePath chains back in as left_file or onward to uploads.',

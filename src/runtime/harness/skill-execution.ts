@@ -18,7 +18,7 @@
  * Everything here is FAIL-OPEN: any error returns the permissive value ([] /
  * false / '') so a bug in skill verification can never wedge a real completion.
  */
-import { listEvents, getToolOutput } from './eventlog.js';
+import { listEvents, resolveToolOutputForAuthority } from './eventlog.js';
 import { projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
@@ -77,8 +77,9 @@ export function gatherSessionSkills(sessionId: string): SessionSkill[] {
     const seen = new Set<string>();
     for (const { name, callId } of skillReadCalls(sessionId)) {
       if (seen.has(name)) continue;
-      const row = getToolOutput(sessionId, callId);
-      if (!row?.output) continue;
+      const resolution = resolveToolOutputForAuthority(sessionId, callId);
+      if (resolution.status !== 'ok' || !resolution.record.output) continue;
+      const row = resolution.record;
       // skill_read returns: head\n\nmanifest\n\ncrib\n\nexecutionContract\n\n---\n<body>.
       // The envelope (head/manifest/crib/contract) contains no '\n---\n', so the
       // FIRST divider is the envelope→body boundary. Use indexOf (not lastIndexOf)

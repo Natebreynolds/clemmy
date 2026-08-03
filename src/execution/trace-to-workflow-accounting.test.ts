@@ -70,3 +70,52 @@ test('native MCP mirror remains audit evidence but reconstructs as one action wi
   assert.equal(trace.draftWorkflowFromSession(session.id).toolCallCount, 1);
   assert.match(trace.readSessionToolReturns(session.id).get('toolu-create-doc') ?? '', /provider rejected duplicate title/);
 });
+
+test('workflow promotion refuses return evidence for a reused call id', () => {
+  eventlog.resetEventLog();
+  const session = eventlog.createSession({ kind: 'chat' });
+  const called = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'reused-promotion-call',
+      accounting: 'top_level',
+      effect: 'read',
+      arguments: JSON.stringify({ tool_slug: 'GOOGLEDOCS_GET_DOCUMENT', arguments: { document_id: 'current' } }),
+    },
+  });
+  eventlog.writeToolOutput({
+    sessionId: session.id,
+    callId: 'reused-promotion-call',
+    invocationNonce: 'stale-long-success',
+    tool: 'composio_execute_tool',
+    output: '{"successful":true,"data":{"document_id":"stale","body":"long stale content"}}',
+  });
+  eventlog.writeToolOutput({
+    sessionId: session.id,
+    callId: 'reused-promotion-call',
+    invocationNonce: 'current-short-failure',
+    tool: 'composio_execute_tool',
+    output: 'FAILED',
+  });
+  eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'reused-promotion-call',
+      accounting: 'top_level',
+      effect: 'read',
+      ok: false,
+      error: 'FAILED',
+    },
+  });
+
+  assert.equal(trace.readSessionToolReturns(session.id).has('reused-promotion-call'), false);
+});

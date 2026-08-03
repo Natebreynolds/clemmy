@@ -20,6 +20,7 @@ const {
 const { recallMemory } = await import('./recall-memory.js');
 const {
   createSession,
+  appendEvent,
   getToolOutput,
   openEventLog,
   resetEventLog,
@@ -43,11 +44,27 @@ test('every new direct fact receives durable, exact evidence', () => {
 
 test('derived fact evidence survives raw tool-output expiry', () => {
   const session = createSession({ kind: 'chat' });
+  const called = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { callId: 'call-evidence', tool: 'crm_lookup', effect: 'read' },
+  });
   writeToolOutput({
     sessionId: session.id,
     callId: 'call-evidence',
+    invocationNonce: 'nonce-call-evidence',
     tool: 'crm_lookup',
     output: 'CRM record: Acme renewal closes on September 30. Owner: Dana.',
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { callId: 'call-evidence', tool: 'crm_lookup', effect: 'read', result: 'stored separately' },
   });
   const fact = rememberFact({
     kind: 'project',
@@ -68,6 +85,57 @@ test('derived fact evidence survives raw tool-output expiry', () => {
   const episode = openMemoryDb().prepare('SELECT status FROM memory_episodes WHERE id = ?')
     .get(afterExpiry[0].episodeId) as { status: string };
   assert.equal(episode.status, 'available');
+});
+
+test('explicit derived fact cannot copy stale longest bytes after call-id reuse', () => {
+  const session = createSession({ kind: 'chat' });
+  const first = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { callId: 'reused-evidence', tool: 'crm_lookup', effect: 'read' },
+  });
+  writeToolOutput({
+    sessionId: session.id,
+    callId: 'reused-evidence',
+    invocationNonce: 'nonce-reused-evidence',
+    tool: 'crm_lookup',
+    output: 'STALE: Alice owns the Acme renewal and closes it September 30.',
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: first.id,
+    data: { callId: 'reused-evidence', tool: 'crm_lookup', effect: 'read', result: 'ok' },
+  });
+  const second = appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_called',
+    data: { callId: 'reused-evidence', tool: 'crm_lookup', effect: 'read' },
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: second.id,
+    data: { callId: 'reused-evidence', tool: 'crm_lookup', effect: 'read', result: 'FAILED' },
+  });
+
+  const fact = rememberFact({
+    kind: 'project',
+    content: 'Alice owns the Acme renewal.',
+    derivedFrom: { sessionId: session.id, callId: 'reused-evidence', tool: 'crm_lookup' },
+  });
+  const evidence = getFactEvidence(fact.id);
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0].status, 'missing');
+  assert.equal(evidence[0].excerpt, '');
 });
 
 test('delayed promotion reuses a pending episode excerpt after raw output is gone', () => {

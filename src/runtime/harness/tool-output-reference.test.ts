@@ -32,7 +32,13 @@ test('extractByPath handles dot paths and [*] array mapping', () => {
 
 test('resolves a recipient roster from a prior tool output — values never model-typed', () => {
   const roster = { result: { records: Array.from({ length: 8 }, (_, i) => ({ Email: `person${i}@scorpion.co` })) } };
-  writeToolOutput({ sessionId: S, callId: 'call_sf', tool: 'salesforce_query', output: JSON.stringify(roster) });
+  writeToolOutput({
+    sessionId: S,
+    callId: 'call_sf',
+    invocationNonce: 'roster-read',
+    tool: 'salesforce_query',
+    output: JSON.stringify(roster),
+  });
 
   const args = {
     subject: '1st Team Meet up!',
@@ -51,7 +57,13 @@ test('resolves a recipient roster from a prior tool output — values never mode
 
 test('resolves through a run_shell_command --json wrapper (sf/gh/aws)', () => {
   const payload = JSON.stringify({ result: { records: [{ Email: 'x@co' }, { Email: 'y@co' }] } });
-  writeToolOutput({ sessionId: S, callId: 'call_shell', tool: 'run_shell_command', output: `exit_code: 0\n\nstdout:\n${payload}\nstderr:\n` });
+  writeToolOutput({
+    sessionId: S,
+    callId: 'call_shell',
+    invocationNonce: 'shell-read',
+    tool: 'run_shell_command',
+    output: `exit_code: 0\n\nstdout:\n${payload}\nstderr:\n`,
+  });
   const out = resolveToolOutputReferences(S, { to: { $fromToolOutput: { callId: 'call_shell', path: 'result.records[*].Email' } } });
   assert.deepEqual(out.errors, []);
   assert.deepEqual((out.resolved as { to: string[] }).to, ['x@co', 'y@co']);
@@ -60,11 +72,55 @@ test('resolves through a run_shell_command --json wrapper (sf/gh/aws)', () => {
 // ---------- fail-closed ----------
 
 test('fail-closed: an unresolvable reference is an error, not a silent empty send', () => {
-  writeToolOutput({ sessionId: S, callId: 'call_ok', tool: 't', output: JSON.stringify({ records: [] }) });
+  writeToolOutput({
+    sessionId: S,
+    callId: 'call_ok',
+    invocationNonce: 'empty-read',
+    tool: 't',
+    output: JSON.stringify({ records: [] }),
+  });
   const missing = resolveToolOutputReferences(S, { to: { $fromToolOutput: { callId: 'call_absent' } } });
   assert.equal(missing.errors.length, 1, 'missing call_id errors');
   const badPath = resolveToolOutputReferences(S, { to: { $fromToolOutput: { callId: 'call_ok', path: 'nope[*].Email' } } });
   assert.equal(badPath.errors.length, 1, 'a path that resolves to nothing errors');
+});
+
+test('fail-closed: reused call ids cannot feed stale longest-wins values into a write', () => {
+  writeToolOutput({
+    sessionId: S,
+    callId: 'dup-read',
+    invocationNonce: 'nonce-stale',
+    tool: 'salesforce_query',
+    output: JSON.stringify({ result: { records: [{ Email: 'stale-dangerous-address@example.com' }] }, padding: 'x'.repeat(5_000) }),
+  });
+  writeToolOutput({
+    sessionId: S,
+    callId: 'dup-read',
+    invocationNonce: 'nonce-current',
+    tool: 'salesforce_query',
+    output: JSON.stringify({ result: { records: [{ Email: 'current@example.com' }] } }),
+  });
+  const out = resolveToolOutputReferences(S, {
+    to: { $fromToolOutput: { callId: 'dup-read', path: 'result.records[*].Email' } },
+  });
+  assert.equal(out.errors.length, 1);
+  assert.match(out.errors[0], /reused by 2 invocations|stale and current/i);
+  assert.equal((out.resolved as { to?: unknown }).to, undefined);
+});
+
+test('fail-closed: provider request echoes are not grounded $fromToolOutput values', () => {
+  writeToolOutput({
+    sessionId: S,
+    callId: 'echo-read',
+    invocationNonce: 'nonce-echo',
+    tool: 'salesforce_query',
+    output: JSON.stringify({ data: { request_body: { Email: 'model-guessed@example.com' }, records: [] } }),
+  });
+  const out = resolveToolOutputReferences(S, {
+    to: { $fromToolOutput: { callId: 'echo-read', path: 'data.request_body.Email' } },
+  });
+  assert.equal(out.errors.length, 1);
+  assert.match(out.errors[0], /resolved to nothing/i);
 });
 
 // ---------- pass-through + detection ----------

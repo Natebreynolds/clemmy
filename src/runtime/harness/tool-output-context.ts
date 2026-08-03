@@ -13,6 +13,10 @@ export interface ToolOutputContext {
   workflowRunId?: string;
   workflowName?: string;
   stepId?: string;
+  /** Unguessable identity for the currently executing harness invocation.
+   * Large-result receipts bind their lossless side-store bytes to this value,
+   * so a reused SDK call id can never reuse an older tool result as evidence. */
+  settlementNonce?: string;
 }
 
 export const toolOutputContextStorage = new AsyncLocalStorage<ToolOutputContext>();
@@ -21,7 +25,12 @@ export function withToolOutputContext<T>(
   context: ToolOutputContext,
   work: () => T | Promise<T>,
 ): T | Promise<T> {
-  return toolOutputContextStorage.run(context, work);
+  const inheritedNonce = context.settlementNonce
+    ?? toolOutputContextStorage.getStore()?.settlementNonce;
+  return toolOutputContextStorage.run(
+    inheritedNonce ? { ...context, settlementNonce: inheritedNonce } : context,
+    work,
+  );
 }
 
 export function getToolOutputContext(): ToolOutputContext | undefined {

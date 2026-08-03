@@ -20,8 +20,15 @@ const {
   resetEventLog,
   createSession,
   getToolOutput,
+  getToolOutputForInvocation,
+  writeToolOutput,
 } = await import('./eventlog.js');
-const { formatRecallableToolText, extractResourceIdIndex, densifyMarkdownForModelHead } = await import('./tool-output-format.js');
+const {
+  formatRecallableToolText,
+  extractResourceIdIndex,
+  densifyMarkdownForModelHead,
+  exactToolOutputForInvocation,
+} = await import('./tool-output-format.js');
 const { withToolOutputContext } = await import('./tool-output-context.js');
 const { textResult } = await import('../../tools/shared.js');
 
@@ -52,6 +59,72 @@ test('formatRecallableToolText stores full output and returns canonical recall s
   const row = getToolOutput(sess.id, 'call_global_clip');
   assert.ok(row);
   assert.equal(row.output, full);
+});
+
+test('an exact output receipt remains valid when trusted provider annotations follow it', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const nonce = '11111111-1111-4111-8111-111111111111';
+  const full = JSON.stringify({ successful: true, data: { id: 'doc-1', body: 'x'.repeat(20_000) } });
+  const compact = withToolOutputContext({
+    sessionId: sess.id,
+    callId: 'call-with-trailing-banner',
+    toolName: 'composio_execute_tool',
+    settlementNonce: nonce,
+  }, () => formatRecallableToolText(full, { maxChars: 200 }));
+  const productionShape = `${compact}\n\n[sender-verified]\n[routed-to: Google Docs]\nConstraints: read back the exact id.`;
+
+  assert.equal(exactToolOutputForInvocation({
+    sessionId: sess.id,
+    callId: 'call-with-trailing-banner',
+    toolName: 'composio_execute_tool',
+    compactResult: productionShape,
+    settlementNonce: nonce,
+  }), full);
+});
+
+test('exact invocation resolution ignores stale larger call-id output and nonce-less rewrites', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const nonce = '22222222-2222-4222-8222-222222222222';
+  const stale = JSON.stringify({ successful: true, data: { id: 'stale', body: 's'.repeat(30_000) } });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'reused-format-call',
+    invocationNonce: '11111111-1111-4111-8111-111111111111',
+    tool: 'composio_execute_tool',
+    output: stale,
+  });
+  const interim = JSON.stringify({ successful: true, data: { id: 'current', body: 'i'.repeat(22_000) } });
+  const final = JSON.stringify({ successful: true, data: { id: 'current', body: 'f'.repeat(14_000) } });
+  withToolOutputContext({
+    sessionId: sess.id,
+    callId: 'reused-format-call',
+    toolName: 'composio_execute_tool',
+    settlementNonce: nonce,
+  }, () => formatRecallableToolText(interim, { maxChars: 200 }));
+  const compactFinal = withToolOutputContext({
+    sessionId: sess.id,
+    callId: 'reused-format-call',
+    toolName: 'composio_execute_tool',
+    settlementNonce: nonce,
+  }, () => formatRecallableToolText(final, { maxChars: 200 }));
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'reused-format-call',
+    tool: 'composio_execute_tool',
+    output: 'later hook output without an invocation nonce',
+  });
+
+  assert.equal(getToolOutput(sess.id, 'reused-format-call')?.output, stale, 'canonical recall is still longest');
+  assert.equal(getToolOutputForInvocation(sess.id, 'reused-format-call', nonce)?.output, final);
+  assert.equal(exactToolOutputForInvocation({
+    sessionId: sess.id,
+    callId: 'reused-format-call',
+    toolName: 'composio_execute_tool',
+    compactResult: compactFinal,
+    settlementNonce: nonce,
+  }), final);
 });
 
 test('clip footer reports the TRUE record count + that recall returns ALL (acme 44→4 fix)', () => {

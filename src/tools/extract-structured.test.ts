@@ -17,6 +17,8 @@ import assert from 'node:assert/strict';
 
 const { registerExtractStructuredTools, focusSource } = await import('./extract-structured-tools.js');
 const { rememberToolSchema, resetToolSchemaCache } = await import('./composio-schema-cache.js');
+const { createSession, writeToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('../runtime/harness/eventlog.js');
+const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 
 test.after(() => rmSync(TMP, { recursive: true, force: true }));
 afterEach(() => resetToolSchemaCache());
@@ -67,6 +69,32 @@ test('a source that genuinely lacks the field FAILS HONESTLY — never invented'
   assert.match(out, /^ERROR:/);
   assert.match(out, /missing required field.*email/);
   assert.match(out, /NEVER invent/, 'the corrective forbids fabrication');
+});
+
+test('a >2MB exact source fails closed before extraction can validate an incomplete prefix', async () => {
+  let extractorCalls = 0;
+  const handler = capture(async () => {
+    extractorCalls += 1;
+    return '{"name":"Amy Chen","email":"amy@firm.example"}';
+  });
+  const sess = createSession({ kind: 'chat' });
+  const source = `Name: Amy Chen\n${'ordinary filler words\n'.repeat(110_000)}Email: amy@firm.example\n`;
+  assert.ok(Buffer.byteLength(source) > TOOL_OUTPUT_MAX_BYTES, 'fixture must cross the durable output cap');
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_truncated_extraction_source',
+    tool: 'provider_read_document',
+    output: source,
+    invocationNonce: 'nonce-truncated-extraction-source',
+  });
+
+  const out = textOf(await withToolOutputContext({ sessionId: sess.id }, () =>
+    handler({ schema: CONTACT_SCHEMA, call_id: 'call_truncated_extraction_source' })));
+  assert.match(out, /^ERROR:/);
+  assert.match(out, /incomplete/);
+  assert.match(out, /will not validate an object from a prefix/);
+  assert.match(out, /Re-read\/page|stage the full result/);
+  assert.equal(extractorCalls, 0, 'the model extractor must never see known-incomplete authority bytes');
 });
 
 test('fenced/prose-wrapped model output is JSON-repaired instead of failing', async () => {

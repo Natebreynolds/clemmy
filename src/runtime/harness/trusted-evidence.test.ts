@@ -17,8 +17,16 @@ const { gatherTrustedEvidence } = await import('./trusted-evidence.js');
 const S = 'sess-trusted-evidence';
 
 function addToolOutput(callId: string, tool: string, effect: string, output: string): void {
-  writeToolOutput({ sessionId: S, callId, tool, output });
-  appendEvent({ sessionId: S, turn: 1, role: 'system', type: 'tool_returned', data: { tool, callId, effect, result: 'ok' } });
+  const called = appendEvent({ sessionId: S, turn: 1, role: 'system', type: 'tool_called', data: { tool, callId, effect } });
+  writeToolOutput({ sessionId: S, callId, invocationNonce: `nonce-${callId}`, tool, output });
+  appendEvent({
+    sessionId: S,
+    turn: 1,
+    role: 'system',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool, callId, effect, result: 'ok' },
+  });
 }
 
 before(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
@@ -53,4 +61,29 @@ test('carries effect + tool metadata so field checks can reason about each sourc
   assert.equal(src?.effect, 'read');
   assert.equal(src?.kind, 'tool');
   assert.match(src?.text ?? '', /a@x\.co/);
+});
+
+test('reused call id contributes zero authority instead of its stale longest output', () => {
+  addToolOutput('call_reused', 'salesforce_query', 'read', 'Old roster: alice@example.com, bob@example.com');
+  const later = appendEvent({
+    sessionId: S,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: 'salesforce_query', callId: 'call_reused', effect: 'read' },
+  });
+  appendEvent({
+    sessionId: S,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: later.id,
+    data: { tool: 'salesforce_query', callId: 'call_reused', effect: 'read', result: 'FAILED: provider unavailable' },
+  });
+
+  assert.equal(
+    gatherTrustedEvidence(S).some((source) => source.id === 'call_reused'),
+    false,
+    'the old canonical roster cannot authorize a later send after id reuse',
+  );
 });

@@ -1,4 +1,5 @@
-import { writeToolOutput } from './eventlog.js';
+import { createHash } from 'node:crypto';
+import { getToolOutputForInvocation, writeToolOutput } from './eventlog.js';
 import { getToolOutputContext } from './tool-output-context.js';
 import { digestToolOutput } from './tool-output-digest.js';
 
@@ -14,6 +15,58 @@ export interface RecallableToolTextOptions {
   toolName?: string | null;
   sessionId?: string;
   callId?: string;
+}
+
+const EXACT_OUTPUT_RECEIPT_RE = /\[exact-output-receipt:v1 nonce=([0-9a-f-]{36}) sha256=([0-9a-f]{64})\]/ig;
+
+function exactOutputSha256(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+/** Verify that the compact result returned by THIS invocation names the exact
+ * bytes in the lossless store. The nonce is minted outside provider code and
+ * inherited through nested tool-output contexts; call ids alone are reusable. */
+export function compactResultProvesExactToolOutput(
+  compactResult: unknown,
+  exactOutput: string,
+  expectedNonce: string | undefined,
+): boolean {
+  if (!expectedNonce || typeof compactResult !== 'string') return false;
+  const expectedHash = exactOutputSha256(exactOutput);
+  return [...compactResult.matchAll(EXACT_OUTPUT_RECEIPT_RE)].some((match) =>
+    match[1] === expectedNonce && match[2]?.toLowerCase() === expectedHash);
+}
+
+/** Resolve model-facing compact output back to the exact bytes parked by this
+ * SAME invocation. Tool + nonce + hash must all agree; otherwise the compact
+ * value is returned unchanged and downstream evidence stays conservative. */
+export function exactToolOutputForInvocation(input: {
+  sessionId: string | undefined;
+  callId: string | undefined;
+  toolName: string;
+  compactResult: unknown;
+  settlementNonce: string | undefined;
+}): unknown {
+  if (!input.sessionId || !input.callId || !input.settlementNonce) return input.compactResult;
+  try {
+    const stored = getToolOutputForInvocation(
+      input.sessionId,
+      input.callId,
+      input.settlementNonce,
+    );
+    if (
+      stored
+      && stored.tool === input.toolName
+      && !stored.truncatedAtWrite
+      && stored.output.trim()
+      && compactResultProvesExactToolOutput(
+        input.compactResult,
+        stored.output,
+        input.settlementNonce,
+      )
+    ) return stored.output;
+  } catch { /* compact result remains the fail-closed fallback */ }
+  return input.compactResult;
 }
 
 export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS): string {
@@ -120,6 +173,26 @@ export function formatRecallableToolText(
   options: RecallableToolTextOptions = {},
 ): string {
   const maxChars = options.maxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS;
+  const active = getToolOutputContext();
+  const sessionId = options.sessionId ?? active?.sessionId;
+  const callId = options.callId ?? active?.callId;
+  const toolName = options.toolName ?? active?.toolName ?? 'tool';
+  let persistenceFailed = false;
+
+  // Persist even a small result when an exact harness invocation exists.
+  // Reconciliation must never fall back to the call-id/longest-wins recall row
+  // merely because the model-facing value did not need clipping.
+  if (sessionId && callId) {
+    try {
+      writeToolOutput({
+        sessionId,
+        callId,
+        tool: toolName,
+        output: text,
+        invocationNonce: active?.settlementNonce,
+      });
+    } catch { persistenceFailed = true; }
+  }
   if (text.length <= maxChars) return text;
 
   // The result is about to be clipped/digested. If it lists addressable
@@ -128,24 +201,8 @@ export function formatRecallableToolText(
   const idIndex = extractResourceIdIndex(text);
   const withIndex = (body: string): string => (idIndex ? `${idIndex}\n\n${body}` : body);
 
-  const active = getToolOutputContext();
-  const sessionId = options.sessionId ?? active?.sessionId;
-  const callId = options.callId ?? active?.callId;
-  const toolName = options.toolName ?? active?.toolName ?? 'tool';
-
-  if (!sessionId || !callId) {
+  if (!sessionId || !callId || persistenceFailed) {
     return withIndex(truncateToolText(densifyMarkdownForModelHead(text), maxChars));
-  }
-
-  try {
-    writeToolOutput({
-      sessionId,
-      callId,
-      tool: toolName,
-      output: text,
-    });
-  } catch {
-    return withIndex(truncateToolText(text, maxChars));
   }
 
   // Full payload is now parked in tool_outputs (above). Replace the raw
@@ -155,5 +212,9 @@ export function formatRecallableToolText(
   // The head is computed from the DENSIFIED view for scrape-shaped payloads
   // (raw storage above is untouched) so the clipped budget carries content,
   // not image links and nav junk.
-  return withIndex(digestToolOutput(densifyMarkdownForModelHead(text), { maxChars, toolName, callId }));
+  const compact = withIndex(digestToolOutput(densifyMarkdownForModelHead(text), { maxChars, toolName, callId }));
+  const settlementNonce = active?.settlementNonce;
+  return settlementNonce
+    ? `${compact}\n[exact-output-receipt:v1 nonce=${settlementNonce} sha256=${exactOutputSha256(text)}]`
+    : compact;
 }

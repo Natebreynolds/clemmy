@@ -1,4 +1,4 @@
-import { listEvents, recentToolOutputs } from './eventlog.js';
+import { listEvents, recentToolOutputs, resolveToolOutputsForAuthority } from './eventlog.js';
 
 /**
  * The ONE shared trusted-evidence ledger for a session.
@@ -56,26 +56,15 @@ export function gatherTrustedEvidence(
     if (text.length > 0) sources.push({ id: `user:${event.seq}`, tool: null, effect: null, text, kind: 'user' });
   }
 
-  // Join tool_outputs (content) with tool_returned (effect + tool) on call_id.
-  const returnsByCall = new Map<string, { effect?: string; tool?: string | null }>();
-  for (const event of events) {
-    if (event.type !== 'tool_returned') continue;
-    const callId = typeof event.data.callId === 'string' ? event.data.callId : '';
-    if (!callId) continue;
-    returnsByCall.set(callId, {
-      effect: typeof event.data.effect === 'string' ? event.data.effect : undefined,
-      tool: typeof event.data.tool === 'string' ? event.data.tool : null,
-    });
-  }
-  for (const output of recentToolOutputs(sessionId, { limit: toolOutputLimit })) {
-    const meta = returnsByCall.get(output.callId);
-    const tool = output.tool ?? meta?.tool ?? null;
+  // Search/recall rows are presentation state: a reused SDK call id keeps its
+  // longest (possibly stale) bytes there. Re-resolve each candidate against the
+  // exact parented read/compute lifecycle before it can source a later field.
+  const candidates = recentToolOutputs(sessionId, { limit: toolOutputLimit });
+  for (const output of resolveToolOutputsForAuthority(sessionId, candidates, { readOrComputeOnly: true })) {
+    const tool = output.tool;
     if (ECHO_TOOL_RE.test(tool ?? '')) continue;
-    // A write/send output is a confirmation of a payload, not authority FOR it.
-    // Legacy rows without effect metadata stay eligible unless echo-named above.
-    if (meta?.effect && meta.effect !== 'read' && meta.effect !== 'compute') continue;
     if (typeof output.output === 'string' && output.output.length > 0) {
-      sources.push({ id: output.callId, tool, effect: meta?.effect ?? null, text: output.output, kind: 'tool' });
+      sources.push({ id: output.callId, tool, effect: output.effect, text: output.output, kind: 'tool' });
     }
   }
   return sources;

@@ -37,6 +37,9 @@ const {
   countMatchingEvents,
   writeToolOutput,
   getToolOutput,
+  getToolOutputForInvocation,
+  resolveToolOutputForAuthority,
+  resolveToolOutputsForAuthority,
   TOOL_OUTPUT_MAX_BYTES,
   getLatestEventSeq,
   requestKill,
@@ -62,6 +65,7 @@ const {
   acceptUserInputForRun,
   recordRunAttemptUserInput,
   reapStaleSessions,
+  reapStaleToolOutputs,
   openEventLog,
   HARNESS_DB_PATH,
 } = await import('./eventlog.js');
@@ -115,7 +119,7 @@ test('latest schema upgrades an existing v4 approval table without losing rows',
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    17, // v17: one public terminal per accepted user source
+    20, // v20: indexed exact-authority lifecycle lookup
   );
   resetEventLog();
 });
@@ -159,7 +163,7 @@ test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => 
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    17, // v17: one public terminal per accepted user source
+    20, // v20: indexed exact-authority lifecycle lookup
   );
   resetEventLog();
 });
@@ -251,6 +255,7 @@ test('fresh schema v12 creates artifact truth and pre-ack cancellation tables ea
     'artifact_run_scopes',
     'artifact_source_roots',
     'harness_chat_request_cancellations',
+    'tool_output_invocations',
   ]) assert.ok(tables.has(name), `${name} exists before the first turn`);
   const columns = new Set(
     (db.prepare('PRAGMA table_info(run_artifacts)').all() as Array<{ name: string }>).map((row) => row.name),
@@ -260,10 +265,21 @@ test('fresh schema v12 creates artifact truth and pre-ack cancellation tables ea
     'verification_call_id',
     'verification_shape',
     'verification_fingerprint',
+    'external_write_event_id',
+    'external_write_action_key',
+    'external_write_tool_name',
   ]) assert.ok(columns.has(name), name);
+  const indexes = new Set(
+    (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  );
+  assert.ok(
+    indexes.has('idx_events_external_write_settlement_key'),
+    'fresh schema enforces one successful settlement per exact reservation',
+  );
   assert.equal(
     (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    17, // v17: one public terminal per accepted user source
+    20, // v20: indexed exact-authority lifecycle lookup
   );
   resetEventLog();
 });
@@ -330,7 +346,54 @@ test('schema v12 upgrades a lazy artifact ledger in place and preserves its earl
   assert.equal(root.root_scope_id, 'root-first');
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    17, // v17: one public terminal per accepted user source
+    20, // v20: indexed exact-authority lifecycle lookup
+  );
+  resetEventLog();
+});
+
+test('schema v19 upgrades a live-like v18 database with invocation-scoped output evidence', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (18, '2026-08-02T00:00:00.000Z');
+    CREATE TABLE sessions (id TEXT PRIMARY KEY);
+    INSERT INTO sessions (id) VALUES ('sess-live-v18');
+    CREATE TABLE tool_outputs (
+      session_id TEXT NOT NULL,
+      call_id TEXT NOT NULL,
+      tool TEXT,
+      output_full TEXT NOT NULL,
+      content_bytes INTEGER NOT NULL,
+      truncated_at_write INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (session_id, call_id)
+    );
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  const tables = new Set(
+    (migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  );
+  assert.ok(tables.has('tool_output_invocations'));
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    20,
+  );
+  writeToolOutput({
+    sessionId: 'sess-live-v18',
+    callId: 'call-live-v18',
+    invocationNonce: 'nonce-live-v18',
+    tool: 'composio_execute_tool',
+    output: 'exact live output',
+  });
+  assert.equal(
+    getToolOutputForInvocation('sess-live-v18', 'call-live-v18', 'nonce-live-v18')?.output,
+    'exact live output',
   );
   resetEventLog();
 });
@@ -1296,6 +1359,204 @@ test('writeToolOutput preserves an existing larger payload for the same call id'
   assert.equal(row.contentBytes, Buffer.byteLength(full, 'utf8'));
 });
 
+test('invocation-scoped output is isolated from reused call ids and nonce-less hook writes', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const staleLarge = 'stale-large-'.repeat(2_000);
+  const currentFinal = 'current final response';
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'sdk-reused',
+    invocationNonce: 'nonce-stale',
+    tool: 'composio_execute_tool',
+    output: staleLarge,
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'sdk-reused',
+    invocationNonce: 'nonce-current',
+    tool: 'composio_execute_tool',
+    output: 'current interim response that is longer',
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'sdk-reused',
+    invocationNonce: 'nonce-current',
+    tool: 'composio_execute_tool',
+    output: currentFinal,
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'sdk-reused',
+    tool: 'composio_execute_tool',
+    output: 'later nonce-less compact hook',
+  });
+
+  assert.equal(getToolOutput(sess.id, 'sdk-reused')?.output, staleLarge, 'legacy recall keeps longest');
+  assert.equal(
+    getToolOutputForInvocation(sess.id, 'sdk-reused', 'nonce-stale')?.output,
+    staleLarge,
+  );
+  assert.equal(
+    getToolOutputForInvocation(sess.id, 'sdk-reused', 'nonce-current')?.output,
+    currentFinal,
+    'the final write for the exact invocation wins even when it is shorter',
+  );
+});
+
+test('authority fallback admits one provable legacy read occurrence', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const called = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'executor',
+    type: 'tool_called',
+    data: { callId: 'legacy-read', tool: 'query_workspace_artifact', effect: 'read' },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'legacy-read',
+    tool: 'query_workspace_artifact',
+    output: 'one durable legacy result',
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'executor',
+    type: 'tool_returned',
+    data: { callId: 'legacy-read', tool: 'query_workspace_artifact', effect: 'read' },
+    parentEventId: called.id,
+  });
+
+  const resolution = resolveToolOutputForAuthority(sess.id, 'legacy-read');
+  assert.equal(resolution.status, 'ok');
+  if (resolution.status !== 'ok') assert.fail('expected one legacy occurrence to resolve');
+  assert.equal(resolution.source, 'legacy');
+  assert.equal(resolution.record.output, 'one durable legacy result');
+});
+
+test('authority fallback rejects reused zero-v19 call ids instead of selecting stale longest bytes', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stale = 'stale legacy output '.repeat(100);
+  for (const [ordinal, output] of [stale, 'current compact output'].entries()) {
+    const called = appendEvent({
+      sessionId: sess.id,
+      turn: ordinal + 1,
+      role: 'executor',
+      type: 'tool_called',
+      data: { callId: 'legacy-reused', tool: 'query_workspace_artifact', effect: 'read' },
+    });
+    writeToolOutput({
+      sessionId: sess.id,
+      callId: 'legacy-reused',
+      tool: 'query_workspace_artifact',
+      output,
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn: ordinal + 1,
+      role: 'executor',
+      type: 'tool_returned',
+      data: { callId: 'legacy-reused', tool: 'query_workspace_artifact', effect: 'read' },
+      parentEventId: called.id,
+    });
+  }
+
+  assert.equal(getToolOutput(sess.id, 'legacy-reused')?.output, stale, 'legacy recall remains longest-wins');
+  const resolution = resolveToolOutputForAuthority(sess.id, 'legacy-reused');
+  assert.equal(resolution.status, 'ambiguous');
+  if (resolution.status !== 'ambiguous') assert.fail('expected reused legacy id to fail closed');
+  assert.equal(resolution.invocationCount, 2);
+});
+
+test('authority resolution rejects a lone nonce row when durable events prove later id reuse', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const first = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'executor',
+    type: 'tool_called',
+    data: { callId: 'mixed-reused', tool: 'query_workspace_artifact', effect: 'read' },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'mixed-reused',
+    invocationNonce: 'nonce-first',
+    tool: 'query_workspace_artifact',
+    output: 'stale nonce-backed result',
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'executor',
+    type: 'tool_returned',
+    data: { callId: 'mixed-reused', tool: 'query_workspace_artifact', effect: 'read' },
+    parentEventId: first.id,
+  });
+  const second = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'executor',
+    type: 'tool_called',
+    data: { callId: 'mixed-reused', tool: 'query_workspace_artifact', effect: 'read' },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'mixed-reused',
+    tool: 'query_workspace_artifact',
+    output: 'current hook-only result',
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'executor',
+    type: 'tool_returned',
+    data: { callId: 'mixed-reused', tool: 'query_workspace_artifact', effect: 'read' },
+    parentEventId: second.id,
+  });
+
+  const resolution = resolveToolOutputForAuthority(sess.id, 'mixed-reused');
+  assert.equal(resolution.status, 'ambiguous');
+  if (resolution.status !== 'ambiguous') assert.fail('expected mixed reused id to fail closed');
+  assert.equal(resolution.invocationCount, 2);
+  assert.deepEqual(
+    resolveToolOutputsForAuthority(sess.id, [{ callId: 'mixed-reused' }], { readOrComputeOnly: true }),
+    [],
+    'bulk authority retrieval drops the ambiguous presentation row',
+  );
+});
+
+test('authority fallback never promotes legacy external-write output', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const called = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'executor',
+    type: 'tool_called',
+    data: { callId: 'legacy-write', tool: 'provider_create', effect: 'external_write' },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'legacy-write',
+    tool: 'provider_create',
+    output: '{"created":true}',
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'executor',
+    type: 'tool_returned',
+    data: { callId: 'legacy-write', tool: 'provider_create', effect: 'external_write' },
+    parentEventId: called.id,
+  });
+
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'legacy-write').status, 'ambiguous');
+});
+
 test('writeToolOutput stores a 300KB result in FULL (was tail-dropped under the old 200KB cap)', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -1319,6 +1580,57 @@ test('writeToolOutput still tail-truncates + marks beyond the cap (backstop)', (
   assert.equal(row.truncatedAtWrite, true, 'overflow is marked');
   assert.equal(row.contentBytes, TOOL_OUTPUT_MAX_BYTES + overBy, 'original byte count preserved for the header');
   assert.equal(row.output.length, TOOL_OUTPUT_MAX_BYTES, 'stored body clamped to the cap');
+});
+
+test('reapStaleToolOutputs bounds exact rows while preserving an uncompensated write', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  for (const callId of ['settled-write', 'unresolved-write']) {
+    writeToolOutput({
+      sessionId: sess.id,
+      callId,
+      invocationNonce: `nonce-${callId}`,
+      tool: 'provider_create',
+      output: JSON.stringify({ callId, ok: true }),
+    });
+    const reservation = appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'system',
+      type: 'external_write',
+      data: { callId, toolName: 'provider_create', shapeKey: 'CREATE', irreversible: true },
+    });
+    if (callId === 'settled-write') {
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'system',
+        type: 'external_write_failed',
+        parentEventId: reservation.id,
+        data: { callId, toolName: 'provider_create', dispatch: 'not_started', effect: 'none' },
+      });
+    }
+  }
+  const db = openEventLog();
+  db.prepare(`UPDATE tool_outputs SET created_at = '2020-01-01T00:00:00.000Z'`).run();
+  db.prepare(`UPDATE tool_output_invocations SET created_at = '2020-01-01T00:00:00.000Z'`).run();
+
+  assert.equal(reapStaleToolOutputs(1), 3, 'two canonical rows and one settled exact row are reaped');
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM tool_outputs').get() as { n: number }).n, 0);
+  assert.deepEqual(
+    db.prepare('SELECT call_id FROM tool_output_invocations').all(),
+    [{ call_id: 'unresolved-write' }],
+    'uncertain write evidence survives until its reservation is compensated',
+  );
+});
+
+test('schema v20 installs the indexed tool-lifecycle lookup used on long sessions', () => {
+  resetEventLog();
+  const indexes = new Set(
+    (openEventLog().prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  );
+  assert.ok(indexes.has('idx_events_tool_lifecycle_call'));
 });
 
 // Destructive-store guard (2026-07-23): the live home's harness.db was found

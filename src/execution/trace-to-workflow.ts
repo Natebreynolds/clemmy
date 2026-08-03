@@ -19,7 +19,7 @@
  * test). The `notes` make those follow-ups explicit so a draft is never
  * mistaken for a finished, trusted workflow.
  */
-import { listEvents, getToolOutput } from '../runtime/harness/eventlog.js';
+import { listEvents, resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
 import {
   pairTransportMirrorToolCalls,
   projectCanonicalTopLevelToolEvents,
@@ -487,7 +487,13 @@ export function readSessionToolReturns(sessionId: string): Map<string, string> {
   for (const call of canonicalCalls) {
     const callId = typeof call.data.callId === 'string' ? call.data.callId : '';
     if (!callId) continue;
-    const parked = getToolOutput(sessionId, callId)?.output ?? '';
+    const resolution = resolveToolOutputForAuthority(sessionId, callId);
+    // A promoted workflow or recovery skill must never learn from whichever
+    // output happened to win a reused call-id slot. Exact ambiguity is a hard
+    // refusal; a genuinely missing side-store row may still use its bounded
+    // canonical event preview below for legacy traces.
+    if (resolution.status === 'ambiguous') continue;
+    const parked = resolution.status === 'ok' ? resolution.record.output : '';
     const canonicalReturn = canonicalReturns.get(callId);
     const mirrorReturn = allReturns.get(pairs.canonicalToMirrorCallId.get(callId) ?? '');
     const result = parked || eventText(canonicalReturn) || eventText(mirrorReturn);

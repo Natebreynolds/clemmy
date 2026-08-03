@@ -71,7 +71,7 @@ test('synthetic fan-out: failing items are counted failed, siblings done, run re
     const callId = `call_w${i}`;
     const item = `Firm ${i}`;
     stub.emit('agent_tool_start', ctx(runSessionId), { name: 'orchestrator' }, { name: 'run_worker' },
-      { toolCall: { callId, arguments: JSON.stringify({ item, objective: 'enrich', resolvedTools: 'x', context: 'x', instructions: 'x', expectedOutput: 'x' }) } });
+      { toolCall: { callId, arguments: JSON.stringify({ item, objective: 'enrich', resolvedTools: 'x', externalMcpToolNames: null, context: 'x', instructions: 'x', expectedOutput: 'x' }) } });
 
     let raw: string;
     if (failedIds.has(i)) raw = `ERROR: ${item} had no contact email on file`;

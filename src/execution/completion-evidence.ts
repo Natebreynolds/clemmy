@@ -2,6 +2,7 @@ import type { ExecutionRecord } from '../types.js';
 import {
   getToolOutput,
   listEvents,
+  resolveToolOutputForAuthority,
   type EventRow,
   type ListEventsOptions,
 } from '../runtime/harness/eventlog.js';
@@ -33,6 +34,7 @@ export interface ExecutionToolEvidenceDeps {
     sessionId: string,
     callId: string,
   ) => { output: string; tool?: string | null } | null;
+  resolveToolOutputForAuthorityFn?: typeof resolveToolOutputForAuthority;
 }
 
 interface CompletionReceipt {
@@ -137,6 +139,11 @@ export function recentExecutionToolEvidence(
   if (!execution.sessionId) return '';
   const list = deps.listEventsFn ?? listEvents;
   const getOutput = deps.getToolOutputFn ?? getToolOutput;
+  // Unit callers that inject the old output reader retain their isolated
+  // fixture behavior. Production authority always goes through the exact
+  // invocation resolver, which refuses a reused/ambiguous SDK call id.
+  const resolveOutput = deps.resolveToolOutputForAuthorityFn
+    ?? (deps.getToolOutputFn ? null : resolveToolOutputForAuthority);
   let events: EventRow[];
   try {
     events = list(execution.sessionId, {
@@ -171,7 +178,13 @@ export function recentExecutionToolEvidence(
 
     let rawOutput = '';
     try {
-      rawOutput = getOutput(execution.sessionId, callId)?.output ?? '';
+      if (resolveOutput) {
+        const resolution = resolveOutput(execution.sessionId, callId);
+        if (resolution.status === 'ambiguous') continue;
+        rawOutput = resolution.status === 'ok' ? resolution.record.output : '';
+      } else {
+        rawOutput = getOutput(execution.sessionId, callId)?.output ?? '';
+      }
     } catch {
       // The durable full-output side store is best effort; event previews are
       // sufficient fallback evidence when it is unavailable.

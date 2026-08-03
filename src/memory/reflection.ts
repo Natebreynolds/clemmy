@@ -910,7 +910,7 @@ export async function replayFailedReflections(
     session_id: string; call_id: string; attempts: number; status: 'failed' | 'processing';
   }>;
   if (rows.length === 0) return summary;
-  const { getToolOutput } = await import('../runtime/harness/eventlog.js');
+  const { resolveToolOutputForAuthority } = await import('../runtime/harness/eventlog.js');
   for (const row of rows) {
     summary.scanned += 1;
     if (row.attempts >= REFLECTION_REPLAY_MAX_ATTEMPTS) {
@@ -923,8 +923,13 @@ export async function replayFailedReflections(
     }
     let raw: { output: string; tool: string | null } | null = null;
     let eventlogUnavailable = false;
+    let rawUnavailableReason: 'raw_expired' | 'raw_ambiguous' = 'raw_expired';
     try {
-      raw = getToolOutput(row.session_id, row.call_id) as { output: string; tool: string | null } | null;
+      const authority = resolveToolOutputForAuthority(row.session_id, row.call_id);
+      raw = authority.status === 'ok'
+        ? { output: authority.record.output, tool: authority.record.tool }
+        : null;
+      if (authority.status === 'ambiguous') rawUnavailableReason = 'raw_ambiguous';
     } catch {
       // A transient event-log read failure is not proof that the TTL expired.
       // Leave the receipt untouched so the next bounded maintenance pass can
@@ -937,9 +942,9 @@ export async function replayFailedReflections(
       // learn from. Terminalize so the drain stops re-scanning it.
       db.prepare(`
         UPDATE memory_reflection_receipts
-        SET status = 'failed', attempts = ?, last_error = 'raw_expired'
+        SET status = 'failed', attempts = ?, last_error = ?
         WHERE session_id = ? AND call_id = ? AND status IN ('failed','processing')
-      `).run(REFLECTION_REPLAY_MAX_ATTEMPTS, row.session_id, row.call_id);
+      `).run(REFLECTION_REPLAY_MAX_ATTEMPTS, rawUnavailableReason, row.session_id, row.call_id);
       summary.rawGone += 1;
       continue;
     }

@@ -8,7 +8,7 @@ import {
   type MemoryEpisodeStatus,
   type MemoryPolicyRow,
 } from './db.js';
-import { getToolOutput } from '../runtime/harness/eventlog.js';
+import { resolveToolOutputForAuthority, type ToolOutputRecord } from '../runtime/harness/eventlog.js';
 import { classifyConstraintEnforcement } from './policy-enforcement.js';
 
 const MAX_EVIDENCE_CHARS = 2_000;
@@ -253,8 +253,14 @@ export function captureFactEvidence(input: {
     ?? existingSourceUri
     ?? (input.sessionId && input.callId ? `tool://${input.sessionId}/${input.callId}` : null);
   if (input.sessionId && input.callId) {
-    let stored: ReturnType<typeof getToolOutput> = null;
-    try { stored = getToolOutput(input.sessionId, input.callId); } catch { /* harness DB unavailable */ }
+    let stored: ToolOutputRecord | null = null;
+    try {
+      const authority = resolveToolOutputForAuthority(input.sessionId, input.callId);
+      if (
+        authority.status === 'ok'
+        && (authority.effect === 'read' || authority.effect === 'compute')
+      ) stored = authority.record;
+    } catch { /* harness DB unavailable */ }
     const excerpt = stored ? selectSupportingExcerpt(stored.output, input.factContent) : '';
     const episode = recordMemoryEpisode({
       kind: 'tool_result',
