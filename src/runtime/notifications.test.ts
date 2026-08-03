@@ -202,7 +202,7 @@ test('loadNotifications: corrupted JSON is quarantined and surfaced via actionBu
     (e) => e.kind === 'notification.created' && e.notification?.kind === 'system',
   );
   assert.ok(corruptionEvent, `expected a system notification.created event, got: ${JSON.stringify(events)}`);
-  assert.match(String(corruptionEvent.notification?.title ?? ''), /corrupt/i);
+  assert.match(String(corruptionEvent.notification?.title ?? ''), /recover/i);
 });
 
 test('loadNotifications: after corruption recovery, addNotification works again', () => {
