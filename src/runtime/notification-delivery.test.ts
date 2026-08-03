@@ -1,8 +1,22 @@
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import type { WebClient } from '@slack/web-api';
 
-import type { NotificationDestination, NotificationRecord } from './notifications.js';
-import { notificationDeliveryInternalsForTest } from './notification-delivery.js';
+import {
+  exactOriginDeliveryMetadata,
+  exactOriginDeliveryReceiptForTarget,
+  type NotificationDestination,
+  type NotificationRecord,
+} from './notifications.js';
+import {
+  _setNotificationDeliverySendersForTests,
+  deliverNotificationToDestination,
+  notificationDeliveryInternalsForTest,
+} from './notification-delivery.js';
+import {
+  _setSlackOutboundClientForTests,
+  slackDeliveryInternalsForTest,
+} from '../channels/slack.js';
 
 function notification(patch: Partial<NotificationRecord>): NotificationRecord {
   return {
@@ -16,6 +30,68 @@ function notification(patch: Partial<NotificationRecord>): NotificationRecord {
     silent: patch.silent,
   };
 }
+
+type ObservedSlackMessage = {
+  ts?: string;
+  thread_ts?: string;
+  metadata?: {
+    event_type?: string;
+    event_payload?: Record<string, unknown>;
+  };
+};
+
+function fakeSlackClient(input: {
+  historyMessages?: ObservedSlackMessage[];
+  repliesMessages?: ObservedSlackMessage[];
+  historyError?: Error;
+  repliesError?: Error;
+  dmChannelId?: string;
+} = {}) {
+  const posts: Array<Record<string, unknown>> = [];
+  const historyCalls: Array<Record<string, unknown>> = [];
+  const repliesCalls: Array<Record<string, unknown>> = [];
+  const openCalls: Array<Record<string, unknown>> = [];
+  const historyMessages = [...(input.historyMessages ?? [])];
+  const repliesMessages = [...(input.repliesMessages ?? [])];
+  const client = {
+    chat: {
+      postMessage: async (args: Record<string, unknown>) => {
+        posts.push(args);
+        return { ok: true, ts: '1900000000.000001' };
+      },
+    },
+    conversations: {
+      history: async (args: Record<string, unknown>) => {
+        historyCalls.push(args);
+        if (input.historyError) throw input.historyError;
+        return { ok: true, messages: historyMessages, response_metadata: { next_cursor: '' } };
+      },
+      replies: async (args: Record<string, unknown>) => {
+        repliesCalls.push(args);
+        if (input.repliesError) throw input.repliesError;
+        return { ok: true, messages: repliesMessages, response_metadata: { next_cursor: '' } };
+      },
+      open: async (args: Record<string, unknown>) => {
+        openCalls.push(args);
+        return { ok: true, channel: { id: input.dmChannelId ?? 'D-EXACT-USER' } };
+      },
+    },
+  } as unknown as WebClient;
+  return {
+    client,
+    posts,
+    historyCalls,
+    repliesCalls,
+    openCalls,
+    historyMessages,
+    repliesMessages,
+  };
+}
+
+afterEach(() => {
+  _setSlackOutboundClientForTests();
+  _setNotificationDeliverySendersForTests();
+});
 
 function customIds(rows: ReturnType<typeof notificationDeliveryInternalsForTest.buildDiscordComponentsForNotification>): string[] {
   if (!rows) return [];
@@ -114,6 +190,72 @@ test('Discord delivery: completed execution updates still deliver as plain text'
   assert.equal(notificationDeliveryInternalsForTest.buildDiscordComponentsForNotification(completed), undefined);
 });
 
+test('exact-origin Discord delivery is body-only and bypasses lifecycle suppression without approval chrome', () => {
+  const exact = notification({
+    kind: 'approval',
+    title: 'Background task queued: this title must not be narrated',
+    body: 'The requested report is ready.',
+    metadata: {
+      ...exactOriginDeliveryMetadata({ type: 'discord_channel', channelId: 'discord-origin-1' }),
+      discordInlineHandled: true,
+      approvalId: 'approval-that-must-not-render',
+    },
+  });
+
+  assert.equal(notificationDeliveryInternalsForTest.shouldDeliverDiscordNotification(exact), true);
+  assert.equal(notificationDeliveryInternalsForTest.buildDiscordBotMessage(exact), exact.body);
+  assert.equal(notificationDeliveryInternalsForTest.buildDiscordComponentsForNotification(exact), undefined);
+  assert.ok(!notificationDeliveryInternalsForTest.buildDiscordBotMessage(exact).includes(exact.title));
+  const nonce = notificationDeliveryInternalsForTest.exactDiscordDeliveryNonce(exact);
+  assert.match(nonce ?? '', /^[a-f0-9]{24}$/);
+  assert.equal(
+    notificationDeliveryInternalsForTest.exactDiscordDeliveryNonce({ ...exact }),
+    nonce,
+    'a retry of the durable notification must reuse the provider nonce',
+  );
+  assert.notEqual(
+    notificationDeliveryInternalsForTest.exactDiscordDeliveryNonce({ ...exact, id: `${exact.id}-other` }),
+    nonce,
+  );
+});
+
+test('exact-origin Slack delivery is body-only and has no approval blocks', () => {
+  const exact = notification({
+    kind: 'approval',
+    title: 'Internal lifecycle wrapper',
+    body: 'Here is the answer you requested.',
+    metadata: {
+      ...exactOriginDeliveryMetadata({ type: 'slack_user', userId: 'U_EXACT' }),
+      slackInlineHandled: true,
+      approvalId: 'approval-that-must-not-render',
+    },
+  });
+
+  assert.equal(notificationDeliveryInternalsForTest.buildSlackBotMessage(exact), exact.body);
+  assert.equal(notificationDeliveryInternalsForTest.buildSlackBlocksForNotification(exact), undefined);
+  assert.ok(!notificationDeliveryInternalsForTest.buildSlackBotMessage(exact).includes(exact.title));
+});
+
+test('exact-origin send path rejects a destination that does not match admitted authority', async () => {
+  const exact = notification({
+    metadata: {
+      ...exactOriginDeliveryMetadata({ type: 'discord_channel', channelId: 'discord-origin-1' }),
+    },
+  });
+  const wrongDestination: NotificationDestination = {
+    id: 'derived-desktop',
+    name: 'Desktop app',
+    type: 'desktop',
+    enabled: true,
+    createdAt: exact.createdAt,
+  };
+
+  await assert.rejects(
+    () => deliverNotificationToDestination(exact, wrongDestination),
+    /does not match its admitted target/i,
+  );
+});
+
 // ── Slack placement: terminal report-backs to an IM channel post top-level ──
 function slackChannelDest(patch: Partial<NotificationDestination>): NotificationDestination {
   return {
@@ -161,6 +303,228 @@ test('slackThreadForDelivery: no threadTs stays undefined (fresh top-level post)
   const completed = notification({ kind: 'execution', title: 'Background task completed: X' });
   const dest = slackChannelDest({ channelId: 'D0ABC' });
   assert.equal(notificationDeliveryInternalsForTest.slackThreadForDelivery(completed, dest), undefined);
+});
+
+test('exact-origin Slack terminal delivery posts top-level in an IM despite a legacy admitted pane thread', () => {
+  const threadTs = '1700000000.000100';
+  const completed = notification({
+    kind: 'execution',
+    title: 'Background task completed: exact follow-up',
+    metadata: {
+      ...exactOriginDeliveryMetadata({
+        type: 'slack_channel',
+        channelId: 'D0EXACT',
+        threadTs,
+      }),
+    },
+  });
+  const dest = slackChannelDest({ channelId: 'D0EXACT', threadTs });
+
+  assert.equal(notificationDeliveryInternalsForTest.slackThreadForDelivery(completed, dest), undefined);
+});
+
+test('exact-origin Slack terminal delivery retains an admitted real-channel thread', () => {
+  const threadTs = '1700000000.000100';
+  const completed = notification({
+    kind: 'workflow',
+    title: 'Platform 49 review',
+    metadata: {
+      ...exactOriginDeliveryMetadata({
+        type: 'slack_channel',
+        channelId: 'C0EXACT',
+        threadTs,
+      }),
+    },
+  });
+  const dest = slackChannelDest({ channelId: 'C0EXACT', threadTs });
+
+  assert.equal(notificationDeliveryInternalsForTest.slackThreadForDelivery(completed, dest), threadTs);
+});
+
+test('exact Slack channel delivery passes a stable key to the actual sender and suppresses a crash replay', async () => {
+  const target = { type: 'slack_channel' as const, channelId: 'C0DELIVERY' };
+  const receipt = exactOriginDeliveryReceiptForTarget(target);
+  assert.ok(receipt);
+  const exact = notification({
+    id: 'notif-durable-slack-1',
+    kind: 'workflow',
+    title: 'Platform 49 review complete',
+    body: 'Here is what changed since the last run.',
+    createdAt: '2026-08-03T13:26:00.000Z',
+    metadata: { ...exactOriginDeliveryMetadata(target) },
+  });
+  const destination: NotificationDestination = {
+    id: receipt,
+    name: receipt,
+    type: 'slack_channel',
+    channelId: target.channelId,
+    enabled: true,
+    createdAt: exact.createdAt,
+  };
+  const fake = fakeSlackClient();
+  _setSlackOutboundClientForTests(fake.client);
+
+  const identity = notificationDeliveryInternalsForTest.exactSlackDeliveryIdentity(exact);
+  assert.ok(identity);
+  await deliverNotificationToDestination(exact, destination);
+
+  assert.equal(fake.posts.length, 1);
+  assert.deepEqual(fake.posts[0]?.metadata, {
+    event_type: slackDeliveryInternalsForTest.exactDeliveryEventType,
+    event_payload: { delivery_key: identity.key },
+  });
+  assert.deepEqual(fake.historyCalls[0], {
+    channel: target.channelId,
+    oldest: identity.oldestTs,
+    inclusive: true,
+    include_all_metadata: true,
+    limit: 100,
+  });
+
+  // Model the real crash window: Slack accepted the first post, but the local
+  // delivery receipt was never saved. The provider message is now observable.
+  fake.historyMessages.push({
+    ts: '1900000000.000001',
+    metadata: fake.posts[0]?.metadata as ObservedSlackMessage['metadata'],
+  });
+  await deliverNotificationToDestination(exact, destination);
+  assert.equal(fake.posts.length, 1, 'provider observation must reuse success instead of posting twice');
+  assert.equal(fake.historyCalls.length, 2);
+});
+
+test('Slack exact metadata cannot be satisfied by the wrong channel, thread, or key', () => {
+  const key = 'a'.repeat(32);
+  const message: ObservedSlackMessage = {
+    thread_ts: '1700000000.000100',
+    metadata: {
+      event_type: slackDeliveryInternalsForTest.exactDeliveryEventType,
+      event_payload: { delivery_key: key },
+    },
+  };
+  const matches = slackDeliveryInternalsForTest.slackMessageMatchesExactDelivery;
+  const base = {
+    expectedChannelId: 'C0EXPECTED',
+    expectedThreadTs: '1700000000.000100',
+    expectedKey: key,
+    observedChannelId: 'C0EXPECTED',
+    message,
+  };
+
+  assert.equal(matches(base), true);
+  assert.equal(matches({ ...base, observedChannelId: 'C0WRONG' }), false);
+  assert.equal(matches({ ...base, expectedThreadTs: '1700000000.000200' }), false);
+  assert.equal(matches({ ...base, expectedKey: 'b'.repeat(32) }), false);
+  assert.equal(matches({ ...base, expectedThreadTs: undefined }), false, 'a threaded post cannot satisfy top-level delivery');
+});
+
+test('exact Slack delivery fails closed when provider observation is unavailable', async () => {
+  const target = { type: 'slack_channel' as const, channelId: 'C0UNAVAILABLE' };
+  const receipt = exactOriginDeliveryReceiptForTarget(target);
+  assert.ok(receipt);
+  const exact = notification({
+    id: 'notif-slack-observation-unavailable',
+    createdAt: '2026-08-03T13:26:00.000Z',
+    metadata: { ...exactOriginDeliveryMetadata(target) },
+  });
+  const fake = fakeSlackClient({ historyError: new Error('missing conversations:history scope') });
+  _setSlackOutboundClientForTests(fake.client);
+
+  await assert.rejects(
+    () => deliverNotificationToDestination(exact, {
+      id: receipt,
+      name: receipt,
+      type: 'slack_channel',
+      channelId: target.channelId,
+      enabled: true,
+      createdAt: exact.createdAt,
+    }),
+    /observation is unavailable.*duplicate-risk/i,
+  );
+  assert.equal(fake.posts.length, 0);
+});
+
+test('exact Slack user delivery observes the opened DM before posting', async () => {
+  const target = { type: 'slack_user' as const, userId: 'U0EXACT' };
+  const receipt = exactOriginDeliveryReceiptForTarget(target);
+  assert.ok(receipt);
+  const exact = notification({
+    id: 'notif-slack-user-replay',
+    createdAt: '2026-08-03T13:26:00.000Z',
+    metadata: { ...exactOriginDeliveryMetadata(target) },
+  });
+  const identity = notificationDeliveryInternalsForTest.exactSlackDeliveryIdentity(exact);
+  assert.ok(identity);
+  const fake = fakeSlackClient({
+    dmChannelId: 'D0EXACTUSER',
+    historyMessages: [{
+      ts: '1900000000.000001',
+      metadata: {
+        event_type: slackDeliveryInternalsForTest.exactDeliveryEventType,
+        event_payload: { delivery_key: identity.key },
+      },
+    }],
+  });
+  _setSlackOutboundClientForTests(fake.client);
+
+  await deliverNotificationToDestination(exact, {
+    id: receipt,
+    name: receipt,
+    type: 'slack_user',
+    userId: target.userId,
+    enabled: true,
+    createdAt: exact.createdAt,
+  });
+
+  assert.deepEqual(fake.openCalls, [{ users: target.userId }]);
+  assert.equal(fake.historyCalls[0]?.channel, 'D0EXACTUSER');
+  assert.equal(fake.posts.length, 0);
+});
+
+test('non-exact Slack delivery remains a direct post without observation or metadata', async () => {
+  const ordinary = notification({ id: 'ordinary-slack' });
+  const fake = fakeSlackClient({ historyError: new Error('must not be called') });
+  _setSlackOutboundClientForTests(fake.client);
+
+  await deliverNotificationToDestination(ordinary, slackChannelDest({ channelId: 'C0ORDINARY' }));
+
+  assert.equal(fake.historyCalls.length, 0);
+  assert.equal(fake.posts.length, 1);
+  assert.equal('metadata' in (fake.posts[0] ?? {}), false);
+});
+
+test('exact Discord channel delivery passes its stable nonce with provider enforcement', async () => {
+  const target = { type: 'discord_channel' as const, channelId: 'discord-exact-channel' };
+  const receipt = exactOriginDeliveryReceiptForTarget(target);
+  assert.ok(receipt);
+  const exact = notification({
+    id: 'notif-durable-discord-1',
+    body: 'The requested result is ready.',
+    metadata: { ...exactOriginDeliveryMetadata(target) },
+  });
+  let captured: { channelId: string; text: string; options: { nonce?: string; enforceNonce?: boolean } } | undefined;
+  _setNotificationDeliverySendersForTests({
+    sendDiscordChannelMessage: async (channelId, text, options) => {
+      captured = { channelId, text, options };
+    },
+  });
+
+  await deliverNotificationToDestination(exact, {
+    id: receipt,
+    name: receipt,
+    type: 'discord_channel',
+    channelId: target.channelId,
+    enabled: true,
+    createdAt: exact.createdAt,
+  });
+
+  assert.deepEqual(captured, {
+    channelId: target.channelId,
+    text: exact.body,
+    options: {
+      nonce: notificationDeliveryInternalsForTest.exactDiscordDeliveryNonce(exact),
+      enforceNonce: true,
+    },
+  });
 });
 
 // ── Discord rendering: buildDiscordBotMessage adapts GFM to Discord's subset ──

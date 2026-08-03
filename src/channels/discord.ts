@@ -3947,7 +3947,11 @@ export async function startDiscordBot(assistant: ClementineAssistant): Promise<v
   }
 }
 
-export async function sendDiscordChannelMessage(channelId: string, text: string): Promise<void> {
+export async function sendDiscordChannelMessage(
+  channelId: string,
+  text: string,
+  options: { nonce?: string; enforceNonce?: boolean } = {},
+): Promise<void> {
   if (!discordClient?.isReady()) {
     throw new Error('Discord client is not connected in this process.');
   }
@@ -3957,8 +3961,22 @@ export async function sendDiscordChannelMessage(channelId: string, text: string)
     throw new Error(`Discord channel ${channelId} is not text-based.`);
   }
 
-  for (const chunk of splitMessage(text)) {
-    await channel.send(chunk);
+  const chunks = splitMessage(text);
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    if (options.nonce) {
+      // Exact workflow terminals are bounded to one chunk. Keep this
+      // deterministic suffix for defense in depth if another caller opts a
+      // longer message into nonce-backed delivery later.
+      const nonce = chunks.length === 1 ? options.nonce : `${options.nonce.slice(0, 20)}-${index}`;
+      await channel.send({
+        content: chunk,
+        nonce,
+        enforceNonce: options.enforceNonce === true,
+      });
+    } else {
+      await channel.send(chunk);
+    }
   }
 }
 

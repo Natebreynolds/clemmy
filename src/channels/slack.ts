@@ -1,6 +1,6 @@
 import pino from 'pino';
 import { App, Assistant } from '@slack/bolt';
-import type { WebClient } from '@slack/web-api';
+import { WebClient } from '@slack/web-api';
 import type { KnownBlock, Button, ActionsBlock } from '@slack/types';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import {
@@ -100,6 +100,9 @@ let teamName = '';
 let startedAt: string | undefined;
 let connected = false;
 let startPromise: Promise<void> | null = null;
+let outboundClientForTests: WebClient | undefined;
+let exactPostClientForTests: WebClient | undefined;
+let exactPostClient: WebClient | undefined;
 // Threads we've already named via assistant.threads.setTitle (once per thread;
 // in-memory is fine — the title persists in Slack, this just avoids re-titling).
 const titledThreads = new Set<string>();
@@ -533,43 +536,213 @@ async function resolveApprovalOrQueueBackgroundContinuation(
 
 // ── Outbound send helpers (used by notification-delivery) ──────────────────
 function requireClient(): WebClient {
+  if (outboundClientForTests) return outboundClientForTests;
   if (!slackApp || !connected) {
     throw new Error('Slack client is not connected in this process.');
   }
   return slackApp.client;
 }
 
+/**
+ * Provider observation is safe to retry, but the create itself is not. The
+ * Slack SDK retries transport/HTTP failures internally by default; if Slack
+ * accepted a post and its response was lost, that retry can create a second
+ * message before our durable worker gets a chance to observe the metadata
+ * marker. Exact delivery therefore uses a dedicated zero-retry client and
+ * leaves every uncertain result to the outer observe-before-send retry loop.
+ */
+const EXACT_POST_RETRY_CONFIG = Object.freeze({ retries: 0 });
+const EXACT_POST_TIMEOUT_MS = 15_000;
+
+function requireExactPostClient(): WebClient {
+  if (exactPostClientForTests) return exactPostClientForTests;
+  if (!slackApp || !connected) {
+    throw new Error('Slack exact-delivery client is not connected in this process.');
+  }
+  exactPostClient ??= new WebClient(SLACK_BOT_TOKEN, {
+    retryConfig: EXACT_POST_RETRY_CONFIG,
+    timeout: EXACT_POST_TIMEOUT_MS,
+    // A 429 is a certain rejection. Surface it immediately so the durable
+    // worker backs off and re-observes instead of sleeping inside this call.
+    rejectRateLimitedCalls: true,
+  });
+  return exactPostClient;
+}
+
+/** Test-only outbound seam. Supplying undefined restores the live clients. */
+export function _setSlackOutboundClientForTests(
+  client?: WebClient,
+  singleAttemptPostClient?: WebClient,
+): void {
+  outboundClientForTests = client;
+  exactPostClientForTests = singleAttemptPostClient ?? client;
+}
+
+export interface SlackExactDeliveryIdentity {
+  /** Stable non-sensitive digest derived from the durable notification id. */
+  key: string;
+  /** Slack timestamp lower bound derived from the durable notification time. */
+  oldestTs: string;
+}
+
+export interface SlackOutboundMessageOptions {
+  threadTs?: string;
+  exactDelivery?: SlackExactDeliveryIdentity;
+}
+
+type SlackMessageWithMetadata = {
+  ts?: string;
+  thread_ts?: string;
+  metadata?: {
+    event_type?: string;
+    event_payload?: Record<string, unknown>;
+  };
+};
+
+const EXACT_DELIVERY_EVENT_TYPE = 'clementine_exact_delivery';
+const EXACT_DELIVERY_MAX_PAGES = 3;
+const EXACT_DELIVERY_PAGE_SIZE = 100;
+
+function validSlackDeliveryKey(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
+}
+
+function validSlackTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && /^\d{1,16}(?:\.\d{1,6})?$/.test(value);
+}
+
+/** Pure identity check kept separate from Slack API traversal so a response
+ * from the wrong admitted channel/thread can never satisfy a retry. */
+function slackMessageMatchesExactDelivery(input: {
+  expectedChannelId: string;
+  expectedThreadTs?: string;
+  expectedKey: string;
+  observedChannelId: string;
+  message: SlackMessageWithMetadata;
+}): boolean {
+  if (input.observedChannelId !== input.expectedChannelId) return false;
+  if (input.expectedThreadTs) {
+    if (input.message.thread_ts !== input.expectedThreadTs) return false;
+  } else if (
+    input.message.thread_ts
+    // Slack adds thread_ts === ts to a top-level parent as soon as it receives
+    // a reply (and retains it even if every reply is later deleted). Only a
+    // different thread_ts proves this history row is a threaded reply.
+    && input.message.thread_ts !== input.message.ts
+  ) {
+    return false;
+  }
+  return input.message.metadata?.event_type === EXACT_DELIVERY_EVENT_TYPE
+    && input.message.metadata.event_payload?.delivery_key === input.expectedKey;
+}
+
+async function exactSlackDeliveryAlreadyExists(input: {
+  client: WebClient;
+  channelId: string;
+  threadTs?: string;
+  identity: SlackExactDeliveryIdentity;
+}): Promise<boolean> {
+  if (!validSlackDeliveryKey(input.identity.key) || !validSlackTimestamp(input.identity.oldestTs)) {
+    throw new Error('Slack exact delivery observation requires a canonical key and durable time bound.');
+  }
+  let cursor: string | undefined;
+  for (let page = 0; page < EXACT_DELIVERY_MAX_PAGES; page += 1) {
+    let response: {
+      ok?: boolean;
+      messages?: SlackMessageWithMetadata[];
+      response_metadata?: { next_cursor?: string };
+    };
+    try {
+      response = input.threadTs
+        ? await input.client.conversations.replies({
+          channel: input.channelId,
+          ts: input.threadTs,
+          oldest: input.identity.oldestTs,
+          inclusive: true,
+          include_all_metadata: true,
+          limit: EXACT_DELIVERY_PAGE_SIZE,
+          ...(cursor ? { cursor } : {}),
+        }) as typeof response
+        : await input.client.conversations.history({
+          channel: input.channelId,
+          oldest: input.identity.oldestTs,
+          inclusive: true,
+          include_all_metadata: true,
+          limit: EXACT_DELIVERY_PAGE_SIZE,
+          ...(cursor ? { cursor } : {}),
+        }) as typeof response;
+    } catch (err) {
+      throw new Error('Slack exact delivery observation is unavailable; refusing a duplicate-risk post.', {
+        cause: err,
+      });
+    }
+    if (response.ok === false || !Array.isArray(response.messages)) {
+      throw new Error('Slack exact delivery observation returned no trustworthy message list.');
+    }
+    if (response.messages.some((message) => slackMessageMatchesExactDelivery({
+      expectedChannelId: input.channelId,
+      expectedThreadTs: input.threadTs,
+      expectedKey: input.identity.key,
+      observedChannelId: input.channelId,
+      message,
+    }))) return true;
+    const next = response.response_metadata?.next_cursor?.trim();
+    if (!next) return false;
+    cursor = next;
+  }
+  throw new Error('Slack exact delivery observation exceeded its bounded page window; refusing a duplicate-risk post.');
+}
+
+function exactSlackMessageMetadata(identity?: SlackExactDeliveryIdentity) {
+  if (!identity) return undefined;
+  return {
+    event_type: EXACT_DELIVERY_EVENT_TYPE,
+    event_payload: { delivery_key: identity.key },
+  };
+}
+
 export async function sendSlackChannelMessage(
   channelId: string,
   text: string,
-  options: { threadTs?: string } = {},
+  options: SlackOutboundMessageOptions = {},
 ): Promise<void> {
-  await requireClient().chat.postMessage({
+  const client = requireClient();
+  if (options.exactDelivery && await exactSlackDeliveryAlreadyExists({
+    client,
+    channelId,
+    threadTs: options.threadTs,
+    identity: options.exactDelivery,
+  })) return;
+  const postClient = options.exactDelivery ? requireExactPostClient() : client;
+  await postClient.chat.postMessage({
     channel: channelId,
     thread_ts: options.threadTs,
     text: toSlackMrkdwn(text) || '…',
     mrkdwn: true,
+    ...(options.exactDelivery ? { metadata: exactSlackMessageMetadata(options.exactDelivery) } : {}),
   });
 }
 
 export async function sendSlackDirectMessage(
   userId: string,
   text: string,
-  options: { blocks?: KnownBlock[] } = {},
+  options: { blocks?: KnownBlock[]; exactDelivery?: SlackExactDeliveryIdentity } = {},
 ): Promise<void> {
   const client = requireClient();
   // Open (or fetch) the IM channel for this user, then post into it.
   const opened = await client.conversations.open({ users: userId });
   const channel = (opened.channel as { id?: string } | undefined)?.id;
   if (!channel) throw new Error(`Could not open Slack DM channel for user ${userId}.`);
-  await postWithOptionalBlocks(client, channel, text, options.blocks);
+  await postWithOptionalBlocks(client, channel, text, options.blocks, {
+    exactDelivery: options.exactDelivery,
+  });
 }
 
 export async function sendSlackChannelMessageWithBlocks(
   channelId: string,
   text: string,
   blocks: KnownBlock[],
-  options: { threadTs?: string } = {},
+  options: SlackOutboundMessageOptions = {},
 ): Promise<void> {
   await postWithOptionalBlocks(requireClient(), channelId, text, blocks, options);
 }
@@ -579,20 +752,42 @@ async function postWithOptionalBlocks(
   channel: string,
   text: string,
   blocks?: KnownBlock[],
-  options: { threadTs?: string } = {},
+  options: SlackOutboundMessageOptions = {},
 ): Promise<void> {
+  if (options.exactDelivery && await exactSlackDeliveryAlreadyExists({
+    client,
+    channelId: channel,
+    threadTs: options.threadTs,
+    identity: options.exactDelivery,
+  })) return;
   const body = toSlackMrkdwn(text);
+  const metadata = exactSlackMessageMetadata(options.exactDelivery);
+  const postClient = options.exactDelivery ? requireExactPostClient() : client;
   if (blocks && blocks.length > 0) {
-    await client.chat.postMessage({
+    await postClient.chat.postMessage({
       channel,
       thread_ts: options.threadTs,
       text: (body || '…').slice(0, 2900),
       blocks: [{ type: 'section', text: { type: 'mrkdwn', text: (body || '…').slice(0, 2900) } }, ...blocks],
+      ...(metadata ? { metadata } : {}),
     });
   } else {
-    await client.chat.postMessage({ channel, thread_ts: options.threadTs, text: body || '…', mrkdwn: true });
+    await postClient.chat.postMessage({
+      channel,
+      thread_ts: options.threadTs,
+      text: body || '…',
+      mrkdwn: true,
+      ...(metadata ? { metadata } : {}),
+    });
   }
 }
+
+export const slackDeliveryInternalsForTest = {
+  exactDeliveryEventType: EXACT_DELIVERY_EVENT_TYPE,
+  exactPostRetryCount: EXACT_POST_RETRY_CONFIG.retries,
+  exactPostTimeoutMs: EXACT_POST_TIMEOUT_MS,
+  slackMessageMatchesExactDelivery,
+};
 
 // ── Block Kit approval buttons for notifications (mirror buildActionsForNotification) ──
 function actionsBlock(blockId: string, elements: Button[]): ActionsBlock {

@@ -1,6 +1,12 @@
 import webPush from 'web-push';
+import { createHash } from 'node:crypto';
 import type { NotificationDestination, NotificationRecord } from './notifications.js';
 import { removeWebPushDestinationByEndpoint } from './notifications.js';
+import {
+  exactOriginDeliveryDestinationMatches,
+  exactOriginDeliveryTarget,
+  hasExactOriginDeliveryMode,
+} from './exact-origin-delivery.js';
 import {
   buildActionsForNotification,
   sendDiscordChannelMessage,
@@ -14,12 +20,32 @@ import {
   sendSlackChannelMessage,
   sendSlackChannelMessageWithBlocks,
   sendSlackDirectMessage,
+  type SlackExactDeliveryIdentity,
 } from '../channels/slack.js';
 import { getVapidKeys } from './web-push-keys.js';
 
 // Discord caps a single message at 2000 chars. We aim slightly lower
 // to leave headroom for markdown / part labels.
 const DISCORD_MAX_CHUNK = 1900;
+
+const defaultDeliverySenders = {
+  sendDiscordChannelMessage,
+  sendDiscordChannelMessageWithComponents,
+  sendDiscordDirectMessage,
+  sendSlackChannelMessage,
+  sendSlackChannelMessageWithBlocks,
+  sendSlackDirectMessage,
+};
+let deliverySenders = { ...defaultDeliverySenders };
+
+/** Test-only transport seam; omit input to restore production senders. */
+export function _setNotificationDeliverySendersForTests(
+  overrides?: Partial<typeof defaultDeliverySenders>,
+): void {
+  deliverySenders = overrides
+    ? { ...defaultDeliverySenders, ...overrides }
+    : { ...defaultDeliverySenders };
+}
 
 /**
  * Split a long body into Discord-sized chunks, preferring paragraph
@@ -76,6 +102,40 @@ function buildGenericPayload(notification: NotificationRecord): Record<string, u
   };
 }
 
+/** Discord can reject a repeated create with the same nonce. Bind that nonce
+ * to the durable notification id so a worker crash after provider acceptance
+ * but before its local receipt does not normally create a second terminal. */
+function exactDiscordDeliveryNonce(notification: NotificationRecord): string | undefined {
+  const target = exactOriginDeliveryTarget(notification);
+  if (target?.type !== 'discord_channel') return undefined;
+  return createHash('sha256')
+    .update(`clementine-exact-discord-delivery:v1\0${notification.id}`)
+    .digest('hex')
+    .slice(0, 24);
+}
+
+/** Slack has no Discord-style nonce. Commit one non-sensitive metadata key to
+ * the durable notification id, then search only the admitted destination and
+ * the notification's bounded creation-time window before every exact post. */
+function exactSlackDeliveryIdentity(
+  notification: NotificationRecord,
+): SlackExactDeliveryIdentity | undefined {
+  const target = exactOriginDeliveryTarget(notification);
+  if (target?.type !== 'slack_channel' && target?.type !== 'slack_user') return undefined;
+  const createdAt = Date.parse(notification.createdAt);
+  if (!Number.isFinite(createdAt)) {
+    throw new Error('Exact Slack delivery requires a valid durable notification timestamp.');
+  }
+  const oldestSeconds = Math.max(0, Math.floor((createdAt - 5 * 60_000) / 1000));
+  return {
+    key: createHash('sha256')
+      .update(`clementine-exact-slack-delivery:v1\0${notification.id}`)
+      .digest('hex')
+      .slice(0, 32),
+    oldestTs: `${oldestSeconds}.000000`,
+  };
+}
+
 /**
  * Sanitized payload for Web Push. We deliberately strip everything
  * beyond a short generic title + body so the push payload that lands
@@ -110,6 +170,12 @@ function buildWebPushPayload(notification: NotificationRecord): {
 // suppressions are channel-agnostic.
 function shouldDeliverBotNotification(notification: NotificationRecord, inlineKey: 'discordInlineHandled' | 'slackInlineHandled'): boolean {
   if (notification.silent) return false;
+  // Exact-origin is an explicit delivery instruction. Lifecycle/title and
+  // inline-card suppression heuristics must not silently eat its one allowed
+  // follow-up. A corrupt envelope is rejected by the send-time match guard.
+  if (hasExactOriginDeliveryMode(notification)) {
+    return Boolean(exactOriginDeliveryTarget(notification));
+  }
   if (notification.metadata?.[inlineKey] === true) return false;
 
   const title = notification.title.trim().toLowerCase();
@@ -173,6 +239,18 @@ function slackThreadForDelivery(
   notification: NotificationRecord,
   destination: NotificationDestination,
 ): string | undefined {
+  if (hasExactOriginDeliveryMode(notification)) {
+    const target = exactOriginDeliveryTarget(notification);
+    if (target?.type !== 'slack_channel') return undefined;
+    // Exact delivery freezes the destination, but terminal placement still
+    // needs to stay visible. Slack assistant-pane DMs carry a thread_ts that
+    // becomes hidden history once the pane closes, so terminal results post
+    // at the admitted D channel's top level just like non-exact report-backs.
+    if (target.channelId.startsWith('D') && isTerminalReportBack(notification)) {
+      return undefined;
+    }
+    return target.threadTs;
+  }
   const threadTs = destination.threadTs;
   if (!threadTs) return undefined;
   const isImChannel = (destination.channelId ?? '').startsWith('D');
@@ -181,11 +259,13 @@ function slackThreadForDelivery(
 }
 
 function buildDiscordComponentsForNotification(notification: NotificationRecord) {
+  if (hasExactOriginDeliveryMode(notification)) return undefined;
   if (notification.kind !== 'approval') return undefined;
   return buildActionsForNotification(notification.metadata);
 }
 
 function buildSlackBlocksForNotification(notification: NotificationRecord) {
+  if (hasExactOriginDeliveryMode(notification)) return undefined;
   if (notification.kind !== 'approval') return undefined;
   return buildSlackActionsForNotification(notification.metadata);
 }
@@ -194,6 +274,12 @@ function buildSlackBlocksForNotification(notification: NotificationRecord) {
 // emphasis is applied inside the send helpers' toSlackMrkdwn pass, so here we
 // emit the same `**title**\nbody` shape the Discord path uses for symmetry.
 function buildSlackBotMessage(notification: NotificationRecord): string {
+  if (hasExactOriginDeliveryMode(notification)) {
+    if (!exactOriginDeliveryTarget(notification)) {
+      throw new Error('Exact-origin delivery target is missing or corrupt.');
+    }
+    return notification.body;
+  }
   return formatSlackNotificationMessage(notification.title, notification.body, notification.metadata);
 }
 
@@ -201,6 +287,12 @@ export async function deliverNotificationToDestination(
   notification: NotificationRecord,
   destination: NotificationDestination,
 ): Promise<void> {
+  if (
+    hasExactOriginDeliveryMode(notification)
+    && !exactOriginDeliveryDestinationMatches(notification, destination)
+  ) {
+    throw new Error('Exact-origin delivery destination does not match its admitted target.');
+  }
   if (destination.type === 'desktop') {
     // The durable notification store lives ON this machine — reaching it IS
     // desktop delivery; the app shell toasts loud unread records from its own
@@ -283,7 +375,7 @@ export async function deliverNotificationToDestination(
     // splits long content automatically (src/channels/discord.ts:splitMessage)
     // and keeps the components on the last chunk only.
     const components = buildDiscordComponentsForNotification(notification);
-    await sendDiscordDirectMessage(destination.userId, buildDiscordBotMessage(notification), { components });
+    await deliverySenders.sendDiscordDirectMessage(destination.userId, buildDiscordBotMessage(notification), { components });
     return;
   }
 
@@ -294,9 +386,14 @@ export async function deliverNotificationToDestination(
     if (!shouldDeliverDiscordNotification(notification)) return;
     const components = buildDiscordComponentsForNotification(notification);
     if (components && components.length > 0) {
-      await sendDiscordChannelMessageWithComponents(destination.channelId, buildDiscordBotMessage(notification), components);
+      await deliverySenders.sendDiscordChannelMessageWithComponents(destination.channelId, buildDiscordBotMessage(notification), components);
     } else {
-      await sendDiscordChannelMessage(destination.channelId, buildDiscordBotMessage(notification));
+      const nonce = exactDiscordDeliveryNonce(notification);
+      await deliverySenders.sendDiscordChannelMessage(
+        destination.channelId,
+        buildDiscordBotMessage(notification),
+        nonce ? { nonce, enforceNonce: true } : {},
+      );
     }
     return;
   }
@@ -307,7 +404,11 @@ export async function deliverNotificationToDestination(
     }
     if (!shouldDeliverSlackNotification(notification)) return;
     const blocks = buildSlackBlocksForNotification(notification);
-    await sendSlackDirectMessage(destination.userId, buildSlackBotMessage(notification), { blocks });
+    const exactDelivery = exactSlackDeliveryIdentity(notification);
+    await deliverySenders.sendSlackDirectMessage(destination.userId, buildSlackBotMessage(notification), {
+      blocks,
+      ...(exactDelivery ? { exactDelivery } : {}),
+    });
     return;
   }
 
@@ -318,13 +419,16 @@ export async function deliverNotificationToDestination(
     if (!shouldDeliverSlackNotification(notification)) return;
     const blocks = buildSlackBlocksForNotification(notification);
     const threadTs = slackThreadForDelivery(notification, destination);
+    const exactDelivery = exactSlackDeliveryIdentity(notification);
     if (blocks && blocks.length > 0) {
-      await sendSlackChannelMessageWithBlocks(destination.channelId, buildSlackBotMessage(notification), blocks, {
+      await deliverySenders.sendSlackChannelMessageWithBlocks(destination.channelId, buildSlackBotMessage(notification), blocks, {
         threadTs,
+        ...(exactDelivery ? { exactDelivery } : {}),
       });
     } else {
-      await sendSlackChannelMessage(destination.channelId, buildSlackBotMessage(notification), {
+      await deliverySenders.sendSlackChannelMessage(destination.channelId, buildSlackBotMessage(notification), {
         threadTs,
+        ...(exactDelivery ? { exactDelivery } : {}),
       });
     }
     return;
@@ -395,6 +499,12 @@ export async function deliverNotificationToDestination(
  * the full body and letting the splitter do its job.
  */
 function buildDiscordBotMessage(notification: NotificationRecord): string {
+  if (hasExactOriginDeliveryMode(notification)) {
+    if (!exactOriginDeliveryTarget(notification)) {
+      throw new Error('Exact-origin delivery target is missing or corrupt.');
+    }
+    return toDiscordMarkdown(notification.body);
+  }
   const header = `**${notification.title}**`;
   // Adapt GFM tables / deep headers / horizontal rules into the subset
   // Discord actually renders, so a report body doesn't arrive looking like
@@ -428,4 +538,6 @@ export const notificationDeliveryInternalsForTest = {
   slackThreadForDelivery,
   buildDiscordBotMessage,
   buildSlackBotMessage,
+  exactDiscordDeliveryNonce,
+  exactSlackDeliveryIdentity,
 };

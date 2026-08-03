@@ -37,6 +37,10 @@ const {
   markNotificationsReadByApprovalId,
   markNotificationsReadByQuestionId,
   isDeliveryJobStale,
+  listQueuedNotificationDeliveries,
+  replaceQueuedNotificationDeliveries,
+  registerNotificationDeliveryKick,
+  settleQueuedNotificationDeliveryPass,
   _failNextNotificationDeliveryQueueWriteForTest,
 } = await import('./notifications.js');
 
@@ -90,6 +94,23 @@ test('addNotification: subsequent writes preserve prior items', () => {
   assert.ok(ids.includes('n1') && ids.includes('n2'), `expected n1 and n2 in ${ids.join(',')}`);
 });
 
+test('addNotification: durably queued delivery requests an immediate daemon drain', () => {
+  let kicks = 0;
+  registerNotificationDeliveryKick(() => { kicks += 1; });
+  try {
+    addNotification(makeNotification('immediate-delivery-kick'));
+    assert.equal(kicks, 1);
+
+    addNotification({
+      ...makeNotification('silent-does-not-kick'),
+      silent: true,
+    });
+    assert.equal(kicks, 1, 'dashboard-only notification should not wake the outbound worker');
+  } finally {
+    registerNotificationDeliveryKick(() => {});
+  }
+});
+
 test('addNotification: a stable-ID retry repairs a delivery job lost after the notification write', () => {
   const notification = makeNotification('partial-queue-write');
   rmSync(DELIVERY_FILE, { force: true });
@@ -111,6 +132,45 @@ test('addNotification: a stable-ID retry repairs a delivery job lost after the n
     1,
     'retry reconciles exactly one outbound delivery job',
   );
+});
+
+test('delivery pass settlement preserves newly appended jobs and same-id requeue generations', () => {
+  const jobA = {
+    notificationId: 'settlement-a',
+    queuedAt: '2026-08-03T12:00:00.000Z',
+    completedDestinationIds: [],
+    failedDestinationIds: [],
+    attemptCountByDestination: {},
+    nextAttemptAtByDestination: {},
+    lastErrorByDestination: {},
+  };
+  const jobB = {
+    ...jobA,
+    notificationId: 'settlement-b',
+    queuedAt: '2026-08-03T12:00:01.000Z',
+  };
+  replaceQueuedNotificationDeliveries([jobA]);
+  const observed = listQueuedNotificationDeliveries();
+
+  // A provider await is in flight; another producer appends B.
+  replaceQueuedNotificationDeliveries([jobA, jobB]);
+  settleQueuedNotificationDeliveryPass(observed, []);
+  assert.deepEqual(
+    listQueuedNotificationDeliveries().map((job) => job.notificationId),
+    ['settlement-b'],
+    'settling observed A removes A without erasing newly appended B',
+  );
+
+  // A same-id requeue is a new generation and must also win over stale pass
+  // results, even though its notification id was in the old snapshot.
+  replaceQueuedNotificationDeliveries([jobA]);
+  const staleGeneration = listQueuedNotificationDeliveries();
+  const requeuedA = { ...jobA, queuedAt: '2026-08-03T12:00:02.000Z' };
+  replaceQueuedNotificationDeliveries([requeuedA]);
+  settleQueuedNotificationDeliveryPass(staleGeneration, []);
+  assert.deepEqual(listQueuedNotificationDeliveries(), [requeuedA]);
+
+  replaceQueuedNotificationDeliveries([]);
 });
 
 test('loadNotifications: corrupted JSON is quarantined and surfaced via actionBus', () => {
