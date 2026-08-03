@@ -249,6 +249,17 @@ test('isMutatingExternalWrite: unknown external actions fail closed on every ext
   assert.equal(isMutatingExternalWrite('composio_execute_tool', '{not valid json'), true, 'malformed wrapper');
   assert.equal(isMutatingExternalWrite('cx_acme_do_thing', {}), true, 'unknown dynamic action');
   assert.equal(isMutatingExternalWrite('mcp__acme__do_thing', {}), true, 'unknown native MCP action');
+  for (const toolName of [
+    'mcp__stripe__refund_payment',
+    'mcp__aws__reboot_instance',
+    'mcp__cloudflare__purge_cache',
+    'mcp__acme__transact',
+    'mcp__github__merge_pull_request',
+    'mcp__secrets__rotate_key',
+    'mcp__billing__charge_customer',
+  ]) {
+    assert.equal(isMutatingExternalWrite(toolName, {}), true, toolName);
+  }
 });
 
 // ─── isMutatingExternalWrite — exempt slug patterns ──────────────
@@ -272,6 +283,29 @@ test('isMutatingExternalWrite: FIRECRAWL_BATCH_SCRAPE is exempt (provider-side r
     isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'FIRECRAWL_BATCH_SCRAPE' }),
     false,
   );
+});
+
+test('isMutatingExternalWrite: explicit mutations cannot borrow a provider read-job exemption', () => {
+  for (const toolSlug of [
+    'DATAFORSEO_DELETE_ACCOUNT',
+    'DATAFORSEO_PUBLISH_REPORT',
+    'FIRECRAWL_SCRAPE_AND_PUBLISH',
+    'FIRECRAWL_CRAWL_AND_DELETE',
+  ]) {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: toolSlug }),
+      true,
+      toolSlug,
+    );
+  }
+  for (const toolName of [
+    'mcp__dataforseo__delete_account',
+    'mcp__dataforseo__publish_report',
+    'mcp__firecrawl__scrape_and_publish',
+    'mcp__firecrawl__crawl_and_delete',
+  ]) {
+    assert.equal(isMutatingExternalWrite(toolName, {}), true, toolName);
+  }
 });
 
 // ─── isMutatingExternalWrite — exempt tool names ──────────────

@@ -107,6 +107,47 @@ test('native MCP production names distinguish sends from reads', () => {
   }
 });
 
+test('unfamiliar native MCP mutations fail closed at the runtime effect boundary', () => {
+  for (const name of [
+    'mcp__stripe__refund_payment',
+    'mcp__aws__reboot_instance',
+    'mcp__cloudflare__purge_cache',
+    'mcp__acme__transact',
+    'mcp__github__merge_pull_request',
+    'mcp__secrets__rotate_key',
+    'mcp__billing__charge_customer',
+    // The SDK also emits this carrier-less namespace shape.
+    'stripe__refund_payment',
+  ]) {
+    const effect = classifyRuntimeToolEffect(name, {});
+    assert.equal(effect.effect, 'external_write', name);
+    assert.equal(effect.mutating, true, name);
+    assert.equal(effect.dangerousWrite, true, name);
+    assert.equal(effect.source, 'native_mcp', name);
+  }
+});
+
+test('native MCP provider read jobs stay reads but explicit mutations win', () => {
+  for (const name of [
+    'mcp__dataforseo__serp_organic_live_advanced',
+    'mcp__dataforseo__create_serp_google_organic_task_post',
+    'mcp__dataforseo__DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST',
+    'mcp__firecrawl__scrape',
+    'mcp__firecrawl__batch_scrape',
+    'mcp__firecrawl__FIRECRAWL_SCRAPE',
+  ]) {
+    assert.equal(classifyRuntimeToolEffect(name, {}).effect, 'read', name);
+  }
+  for (const name of [
+    'mcp__dataforseo__delete_account',
+    'mcp__dataforseo__publish_report',
+    'mcp__firecrawl__scrape_and_publish',
+    'mcp__firecrawl__crawl_and_delete',
+  ]) {
+    assert.equal(classifyRuntimeToolEffect(name, {}).effect, 'external_write', name);
+  }
+});
+
 test('Composio gateways classify the inner operation rather than the wrapper', () => {
   assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
     tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{}',
@@ -126,6 +167,9 @@ test('Composio gateways classify the inner operation rather than the wrapper', (
   assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
     tool_slug: 'GONG_GET_CALL_AND_UPDATE_CONTACT', arguments: '{}',
   }).effect, 'external_write', 'a real mutation token still wins over the call-read shape');
+  assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+    tool_slug: 'FIRECRAWL_SCRAPE_AND_PUBLISH', arguments: '{}',
+  }).effect, 'external_write', 'a read-job prefix cannot hide an explicit publish');
 });
 
 test('call_tool accounting follows the inner tool and never labels a failed guessed read as a local write', () => {

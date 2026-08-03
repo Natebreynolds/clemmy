@@ -1,5 +1,4 @@
 import { TOOL_REGISTRY, type ToolSideEffect } from '../../tools/tool-registry.js';
-import { classifyComposioSlugEffect, isReadOnlyCallAction } from '../../integrations/composio/slug-effect.js';
 import { classifyShellCommand, classifyShellNetworkMutation, expandLiteralShellCommands } from './destination-gate.js';
 import { isMutatingExternalWrite } from './execution-gate.js';
 import { resolveCallToolAlias } from '../../tools/call-tool-alias.js';
@@ -174,25 +173,6 @@ const REGISTRY_EFFECTS = new Map<string, ToolSideEffect>(
   TOOL_REGISTRY.map((decl) => [decl.name, decl.sideEffect]),
 );
 
-const READ_ACTIONS = new Set([
-  'GET', 'LIST', 'SEARCH', 'FIND', 'FETCH', 'READ', 'QUERY', 'LOOKUP',
-  'RETRIEVE', 'DESCRIBE', 'BROWSE', 'SCAN', 'VIEW', 'INSPECT', 'STATUS',
-  'HEAD', 'PEEK', 'COUNT', 'SUMMARIZE', 'RECALL', 'OBSERVE', 'PREVIEW',
-  'SHOW', 'CHECK', 'DISCOVER', 'PROBE', 'DETECT', 'ENUMERATE', 'AUDIT',
-  'INTROSPECT',
-]);
-
-const WRITE_ACTIONS = new Set([
-  'UPDATE', 'CREATE', 'INSERT', 'DELETE', 'REPLACE', 'APPEND', 'SEND',
-  'PATCH', 'POST', 'WRITE', 'REMOVE', 'PUBLISH', 'UPLOAD', 'PUT', 'SET',
-  'EDIT', 'MODIFY', 'SAVE', 'ARCHIVE', 'RESTORE', 'ADD', 'REGISTER',
-  'UNREGISTER', 'SCHEDULE', 'UNSCHEDULE', 'DISPATCH', 'FORWARD', 'REPLY',
-  'CALL', 'DIAL', 'OUTBOUND', 'TWEET', 'BROADCAST', 'DM',
-  'MOVE', 'COPY', 'DUPLICATE', 'RENAME', 'ASSIGN', 'UNASSIGN', 'ATTACH',
-  'DETACH', 'LINK', 'UNLINK', 'ACCEPT', 'REJECT', 'APPROVE', 'DECLINE',
-  'INVITE', 'CANCEL', 'ENABLE', 'DISABLE',
-]);
-
 function normalizedToolName(toolName: string): string {
   return toolName.replace(/^mcp__/, '');
 }
@@ -222,14 +202,6 @@ function decodedToolArgs(args: unknown): unknown {
   try { return JSON.parse(trimmed) as unknown; } catch { return args; }
 }
 
-function actionTokens(value: string): string[] {
-  return value
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .toUpperCase()
-    .split(/[^A-Z0-9]+/)
-    .filter(Boolean);
-}
-
 function readDecision(source: RuntimeToolEffectDecision['source']): RuntimeToolEffectDecision {
   return { effect: 'read', mutating: false, dangerousWrite: false, source };
 }
@@ -239,34 +211,26 @@ function externalWriteDecision(source: RuntimeToolEffectDecision['source']): Run
 }
 
 function classifyComposio(args: unknown): RuntimeToolEffectDecision {
-  const slug = composioSlug(args);
-  // Missing dispatch identity is not provably a read. Keep the historical safe
-  // default, but make it explicit and durable in the tracker.
-  if (!slug) return externalWriteDecision('composio');
-  return classifyComposioSlugEffect(slug) === 'read'
-    ? readDecision('composio')
-    : externalWriteDecision('composio');
+  // Use the same canonical carrier-aware classifier as dispatch admission.
+  // Missing and unfamiliar external actions therefore fail closed here too.
+  return isMutatingExternalWrite('composio_execute_tool', args)
+    ? externalWriteDecision('composio')
+    : readDecision('composio');
 }
 
 function classifyNativeMcp(toolName: string, args: unknown): RuntimeToolEffectDecision {
   const normalized = normalizedToolName(toolName);
-  const [server = '', ...rest] = normalized.split('__');
-  const action = rest.join('__') || normalized;
-  const lowerServer = server.toLowerCase();
-  const upperAction = action.toUpperCase();
-  if (
-    lowerServer.includes('dataforseo')
-    || (lowerServer.includes('firecrawl') && /(?:^|_)(?:SCRAPE|MAP|SEARCH|CRAWL)(?:_|$)/.test(upperAction))
-  ) return readDecision('native_mcp');
-  const tokens = actionTokens(action);
-  // CALL can be a read object, not a verb. That exception is deliberately
-  // narrow; normal irreversible/mutation classification still wins for mixed
-  // names such as GET_CALL_AND_UPDATE_CONTACT.
-  if (isReadOnlyCallAction(action)) return readDecision('native_mcp');
-  if (isMutatingExternalWrite(normalized, args)) return externalWriteDecision('native_mcp');
-  if (tokens.some((token) => WRITE_ACTIONS.has(token))) return externalWriteDecision('native_mcp');
-  if (tokens.some((token) => READ_ACTIONS.has(token))) return readDecision('native_mcp');
-  return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'native_mcp' };
+  // Claude may report either `mcp__server__tool` or `server__tool`. Preserve
+  // the former and restore the carrier on the latter before classification;
+  // stripping `mcp__` made the canonical boundary mistake an external action
+  // for a local unknown. A namespaced action is a read only when the canonical
+  // classifier can affirmatively prove that it is one.
+  const authorityName = toolName.startsWith('mcp__')
+    ? toolName
+    : `mcp__${normalized}`;
+  return isMutatingExternalWrite(authorityName, args)
+    ? externalWriteDecision('native_mcp')
+    : readDecision('native_mcp');
 }
 
 /** High-signal local mutations. These consume exact-repeat/tool ceilings, but
@@ -370,7 +334,7 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
 
   const isNamespaced = normalized.includes('__');
   const isClementineLocal = /^(?:clementine(?:-local)?|clem(?:entine)?_local)$/i.test(normalized.split('__')[0] ?? '');
-  if (isNamespaced && !isClementineLocal) return classifyNativeMcp(normalized, args);
+  if (isNamespaced && !isClementineLocal) return classifyNativeMcp(toolName, args);
 
   return classifyRegistered(normalized)
     ?? { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };

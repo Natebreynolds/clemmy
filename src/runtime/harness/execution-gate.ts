@@ -68,20 +68,63 @@ const MUTATING_VERBS: ReadonlySet<string> = new Set([
   'DM',
 ]);
 
+// These tokens are both common API objects/transport nouns and mutations.
+// They are writes by default, but an affirmative read action may disambiguate
+// them (`GET_CALL`, `GET_POST`, `BATCH_GET`). Every other mutation token wins.
+const READ_COMPATIBLE_MUTATING_VERBS: ReadonlySet<string> = new Set([
+  'CALL',
+  'POST',
+  'BATCH',
+]);
+
 /**
  * Composio tool slugs that LOOK mutating by verb but aren't actually
  * user-data mutations. Today this is just DataForSEO's task creation
  * (queueing a SERP/backlinks job is read-only from the user's
  * perspective — it doesn't write to any persistent user store).
  */
+const DATAFORSEO_READ_JOB_FAMILY = /^DATAFORSEO_(?:DATAFORSEO_)?/;
+const FIRECRAWL_READ_JOB_FAMILY = /^FIRECRAWL_(?:FIRECRAWL_)?(BATCH_)?(SCRAPE|MAP|SEARCH|CRAWL)(?:_|$)/;
+
 const EXEMPT_COMPOSIO_SLUG_PATTERNS: RegExp[] = [
-  // DataForSEO uses CREATE/POST for queueing scans, not for user data writes.
-  /^DATAFORSEO_/,
+  // These identify provider read-job *families*. Matching a family is not
+  // sufficient by itself: providerReadJobIsExempt below makes explicit
+  // mutations win, while preserving the provider's documented task jobs.
+  DATAFORSEO_READ_JOB_FAMILY,
   // Firecrawl search/scrape/map/crawl are reads from external URLs,
   // not writes to the user's data. BATCH_SCRAPE still only creates a
   // provider-side read job.
-  /^FIRECRAWL_(BATCH_)?(SCRAPE|MAP|SEARCH|CRAWL)/,
+  FIRECRAWL_READ_JOB_FAMILY,
 ];
+
+function providerReadJobIsExempt(
+  normalizedAction: string,
+  mutationParts: readonly string[],
+): boolean {
+  if (DATAFORSEO_READ_JOB_FAMILY.test(normalizedAction)) {
+    // DataForSEO's synchronous research endpoints are reads. Its TASK_POST
+    // endpoints enqueue the same research job, so CREATE/POST are transport
+    // vocabulary there rather than user-data mutations. No other affirmative
+    // mutation may borrow that exemption.
+    if (mutationParts.length === 0) return true;
+    const taskPost = /(?:^|_)TASKS?_POST$/.test(normalizedAction);
+    return taskPost
+      && mutationParts.every((part) => part === 'CREATE' || part === 'POST');
+  }
+
+  if (FIRECRAWL_READ_JOB_FAMILY.test(normalizedAction)) {
+    // BATCH_SCRAPE is still a provider-side read job. DELETE/PUBLISH/etc. in
+    // the same action are real mutations and must reach the write boundary.
+    return mutationParts.every((part) => part === 'BATCH');
+  }
+
+  return false;
+}
+
+function isProviderReadJobFamily(normalizedAction: string): boolean {
+  return DATAFORSEO_READ_JOB_FAMILY.test(normalizedAction)
+    || FIRECRAWL_READ_JOB_FAMILY.test(normalizedAction);
+}
 
 /**
  * Internal harness tools that must NEVER trigger the gate — they're
@@ -303,17 +346,29 @@ function canonicalExternalActionWriteClassification(action: string | undefined):
   if (documentedReadOnlyExternalAction(normalized)) {
     return { mutating: false, classificationKnown: true };
   }
-  for (const pattern of EXEMPT_COMPOSIO_SLUG_PATTERNS) {
-    if (pattern.test(normalized)) return { mutating: false, classificationKnown: true };
-  }
-  if (composioSlugIsReadOnly(normalized) || isReadOnlyCallAction(normalized)) {
-    return { mutating: false, classificationKnown: true };
-  }
   const parts = normalized
     .split(/[^A-Z0-9]+/)
     .filter(Boolean);
   const knownMutation = parts.some((part) => MUTATING_VERBS.has(part))
     || isIrreversibleSendSlug(action);
+  const mutationParts = parts.filter((part) => MUTATING_VERBS.has(part));
+  if (providerReadJobIsExempt(normalized, mutationParts)) {
+    return { mutating: false, classificationKnown: true };
+  }
+  // A candidate in one of these provider families reached here only because
+  // its action contains non-read-job mutation vocabulary. Do not feed it back
+  // into the older broad Composio exemption below.
+  if (isProviderReadJobFamily(normalized)) {
+    return { mutating: true, classificationKnown: knownMutation };
+  }
+  // Outside the narrow provider read-job exception, affirmative mutation
+  // vocabulary always wins over a GET/LIST/etc token elsewhere in the name.
+  const decisiveMutation = mutationParts.some((part) => !READ_COMPATIBLE_MUTATING_VERBS.has(part))
+    || isIrreversibleSendSlug(action);
+  if (decisiveMutation) return { mutating: true, classificationKnown: true };
+  if (composioSlugIsReadOnly(normalized) || isReadOnlyCallAction(normalized)) {
+    return { mutating: false, classificationKnown: true };
+  }
   return { mutating: true, classificationKnown: knownMutation };
 }
 
