@@ -28,8 +28,8 @@ test('single-deliverable policy turns the 135-call incident into a 15-call maxim
   for (let i = 1; i <= 135; i += 1) {
     const verdict = evaluateToolEconomy({
       state,
-      toolName: 'mcp__dataforseo__search',
-      args: { q: `firm evidence ${i}` },
+      toolName: 'mcp__dataforseo__DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED',
+      args: { keyword: `firm evidence ${i}` },
       callId: `toolu_${i}`,
     });
     if (verdict?.interrupt) { terminalAt = i; break; }
@@ -64,7 +64,10 @@ test('finish phase preserves batching, deliverable writes, render work, and exac
     ['mcp__clementine-local__offer_background', { objective: 'finish research' }],
   ] as const;
   for (const [toolName, args] of allowed) assert.equal(isFinishPhaseTool(toolName, args), true, toolName);
-  assert.equal(isFinishPhaseTool('mcp__dataforseo__search', { q: 'one more thing' }), false);
+  assert.equal(isFinishPhaseTool(
+    'mcp__dataforseo__DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED',
+    { keyword: 'one more thing' },
+  ), false, 'an exact production DataForSEO research action is exploration');
   assert.equal(isFinishPhaseTool('mcp__clementine-local__read_file', { path: '/tmp/new-source' }), false);
   assert.equal(isFinishPhaseTool('mcp__googledocs__get_document', {}), false, 'read-back needs an exact id');
   assert.equal(isFinishPhaseTool('mcp__googledocs__get_documents_list', { page_size: 50 }), false, 'list is exploration');

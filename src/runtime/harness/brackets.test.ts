@@ -3339,8 +3339,28 @@ async function runJudgeFailSendProbe(opts: {
     } else {
       // A GENUINE gap verdict with a loaded skill → hard block, NOT a judge failure.
       const scid = 'skill_1';
-      appendEvent({ sessionId: sess, turn: 0, role: 'orchestrator', type: 'tool_called', data: { tool: 'skill_read', callId: scid, arguments: JSON.stringify({ name: 'outbound' }) } });
-      writeToolOutput({ sessionId: sess, callId: scid, tool: 'skill_read', output: 'SKILL: outbound\n(manifest)\n---\nResearch each firm and personalize the opening per firm before sending.' });
+      const skillCalled = appendEvent({
+        sessionId: sess,
+        turn: 0,
+        role: 'orchestrator',
+        type: 'tool_called',
+        data: { tool: 'skill_read', callId: scid, effect: 'read', arguments: JSON.stringify({ name: 'outbound' }) },
+      });
+      writeToolOutput({
+        sessionId: sess,
+        callId: scid,
+        invocationNonce: 'p0c-genuine-block-skill',
+        tool: 'skill_read',
+        output: 'SKILL: outbound\n(manifest)\n---\nResearch each firm and personalize the opening per firm before sending.',
+      });
+      appendEvent({
+        sessionId: sess,
+        turn: 0,
+        role: 'orchestrator',
+        type: 'tool_returned',
+        parentEventId: skillCalled.id,
+        data: { tool: 'skill_read', callId: scid, effect: 'read', ok: true },
+      });
       _setGoalFidelityJudgeForTests(async () => ({ fulfills: false, gap: 'the opening is identical across firms — per-firm research was skipped' }));
     }
     let invoked = 0;

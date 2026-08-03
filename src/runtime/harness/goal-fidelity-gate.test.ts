@@ -47,9 +47,29 @@ test.after(() => {
 let skillSeq = 0;
 function seedSkill(sessionId: string, name: string, body: string): void {
   const callId = `skill_${++skillSeq}`;
-  appendEvent({ sessionId, turn: 0, role: 'orchestrator', type: 'tool_called', data: { tool: 'skill_read', callId, arguments: JSON.stringify({ name }) } });
+  const called = appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'orchestrator',
+    type: 'tool_called',
+    data: { tool: 'skill_read', callId, effect: 'read', arguments: JSON.stringify({ name }) },
+  });
   // skill_read returns envelope\n---\nbody; the gate strips at the FIRST '\n---\n'.
-  writeToolOutput({ sessionId, callId, tool: 'skill_read', output: `SKILL: ${name}\n(manifest + crib + contract)\n---\n${body}` });
+  writeToolOutput({
+    sessionId,
+    callId,
+    invocationNonce: `goal-fidelity-skill:${callId}`,
+    tool: 'skill_read',
+    output: `SKILL: ${name}\n(manifest + crib + contract)\n---\n${body}`,
+  });
+  appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'orchestrator',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: 'skill_read', callId, effect: 'read', ok: true },
+  });
 }
 
 function seedGoal(sessionId: string, text: string): void {

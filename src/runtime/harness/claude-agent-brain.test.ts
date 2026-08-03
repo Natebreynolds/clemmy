@@ -2176,9 +2176,31 @@ test('H2: a skill loaded before the turn cap is RE-INJECTED into the auto-contin
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   createSession({ id: 'brain-skill-cont', kind: 'chat', title: 's' });
-  // Simulate a skill_read earlier in the run: the tool_called event + the stored body.
-  appendEvent({ sessionId: 'brain-skill-cont', turn: 0, role: 'Clem', type: 'tool_called', data: { tool: 'skill_read', callId: 'sk1', args: { name: 'client-seo-report' } } });
-  writeToolOutput({ sessionId: 'brain-skill-cont', callId: 'sk1', tool: 'skill_read', output: 'Skill: client-seo-report\nmanifest…\n---\nSTEP 1: pull ranked keywords. STEP 2: compute the SEO_MAGIC_SCORE_XYZ. STEP 3: render the branded HTML.' });
+  // Simulate one exact successful skill_read earlier in the run. Authority
+  // consumers intentionally reject a stored body next to an incomplete durable
+  // lifecycle, so the fixture must mirror the production call/return pair.
+  const skillCalled = appendEvent({
+    sessionId: 'brain-skill-cont',
+    turn: 0,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'skill_read', callId: 'sk1', effect: 'read', args: { name: 'client-seo-report' } },
+  });
+  writeToolOutput({
+    sessionId: 'brain-skill-cont',
+    callId: 'sk1',
+    invocationNonce: 'brain-skill-cont:sk1',
+    tool: 'skill_read',
+    output: 'Skill: client-seo-report\nmanifest…\n---\nSTEP 1: pull ranked keywords. STEP 2: compute the SEO_MAGIC_SCORE_XYZ. STEP 3: render the branded HTML.',
+  });
+  appendEvent({
+    sessionId: 'brain-skill-cont',
+    turn: 0,
+    role: 'Clem',
+    type: 'tool_returned',
+    parentEventId: skillCalled.id,
+    data: { tool: 'skill_read', callId: 'sk1', effect: 'read', ok: true },
+  });
 
   const prompts: string[] = [];
   let calls = 0;

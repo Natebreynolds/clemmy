@@ -76,7 +76,7 @@ stdout:
 function seedReadOnlyListing(sessionId: string, clippedEvent = false): void {
   const secondObject = TWO_SITE_LISTING.indexOf('  {\n    "id": "22222222');
   const capturedPrefix = `${TWO_SITE_LISTING.slice(0, secondObject)}  {"id":"partial"\n...[capture stopped after 200000 chars]`;
-  appendEvent({
+  const called = appendEvent({
     sessionId,
     turn: 1,
     role: 'Clem',
@@ -84,30 +84,34 @@ function seedReadOnlyListing(sessionId: string, clippedEvent = false): void {
     data: {
       tool: 'run_shell_command',
       callId: 'list-1',
+      effect: 'compute',
       arguments: JSON.stringify({ command: 'netlify sites:list --json' }),
-    },
-  });
-  appendEvent({
-    sessionId,
-    turn: 1,
-    role: 'tool',
-    type: 'tool_returned',
-    data: {
-      tool: 'run_shell_command',
-      callId: 'list-1',
-      result: clippedEvent
-        ? 'exit_code: 0\n\nstdout:\n[{"id":"partial"\n[clipped: use recall_tool_result("list-1") for full output]'
-        : TWO_SITE_LISTING,
     },
   });
   if (clippedEvent) {
     writeToolOutput({
       sessionId,
       callId: 'list-1',
+      invocationNonce: 'nonce-list-1',
       tool: 'run_shell_command',
       output: capturedPrefix,
     });
   }
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      tool: 'run_shell_command',
+      callId: 'list-1',
+      effect: 'compute',
+      result: clippedEvent
+        ? 'exit_code: 0\n\nstdout:\n[{"id":"partial"\n[clipped: use recall_tool_result("list-1") for full output]'
+        : TWO_SITE_LISTING,
+    },
+  });
 }
 
 test('an exact user-named site URL can resolve to its canonical UUID without provenancing neighboring sites', () => {
