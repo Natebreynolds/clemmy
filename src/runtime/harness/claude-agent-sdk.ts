@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { existsSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { query as claudeQuery } from '@anthropic-ai/claude-agent-sdk';
 import type {
   CanUseTool,
@@ -1341,21 +1341,28 @@ export function resolveClaudeAgentSdkTrackerScope(
   return `${sessionId}::claude`;
 }
 
-function extractAssistantToolUses(message: SDKMessage, seenCallIds?: Set<string>): string[] {
+function extractIdlessAssistantToolUses(message: SDKMessage): string[] {
   if (message.type !== 'assistant') return [];
   const content = (message as { message?: { content?: unknown } }).message?.content;
   if (!Array.isArray(content)) return [];
   const out: string[] = [];
   for (const block of content) {
     const b = block as { type?: unknown; id?: unknown; name?: unknown };
-    if (b.type !== 'tool_use' || typeof b.name !== 'string') continue;
-    if (typeof b.id === 'string' && seenCallIds) {
-      if (seenCallIds.has(b.id)) continue;
-      seenCallIds.add(b.id);
-    }
-    out.push(b.name);
+    if (b.type === 'tool_use' && typeof b.id !== 'string' && typeof b.name === 'string') out.push(b.name);
   }
   return out;
+}
+
+function sdkToolResultFingerprint(result: {
+  output: string;
+  isError: boolean;
+  valid: boolean;
+}): string {
+  return createHash('sha256')
+    .update(result.isError ? 'error\0' : 'success\0')
+    .update(result.valid ? 'valid\0' : 'malformed\0')
+    .update(result.output)
+    .digest('hex');
 }
 
 /** Pair tool_use ids → names from an assistant message (the MCP tool name is
@@ -1892,7 +1899,25 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     if (providerCallId) {
       const cached = nativePermissionResults.get(providerCallId);
       if (cached) {
-        if (cached.signature === permissionSignature) return cached.result;
+        if (cached.signature === permissionSignature) {
+          // A repeated permission callback for a read or a denial can safely
+          // reuse the first verdict. Replaying an ALLOW for a native mutation
+          // would authorize a second provider dispatch under the first durable
+          // reservation, however, so stop before the write can disappear behind
+          // the reused id. Concurrent callbacks still share the in-flight promise
+          // below and therefore remain one physical admission decision.
+          if (
+            cached.result?.behavior === 'allow'
+            && nativeExternalWriteAttempt(toolName, input, providerCallId)
+          ) {
+            return {
+              behavior: 'deny',
+              interrupt: true,
+              message: `Provider call id ${providerCallId} was reused after a native write was admitted. The turn was stopped rather than authorize another dispatch under the first reservation.`,
+            } as PermissionResult;
+          }
+          return cached.result;
+        }
         return {
           behavior: 'deny',
           interrupt: true,
@@ -2349,13 +2374,50 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // visible output. Once tools run or deltas stream, the error propagates and
   // the caller decides (workflow step re-dispatch / chat turn-boundary switch).
   let streamedAny = false;
-  // The SDK may replay a full assistant/user message around stream boundaries.
-  // Canonical accounting is keyed by the provider's tool_use id, not message
-  // count, so every logical call has exactly one start and one completion row.
-  const seenTopLevelToolCallIds = new Set<string>();
-  const seenTopLevelToolReturnIds = new Set<string>();
-  const seenReturnedToolCallIds = new Set<string>();
-  const topLevelToolCalledEventIds = new Map<string, string>();
+  // The SDK may replay a full assistant/user message around stream boundaries,
+  // but provider ids are not globally unique. Coalesce only an identical
+  // use/result replay. If one id carries a different tool/input/result later in
+  // this run, retain a second parented occurrence and exact-output nonce so the
+  // authority resolver sees ambiguity instead of silently selecting the first.
+  type TopLevelToolOccurrence = {
+    source: { name: string; input: unknown } | undefined;
+    useFingerprint: string;
+    calledEventId: string | undefined;
+    resultFingerprint?: string;
+  };
+  const topLevelToolOccurrences = new Map<string, TopLevelToolOccurrence[]>();
+  const startTopLevelToolOccurrence = (
+    callId: string,
+    source: { name: string; input: unknown } | undefined,
+  ): TopLevelToolOccurrence => {
+    const occurrence: TopLevelToolOccurrence = {
+      source,
+      useFingerprint: source
+        ? toolCallCorrelationFingerprint(source.name, source.input)
+        : '',
+      calledEventId: undefined,
+    };
+    const occurrences = topLevelToolOccurrences.get(callId) ?? [];
+    occurrences.push(occurrence);
+    topLevelToolOccurrences.set(callId, occurrences);
+    if (!source) return occurrence;
+    try {
+      toolCallLedger.push({
+        callId,
+        name: mcpToolTail(source.name),
+        argsPreview: JSON.stringify(source.input ?? {}).slice(0, 120),
+      });
+    } catch { /* ledger is best-effort */ }
+    toolUses.push(source.name);
+    occurrence.calledEventId = appendSdkTopLevelToolEvent(
+      options.sessionId,
+      'tool_called',
+      callId,
+      source,
+    );
+    emitSdkToolCallEvent(options.sessionId, 'tool_call_started', callId, source.name);
+    return occurrence;
+  };
   // One unique child scope per SDK invocation, with a new generation for each
   // query()/internal retry. The caller's lease remains shared authority owned
   // by the brain/workflow/worker wrapper; this function revokes only children.
@@ -2389,7 +2451,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     const startedAt = Date.now();
     let lastHeartbeatAt = startedAt;
     let sawSdkApiRetry = false;
-    const toolById = new Map<string, { name: string; input: unknown }>();
     let stream: Query | undefined;
     const queryDispatchLease = options.dispatchLease && internalQueryScopeId
       ? activateDispatchLease({
@@ -2615,36 +2676,31 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // tool use/result so the Observability panel shows what Clem actually does,
         // on BOTH lanes (chat brain + workflow step share this runner). Fail-open.
         for (const use of extractToolUseIds(message)) {
-          if (seenTopLevelToolCallIds.has(use.id)) continue;
-          seenTopLevelToolCallIds.add(use.id);
-          // The first provider frame owns this canonical id. A replay must not
-          // overwrite the source name/input later used to interpret its result.
-          toolById.set(use.id, { name: use.name, input: use.input });
-          try {
-            toolCallLedger.push({
-              callId: use.id,
-              name: mcpToolTail(use.name),
-              argsPreview: JSON.stringify(use.input ?? {}).slice(0, 120),
-            });
-          } catch { /* ledger is best-effort */ }
-          const calledEventId = appendSdkTopLevelToolEvent(
-            options.sessionId,
-            'tool_called',
-            use.id,
-            { name: use.name, input: use.input },
-          );
-          if (calledEventId) topLevelToolCalledEventIds.set(use.id, calledEventId);
-          emitSdkToolCallEvent(options.sessionId, 'tool_call_started', use.id, use.name);
+          const source = { name: use.name, input: use.input };
+          const useFingerprint = toolCallCorrelationFingerprint(use.name, use.input);
+          const occurrences = topLevelToolOccurrences.get(use.id) ?? [];
+          // An identical assistant block may be replayed before or after its
+          // result. A later differing result promotes itself to a new occurrence
+          // below; until then this frame is indistinguishable from exact replay.
+          if (occurrences.some((occurrence) => occurrence.useFingerprint === useFingerprint)) continue;
+          startTopLevelToolOccurrence(use.id, source);
         }
-        // The SDK can replay a complete assistant frame around stream/compact
-        // boundaries. Return one logical tool use per provider id, matching the
-        // canonical event accounting above. Legacy/id-less blocks remain
-        // visible because there is no safe identity with which to coalesce them.
-        toolUses.push(...extractAssistantToolUses(message, seenReturnedToolCallIds));
+        // Legacy/id-less tool blocks remain visible because there is no provider
+        // identity with which to correlate or coalesce them safely.
+        toolUses.push(...extractIdlessAssistantToolUses(message));
         for (const tr of extractToolResults(message)) {
-          const source = toolById.get(tr.callId);
-          if (seenTopLevelToolReturnIds.has(tr.callId)) continue;
-          seenTopLevelToolReturnIds.add(tr.callId);
+          const resultFingerprint = sdkToolResultFingerprint(tr);
+          const occurrences = topLevelToolOccurrences.get(tr.callId) ?? [];
+          let occurrence = occurrences.find((candidate) => candidate.resultFingerprint === undefined);
+          if (!occurrence) {
+            if (occurrences.some((candidate) => candidate.resultFingerprint === resultFingerprint)) continue;
+            // The provider reused an id with the same tool/input but different
+            // result bytes. Materialize a second call occurrence now so its
+            // output is parented independently and exact authority fails closed.
+            occurrence = startTopLevelToolOccurrence(tr.callId, occurrences.at(-1)?.source);
+          }
+          occurrence.resultFingerprint = resultFingerprint;
+          const source = occurrence.source;
           const resultFailed = tr.isError || !tr.valid;
           let invocationNonce: string | undefined;
           // Persist the exact bytes before the parented terminal event. That
@@ -2765,7 +2821,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             tr.callId,
             source,
             { isError: resultFailed, output: tr.output, invocationNonce },
-            topLevelToolCalledEventIds.get(tr.callId),
+            occurrence.calledEventId,
           );
           if (reflectLearning && tr.output) {
             const tool = source ? reflectionToolName(source.name, source.input) : null;

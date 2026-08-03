@@ -844,6 +844,44 @@ test('native targetless writes require call ids, race by payload, and keep malfo
   assert.equal(eventlog.listEvents(session.id, { types: ['external_write_failed'] }).length, 0);
 });
 
+test('a resolved native-write permission cannot be replayed under the same provider call id', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const toolName = 'mcp__linkedin__create_post';
+  const input = { text: `call-id reuse guard ${session.id}`, visibility: 'PUBLIC' };
+  const callId = 'toolu_native_write_permission_reuse';
+  const verdicts: Array<{ behavior?: string; interrupt?: boolean; message?: string }> = [];
+  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
+    yield {
+      ...initOnlyMessage(),
+      tools: [toolName],
+      mcp_servers: [{ name: 'linkedin', status: 'connected' }],
+    } as any;
+    const canUse = params.options.canUseTool as (
+      name: string,
+      args: unknown,
+      options: { signal: AbortSignal; toolUseID: string },
+    ) => Promise<{ behavior?: string; interrupt?: boolean; message?: string }>;
+    const permissionOptions = { signal: new AbortController().signal, toolUseID: callId };
+    verdicts.push(await canUse(toolName, input, permissionOptions));
+    verdicts.push(await canUse(toolName, input, permissionOptions));
+    yield successResultMessage('permission reuse checked');
+  })())) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Publish this post once.',
+    sessionId: session.id,
+    modelId: 'claude-sonnet-4-6',
+    trackerScopeId: `${session.id}::native-write-permission-reuse`,
+    allowedLocalMcpTools: [toolName],
+  });
+
+  assert.deepEqual(verdicts.map((verdict) => verdict.behavior), ['allow', 'deny']);
+  assert.equal(verdicts[1]?.interrupt, true);
+  assert.match(verdicts[1]?.message ?? '', /reused|another dispatch|reservation/i);
+  assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 1);
+  assert.equal(eventlog.listEvents(session.id, { types: ['external_write_orphaned'] }).length, 1);
+});
+
 test('explicit multi-document objective permits distinct native creates and settles reversed results by call id', async () => {
   const session = eventlog.createSession({ kind: 'chat' });
   const trackerScopeId = `${session.id}::multi-doc-root`;
@@ -1126,6 +1164,77 @@ test('Claude-native result parking mints one exact invocation row per physical r
       eventlog.resolveToolOutputForAuthority(session.id, callId).status,
       'ambiguous',
       'reusing the provider id never silently selects one physical result',
+    );
+  } finally {
+    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
+  }
+});
+
+test('same-run Claude-native call-id reuse keeps differing results and inputs as ambiguous occurrences', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const callId = 'toolu_native_reused_same_run';
+  const toolName = 'mcp__records__query_rows';
+  const input = { table: 'sales', limit: 8 };
+  const firstOutput = JSON.stringify({ rows: [{ id: 1 }, { id: 2 }] });
+  const secondOutput = JSON.stringify({ rows: [{ id: 9 }] });
+  const thirdOutput = JSON.stringify({ rows: [{ id: 17 }] });
+  const use = {
+    type: 'assistant', session_id: 'sdk-native-reused-same-run', parent_tool_use_id: null,
+    message: { content: [{ type: 'tool_use', id: callId, name: toolName, input }] },
+  };
+  const returned = (uuid: string, content: string) => ({
+    type: 'user', session_id: 'sdk-native-reused-same-run', uuid, parent_tool_use_id: null,
+    message: { content: [{ type: 'tool_result', tool_use_id: callId, is_error: false, content }] },
+  });
+  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
+  setClaudeAgentSdkQueryForTest((() => queryFromMessages([
+    {
+      ...initOnlyMessage(),
+      tools: [toolName],
+      mcp_servers: [{ name: 'records', status: 'connected' }],
+    } as any,
+    { ...use, uuid: 'use-native-reused-same-run-1' } as any,
+    { ...use, uuid: 'use-native-reused-same-run-replay' } as any,
+    returned('return-native-reused-same-run-1', firstOutput) as any,
+    returned('return-native-reused-same-run-replay', firstOutput) as any,
+    { ...use, uuid: 'use-native-reused-same-run-2' } as any,
+    returned('return-native-reused-same-run-2', secondOutput) as any,
+    {
+      ...use,
+      uuid: 'use-native-reused-same-run-3',
+      message: {
+        content: [{ type: 'tool_use', id: callId, name: toolName, input: { table: 'customers', limit: 2 } }],
+      },
+    } as any,
+    returned('return-native-reused-same-run-3', thirdOutput) as any,
+    successResultMessage('read both physical occurrences'),
+  ], {})) as any);
+
+  try {
+    const result = await runClaudeAgentSdk({
+      prompt: 'Read the exact current rows.',
+      sessionId: session.id,
+      modelId: 'claude-sonnet-4-6',
+      trackerScopeId: `${session.id}::native-reused-same-run`,
+      allowedLocalMcpTools: [],
+    });
+    const invocations = eventlog.listToolOutputInvocations(session.id, callId);
+    assert.equal(invocations.length, 3, 'exact frame replay coalesces while differing result bytes or inputs remain physical occurrences');
+    assert.equal(new Set(invocations.map((row: any) => row.invocationNonce)).size, 3);
+    assert.deepEqual(invocations.map((row: any) => row.output), [firstOutput, secondOutput, thirdOutput]);
+    assert.equal(result.toolCallLedger?.length, 3);
+    assert.deepEqual(result.toolUses, [toolName, toolName, toolName]);
+    const called = eventlog.listEvents(session.id, { types: ['tool_called'] });
+    const returnedEvents = eventlog.listEvents(session.id, { types: ['tool_returned'] });
+    assert.equal(called.length, 3);
+    assert.equal(returnedEvents.length, 3);
+    assert.deepEqual(returnedEvents.map((event) => event.parentEventId), called.map((event) => event.id));
+    assert.equal(
+      eventlog.resolveToolOutputForAuthority(session.id, callId).status,
+      'ambiguous',
+      'a reused provider id cannot silently select the first same-run result',
     );
   } finally {
     if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
@@ -1520,7 +1629,7 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__ping']);
 });
 
-test('replayed assistant frames contribute one returned tool use per provider call id', async () => {
+test('byte-identical replayed assistant frames contribute one returned tool use', async () => {
   const toolUse = {
     type: 'tool_use',
     id: 'toolu_replayed_frame',
@@ -1543,7 +1652,7 @@ test('replayed assistant frames contribute one returned tool use per provider ca
     {
       type: 'assistant', session_id: 'sdk-frame-replay', uuid: 'frame-assistant-replay',
       parent_tool_use_id: null,
-      message: { content: [{ ...toolUse, name: 'mcp__clementine-local__write_file', input: { path: '/tmp/altered' } }] },
+      message: { content: [toolUse] },
     } as any,
     {
       type: 'result', subtype: 'success', session_id: 'sdk-frame-replay', uuid: 'frame-done',
