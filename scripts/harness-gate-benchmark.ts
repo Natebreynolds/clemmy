@@ -30,6 +30,7 @@ mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
 const { resetEventLog, createSession, listEvents, writeToolOutput, appendEvent } = await import('../src/runtime/harness/eventlog.js');
 const { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter } = await import('../src/runtime/harness/brackets.js');
+const { runtimeToolAccountingMetadata } = await import('../src/runtime/harness/tool-effect.js');
 const destination = await import('../src/runtime/harness/destination-gate.js');
 const grounding = await import('../src/runtime/harness/grounding-gate.js');
 const goalfid = await import('../src/runtime/harness/goal-fidelity-gate.js');
@@ -100,6 +101,65 @@ function invoker(sessionId: string) {
   const counter = new ToolCallsCounter(1000);
   return (wrapped: ReturnType<typeof composioTool>, args: unknown) =>
     withHarnessRunContext({ sessionId, counter }, () => (wrapped as { execute: (a: unknown) => Promise<unknown> }).execute(args));
+}
+
+/** Seed evidence through the same exact lifecycle authority used in production.
+ * A presentation-only tool_outputs row is deliberately not evidence: the
+ * parented call/return pair and nonce-bound bytes prove one successful read or
+ * compute occurrence. */
+function writeAuthoritativeOutput(input: {
+  sessionId: string;
+  callId: string;
+  tool: string;
+  output: string;
+  arguments: unknown;
+}): void {
+  const accounting = runtimeToolAccountingMetadata(input.tool, input.arguments);
+  if (accounting.effect !== 'read' && accounting.effect !== 'compute') {
+    throw new Error(
+      `benchmark evidence producer ${input.tool} classified ${accounting.effect}; expected read/compute`,
+    );
+  }
+  const lifecycleMetadata = {
+    accounting: 'top_level',
+    effect: accounting.effect,
+    ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
+    ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
+  };
+  const called = appendEvent({
+    sessionId: input.sessionId,
+    turn: 0,
+    role: 'orchestrator',
+    type: 'tool_called',
+    data: {
+      tool: input.tool,
+      callId: input.callId,
+      canonicalCallId: input.callId,
+      ...lifecycleMetadata,
+      arguments: input.arguments,
+    },
+  });
+  writeToolOutput({
+    sessionId: input.sessionId,
+    callId: input.callId,
+    invocationNonce: `gate-benchmark:${input.callId}`,
+    tool: input.tool,
+    output: input.output,
+  });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 0,
+    role: 'orchestrator',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      tool: input.tool,
+      callId: input.callId,
+      canonicalCallId: input.callId,
+      ...lifecycleMetadata,
+      result: 'stored separately',
+    },
+  });
 }
 
 export const TRAPS: Trap[] = [
@@ -205,10 +265,14 @@ export const TRAPS: Trap[] = [
       grounding._resetDuplicateStateForTests();
       const sess = createSession({ kind: 'chat' });
       // The session's own source artifact for this target says Denver.
-      writeToolOutput({
+      writeAuthoritativeOutput({
         sessionId: sess.id,
         callId: 'call_extract_fixture',
-        tool: 'run_worker',
+        tool: 'composio_execute_tool',
+        arguments: JSON.stringify({
+          tool_slug: 'GOOGLEDRIVE_SEARCH',
+          arguments: JSON.stringify({ query: 'Oakridge Law Denver workers compensation research' }),
+        }),
         output: 'Oakridge Law; verified search term: "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
       });
       grounding._setGroundingJudgeForTests(async (payload: string) => payload.includes('Houston')
@@ -245,8 +309,13 @@ export const TRAPS: Trap[] = [
       const sess = createSession({ kind: 'chat' });
       // Goal + a loaded skill whose DEFINING requirement is per-firm research.
       appendEvent({ sessionId: sess.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Email each firm a personalized outreach note that references our specific per-firm SEO research.' } });
-      writeToolOutput({ sessionId: sess.id, callId: 'skill_acme', tool: 'skill_read', output: 'SKILL: acme-outbound\n(manifest)\n---\n## Per-firm research (REQUIRED)\nBefore writing ANY email, research that specific firm and weave a firm-specific finding into the opening. Never reuse a generic opening across firms.' });
-      appendEvent({ sessionId: sess.id, turn: 0, role: 'orchestrator', type: 'tool_called', data: { tool: 'skill_read', callId: 'skill_acme', arguments: JSON.stringify({ name: 'acme-outbound' }) } });
+      writeAuthoritativeOutput({
+        sessionId: sess.id,
+        callId: 'skill_acme',
+        tool: 'skill_read',
+        arguments: JSON.stringify({ name: 'acme-outbound' }),
+        output: 'SKILL: acme-outbound\n(manifest)\n---\n## Per-firm research (REQUIRED)\nBefore writing ANY email, research that specific firm and weave a firm-specific finding into the opening. Never reuse a generic opening across firms.',
+      });
       const GENERIC = 'Our agency helps law firms dominate local search with SEO, paid media, and conversion-focused websites that turn searchers into signed clients. I would love to show you what we can do for your practice.';
       const send = (slug: string, to: string, body: string) => ({ tool_slug: slug, arguments: JSON.stringify({ to_email: to, subject: 's', body }) });
       // Two prior same-shape sends with a byte-identical generic opening to DISTINCT firms.
@@ -276,10 +345,17 @@ export const TRAPS: Trap[] = [
       outputgrounding._resetOutputGroundingStateForTests();
       const sess = createSession({ kind: 'chat' });
       // The session's own captured data: ad spend by campaign totals $11,000.
-      writeToolOutput({
+      writeAuthoritativeOutput({
         sessionId: sess.id,
         callId: 'call_spend',
         tool: 'composio_execute_tool',
+        arguments: JSON.stringify({
+          tool_slug: 'GOOGLESHEETS_BATCH_GET',
+          arguments: JSON.stringify({
+            spreadsheet_id: 'fixture-campaign-report',
+            ranges: ['Campaign spend!A2:D4'],
+          }),
+        }),
         output: 'Ad spend by campaign: Alpha $4,000; Bravo $4,000; Charlie $3,000. Total $11,000.',
       });
       // Judge: a $24.5K spend claim contradicts the $11,000 source total.
