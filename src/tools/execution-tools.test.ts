@@ -796,7 +796,7 @@ test('execution_reconcile_write settles an ambiguous attempt from ANY read whose
   const missingEvidence = await call({
     id: execution.id, call_id: 'draft-ambiguous', verdict: 'absent', evidence_call_id: 'no-such-read',
   });
-  assert.match(missingEvidence.content[0].text, /no stored output/i);
+  assert.match(missingEvidence.content[0].text, /no exact invocation-scoped output/i);
 
   // 3. A LIST read (no target in args) whose OUTPUT names the target counts —
   //    the shape-agnostic evidence rule.
@@ -806,6 +806,7 @@ test('execution_reconcile_write settles an ambiguous attempt from ANY read whose
   });
   writeToolOutput({
     sessionId, callId: 'list-drafts', tool: 'composio_execute_tool',
+    invocationNonce: 'nonce-list-drafts',
     output: 'Drafts (2): weekly summary to team@example.com; intro to bob@example.com. No draft addressed to annie@example.com exists.',
   });
   const settled = await call({
@@ -823,6 +824,9 @@ test('execution_reconcile_write settles an ambiguous attempt from ANY read whose
     .find((event) => event.data.callId === 'draft-ambiguous');
   assert.equal(settlement?.data.reason, 'reconciled_absent');
   assert.equal(settlement?.data.evidenceCallId, 'list-drafts');
+  const reservation = listEvents(sessionId, { types: ['external_write'] })
+    .find((event) => event.data.callId === 'draft-ambiguous');
+  assert.equal(settlement?.parentEventId, reservation?.id, 'reconciliation binds the exact reservation');
 
   // 5. Already-settled attempts refuse re-reconciliation.
   const again = await call({
@@ -852,14 +856,22 @@ test('execution_reconcile_write verdict PRESENT records success; unrelated evide
   const ctx = { sessionId, sourceUserSeq: source.seq, counter: new ToolCallsCounter(20) };
 
   // Unrelated evidence (never names the target) is refused.
-  writeToolOutput({ sessionId, callId: 'other-read', tool: 'composio_execute_tool', output: 'Rows: acct-100, acct-101.' });
+  appendEvent({
+    sessionId, turn: 2, role: 'system', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'other-read', canonicalCallId: 'other-read', arguments: { tool_slug: 'GOOGLESHEETS_GET_RANGE', arguments: { range: 'Sheet1!A:Z' } } },
+  });
+  writeToolOutput({ sessionId, callId: 'other-read', invocationNonce: 'nonce-other-read', tool: 'composio_execute_tool', output: 'Rows: acct-100, acct-101.' });
   const unrelated = await withHarnessRunContext(ctx, () => reconcile({
     id: execution.id, call_id: 'row-ambiguous', verdict: 'present', evidence_call_id: 'other-read',
   }));
   assert.match(unrelated.content[0].text, /never mentions the attempt's target/i);
 
   // Evidence naming the target settles it as landed.
-  writeToolOutput({ sessionId, callId: 'target-read', tool: 'composio_execute_tool', output: 'Row found: acct-991 | Follow-up | 2026-07-30' });
+  appendEvent({
+    sessionId, turn: 2, role: 'system', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'target-read', canonicalCallId: 'target-read', arguments: { tool_slug: 'GOOGLESHEETS_GET_RANGE', arguments: { range: 'Sheet1!A:Z' } } },
+  });
+  writeToolOutput({ sessionId, callId: 'target-read', invocationNonce: 'nonce-target-read', tool: 'composio_execute_tool', output: 'Row found: acct-991 | Follow-up | 2026-07-30' });
   const present = await withHarnessRunContext(ctx, () => reconcile({
     id: execution.id, call_id: 'row-ambiguous', verdict: 'present', evidence_call_id: 'target-read',
   }));
@@ -868,4 +880,148 @@ test('execution_reconcile_write verdict PRESENT records success; unrelated evide
   const settlement = listEvents(sessionId, { types: ['external_write_succeeded'] })
     .find((event) => event.data.callId === 'row-ambiguous');
   assert.equal(settlement?.data.reason, 'reconciled_present');
+  const reservation = listEvents(sessionId, { types: ['external_write'] })
+    .find((event) => event.data.callId === 'row-ambiguous');
+  assert.equal(settlement?.parentEventId, reservation?.id);
+  assert.equal(settlement?.data.settlementKey, `external-write:${reservation?.id}`);
+});
+
+test('execution_reconcile_write rejects reused evidence ids and PRESENT against exact NOT FOUND bytes', async () => {
+  const sessionId = `sess-exec-reconcile-evidence-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'exact evidence identity' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Create the row for acct-991.' },
+  });
+  const execution = createTrackedExecution({ sessionId, sourceUserSeq: source.seq, status: 'active' } as never);
+  appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'external_write',
+    data: {
+      sourceUserSeq: source.seq,
+      callId: 'row-ambiguous-exact', canonicalCallId: 'row-ambiguous-exact',
+      actionKey: 'sheet:append', shapeKey: 'GOOGLESHEETS_APPEND',
+      targets: ['acct-991'], preDispatch: true,
+    },
+  });
+  appendEvent({
+    sessionId, turn: 2, role: 'system', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'read-reused', canonicalCallId: 'read-reused', arguments: { tool_slug: 'GOOGLESHEETS_GET_RANGE', arguments: { range: 'Sheet1!A:Z' } } },
+  });
+  writeToolOutput({
+    sessionId, callId: 'read-reused', invocationNonce: 'nonce-old-present', tool: 'composio_execute_tool',
+    output: `Row found: acct-991 ${'stale '.repeat(1_000)}`,
+  });
+  writeToolOutput({
+    sessionId, callId: 'read-reused', invocationNonce: 'nonce-current-absent', tool: 'composio_execute_tool',
+    output: 'NOT FOUND: acct-991',
+  });
+  const reconcile = registeredToolHandlers().get('execution_reconcile_write')!;
+  const ctx = { sessionId, sourceUserSeq: source.seq, counter: new ToolCallsCounter(20) };
+  const reused = await withHarnessRunContext(ctx, () => reconcile({
+    id: execution.id,
+    call_id: 'row-ambiguous-exact',
+    verdict: 'present',
+    evidence_call_id: 'read-reused',
+  }));
+  assert.match(reused.content[0].text, /reused by 2 invocations|stale and current/i);
+  assert.equal(listEvents(sessionId, { types: ['external_write_succeeded'] }).length, 0);
+
+  appendEvent({
+    sessionId, turn: 3, role: 'system', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'read-exact-absent', canonicalCallId: 'read-exact-absent', arguments: { tool_slug: 'GOOGLESHEETS_GET_RANGE', arguments: { range: 'Sheet1!A:Z' } } },
+  });
+  writeToolOutput({
+    sessionId, callId: 'read-exact-absent', invocationNonce: 'nonce-exact-absent', tool: 'composio_execute_tool',
+    output: 'NOT FOUND: acct-991',
+  });
+  const contradicted = await withHarnessRunContext(ctx, () => reconcile({
+    id: execution.id,
+    call_id: 'row-ambiguous-exact',
+    verdict: 'present',
+    evidence_call_id: 'read-exact-absent',
+  }));
+  assert.match(contradicted.content[0].text, /cannot prove PRESENT|failure\/absence-shaped/i);
+  assert.equal(listEvents(sessionId, { types: ['external_write_succeeded'] }).length, 0);
+
+  appendEvent({
+    sessionId, turn: 3, role: 'system', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'read-sibling-empty', canonicalCallId: 'read-sibling-empty', arguments: { tool_slug: 'GOOGLESHEETS_GET_RANGE', arguments: { range: 'Sheet1!A:Z' } } },
+  });
+  writeToolOutput({
+    sessionId, callId: 'read-sibling-empty', invocationNonce: 'nonce-sibling-empty', tool: 'composio_execute_tool',
+    output: JSON.stringify({ successful: true, data: { rows: [{ account: 'acct-991', status: 'present' }], results: [] } }),
+  });
+  const siblingEmpty = await withHarnessRunContext(ctx, () => reconcile({
+    id: execution.id,
+    call_id: 'row-ambiguous-exact',
+    verdict: 'absent',
+    evidence_call_id: 'read-sibling-empty',
+  }));
+  assert.match(siblingEmpty.content[0].text, /returns the write target|empty sibling/i);
+  assert.equal(listEvents(sessionId, { types: ['external_write_failed'] }).length, 0);
+
+  appendEvent({
+    sessionId, turn: 3, role: 'system', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'read-request-echo', canonicalCallId: 'read-request-echo', arguments: { tool_slug: 'GOOGLESHEETS_GET_RANGE', arguments: { account: 'acct-991' } } },
+  });
+  writeToolOutput({
+    sessionId, callId: 'read-request-echo', invocationNonce: 'nonce-request-echo', tool: 'composio_execute_tool',
+    output: JSON.stringify({ successful: true, data: { request: { account: 'acct-991' }, records: [{ account: 'acct-OTHER' }] } }),
+  });
+  const requestEcho = await withHarnessRunContext(ctx, () => reconcile({
+    id: execution.id,
+    call_id: 'row-ambiguous-exact',
+    verdict: 'present',
+    evidence_call_id: 'read-request-echo',
+  }));
+  assert.match(requestEcho.content[0].text, /does not return the write target|request arguments alone/i);
+  assert.equal(listEvents(sessionId, { types: ['external_write_succeeded'] }).length, 0);
+
+  const absent = await withHarnessRunContext(ctx, () => reconcile({
+    id: execution.id,
+    call_id: 'row-ambiguous-exact',
+    verdict: 'absent',
+    evidence_call_id: 'read-exact-absent',
+  }));
+  assert.match(absent.content[0].text, /Reconciled row-ambiguous-exact as ABSENT/i);
+  const settlement = listEvents(sessionId, { types: ['external_write_failed'] })[0];
+  assert.equal(settlement?.data.evidenceInvocationNonce, 'nonce-exact-absent');
+  assert.match(String(settlement?.data.evidenceSha256), /^[a-f0-9]{64}$/);
+});
+
+test('execution_reconcile_write refuses a reused call id with multiple unsettled reservations', async () => {
+  const sessionId = `sess-exec-reconcile-reused-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'reused call reconciliation' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Create the account row.' },
+  });
+  const execution = createTrackedExecution({ sessionId, sourceUserSeq: source.seq, status: 'active' } as never);
+  for (const actionKey of ['sheet:append:first', 'sheet:append:second']) {
+    appendEvent({
+      sessionId, turn: 1, role: 'system', type: 'external_write',
+      data: {
+        sourceUserSeq: source.seq,
+        callId: 'sdk-reused-call', canonicalCallId: 'sdk-reused-call',
+        actionKey, shapeKey: 'GOOGLESHEETS_APPEND', targets: ['acct-reused'], preDispatch: true,
+      },
+    });
+  }
+  writeToolOutput({
+    sessionId,
+    callId: 'reused-read',
+    invocationNonce: 'nonce-reused-read',
+    tool: 'composio_execute_tool',
+    output: 'Row found: acct-reused',
+  });
+  const reconcile = registeredToolHandlers().get('execution_reconcile_write')!;
+  const ctx = { sessionId, sourceUserSeq: source.seq, counter: new ToolCallsCounter(20) };
+  const result = await withHarnessRunContext(ctx, () => reconcile({
+    id: execution.id,
+    call_id: 'sdk-reused-call',
+    verdict: 'present',
+    evidence_call_id: 'reused-read',
+  }));
+  assert.match(result.content[0].text, /multiple|2 unsettled|exact reservation/i);
+  assert.equal(listEvents(sessionId, { types: ['external_write_succeeded'] }).length, 0);
 });

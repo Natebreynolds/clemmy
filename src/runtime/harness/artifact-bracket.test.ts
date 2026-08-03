@@ -27,6 +27,31 @@ function runContext(sessionId: string, runScopeId: string) {
   };
 }
 
+function seedArtifactVerification(sessionId: string, callId: string, output: unknown): void {
+  const called = eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { callId, tool: 'provider_list', effect: 'read' },
+  });
+  eventlog.writeToolOutput({
+    sessionId,
+    callId,
+    invocationNonce: `nonce-${callId}`,
+    tool: 'provider_list',
+    output: JSON.stringify(output),
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { callId, tool: 'provider_list', effect: 'read', result: 'stored separately' },
+  });
+}
+
 test('the tool bracket binds one create and reuses it across renamed retries in the same run', async () => {
   const sessionId = eventlog.createSession({ kind: 'chat' }).id;
   let dispatches = 0;
@@ -128,8 +153,11 @@ test('Netlify API create shares the site slot and cannot bypass an uncertain sit
   assert.match(String(denied), new RegExp(`artifactId ${uncertain!.id}`));
   assert.equal(dispatches, 1, 'the alternate Netlify API spelling cannot bypass the claim');
 
+  seedArtifactVerification(sessionId, 'verify-site-absent', { resources: [] });
   assert.equal(
-    ledger.resolveUncertainArtifactClaim(sessionId, uncertain!.id, { kind: 'absent' }).ok,
+    ledger.resolveUncertainArtifactClaim(sessionId, uncertain!.id, {
+      kind: 'absent', verificationCallId: 'verify-site-absent',
+    }).ok,
     true,
     'a read-only absence proof releases the exact claim',
   );

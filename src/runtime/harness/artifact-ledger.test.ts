@@ -9,6 +9,7 @@ process.env.CLEMENTINE_HOME = home;
 
 const eventlog = await import('./eventlog.js');
 const ledger = await import('./artifact-ledger.js');
+const { formatComposioExecuteOutput } = await import('../../tools/composio-tools.js');
 
 beforeEach(() => {
   eventlog.resetEventLog();
@@ -448,13 +449,83 @@ test('Google Docs binding verifies only when request and successful response ide
     sid, runScope, 'composio_execute_tool', getter,
     { data: { document_id: 'doc_exact_123456789' } }, 'native-error', false,
   ), null, 'the native SDK is_error bit is authoritative');
+  const contradictorySuccess = {
+    successful: true,
+    status_code: 404,
+    error: 'Document doc_exact_123456789 not found',
+    data: {
+      documentId: 'doc_exact_123456789',
+      display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
+    },
+  };
+  assert.equal(ledger.verifyArtifactBindingFromToolResult(
+    sid, runScope, 'composio_execute_tool', getter,
+    contradictorySuccess, 'contradictory-object-read',
+  ), null, 'successful:true cannot override an explicit 4xx/error contradiction');
+  assert.equal(ledger.verifyArtifactBindingFromToolResult(
+    sid, runScope, 'composio_execute_tool', getter,
+    JSON.stringify(contradictorySuccess), 'contradictory-json-read',
+  ), null, 'the same contradiction is rejected after JSON formatting');
+  assert.equal(ledger.verifyArtifactBindingFromToolResult(
+    sid, runScope, 'composio_execute_tool', getter,
+    {
+      successful: true,
+      response: {
+        successful: 'false',
+        documentId: 'doc_exact_123456789',
+        display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
+      },
+    },
+    'nested-string-false-read',
+  ), null, 'nested provider string flags cannot bypass the contradiction check');
+  assert.equal(ledger.verifyArtifactBindingFromToolResult(
+    sid, runScope, 'composio_execute_tool', getter,
+    {
+      successful: true,
+      data: {
+        failed: 'yes',
+        documentId: 'doc_exact_123456789',
+        display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
+      },
+    },
+    'nested-string-failed-read',
+  ), null, 'nested provider failed=yes cannot certify an artifact');
+  const formattedNotFound = formatComposioExecuteOutput({
+    successful: false,
+    status_code: 404,
+    error: 'Document doc_exact_123456789 not found',
+    data: {
+      documentId: 'doc_exact_123456789',
+      display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
+    },
+  }, {
+    toolName: 'composio_execute_tool',
+    toolSlug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+  });
+  assert.match(formattedNotFound, /NOT FOUND/i, 'fixture uses the production formatter shape');
+  assert.equal(ledger.verifyArtifactBindingFromToolResult(
+    sid, runScope, 'composio_execute_tool', getter,
+    formattedNotFound, 'formatted-failed-read',
+  ), null, 'a production-formatted read failure cannot certify its echoed id or URL');
+  assert.equal(ledger.verifyArtifactBindingFromToolResult(
+    sid, runScope, 'composio_execute_tool', getter,
+    'Not found: https://docs.google.com/document/d/doc_exact_123456789/edit', 'raw-failed-read',
+  ), null, 'failure prose containing the exact URL cannot certify a read');
 
   const verified = ledger.verifyArtifactBindingFromToolResult(
     sid,
     runScope,
     'composio_execute_tool',
     getter,
-    { data: { display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit', plain_text: 'Finished brief' } },
+    {
+      successful: true,
+      error: 'deprecation notice',
+      data: {},
+      response: {
+        display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
+        plain_text: 'Finished brief: the appendix discusses a NOT FOUND status from an earlier audit.',
+      },
+    },
     'readback-doc',
   );
   assert.ok(verified?.bindingVerifiedAt);
@@ -939,9 +1010,9 @@ test('partitionSupersededPendingClaims: a dead mid-flight claim is superseded on
   equal(noPendHelp.superseded.length, 0);
 });
 
-test('resolveUncertainArtifactClaim: bind and absent free a jailed uncertain claim; bound claims are untouchable', async () => {
+test('resolveUncertainArtifactClaim: exact read evidence binds/releases a jailed claim; bound claims are untouchable', async () => {
   const { resolveUncertainArtifactClaim, claimArtifactSlot } = await import('./artifact-ledger.js');
-  const { openEventLog, createSession } = await import('./eventlog.js');
+  const { appendEvent, openEventLog, createSession, writeToolOutput } = await import('./eventlog.js');
   const { equal, ok } = await import('node:assert/strict');
   const session = createSession({ id: 'sess-uncertain-claim', kind: 'chat' });
   const db = openEventLog();
@@ -956,8 +1027,31 @@ test('resolveUncertainArtifactClaim: bind and absent free a jailed uncertain cla
   mkClaim('art-uncertain-2', 'uncertain');
   mkClaim('art-bound-1', 'bound');
 
+  const addVerification = (callId: string, output: string): void => {
+    const called = appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'tool',
+      type: 'tool_called',
+      data: { callId, tool: 'provider_list', effect: 'read' },
+    });
+    writeToolOutput({ sessionId: session.id, callId, invocationNonce: `nonce-${callId}`, tool: 'provider_list', output });
+    appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'tool',
+      type: 'tool_returned',
+      parentEventId: called.id,
+      data: { callId, tool: 'provider_list', effect: 'read', result: 'stored separately' },
+    });
+  };
+  addVerification('verify-bind', JSON.stringify({ resources: [{ id: 'site-abc123' }] }));
+  addVerification('verify-absent', JSON.stringify({ resources: [] }));
+
   // bind: attaches the id and verifies.
-  const bound = resolveUncertainArtifactClaim(session.id, 'art-uncertain-1', { kind: 'bind', resourceId: 'site-abc123' });
+  const bound = resolveUncertainArtifactClaim(session.id, 'art-uncertain-1', {
+    kind: 'bind', resourceId: 'site-abc123', verificationCallId: 'verify-bind',
+  });
   equal(bound.ok, true);
   const row = db.prepare('SELECT status, resource_id, binding_verified_at FROM run_artifacts WHERE id = ?').get('art-uncertain-1') as { status: string; resource_id: string; binding_verified_at: string | null };
   equal(row.status, 'bound');
@@ -965,14 +1059,92 @@ test('resolveUncertainArtifactClaim: bind and absent free a jailed uncertain cla
   ok(row.binding_verified_at, 'bind marks the claim verified');
 
   // absent: releases the claim entirely.
-  equal(resolveUncertainArtifactClaim(session.id, 'art-uncertain-2', { kind: 'absent' }).ok, true);
+  equal(resolveUncertainArtifactClaim(session.id, 'art-uncertain-2', { kind: 'absent', verificationCallId: 'verify-absent' }).ok, true);
   equal(db.prepare('SELECT COUNT(*) AS n FROM run_artifacts WHERE id = ?').get('art-uncertain-2') as unknown as { n: number } | undefined && (db.prepare('SELECT COUNT(*) AS n FROM run_artifacts WHERE id = ?').get('art-uncertain-2') as { n: number }).n, 0);
 
   // an already-bound claim is untouchable.
-  equal(resolveUncertainArtifactClaim(session.id, 'art-bound-1', { kind: 'absent' }).ok, false);
+  equal(resolveUncertainArtifactClaim(session.id, 'art-bound-1', { kind: 'absent', verificationCallId: 'verify-absent' }).ok, false);
   // wrong session is refused.
-  equal(resolveUncertainArtifactClaim('sess-other', 'art-uncertain-1', { kind: 'absent' }).ok, false);
+  equal(resolveUncertainArtifactClaim('sess-other', 'art-uncertain-1', { kind: 'absent', verificationCallId: 'verify-absent' }).ok, false);
   void claimArtifactSlot;
+});
+
+test('resolveUncertainArtifactClaim refuses stale, reused, and request-echo evidence', async () => {
+  const { resolveUncertainArtifactClaim } = await import('./artifact-ledger.js');
+  const { appendEvent, createSession, openEventLog, writeToolOutput } = await import('./eventlog.js');
+  const session = createSession({ id: 'sess-uncertain-stale-proof', kind: 'chat' });
+  const db = openEventLog();
+  for (const id of ['art-stale-bind', 'art-stale-absent', 'art-echo-bind']) {
+    db.prepare(`
+      INSERT INTO run_artifacts
+        (id, session_id, run_scope_id, slot_key, kind, provider, status, create_shape, created_at, updated_at)
+      VALUES (?, ?, 'scope-stale', ?, 'site', 'Fixture', 'uncertain', 'fixture-create', datetime('now'), datetime('now'))
+    `).run(id, session.id, `slot-${id}`);
+  }
+  const addRead = (callId: string, nonce: string, output: string, turn: number): void => {
+    const called = appendEvent({
+      sessionId: session.id,
+      turn,
+      role: 'tool',
+      type: 'tool_called',
+      data: { callId, tool: 'provider_list', effect: 'read' },
+    });
+    writeToolOutput({ sessionId: session.id, callId, invocationNonce: nonce, tool: 'provider_list', output });
+    appendEvent({
+      sessionId: session.id,
+      turn,
+      role: 'tool',
+      type: 'tool_returned',
+      parentEventId: called.id,
+      data: { callId, tool: 'provider_list', effect: 'read', result: 'stored separately' },
+    });
+  };
+
+  addRead('reused-bind-proof', 'nonce-old-bind', JSON.stringify({ resources: [{ id: 'site-stale-123' }] }), 1);
+  const laterBind = appendEvent({
+    sessionId: session.id, turn: 2, role: 'tool', type: 'tool_called',
+    data: { callId: 'reused-bind-proof', tool: 'provider_list', effect: 'read' },
+  });
+  appendEvent({
+    sessionId: session.id, turn: 2, role: 'tool', type: 'tool_returned', parentEventId: laterBind.id,
+    data: { callId: 'reused-bind-proof', tool: 'provider_list', effect: 'read', result: 'FAILED' },
+  });
+  const staleBind = resolveUncertainArtifactClaim(session.id, 'art-stale-bind', {
+    kind: 'bind', resourceId: 'site-stale-123', verificationCallId: 'reused-bind-proof',
+  });
+  assert.equal(staleBind.ok, false);
+  assert.match(staleBind.reason ?? '', /ambiguous|fresh provider read/);
+
+  addRead('reused-absence-proof', 'nonce-old-empty', JSON.stringify({ resources: [] }), 3);
+  addRead('reused-absence-proof', 'nonce-current-nonempty', JSON.stringify({ resources: [{ id: 'site-live' }] }), 4);
+  const staleAbsent = resolveUncertainArtifactClaim(session.id, 'art-stale-absent', {
+    kind: 'absent', verificationCallId: 'reused-absence-proof',
+  });
+  assert.equal(staleAbsent.ok, false);
+
+  addRead('echo-bind-proof', 'nonce-echo', JSON.stringify({
+    request: { resourceId: 'site-echo-only' },
+    resources: [],
+  }), 5);
+  const echoBind = resolveUncertainArtifactClaim(session.id, 'art-echo-bind', {
+    kind: 'bind', resourceId: 'site-echo-only', verificationCallId: 'echo-bind-proof',
+  });
+  assert.equal(echoBind.ok, false);
+  assert.match(echoBind.reason ?? '', /absent from the exact provider result/);
+
+  assert.deepEqual(
+    db.prepare(`
+      SELECT id, status, resource_id, binding_verified_at
+        FROM run_artifacts
+       WHERE id IN ('art-stale-bind','art-stale-absent','art-echo-bind')
+       ORDER BY id
+    `).all(),
+    [
+      { id: 'art-echo-bind', status: 'uncertain', resource_id: null, binding_verified_at: null },
+      { id: 'art-stale-absent', status: 'uncertain', resource_id: null, binding_verified_at: null },
+      { id: 'art-stale-bind', status: 'uncertain', resource_id: null, binding_verified_at: null },
+    ],
+  );
 });
 
 test('effect-anchored generic classifier: any CLI create and any root provider create claim; item-level creates never do', async () => {

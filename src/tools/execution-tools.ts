@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { ExecutionStore } from '../execution/store.js';
@@ -6,7 +7,13 @@ import { textResult } from './shared.js';
 import type { ExecutionRecord } from '../types.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { recentExecutionToolEvidence } from '../execution/completion-evidence.js';
-import { appendEvent, getToolOutput, listEvents } from '../runtime/harness/eventlog.js';
+import { appendEvent, listEvents, listToolOutputInvocations } from '../runtime/harness/eventlog.js';
+import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
+import { toolOutputLooksSuccessful } from '../runtime/harness/tool-evidence.js';
+import {
+  projectProviderResult,
+  providerEnvelopeHasContradiction,
+} from '../runtime/harness/provider-read-evidence.js';
 import {
   externalWriteAdmissionKey,
   externalWriteDuplicateIdentityKeys,
@@ -169,6 +176,81 @@ function evidenceCallId(data: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function decodedEvidenceToolInput(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const text = value.trim();
+  if (!text.startsWith('{') && !text.startsWith('[')) return value;
+  try { return JSON.parse(text) as unknown; } catch { return value; }
+}
+
+function evidenceToolCallData(data: unknown): { toolName: string; input: unknown } | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const row = data as Record<string, unknown>;
+  const toolName = typeof row.tool === 'string' ? row.tool.trim() : '';
+  if (!toolName) return null;
+  return {
+    toolName,
+    input: decodedEvidenceToolInput(row.arguments ?? row.args ?? row.input ?? {}),
+  };
+}
+
+const EXPLICIT_ABSENCE_RE = /\b(?:absent|cannot find|could not find|does not exist|doesn't exist|do not exist|don't exist|failed to find|missing|no such|not found)\b|(?:^|[\s:])no\s+(?:matching\s+)?(?:documents?|drafts?|items?|messages?|records?|resources?|results?|rows?)\b|\b0\s+(?:matching\s+)?(?:documents?|drafts?|items?|messages?|records?|resources?|results?|rows?)\b/i;
+const EXPLICIT_PRESENCE_RE = /\b(?:exists?|found|landed|matched|present|returned)\b/i;
+
+function exactEvidenceSupportsVerdict(input: {
+  output: string;
+  verdict: 'absent' | 'present';
+  targets: string[];
+  argsText: string;
+}): { ok: true } | { ok: false; reason: string } {
+  const outputText = input.output.trim();
+  const outputLower = outputText.toLowerCase();
+  const argsLower = input.argsText.toLowerCase();
+  const plainOutputNamesTarget = input.targets.length === 0
+    || input.targets.some((target) => outputLower.includes(target.toLowerCase()));
+  const argsNameTarget = input.targets.length === 0
+    || input.targets.some((target) => argsLower.includes(target.toLowerCase()));
+  if (!outputText) return { ok: false, reason: 'the exact read output is empty' };
+  let parsed: unknown;
+  if (outputText.startsWith('{') || outputText.startsWith('[')) {
+    try { parsed = JSON.parse(outputText) as unknown; } catch { /* use plain evidence rules */ }
+  }
+  const projection = parsed === undefined
+    ? null
+    : projectProviderResult(parsed, input.targets);
+  if (parsed !== undefined && providerEnvelopeHasContradiction(parsed)) {
+    return { ok: false, reason: 'the provider read envelope contradicts success' };
+  }
+  const structuredGlobalEmpty = Boolean(
+    projection?.hasEmptyResult
+    && !projection.hasNonEmptyResult
+    && !projection.containsExpectedTarget,
+  );
+  const provesAbsence = EXPLICIT_ABSENCE_RE.test(outputText) || structuredGlobalEmpty;
+  if (input.verdict === 'present') {
+    if (!toolOutputLooksSuccessful(outputText) || provesAbsence) {
+      return { ok: false, reason: 'the exact read output is failure/absence-shaped, so it cannot prove PRESENT' };
+    }
+    const returnsTarget = projection
+      ? projection.containsExpectedTarget
+      : plainOutputNamesTarget && EXPLICIT_PRESENCE_RE.test(outputText);
+    if (!returnsTarget) {
+      return { ok: false, reason: 'the exact read output does not return the write target, so request arguments alone cannot prove PRESENT' };
+    }
+    return { ok: true };
+  }
+  if (projection?.containsExpectedTarget) {
+    return { ok: false, reason: 'the provider result returns the write target, so an empty sibling cannot prove ABSENT' };
+  }
+  if (!provesAbsence) {
+    return { ok: false, reason: 'the exact read output carries no deterministic absence evidence' };
+  }
+  if (!plainOutputNamesTarget && !argsNameTarget) {
+    return { ok: false, reason: 'the absence evidence is not bound to the write target' };
+  }
+  return { ok: true };
+}
+
 function authorizeExternalWriteRetryUnlocked(input: {
   execution: ExecutionRecord;
   sourceUserSeq: number | undefined;
@@ -299,10 +381,40 @@ function reconcileExternalWriteUnlocked(input: {
     ],
   });
   const sameCall = events.filter((event) => evidenceCallId(event.data) === input.callId);
-  const attempt = sameCall.find((event) => event.type === 'external_write');
-  if (!attempt) {
+  const attempts = sameCall.filter((event) => event.type === 'external_write');
+  if (attempts.length === 0) {
     return `Reconciliation refused: no external-write attempt with call id ${input.callId} exists in this session.`;
   }
+  const lineageAttempts = attempts.filter((candidate) => {
+    const source = candidate.data.sourceUserSeq;
+    return Number.isSafeInteger(source) && acceptedSources.has(source as number);
+  });
+  if (lineageAttempts.length === 0) {
+    return `Reconciliation refused: ${input.callId} is outside this execution's explicit request lineage.`;
+  }
+  const terminalSettlements = sameCall.filter((event) =>
+    event.type === 'external_write_succeeded' || event.type === 'external_write_failed');
+  // New receipts name their exact reservation. A historical unparented receipt
+  // is usable only when the call id names one reservation; otherwise a reused
+  // SDK call id is ambiguous and reconciliation must fail closed.
+  const unparentedTerminal = terminalSettlements.filter((event) => !event.parentEventId);
+  if (lineageAttempts.length > 1 && unparentedTerminal.length > 0) {
+    return `Reconciliation refused: call id ${input.callId} was reused and its historical settlement is not bound to one exact reservation.`;
+  }
+  const unsettledAttempts = lineageAttempts.filter((candidate) => {
+    const exactTerminal = terminalSettlements.some((event) => event.parentEventId === candidate.id);
+    const legacyTerminal = lineageAttempts.length === 1 && unparentedTerminal.length > 0;
+    return !exactTerminal && !legacyTerminal;
+  });
+  if (unsettledAttempts.length === 0) {
+    const settled = terminalSettlements.at(-1);
+    return `Reconciliation refused: ${input.callId} already has a settled outcome (${settled?.type ?? 'terminal'}). `
+      + 'Use execution_update_step with retryOfCallId for a proven failure; a succeeded write needs nothing.';
+  }
+  if (unsettledAttempts.length > 1) {
+    return `Reconciliation refused: call id ${input.callId} names ${unsettledAttempts.length} unsettled write reservations; exact reservation identity is required.`;
+  }
+  const attempt = unsettledAttempts[0];
   const attemptData = attempt.data as {
     sourceUserSeq?: unknown;
     actionKey?: unknown;
@@ -311,22 +423,35 @@ function reconcileExternalWriteUnlocked(input: {
     duplicateIdentityKeys?: unknown;
     correlationFingerprint?: unknown;
   };
-  if (
-    !Number.isSafeInteger(attemptData.sourceUserSeq)
-    || !acceptedSources.has(attemptData.sourceUserSeq as number)
-  ) {
-    return `Reconciliation refused: ${input.callId} is outside this execution's explicit request lineage.`;
+  const evidenceInvocations = listToolOutputInvocations(
+    input.execution.sessionId,
+    input.evidenceCallId,
+  );
+  if (evidenceInvocations.length === 0) {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} has no exact invocation-scoped output. `
+      + 'Run the read-only check again, then pass its new exact call id.';
   }
-  const settled = [...sameCall].reverse().find((event) =>
-    event.type === 'external_write_succeeded' || event.type === 'external_write_failed');
-  if (settled) {
-    return `Reconciliation refused: ${input.callId} already has a settled outcome (${settled.type}). `
-      + 'Use execution_update_step with retryOfCallId for a proven failure; a succeeded write needs nothing.';
+  if (evidenceInvocations.length > 1) {
+    return `Reconciliation refused: evidence call id ${input.evidenceCallId} was reused by ${evidenceInvocations.length} invocations. `
+      + 'Run one fresh read with a unique call id; Clementine will not choose between stale and current bytes.';
   }
-  const evidence = getToolOutput(input.execution.sessionId, input.evidenceCallId);
-  if (!evidence || !evidence.output?.trim()) {
-    return `Reconciliation refused: evidence call ${input.evidenceCallId} has no stored output in this session. `
-      + 'Run the read-only check first, then pass its exact call id.';
+  const evidence = evidenceInvocations[0];
+  if (!evidence.output?.trim() || evidence.truncatedAtWrite) {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} has no complete exact output in this session. `
+      + 'Run a narrower read-only check, then pass its exact call id.';
+  }
+  const evidenceCallEvents = listEvents(input.execution.sessionId, { types: ['tool_called'] })
+    .filter((event) => evidenceCallId(event.data) === input.evidenceCallId);
+  if (evidenceCallEvents.length !== 1) {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} has ${evidenceCallEvents.length} durable call records; exact read identity is required.`;
+  }
+  const evidenceCall = evidenceToolCallData(evidenceCallEvents[0]?.data);
+  if (!evidenceCall || (evidence.tool && evidence.tool !== evidenceCall.toolName)) {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} has inconsistent tool identity.`;
+  }
+  const evidenceEffect = classifyRuntimeToolEffect(evidenceCall.toolName, evidenceCall.input);
+  if (evidenceEffect.effect !== 'read' || evidenceEffect.mutating) {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} is not a provably read-only tool call.`;
   }
   if (Date.parse(evidence.createdAt) <= Date.parse(attempt.createdAt)) {
     return 'Reconciliation refused: the evidence read predates the ambiguous attempt — read the target back AFTER the attempt.';
@@ -336,9 +461,7 @@ function reconcileExternalWriteUnlocked(input: {
     : [];
   if (targets.length > 0) {
     const haystack = `${evidence.output}\n${evidence.tool ?? ''}`.toLowerCase();
-    const argsRow = listEvents(input.execution.sessionId, { types: ['tool_called'] })
-      .find((event) => evidenceCallId(event.data) === input.evidenceCallId);
-    const argsText = argsRow ? JSON.stringify(argsRow.data ?? {}).toLowerCase() : '';
+    const argsText = JSON.stringify(evidenceCallEvents[0]?.data ?? {}).toLowerCase();
     const mentioned = targets.some((target) => {
       const t = target.toLowerCase();
       return haystack.includes(t) || argsText.includes(t);
@@ -348,6 +471,15 @@ function reconcileExternalWriteUnlocked(input: {
         + 'Use a read that provably concerns this exact record — any list/search/get whose args or results name it.';
     }
   }
+  const verdictSupport = exactEvidenceSupportsVerdict({
+    output: evidence.output,
+    verdict: input.verdict,
+    targets,
+    argsText: JSON.stringify(evidenceCallEvents[0]?.data ?? {}),
+  });
+  if (!verdictSupport.ok) {
+    return `Reconciliation refused: ${verdictSupport.reason}.`;
+  }
   const actionKey = typeof attemptData.actionKey === 'string' && attemptData.actionKey.trim()
     ? attemptData.actionKey.trim()
     : `call:${input.callId}`;
@@ -356,6 +488,7 @@ function reconcileExternalWriteUnlocked(input: {
     turn: 0,
     role: 'system',
     type: input.verdict === 'absent' ? 'external_write_failed' : 'external_write_succeeded',
+    parentEventId: attempt.id,
     data: {
       callId: input.callId,
       canonicalCallId: input.callId,
@@ -370,7 +503,13 @@ function reconcileExternalWriteUnlocked(input: {
         ? { correlationFingerprint: attemptData.correlationFingerprint }
         : {}),
       reason: input.verdict === 'absent' ? 'reconciled_absent' : 'reconciled_present',
+      ...(input.verdict === 'present'
+        ? { settlementKey: `external-write:${attempt.id}` }
+        : {}),
       evidenceCallId: input.evidenceCallId,
+      evidenceInvocationNonce: evidence.invocationNonce,
+      evidenceSha256: createHash('sha256').update(evidence.output).digest('hex'),
+      evidenceToolName: evidenceCall.toolName,
       reconciledBy: 'execution_reconcile_write',
     },
   });
@@ -541,7 +680,7 @@ export function registerExecutionTools(server: McpServer): void {
 
   server.tool(
     'execution_reconcile_write',
-    'Settle an AMBIGUOUS or ORPHANED external write from read-back evidence. When a write died mid-flight (timeout/crash), Clementine\'s duplicate-safety ledger holds the outcome as ambiguous — this is HER ledger, never "the provider refusing". Flow: (1) read the exact target back with ANY read-only call you choose (a get, a list, a search); (2) call this with the ambiguous attempt\'s call id, the read\'s call id as evidence, and your verdict. verdict "absent" records a proven failure — execution_update_step with retryOfCallId then authorizes exactly ONE corrected retry. verdict "present" records the write as landed — report it done, never re-send. The evidence read must postdate the attempt and provably concern its target.',
+    'Settle an AMBIGUOUS or ORPHANED external write from exact read-back evidence. When a write died mid-flight (timeout/crash), Clementine\'s duplicate-safety ledger holds the outcome as ambiguous — this is HER ledger, never "the provider refusing". Flow: (1) read the exact target back with a provably read-only get/list/search; (2) call this with the ambiguous attempt\'s call id, the read\'s unique call id, and your verdict. verdict "absent" is accepted only from deterministic absence/empty evidence and then authorizes exactly ONE corrected retry via execution_update_step retryOfCallId. verdict "present" is accepted only when the read result itself returns the target. Reused evidence call ids and request-only echoes fail closed.',
     {
       id: z.string().min(1).describe('The active execution id.'),
       call_id: z.string().min(1).max(200).describe('Exact call id of the ambiguous/orphaned external-write attempt.'),

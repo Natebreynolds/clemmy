@@ -47,6 +47,7 @@ const packet = {
   objective: 'Design a concise report section using an installed skill.',
   item: 'report hero',
   resolvedTools: 'skill_read',
+  externalMcpToolNames: null,
   context: 'Use skill claude-worker-smoke.',
   instructions: 'Use the installed skill before writing.',
   expectedOutput: 'One compact design direction.',
@@ -102,7 +103,9 @@ test('runClaudeAgentSdkWorker builds a worker packet prompt with read-only tools
   assert.ok(captured.allowedLocalMcpTools.includes('memory_search'));
   assert.equal(captured.allowedLocalMcpTools.includes('run_shell_command'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('write_file'), false);
-  assert.equal(captured.nativeMcpScopeInput, 'skill_read');
+  // Local skill_read remains on allowedLocalMcpTools; an explicit null typed
+  // external lease must not re-interpret that local name as native MCP scope.
+  assert.equal(captured.nativeMcpScopeInput, '');
   assert.equal(captured.nativeMcpScopeMode, 'resolved_tools');
 });
 
@@ -113,6 +116,7 @@ test('runClaudeAgentSdkWorker builds a worker packet prompt with read-only tools
 const researchPacket = {
   objective: 'analyze one client', item: 'Northstar Legal — northstar-legal.example',
   resolvedTools: 'dataforseo', context: 'x', instructions: 'x', expectedOutput: 'x',
+  externalMcpToolNames: null,
   intent: 'research',
 };
 const ordinaryPacket = { ...researchPacket, intent: null };

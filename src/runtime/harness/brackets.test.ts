@@ -23,6 +23,7 @@ import assert from 'node:assert/strict';
 
 // Dynamic imports — see eventlog.test.ts for why.
 const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput, listEvents } = await import('./eventlog.js');
+const { formatRecallableToolText } = await import('./tool-output-format.js');
 const {
   assertNotKilled,
   KillRequested,
@@ -46,6 +47,7 @@ const {
   mintJudgeFailApproval,
   OrphanedWriteRetryError,
   _setBeforeSharedWriteAdmissionForTests,
+  _setAfterSharedWriteReservationForTests,
 } = await import('./brackets.js');
 
 test.after(() => {
@@ -68,6 +70,25 @@ async function raiseSoftRefusal<T>(p: T | Promise<T>): Promise<T> {
     throw new Error(v);
   }
   return v;
+}
+
+function writeAuthoritativeToolOutput(input: Parameters<typeof writeToolOutput>[0], effect = 'read'): void {
+  const called = appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect },
+  });
+  writeToolOutput({ ...input, invocationNonce: input.invocationNonce ?? `nonce-${input.callId}` });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect, result: 'stored separately' },
+  });
 }
 
 test('parallelPreWriteGatesEnabled: DEFAULT-ON with =off kill-switch', () => {
@@ -246,6 +267,90 @@ test('revoke-before-admission leaves zero reservation and zero invoke for shell 
     await runCase('generic');
   } finally {
     _setBeforeSharedWriteAdmissionForTests(null);
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('revoke-after-reservation compensates proven non-dispatch and permits one clean retry', async () => {
+  const saved: Record<string, string | undefined> = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  const leases = await import('./dispatch-lease.js');
+
+  const runCase = async (kind: 'shell' | 'generic'): Promise<void> => {
+    resetEventLog();
+    const session = createSession({ kind: 'chat' });
+    const scopeId = `${session.id}::${kind}:post-reservation`;
+    const lease = leases.activateDispatchLease({ sessionId: session.id, scopeId });
+    let invoked = 0;
+    let release!: () => void;
+    let reached!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const atReservation = new Promise<void>((resolve) => { reached = resolve; });
+    _setAfterSharedWriteReservationForTests(async (seenKind) => {
+      if (seenKind !== kind) return;
+      reached();
+      await hold;
+    });
+    const input = kind === 'shell'
+      ? { command: 'curl -X POST https://api.example.test/messages -d \'{"body":"hello"}\'' }
+      : {
+          tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+          arguments: JSON.stringify({ to_email: 'post-reservation@example.test', subject: 'hello', body: 'hello' }),
+        };
+    const wrapped = kind === 'shell'
+      ? wrapToolForHarness({ name: 'run_shell_command', execute: async () => { invoked += 1; return 'posted'; } })
+      : wrapToolForHarness({ name: 'composio_execute_tool', invoke: async () => { invoked += 1; return 'sent'; } });
+    const dispatch = (activeLease: typeof lease, suffix: string): Promise<unknown> => Promise.resolve(
+      withHarnessRunContext(
+        { sessionId: session.id, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(10), dispatchLease: activeLease },
+        () => kind === 'shell'
+          ? wrapped.execute!(input)
+          : (wrapped as unknown as { invoke: (rc: unknown, input: string, details: unknown) => Promise<unknown> })
+              .invoke(null, JSON.stringify(input), { toolCall: { callId: `post-reservation-${suffix}` } }),
+      ),
+    );
+
+    const pending = dispatch(lease, 'first');
+    await atReservation;
+    const [reservation] = listEvents(session.id, { types: ['external_write'] });
+    assert.ok(reservation, `${kind}: reservation exists before final dispatch edge`);
+    leases.revokeDispatchLease(lease);
+    release();
+    await assert.rejects(pending, (err: unknown) => err instanceof leases.StaleDispatchLeaseError);
+    assert.equal(invoked, 0, `${kind}: provider never starts`);
+    const [failed] = listEvents(session.id, { types: ['external_write_failed'] });
+    assert.equal(failed?.parentEventId, reservation.id, `${kind}: exact reservation is compensated`);
+    assert.equal(failed?.data.dispatch, 'not_started');
+    assert.equal(failed?.data.effect, 'none');
+
+    _setAfterSharedWriteReservationForTests(null);
+    const retryLease = leases.activateDispatchLease({ sessionId: session.id, scopeId });
+    await dispatch(retryLease, 'retry');
+    assert.equal(invoked, 1, `${kind}: compensated reservation does not wedge the repaired retry`);
+  };
+
+  try {
+    await runCase('shell');
+    await runCase('generic');
+  } finally {
+    _setAfterSharedWriteReservationForTests(null);
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -1795,7 +1900,7 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
       );
     assert.equal(await invoke('call-1'), 'memory rows');
     // hooks.ts persists tool_outputs in prod; seed it so the serve-side peek finds it.
-    writeToolOutput({ sessionId: sess.id, callId: 'call-1', tool: 'memory_search', output: 'memory rows' });
+    writeAuthoritativeToolOutput({ sessionId: sess.id, callId: 'call-1', tool: 'memory_search', output: 'memory rows' });
     const r2 = String(await invoke('call-2'));
     assert.ok(r2.includes('[within-task memory]'), 'cache nudge lands in the result');
     assert.ok(r2.includes('recall_tool_result'), 'nudge points at recall_tool_result');
@@ -1814,7 +1919,7 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
           .invoke(null, wargs, { toolCall: { callId } }),
       );
     await winvoke('w-1');
-    writeToolOutput({ sessionId: sess2.id, callId: 'w-1', tool: 'memory_search', output: 'rows' });
+    writeAuthoritativeToolOutput({ sessionId: sess2.id, callId: 'w-1', tool: 'memory_search', output: 'rows' });
     assert.equal(await winvoke('w-2'), 'rows', 'worker-scope repeat carries NO cache nudge');
 
     // Error-shaped prior output: a retry after a transient failure must NOT be discouraged.
@@ -1830,7 +1935,7 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
           .invoke(null, eargs, { toolCall: { callId } }),
       );
     await einvoke('e-1');
-    writeToolOutput({ sessionId: sess3.id, callId: 'e-1', tool: 'memory_search', output: 'ERROR: timed out' });
+    writeAuthoritativeToolOutput({ sessionId: sess3.id, callId: 'e-1', tool: 'memory_search', output: 'ERROR: timed out' });
     assert.equal(await einvoke('e-2'), 'ERROR: timed out', 'an error-shaped prior result does NOT become a do-not-retry nudge');
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
@@ -1857,7 +1962,7 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
   grounding._resetDuplicateStateForTests();
   const sess = createSession({ kind: 'chat' });
   // The extraction worker's CORRECT artifact for this target (Denver).
-  writeToolOutput({
+  writeAuthoritativeToolOutput({
     sessionId: sess.id,
     callId: 'call_extract_fixture',
     tool: 'run_worker',
@@ -2102,7 +2207,7 @@ test('shell-send grounding: a curl POST with a contradicting payload soft-blocks
   grounding._resetGroundingStateForTests();
   grounding._resetDuplicateStateForTests();
   const sess = createSession({ kind: 'chat' });
-  writeToolOutput({
+  writeAuthoritativeToolOutput({
     sessionId: sess.id, callId: 'c_extract', tool: 'run_worker',
     output: 'Oakridge Law; verified "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
   });
@@ -2169,7 +2274,7 @@ test('parallel shell pre-write gates consume the prestarted output-grounding pro
   const output = await import('./output-grounding-gate.js');
   output._resetOutputGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
-  writeToolOutput({
+  writeAuthoritativeToolOutput({
     sessionId: sess.id,
     callId: 'analytics-source',
     tool: 'analytics_lookup',
@@ -2453,6 +2558,533 @@ test('external-write settlement requires a positive acknowledgement, never failu
     }));
     assert.equal(listEvents(successSession.id, { types: ['external_write_succeeded'] }).length, 1);
     assert.equal(listEvents(successSession.id, { types: ['external_write_orphaned'] }).length, 0);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('large successful mutation settles from its exact lossless output, never the model-facing digest', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create the report document.' },
+  });
+  const exact = JSON.stringify({
+    successful: true,
+    error: null,
+    data: {
+      documentId: 'doc-large-success-1',
+      display_url: 'https://docs.google.com/document/d/doc-large-success-1/edit',
+      request_data: 'x'.repeat(20_000),
+    },
+  });
+  writeToolOutput({
+    sessionId: session.id,
+    callId: 'large-success-call',
+    tool: 'composio_execute_tool',
+    output: JSON.stringify({
+      successful: true,
+      data: {
+        documentId: 'stale-larger-document',
+        body: 's'.repeat(40_000),
+      },
+    }),
+  });
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async (_runContext: unknown, _input: unknown, details?: { toolCall?: { callId?: string } }) => {
+      const callId = details?.toolCall?.callId ?? '';
+      const compact = formatRecallableToolText(exact, {
+        sessionId: session.id,
+        callId,
+        toolName: 'composio_execute_tool',
+      });
+      return `${compact}\n\n[sender-verified]\n[routed-to: Google Docs]\nConstraints: verify the exact document id.`;
+    },
+  });
+  const invoke = (wrapped as unknown as {
+    invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+  }).invoke;
+  try {
+    const outward = await withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: 'large-success-settlement',
+      counter: new ToolCallsCounter(20),
+    }, () => invoke(null, JSON.stringify({
+      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      arguments: JSON.stringify({ title: 'Report', markdown_text: '# Report' }),
+    }), { toolCall: { callId: 'large-success-call' } }));
+
+    assert.notEqual(String(outward), exact, 'the model receives the compact presentation plus trusted annotations');
+    assert.equal(listEvents(session.id, { types: ['external_write_succeeded'] }).length, 1);
+    assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0);
+    assert.equal(
+      listEvents(session.id, { types: ['external_write_succeeded'] })[0]?.data.callId,
+      'large-success-call',
+    );
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('a reused call id cannot promote a stale side-store success for a failing invocation', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create the report document.' },
+  });
+  const callId = 'reused-side-store-call';
+  writeToolOutput({
+    sessionId: session.id,
+    callId,
+    tool: 'composio_execute_tool',
+    output: JSON.stringify({
+      successful: true,
+      data: {
+        documentId: 'stale-doc-success',
+        display_url: 'https://docs.google.com/document/d/stale-doc-success/edit',
+        body: 'x'.repeat(20_000),
+      },
+    }),
+  });
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async () => 'Invalid JSON input',
+  });
+  const invoke = (wrapped as unknown as {
+    invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+  }).invoke;
+  try {
+    const outward = await withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: 'reused-side-store-scope',
+      counter: new ToolCallsCounter(20),
+    }, () => invoke(null, JSON.stringify({
+      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      arguments: JSON.stringify({ title: 'Report', markdown_text: '# Report' }),
+    }), { toolCall: { callId } }));
+
+    assert.equal(outward, 'Invalid JSON input');
+    assert.equal(listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
+    assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 1);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('exact artifact readback idempotently settles its original ambiguous create receipt', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create one report document and verify it.' },
+  });
+  const documentId = 'doc-readback-settles-1';
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async (_runContext: unknown, rawInput: unknown, details?: { toolCall?: { callId?: string } }) => {
+      const input = JSON.parse(String(rawInput)) as { tool_slug?: string };
+      if (input.tool_slug === 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN') {
+        return `[provider-dispatch:uncertain]\nhttps://docs.google.com/document/d/${documentId}/edit`;
+      }
+      const exactReadback = JSON.stringify({
+        successful: true,
+        data: {
+          plain_text: 'Report body '.repeat(2_000),
+          documentId,
+        },
+      });
+      return formatRecallableToolText(exactReadback, {
+        sessionId: session.id,
+        callId: details?.toolCall?.callId,
+        toolName: 'composio_execute_tool',
+        maxChars: 300,
+      });
+    },
+  });
+  const invoke = (callId: string, input: unknown) => (wrapped as unknown as {
+    invoke: (runContext: unknown, rawInput: unknown, details?: unknown) => Promise<unknown>;
+  }).invoke(null, JSON.stringify(input), { toolCall: { callId } });
+  try {
+    const counter = new ToolCallsCounter(20);
+    await withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: 'ambiguous-create-scope',
+      counter,
+    }, () => invoke('ambiguous-create-call', {
+      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      arguments: JSON.stringify({ title: 'Report', markdown_text: '# Report' }),
+    }));
+    assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 1);
+    assert.equal(listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
+
+    // Simulate the crash window: exact provider verification became durable,
+    // but the process died before the external-write settlement append.
+    const {
+      listRunArtifacts,
+      verifyArtifactBindingFromToolResult,
+    } = await import('./artifact-ledger.js');
+    const claimed = listRunArtifacts(session.id)[0];
+    assert.ok(claimed?.runScopeId);
+    const verifiedBeforeCrash = verifyArtifactBindingFromToolResult(
+      session.id,
+      claimed.runScopeId,
+      'composio_execute_tool',
+      {
+        tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+        arguments: JSON.stringify({ document_id: documentId }),
+      },
+      { successful: true, data: { documentId, plain_text: 'durable provider proof' } },
+      'lost-read-before-settlement',
+    );
+    assert.equal(verifiedBeforeCrash?.verificationCallId, 'lost-read-before-settlement');
+    assert.equal(listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
+
+    const read = (callId: string) => withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: 'exact-readback-scope',
+      counter,
+    }, () => invoke(callId, {
+      tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+      arguments: JSON.stringify({ document_id: documentId }),
+    }));
+    await read('exact-readback-call');
+    await read('exact-readback-call-2');
+
+    const settled = listEvents(session.id, { types: ['external_write_succeeded'] });
+    assert.equal(settled.length, 1, 'replayed verification does not duplicate settlement');
+    assert.equal(settled[0]?.data.callId, 'ambiguous-create-call', 'the create—not the read—is settled');
+    assert.equal(settled[0]?.data.evidenceCallId, 'lost-read-before-settlement');
+    assert.equal(settled[0]?.data.resourceId, documentId);
+    assert.equal(settled[0]?.data.reason, 'artifact_readback_verified');
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('artifact readback does not duplicate a prior exact reconciliation settlement', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create and verify one report document.' },
+  });
+  const documentId = 'doc-prior-reconcile-1';
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async (_runContext: unknown, rawInput: unknown) => {
+      const input = JSON.parse(String(rawInput)) as { tool_slug?: string };
+      return input.tool_slug === 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN'
+        ? `[provider-dispatch:uncertain]\nhttps://docs.google.com/document/d/${documentId}/edit`
+        : JSON.stringify({ successful: true, data: { documentId, plain_text: 'verified' } });
+    },
+  });
+  const invoke = (callId: string, input: unknown) => (wrapped as unknown as {
+    invoke: (runContext: unknown, rawInput: unknown, details?: unknown) => Promise<unknown>;
+  }).invoke(null, JSON.stringify(input), { toolCall: { callId } });
+  try {
+    const counter = new ToolCallsCounter(20);
+    const run = (callId: string, input: unknown) => withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: `prior-reconcile-${callId}`,
+      counter,
+    }, () => invoke(callId, input));
+    await run('prior-reconcile-create', {
+      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      arguments: JSON.stringify({ title: 'Report', markdown_text: '# Report' }),
+    });
+    const reservation = listEvents(session.id, { types: ['external_write'] })[0];
+    assert.ok(reservation);
+    appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'system',
+      type: 'external_write_succeeded',
+      parentEventId: reservation.id,
+      data: {
+        ...reservation.data,
+        callId: 'prior-reconcile-create',
+        canonicalCallId: 'prior-reconcile-create',
+        settlementKey: `external-write:${reservation.id}`,
+        reason: 'reconciled_present',
+        evidenceCallId: 'manual-readback',
+      },
+    });
+    await run('later-exact-readback', {
+      tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+      arguments: JSON.stringify({ document_id: documentId }),
+    });
+    const settlements = listEvents(session.id, { types: ['external_write_succeeded'] });
+    assert.equal(settlements.length, 1);
+    assert.equal(settlements[0]?.data.reason, 'reconciled_present');
+    assert.equal(settlements[0]?.parentEventId, reservation.id);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('reused SDK call ids cannot attach verified artifact settlement to another reservation', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update Airtable, then create and verify one Google Doc.' },
+  });
+  const documentId = 'doc-call-id-collision-1';
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async (_runContext: unknown, rawInput: unknown) => {
+      const input = JSON.parse(String(rawInput)) as { tool_slug?: string };
+      if (input.tool_slug === 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT') {
+        return JSON.stringify({
+          successful: true,
+          data: {
+            documentId,
+            document_url: `https://docs.google.com/document/d/${documentId}/edit`,
+            text: 'Verified report',
+          },
+        });
+      }
+      if (input.tool_slug === 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN') {
+        return `[provider-dispatch:uncertain]\nhttps://docs.google.com/document/d/${documentId}/edit`;
+      }
+      return '[provider-dispatch:uncertain]';
+    },
+  });
+  const invoke = (callId: string, input: unknown) => (wrapped as unknown as {
+    invoke: (runContext: unknown, rawInput: unknown, details?: unknown) => Promise<unknown>;
+  }).invoke(null, JSON.stringify(input), { toolCall: { callId } });
+  try {
+    const counter = new ToolCallsCounter(20);
+    const run = (callId: string, input: unknown, behaviorScopeId: string) => withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId,
+      counter,
+    }, () => invoke(callId, input));
+    await run('duplicate-call', {
+      tool_slug: 'AIRTABLE_UPDATE_RECORD',
+      arguments: JSON.stringify({ base_id: 'base-1', table_id: 'table-1', record_id: 'rec-1', fields: { status: 'done' } }),
+    }, 'airtable-collision-scope');
+    await run('duplicate-call', {
+      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      arguments: JSON.stringify({ title: 'Report', markdown_text: '# Report' }),
+    }, 'doc-collision-scope');
+    await run('verify-doc-collision', {
+      tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+      arguments: JSON.stringify({ document_id: documentId }),
+    }, 'verify-collision-scope');
+
+    const reservations = listEvents(session.id, { types: ['external_write'] });
+    assert.equal(reservations.length, 2);
+    const airtable = reservations.find((event) => event.data.shapeKey === 'AIRTABLE_UPDATE_RECORD');
+    const doc = reservations.find((event) => event.data.shapeKey === 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN');
+    assert.ok(airtable);
+    assert.ok(doc);
+    const settled = listEvents(session.id, { types: ['external_write_succeeded'] });
+    assert.equal(settled.length, 1);
+    assert.equal(settled[0]?.parentEventId, doc.id);
+    assert.notEqual(settled[0]?.parentEventId, airtable.id);
+    assert.equal(settled[0]?.data.shapeKey, 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN');
+    assert.equal(settled[0]?.data.resourceId, documentId);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('a provider request echo is not artifact readback evidence', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create and verify one Google Doc.' },
+  });
+  const documentId = 'doc-echo-only-1';
+  let readCount = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async (_runContext: unknown, rawInput: unknown) => {
+      const input = JSON.parse(String(rawInput)) as { tool_slug?: string };
+      return input.tool_slug === 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN'
+        ? `[provider-dispatch:uncertain]\nhttps://docs.google.com/document/d/${documentId}/edit`
+        : JSON.stringify(readCount++ === 0
+            ? {
+                successful: true,
+                data: { request_data: { document_id: documentId } },
+              }
+            : {
+                successful: true,
+                response: { nested: { args: { document_id: documentId } } },
+              });
+    },
+  });
+  const invoke = (callId: string, input: unknown) => (wrapped as unknown as {
+    invoke: (runContext: unknown, rawInput: unknown, details?: unknown) => Promise<unknown>;
+  }).invoke(null, JSON.stringify(input), { toolCall: { callId } });
+  try {
+    const counter = new ToolCallsCounter(20);
+    const run = (callId: string, input: unknown) => withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: `echo-only-${callId}`,
+      counter,
+    }, () => invoke(callId, input));
+    await run('echo-create', {
+      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      arguments: JSON.stringify({ title: 'Echo test', markdown_text: '# Echo test' }),
+    });
+    await run('echo-read', {
+      tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+      arguments: JSON.stringify({ document_id: documentId }),
+    });
+    await run('echo-read-nested-response', {
+      tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+      arguments: JSON.stringify({ document_id: documentId }),
+    });
+
+    assert.equal(listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
+    assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 1);
+    const { listRunArtifacts } = await import('./artifact-ledger.js');
+    assert.equal(listRunArtifacts(session.id)[0]?.bindingVerifiedAt, null);
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
@@ -2827,7 +3459,13 @@ test('Layer 1: a $fromToolOutput reference is resolved to REAL store values befo
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const roster = { result: { records: [{ Email: 'real1@scorpion.co' }, { Email: 'real2@scorpion.co' }] } };
-  writeToolOutput({ sessionId: sess.id, callId: 'call_sf', tool: 'salesforce_query', output: JSON.stringify(roster) });
+  writeAuthoritativeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_sf',
+    invocationNonce: 'layer1-roster-read',
+    tool: 'salesforce_query',
+    output: JSON.stringify(roster),
+  });
 
   let received: any;
   const wrapped = wrapToolForHarness({ name: 'echo', execute: async (input) => { received = input; return 'ok'; } });

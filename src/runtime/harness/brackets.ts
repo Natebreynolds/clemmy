@@ -1,8 +1,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
-import { isKillRequested, appendEvent, getSession, listEvents, getToolOutput, type KillRequestTarget } from './eventlog.js';
+import { isKillRequested, appendEvent, getSession, listEvents, resolveToolOutputForAuthority, type KillRequestTarget } from './eventlog.js';
 import { effectiveTurnObjective } from './turn-control.js';
 import { runWithToolAbortSignal } from '../tool-abort-context.js';
+import { withToolOutputContext } from './tool-output-context.js';
+import { exactToolOutputForInvocation } from './tool-output-format.js';
+import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
 import {
   takeShellExecutionOutcome,
   type ShellExecutionOutcome,
@@ -114,6 +117,7 @@ import {
   artifactOutputProvesNoDispatch,
   artifactReuseMessage,
   artifactVerificationIntentForTool,
+  bindClaimedArtifactExternalWrite,
   bindClaimedArtifact,
   claimArtifactSlot,
   extractArtifactResource,
@@ -1545,7 +1549,8 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
           // that source so a user-named site near the clipped edge can still
           // resolve to its canonical id; unit fixtures without a side-store row
           // keep using the event payload.
-          const full = getToolOutput(sessionId, callId)?.output;
+          const authorityOutput = resolveToolOutputForAuthority(sessionId, callId);
+          const full = authorityOutput.status === 'ok' ? authorityOutput.record.output : undefined;
           discoveryResults.push(stripAnsi(full || joinedEventText(d?.result, d?.preview, d?.output)));
         }
         const names = createCallNames.get(callId);
@@ -1607,6 +1612,13 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
  * ambiguous unless a local typed outcome proves dispatch=not_started AND
  * effect=none. A clean resolved result gets an exact-call success receipt.
  */
+interface ExternalWriteReservationRef {
+  eventId: string;
+  actionKey: string;
+  toolName: string;
+  callId: string;
+}
+
 function recordExternalWriteSettlement(
   sessionId: string | undefined,
   toolName: string,
@@ -1615,6 +1627,8 @@ function recordExternalWriteSettlement(
   shellOutcome?: ShellExecutionOutcome,
   callId?: string,
   threw = false,
+  settlementNonce?: string,
+  reservation?: ExternalWriteReservationRef,
 ): 'external_write_succeeded' | 'external_write_failed' | 'external_write_orphaned' | undefined {
   if (!sessionId || !callId) return undefined;
 
@@ -1655,16 +1669,32 @@ function recordExternalWriteSettlement(
       shellOutcome?.dispatch === 'not_started'
       && shellOutcome.effect === 'none'
     );
-  const resultCarriesAcknowledgement = result !== undefined
-    && result !== null
+  // Tool formatting is presentation, not settlement authority. Large results
+  // are parked losslessly under this exact call id and replaced with a compact
+  // model-facing digest. Judging that digest made valid >12K mutations look
+  // orphaned (live Google Docs regression, 2026-08-02). Use only the exact,
+  // same-tool, non-truncated side-store row for a normally returned call;
+  // thrown/time-out outcomes remain ambiguous and can never be upgraded here.
+  const settlementResult = (() => {
+    if (threw || toolName === 'run_shell_command') return result;
+    return exactToolOutputForInvocation({
+      sessionId,
+      callId,
+      toolName,
+      compactResult: result,
+      settlementNonce,
+    });
+  })();
+  const resultCarriesAcknowledgement = settlementResult !== undefined
+    && settlementResult !== null
     && (
-      typeof result !== 'string'
-      || result.trim().length > 0
+      typeof settlementResult !== 'string'
+      || settlementResult.trim().length > 0
     );
   const cleanAcknowledgement = !threw && resultCarriesAcknowledgement && (
     toolName === 'run_shell_command'
       ? shellOutcome?.dispatch === 'acknowledged' && shellOutcome.exitCode === 0
-      : toolOutputProvesExternalWriteAcknowledgement(result)
+      : toolOutputProvesExternalWriteAcknowledgement(settlementResult)
   );
   const type = trustedNotStarted
     ? 'external_write_failed'
@@ -1672,6 +1702,12 @@ function recordExternalWriteSettlement(
       ? 'external_write_succeeded'
       : 'external_write_orphaned';
   const actionKey = canonicalExternalWriteActionKey(toolName, shapeKey);
+  const exactReservation = reservation
+    && reservation.callId === callId
+    && reservation.toolName === toolName
+    && reservation.actionKey === actionKey
+    ? reservation
+    : undefined;
   const correlationFingerprint = toolCallCorrelationFingerprint(toolName, parsedInput);
   const semanticFingerprint = externalWriteSemanticFingerprint(actionKey, parsedInput);
   appendEvent({
@@ -1679,6 +1715,7 @@ function recordExternalWriteSettlement(
     turn: 0,
     role: 'system',
     type,
+    ...(exactReservation?.eventId ? { parentEventId: exactReservation.eventId } : {}),
     data: {
       ...currentExternalWriteEventAttribution(),
       shapeKey,
@@ -1686,6 +1723,9 @@ function recordExternalWriteSettlement(
       toolName,
       callId,
       canonicalCallId: callId,
+      ...(type === 'external_write_succeeded' && exactReservation?.eventId
+        ? { settlementKey: `external-write:${exactReservation.eventId}` }
+        : {}),
       correlationFingerprint,
       irreversible,
       targets,
@@ -1706,8 +1746,8 @@ function recordExternalWriteSettlement(
                 ? result.message
                 : result instanceof ExternalWritePreDispatchResult
                   ? result.output
-                : typeof result === 'string'
-                  ? result
+                : typeof settlementResult === 'string'
+                  ? settlementResult
                   : 'provider result did not carry a trusted clean acknowledgement',
             ).replace(/\s+/g, ' ').slice(0, 240),
             ...(trustedNotStarted ? { dispatch: 'not_started', effect: 'none', preDispatch: true } : {}),
@@ -1946,11 +1986,20 @@ function creditRecallFromToolResult(
 let beforeSharedWriteAdmissionForTests:
   | ((kind: 'shell' | 'generic') => void | Promise<void>)
   | null = null;
+let afterSharedWriteReservationForTests:
+  | ((kind: 'shell' | 'generic') => void | Promise<void>)
+  | null = null;
 
 export function _setBeforeSharedWriteAdmissionForTests(
   hook: ((kind: 'shell' | 'generic') => void | Promise<void>) | null,
 ): void {
   beforeSharedWriteAdmissionForTests = hook;
+}
+
+export function _setAfterSharedWriteReservationForTests(
+  hook: ((kind: 'shell' | 'generic') => void | Promise<void>) | null,
+): void {
+  afterSharedWriteReservationForTests = hook;
 }
 
 export function wrapToolForHarness<T extends WrappableTool>(
@@ -1987,6 +2036,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
     callId?: string;
   };
   type ArtifactAdmission = { dispatch?: ArtifactDispatch; deny?: string };
+  type BracketOutcome = {
+    advisory?: string;
+    reservation?: ExternalWriteReservationRef;
+  };
 
   /** Internal control flow for a durable duplicate-artifact refusal. It stays
    *  separate from the generic soft-error rail so callers receive the existing
@@ -2009,12 +2062,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
     parsedInput: unknown,
     callId?: string,
     claimBeforeAccounting?: () => ArtifactAdmission,
-  ): Promise<string | undefined> => {
+  ): Promise<BracketOutcome | undefined> => {
     const ctx = harnessRunContextStorage.getStore();
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
     // 0. Physical-attempt authority. This must precede counters, artifact
     // claims, write reservations, and every other bookkeeping side effect.
     assertDispatchLeaseCurrent(ctx.dispatchLease);
+    let reservation: ExternalWriteReservationRef | undefined;
     // 1. Kill check
     assertNotKilled(
       ctx.sessionId,
@@ -2140,7 +2194,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (decision.cachedCallId && !ctx.codeMode && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         let priorOutput: string | null = null;
         try {
-          priorOutput = getToolOutput(ctx.sessionId, decision.cachedCallId)?.output ?? null;
+          const authority = resolveToolOutputForAuthority(ctx.sessionId, decision.cachedCallId);
+          priorOutput = authority.status === 'ok' ? authority.record.output : null;
         } catch { priorOutput = null; }
         const errorShaped = priorOutput != null && /^\s*ERROR:/i.test(priorOutput);
         if (priorOutput != null && !errorShaped) {
@@ -2845,7 +2900,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               duplicateIdentityKeys,
             });
             try {
-              appendEvent({
+              const event = appendEvent({
                 sessionId: ctx.sessionId,
                 turn: 0,
                 role: 'system',
@@ -2870,6 +2925,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
                   } : {}),
                 },
               });
+              reservation = {
+                eventId: event.id,
+                actionKey,
+                toolName: tool.name,
+                callId: callId ?? '',
+              };
             } catch (cause) {
               throw new ExternalWriteReservationError(tool.name, cause);
             }
@@ -2981,7 +3042,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               duplicateIdentityKeys,
             });
             try {
-              appendEvent({
+              const event = appendEvent({
                 sessionId: ctx.sessionId,
                 turn: 0,
                 role: 'system',
@@ -3007,6 +3068,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
                   } : {}),
                 },
               });
+              reservation = {
+                eventId: event.id,
+                actionKey,
+                toolName: tool.name,
+                callId: callId ?? '',
+              };
             } catch (cause) {
               throw new ExternalWriteReservationError(tool.name, cause);
             }
@@ -3045,11 +3112,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // Code-mode callers must always receive the native result unchanged.
     // Keep this final invariant even if a future advisory is added above and
     // forgets its local codeMode exemption.
-    if (ctx.codeMode) return undefined;
+    if (ctx.codeMode) return reservation ? { reservation } : undefined;
     // All nudges ride the same advisory rail (appended to the tool result by the
     // caller). Combine so a turn that trips several still delivers each.
     const nudges = [fanoutNudge, cacheNudge, workerFinishNudge].filter(Boolean);
-    return nudges.length > 0 ? nudges.join('\n\n') : undefined;
+    const advisory = nudges.length > 0 ? nudges.join('\n\n') : undefined;
+    return advisory || reservation ? { advisory, reservation } : undefined;
   };
 
   // Resolve the per-tool timeout once at wrap time.
@@ -3135,6 +3203,38 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if (!dispatch) return;
     try { releaseClaimedArtifact(dispatch.artifactId, dispatch.callId); } catch { /* keep the pending claim fail-closed */ }
   };
+  const compensateUndispatchedReservation = (
+    ctx: HarnessRunContext | undefined,
+    parsedInput: unknown,
+    callId: string,
+    settlementNonce: string,
+    reservation: ExternalWriteReservationRef | undefined,
+    cause: unknown,
+  ): void => {
+    if (!reservation) return;
+    const preDispatch = cause instanceof ExternalWritePreDispatchError
+      ? cause
+      : new ExternalWritePreDispatchError(
+          `Provider dispatch did not start: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+    const settled = recordExternalWriteSettlement(
+      ctx?.sessionId,
+      tool.name,
+      parsedInput,
+      preDispatch,
+      undefined,
+      callId,
+      true,
+      settlementNonce,
+      reservation,
+    );
+    if (settled !== 'external_write_failed') {
+      throw new ExternalWriteReservationError(
+        tool.name,
+        new Error('could not durably compensate a proven non-dispatch reservation'),
+      );
+    }
+  };
   const settleArtifactReadback = (
     ctx: HarnessRunContext | undefined,
     parsedInput: unknown,
@@ -3149,7 +3249,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // still resolve the root and run the strict ID-matching verifier below.
     if (!artifactVerificationIntentForTool(tool.name, parsedInput)) return;
     try {
-      verifyArtifactBindingFromToolResult(
+      const verified = verifyArtifactBindingFromToolResult(
         ctx.sessionId,
         resolveArtifactRunScopeId(ctx.sessionId, guardrailScopeKey(ctx), ctx.sourceUserSeq),
         tool.name,
@@ -3157,6 +3257,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         result,
         callId,
       );
+      if (verified) settleExternalWriteFromVerifiedArtifact(ctx.sessionId, verified, callId);
     } catch {
       // Verification bookkeeping is fail-closed for completion (the row stays
       // unverified) but must never turn a successful provider read into a tool
@@ -3187,6 +3288,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // correlate a future identical call back to this one's tool_outputs row.
       const invokeCall = (details as { toolCall?: { callId?: string; id?: string } } | undefined)?.toolCall;
       const invokeCallId = invokeCall?.callId ?? invokeCall?.id ?? `harness-${randomUUID()}`;
+      const settlementNonce = randomUUID();
       // Layer 1 — structural prevention. Bind $fromToolOutput references to REAL
       // values from the lossless store BEFORE gates + execution, so a high-stakes
       // field comes from a trusted source, never model-authored text (the class of
@@ -3207,15 +3309,39 @@ export function wrapToolForHarness<T extends WrappableTool>(
       }
       let fanoutNudge: string | undefined;
       let artifact: ArtifactAdmission = {};
+      let bracketOutcome: BracketOutcome | undefined;
       try {
-        fanoutNudge = await runBrackets(ctx?.sessionId ?? '', parsedInput, invokeCallId, () => {
+        bracketOutcome = await runBrackets(ctx?.sessionId ?? '', parsedInput, invokeCallId, () => {
           artifact = claimArtifact(ctx, parsedInput, invokeCallId);
           return artifact;
         });
+        fanoutNudge = bracketOutcome?.advisory;
+        if (artifact.dispatch && bracketOutcome?.reservation) {
+          const reservation = bracketOutcome.reservation;
+          if (
+            reservation.callId !== invokeCallId
+            || reservation.toolName !== tool.name
+            || !bindClaimedArtifactExternalWrite(
+              artifact.dispatch.artifactId,
+              invokeCallId,
+              reservation,
+            )
+          ) {
+            throw new ExternalWriteReservationError(tool.name, new Error('artifact/write reservation binding failed'));
+          }
+        }
       } catch (err) {
         // No provider code has run yet. A bracket refusal after acquisition is
         // proven non-dispatch, so the slot is safe to release; a duplicate
         // refusal acquired nothing and leaves the authoritative row untouched.
+        compensateUndispatchedReservation(
+          ctx,
+          parsedInput,
+          invokeCallId,
+          settlementNonce,
+          bracketOutcome?.reservation,
+          err,
+        );
         releaseUndispatchedArtifact(artifact.dispatch);
         if (err instanceof ArtifactReuseDenied) return err.reuseMessage;
         if (ctx?.certifiedBatch && err instanceof ExternalWritePreDispatchError) throw err;
@@ -3231,11 +3357,24 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // propagate — these SHOULD abort the run.
         throw err;
       }
+      if (bracketOutcome?.reservation) {
+        await afterSharedWriteReservationForTests?.(
+          tool.name === 'run_shell_command' ? 'shell' : 'generic',
+        );
+      }
       // Gates above may await judges/approval/storage while a recovery rotates
       // the physical attempt. Re-check at the final pre-dispatch edge.
       try {
         assertDispatchLeaseCurrent(ctx?.dispatchLease);
       } catch (err) {
+        compensateUndispatchedReservation(
+          ctx,
+          parsedInput,
+          invokeCallId,
+          settlementNonce,
+          bracketOutcome?.reservation,
+          err,
+        );
         releaseUndispatchedArtifact(artifact.dispatch);
         throw err;
       }
@@ -3245,7 +3384,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // onTimeout → ac.abort() so a timed-out call is CANCELLED at the network
         // layer instead of running on and burning provider credits.
         const ac = new AbortController();
-        const start = () => originalInvoke.call(tt, runContext, input, details);
+        const start = () => Promise.resolve(withToolOutputContext({
+          sessionId: ctx?.sessionId,
+          runScopeId: ctx ? guardrailScopeKey(ctx) : undefined,
+          callId: invokeCallId,
+          toolName: tool.name,
+          settlementNonce,
+        }, () => originalInvoke.call(tt, runContext, input, details)));
         const work = runWithToolAbortSignal(ac.signal, start);
         return withTimeout(
           work,
@@ -3273,8 +3418,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
         const shellOutcome = tool.name === 'run_shell_command'
           ? takeShellExecutionOutcome(invokeCallId)
           : undefined;
-        settleArtifact(artifact.dispatch, result, shellOutcome);
-        settleArtifactReadback(ctx, parsedInput, result, invokeCallId);
+        const exactEvidenceResult = exactToolOutputForInvocation({
+          sessionId: ctx?.sessionId,
+          callId: invokeCallId,
+          toolName: tool.name,
+          compactResult: result,
+          settlementNonce,
+        });
+        settleArtifact(artifact.dispatch, exactEvidenceResult, shellOutcome);
+        settleArtifactReadback(ctx, parsedInput, exactEvidenceResult, invokeCallId);
         recordExternalWriteSettlement(
           ctx?.sessionId,
           tool.name,
@@ -3282,6 +3434,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
           result,
           shellOutcome,
           invokeCallId,
+          false,
+          settlementNonce,
+          bracketOutcome?.reservation,
         );
         const outwardResult = unwrapExternalWritePreDispatchResult(result);
         recordPublishIfSucceeded(tool.name, parsedInput, outwardResult, shellOutcome);
@@ -3304,6 +3459,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
           shellOutcome,
           invokeCallId,
           true,
+          settlementNonce,
+          bracketOutcome?.reservation,
         );
         if (ctx?.certifiedBatch && err instanceof ExternalWritePreDispatchError) throw err;
         const soft = softToolError(err);
@@ -3391,6 +3548,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
     const ctx = harnessRunContextStorage.getStore();
     const executeCallId = `harness-${randomUUID()}`;
+    const settlementNonce = randomUUID();
     // Layer 1 — bind $fromToolOutput references to real store values before gates
     // + execution (mirror of the invoke path). No-op without the syntax.
     if (toolOutputReferenceResolutionEnabled() && hasToolOutputReference(input)) {
@@ -3406,12 +3564,36 @@ export function wrapToolForHarness<T extends WrappableTool>(
     }
     let fanoutNudge: string | undefined;
     let artifact: ArtifactAdmission = {};
+    let bracketOutcome: BracketOutcome | undefined;
     try {
-      fanoutNudge = await runBrackets(ctx?.sessionId ?? '', input, executeCallId, () => {
+      bracketOutcome = await runBrackets(ctx?.sessionId ?? '', input, executeCallId, () => {
         artifact = claimArtifact(ctx, input, executeCallId);
         return artifact;
       });
+      fanoutNudge = bracketOutcome?.advisory;
+      if (artifact.dispatch && bracketOutcome?.reservation) {
+        const reservation = bracketOutcome.reservation;
+        if (
+          reservation.callId !== executeCallId
+          || reservation.toolName !== tool.name
+          || !bindClaimedArtifactExternalWrite(
+            artifact.dispatch.artifactId,
+            executeCallId,
+            reservation,
+          )
+        ) {
+          throw new ExternalWriteReservationError(tool.name, new Error('artifact/write reservation binding failed'));
+        }
+      }
     } catch (err) {
+      compensateUndispatchedReservation(
+        ctx,
+        input,
+        executeCallId,
+        settlementNonce,
+        bracketOutcome?.reservation,
+        err,
+      );
       releaseUndispatchedArtifact(artifact.dispatch);
       if (err instanceof ArtifactReuseDenied) return err.reuseMessage;
       if (ctx?.certifiedBatch && err instanceof ExternalWritePreDispatchError) throw err;
@@ -3422,11 +3604,24 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (soft !== null) return soft;
       throw err;
     }
+    if (bracketOutcome?.reservation) {
+      await afterSharedWriteReservationForTests?.(
+        tool.name === 'run_shell_command' ? 'shell' : 'generic',
+      );
+    }
     // Mirror the invoke path's final pre-dispatch generation check. A claim
     // acquired by this call is still proven undispatched and can be released.
     try {
       assertDispatchLeaseCurrent(ctx?.dispatchLease);
     } catch (err) {
+      compensateUndispatchedReservation(
+        ctx,
+        input,
+        executeCallId,
+        settlementNonce,
+        bracketOutcome?.reservation,
+        err,
+      );
       releaseUndispatchedArtifact(artifact.dispatch);
       throw err;
     }
@@ -3434,7 +3629,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
     try {
       // S3 abort-on-timeout (legacy execute twin — mirrors the invoke path above).
       const ac = new AbortController();
-      const start = () => originalExecute(input, runContext);
+      const start = () => Promise.resolve(withToolOutputContext({
+        sessionId: ctx?.sessionId,
+        runScopeId: ctx ? guardrailScopeKey(ctx) : undefined,
+        callId: executeCallId,
+        toolName: tool.name,
+        settlementNonce,
+      }, () => originalExecute(input, runContext)));
       const work = runWithToolAbortSignal(ac.signal, start);
       result = await withTimeout(
         work,
@@ -3458,6 +3659,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
         shellOutcome,
         executeCallId,
         true,
+        settlementNonce,
+        bracketOutcome?.reservation,
       );
       if (ctx?.certifiedBatch && err instanceof ExternalWritePreDispatchError) throw err;
       // Same general self-correction as the invoke path: a long-job timeout on an
@@ -3476,8 +3679,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
     const shellOutcome = tool.name === 'run_shell_command'
       ? takeShellExecutionOutcome(executeCallId)
       : undefined;
-    settleArtifact(artifact.dispatch, result, shellOutcome);
-    settleArtifactReadback(ctx, input, result, executeCallId);
+    const exactEvidenceResult = exactToolOutputForInvocation({
+      sessionId: ctx?.sessionId,
+      callId: executeCallId,
+      toolName: tool.name,
+      compactResult: result,
+      settlementNonce,
+    });
+    settleArtifact(artifact.dispatch, exactEvidenceResult, shellOutcome);
+    settleArtifactReadback(ctx, input, exactEvidenceResult, executeCallId);
     recordExternalWriteSettlement(
       ctx?.sessionId,
       tool.name,
@@ -3485,6 +3695,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
       result,
       shellOutcome,
       executeCallId,
+      false,
+      settlementNonce,
+      bracketOutcome?.reservation,
     );
     const outwardResult = unwrapExternalWritePreDispatchResult(result);
     recordPublishIfSucceeded(tool.name, input, outwardResult, shellOutcome);

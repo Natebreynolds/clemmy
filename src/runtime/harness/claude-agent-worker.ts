@@ -10,8 +10,7 @@ import {
 import type { DispatchLeaseRef } from './dispatch-lease.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
-  externalMcpScopeFromResolvedTools,
-  intersectExternalMcpToolScopes,
+  workerPacketMcpToolScope,
 } from '../../agents/external-mcp-scope-lock.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
@@ -111,15 +110,15 @@ export async function runClaudeAgentSdkWorker(
   // is off or the intent is ordinary.
   const resolvedMaxTurns = guard ? resolveWorkerMaxTurns(input.intent, maxTurns()) : maxTurns();
   const trackerScopeId = sid ? `${sid}::worker:${workerPacketKey(input)}` : undefined;
-  const packetMcpToolScope = externalMcpScopeFromResolvedTools(input.resolvedTools);
   // A child can narrow parent authority but never widen it. Broad parent
   // scopes (allowAll/fail-open) yield to the packet's exact resolved server;
   // concrete/local-only parent scopes remain the hard outer boundary.
-  const nativeMcpToolScope = intersectExternalMcpToolScopes(
-    parentMcpToolScope,
-    packetMcpToolScope,
-    'Claude SDK worker parent/packet external MCP intersection',
-  );
+  const nativeMcpToolScope = workerPacketMcpToolScope({
+    buildScope: parentMcpToolScope,
+    runtimeScope: undefined,
+    resolvedTools: input.resolvedTools,
+    externalMcpToolNames: input.externalMcpToolNames,
+  });
   const result = await runClaudeAgentSdkImpl({
     prompt: buildWorkerJobPrompt(input),
     sessionId: sid,
@@ -129,7 +128,9 @@ export async function runClaudeAgentSdkWorker(
     // Scope the worker's NATIVE external MCP surface to exact parent-resolved
     // external MCP slugs only. "none needed", skill_read, read_file, and Composio
     // slugs remain local/core — never fail-open to every external MCP child.
-    nativeMcpScopeInput: input.resolvedTools,
+    nativeMcpScopeInput: input.externalMcpToolNames !== undefined
+      ? (input.externalMcpToolNames ?? []).join('\n')
+      : input.resolvedTools,
     nativeMcpScopeMode: 'resolved_tools',
     nativeMcpToolScope,
     agentic,

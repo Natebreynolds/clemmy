@@ -1,6 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { getSession, listEvents, openEventLog } from './eventlog.js';
+import { getSession, listEvents, openEventLog, resolveToolOutputForAuthority } from './eventlog.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
+import {
+  providerEnvelopeHasContradiction,
+  projectProviderResult,
+  pruneProviderRequestEchoes,
+} from './provider-read-evidence.js';
 import type { ShellExecutionOutcome } from '../shell-execution-outcome.js';
 
 /**
@@ -46,6 +51,10 @@ export interface RunArtifact {
   resourceId: string | null;
   uri: string | null;
   sourceCallId: string | null;
+  /** Exact durable pre-dispatch reservation owned by this create attempt. */
+  externalWriteEventId: string | null;
+  externalWriteActionKey: string | null;
+  externalWriteToolName: string | null;
   /** A create response supplied a stable pointer, but only an independent
    * provider read-back proves that exact pointer is readable. This is binding
    * verification, not a claim that the artifact's full contents were QA'd. */
@@ -113,6 +122,9 @@ interface ArtifactRow {
   resource_id: string | null;
   uri: string | null;
   source_call_id: string | null;
+  external_write_event_id: string | null;
+  external_write_action_key: string | null;
+  external_write_tool_name: string | null;
   binding_verified_at: string | null;
   verification_call_id: string | null;
   verification_shape: string | null;
@@ -145,6 +157,9 @@ function ensureSchema(): void {
       resource_id    TEXT,
       uri            TEXT,
       source_call_id TEXT,
+      external_write_event_id TEXT,
+      external_write_action_key TEXT,
+      external_write_tool_name TEXT,
       binding_verified_at TEXT,
       verification_call_id TEXT,
       verification_shape TEXT,
@@ -196,6 +211,9 @@ function ensureSchema(): void {
   ensureColumn('verification_call_id', 'verification_call_id TEXT');
   ensureColumn('verification_shape', 'verification_shape TEXT');
   ensureColumn('verification_fingerprint', 'verification_fingerprint TEXT');
+  ensureColumn('external_write_event_id', 'external_write_event_id TEXT');
+  ensureColumn('external_write_action_key', 'external_write_action_key TEXT');
+  ensureColumn('external_write_tool_name', 'external_write_tool_name TEXT');
   // Older ledgers used only the attempt-scoped mapping. Seed one canonical
   // source authority from the earliest mapping so an additive upgrade retains
   // its established root while closing the cross-lane check-then-insert race.
@@ -237,6 +255,9 @@ function fromRow(row: ArtifactRow): RunArtifact {
     resourceId: row.resource_id,
     uri: row.uri,
     sourceCallId: row.source_call_id,
+    externalWriteEventId: row.external_write_event_id ?? null,
+    externalWriteActionKey: row.external_write_action_key ?? null,
+    externalWriteToolName: row.external_write_tool_name ?? null,
     bindingVerifiedAt: row.binding_verified_at ?? null,
     verificationCallId: row.verification_call_id ?? null,
     verificationShape: row.verification_shape ?? null,
@@ -1030,6 +1051,36 @@ function getRunArtifactById(id: string): RunArtifact | null {
   return row ? fromRow(row) : null;
 }
 
+/** Bind the artifact claim to the exact durable write reservation minted after
+ * admission. First writer wins; a replay/reused call id cannot retarget an
+ * already-bound artifact to another reservation. */
+export function bindClaimedArtifactExternalWrite(
+  artifactId: string,
+  expectedSourceCallId: string,
+  reservation: { eventId: string; actionKey: string; toolName: string },
+): RunArtifact | null {
+  ensureSchema();
+  const result = openEventLog().prepare(`
+    UPDATE run_artifacts
+       SET external_write_event_id = ?,
+           external_write_action_key = ?,
+           external_write_tool_name = ?,
+           updated_at = ?
+     WHERE id = ?
+       AND source_call_id = ?
+       AND (external_write_event_id IS NULL OR external_write_event_id = ?)
+  `).run(
+    reservation.eventId,
+    reservation.actionKey,
+    reservation.toolName,
+    new Date().toISOString(),
+    artifactId,
+    expectedSourceCallId,
+    reservation.eventId,
+  );
+  return result.changes === 1 ? getRunArtifactById(artifactId) : null;
+}
+
 /** Settle the exact row acquired by one provider call. The call-id predicate is
  * critical for native MCP parallelism: an out-of-order result can never bind a
  * sibling claim merely because both calls proposed the same slot. */
@@ -1096,16 +1147,18 @@ export function markClaimedArtifactUncertain(
  * and binding needs the create's own callback, so the claim was permanently
  * unresolvable even after the model FOUND the real resource. This is the
  * standard lane's explicit repair boundary:
- *  - bind: attach the verified provider resource (evidence-checked by the
- *    calling tool — the resourceId must appear in this session's tool
- *    outputs) and mark it verified.
+ *  - bind: attach the verified provider resource only when this boundary can
+ *    resolve one exact, parented provider-read lifecycle whose response names
+ *    the same resourceId, then mark it verified.
  *  - absent: delete the claim — the provider was read and the resource
  *    provably does not exist; the duplicate wall still backstops the redo.
  */
 export function resolveUncertainArtifactClaim(
   sessionId: string,
   artifactId: string,
-  resolution: { kind: 'bind'; resourceId: string; uri?: string } | { kind: 'absent' },
+  resolution:
+    | { kind: 'bind'; resourceId: string; uri?: string; verificationCallId: string }
+    | { kind: 'absent'; verificationCallId: string },
 ): { ok: boolean; reason?: string } {
   ensureSchema();
   const db = openEventLog();
@@ -1117,18 +1170,61 @@ export function resolveUncertainArtifactClaim(
   if (row.status !== 'pending' && row.status !== 'uncertain') {
     return { ok: false, reason: `claim status ${row.status} is not resolvable` };
   }
+  const verificationCallId = resolution.verificationCallId.trim();
+  if (!verificationCallId) return { ok: false, reason: 'verification call id is required' };
+  const authority = resolveToolOutputForAuthority(sessionId, verificationCallId);
+  if (authority.status !== 'ok') {
+    return { ok: false, reason: `verification output is ${authority.status}; run one fresh provider read` };
+  }
+  if (authority.effect !== 'read' && authority.effect !== 'compute') {
+    return { ok: false, reason: 'verification must come from one parented read/compute invocation' };
+  }
+  let parsed: unknown = authority.record.output;
+  try { parsed = JSON.parse(authority.record.output); } catch { /* a CLI read may return plain provider text */ }
+  if (providerEnvelopeHasContradiction(parsed)) {
+    return { ok: false, reason: 'verification output contains a provider failure/contradiction' };
+  }
+  const providerResult = pruneProviderRequestEchoes(parsed);
+  const evidenceText = typeof providerResult === 'string'
+    ? providerResult
+    : JSON.stringify(providerResult);
+  const verificationShape = `artifact_claim_resolve:${resolution.kind}`;
+  const verificationFingerprint = createHash('sha256')
+    .update([sessionId, artifactId, verificationCallId, verificationShape, authority.record.output].join('\0'))
+    .digest('hex')
+    .slice(0, 16);
   const now = new Date().toISOString();
   if (resolution.kind === 'bind') {
+    if (!evidenceText.includes(resolution.resourceId)) {
+      return { ok: false, reason: 'resource id is absent from the exact provider result (request echoes do not count)' };
+    }
     const changes = db.prepare(`
       UPDATE run_artifacts
          SET status = 'bound',
              resource_id = ?,
              uri = COALESCE(?, uri),
              binding_verified_at = ?,
+             verification_call_id = ?,
+             verification_shape = ?,
+             verification_fingerprint = ?,
              updated_at = ?
        WHERE id = ? AND session_id = ? AND status IN ('pending', 'uncertain')
-    `).run(resolution.resourceId, resolution.uri ?? null, now, now, artifactId, sessionId).changes;
+    `).run(
+      resolution.resourceId,
+      resolution.uri ?? null,
+      now,
+      verificationCallId,
+      verificationShape,
+      verificationFingerprint,
+      now,
+      artifactId,
+      sessionId,
+    ).changes;
     return changes === 1 ? { ok: true } : { ok: false, reason: 'claim changed concurrently' };
+  }
+  const projection = projectProviderResult(providerResult, []);
+  if (!projection.hasEmptyResult || projection.hasNonEmptyResult) {
+    return { ok: false, reason: 'exact provider read does not prove one globally empty result' };
   }
   const changes = db.prepare(`
     DELETE FROM run_artifacts
@@ -1278,41 +1374,91 @@ function directResultObject(value: unknown): Record<string, unknown> | null {
     : parsed;
 }
 
+/** Provider-returned content only. Request/input echo containers are excluded
+ * recursively because proving that the caller asked for id X is not proving X
+ * was read. Providers nest these echoes under data/response/result as well as
+ * at the outer envelope. */
+function readbackResultObjects(value: unknown): Record<string, unknown>[] {
+  const parsed = jsonRecordFromOutput(value);
+  if (!parsed) return [];
+  const pruned = pruneProviderRequestEchoes(parsed) as Record<string, unknown>;
+  const candidates: Record<string, unknown>[] = [];
+  for (const key of ['data', 'response', 'result', 'output']) {
+    const candidate = pruned[key];
+    if (Array.isArray(candidate) && candidate.length > 0) {
+      candidates.push({ items: candidate });
+    } else if (candidate && typeof candidate === 'object') {
+      const record = candidate as Record<string, unknown>;
+      if (Object.keys(record).length > 0) candidates.push(record);
+    }
+  }
+  const outer = Object.fromEntries(Object.entries(pruned)
+    .filter(([key]) => !['data', 'response', 'result', 'output'].includes(key.toLowerCase())));
+  if (Object.keys(outer).length > 0) candidates.push(outer);
+  return candidates;
+}
+
+const RAW_READBACK_FAILURE_RE = /^(?:\[provider-dispatch:[^\]]+\]|[\s⚠️]*(?:(?:[A-Za-z0-9_.:/-]+)\s+)?(?:not found|no such|does not exist|error|failed|failure|unable|could not|cannot|denied|forbidden|unauthori[sz]ed|timed out|timeout|not connected)(?:\b|\s*[:(]))/i;
+
+function rawReadbackUri(output: unknown, pattern: RegExp): string | undefined {
+  if (typeof output !== 'string') return undefined;
+  const text = output.trim();
+  if (RAW_READBACK_FAILURE_RE.test(text)) return undefined;
+  return text.match(pattern)?.[0];
+}
+
 function readbackResource(intent: ArtifactVerificationIntent, output: unknown): ArtifactResource | null {
   const parsed = jsonRecordFromOutput(output);
-  const direct = directResultObject(output);
+  const candidates = readbackResultObjects(output);
   if (intent.kind === 'google_doc') {
-    const uri = walkForKey(parsed, new Set(['display_url', 'documenturl', 'document_url', 'url', 'uri']))
-      ?? (typeof output === 'string'
-        ? output.match(/https:\/\/docs\.google\.com\/document\/d\/[A-Za-z0-9_-]+(?:\/edit)?/i)?.[0]
-        : undefined);
-    const resourceId = walkForKey(parsed, new Set(['documentid', 'document_id', 'docid', 'doc_id']))
-      ?? googleDocumentIdFromUri(uri);
-    return resourceId ? { resourceId, uri } : null;
+    const resources: ArtifactResource[] = [];
+    for (const candidate of candidates) {
+      const uri = walkForKey(candidate, new Set(['display_url', 'documenturl', 'document_url', 'url', 'uri']));
+      const resourceId = walkForKey(candidate, new Set(['documentid', 'document_id', 'docid', 'doc_id']))
+        ?? googleDocumentIdFromUri(uri);
+      if (resourceId) resources.push({ resourceId, uri });
+    }
+    const rawUri = !parsed
+      ? rawReadbackUri(output, /https:\/\/docs\.google\.com\/document\/d\/[A-Za-z0-9_-]+(?:\/edit)?/i)
+      : undefined;
+    if (rawUri) resources.push({ resourceId: googleDocumentIdFromUri(rawUri) ?? '', uri: rawUri });
+    return resources.find((resource) => resource.resourceId === intent.resourceId) ?? resources[0] ?? null;
   }
   if (intent.kind === 'resource' && intent.provider === 'googlesheets') {
-    const uri = walkForKey(parsed, new Set([
-      'display_url', 'spreadsheeturl', 'spreadsheet_url', 'url', 'uri',
-    ]))
-      ?? (typeof output === 'string'
-        ? output.match(/https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+(?:\/edit)?/i)?.[0]
-        : undefined);
-    const resourceId = walkForKey(parsed, new Set([
-      'spreadsheetid', 'spreadsheet_id',
-    ])) ?? googleSpreadsheetIdFromUri(uri);
-    return resourceId ? { resourceId, uri } : null;
+    const resources: ArtifactResource[] = [];
+    for (const candidate of candidates) {
+      const uri = walkForKey(candidate, new Set([
+        'display_url', 'spreadsheeturl', 'spreadsheet_url', 'url', 'uri',
+      ]));
+      const resourceId = walkForKey(candidate, new Set([
+        'spreadsheetid', 'spreadsheet_id',
+      ])) ?? googleSpreadsheetIdFromUri(uri);
+      if (resourceId) resources.push({ resourceId, uri });
+    }
+    const rawUri = !parsed
+      ? rawReadbackUri(output, /https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+(?:\/edit)?/i)
+      : undefined;
+    if (rawUri) resources.push({ resourceId: googleSpreadsheetIdFromUri(rawUri) ?? '', uri: rawUri });
+    return resources.find((resource) => resource.resourceId === intent.resourceId) ?? resources[0] ?? null;
   }
-  if (!direct) return null;
   // Netlify getSite returns the site at the top level. Never recursively accept
   // a generic `id`, which could be an account, owner, deploy, or build id.
-  const resourceId = stringField(direct, ['site_id', 'siteId', 'siteid', 'id']);
-  const uri = stringField(direct, ['ssl_url', 'sslUrl', 'url', 'deploy_url', 'deployUrl']);
-  return resourceId ? { resourceId, uri } : null;
+  const resources: ArtifactResource[] = [];
+  for (const candidate of candidates) {
+    const resourceId = stringField(candidate, ['site_id', 'siteId', 'siteid', 'id']);
+    const uri = stringField(candidate, ['ssl_url', 'sslUrl', 'url', 'deploy_url', 'deployUrl']);
+    if (resourceId) resources.push({ resourceId, uri });
+  }
+  return resources.find((resource) => resource.resourceId === intent.resourceId) ?? resources[0] ?? null;
 }
 
 function readbackOutputLooksSuccessful(output: unknown, explicitOk: boolean): boolean {
   if (!explicitOk || !toolOutputLooksSuccessful(output, explicitOk)) return false;
+  const structured = jsonRecordFromOutput(output);
+  if (structured && providerEnvelopeHasContradiction(structured)) return false;
   if (typeof output === 'string') {
+    const firstLine = output.trim().split(/\r?\n/, 1)[0] ?? '';
+    if (RAW_READBACK_FAILURE_RE.test(firstLine)) return false;
     const exitCode = output.match(/(?:^|\n)exit_code:\s*(-?\d+)\b/i)?.[1];
     if (exitCode !== undefined && Number(exitCode) !== 0) return false;
   }

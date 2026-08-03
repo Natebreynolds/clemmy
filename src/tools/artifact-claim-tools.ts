@@ -1,6 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { openEventLog } from '../runtime/harness/eventlog.js';
 import { resolveUncertainArtifactClaim } from '../runtime/harness/artifact-ledger.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { textResult } from './shared.js';
@@ -28,7 +27,7 @@ export function registerArtifactClaimTools(server: McpServer): void {
     'artifact_claim_resolve',
     [
       'Resolve an UNRESOLVED provider-create claim after you have verified the provider state with read-only tools.',
-      'Use ONLY during an artifact verification retry. resolution="bind" when the resource exists (pass its exact resourceId, which must appear verbatim in a tool output from this session — read it back first). resolution="absent" when a provider listing proves it was never created.',
+      'Use ONLY during an artifact verification retry. Pass verificationCallId from ONE fresh provider read. resolution="bind" requires its provider result to contain the exact resourceId; resolution="absent" requires a structured globally-empty listing.',
       'Never use this to skip verification: bind without a read-back will be refused.',
     ].join(' '),
     {
@@ -36,27 +35,25 @@ export function registerArtifactClaimTools(server: McpServer): void {
       resolution: z.enum(['bind', 'absent']),
       resourceId: z.string().min(1).nullable().optional().describe('bind only: the exact provider resource id you read back.'),
       uri: z.string().min(4).nullable().optional().describe('bind only: the resource URL if known.'),
+      verificationCallId: z.string().min(1).describe('The exact call_id of the fresh provider read/list result that proves this resolution.'),
     },
-    async ({ artifactId, resolution, resourceId, uri }) => {
+    async ({ artifactId, resolution, resourceId, uri, verificationCallId }) => {
       const sessionId = getToolOutputContext()?.sessionId;
       if (!sessionId) return textResult('ERROR: artifact_claim_resolve needs a live session context.');
       if (resolution === 'bind') {
         const id = resourceId?.trim();
         if (!id) return textResult('ERROR: resolution="bind" requires resourceId.');
-        // Evidence gate: the id must exist verbatim in this session's recorded
-        // tool outputs — i.e. the model actually read it back from the provider.
-        const seen = openEventLog().prepare(
-          "SELECT 1 FROM tool_outputs WHERE session_id = ? AND output_full LIKE '%' || ? || '%' LIMIT 1",
-        ).get(sessionId, id);
-        if (!seen) {
-          return textResult(`ERROR: resourceId "${id}" does not appear in any tool output of this session. Read the resource back from the provider first (list/fetch), then bind with the id exactly as returned.`);
-        }
-        const out = resolveUncertainArtifactClaim(sessionId, artifactId, { kind: 'bind', resourceId: id, uri: uri ?? undefined });
+        const out = resolveUncertainArtifactClaim(sessionId, artifactId, {
+          kind: 'bind',
+          resourceId: id,
+          uri: uri ?? undefined,
+          verificationCallId,
+        });
         return textResult(out.ok
           ? `Claim ${artifactId} bound to ${id} and verified. Continue the task from this existing resource — do NOT create a replacement.`
           : `ERROR: could not bind claim ${artifactId}: ${out.reason}`);
       }
-      const out = resolveUncertainArtifactClaim(sessionId, artifactId, { kind: 'absent' });
+      const out = resolveUncertainArtifactClaim(sessionId, artifactId, { kind: 'absent', verificationCallId });
       return textResult(out.ok
         ? `Claim ${artifactId} released — the resource provably does not exist. You may now create it ONCE with the originally intended parameters.`
         : `ERROR: could not release claim ${artifactId}: ${out.reason}`);

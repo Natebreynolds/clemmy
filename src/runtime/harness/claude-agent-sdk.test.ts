@@ -225,8 +225,14 @@ test('native artifact replay with one durable run scope binds once and blocks a 
     await runClaudeAgentSdk(options);
     assert.deepEqual(permissionVerdicts, ['allow', 'deny']);
     assert.equal(providerDispatches, 1, 'the replay never crosses the provider boundary');
-    assert.equal(artifactLedger.listRunArtifacts(session.id, trackerScopeId)[0]?.status, 'bound');
-    assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 1, 'native mutation is durable before dispatch');
+    const [artifact] = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
+    const [reservation] = eventlog.listEvents(session.id, { types: ['external_write'] });
+    const [settlement] = eventlog.listEvents(session.id, { types: ['external_write_succeeded'] });
+    assert.equal(artifact?.status, 'bound');
+    assert.equal(artifact?.externalWriteEventId, reservation?.id, 'artifact is bound to the exact pre-dispatch reservation');
+    assert.equal(reservation?.data.preDispatch, true, 'native mutation is durable before dispatch');
+    assert.equal(settlement?.parentEventId, reservation?.id);
+    assert.equal(settlement?.data.settlementKey, `external-write:${reservation?.id}`);
   } finally {
     if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
     else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
@@ -952,6 +958,53 @@ test('artifact verification repair gate enforces exact-id read-back and denies e
   assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 0);
 });
 
+test('native MCP scope classifies by exact server identity even when server or tool names contain clement', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const outOfLease = [
+    'mcp__leased-server__read_clement_history',
+    'mcp__clement-data-provider__read_record',
+  ];
+  const verdicts: Array<{ behavior?: string; message?: string }> = [];
+  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
+    yield {
+      ...initOnlyMessage(),
+      tools: outOfLease,
+      mcp_servers: [
+        { name: 'leased-server', status: 'connected' },
+        { name: 'clement-data-provider', status: 'connected' },
+      ],
+    } as any;
+    for (const [index, toolName] of outOfLease.entries()) {
+      verdicts.push(await params.options.canUseTool(
+        toolName,
+        { query: 'private' },
+        { signal: new AbortController().signal, toolUseID: `toolu_scope_clement_${index}` },
+      ));
+    }
+    yield successResultMessage('scope checks complete');
+  })())) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Use only the leased exact read.',
+    sessionId: session.id,
+    modelId: 'claude-sonnet-4-6',
+    trackerScopeId: `${session.id}::native-structural-scope`,
+    allowedLocalMcpTools: outOfLease,
+    nativeMcpToolScope: {
+      reason: 'exact structural classifier test',
+      allowedServerSlugs: ['leased-server'],
+      allowedToolNames: ['leased-server__read_record'],
+      maxTools: 1,
+    },
+  });
+
+  assert.equal(verdicts.length, 2);
+  for (const verdict of verdicts) {
+    assert.equal(verdict.behavior, 'deny');
+    assert.match(verdict.message ?? '', /MCP_SCOPE_DENIED/);
+  }
+});
+
 test('native MCP getter result independently verifies the exact bound Google Doc', async () => {
   const session = eventlog.createSession({ kind: 'chat' });
   const trackerScopeId = `${session.id}::brain:verify-native-doc`;
@@ -1013,6 +1066,251 @@ test('native MCP getter result independently verifies the exact bound Google Doc
   } finally {
     if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
     else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
+  }
+});
+
+test('Claude-native result parking mints one exact invocation row per physical reused call id', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const callId = 'toolu_native_reused_exact';
+  const outputs = [
+    JSON.stringify({ rows: Array.from({ length: 8 }, (_, index) => ({ id: index + 1 })) }),
+    JSON.stringify({ rows: [{ id: 9 }] }),
+  ];
+  let run = 0;
+  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
+  setClaudeAgentSdkQueryForTest((() => {
+    const output = outputs[run++]!;
+    return queryFromMessages([
+      {
+        ...initOnlyMessage(),
+        tools: ['mcp__records__query_rows'],
+        mcp_servers: [{ name: 'records', status: 'connected' }],
+      } as any,
+      {
+        type: 'assistant', session_id: `sdk-native-reused-${run}`, uuid: `use-native-reused-${run}`,
+        parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_use', id: callId, name: 'mcp__records__query_rows', input: { limit: run === 1 ? 8 : 1 },
+        }] },
+      } as any,
+      {
+        type: 'user', session_id: `sdk-native-reused-${run}`, uuid: `return-native-reused-${run}`,
+        parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_result', tool_use_id: callId, is_error: false, content: output }] },
+      } as any,
+      successResultMessage(`physical invocation ${run}`),
+    ], {});
+  }) as any);
+
+  try {
+    for (let index = 0; index < outputs.length; index += 1) {
+      await runClaudeAgentSdk({
+        prompt: 'Read the exact current rows.',
+        sessionId: session.id,
+        modelId: 'claude-sonnet-4-6',
+        trackerScopeId: `${session.id}::native-reused-${index + 1}`,
+        allowedLocalMcpTools: [],
+      });
+      if (index === 0) {
+        const exact = eventlog.resolveToolOutputForAuthority(session.id, callId);
+        assert.equal(exact.status, 'ok', 'one parented native occurrence is exact authority');
+        if (exact.status === 'ok') assert.equal(exact.record.output, outputs[0]);
+      }
+    }
+    const invocations = eventlog.listToolOutputInvocations(session.id, callId);
+    assert.equal(invocations.length, 2);
+    assert.equal(new Set(invocations.map((row: any) => row.invocationNonce)).size, 2);
+    assert.deepEqual(invocations.map((row: any) => row.output), outputs);
+    assert.equal(
+      eventlog.resolveToolOutputForAuthority(session.id, callId).status,
+      'ambiguous',
+      'reusing the provider id never silently selects one physical result',
+    );
+  } finally {
+    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
+  }
+});
+
+test('later exact native readback idempotently settles the original reservation after the verification crash window', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const trackerScopeId = `${session.id}::native-artifact-crash-window`;
+  const documentId = 'doc_native_crash_recovery_123456789';
+  const createCallId = 'toolu_native_crash_create';
+  const lostVerificationCallId = 'toolu_native_lost_verification';
+  const createTool = 'mcp__googledocs__create_document';
+  const readTool = 'mcp__googledocs__get_document';
+  let run = 0;
+  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    run += 1;
+    if (run === 1) {
+      return stubsFor((async function* () {
+        yield {
+          ...initOnlyMessage(),
+          tools: [createTool],
+          mcp_servers: [{ name: 'googledocs', status: 'connected' }],
+        } as any;
+        const input = { title: 'Crash-safe native brief' };
+        const verdict = await params.options.canUseTool(
+          createTool,
+          input,
+          { signal: new AbortController().signal, toolUseID: createCallId },
+        );
+        assert.equal(verdict.behavior, 'allow');
+        yield {
+          type: 'assistant', session_id: 'sdk-native-crash-create', uuid: 'use-native-crash-create',
+          parent_tool_use_id: null,
+          message: { content: [{ type: 'tool_use', id: createCallId, name: createTool, input }] },
+        } as any;
+        yield {
+          type: 'user', session_id: 'sdk-native-crash-create', uuid: 'return-native-crash-create',
+          parent_tool_use_id: null,
+          message: { content: [{
+            type: 'tool_result', tool_use_id: createCallId, is_error: false,
+            content: `[provider-dispatch:uncertain]\n{"documentId":"${documentId}","url":"https://docs.google.com/document/d/${documentId}/edit"}`,
+          }] },
+        } as any;
+        yield successResultMessage('create outcome is ambiguous');
+      })());
+    }
+    const readCallId = `toolu_native_recovery_read_${run}`;
+    return queryFromMessages([
+      {
+        ...initOnlyMessage(),
+        tools: [readTool],
+        mcp_servers: [{ name: 'googledocs', status: 'connected' }],
+      } as any,
+      {
+        type: 'assistant', session_id: `sdk-native-recovery-${run}`, uuid: `use-native-recovery-${run}`,
+        parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_use', id: readCallId, name: readTool, input: { document_id: documentId },
+        }] },
+      } as any,
+      {
+        type: 'user', session_id: `sdk-native-recovery-${run}`, uuid: `return-native-recovery-${run}`,
+        parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_result', tool_use_id: readCallId, is_error: false,
+          content: JSON.stringify({ data: {
+            document_id: documentId,
+            display_url: `https://docs.google.com/document/d/${documentId}/edit`,
+            plain_text: 'Durable provider readback',
+          } }),
+        }] },
+      } as any,
+      successResultMessage('readback observed'),
+    ], {});
+  }) as any);
+
+  try {
+    const shared = {
+      prompt: 'Create and verify one crash-safe native brief.',
+      sessionId: session.id,
+      modelId: 'claude-sonnet-4-6',
+      trackerScopeId,
+      artifactRunScopeId: trackerScopeId,
+      artifactObjective: 'Create one Google Doc named Crash-safe native brief.',
+    };
+    await runClaudeAgentSdk({ ...shared, allowedLocalMcpTools: [createTool] });
+
+    const [reservation] = eventlog.listEvents(session.id, { types: ['external_write'] });
+    const [orphan] = eventlog.listEvents(session.id, { types: ['external_write_orphaned'] });
+    const [boundBeforeRead] = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
+    assert.equal(boundBeforeRead?.externalWriteEventId, reservation?.id);
+    assert.equal(orphan?.parentEventId, reservation?.id);
+    assert.equal(eventlog.listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
+
+    const verifiedBeforeCrash = artifactLedger.verifyArtifactBindingFromToolResult(
+      session.id,
+      trackerScopeId,
+      readTool,
+      { document_id: documentId },
+      { data: {
+        document_id: documentId,
+        display_url: `https://docs.google.com/document/d/${documentId}/edit`,
+        plain_text: 'Verified before the bridge ran',
+      } },
+      lostVerificationCallId,
+      true,
+    );
+    assert.ok(verifiedBeforeCrash?.bindingVerifiedAt, 'verification commits before the simulated crash');
+    assert.equal(eventlog.listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
+
+    await runClaudeAgentSdk({ ...shared, allowedLocalMcpTools: [readTool] });
+    await runClaudeAgentSdk({ ...shared, allowedLocalMcpTools: [readTool] });
+    const settlements = eventlog.listEvents(session.id, { types: ['external_write_succeeded'] });
+    assert.equal(settlements.length, 1, 'repeated exact reads cannot duplicate the success settlement');
+    assert.equal(settlements[0]?.parentEventId, reservation?.id);
+    assert.equal(settlements[0]?.data.settlementKey, `external-write:${reservation?.id}`);
+    assert.equal(settlements[0]?.data.evidenceCallId, lostVerificationCallId);
+    assert.equal(settlements[0]?.data.reason, 'artifact_readback_verified');
+  } finally {
+    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
+  }
+});
+
+test('native artifact/write binding refusal closes the reservation with a parented pre-dispatch failure', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const trackerScopeId = `${session.id}::native-artifact-bind-failure`;
+  const toolName = 'mcp__googledocs__create_document';
+  const callId = 'toolu_native_bind_failure';
+  let verdict: { behavior?: string; message?: string; interrupt?: boolean } | undefined;
+  artifactLedger.listRunArtifacts(session.id, trackerScopeId);
+  const db = eventlog.openEventLog();
+  db.exec(`
+    DROP TRIGGER IF EXISTS force_native_artifact_binding_conflict;
+    CREATE TRIGGER force_native_artifact_binding_conflict
+    AFTER INSERT ON events
+    WHEN NEW.type = 'external_write'
+      AND json_extract(NEW.data_json, '$.callId') = '${callId}'
+    BEGIN
+      UPDATE run_artifacts
+         SET external_write_event_id = 'forced-conflicting-reservation'
+       WHERE session_id = NEW.session_id
+         AND source_call_id = '${callId}';
+    END;
+  `);
+  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
+    yield {
+      ...initOnlyMessage(),
+      tools: [toolName],
+      mcp_servers: [{ name: 'googledocs', status: 'connected' }],
+    } as any;
+    verdict = await params.options.canUseTool(
+      toolName,
+      { title: 'Binding failure brief' },
+      { signal: new AbortController().signal, toolUseID: callId },
+    );
+    yield successResultMessage('binding refusal observed');
+  })())) as any);
+
+  try {
+    await runClaudeAgentSdk({
+      prompt: 'Create one Google Doc named Binding failure brief.',
+      sessionId: session.id,
+      modelId: 'claude-sonnet-4-6',
+      trackerScopeId,
+      artifactRunScopeId: trackerScopeId,
+      artifactObjective: 'Create one Google Doc named Binding failure brief.',
+      allowedLocalMcpTools: [toolName],
+    });
+    assert.equal(verdict?.behavior, 'deny');
+    assert.equal(verdict?.interrupt, true);
+    assert.match(verdict?.message ?? '', /ARTIFACT_WRITE_BINDING_FAILED/);
+    const [reservation] = eventlog.listEvents(session.id, { types: ['external_write'] });
+    const [failure] = eventlog.listEvents(session.id, { types: ['external_write_failed'] });
+    assert.equal(failure?.parentEventId, reservation?.id);
+    assert.equal(failure?.data.dispatch, 'not_started');
+    assert.equal(failure?.data.effect, 'none');
+    assert.equal(failure?.data.preDispatch, true);
+    assert.equal(artifactLedger.listRunArtifacts(session.id, trackerScopeId).length, 0);
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS force_native_artifact_binding_conflict');
   }
 });
 

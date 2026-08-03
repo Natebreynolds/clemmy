@@ -98,6 +98,7 @@ import {
   artifactReuseMessage,
   artifactVerificationIntentForTool,
   bindClaimedArtifact,
+  bindClaimedArtifactExternalWrite,
   claimArtifactSlot,
   extractArtifactResource,
   markClaimedArtifactUncertain,
@@ -108,6 +109,7 @@ import {
   type ArtifactIntent,
   type ArtifactVerificationIntent,
 } from './artifact-ledger.js';
+import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
 import { resolveHotSet } from '../../agents/tool-catalog.js';
 
 type QueryFn = typeof claudeQuery;
@@ -123,6 +125,21 @@ type ReflectFn = typeof scheduleReflection;
 let reflectImpl: ReflectFn = scheduleReflection;
 export function setClaudeAgentSdkReflectionForTest(fn: ReflectFn | null): void {
   reflectImpl = fn ?? scheduleReflection;
+}
+
+const LOCAL_MCP_SERVER_SLUG = 'clementine-local';
+
+/** Parse the SDK's native MCP identity by namespace, never by a substring of
+ * the full tool name. External servers and tools are free to contain the word
+ * "clement"; only the exact in-process server slug is local. */
+function nativeExternalMcpTool(rawName: unknown): { namespacedToolName: string; serverSlug: string } | null {
+  if (typeof rawName !== 'string') return null;
+  const namespacedToolName = rawName.replace(/^mcp__/, '');
+  const separator = namespacedToolName.indexOf('__');
+  if (separator <= 0 || separator >= namespacedToolName.length - 2) return null;
+  const serverSlug = namespacedToolName.slice(0, separator);
+  if (serverSlug.toLowerCase() === LOCAL_MCP_SERVER_SLUG) return null;
+  return { namespacedToolName, serverSlug };
 }
 
 // -------- In-lane provider-overload retry (first-byte-safe) --------
@@ -362,8 +379,8 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
  *  (brackets) nor the namespace shim WITH a live harness AsyncLocalStorage context,
  *  so this permission callback is the one harness-controlled point that sees them
  *  (as `mcp__<server>__<tool>`, per the split at line ~220). We register ONLY those
- *  native-external names (local/clementine + composio are already covered by
- *  brackets — evaluating them here would double-count), stripping the SDK's `mcp__`
+ *  native-external names (the exact clementine-local server is already covered
+ *  by brackets — evaluating it here would double-count), stripping the SDK's `mcp__`
  *  prefix so the fanout key + the run_tool_program recovery skeleton name the tool
  *  exactly as code mode dispatches it. On a fanout refusal we DENY (interrupt:false)
  *  with the recovery message so the model reads the "write ONE program" steer. */
@@ -373,9 +390,9 @@ export function withReadFanoutGuard(base: CanUseTool, sessionId: string | undefi
       // SDK native external MCP name: mcp__<server>__<tool>. Strip the leading
       // mcp__, then require a remaining <server>__<tool> shape that is NOT the
       // in-process clementine-local server (whose tools ride brackets).
-      const stripped = toolName.replace(/^mcp__/, '');
-      const isNativeExternalMcp = stripped.includes('__') && !/clement/i.test(stripped);
-      if (isNativeExternalMcp) {
+      const nativeIdentity = nativeExternalMcpTool(toolName);
+      if (nativeIdentity) {
+        const stripped = nativeIdentity.namespacedToolName;
         try {
           const decision = applyMode(evaluateToolCall(sessionId, stripped, input));
           if (decision.fanoutBlock) {
@@ -814,17 +831,19 @@ function appendSdkTopLevelToolEvent(
   type: 'tool_called' | 'tool_returned',
   callId: string,
   source: { name: string; input: unknown } | undefined,
-  result?: { isError: boolean; output?: unknown },
-): void {
-  if (!sessionId) return;
+  result?: { isError: boolean; output?: unknown; invocationNonce?: string },
+  parentEventId?: string,
+): string | undefined {
+  if (!sessionId) return undefined;
   try {
     const name = source?.name ?? '';
     const metadata = runtimeToolAccountingMetadata(name, source?.input);
-    appendEvent({
+    const event = appendEvent({
       sessionId,
       turn: 0,
       role: type === 'tool_called' ? 'Clem' : 'tool',
       type,
+      ...(type === 'tool_returned' && parentEventId ? { parentEventId } : {}),
       data: {
         tool: name ? mcpToolTail(name) : undefined,
         callId,
@@ -838,6 +857,7 @@ function appendSdkTopLevelToolEvent(
         ...(type === 'tool_called' ? { arguments: sdkToolArgumentsPreview(source?.input) } : {}),
         ...(type === 'tool_returned' ? {
           ok: !result?.isError,
+          ...(result?.invocationNonce ? { invocationNonce: result.invocationNonce } : {}),
           // Keep the canonical row independently useful to semantic readers.
           // The full payload still lives in tool_outputs; this matches the
           // existing bounded transport preview without duplicating the body.
@@ -845,7 +865,9 @@ function appendSdkTopLevelToolEvent(
         } : {}),
       },
     });
+    return event.id;
   } catch { /* progress/accounting must never break the stream */ }
+  return undefined;
 }
 
 interface NativeExternalWriteAttempt {
@@ -860,6 +882,7 @@ interface NativeExternalWriteAttempt {
   retryOfCallId?: string;
   retryAuthorizationSeq?: number;
   executionId?: string;
+  reservationEventId?: string;
 }
 
 function nativeExternalWriteReturnedFailure(output: unknown, providerError = false): {
@@ -998,13 +1021,19 @@ function appendNativeExternalWriteEvent(
   attempt: NativeExternalWriteAttempt,
   type: 'external_write' | 'external_write_succeeded' | 'external_write_failed' | 'external_write_orphaned',
   extra: Record<string, unknown> = {},
-): void {
-  if (!sessionId) return;
-  appendEvent({
+): string | undefined {
+  if (!sessionId) return undefined;
+  const isReservation = type === 'external_write';
+  const reservationEventId = attempt.reservationEventId;
+  if (!isReservation && !reservationEventId) {
+    throw new Error(`Native external-write settlement ${type} is missing its reservation event id.`);
+  }
+  const event = appendEvent({
     sessionId,
     turn: 0,
     role: 'system',
     type,
+    ...(!isReservation ? { parentEventId: reservationEventId } : {}),
     data: {
       shapeKey: attempt.shapeKey,
       actionKey: attempt.actionKey,
@@ -1020,9 +1049,14 @@ function appendNativeExternalWriteEvent(
         retryAuthorizationSeq: attempt.retryAuthorizationSeq,
         executionId: attempt.executionId,
       } : {}),
+      ...(type === 'external_write_succeeded'
+        ? { settlementKey: `external-write:${reservationEventId}` }
+        : {}),
       ...extra,
     },
   });
+  if (isReservation) attempt.reservationEventId = event.id;
+  return event.id;
 }
 
 function sdkPreapprovedToolsForMode(tools: string[], agentic: boolean): string[] {
@@ -1890,12 +1924,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         }
       }
 
-      let nativeExternal = false;
-      let strippedToolName = typeof toolName === 'string' ? toolName.replace(/^mcp__/, '') : '';
-      if (typeof toolName === 'string' && options.sessionId) {
-        strippedToolName = toolName.replace(/^mcp__/, '');
-        nativeExternal = strippedToolName.includes('__') && !/clement/i.test(strippedToolName);
-      }
+      const nativeIdentity = options.sessionId ? nativeExternalMcpTool(toolName) : null;
+      const nativeExternal = nativeIdentity !== null;
+      const strippedToolName = nativeIdentity?.namespacedToolName
+        ?? (typeof toolName === 'string' ? toolName.replace(/^mcp__/, '') : '');
       if (
         nativeExternal
         && options.nativeMcpToolScope !== undefined
@@ -2015,10 +2047,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           const staleAfterPermission = staleLeaseDenial();
           if (staleAfterPermission) return staleAfterPermission;
 
-          if (artifactAdmission) {
-            if (providerCallId) nativeArtifactClaims.set(providerCallId, artifactAdmission);
-            else markClaimedArtifactUncertain(artifactAdmission.artifactId);
-          }
           if (pendingNativeWrite && !nativeExternalWrites.has(providerCallId)) {
             const duplicateDenial = await withExternalWriteAdmissionLock(
               externalWriteAdmissionKey(options.sessionId as string),
@@ -2043,16 +2071,53 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                   pendingNativeWrite.retryAuthorizationSeq = retry.authorizationSeq;
                   pendingNativeWrite.executionId = retry.executionId;
                 }
-                appendNativeExternalWriteEvent(options.sessionId, pendingNativeWrite, 'external_write', {
+                const reservationEventId = appendNativeExternalWriteEvent(options.sessionId, pendingNativeWrite, 'external_write', {
                   irreversible: irreversibleNativeWrite,
                   preDispatch: true,
                   sourceUserSeq: options.sourceUserSeq,
                 });
+                let artifactWriteBound = true;
+                if (artifactAdmission) {
+                  try {
+                    artifactWriteBound = Boolean(
+                      reservationEventId
+                      && bindClaimedArtifactExternalWrite(
+                        artifactAdmission.artifactId,
+                        providerCallId,
+                        {
+                          eventId: reservationEventId,
+                          actionKey: pendingNativeWrite.actionKey,
+                          toolName: pendingNativeWrite.toolName,
+                        },
+                      ),
+                    );
+                  } catch {
+                    artifactWriteBound = false;
+                  }
+                }
+                if (!artifactWriteBound) {
+                  appendNativeExternalWriteEvent(options.sessionId, pendingNativeWrite, 'external_write_failed', {
+                    dispatch: 'not_started',
+                    effect: 'none',
+                    preDispatch: true,
+                    reason: 'artifact/write reservation binding failed',
+                    sourceUserSeq: options.sourceUserSeq,
+                  });
+                  return {
+                    behavior: 'deny',
+                    interrupt: true,
+                    message: 'ARTIFACT_WRITE_BINDING_FAILED: Clementine stopped before dispatch because it could not bind the artifact claim to the durable write reservation.',
+                  } as PermissionResult;
+                }
                 nativeExternalWrites.set(providerCallId, pendingNativeWrite);
                 return null;
               },
             );
             if (duplicateDenial) return duplicateDenial;
+          }
+          if (artifactAdmission) {
+            if (providerCallId) nativeArtifactClaims.set(providerCallId, artifactAdmission);
+            else markClaimedArtifactUncertain(artifactAdmission.artifactId);
           }
           // A native write that reached this point has a durable pre-dispatch
           // reservation, which is the recovery interlock. Reads/local calls
@@ -2290,6 +2355,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const seenTopLevelToolCallIds = new Set<string>();
   const seenTopLevelToolReturnIds = new Set<string>();
   const seenReturnedToolCallIds = new Set<string>();
+  const topLevelToolCalledEventIds = new Map<string, string>();
   // One unique child scope per SDK invocation, with a new generation for each
   // query()/internal retry. The caller's lease remains shared authority owned
   // by the brain/workflow/worker wrapper; this function revokes only children.
@@ -2561,7 +2627,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               argsPreview: JSON.stringify(use.input ?? {}).slice(0, 120),
             });
           } catch { /* ledger is best-effort */ }
-          appendSdkTopLevelToolEvent(options.sessionId, 'tool_called', use.id, { name: use.name, input: use.input });
+          const calledEventId = appendSdkTopLevelToolEvent(
+            options.sessionId,
+            'tool_called',
+            use.id,
+            { name: use.name, input: use.input },
+          );
+          if (calledEventId) topLevelToolCalledEventIds.set(use.id, calledEventId);
           emitSdkToolCallEvent(options.sessionId, 'tool_call_started', use.id, use.name);
         }
         // The SDK can replay a complete assistant frame around stream/compact
@@ -2573,6 +2645,26 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           const source = toolById.get(tr.callId);
           if (seenTopLevelToolReturnIds.has(tr.callId)) continue;
           seenTopLevelToolReturnIds.add(tr.callId);
+          const resultFailed = tr.isError || !tr.valid;
+          let invocationNonce: string | undefined;
+          // Persist the exact bytes before the parented terminal event. That
+          // ordering lets authority consumers prove the row belongs inside this
+          // one physical call/return occurrence even after a reused SDK id.
+          if (options.sessionId && tr.output !== undefined && tr.output !== null && !resultFailed) {
+            try {
+              invocationNonce = randomUUID();
+              writeToolOutput({
+                sessionId: options.sessionId,
+                callId: tr.callId,
+                tool: source ? mcpToolTail(source.name) : null,
+                output: tr.output,
+                invocationNonce,
+              });
+            } catch {
+              invocationNonce = undefined;
+              // Recall parking must never break the run.
+            }
+          }
           if (options.sessionId && source) {
             // Native external MCP reads never enter wrapToolForHarness. Observe
             // exact-id provider getters here so a Google Doc/site binding can
@@ -2583,7 +2675,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               try {
                 const artifactRunScopeId = ensureArtifactRunScopeId();
                 if (artifactRunScopeId) {
-                  verifyArtifactBindingFromToolResult(
+                  const verifiedArtifact = verifyArtifactBindingFromToolResult(
                     options.sessionId,
                     artifactRunScopeId,
                     source.name,
@@ -2592,6 +2684,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                     tr.callId,
                     !tr.isError && tr.valid,
                   );
+                  if (verifiedArtifact) {
+                    settleExternalWriteFromVerifiedArtifact(
+                      options.sessionId,
+                      verifiedArtifact,
+                      tr.callId,
+                    );
+                  }
                 }
               } catch { /* the artifact remains unverified; never break the tool stream */ }
             }
@@ -2647,7 +2746,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           // On failure, carry the cause into telemetry — SDK-lane failures were
           // emitted with no error detail (151/172 tool_call_failed rows had no
           // cause), making the reliability signal unusable.
-          const resultFailed = tr.isError || !tr.valid;
           const failExtra = resultFailed
             ? (() => {
                 const msg = (!tr.valid
@@ -2661,16 +2759,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           if (source?.name && !resultFailed && toolOutputLooksSuccessful(tr.output)) {
             successfulToolUses.push(completionEvidenceToolName(source.name, source.input));
           }
-          appendSdkTopLevelToolEvent(options.sessionId, 'tool_returned', tr.callId, source, { isError: resultFailed, output: tr.output });
-          // A3 recall contract: park every result under the SDK's OWN tool_use id
-          // (toolu_…) — the id the continuation ledger hands out. Without this,
-          // outputs live only under harness-generated mcp-<uuid> ids (and only
-          // when clipped), so every tool_output_query(toolu_…) would miss.
-          if (options.sessionId && tr.output && !resultFailed) {
-            try {
-              writeToolOutput({ sessionId: options.sessionId, callId: tr.callId, tool: source ? mcpToolTail(source.name) : null, output: tr.output });
-            } catch { /* recall parking must never break the run */ }
-          }
+          appendSdkTopLevelToolEvent(
+            options.sessionId,
+            'tool_returned',
+            tr.callId,
+            source,
+            { isError: resultFailed, output: tr.output, invocationNonce },
+            topLevelToolCalledEventIds.get(tr.callId),
+          );
           if (reflectLearning && tr.output) {
             const tool = source ? reflectionToolName(source.name, source.input) : null;
             reflectImpl({
