@@ -63,6 +63,22 @@ interface ParsedReportBackTruth {
   detail: string;
 }
 
+const EXACT_ORIGIN_OBSERVER_ID = /^workflow-origin-v2:[a-f0-9]{64}$/;
+
+function validObserverSettlementProjections(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Object.entries(value).every(([observerId, candidate]) => {
+    if (!EXACT_ORIGIN_OBSERVER_ID.test(observerId)) return false;
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+    const projection = candidate as Record<string, unknown>;
+    return Object.keys(projection).sort().join('\0') === ['reportBackDigest', 'settlementDigest'].join('\0')
+      && typeof projection.settlementDigest === 'string'
+      && /^[a-f0-9]{64}$/.test(projection.settlementDigest)
+      && typeof projection.reportBackDigest === 'string'
+      && /^[a-f0-9]{64}$/.test(projection.reportBackDigest);
+  });
+}
+
 interface ParsedCompiledProjectTerminal {
   id: string;
   workflow: string;
@@ -120,15 +136,21 @@ function parseReportBackTruth(
 ): ParsedReportBackTruth | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const report = value as Record<string, unknown>;
-  const expectedKeys = [
+  const expectedKeys: string[] = [
     'acknowledgedOriginSessionIds',
     'detail',
     'outcome',
     'version',
     'workflowName',
   ];
+  if (report.acknowledgedOriginObserverIds !== undefined) {
+    expectedKeys.push('acknowledgedOriginObserverIds');
+  }
+  if (report.acknowledgedOriginObserverSettlements !== undefined) {
+    expectedKeys.push('acknowledgedOriginObserverSettlements');
+  }
   if (
-    Object.keys(report).sort().join('\0') !== expectedKeys.join('\0')
+    Object.keys(report).sort().join('\0') !== expectedKeys.sort().join('\0')
     || report.version !== 1
     || report.workflowName !== workflow
     || report.outcome !== workflowTerminalOutcomeReportLane(terminalOutcome)
@@ -142,6 +164,19 @@ function parseReportBackTruth(
     acknowledgements.some((id) =>
       typeof id !== 'string' || !id || id !== id.trim())
     || new Set(acknowledgements).size !== acknowledgements.length
+  ) return null;
+  const observerIds = report.acknowledgedOriginObserverIds;
+  if (
+    observerIds !== undefined
+    && (
+      !Array.isArray(observerIds)
+      || observerIds.some((id) => typeof id !== 'string' || !EXACT_ORIGIN_OBSERVER_ID.test(id))
+      || new Set(observerIds).size !== observerIds.length
+    )
+  ) return null;
+  if (
+    report.acknowledgedOriginObserverSettlements !== undefined
+    && !validObserverSettlementProjections(report.acknowledgedOriginObserverSettlements)
   ) return null;
   return {
     version: 1,

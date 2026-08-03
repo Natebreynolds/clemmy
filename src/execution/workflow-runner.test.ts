@@ -908,6 +908,8 @@ test('compiled project winner drains its catalogless V3 model node once and repo
     assert.equal(settledProject?.workflowBindings?.[0]?.status, 'completed');
     assert.equal(terminal.reportBack?.outcome, 'done');
     assert.deepEqual(terminal.reportBack?.acknowledgedOriginSessionIds, [sessionId]);
+    assert.deepEqual(terminal.reportBack?.acknowledgedOriginObserverIds, []);
+    assert.deepEqual(terminal.reportBack?.acknowledgedOriginObserverSettlements, {});
     assert.equal(typeof terminal.reportBackAcknowledgedAt, 'string');
     assert.equal(
       readWorkflowEvents(admitted.workflowSlug, runId)
