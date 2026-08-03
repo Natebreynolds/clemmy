@@ -1,5 +1,10 @@
 import { readHarnessCapabilityHealth, recordHarnessCapabilityHealth } from '../runtime/harness/capability-health.js';
 import { createHash } from 'node:crypto';
+
+import {
+  describeCarrierRefusal,
+  normalizeComposioCarrierInput,
+} from './composio-carrier.js';
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
@@ -2243,17 +2248,31 @@ export function runComposioExecuteWithGatewayForTest(
   );
 }
 
-function parseArgumentsJson(value: string | null | undefined): Record<string, unknown> {
-  if (!value?.trim()) return {};
-  try {
-    const parsed = JSON.parse(value);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('Composio tool arguments must be a JSON object.');
-    }
-    return parsed as Record<string, unknown>;
-  } catch (error) {
-    throw new Error(`Invalid Composio arguments JSON: ${error instanceof Error ? error.message : String(error)}`);
+/**
+ * Read the carrier's `arguments` payload through the ONE canonical adapter.
+ *
+ * The 2026-08-02 calendar incident spent four pre-dispatch failures on
+ * representation rather than meaning — `arguments` as an object, `slug` for
+ * `tool_slug`, an `arguments_json` nesting, an object again. Those are the same
+ * call written four ways, and re-teaching the transport each time is what made
+ * a 2.1s provider read cost 52s.
+ *
+ * So drift is repaired here, deterministically, and a genuine mistake is
+ * refused with the authoritative contract attached rather than a bare
+ * "invalid" the caller can only respond to by guessing again.
+ */
+function parseArgumentsJson(
+  value: string | null | undefined,
+  toolSlug?: string,
+): Record<string, unknown> {
+  const normalized = normalizeComposioCarrierInput({
+    tool_slug: toolSlug ?? 'PLACEHOLDER_SLUG',
+    arguments: value ?? null,
+  });
+  if (!normalized.ok) {
+    throw new Error(describeCarrierRefusal(normalized));
   }
+  return normalized.canonical.args;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
