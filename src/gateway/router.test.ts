@@ -435,7 +435,7 @@ test('gateway bare continue prioritizes a parked background continuation', async
   assert.ok(stored?.continueResolution, 'continue request should be queued on the background task');
 });
 
-test('gateway auto-promotes broad multi-system data pipelines to background', async () => {
+test('gateway keeps an INFERRED pipeline in the conversation, and backgrounds a named one', async () => {
   const session = createSession({ kind: 'chat', channel: 'mobile', title: 'CRM enrichment' });
   let respondCalled = false;
   const gateway = new ClementineGateway({
@@ -452,11 +452,26 @@ test('gateway auto-promotes broad multi-system data pipelines to background', as
     source: 'mobile',
   });
 
-  assert.equal(respondCalled, false, 'foreground chat run should be skipped');
-  assert.ok(response.queuedTaskId, 'a durable background task should be queued');
-  assert.match(response.text, /background task/i);
+  // Shape alone is Clementine's inference, not the user's instruction. Live
+  // 2026-08-03: a request of exactly this shape was dispatched unattended
+  // without ever asking what it needed, then spent twelve minutes acting on
+  // guesses. It stays in the conversation now, where the turn can align first.
+  assert.equal(respondCalled, true, 'an inferred pipeline should stay in the conversation');
+  assert.equal(response.queuedTaskId, undefined, 'an inferred pipeline must not auto-dispatch');
 
-  const task = getBackgroundTask(response.queuedTaskId!);
+  // Naming the lane is an instruction, and it is still honoured immediately.
+  respondCalled = false;
+  const named = await gateway.handleMessage({
+    message: 'Run this in the background: Pull full data from Salesforce via the CLI, then scrape all of it with Apify MCP, then add the results to my Airtable CRM via MCP.',
+    sessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile',
+  });
+  assert.equal(respondCalled, false, 'a named background lane should skip the foreground run');
+  assert.ok(named.queuedTaskId, 'a durable background task should be queued');
+  assert.match(named.text, /background task/i);
+
+  const task = getBackgroundTask(named.queuedTaskId!);
   assert.ok(task, 'queued task should be persisted');
   assert.equal(task!.originSessionId, session.id);
   assert.equal(task!.source, 'mobile');
