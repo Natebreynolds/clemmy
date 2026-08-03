@@ -3571,7 +3571,10 @@ interface DurableToolOutputOccurrence {
   explicitOk: boolean | null;
 }
 
-function authorityEventString(event: EventRow, field: 'callId' | 'tool' | 'effect'): string {
+function authorityEventString(
+  event: EventRow,
+  field: 'callId' | 'tool' | 'effect' | 'effectiveTool',
+): string {
   const value = event.data[field];
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -3643,12 +3646,15 @@ function durableToolOutputOccurrence(
   const returnTool = authorityEventString(returned, 'tool');
   const callEffect = authorityEventString(call, 'effect');
   const returnEffect = authorityEventString(returned, 'effect');
+  const callEffectiveTool = authorityEventString(call, 'effectiveTool');
+  const returnEffectiveTool = authorityEventString(returned, 'effectiveTool');
   if (
     returned.parentEventId !== call.id
     || returned.seq <= call.seq
     || !callTool
     || callTool !== returnTool
     || callEffect !== returnEffect
+    || callEffectiveTool !== returnEffectiveTool
   ) {
     return {
       occurrence: null,

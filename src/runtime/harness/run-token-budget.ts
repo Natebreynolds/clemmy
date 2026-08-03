@@ -1,9 +1,8 @@
 /**
  * DREAM Stage 4 — the aggregate RUN TOKEN BUDGET (Gap D).
  *
- * Bounds existed for steps/turns/wall-clock/concurrency only, and
- * autoContinueOnLimit lifts the step cap to 1,000,000 — so nothing bounded
- * cumulative SPEND. This module is the soft ceiling: a durable per-session
+ * Step/turn/wall-clock/concurrency bounds do not themselves bound cumulative
+ * SPEND across durable continuations. This module is the soft ceiling: a durable per-session
  * token accumulator (sessions.tokens_used, filled by recordModelUsage via
  * accrueSessionTokens) checked at turn/step boundaries, parking honestly
  * through the existing limit templates — never a hard kill mid-write.

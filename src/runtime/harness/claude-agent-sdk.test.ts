@@ -2351,6 +2351,70 @@ test('Claude reflection unwraps deferred call_tool to the real inner capability'
   assert.equal(reflected[0].tool, 'SALESFORCE_QUERY');
 });
 
+test('Claude lifecycle preserves effective call_tool identity before an oversized input preview is clipped', async () => {
+  const largeCarrierInput = {
+    name: 'workflow_run',
+    args_json: JSON.stringify({
+      name: 'large-sdk-workflow',
+      inputs: { brief: 'x'.repeat(9_000) },
+    }),
+  };
+  setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages([
+    {
+      type: 'system', subtype: 'init', model: 'claude-opus-4-8',
+      session_id: 'sdk-large-carrier', uuid: 'large-u1', apiKeySource: 'none',
+      claude_code_version: '2.1.181', cwd: process.cwd(), tools: [],
+      mcp_servers: [], permissionMode: 'default', slash_commands: [],
+      output_style: 'default', skills: [], plugins: [],
+    } as any,
+    {
+      type: 'assistant', session_id: 'sdk-large-carrier', uuid: 'large-u2',
+      parent_tool_use_id: null,
+      message: { content: [{
+        type: 'tool_use',
+        id: 'toolu_large_workflow_carrier',
+        name: 'mcp__clementine-local__call_tool',
+        input: largeCarrierInput,
+      }] },
+    } as any,
+    {
+      type: 'user', session_id: 'sdk-large-carrier', uuid: 'large-u3',
+      parent_tool_use_id: null,
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'toolu_large_workflow_carrier',
+        content: 'Queued "large-sdk-workflow" — it is now running in the BACKGROUND.',
+      }] },
+    } as any,
+    {
+      type: 'result', subtype: 'success', session_id: 'sdk-large-carrier',
+      uuid: 'large-u4', result: 'Queued the workflow.', duration_ms: 1,
+      duration_api_ms: 1, is_error: false, num_turns: 1,
+      stop_reason: 'end_turn', total_cost_usd: 0,
+      usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {},
+      permission_denials: [],
+    } as any,
+  ], {})) as any);
+  setClaudeAgentSdkReflectionForTest((() => {}) as any);
+  const sess = eventlog.createSession({ id: 'sdk-large-carrier-parent', kind: 'chat' });
+
+  await runClaudeAgentSdk({
+    prompt: 'Run the prepared workflow.',
+    sessionId: sess.id,
+    agentic: true,
+    allowedLocalMcpTools: ['call_tool'],
+  });
+
+  const called = eventlog.listEvents(sess.id, { types: ['tool_called'] });
+  const returned = eventlog.listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(called.length, 1);
+  assert.equal(returned.length, 1);
+  assert.equal(called[0].data.effectiveTool, 'workflow_run');
+  assert.equal(returned[0].data.effectiveTool, 'workflow_run');
+  assert.equal(String(called[0].data.arguments).length, 8_000, 'preview stays bounded');
+  assert.throws(() => JSON.parse(String(called[0].data.arguments)), 'bounded preview is not reparsed');
+});
+
 test('shared SDK stream emits one canonical call for repeated tool_use frames on allow-only lanes', async () => {
   const sess = eventlog.createSession({ id: 'sdk-canonical-allow-only', kind: 'workflow' });
   const toolUse = {

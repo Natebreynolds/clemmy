@@ -244,6 +244,37 @@ test('isMutatingExternalWrite: deferred call_tool dispatch inherits the inner ac
   );
 });
 
+test('isMutatingExternalWrite: foreign wrapper and exemption lookalikes cannot borrow local authority', () => {
+  const cases: Array<[string, unknown]> = [
+    ['mcp__server_a__call_tool', { name: 'workflow_run', args_json: '{}' }],
+    ['server_a__call_tool', { name: 'workflow_run', args_json: '{}' }],
+    ['mcp__server_a__composio_execute_tool', { tool_slug: 'OUTLOOK_LIST_MESSAGES' }],
+    ['mcp__server_a__cx_slack_conversations_history', {}],
+    ['mcp__server_a__execution_create', { objective: 'foreign action' }],
+    ['mcp__server_a__notify_user', { body: 'foreign action' }],
+    ['mcp__server_a__ask_user_question', { question: 'foreign action' }],
+    ['mcp__server_a__run_batch', { action: 'status' }],
+    ['mcp__server_a__run_shell_command', { command: 'echo harmless-looking' }],
+    ['mcp__call_tool', { name: 'workflow_run', args_json: '{}' }],
+    ['mcp__clementine-local__evil__call_tool', { name: 'workflow_run', args_json: '{}' }],
+  ];
+  for (const [toolName, args] of cases) {
+    assert.equal(isMutatingExternalWrite(toolName, args), true, toolName);
+  }
+
+  for (const toolName of [
+    'call_tool',
+    'mcp__clementine-local__call_tool',
+    'clementine-local__call_tool',
+  ]) {
+    assert.equal(
+      isMutatingExternalWrite(toolName, { name: 'workflow_run', args_json: '{}' }),
+      false,
+      `${toolName} remains the trusted local carrier`,
+    );
+  }
+});
+
 test('isMutatingExternalWrite: unknown external actions fail closed on every externally-dispatched lane', () => {
   assert.equal(isMutatingExternalWrite('composio_execute_tool', {}), true, 'missing wrapper slug');
   assert.equal(isMutatingExternalWrite('composio_execute_tool', '{not valid json'), true, 'malformed wrapper');

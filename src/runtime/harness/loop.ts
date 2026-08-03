@@ -93,7 +93,12 @@ import { recordVerdictEvent } from '../../execution/verdict.js';
 import { gatherSessionSkills, summarizeToolCallsForJudge, skillExecutionShortfall } from './skill-execution.js';
 import { isOutputGroundingGateEnabled, evaluateOutputGrounding, buildOutputGroundingChatRetry } from './output-grounding-gate.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
-import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
+import {
+  attachEventLogHooks,
+  extractSessionIdFromContext,
+  unwrapEffectiveToolIdentity,
+  type RunHooksLike,
+} from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
 import { approvalAuthorityMatchesToolCall, exactApprovalAuthorityMatches } from './approval-authority.js';
 import {
@@ -207,17 +212,30 @@ import { pairTransportMirrorToolCalls, projectCanonicalTopLevelToolEvents } from
  *  result may still be a refusal, but a queued-or-refused dispatch is a REAL
  *  action either way — the reply narrates it, so it is never a zero-work punt. */
 const DISPATCHING_TOOL_NAMES = new Set(['workflow_run', 'dispatch_background_task']);
-const DISPATCHING_CALL_TOOL_RE = /"name"\s*:\s*"(?:workflow_run|dispatch_background_task)"/;
+
+function effectiveCalledToolName(data: Record<string, unknown>): string {
+  const hasDurableIdentity = Object.prototype.hasOwnProperty.call(data, 'effectiveTool');
+  const durableIdentity = typeof data.effectiveTool === 'string'
+    ? data.effectiveTool.trim()
+    : '';
+  if (hasDurableIdentity) {
+    return durableIdentity
+      && data.accounting === 'top_level'
+      && data.effect === 'read'
+      ? durableIdentity
+      : '';
+  }
+  const tool = typeof data.tool === 'string' ? data.tool : '';
+  if (!tool) return '';
+  return unwrapEffectiveToolIdentity(tool, data.arguments).toolName ?? '';
+}
+
 function turnDispatchedBackgroundRun(sessionId: string, turn?: number): boolean {
   try {
     const calls = listEvents(sessionId, { types: ['tool_called'], desc: true, limit: 200 })
       .filter((e) => turn === undefined || e.turn === turn);
     for (const e of calls) {
-      const d = e.data as { tool?: unknown; arguments?: unknown };
-      const tool = typeof d.tool === 'string' ? d.tool : '';
-      if (DISPATCHING_TOOL_NAMES.has(tool)) return true;
-      if (tool === 'call_tool' && typeof d.arguments === 'string'
-        && DISPATCHING_CALL_TOOL_RE.test(d.arguments)) return true;
+      if (DISPATCHING_TOOL_NAMES.has(effectiveCalledToolName(e.data))) return true;
     }
   } catch { /* evidence read is best-effort; absent = no salvage */ }
   return false;
@@ -2053,6 +2071,21 @@ export const DEFAULT_MAX_CONVERSATION_WALL_MS = positiveIntEnv(
   positiveIntEnv('HARNESS_MAX_CONVERSATION_WALL_MINUTES', 120) * 60 * 1000,
 );
 
+/** Resolve the ceiling for one in-memory conversation activation.
+ *
+ * `autoContinueOnLimit` must never erase the configured boundary by silently
+ * widening it to a million model hops. Durable callers may checkpoint and
+ * re-enter after this activation parks; the explicit `unlimited` preset keeps
+ * its operator-selected 1,000,000-step ceiling through
+ * `maxConversationSteps` itself.
+ */
+export function resolveConversationStepCeiling(
+  explicitMaxSteps: number | undefined,
+  budget: Pick<HarnessBudgetRuntime, 'preset' | 'maxConversationSteps' | 'autoContinueOnLimit'>,
+): number {
+  return explicitMaxSteps ?? budget.maxConversationSteps;
+}
+
 function inFlightCompactionEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_INFLIGHT_COMPACTION', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
@@ -2099,14 +2132,17 @@ const CONTINUATION_INPUT =
  * can only produce a false NOT-finished — which forces pointless
  * workflow_run_status polling between dispatch and report-back (2026-06-12:
  * 6 junk "still running" turns on a 3-minute run). Detection is exact: the
- * queue tool's own success message, fetched from the tool-output store for a
- * workflow_run call made in THIS turn. Fail-closed to judging as before.
+ * queue tool's own success message, fetched from the tool-output store for the
+ * canonical top-level call made in THIS turn. That may be `workflow_run`
+ * directly or its schema-on-demand `call_tool` carrier; authority stays on the
+ * outer call id whose lifecycle and exact output are durable. Fail-closed to
+ * judging as before.
  */
 export function dispatchedBackgroundWorkflowRun(sessionId: string, turn: number): boolean {
   try {
     const calls = listEvents(sessionId, { types: ['tool_called'] })
       .filter((ev) => ev.turn === turn
-        && (ev.data as { tool?: unknown } | undefined)?.tool === 'workflow_run');
+        && effectiveCalledToolName(ev.data) === 'workflow_run');
     for (const call of calls) {
       const callId = (call.data as { callId?: unknown } | undefined)?.callId;
       if (typeof callId !== 'string' || !callId) continue;
@@ -2937,20 +2973,19 @@ function emitRuntimeTerminalEvent(sessionId: string, result: RunConversationResu
 /**
  * Pure: should a forward-progressing run auto-elevate its budget because it is
  * about to exhaust the STEP cap? Only fires on the capped `standard` preset with
- * no caller-pinned maxSteps and autoContinue OFF — i.e. exactly the default
- * install that would otherwise pause at 40 steps. Exported for tests.
+ * no caller-pinned maxSteps. The configured ceiling stays authoritative after
+ * the one standard → long promotion; a legacy auto-continue setting never
+ * turns this activation into an unbounded loop. Exported for tests.
  */
 export function shouldElevateOnStepProgress(opts: {
   alreadyElevated: boolean;
   preset: string;
-  autoContinueOnLimit: boolean;
   explicitMaxSteps: boolean;
   stepIndex: number;
   maxSteps: number;
 }): boolean {
   if (opts.alreadyElevated) return false;
   if (opts.explicitMaxSteps) return false; // caller pinned the cap — respect it
-  if (opts.autoContinueOnLimit) return false; // already long-run capable (no-op for long/unlimited)
   if (opts.preset !== 'standard') return false; // only the capped default preset
   return opts.stepIndex >= opts.maxSteps; // about to exit on the step cap
 }
@@ -3018,10 +3053,7 @@ async function runConversationCore(
   // ceilings on the next loop iteration via the helper.
   let budget: HarnessBudgetRuntime = getHarnessBudgetSettings();
   let elevated = false;
-  let maxSteps = options.maxSteps ?? budget.maxConversationSteps;
-  if (options.maxSteps === undefined && budget.autoContinueOnLimit) {
-    maxSteps = Math.max(maxSteps, 1_000_000);
-  }
+  let maxSteps = resolveConversationStepCeiling(options.maxSteps, budget);
   let maxWallMs = options.maxWallClockMs ?? budget.maxConversationWallMs;
   let maxTurns = options.maxTurns ?? budget.maxTurns;
   let toolCallsPerTurn = options.toolCallsPerTurn ?? budget.toolCallsPerTurn;
@@ -3030,8 +3062,8 @@ async function runConversationCore(
   let lastCheckInAt = startedAt;
   // Stage 4 — aggregate run token budget: window opened at loop entry (or at
   // the caller's durable baseline), checked at the same boundary the
-  // wall-clock uses. Enforcement is kill-switched; independent of maxSteps,
-  // so autoContinueOnLimit's 1,000,000-step lift cannot bypass it.
+  // wall-clock uses. Enforcement is kill-switched and independent of the
+  // configured step ceiling.
   const runTokenCeiling = resolveRunTokenCeiling({ override: options.maxRunTokens, budget });
   const tokenBudgetOn = runTokenBudgetEnforcementEnabled() && runTokenCeiling > 0;
   // Window (and its baseline SELECT) only exists when a ceiling can actually
@@ -3198,9 +3230,6 @@ async function runConversationCore(
     const prev = { maxSteps, maxTurns, toolCallsPerTurn, maxWallMs };
     budget = next;
     maxSteps = options.maxSteps ?? Math.max(maxSteps, budget.maxConversationSteps);
-    if (options.maxSteps === undefined && budget.autoContinueOnLimit) {
-      maxSteps = Math.max(maxSteps, 1_000_000);
-    }
     maxWallMs = options.maxWallClockMs ?? Math.max(maxWallMs, budget.maxConversationWallMs);
     maxTurns = options.maxTurns ?? Math.max(maxTurns, budget.maxTurns);
     toolCallsPerTurn = options.toolCallsPerTurn ?? Math.max(toolCallsPerTurn, budget.toolCallsPerTurn);
@@ -3398,9 +3427,10 @@ async function runConversationCore(
 
     // v0.5.19 F2 — elevate budget mid-conversation if the preflight
     // gate just emitted warn/block AND we're still on `standard`.
-    // The 40/40/40 standard caps trap long-running tasks with no
-    // recourse (autoContinueOnLimit=false). One-way ratchet — once
-    // elevated this run stays elevated. Honors CLEMMY_AUTOBUMP_BUDGET.
+    // The 40/40/40 standard caps can be too small for a legitimate task.
+    // One-way ratchet — once elevated this run stays elevated, but the long
+    // preset's authored 160-step activation ceiling remains authoritative.
+    // Honors CLEMMY_AUTOBUMP_BUDGET.
     if (!elevated && budget.preset === 'standard') {
       const recentPreflight = findLatestPreflightVerdict(options.sessionId, lastTurn);
       if (recentPreflight && (recentPreflight.status === 'warn' || recentPreflight.status === 'block')
@@ -5630,12 +5660,11 @@ async function runConversationCore(
     // `continue`, so a genuinely long task finishes within its time budget.
     // Reaching here means the turn completed and the conversation is NOT done /
     // abandoned / stalled (those returned earlier) — i.e. real forward progress.
-    // No-op when autoContinue is already on (maxSteps is 1,000,000, so the cap
-    // is never approached) → cannot regress a long/unlimited instance.
+    // Long and unlimited presets already own their authored ceilings, so only
+    // the standard preset can take this one-way standard → long promotion.
     if (shouldElevateOnStepProgress({
       alreadyElevated: elevated,
       preset: budget.preset,
-      autoContinueOnLimit: budget.autoContinueOnLimit,
       explicitMaxSteps: options.maxSteps !== undefined,
       stepIndex,
       maxSteps,
@@ -7598,15 +7627,13 @@ async function runConversationFromResumeCore(opts: {
   judgeFn?: ObjectiveJudgeFn;
   onChunk?: (delta: string) => void | Promise<void>;
 }): Promise<RunConversationResult> {
-  const budget = getHarnessBudgetSettings();
-  let maxSteps = opts.maxSteps ?? budget.maxConversationSteps;
-  if (opts.maxSteps === undefined && budget.autoContinueOnLimit) {
-    maxSteps = Math.max(maxSteps, 1_000_000);
-  }
-  const maxWallMs = opts.maxWallClockMs ?? budget.maxConversationWallMs;
-  const maxTurns = opts.maxTurns ?? budget.maxTurns;
-  const toolCallsPerTurn = opts.toolCallsPerTurn ?? budget.toolCallsPerTurn;
-  const checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
+  let budget = getHarnessBudgetSettings();
+  let elevated = false;
+  let maxSteps = resolveConversationStepCeiling(opts.maxSteps, budget);
+  let maxWallMs = opts.maxWallClockMs ?? budget.maxConversationWallMs;
+  let maxTurns = opts.maxTurns ?? budget.maxTurns;
+  let toolCallsPerTurn = opts.toolCallsPerTurn ?? budget.toolCallsPerTurn;
+  let checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
   const startedAt = Date.now();
   const activeSourceUserSeq = Number.isSafeInteger(opts.sourceUserSeq) && opts.sourceUserSeq > 0
     ? opts.sourceUserSeq
@@ -7642,6 +7669,35 @@ async function runConversationFromResumeCore(opts: {
   let stallRetriesUsed = 0;
   let missingReplyRetriesUsed = 0;
   let resumeContinuationInput = CONTINUATION_INPUT;
+
+  // Approval resumes are a second entry into the same conversation machine,
+  // so they receive the same one-way standard → long promotion as fresh
+  // turns. The long preset's authored 160-step ceiling remains authoritative;
+  // this never reintroduces the removed million-hop auto-continue lift.
+  const applyResumeElevation = (eventData: Record<string, unknown>): void => {
+    const next = getElevatedBudget(budget);
+    if (next === budget) return;
+    const prev = { maxSteps, maxTurns, toolCallsPerTurn, maxWallMs };
+    budget = next;
+    maxSteps = opts.maxSteps ?? Math.max(maxSteps, budget.maxConversationSteps);
+    maxWallMs = opts.maxWallClockMs ?? Math.max(maxWallMs, budget.maxConversationWallMs);
+    maxTurns = opts.maxTurns ?? Math.max(maxTurns, budget.maxTurns);
+    toolCallsPerTurn = opts.toolCallsPerTurn ?? Math.max(toolCallsPerTurn, budget.toolCallsPerTurn);
+    checkInMs = Math.min(checkInMs, Math.max(60_000, budget.checkInMinutes * 60 * 1000));
+    elevated = true;
+    safeAppend({
+      sessionId: opts.sessionId,
+      turn: lastTurn,
+      role: 'system',
+      type: 'budget_elevated',
+      data: {
+        ...eventData,
+        path: 'resume',
+        from: prev,
+        to: { maxSteps, maxTurns, toolCallsPerTurn, maxWallMs },
+      },
+    });
+  };
 
   // Step 1: resume the paused approval.
   const firstResult = await resumePendingApproval({
@@ -8232,6 +8288,16 @@ async function runConversationFromResumeCore(opts: {
         `${buildStallRetryMessage(opts.sessionId, resumeStall)} The tool surface is available in this run; do not ask the user to resend a tool-enabled message. Pick the needed local, shell, web, memory, or external-service tool and call it now.`;
     } else {
       resumeContinuationInput = CONTINUATION_INPUT;
+    }
+
+    if (shouldElevateOnStepProgress({
+      alreadyElevated: elevated,
+      preset: budget.preset,
+      explicitMaxSteps: opts.maxSteps !== undefined,
+      stepIndex,
+      maxSteps,
+    })) {
+      applyResumeElevation({ reason: 'step_progress', steps: stepIndex });
     }
   }
 

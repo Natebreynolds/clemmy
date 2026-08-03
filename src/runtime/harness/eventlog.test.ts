@@ -1436,6 +1436,60 @@ test('authority fallback admits one provable legacy read occurrence', () => {
   assert.equal(resolution.record.output, 'one durable legacy result');
 });
 
+test('authority resolution requires effective identity parity across a lifecycle occurrence', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const addOccurrence = (
+    callId: string,
+    callEffectiveTool: string | undefined,
+    returnEffectiveTool: string | undefined,
+  ) => {
+    const called = appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'executor',
+      type: 'tool_called',
+      data: {
+        callId,
+        tool: 'call_tool',
+        effect: 'read',
+        accounting: 'top_level',
+        ...(callEffectiveTool ? { effectiveTool: callEffectiveTool } : {}),
+      },
+    });
+    writeToolOutput({
+      sessionId: sess.id,
+      callId,
+      invocationNonce: `nonce-${callId}`,
+      tool: 'call_tool',
+      output: 'Queued the workflow — it is now running in the BACKGROUND.',
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'executor',
+      type: 'tool_returned',
+      parentEventId: called.id,
+      data: {
+        callId,
+        tool: 'call_tool',
+        effect: 'read',
+        accounting: 'top_level',
+        ok: true,
+        ...(returnEffectiveTool ? { effectiveTool: returnEffectiveTool } : {}),
+      },
+    });
+  };
+
+  addOccurrence('matching-effective', 'workflow_run', 'workflow_run');
+  addOccurrence('mismatched-effective', 'workflow_run', 'server_a__workflow_run');
+  addOccurrence('one-sided-effective', 'workflow_run', undefined);
+
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'matching-effective').status, 'ok');
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'mismatched-effective').status, 'ambiguous');
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'one-sided-effective').status, 'ambiguous');
+});
+
 test('authority resolution rejects an exact read whose lifecycle or provider envelope failed', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

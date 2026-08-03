@@ -853,6 +853,7 @@ function appendSdkTopLevelToolEvent(
           correlationFingerprint: toolCallCorrelationFingerprint(name ? mcpToolTail(name) : '', source?.input),
         } : {}),
         effect: metadata.effect,
+        ...(metadata.effectiveTool ? { effectiveTool: metadata.effectiveTool } : {}),
         ...(metadata.toolSlug ? { toolSlug: metadata.toolSlug } : {}),
         ...(type === 'tool_called' ? { arguments: sdkToolArgumentsPreview(source?.input) } : {}),
         ...(type === 'tool_returned' ? {

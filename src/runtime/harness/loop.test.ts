@@ -95,6 +95,7 @@ const { getPendingAction, pendingActionPayloadHash, queuePendingAction } = await
 const { pendingActionApprovalView } = await import('./pending-action-view.js');
 const { executeApprovedPendingActionCall } = await import('../../execution/pending-action-executor.js');
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
+const { runtimeToolAccountingMetadata } = await import('./tool-effect.js');
 const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
 const { buildCallTool } = await import('../../tools/call-tool.js');
@@ -4569,6 +4570,143 @@ test('resume budget exit emits the PAIRED conversation_completed (bare limit eve
   assert.ok(paired, 'resume budget exit MUST emit a paired conversation_completed(reason=awaiting_continue)');
 });
 
+test('runConversationFromResume: long activation ceiling survives legacy auto-continue state', async () => {
+  resetEventLog();
+  const previous = {
+    preset: process.env.HARNESS_BUDGET_PRESET,
+    steps: process.env.HARNESS_MAX_CONVERSATION_STEPS,
+    auto: process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT,
+  };
+  process.env.HARNESS_BUDGET_PRESET = 'long';
+  process.env.HARNESS_MAX_CONVERSATION_STEPS = '3';
+  process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT = 'true';
+  try {
+    const agent = new Agent({ name: 'ResumeLongCeilingTest', instructions: 'test' });
+    const sess = HarnessSession.create({ kind: 'chat', title: 'resume-long-ceiling' });
+    sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+      toolName: 'composio_execute_tool',
+      callId: 'resume-long-c1',
+      argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+    }]));
+    approvalRegistry.register({
+      sessionId: sess.id,
+      subject: 'one bounded approval',
+      tool: 'composio_execute_tool',
+      args: { tool_slug: 'X', arguments: '{}' },
+    });
+    let calls = 0;
+    const recurseUntilBug: RunRunnerFn = async (_runner, _agent, items) => {
+      calls += 1;
+      if (calls > 3) throw new Error('resume maxConversationSteps was bypassed');
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: 'still working after approval',
+          done: false,
+          nextAction: 'awaiting_handoff_result',
+          reason: null,
+        },
+      };
+    };
+
+    const result = await runConversationFromResume({
+      agent,
+      sessionId: sess.id,
+      decision: 'approve',
+      resolver: 'unit-test',
+      makeRunner: makeRunnerStub,
+      runRunner: recurseUntilBug,
+    });
+    assert.equal(result.status, 'limit_exceeded');
+    assert.equal(result.limitKind, 'max_steps');
+    assert.equal(result.steps, 3);
+    assert.equal(calls, 3);
+  } finally {
+    if (previous.preset === undefined) delete process.env.HARNESS_BUDGET_PRESET;
+    else process.env.HARNESS_BUDGET_PRESET = previous.preset;
+    if (previous.steps === undefined) delete process.env.HARNESS_MAX_CONVERSATION_STEPS;
+    else process.env.HARNESS_MAX_CONVERSATION_STEPS = previous.steps;
+    if (previous.auto === undefined) delete process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT;
+    else process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT = previous.auto;
+  }
+});
+
+test('runConversationFromResume: standard promotes once to the bounded long envelope', async () => {
+  resetEventLog();
+  const previous = {
+    preset: process.env.HARNESS_BUDGET_PRESET,
+    steps: process.env.HARNESS_MAX_CONVERSATION_STEPS,
+    auto: process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT,
+    autobump: process.env.CLEMMY_AUTOBUMP_BUDGET,
+  };
+  process.env.HARNESS_BUDGET_PRESET = 'standard';
+  process.env.HARNESS_MAX_CONVERSATION_STEPS = '3';
+  process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT = 'true';
+  process.env.CLEMMY_AUTOBUMP_BUDGET = 'on';
+  try {
+    const agent = new Agent({ name: 'ResumeBoundedPromotionTest', instructions: 'test' });
+    const sess = HarnessSession.create({ kind: 'chat', title: 'resume-bounded-promotion' });
+    sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+      toolName: 'composio_execute_tool',
+      callId: 'resume-promote-c1',
+      argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+    }]));
+    approvalRegistry.register({
+      sessionId: sess.id,
+      subject: 'one resumable approval',
+      tool: 'composio_execute_tool',
+      args: { tool_slug: 'X', arguments: '{}' },
+    });
+    let calls = 0;
+    const finishImmediatelyAfterPromotion: RunRunnerFn = async (_runner, _agent, items) => {
+      calls += 1;
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: calls >= 4
+          ? {
+              summary: 'Approved work complete.',
+              reply: 'The approved work is complete.',
+              done: true,
+              nextAction: 'completed',
+              reason: null,
+            }
+          : {
+              summary: 'still working after approval',
+              done: false,
+              nextAction: 'awaiting_handoff_result',
+              reason: null,
+            },
+      };
+    };
+
+    const result = await runConversationFromResume({
+      agent,
+      sessionId: sess.id,
+      decision: 'approve',
+      resolver: 'unit-test',
+      makeRunner: makeRunnerStub,
+      runRunner: finishImmediatelyAfterPromotion,
+    });
+    assert.equal(result.status, 'completed');
+    assert.equal(result.steps, 4, 'resume continues past the standard cap');
+    assert.equal(calls, 4);
+    const promotion = listEventsForConv(sess.id, { types: ['budget_elevated'] }).at(-1)!;
+    assert.equal(promotion.data.path, 'resume');
+    assert.equal((promotion.data.to as { maxSteps?: unknown }).maxSteps, 160);
+  } finally {
+    if (previous.preset === undefined) delete process.env.HARNESS_BUDGET_PRESET;
+    else process.env.HARNESS_BUDGET_PRESET = previous.preset;
+    if (previous.steps === undefined) delete process.env.HARNESS_MAX_CONVERSATION_STEPS;
+    else process.env.HARNESS_MAX_CONVERSATION_STEPS = previous.steps;
+    if (previous.auto === undefined) delete process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT;
+    else process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT = previous.auto;
+    if (previous.autobump === undefined) delete process.env.CLEMMY_AUTOBUMP_BUDGET;
+    else process.env.CLEMMY_AUTOBUMP_BUDGET = previous.autobump;
+  }
+});
+
 test('resume path: narration-deferral in a continuation turn is force-corrected (was an UNGUARDED path)', async () => {
   // Audit 2026-06-16, headline gap: runConversationFromResumeCore never called
   // evaluateStructuredDecisionStall, so EVERY stall detector (narration-deferral,
@@ -5289,6 +5427,53 @@ test('runConversation: bails out at maxSteps when the orchestrator keeps recursi
   const limitEvents = listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] });
   assert.equal(limitEvents.length, 1);
   assert.equal(limitEvents[0].data.reason, 'max_steps');
+});
+
+test('runConversation: long auto-continue preference cannot erase the configured activation ceiling', async () => {
+  const previous = {
+    preset: process.env.HARNESS_BUDGET_PRESET,
+    steps: process.env.HARNESS_MAX_CONVERSATION_STEPS,
+    auto: process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT,
+  };
+  process.env.HARNESS_BUDGET_PRESET = 'long';
+  process.env.HARNESS_MAX_CONVERSATION_STEPS = '3';
+  process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT = 'true';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat' });
+    let calls = 0;
+    const recurseUntilBug: RunRunnerFn = async (_runner, _agent, items) => {
+      calls += 1;
+      if (calls > 3) throw new Error('configured maxConversationSteps was bypassed');
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: 'still working',
+          done: false,
+          nextAction: 'awaiting_handoff_result',
+          reason: null,
+        },
+      };
+    };
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'do the bounded long thing',
+      makeRunner: makeRunnerStub,
+      runRunner: recurseUntilBug,
+    });
+    assert.equal(result.status, 'limit_exceeded');
+    assert.equal(result.limitKind, 'max_steps');
+    assert.equal(result.steps, 3);
+    assert.equal(calls, 3);
+  } finally {
+    if (previous.preset === undefined) delete process.env.HARNESS_BUDGET_PRESET;
+    else process.env.HARNESS_BUDGET_PRESET = previous.preset;
+    if (previous.steps === undefined) delete process.env.HARNESS_MAX_CONVERSATION_STEPS;
+    else process.env.HARNESS_MAX_CONVERSATION_STEPS = previous.steps;
+    if (previous.auto === undefined) delete process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT;
+    else process.env.HARNESS_AUTO_CONTINUE_ON_LIMIT = previous.auto;
+  }
 });
 
 test('runConversation: bails out at maxWallClockMs', async () => {
@@ -7454,6 +7639,154 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
   assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 1), true, 'queued dispatch this turn is detected');
   assert.equal(dispatchedBackgroundWorkflowRun(sess.id, 2), false, 'a different turn does not inherit the dispatch');
 
+  // Schema-on-demand exposes call_tool instead of workflow_run as a first-class
+  // schema. The carrier's OUTER lifecycle owns the exact inner result, so the
+  // detector must unwrap its target while retaining the outer call id.
+  const carrier = createSession({ kind: 'chat' });
+  const carrierArgs = JSON.stringify({
+    name: 'workflow_run',
+    args_json: JSON.stringify({ name: 'carrier-workflow' }),
+  });
+  const carrierCall = appendEvent({
+    sessionId: carrier.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { tool: 'call_tool', callId: 'call_carrier_queued', effect: 'read', arguments: carrierArgs },
+  });
+  writeToolOutput({
+    sessionId: carrier.id,
+    callId: 'call_carrier_queued',
+    invocationNonce: 'carrier-queued-success',
+    tool: 'call_tool',
+    output: 'Queued "carrier-workflow" (run carrier-123) — it is now running in the BACKGROUND.',
+  });
+  appendEvent({
+    sessionId: carrier.id, turn: 1, role: 'tool', type: 'tool_returned',
+    parentEventId: carrierCall.id,
+    data: { tool: 'call_tool', callId: 'call_carrier_queued', effect: 'read', ok: true },
+  });
+  assert.equal(
+    dispatchedBackgroundWorkflowRun(carrier.id, 1),
+    true,
+    'schema-on-demand carrier resolves the exact outer queue receipt',
+  );
+
+  // Production lifecycle previews are bounded. Persisted effective identity is
+  // computed from the full payload before clipping, so a >8 KB carrier remains
+  // settleable without treating its preview as an authority-bearing payload.
+  const largeCarrier = createSession({ kind: 'chat' });
+  const largeCarrierArgs = JSON.stringify({
+    name: 'workflow_run',
+    args_json: JSON.stringify({
+      name: 'large-carrier-workflow',
+      inputs: { brief: 'x'.repeat(9_000) },
+    }),
+  });
+  const clippedCarrierArgs = `${largeCarrierArgs.slice(0, 8_000)}…[preview clipped]`;
+  assert.throws(() => JSON.parse(clippedCarrierArgs), 'regression requires an unparseable preview');
+  const largeCarrierCall = appendEvent({
+    sessionId: largeCarrier.id, turn: 1, role: 'system', type: 'tool_called',
+    data: {
+      tool: 'call_tool',
+      effectiveTool: 'workflow_run',
+      callId: 'call_large_carrier_queued',
+      accounting: 'top_level',
+      effect: 'read',
+      arguments: clippedCarrierArgs,
+    },
+  });
+  writeToolOutput({
+    sessionId: largeCarrier.id,
+    callId: 'call_large_carrier_queued',
+    invocationNonce: 'large-carrier-success',
+    tool: 'call_tool',
+    output: 'Queued "large-carrier-workflow" (run carrier-large-123) — it is now running in the BACKGROUND.',
+  });
+  appendEvent({
+    sessionId: largeCarrier.id, turn: 1, role: 'tool', type: 'tool_returned',
+    parentEventId: largeCarrierCall.id,
+    data: {
+      tool: 'call_tool',
+      effectiveTool: 'workflow_run',
+      callId: 'call_large_carrier_queued',
+      invocationNonce: 'large-carrier-success',
+      accounting: 'top_level',
+      effect: 'read',
+      ok: true,
+    },
+  });
+  assert.equal(
+    dispatchedBackgroundWorkflowRun(largeCarrier.id, 1),
+    true,
+    'durable effective identity settles an oversized carrier against its exact outer receipt',
+  );
+
+  const foreignCarrier = createSession({ kind: 'chat' });
+  const foreignMetadata = runtimeToolAccountingMetadata('mcp__server_a__call_tool', {
+    name: 'workflow_run',
+    args_json: JSON.stringify({ objective: 'unrelated external action' }),
+  });
+  const foreignCall = appendEvent({
+    sessionId: foreignCarrier.id, turn: 1, role: 'system', type: 'tool_called',
+    data: {
+      // Claude persists the canonical outer tool tail while effectiveTool keeps
+      // the full foreign namespace. A rejected durable identity must never
+      // fall back to reparsing this apparently-local carrier preview.
+      tool: 'call_tool',
+      accounting: 'top_level',
+      ...foreignMetadata,
+      callId: 'call_foreign_workflow_name',
+      arguments: JSON.stringify({ name: 'workflow_run', args_json: '{}' }),
+    },
+  });
+  writeToolOutput({
+    sessionId: foreignCarrier.id,
+    callId: 'call_foreign_workflow_name',
+    invocationNonce: 'foreign-workflow-success',
+    tool: 'call_tool',
+    output: 'External response: running in the BACKGROUND.',
+  });
+  appendEvent({
+    sessionId: foreignCarrier.id, turn: 1, role: 'tool', type: 'tool_returned',
+    parentEventId: foreignCall.id,
+    data: {
+      tool: 'call_tool',
+      accounting: 'top_level',
+      ...foreignMetadata,
+      callId: 'call_foreign_workflow_name',
+      invocationNonce: 'foreign-workflow-success',
+      ok: true,
+    },
+  });
+  assert.equal(foreignMetadata.effectiveTool, 'server_a__call_tool');
+  assert.equal(foreignMetadata.effect, 'external_write');
+  assert.equal(
+    dispatchedBackgroundWorkflowRun(foreignCarrier.id, 1),
+    false,
+    'a foreign namespaced lookalike cannot claim Clementine workflow settlement',
+  );
+
+  const refusedCarrier = createSession({ kind: 'chat' });
+  const refusedCarrierCall = appendEvent({
+    sessionId: refusedCarrier.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { tool: 'call_tool', callId: 'call_carrier_refused', effect: 'read', arguments: carrierArgs },
+  });
+  writeToolOutput({
+    sessionId: refusedCarrier.id,
+    callId: 'call_carrier_refused',
+    invocationNonce: 'carrier-refused',
+    tool: 'call_tool',
+    output: 'Workflow "carrier-workflow" is disabled.',
+  });
+  appendEvent({
+    sessionId: refusedCarrier.id, turn: 1, role: 'tool', type: 'tool_returned',
+    parentEventId: refusedCarrierCall.id,
+    data: { tool: 'call_tool', callId: 'call_carrier_refused', effect: 'read', ok: false },
+  });
+  assert.equal(
+    dispatchedBackgroundWorkflowRun(refusedCarrier.id, 1),
+    false,
+    'a refused carrier dispatch cannot settle the foreground turn',
+  );
+
   // A workflow_run whose output is NOT a queue success (e.g. validation refusal) → false.
   const sess2 = createSession({ kind: 'chat' });
   const refusedCall = appendEvent({
@@ -7508,6 +7841,7 @@ test('runConversation: a receipt-backed structured workflow handoff parks after 
   const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
     runs += 1;
     const runContext = { context: opts.context };
+    const tool = { name: 'workflow_run' };
     const details = {
       toolCall: {
         callId: 'call_workflow_dispatch',
@@ -7518,17 +7852,24 @@ test('runConversation: a receipt-backed structured workflow handoff parks after 
       'agent_tool_start',
       runContext,
       { name: 'Orchestrator' },
-      { name: 'workflow_run' },
+      tool,
       details,
     );
-    writeToolOutput({
-      sessionId: sess.id,
-      callId: 'call_workflow_dispatch',
-      tool: 'workflow_run',
-      output:
-        'Queued "social-manager-rc" (run run-123) — it is now running in the BACKGROUND. '
-        + 'Its outcome will be delivered to this chat automatically.',
-    });
+    const receipt =
+      'Queued "social-manager-rc" (run run-123) — it is now running in the BACKGROUND. '
+      + 'Its outcome will be delivered to this chat automatically.';
+    // Mirror the SDK lifecycle, not just its start notification. Settlement
+    // authority requires the durable parented call/return pair; omitting the
+    // return made this fixture unlike production and turned a failed assertion
+    // into an effectively-unbounded continuation loop.
+    (runner as unknown as EventEmitter).emit(
+      'agent_tool_end',
+      runContext,
+      { name: 'Orchestrator' },
+      tool,
+      receipt,
+      details,
+    );
     return {
       history: items,
       lastResponseId: undefined,
@@ -7546,6 +7887,9 @@ test('runConversation: a receipt-backed structured workflow handoff parks after 
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'run the social-manager workflow',
+    // Fail fast if exact receipt settlement ever regresses again. This test is
+    // about a one-turn handoff, not the long-horizon conversation budget.
+    maxSteps: 2,
     makeRunner: makeRunnerStub,
     runRunner,
     judgeFn: async () => {
@@ -7566,6 +7910,118 @@ test('runConversation: a receipt-backed structured workflow handoff parks after 
     ['workflow_run'],
     'no workflow_run_status poll is generated',
   );
+});
+
+test('runConversation: schema-on-demand workflow handoff settles from the exact call_tool carrier', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let runs = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    runs += 1;
+    const runContext = { context: opts.context };
+    const tool = { name: 'call_tool' };
+    const details = {
+      toolCall: {
+        callId: 'call_workflow_carrier',
+        arguments: JSON.stringify({
+          name: 'workflow_run',
+          args_json: JSON.stringify({ name: 'social-manager-rc' }),
+        }),
+      },
+    };
+    const receipt =
+      'Queued "social-manager-rc" (run run-carrier-123) — it is now running in the BACKGROUND. '
+      + 'Its outcome will be delivered to this chat automatically.';
+    (runner as unknown as EventEmitter).emit(
+      'agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details,
+    );
+    (runner as unknown as EventEmitter).emit(
+      'agent_tool_end', runContext, { name: 'Orchestrator' }, tool, receipt, details,
+    );
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'The social-manager workflow is running in the background.',
+        reply: 'It is running in the background. I’ll report back here when it finishes.',
+        done: false,
+        nextAction: 'awaiting_handoff_result',
+        reason: 'Waiting for the automatic workflow report-back.',
+      },
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'run the social-manager workflow',
+    maxSteps: 2,
+    makeRunner: makeRunnerStub,
+    runRunner,
+    judgeFn: async () => {
+      throw new Error('a queued workflow must not invoke the completion judge');
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(runs, 1);
+  assert.equal(result.lastDecision?.reason, 'queued_workflow_owns_continuation');
+  const calls = listEventsForConv(sess.id, { types: ['tool_called'] });
+  assert.deepEqual(calls.map((event) => event.data.tool), ['call_tool']);
+});
+
+test('runConversation: an incomplete workflow lifecycle fails closed at its bounded activation', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let runs = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    runs += 1;
+    const details = {
+      toolCall: {
+        callId: 'call_incomplete_workflow_dispatch',
+        arguments: '{"name":"social-manager-rc"}',
+      },
+    };
+    (runner as unknown as EventEmitter).emit(
+      'agent_tool_start',
+      { context: opts.context },
+      { name: 'Orchestrator' },
+      { name: 'workflow_run' },
+      details,
+    );
+    writeToolOutput({
+      sessionId: sess.id,
+      callId: 'call_incomplete_workflow_dispatch',
+      tool: 'workflow_run',
+      output: 'Queued "social-manager-rc" — it is now running in the BACKGROUND.',
+    });
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Still waiting on the handoff.',
+        reply: 'It is running in the background.',
+        done: false,
+        nextAction: 'awaiting_handoff_result',
+        reason: 'Waiting for an unproven receipt.',
+      },
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'run the social-manager workflow',
+    maxSteps: 2,
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'limit_exceeded');
+  assert.equal(result.limitKind, 'max_steps');
+  assert.equal(runs, 2);
+  assert.notEqual(result.lastDecision?.reason, 'queued_workflow_owns_continuation');
 });
 
 test('speed: a hanging embeddings provider cannot gate model dispatch (fire-and-forget recall vector)', async () => {

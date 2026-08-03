@@ -5,7 +5,11 @@ import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { autoInvalidateOnFailure } from './auto-invalidate.js';
 import { autoRememberOnSuccess } from './auto-remember.js';
 import { fanoutLedgerEnabled, recordWorkerResult } from './fanout-ledger.js';
-import { runtimeToolAccountingMetadata, type RuntimeToolEffect } from './tool-effect.js';
+import {
+  runtimeToolAccountingMetadata,
+  unwrapRuntimeEffectiveToolIdentity,
+  type RuntimeEffectiveToolIdentity,
+} from './tool-effect.js';
 import { harnessRunContextStorage } from './brackets.js';
 
 /**
@@ -64,10 +68,7 @@ interface ToolDetails {
   toolCall?: ToolCallLike;
 }
 
-export interface EffectiveToolIdentity {
-  toolName: string | null;
-  args: unknown;
-}
+export type EffectiveToolIdentity = RuntimeEffectiveToolIdentity;
 
 /**
  * Default extractor: reads sessionId from `runContext.context.sessionId`.
@@ -144,17 +145,6 @@ function workerItemFromDetails(details: ToolDetails | undefined): string | null 
   }
 }
 
-function decodeEffectiveToolArgs(rawArgs: unknown): unknown {
-  if (typeof rawArgs !== 'string') return rawArgs;
-  const trimmed = rawArgs.trim();
-  if (!trimmed) return rawArgs;
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return rawArgs;
-  }
-}
-
 function effectiveToolTail(toolName: string): string {
   return toolName.split('__').at(-1) ?? toolName;
 }
@@ -170,44 +160,7 @@ export function unwrapEffectiveToolIdentity(
   rawArgs: unknown,
   depth = 0,
 ): EffectiveToolIdentity {
-  if (!toolName) return { toolName: null, args: rawArgs };
-  if (depth > 8) return { toolName: effectiveToolTail(toolName), args: rawArgs };
-  const args = decodeEffectiveToolArgs(rawArgs);
-  const tail = effectiveToolTail(toolName);
-
-  if (tail === 'call_tool') {
-    if (!args || typeof args !== 'object' || Array.isArray(args)) {
-      return { toolName: tail, args };
-    }
-    const record = args as Record<string, unknown>;
-    const target = typeof record.name === 'string' ? record.name.trim() : '';
-    if (!target) return { toolName: tail, args };
-    return unwrapEffectiveToolIdentity(
-      target,
-      record.args_json ?? record.args ?? {},
-      depth + 1,
-    );
-  }
-
-  if (
-    tail === 'composio_execute_tool'
-    || (tail === 'execute_tool' && /composio/i.test(toolName))
-  ) {
-    const slug = args && typeof args === 'object' && !Array.isArray(args)
-      ? (args as Record<string, unknown>).tool_slug
-      : undefined;
-    return {
-      toolName: typeof slug === 'string' && slug.trim() ? slug.trim() : tail,
-      args,
-    };
-  }
-
-  if (tail.toLowerCase().startsWith('cx_')) {
-    const slug = tail.slice(3).trim();
-    return { toolName: slug ? slug.toUpperCase() : tail, args };
-  }
-
-  return { toolName, args };
+  return unwrapRuntimeEffectiveToolIdentity(toolName, rawArgs, depth);
 }
 
 /**
@@ -251,7 +204,7 @@ export function attachEventLogHooks(
   // currently-open occurrence. A closed id may legitimately be reused by a
   // retry; permanent `seen call id` sets used to erase that later lifecycle.
   const callIdToCalledEventId = new Map<string, string>();
-  const callIdToAccounting = new Map<string, { effect: RuntimeToolEffect; toolSlug?: string }>();
+  const callIdToAccounting = new Map<string, ReturnType<typeof runtimeToolAccountingMetadata>>();
   const activeToolCallKeys = new Set<string>();
   const closedToolCallKeys = new Set<string>();
   // The SDK can replay the exact same lifecycle notification. Object identity
@@ -355,6 +308,7 @@ export function attachEventLogHooks(
           canonicalCallId: callId ?? null,
           accounting: 'top_level',
           effect: accounting.effect,
+          ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
           ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
           arguments: clip(details?.toolCall?.arguments ?? null, maxResultChars),
         },
@@ -515,6 +469,7 @@ export function attachEventLogHooks(
           canonicalCallId: callId ?? null,
           accounting: 'top_level',
           effect: accounting.effect,
+          ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
           ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
           result: clipToolResult(
             resultStr,

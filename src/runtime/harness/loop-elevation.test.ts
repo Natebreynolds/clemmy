@@ -3,8 +3,8 @@
  *
  * Pure predicate behind the surgical long-run elevation (#1): a forward-
  * progressing run about to hit the STEP cap auto-elevates instead of pausing
- * for a manual `continue`. Crucially a NO-OP on a long/unlimited (autoContinue)
- * instance — that is the regression guard for Alexander's config.
+ * for a manual `continue`. Long/unlimited presets keep their own authored
+ * ceilings; a legacy auto-continue preference cannot widen an activation.
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -17,7 +17,7 @@ writeFileSync(path.join(TMP, 'state', 'machine-id'), 'machine-A\n');
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-const { shouldElevateOnStepProgress } = await import('./loop.js');
+const { resolveConversationStepCeiling, shouldElevateOnStepProgress } = await import('./loop.js');
 
 test.after(() => {
   try { rmSync(TMP, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -26,7 +26,6 @@ test.after(() => {
 const base = {
   alreadyElevated: false,
   preset: 'standard',
-  autoContinueOnLimit: false,
   explicitMaxSteps: false,
   stepIndex: 40,
   maxSteps: 40,
@@ -36,11 +35,8 @@ test('elevates a progressing standard run at the step cap', () => {
   assert.equal(shouldElevateOnStepProgress(base), true);
 });
 
-test('NO-OP when autoContinue already on (long/unlimited — Alexander’s config)', () => {
-  // The regression guard: his instance never elevates here because maxSteps is
-  // already 1,000,000 and the cap is never approached; even if it were, this
-  // returns false.
-  assert.equal(shouldElevateOnStepProgress({ ...base, autoContinueOnLimit: true }), false);
+test('bounded standard → long promotion remains available', () => {
+  assert.equal(shouldElevateOnStepProgress(base), true);
 });
 
 test('NO-OP on a non-standard preset', () => {
@@ -58,4 +54,19 @@ test('NO-OP when the caller pinned an explicit maxSteps', () => {
 
 test('does NOT fire before the step cap is reached', () => {
   assert.equal(shouldElevateOnStepProgress({ ...base, stepIndex: 20, maxSteps: 40 }), false);
+});
+
+test('one-activation ceiling honors each preset and an explicit caller override', () => {
+  assert.equal(resolveConversationStepCeiling(undefined, {
+    preset: 'standard', maxConversationSteps: 40, autoContinueOnLimit: false,
+  }), 40);
+  assert.equal(resolveConversationStepCeiling(undefined, {
+    preset: 'long', maxConversationSteps: 160, autoContinueOnLimit: true,
+  }), 160, 'long never receives a hidden million-step lift');
+  assert.equal(resolveConversationStepCeiling(undefined, {
+    preset: 'unlimited', maxConversationSteps: 1_000_000, autoContinueOnLimit: true,
+  }), 1_000_000, 'explicit supervised-unlimited remains available');
+  assert.equal(resolveConversationStepCeiling(7, {
+    preset: 'unlimited', maxConversationSteps: 1_000_000, autoContinueOnLimit: true,
+  }), 7, 'a caller-pinned ceiling remains authoritative');
 });

@@ -126,6 +126,7 @@ test('public tool progress never derives identity from model-supplied carrier ar
   const shellCarrier = projectHarnessEventForPublic(event('tool_called', {
     tool: 'call_tool',
     accounting: 'top_level',
+    effectiveTool: 'customer-secret-effective-tool',
     arguments: JSON.stringify({
       name: 'customer-secret-123',
       args_json: JSON.stringify({ command: 'deploy --token bearer-secret-123' }),
@@ -134,9 +135,10 @@ test('public tool progress never derives identity from model-supplied carrier ar
   assert.ok(shellCarrier);
   assert.equal(shellCarrier.data.progress, 'using call_tool');
   assert.equal('arguments' in shellCarrier.data, false);
+  assert.equal('effectiveTool' in shellCarrier.data, false);
   assert.doesNotMatch(
     JSON.stringify(shellCarrier.data),
-    /customer-secret-123|bearer-secret-123|deploy --token/,
+    /customer-secret-123|customer-secret-effective-tool|bearer-secret-123|deploy --token/,
   );
 
   const composioCarrier = projectHarnessEventForPublic(event('tool_called', {

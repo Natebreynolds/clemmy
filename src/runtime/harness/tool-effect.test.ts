@@ -297,6 +297,7 @@ test('accounting metadata decodes hook arguments and exposes the inner provider 
     JSON.stringify({ tool_slug: 'HUBSPOT_FIND_OR_CREATE_CONTACT', arguments: '{}' }),
   ), {
     effect: 'external_write',
+    effectiveTool: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
     toolSlug: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
   });
   assert.deepEqual(runtimeToolAccountingMetadata(
@@ -304,6 +305,63 @@ test('accounting metadata decodes hook arguments and exposes the inner provider 
     { tool_slug: 'DATAFORSEO_CREATE_SERP_TASK_POST' },
   ), {
     effect: 'read',
+    effectiveTool: 'DATAFORSEO_CREATE_SERP_TASK_POST',
     toolSlug: 'DATAFORSEO_CREATE_SERP_TASK_POST',
   });
+});
+
+test('effective lifecycle identity collapses only trusted local carriers', () => {
+  assert.equal(
+    runtimeToolAccountingMetadata('mcp__clementine-local__workflow_run', {}).effectiveTool,
+    'workflow_run',
+  );
+  assert.equal(
+    runtimeToolAccountingMetadata('mcp__server_a__workflow_run', {}).effectiveTool,
+    'server_a__workflow_run',
+  );
+  assert.equal(
+    runtimeToolAccountingMetadata('server_b__workflow_run', {}).effectiveTool,
+    'server_b__workflow_run',
+  );
+  assert.equal(
+    runtimeToolAccountingMetadata('call_tool', {
+      name: 'mcp__server_a__workflow_run',
+      args_json: '{}',
+    }).effectiveTool,
+    'server_a__workflow_run',
+  );
+  assert.equal(
+    runtimeToolAccountingMetadata('mcp__server_a__call_tool', {
+      name: 'workflow_run',
+      args_json: '{}',
+    }).effectiveTool,
+    'server_a__call_tool',
+    'a foreign wrapper cannot shed its namespace by impersonating call_tool',
+  );
+  assert.equal(
+    runtimeToolAccountingMetadata('mcp__server_a__composio_execute_tool', {
+      tool_slug: 'workflow_run',
+    }).effectiveTool,
+    'server_a__composio_execute_tool',
+    'a foreign wrapper cannot shed its namespace by impersonating Composio',
+  );
+  for (const malformed of [
+    'mcp__call_tool',
+    'mcp__clementine-local__evil__call_tool',
+  ]) {
+    const metadata = runtimeToolAccountingMetadata(malformed, {
+      name: 'workflow_run',
+      args_json: '{}',
+    });
+    assert.equal(metadata.effect, 'external_write', malformed);
+    assert.notEqual(metadata.effectiveTool, 'workflow_run', malformed);
+  }
+  assert.equal(
+    runtimeToolAccountingMetadata('call_tool', {
+      name: 'x'.repeat(257),
+      args_json: '{}',
+    }).effectiveTool,
+    undefined,
+    'model-supplied carrier names cannot create unbounded lifecycle metadata',
+  );
 });

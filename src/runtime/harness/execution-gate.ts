@@ -37,6 +37,14 @@ import {
   firecrawlResearchActionIsReadOnly,
   isReadOnlyCallAction,
 } from '../../integrations/composio/slug-effect.js';
+import {
+  isClementineLocalToolNamespace as isClementineLocalMcpName,
+  isPlainOrClementineLocalTool,
+  isTrustedComposioGateway as isTrustedComposioCarrier,
+  isTrustedDynamicComposioTool,
+  runtimeToolTail as mcpToolTail,
+  stripMcpTransportPrefix as withoutMcpTransportPrefix,
+} from './runtime-tool-identity.js';
 
 /**
  * Verbs in a Composio tool_slug that indicate external state mutation.
@@ -259,14 +267,10 @@ function decodedArgs(rawArgs: unknown): unknown {
   }
 }
 
-function mcpToolTail(toolName: string): string {
-  return toolName.split('__').at(-1) ?? toolName;
-}
-
-function isClementineLocalMcpName(toolName: string): boolean {
-  if (!toolName.startsWith('mcp__')) return false;
-  const server = toolName.slice(5).split('__')[0] ?? '';
-  return /^(?:clementine(?:-local)?|clem(?:entine)?_local)$/i.test(server);
+function isInternalExemptTool(toolName: string): boolean {
+  const tail = mcpToolTail(toolName);
+  return EXEMPT_TOOL_NAMES.has(tail)
+    && isPlainOrClementineLocalTool(toolName, tail);
 }
 
 /**
@@ -283,8 +287,15 @@ function canonicalExternalAction(
   if (depth > 8) return { external: true };
   const args = decodedArgs(rawArgs);
   const tail = mcpToolTail(toolName);
+  const normalized = withoutMcpTransportPrefix(toolName);
+  const namespace = normalized.split('__');
+  const namespaced = namespace.length > 1;
+  const server = namespace.slice(0, -1).join('__');
 
   if (tail === 'call_tool') {
+    if (!isPlainOrClementineLocalTool(toolName, 'call_tool')) {
+      return { external: true };
+    }
     if (!args || typeof args !== 'object' || Array.isArray(args)) {
       return { external: false };
     }
@@ -294,22 +305,23 @@ function canonicalExternalAction(
     return canonicalExternalAction(target, record.args_json ?? record.args ?? {}, depth + 1);
   }
 
-  const namespace = toolName.startsWith('mcp__')
-    ? toolName.slice(5).split('__')
-    : [];
-  const server = namespace.slice(0, -1).join('__');
-  const composioCarrier = tail === 'composio_execute_tool'
-    || (tail === 'execute_tool' && /composio/i.test(server));
+  const composioCarrier = isTrustedComposioCarrier(toolName);
   if (composioCarrier) {
     return { external: true, action: extractToolSlug(args) };
   }
+  if (namespaced && (tail === 'composio_execute_tool' || tail === 'execute_tool')) {
+    return { external: true };
+  }
 
-  if (tail.toLowerCase().startsWith('cx_')) {
+  if (isTrustedDynamicComposioTool(toolName)) {
     const action = tail.slice(3).trim();
     return { external: true, ...(action ? { action: action.toUpperCase() } : {}) };
   }
+  if (namespaced && tail.toLowerCase().startsWith('cx_')) {
+    return { external: true };
+  }
 
-  if (toolName.startsWith('mcp__')) {
+  if (namespaced) {
     // Clementine's own MCP namespace contains local memory/files/control tools.
     // Only its explicit external carriers above cross the provider boundary.
     if (isClementineLocalMcpName(toolName)) return { external: false };
@@ -400,7 +412,7 @@ export function isMutatingExternalWrite(
   rawArgs: unknown,
 ): boolean {
   // Internal exempt tools never trigger the gate.
-  if (EXEMPT_TOOL_NAMES.has(mcpToolTail(toolName))) return false;
+  if (isInternalExemptTool(toolName)) return false;
 
   const canonical = canonicalExternalAction(toolName, rawArgs);
   return canonical.external
@@ -417,7 +429,7 @@ export function classifyCanonicalExternalEffect(
   toolName: string,
   rawArgs: unknown,
 ): CanonicalExternalEffect {
-  if (EXEMPT_TOOL_NAMES.has(mcpToolTail(toolName))) {
+  if (isInternalExemptTool(toolName)) {
     return {
       external: false,
       mutating: false,

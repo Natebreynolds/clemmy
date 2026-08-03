@@ -13,6 +13,9 @@ export interface HarnessBudgetSettings {
    *  swarm (run_worker). Higher = faster on 100-item jobs; lower = gentler on rate limits. */
   maxParallelWorkers: number;
   checkInMinutes: number;
+  /** Legacy persisted preference retained for configuration compatibility.
+   * It never widens one in-memory activation past maxConversationSteps;
+   * durable background owners decide whether a bounded run is re-enqueued. */
   autoContinueOnLimit: boolean;
   /** Stage 4 — aggregate run token budget (soft ceiling, UNCACHED tokens per
    *  run window). Catches RUNAWAY spend, never legit scale: a heavy worker
@@ -141,9 +144,8 @@ export function getHarnessBudgetSettings(): HarnessBudgetRuntime {
  *
  * Triggered by the preflight gate seeing `fractionUsed > 0.5` early
  * in a `standard`-preset chat session. Standard's 40 steps / 40
- * turns / 40 tools-per-turn caps trap a long-running task with no
- * recourse (autoContinueOnLimit=false). The elevated runtime applies
- * the `long` preset's defaults (160 / 120 / 80, autoContinue=true)
+ * turns / 40 tools-per-turn caps can be too small for a legitimate task. The
+ * elevated runtime applies the `long` preset's defaults (160 / 120 / 80)
  * for the remainder of THIS conversation only — no env mutation, no
  * settings.json write. One-way ratchet: never downgrades.
  *
@@ -169,7 +171,9 @@ export function getElevatedBudget(current: HarnessBudgetRuntime): HarnessBudgetR
     toolCallsPerTurn: Math.max(current.toolCallsPerTurn, long.toolCallsPerTurn),
     maxParallelWorkers: Math.max(current.maxParallelWorkers, long.maxParallelWorkers),
     checkInMinutes: Math.min(current.checkInMinutes, long.checkInMinutes),
-    autoContinueOnLimit: true, // critical — the standard preset's `false` is the trap
+    // Retain the long preset's compatibility value. Step authority comes from
+    // maxConversationSteps; this field never erases that ceiling.
+    autoContinueOnLimit: long.autoContinueOnLimit,
     maxRunTokens: current.maxRunTokens === 0 || long.maxRunTokens === 0
       ? 0
       : Math.max(current.maxRunTokens, long.maxRunTokens),

@@ -2,6 +2,14 @@ import { TOOL_REGISTRY, type ToolSideEffect } from '../../tools/tool-registry.js
 import { classifyShellCommand, classifyShellNetworkMutation, expandLiteralShellCommands } from './destination-gate.js';
 import { isMutatingExternalWrite } from './execution-gate.js';
 import { resolveCallToolAlias } from '../../tools/call-tool-alias.js';
+import {
+  isClementineLocalToolNamespace as isClementineLocalNamespace,
+  isPlainOrClementineLocalTool,
+  isTrustedComposioGateway,
+  isTrustedDynamicComposioTool,
+  runtimeToolTail as localToolTail,
+  stripMcpTransportPrefix as normalizedToolName,
+} from './runtime-tool-identity.js';
 
 /**
  * Runtime effect classification used by the guardrail and SDK call ceiling.
@@ -173,15 +181,6 @@ const REGISTRY_EFFECTS = new Map<string, ToolSideEffect>(
   TOOL_REGISTRY.map((decl) => [decl.name, decl.sideEffect]),
 );
 
-function normalizedToolName(toolName: string): string {
-  return toolName.replace(/^mcp__/, '');
-}
-
-function localToolTail(toolName: string): string {
-  const normalized = normalizedToolName(toolName);
-  return normalized.split('__').at(-1) ?? normalized;
-}
-
 function shellCommand(args: unknown): string {
   if (typeof args === 'string') return args;
   if (!args || typeof args !== 'object') return '';
@@ -200,6 +199,78 @@ function decodedToolArgs(args: unknown): unknown {
   const trimmed = args.trim();
   if (!trimmed.startsWith('{')) return args;
   try { return JSON.parse(trimmed) as unknown; } catch { return args; }
+}
+
+export interface RuntimeEffectiveToolIdentity {
+  toolName: string | null;
+  args: unknown;
+}
+
+/**
+ * Peel schema/discovery carriers using the full invocation payload. Callers
+ * must run this before event previews are clipped: the returned identity is a
+ * small durable fact, while `args` may be arbitrarily large and remains only
+ * in the tool lifecycle/output stores.
+ */
+export function unwrapRuntimeEffectiveToolIdentity(
+  toolName: string | null,
+  rawArgs: unknown,
+  depth = 0,
+): RuntimeEffectiveToolIdentity {
+  if (!toolName) return { toolName: null, args: rawArgs };
+  if (depth > 8) return { toolName: null, args: rawArgs };
+  const args = decodedToolArgs(rawArgs);
+  const tail = localToolTail(toolName);
+
+  if (tail === 'call_tool' && isPlainOrClementineLocalTool(toolName, 'call_tool')) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return { toolName: tail, args };
+    }
+    const record = args as Record<string, unknown>;
+    const target = typeof record.name === 'string' ? record.name.trim() : '';
+    if (!target) return { toolName: tail, args };
+    return unwrapRuntimeEffectiveToolIdentity(
+      target,
+      record.args_json ?? record.args ?? {},
+      depth + 1,
+    );
+  }
+
+  if (isTrustedComposioGateway(toolName)) {
+    const slug = args && typeof args === 'object' && !Array.isArray(args)
+      ? (args as Record<string, unknown>).tool_slug
+      : undefined;
+    return {
+      toolName: typeof slug === 'string' && slug.trim() ? slug.trim() : tail,
+      args,
+    };
+  }
+
+  if (isTrustedDynamicComposioTool(toolName)) {
+    const slug = tail.slice(3).trim();
+    return { toolName: slug ? slug.toUpperCase() : tail, args };
+  }
+
+  return { toolName, args };
+}
+
+/**
+ * Compact cross-SDK identity persisted on lifecycle rows. Strip only the MCP
+ * transport prefix and Clementine's own local namespace; a foreign namespace
+ * remains part of the identity so `server__workflow_run` cannot impersonate
+ * the local controller. Model-supplied carrier names are bounded and limited
+ * to provider-safe tool-name characters before entering durable telemetry.
+ */
+function canonicalRuntimeEffectiveToolName(toolName: string | null): string | undefined {
+  if (!toolName) return undefined;
+  const trimmed = toolName.trim();
+  if (!trimmed || trimmed.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9_.:/-]*$/.test(trimmed)) {
+    return undefined;
+  }
+  const normalized = normalizedToolName(trimmed);
+  return isClementineLocalNamespace(normalized)
+    ? localToolTail(normalized)
+    : normalized;
 }
 
 function readDecision(source: RuntimeToolEffectDecision['source']): RuntimeToolEffectDecision {
@@ -273,7 +344,7 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
   const normalized = normalizedToolName(toolName);
   const tail = localToolTail(normalized);
 
-  if (tail === 'call_tool') {
+  if (tail === 'call_tool' && isPlainOrClementineLocalTool(toolName, 'call_tool')) {
     const outer = decodedToolArgs(args);
     if (!outer || typeof outer !== 'object' || Array.isArray(outer)) {
       return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
@@ -292,7 +363,7 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
     return classifyRuntimeToolEffect(target, innerArgs);
   }
 
-  if (tail === 'run_batch') {
+  if (tail === 'run_batch' && isPlainOrClementineLocalTool(toolName, 'run_batch')) {
     const input = decodedToolArgs(args);
     if (input && typeof input === 'object' && !Array.isArray(input)) {
       const batch = input as Record<string, unknown>;
@@ -306,7 +377,7 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
     }
   }
 
-  if (tail === 'run_shell_command') {
+  if (tail === 'run_shell_command' && isPlainOrClementineLocalTool(toolName, 'run_shell_command')) {
     const command = shellCommand(args);
     const expanded = expandLiteralShellCommands(command);
     const network = classifyShellNetworkMutation(command);
@@ -327,13 +398,13 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
     return { effect: 'compute', mutating: false, dangerousWrite: false, source: 'shell' };
   }
 
-  if (tail === 'composio_execute_tool') return classifyComposio(args);
-  if (tail.startsWith('cx_')) {
+  if (isTrustedComposioGateway(toolName)) return classifyComposio(args);
+  if (isTrustedDynamicComposioTool(toolName)) {
     return classifyComposio({ tool_slug: tail.slice(3), arguments: args });
   }
 
   const isNamespaced = normalized.includes('__');
-  const isClementineLocal = /^(?:clementine(?:-local)?|clem(?:entine)?_local)$/i.test(normalized.split('__')[0] ?? '');
+  const isClementineLocal = isClementineLocalNamespace(normalized);
   if (isNamespaced && !isClementineLocal) return classifyNativeMcp(toolName, args);
 
   return classifyRegistered(normalized)
@@ -346,14 +417,20 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
 export function runtimeToolAccountingMetadata(
   toolName: string,
   rawArgs: unknown,
-): { effect: RuntimeToolEffect; toolSlug?: string } {
+): { effect: RuntimeToolEffect; effectiveTool?: string; toolSlug?: string } {
   const args = decodedToolArgs(rawArgs);
   const effect = classifyRuntimeToolEffect(toolName, args).effect;
   const tail = localToolTail(toolName);
-  const slug = tail === 'composio_execute_tool'
+  const effectiveIdentity = unwrapRuntimeEffectiveToolIdentity(toolName, rawArgs);
+  const effectiveTool = canonicalRuntimeEffectiveToolName(effectiveIdentity.toolName);
+  const slug = isTrustedComposioGateway(toolName)
     ? composioSlug(args)
-    : tail.startsWith('cx_')
+    : isTrustedDynamicComposioTool(toolName)
       ? tail.slice(3).toUpperCase()
       : undefined;
-  return { effect, ...(slug ? { toolSlug: slug } : {}) };
+  return {
+    effect,
+    ...(effectiveTool ? { effectiveTool } : {}),
+    ...(slug ? { toolSlug: slug } : {}),
+  };
 }

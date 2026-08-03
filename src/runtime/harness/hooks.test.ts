@@ -264,6 +264,48 @@ test('tool hooks expose inner provider effects and dedupe duplicate open notific
   assert.equal(returned[0].data.effect, 'external_write');
 });
 
+test('tool hooks preserve effective call_tool identity before an oversized argument preview is clipped', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  const callId = 'call_large_workflow_carrier';
+  const argumentsJson = JSON.stringify({
+    name: 'workflow_run',
+    args_json: JSON.stringify({
+      name: 'large-workflow',
+      inputs: { brief: 'x'.repeat(9_000) },
+    }),
+  });
+
+  stub.emit(
+    'agent_tool_start',
+    ctx(sess.id),
+    { name: 'orchestrator' },
+    { name: 'call_tool' },
+    { toolCall: { callId, arguments: argumentsJson } },
+  );
+  // The SDK does not always repeat arguments on end; the start-side metadata
+  // must own the whole occurrence and survive until its paired return.
+  stub.emit(
+    'agent_tool_end',
+    ctx(sess.id),
+    { name: 'orchestrator' },
+    { name: 'call_tool' },
+    'Queued "large-workflow" — it is now running in the BACKGROUND.',
+    { toolCall: { callId } },
+  );
+
+  const called = listEvents(sess.id, { types: ['tool_called'] });
+  const returned = listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(called.length, 1);
+  assert.equal(returned.length, 1);
+  assert.equal(called[0].data.effectiveTool, 'workflow_run');
+  assert.equal(returned[0].data.effectiveTool, 'workflow_run');
+  assert.notEqual(called[0].data.arguments, argumentsJson, 'event preview is bounded');
+  assert.throws(() => JSON.parse(String(called[0].data.arguments)), 'clipped JSON cannot be reparsed');
+});
+
 test('tool hooks admit a later occurrence that legitimately reuses a closed call id', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
