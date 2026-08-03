@@ -29,7 +29,7 @@ import type { MCPServer } from '@openai/agents';
 
 const { createMcpNamespaceShim } = await import('./mcp-namespace-shim.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
-const { createSession, writeToolOutput, listEvents, resetEventLog } = await import('./harness/eventlog.js');
+const { appendEvent, createSession, writeToolOutput, listEvents, resetEventLog } = await import('./harness/eventlog.js');
 const { openPlanScope } = await import('../agents/plan-scope.js');
 const grounding = await import('./harness/grounding-gate.js');
 const outputGrounding = await import('./harness/output-grounding-gate.js');
@@ -57,6 +57,30 @@ function makeSendServer(name: string): MCPServer & { _calls: Array<{ tool: strin
   return server as any;
 }
 
+function writeTrustedReadOutput(
+  sessionId: string,
+  callId: string,
+  tool: string,
+  output: string,
+): void {
+  const called = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'agent',
+    type: 'tool_called',
+    data: { tool, callId, effect: 'read' },
+  });
+  writeToolOutput({ sessionId, callId, tool, output });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool, callId, effect: 'read', ok: true },
+  });
+}
+
 test('MCP send gets grounding + duplicate gates under a `*` scope (the only guard with no human)', async () => {
   resetEventLog();
   grounding._resetGroundingStateForTests();
@@ -71,12 +95,12 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
   openPlanScope({ sessionId: sess.id, planProposalId: 'p-integ', approvedPlanObjective: 'send the reviewed emails', allowedTools: ['gmail__send_email'] });
 
   // The agent's own extraction artifact for this target (Denver).
-  writeToolOutput({
-    sessionId: sess.id,
-    callId: 'c_extract',
-    tool: 'mcp__research__lookup',
-    output: 'Oakridge Law; verified term "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
-  });
+  writeTrustedReadOutput(
+    sess.id,
+    'c_extract',
+    'mcp__research__lookup',
+    'Oakridge Law; verified term "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
+  );
   grounding._setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
     ? { grounded: false, reason: 'Payload claims Houston; the extraction artifact says Denver.' }
     : { grounded: true, reason: 'Matches the Denver extraction.' });
@@ -130,10 +154,12 @@ test('MCP EXEC tool with a network-mutation command gets grounding too (audit #6
   grounding._resetGroundingStateForTests();
   grounding._resetDuplicateStateForTests();
   const sess = createSession({ kind: 'chat' });
-  writeToolOutput({
-    sessionId: sess.id, callId: 'c_extract', tool: 'mcp__research__lookup',
-    output: 'Oakridge Law; verified term "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
-  });
+  writeTrustedReadOutput(
+    sess.id,
+    'c_extract',
+    'mcp__research__lookup',
+    'Oakridge Law; verified term "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
+  );
   grounding._setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
     ? { grounded: false, reason: 'Payload claims Houston; artifact says Denver.' }
     : { grounded: true, reason: 'matches' });
@@ -173,10 +199,12 @@ test('MCP send gets the OUTPUT-GROUNDING gate too — a fabricated figure bounce
   const sess = createSession({ kind: 'chat' });
   openPlanScope({ sessionId: sess.id, planProposalId: 'p-integ2', approvedPlanObjective: 'send the reviewed emails', allowedTools: ['gmail__send_email'] });
   // Source: campaign spend sums to $11,000 (labels include "spend"/"campaign").
-  writeToolOutput({
-    sessionId: sess.id, callId: 'call_spend', tool: 'composio_execute_tool',
-    output: 'Ad spend by campaign: Alpha $4,000; Bravo $4,000; Charlie $3,000. Total $11,000.',
-  });
+  writeTrustedReadOutput(
+    sess.id,
+    'call_spend',
+    'composio_execute_tool',
+    'Ad spend by campaign: Alpha $4,000; Bravo $4,000; Charlie $3,000. Total $11,000.',
+  );
   // Identity grounding always passes here — isolate the output-grounding gate.
   grounding._setGroundingJudgeForTests(async () => ({ grounded: true, reason: 'target ok' }));
   // Output-grounding judge: contradict iff the body claims $24.5K.

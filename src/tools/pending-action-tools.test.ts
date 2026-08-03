@@ -54,6 +54,30 @@ function schemaFor(name: string): Record<string, unknown> {
   return schema;
 }
 
+function writeTrustedReadOutput(
+  sessionId: string,
+  callId: string,
+  tool: string,
+  output: string,
+): void {
+  const called = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'agent',
+    type: 'tool_called',
+    data: { tool, callId, effect: 'read' },
+  });
+  writeToolOutput({ sessionId, callId, tool, output });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool, callId, effect: 'read', ok: true },
+  });
+}
+
 before(() => rmSync(TEST_HOME, { recursive: true, force: true }));
 beforeEach(() => {
   resetEventLog();
@@ -65,19 +89,12 @@ test('pending_action_queue refuses a fabricated multi-recipient payload before a
   const session = createSession({ kind: 'chat' });
   const correct = ['avery@example.com', 'blair@example.com', 'casey@example.com'];
   const outgoing = ['avery@example.com', 'jamie@example.com', 'jules@example.com'];
-  writeToolOutput({
-    sessionId: session.id,
-    callId: 'team-source',
-    tool: 'memory_recall_all',
-    output: `Complete team: ${correct.join(', ')}`,
-  });
-  appendEvent({
-    sessionId: session.id,
-    turn: 1,
-    role: 'tool',
-    type: 'tool_returned',
-    data: { tool: 'memory_recall_all', callId: 'team-source', effect: 'read', result: 'stored' },
-  });
+  writeTrustedReadOutput(
+    session.id,
+    'team-source',
+    'memory_recall_all',
+    `Complete team: ${correct.join(', ')}`,
+  );
 
   const response = await withToolOutputContext({ sessionId: session.id }, () =>
     handlerFor('pending_action_queue')({
@@ -99,14 +116,12 @@ test('pending_action_queue refuses a fabricated multi-recipient payload before a
 test('pending_action_queue accepts the exact source-backed recipient set', async () => {
   const session = createSession({ kind: 'chat' });
   const correct = ['avery@example.com', 'blair@example.com', 'casey@example.com'];
-  writeToolOutput({ sessionId: session.id, callId: 'team-source', tool: 'memory_recall_all', output: correct.join(', ') });
-  appendEvent({
-    sessionId: session.id,
-    turn: 1,
-    role: 'tool',
-    type: 'tool_returned',
-    data: { tool: 'memory_recall_all', callId: 'team-source', effect: 'read', result: 'stored' },
-  });
+  writeTrustedReadOutput(
+    session.id,
+    'team-source',
+    'memory_recall_all',
+    correct.join(', '),
+  );
 
   const response = await withToolOutputContext({ sessionId: session.id }, () =>
     handlerFor('pending_action_queue')({

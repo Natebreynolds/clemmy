@@ -1025,6 +1025,8 @@ test('resolveUncertainArtifactClaim: exact read evidence binds/releases a jailed
   };
   mkClaim('art-uncertain-1', 'uncertain');
   mkClaim('art-uncertain-2', 'uncertain');
+  mkClaim('art-status-content', 'uncertain');
+  mkClaim('art-message-content', 'uncertain');
   mkClaim('art-bound-1', 'bound');
 
   const addVerification = (callId: string, output: string): void => {
@@ -1047,6 +1049,8 @@ test('resolveUncertainArtifactClaim: exact read evidence binds/releases a jailed
   };
   addVerification('verify-bind', JSON.stringify({ resources: [{ id: 'site-abc123' }] }));
   addVerification('verify-absent', JSON.stringify({ resources: [] }));
+  addVerification('verify-active-status', JSON.stringify({ resources: [], data: { status: 'active' } }));
+  addVerification('verify-found-message', JSON.stringify({ resources: [], data: { message: '1 resource found' } }));
 
   // bind: attaches the id and verifies.
   const bound = resolveUncertainArtifactClaim(session.id, 'art-uncertain-1', {
@@ -1061,6 +1065,17 @@ test('resolveUncertainArtifactClaim: exact read evidence binds/releases a jailed
   // absent: releases the claim entirely.
   equal(resolveUncertainArtifactClaim(session.id, 'art-uncertain-2', { kind: 'absent', verificationCallId: 'verify-absent' }).ok, true);
   equal(db.prepare('SELECT COUNT(*) AS n FROM run_artifacts WHERE id = ?').get('art-uncertain-2') as unknown as { n: number } | undefined && (db.prepare('SELECT COUNT(*) AS n FROM run_artifacts WHERE id = ?').get('art-uncertain-2') as { n: number }).n, 0);
+
+  // An empty sibling cannot prove global absence when the provider's result
+  // envelope still contains nonempty state/message content.
+  equal(resolveUncertainArtifactClaim(session.id, 'art-status-content', {
+    kind: 'absent', verificationCallId: 'verify-active-status',
+  }).ok, false);
+  equal(resolveUncertainArtifactClaim(session.id, 'art-message-content', {
+    kind: 'absent', verificationCallId: 'verify-found-message',
+  }).ok, false);
+  equal((db.prepare('SELECT status FROM run_artifacts WHERE id = ?').get('art-status-content') as { status: string }).status, 'uncertain');
+  equal((db.prepare('SELECT status FROM run_artifacts WHERE id = ?').get('art-message-content') as { status: string }).status, 'uncertain');
 
   // an already-bound claim is untouchable.
   equal(resolveUncertainArtifactClaim(session.id, 'art-bound-1', { kind: 'absent', verificationCallId: 'verify-absent' }).ok, false);
@@ -1144,6 +1159,63 @@ test('resolveUncertainArtifactClaim refuses stale, reused, and request-echo evid
       { id: 'art-stale-absent', status: 'uncertain', resource_id: null, binding_verified_at: null },
       { id: 'art-stale-bind', status: 'uncertain', resource_id: null, binding_verified_at: null },
     ],
+  );
+});
+
+test('resolveUncertainArtifactClaim never releases a claim from truncated absence evidence', async () => {
+  const { resolveUncertainArtifactClaim } = await import('./artifact-ledger.js');
+  const { appendEvent, createSession, openEventLog, resolveToolOutputForAuthority, writeToolOutput } = await import('./eventlog.js');
+  const truncatedSession = createSession({ id: 'sess-truncated-absence-proof', kind: 'chat' });
+  const db = openEventLog();
+  db.prepare(`
+    INSERT INTO run_artifacts
+      (id, session_id, run_scope_id, slot_key, kind, provider, status, create_shape, created_at, updated_at)
+    VALUES ('art-truncated-absence', ?, 'scope-truncated', 'site:primary', 'site', 'Fixture',
+            'uncertain', 'fixture-create', datetime('now'), datetime('now'))
+  `).run(truncatedSession.id);
+
+  const called = appendEvent({
+    sessionId: truncatedSession.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: { callId: 'truncated-absence-proof', tool: 'provider_list', effect: 'read' },
+  });
+  writeToolOutput({
+    sessionId: truncatedSession.id,
+    callId: 'truncated-absence-proof',
+    invocationNonce: 'nonce-truncated-absence',
+    tool: 'provider_list',
+    output: JSON.stringify({ resources: [] }),
+  });
+  appendEvent({
+    sessionId: truncatedSession.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { callId: 'truncated-absence-proof', tool: 'provider_list', effect: 'read', result: 'stored separately' },
+  });
+  db.prepare(`
+    UPDATE tool_output_invocations
+       SET truncated_at_write = 1
+     WHERE session_id = ? AND call_id = ? AND invocation_nonce = ?
+  `).run(truncatedSession.id, 'truncated-absence-proof', 'nonce-truncated-absence');
+
+  const authority = resolveToolOutputForAuthority(truncatedSession.id, 'truncated-absence-proof');
+  assert.equal(authority.status, 'ok');
+  if (authority.status === 'ok') assert.equal(authority.record.truncatedAtWrite, true);
+
+  const resolution = resolveUncertainArtifactClaim(truncatedSession.id, 'art-truncated-absence', {
+    kind: 'absent',
+    verificationCallId: 'truncated-absence-proof',
+  });
+  assert.equal(resolution.ok, false);
+  assert.match(resolution.reason ?? '', /truncated.*cannot prove.*absence/i);
+  assert.deepEqual(
+    db.prepare('SELECT status FROM run_artifacts WHERE id = ?').get('art-truncated-absence'),
+    { status: 'uncertain' },
+    'the duplicate-write reservation remains jailed',
   );
 });
 

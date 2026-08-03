@@ -685,7 +685,7 @@ test('execution_complete gives the judge exact durable readback receipts without
     tool_slug: 'GOOGLESHEETS_BATCH_GET',
     arguments: { spreadsheet_id: 'sheet-test', ranges: ['Sheet1!A1:B4'] },
   });
-  appendEvent({
+  const called = appendEvent({
     sessionId,
     turn: 1,
     role: 'agent',
@@ -697,20 +697,6 @@ test('execution_complete gives the judge exact durable readback receipts without
       accounting: 'top_level',
       effect: 'read',
       arguments: argumentsJson,
-    },
-  });
-  appendEvent({
-    sessionId,
-    turn: 1,
-    role: 'tool',
-    type: 'tool_returned',
-    data: {
-      tool: 'composio_execute_tool',
-      toolSlug: 'GOOGLESHEETS_BATCH_GET',
-      callId,
-      accounting: 'top_level',
-      effect: 'read',
-      ok: true,
     },
   });
   writeToolOutput({
@@ -731,6 +717,21 @@ test('execution_complete gives the judge exact durable readback receipts without
         }],
       },
     }),
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      tool: 'composio_execute_tool',
+      toolSlug: 'GOOGLESHEETS_BATCH_GET',
+      callId,
+      accounting: 'top_level',
+      effect: 'read',
+      ok: true,
+    },
   });
 
   let judgeCalls = 0;

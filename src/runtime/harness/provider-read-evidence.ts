@@ -89,6 +89,8 @@ export function providerEnvelopeHasContradiction(value: unknown, depth = 0): boo
 
 const COUNT_KEYS = new Set(['count', 'total', 'totalcount', 'rowcount', 'recordcount', 'resultcount']);
 const RESULT_ARRAY_KEYS = new Set(['items', 'records', 'results', 'rows', 'documents', 'drafts', 'messages', 'resources']);
+const RESULT_ENVELOPE_KEYS = new Set(['data', 'response', 'result', 'output']);
+const AUXILIARY_COLLECTION_KEYS = new Set(['error', 'errors', 'warning', 'warnings', 'advisory', 'metadata']);
 const NON_RESULT_SCALAR_KEYS = new Set([
   'error', 'errors', 'warning', 'warnings', 'advisory', 'message', 'status',
   'statusmessage', 'statuscode', 'httpstatus', 'httpstatuscode', 'successful',
@@ -102,8 +104,11 @@ export interface ProviderResultProjection {
 }
 
 /** Inspect only provider-returned content after echo pruning. A target returned
- * anywhere in a real result dominates empty sibling arrays; only a globally
- * empty result can prove absence. */
+ * anywhere in a real result dominates empty sibling result sets; only a
+ * globally empty, explicitly identified result can prove absence. Auxiliary
+ * arrays such as `warnings`, `errors`, and `metadata` are deliberately not
+ * result sets: treating their emptiness as provider absence could authorize a
+ * duplicate external create. Unknown shapes fail closed. */
 export function projectProviderResult(
   value: unknown,
   expectedTargets: readonly string[],
@@ -115,36 +120,72 @@ export function projectProviderResult(
     hasNonEmptyResult: false,
   };
   const pruned = pruneProviderRequestEchoes(value);
-  const visit = (node: unknown, key = '', insideResult = false): void => {
+  const visit = (
+    node: unknown,
+    key: string,
+    context: {
+      resultContent: boolean;
+      arrayIsResult: boolean;
+      countsAreResults: boolean;
+    },
+  ): void => {
     if (Array.isArray(node)) {
-      if (node.length === 0) projection.hasEmptyResult = true;
-      else projection.hasNonEmptyResult = true;
-      for (const entry of node) visit(entry, key, true);
+      if (context.arrayIsResult) {
+        if (node.length === 0) projection.hasEmptyResult = true;
+        else projection.hasNonEmptyResult = true;
+      }
+      for (const entry of node) {
+        visit(entry, key, {
+          // Keep target-search scope through provider-specific nested arrays,
+          // but do not let an unrecognized array become absence evidence.
+          resultContent: context.resultContent || context.arrayIsResult,
+          arrayIsResult: false,
+          countsAreResults: false,
+        });
+      }
       return;
     }
     if (!node || typeof node !== 'object') {
       if (
-        insideResult
+        context.resultContent
         && typeof node === 'string'
         && !NON_RESULT_SCALAR_KEYS.has(key)
         && targets.some((target) => node.toLowerCase().includes(target))
       ) projection.containsExpectedTarget = true;
+      if (
+        context.resultContent
+        && !COUNT_KEYS.has(key)
+        && node !== null
+        && node !== undefined
+        && node !== ''
+      ) projection.hasNonEmptyResult = true;
       return;
     }
     for (const [rawKey, child] of Object.entries(node as Record<string, unknown>)) {
       const normalizedKey = rawKey.toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (COUNT_KEYS.has(normalizedKey)) {
+      if (context.countsAreResults && COUNT_KEYS.has(normalizedKey)) {
         if (child === 0 || child === '0') projection.hasEmptyResult = true;
         else if ((typeof child === 'number' && child > 0) || (typeof child === 'string' && /^[1-9]\d*$/.test(child))) {
           projection.hasNonEmptyResult = true;
         }
       }
-      const resultCarrier = insideResult
-        || RESULT_ARRAY_KEYS.has(normalizedKey)
-        || ['data', 'response', 'result', 'output'].includes(normalizedKey);
-      visit(child, normalizedKey, resultCarrier);
+      const resultEnvelope = RESULT_ENVELOPE_KEYS.has(normalizedKey);
+      const resultCollection = RESULT_ARRAY_KEYS.has(normalizedKey);
+      const auxiliaryCollection = AUXILIARY_COLLECTION_KEYS.has(normalizedKey);
+      visit(child, normalizedKey, {
+        // Diagnostic collections never become result sets. Other nonempty
+        // fields beneath a real result envelope remain conservative evidence
+        // of content/uncertainty, so an empty sibling cannot prove absence.
+        resultContent: !auxiliaryCollection && (context.resultContent || resultEnvelope || resultCollection),
+        arrayIsResult: !auxiliaryCollection && (resultEnvelope || resultCollection),
+        countsAreResults: !auxiliaryCollection && (resultEnvelope || resultCollection),
+      });
     }
   };
-  visit(pruned);
+  visit(pruned, '', {
+    resultContent: false,
+    arrayIsResult: Array.isArray(pruned),
+    countsAreResults: true,
+  });
   return projection;
 }

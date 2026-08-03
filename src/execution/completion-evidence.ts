@@ -177,19 +177,29 @@ export function recentExecutionToolEvidence(
     if (isBookkeepingTool(tool, action)) continue;
 
     let rawOutput = '';
+    let previewFallbackAllowed = resolveOutput === null;
     try {
       if (resolveOutput) {
         const resolution = resolveOutput(execution.sessionId, callId);
-        if (resolution.status === 'ambiguous') continue;
-        rawOutput = resolution.status === 'ok' ? resolution.record.output : '';
+        if (resolution.status === 'failed' || resolution.status === 'ambiguous') continue;
+        if (resolution.status === 'ok') {
+          rawOutput = resolution.record.output;
+        } else {
+          // Only a genuinely absent side-store row may fall back to the
+          // canonical bounded event preview. A rejected exact result is a hard
+          // negative, even when its preview happens to look successful.
+          previewFallbackAllowed = true;
+        }
       } else {
         rawOutput = getOutput(execution.sessionId, callId)?.output ?? '';
       }
     } catch {
-      // The durable full-output side store is best effort; event previews are
-      // sufficient fallback evidence when it is unavailable.
+      // Resolver failure is not evidence that the side-store row is missing.
+      // Fail closed: only an explicit `missing` result may use a bounded legacy
+      // preview, otherwise an authority outage could certify rejected bytes.
+      continue;
     }
-    if (!rawOutput) {
+    if (!rawOutput && previewFallbackAllowed) {
       const fallback = returned.preview ?? returned.output ?? returned.result ?? returned.summary;
       rawOutput = typeof fallback === 'string' ? fallback : safeJson(fallback);
     }

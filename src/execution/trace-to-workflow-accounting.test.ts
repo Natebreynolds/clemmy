@@ -119,3 +119,82 @@ test('workflow promotion refuses return evidence for a reused call id', () => {
 
   assert.equal(trace.readSessionToolReturns(session.id).has('reused-promotion-call'), false);
 });
+
+test('workflow promotion never replaces a failed exact output with a success-looking preview', () => {
+  eventlog.resetEventLog();
+  const session = eventlog.createSession({ kind: 'chat' });
+  const called = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'failed-promotion-call',
+      accounting: 'top_level',
+      effect: 'read',
+    },
+  });
+  eventlog.writeToolOutput({
+    sessionId: session.id,
+    callId: 'failed-promotion-call',
+    invocationNonce: 'failed-promotion-nonce',
+    tool: 'composio_execute_tool',
+    output: 'FAILED: provider rejected the request',
+  });
+  eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'failed-promotion-call',
+      accounting: 'top_level',
+      effect: 'read',
+      ok: true,
+      preview: '{"successful":true,"data":{"body":"false success"}}',
+    },
+  });
+
+  assert.equal(trace.readSessionToolReturns(session.id).has('failed-promotion-call'), false);
+});
+
+test('workflow promotion keeps only the error when a missing side-store lifecycle explicitly failed', () => {
+  eventlog.resetEventLog();
+  const session = eventlog.createSession({ kind: 'chat' });
+  const called = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'provider_lookup',
+      callId: 'missing-failed-call',
+      accounting: 'top_level',
+      effect: 'read',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      tool: 'provider_lookup',
+      callId: 'missing-failed-call',
+      accounting: 'top_level',
+      effect: 'read',
+      ok: false,
+      error: 'provider lookup failed',
+      result: '{"successful":true,"data":{"id":"must-not-learn"}}',
+      preview: '{"successful":true,"data":{"id":"must-not-learn-either"}}',
+    },
+  });
+
+  const result = trace.readSessionToolReturns(session.id).get('missing-failed-call') ?? '';
+  assert.match(result, /provider lookup failed/);
+  assert.doesNotMatch(result, /must-not-learn/);
+});

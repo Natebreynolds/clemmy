@@ -230,3 +230,97 @@ test('completion evidence refuses a reused call id instead of certifying stale s
 
   assert.equal(evidence, '');
 });
+
+test('completion evidence never promotes a failed exact result from a success-looking preview', () => {
+  const events = [
+    event(1, 'tool_called', {
+      tool: 'composio_execute_tool',
+      toolSlug: 'GOOGLESHEETS_BATCH_GET',
+      callId: 'failed-read',
+      accounting: 'top_level',
+      effect: 'read',
+    }),
+    event(2, 'tool_returned', {
+      tool: 'composio_execute_tool',
+      toolSlug: 'GOOGLESHEETS_BATCH_GET',
+      callId: 'failed-read',
+      accounting: 'top_level',
+      effect: 'read',
+      ok: true,
+      preview: '{"successful":true,"data":{"values":[["false receipt"]]}}',
+    }),
+  ];
+
+  const evidence = recentExecutionToolEvidence({
+    sessionId: 'completion-evidence-session',
+    createdAt: '2026-07-25T19:00:00.000Z',
+  }, {
+    listEventsFn: () => events,
+    resolveToolOutputForAuthorityFn: () => ({
+      status: 'failed',
+      reason: 'stored tool output is failure-shaped',
+    }),
+  });
+
+  assert.equal(evidence, '');
+});
+
+test('completion evidence preserves bounded legacy preview fallback only when exact output is missing', () => {
+  const events = [
+    event(1, 'tool_called', {
+      tool: 'provider_lookup',
+      callId: 'legacy-missing-read',
+      accounting: 'top_level',
+      effect: 'read',
+    }),
+    event(2, 'tool_returned', {
+      tool: 'provider_lookup',
+      callId: 'legacy-missing-read',
+      accounting: 'top_level',
+      effect: 'read',
+      ok: true,
+      preview: '{"successful":true,"data":{"id":"verified-legacy-result"}}',
+    }),
+  ];
+
+  const evidence = recentExecutionToolEvidence({
+    sessionId: 'completion-evidence-session',
+    createdAt: '2026-07-25T19:00:00.000Z',
+  }, {
+    listEventsFn: () => events,
+    resolveToolOutputForAuthorityFn: () => ({ status: 'missing' }),
+  });
+
+  assert.match(evidence, /verified-legacy-result/);
+});
+
+test('completion evidence fails closed when exact authority resolution throws', () => {
+  const events = [
+    event(1, 'tool_called', {
+      tool: 'provider_lookup',
+      callId: 'resolver-error-read',
+      accounting: 'top_level',
+      effect: 'read',
+    }),
+    event(2, 'tool_returned', {
+      tool: 'provider_lookup',
+      callId: 'resolver-error-read',
+      accounting: 'top_level',
+      effect: 'read',
+      ok: true,
+      preview: '{"successful":true,"data":{"id":"must-not-certify"}}',
+    }),
+  ];
+
+  const evidence = recentExecutionToolEvidence({
+    sessionId: 'completion-evidence-session',
+    createdAt: '2026-07-25T19:00:00.000Z',
+  }, {
+    listEventsFn: () => events,
+    resolveToolOutputForAuthorityFn: () => {
+      throw new Error('authority store unavailable');
+    },
+  });
+
+  assert.equal(evidence, '');
+});

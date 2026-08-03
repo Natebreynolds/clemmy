@@ -10,13 +10,44 @@ import { rmSync } from 'node:fs';
 const TEST_HOME = '/tmp/clemmy-test-tool-output-ref';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
-const { createSession, resetEventLog, writeToolOutput } = await import('./eventlog.js');
+const { appendEvent, createSession, resetEventLog, writeToolOutput } = await import('./eventlog.js');
 const { resolveToolOutputReferences, extractByPath, hasToolOutputReference } = await import('./tool-output-reference.js');
 
 const S = 'sess-tool-output-ref';
 
 before(() => rmSync(TEST_HOME, { recursive: true, force: true }));
 beforeEach(() => { resetEventLog(); createSession({ id: S, kind: 'chat' }); });
+
+function writeTrustedOutput(input: {
+  callId: string;
+  invocationNonce: string;
+  tool: string;
+  output: string;
+  effect: 'read' | 'compute';
+}): void {
+  const called = appendEvent({
+    sessionId: S,
+    turn: 1,
+    role: 'agent',
+    type: 'tool_called',
+    data: { tool: input.tool, callId: input.callId, effect: input.effect },
+  });
+  writeToolOutput({
+    sessionId: S,
+    callId: input.callId,
+    invocationNonce: input.invocationNonce,
+    tool: input.tool,
+    output: input.output,
+  });
+  appendEvent({
+    sessionId: S,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: input.tool, callId: input.callId, effect: input.effect, ok: true },
+  });
+}
 
 // ---------- extractByPath ----------
 
@@ -32,12 +63,12 @@ test('extractByPath handles dot paths and [*] array mapping', () => {
 
 test('resolves a recipient roster from a prior tool output — values never model-typed', () => {
   const roster = { result: { records: Array.from({ length: 8 }, (_, i) => ({ Email: `person${i}@scorpion.co` })) } };
-  writeToolOutput({
-    sessionId: S,
+  writeTrustedOutput({
     callId: 'call_sf',
     invocationNonce: 'roster-read',
     tool: 'salesforce_query',
     output: JSON.stringify(roster),
+    effect: 'read',
   });
 
   const args = {
@@ -57,12 +88,12 @@ test('resolves a recipient roster from a prior tool output — values never mode
 
 test('resolves through a run_shell_command --json wrapper (sf/gh/aws)', () => {
   const payload = JSON.stringify({ result: { records: [{ Email: 'x@co' }, { Email: 'y@co' }] } });
-  writeToolOutput({
-    sessionId: S,
+  writeTrustedOutput({
     callId: 'call_shell',
     invocationNonce: 'shell-read',
     tool: 'run_shell_command',
     output: `exit_code: 0\n\nstdout:\n${payload}\nstderr:\n`,
+    effect: 'compute',
   });
   const out = resolveToolOutputReferences(S, { to: { $fromToolOutput: { callId: 'call_shell', path: 'result.records[*].Email' } } });
   assert.deepEqual(out.errors, []);
@@ -72,17 +103,18 @@ test('resolves through a run_shell_command --json wrapper (sf/gh/aws)', () => {
 // ---------- fail-closed ----------
 
 test('fail-closed: an unresolvable reference is an error, not a silent empty send', () => {
-  writeToolOutput({
-    sessionId: S,
+  writeTrustedOutput({
     callId: 'call_ok',
     invocationNonce: 'empty-read',
     tool: 't',
     output: JSON.stringify({ records: [] }),
+    effect: 'read',
   });
   const missing = resolveToolOutputReferences(S, { to: { $fromToolOutput: { callId: 'call_absent' } } });
   assert.equal(missing.errors.length, 1, 'missing call_id errors');
   const badPath = resolveToolOutputReferences(S, { to: { $fromToolOutput: { callId: 'call_ok', path: 'nope[*].Email' } } });
   assert.equal(badPath.errors.length, 1, 'a path that resolves to nothing errors');
+  assert.match(badPath.errors[0], /resolved to nothing/i);
 });
 
 test('fail-closed: reused call ids cannot feed stale longest-wins values into a write', () => {
@@ -104,17 +136,17 @@ test('fail-closed: reused call ids cannot feed stale longest-wins values into a 
     to: { $fromToolOutput: { callId: 'dup-read', path: 'result.records[*].Email' } },
   });
   assert.equal(out.errors.length, 1);
-  assert.match(out.errors[0], /reused by 2 invocations|stale and current/i);
+  assert.match(out.errors[0], /not a trusted read\/compute|reused by 2 invocations|stale and current/i);
   assert.equal((out.resolved as { to?: unknown }).to, undefined);
 });
 
 test('fail-closed: provider request echoes are not grounded $fromToolOutput values', () => {
-  writeToolOutput({
-    sessionId: S,
+  writeTrustedOutput({
     callId: 'echo-read',
     invocationNonce: 'nonce-echo',
     tool: 'salesforce_query',
     output: JSON.stringify({ data: { request_body: { Email: 'model-guessed@example.com' }, records: [] } }),
+    effect: 'read',
   });
   const out = resolveToolOutputReferences(S, {
     to: { $fromToolOutput: { callId: 'echo-read', path: 'data.request_body.Email' } },

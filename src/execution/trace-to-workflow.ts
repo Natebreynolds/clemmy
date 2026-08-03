@@ -481,7 +481,24 @@ export function readSessionToolReturns(sessionId: string): Map<string, string> {
 
   const eventText = (event: (typeof returns)[number] | undefined): string => {
     if (!event) return '';
-    const value = event.data.result ?? event.data.error ?? event.data.preview ?? '';
+    const value = event.data.error ?? event.data.errors ?? event.data.result ?? event.data.preview ?? '';
+    return typeof value === 'string' ? value : JSON.stringify(value);
+  };
+  const eventExplicitlyFailed = (event: (typeof returns)[number] | undefined): boolean => {
+    if (!event) return false;
+    const data = event.data;
+    return data.ok === false
+      || data.success === false
+      || data.successful === false
+      || data.failed === true
+      || data.error === true
+      || (typeof data.error === 'string' && data.error.trim().length > 0)
+      || (Array.isArray(data.errors) && data.errors.length > 0);
+  };
+  const eventFailureText = (event: (typeof returns)[number] | undefined): string => {
+    if (!event) return '';
+    const value = event.data.error ?? event.data.errors;
+    if (value === undefined || value === null || value === false || value === '') return '';
     return typeof value === 'string' ? value : JSON.stringify(value);
   };
   for (const call of canonicalCalls) {
@@ -489,13 +506,21 @@ export function readSessionToolReturns(sessionId: string): Map<string, string> {
     if (!callId) continue;
     const resolution = resolveToolOutputForAuthority(sessionId, callId);
     // A promoted workflow or recovery skill must never learn from whichever
-    // output happened to win a reused call-id slot. Exact ambiguity is a hard
-    // refusal; a genuinely missing side-store row may still use its bounded
-    // canonical event preview below for legacy traces.
-    if (resolution.status === 'ambiguous') continue;
+    // output happened to win a reused call-id slot. Exact ambiguity or failure
+    // is a hard refusal; only a genuinely missing side-store row may still use
+    // its bounded canonical event preview below for legacy traces.
+    if (resolution.status === 'ambiguous' || resolution.status === 'failed') continue;
     const parked = resolution.status === 'ok' ? resolution.record.output : '';
     const canonicalReturn = canonicalReturns.get(callId);
     const mirrorReturn = allReturns.get(pairs.canonicalToMirrorCallId.get(callId) ?? '');
+    if (
+      resolution.status === 'missing'
+      && (eventExplicitlyFailed(canonicalReturn) || eventExplicitlyFailed(mirrorReturn))
+    ) {
+      const failure = eventFailureText(canonicalReturn) || eventFailureText(mirrorReturn);
+      if (failure) out.set(callId, failure.slice(0, 8_000));
+      continue;
+    }
     const result = parked || eventText(canonicalReturn) || eventText(mirrorReturn);
     if (canonicalReturn || mirrorReturn || result) out.set(callId, result.slice(0, 8_000));
   }

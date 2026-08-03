@@ -1222,6 +1222,9 @@ export function resolveUncertainArtifactClaim(
     ).changes;
     return changes === 1 ? { ok: true } : { ok: false, reason: 'claim changed concurrently' };
   }
+  if (authority.record.truncatedAtWrite) {
+    return { ok: false, reason: 'truncated verification output cannot prove global provider absence' };
+  }
   const projection = projectProviderResult(providerResult, []);
   if (!projection.hasEmptyResult || projection.hasNonEmptyResult) {
     return { ok: false, reason: 'exact provider read does not prove one globally empty result' };

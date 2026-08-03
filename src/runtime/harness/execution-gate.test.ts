@@ -242,6 +242,38 @@ test('isMutatingExternalWrite: deferred call_tool dispatch inherits the inner ac
     }),
     false,
   );
+  assert.equal(
+    isMutatingExternalWrite('call_tool', {
+      name: 'googledocs__create_document',
+      args_json: '{}',
+    }),
+    true,
+    'the trusted catalog carrier proves a carrier-less provider create is external',
+  );
+  assert.equal(
+    isMutatingExternalWrite('call_tool', {
+      name: 'googledocs__get_document',
+      args_json: '{}',
+    }),
+    false,
+    'the same catalog provenance preserves a known provider read',
+  );
+  assert.equal(
+    isMutatingExternalWrite('call_tool', {
+      name: 'server_a__transact',
+      args_json: '{}',
+    }),
+    true,
+    'an unfamiliar connected action fails closed',
+  );
+  assert.equal(
+    isMutatingExternalWrite('call_tool', {
+      name: 'clementine-local__workflow_run',
+      args_json: '{}',
+    }),
+    false,
+    'a qualified Clementine-local controller remains local',
+  );
 });
 
 test('isMutatingExternalWrite: foreign wrapper and exemption lookalikes cannot borrow local authority', () => {
@@ -273,6 +305,14 @@ test('isMutatingExternalWrite: foreign wrapper and exemption lookalikes cannot b
       `${toolName} remains the trusted local carrier`,
     );
   }
+});
+
+test('isMutatingExternalWrite: ordinary carrier-less SDK identities are not raw MCP admission proof', () => {
+  assert.equal(isMutatingExternalWrite('googledocs__create_document', {}), false);
+  assert.equal(isMutatingExternalWrite('salesforce__query', {}), false);
+  // The runtime effect classifier restores this transport qualification before
+  // it asks the shared write classifier, so the qualified mutation stays shut.
+  assert.equal(isMutatingExternalWrite('mcp__googledocs__create_document', {}), true);
 });
 
 test('isMutatingExternalWrite: unknown external actions fail closed on every externally-dispatched lane', () => {

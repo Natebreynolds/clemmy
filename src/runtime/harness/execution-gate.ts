@@ -288,8 +288,14 @@ function canonicalExternalAction(
   const args = decodedArgs(rawArgs);
   const tail = mcpToolTail(toolName);
   const normalized = withoutMcpTransportPrefix(toolName);
-  const namespace = normalized.split('__');
-  const namespaced = namespace.length > 1;
+  // This admission boundary receives both raw local/SDK identities and fully
+  // qualified MCP transport names. Only the latter prove a native provider
+  // boundary here. Runtime effect accounting restores `mcp__` before calling
+  // this classifier, so carrier-less SDK provider names still fail closed
+  // there without turning every local `namespace__tool` into an external write.
+  const hasMcpTransport = toolName.startsWith('mcp__');
+  const namespace = hasMcpTransport ? normalized.split('__') : [];
+  const namespaced = hasMcpTransport && namespace.length > 1;
   const server = namespace.slice(0, -1).join('__');
 
   if (tail === 'call_tool') {
@@ -302,7 +308,14 @@ function canonicalExternalAction(
     const record = args as Record<string, unknown>;
     const target = typeof record.name === 'string' ? record.name.trim() : '';
     if (!target) return { external: false };
-    return canonicalExternalAction(target, record.args_json ?? record.args ?? {}, depth + 1);
+    // A trusted local call_tool dispatches names from the connected tool
+    // catalog. That carrier supplies the provenance a bare SDK callback name
+    // lacks, so restore MCP qualification before classifying server__tool.
+    // Clementine-local namespaces remain local under the shared identity rule.
+    const catalogTarget = !target.startsWith('mcp__') && target.includes('__')
+      ? `mcp__${target}`
+      : target;
+    return canonicalExternalAction(catalogTarget, record.args_json ?? record.args ?? {}, depth + 1);
   }
 
   const composioCarrier = isTrustedComposioCarrier(toolName);
