@@ -1,20 +1,18 @@
 /**
  * Run: npx tsx --test apps/console-web/src/lib/live-agents.test.ts
  *
- * Pins the decluttered live-agents projection (owner decision 2026-07-30):
- * RUNNING rows only — no needs_you, no parked, no archived — the badge counts
- * live agents, and the auto-pop fires ONLY for work that starts while the
- * user is here (first poll seeds silently; stale rows never pop).
+ * Pins the detached-work projection: foreground chat attempts never mirror
+ * into Background work, while real background/project/workflow work still
+ * updates a passive badge and can be opened by the user.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  AUTO_OPEN_FRESH_MS,
-  elapsedLabel,
-  liveAgentAutoOpen,
   liveAgentBadgeCount,
   liveAgentRows,
+  liveAgentTarget,
   sourceKindLabel,
+  updatedLabel,
 } from './live-agents';
 import type { BoardCard } from './board';
 
@@ -44,6 +42,13 @@ test('liveAgentRows: RUNNING only — needs_you, queued, done, archived, and par
     card({ id: 'q', column: 'queued', title: 'Queued' }),
     card({ id: 'done', column: 'done', title: 'Finished' }),
     card({ id: 'gone', column: 'running', archived: true, title: 'Archived' }),
+    card({
+      id: 'foreground-chat',
+      sourceKind: 'run',
+      attemptId: 'attempt:desktop:1',
+      column: 'running',
+      title: 'The chat I am already watching',
+    }),
     // A parked workflow run mis-columns as running upstream but is actually
     // waiting on the user — it is NOT live work.
     card({ id: 'parked', column: 'running', status: 'parked', sourceKind: 'workflow', title: 'Parked on approval' }),
@@ -52,44 +57,30 @@ test('liveAgentRows: RUNNING only — needs_you, queued, done, archived, and par
   assert.equal(rows[0].canStop, true, 'a running card with a cancel action gets the stop affordance');
   assert.equal(liveAgentBadgeCount([
     card({ id: 'a', column: 'running' }),
+    card({ id: 'chat', sourceKind: 'run', attemptId: 'attempt:discord:1', column: 'running' }),
     card({ id: 'b', column: 'needs_you', sourceKind: 'approval' }),
   ]), 1, 'the badge counts live agents, never waiting items');
 });
 
-test('auto-pop: first poll seeds silently (no launch pop); only a FRESH new row pops later; close is respected', () => {
-  const preExisting = [
-    card({ id: 'old-a', column: 'running', ageMs: 2 * 3600_000 }),
-    card({ id: 'old-b', column: 'running', ageMs: 40 * 60_000, sourceKind: 'guest' }),
-  ];
-  // App launch with pre-existing work → NEVER pops (the every-launch regression).
-  const s1 = liveAgentAutoOpen({ seenIds: [], primed: false }, preExisting);
-  assert.equal(s1.open, false, 'the first poll after mount must not pop for pre-existing rows');
-
-  // Same rows on the next poll → quiet.
-  const s2 = liveAgentAutoOpen(s1.state, preExisting);
-  assert.equal(s2.open, false);
-
-  // A STALE row newly appearing (e.g. an old run resurfacing in the window)
-  // is not a live start → quiet.
-  const withStaleNew = [...preExisting, card({ id: 'resurfaced', column: 'running', ageMs: AUTO_OPEN_FRESH_MS + 1 })];
-  const s3 = liveAgentAutoOpen(s2.state, withStaleNew);
-  assert.equal(s3.open, false, 'an old row appearing is not a live kickoff');
-
-  // A genuinely fresh row → pop.
-  const withFresh = [...withStaleNew, card({ id: 'kicked-off', column: 'running', ageMs: 20_000, sourceKind: 'guest' })];
-  const s4 = liveAgentAutoOpen(s3.state, withFresh);
-  assert.equal(s4.open, true, 'work starting while the user is here pops the panel');
-
-  // Seen once → closing the panel is respected on the next poll.
-  const s5 = liveAgentAutoOpen(s4.state, withFresh);
-  assert.equal(s5.open, false, 'a row the user already saw must not re-open the panel');
+test('rows deep-link to the exact trace identity when one exists', () => {
+  const [row] = liveAgentRows([card({
+    id: 'run-1',
+    sourceKind: 'guest',
+    sessionId: 'session 1',
+    attemptId: 'attempt:1',
+    runScopeId: 'scope:1',
+  })]);
+  assert.equal(
+    liveAgentTarget(row),
+    '/tasks?select=session+1&attemptId=attempt%3A1&runScopeId=scope%3A1',
+  );
 });
 
-test('labels: elapsed is glanceable and source kinds speak product language, not plumbing', () => {
-  assert.equal(elapsedLabel(20_000), 'just now');
-  assert.equal(elapsedLabel(3 * 60_000), '3m');
-  assert.equal(elapsedLabel(90 * 60_000), '1h 30m');
-  assert.equal(elapsedLabel(-5), '');
+test('labels: update recency is honest and source kinds speak product language, not plumbing', () => {
+  assert.equal(updatedLabel(20_000), 'updated now');
+  assert.equal(updatedLabel(3 * 60_000), 'updated 3m ago');
+  assert.equal(updatedLabel(90 * 60_000), 'updated 1h 30m ago');
+  assert.equal(updatedLabel(-5), '');
   assert.equal(sourceKindLabel('guest'), 'project run');
   assert.equal(sourceKindLabel('background'), 'task');
 });

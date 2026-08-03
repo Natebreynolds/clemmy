@@ -1,4 +1,4 @@
-import { useEffect, useRef, type KeyboardEvent } from 'react';
+import { useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, Sparkles, X } from 'lucide-react';
@@ -31,9 +31,9 @@ function inboxTarget(item: CommandCenterItem): string {
   return '/inbox';
 }
 
-function AttentionStrip({ needsYou, workingNow, onDismiss }: { needsYou: CommandCenterItem[]; workingNow: CommandCenterItem[]; onDismiss?: (item: CommandCenterItem) => void }) {
+function AttentionStrip({ needsYou, onDismiss }: { needsYou: CommandCenterItem[]; onDismiss?: (item: CommandCenterItem) => void }) {
   const navigate = useNavigate();
-  if (needsYou.length === 0 && workingNow.length === 0) return null;
+  if (needsYou.length === 0) return null;
   return (
     <div className="space-y-2">
       {needsYou.slice(0, 3).map((item, i) => (
@@ -70,33 +70,6 @@ function AttentionStrip({ needsYou, workingNow, onDismiss }: { needsYou: Command
           See all {needsYou.length} in Inbox
         </button>
       )}
-      {workingNow.slice(0, 2).map((item, i) => {
-        // A live row you can't open is a dead end — deep-link to the board
-        // card when the item names its session, so "what is she doing?"
-        // is always one click away.
-        const target = item.targetSessionId ? `/tasks?select=${encodeURIComponent(item.targetSessionId)}` : null;
-        return (
-          <div
-            key={`w${i}`}
-            {...(target
-              ? {
-                  role: 'button' as const,
-                  tabIndex: 0,
-                  onClick: () => navigate(target),
-                  onKeyDown: (e: KeyboardEvent) => { if (e.key === 'Enter') navigate(target); },
-                }
-              : {})}
-            className={cn(
-              'flex items-center gap-3 rounded-md border border-border bg-subtle px-3 py-2.5',
-              target && 'cursor-pointer transition-colors hover:brightness-[0.99]',
-            )}
-          >
-            <StatusPill tone="live">Working now</StatusPill>
-            <span className="min-w-0 flex-1 truncate text-body text-muted">{item.title ?? 'In progress'}</span>
-            {target && <ArrowRight className="h-4 w-4 shrink-0 text-muted" aria-hidden />}
-          </div>
-        );
-      })}
     </div>
   );
 }
@@ -126,7 +99,6 @@ export function Chat() {
   const seededRef = useRef(false);
 
   const needsYou = cc.data?.needsYou ?? [];
-  const workingNow = cc.data?.workingNow ?? [];
   const hasThread = chat.messages.length > 0;
 
   const onScroll = () => {
@@ -176,19 +148,19 @@ export function Chat() {
         <div className="mb-6 text-center">
           <DogMark size={56} className="mx-auto mb-4" />
           <h2 className="text-display text-fg">{timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile))}</h2>
-          {/* The away-message derives from workingNow[0] ?? needsYou[0] — the
-              exact item the AttentionStrip renders right below. Printing it
-              twice is the clutter; when the strip will show it, stay quiet. */}
+          {/* Needs-you is rendered directly below, so do not repeat the same
+              item as the away message. Foreground progress belongs inside the
+              assistant bubble; detached work stays behind the top-bar badge. */}
           <p className="mt-1 text-body-lg text-muted">
-            {(needsYou.length > 0 || workingNow.length > 0)
+            {needsYou.length > 0
               ? "I'm here. Ask me anything, or tap Talk."
               : (cc.data?.presence?.awayMessage ?? "I'm here. Ask me anything, or tap Talk.")}
           </p>
         </div>
 
-        {(needsYou.length > 0 || workingNow.length > 0) && (
+        {needsYou.length > 0 && (
           <div className="mb-5">
-            <AttentionStrip needsYou={needsYou} workingNow={workingNow} onDismiss={dismissCard} />
+            <AttentionStrip needsYou={needsYou} onDismiss={dismissCard} />
           </div>
         )}
 
@@ -217,8 +189,8 @@ export function Chat() {
     <div className="flex h-full flex-col">
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl space-y-5 px-8 py-6">
-          {(needsYou.length > 0 || workingNow.length > 0) && (
-            <AttentionStrip needsYou={needsYou} workingNow={workingNow} onDismiss={dismissCard} />
+          {needsYou.length > 0 && (
+            <AttentionStrip needsYou={needsYou} onDismiss={dismissCard} />
           )}
           <CollaborativeWorkstate snapshot={cc.data?.focus} compact />
           {chat.messages.map((m) => (

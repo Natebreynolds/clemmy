@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import { AlertTriangle, X } from 'lucide-react';
 import { Sidebar } from './Sidebar';
@@ -12,7 +12,7 @@ import { LiveAgentsPanel } from './LiveAgentsPanel';
 import { ALL_NAV } from '@/lib/nav';
 import { listBoard } from '@/lib/board';
 import { usePoll } from '@/lib/poll';
-import { liveAgentAutoOpen, liveAgentBadgeCount } from '@/lib/live-agents';
+import { liveAgentBadgeCount } from '@/lib/live-agents';
 
 const LIVE_AGENTS_PREF = 'clem.live-agents.open';
 
@@ -33,25 +33,12 @@ export function AppShell() {
   const [liveAgentsOpen, setLiveAgentsOpen] = useState(() => {
     try { return localStorage.getItem(LIVE_AGENTS_PREF) === '1'; } catch { return false; }
   });
-  // One shared board poll powers the badge, the auto-pop, and the panel rows.
+  // One shared board poll powers the passive detached-work badge and rows.
   // Faster while the panel is open; a slow heartbeat while closed so a freshly
-  // kicked-off agent can still pop the panel and the badge stays honest.
+  // kicked-off background work updates the badge without moving the user's UI.
   const board = usePoll(['board'], listBoard, liveAgentsOpen ? 4000 : 12_000);
   const boardCards = board.data?.cards ?? [];
   const liveRunCount = liveAgentBadgeCount(boardCards);
-
-  // Auto-pop: open ONLY when work starts while the user is here. The first
-  // poll seeds the seen-set silently (an app launch with pre-existing rows
-  // never pops — the live 2026-07-30 regression), and later polls pop only
-  // for a genuinely fresh new row. Closing the panel is respected.
-  const autoOpenRef = useRef<{ seenIds: string[]; primed: boolean }>({ seenIds: [], primed: false });
-  useEffect(() => {
-    if (!board.data) return;
-    const decision = liveAgentAutoOpen(autoOpenRef.current, boardCards);
-    autoOpenRef.current = decision.state;
-    if (decision.open) setLiveAgentsOpen(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [board.data]);
 
   const toggleLiveAgents = () => {
     setLiveAgentsOpen((current) => {

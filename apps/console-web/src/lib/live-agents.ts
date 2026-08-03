@@ -1,6 +1,6 @@
 /**
- * Live-agents panel presentation — the glanceable "who is working right now"
- * projection of the Tasks board, for the slide-in panel on every screen.
+ * Live-agents panel presentation — the glanceable "what is running away from
+ * this foreground conversation" projection of the Tasks board.
  *
  * PURE RUNNING WORK ONLY (owner decision, 2026-07-30 declutter): the first
  * live day filled this panel with week-old "waiting on you" rows and it read
@@ -8,9 +8,11 @@
  * Needs-you strip, the Inbox, and the Tasks board — this surface answers one
  * question: what is Clem doing right now.
  *
- * Everything here is pure so the row projection, badge count, and the
- * auto-pop decision get cheap regression pins (same pattern as
- * chatRailLayout).
+ * A canonical harness attempt is the foreground chat itself. Its progress is
+ * already rendered in ChatBubble, so mirroring it here made every message pop
+ * an empty-looking side panel. Detached/background work still belongs here.
+ * The top-bar count is intentionally passive: background work never moves the
+ * user's layout. The user opens this panel when they want it.
  */
 import type { BoardCard, BoardSourceKind } from './board';
 
@@ -20,20 +22,29 @@ export interface LiveAgentRow {
   title: string;
   /** One glanceable line: the card's live progress hint (may be ''). */
   statusLine: string;
-  elapsedLabel: string;
+  /** Age of the latest update, explicitly labeled as recency (not elapsed run
+   * time—the board API currently supplies updatedAt-derived ageMs). */
+  updatedLabel: string;
   canStop: boolean;
   sessionId: string | null;
   card: BoardCard;
 }
 
-export function elapsedLabel(ageMs: number): string {
+/** Canonical harness attempts are the currently visible foreground
+ * conversation, not a second agent working in the background. Legacy run
+ * records do not carry attemptId and remain eligible for this panel. */
+export function isForegroundConversationCard(card: BoardCard): boolean {
+  return card.sourceKind === 'run' && Boolean(card.attemptId);
+}
+
+export function updatedLabel(ageMs: number): string {
   if (!Number.isFinite(ageMs) || ageMs < 0) return '';
   const minutes = Math.floor(ageMs / 60_000);
-  if (minutes < 1) return 'just now';
-  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1) return 'updated now';
+  if (minutes < 60) return `updated ${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ${minutes % 60}m`;
-  return `${Math.floor(hours / 24)}d`;
+  if (hours < 24) return `updated ${hours}h ${minutes % 60}m ago`;
+  return `updated ${Math.floor(hours / 24)}d ago`;
 }
 
 /** Human word for where a row came from — spoken language, never plumbing. */
@@ -60,14 +71,19 @@ export function sourceKindLabel(kind: BoardSourceKind): string {
  */
 export function liveAgentRows(cards: BoardCard[]): LiveAgentRow[] {
   return cards
-    .filter((card) => card.column === 'running' && !card.archived && card.status !== 'parked')
+    .filter((card) => (
+      card.column === 'running'
+      && !card.archived
+      && card.status !== 'parked'
+      && !isForegroundConversationCard(card)
+    ))
     .sort((a, b) => a.ageMs - b.ageMs)
     .map((card) => ({
       id: `${card.sourceKind}:${card.id}`,
       sourceKind: card.sourceKind,
       title: card.title,
       statusLine: card.progressHint || '',
-      elapsedLabel: elapsedLabel(card.ageMs),
+      updatedLabel: updatedLabel(card.ageMs),
       canStop: card.actions.includes('cancel'),
       sessionId: card.sessionId,
       card,
@@ -79,35 +95,12 @@ export function liveAgentBadgeCount(cards: BoardCard[]): number {
   return liveAgentRows(cards).length;
 }
 
-/** A row only counts as "just started" for this long — older rows appearing
- *  in the poll are pre-existing work (an app launch, a re-focused tab), not a
- *  live kickoff, and must not pop the panel at the user. */
-export const AUTO_OPEN_FRESH_MS = 5 * 60_000;
-
-export interface LiveAgentAutoOpenState {
-  seenIds: string[];
-  /** False until the first poll has seeded the seen-set. */
-  primed: boolean;
-}
-
-/**
- * Auto-pop decision: the panel opens itself ONLY when work starts while the
- * user is actually here — a new row that is genuinely fresh, observed on a
- * poll AFTER the first. The first poll seeds the seen-set silently, so an app
- * launch with pre-existing work never pops (the live 2026-07-30 regression:
- * the in-memory seen-set made every launch "new"). Closing the panel is
- * respected until the next live start. Pure: the caller persists the state.
- */
-export function liveAgentAutoOpen(
-  state: LiveAgentAutoOpenState,
-  cards: BoardCard[],
-): { open: boolean; state: LiveAgentAutoOpenState } {
-  const rows = liveAgentRows(cards);
-  const current = rows.map((row) => row.id);
-  if (!state.primed) {
-    return { open: false, state: { seenIds: current, primed: true } };
-  }
-  const seen = new Set(state.seenIds);
-  const open = rows.some((row) => !seen.has(row.id) && row.card.ageMs < AUTO_OPEN_FRESH_MS);
-  return { open, state: { seenIds: current, primed: true } };
+/** Exact Tasks target for a row. Canonical runs carry attempt/scope identity;
+ * other sources still land on their best board-card or session selector. */
+export function liveAgentTarget(row: LiveAgentRow): string {
+  const select = row.sessionId || row.card.id;
+  const params = new URLSearchParams({ select });
+  if (row.card.attemptId) params.set('attemptId', row.card.attemptId);
+  if (row.card.runScopeId) params.set('runScopeId', row.card.runScopeId);
+  return `/tasks?${params.toString()}`;
 }

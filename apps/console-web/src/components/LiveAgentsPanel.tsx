@@ -1,9 +1,9 @@
 /**
- * Live agents — the glanceable "who is working right now" side panel.
+ * Live agents — a glanceable view of detached/background work.
  *
- * The owner's model: you hand Clem work in the chat, the chat stays free, this
- * panel pops with the agent working in the background, and the result comes
- * back to the conversation proactively. So this surface is deliberately
+ * The owner's model: you hand Clem work in the chat, the chat stays free, the
+ * passive Agents badge reflects detached work, and the result comes back to
+ * the conversation proactively. This user-opened surface is deliberately
  * simple — live rows + waiting-on-you rows + a stop button — and deep
  * inspection (plan, tools, artifacts, trace) stays on the Tasks board. It
  * replaced the Run environment panel, whose inline provenance bookkeeping is
@@ -19,9 +19,9 @@ import { ArrowRight, Bot, CircleStop, X } from 'lucide-react';
 import { Button } from './ui/Button';
 import { cn } from '@/lib/cn';
 import { runBoardAction, type BoardCard } from '@/lib/board';
-import { liveAgentRows, sourceKindLabel, type LiveAgentRow } from '@/lib/live-agents';
+import { liveAgentRows, liveAgentTarget, sourceKindLabel, type LiveAgentRow } from '@/lib/live-agents';
 
-function AgentRow({ row }: { row: LiveAgentRow }) {
+function AgentRow({ row, onOpen }: { row: LiveAgentRow; onOpen: () => void }) {
   const qc = useQueryClient();
   const [stopping, setStopping] = useState(false);
   const [stopError, setStopError] = useState('');
@@ -42,16 +42,26 @@ function AgentRow({ row }: { row: LiveAgentRow }) {
 
   return (
     <li className="rounded-lg border border-border bg-canvas px-3 py-2.5">
-      <div className="flex min-w-0 items-center gap-2">
-        <span className="h-2 w-2 shrink-0 animate-breathe rounded-full bg-success" aria-hidden />
-        <span className="min-w-0 flex-1 truncate text-small font-medium text-fg" title={row.title}>{row.title}</span>
-        <span className="shrink-0 text-caption text-faint">{row.elapsedLabel}</span>
-      </div>
-      <div className="mt-1 flex min-w-0 items-center gap-2 pl-4">
-        <span className="shrink-0 rounded border border-border px-1.5 py-px text-caption text-muted">{sourceKindLabel(row.sourceKind)}</span>
-        <span className="min-w-0 flex-1 truncate text-caption text-muted" title={row.statusLine}>
-          {row.statusLine || 'Working…'}
-        </span>
+      <div className="flex min-w-0 items-start gap-2">
+        <button
+          type="button"
+          onClick={onOpen}
+          className="min-w-0 flex-1 rounded-md text-left outline-none transition-colors hover:text-primary focus-visible:ring-2 focus-visible:ring-primary/40"
+          aria-label={`Open task trace for ${row.title}`}
+        >
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="h-2 w-2 shrink-0 animate-breathe rounded-full bg-success" aria-hidden />
+            <span className="min-w-0 flex-1 truncate text-small font-medium text-fg" title={row.title}>{row.title}</span>
+            <span className="shrink-0 text-caption text-faint">{row.updatedLabel}</span>
+          </span>
+          <span className="mt-1 flex min-w-0 items-center gap-2 pl-4">
+            <span className="shrink-0 rounded border border-border px-1.5 py-px text-caption text-muted">{sourceKindLabel(row.sourceKind)}</span>
+            <span className="min-w-0 flex-1 truncate text-caption text-muted" title={row.statusLine}>
+              {row.statusLine || 'Working…'}
+            </span>
+            <ArrowRight className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden />
+          </span>
+        </button>
         {row.canStop && (
           <button
             type="button"
@@ -59,7 +69,7 @@ function AgentRow({ row }: { row: LiveAgentRow }) {
             disabled={stopping}
             aria-label={`Stop ${row.title}`}
             title="Stop this run"
-            className="shrink-0 rounded-md p-1 text-muted transition-colors hover:bg-danger-tint hover:text-danger disabled:opacity-50"
+            className="mt-5 shrink-0 rounded-md p-1 text-muted transition-colors hover:bg-danger-tint hover:text-danger disabled:opacity-50"
           >
             <CircleStop className="h-3.5 w-3.5" aria-hidden />
           </button>
@@ -160,7 +170,7 @@ export function LiveAgentsPanel({
       >
         <div className="app-drag flex min-h-14 min-w-0 shrink-0 items-center gap-3 border-b border-border px-4 py-2">
           <Bot className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-          <h2 id="live-agents-title" className="min-w-0 flex-1 truncate text-body font-semibold text-fg">Working now</h2>
+          <h2 id="live-agents-title" className="min-w-0 flex-1 truncate text-body font-semibold text-fg">Background work</h2>
           <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close live agents" title="Close" className="app-no-drag">
             <X className="h-4 w-4" aria-hidden />
           </Button>
@@ -174,11 +184,17 @@ export function LiveAgentsPanel({
             </div>
           ) : rows.length === 0 ? (
             <div className="px-1 py-6 text-center text-small text-muted">
-              {loading ? 'Checking…' : 'Nothing running right now. Kick something off in the chat and it shows up here.'}
+              {loading ? 'Checking…' : 'Nothing running in the background.'}
             </div>
           ) : (
             <ul className="flex flex-col gap-2">
-              {rows.map((row) => <AgentRow key={row.id} row={row} />)}
+              {rows.map((row) => (
+                <AgentRow
+                  key={row.id}
+                  row={row}
+                  onOpen={() => { onClose(); navigate(liveAgentTarget(row)); }}
+                />
+              ))}
             </ul>
           )}
         </div>
