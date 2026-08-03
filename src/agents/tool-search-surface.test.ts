@@ -140,21 +140,35 @@ test('ON: an excluded tool is absent from both first-class and deferred reachabi
   assert.doesNotMatch(catalog, new RegExp(`\\b${CATALOG_ONLY_WHEN_ON}\\b`));
 });
 
-test('execute-now work lets the primary model act without an agent-as-tool planning tax', async () => {
-  const direct = await withFlag('on', () => buildOrchestratorAgent({
+test('execute-now work stays direct while consequential turns retain confirm-first recovery', async () => {
+  const consequentialDirect = await withFlag('on', () => buildOrchestratorAgent({
     userInput: 'Create one disposable Netlify site, deploy the supplied sentinel page, and verify the live URL.',
     allowToolJit: true,
   }));
-  assert.equal(namesOf(direct).has('draft_plan'), false);
+  assert.equal(
+    namesOf(consequentialDirect).has('draft_plan'),
+    true,
+    'an irreversible action keeps the recovery capability available without invoking it',
+  );
 
-  const directBatch = await withFlag('on', () => buildOrchestratorAgent({
+  const naturalBatch = await withFlag('on', () => buildOrchestratorAgent({
+    userInput: 'Email everyone on the list.',
+    allowToolJit: true,
+  }));
+  assert.equal(
+    namesOf(naturalBatch).has('draft_plan'),
+    true,
+    'a natural uncounted send batch cannot lose the confirm-first recovery tool',
+  );
+
+  const safeAggregate = await withFlag('on', () => buildOrchestratorAgent({
     userInput: 'Research these 10 firms now, create the end-of-month report, and verify every result.',
     allowToolJit: true,
   }));
   assert.equal(
-    namesOf(directBatch).has('draft_plan'),
+    namesOf(safeAggregate).has('draft_plan'),
     false,
-    'multi-item execution uses worker topology, not a second planning model',
+    'read-only aggregate work keeps the lean direct surface and uses worker topology if useful',
   );
 
   const collaborative = await withFlag('on', () => buildOrchestratorAgent({
@@ -164,7 +178,7 @@ test('execute-now work lets the primary model act without an agent-as-tool plann
   assert.equal(namesOf(collaborative).has('draft_plan'), true);
 });
 
-test('old planning language does not tax a later direct execution turn', async () => {
+test('old planning language does not tax a later read-only turn', async () => {
   const session = createSession({ kind: 'chat' });
   appendEvent({
     sessionId: session.id,
@@ -175,7 +189,7 @@ test('old planning language does not tax a later direct execution turn', async (
   });
   const agent = await withFlag('on', () => buildOrchestratorAgent({
     sessionId: session.id,
-    userInput: 'Great, deploy the supplied page now and verify its live URL.',
+    userInput: 'Great, summarize the current live URL status.',
     allowToolJit: true,
   }));
   assert.equal(namesOf(agent).has('draft_plan'), false);

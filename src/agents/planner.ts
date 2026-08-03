@@ -326,7 +326,8 @@ export function buildPlannerTool(): Tool<RuntimeContextValue> {
     toolName: 'draft_plan',
     toolDescription: [
       'Draft a structured plan for multi-step work before executing it.',
-      'Use when the user\'s request is multi-step OR the path is not obvious from the message alone.',
+      'Use when the user explicitly asks to plan/compare, the path is genuinely unclear, or CONFIRM_FIRST_REQUIRED asks for a reviewed batch scope.',
+      'Do NOT call merely because a request contains many independent items; run_worker/workManifest own execution topology and the primary model should start that work directly.',
       'Do NOT use for trivial single-tool actions or read-only lookups.',
       'The planner is read-only — calling it does not mutate anything.',
       'Returns a JSON plan with objective, steps, successCriteria, risks, estimatedComplexity, recommendsTrackedExecution, needsUserInput, appliedInstructions (the standing instructions from memory this plan follows — surfaced to the user for review), and externalSends (the irreversible sends the plan will make, enumerated for the user to bless on approval).',

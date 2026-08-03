@@ -23,6 +23,7 @@ import {
   workerPacketMcpToolScope,
 } from './external-mcp-scope-lock.js';
 import { harnessInstructions } from './harness-context.js';
+import { classifyTurnIntent } from '../runtime/harness/turn-intent.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
@@ -922,8 +923,12 @@ export function recentPriorUserInputsForScope(
  * a capable orchestrator and does not benefit from paying an agent-as-tool
  * planning loop before work begins.
  *
- * Batch size is execution topology, not planning intent: run_worker/workManifest
- * already own it, while approvals and receipts remain at effect boundaries.
+ * Batch size is execution topology, not a reason to invoke the planner. Every
+ * consequential action turn still needs the tool structurally reachable:
+ * CONFIRM_FIRST_REQUIRED may ask the parent to open a reviewed scope after an
+ * irreversible-write threshold. Reuse the shared generic turn-intent signal
+ * instead of inventing an all/every/bulk prompt classifier here. Exposure is
+ * not invocation; the planner description keeps ordinary execution direct.
  * No-input construction keeps the tool for autonomous/compatibility callers.
  */
 export function shouldExposePlannerTool(
@@ -941,7 +946,7 @@ export function shouldExposePlannerTool(
     || /\b(?:how|what) (?:should|would|could) (?:we|i|you)\b/.test(text)
     || /\b(?:do not|don't|dont|without) (?:start|execute|build|change|write|send|deploy)\b/.test(text)
   ) return true;
-  return false;
+  return classifyTurnIntent(current) === 'action';
 }
 
 /**
