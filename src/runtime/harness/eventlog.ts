@@ -9,6 +9,7 @@ import { mirrorEventToOperational } from './eventlog-operational-mirror.js';
 import { AUDIT_MIRRORED_EVENT_TYPES, appendAuditRecord } from '../audit-ledger.js';
 import { projectHarnessEventForPublic } from './public-presentation.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
+import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 
 /**
  * Event log — the spine of the 0.3 harness.
@@ -3594,6 +3595,92 @@ function durableReturnExplicitOk(returned: EventRow): boolean | null {
   return null;
 }
 
+const DERIVED_TOOL_OUTPUT_READERS = ['recall_tool_result', 'tool_output_query'] as const;
+const DERIVED_READER_AUTHORITY_REASON =
+  'derived tool-output reader is presentation-only and has no independent evidence authority';
+
+type LegacyCallToolTarget =
+  | { status: 'ok'; name: string }
+  | { status: 'invalid' };
+
+/** Before effectiveTool was durable, call_tool's only inner-identity record was
+ *  its bounded raw argument preview. Accept that legacy evidence only when the
+ *  complete outer schema and inner JSON object are both exact. A clipped,
+ *  malformed, recursive, or widened carrier has no safe authority identity. */
+function legacyCallToolTarget(call: EventRow): LegacyCallToolTarget {
+  let parsed: unknown = call.data.arguments;
+  if (typeof parsed === 'string') {
+    const raw = parsed.trim();
+    if (!raw.startsWith('{') || !raw.endsWith('}')) return { status: 'invalid' };
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      return { status: 'invalid' };
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { status: 'invalid' };
+  const input = parsed as Record<string, unknown>;
+  const keys = Object.keys(input).sort();
+  if (keys.length !== 2 || keys[0] !== 'args_json' || keys[1] !== 'name') return { status: 'invalid' };
+  if (typeof input.name !== 'string' || typeof input.args_json !== 'string') return { status: 'invalid' };
+  const name = input.name.trim();
+  if (
+    !name
+    || name.length > 256
+    || !/^[A-Za-z0-9][A-Za-z0-9_.:/-]*$/.test(name)
+    || isPlainOrClementineLocalTool(name, 'call_tool')
+  ) return { status: 'invalid' };
+  try {
+    // The live carrier treats an empty string as `{}` for no-argument tools;
+    // mirror that exact legacy dispatch contract instead of dropping a genuine
+    // provider read solely because its serialized args were empty.
+    const rawArgs = input.args_json.trim();
+    const args = rawArgs ? JSON.parse(rawArgs) as unknown : {};
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return { status: 'invalid' };
+  } catch {
+    return { status: 'invalid' };
+  }
+  return { status: 'ok', name };
+}
+
+/** These readers render bytes from another tool occurrence for the model. Their
+ *  response also contains harness-generated headers and model-selected query
+ *  fields/offsets, so it is presentation state rather than a second independent
+ *  provider observation. The original producer call remains the authority. */
+function derivedToolOutputReaderFailureReason(
+  record: ToolOutputRecord,
+  occurrence: DurableToolOutputOccurrence | null,
+): string | null {
+  // Current lifecycle rows persist the transport-normalized inner identity on
+  // both call and return. Prefer that parity-verified identity before looking
+  // at the outer producer name: Claude records some foreign MCP tools under
+  // their tail (for example `recall_tool_result`) while retaining the foreign
+  // namespace only in `effectiveTool`.
+  const effectiveTool = occurrence
+    ? authorityEventString(occurrence.call, 'effectiveTool')
+    : '';
+  if (effectiveTool) {
+    return DERIVED_TOOL_OUTPUT_READERS.some((tool) =>
+      isPlainOrClementineLocalTool(effectiveTool, tool)
+    ) ? DERIVED_READER_AUTHORITY_REASON : null;
+  }
+  const producer = occurrence?.tool || record.tool || '';
+  if (DERIVED_TOOL_OUTPUT_READERS.some((tool) =>
+    isPlainOrClementineLocalTool(producer, tool)
+  )) return DERIVED_READER_AUTHORITY_REASON;
+  // A generic discovery carrier inherits this policy only from the compact
+  // identity that was persisted on BOTH sides of its durable lifecycle. A
+  // foreign MCP tool with the same tail is deliberately not shadowed.
+  if (!occurrence || !isPlainOrClementineLocalTool(producer, 'call_tool')) return null;
+  const legacyTarget = legacyCallToolTarget(occurrence.call);
+  if (legacyTarget.status !== 'ok') {
+    return 'legacy call_tool output lacks durable effective identity and exact well-formed arguments';
+  }
+  return DERIVED_TOOL_OUTPUT_READERS.some((tool) =>
+    isPlainOrClementineLocalTool(legacyTarget.name, tool)
+  ) ? DERIVED_READER_AUTHORITY_REASON : null;
+}
+
 function authorityOutputFailureReason(
   record: ToolOutputRecord,
   occurrence: DurableToolOutputOccurrence | null,
@@ -3602,6 +3689,8 @@ function authorityOutputFailureReason(
   if (!toolOutputLooksSuccessful(record.output, occurrence?.explicitOk ?? undefined)) {
     return 'stored tool output is failure-shaped';
   }
+  const derivedReaderReason = derivedToolOutputReaderFailureReason(record, occurrence);
+  if (derivedReaderReason) return derivedReaderReason;
   return null;
 }
 

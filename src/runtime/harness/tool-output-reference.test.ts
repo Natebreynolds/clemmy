@@ -155,6 +155,37 @@ test('fail-closed: provider request echoes are not grounded $fromToolOutput valu
   assert.match(out.errors[0], /resolved to nothing/i);
 });
 
+test('fail-closed: a derived reader call cannot replace the original source authority', () => {
+  const providerOutput = JSON.stringify({ records: [{ Email: 'provider-returned@example.com' }] });
+  writeTrustedOutput({
+    callId: 'original-read',
+    invocationNonce: 'nonce-original-read',
+    tool: 'provider_search',
+    output: providerOutput,
+    effect: 'read',
+  });
+  writeTrustedOutput({
+    callId: 'query-rendering',
+    invocationNonce: 'nonce-query-rendering',
+    tool: 'tool_output_query',
+    output: providerOutput,
+    effect: 'read',
+  });
+
+  const derived = resolveToolOutputReferences(S, {
+    to: { $fromToolOutput: { callId: 'query-rendering', path: 'records[*].Email' } },
+  });
+  assert.equal(derived.errors.length, 1);
+  assert.match(derived.errors[0], /not a trusted read\/compute result/);
+  assert.equal((derived.resolved as { to?: unknown }).to, undefined);
+
+  const original = resolveToolOutputReferences(S, {
+    to: { $fromToolOutput: { callId: 'original-read', path: 'records[*].Email' } },
+  });
+  assert.deepEqual(original.errors, []);
+  assert.deepEqual((original.resolved as { to: string[] }).to, ['provider-returned@example.com']);
+});
+
 // ---------- pass-through + detection ----------
 
 test('non-reference args pass through unchanged; detection works', () => {

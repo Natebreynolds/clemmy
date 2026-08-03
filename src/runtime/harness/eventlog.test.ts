@@ -1490,6 +1490,191 @@ test('authority resolution requires effective identity parity across a lifecycle
   assert.equal(resolveToolOutputForAuthority(sess.id, 'one-sided-effective').status, 'ambiguous');
 });
 
+test('authority resolution keeps tool-output readers presentation-only without shadowing original reads', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const addOccurrence = (
+    callId: string,
+    tool: string,
+    output: string,
+    effectiveTool?: string,
+  ) => {
+    const called = appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'executor',
+      type: 'tool_called',
+      data: { callId, tool, effect: 'read', ...(effectiveTool ? { effectiveTool } : {}) },
+    });
+    writeToolOutput({
+      sessionId: sess.id,
+      callId,
+      invocationNonce: `nonce-${callId}`,
+      tool,
+      output,
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'executor',
+      type: 'tool_returned',
+      parentEventId: called.id,
+      data: { callId, tool, effect: 'read', ok: true, ...(effectiveTool ? { effectiveTool } : {}) },
+    });
+  };
+
+  addOccurrence('source-read', 'provider_search', '{"records":[{"email":"real@example.com"}]}');
+  addOccurrence('direct-recall', 'recall_tool_result', 'Recalled chars 24601–24650 of 50000\n\nprovider bytes');
+  addOccurrence(
+    'claude-local-tail',
+    'recall_tool_result',
+    'Recalled chars 0–100 of 100',
+    'recall_tool_result',
+  );
+  addOccurrence(
+    'claude-foreign-tail',
+    'recall_tool_result',
+    '{"records":[{"email":"foreign-claude@example.com"}]}',
+    'third_party__recall_tool_result',
+  );
+  addOccurrence('direct-query', 'tool_output_query', 'None of ["model-authored@example.com"] exist on these records.');
+  addOccurrence(
+    'local-query',
+    'mcp__clementine-local__tool_output_query',
+    'Showing 50 records [1234–1284] of 5000 matching',
+    'tool_output_query',
+  );
+  addOccurrence(
+    'carrier-recall',
+    'call_tool',
+    'Recalled chars 0–100 of 100',
+    'recall_tool_result',
+  );
+  addOccurrence(
+    'foreign-lookalike',
+    'mcp__third_party__recall_tool_result',
+    '{"records":[{"email":"foreign-provider@example.com"}]}',
+    'third_party__recall_tool_result',
+  );
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'detached-recall',
+    invocationNonce: 'nonce-detached-recall',
+    tool: 'recall_tool_result',
+    output: 'Recalled chars 0–100 of 100',
+  });
+
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'source-read').status, 'ok');
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'foreign-lookalike').status, 'ok');
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'claude-foreign-tail').status, 'ok');
+  for (const callId of [
+    'direct-recall',
+    'claude-local-tail',
+    'direct-query',
+    'local-query',
+    'carrier-recall',
+    'detached-recall',
+  ]) {
+    const resolution = resolveToolOutputForAuthority(sess.id, callId);
+    assert.equal(resolution.status, 'failed', `${callId} must not acquire independent authority`);
+    if (resolution.status !== 'failed') assert.fail(`expected ${callId} to fail authority resolution`);
+    assert.match(resolution.reason, /presentation-only/);
+  }
+});
+
+test('legacy authority rejects nonce-less readers and resolves only exact call_tool identities', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const addLegacyOccurrence = (
+    callId: string,
+    tool: string,
+    output: string,
+    args?: unknown,
+  ) => {
+    const called = appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'executor',
+      type: 'tool_called',
+      data: { callId, tool, effect: 'read', ...(args !== undefined ? { arguments: args } : {}) },
+    });
+    writeToolOutput({ sessionId: sess.id, callId, tool, output });
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'executor',
+      type: 'tool_returned',
+      parentEventId: called.id,
+      data: { callId, tool, effect: 'read', ok: true },
+    });
+  };
+  const carrierArgs = (name: string) => JSON.stringify({ name, args_json: '{}' });
+
+  addLegacyOccurrence('legacy-direct-recall', 'recall_tool_result', 'Recalled chars 0–100 of 100');
+  addLegacyOccurrence(
+    'legacy-carrier-query',
+    'call_tool',
+    'Showing 50 records [1200–1250] of 5000 matching',
+    carrierArgs('tool_output_query'),
+  );
+  addLegacyOccurrence(
+    'legacy-carrier-local-recall',
+    'call_tool',
+    'Recalled chars 0–100 of 100',
+    carrierArgs('mcp__clementine-local__recall_tool_result'),
+  );
+  addLegacyOccurrence(
+    'legacy-carrier-provider',
+    'call_tool',
+    '{"records":[{"email":"provider@example.com"}]}',
+    carrierArgs('provider_search'),
+  );
+  addLegacyOccurrence(
+    'legacy-carrier-provider-empty-args',
+    'call_tool',
+    '{"records":[{"email":"provider-empty@example.com"}]}',
+    JSON.stringify({ name: 'provider_status', args_json: '' }),
+  );
+  addLegacyOccurrence(
+    'legacy-carrier-foreign-lookalike',
+    'call_tool',
+    '{"records":[{"email":"foreign@example.com"}]}',
+    carrierArgs('mcp__third_party__recall_tool_result'),
+  );
+  addLegacyOccurrence(
+    'legacy-carrier-clipped',
+    'call_tool',
+    'Recalled chars 0–100 of 100',
+    '{"name":"recall_tool_result","args_json":"{}"…[preview clipped]',
+  );
+  addLegacyOccurrence(
+    'legacy-carrier-widened',
+    'call_tool',
+    'Recalled chars 0–100 of 100',
+    JSON.stringify({ name: 'recall_tool_result', args_json: '{}', target: 'provider_search' }),
+  );
+
+  for (const callId of [
+    'legacy-direct-recall',
+    'legacy-carrier-query',
+    'legacy-carrier-local-recall',
+  ]) {
+    const resolution = resolveToolOutputForAuthority(sess.id, callId);
+    assert.equal(resolution.status, 'failed', `${callId} must remain presentation-only`);
+    if (resolution.status !== 'failed') assert.fail(`expected ${callId} to fail authority resolution`);
+    assert.match(resolution.reason, /presentation-only/);
+  }
+  for (const callId of ['legacy-carrier-clipped', 'legacy-carrier-widened']) {
+    const resolution = resolveToolOutputForAuthority(sess.id, callId);
+    assert.equal(resolution.status, 'failed', `${callId} cannot prove a legacy carrier identity`);
+    if (resolution.status !== 'failed') assert.fail(`expected ${callId} to fail authority resolution`);
+    assert.match(resolution.reason, /lacks durable effective identity/);
+  }
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'legacy-carrier-provider').status, 'ok');
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'legacy-carrier-provider-empty-args').status, 'ok');
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'legacy-carrier-foreign-lookalike').status, 'ok');
+});
+
 test('authority resolution rejects an exact read whose lifecycle or provider envelope failed', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

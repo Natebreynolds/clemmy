@@ -17,6 +17,7 @@ import {
   openEventLog,
   recentToolOutputs,
   resolveToolOutputForAuthority,
+  resolveToolOutputsForAuthority,
   searchToolOutputs,
   type AppendEventInput,
   type EventRow,
@@ -5125,8 +5126,9 @@ async function runConversationCore(
       // run ever OBSERVED gets ONE advisory bounce — verify it however fits,
       // or say plainly what's real. Structural only: no provider rules, no
       // verification recipes (owner directive — rigidity here is the old
-      // rabbit hole). Evidence = the session's lossless tool outputs + call
-      // args, searched per-pointer so long sessions stay cheap.
+      // rabbit hole). Evidence candidates come from the session's lossless
+      // tool-output index, searched per-pointer so long sessions stay cheap;
+      // only exact successful READ/COMPUTE occurrences may ground the claim.
       if (
         !claimGroundingNudged
         && decision.nextAction === 'completed'
@@ -5142,19 +5144,20 @@ async function runConversationCore(
             // against — "did you do any work at all" is the objective judge's
             // question, not this one's. Mirrors the figures judge's
             // no-captures allow.
-            if (recentToolOutputs(options.sessionId, { limit: 1 }).length === 0) return null;
-            const evidence: string[] = [];
+            const recentCandidates = recentToolOutputs(options.sessionId, { limit: 10 });
+            if (recentCandidates.length === 0) return null;
+            const candidates: Array<{ callId: string }> = [];
             for (const pointer of pointers) {
               for (const row of searchToolOutputs(options.sessionId, [pointer.searchTerm], { limit: 4 })) {
-                evidence.push(row.output);
+                candidates.push(row);
               }
             }
-            for (const row of recentToolOutputs(options.sessionId, { limit: 10 })) evidence.push(row.output);
-            try {
-              for (const ev of listEvents(options.sessionId, { types: ['tool_called'], desc: true, limit: 40 })) {
-                evidence.push(JSON.stringify(ev.data ?? {}));
-              }
-            } catch { /* args are supplementary evidence */ }
+            candidates.push(...recentCandidates);
+            const evidence = resolveToolOutputsForAuthority(
+              options.sessionId,
+              candidates,
+              { readOrComputeOnly: true },
+            ).map((row) => row.output);
             return claimGroundingNudge(ungroundedPointers(pointers, evidence));
           } catch { return null; }
         })();

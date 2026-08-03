@@ -140,3 +140,31 @@ test('structured request echoes are pruned from an otherwise successful provider
   assert.doesNotMatch(source.text, /echo-only@example\.com/);
   assert.match(source.text, /returned@example\.com/);
 });
+
+test('derived recall/query renderings cannot launder model-selected fields or offsets into authority', () => {
+  addToolOutput(
+    'original-provider-read',
+    'provider_search',
+    'read',
+    JSON.stringify({ records: [{ email: 'returned@example.com', amount: 700 }] }),
+  );
+  addToolOutput(
+    'derived-recall',
+    'recall_tool_result',
+    'read',
+    'Recalled chars 24601–25301 of 50000\n\nreturned@example.com amount 700',
+  );
+  addToolOutput(
+    'derived-query',
+    'tool_output_query',
+    'read',
+    'None of ["model-authored@example.com"] exist on these records. Showing 50 records [1234–1284].',
+  );
+
+  const sources = gatherTrustedEvidence(S);
+  const ids = sources.map((source) => source.id);
+  assert.ok(ids.includes('original-provider-read'), 'the original provider observation remains authority');
+  assert.ok(!ids.includes('derived-recall'), 'recall presentation is excluded');
+  assert.ok(!ids.includes('derived-query'), 'query presentation is excluded');
+  assert.doesNotMatch(sources.map((source) => source.text).join('\n'), /model-authored@example\.com|24601|1234/);
+});

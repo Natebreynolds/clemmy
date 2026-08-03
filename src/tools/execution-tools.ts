@@ -7,7 +7,7 @@ import { textResult } from './shared.js';
 import type { ExecutionRecord } from '../types.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { recentExecutionToolEvidence } from '../execution/completion-evidence.js';
-import { appendEvent, listEvents, listToolOutputInvocations } from '../runtime/harness/eventlog.js';
+import { appendEvent, listEvents, resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
 import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
 import { toolOutputLooksSuccessful } from '../runtime/harness/tool-evidence.js';
 import {
@@ -423,19 +423,37 @@ function reconcileExternalWriteUnlocked(input: {
     duplicateIdentityKeys?: unknown;
     correlationFingerprint?: unknown;
   };
-  const evidenceInvocations = listToolOutputInvocations(
+  const evidenceResolution = resolveToolOutputForAuthority(
     input.execution.sessionId,
     input.evidenceCallId,
   );
-  if (evidenceInvocations.length === 0) {
+  if (evidenceResolution.status === 'missing') {
     return `Reconciliation refused: evidence call ${input.evidenceCallId} has no exact invocation-scoped output. `
       + 'Run the read-only check again, then pass its new exact call id.';
   }
-  if (evidenceInvocations.length > 1) {
-    return `Reconciliation refused: evidence call id ${input.evidenceCallId} was reused by ${evidenceInvocations.length} invocations. `
+  if (evidenceResolution.status === 'ambiguous') {
+    return `Reconciliation refused: evidence call id ${input.evidenceCallId} does not identify one exact successful lifecycle (${evidenceResolution.invocationCount} candidate invocation(s)). `
       + 'Run one fresh read with a unique call id; Clementine will not choose between stale and current bytes.';
   }
-  const evidence = evidenceInvocations[0];
+  if (evidenceResolution.status === 'failed') {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} is not successful authority (${evidenceResolution.reason}). `
+      + 'Run the read-only check again, then pass its new exact call id.';
+  }
+  if (evidenceResolution.source !== 'exact') {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} is legacy presentation state, not one exact invocation. `
+      + 'Run the read-only check again, then pass its new exact call id.';
+  }
+  if (evidenceResolution.effect !== 'read') {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} is not a successful, parented provider read.`;
+  }
+  const evidence = evidenceResolution.record;
+  const evidenceInvocationNonce = (
+    evidence as typeof evidence & { invocationNonce?: unknown }
+  ).invocationNonce;
+  if (typeof evidenceInvocationNonce !== 'string' || !evidenceInvocationNonce.trim()) {
+    return `Reconciliation refused: evidence call ${input.evidenceCallId} has no exact invocation identity. `
+      + 'Run the read-only check again, then pass its new exact call id.';
+  }
   if (!evidence.output?.trim() || evidence.truncatedAtWrite) {
     return `Reconciliation refused: evidence call ${input.evidenceCallId} has no complete exact output in this session. `
       + 'Run a narrower read-only check, then pass its exact call id.';
@@ -507,7 +525,7 @@ function reconcileExternalWriteUnlocked(input: {
         ? { settlementKey: `external-write:${attempt.id}` }
         : {}),
       evidenceCallId: input.evidenceCallId,
-      evidenceInvocationNonce: evidence.invocationNonce,
+      evidenceInvocationNonce,
       evidenceSha256: createHash('sha256').update(evidence.output).digest('hex'),
       evidenceToolName: evidenceCall.toolName,
       reconciledBy: 'execution_reconcile_write',

@@ -124,6 +124,48 @@ function seedArtifactVerification(sessionId: string, callId: string, resourceId:
     data: { callId, tool: 'fixture_provider_get', effect: 'read', result: 'stored separately' },
   });
 }
+
+function seedClaimGroundingOutput(input: {
+  sessionId: string;
+  callId: string;
+  tool: string;
+  output: string;
+  ok?: boolean;
+  argumentsJson?: string;
+}): void {
+  const called = appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: {
+      callId: input.callId,
+      tool: input.tool,
+      effect: 'read',
+      ...(input.argumentsJson ? { arguments: input.argumentsJson } : {}),
+    },
+  });
+  writeToolOutput({
+    sessionId: input.sessionId,
+    callId: input.callId,
+    invocationNonce: `nonce-${input.callId}`,
+    tool: input.tool,
+    output: input.output,
+  });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      callId: input.callId,
+      tool: input.tool,
+      effect: 'read',
+      ok: input.ok ?? true,
+    },
+  });
+}
 const { _setCodeModeToolsForTests } = await import('../../tools/code-mode-tool.js');
 
 test.after(() => {
@@ -2411,6 +2453,167 @@ function scriptedRunner(turns: ScriptedTurn[]): RunRunnerFn {
     };
   };
 }
+
+test('claim grounding: recall/query presentation fields cannot launder an invented URL or path', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const claimedUrl = 'https://invented-query.example/reports/final';
+  const claimedPath = '/tmp/invented-query/final.html';
+
+  seedClaimGroundingOutput({
+    sessionId: sess.id,
+    callId: 'claim-derived-query',
+    tool: 'tool_output_query',
+    argumentsJson: JSON.stringify({
+      fields: ['url', 'path'],
+      filter: { pointer: claimedUrl },
+    }),
+    output: `Showing model-selected fields url,path for filter pointer=${claimedUrl}`,
+  });
+  seedClaimGroundingOutput({
+    sessionId: sess.id,
+    callId: 'claim-derived-recall',
+    tool: 'recall_tool_result',
+    argumentsJson: JSON.stringify({ call_id: 'some-source', pointer: claimedPath }),
+    output: `Recalled chars 1000–1200 of 5000\n\nCached artifact: ${claimedPath}`,
+  });
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Give me the verified report location.',
+    makeRunner: makeRunnerStub,
+    runRunner: scriptedRunner([
+      {
+        finalOutput: {
+          summary: 'Reported the deliverable locations.',
+          reply: `The report is live at ${claimedUrl} and saved at ${claimedPath}.`,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      },
+      {
+        finalOutput: {
+          summary: 'Corrected the unsupported handoff.',
+          reply: 'I could not verify a live report location, so I am not handing one over as real.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      },
+    ]),
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 2, 'presentation-only recall/query bytes must trigger one verification bounce');
+  const nudges = listEventsForConv(sess.id, { types: ['guardrail_tripped'] })
+    .filter((event) => event.data.kind === 'claim_grounding_nudge');
+  assert.equal(nudges.length, 1);
+  const completion = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.doesNotMatch(String(completion.data.reply ?? completion.data.summary ?? ''), /invented-query/);
+});
+
+test('claim grounding: failed and no-output calls cannot ground model-authored pointer args', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const claimedUrl = 'https://failed-call-arg.example/deliverable';
+
+  seedClaimGroundingOutput({
+    sessionId: sess.id,
+    callId: 'claim-failed-read',
+    tool: 'provider_get',
+    argumentsJson: JSON.stringify({ url: claimedUrl }),
+    output: '{"error":"provider request timed out before returning a record"}',
+    ok: false,
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: {
+      callId: 'claim-no-output',
+      tool: 'provider_search',
+      effect: 'read',
+      arguments: JSON.stringify({ filter: { pointer: claimedUrl } }),
+    },
+  });
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Return the verified deliverable URL.',
+    makeRunner: makeRunnerStub,
+    runRunner: scriptedRunner([
+      {
+        finalOutput: {
+          summary: 'Returned the requested URL.',
+          reply: `Verified: ${claimedUrl}`,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      },
+      {
+        finalOutput: {
+          summary: 'Reported the failed verification honestly.',
+          reply: 'The provider did not return a verified deliverable URL.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      },
+    ]),
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 2, 'request args without a successful authoritative output are never observations');
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data.kind === 'claim_grounding_nudge').length,
+    1,
+  );
+});
+
+test('claim grounding: exact successful provider output grounds its returned pointer', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const claimedUrl = 'https://provider-observed.example/reports/final';
+  seedClaimGroundingOutput({
+    sessionId: sess.id,
+    callId: 'claim-authoritative-read',
+    tool: 'provider_get',
+    argumentsJson: JSON.stringify({ report: 'final' }),
+    output: JSON.stringify({ report: { status: 'ready', url: claimedUrl } }),
+  });
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Return the verified deliverable URL.',
+    makeRunner: makeRunnerStub,
+    runRunner: scriptedRunner([
+      {
+        finalOutput: {
+          summary: 'Returned the provider-observed URL.',
+          reply: `The verified report is at ${claimedUrl}`,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      },
+    ]),
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1, 'an exact successful read needs no claim-grounding retry');
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data.kind === 'claim_grounding_nudge').length,
+    0,
+  );
+});
 
 test('standard lane parks unresolved provider artifacts and carries exact pending evidence in the typed terminal', async () => {
   resetEventLog();
