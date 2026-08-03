@@ -443,12 +443,33 @@ function releaseDeletionGuard(guard: FileLockDeletionGuard): void {
   removeUniqueDeletionGuardMarker(guard.path);
 }
 
+/**
+ * Reap a stale lock AND take its place in one atomic step.
+ *
+ * Unlinking and then re-racing `openSync(wx)` looks equivalent and is not. The
+ * deletion guard serialises REAPERS against each other; an ordinary contender
+ * never touches it and simply spins on the lock path. So a reaper that unlinks
+ * and returns hands the freed lock to whoever happens to hit the syscall next —
+ * having paid the entire cost of validating and clearing it.
+ *
+ * That is exactly what the live-deletion-guard test observed: the process that
+ * cleared the stale lock was overtaken by one that arrived 1.25 seconds later,
+ * and only got in after that latecomer finished. Mutual exclusion was never at
+ * risk; the ordering guarantee was.
+ *
+ * Replacing by rename closes the window entirely rather than narrowing it. The
+ * stale file is known to exist and to be unchanged, so no contender can hold it
+ * — `openSync(wx)` fails against an existing path — and one `rename` swaps our
+ * lock in without ever exposing an unlocked instant.
+ *
+ * Returns the claimed lease, or null when this reaper did not do the reaping.
+ */
 function tryReapStaleFileLock(
   lockPath: string,
   observed: FileLockSnapshot,
-): void {
+): FileLockLease | null {
   const guard = tryAcquireDeletionGuard(lockPath);
-  if (!guard) return;
+  if (!guard) return null;
   try {
     const current = readFileLockSnapshot(lockPath);
     const currentOwnerPid = current ? lockOwnerPid(current.ownerToken) : null;
@@ -463,13 +484,49 @@ function tryReapStaleFileLock(
       || !sameFileGeneration(observed, current)
       || !currentIsStillStale
       || !deletionGuardStillOwned(guard)
-    ) return;
+    ) return null;
     waitAfterDeletionGuardValidationForTest();
-    unlinkSync(lockPath);
+    return replaceStaleFileLock(lockPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    return null;
   } finally {
     releaseDeletionGuard(guard);
+  }
+}
+
+/**
+ * Swap our own lock in over a validated stale one, atomically.
+ *
+ * The replacement is written and fsynced at a private path first, so the rename
+ * publishes a lock that is already durable. On any failure the stale lock is
+ * removed anyway — leaving it in place would strand every future contender,
+ * which is worse than losing our turn.
+ */
+function replaceStaleFileLock(lockPath: string): FileLockLease | null {
+  const ownerToken = createOwnerToken();
+  const stagingPath = `${lockPath}.reap.${randomUUID()}`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(stagingPath, 'wx');
+    writeFileSync(fd, ownerToken, 'utf-8');
+    fsyncSync(fd);
+    // Stat the descriptor, not the path: after the rename this inode IS the
+    // lock, and the generation checks every other holder relies on compare
+    // against exactly these numbers.
+    const stat = fstatSync(fd, { bigint: true });
+    closeSync(fd);
+    fd = undefined;
+    renameSync(stagingPath, lockPath);
+    return { ownerToken, dev: stat.dev, ino: stat.ino };
+  } catch {
+    // Fall back to the original behaviour rather than strand the lock: clear
+    // the stale file and let the ordinary contention path settle it.
+    try { unlinkSync(lockPath); } catch { /* already gone */ }
+    return null;
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* best effort */ } }
+    try { unlinkSync(stagingPath); } catch { /* renamed away or never created */ }
   }
 }
 
@@ -489,7 +546,10 @@ function tryAcquireFileLock(filePath: string): FileLockLease | null {
     const observed = readFileLockSnapshot(lockPath);
     if (observed && lockSnapshotIsStale(observed)) {
       waitAfterStaleLockObservationForTest();
-      tryReapStaleFileLock(lockPath, observed);
+      // The reaper takes the lock it just cleared. Returning null here would
+      // put it back at the end of the queue behind every waiting contender.
+      const claimed = tryReapStaleFileLock(lockPath, observed);
+      if (claimed) return claimed;
     }
     return null;
   } finally {
