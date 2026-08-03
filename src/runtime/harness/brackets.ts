@@ -1550,8 +1550,14 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
           // resolve to its canonical id; unit fixtures without a side-store row
           // keep using the event payload.
           const authorityOutput = resolveToolOutputForAuthority(sessionId, callId);
-          const full = authorityOutput.status === 'ok' ? authorityOutput.record.output : undefined;
-          discoveryResults.push(stripAnsi(full || joinedEventText(d?.result, d?.preview, d?.output)));
+          if (authorityOutput.status === 'ok') {
+            discoveryResults.push(stripAnsi(authorityOutput.record.output));
+          } else if (authorityOutput.status === 'missing') {
+            // Backward compatibility for pre-side-store fixture/legacy traces.
+            // Ambiguous, reused, or failed bytes are negative authority: their
+            // clipped event preview must not mint a deploy destination id.
+            discoveryResults.push(stripAnsi(joinedEventText(d?.result, d?.preview, d?.output)));
+          }
         }
         const names = createCallNames.get(callId);
         if (names) {

@@ -48,6 +48,7 @@ const {
   OrphanedWriteRetryError,
   _setBeforeSharedWriteAdmissionForTests,
   _setAfterSharedWriteReservationForTests,
+  buildPublishProvenance,
 } = await import('./brackets.js');
 
 test.after(() => {
@@ -2012,6 +2013,93 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
     process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
     if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
   }
+});
+
+test('publish provenance never falls back to ambiguous or failed discovery previews', () => {
+  resetEventLog();
+  const listing = JSON.stringify([{
+    id: 'site_stale_preview',
+    name: 'fixture-reused-destination',
+    ssl_url: 'https://fixture-reused-destination.netlify.app',
+  }]);
+  const addDiscoveryOccurrence = (
+    sessionId: string,
+    callId: string,
+    nonce: string,
+    output: string,
+    returned: Record<string, unknown>,
+  ) => {
+    const called = appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'tool',
+      type: 'tool_called',
+      data: {
+        tool: 'run_shell_command',
+        callId,
+        effect: 'read',
+        args: { command: 'netlify sites:list --json' },
+      },
+    });
+    writeToolOutput({
+      sessionId,
+      callId,
+      invocationNonce: nonce,
+      tool: 'run_shell_command',
+      output,
+    });
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'tool',
+      type: 'tool_returned',
+      parentEventId: called.id,
+      data: {
+        tool: 'run_shell_command',
+        callId,
+        effect: 'read',
+        preview: listing,
+        ...returned,
+      },
+    });
+  };
+
+  const reused = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: reused.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Deploy to fixture-reused-destination.netlify.app.' },
+  });
+  addDiscoveryOccurrence(reused.id, 'reused-discovery', 'nonce-old', listing, { ok: true });
+  addDiscoveryOccurrence(reused.id, 'reused-discovery', 'nonce-new', '[]', { ok: true });
+  assert.equal(
+    buildPublishProvenance(reused.id)('site_stale_preview'),
+    false,
+    'a reused discovery id cannot mint a destination from either clipped preview',
+  );
+
+  const failed = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: failed.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Deploy to fixture-reused-destination.netlify.app.' },
+  });
+  addDiscoveryOccurrence(
+    failed.id,
+    'failed-discovery',
+    'nonce-failed',
+    JSON.stringify({ successful: false, error: 'provider unavailable' }),
+    { ok: false },
+  );
+  assert.equal(
+    buildPublishProvenance(failed.id)('site_stale_preview'),
+    false,
+    'a failed discovery lifecycle cannot mint a destination from its event preview',
+  );
 });
 
 test('destination gate: a PROD ambient publish HARD-blocks every attempt until explicit; a DRAFT ambient publish is a one-shot nudge (2026-06-14 Test-5 fix)', async () => {
