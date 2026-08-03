@@ -28,6 +28,7 @@ const {
   isSpaceSession,
   isContinuationDirective,
   stripBackgroundPrefix,
+  durableExecutionDecision,
   shouldPromoteToDurable,
   enqueueDurableChatTask,
   renderDurableTaskQueued,
@@ -109,8 +110,15 @@ test('shouldPromoteToDurable requires intent AND a non-empty instruction', () =>
   assert.equal(shouldPromoteToDurable('move this to the background. Read the workspace files.'), true);
   assert.equal(shouldPromoteToDurable('Live validation only: move this to the background. Read the top-level files.'), true);
   assert.equal(shouldPromoteToDurable('keep working until the audit is done'), true);
+  // An INFERRED pipeline no longer auto-dispatches. Shape is Clementine's
+  // guess; choosing to run unattended is the user's call. Naming the lane
+  // still promotes it immediately (asserted above and below).
   assert.equal(
     shouldPromoteToDurable('Pull all Salesforce leads, enrich them through Apify and Google reviews, then sync the cleaned records into Airtable.'),
+    false,
+  );
+  assert.equal(
+    shouldPromoteToDurable('Run this in the background: pull all Salesforce leads, enrich them through Apify, then sync into Airtable.'),
     true,
   );
   // A bare command with no task must NOT queue a content-free worker.
@@ -435,4 +443,52 @@ test('handoff objective prefers focus/session-title over a conversational uttera
     !/keep working on it here/i.test(resolved!.objective),
     'the conversational utterance never becomes the task name',
   );
+});
+
+test('an inferred pipeline asks first; a named lane still runs immediately', () => {
+  // The live 2026-08-03 request. It matched on service + verb keywords and
+  // dispatched instantly, never asking page 2 of what search, in which
+  // geography, what that ICP is, which metrics, or which sheet — then spent
+  // twenty minutes acting on five guesses.
+  const incident =
+    "Find me 10 personal injury firms that are on page 2 that would fit scorpion's ICP "
+    + "once you find them let's scrape some SEO data and then create a google sheet with all the data";
+
+  const inferred = durableExecutionDecision(incident);
+  assert.equal(inferred.lane, 'confirm', 'an inferred pipeline auto-dispatched again');
+  assert.equal(inferred.reason, 'inferred_pipeline_shape');
+  assert.equal(shouldPromoteToDurable(incident), false, 'the incident request still fires and forgets');
+
+  // The user naming the lane is an instruction, not an inference — honour it.
+  for (const named of [
+    `Run this in the background: ${incident}`,
+    `/background ${incident}`,
+    `${incident} — keep working until it's done`,
+  ]) {
+    const decision = durableExecutionDecision(named);
+    assert.equal(decision.lane, 'background', `a named lane was not honoured: ${named.slice(0, 40)}`);
+    assert.equal(shouldPromoteToDurable(named), true);
+  }
+});
+
+test('ordinary turns and explicit directives are unchanged', () => {
+  for (const plain of [
+    'what is on my calendar tomorrow',
+    'summarize this thread',
+    'build me a site',
+    'pull 5 salesforce accounts',
+  ]) {
+    assert.equal(durableExecutionDecision(plain).lane !== 'background', true, `${plain} auto-dispatched`);
+    assert.equal(shouldPromoteToDurable(plain), false);
+  }
+  assert.equal(durableExecutionDecision('/background build the site').lane, 'background');
+  assert.equal(durableExecutionDecision('keep working until the audit is done').lane, 'background');
+  // Empty instructions never queue a content-free worker.
+  for (const empty of ['/background', 'bg:', '  /bg   ']) {
+    assert.equal(durableExecutionDecision(empty).lane, 'foreground');
+  }
+  // A space session still requires the user to name the lane.
+  const space = { sessionId: 'space-james-english-pipeline' };
+  assert.equal(durableExecutionDecision('pull all salesforce leads and sync to airtable', space).lane, 'foreground');
+  assert.equal(durableExecutionDecision('/background pull all salesforce leads', space).lane, 'background');
 });

@@ -222,13 +222,88 @@ export function isSpaceSession(sessionId: string | undefined): boolean {
  * an explicit background directive ("/background", "run this in the background")
  * still promotes: the user owns the designation.
  */
-export function shouldPromoteToDurable(message: string, opts?: { sessionId?: string }): boolean {
-  if (stripBackgroundPrefix(message).trim().length === 0) return false;
-  if (isSpaceSession(opts?.sessionId)) {
-    const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
-    return hasExplicitBackgroundDirective(stripNegatedDurableIntent(lower));
+/**
+ * Which lane this request belongs in, and why.
+ *
+ * `background` — the user NAMED the lane. Their instruction, so it is followed.
+ * `confirm`    — this only LOOKS like an unattended pipeline. Clementine
+ *                inferred it; the user never asked for it.
+ * `foreground` — an ordinary turn.
+ *
+ * The distinction is the whole point. Inferring "multi-system data pipeline"
+ * from service and verb keywords is a guess about SHAPE, and it says nothing
+ * about whether the request is specified well enough to run unattended for
+ * twenty minutes. Live 2026-08-03: "find me 10 personal injury firms on page 2
+ * that fit scorpion's ICP, scrape SEO data, create a google sheet" matched on
+ * `seo` + `sheets` + `scrape`/`create` and dispatched instantly — never asking
+ * page 2 of what search, in which geography, what that ICP is, which metrics,
+ * or which sheet. Four unanswered questions, all guessed, twenty minutes spent
+ * before anyone could find out the guesses were wrong.
+ *
+ * Deciding to run unattended is the user's call to make, not an inference to
+ * act on. So an inferred pipeline no longer auto-dispatches: it stays in the
+ * conversation, where the ordinary turn can align first, and the user can still
+ * say "run that in the background" — which lands in `background` immediately.
+ */
+export type DurableExecutionLane = 'background' | 'confirm' | 'foreground';
+
+export interface DurableExecutionDecision {
+  lane: DurableExecutionLane;
+  /** Short, private rationale. Useful in telemetry; never shown as prose. */
+  reason: string;
+}
+
+export function durableExecutionDecision(
+  message: string,
+  opts?: { sessionId?: string },
+): DurableExecutionDecision {
+  if (stripBackgroundPrefix(message).trim().length === 0) {
+    return { lane: 'foreground', reason: 'empty_instruction' };
   }
-  return hasDurableExecutionIntent(message);
+  const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
+  const intentText = stripNegatedDurableIntent(lower);
+
+  // A space session has always required the user to name the lane explicitly.
+  if (isSpaceSession(opts?.sessionId)) {
+    return hasExplicitBackgroundDirective(intentText)
+      ? { lane: 'background', reason: 'explicit_directive' }
+      : { lane: 'foreground', reason: 'space_requires_explicit_directive' };
+  }
+
+  // The user named the lane — including the soft continuations ("keep working",
+  // "take your time"), which are still the user choosing to let it run long.
+  if (hasDurableExecutionIntentDirective(message)) {
+    return { lane: 'background', reason: 'explicit_directive' };
+  }
+
+  // Shape alone. Clementine's inference, not the user's instruction.
+  if (hasAutomaticDataPipelineShape(lower)) {
+    return { lane: 'confirm', reason: 'inferred_pipeline_shape' };
+  }
+
+  return { lane: 'foreground', reason: 'no_durable_intent' };
+}
+
+/**
+ * Only an explicitly-requested background job auto-dispatches.
+ *
+ * Callers treat `true` as "enqueue without asking", so an inferred pipeline
+ * must not return true here — that is exactly the fire-and-forget this fixes.
+ */
+export function shouldPromoteToDurable(message: string, opts?: { sessionId?: string }): boolean {
+  return durableExecutionDecision(message, opts).lane === 'background';
+}
+
+/** The directive half of `hasDurableExecutionIntent`, without the shape guess. */
+function hasDurableExecutionIntentDirective(message: string): boolean {
+  const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
+  const intentText = stripNegatedDurableIntent(lower);
+  const leadingDirective = intentText.slice(0, 400);
+  if (startsAsForegroundDiscussion(leadingDirective)) {
+    return hasDirectDurableDirective(leadingDirective);
+  }
+  if (hasForegroundWatchIntent(intentText)) return hasExplicitBackgroundDirective(intentText);
+  return hasDirectDurableDirective(intentText);
 }
 
 export interface EnqueueDurableChatTaskInput {
