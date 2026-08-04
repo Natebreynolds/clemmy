@@ -253,6 +253,52 @@ export function uncachedTokensForAccrual(event: {
     : Math.max(0, event.inputTokens ?? 0) + Math.max(0, event.outputTokens ?? 0);
 }
 
+export type CacheDialect = 'cache_inclusive' | 'cache_exclusive' | 'invalid';
+
+export interface NormalizedCacheAccounting {
+  dialect: CacheDialect;
+  /** Full prompt read by the model, cached + uncached, in ONE convention. */
+  promptTokens: number;
+  cachedReadTokens: number;
+  /** cachedReadTokens / promptTokens. Structurally within [0, 1]. */
+  hitRate: number;
+}
+
+/**
+ * Normalize the two cache-accounting dialects into one convention.
+ *
+ * OpenAI-style reporting is cache-INCLUSIVE: `inputTokens` already contains the
+ * cached subset, so `cached <= input` and the hit rate is `cached / input`.
+ * Anthropic-style reporting is cache-EXCLUSIVE: `inputTokens` counts only the
+ * uncached remainder, so cached can far exceed input — and summing the two
+ * dialects as though they were one is how the Stage 0 audit found a model
+ * aggregate whose cached tokens dwarfed its input tokens, and how a naive
+ * `cached / input` can certify a >100% hit rate.
+ *
+ * `cached > input` identifies the exclusive dialect deterministically — the
+ * same rule `uncachedTokensForAccrual` already relies on. A sample that is not
+ * arithmetically a token count (negative, NaN, non-finite) is `invalid`:
+ * certified rollups exclude it and count it, while its raw NDJSON record stays
+ * untouched for diagnosis. Pure.
+ */
+export function normalizeCacheAccounting(event: {
+  inputTokens?: number;
+  cachedInputTokens?: number;
+}): NormalizedCacheAccounting {
+  const input = event.inputTokens ?? 0;
+  const cached = event.cachedInputTokens ?? 0;
+  if (!Number.isFinite(input) || !Number.isFinite(cached) || input < 0 || cached < 0) {
+    return { dialect: 'invalid', promptTokens: 0, cachedReadTokens: 0, hitRate: 0 };
+  }
+  const promptTokens = cached > input ? input + cached : input;
+  return {
+    dialect: cached > input ? 'cache_exclusive' : 'cache_inclusive',
+    promptTokens,
+    cachedReadTokens: cached,
+    hitRate: promptTokens > 0 ? cached / promptTokens : 0,
+  };
+}
+
 export function recordModelUsage(args: {
   sessionId: string;
   channel?: string;
@@ -391,20 +437,37 @@ export interface UsageRollup {
   totalCalls: number;
   totalInputTokens: number;
   totalOutputTokens: number;
-  /** Cached-read input tokens across the window, and the derived hit-rate
-   *  (cachedInputTokens / inputTokens). The single largest economic lever —
-   *  segment via byKind below to read the INTERACTIVE-chat rate in isolation
-   *  (boot `warmup` traffic otherwise dominates and skews it). */
+  /** Cached-read input tokens across the window, and the derived hit-rate.
+   *  The rate is computed over DIALECT-NORMALIZED prompt tokens
+   *  (`normalizeCacheAccounting`), so it is structurally within [0, 1] — a
+   *  window mixing cache-inclusive (OpenAI) and cache-exclusive (Anthropic)
+   *  reporting can no longer certify an impossible >100% rate. Segment via
+   *  byKind below to read the INTERACTIVE-chat rate in isolation (boot
+   *  `warmup` traffic otherwise dominates and skews it). */
   totalCachedInputTokens: number;
+  /** Normalized full-prompt tokens (cached + uncached, one convention). */
+  totalPromptTokens: number;
   cacheHitRate: number;
-  /** Tokens grouped by `kind` (chat/cron/autonomy/...). `tokens`/`calls` are
-   *  unchanged; `inputTokens`/`cachedInputTokens` are additive so each kind's
-   *  cache-hit-rate is derivable (cachedInputTokens / inputTokens). */
-  byKind: Record<string, { tokens: number; calls: number; inputTokens: number; cachedInputTokens: number }>;
+  /** Samples excluded from certified token sums because their token fields are
+   *  not arithmetically token counts. Counted here, never hidden — the raw
+   *  NDJSON record is untouched for diagnosis. */
+  quarantinedCalls: number;
+  /** Tokens grouped by `kind` (chat/cron/autonomy/...). `promptTokens` is
+   *  dialect-normalized so each kind's hit-rate (cachedInputTokens /
+   *  promptTokens) is certified. `durationSamples`/`totalDurationMs` make
+   *  latency PRESENCE visible: a lane whose durationSamples < calls is a lane
+   *  whose latency cannot yet be trusted, which the Stage 0 audit found. */
+  byKind: Record<string, {
+    tokens: number; calls: number; inputTokens: number; cachedInputTokens: number;
+    promptTokens: number; durationSamples: number; totalDurationMs: number;
+  }>;
   /** Tokens grouped by `source`. Surfaces "cron:morning-briefing", "console:home", etc. */
   bySource: Array<{ source: string; tokens: number; calls: number; kind: string }>;
-  /** Tokens grouped by model. */
-  byModel: Record<string, { tokens: number; calls: number; inputTokens: number; cachedInputTokens: number }>;
+  /** Tokens grouped by model. `promptTokens` is dialect-normalized. */
+  byModel: Record<string, {
+    tokens: number; calls: number; inputTokens: number; cachedInputTokens: number;
+    promptTokens: number;
+  }>;
   /** Per-hour buckets for the chart (24 entries, 00:00–23:00, current day local time). */
   byHour: Array<{ hour: string; tokens: number; calls: number }>;
   /** When the underlying log was last updated. */
@@ -422,9 +485,17 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
   let totalCachedInputTokens = 0;
-  const byKind: Record<string, { tokens: number; calls: number; inputTokens: number; cachedInputTokens: number }> = {};
+  let totalPromptTokens = 0;
+  let quarantinedCalls = 0;
+  const byKind: Record<string, {
+    tokens: number; calls: number; inputTokens: number; cachedInputTokens: number;
+    promptTokens: number; durationSamples: number; totalDurationMs: number;
+  }> = {};
   const bySourceMap = new Map<string, { tokens: number; calls: number; kind: string }>();
-  const byModel: Record<string, { tokens: number; calls: number; inputTokens: number; cachedInputTokens: number }> = {};
+  const byModel: Record<string, {
+    tokens: number; calls: number; inputTokens: number; cachedInputTokens: number;
+    promptTokens: number;
+  }> = {};
   const hourBuckets = new Map<string, { tokens: number; calls: number }>();
   // Seed 24 hour buckets for the local day so the chart has stable x-axis.
   const dayStart = new Date(windowDate);
@@ -435,18 +506,36 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
   }
 
   for (const ev of events) {
+    const accounting = normalizeCacheAccounting(ev);
+    if (accounting.dialect === 'invalid') {
+      // Excluded from certified token sums, counted so it cannot hide, raw
+      // NDJSON record untouched for diagnosis.
+      quarantinedCalls += 1;
+      continue;
+    }
     totalTokens += ev.totalTokens;
     totalInputTokens += ev.inputTokens;
     totalOutputTokens += ev.outputTokens;
-    const cached = ev.cachedInputTokens ?? 0;
+    const cached = accounting.cachedReadTokens;
     totalCachedInputTokens += cached;
+    totalPromptTokens += accounting.promptTokens;
 
     const k = ev.kind || 'other';
-    if (!byKind[k]) byKind[k] = { tokens: 0, calls: 0, inputTokens: 0, cachedInputTokens: 0 };
+    if (!byKind[k]) {
+      byKind[k] = {
+        tokens: 0, calls: 0, inputTokens: 0, cachedInputTokens: 0,
+        promptTokens: 0, durationSamples: 0, totalDurationMs: 0,
+      };
+    }
     byKind[k].tokens += ev.totalTokens;
     byKind[k].calls += 1;
     byKind[k].inputTokens += ev.inputTokens;
     byKind[k].cachedInputTokens += cached;
+    byKind[k].promptTokens += accounting.promptTokens;
+    if (Number.isFinite(ev.durationMs) && (ev.durationMs ?? 0) > 0) {
+      byKind[k].durationSamples += 1;
+      byKind[k].totalDurationMs += ev.durationMs!;
+    }
 
     const srcKey = ev.source;
     const existing = bySourceMap.get(srcKey);
@@ -458,11 +547,14 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     }
 
     const m = ev.model || 'unknown';
-    if (!byModel[m]) byModel[m] = { tokens: 0, calls: 0, inputTokens: 0, cachedInputTokens: 0 };
+    if (!byModel[m]) {
+      byModel[m] = { tokens: 0, calls: 0, inputTokens: 0, cachedInputTokens: 0, promptTokens: 0 };
+    }
     byModel[m].tokens += ev.totalTokens;
     byModel[m].calls += 1;
     byModel[m].inputTokens += ev.inputTokens;
     byModel[m].cachedInputTokens += cached;
+    byModel[m].promptTokens += accounting.promptTokens;
 
     try {
       const ts = new Date(ev.at);
@@ -491,7 +583,10 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     totalInputTokens,
     totalOutputTokens,
     totalCachedInputTokens,
-    cacheHitRate: totalInputTokens > 0 ? totalCachedInputTokens / totalInputTokens : 0,
+    totalPromptTokens,
+    // Over normalized prompt tokens, so mixing dialects cannot exceed 1.
+    cacheHitRate: totalPromptTokens > 0 ? totalCachedInputTokens / totalPromptTokens : 0,
+    quarantinedCalls,
     byKind,
     bySource,
     byModel,

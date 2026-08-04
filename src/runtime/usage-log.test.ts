@@ -12,6 +12,7 @@ const {
   rollupUsage,
   classifyUsageKind,
   resolveUsageKind,
+  normalizeCacheAccounting,
   parseWorkflowSource,
   reconcilePromptComponents,
   uncachedTokensForAccrual,
@@ -136,15 +137,16 @@ test('uncachedTokensForAccrual handles BOTH metering dialects (2026-07-30: 8M gu
 // `other`, and the top sources were ordinary CHAT sessions — `sess-desktop-…`
 // minted by console-routes and `sess-…` ids the classifier had never heard of.
 // The efficiency readout therefore showed "no chat row despite recent chat".
-// These pins are the exact live shapes, so the readout can only lose its chat
-// row again by someone deleting a line here.
+// These pins use synthetic ids with the exact live SHAPES (the hygiene gate
+// rightly refuses real session identifiers in the public repo), so the readout
+// can only lose its chat row again by someone deleting a line here.
 
 test('the live incident shapes classify to their real lanes', () => {
-  // The two dominant `other` sources from the 2026-08-04 live log.
-  assert.equal(classifyUsageKind('sess-desktop-b435fdcfc4a14444191e526d'), 'chat');
-  assert.equal(classifyUsageKind('sess-msdprfg7-d517142a'), 'chat');
+  // The two dominant `other` shapes from the 2026-08-04 live log.
+  assert.equal(classifyUsageKind('sess-desktop-0123456789abcdef01234567'), 'chat');
+  assert.equal(classifyUsageKind('sess-abc0defg1-01234567'), 'chat');
   // The execution controller's sessions (54 live events).
-  assert.equal(classifyUsageKind('execution:565f6c1a-b98c-407c-887c:controller'), 'controller');
+  assert.equal(classifyUsageKind('execution:00000000-1111-2222-3333:controller'), 'controller');
   // Surfaces that existed in production but not in the classifier.
   assert.equal(classifyUsageKind('slack:C0123:thread'), 'chat');
   assert.equal(classifyUsageKind('mobile-4f2a'), 'chat');
@@ -159,7 +161,7 @@ test('the live incident shapes classify to their real lanes', () => {
 
 test('the durable session row outranks id-shape guessing', () => {
   // A session id no prefix rule recognizes, but whose row says what it is.
-  const fromRow = resolveUsageKind('f1a441dc-3435-4837-bd54', { sessionRowKind: 'chat' });
+  const fromRow = resolveUsageKind('01234567-89ab-cdef-0123', { sessionRowKind: 'chat' });
   assert.equal(fromRow.kind, 'chat');
   assert.equal(fromRow.reason, 'session_row:chat');
   assert.equal(resolveUsageKind('anything', { sessionRowKind: 'agent' }).kind, 'autonomy');
@@ -171,9 +173,9 @@ test('the durable session row outranks id-shape guessing', () => {
 });
 
 test('`other` always names what it could not classify', () => {
-  const r = resolveUsageKind('f1a441dc-3435-4837-bd54-c0fae2442773');
+  const r = resolveUsageKind('01234567-89ab-cdef-0123-456789abcdef');
   assert.equal(r.kind, 'other');
-  assert.match(r.reason, /^unclassified:f1a441dc$/);
+  assert.match(r.reason, /^unclassified:01234567$/);
   // Every classified lane carries a reason too — the residue is diagnosable,
   // and so is the classification itself.
   assert.equal(resolveUsageKind('sess-abc').reason, 'prefix:sess-');
@@ -194,5 +196,68 @@ test('every historical classification still holds', () => {
   assert.equal(classifyUsageKind('discord:guild'), 'chat');
   assert.equal(classifyUsageKind('x', 'electron'), 'chat');
   assert.equal(classifyUsageKind('x', 'cli'), 'chat');
+});
+
+// ── Stage 0: cache accounting cannot certify the impossible ─────────────────
+// The audit found a model aggregate whose cached tokens dwarfed its input
+// tokens: Anthropic-style reporting is cache-EXCLUSIVE (input counts only the
+// uncached remainder) while OpenAI-style is cache-INCLUSIVE, and summing the
+// two as one convention produced hit rates over 100%.
+
+test('the two cache dialects normalize to one convention', () => {
+  // OpenAI-style: input already contains the cached subset.
+  const inclusive = normalizeCacheAccounting({ inputTokens: 1000, cachedInputTokens: 800 });
+  assert.equal(inclusive.dialect, 'cache_inclusive');
+  assert.equal(inclusive.promptTokens, 1000);
+  assert.equal(inclusive.hitRate, 0.8);
+
+  // Anthropic-style: cached exceeds input, so input was the uncached remainder.
+  const exclusive = normalizeCacheAccounting({ inputTokens: 200, cachedInputTokens: 1800 });
+  assert.equal(exclusive.dialect, 'cache_exclusive');
+  assert.equal(exclusive.promptTokens, 2000);
+  assert.equal(exclusive.hitRate, 0.9);
+
+  assert.equal(normalizeCacheAccounting({ inputTokens: 0, cachedInputTokens: 0 }).hitRate, 0);
+});
+
+test('a mixed-dialect window cannot certify a hit rate above 100%', () => {
+  // Before normalization this window computed cached/input = 2600/1200 ≈ 217%.
+  const r = rollupUsage([
+    ev({ inputTokens: 1000, cachedInputTokens: 800 }),          // inclusive
+    ev({ inputTokens: 200, cachedInputTokens: 1800 }),          // exclusive
+  ]);
+  assert.equal(r.totalPromptTokens, 3000);
+  assert.equal(r.totalCachedInputTokens, 2600);
+  assert.ok(r.cacheHitRate <= 1, `certified an impossible hit rate: ${r.cacheHitRate}`);
+  assert.ok(Math.abs(r.cacheHitRate - 2600 / 3000) < 1e-9);
+  // Per-kind and per-model rates are certified the same way.
+  assert.ok(r.byKind.chat!.cachedInputTokens / r.byKind.chat!.promptTokens <= 1);
+  assert.ok(r.byModel['gpt-5.5']!.cachedInputTokens / r.byModel['gpt-5.5']!.promptTokens <= 1);
+});
+
+test('an impossible sample is quarantined, counted, and excluded from sums', () => {
+  const r = rollupUsage([
+    ev({ inputTokens: 1000, cachedInputTokens: 500 }),
+    ev({ inputTokens: -50, cachedInputTokens: 10, totalTokens: 999 }),
+    ev({ inputTokens: Number.NaN as unknown as number, totalTokens: 777 }),
+  ]);
+  assert.equal(r.quarantinedCalls, 2, 'impossible samples entered the certified rollup');
+  assert.equal(r.totalInputTokens, 1000, 'a quarantined sample leaked into token sums');
+  assert.equal(r.totalTokens, 1100, 'a quarantined totalTokens leaked into the rollup');
+  // They still happened: total calls includes them so nothing hides.
+  assert.equal(r.totalCalls, 3);
+});
+
+test('latency PRESENCE is visible per lane, not assumed', () => {
+  // The audit found lanes with no average latency at all. durationSamples <
+  // calls is the signal that a lane's latency cannot yet be trusted.
+  const r = rollupUsage([
+    ev({ durationMs: 1200 }),
+    ev({ durationMs: 800 }),
+    ev({}), // no duration reported
+  ]);
+  assert.equal(r.byKind.chat!.calls, 3);
+  assert.equal(r.byKind.chat!.durationSamples, 2);
+  assert.equal(r.byKind.chat!.totalDurationMs, 2000);
 });
 
