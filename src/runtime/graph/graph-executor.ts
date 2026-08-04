@@ -18,17 +18,41 @@
  *      topology, never as a new branch in this file.
  *   2. It does not perform effects, resolve capability, assemble context, or
  *      own policy. Those are nodes. An executor that grows those becomes the
- *      next mega-loop.
+ *      next mega-loop. Time, durability, and terminal judgment are INJECTED
+ *      ports (clock, journal adapter, terminal reducer) for the same reason.
  *   3. It does not decide structural validity. Compilers and validators reject
  *      cycles and dangling edges at admission; a definition that cannot
  *      progress surfaces here as an explicit stall naming what is waiting,
  *      never as a throw from inside the loop or as an infinite spin.
  *
- * Failure is an edge, not an exception. A node that fails routes along its
- * `failure` edges when it has them, and only halts the branch when it does not
- * — so a graph can express recovery as topology instead of as runner-side
- * catch blocks the graph cannot see.
+ * Failure is an edge, not an exception. A node whose OWN logic fails routes
+ * along its `failure` edges. A runner that THROWS is not node logic — it is
+ * infrastructure — and infrastructure never routes recovery topology, because
+ * a crashed harness is not evidence about the work.
+ *
+ * Two operating modes share one loop:
+ *
+ *   - PURE WALKER: no admission. Optional limits, node-id journal, sync-ish
+ *     use in tests and differential proofs. This mode may not be a production
+ *     caller's shape.
+ *   - ADMITTED RUN: a `GraphAdmission` binds content-addressed identity, every
+ *     budget is finite, a durable journal adapter is mandatory, `node_started`
+ *     is durable BEFORE dispatch, settlement is durable BEFORE dependents
+ *     advance, and resume trusts only a causally validated journal whose node
+ *     and input digests match. Node ID alone is never reuse identity here.
  */
+import {
+  computeInputDigest,
+  computeNodeDigest,
+  type GraphAdmission,
+} from './graph-admission.js';
+import {
+  validateJournalForResume,
+  type GraphJournalAdapter,
+  type GraphJournalEntry,
+  type NodeSettledEntry,
+  type SettlementClass,
+} from './graph-journal.js';
 
 /** A node the executor schedules. `kind` is meaningful only to the runner. */
 export interface ExecutableNode {
@@ -40,10 +64,11 @@ export interface ExecutableNode {
  * Edge conditions the executor understands.
  *
  * `success` is the default and the only one that fires on completion.
- * `failure` fires when the source node failed, which is what makes recovery
- * expressible as topology. Any other label is opaque: the runner decides,
- * and an unrecognized label with no runner opinion never fires — a condition
- * nobody can evaluate must not silently behave like an unconditional edge.
+ * `failure` fires when the source node's own logic failed, which is what makes
+ * recovery expressible as topology. Any other label is opaque: the runner
+ * decides, and an unrecognized label with no runner opinion never fires — a
+ * condition nobody can evaluate must not silently behave like an
+ * unconditional edge.
  */
 export type ExecutableEdgeCondition = 'success' | 'failure' | (string & {});
 
@@ -61,21 +86,34 @@ export interface ExecutableGraph {
   edges: readonly ExecutableEdge[];
 }
 
-export type NodeStatus = 'completed' | 'failed' | 'blocked' | 'paused';
+export type NodeStatus = 'completed' | 'failed' | 'blocked' | 'paused' | 'cancelled';
 
 export type NodeOutcome =
-  | { status: 'completed'; evidenceRef?: string }
-  /** Ran and did not succeed. Routes along `failure` edges when they exist. */
-  | { status: 'failed'; reason: string }
+  | { status: 'completed'; outputRef?: string; evidenceRefs?: string[] }
+  /** Ran and did not succeed. `settlementClass` defaults to 'node'; an
+   *  'infrastructure' failure never routes failure edges. */
+  | { status: 'failed'; reason: string; settlementClass?: SettlementClass }
   /** Cannot run at all (missing authority/capability). Never routes. */
   | { status: 'blocked'; reason: string }
   /** Awaiting input, approval, or budget. Halts the run for later resume. */
   | { status: 'paused'; reason: string };
 
+export interface PredecessorRef {
+  nodeId: string;
+  outputRef?: string;
+  evidenceRefs?: readonly string[];
+}
+
 export interface NodeRunContext {
   graphId: string;
   /** Ids completed before this node, including those restored from a journal. */
   completed: readonly string[];
+  /**
+   * The fired predecessors of THIS node with their settled artifact refs —
+   * typed data flow without raw payload injection. A journal-reused
+   * predecessor contributes the refs its settlement recorded.
+   */
+  predecessors: readonly PredecessorRef[];
   /** 0-based scheduling wave, for telemetry and trace stability. */
   wave: number;
 }
@@ -107,15 +145,17 @@ export interface GraphRunBudget {
   maxWaves?: number;
   /** Nodes dispatched concurrently within one wave. Default 1 (deterministic). */
   maxConcurrency?: number;
+  /** Elapsed ceiling, measured by the injected clock. */
+  maxElapsedMs?: number;
 }
 
 /**
  * How the DRIVE LOOP ended — not whether the work succeeded.
  *
  * `completed` means the loop reached quiescence, which it also does when nodes
- * failed. Inspect `failed`/`blocked` for node verdicts. Turning a set of node
- * outcomes into one public answer is the terminal reducer's job; an executor
- * that also decided verdicts would be deciding policy.
+ * failed. Inspect `failed`/`blocked` — or supply a `terminalReducer`, whose
+ * typed verdict is the ONLY thing a public committer may consume. An executor
+ * that decided verdicts itself would be deciding policy.
  */
 export type GraphRunStatus =
   /** Nothing further can be scheduled. Says nothing about node success. */
@@ -124,8 +164,23 @@ export type GraphRunStatus =
   | 'paused'
   /** Work remains but nothing is ready and nothing is running. */
   | 'stalled'
-  /** A budget ceiling stopped the run. */
-  | 'budget_exhausted';
+  /** A budget ceiling parked the run at a safe, resumable boundary. */
+  | 'budget_exhausted'
+  /** The cancellation signal stopped the run between dispatches. */
+  | 'cancelled'
+  /** The durable boundary failed (journal append rejected). Nothing after the
+   *  failed append was dispatched; the journal remains the source of truth. */
+  | 'halted';
+
+/**
+ * The typed verdict a terminal reducer produces. The executor never invents
+ * one — quiescence is not success, and mapping outcomes to a public answer is
+ * policy that belongs to the injected reducer.
+ */
+export interface GraphTerminal {
+  status: 'success' | 'failed' | 'blocked' | 'cancelled' | 'needs_input';
+  reason?: string;
+}
 
 export interface GraphRunResult {
   graphId: string;
@@ -135,24 +190,45 @@ export interface GraphRunResult {
   failed: string[];
   blocked: string[];
   paused: string[];
-  /** Never reachable given what completed. Not an error — an unfired branch. */
+  cancelled: string[];
+  /** Never reachable given what settled. Not an error — an unfired branch. */
   unreached: string[];
   waves: number;
   /** Set when status is `stalled`, naming what each remaining node waits on. */
   stalledDetail?: string;
+  /** Set when status is `halted`: the infrastructure reason, never node logic. */
+  haltReason?: string;
+  /** Present when a terminalReducer was injected. */
+  terminal?: GraphTerminal;
 }
 
 export interface RunGraphOptions {
   runner: NodeRunner;
   /**
-   * Node ids already completed in a previous attempt. Their runners are not
-   * called again — the journal is the cache, so replay is free and effects are
-   * not repeated.
+   * PURE-WALKER resume: node ids already completed. Refused under admission,
+   * where identity-verified journal entries are the only trustworthy history.
    */
   journal?: Iterable<string>;
   budget?: GraphRunBudget;
-  /** Called for each trace entry as it is produced, for durable event writing. */
+  /** Called for each trace entry as it is produced. Telemetry only — the
+   *  DURABLE boundary is the journal adapter, whose appends are awaited. */
   onStep?: (entry: GraphTraceEntry) => void;
+  /** Content-addressed identity. Presence switches on the durable contract. */
+  admission?: GraphAdmission;
+  /** Mandatory under admission. `append` resolves only when durable. */
+  journalAdapter?: GraphJournalAdapter;
+  /** Prior journal for resume under admission; validated causally. */
+  resumeEntries?: readonly GraphJournalEntry[];
+  /** Injected time. Mandatory under admission (a ceiling needs a clock);
+   *  monotonic ms. The executor itself never reads a clock. */
+  clock?: () => number;
+  /** Cancellation port; checked between dispatches, never mid-runner. */
+  signal?: { readonly aborted: boolean };
+  /** Mints attempt ids. Injected so tests are deterministic and the executor
+   *  never reaches for randomness. Default: sequential per run. */
+  attemptIds?: () => string;
+  /** Turns node outcomes into ONE typed verdict. Policy, injected. */
+  terminalReducer?: (result: Omit<GraphRunResult, 'terminal'>) => GraphTerminal;
 }
 
 function enabledEdges(graph: ExecutableGraph): ExecutableEdge[] {
@@ -221,7 +297,11 @@ function edgeFires(
 ): boolean {
   const when = edge.when ?? 'success';
   if (when === 'success') return outcome.status === 'completed';
-  if (when === 'failure') return outcome.status === 'failed';
+  if (when === 'failure') {
+    // Only the node's OWN failure routes recovery topology. Infrastructure,
+    // policy, and cancellation are not evidence about the work.
+    return outcome.status === 'failed' && (outcome.settlementClass ?? 'node') === 'node';
+  }
   // Opaque condition: only the runner can judge it, and silence means no.
   return runner.edgeSatisfied?.(edge, outcome) === true;
 }
@@ -243,56 +323,115 @@ function describeStall(
     .join('; ');
 }
 
+interface AdmittedResume {
+  reusable: Map<string, NodeSettledEntry>;
+}
+
+/**
+ * Validate resume state under admission. Reuse requires the settlement's
+ * node digest to match the CURRENT definition — a changed node is different
+ * work wearing the same id, and stale reuse is refused, not repaired.
+ * Input-digest agreement is enforced at schedule time, when this run's
+ * predecessor refs are known.
+ */
+function resolveAdmittedResume(
+  graph: ExecutableGraph,
+  admission: GraphAdmission,
+  entries: readonly GraphJournalEntry[],
+): { ok: true; resume: AdmittedResume } | { ok: false; errors: string[] } {
+  const validated = validateJournalForResume(graph, admission, entries);
+  if (!validated.ok) return validated;
+  const reusable = new Map<string, NodeSettledEntry>();
+  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+  for (const [nodeId, entry] of validated.completed) {
+    const node = byId.get(nodeId);
+    if (!node) continue; // patch-added completion; replay re-admits patches first
+    if (entry.nodeDigest !== computeNodeDigest(node)) continue; // different work — re-run
+    reusable.set(nodeId, entry);
+  }
+  return { ok: true, resume: { reusable } };
+}
+
 /**
  * Drive a graph to a terminal state.
  *
  * Deterministic by construction: waves are computed from the graph, nodes
- * within a wave are dispatched in id order, and the trace records the same
- * sequence for the same graph and the same runner verdicts. That is what lets a
- * new engine be proved equivalent to an old one by comparing traces rather than
- * by trusting that both "did the right thing".
+ * within a wave are dispatched in declaration order, and the trace records the
+ * same sequence for the same graph and the same runner verdicts. That is what
+ * lets a new engine be proved equivalent to an old one by comparing traces
+ * rather than by trusting that both "did the right thing".
  */
 export async function runGraph(
   graph: ExecutableGraph,
   options: RunGraphOptions,
 ): Promise<GraphRunResult> {
-  const { runner, onStep } = options;
-  const maxNodes = options.budget?.maxNodes ?? Number.POSITIVE_INFINITY;
-  const maxWaves = options.budget?.maxWaves ?? Number.POSITIVE_INFINITY;
-  const maxConcurrency = Math.max(1, options.budget?.maxConcurrency ?? 1);
+  const { runner, onStep, admission } = options;
+
+  // ── mode resolution ────────────────────────────────────────────────────────
+  let haltReason: string | undefined;
+  let resume: AdmittedResume = { reusable: new Map() };
+  if (admission) {
+    if (!options.journalAdapter) haltReason = 'admitted run requires a journal adapter';
+    else if (!options.clock) haltReason = 'admitted run requires a clock (a ceiling needs one)';
+    else if (options.journal) haltReason = 'admitted run refuses a node-id journal; supply resumeEntries';
+    else if (options.resumeEntries?.length) {
+      const resolved = resolveAdmittedResume(graph, admission, options.resumeEntries);
+      if (!resolved.ok) haltReason = `resume refused: ${resolved.errors.join('; ')}`;
+      else resume = resolved.resume;
+    }
+  }
+
+  const budget = admission ? admission.budget : options.budget;
+  const maxNodes = budget?.maxNodes ?? Number.POSITIVE_INFINITY;
+  const maxWaves = budget?.maxWaves ?? Number.POSITIVE_INFINITY;
+  const maxConcurrency = Math.max(1, budget?.maxConcurrency ?? 1);
+  const maxElapsedMs = (admission ? admission.budget.maxElapsedMs : options.budget?.maxElapsedMs)
+    ?? Number.POSITIVE_INFINITY;
+  const clock = options.clock;
+  const startedAt = clock?.() ?? 0;
+
+  let attemptCounter = 0;
+  const nextAttemptId = options.attemptIds ?? (() => `attempt-${(attemptCounter += 1)}`);
 
   const trace: GraphTraceEntry[] = [];
   const completed = new Set<string>();
   const failed = new Set<string>();
   const blocked = new Set<string>();
   const paused = new Set<string>();
+  const cancelled = new Set<string>();
   /** Terminal for scheduling purposes — never dispatched again. */
   const settled = new Set<string>();
   /** Edge ids whose condition has been satisfied. */
   const fired = new Set<string>();
+  /** Settled artifact refs, for successors' typed data flow. */
+  const artifactRefs = new Map<string, { outputRef?: string; evidenceRefs?: readonly string[] }>();
 
-  const journal = new Set(options.journal ?? []);
+  const pureJournal = new Set(admission ? [] : options.journal ?? []);
   let dispatched = 0;
   let wave = 0;
-  let status: GraphRunStatus = 'completed';
+  let status: GraphRunStatus = haltReason ? 'halted' : 'completed';
 
   const record = (entry: GraphTraceEntry): void => {
     trace.push(entry);
     onStep?.(entry);
   };
 
-  const settle = (node: ExecutableNode, outcome: NodeOutcome, reused?: true): void => {
-    settled.add(node.id);
-    if (outcome.status === 'completed') completed.add(node.id);
-    else if (outcome.status === 'failed') failed.add(node.id);
-    else if (outcome.status === 'blocked') blocked.add(node.id);
-    else paused.add(node.id);
-
+  const fireEdgesFor = (nodeId: string, outcome: NodeOutcome): void => {
     for (const edge of enabledEdges(graph)) {
-      if (edge.source !== node.id) continue;
+      if (edge.source !== nodeId) continue;
       if (edgeFires(edge, outcome, runner)) fired.add(edge.id);
     }
+  };
 
+  const settle = (node: ExecutableNode, outcome: NodeOutcome, reused?: true): void => {
+    settled.add(node.id);
+    if (outcome.status === 'completed') {
+      completed.add(node.id);
+      artifactRefs.set(node.id, { outputRef: outcome.outputRef, evidenceRefs: outcome.evidenceRefs });
+    } else if (outcome.status === 'failed') failed.add(node.id);
+    else if (outcome.status === 'blocked') blocked.add(node.id);
+    else paused.add(node.id);
+    fireEdgesFor(node.id, outcome);
     record({
       wave,
       nodeId: node.id,
@@ -303,44 +442,136 @@ export async function runGraph(
     });
   };
 
-  for (;;) {
+  const predecessorRefsFor = (node: ExecutableNode): PredecessorRef[] => {
+    return enabledEdges(graph)
+      .filter((edge) => edge.target === node.id && fired.has(edge.id) && completed.has(edge.source))
+      .map((edge) => ({ nodeId: edge.source, ...(artifactRefs.get(edge.source) ?? {}) }));
+  };
+
+  main: while (!haltReason) {
+    if (options.signal?.aborted) { status = 'cancelled'; break; }
+    if (clock && clock() - startedAt > maxElapsedMs) { status = 'budget_exhausted'; break; }
+
     const ready = readyExecutableNodes(graph, fired, settled);
-    if (ready.length === 0) break;
+    if (ready.length === 0) { if (status !== 'halted') status = 'completed'; break; }
     if (wave >= maxWaves) { status = 'budget_exhausted'; break; }
 
-    // A journaled node is settled without dispatch and without consuming
+    // Journal/resume reuse settles without dispatch and without consuming
     // budget: replaying a completed step must be free, or restart becomes more
     // expensive than the original run.
     const fresh: ExecutableNode[] = [];
     for (const node of ready) {
-      if (journal.has(node.id)) settle(node, { status: 'completed' }, true);
-      else fresh.push(node);
+      const journaled = resume.reusable.get(node.id);
+      if (journaled) {
+        settle(node, {
+          status: 'completed',
+          outputRef: journaled.outputRef,
+          evidenceRefs: journaled.evidenceRefs,
+        }, true);
+      } else if (pureJournal.has(node.id)) {
+        settle(node, { status: 'completed' }, true);
+      } else {
+        fresh.push(node);
+      }
     }
     if (fresh.length === 0) { wave += 1; continue; }
 
-    if (dispatched + fresh.length > maxNodes) {
-      status = 'budget_exhausted';
-      break;
-    }
+    // A wave that would exceed the node budget parks BEFORE dispatching any of
+    // it — deterministic, and a partial wave never half-happens.
+    if (dispatched + fresh.length > maxNodes) { status = 'budget_exhausted'; break; }
 
     const outcomes: Array<{ node: ExecutableNode; outcome: NodeOutcome }> = [];
     for (let i = 0; i < fresh.length; i += maxConcurrency) {
+      if (options.signal?.aborted) { status = 'cancelled'; break main; }
       const slice = fresh.slice(i, i + maxConcurrency);
-      const settledSnapshot = [...completed];
-      const resolved = await Promise.all(slice.map(async (node) => ({
-        node,
-        outcome: await runner.run(node, {
-          graphId: graph.graphId,
-          completed: settledSnapshot,
-          wave,
-        }),
-      })));
-      outcomes.push(...resolved);
-    }
-    dispatched += fresh.length;
+      const completedSnapshot = [...completed];
 
-    // Settle in id order regardless of completion order, so concurrency never
-    // reorders a trace.
+      // Durable claim precedes dispatch: a crash between the two leaves an
+      // interrupted attempt in the journal, never an untracked side effect.
+      const prepared = slice.map((node) => {
+        const predecessors = predecessorRefsFor(node);
+        return {
+          node,
+          predecessors,
+          nodeDigest: computeNodeDigest(node),
+          inputDigest: computeInputDigest(predecessors),
+          attemptId: nextAttemptId(),
+        };
+      });
+      if (admission && options.journalAdapter) {
+        for (const p of prepared) {
+          try {
+            await options.journalAdapter.append({
+              type: 'node_started',
+              admissionDigest: admission.admissionDigest,
+              nodeId: p.node.id,
+              nodeDigest: p.nodeDigest,
+              inputDigest: p.inputDigest,
+              attemptId: p.attemptId,
+              wave,
+            });
+          } catch (error) {
+            haltReason = `journal append failed before dispatch of "${p.node.id}": ${error instanceof Error ? error.message : String(error)}`;
+            status = 'halted';
+            break main;
+          }
+        }
+      }
+
+      const resolved = await Promise.all(prepared.map(async (p) => {
+        let outcome: NodeOutcome;
+        try {
+          outcome = await runner.run(p.node, {
+            graphId: graph.graphId,
+            completed: completedSnapshot,
+            predecessors: p.predecessors,
+            wave,
+          });
+        } catch (error) {
+          // A throwing runner is infrastructure, not node logic: typed, never
+          // routed along failure edges, and never a torn-down executor.
+          outcome = {
+            status: 'failed',
+            reason: error instanceof Error ? error.message : String(error),
+            settlementClass: 'infrastructure',
+          };
+        }
+        return { ...p, outcome };
+      }));
+
+      // Settlement is durable BEFORE dependents can observe it.
+      for (const p of resolved) {
+        if (admission && options.journalAdapter) {
+          try {
+            await options.journalAdapter.append({
+              type: 'node_settled',
+              admissionDigest: admission.admissionDigest,
+              nodeId: p.node.id,
+              nodeDigest: p.nodeDigest,
+              inputDigest: p.inputDigest,
+              attemptId: p.attemptId,
+              wave,
+              status: p.outcome.status,
+              ...(p.outcome.status === 'completed'
+                ? { outputRef: p.outcome.outputRef, evidenceRefs: p.outcome.evidenceRefs }
+                : { reason: p.outcome.reason }),
+              ...(p.outcome.status === 'failed'
+                ? { settlementClass: p.outcome.settlementClass ?? 'node' }
+                : {}),
+            });
+          } catch (error) {
+            haltReason = `journal append failed while settling "${p.node.id}": ${error instanceof Error ? error.message : String(error)}`;
+            status = 'halted';
+            break main;
+          }
+        }
+        outcomes.push({ node: p.node, outcome: p.outcome });
+      }
+    }
+    dispatched += outcomes.length;
+
+    // Settle in declaration order regardless of completion order, so
+    // concurrency never reorders a trace.
     for (const { node, outcome } of outcomes) settle(node, outcome);
 
     if (outcomes.some(({ outcome }) => outcome.status === 'paused')) {
@@ -356,7 +587,7 @@ export async function runGraph(
 
   if (status === 'completed' && unreached.length > 0) {
     // Distinguish "a branch legitimately did not fire" from "nothing can move".
-    // A node is only stalled if every route into it is still pending — if a
+    // A node is only stalled if some route into it is still pending — if every
     // route's source settled and simply did not satisfy the condition, that
     // branch is unreached by design.
     const enabled = enabledEdges(graph);
@@ -364,12 +595,10 @@ export async function runGraph(
       const incoming = enabled.filter((edge) => edge.target === nodeId);
       return incoming.length > 0 && incoming.some((edge) => !settled.has(edge.source));
     });
-    if (stalled) {
-      status = 'stalled';
-    }
+    if (stalled) status = 'stalled';
   }
 
-  return {
+  const base: Omit<GraphRunResult, 'terminal'> = {
     graphId: graph.graphId,
     status,
     trace,
@@ -377,10 +606,15 @@ export async function runGraph(
     failed: [...failed],
     blocked: [...blocked],
     paused: [...paused],
+    cancelled: [...cancelled],
     unreached,
     waves: wave,
     ...(status === 'stalled' ? { stalledDetail: describeStall(graph, settled, fired) } : {}),
+    ...(haltReason ? { haltReason } : {}),
   };
+  return options.terminalReducer
+    ? { ...base, terminal: options.terminalReducer(base) }
+    : base;
 }
 
 /** Compact, comparable rendering of a run. The unit of engine-parity proof. */

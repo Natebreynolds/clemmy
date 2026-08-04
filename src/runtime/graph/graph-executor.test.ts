@@ -415,16 +415,23 @@ test('every step is reported as it happens, for durable event writing', async ()
 
 // ── the executor stays a scheduler ───────────────────────────────────────────
 
-test('the executor imports nothing and reaches nowhere', async () => {
+test('the executor imports only its pure siblings and reaches nowhere', async () => {
   const { readFileSync } = await import('node:fs');
   const { fileURLToPath } = await import('node:url');
   const path = await import('node:path');
   const here = path.dirname(fileURLToPath(import.meta.url));
   const source = readFileSync(path.join(here, 'graph-executor.ts'), 'utf-8');
 
-  assert.deepEqual([...source.matchAll(/from '([^']+)';/g)].map((m) => m[1]), [],
-    'the executor grew a dependency — policy, capability and effects belong in nodes');
-  for (const forbidden of ['process.env', 'readFileSync', 'Date.now', 'new Date', 'BASE_DIR', 'fetch(']) {
+  // The identity and journal CONTRACTS are pure same-directory modules (crypto
+  // digests and validation only — their own tests pin that). Anything else —
+  // providers, tools, memory, filesystem, environment, UI — belongs in nodes
+  // and adapters, and its appearance here is the executor becoming a runtime.
+  assert.deepEqual(
+    [...source.matchAll(/^import (?!type ).*?from '([^']+)';$/gms)].map((m) => m[1]).sort(),
+    ['./graph-admission.js', './graph-journal.js'],
+    'the executor grew a dependency — policy, capability and effects belong in nodes',
+  );
+  for (const forbidden of ['process.env', 'readFileSync', 'Date.now', 'new Date', 'BASE_DIR', 'fetch(', 'Math.random']) {
     assert.equal(source.includes(forbidden), false, `executor references ${forbidden}`);
   }
 
