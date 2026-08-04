@@ -424,9 +424,18 @@ inherited divergence: a proof scenario asserting outcome content through the
 runs-list API, which excludes outputs BY PRIVACY DESIGN — the check now
 reads the durable record, and the privacy projection stays exactly as strict.
 
-Remaining rungs: the M5 canary proper (cloned workflow on live surfaces) and
-optional on-screen surface smokes, then interior depth and U2–U6 — now
-UNBLOCKED by smoke green.
+The live matrix then EXPANDED beyond the smoke, both brains green on every
+row: `workspace-build` (a real workspace constructed live — the workspaces
+lane), `graph-reshape-live` (the graph mutated mid-run and execution followed
+it), `schema-on-demand` (tool schemas acquired during the run), and
+`clean-turn-isolation`. Combined with the smoke set and M4, this candidate's
+live evidence is nine distinct scenarios × two brains, all green, plus the
+critical and endurance suites.
+
+Remaining rungs: the live-home canary (deliberately NOT run unattended — a
+daemon swap's failure mode is the assistant being down in the morning; it
+waits for Nathan present), on-screen surface smokes at his option, then
+interior depth and U2–U6 — unblocked by smoke green.
 
 ### The interior-depth manifest (scoped with evidence, 2026-08-04)
 
