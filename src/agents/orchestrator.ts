@@ -32,7 +32,7 @@ import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 import { createHash } from 'node:crypto';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
-import { bindAgentCapabilityEnvelope, bindAgentCapabilityRevision, sealAgentCapabilityUniverse, type SealableToolLike } from './capability-envelope.js';
+import { appendAgentCapabilityBinding, bindAgentCapabilityEnvelope, bindAgentCapabilityRevision, sealAgentCapabilityUniverse, type SealableToolLike } from './capability-envelope.js';
 import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
 import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
 import type { Tool } from '@openai/agents';
@@ -2039,6 +2039,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // per-turn re-render), not baked into a separate cacheable prefix.
   let firstClassDiscovery = jitDiscoveryTools;
   let callTool: Tool<RuntimeContextValue> | null = null;
+  // Assigned after the capability universe seals (the agent does not exist yet
+  // when the dispatcher is built); null = unsealed, acquisitions unobserved.
+  let acquisitionSink: ((targetName: string) => void) | null = null;
   let catalogBlock: string | null = null;
   let searchFirstClassCount = 0;
   let searchCatalogCount = 0;
@@ -2091,6 +2094,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             firstClassNames,
             deniedNames: excludes,
             mcpToolScope,
+            // The dispatcher is built before the agent exists; the sink cell is
+            // assigned after sealing so each acquisition lands as a monotonic
+            // binding revision on THIS agent's sealed universe.
+            onBuiltinAcquisition: (targetName) => acquisitionSink?.(targetName),
           });
       const catalogText = buildCompactToolCatalog({ allowedNames: deferredNames });
       searchCatalogCount = deferredNames.size;
@@ -2282,6 +2289,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     if (sealed.ok) {
       bindAgentCapabilityEnvelope(agent, sealed.envelope);
       bindAgentCapabilityRevision(agent, sealed.revision);
+      // Every call_tool acquisition from here on is a revision within the
+      // sealed universe. An outside name is loud — that is the exact event
+      // the enforcement slice turns into a lawful pause.
+      acquisitionSink = (targetName) => {
+        const appended = appendAgentCapabilityBinding(agent, targetName);
+        if (appended && !appended.ok) {
+          // eslint-disable-next-line no-console
+          console.warn(`[orchestrator] capability acquisition refused: ${appended.reason}`);
+        }
+      };
     } else {
       // eslint-disable-next-line no-console
       console.warn(`[orchestrator] capability universe refused to seal: ${sealed.errors.join('; ')}`);

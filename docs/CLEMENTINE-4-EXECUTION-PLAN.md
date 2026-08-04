@@ -499,6 +499,16 @@ already carries the deny-list). What remains of enforcement: call_tool's
 acquisition path appending revisions at dispatch time, then boundary
 refusal for names outside the bound revision + outside MCP scope.
 
+**ACQUISITION OBSERVATION EXECUTED (2026-08-04):** call_tool now reports
+each built-in inner name at the moment of dispatch (after every authority
+gate, before `dispatchBatchItemTool`; never for MCP-namespaced targets)
+through `onBuiltinAcquisition`, and the orchestrator appends it to the
+agent's bound revision via `appendAgentCapabilityBinding` — idempotent for
+already-bound names, loud on an outside-universe name (the exact event the
+refusal slice turns into a lawful pause). The observer is instrumentation:
+a throwing sink never breaks dispatch, pinned in call-tool tests. The last
+enforcement step remaining is boundary refusal itself.
+
 ### The interior-depth manifest (scoped with evidence, 2026-08-04)
 
 Each interior phase of the chat spine was scoped to its exact seam, so the

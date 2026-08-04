@@ -9,6 +9,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  appendAgentCapabilityBinding,
   bindAgentCapabilityEnvelope,
   bindAgentCapabilityRevision,
   boundAgentCapabilityEnvelope,
@@ -104,6 +105,43 @@ test('an active surface naming a tool outside the universe refuses with the outs
   assert.equal(sealed.ok, false, 'an active surface wider than its universe sealed anyway');
   assert.match((sealed as Extract<typeof sealed, { ok: false }>).errors.join(' '), /ghost_tool/,
     'the refusal must name the outsider so the pause is actionable');
+});
+
+test('an acquisition appends a monotonic revision within the universe and refuses outside it', () => {
+  const agent = {};
+  const sealed = sealAgentCapabilityUniverse({
+    sessionId: 'sess-a',
+    universeTools: [
+      { name: 'active_tool', parameters: {} },
+      { name: 'deferred_tool', parameters: {} },
+    ],
+    activeToolNames: ['active_tool'],
+    policyHash: 'p1',
+    budget: BUDGET,
+  });
+  const { envelope, revision } = sealed as Extract<typeof sealed, { ok: true }>;
+  bindAgentCapabilityEnvelope(agent, envelope);
+  bindAgentCapabilityRevision(agent, revision);
+
+  const acquired = appendAgentCapabilityBinding(agent, 'deferred_tool');
+  assert.equal(acquired?.ok, true, JSON.stringify(acquired));
+  const grown = boundAgentCapabilityRevision(agent)!;
+  assert.equal(grown.revision, 2);
+  assert.deepEqual([...grown.bound], ['active_tool', 'deferred_tool']);
+
+  // Re-acquiring an already-bound name is idempotent — no revision churn.
+  assert.equal(appendAgentCapabilityBinding(agent, 'deferred_tool')?.ok, true);
+  assert.equal(boundAgentCapabilityRevision(agent)!.revision, 2,
+    'a duplicate acquisition minted a new revision');
+
+  const outside = appendAgentCapabilityBinding(agent, 'ghost_tool');
+  assert.equal(outside?.ok, false, 'a name outside the sealed universe was bound');
+  assert.match((outside as Extract<typeof outside, { ok: false }>).reason, /ghost_tool/);
+  assert.equal(boundAgentCapabilityRevision(agent)!.revision, 2,
+    'a refused acquisition mutated the bound revision');
+
+  assert.equal(appendAgentCapabilityBinding({}, 'anything'), null,
+    'an unsealed agent grew a revision from nothing');
 });
 
 test('the binding is per-agent and null means unknown, not unlimited', () => {

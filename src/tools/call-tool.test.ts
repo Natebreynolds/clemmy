@@ -1079,3 +1079,68 @@ test('a FAILING call_tool dispatch still charges the budget — no zero-cost ret
     },
   );
 });
+
+test('a built-in dispatch is observed as an acquisition; refusals and MCP names are not', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const acquired: string[] = [];
+  _setCodeModeToolsForTests(
+    new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'updated' }]]),
+  );
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(['composio_execute_tool']),
+      onBuiltinAcquisition: (name: string) => acquired.push(name),
+    }) as unknown as ToolLike;
+    const invoke = (name: string, argsJson: string) =>
+      withToolOutputContext({ sessionId: sess.id }, () =>
+        callTool.invoke!(
+          { context: { sessionId: sess.id } },
+          JSON.stringify({ name, args_json: argsJson }),
+          { toolCall: { callId: `acq-${name}` } },
+        ) as Promise<unknown>,
+      );
+
+    // A refused target is NEVER an acquisition — nothing dispatched.
+    const refused = JSON.parse(String(await invoke('nonexistent_tool_xyz', '{}')));
+    assert.equal(refused.error, 'not_reachable');
+    assert.deepEqual(acquired, [], 'a refusal was recorded as an acquisition');
+
+    // A successful built-in dispatch is observed exactly once, by inner name.
+    const out = String(await invoke(
+      'composio_execute_tool',
+      JSON.stringify({ tool_slug: 'GOOGLESHEETS_VALUES_UPDATE', arguments: JSON.stringify({ range: 'A1' }) }),
+    ));
+    assert.ok(out.startsWith('updated'), out);
+    assert.deepEqual(acquired, ['composio_execute_tool']);
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
+test('a throwing acquisition observer never breaks dispatch', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  _setCodeModeToolsForTests(
+    new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'updated' }]]),
+  );
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(['composio_execute_tool']),
+      onBuiltinAcquisition: () => { throw new Error('observer exploded'); },
+    }) as unknown as ToolLike;
+    const out = String(await withToolOutputContext({ sessionId: sess.id }, () =>
+      callTool.invoke!(
+        { context: { sessionId: sess.id } },
+        JSON.stringify({
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_VALUES_UPDATE', arguments: JSON.stringify({ range: 'A1' }) }),
+        }),
+        { toolCall: { callId: 'acq-throwing' } },
+      ) as Promise<unknown>,
+    ));
+    assert.ok(out.startsWith('updated'), `instrumentation killed the dispatch: ${out}`);
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});

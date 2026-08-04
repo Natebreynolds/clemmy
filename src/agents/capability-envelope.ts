@@ -23,6 +23,7 @@
 import { createHash } from 'node:crypto';
 
 import {
+  appendBindings,
   initialBindingRevision,
   sealAdmissionEnvelope,
   type AdmissionEnvelope,
@@ -153,6 +154,38 @@ export function sealAgentCapabilityUniverse(input: {
 
 export function bindAgentCapabilityRevision(agent: object, revision: CapabilityBindingRevision): void {
   AGENT_REVISIONS.set(agent, revision);
+}
+
+/**
+ * Record a schema-on-demand acquisition as the next monotonic binding
+ * revision. Returns null for an agent with no sealed envelope/revision
+ * (unknown, never unlimited — there is nothing lawful to append to).
+ * `requires_readmission` here means the dispatcher reached a name outside
+ * the sealed universe: today that is surfaced to the caller to warn loudly;
+ * the enforcement slice turns it into the pause the contract demands.
+ */
+export function appendAgentCapabilityBinding(
+  agent: object,
+  name: string,
+):
+  | { ok: true; revision: CapabilityBindingRevision }
+  | { ok: false; reason: string }
+  | null {
+  const envelope = AGENT_ENVELOPES.get(agent);
+  const previous = AGENT_REVISIONS.get(agent);
+  if (!envelope || !previous) return null;
+  if (previous.bound.includes(name)) return { ok: true, revision: previous };
+  const appended = appendBindings(envelope, previous, [name]);
+  if (!appended.ok) {
+    return {
+      ok: false,
+      reason: appended.kind === 'requires_readmission'
+        ? `"${appended.outside.join(', ')}" is outside the sealed capability universe`
+        : appended.errors.join('; '),
+    };
+  }
+  AGENT_REVISIONS.set(agent, appended.revision);
+  return { ok: true, revision: appended.revision };
 }
 
 /** The active binding revision, or null (unknown, never unlimited). */

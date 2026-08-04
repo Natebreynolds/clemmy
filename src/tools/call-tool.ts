@@ -330,6 +330,13 @@ export interface BuildCallToolOptions {
    * to the active HarnessRunContext (and then legacy behavior); `null` is an
    * explicit no-external-tools boundary. */
   mcpToolScope?: McpToolScope | null;
+  /** Observes each built-in name the moment it is about to dispatch — the
+   * schema-on-demand ACQUISITION event the capability revision chain records
+   * (Clem 4 Stage 4). Called after every authority gate has passed and args
+   * validated, immediately before the inner dispatch; never for MCP-namespaced
+   * targets (they carry their own scope authority). Instrumentation only: a
+   * throwing observer must never break dispatch. */
+  onBuiltinAcquisition?: (targetName: string) => void;
 }
 
 export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeContextValue> {
@@ -516,6 +523,13 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       const activeRunContext = harnessRunContextStorage.getStore();
       const counter = activeRunContext?.counter ?? new ToolCallsCounter(1000);
       const outerCallId = details?.toolCall?.callId ?? details?.toolCall?.id;
+      if (options.onBuiltinAcquisition && !isMcpNamespacedTool(target)) {
+        try {
+          options.onBuiltinAcquisition(target);
+        } catch {
+          // Acquisition observation is instrumentation; dispatch never dies for it.
+        }
+      }
       const out = await dispatchBatchItemTool(
         target,
         dispatchArgs,
