@@ -23,9 +23,11 @@
 import { createHash } from 'node:crypto';
 
 import {
+  initialBindingRevision,
   sealAdmissionEnvelope,
   type AdmissionEnvelope,
   type AdmittedCapability,
+  type CapabilityBindingRevision,
   type EnvelopeBudget,
 } from '../runtime/graph/admission-envelope.js';
 import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
@@ -100,14 +102,60 @@ export function sealAgentCapabilityEnvelope(input: {
 // ── binding (the bindAgentMcpToolScope pattern) ──────────────────────────────
 
 const AGENT_ENVELOPES = new WeakMap<object, AdmissionEnvelope>();
+const AGENT_REVISIONS = new WeakMap<object, CapabilityBindingRevision>();
 
 export function bindAgentCapabilityEnvelope(agent: object, envelope: AdmissionEnvelope): void {
   AGENT_ENVELOPES.set(agent, envelope);
 }
 
-/** The sealed surface this agent was built with, or null for agents that
+/** The sealed UNIVERSE this agent was built under, or null for agents that
  *  predate sealing (tests, custom builders). Callers must treat null as
  *  "unknown", never as "unlimited". */
 export function boundAgentCapabilityEnvelope(agent: object): AdmissionEnvelope | null {
   return AGENT_ENVELOPES.get(agent) ?? null;
+}
+
+/**
+ * Seal the ADMITTED CATALOG UNIVERSE and record the active surface as
+ * binding revision 1 — the envelope/revision split the charter demands.
+ * Deferred (schema-on-demand) tools live in the universe from birth, so a
+ * later acquisition is a monotonic revision WITHIN it, never a widening;
+ * MCP tools are governed by their own bound scope authority, and the two
+ * compose at enforcement. Refuses if the active surface names anything the
+ * universe does not contain — impossible by construction, load-bearing to
+ * assert.
+ */
+export function sealAgentCapabilityUniverse(input: {
+  sessionId: string;
+  universeTools: readonly SealableToolLike[];
+  activeToolNames: readonly string[];
+  policyHash: string;
+  budget: EnvelopeBudget;
+}): { ok: true; envelope: AdmissionEnvelope; revision: CapabilityBindingRevision } | { ok: false; errors: string[] } {
+  const sealed = sealAgentCapabilityEnvelope({
+    sessionId: input.sessionId,
+    tools: input.universeTools,
+    policyHash: input.policyHash,
+    budget: input.budget,
+  });
+  if (!sealed.ok) return sealed;
+  const revision = initialBindingRevision(sealed.envelope, input.activeToolNames);
+  if (!revision.ok) {
+    return {
+      ok: false,
+      errors: revision.kind === 'requires_readmission'
+        ? [`active surface names capabilities outside the sealed universe: ${revision.outside.join(', ')}`]
+        : revision.errors,
+    };
+  }
+  return { ok: true, envelope: sealed.envelope, revision: revision.revision };
+}
+
+export function bindAgentCapabilityRevision(agent: object, revision: CapabilityBindingRevision): void {
+  AGENT_REVISIONS.set(agent, revision);
+}
+
+/** The active binding revision, or null (unknown, never unlimited). */
+export function boundAgentCapabilityRevision(agent: object): CapabilityBindingRevision | null {
+  return AGENT_REVISIONS.get(agent) ?? null;
 }

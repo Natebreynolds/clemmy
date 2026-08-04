@@ -32,7 +32,7 @@ import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 import { createHash } from 'node:crypto';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
-import { bindAgentCapabilityEnvelope, sealAgentCapabilityEnvelope, type SealableToolLike } from './capability-envelope.js';
+import { bindAgentCapabilityEnvelope, bindAgentCapabilityRevision, sealAgentCapabilityUniverse, type SealableToolLike } from './capability-envelope.js';
 import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
 import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
 import type { Tool } from '@openai/agents';
@@ -2240,17 +2240,35 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     outputGuardrails: harnessOutputGuardrails,
   });
   bindAgentMcpToolScope(agent, mcpToolScope);
-  // Clem 4, Stage 4 activation slice 1: seal the assembled tool surface into
-  // the immutable capability envelope and bind it to the agent. Nothing
-  // refuses on it yet — the dispatch boundary gains the artifact to enforce
-  // against in the next slice. Loud and non-fatal on refusal: chat must not
-  // die because instrumentation declined, and a silent skip is how
-  // instrumentation rots.
+  // Clem 4, Stage 4 activation slice 2: seal the admitted CATALOG UNIVERSE —
+  // the full scoped discovery set (every deferred tool with its real schema)
+  // plus the structural/dispatcher tools — and record the active surface as
+  // binding revision 1. A schema-on-demand acquisition is then a monotonic
+  // revision WITHIN the sealed universe, never a widening; MCP tools stay
+  // under their own bound scope authority and compose at enforcement. Active
+  // instances win name collisions (the turn-scoped tool_search ships a
+  // different schema than the static registry instance, and the fingerprint
+  // must describe what actually dispatches). Nothing refuses on this yet —
+  // the dispatch boundary gains the artifact to enforce against in the next
+  // slice. Loud and non-fatal on refusal: chat must not die because
+  // instrumentation declined, and a silent skip is how instrumentation rots.
   try {
     const budgetSettings = getHarnessBudgetSettings();
-    const sealed = sealAgentCapabilityEnvelope({
+    const universeByName = new Map<string, SealableToolLike>();
+    for (const toolRef of [
+      ...scopedDiscoveryTools,
+      ...assembledTools,
+      ...toolPolicy.tools,
+    ] as unknown as SealableToolLike[]) {
+      const name = typeof toolRef.name === 'string' ? toolRef.name : '';
+      if (name) universeByName.set(name, toolRef); // later (active) instances win
+    }
+    const sealed = sealAgentCapabilityUniverse({
       sessionId: options.sessionId ?? 'unbound',
-      tools: toolPolicy.tools as unknown as SealableToolLike[],
+      universeTools: [...universeByName.values()],
+      activeToolNames: toolPolicy.tools
+        .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+        .filter(Boolean),
       policyHash: createHash('sha256')
         .update(JSON.stringify(getProactivityPolicySnapshot().policy), 'utf-8')
         .digest('hex'),
@@ -2261,14 +2279,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         maxElapsedMs: budgetSettings.maxConversationWallMs > 0 ? budgetSettings.maxConversationWallMs : 3_600_000,
       },
     });
-    if (sealed.ok) bindAgentCapabilityEnvelope(agent, sealed.envelope);
-    else {
+    if (sealed.ok) {
+      bindAgentCapabilityEnvelope(agent, sealed.envelope);
+      bindAgentCapabilityRevision(agent, sealed.revision);
+    } else {
       // eslint-disable-next-line no-console
-      console.warn(`[orchestrator] capability envelope refused to seal: ${sealed.errors.join('; ')}`);
+      console.warn(`[orchestrator] capability universe refused to seal: ${sealed.errors.join('; ')}`);
     }
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.warn('[orchestrator] capability envelope sealing threw:', err instanceof Error ? err.message : err);
+    console.warn('[orchestrator] capability universe sealing threw:', err instanceof Error ? err.message : err);
   }
   return agent;
 }

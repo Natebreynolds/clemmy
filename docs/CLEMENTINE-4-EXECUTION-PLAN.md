@@ -481,6 +481,24 @@ acquisitions as later monotonic revisions — exactly the charter's
 envelope/revision split. That reseal is the enforcement slice's first step;
 refusal wiring comes only after it.
 
+**CATALOG RESEAL EXECUTED (2026-08-04):** `sealAgentCapabilityUniverse`
+seals the scoped discovery set (`scopedDiscoveryTools` — pre-JIT-prune,
+pre-deferral, so every deferred name carries its REAL schema fingerprint)
+plus structural tools and the call_tool dispatcher, with active instances
+winning name collisions (the turn-scoped tool_search ships a different
+schema than the static registry instance; the fingerprint must describe
+what actually dispatches). The active surface (`toolPolicy.tools`) is
+recorded as binding revision 1 via `initialBindingRevision`, and BOTH
+artifacts bind to the agent (`bindAgentCapabilityRevision` beside the
+envelope WeakMap). A schema-on-demand acquisition is now representable as
+`appendBindings` within the sealed universe — never a widening — and MCP
+tools stay under `mcp-tool-authority`'s own bound scope; the two compose at
+the dispatch boundary. Policy-excluded names remain IN the universe (they
+were admitted at catalog level; exclusion is surface shaping and call_tool
+already carries the deny-list). What remains of enforcement: call_tool's
+acquisition path appending revisions at dispatch time, then boundary
+refusal for names outside the bound revision + outside MCP scope.
+
 ### The interior-depth manifest (scoped with evidence, 2026-08-04)
 
 Each interior phase of the chat spine was scoped to its exact seam, so the
