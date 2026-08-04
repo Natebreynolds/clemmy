@@ -462,6 +462,54 @@ the interior phases, effects, and provider rows convert AND the live matrix
 runs green. The table exists so nobody — including the author — can mistake
 spine conversion for finished interiors.
 
+## 3c. Stage-start manifest: the verify-node extraction (ready to execute)
+
+The charter's required pre-stage declaration, written while the seam evidence
+is fresh, so the next session executes a reviewed plan instead of re-deriving
+one.
+
+**Objective.** The spine's `verify` node stops pass-throughing: the delivery
+gate's verdict becomes the node's outcome, and the compiled
+`verify --repairable--> execute` edge becomes the continuation mechanism the
+loop currently expresses as self-iteration. Quiescence-with-undelivered
+becomes a graph state, not a loop branch.
+
+**Allowed files.** `loop.ts` (the two gate sites and the continuation branch
+they feed), `chat-turn-spine.ts` (verify runner + repairable edge grant),
+`objective-judge.ts` read-only, plus tests. Nothing else.
+
+**The seam, precisely.** Both gate sites share one shape:
+`verifyDelivered(objective, text, {judgeFn}) → DeliveryVerdict` at
+`loop.ts:4068` (recovery path) and `loop.ts:5783` (standard path), each
+followed by a continuation decision on `!delivered`. Extraction phase 1
+(this stage): the core RETURNS the verdict as part of its result instead of
+self-continuing on the standard path; the spine's verify node evaluates it;
+`edgeSatisfied('evidence_sufficient')` becomes real (granted only on
+`delivered`); the repairable edge re-enters a bounded re-core. The recovery
+path stays internal this stage (its verdict caching is entangled with
+restart state) and is named as phase 2.
+
+**Behavioral invariants (must not change).** One public terminal per accepted
+source; the continuation BUDGET semantics (maxSteps/wall-clock) still bound
+total work; a `dispatched` result still bypasses verification; judge
+fail-open semantics unchanged; verdict telemetry (`recordVerdictEvent`)
+fires identically.
+
+**Biting tests.** (a) an undelivered verdict routes the repairable edge and
+re-enters execute exactly once per grant — pinned by trace; (b) a delivered
+verdict grants `evidence_sufficient` and publish follows — trace-pinned;
+(c) budget exhaustion during repair parks as `needs_input/continue`, not a
+silent truncation; (d) the full chat differential (102) + loop suite + both
+smoke sets, both brains, unchanged; (e) revert-probe: forcing the edge grant
+to unconditional must fail (a).
+
+**Expected deletions.** The standard-path `!delivered` self-continuation
+branch in `runConversationCore`; the interim `edgeSatisfied: () => true`
+grant in the spine for `evidence_sufficient` specifically.
+
+**Non-goals.** Recovery-path extraction (phase 2); context/capability nodes
+(later slices); any change to judge internals.
+
 ## 4. Sequencing
 
 ```mermaid
