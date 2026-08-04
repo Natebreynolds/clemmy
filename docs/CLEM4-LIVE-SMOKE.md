@@ -1,5 +1,15 @@
 # Clem 4 live smoke — the ten-minute gate
 
+> **STATUS: GREEN — BOTH BRAINS (2026-08-04).** Executed headlessly under
+> Nathan's authorization via the proof harness (disposable home, real brain
+> auth): conversational, retrieval, fan-out-shaped, and approval-resume turns
+> all green on Claude AND Codex, with the fallback grep pinned as a permanent
+> live proof (`chat-spine-graph-drive`: zero "fell back to legacy order"
+> lines — the graph drove every turn). This document remains the recipe for
+> on-screen surface smokes; the headless equivalent is:
+> `npx tsx scripts/proof/run-proof.ts --brain <brain> --scenario chat-spine-graph-drive,converse-first,continuity-recall,fanout-multi-item,approval-park-resume`
+
+
 Branch: `codex/monday-chat-settlement` · validates the chat-spine conversion
 (`7068265d` + `70174bfc`) on real surfaces before interior extraction, U2–U6,
 or the tag build on top of it.

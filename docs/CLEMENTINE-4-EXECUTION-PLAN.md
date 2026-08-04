@@ -412,8 +412,21 @@ the durable resume-authority timestamps existed in run records but were
 dropped by the console API's whitelist projector — fixed in two bounded
 commits with the failing proof as the differential.
 
-Remaining rungs: M5 live canary (first rung: docs/CLEM4-LIVE-SMOKE.md), then
-interior depth and U2–U6 on the far side of it.
+### M5 first rung — the live smoke: GREEN, BOTH BRAINS (2026-08-04)
+
+Driven headlessly under authorization via the proof harness against the real
+brains: conversational, retrieval, fan-out-shaped, and approval-resume turns
+green on Claude and Codex, plus the new permanent `chat-spine-graph-drive`
+proof asserting ZERO legacy-order fallbacks in the daemon log — the compiled
+graph drove every live turn, on both brains, including the resume spine
+converted this session. Running the smoke surfaced and fixed one more
+inherited divergence: a proof scenario asserting outcome content through the
+runs-list API, which excludes outputs BY PRIVACY DESIGN — the check now
+reads the durable record, and the privacy projection stays exactly as strict.
+
+Remaining rungs: the M5 canary proper (cloned workflow on live surfaces) and
+optional on-screen surface smokes, then interior depth and U2–U6 — now
+UNBLOCKED by smoke green.
 
 ### The interior-depth manifest (scoped with evidence, 2026-08-04)
 
