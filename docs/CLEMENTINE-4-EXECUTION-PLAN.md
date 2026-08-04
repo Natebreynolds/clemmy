@@ -478,16 +478,29 @@ becomes a graph state, not a loop branch.
 they feed), `chat-turn-spine.ts` (verify runner + repairable edge grant),
 `objective-judge.ts` read-only, plus tests. Nothing else.
 
-**The seam, precisely.** Both gate sites share one shape:
-`verifyDelivered(objective, text, {judgeFn}) → DeliveryVerdict` at
-`loop.ts:4068` (recovery path) and `loop.ts:5783` (standard path), each
-followed by a continuation decision on `!delivered`. Extraction phase 1
-(this stage): the core RETURNS the verdict as part of its result instead of
-self-continuing on the standard path; the spine's verify node evaluates it;
-`edgeSatisfied('evidence_sufficient')` becomes real (granted only on
-`delivered`); the repairable edge re-enters a bounded re-core. The recovery
-path stays internal this stage (its verdict caching is entangled with
-restart state) and is named as phase 2.
+**The seam, precisely — CORRECTED after full-branch read (2026-08-04).**
+Both gate sites share `verifyDelivered(...) → DeliveryVerdict` at
+`loop.ts:4068` (recovery) and `loop.ts:5783` (standard). The original
+manifest predicted a `!delivered` self-continuation on the standard path;
+the full read FALSIFIES that: `!delivered` commits a BLOCKED PUBLIC TERMINAL
+(`commitStandardBlockedTerminal` → `awaiting_user_input`) — there is no
+iteration branch there to delete. Both verdict outcomes are public
+terminals, exactly per the runtime doc's terminal-reduction table
+(done/answer vs needs_input/question).
+
+The REAL phase 1 therefore begins in the COMPILER: the turn IR's `verify`
+node has only the delivered route (`evidence_sufficient → compose_reply`);
+the blocked route exists in production but not in topology. Phase 1 =
+(a) IR/compiler: `verify --insufficient--> compose_blocked --> publish` (or
+an equivalent typed blocked route), so BOTH outcomes are graph paths;
+(b) spine: thread the core's real verdict (derivable today —
+`status === 'completed'` vs `awaiting_user_input` + `verification` in the
+event data) into `edgeSatisfied`, granting `evidence_sufficient` only on
+delivered and the blocked route only on undelivered;
+(c) delete the interim blanket grant for these two conditions.
+Only AFTER both routes are topology does moving the verdict decision itself
+out of the core become meaningful (phase 2, with the recovery path's
+restart-entangled caching as phase 3).
 
 **Behavioral invariants (must not change).** One public terminal per accepted
 source; the continuation BUDGET semantics (maxSteps/wall-clock) still bound
@@ -503,9 +516,10 @@ silent truncation; (d) the full chat differential (102) + loop suite + both
 smoke sets, both brains, unchanged; (e) revert-probe: forcing the edge grant
 to unconditional must fail (a).
 
-**Expected deletions.** The standard-path `!delivered` self-continuation
-branch in `runConversationCore`; the interim `edgeSatisfied: () => true`
-grant in the spine for `evidence_sufficient` specifically.
+**Expected deletions.** The interim blanket grant in the spine for
+`evidence_sufficient` (and the new blocked-route condition). NOTE: the
+originally-listed "standard-path self-continuation branch" does not exist —
+falsified by the full-branch read; nothing in the core deletes in phase 1.
 
 **Non-goals.** Recovery-path extraction (phase 2); context/capability nodes
 (later slices); any change to judge internals.
