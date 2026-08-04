@@ -178,3 +178,44 @@ test('the spine grants nothing it does not understand — future gates fail clos
     'the compiler emits a condition the spine has no real signal for — grant it from its OWN signal, never blanket',
   );
 });
+
+test('capability resolves AT the capability_resolve node, exactly once, before any model call', async () => {
+  // The capability interior's first real slice: agent/tool assembly is graph
+  // work. On shapes WITH the node, construction happens there — a real trace
+  // step ordered before the work node; on the direct shape (no node), it
+  // happens lazily before the core; on every path it runs exactly once.
+  const order: string[] = [];
+  const retrieval = await driveChatTurnSpine({
+    identity: { sessionId: 'cap-spine', turn: 1, sourceUserSeq: 11 },
+    input: 'What is the current status of the Acme account?',
+    surface: 'direct',
+    policy: POLICY,
+    phases: {
+      resolveCapability: async () => { order.push('capability'); },
+      runCore: async () => { order.push('core'); return { ok: true }; },
+      shouldPublish: () => true,
+      publish: () => { order.push('publish'); },
+      delivered: () => true,
+    },
+  });
+  assert.equal(retrieval.engine, 'graph');
+  assert.deepEqual(order, ['capability', 'core', 'publish'], 'capability did not resolve before the core');
+  const capabilityStep = retrieval.trace!.find((t) => t.kind === 'capability_resolve')!;
+  const hostStep = retrieval.trace!.find((t) => t.kind === 'retrieve')!;
+  assert.ok(capabilityStep.wave < hostStep.wave, 'the capability node did not precede the work node in the trace');
+
+  const direct: string[] = [];
+  await driveChatTurnSpine({
+    identity: { sessionId: 'cap-spine', turn: 2, sourceUserSeq: 12 },
+    input: 'hello',
+    surface: 'direct',
+    policy: POLICY,
+    phases: {
+      resolveCapability: async () => { direct.push('capability'); },
+      runCore: async () => { direct.push('core'); return { ok: true }; },
+      shouldPublish: () => true,
+      publish: () => {},
+    },
+  });
+  assert.deepEqual(direct, ['capability', 'core'], 'the direct shape did not resolve capability before its core');
+});

@@ -341,7 +341,9 @@ function fakeHarnessAssistant(responses: HarnessStubReply[]): {
       authority.push(options.allowedToolNames);
       return {};
     }) as never,
-    runConversation: (async (options: { sessionId: string; input: string }) => {
+    runConversation: (async (options: { sessionId: string; input: string; buildAgent?: () => Promise<unknown> }) => {
+      // Contract mirror: capability resolves during the turn.
+      await options.buildAgent?.();
       prompts.push(options.input);
       const response = responses.shift();
       if (!response) throw new Error('unexpected harness conversation call');

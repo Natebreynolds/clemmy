@@ -834,7 +834,11 @@ export async function respondViaHarness(
   let preserveRequestAttemptOwnership = false;
   try {
     const modelForRun = opts.modelOverride ?? (config.honorModel && request.model ? request.model : undefined);
-    const agent = await buildAgentImpl({
+    // Capability interior (Clem 4): the agent is BUILT at the spine's
+    // capability_resolve node, not before the turn — tool/capability assembly
+    // is graph work with a real trace step. Same builder, same arguments,
+    // moved in time; the fallover wiring keeps its own builder for rebuilds.
+    const buildAgent = () => buildAgentImpl({
       userInput: request.message,
       sessionId,
       allowedToolNames: request.allowedToolNames,
@@ -900,7 +904,7 @@ export async function respondViaHarness(
     // proposal: retries, judges, and effect verification can replace it. The
     // terminal TurnOutcome committer publishes the authoritative presentation.
     const result = await runConversationImpl({
-      agent,
+      buildAgent,
       sessionId,
       input: request.message,
       sourceUserSeq: sourceUserEvent.seq,

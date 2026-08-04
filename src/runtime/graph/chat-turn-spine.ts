@@ -37,6 +37,15 @@ export interface ChatTurnSpinePhases<CoreResult> {
   /** The terminal reduction + public commit — runs at the publish node. */
   publish: (core: CoreResult) => void;
   /**
+   * Capability resolution — agent/tool assembly — owned by the
+   * capability_resolve node when the compiled shape has one, and invoked
+   * lazily before the core on shapes that do not (direct replies). Runs
+   * exactly once per turn, before any model call, on both the graph and the
+   * legacy-order fallback paths. The capability interior's first real slice:
+   * construction happens AT the node, as a real trace step.
+   */
+  resolveCapability?: () => Promise<void>;
+  /**
    * Was the answer DELIVERED (evidence sufficient), per the core's own
    * delivery verdict? Drives which verdict route fires: `true` grants
    * `evidence_sufficient` (compose_reply), `false` grants
@@ -104,6 +113,7 @@ export async function driveChatTurnSpine<CoreResult>(
 
   if (!compiled) {
     // Legacy ORDER, same phases: behavior-identical spine, minus the trace.
+    await spine.phases.resolveCapability?.();
     const core = await spine.phases.runCore();
     if (spine.phases.shouldPublish(core)) spine.phases.publish(core);
     return { core, engine: 'legacy_order', compileError };
@@ -121,6 +131,12 @@ export async function driveChatTurnSpine<CoreResult>(
   let coreDelivered = true;
   let coreError: unknown;
   let published = false;
+  let capabilityResolved = false;
+  const resolveCapabilityOnce = async (): Promise<void> => {
+    if (capabilityResolved) return;
+    capabilityResolved = true;
+    await spine.phases.resolveCapability?.();
+  };
 
   const run = await runGraph(
     {
@@ -136,6 +152,21 @@ export async function driveChatTurnSpine<CoreResult>(
     {
       runner: {
         run: async (node) => {
+          if (node.kind === 'capability_resolve') {
+            // Construction happens AT the node — a real trace step, not a
+            // pass-through. Failure here is the node's own failure.
+            try {
+              await resolveCapabilityOnce();
+              return { status: 'completed' };
+            } catch (error) {
+              coreError = error;
+              return {
+                status: 'failed',
+                reason: error instanceof Error ? error.message : String(error),
+                settlementClass: 'infrastructure',
+              };
+            }
+          }
           if (node.id === hostNodeId) {
             // The provider error contract must not change shape under the
             // executor: a throwing core is captured here and RETHROWN after
@@ -144,6 +175,9 @@ export async function driveChatTurnSpine<CoreResult>(
             // can never route this turn into a second provider call.
             coreAttempted = true;
             try {
+              // Direct-reply shapes have no capability_resolve node; resolve
+              // here, idempotently, before the first model call.
+              await resolveCapabilityOnce();
               core = await spine.phases.runCore();
               coreRan = true;
               coreDelivered = spine.phases.delivered?.(core) ?? true;
@@ -202,6 +236,7 @@ export async function driveChatTurnSpine<CoreResult>(
     // The graph never reached compose_reply — a spine defect, not a user
     // outcome, and the core was NEVER attempted, so running the legacy order
     // is a first execution rather than a duplicate. Surface the anomaly.
+    await resolveCapabilityOnce();
     const fallbackCore = await spine.phases.runCore();
     if (spine.phases.shouldPublish(fallbackCore)) spine.phases.publish(fallbackCore);
     return {

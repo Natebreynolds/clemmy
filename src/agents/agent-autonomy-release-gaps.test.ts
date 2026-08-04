@@ -131,7 +131,9 @@ test('delegation wake fires even when cadence proactivity is disabled', async ()
     runConversation: (async (options: {
       sessionId: string;
       acceptStructuredNoToolResult?: boolean;
+      buildAgent?: () => Promise<unknown>;
     }) => {
+      await options.buildAgent?.();
       assistantCalls += 1;
       structuredNoToolOptIn = options.acceptStructuredNoToolResult;
       return {
@@ -304,7 +306,7 @@ test('OAuth autonomy uses an explicit empty tool allowlist instead of generic cr
       builtWith = options;
       return {};
     }) as never,
-    runConversation: (async (options: { sessionId: string }) => ({
+    runConversation: (async (options: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await options.buildAgent?.(), {
       sessionId: options.sessionId,
       status: 'completed',
       steps: 1,
@@ -450,7 +452,7 @@ test('a denied runtime action fails the cycle and leaves delegated input availab
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
-    runConversation: (async (options: { sessionId: string }) => ({
+    runConversation: (async (options: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await options.buildAgent?.(), {
       sessionId: options.sessionId,
       status: 'completed',
       steps: 1,
@@ -501,7 +503,7 @@ test('a delegation wake cannot succeed as an empty no-op cycle', async () => {
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
-    runConversation: (async (options: { sessionId: string }) => ({
+    runConversation: (async (options: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await options.buildAgent?.(), {
       sessionId: options.sessionId,
       status: 'completed',
       steps: 1,
@@ -544,7 +546,7 @@ test('an ordinary cadence wake may still succeed as a truthful no-op', async () 
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
-    runConversation: (async (options: { sessionId: string }) => ({
+    runConversation: (async (options: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await options.buildAgent?.(), {
       sessionId: options.sessionId,
       status: 'completed',
       steps: 1,

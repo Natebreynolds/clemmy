@@ -90,12 +90,19 @@ const okConfigure = (async () => ({ ok: true })) as never;
 const fakeAgentBuilder = (async () => FAKE_AGENT) as never;
 
 function fakeRun(result: Record<string, unknown>): never {
-  return (async (opts: { sessionId: string }) => ({
-    sessionId: opts.sessionId,
-    steps: 1,
-    lastTurn: 1,
-    ...result,
-  })) as never;
+  return (async (opts: { sessionId: string; buildAgent?: () => Promise<unknown> }) => {
+    // Capability interior contract: the real runConversation resolves the
+    // agent AT the capability_resolve node. The stub mirrors that, so tests
+    // asserting builder arguments keep asserting the true call, at its true
+    // time — during the turn, not before it.
+    await opts.buildAgent?.();
+    return {
+      sessionId: opts.sessionId,
+      steps: 1,
+      lastTurn: 1,
+      ...result,
+    };
+  }) as never;
 }
 
 function appendActiveWorkflowDispatch(source: import('./eventlog.js').EventRow, runId: string): void {
@@ -784,7 +791,7 @@ test('Claude SDK brain fallover forces a non-Claude harness model when one is co
         capturedModel = opts.model;
         return FAKE_AGENT;
       }) as never,
-      runConversation: (async (opts: { sessionId: string }) => ({
+      runConversation: (async (opts: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await opts.buildAgent?.(), {
         sessionId: opts.sessionId,
         status: 'completed',
         steps: 1,
@@ -2161,7 +2168,9 @@ test('parse-exhaustion completion re-runs ONCE on the next brain instead of ship
   let calls = 0;
   const attemptIds: string[] = [];
   const sourceUserSeqs: number[] = [];
-  const run = (async (opts: { sessionId: string; runAttemptId?: string; sourceUserSeq?: number }) => {
+  const run = (async (opts: { sessionId: string; runAttemptId?: string; sourceUserSeq?: number; buildAgent?: () => Promise<unknown> }) => {
+    // Contract mirror: capability resolves during the turn.
+    await opts.buildAgent?.();
     calls += 1;
     attemptIds.push(opts.runAttemptId ?? '');
     sourceUserSeqs.push(opts.sourceUserSeq ?? 0);

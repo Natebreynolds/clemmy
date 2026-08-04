@@ -1947,7 +1947,14 @@ export type RunConversationStatus =
   | 'failed';
 
 export interface RunConversationOptions {
-  agent: Agent<any, any>;
+  /** Pre-built agent. Optional when `buildAgent` is supplied — the spine's
+   *  capability_resolve node then owns construction (Clem 4, capability
+   *  interior). Exactly one of `agent`/`buildAgent` is required. */
+  agent?: Agent<any, any>;
+  /** Build the agent AT the capability_resolve node instead of before the
+   *  turn — tool/capability assembly becomes graph work with a real trace
+   *  step. Invoked exactly once per turn, before any model call. */
+  buildAgent?: () => Promise<Agent<any, any>>;
   sessionId: string;
   input: string;
   /** Max auto-continuation hops. Defaults to 12. */
@@ -3484,15 +3491,25 @@ export async function runConversation(
     type SpineCore =
       | { kind: 'dispatched'; result: Awaited<ReturnType<typeof runConversationCore>> }
       | { kind: 'reduced'; reduced: ReturnType<typeof reduceStandardConversationTerminal> };
+    let activeAgent = options.agent;
+    if (!activeAgent && !options.buildAgent) {
+      throw new Error('runConversation requires either agent or buildAgent.');
+    }
+    const resolveCapability = options.buildAgent
+      ? async () => { if (!options.agent) activeAgent = await options.buildAgent!(); }
+      : undefined;
     const spine = await driveChatTurnSpine<SpineCore>({
       identity: { sessionId: options.sessionId, turn: acceptedSource.turn, sourceUserSeq },
       input: options.input,
       surface: 'direct',
       policy: getProactivityPolicySnapshot(),
       phases: {
+        ...(resolveCapability ? { resolveCapability } : {}),
         runCore: async () => {
+          if (!activeAgent) throw new Error('capability_resolve did not produce an agent before the core.');
           const result = await runConversationCore({
             ...options,
+            agent: activeAgent,
             sourceUserSeq,
             reuseRecordedUserInput: true,
           });
@@ -3556,7 +3573,9 @@ function refreshTerminalWorkingMemory(sessionId: string): void {
 }
 
 async function runConversationCore(
-  options: RunConversationOptions,
+  // The core demands a RESOLVED agent — capability resolution happened at the
+  // spine's capability_resolve node (or the caller passed one pre-built).
+  options: RunConversationOptions & { agent: Agent<any, any> },
 ): Promise<RunConversationResult> {
   // v0.5.19 F2 — `budget` is mutable so the elevate-on-warn path can
   // rebind it mid-conversation. The cached locals below pick up new
