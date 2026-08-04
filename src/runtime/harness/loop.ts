@@ -8112,21 +8112,55 @@ export async function runConversationFromResume(opts: {
   });
   let foregroundReleased = false;
   try {
-    const result = await runConversationFromResumeCore({ ...opts, sourceUserSeq });
-    if (result.status === 'dispatched') {
-      foregroundReleased = true;
-      return result;
-    }
-    const reduced = reduceStandardConversationTerminal({
-      result,
-      sourceUserSeq,
-      approvalIdHint: opts.approvalId,
+    // G5b: the resume family rides the same executor-driven spine as fresh
+    // turns — an approval resume was the one chat entry still running the
+    // legacy order after 7068265d, found while writing the smoke runbook.
+    // The compiled input is the decision verb, not user prose: deterministic,
+    // content-free, and the shadow recorder above still hashes the real
+    // accepted event for telemetry.
+    type ResumeSpineCore =
+      | { kind: 'dispatched'; result: Awaited<ReturnType<typeof runConversationFromResumeCore>> }
+      | { kind: 'reduced'; reduced: ReturnType<typeof reduceStandardConversationTerminal> };
+    const spine = await driveChatTurnSpine<ResumeSpineCore>({
+      identity: { sessionId: opts.sessionId, turn: acceptedSource.turn, sourceUserSeq },
+      input: `approval ${opts.decision}`,
+      surface: 'approval_resume',
+      policy: getProactivityPolicySnapshot(),
+      phases: {
+        runCore: async () => {
+          const result = await runConversationFromResumeCore({ ...opts, sourceUserSeq });
+          if (result.status === 'dispatched') return { kind: 'dispatched', result };
+          return {
+            kind: 'reduced',
+            reduced: reduceStandardConversationTerminal({
+              result,
+              sourceUserSeq,
+              approvalIdHint: opts.approvalId,
+            }),
+          };
+        },
+        shouldPublish: (core) => core.kind === 'reduced' && !core.reduced.completedReason,
+        publish: (core) => {
+          if (core.kind !== 'reduced') return;
+          emitRuntimeTerminalEvent(opts.sessionId, core.reduced);
+          refreshTerminalWorkingMemory(opts.sessionId);
+        },
+      },
     });
-    if (reduced.completedReason) return reduced;
-    foregroundReleased = Boolean(reduced.publicPresentation);
-    emitRuntimeTerminalEvent(opts.sessionId, reduced);
-    refreshTerminalWorkingMemory(opts.sessionId);
-    return reduced;
+    if (spine.engine === 'legacy_order') {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[harness] chat turn spine fell back to legacy order (session ${opts.sessionId}, seq ${sourceUserSeq}): ${spine.compileError ?? 'unknown'} — the turn answered; the graph did not drive it`,
+      );
+    }
+    const core = spine.core;
+    if (core.kind === 'dispatched') {
+      foregroundReleased = true;
+      return core.result;
+    }
+    if (core.reduced.completedReason) return core.reduced;
+    foregroundReleased = Boolean(core.reduced.publicPresentation);
+    return core.reduced;
   } finally {
     if (foregroundReleased) {
       clearRunInFlightAfterTerminal(opts.sessionId, opts.runAttemptId, sourceUserSeq);
