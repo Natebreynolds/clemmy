@@ -1,0 +1,379 @@
+# Clementine 4: Execution Plan
+
+Status: proposed
+Date: 2026-08-03
+Baseline: `65c54490` (v3.6.3, published)
+Supersedes: the "After this patch: true Clementine 4 work" section of `CLEMENTINE-4-SHIP-ROADMAP.md`
+
+`CLEMENTINE-4-GRAPH-RUNTIME.md` describes the destination well and does not need rewriting.
+This document is the missing half: where we measurably are, why the remaining
+distance is smaller than the phase list implies, and the order to close it in.
+
+## 1. Measured state
+
+Counted at `65c54490`, not inferred from prior status notes.
+
+| Thing | Measured | What it means |
+|---|---|---|
+| Chat turn graph | 791 non-test LOC | `turn-graph-ir.ts` + `turn-graph-compiler.ts` + `turn-graph-shadow.ts` |
+| Chat turn graph call sites | 4, all `recordTurnGraphShadow` | `loop.ts` ×2, `claude-agent-brain.ts`, `respond-bridge.ts`. Every one discards the return value. Observation only, zero execution authority. |
+| `src/runtime/harness/loop.ts` | 10,314 LOC | The actual chat engine |
+| `src/execution/workflow-runner.ts` | 11,084 LOC | The actual workflow engine |
+| `src/dashboard/console-routes.ts` | 15,985 LOC | The largest file in the repository |
+| `workflow-graph.ts` | 528 LOC | Topology **declaration**. Executed by `workflow-runner.ts` at lines 3176 / 6659 / 6858 / 7145. |
+| Distinct `CLEMMY_*` / `CLEMENTINE_*` gates | 470 | Against a target of one `RuntimeBudget` |
+| `process.env` reads | 4,656 across 113 non-test files | Against a target of zero inside graph nodes |
+| `src/memory/**` | 69 files, 36,947 LOC | The subsystem with the correctness requirement |
+
+### The finding that matters
+
+**No graph executor exists anywhere in the codebase.**
+
+What exists is a graph *vocabulary* — an IR, a validator, a store, a compiler, a
+hash — and two independent mega-loops that special-case parts of it. The chat
+graph observes and never runs. The workflow graph is a declaration that
+`workflow-runner.ts` interprets inline; `read_parallel_v1` is a branch inside an
+11,000-line function, not a topology an engine executes.
+
+This is worth stating plainly because the roadmap's phase list reads as though
+Phase 1 is complete and Phase 3 is one item of seven. Measured against
+"a graph runs the work," we are at the beginning of Phase 2, and the single
+missing keystone is the same in both lanes.
+
+### The reframe
+
+That finding is better news than it sounds. The expensive parts of a graph
+runtime are the contracts — typed events with audience, immutable per-turn
+policy, one terminal reduction, exactly-once effect identity, deterministic
+plan hashes, restart materialization. Those are **written, tested, and shipped**.
+What is missing is the smallest piece: something that walks nodes.
+
+So Clementine 4 is not "build a graph runtime." It is:
+
+> Extract one executor that both lanes call, then move node classes onto it
+> one at a time, deleting the mega-loop branch each move retires.
+
+That is a sequence of small, individually shippable, individually revertible
+changes, which is the only kind this codebase should accept given the
+forward-only and no-architecture-churn constraints.
+
+## 2. Principles
+
+Five, in priority order. Each is a rule that decides arguments, not a slogan.
+
+### P1 — Unbounded topology, bounded authority
+
+The user requirement is that the harness must never be the limit — only the
+tools and the model are. That requirement is in direct tension with a typed
+graph, and the tension has to be resolved explicitly or the graph becomes the
+new ceiling. `read_parallel_v1` already demonstrates the failure mode: it
+requires 2–6 specialists and read-only effects. A task needing seven readers, or
+one reader, or a write inside the fan-out, is structurally excluded by the
+harness — exactly what we are trying to stop doing.
+
+The resolution is that node **kinds** stay few and generic while **topology**
+stays unbounded and data-driven:
+
+| Node kind | Purpose |
+|---|---|
+| `model` | run a provider turn |
+| `tool` | one classified, authorized invocation |
+| `reduce` | typed join of N inputs |
+| `gate` | approval, missing input, budget, policy |
+| `subgraph` | run a graph produced at runtime |
+
+`subgraph` is the load-bearing one. A planner node emits topology and the
+executor runs it, so the set of achievable task shapes is not enumerated
+anywhere in the harness. New capability arrives as new *tools* and new *emitted
+topology*, never as a new node type and never as a runner branch.
+
+What stays bounded is authority, not shape. Every external effect passes the
+same reservation → receipt → commit seam regardless of where it sits in the
+graph. Constrain effects, not methods.
+
+**Test of the principle:** if closing a capability gap requires editing the
+executor, the design is wrong.
+
+### P2 — Memory is validated on write and on read, by one validator
+
+This is the pillar the existing design documents do not have. They treat memory
+as retrieval — the context assembler, layers 1–5, bounded packets. The defect
+class we hit is not a retrieval defect. It is a **write-path** defect, and no
+amount of better retrieval fixes it.
+
+The live 2026-08-03 incident traces to one field:
+
+```ts
+/** Free-form template the Executor renders. May contain `{{var}}` placeholders. */
+invocationTemplate?: string;
+```
+
+A proven procedure is stored as an unvalidated string. Three defects compound:
+
+1. **Capture, not promotion.** The write path is automatic. Nothing at write
+   time proves the identifier is a dispatchable action or that the template
+   parses. `PLACEHOLDER` was stored as a tool slug and later sent verbatim.
+2. **No schema binding.** The record does not carry the tool schema it was
+   validated against, so provider drift silently invalidates it with no signal.
+   `testedAt` and `testEvidence` are free-form and documented as informational.
+3. **No read-time gate.** Retrieval returns a procedure that cannot dispatch.
+   `composioSlugIsDispatchable` now exists but gates the *call*, not the *recall*.
+
+The contract for Clementine 4:
+
+- A procedure is a **content-addressed artifact**, not a string. It stores a
+  canonical carrier, the **tool schema fingerprint** it was validated against,
+  and a **replay receipt** from a real successful dispatch.
+- **Promotion, not capture.** A procedure enters memory only from a verified
+  dispatch carrying its receipt. This is the one write path that is never fully
+  automatic — a conclusion the external literature reaches independently.
+- **One shared validator, run on both sides.** The same function validates at
+  write and at read. This is the M6 project-artifact rule, and it is the reason
+  that substrate never returns an artifact it would have refused to store.
+- **Temporal validity.** `valid_at` / `invalid_at` / `superseded_by`. A
+  fingerprint mismatch quarantines rather than deletes, so the procedure remains
+  inspectable and re-provable.
+- **Recall never returns a procedure that cannot dispatch.** Undispatchable is a
+  retrieval-time refusal with the reason attached, not a runtime surprise.
+
+The storage model already exists: the M6 substrate is content-addressed
+artifacts plus receipts plus one shared digest validator. Procedural memory is
+the same shape with a different payload. This is reuse, not new architecture.
+
+The same three properties — provenance, validity window, validate-on-read —
+generalize to facts and bindings. Applying them uniformly is what makes
+"memory needs to be really sound" a checkable property rather than an intention.
+
+### P3 — Token efficiency is a measured budget
+
+"Token efficient" has to be a number a test can fail on, or it decays. Every
+node declares its context budget; the executor enforces it; a per-turn total is
+recorded next to latency and asserted against a fixture.
+
+Three mechanics carry most of the win, and all three are already designed in
+`CLEMENTINE-4-GRAPH-RUNTIME.md` — they need enforcement, not invention:
+
+- **Monotonic per-attempt tool sets** so the prompt prefix stays cacheable. The
+  measured 136-tool catalog and three searches in one CRM lookup is the counter-example.
+- **Evidence references, not payloads.** Tool results live out of context;
+  bounded references move between nodes. The 99k-token lookup was payload copying.
+- **Fast paths that skip nodes entirely.** Conversation must not pay for a
+  planner, a worker, or a judge.
+
+**Test of the principle:** the demo fixture asserts a token ceiling, and the
+ceiling only ever moves down.
+
+### P4 — One engine, or it is not a unification
+
+Two mega-loops that both interpret graph declarations is worse than one loop,
+because divergence between them becomes a defect class. Chat and workflow must
+call the same executor with different policy, or the work has not been done.
+
+### P5 — Every promotion deletes its predecessor
+
+A node class moved onto the executor removes the mega-loop branch it replaces in
+the same change. Otherwise the loops keep their line count, gain a second code
+path, and the subtraction never happens. No rollout flag; the single coarse
+engine selector already has a removal milestone and no second one is added.
+
+## 3. Milestones
+
+Sequenced by risk, not by appeal. Each is independently shippable and
+independently revertible. Each names what it deletes.
+
+### G0 — Characterize (no behavior change)
+
+Establish the baseline the later milestones are measured against, because
+"token efficient and quick" is unfalsifiable without it.
+
+- Golden fixtures for: conversation, fact lookup, connected-app read,
+  connected-app write, heavy fan-out, approval pause.
+- For each, record wall-clock, input/output tokens, tool calls, cache hit rate,
+  duplicate retries.
+- Land these as an asserted budget file, initially at measured values.
+
+**Accepts when:** the six fixtures run in CI and fail on regression.
+**Deletes:** nothing.
+
+### G1 — The executor
+
+The keystone. A single module that walks a typed graph: node kinds from P1,
+typed edges, durable per-node events, restart materialization, budget
+enforcement, and one terminal reduction.
+
+It must ship with **zero production callers**. Its correctness is proved by
+replaying the existing workflow-graph fixtures through it and asserting
+identical node sequences, identical plan hashes, and identical terminal outcomes
+to what `workflow-runner.ts` produces today.
+
+**Accepts when:** every `workflow-graph-runtime.integration.test.ts` scenario and
+the Platform 49 matrix produce byte-identical graph traces under both engines.
+**Deletes:** nothing yet. This is the one milestone that is permitted to add
+without subtracting, because it is the thing everything else subtracts into.
+
+**Risk:** this is where the plan is most likely to grow beyond its scope. The
+executor is a walker, not a runtime. Policy, capability, memory, and effects
+stay outside it and are injected. If it exceeds roughly 800 lines, it has
+absorbed something that belongs in a node.
+
+### G2 — Workflows execute on the executor
+
+Switch `read_parallel_v1` from a `workflow-runner.ts` branch to executor
+topology. Behavior identical; the special-case branch is removed.
+
+This is deliberately first because the workflow lane already has durable
+receipts, restart proofs, watermarks, and a live control in Platform 49. It is
+the lane where a mistake is caught by existing tests rather than by a user.
+
+**Accepts when:** graph/effect/restart gates green, Platform 49 matrix 5/5,
+sales-portal acceptance 1/1, and the cloned canary reproduces its restart-reuse
+and reducer-only publication proofs.
+**Deletes:** the `read_parallel_v1` interpretation inside `workflow-runner.ts`.
+
+### G3 — Procedural memory becomes a validated artifact (P2)
+
+The user-named requirement, and the first milestone that fixes a defect users
+have felt. Independent of G1/G2 — it can proceed in parallel, and should, since
+it is the one item with a live incident behind it.
+
+- Procedure record gains canonical carrier, schema fingerprint, replay receipt,
+  and validity window.
+- Write path becomes promotion-from-receipt.
+- One shared validator, invoked on write and on read.
+- Recall refuses undispatchable procedures with an attached reason.
+- Migration quarantines every existing record that cannot be validated, rather
+  than deleting or trusting it.
+
+**Accepts when:** a stored `PLACEHOLDER` slug cannot be written; a stored
+procedure whose live schema fingerprint changed is not returned by recall; a
+quarantined procedure is re-promoted by one successful verified dispatch; and
+the 2026-08-03 incident shape is a regression fixture that bites on revert.
+**Deletes:** the free-form `invocationTemplate` read path and the
+`testedAt`/`testEvidence` informational fields.
+
+### G4 — Chat context and capability nodes
+
+Extract the context assembler, memory retrieval, capability resolver, and skill
+resolver from `loop.ts` into executor nodes behind typed interfaces. The
+provider turn remains one large `model` node initially — this milestone moves
+*around* the loop, not through it.
+
+Run in shadow first: both paths compute, only the legacy path acts, and a test
+asserts they agree on selected tools, retrieved memory, and resolved capability.
+Promote when they agree across the G0 fixtures.
+
+**Accepts when:** shadow agreement holds on all six fixtures, and the token
+budget from G0 improves on the fact-lookup and connected-app-read fixtures.
+**Deletes:** the corresponding assembly and resolution code in `loop.ts`,
+and the JIT / tool-search / MCP-scope / fail-open switches that collapse into
+the capability resolver.
+
+### G5 — Chat executes on the executor
+
+Route the accepted chat turn through the executor. `recordTurnGraphShadow`
+becomes a real compile-and-run. Fast paths land here: conversation and grounded
+answers must skip planner, worker, and judge, measured against G0.
+
+**Accepts when:** the client-demo golden replay passes through the executor with
+one terminal and no provisional bytes; all release-gate criteria 1–8 from
+`CLEMENTINE-4-GRAPH-RUNTIME.md` hold; conversation latency and tokens are at or
+below the G0 baseline.
+**Deletes:** `turn-graph-shadow.ts` and the chat orchestration in `loop.ts` that
+the executor now owns.
+
+### G6 — Effects are graph-owned
+
+Move `intent → started → receipt → commit → verified readback → checkpoint` from
+the tool boundary into an executor-owned effect ledger, with idempotency keys
+derived from the canonical carrier digest that already exists.
+
+**Accepts when:** retry, reconnect, and brain fallover never duplicate an
+external write, proven by fault injection at each lifecycle phase; and a
+`started` write with no receipt is never blindly re-dispatched.
+**Deletes:** `CLEMMY_CONFIRM_FIRST` and the provider-specific recovery loops.
+
+### G7 — One node lifecycle
+
+Claude and Codex behind one `NodeRunner`. Parity tests across brains and surfaces.
+
+**Accepts when:** both brains pass the full critical and endurance proofs
+through one lifecycle, and no provider name appears in control flow.
+**Deletes:** provider-specific transcript, continuation, delivery, and recovery
+paths in `claude-agent-brain.ts` and its Codex counterpart.
+
+### G8 — Subtraction and 4.0
+
+The 470 gates collapse into `RuntimeBudget`, `CapabilitySnapshot`, and
+`AuthoritySnapshot` per the flag disposition table. The legacy responder, the
+engine selector, and prose-derived routing go. A CI architecture test forbids
+`process.env` inside node code.
+
+**Accepts when:** the exit criteria in `CLEMENTINE-4-GRAPH-RUNTIME.md` pass.
+
+## 4. Sequencing
+
+```mermaid
+flowchart LR
+  G0[G0 characterize] --> G1[G1 executor]
+  G1 --> G2[G2 workflows on executor]
+  G2 --> G4[G4 chat context nodes]
+  G4 --> G5[G5 chat on executor]
+  G5 --> G6[G6 graph-owned effects]
+  G6 --> G7[G7 one node lifecycle]
+  G7 --> G8[G8 subtraction / 4.0]
+  G3[G3 procedural memory] -.independent.-> G4
+```
+
+G3 is off the critical path and has a live incident behind it, so it should run
+in parallel from the start rather than waiting on the executor.
+
+G0 through G3 is the near-term band: it produces a measurably faster, provably
+sounder Clementine without touching the chat engine, and every milestone in it
+ships on its own. G4 onward is where the mega-loops actually shrink.
+
+## 5. Risks
+
+**The executor grows into a runtime.** The single most likely failure. Mitigated
+by the ~800-line ceiling in G1 and by the P1 test: a capability gap that
+requires editing the executor means the design is wrong.
+
+**Shadow agreement gets weakened to pass.** G4 and G5 both depend on two paths
+agreeing. The pressure to relax the comparison when it fails is real, and a
+weakened comparison produces a false green — the same shape as the target-only
+worker reuse that an earlier parity audit already caught once. The comparison
+must assert equality, not absence of exceptions.
+
+**Two engines coexist longer than planned.** P5 exists for this. If a milestone
+lands without deleting its predecessor, the next one must not start.
+
+**Memory migration trusts what it cannot validate.** G3 must quarantine rather
+than assume. A migration that silently keeps unvalidatable records reproduces
+the original defect with a new schema.
+
+**Numbers here go stale.** Every figure in section 1 is measured at `65c54490`
+and should be re-measured, not cited, at each milestone.
+
+## 6. What this does not change
+
+`CLEMENTINE-4-GRAPH-RUNTIME.md` stands as written: the dual-graph model, the
+typed event contract, the terminal reduction table, the flag disposition table,
+the release gate, and the exit criteria. This plan does not revise the
+destination. It replaces the seven unordered bullets of remaining work with a
+sequence that has acceptance criteria, named deletions, and a stated
+dependency order — and it adds the memory-correctness pillar the design
+documents were missing.
+
+## Sources
+
+External research consulted for section 2:
+
+- [Durable Execution for AI Agent Runtimes: Checkpointing, Replay, and Recovery](https://zylos.ai/research/2026-04-24-durable-execution-agent-runtimes/)
+- [Graph-Based Agent Workflow Orchestration in Production: The 2026 Landscape](https://zylos.ai/research/2026-04-14-graph-based-agent-workflow-orchestration-production/)
+- [Durable Execution: The Key to Harnessing AI Agents in Production](https://www.inngest.com/blog/durable-execution-key-to-harnessing-ai-agents)
+- [Temporal Validity in Retrieval Memory: Eliminating Stale-Fact Errors for AI Agents over Evolving Knowledge](https://arxiv.org/pdf/2606.26511)
+- [Governing Evolving Memory in LLM Agents: the SSGM Framework](https://arxiv.org/html/2603.11768v1)
+- [From Agent Traces to Trust: A Survey of Evidence Tracing and Execution Provenance in LLM Agents](https://arxiv.org/pdf/2606.04990)
+- [Real-Time Procedural Learning From Experience for AI Agents](https://arxiv.org/pdf/2511.22074)
+- [Internal Representations as Indicators of Hallucinations in Agent Tool Selection](https://arxiv.org/abs/2601.05214)
+- [Context Engineering for AI Agents: Token Economics and Production Optimization](https://www.getmaxim.ai/articles/context-engineering-for-ai-agents-production-optimization-strategies/)
+- [How to optimize token efficiency in agentic systems](https://www.glean.com/perspectives/how-to-optimize-token-efficiency-in-agentic-systems)
