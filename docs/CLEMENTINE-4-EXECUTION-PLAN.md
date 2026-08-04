@@ -467,6 +467,20 @@ assembly inside buildOrchestratorAgent) becoming envelope-admitted
 resolution — that is the Stage 4 resolver consuming the admission envelope
 and the procedure artifacts, the next slice up.
 
+**ENFORCEMENT DESIGN FORK (recorded 2026-08-04, before anyone wires it
+wrong):** the sealed envelope currently covers the ACTIVE tool surface
+(`toolPolicy.tools`). Two legitimate capability paths live outside it: MCP
+server tools (surfaced via `mcpServers`, never in the array) and
+schema-on-demand acquisitions (tool_search → call_tool — NEW names by
+definition). Under the envelope contract both would be
+`requires_readmission`, so enforcing dispatch against the surface-envelope
+would break MCP and tool-search on day one. Correct enforcement requires
+sealing the ADMITTED CATALOG UNIVERSE (every connected/known capability,
+MCP listings included) with the active surface as binding revision 1 and
+acquisitions as later monotonic revisions — exactly the charter's
+envelope/revision split. That reseal is the enforcement slice's first step;
+refusal wiring comes only after it.
+
 ### The interior-depth manifest (scoped with evidence, 2026-08-04)
 
 Each interior phase of the chat spine was scoped to its exact seam, so the
