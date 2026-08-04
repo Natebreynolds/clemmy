@@ -126,8 +126,8 @@ test('a patch-added node may complete without refusing the journal', () => {
       admissionDigest: adm.admissionDigest,
       emittedBy: 'a',
       patchDigest: 'pd',
-      addedNodeIds: ['w1'],
-      addedEdgeIds: ['pe1'],
+      nodes: [{ id: 'w1', kind: 'worker' }],
+      edges: [{ id: 'pe1', source: 'a', target: 'w1' }],
     },
     settled({ nodeId: 'w1' }),
   ];

@@ -12,7 +12,7 @@
  * Pure: types and validation only. Storage lives behind the adapter, injected
  * by the caller.
  */
-import type { ExecutableGraph, NodeStatus } from './graph-executor.js';
+import type { ExecutableEdge, ExecutableGraph, ExecutableNode, NodeStatus } from './graph-executor.js';
 import type { GraphAdmission } from './graph-admission.js';
 
 /** Why a non-completed settlement happened, for retry policy OUTSIDE the walker. */
@@ -57,8 +57,11 @@ export interface PatchAdmittedEntry {
   admissionDigest: string;
   emittedBy: string;
   patchDigest: string;
-  addedNodeIds: string[];
-  addedEdgeIds: string[];
+  /** The FULL patch content — resume must be able to reconstruct the grown
+   *  topology from the journal alone, and ids without definitions cannot. The
+   *  digest lets replay refuse tampered content. */
+  nodes: ExecutableNode[];
+  edges: ExecutableEdge[];
 }
 
 export type GraphJournalEntry = NodeStartedEntry | NodeSettledEntry | PatchAdmittedEntry;
@@ -120,7 +123,7 @@ export function validateJournalForResume(
       continue;
     }
     if (entry.type === 'patch_admitted') {
-      for (const added of entry.addedNodeIds) nodeIds.add(added);
+      for (const added of entry.nodes) nodeIds.add(added.id);
       patches.push(entry);
       continue;
     }
