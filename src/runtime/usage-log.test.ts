@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 const {
   rollupUsage,
   classifyUsageKind,
+  resolveUsageKind,
   parseWorkflowSource,
   reconcilePromptComponents,
   uncachedTokensForAccrual,
@@ -129,3 +130,69 @@ test('uncachedTokensForAccrual handles BOTH metering dialects (2026-07-30: 8M gu
   // Degenerate/absent fields never go negative.
   assert.equal(uncachedTokensForAccrual({}), 0);
 });
+
+// ── Stage 0: lane attribution is trustworthy ────────────────────────────────
+// Measured 2026-08-04 before the fix: 490 of 884 live events (55%) landed in
+// `other`, and the top sources were ordinary CHAT sessions — `sess-desktop-…`
+// minted by console-routes and `sess-…` ids the classifier had never heard of.
+// The efficiency readout therefore showed "no chat row despite recent chat".
+// These pins are the exact live shapes, so the readout can only lose its chat
+// row again by someone deleting a line here.
+
+test('the live incident shapes classify to their real lanes', () => {
+  // The two dominant `other` sources from the 2026-08-04 live log.
+  assert.equal(classifyUsageKind('sess-desktop-b435fdcfc4a14444191e526d'), 'chat');
+  assert.equal(classifyUsageKind('sess-msdprfg7-d517142a'), 'chat');
+  // The execution controller's sessions (54 live events).
+  assert.equal(classifyUsageKind('execution:565f6c1a-b98c-407c-887c:controller'), 'controller');
+  // Surfaces that existed in production but not in the classifier.
+  assert.equal(classifyUsageKind('slack:C0123:thread'), 'chat');
+  assert.equal(classifyUsageKind('mobile-4f2a'), 'chat');
+  assert.equal(classifyUsageKind('webhook:ingress-1'), 'chat');
+  assert.equal(classifyUsageKind('approval-resume-9'), 'chat');
+  assert.equal(classifyUsageKind('x', 'slack'), 'chat');
+  assert.equal(classifyUsageKind('x', 'mobile'), 'chat');
+  // Guest-harness runs are detached project work, never interactive chat —
+  // mapping them to chat would pollute the interactive cache-hit-rate.
+  assert.equal(classifyUsageKind('x', 'guest-harness'), 'background');
+});
+
+test('the durable session row outranks id-shape guessing', () => {
+  // A session id no prefix rule recognizes, but whose row says what it is.
+  const fromRow = resolveUsageKind('f1a441dc-3435-4837-bd54', { sessionRowKind: 'chat' });
+  assert.equal(fromRow.kind, 'chat');
+  assert.equal(fromRow.reason, 'session_row:chat');
+  assert.equal(resolveUsageKind('anything', { sessionRowKind: 'agent' }).kind, 'autonomy');
+  assert.equal(resolveUsageKind('anything', { sessionRowKind: 'execution' }).kind, 'controller');
+  // Channel (the ingress surface) still outranks the row when both exist.
+  assert.equal(resolveUsageKind('anything', { channel: 'cron', sessionRowKind: 'chat' }).kind, 'cron');
+  // Warmup outranks everything — boot traffic never pollutes a lane.
+  assert.equal(resolveUsageKind('warmup-123', { sessionRowKind: 'chat' }).kind, 'warmup');
+});
+
+test('`other` always names what it could not classify', () => {
+  const r = resolveUsageKind('f1a441dc-3435-4837-bd54-c0fae2442773');
+  assert.equal(r.kind, 'other');
+  assert.match(r.reason, /^unclassified:f1a441dc$/);
+  // Every classified lane carries a reason too — the residue is diagnosable,
+  // and so is the classification itself.
+  assert.equal(resolveUsageKind('sess-abc').reason, 'prefix:sess-');
+  assert.equal(resolveUsageKind('x', { channel: 'discord' }).reason, 'channel:discord');
+});
+
+test('every historical classification still holds', () => {
+  // The pre-existing contract, so widening the classifier cannot have moved
+  // any event that was already classified.
+  assert.equal(classifyUsageKind('warmup-1781833012346'), 'warmup');
+  assert.equal(classifyUsageKind('console:home'), 'chat');
+  assert.equal(classifyUsageKind('cron:morning-briefing'), 'cron');
+  assert.equal(classifyUsageKind('workflow:abc'), 'workflow');
+  assert.equal(classifyUsageKind('background:job'), 'background');
+  assert.equal(classifyUsageKind('bg-1'), 'background');
+  assert.equal(classifyUsageKind('execution-controller:x'), 'controller');
+  assert.equal(classifyUsageKind('agent:clementine'), 'autonomy');
+  assert.equal(classifyUsageKind('discord:guild'), 'chat');
+  assert.equal(classifyUsageKind('x', 'electron'), 'chat');
+  assert.equal(classifyUsageKind('x', 'cli'), 'chat');
+});
+

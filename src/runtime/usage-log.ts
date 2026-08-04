@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, appendFileSync } from
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { recordOperationalEvent } from './operational-telemetry.js';
-import { accrueSessionTokens } from './harness/eventlog.js';
+import { accrueSessionTokens, getSession, type SessionKind } from './harness/eventlog.js';
 
 /**
  * Token-usage observability log. Append-only NDJSON per day.
@@ -38,6 +38,9 @@ export interface UsageEvent {
   source: string;
   /** Higher-level category for grouping in the UI. */
   kind: UsageKind;
+  /** Why `kind` was chosen (`channel:…`, `session_row:…`, `prefix:…`,
+   *  `unclassified:…`). Absent on events written before it existed. */
+  kindReason?: string;
   /** Model name (gpt-5.4, gpt-5.4-mini, text-embedding-3-small, etc.). */
   model: string;
   /** Total prompt (input) tokens for the call, INCLUDING any cached subset —
@@ -101,15 +104,102 @@ export function parseWorkflowSource(source: string): { runId?: string; stepId?: 
  * one-shot, near-zero-output traffic never pollutes the interactive-chat
  * cache-hit-rate number.
  */
+export interface UsageKindResolution {
+  kind: UsageKind;
+  /**
+   * WHY this kind was chosen — `channel:<value>`, `session_row:<kind>`,
+   * `prefix:<token>`, or `unclassified:<head>`. The Stage 0 acceptance rule is
+   * that no interactive sample lands in `other` without an explicit reason, and
+   * a reason string is what makes the residue diagnosable instead of a bucket.
+   */
+  reason: string;
+}
+
+/** Channel → kind. A channel names the ingress surface, which is authoritative
+ *  when present. `guest-harness` is detached project work, not chat. */
+const CHANNEL_KINDS: Record<string, UsageKind> = {
+  cron: 'cron',
+  workflow: 'workflow',
+  background: 'background',
+  controller: 'controller',
+  cli: 'chat',
+  discord: 'chat',
+  slack: 'chat',
+  electron: 'chat',
+  desktop: 'chat',
+  mobile: 'chat',
+  web: 'chat',
+  webhook: 'chat',
+  'guest-harness': 'background',
+};
+
+/** Durable session-row kind → usage kind. The sessions table is the write-time
+ *  truth for what a session IS; string sniffing is only the fallback. */
+const SESSION_ROW_KINDS: Record<SessionKind, UsageKind> = {
+  chat: 'chat',
+  workflow: 'workflow',
+  agent: 'autonomy',
+  execution: 'controller',
+};
+
+/**
+ * Session-id prefixes observed in production mints, most specific first.
+ * Measured 2026-08-04: 490 of 884 live events fell to `other`, and the top
+ * sources were `sess-*` chat sessions (desktop chat mints `sess-desktop-…` in
+ * console-routes; Discord routes reference `sess-` ids) and the execution
+ * controller's `execution:<id>` sessions. A classifier that recognizes only
+ * yesterday's id shapes silently un-classifies every new surface, so each entry
+ * here names real minting code, not a guess.
+ */
+const PREFIX_KINDS: Array<[prefix: string, kind: UsageKind]> = [
+  ['warmup', 'warmup'],
+  ['cron:', 'cron'], ['cron-', 'cron'],
+  ['workflow:', 'workflow'], ['workflow-', 'workflow'],
+  ['background:', 'background'], ['background-', 'background'], ['bg-', 'background'],
+  ['execution-controller:', 'controller'],
+  ['execution:', 'controller'],
+  ['agent:', 'autonomy'], ['agent-', 'autonomy'],
+  ['console:', 'chat'], ['console-', 'chat'],
+  ['discord:', 'chat'], ['discord-', 'chat'],
+  ['slack:', 'chat'], ['slack-', 'chat'],
+  ['mobile-', 'chat'],
+  ['webhook:', 'chat'],
+  ['approval-', 'chat'],
+  ['chat:', 'chat'],
+  ['sess-', 'chat'],
+];
+
+/**
+ * Resolve a usage event's lane, with the reason attached.
+ *
+ * Authority order: explicit ingress channel, then the durable session row
+ * (kind), then id-prefix evidence, then `other` with the unrecognized head so
+ * the residue names itself. Pure — the session row is passed in, not fetched.
+ */
+export function resolveUsageKind(
+  sessionId: string,
+  opts: { channel?: string; sessionRowKind?: SessionKind } = {},
+): UsageKindResolution {
+  // Warmup outranks everything: boot traffic must never pollute a lane's
+  // interactive cache-hit-rate no matter which channel spawned it.
+  if (sessionId.startsWith('warmup')) return { kind: 'warmup', reason: 'prefix:warmup' };
+  const channel = opts.channel?.trim().toLowerCase();
+  if (channel && CHANNEL_KINDS[channel]) {
+    return { kind: CHANNEL_KINDS[channel], reason: `channel:${channel}` };
+  }
+  if (opts.sessionRowKind && SESSION_ROW_KINDS[opts.sessionRowKind]) {
+    return { kind: SESSION_ROW_KINDS[opts.sessionRowKind], reason: `session_row:${opts.sessionRowKind}` };
+  }
+  for (const [prefix, kind] of PREFIX_KINDS) {
+    if (sessionId.startsWith(prefix)) return { kind, reason: `prefix:${prefix}` };
+  }
+  const head = sessionId.split(/[:\-]/, 1)[0] || 'empty';
+  return { kind: 'other', reason: `unclassified:${head.slice(0, 24)}` };
+}
+
+/** Back-compat wrapper. Prefer `resolveUsageKind`, which also says WHY. */
 export function classifyUsageKind(sessionId: string, channel?: string): UsageKind {
-  if (sessionId.startsWith('warmup')) return 'warmup';
-  if (channel === 'cron' || sessionId.startsWith('cron:')) return 'cron';
-  if (channel === 'workflow' || sessionId.startsWith('workflow:')) return 'workflow';
-  if (channel === 'background' || sessionId.startsWith('background:') || sessionId.startsWith('bg-')) return 'background';
-  if (channel === 'controller' || sessionId.startsWith('execution-controller:')) return 'controller';
-  if (sessionId.startsWith('agent:')) return 'autonomy';
-  if (sessionId === 'console:home' || sessionId.startsWith('console:') || sessionId.startsWith('discord:') || channel === 'cli' || channel === 'discord' || channel === 'electron') return 'chat';
-  return 'other';
+  return resolveUsageKind(sessionId, { channel }).kind;
 }
 
 /**
@@ -184,10 +274,19 @@ export function recordModelUsage(args: {
   firstByteMs?: number;
 }): void {
   const source = args.sessionId || 'unknown';
+  // Write-time authority: the durable session row knows what this session IS,
+  // so classification does not depend on every surface's id-minting habits.
+  // Guarded — observability must never break the model-call path.
+  let sessionRowKind: SessionKind | undefined;
+  try {
+    sessionRowKind = getSession(source)?.kind;
+  } catch { /* classification falls back to channel/prefix evidence */ }
+  const resolution = resolveUsageKind(source, { channel: args.channel, sessionRowKind });
   const event = {
     at: new Date().toISOString(),
     source,
-    kind: classifyUsageKind(source, args.channel),
+    kind: resolution.kind,
+    kindReason: resolution.reason,
     model: args.model,
     inputTokens: args.inputTokens,
     cachedInputTokens: args.cachedInputTokens,
