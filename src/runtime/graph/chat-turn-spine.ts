@@ -36,6 +36,15 @@ export interface ChatTurnSpinePhases<CoreResult> {
   shouldPublish: (core: CoreResult) => boolean;
   /** The terminal reduction + public commit — runs at the publish node. */
   publish: (core: CoreResult) => void;
+  /**
+   * Was the answer DELIVERED (evidence sufficient), per the core's own
+   * delivery verdict? Drives which verdict route fires: `true` grants
+   * `evidence_sufficient` (compose_reply), `false` grants
+   * `evidence_insufficient` (compose_blocked). Defaults to true when absent
+   * so direct-reply-shaped callers need no opinion. Phase 1(b) of the verify
+   * extraction: the graph's routes now follow the REAL verdict.
+   */
+  delivered?: (core: CoreResult) => boolean;
 }
 
 export interface ChatTurnSpineInput<CoreResult> {
@@ -60,12 +69,15 @@ export interface ChatTurnSpineResult<CoreResult> {
 /**
  * Drive one accepted chat turn through its compiled graph.
  *
- * The core runs at the `compose_reply` node — the one node every compiled
- * shape contains. Nodes before it settle as pass-throughs; `publish` runs the
- * injected publication phase; a `fanout` planner node settles as a
- * pass-through too, because the interim core still owns its own item work —
- * emitting real siblings here is the next slice, and the contract for it is
- * already on the node.
+ * The core is hosted at the turn's WORK node — `retrieve`, `execute`, or
+ * `fanout` when the compiled shape has one, else `compose_reply` (the
+ * direct-reply shape) — so the delivery verdict EXISTS before the verify
+ * node's outgoing edges are judged. The verdict then decides which verdict
+ * route fires: evidence_sufficient into compose_reply, or
+ * evidence_insufficient into compose_blocked, converging on the single
+ * any-join publish node. Remaining pass-throughs (context, capability,
+ * verify itself) are the later interior slices; their conditions are the
+ * only ones still interim-granted.
  */
 export async function driveChatTurnSpine<CoreResult>(
   spine: ChatTurnSpineInput<CoreResult>,
@@ -97,16 +109,22 @@ export async function driveChatTurnSpine<CoreResult>(
   }
 
   const graph = compiled.graph;
+  // Host the core at the first WORK node of the compiled shape; the
+  // direct-reply shape has none, so compose_reply hosts as before.
+  const workKinds = new Set(['retrieve', 'execute', 'fanout']);
+  const hostNodeId = (graph.nodes.find((node) => workKinds.has(node.kind))
+    ?? graph.nodes.find((node) => node.kind === 'compose_reply'))?.id;
   let core: CoreResult | undefined;
   let coreAttempted = false;
   let coreRan = false;
+  let coreDelivered = true;
   let coreError: unknown;
   let published = false;
 
   const run = await runGraph(
     {
       graphId: graph.graphId,
-      nodes: graph.nodes.map((node) => ({ id: node.id, kind: node.kind })),
+      nodes: graph.nodes.map((node) => ({ id: node.id, kind: node.kind, ...(node.joinMode ? { joinMode: node.joinMode } : {}) })),
       edges: graph.edges.map((edge) => ({
         id: edge.id,
         source: edge.source,
@@ -117,7 +135,7 @@ export async function driveChatTurnSpine<CoreResult>(
     {
       runner: {
         run: async (node) => {
-          if (node.kind === 'compose_reply') {
+          if (node.id === hostNodeId) {
             // The provider error contract must not change shape under the
             // executor: a throwing core is captured here and RETHROWN after
             // the run, so the caller's retry/fallover machinery sees exactly
@@ -127,6 +145,7 @@ export async function driveChatTurnSpine<CoreResult>(
             try {
               core = await spine.phases.runCore();
               coreRan = true;
+              coreDelivered = spine.phases.delivered?.(core) ?? true;
               return { status: 'completed' };
             } catch (error) {
               coreError = error;
@@ -152,10 +171,15 @@ export async function driveChatTurnSpine<CoreResult>(
           // Interim pass-through: the core still owns this phase internally.
           return { status: 'completed' };
         },
-        // Interim: the core owns evidence/input/authority resolution
-        // internally, so its downstream edges are granted once it has run.
-        // Each extracted phase claims its own condition in a later slice.
-        edgeSatisfied: () => true,
+        // The verdict routes follow the REAL delivery verdict (phase 1b).
+        // input_available / authority_available remain interim-granted until
+        // their phases extract; unknown conditions stay closed by default in
+        // the executor, so listing them here is deliberate.
+        edgeSatisfied: (edge) => {
+          if (edge.when === 'evidence_sufficient') return coreRan && coreDelivered;
+          if (edge.when === 'evidence_insufficient') return coreRan && !coreDelivered;
+          return true;
+        },
       },
       budget: { maxConcurrency: 1 },
       terminalReducer: (result) => {

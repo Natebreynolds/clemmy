@@ -111,3 +111,50 @@ test('an uncompilable turn runs the exact legacy order, loudly', async () => {
   assert.deepEqual(calls, ['core', 'publish'], 'the legacy order changed');
   assert.equal(result.core.answer, 'still answered');
 });
+
+test('the verdict routes are REAL: undelivered fires compose_blocked, publish still commits once', async () => {
+  // Phase 1b of the verify extraction. A false delivery verdict must route
+  // the blocked branch — compose_reply unreached-by-design — and the single
+  // any-join publish node still runs the publication phase exactly once,
+  // because a blocked answer is still a public terminal.
+  const calls: string[] = [];
+  const result = await driveChatTurnSpine({
+    identity: { sessionId: 'spine-verdict', turn: 1, sourceUserSeq: 9 },
+    input: 'What is the current status of the Acme account?',
+    surface: 'direct',
+    policy: POLICY,
+    phases: {
+      runCore: async () => { calls.push('core'); return { blocked: true }; },
+      shouldPublish: () => true,
+      publish: () => { calls.push('publish'); },
+      delivered: () => false,
+    },
+  });
+  assert.equal(result.engine, 'graph');
+  const byKind = new Map(result.trace!.map((t) => [t.kind, t]));
+  assert.equal(byKind.get('compose_blocked')?.status, 'completed', 'the blocked route did not fire');
+  assert.equal(byKind.has('compose_reply'), false, 'the delivered route fired on a false verdict');
+  assert.equal(byKind.get('publish')?.status, 'completed', 'the blocked terminal was not published');
+  assert.deepEqual(calls, ['core', 'publish']);
+  assert.equal(result.trace!.filter((t) => t.kind === 'publish').length, 1, 'publish double-fired');
+
+  // And the delivered verdict routes the other way through the same graph.
+  const deliveredCalls: string[] = [];
+  const deliveredRun = await driveChatTurnSpine({
+    identity: { sessionId: 'spine-verdict', turn: 2, sourceUserSeq: 10 },
+    input: 'What is the current status of the Acme account?',
+    surface: 'direct',
+    policy: POLICY,
+    phases: {
+      runCore: async () => { deliveredCalls.push('core'); return { blocked: false }; },
+      shouldPublish: () => true,
+      publish: () => { deliveredCalls.push('publish'); },
+      delivered: () => true,
+    },
+  });
+  const kinds2 = new Map(deliveredRun.trace!.map((t) => [t.kind, t]));
+  assert.equal(kinds2.get('compose_reply')?.status, 'completed');
+  assert.equal(kinds2.has('compose_blocked'), false, 'the blocked route fired on a true verdict');
+  assert.equal(kinds2.get('publish')?.status, 'completed');
+});
+

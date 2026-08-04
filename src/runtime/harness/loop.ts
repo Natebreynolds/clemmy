@@ -3505,6 +3505,12 @@ export async function runConversation(
           emitRuntimeTerminalEvent(options.sessionId, core.reduced);
           refreshTerminalWorkingMemory(options.sessionId);
         },
+        // The REAL delivery verdict, phase 1b: a completed reduction delivered
+        // its answer; awaiting_user_input (blocked verdict or clarifying
+        // question) is the needs-input route; a dispatched turn's public edge
+        // is its ACK, which counts as delivered for routing.
+        delivered: (core) => core.kind === 'dispatched'
+          || core.reduced.status === 'completed',
       },
     });
     if (spine.engine === 'legacy_order') {
@@ -8145,6 +8151,8 @@ export async function runConversationFromResume(opts: {
           emitRuntimeTerminalEvent(opts.sessionId, core.reduced);
           refreshTerminalWorkingMemory(opts.sessionId);
         },
+        delivered: (core) => core.kind === 'dispatched'
+          || core.reduced.status === 'completed',
       },
     });
     if (spine.engine === 'legacy_order') {

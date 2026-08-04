@@ -56,7 +56,7 @@ function compile(input: string, overrides: Partial<CompileTurnGraphInput> = {}) 
 function adapt(graph: TurnGraphIR): ExecutableGraph {
   return {
     graphId: graph.graphId,
-    nodes: graph.nodes.map((node) => ({ id: node.id, kind: node.kind })),
+    nodes: graph.nodes.map((node) => ({ id: node.id, kind: node.kind, ...(node.joinMode ? { joinMode: node.joinMode } : {}) })),
     edges: graph.edges.map((edge) => ({
       id: edge.id,
       source: edge.source,
