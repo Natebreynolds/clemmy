@@ -437,6 +437,22 @@ daemon swap's failure mode is the assistant being down in the morning; it
 waits for Nathan present), on-screen surface smokes at his option, then
 interior depth and U2–U6 — unblocked by smoke green.
 
+### VERIFY PHASE 1: SHIPPED AND LIVE-PROVEN (2026-08-04)
+
+The manifest below was executed the same day it was corrected. Phase 1(a):
+the compiler (turn-graph-shadow-v2) emits BOTH verdict routes — verify
+branches on evidence_sufficient / evidence_insufficient into compose_reply /
+compose_blocked, converging on ONE any-join publish node; the executor
+learned the explicit branch-merge (joinMode 'any', default rendezvous
+untouched, joinMode in the admission digest). Phase 1(b): the core rehosts
+at the turn's WORK node so the verdict exists before verify's edges are
+judged, and the evidence edges follow the REAL delivery verdict; the interim
+blanket grant for them is deleted. Live-proven both brains, including
+converse-first — a clarifying question IS the blocked route, live. The
+evidence_sufficient edge is real. Remaining: phase 2 (the verdict decision
+itself moves out of the core) and phase 3 (recovery path); the two
+still-interim conditions are input_available and authority_available.
+
 ### The interior-depth manifest (scoped with evidence, 2026-08-04)
 
 Each interior phase of the chat spine was scoped to its exact seam, so the
