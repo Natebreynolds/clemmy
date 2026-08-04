@@ -122,3 +122,29 @@ test('read-back is the ONLY clearing authority — the live dedup cache never is
       `consultation ${i} decayed ambiguity into permission`);
   }
 });
+
+test('the orphan gate is brain-blind — fallover safety is architectural, not per-brain discipline', async () => {
+  // Stage 8 audit finding, pinned. The duplicate-write protection keys on
+  // (sessionId, shapeKey, targets) at the tool boundary that EVERY brain must
+  // pass through — original, fallover, or post-restart. No brain identity in
+  // the key means no brain can have a private recovery policy; the invariant
+  // decideProviderFallover states upstream is enforced downstream for all of
+  // them identically. This pin breaks if the gate's signature grows a
+  // model/brain/provider parameter, and that growth is exactly the
+  // split-brain regression it must force a review of.
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const path = await import('node:path');
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(path.join(here, 'brackets.ts'), 'utf-8');
+  const signature = source.match(/function findOrphanedWriteMatch\(([\s\S]*?)\)/);
+  assert.ok(signature, 'the orphan gate moved — re-point this pin at its new home');
+  const params = signature![1]!;
+  assert.match(params, /sessionId/);
+  assert.match(params, /shapeKey/);
+  assert.match(params, /targets/);
+  for (const brainy of ['modelId', 'brain', 'provider', 'agent']) {
+    assert.equal(params.includes(brainy), false,
+      `the orphan gate grew a "${brainy}" parameter — per-brain recovery policy is the split-brain class`);
+  }
+});
