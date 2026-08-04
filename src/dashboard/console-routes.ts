@@ -2290,6 +2290,7 @@ function projectWorkflowCapabilityBlock(value: unknown): Record<string, unknown>
     ['reason', 500],
     ['message', 1_000],
     ['retryAt', 80],
+    ['blockedAt', 80],
     ['state', 40],
   ] as const) {
     const value = stringField(row[key]);
@@ -2298,6 +2299,10 @@ function projectWorkflowCapabilityBlock(value: unknown): Record<string, unknown>
   if (typeof row.retryCount === 'number' && Number.isFinite(row.retryCount)) {
     out.retryCount = Math.max(0, Math.trunc(row.retryCount));
   }
+  // The park's safety claim — "no provider dispatch was started" — is a truth
+  // consumers act on (safe to resume this same run), so the projection must
+  // carry it. Strict === true: the projector never invents the claim.
+  if (row.provenNoDispatch === true) out.provenNoDispatch = true;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
