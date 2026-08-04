@@ -5,6 +5,11 @@ import matter from 'gray-matter';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
+import {
+  blockingRefusal,
+  describeProcedureValidity,
+  validateStoredProcedure,
+} from './procedure-validity.js';
 
 /**
  * Tool-choice memory store.
@@ -55,6 +60,16 @@ export interface ToolChoiceRecordChoice {
   testedAt: string;
   /** Short string describing how validation passed (e.g. "sf --version exit 0"). */
   testEvidence?: string;
+  /**
+   * Fingerprint of the TOOL CONTRACT this choice was validated against.
+   *
+   * Distinct from `operationHash`, which is derived from the identifier and is
+   * therefore part of the procedure's IDENTITY — it can never change when a
+   * provider reshapes a schema under a stable name, so it cannot detect drift.
+   * This field can. Absent on every record written before it existed; absence
+   * means "never recorded", which is legacy, not drift.
+   */
+  schemaFingerprint?: string;
   // ── Thread 2 — outcome-driven procedural memory ──
   // Track record of how this proven path has FARED since it was learned, so
   // retrieval can prefer procedures that actually work and retire ones that
@@ -156,6 +171,10 @@ export interface RememberToolChoiceInput {
   /** Optional operation/schema fingerprint supplied by a discovery surface.
    * When absent, a stable conservative fingerprint is derived. */
   operationHash?: string;
+  /** Fingerprint of the live tool contract this choice was validated against.
+   * Recording it is what lets a later read detect that the provider reshaped
+   * the schema under a stable name. See `ToolChoiceRecordChoice`. */
+  schemaFingerprint?: string;
 }
 
 const TOOL_CHOICES_ROOT = path.join(BASE_DIR, 'memory', 'tool-choices');
@@ -320,6 +339,9 @@ function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
     rejectionCount: numOrUndef(r.rejectionCount),
     lastSuccessAt: typeof r.lastSuccessAt === 'string' ? r.lastSuccessAt : undefined,
     lastFailureAt: typeof r.lastFailureAt === 'string' ? r.lastFailureAt : undefined,
+    // Absent on every record written before drift detection existed. Parsing it
+    // back is what makes the fingerprint durable rather than write-only.
+    schemaFingerprint: typeof r.schemaFingerprint === 'string' ? r.schemaFingerprint : undefined,
   };
 }
 
@@ -907,6 +929,52 @@ function isFailingChoice(record: ToolChoiceRecord | null | undefined): boolean {
   return computeChoiceScore(choice) < FAILING_CHOICE_SCORE_FLOOR;
 }
 
+/**
+ * Can this stored choice still be dispatched at all?
+ *
+ * Deliberately independent of `isFailingChoice`, which needs two accumulated
+ * negatives before it suppresses anything. A procedure whose identifier is a
+ * filler token has no outcome history — it has never run and never can — so
+ * counting failures would never reach it. This is structural, so it bites on
+ * the first read, including for records written before the guard existed.
+ *
+ * Recall is the last place a poisoned memo can be stopped before it reaches a
+ * model, which is why the check runs here and not only at the write.
+ */
+function isUnservableChoice(record: ToolChoiceRecord | null | undefined): boolean {
+  const choice = record?.choice;
+  if (!choice) return false;
+  return !validateStoredProcedure({
+    kind: choice.kind,
+    identifier: choice.identifier,
+    invocationTemplate: choice.invocationTemplate,
+    schemaFingerprint: choice.schemaFingerprint,
+  }).ok;
+}
+
+/**
+ * Drop structurally undispatchable memos from anything model-facing.
+ *
+ * Applied at every recall surface rather than once inside `listToolChoices`,
+ * because migration, audit, and hygiene legitimately need to SEE bad records in
+ * order to repair them. Only the paths that hand memory to a model filter.
+ */
+function servableChoices(records: ToolChoiceRecord[]): ToolChoiceRecord[] {
+  return records.filter((record) => !isUnservableChoice(record));
+}
+
+/** The reason a stored choice cannot be served, for telemetry. */
+function unservableReason(record: ToolChoiceRecord): string {
+  const choice = record.choice;
+  if (!choice) return 'no_choice';
+  return describeProcedureValidity(validateStoredProcedure({
+    kind: choice.kind,
+    identifier: choice.identifier,
+    invocationTemplate: choice.invocationTemplate,
+    schemaFingerprint: choice.schemaFingerprint,
+  }));
+}
+
 export function recallToolChoice(intent: string): ToolChoiceRecord | null {
   const slug = slugifyIntent(intent);
   if (!slug) return null;
@@ -914,6 +982,13 @@ export function recallToolChoice(intent: string): ToolChoiceRecord | null {
   const exactPath = path.join(machineDir(), `${slug}.md`);
   const exact = parseRecord(exactPath);
   if (exact && exact.aliasStatus !== 'quarantined' && exact.aliasStatus !== 'superseded') {
+    if (isUnservableChoice(exact)) {
+      // Structurally undispatchable: never hand it back, and do not fall
+      // through to a fuzzy alternative as if this were a near miss. A clean
+      // rediscovery is the correct outcome.
+      emitToolChoiceEvent('recall_suppressed_unservable', intent, unservableReason(exact));
+      return null;
+    }
     if (isFailingChoice(exact)) {
       // Known-failing exact match: don't return it as authoritative. Fall
       // through to a healthy alternative or a re-probe.
@@ -933,6 +1008,8 @@ export function recallToolChoice(intent: string): ToolChoiceRecord | null {
     // Clearly-failing choices are excluded so a healthy alternative can win, or
     // a re-probe happens, instead of recalling a known-bad path (the teeth).
     .filter((record) => !isFailingChoice(record))
+    // Structurally undispatchable memos never become a fuzzy answer either.
+    .filter((record) => !isUnservableChoice(record))
     .map((record) => {
       const aliases = (record.aliases?.length ? record.aliases : [{
         intent: record.intent,
@@ -1065,7 +1142,20 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
   }
   const existing = parseRecord(filePathFor(input.intent));
   const now = new Date().toISOString();
-  if (placeholderChoiceString(input.choice.identifier)) {
+  // One validator decides what a storable procedure is, and the same call runs
+  // on the read path. A guard that lives only here is optional for everything
+  // already on disk, which is how a poisoned record outlives its fix.
+  const validity = validateStoredProcedure({
+    kind: input.choice.kind,
+    identifier: input.choice.identifier,
+    // Connection-id stripping happens first: a rotating id is a repairable
+    // defect, not a reason to refuse a real procedure.
+    invocationTemplate: cleanInvocationTemplate(input.choice.invocationTemplate),
+    schemaFingerprint: input.schemaFingerprint,
+  });
+  if (!validity.ok) {
+    // Keep any EXISTING proven choice. Refusing the write must not also erase
+    // the working memo this bad write was trying to replace.
     const saved = writeRecord({
       intent: input.intent,
       description: input.description ?? existing?.description,
@@ -1077,7 +1167,11 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
       procedureKey: existing?.procedureKey,
       aliasStatus: existing?.aliasStatus,
     });
-    emitToolChoiceEvent('remember_rejected_failed', input.intent, 'placeholder');
+    emitToolChoiceEvent(
+      'remember_rejected_failed',
+      input.intent,
+      blockingRefusal(validity)?.code ?? 'invalid_procedure',
+    );
     return saved;
   }
   // Write-back guard (2026-06-21 poisoned-memo class): if the model's OWN
@@ -1119,12 +1213,20 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
   const choice: ToolChoiceRecordChoice = {
     kind: input.choice.kind,
     identifier: input.choice.identifier.trim(),
-    invocationTemplate: cleanInvocationTemplate(input.choice.invocationTemplate),
+    // The validator already cleaned and vetted this; a stale template was
+    // repaired away rather than allowed through as a stored call.
+    invocationTemplate: validity.invocationTemplate,
     // Learn the mailbox: a new valid email wins; else keep the one this same
     // slug last used (re-validating the intent must not forget its mailbox).
     accountIdentity: parseAccountIdentity(input.choice.accountIdentity) ?? (samePath ? prev.accountIdentity : undefined),
     testedAt: input.choice.testedAt ?? now,
     testEvidence: input.choice.testEvidence,
+    // Carry the last known contract forward when re-remembering the same tool,
+    // so a re-validation that omits the fingerprint does not quietly erase the
+    // only thing that can detect drift.
+    schemaFingerprint: input.schemaFingerprint
+      ?? input.choice.schemaFingerprint
+      ?? (samePath ? prev.schemaFingerprint : undefined),
     ...(samePath ? {
       successCount: prev.successCount,
       failureCount: prev.failureCount,
@@ -1805,7 +1907,7 @@ export function matchToolChoicesForStep(
 
   let records: ToolChoiceRecord[];
   try {
-    records = (opts.choices ?? listToolChoices()).filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
+    records = servableChoices((opts.choices ?? listToolChoices()).filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX)));
   } catch {
     return [];
   }
@@ -1994,7 +2096,7 @@ export function recallComposioForSearch(
   if (q.size === 0) return [];
   let records: ToolChoiceRecord[];
   try {
-    records = (opts.choices ?? listToolChoices()).filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
+    records = servableChoices((opts.choices ?? listToolChoices()).filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX)));
   } catch {
     return [];
   }
@@ -2176,7 +2278,7 @@ export function boundCommandForChoice(choice: ToolChoiceRecordChoice): string {
  * perturb a recall/remember path. The CONTEXT INJECTION (behavior change)
  * is what's flag-gated, not this measurement.
  */
-type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'recall_suppressed_failing' | 'remember' | 'remember_rejected_failed' | 'invalidate' | 'auto_invalidate' | 'forget' | 'outcome_pos' | 'outcome_neg';
+type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'recall_suppressed_failing' | 'recall_suppressed_unservable' | 'remember' | 'remember_rejected_failed' | 'invalidate' | 'auto_invalidate' | 'forget' | 'outcome_pos' | 'outcome_neg';
 function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifier?: string): void {
   try {
     recordToolEvent({
@@ -2545,7 +2647,7 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   if (!contextInjectEnabled()) return '';
   let records: ToolChoiceRecord[];
   try {
-    records = listToolChoices().filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
+    records = servableChoices(listToolChoices().filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX)));
   } catch {
     return '';
   }

@@ -1172,3 +1172,163 @@ test('hygiene reaper: never-proven stale memos retire to fallback history; prove
   assert.equal(dead?.choice, null, 'retired memo has no active choice');
   assert.match(dead?.fallbacks?.at(-1)?.reason ?? '', /hygiene reaper/i, 'the retirement explains itself in the fallback history');
 });
+
+// ── 2026-08-03 procedural-memory poisoning class ────────────────────────────
+// The live run stored a choice whose identifier was the literal token
+// `PLACEHOLDER` and later sent it to the provider verbatim. Two independent
+// holes let that happen: the write guard checked an exact list of seven filler
+// words that did not contain it, and the read path had no dispatchability check
+// at all — so anything already on disk was served regardless. Both are pinned.
+
+test('a filler identifier cannot become a proven choice', () => {
+  const intent = 'sheets.rows.append';
+  rememberToolChoice({
+    intent,
+    choice: {
+      kind: 'composio',
+      identifier: 'GOOGLESHEETS_BATCH_UPDATE',
+      testEvidence: 'appended one row, verified readback',
+    },
+  });
+
+  // The exact incident shape. Note the evidence reads like a SUCCESS: the old
+  // write path only rejected memos whose prose looked like a failure, so
+  // absence of failure language was treated as proof the choice worked.
+  rememberToolChoice({
+    intent,
+    choice: {
+      kind: 'composio',
+      identifier: 'PLACEHOLDER',
+      testEvidence: 'call completed and the sheet was updated',
+    },
+  });
+
+  const got = recallToolChoice(intent);
+  assert.equal(got!.choice?.identifier, 'GOOGLESHEETS_BATCH_UPDATE',
+    'a filler identifier overwrote a working procedure');
+});
+
+test('refusing a bad write never erases the memo it tried to replace', () => {
+  const intent = 'crm.contacts.search';
+  rememberToolChoice({ intent, choice: { kind: 'cli', identifier: 'sf' } });
+  for (const filler of ['PLACEHOLDER', 'TODO', '{{tool_slug}}', 'YOUR_SLUG', '<slug>']) {
+    rememberToolChoice({ intent, choice: { kind: 'cli', identifier: filler } });
+    assert.equal(recallToolChoice(intent)?.choice?.identifier, 'sf',
+      `"${filler}" displaced the proven choice`);
+  }
+});
+
+test('an undispatchable provider slug is refused even though it is not filler', () => {
+  const intent = 'sheets.values.update';
+  rememberToolChoice({ intent, choice: { kind: 'composio', identifier: 'GOOGLESHEETS_VALUES_UPDATE' } });
+  // Reordered words and a bare toolkit name: both were guessed during the live
+  // incident. Neither can name an action, so neither is storable.
+  rememberToolChoice({ intent, choice: { kind: 'composio', identifier: 'GOOGLESHEETS' } });
+  assert.equal(recallToolChoice(intent)?.choice?.identifier, 'GOOGLESHEETS_VALUES_UPDATE');
+});
+
+test('a poisoned record ALREADY on disk is never served', () => {
+  // The read-path hole. A guard that only runs on write is optional for every
+  // record written before it existed, so recall must refuse independently.
+  // Earlier tests leave the machine-id elsewhere; pin it so the planted file
+  // lands in the directory recall actually reads.
+  writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-A\n');
+  resetMachineIdCacheForTests();
+  const dir = path.join(TMP_HOME, 'memory', 'tool-choices', 'machine-A');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'legacy.poisoned.intent.md'),
+    [
+      '---',
+      'intent: legacy.poisoned.intent',
+      'choice:',
+      '  kind: composio',
+      "  identifier: PLACEHOLDER",
+      "  testedAt: '2026-08-03T00:00:00Z'",
+      'fallbacks: []',
+      '---',
+      'Planted directly, as if written before the guard existed.',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  // It parses — this is not a "file is unreadable" pass.
+  assert.ok(listToolChoices().some((r) => r.intent === 'legacy.poisoned.intent'),
+    'the planted record was not readable, so the test proves nothing');
+  assert.equal(recallToolChoice('legacy.poisoned.intent'), null,
+    'a stored filler identifier was served to a caller');
+});
+
+test('a poisoned record cannot win a fuzzy match either', () => {
+  // Earlier tests leave the machine-id elsewhere; pin it so the planted file
+  // lands in the directory recall actually reads.
+  writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-A\n');
+  resetMachineIdCacheForTests();
+  const dir = path.join(TMP_HOME, 'memory', 'tool-choices', 'machine-A');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'zendesk.tickets.escalate.md'),
+    [
+      '---',
+      'intent: zendesk.tickets.escalate',
+      'choice:',
+      '  kind: composio',
+      "  identifier: TODO",
+      "  testedAt: '2026-08-03T00:00:00Z'",
+      'fallbacks: []',
+      '---',
+      'Planted.',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  // Same tokens, different spacing/case — this would fuzzy-match comfortably.
+  assert.equal(recallToolChoice('Zendesk tickets escalate'), null,
+    'a poisoned record was reached through the fuzzy path');
+});
+
+test('a stale template is repaired away, and the procedure survives it', () => {
+  // Severity matters: the identifier still names a real tool the executor can
+  // re-derive a call for. Refusing the whole record would lose working memory
+  // to a cosmetic defect.
+  const intent = 'sheets.rows.append_v2';
+  rememberToolChoice({
+    intent,
+    choice: {
+      kind: 'composio',
+      identifier: 'GOOGLESHEETS_BATCH_UPDATE',
+      invocationTemplate: 'just call the sheets thing',
+    },
+  });
+  const got = recallToolChoice(intent);
+  assert.equal(got!.choice?.identifier, 'GOOGLESHEETS_BATCH_UPDATE', 'a stale template destroyed the procedure');
+  assert.equal(got!.choice?.invocationTemplate, undefined, 'an unusable template was stored anyway');
+});
+
+test('a parameterized template survives — holes are the reusable part', () => {
+  const intent = 'sheets.rows.append_v3';
+  const template = 'GOOGLESHEETS_BATCH_UPDATE(arguments={"spreadsheet_id": "{{sheet_id}}"})';
+  rememberToolChoice({
+    intent,
+    choice: { kind: 'composio', identifier: 'GOOGLESHEETS_BATCH_UPDATE', invocationTemplate: template },
+  });
+  assert.equal(recallToolChoice(intent)?.choice?.invocationTemplate, template,
+    'a reusable template was stripped of its placeholders');
+});
+
+test('the validated contract fingerprint round-trips to disk', () => {
+  const intent = 'sheets.rows.append_v4';
+  rememberToolChoice({
+    intent,
+    choice: { kind: 'composio', identifier: 'GOOGLESHEETS_BATCH_UPDATE' },
+    schemaFingerprint: 'sha256:contract-a',
+  });
+  assert.equal(recallToolChoice(intent)?.choice?.schemaFingerprint, 'sha256:contract-a');
+
+  // Re-remembering the same tool without restating the fingerprint must not
+  // erase it — that would silently remove the only drift signal.
+  rememberToolChoice({ intent, choice: { kind: 'composio', identifier: 'GOOGLESHEETS_BATCH_UPDATE' } });
+  assert.equal(recallToolChoice(intent)?.choice?.schemaFingerprint, 'sha256:contract-a',
+    're-validation erased the recorded contract');
+});
