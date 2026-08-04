@@ -453,6 +453,20 @@ evidence_sufficient edge is real. Remaining: phase 2 (the verdict decision
 itself moves out of the core) and phase 3 (recovery path); the two
 still-interim conditions are input_available and authority_available.
 
+### CAPABILITY INTERIOR: FIRST SLICE SHIPPED AND LIVE-PROVEN (2026-08-04)
+
+Agent/tool construction is graph work: the bridge — every chat surface —
+passes a builder instead of a pre-built agent, and construction happens AT
+the capability_resolve node (a real trace step, failing as the node's own
+failure), lazily before the core on the direct shape, exactly once per turn
+on every path. The core's boundary type demands a resolved agent, which
+contained the eleven-use ripple in one line. Back-compat: `agent` remains
+accepted; every non-bridge caller untouched. Live-proven both brains.
+Remaining in this interior: the builder's INTERNALS (registry/JIT/scope
+assembly inside buildOrchestratorAgent) becoming envelope-admitted
+resolution — that is the Stage 4 resolver consuming the admission envelope
+and the procedure artifacts, the next slice up.
+
 ### The interior-depth manifest (scoped with evidence, 2026-08-04)
 
 Each interior phase of the chat spine was scoped to its exact seam, so the
