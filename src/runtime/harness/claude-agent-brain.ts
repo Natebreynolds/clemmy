@@ -2465,10 +2465,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       result = {
         ...result,
         text: status === 'ambiguous'
-          ? 'I cannot honestly confirm this external write: its current-request outcome is ambiguous. I did not repeat it or use an older receipt as proof; the exact target needs a read-only reconciliation.'
+          ? 'I cannot honestly confirm this change went through — the outcome is still ambiguous, and I did not run it twice or count an older receipt as proof. Say "check it" and I\'ll verify the live state before calling this complete.'
           : status === 'failed'
             ? 'At least one external write required by this request was recorded as failed, so I cannot call the request complete or substitute another action’s receipt.'
-            : 'I cannot honestly confirm a new external write for this request: no write receipt exists after your current request, and I did not treat an older focus or execution receipt as proof.',
+            : 'I cannot honestly confirm the work went out for this request — I have no receipt of it landing after your message, and I did not count an older one as proof. If it still needs to go out, tell me and I\'ll do it properly.',
         stoppedReason: 'awaiting-input',
       };
       try {

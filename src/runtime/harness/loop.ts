@@ -1161,7 +1161,7 @@ function assessEffectArtifactSelfReconciliation(input: {
         return {
           status: 'ambiguous',
           reason: 'artifact_reconciliation_remains_unresolved',
-          publicText: 'I cannot honestly confirm the artifact yet: its create outcome remains unresolved after the read-only reconciliation attempt. I did not create another replacement or treat the recovery reply as proof.',
+          publicText: 'I cannot honestly confirm it was created yet — the attempt is still unresolved, and I did not create a duplicate. Say "check it" and I\'ll look at what actually happened, or if you can see it on your side, tell me and I\'ll continue from there.',
         };
       }
       return {
@@ -1186,7 +1186,7 @@ function assessEffectArtifactSelfReconciliation(input: {
       return {
         status: 'ambiguous',
         reason: 'external_write_reconciliation_remains_ambiguous',
-        publicText: 'I cannot honestly confirm this external write: the exact target remains ambiguous after the read-only reconciliation attempt. I did not repeat the write, and I did not treat the recovery reply as proof.',
+        publicText: 'I cannot honestly confirm that change went through — I checked without re-sending it, and the result is still unclear. I did not do it twice. Say "check it" and I\'ll verify what actually happened, or if you can see the result on your side, tell me and I\'ll continue from there.',
         externalWriteStatus,
       };
   }
@@ -5762,10 +5762,10 @@ async function runConversationCore(
         : '';
       if (terminalFreshWriteGap) {
         userVisibleSummary = terminalExternalWriteStatus === 'ambiguous'
-          ? 'I cannot honestly confirm this external write: the current request has an ambiguous outcome. I did not repeat it, and I did not treat an older receipt as proof. The exact target needs a read-only reconciliation before this can be called complete.'
+          ? 'I cannot honestly confirm this change went through — the outcome is still ambiguous, and I did not run it twice or count an older receipt as proof. Say "check it" and I\'ll verify the live state before calling this complete.'
           : terminalExternalWriteStatus === 'failed'
             ? 'At least one external write required by this request was recorded as failed, so I cannot call the task complete or substitute another action’s receipt. That exact failure needs to be resolved before any full-success claim.'
-            : 'I cannot honestly confirm a new external write for this request: no write receipt exists after your current request. I did not treat an older focus summary or execution receipt as proof.';
+            : 'I cannot honestly confirm the work went out for this request — I have no receipt of it landing after your message, and I did not count an older one as proof. If it still needs to go out, tell me and I\'ll do it properly.';
         safeAppend({
           sessionId: options.sessionId,
           turn: turnResult.turn,
@@ -8464,12 +8464,20 @@ async function runConversationFromResumeCore(opts: {
       const resumeWorkReport = (!hasReply && isCompletedAction)
         ? (() => { try { return synthesizeTurnReport(opts.sessionId, activeSourceUserSeq); } catch { return null; } })()
         : null;
+      // The generic floor tells the user to "send that again" — on an
+      // approval resume that advice is WRONG (re-sending re-approves, and the
+      // registry will answer "already resolved"). Say what actually happened
+      // to the decision and give a next step that is safe to take. Live
+      // 2026-08-04 (desktop): "approve apr-kmaw" → this floor verbatim.
+      const resumeFloor = opts.approvalId
+        ? `Your approval of ${opts.approvalId} was applied and the run continued, but I don't have a clean summary of that step. Ask "status" and I'll check the current state — no need to approve again.`
+        : MISSING_REPLY_USER_FALLBACK;
       const userVisibleSummary = hasReply
         ? decision!.reply!
         : resumeWorkReport
           ? resumeWorkReport
           : isCompletedAction
-            ? MISSING_REPLY_USER_FALLBACK
+            ? resumeFloor
             : decision?.summary;
 
       // Honest-completion backstop (resume variant): a blocked/error-stub or

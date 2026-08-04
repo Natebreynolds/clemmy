@@ -1610,7 +1610,7 @@ test('full mode: exhausted completion retries never false-green a stale external
   });
 
   assert.equal(res.stoppedReason, 'awaiting-input');
-  assert.match(res.text, /no write receipt exists after your current request/i);
+  assert.match(res.text, /no receipt of it landing after your message/i);
   assert.doesNotMatch(res.text, /^PASS\b/);
   assert.ok(
     listEvents('brain-request-bound-write-exhausted', { types: ['guardrail_tripped'] })
@@ -1664,7 +1664,7 @@ test('full mode: the fresh-write terminal floor is phrase-independent and reques
   });
 
   assert.equal(res.stoppedReason, 'awaiting-input');
-  assert.match(res.text, /no write receipt exists after your current request/i);
+  assert.match(res.text, /no receipt of it landing after your message/i);
   assert.doesNotMatch(res.text, /fresh Sheet write is complete/i);
 });
 

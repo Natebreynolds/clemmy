@@ -4326,7 +4326,7 @@ test('request-bound write evidence: exhausted verification never false-greens a 
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /no write receipt exists after your current request/i);
+    assert.match(String(terminal.data.summary), /no receipt of it landing after your message/i);
     assert.doesNotMatch(String(terminal.data.reply), /^PASS\b/);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
@@ -4363,7 +4363,7 @@ test('request-bound write evidence: a direct communication command requires a cu
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /no write receipt exists after your current request/i);
+    assert.match(String(terminal.data.summary), /no receipt of it landing after your message/i);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
   } finally {
@@ -4399,7 +4399,7 @@ test('request-bound write evidence: a direct invitation response cannot false-co
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /no write receipt exists after your current request/i);
+    assert.match(String(terminal.data.summary), /no receipt of it landing after your message/i);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
   } finally {
@@ -4461,7 +4461,7 @@ test('request-bound write evidence: an overlapping request completion cannot cer
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /no write receipt exists after your current request/i);
+    assert.match(String(terminal.data.summary), /no receipt of it landing after your message/i);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
     else process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = prev;
@@ -4542,7 +4542,7 @@ test('request-bound write evidence: an accepted execution cannot hide a mixed or
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /ambiguous outcome/i);
+    assert.match(String(terminal.data.summary), /outcome is still ambiguous/i);
     assert.doesNotMatch(String(terminal.data.reply), /Sent both emails successfully/i);
     const trip = listEventsForConv(sess.id, { types: ['guardrail_tripped'] })
       .find((event) => event.data.kind === 'request_bound_external_write_missing');
