@@ -7,6 +7,9 @@ import {
   findSoleAwaitingInputTaskForOrigin,
   getBackgroundTask,
   listBackgroundTasks,
+  findSoleAwaitingApprovalTaskForOrigin,
+  getBackgroundTaskByApprovalId,
+  queueBackgroundTaskApprovalResolution,
   queueBackgroundTaskContinue,
   queueBackgroundTaskInputResolution,
   renderBackgroundTask,
@@ -14,6 +17,7 @@ import {
   resumeBackgroundTask,
 } from '../execution/background-tasks.js';
 import { enqueueDurableChatTask, shouldPromoteToDurable } from '../execution/background-promote.js';
+import { parseApprovalIntent } from '../channels/discord-harness.js';
 import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } from '../runtime/run-events.js';
 import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix, revertWorkflowFix } from '../execution/workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
@@ -516,6 +520,42 @@ interface ParkedBackgroundRoute {
 
 function routeParkedBackgroundReply(request: GatewayRequest): ParkedBackgroundRoute | null {
   const answer = request.message.trim();
+
+  // ── Step 0: a verbal decision for an approval-parked task ───────────────────
+  // The desktop route settles these deterministically; the gateway (mobile,
+  // channel surfaces) must too, or "Approved" typed on a phone falls through
+  // to a fresh brain turn that cannot reach the task session's card (live
+  // 2026-08-04 on desktop — same class). An explicit apr-id wins regardless
+  // of origin; a bare decision applies only to the SOLE parked task for this
+  // session — anything ambiguous falls through so the brain can ask.
+  const approvalIntent = parseApprovalIntent(answer);
+  if (approvalIntent) {
+    const target = approvalIntent.approvalId
+      ? (() => {
+          const byId = getBackgroundTaskByApprovalId(approvalIntent.approvalId);
+          return byId?.status === 'awaiting_approval' && byId.pendingApprovalId === approvalIntent.approvalId
+            ? byId
+            : null;
+        })()
+      : findSoleAwaitingApprovalTaskForOrigin(request.sessionId);
+    if (target?.pendingApprovalId) {
+      const approved = approvalIntent.decision === 'approve';
+      const queued = queueBackgroundTaskApprovalResolution(target.pendingApprovalId, approved);
+      if (queued) {
+        return {
+          terminalStatus: 'done',
+          response: {
+            sessionId: request.sessionId,
+            handledControl: true,
+            queuedTaskId: queued.id,
+            text: approved
+              ? `Approved — "${queued.title}" is back underway and will report back here when it's done.`
+              : `Got it — "${queued.title}" will skip that action and report back with where things stand.`,
+          },
+        };
+      }
+    }
+  }
 
   // ── Step 2: a confirmation is already pending for this session ──────────────
   const pending = pendingParkedApply.get(request.sessionId);

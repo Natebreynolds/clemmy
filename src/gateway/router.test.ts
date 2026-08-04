@@ -696,3 +696,41 @@ test('gateway preserves a verified dispatch when the foreground responder throws
   assert.equal(getRun(runId)?.status, 'queued');
   assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 0);
 });
+
+test('a verbal approval settles a sole approval-parked task deterministically (no brain turn)', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const { createBackgroundTask, getBackgroundTask, markBackgroundTaskRunning, markBackgroundTaskAwaitingApproval } =
+    await import('../execution/background-tasks.js');
+  const task = createBackgroundTask({
+    title: 'Outreach draft sweep',
+    prompt: 'draft outreach',
+    originSessionId: session.id,
+    source: 'gateway',
+    channel: 'mobile',
+  });
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskAwaitingApproval(task.id, 'apr-gwok', 'Awaiting approval for the crawl.');
+
+  let brainTurns = 0;
+  const gateway = new ClementineGateway({
+    respond: async (req: { message: string; sessionId: string }) => {
+      brainTurns += 1;
+      return { text: 'brain must not run', sessionId: req.sessionId };
+    },
+  } as never);
+
+  const response = await gateway.handleMessage({
+    message: 'Approved',
+    sessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile',
+    runId: 'run-gateway-approval-settle',
+  });
+
+  assert.match(response.text ?? '', /Approved — "Outreach draft sweep"/, 'the reply must lead with the task the user recognizes, not the card id');
+  assert.equal(brainTurns, 0, 'a deterministic settlement woke the brain');
+  const settled = getBackgroundTask(task.id);
+  assert.equal(settled?.status, 'pending', 'the parked task was not queued for continuation');
+  assert.equal(settled?.approvalResolution?.approved, true);
+});

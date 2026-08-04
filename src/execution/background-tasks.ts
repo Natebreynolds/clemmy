@@ -1538,6 +1538,13 @@ export function findSoleAwaitingContinueTaskForOrigin(originSessionId: string): 
   return parked.length === 1 ? parked[0] : null;
 }
 
+export function findSoleAwaitingApprovalTaskForOrigin(originSessionId: string): BackgroundTaskRecord | null {
+  if (!originSessionId) return null;
+  const parked = listBackgroundTasks({ status: 'awaiting_approval' })
+    .filter((task) => task.originSessionId === originSessionId && !!task.pendingApprovalId);
+  return parked.length === 1 ? parked[0] : null;
+}
+
 function updateBackgroundTaskWhere(
   id: string,
   predicate: (task: BackgroundTaskRecord) => boolean,

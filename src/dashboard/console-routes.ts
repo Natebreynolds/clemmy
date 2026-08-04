@@ -289,6 +289,7 @@ import {
   findSoleAwaitingContinueTaskForOrigin,
   findSoleAwaitingInputTaskForOrigin,
   getBackgroundTask,
+  getBackgroundTaskByApprovalId,
   listBackgroundTasks,
   markBackgroundTaskDone,
   markBackgroundTaskRunning,
@@ -14570,7 +14571,43 @@ export function registerConsoleRoutes(
     // owned by their deterministic runtime.
     const registryApprovalPending = !isPausedOnApproval
       && approvalRegistry.listPending({ sessionId, status: 'pending' }).length > 0;
-    const intent = (isPausedOnApproval || registryApprovalPending) ? parseApprovalIntent(input) : null;
+    // Approvals parked in a background task THIS chat spawned live in the
+    // task's OWN run session, so the session-scoped registry check above never
+    // sees them. Live 2026-08-04 (desktop): the user typed "Approved" six
+    // times while the saved task sat awaiting_approval — every reply was a
+    // fresh model turn improvising about approvals it could not reach. The
+    // origin link is the routing authority: a verbal decision here must queue
+    // the task's durable continuation, exactly like the Tasks-board button.
+    const originTaskApprovals = listBackgroundTasks({ status: 'awaiting_approval' })
+      .filter((task) => task.originSessionId === sessionId && !!task.pendingApprovalId);
+    const intent = (isPausedOnApproval || registryApprovalPending || originTaskApprovals.length > 0)
+      ? parseApprovalIntent(input)
+      : null;
+    // The task settlement target: an explicit apr-id naming a spawned task's
+    // approval always wins; a bare approve/reject reaches the task only when
+    // NOTHING in this session competes for it and exactly one task waits —
+    // ambiguity must ask, never guess.
+    const addressedTaskApproval = intent
+      ? (intent.approvalId
+          // An explicit id is the user naming the exact card — honor it even
+          // when the task was spawned elsewhere (Discord already does).
+          ? (() => {
+              const byOrigin = originTaskApprovals.find((task) => task.pendingApprovalId === intent.approvalId);
+              if (byOrigin) return byOrigin;
+              const anywhere = getBackgroundTaskByApprovalId(intent.approvalId);
+              return anywhere?.status === 'awaiting_approval' && anywhere.pendingApprovalId === intent.approvalId
+                ? anywhere
+                : null;
+            })()
+          : (!isPausedOnApproval && !registryApprovalPending && originTaskApprovals.length === 1
+              ? originTaskApprovals[0]
+              : null))
+      : null;
+    const bareTaskApprovalAmbiguous = !!intent
+      && !intent.approvalId
+      && !isPausedOnApproval
+      && !registryApprovalPending
+      && originTaskApprovals.length > 1;
     // Freeze approval addressing at acceptance. A bare approve/reject owns an
     // exact card only when one actionable card exists now; if the registry
     // changes before the async executor runs, it must ask again rather than
@@ -14967,6 +15004,66 @@ export function registerConsoleRoutes(
         // registry inside the accepted attempt so a row resolved between the
         // 202 and this executor cannot inherit authority. A bare approve/reject
         // remains convenient only when one actionable card exists.
+        // A verbal decision addressed to a spawned task's parked approval
+        // settles FIRST, deterministically — the same queued continuation the
+        // Tasks-board button uses — never as a fresh model turn and never via
+        // the session-scoped selection below (whose registry cannot see a task
+        // session's card and would answer "no longer pending"). Live
+        // 2026-08-04 (desktop): six approvals typed, zero applied.
+        if (addressedTaskApproval?.pendingApprovalId && intent) {
+          const approved = intent.decision === 'approve';
+          const queued = queueBackgroundTaskApprovalResolution(addressedTaskApproval.pendingApprovalId, approved);
+          // Lead with what the user recognizes — the task by name. The card id
+          // is plumbing; people who never learned it must not need it.
+          const text = queued
+            ? (approved
+                ? `Approved — "${queued.title}" is back underway and will report back here when it's done.`
+                : `Got it — "${queued.title}" will skip that action and report back with where things stand.`)
+            : `That one was already resolved — nothing further was needed.`;
+          commitConsoleTerminal({
+            identity: requestTurnIdentity,
+            text,
+            status: 'done',
+            legacyReason: 'task_approval_settled',
+            metadata: { steps: 0, approvalId: addressedTaskApproval.pendingApprovalId, taskId: addressedTaskApproval.id },
+          });
+          return;
+        }
+        if (bareTaskApprovalAmbiguous && intent) {
+          const choices = originTaskApprovals
+            .slice(0, 12)
+            .map((task) => `${intent.decision} ${task.pendingApprovalId} — ${task.title}`);
+          commitConsoleTerminal({
+            identity: requestTurnIdentity,
+            text: [
+              `${originTaskApprovals.length} pieces of work are each waiting on a go-ahead, so I need to know which one you mean — I haven't approved or rejected anything. Reply with one of these:`,
+              ...choices,
+            ].join('\n'),
+            status: 'needs_input',
+            legacyReason: 'task_approval_ambiguous',
+            metadata: { steps: 0 },
+          });
+          return;
+        }
+        // An explicit id that matches nothing pending anywhere gets an honest
+        // answer, not a model turn improvising about it — and not the
+        // session-scoped "no longer pending" text for a card this session
+        // never owned.
+        if (
+          intent?.approvalId
+          && !addressedTaskApproval
+          && !isPausedOnApproval
+          && !registryApprovalPending
+        ) {
+          commitConsoleTerminal({
+            identity: requestTurnIdentity,
+            text: `I couldn't find anything still waiting on ${intent.approvalId} — it may already be resolved or expired. Nothing was approved or rejected. If work seems stuck, ask "status" and I'll check.`,
+            status: 'needs_input',
+            legacyReason: 'task_approval_not_found',
+            metadata: { steps: 0 },
+          });
+          return;
+        }
         let addressedApprovalId = intent?.approvalId;
         if (intent) {
           const actionable = approvalRegistry.listPending({ sessionId, status: 'pending' })
