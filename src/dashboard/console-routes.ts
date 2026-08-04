@@ -71,6 +71,7 @@ import { promoteReflectionCandidateById, rejectReflectionCandidateClusterById } 
 import { approveIdentityProposal, listIdentityProposals, rejectIdentityProposal } from '../memory/identity-evolution.js';
 import { composeCuratedMemory, IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, splitCuratedMemory, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { resolveWorkingMemoryForConsole } from '../memory/working-memory.js';
+import { projectWorkflowRunActivity } from './activity-projection.js';
 import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
   listWorkflows,
@@ -5700,6 +5701,33 @@ export function registerConsoleRoutes(
    * are reduced to a safe summary; definitions, prompts, inputs, and step
    * outputs stay on disk and run-scoped compiled projects stay out of Studio.
    */
+  // U1 (Clem 4, Stage 9): the shared activity projection, behind current
+  // rendering. Nothing consumes this yet; U2+ migrates surfaces onto it one
+  // at a time, each deleting its private reducer. Snapshots only — the delta
+  // stream arrives with the durable journal's event feed.
+  app.get('/api/console/activity/v2', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const observedAt = new Date().toISOString();
+      const snapshots: unknown[] = [];
+      if (fs.existsSync(WORKFLOW_RUNS_DIR)) {
+        const files = fs.readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json'));
+        for (const file of files) {
+          try {
+            const data = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
+            const snapshot = projectWorkflowRunActivity(data, observedAt);
+            if (snapshot) snapshots.push(snapshot);
+          } catch { /* skip malformed */ }
+        }
+      }
+      snapshots.sort((a, b) => String((b as { startedAt?: string }).startedAt ?? '')
+        .localeCompare(String((a as { startedAt?: string }).startedAt ?? '')));
+      res.json({ schemaVersion: 1, observedAt, snapshots: snapshots.slice(0, 100) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/workflows/:name/runs', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
