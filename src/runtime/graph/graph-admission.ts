@@ -62,7 +62,7 @@ function sha256(text: string): string {
 }
 
 function canonicalNode(node: ExecutableNode): string {
-  return JSON.stringify({ id: node.id, kind: node.kind });
+  return JSON.stringify({ id: node.id, kind: node.kind, joinMode: node.joinMode ?? 'all' });
 }
 
 function canonicalEdge(edge: ExecutableEdge): string {

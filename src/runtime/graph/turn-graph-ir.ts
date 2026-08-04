@@ -13,7 +13,7 @@ import type { TurnEvidenceKind, TurnIdentity } from '../harness/turn-outcome.js'
  * this IR grants tool authority or changes the v3.6 execution path.
  */
 export const TURN_GRAPH_IR_VERSION = 1 as const;
-export const TURN_GRAPH_COMPILER_VERSION = 'turn-graph-shadow-v1' as const;
+export const TURN_GRAPH_COMPILER_VERSION = 'turn-graph-shadow-v2' as const;
 export const TURN_GRAPH_POLICY_VERSION = 'turn-policy-v1' as const;
 
 export type TurnGraphSurface =
@@ -42,6 +42,10 @@ export type TurnGraphFastPath =
 
 export type TurnGraphNodeKind =
   | 'turn_accepted'
+  /** Composes the blocked/needs-input public answer when evidence was
+   *  INSUFFICIENT — the terminal-reduction table's needs_input/question route,
+   *  as topology instead of only as loop behavior. */
+  | 'compose_blocked'
   | 'policy_snapshot'
   | 'intent_authority'
   | 'context_resolve'
@@ -112,6 +116,10 @@ export interface TurnGraphEvidenceRequirement {
 export interface TurnGraphNode {
   id: string;
   kind: TurnGraphNodeKind;
+  /** Join semantics for incoming edges. Default 'all' (rendezvous). 'any' is
+   *  the branch-merge: alternative verdict routes converge and exactly one
+   *  fires — the publish node's shape once both verdict routes are topology. */
+  joinMode?: 'all' | 'any';
   runner: TurnGraphRunner;
   effect: TurnGraphEffect;
   authority: TurnGraphAuthority;
@@ -142,7 +150,7 @@ export interface TurnGraphEdge {
   id: string;
   source: string;
   target: string;
-  when: 'success' | 'evidence_sufficient' | 'input_available' | 'authority_available';
+  when: 'success' | 'evidence_sufficient' | 'evidence_insufficient' | 'input_available' | 'authority_available';
 }
 
 /** Only authority-relevant policy is copied into the turn graph. Mutable

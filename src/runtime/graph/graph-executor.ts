@@ -60,6 +60,15 @@ import {
 export interface ExecutableNode {
   id: string;
   kind: string;
+  /**
+   * How incoming edges combine. Default 'all' — a join is a rendezvous, the
+   * workflow engine's exact semantics. 'any' fires on the FIRST satisfied
+   * incoming edge, which is what a branch-merge needs: two verdict routes
+   * converging on one publish node, exactly one of which fires per run.
+   * Declared per-node and explicit, never inferred — an implicit OR is how a
+   * rendezvous silently becomes a race.
+   */
+  joinMode?: 'all' | 'any';
 }
 
 /**
@@ -266,11 +275,12 @@ function enabledEdges(graph: ExecutableGraph): ExecutableEdge[] {
  * disabling the last route into a node removes it from the run rather than
  * promoting it to a root.
  *
- * Incoming edges are ANDed. This deliberately matches the existing workflow
- * engine, whose readiness is `every(edge => completed.has(edge.source))`, so
- * the executor can be proved equivalent to it. It means a join is a rendezvous,
- * never a race: "run C when A OR B succeeds" is not expressible, and adding it
- * would be a behavior change rather than an extraction.
+ * Incoming edges are ANDed by default, deliberately matching the existing
+ * workflow engine (`every(edge => completed.has(edge.source))`) so the
+ * executor is provably equivalent to it — a join is a rendezvous. A node may
+ * OPT INTO `joinMode: 'any'`, firing on the first satisfied incoming edge:
+ * the branch-merge shape, where alternative verdict routes converge and
+ * exactly one fires. The default never changed, so workflow parity holds.
  */
 export function readyExecutableNodes(
   graph: ExecutableGraph,
@@ -286,7 +296,9 @@ export function readyExecutableNodes(
     const structuralIncoming = graph.edges.filter((edge) => edge.target === node.id);
     const incoming = enabled.filter((edge) => edge.target === node.id);
     if (structuralIncoming.length > 0 && incoming.length === 0) return false;
-    return incoming.every((edge) => fired.has(edge.id));
+    return node.joinMode === 'any'
+      ? incoming.some((edge) => fired.has(edge.id))
+      : incoming.every((edge) => fired.has(edge.id));
   });
 }
 

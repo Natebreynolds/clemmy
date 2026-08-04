@@ -64,6 +64,7 @@ test('lookup compiles one bounded context/capability/retrieval/evidence path', (
     'retrieve',
     'verify',
     'compose_reply',
+    'compose_blocked',
     'publish',
   ]);
   const retrieve = result.graph.nodes.find((node) => node.kind === 'retrieve');

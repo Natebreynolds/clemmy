@@ -420,12 +420,70 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
     });
   }
 
-  addNode({
-    kind: 'compose_reply',
-    runner: { kind: 'model', role: 'reply_composer' },
-    edgeWhen: route === 'direct_reply' ? 'success' : 'evidence_sufficient',
-  });
-  addNode({ kind: 'publish', runner: { kind: 'runtime' } });
+  if (route === 'direct_reply') {
+    addNode({
+      kind: 'compose_reply',
+      runner: { kind: 'model', role: 'reply_composer' },
+      edgeWhen: 'success',
+    });
+    addNode({ kind: 'publish', runner: { kind: 'runtime' } });
+  } else {
+    // Phase 1(a) of the verify extraction: BOTH verdict routes are topology.
+    // Production has always published both outcomes — a delivered answer or a
+    // blocked/needs-input question (the terminal-reduction table) — but the
+    // compiled graph carried only the delivered route, which made
+    // `evidence_sufficient` ungateable without stranding undelivered turns.
+    // Exactly one route fires per turn under AND-join semantics; the other is
+    // unreached-by-design, exactly like a workflow failure branch.
+    const verifyNode = nodes[nodes.length - 1]!;
+    const composeReply = addNode({
+      kind: 'compose_reply',
+      runner: { kind: 'model', role: 'reply_composer' },
+      edgeWhen: 'evidence_sufficient',
+    });
+    const composeBlocked: TurnGraphNode = {
+      id: `n${nodes.length}:compose_blocked`,
+      kind: 'compose_blocked',
+      runner: { kind: 'model', role: 'reply_composer' },
+      effect: noEffect(),
+      authority: authorityFor(input.identity.sourceUserSeq, noEffect()),
+      capabilities: [],
+      evidence: { mode: 'none', kinds: [] },
+    };
+    nodes.push(composeBlocked);
+    edges.push({
+      id: `e${edges.length}:${verifyNode.id}->${composeBlocked.id}`,
+      source: verifyNode.id,
+      target: composeBlocked.id,
+      when: 'evidence_insufficient',
+    });
+    // ONE publish node — the one-public-committer invariant as structure —
+    // with an explicit ANY-join: the two verdict routes converge here and
+    // exactly one fires per turn.
+    const publishNode: TurnGraphNode = {
+      id: `n${nodes.length}:publish`,
+      kind: 'publish',
+      runner: { kind: 'runtime' },
+      joinMode: 'any',
+      effect: noEffect(),
+      authority: authorityFor(input.identity.sourceUserSeq, noEffect()),
+      capabilities: [],
+      evidence: { mode: 'none', kinds: [] },
+    };
+    nodes.push(publishNode);
+    edges.push({
+      id: `e${edges.length}:${composeReply.id}->${publishNode.id}`,
+      source: composeReply.id,
+      target: publishNode.id,
+      when: 'success',
+    });
+    edges.push({
+      id: `e${edges.length}:${composeBlocked.id}->${publishNode.id}`,
+      source: composeBlocked.id,
+      target: publishNode.id,
+      when: 'success',
+    });
+  }
 
   const policyHash = sha256(stableJson(policy));
   const graph: TurnGraphIR = {

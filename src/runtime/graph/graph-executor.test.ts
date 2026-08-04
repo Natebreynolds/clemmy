@@ -440,3 +440,51 @@ test('the executor imports only its pure siblings and reaches nowhere', async ()
   const lines = source.split('\n').length;
   assert.ok(lines < 800, `the executor is ${lines} lines; it is becoming a runtime`);
 });
+
+test('an ANY-join fires on the first satisfied route; the rendezvous default is untouched', async () => {
+  // The branch-merge primitive (Clem 4, verify phase 1a): two verdict routes
+  // converge on one publish node, exactly one fires per run. Explicit opt-in
+  // per node — the default remains the workflow engine's rendezvous, so the
+  // differential oracle above keeps holding without modification.
+  const graph: ExecutableGraph = {
+    graphId: 'branch-merge',
+    nodes: [
+      { id: 'verify', kind: 'verify' },
+      { id: 'ok', kind: 'compose' },
+      { id: 'blocked', kind: 'compose' },
+      { id: 'publish', kind: 'publish', joinMode: 'any' },
+      { id: 'rendezvous', kind: 'join' }, // default all — for contrast
+    ],
+    edges: [
+      { id: 'e1', source: 'verify', target: 'ok', when: 'evidence_sufficient' },
+      { id: 'e2', source: 'verify', target: 'blocked', when: 'evidence_insufficient' },
+      { id: 'e3', source: 'ok', target: 'publish' },
+      { id: 'e4', source: 'blocked', target: 'publish' },
+      { id: 'e5', source: 'ok', target: 'rendezvous' },
+      { id: 'e6', source: 'blocked', target: 'rendezvous' },
+    ],
+  };
+  const delivered = await runGraph(graph, {
+    runner: {
+      run: () => ({ status: 'completed' }),
+      edgeSatisfied: (edge) => edge.when === 'evidence_sufficient',
+    },
+  });
+  assert.deepEqual(delivered.completed.sort(), ['ok', 'publish', 'verify'],
+    'the any-join did not fire from a single route');
+  assert.ok(delivered.unreached.includes('blocked'), 'the unfired route ran anyway');
+  assert.ok(delivered.unreached.includes('rendezvous'),
+    'a DEFAULT join fired on one of two routes — the rendezvous semantics broke');
+  // Exactly one publish settlement — the merge cannot double-fire.
+  assert.equal(delivered.trace.filter((t) => t.nodeId === 'publish').length, 1);
+
+  const blockedRoute = await runGraph(graph, {
+    runner: {
+      run: () => ({ status: 'completed' }),
+      edgeSatisfied: (edge) => edge.when === 'evidence_insufficient',
+    },
+  });
+  assert.deepEqual(blockedRoute.completed.sort(), ['blocked', 'publish', 'verify'],
+    'the blocked route did not reach the shared publish node');
+});
+

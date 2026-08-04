@@ -242,6 +242,9 @@ test('Workflow Studio scopes run history to real catalog workflows while generic
       retryAt: '2026-08-02T12:05:00.000Z',
       state: 'blocked',
       retryCount: 2,
+      // The park's safety claim survives projection since the M4 proof fix —
+      // "no provider dispatch was started" is what makes resuming safe.
+      provenNoDispatch: true,
     });
 
     const missingResponse = await fetch(
