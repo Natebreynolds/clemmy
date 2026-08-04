@@ -234,7 +234,21 @@ export const approvalParkResume: ScenarioDef = {
       const writeDispatches = stepMetrics?.logicalToolCalls.write_file ?? 0;
       const completedSteps = events.filter((event) => event.kind === 'step_completed' && event.stepId === STEP_ID);
       const completedRuns = events.filter((event) => event.kind === 'run_completed');
-      const serializedRun = JSON.stringify(finalRun ?? {});
+      // The runs-list API is a deliberate privacy projection — it excludes
+      // outputs by design ("Never return the raw queue record"). The check's
+      // intent is that the OUTCOME carried the real content exactly once, and
+      // the truth store for that is the durable run record on disk, which
+      // scenarios already read for artifacts and audit rows. Status and
+      // terminality still come from the API; content truth comes from disk.
+      let serializedRun = JSON.stringify(finalRun ?? {});
+      try {
+        if (runId) {
+          serializedRun = readFileSync(
+            path.join(daemon.home, 'workflows', 'runs', `${runId}.json`),
+            'utf-8',
+          );
+        }
+      } catch { /* fall back to the API record; the check will say why */ }
 
       checks.push({ name: 'workflow run completed', pass: finalRun?.status === 'completed', detail: `status ${finalRun?.status ?? 'missing'}${finalRun?.error ? `, error ${String(finalRun.error).slice(0, 180)}` : ''}` });
       checks.push({ name: 'exactly one write_file dispatch', pass: writeDispatches === 1, detail: `dispatches ${writeDispatches}; lifecycle events ${rawWriteEvents}; all tools ${JSON.stringify(stepMetrics?.toolCalls ?? {})}` });
