@@ -391,6 +391,16 @@ therefore DEPTH within one already-converted spine node (phases the core
 still owns internally), not an unconverted lane: breadth is complete,
 evidenced above; depth, presentation (U2–U6), and live validation remain.
 
+### M3 whole-candidate gate: GREEN at HEAD (2026-08-04)
+
+The charter's full offline ladder, run on this candidate: corpus 8,887/0/1 ·
+journeys 5/5 · public hygiene pass + 3/3 · release assets 40/40 · proof
+self-tests 53/53 · report-back smoke exit 0 · root/console-web/mobile-web/
+desktop builds green · desktop typecheck clean · fresh-install smoke gate
+exit 0. The branch is a whole-candidate-gated RC in the offline dimension;
+what the charter sequences next is exactly M4 (stable-commit provider
+proofs) and M5 (live canary) — the gates that require providers and Nathan.
+
 The tag gate from the charter is unchanged by this table: 4.0 is claimable when
 the interior phases, effects, and provider rows convert AND the live matrix
 runs green. The table exists so nobody — including the author — can mistake
