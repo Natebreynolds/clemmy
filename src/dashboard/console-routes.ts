@@ -2291,6 +2291,8 @@ function projectWorkflowCapabilityBlock(value: unknown): Record<string, unknown>
     ['message', 1_000],
     ['retryAt', 80],
     ['blockedAt', 80],
+    ['resumedAt', 80],
+    ['resumeAuthorityConsumedAt', 80],
     ['state', 40],
   ] as const) {
     const value = stringField(row[key]);
