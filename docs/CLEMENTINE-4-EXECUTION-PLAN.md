@@ -363,9 +363,9 @@ the predecessor path is deleted, not gated.
 | Long-horizon / detached | **Converted transitively** — detached chat work re-enters `runConversation` (spine); scheduled work enters the runner (epochs) | same suites as above |
 | Multi-agent fan-out | **Executor-native** — runtime patches, per-item siblings, 1,000-node pin; chat compiler emits the planner contract | `8d371889`, `22e86099` |
 | Chat interior phases | **Interim** — context/capability/retrieve/verify are pass-through nodes; the core loop still owns them internally (charter Phase 2 shape) | `chat-turn-spine.ts` documents each |
-| Effects | **Not converted** — reservation→receipt→commit still lives at the tool boundary, not executor-owned (Stage 6) | — |
-| Provider lifecycle | **Not converted** — Claude/Codex/BYO orchestration divergence remains (Stage 8) | — |
-| UI projection | **Not converted** — multiple activity reducers remain (Stage 9) | — |
+| Effects | **Contract landed** (`effect-lifecycle.ts`) — lawful phase machine, digest-bound approvals, resume decisions with no redispatch arm from ambiguity; tool boundary + executor migrate onto it in the Stage 6 slices | 10 crash-window pins |
+| Provider lifecycle | **Not converted** — Claude/Codex/BYO orchestration divergence remains (Stage 8); the executor's NodeRunner port is the target shape | — |
+| UI projection | **U1 landed** (`surface-projection.ts`) — the versioned truth contract with conformance pins; surfaces migrate in U2–U6, each deleting its private reducer | 10 pins |
 | Live matrix | **Not run** — cross-surface canary, per-brain demo replay, measured latency/token ceilings require authorized live runs | blocker recorded in Stage 0 handoff |
 
 The tag gate from the charter is unchanged by this table: 4.0 is claimable when
