@@ -368,6 +368,29 @@ the predecessor path is deleted, not gated.
 | UI projection | **U1 landed** (`surface-projection.ts`) — the versioned truth contract with conformance pins; surfaces migrate in U2–U6, each deleting its private reducer | 10 pins |
 | Live matrix | **Not run** — cross-surface canary, per-brain demo replay, measured latency/token ceilings require authorized live runs | blocker recorded in Stage 0 handoff |
 
+### The lane inventory, closed (2026-08-04)
+
+"Across all lanes" is a completeness claim, so here is the complete
+enumeration — every model-usage kind in the write-time taxonomy
+(`classifyUsageKind`), audited to its dispatch path:
+
+| Usage kind | Dispatch path | Standing |
+|---|---|---|
+| `chat` (desktop/Discord/Slack/mobile/webhook/CLI) | `runConversation` → executor spine | Converted (`7068265d`) |
+| `chat` approval-resume | `runConversationFromResume` → executor spine | Converted (`70174bfc`) |
+| `workflow` / `cron` workflows | `executeWorkflow` → executor epochs | Converted (`85204c5e`) |
+| `background` (detached chat work) | chat sessions → spine | Converted transitively |
+| `autonomy` (`agent:*` daemon cycles) | `respondPreferHarness` → spine (`autonomy-v2.ts:1269`) | Converted transitively |
+| `controller` (`execution:*`) | single-shot, wall-clock-bounded JSON decision calls over a durable state machine; step work dispatches via the converted lanes | Already node-shaped — no orchestration loop exists to convert |
+| `warmup` | single-shot boot calls | No orchestration |
+| `embedding` | not model orchestration | n/a |
+
+**Every model-orchestrating loop in production is executor-driven; every
+other model call is single-shot.** The remaining "chat interiors" work is
+therefore DEPTH within one already-converted spine node (phases the core
+still owns internally), not an unconverted lane: breadth is complete,
+evidenced above; depth, presentation (U2–U6), and live validation remain.
+
 The tag gate from the charter is unchanged by this table: 4.0 is claimable when
 the interior phases, effects, and provider rows convert AND the live matrix
 runs green. The table exists so nobody — including the author — can mistake
