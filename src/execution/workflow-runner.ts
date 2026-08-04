@@ -7160,6 +7160,12 @@ async function executeWorkflow(
   } else {
     let completedStepIds = new Set(Object.keys(stepOutputs));
     let executionRound = 0;
+    // Monotonic across EPOCHS, not per-epoch: a run that spans several
+    // executor epochs (graph growth, park/resume) must never reuse a round
+    // number, or the cockpit's ready-batch history interleaves two epochs as
+    // one. Incremented once per flushed scheduler wave. (Caught in self-review
+    // of the epoch conversion: executionRound + wave collided across epochs.)
+    let telemetryRound = 0;
     // Stage 4 — aggregate run token budget, WORKFLOW lane: advisory-only in
     // v1 (a park here has no approval for the reaper to watch — a forever-
     // strand would be a worse lie than a warning; see the Stage-4 design
@@ -7294,8 +7300,9 @@ async function executeWorkflow(
       const flushWaveTelemetry = (): void => {
         if (telemetryWave < 0 || waveMembers.length === 0) return;
         const members = steps.filter((step) => waveMembers.includes(step.id));
+        telemetryRound += 1;
         appendWorkflowNodeReadyBatch(
-          workflowSlug, runId, members, members, executionRound + telemetryWave, concurrencyCap,
+          workflowSlug, runId, members, members, telemetryRound, concurrencyCap,
         );
         waveMembers.length = 0;
       };
