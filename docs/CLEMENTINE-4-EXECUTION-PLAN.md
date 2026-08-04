@@ -349,6 +349,30 @@ engine selector, and prose-derived routing go. A CI architecture test forbids
 
 **Accepts when:** the exit criteria in `CLEMENTINE-4-GRAPH-RUNTIME.md` pass.
 
+## 3b. Conversion status (2026-08-04, HEAD `7068265d`)
+
+Where the loop→graph claim actually stands, with the evidence that carries it.
+Every "converted" row means the executor owns dispatch in production code and
+the predecessor path is deleted, not gated.
+
+| Lane | Status | Evidence |
+|---|---|---|
+| Workflows (manual, cron, scheduled) | **Converted** — executor epochs own dispatch; wave-loop core deleted | `85204c5e`; integration 11/11, P49 matrix+runtime 5/5, runner 201/201 |
+| Workspaces / compiled projects | **Converted transitively** — compiled project runs flow through the same converted `executeWorkflow` dispatch | sales-portal fixture 1/1 (durable inputs, three specialists, reducer, governed deploy, restart reuse) + project-compiler 22/22 through the epoch loop |
+| Chat spine (all surfaces enter via `runConversation`) | **Converted** — the compiled turn graph drives accept→core→publish; public commit only at the publish node | `7068265d`; real-path chat suites 102/102 (client-demo replay, public presentation, respond-bridge, Discord terminal) |
+| Long-horizon / detached | **Converted transitively** — detached chat work re-enters `runConversation` (spine); scheduled work enters the runner (epochs) | same suites as above |
+| Multi-agent fan-out | **Executor-native** — runtime patches, per-item siblings, 1,000-node pin; chat compiler emits the planner contract | `8d371889`, `22e86099` |
+| Chat interior phases | **Interim** — context/capability/retrieve/verify are pass-through nodes; the core loop still owns them internally (charter Phase 2 shape) | `chat-turn-spine.ts` documents each |
+| Effects | **Not converted** — reservation→receipt→commit still lives at the tool boundary, not executor-owned (Stage 6) | — |
+| Provider lifecycle | **Not converted** — Claude/Codex/BYO orchestration divergence remains (Stage 8) | — |
+| UI projection | **Not converted** — multiple activity reducers remain (Stage 9) | — |
+| Live matrix | **Not run** — cross-surface canary, per-brain demo replay, measured latency/token ceilings require authorized live runs | blocker recorded in Stage 0 handoff |
+
+The tag gate from the charter is unchanged by this table: 4.0 is claimable when
+the interior phases, effects, and provider rows convert AND the live matrix
+runs green. The table exists so nobody — including the author — can mistake
+spine conversion for finished interiors.
+
 ## 4. Sequencing
 
 ```mermaid
