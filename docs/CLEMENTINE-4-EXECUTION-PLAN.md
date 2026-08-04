@@ -401,6 +401,20 @@ exit 0. The branch is a whole-candidate-gated RC in the offline dimension;
 what the charter sequences next is exactly M4 (stable-commit provider
 proofs) and M5 (live canary) — the gates that require providers and Nathan.
 
+### M4 stable-commit provider proofs: GREEN, both brains (2026-08-04)
+
+Run from a clean candidate (the harness enforces it) with disposable homes
+and proof-local shims: Codex critical 5/5 scenarios + brain-served backstop;
+Claude critical 5/5 with live TTFTs (2.4–7.7s); Codex endurance 21/21
+checks; Claude 120-item long-horizon green. Running the suite caught an
+inherited truth-loss defect: the park's `provenNoDispatch` safety claim and
+the durable resume-authority timestamps existed in run records but were
+dropped by the console API's whitelist projector — fixed in two bounded
+commits with the failing proof as the differential.
+
+Remaining rungs: M5 live canary (first rung: docs/CLEM4-LIVE-SMOKE.md), then
+interior depth and U2–U6 on the far side of it.
+
 The tag gate from the charter is unchanged by this table: 4.0 is claimable when
 the interior phases, effects, and provider rows convert AND the live matrix
 runs green. The table exists so nobody — including the author — can mistake
