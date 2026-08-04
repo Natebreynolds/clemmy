@@ -415,6 +415,26 @@ commits with the failing proof as the differential.
 Remaining rungs: M5 live canary (first rung: docs/CLEM4-LIVE-SMOKE.md), then
 interior depth and U2–U6 on the far side of it.
 
+### The interior-depth manifest (scoped with evidence, 2026-08-04)
+
+Each interior phase of the chat spine was scoped to its exact seam, so the
+depth work starts from a map instead of a 10k-line read. None of these are
+nodes-in-waiting behind a clean seam; each is interleaved with the
+continuation loop's iteration state, which is WHY they are post-M5 work with
+shadow-compare gates rather than tonight-slices:
+
+| Phase | Where it lives | What extraction requires |
+|---|---|---|
+| context (memory primer) | built PER-HOP inside `runTurn` (`loop.ts:6728`), fed by per-continuation semantic input | a per-hop context port with compaction/continuation contract; shadow-compare primer parity before promotion |
+| capability (agent/tool assembly) | built by CALLERS before `runConversation` (`outcome.ts:439` + fallover `rebuildAgentForBrain`) | API migration across all callers moving the build into the spine's capability node; fallover rebuild becomes a node re-entry |
+| verify (delivery gate + objective judge) | TWO in-loop sites (`loop.ts:4068`, `loop.ts:5783`) consuming same-iteration judge verdicts and DECIDING continuation (undelivered → another hop) | the verify node must own the continuation edge itself — this is the compiled `verify → repairable → execute` edge becoming real, the deepest and most valuable extraction |
+
+The verify row is the destination worth naming: when it lands, the graph's
+`evidence_sufficient` edge stops being interim-granted and the executor owns
+the retry topology the loop currently expresses as iteration. That is the
+final deletion of loop-engineering from chat — and it rides on M5 being
+green first.
+
 The tag gate from the charter is unchanged by this table: 4.0 is claimable when
 the interior phases, effects, and provider rows convert AND the live matrix
 runs green. The table exists so nobody — including the author — can mistake
