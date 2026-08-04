@@ -29,6 +29,10 @@ import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
+import { createHash } from 'node:crypto';
+import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
+import { getProactivityPolicySnapshot } from './proactivity-policy.js';
+import { bindAgentCapabilityEnvelope, sealAgentCapabilityEnvelope, type SealableToolLike } from './capability-envelope.js';
 import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
 import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
 import type { Tool } from '@openai/agents';
@@ -2236,6 +2240,36 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     outputGuardrails: harnessOutputGuardrails,
   });
   bindAgentMcpToolScope(agent, mcpToolScope);
+  // Clem 4, Stage 4 activation slice 1: seal the assembled tool surface into
+  // the immutable capability envelope and bind it to the agent. Nothing
+  // refuses on it yet — the dispatch boundary gains the artifact to enforce
+  // against in the next slice. Loud and non-fatal on refusal: chat must not
+  // die because instrumentation declined, and a silent skip is how
+  // instrumentation rots.
+  try {
+    const budgetSettings = getHarnessBudgetSettings();
+    const sealed = sealAgentCapabilityEnvelope({
+      sessionId: options.sessionId ?? 'unbound',
+      tools: toolPolicy.tools as unknown as SealableToolLike[],
+      policyHash: createHash('sha256')
+        .update(JSON.stringify(getProactivityPolicySnapshot().policy), 'utf-8')
+        .digest('hex'),
+      budget: {
+        maxUncachedTokens: budgetSettings.maxRunTokens > 0 ? budgetSettings.maxRunTokens : 10_000_000,
+        maxModelCalls: budgetSettings.maxTurns > 0 ? budgetSettings.maxTurns * 4 : 200,
+        maxToolCalls: budgetSettings.toolCallsPerTurn > 0 ? budgetSettings.toolCallsPerTurn * (budgetSettings.maxTurns > 0 ? budgetSettings.maxTurns : 50) : 500,
+        maxElapsedMs: budgetSettings.maxConversationWallMs > 0 ? budgetSettings.maxConversationWallMs : 3_600_000,
+      },
+    });
+    if (sealed.ok) bindAgentCapabilityEnvelope(agent, sealed.envelope);
+    else {
+      // eslint-disable-next-line no-console
+      console.warn(`[orchestrator] capability envelope refused to seal: ${sealed.errors.join('; ')}`);
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[orchestrator] capability envelope sealing threw:', err instanceof Error ? err.message : err);
+  }
   return agent;
 }
 
