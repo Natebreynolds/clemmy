@@ -162,6 +162,8 @@ import {
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
 import { effectiveTurnObjective } from './turn-control.js';
 import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
+import { driveChatTurnSpine } from '../graph/chat-turn-spine.js';
+import { getProactivityPolicySnapshot } from '../../agents/proactivity-policy.js';
 import { claimGroundingNudge, extractDeliverablePointers, ungroundedPointers } from './claim-grounding.js';
 import {
   getArtifactRootForSourceUserSeq,
@@ -3473,24 +3475,55 @@ export async function runConversation(
   });
   let foregroundReleased = false;
   try {
-    const result = await runConversationCore({
-      ...options,
-      sourceUserSeq,
-      reuseRecordedUserInput: true,
+    // G5b slice 1: the compiled turn graph DRIVES the spine instead of being
+    // observed and discarded. The provider core remains one interim node
+    // (charter Phase 2 — "keep the existing loops as temporary executor
+    // nodes"); terminal reduction derives the outcome inside the core phase,
+    // and the public commit happens only when the executor reaches the
+    // publish node. An uncompilable turn runs the identical legacy order.
+    type SpineCore =
+      | { kind: 'dispatched'; result: Awaited<ReturnType<typeof runConversationCore>> }
+      | { kind: 'reduced'; reduced: ReturnType<typeof reduceStandardConversationTerminal> };
+    const spine = await driveChatTurnSpine<SpineCore>({
+      identity: { sessionId: options.sessionId, turn: acceptedSource.turn, sourceUserSeq },
+      input: options.input,
+      surface: 'direct',
+      policy: getProactivityPolicySnapshot(),
+      phases: {
+        runCore: async () => {
+          const result = await runConversationCore({
+            ...options,
+            sourceUserSeq,
+            reuseRecordedUserInput: true,
+          });
+          if (result.status === 'dispatched') return { kind: 'dispatched', result };
+          return { kind: 'reduced', reduced: reduceStandardConversationTerminal({ result, sourceUserSeq }) };
+        },
+        shouldPublish: (core) => core.kind === 'reduced' && !core.reduced.completedReason,
+        publish: (core) => {
+          if (core.kind !== 'reduced') return;
+          emitRuntimeTerminalEvent(options.sessionId, core.reduced);
+          refreshTerminalWorkingMemory(options.sessionId);
+        },
+      },
     });
-    if (result.status === 'dispatched') {
+    if (spine.engine === 'legacy_order') {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[harness] chat turn spine fell back to legacy order (session ${options.sessionId}, seq ${sourceUserSeq}): ${spine.compileError ?? 'unknown'} — the turn answered; the graph did not drive it`,
+      );
+    }
+    const core = spine.core;
+    if (core.kind === 'dispatched') {
       // The exact async_work_dispatched row remains the pending logical edge.
       // This releases only the coarse foreground marker; provider inbox rows
       // may become `replied` once their compact dispatch ACK is delivered.
       foregroundReleased = true;
-      return result;
+      return core.result;
     }
-    const reduced = reduceStandardConversationTerminal({ result, sourceUserSeq });
-    if (reduced.completedReason) return reduced;
-    foregroundReleased = Boolean(reduced.publicPresentation);
-    emitRuntimeTerminalEvent(options.sessionId, reduced);
-    refreshTerminalWorkingMemory(options.sessionId);
-    return reduced;
+    if (core.reduced.completedReason) return core.reduced;
+    foregroundReleased = Boolean(core.reduced.publicPresentation);
+    return core.reduced;
   } finally {
     if (foregroundReleased) {
       clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId, sourceUserSeq);
