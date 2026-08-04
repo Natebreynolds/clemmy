@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 import { irreversibleBoundaryViolations } from './workflow-graph-boundaries.js';
+import {
+  firedEdgesFromCompleted,
+  readyExecutableNodes,
+  type ExecutableGraph,
+} from '../runtime/graph/graph-executor.js';
 import type {
   WorkflowStepInput,
   WorkflowStepInputBinding,
@@ -337,21 +342,57 @@ export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowG
   };
 }
 
+/**
+ * Present a compiled workflow graph as the executor's structural contract.
+ *
+ * Every edge maps to `success` because this engine has never distinguished
+ * them: readiness asked only whether the source completed. Only `dependency`
+ * edges are compiled today, so nothing is lost — and when `failure` edges
+ * eventually are emitted, this is the one line that has to change.
+ */
+function toExecutableGraph(graph: WorkflowGraphDefinition): ExecutableGraph {
+  return {
+    graphId: `${graph.name ?? 'workflow'}:${graph.version ?? 0}`,
+    nodes: graph.nodes.map((node) => ({ id: node.id, kind: node.type })),
+    edges: graph.edges.map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      when: 'success' as const,
+      disabled: edge.disabled,
+    })),
+  };
+}
+
+/**
+ * Which workflow nodes can run next?
+ *
+ * Delegates to the graph executor's readiness so there is ONE implementation of
+ * this question in the system rather than two that must be kept in agreement.
+ * The previous local copy is deleted rather than kept as a reference: two
+ * implementations of one question is how the graph became a photograph in the
+ * first place.
+ *
+ * Behavior is unchanged. Graph order is preserved, blocked nodes are excluded,
+ * and a node whose every route was disabled stays out of the run.
+ */
 export function getReadyWorkflowGraphNodes(
   graph: WorkflowGraphDefinition,
   completedNodeIds: Iterable<string>,
   blockedNodeIds: Iterable<string> = [],
 ): WorkflowGraphNode[] {
+  const executable = toExecutableGraph(graph);
   const completed = new Set(completedNodeIds);
-  const blocked = new Set(blockedNodeIds);
-  const enabledEdges = graph.edges.filter((edge) => !edge.disabled);
-  return graph.nodes.filter((node) => {
-    if (completed.has(node.id) || blocked.has(node.id)) return false;
-    const structuralIncoming = graph.edges.filter((edge) => edge.target === node.id);
-    const incoming = enabledEdges.filter((edge) => edge.target === node.id);
-    if (structuralIncoming.length > 0 && incoming.length === 0) return false;
-    return incoming.every((edge) => completed.has(edge.source));
-  });
+  // Blocked nodes are settled for scheduling purposes: never dispatched, but
+  // also never treated as having completed, so their dependents stay waiting.
+  const settled = new Set([...completed, ...blockedNodeIds]);
+  const ready = readyExecutableNodes(
+    executable,
+    firedEdgesFromCompleted(executable, completed),
+    settled,
+  );
+  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+  return ready.map((node) => byId.get(node.id)!).filter(Boolean);
 }
 
 export function applyWorkflowGraphPatch(

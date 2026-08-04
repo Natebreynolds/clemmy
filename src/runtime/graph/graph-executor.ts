@@ -176,22 +176,42 @@ function enabledEdges(graph: ExecutableGraph): ExecutableEdge[] {
  * never a race: "run C when A OR B succeeds" is not expressible, and adding it
  * would be a behavior change rather than an extraction.
  */
-function readyNodes(
+export function readyExecutableNodes(
   graph: ExecutableGraph,
   fired: ReadonlySet<string>,
   settled: ReadonlySet<string>,
 ): ExecutableNode[] {
   const enabled = enabledEdges(graph);
-  return graph.nodes
-    .filter((node) => {
-      if (settled.has(node.id)) return false;
-      const structuralIncoming = graph.edges.filter((edge) => edge.target === node.id);
-      const incoming = enabled.filter((edge) => edge.target === node.id);
-      if (structuralIncoming.length > 0 && incoming.length === 0) return false;
-      return incoming.every((edge) => fired.has(edge.id));
-    })
-    // Sorted so a trace is comparable across runs and across engines.
-    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  // Graph order is preserved rather than sorted. It is already deterministic,
+  // and it is the order the existing engine returns — sorting here would be a
+  // gratuitous divergence that makes exact parity unprovable.
+  return graph.nodes.filter((node) => {
+    if (settled.has(node.id)) return false;
+    const structuralIncoming = graph.edges.filter((edge) => edge.target === node.id);
+    const incoming = enabled.filter((edge) => edge.target === node.id);
+    if (structuralIncoming.length > 0 && incoming.length === 0) return false;
+    return incoming.every((edge) => fired.has(edge.id));
+  });
+}
+
+/**
+ * Edge ids that count as fired when all that is known is which nodes completed.
+ *
+ * The bridge for callers whose state is a completed-node set rather than an
+ * edge set. Every enabled edge out of a completed node fires, which is exactly
+ * the current engine's rule: it ignores edge type and asks only whether the
+ * source completed.
+ */
+export function firedEdgesFromCompleted(
+  graph: ExecutableGraph,
+  completed: Iterable<string>,
+): Set<string> {
+  const done = new Set(completed);
+  return new Set(
+    enabledEdges(graph)
+      .filter((edge) => done.has(edge.source))
+      .map((edge) => edge.id),
+  );
 }
 
 function edgeFires(
@@ -284,7 +304,7 @@ export async function runGraph(
   };
 
   for (;;) {
-    const ready = readyNodes(graph, fired, settled);
+    const ready = readyExecutableNodes(graph, fired, settled);
     if (ready.length === 0) break;
     if (wave >= maxWaves) { status = 'budget_exhausted'; break; }
 

@@ -50,7 +50,11 @@ function adapt(graph: WorkflowGraphDefinition): ExecutableGraph {
 
 const ALWAYS_COMPLETES: NodeRunner = { run: () => ({ status: 'completed' }) };
 
-/** Group a trace into waves for comparison with the reference driver. */
+/**
+ * Group a trace into waves. Order WITHIN a wave is preserved, not sorted — the
+ * executor emits graph order, which is what the existing engine returns, so the
+ * comparison below is exact rather than set-equality.
+ */
 function waves(trace: readonly GraphTraceEntry[]): string[][] {
   const byWave = new Map<number, string[]>();
   for (const entry of trace) {
@@ -58,7 +62,7 @@ function waves(trace: readonly GraphTraceEntry[]): string[][] {
     bucket.push(entry.nodeId);
     byWave.set(entry.wave, bucket);
   }
-  return [...byWave.keys()].sort((a, b) => a - b).map((w) => byWave.get(w)!.sort());
+  return [...byWave.keys()].sort((a, b) => a - b).map((w) => byWave.get(w)!);
 }
 
 /** The reference driver: what the existing engine does, expressed minimally. */
@@ -66,7 +70,7 @@ function referenceWaves(graph: WorkflowGraphDefinition): string[][] {
   const completed: string[] = [];
   const out: string[][] = [];
   for (;;) {
-    const ready = getReadyWorkflowGraphNodes(graph, completed).map((n) => n.id).sort();
+    const ready = getReadyWorkflowGraphNodes(graph, completed).map((n) => n.id);
     if (ready.length === 0) return out;
     out.push(ready);
     completed.push(...ready);
@@ -151,7 +155,7 @@ test('the fan-out shape really does fan out — specialists share one wave', asy
   assert.deepEqual(grouped[1], [
     workflowSubgraphSpecialistNodeId('analyze', 'facts'),
     workflowSubgraphSpecialistNodeId('analyze', 'risks'),
-  ].sort(), 'specialists did not become one parallel wave');
+  ], 'specialists did not become one parallel wave in declaration order');
   assert.deepEqual(grouped[2], ['analyze'], 'the reducer did not wait for every specialist');
 });
 
