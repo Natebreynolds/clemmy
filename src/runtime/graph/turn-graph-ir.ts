@@ -117,10 +117,24 @@ export interface TurnGraphNode {
   authority: TurnGraphAuthority;
   capabilities: TurnGraphCapabilityRequirement[];
   evidence: TurnGraphEvidenceRequirement;
-  multiplicity?: {
-    kind: 'per_item';
-    estimatedItems: number;
+  /**
+   * The runtime-topology CONTRACT for a planner node (Clem 4 G5a).
+   *
+   * Replaces the old `multiplicity` metadata, which stored an estimated item
+   * count on a single node — a number a scheduler cannot spread. A planner
+   * instead emits one identity-bound sibling per item of the CANONICAL
+   * manifest at execution time, as a validated graph patch joined at
+   * `joinNodeId`. `estimatedItems` is diagnostic only and never manufactures
+   * a node: the real count is decided by the manifest the planner produces,
+   * which is how "handle any task" stays unbounded by compile-time guesses.
+   */
+  emitsTopology?: {
+    kind: 'per_item_siblings';
+    joinNodeId: string;
+    workerRunner: TurnGraphRunner;
+    workerEffect: TurnGraphEffect;
     maxConcurrency: number;
+    estimatedItems: number;
   };
 }
 

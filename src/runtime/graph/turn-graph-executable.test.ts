@@ -3,20 +3,18 @@
  *
  * Can the executor drive the CHAT topology, and what would happen if it did?
  *
- * Two answers, and the second one is the point. Every compiled chat graph is
- * structurally drivable — it reaches quiescence with every node visited and no
- * stall. But every one of them is also a strictly linear PATH: the compiler
- * chains each node to its predecessor, so a "fan-out" over twelve items is one
- * `fanout` node carrying a `multiplicity` field, followed by one `execute`
- * node, in sequence.
+ * The compiled chat graph is a PATH by design: fan-out is not compiled from an
+ * estimated count, because an estimate manufactures work that may not exist.
+ * Instead the `fanout` node is a PLANNER under a runtime-topology contract
+ * (G5a): at execution it produces the canonical item manifest and emits one
+ * identity-bound worker per REAL item as a graph patch joined at the reducer.
+ * The tests below prove both halves — the compiled path stays honest, and
+ * under the executor a twelve-item manifest becomes twelve real siblings in
+ * one scheduling wave.
  *
- * That matters because wiring the executor into chat would not, by itself,
- * make anything run in parallel. The compiler has to emit real topology first.
- * These tests pin the current shape so that change announces itself here
- * instead of being discovered later in a latency measurement.
- *
- * The adapter lives in this test rather than in source: nothing in the running
- * system consumes it yet, and an adapter with no caller is speculation.
+ * The adapter lives in this test rather than in source: production chat does
+ * not execute through the graph yet (G5b), and an adapter with no caller is
+ * speculation.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -119,27 +117,10 @@ test('a typed edge condition nobody evaluates holds the turn — it does not ope
   assert.notEqual(silent.completed.length, graph.nodes.length);
 });
 
-test('chat topology is a PATH — wiring the executor in would parallelize nothing', async () => {
-  // The gap this file exists to record. Every node chains to its predecessor,
-  // so each scheduling wave holds exactly one node. Real fan-out requires the
-  // COMPILER to emit sibling nodes; the executor already supports them, as the
-  // workflow lane's read_parallel_v1 fixtures demonstrate.
-  for (const [label, build] of SHAPES) {
-    const { graph } = build();
-    const result = await runGraph(adapt(graph), { runner: PERMISSIVE, budget: { maxConcurrency: 8 } });
-
-    const perWave = new Map<number, number>();
-    for (const entry of result.trace) perWave.set(entry.wave, (perWave.get(entry.wave) ?? 0) + 1);
-    const widest = Math.max(...perWave.values());
-    assert.equal(widest, 1, `${label} unexpectedly has parallel topology — update this pin, it is good news`);
-    assert.equal(result.waves, graph.nodes.length, `${label} is not a strict path`);
-  }
-});
-
-test('a twelve-item fan-out compiles to ONE execute node, not twelve', async () => {
-  // Stated as sharply as possible, because it is the difference between a
-  // planned graph and an executed one. The multiplicity is a NUMBER on a node,
-  // not a set of nodes, so there is nothing for a scheduler to spread.
+test('the compiled graph never manufactures workers from an estimate', () => {
+  // The charter's fan-out rule: an estimated count is diagnostic, never
+  // executable shape. Twelve estimated items compile to ZERO worker clones —
+  // the planner's contract, not a guess, decides the real count at runtime.
   const { graph } = compile('Research these firms.', {
     signals: {
       intent: { intent: 'action', confidence: 0.99, reasons: ['test'] },
@@ -150,14 +131,70 @@ test('a twelve-item fan-out compiles to ONE execute node, not twelve', async () 
       },
     },
   });
-
+  assert.equal(graph.nodes.filter((node) => node.kind === 'execute').length, 0,
+    'a worker clone was compiled from an estimated count');
   const fanout = graph.nodes.find((node) => node.kind === 'fanout');
-  assert.equal(fanout?.multiplicity?.estimatedItems, 12);
-  assert.equal(fanout?.multiplicity?.maxConcurrency, 8);
-  assert.equal(graph.nodes.filter((node) => node.kind === 'execute').length, 1,
-    'twelve items still compile to a single execute node');
+  const reduce = graph.nodes.find((node) => node.kind === 'reduce');
+  assert.equal(fanout?.emitsTopology?.kind, 'per_item_siblings');
+  assert.equal(fanout?.emitsTopology?.joinNodeId, reduce?.id);
+});
 
-  const result = await runGraph(adapt(graph), { runner: PERMISSIVE, budget: { maxConcurrency: 8 } });
-  const executeSteps = result.trace.filter((entry) => entry.kind === 'execute');
-  assert.equal(executeSteps.length, 1, 'the executor cannot spread work the compiler did not express');
+test('under the executor, the chat fan-out becomes REAL siblings — the demo-gap shape, closed', async () => {
+  // The 2026 client-demo failure shape: "research these N firms" ran as one
+  // loop with zero workers. Here the same compiled chat graph, driven by the
+  // executor, turns a twelve-item manifest into twelve identity-bound workers
+  // in ONE scheduling wave, joined by the compiled reducer, finishing through
+  // the compiled verify → compose_reply → publish chain.
+  const { graph } = compile('Research these firms.', {
+    signals: {
+      intent: { intent: 'action', confidence: 0.99, reasons: ['test'] },
+      externalEffect: { requested: false, kinds: [] },
+      multiItem: {
+        isMultiItem: true, itemCount: 12, itemKind: 'firms',
+        sameShapeWork: true, explicitParallelRequest: true,
+      },
+    },
+  });
+  const fanout = graph.nodes.find((node) => node.kind === 'fanout')!;
+  const contract = fanout.emitsTopology!;
+  // The manifest the planner "produced" at runtime. Note: ELEVEN items, not
+  // the estimated twelve — the real manifest wins, which is the whole point.
+  const manifest = Array.from({ length: 11 }, (_, i) => `firm-${i}`);
+
+  const result = await runGraph(adapt(graph), {
+    runner: {
+      run: (node) => {
+        if (node.id === fanout.id) {
+          return {
+            status: 'completed',
+            emitPatch: {
+              nodes: manifest.map((item) => ({ id: `worker:${item}`, kind: 'worker' })),
+              edges: [
+                ...manifest.map((item) => ({
+                  id: `spawn:${item}`, source: fanout.id, target: `worker:${item}`,
+                })),
+                ...manifest.map((item) => ({
+                  id: `join:${item}`, source: `worker:${item}`, target: contract.joinNodeId,
+                })),
+              ],
+            },
+          };
+        }
+        return { status: 'completed' };
+      },
+      edgeSatisfied: () => true,
+    },
+    budget: { maxConcurrency: contract.maxConcurrency },
+  });
+
+  assert.equal(result.status, 'completed', result.stalledDetail ?? '');
+  const workers = result.trace.filter((entry) => entry.kind === 'worker');
+  assert.equal(workers.length, 11, 'the manifest did not decide the worker count');
+  assert.equal(new Set(workers.map((entry) => entry.wave)).size, 1,
+    'workers did not share one scheduling wave');
+  const reduceEntry = result.trace.find((entry) => entry.kind === 'reduce')!;
+  assert.ok(reduceEntry.wave > workers[0]!.wave, 'the reducer did not wait for the workers');
+  const publish = result.trace.find((entry) => entry.kind === 'publish');
+  assert.equal(publish?.status, 'completed', 'the turn did not reach its publish terminal');
+  assert.equal(result.unreached.length, 0);
 });

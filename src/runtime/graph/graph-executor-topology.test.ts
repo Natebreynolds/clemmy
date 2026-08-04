@@ -301,3 +301,38 @@ test('a 1,000-item fan-out runs under bounded concurrency', async () => {
   const workerCount = result.trace.filter((t) => t.kind === 'worker').length;
   assert.equal(workerCount, 1_000);
 });
+
+test('a join into a node whose scheduling future closed fails the emitter', async () => {
+  // The temporal half of the join rule. Structurally a worker may join a
+  // compiled node; temporally it may not join one that already settled (or
+  // whose readiness fired) — that would grow an AND-set history has already
+  // resolved. The emitter takes the failure as node logic.
+  const graph: ExecutableGraph = {
+    graphId: 'late-join',
+    nodes: [
+      { id: 'early', kind: 'step' },
+      { id: 'late-planner', kind: 'planner' },
+    ],
+    edges: [{ id: 'e1', source: 'early', target: 'late-planner' }],
+  };
+  const result = await runGraph(graph, {
+    runner: {
+      run: (node) => (node.id === 'late-planner'
+        ? {
+            status: 'completed',
+            emitPatch: {
+              nodes: [{ id: 'w', kind: 'worker' }],
+              // `early` settled a wave ago — joining it now rewrites history.
+              edges: [{ id: 'pj', source: 'w', target: 'early' }],
+            },
+          }
+        : { status: 'completed' }),
+    },
+  });
+  assert.deepEqual(result.failed, ['late-planner']);
+  assert.match(
+    result.trace.find((t) => t.nodeId === 'late-planner')?.reason ?? '',
+    /already settled/,
+  );
+  assert.equal(result.patches.length, 0);
+});

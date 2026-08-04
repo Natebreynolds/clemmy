@@ -189,13 +189,18 @@ export type PatchValidationResult = PatchValidationOk | AdmissionRefusal;
 /**
  * Structural validation of a runtime-emitted patch, before any child starts.
  *
- * A patch may only ADD: new node ids, and edges among new nodes or from
- * existing nodes into new ones. It cannot redefine an existing node, cannot
- * add an edge into an already-settled region's past (no edge targeting an
- * existing node — that could retroactively change readiness that already
- * fired), and cannot introduce a cycle among its additions. Authority
- * narrowing is the caller's dimension — the executor injects a patch admitter
- * for that; this function owns the structural half.
+ * A patch may only ADD: new node ids, edges among new nodes, edges from
+ * existing nodes into new ones, and JOIN edges from new nodes into existing
+ * nodes — the shape a fan-out contract needs, where runtime workers join a
+ * compiled reducer. It cannot redefine an existing node and cannot introduce
+ * a cycle anywhere in the combined graph.
+ *
+ * A join edge is structurally legal but temporally guarded: the EXECUTOR
+ * refuses a patch whose join target has already settled or whose readiness
+ * has already fired, because growing a node's AND-set after it fired would
+ * rewrite scheduling history. Structure here, time there — this function is
+ * pure and cannot know runtime state. Authority narrowing is the injected
+ * patch admitter's dimension.
  */
 export function validateGraphPatch(
   graph: ExecutableGraph,
@@ -217,23 +222,25 @@ export function validateGraphPatch(
   }
   for (const edge of patch.edges) {
     if (existingEdges.has(edge.id)) errors.push(`edge "${edge.id}" already exists`);
-    if (!newNodes.has(edge.target)) {
-      errors.push(`edge "${edge.id}" targets "${edge.target}", which is not a patch node — a patch cannot rewire the existing graph`);
+    if (!newNodes.has(edge.target) && !existingNodes.has(edge.target)) {
+      errors.push(`edge "${edge.id}" targets unknown node "${edge.target}"`);
     }
     if (!newNodes.has(edge.source) && !existingNodes.has(edge.source)) {
       errors.push(`edge "${edge.id}" sources unknown node "${edge.source}"`);
     }
-  }
-
-  // Cycle check among additions (existing graph is acyclic by its own
-  // admission, and patch edges cannot target existing nodes, so a new cycle
-  // can only live among new nodes).
-  const adjacency = new Map<string, string[]>();
-  for (const edge of patch.edges) {
-    if (newNodes.has(edge.source) && newNodes.has(edge.target)) {
-      adjacency.set(edge.source, [...(adjacency.get(edge.source) ?? []), edge.target]);
+    if (existingNodes.has(edge.source) && existingNodes.has(edge.target)) {
+      errors.push(`edge "${edge.id}" connects two existing nodes — a patch cannot rewire the admitted graph`);
     }
   }
+
+  // Cycle check over the COMBINED graph: a join edge into an existing node can
+  // close a loop through the admitted topology, not only among additions.
+  const adjacency = new Map<string, string[]>();
+  const link = (source: string, target: string): void => {
+    adjacency.set(source, [...(adjacency.get(source) ?? []), target]);
+  };
+  for (const edge of graph.edges) { if (!edge.disabled) link(edge.source, edge.target); }
+  for (const edge of patch.edges) { if (!edge.disabled) link(edge.source, edge.target); }
   const visiting = new Set<string>();
   const done = new Set<string>();
   const hasCycle = (id: string): boolean => {
@@ -245,8 +252,8 @@ export function validateGraphPatch(
     done.add(id);
     return false;
   };
-  for (const id of newNodes) {
-    if (hasCycle(id)) { errors.push('patch introduces a cycle among its new nodes'); break; }
+  for (const id of [...existingNodes, ...newNodes]) {
+    if (hasCycle(id)) { errors.push('patch introduces a cycle in the combined graph'); break; }
   }
 
   if (errors.length > 0) return { ok: false, errors };

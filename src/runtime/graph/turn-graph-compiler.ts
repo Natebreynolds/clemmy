@@ -313,7 +313,7 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
     effect?: TurnGraphEffect;
     capabilities?: TurnGraphCapabilityRequirement[];
     evidence?: TurnGraphNode['evidence'];
-    multiplicity?: TurnGraphNode['multiplicity'];
+    emitsTopology?: TurnGraphNode['emitsTopology'];
     edgeWhen?: TurnGraphEdge['when'];
   }): TurnGraphNode => {
     const effect = opts.effect ?? noEffect();
@@ -325,7 +325,7 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
       authority: authorityFor(input.identity.sourceUserSeq, effect),
       capabilities: opts.capabilities ?? [],
       evidence: opts.evidence ?? { mode: 'none', kinds: [] },
-      ...(opts.multiplicity ? { multiplicity: opts.multiplicity } : {}),
+      ...(opts.emitsTopology ? { emitsTopology: opts.emitsTopology } : {}),
     };
     nodes.push(node);
     if (prior) {
@@ -379,19 +379,31 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
     });
   } else if (route === 'act') {
     if (multiItem.isMultiItem) {
-      const multiplicity = {
-        kind: 'per_item' as const,
-        estimatedItems: multiItem.itemCount,
-        maxConcurrency: 8,
-      };
-      addNode({ kind: 'fanout', runner: { kind: 'runtime' }, multiplicity });
+      // G5a: the fanout node is a PLANNER under a runtime-topology contract.
+      // It does not carry a worker clone or an estimated count as executable
+      // shape — at execution it produces the canonical item manifest and emits
+      // one identity-bound worker per REAL item as a graph patch joining at
+      // the reducer. The single execute-with-multiplicity node this replaces
+      // was a number a scheduler could never spread.
+      const reduceNodeId = `n${nodes.length + 1}:reduce`;
       addNode({
-        kind: 'execute',
-        runner: { kind: 'model', role: 'worker' },
-        effect: routeEffect,
-        multiplicity,
+        kind: 'fanout',
+        runner: { kind: 'model', role: 'brain' },
+        emitsTopology: {
+          kind: 'per_item_siblings',
+          joinNodeId: reduceNodeId,
+          workerRunner: { kind: 'model', role: 'worker' },
+          workerEffect: routeEffect,
+          maxConcurrency: 8,
+          estimatedItems: multiItem.itemCount,
+        },
       });
-      addNode({ kind: 'reduce', runner: { kind: 'runtime' } });
+      const reduceNode = addNode({ kind: 'reduce', runner: { kind: 'runtime' } });
+      if (reduceNode.id !== reduceNodeId) {
+        // The contract names its join by id; a drifted id would orphan the
+        // runtime siblings. Deterministic by construction, asserted anyway.
+        throw new Error(`fanout contract join drift: expected ${reduceNodeId}, got ${reduceNode.id}`);
+      }
     } else {
       addNode({
         kind: 'execute',

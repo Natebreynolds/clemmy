@@ -395,6 +395,24 @@ export async function runGraph(
   const applyPatch = (patch: GraphPatch): { ok: true; patchDigest: string } | { ok: false; reason: string } => {
     const validated = validateGraphPatch(working, patch);
     if (!validated.ok) return { ok: false, reason: validated.errors.join('; ') };
+    // The temporal half of the join rule: an edge may join an EXISTING node
+    // only while that node's scheduling future is still open. Growing the
+    // AND-set of a node that settled, or whose readiness already fired, would
+    // rewrite history the trace has already recorded.
+    for (const edge of patch.edges) {
+      const joinsExisting = working.nodes.some((node) => node.id === edge.target)
+        && !patch.nodes.some((node) => node.id === edge.target);
+      if (!joinsExisting) continue;
+      if (settled.has(edge.target)) {
+        return { ok: false, reason: `edge "${edge.id}" joins "${edge.target}", which has already settled` };
+      }
+      const firedIncoming = working.edges.some(
+        (incoming) => !incoming.disabled && incoming.target === edge.target && fired.has(incoming.id),
+      );
+      if (firedIncoming) {
+        return { ok: false, reason: `edge "${edge.id}" joins "${edge.target}", whose readiness has already fired` };
+      }
+    }
     // Idempotent by digest: a crash between patch admission and emitter
     // settlement re-emits the same patch on resume, and replay must not turn
     // that into a duplicate-node refusal.

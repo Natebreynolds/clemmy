@@ -115,12 +115,38 @@ test('a patch cannot redefine, rewire, or cycle', () => {
   });
   assert.equal(redefine.ok, false, 'redefining an existing node was admitted');
 
+  // A JOIN edge into an existing node is structurally legal — that is how a
+  // fan-out contract joins runtime workers into a compiled reducer. But an
+  // edge between two EXISTING nodes rewires the admitted graph, and a join
+  // that closes a loop through the admitted topology is a cycle. (The
+  // temporal half — refusing joins whose target already settled or fired —
+  // is the executor's, pinned in graph-executor-topology.test.ts.)
+  const join = validateGraphPatch(GRAPH, {
+    emittedBy: 'a',
+    nodes: [{ id: 'c', kind: 'worker' }],
+    edges: [
+      { id: 'p1', source: 'a', target: 'c' },
+      { id: 'p2', source: 'c', target: 'b' },
+    ],
+  });
+  assert.equal(join.ok, true, 'a legal join into an unsettled compiled reducer was refused');
+
   const rewire = validateGraphPatch(GRAPH, {
     emittedBy: 'b',
     nodes: [{ id: 'c', kind: 'step' }],
-    edges: [{ id: 'p1', source: 'c', target: 'a' }],
+    edges: [{ id: 'p1', source: 'a', target: 'b' }],
   });
-  assert.equal(rewire.ok, false, 'an edge into the EXISTING graph was admitted — that rewrites readiness history');
+  assert.equal(rewire.ok, false, 'an edge between two existing nodes was admitted');
+
+  const cycleViaExisting = validateGraphPatch(GRAPH, {
+    emittedBy: 'a',
+    nodes: [{ id: 'c', kind: 'step' }],
+    edges: [
+      { id: 'p1', source: 'b', target: 'c' },
+      { id: 'p2', source: 'c', target: 'a' },
+    ],
+  });
+  assert.equal(cycleViaExisting.ok, false, 'a cycle THROUGH the admitted graph was admitted');
 
   const cycle = validateGraphPatch(GRAPH, {
     emittedBy: 'b',

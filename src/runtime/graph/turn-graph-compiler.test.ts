@@ -106,14 +106,25 @@ test('conservative multi-item signal compiles bounded fanout, per-item execution
     },
   });
   assert.equal(result.graph.fastPath, 'fanout_action');
-  assert.deepEqual(kinds(result).slice(5, 10), ['fanout', 'execute', 'reduce', 'verify', 'compose_reply']);
+  // G5a: no execute-with-multiplicity clone. The fanout node is a PLANNER
+  // under a runtime-topology contract; workers arrive at execution as a graph
+  // patch, one per REAL manifest item, joined at the reducer.
+  assert.deepEqual(kinds(result).slice(5, 9), ['fanout', 'reduce', 'verify', 'compose_reply']);
+  assert.equal(result.graph.nodes.some((node) => node.kind === 'execute'), false,
+    'a worker clone was compiled from an estimated count');
   const fanout = result.graph.nodes.find((node) => node.kind === 'fanout');
-  const execute = result.graph.nodes.find((node) => node.kind === 'execute');
-  assert.deepEqual(fanout?.multiplicity, { kind: 'per_item', estimatedItems: 12, maxConcurrency: 8 });
-  assert.equal(execute?.runner.kind, 'model');
-  assert.deepEqual(execute?.multiplicity, fanout?.multiplicity);
-  assert.equal(execute?.effect.kind, 'unknown');
-  assert.equal(execute?.authority.state, 'deferred');
+  const reduce = result.graph.nodes.find((node) => node.kind === 'reduce');
+  assert.equal(fanout?.emitsTopology?.kind, 'per_item_siblings');
+  assert.equal(fanout?.emitsTopology?.joinNodeId, reduce?.id, 'the contract does not name the real reducer');
+  assert.deepEqual(fanout?.emitsTopology?.workerRunner, { kind: 'model', role: 'worker' });
+  assert.equal(fanout?.emitsTopology?.workerEffect.kind, 'unknown');
+  assert.equal(fanout?.emitsTopology?.maxConcurrency, 8);
+  // Diagnostic only — the executable count comes from the manifest at runtime.
+  assert.equal(fanout?.emitsTopology?.estimatedItems, 12);
+  // The planner ITSELF performs no external effect; authority defers to patch
+  // admission and to the emitted workers, whose effect the contract carries.
+  assert.equal(fanout?.authority.state, 'not_required');
+  assert.equal(fanout?.emitsTopology?.workerEffect.idempotency, 'required_before_dispatch');
 });
 
 test('explicit empty tool authority survives compilation and is not widened', () => {
