@@ -350,7 +350,7 @@ export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowG
  * edges are compiled today, so nothing is lost — and when `failure` edges
  * eventually are emitted, this is the one line that has to change.
  */
-function toExecutableGraph(graph: WorkflowGraphDefinition): ExecutableGraph {
+export function toExecutableGraph(graph: WorkflowGraphDefinition): ExecutableGraph {
   return {
     graphId: `${graph.name ?? 'workflow'}:${graph.version ?? 0}`,
     nodes: graph.nodes.map((node) => ({ id: node.id, kind: node.type })),

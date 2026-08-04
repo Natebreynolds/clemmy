@@ -251,6 +251,7 @@ import {
 import { workflowCodeRevisionFingerprint } from './workflow-code-certification.js';
 import {
   compileWorkflowStepsToGraph,
+  toExecutableGraph,
   validateWorkflowGraph,
   WORKFLOW_GRAPH_ALLOWED_TOOLS,
   WORKFLOW_GRAPH_ADDITIVE_NODE_MODE,
@@ -260,6 +261,7 @@ import {
   type WorkflowGraphNode,
 } from './workflow-graph.js';
 import { resolveWorkflowReadiness } from './workflow-readiness.js';
+import { runGraph, type NodeOutcome as GraphNodeOutcome } from '../runtime/graph/graph-executor.js';
 import {
   loadWorkflowGraphSnapshotByRunId,
   persistWorkflowGraphSnapshot,
@@ -5873,12 +5875,6 @@ function formatStepOutputs(
     .join('\n\n');
 }
 
-function parallelStepLabel(steps: WorkflowStepInput[]): string {
-  if (steps.length === 1) return steps[0].id;
-  const labels = steps.map((step) => step.id);
-  const preview = labels.slice(0, 3).join(' + ');
-  return labels.length > 3 ? `parallel: ${preview} + ${labels.length - 3} more` : `parallel: ${preview}`;
-}
 
 function appendWorkflowNodeReadyBatch(
   workflowSlug: string,
@@ -7193,18 +7189,12 @@ async function executeWorkflow(
         });
       } catch { /* the advisory must never fail a run */ }
     };
-    while (true) {
-      // Re-read the persisted graph at every scheduling boundary. A prompt
-      // node added by the batch that just finished therefore joins this same
-      // run; after a daemon restart the first pass materializes it identically.
-      refreshLiveExecutionPlan();
-      steps = allExecutionSteps;
-      if (steps.every((step) => completedStepIds.has(step.id))) break;
-
-      // Give already-resolved watcher promises one microtask turn to publish
-      // into the mailbox. This never waits for judge I/O: a slow check simply
-      // remains in flight while the next graph batch starts.
-      await Promise.resolve();
+    // Consume a landed watcher verdict into a steer, respecting the injection
+    // cap. Shared by the epoch-top boundary and the executor's per-dispatch
+    // boundary — under the shared executor a whole run is often ONE epoch, so
+    // waiting for the next while-iteration would discard every mid-run verdict
+    // and silently kill live steering.
+    const consumeWatcherVerdict = (): string | undefined => {
       const watcherResult = watcherMailbox.take();
       if (
         watcherResult?.verdict
@@ -7212,7 +7202,6 @@ async function executeWorkflow(
         && watcherInjections < MAX_WATCHER_INJECTIONS
       ) {
         watcherInjections += 1;
-        watcherSteer = `${watcherResult.verdict.miss}. ${watcherResult.verdict.steer}`;
         appendWorkflowEvent(workflowSlug, runId, {
           kind: 'step_advisory',
           stepId: '(watcher)',
@@ -7225,73 +7214,194 @@ async function executeWorkflow(
             nonBlocking: true,
           },
         });
+        return `${watcherResult.verdict.miss}. ${watcherResult.verdict.steer}`;
       }
+      return undefined;
+    };
+    // Launch a trajectory check at a step boundary but never await it —
+    // fail-open, silent when on-track, bounded checks and steers.
+    const maybeStartWatcherCheck = (): void => {
+      if (
+        !watcherEnabled
+        || !steps.some((step) => stepOutputs[step.id] === undefined)
+        || watcherMailbox.inFlight
+        || watcherInjections >= MAX_WATCHER_INJECTIONS
+        || watcherChecks >= MAX_WATCHER_CHECKS
+        || Object.keys(stepOutputs).length - watcherLastCheckedAtSteps < WATCHER_STEP_INTERVAL
+      ) return;
+      watcherChecks += 1;
+      watcherLastCheckedAtSteps = Object.keys(stepOutputs).length;
+      const digest = renderWatcherWorkflowDigest(steps, stepOutputs);
+      watcherMailbox.start(Object.keys(stepOutputs).length, () =>
+        workflowWatcherFn({
+          objective: watcherObjective,
+          ...(watcherCriteria ? { successCriteria: watcherCriteria } : {}),
+          toolCallSummary: digest.summary,
+          latestAssistantNote: digest.latest,
+          toolCallCount: Object.keys(stepOutputs).length,
+        }),
+      );
+    };
+    while (true) {
+      // Re-read the persisted graph at every scheduling boundary. A prompt
+      // node added by the batch that just finished therefore joins this same
+      // run; after a daemon restart the first pass materializes it identically.
+      refreshLiveExecutionPlan();
+      steps = allExecutionSteps;
+      if (steps.every((step) => completedStepIds.has(step.id))) break;
+
+      // Give already-resolved watcher promises one microtask turn to publish
+      // into the mailbox. This never waits for judge I/O: a slow check simply
+      // remains in flight while the next graph batch starts.
+      await Promise.resolve();
+      watcherSteer = consumeWatcherVerdict() ?? watcherSteer;
 
       executionRound += 1;
       maybeWarnRunBudget();
-      // A fulfilled `{blocked:true}` is an honest terminal outcome for that
-      // node, not valid data. Close every dependent branch without executing
-      // more model/tool work; independent branches are left untouched.
-      const dependencySkips = planBlockedDependencySkips(steps, stepOutputs);
-      for (const skipped of dependencySkips) {
-        stepOutputs[skipped.stepId] = skipped.output;
-        completedStepIds.add(skipped.stepId);
-        persistAndPublishStepCompletion({
-          workflowSlug,
-          runId,
-          stepId: skipped.stepId,
-          output: skipped.output,
-          meta: {
-            blocked: true,
-            skipped: true,
-            reason: 'blocked_upstream_dependency',
-            blockedBy: skipped.blockedBy,
-          },
-        });
-      }
       if (steps.every((step) => completedStepIds.has(step.id))) continue;
-      // Readiness comes from the graph (workflow-readiness.ts), so the
-      // persisted/patched graph is what decides execution order rather than
-      // only observing it. A definition that cannot progress surfaces as a
-      // named stall instead of an exception thrown from inside the loop.
-      const readiness = resolveWorkflowReadiness(steps, completedStepIds, {
-        graph: liveExecutionPlan.graph,
-      });
-      if (readiness.structurallyStalled) {
-        throw new Error(`Workflow dependency graph is blocked or cyclic: ${readiness.stalledDetail ?? 'no step can proceed'}`);
-      }
-      const readyIds = new Set(readiness.readyStepIds);
-      const readyBatch = steps.filter((step) => readyIds.has(step.id));
+
+      // ── the executor epoch ────────────────────────────────────────────────
+      // Dispatch is owned by the shared graph executor (Clementine 4 Stage 3):
+      // the SAME drive loop the chat lane will use. This epoch runs the graph
+      // until pause, quiescence, cancellation, or abort; the outer while stays
+      // as the boundary that re-reads the persisted graph (a prompt node added
+      // by a finished batch joins this same run) and consumes watcher verdicts.
+      //
+      // The old batch-settlement POLICY is preserved exactly — park outranks a
+      // capability block outranks failure, siblings finish before the run acts
+      // (decideBatchSettlement remains as the policy reference its tests pin).
+      const stepsById = new Map(steps.map((step) => [step.id, step]));
+      const executable = toExecutableGraph(
+        liveExecutionPlan.graph ?? compileWorkflowStepsToGraph(steps),
+      );
       const concurrencyCap = Math.max(1, RUNNER_CONCURRENCY);
-      const batch = readyBatch.slice(0, concurrencyCap);
-      appendWorkflowNodeReadyBatch(workflowSlug, runId, readyBatch, batch, executionRound, concurrencyCap);
-      const batchIndex = completedStepIds.size + 1;
-      setWorkflowRunCurrentStep(runId, {
-        stepId: parallelStepLabel(batch),
-        index: batchIndex,
-        total: steps.length,
-      });
-
-      const settled = await Promise.allSettled(batch.map(async (step) => {
-        throwIfWorkflowRunCancelled(runId);
-        const completedItems = resume.completedItems.get(step.id) ?? new Map();
-        const output = await executeStepVerified(step, {
-          workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
-          ...(watcherSteer ? { watcherSteer } : {}),
-        });
-        return { step, output };
-      }));
-      // A steer applies to exactly ONE batch — consumed above, cleared here.
+      const epoch = {
+        parkedSteps: [] as ConstructorParameters<typeof ParkRunSignal>[0],
+        capabilityBlocks: [] as WorkflowCapabilityBlockedError[],
+        failures: [] as Array<{ stepId: string; message: string }>,
+        abort: { aborted: false },
+        cancellation: undefined as unknown,
+        // A steer applies to exactly ONE scheduler wave — the first wave that
+        // dispatches after the verdict landed, which is what "one batch" was.
+        steer: watcherSteer,
+        steerWave: null as number | null,
+      };
       watcherSteer = undefined;
+      // Per-wave telemetry: the executor settles in declaration order, so a
+      // wave's membership is known when its first settlement arrives.
+      let telemetryWave = -1;
+      const waveMembers: string[] = [];
+      const flushWaveTelemetry = (): void => {
+        if (telemetryWave < 0 || waveMembers.length === 0) return;
+        const members = steps.filter((step) => waveMembers.includes(step.id));
+        appendWorkflowNodeReadyBatch(
+          workflowSlug, runId, members, members, executionRound + telemetryWave, concurrencyCap,
+        );
+        waveMembers.length = 0;
+      };
 
-      const decision = decideBatchSettlement(batch, settled);
-      for (const done of decision.completions) {
-        stepOutputs[done.stepId] = done.output;
-        completedStepIds.add(done.stepId);
-      }
+      const result = await runGraph(executable, {
+        runner: {
+          run: async (node, context): Promise<GraphNodeOutcome> => {
+            const step = stepsById.get(node.id);
+            if (!step) {
+              // A graph node with no step counterpart never dispatches — the
+              // same exclusion the readiness seam applied.
+              return { status: 'blocked', reason: `graph node "${node.id}" has no executable step` };
+            }
+            try {
+              throwIfWorkflowRunCancelled(runId);
+              // A fulfilled `{blocked:true}` upstream is an honest terminal
+              // for THIS branch: close it without model/tool work.
+              const skips = planBlockedDependencySkips([step], stepOutputs);
+              const skipped = skips.find((candidate) => candidate.stepId === step.id);
+              if (skipped) {
+                stepOutputs[step.id] = skipped.output;
+                persistAndPublishStepCompletion({
+                  workflowSlug,
+                  runId,
+                  stepId: step.id,
+                  output: skipped.output,
+                  meta: {
+                    blocked: true,
+                    skipped: true,
+                    reason: 'blocked_upstream_dependency',
+                    blockedBy: skipped.blockedBy,
+                  },
+                });
+                return { status: 'completed' };
+              }
+              setWorkflowRunCurrentStep(runId, {
+                stepId: step.id,
+                index: Object.keys(stepOutputs).length + 1,
+                total: steps.length,
+              });
+              // The executor's dispatch IS the "next graph boundary": a
+              // verdict that landed mid-epoch steers the next step to start,
+              // exactly as it steered the next batch before. One microtask
+              // turn lets an already-resolved check publish into the mailbox —
+              // the same yield the round-top boundary always gave it.
+              await Promise.resolve();
+              const landedSteer = consumeWatcherVerdict();
+              if (landedSteer) {
+                epoch.steer = landedSteer;
+                epoch.steerWave = null;
+              }
+              const completedItems = resume.completedItems.get(step.id) ?? new Map();
+              const steerForStep = epoch.steer && (epoch.steerWave === null || epoch.steerWave === context.wave)
+                ? (epoch.steerWave = context.wave, epoch.steer)
+                : undefined;
+              const output = await executeStepVerified(step, {
+                workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
+                ...(steerForStep ? { watcherSteer: steerForStep } : {}),
+              });
+              stepOutputs[step.id] = output;
+              return { status: 'completed' };
+            } catch (error) {
+              if (error instanceof ParkRunSignal) {
+                epoch.parkedSteps.push(...error.parkedSteps);
+                // Paused halts the epoch after in-flight siblings settle —
+                // exactly the old "batch finishes, then the run parks".
+                return { status: 'paused', reason: 'approval_parked' };
+              }
+              if (error instanceof WorkflowCapabilityBlockedError) {
+                epoch.capabilityBlocks.push(error);
+                epoch.abort.aborted = true;
+                return { status: 'blocked', reason: error.message };
+              }
+              if (error instanceof WorkflowRunCancelledError) {
+                epoch.cancellation = error;
+                epoch.abort.aborted = true;
+                return { status: 'failed', reason: 'run cancelled', settlementClass: 'cancelled' };
+              }
+              const message = error instanceof Error ? error.message : String(error);
+              epoch.failures.push({ stepId: step.id, message });
+              epoch.abort.aborted = true;
+              return { status: 'failed', reason: message, settlementClass: 'node' };
+            }
+          },
+        },
+        journal: completedStepIds,
+        budget: { maxConcurrency: concurrencyCap },
+        signal: epoch.abort,
+        onStep: (entry) => {
+          if (entry.reused) return;
+          if (entry.wave !== telemetryWave) {
+            flushWaveTelemetry();
+            telemetryWave = entry.wave;
+          }
+          waveMembers.push(entry.nodeId);
+          // Step-boundary cadence, exactly where rounds used to end.
+          if (entry.status === 'completed') maybeStartWatcherCheck();
+        },
+      });
+      flushWaveTelemetry();
+
+      // ── epoch settlement, in the exact old priority order ─────────────────
+      if (epoch.cancellation) throw epoch.cancellation;
       throwIfWorkflowRunCancelled(runId);
-      if (decision.action === 'park') {
-        for (const failure of decision.failures) {
+      if (epoch.parkedSteps.length > 0) {
+        for (const failure of epoch.failures) {
           appendWorkflowEvent(workflowSlug, runId, {
             kind: 'step_advisory',
             stepId: failure.stepId,
@@ -7303,10 +7413,10 @@ async function executeWorkflow(
             'batch step failed while a sibling parked on approval — preserving the park; the failed step re-runs after the approval resolves',
           );
         }
-        throw new ParkRunSignal(decision.parkedSteps);
+        throw new ParkRunSignal(epoch.parkedSteps);
       }
-      if (decision.action === 'capability') {
-        for (const failure of decision.failures) {
+      if (epoch.capabilityBlocks.length > 0) {
+        for (const failure of epoch.failures) {
           appendWorkflowEvent(workflowSlug, runId, {
             kind: 'step_advisory',
             stepId: failure.stepId,
@@ -7314,40 +7424,16 @@ async function executeWorkflow(
             meta: { reason: 'batch_sibling_failed_while_capability_blocked' },
           });
         }
-        throw decision.capabilityBlocks[0];
+        throw epoch.capabilityBlocks[0];
       }
-      if (decision.action === 'fail') {
-        const messages = decision.failures.map((e) => e.message);
+      if (epoch.failures.length > 0) {
+        const messages = epoch.failures.map((e) => e.message);
         throw new Error(messages.length === 1 ? messages[0] : `Workflow batch failed: ${messages.join('; ')}`);
       }
-      completedStepIds = new Set(Object.keys(stepOutputs));
-
-      // WATCHER (workflow mount): launch a trajectory check at a step boundary
-      // but never await it. A verdict is consumed at the next available graph
-      // boundary; if the judge is slow, execution keeps breathing and the
-      // steer lands on a later batch (or is discarded when no work remains).
-      // Fail-open + silent when on-track/unsure; bounded checks and steers.
-      if (
-        watcherEnabled
-        && steps.some((step) => !completedStepIds.has(step.id))
-        && !watcherMailbox.inFlight
-        && watcherInjections < MAX_WATCHER_INJECTIONS
-        && watcherChecks < MAX_WATCHER_CHECKS
-        && completedStepIds.size - watcherLastCheckedAtSteps >= WATCHER_STEP_INTERVAL
-      ) {
-        watcherChecks += 1;
-        watcherLastCheckedAtSteps = completedStepIds.size;
-        const digest = renderWatcherWorkflowDigest(steps, stepOutputs);
-        watcherMailbox.start(completedStepIds.size, () =>
-          workflowWatcherFn({
-            objective: watcherObjective,
-            ...(watcherCriteria ? { successCriteria: watcherCriteria } : {}),
-            toolCallSummary: digest.summary,
-            latestAssistantNote: digest.latest,
-            toolCallCount: completedStepIds.size,
-          }),
-        );
+      if (result.status === 'stalled') {
+        throw new Error(`Workflow dependency graph is blocked or cyclic: ${result.stalledDetail ?? 'no step can proceed'}`);
       }
+      completedStepIds = new Set(Object.keys(stepOutputs));
     }
     // Never join an advisory verifier at run completion. Late results are
     // intentionally discarded: terminal proof owns the final outcome.

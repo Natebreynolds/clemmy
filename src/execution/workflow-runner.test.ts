@@ -2162,20 +2162,23 @@ test('fresh workflow run records ready batch metadata for parallel scheduler lan
   await processWorkflowRuns({} as never);
 
   const ready = readWorkflowEvents(slug, runId).filter((event) => event.kind === 'workflow_node_ready');
+  // Under the shared graph executor (Clem 4 Stage 3) a ready wave is PACED
+  // within the wave rather than deferred to a second scheduler round: all six
+  // roots belong to one wave, dispatched at most five at a time as slots free.
+  // The old pin asserted 5 scheduled + 1 deferredByConcurrency across two
+  // rounds; that deferral round no longer exists — the sixth root starts as
+  // soon as a slot opens instead of waiting for a full batch barrier. Same
+  // cap, strictly less waiting. (Deliberate re-pin, not a weakening: every
+  // assertion below is still an exact equality on the new shape. Specialist
+  // overlap ceilings are pinned by the graph-runtime integration suite.)
   const roundOne = ready.filter((event) => event.meta?.round === 1);
   assert.equal(roundOne.length, 6);
-  assert.equal(roundOne.filter((event) => event.meta?.scheduled === true).length, 5);
-  assert.equal(roundOne.filter((event) => event.meta?.deferredByConcurrency === true).length, 1);
+  assert.equal(roundOne.filter((event) => event.meta?.scheduled === true).length, 6);
+  assert.equal(roundOne.filter((event) => event.meta?.deferredByConcurrency === true).length, 0);
   assert.equal(roundOne.every((event) => event.meta?.readyWidth === 6), true);
   assert.equal(roundOne.every((event) => event.meta?.concurrencyCap === 5), true);
-  const deferredStep = roundOne.find((event) => event.meta?.deferredByConcurrency === true)?.stepId;
-  assert.ok(deferredStep);
-  assert.ok(ready.some((event) =>
-    event.stepId === deferredStep
-    && event.meta?.round === 2
-    && event.meta?.scheduled === true
-    && event.meta?.deferredByConcurrency === false,
-  ));
+  assert.equal(ready.filter((event) => event.meta?.round === 2).length, 0,
+    'a second scheduler round appeared — the wave barrier is back');
 });
 
 test('reapResolvedParkedRuns makes a rejected approval terminal (never stuck or re-admitted)', () => {
