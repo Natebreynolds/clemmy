@@ -197,6 +197,22 @@ Establish the baseline the later milestones are measured against, because
 
 ### G1 — The executor
 
+**Status: G1a (scheduler/readiness extraction) landed as `464df242` +
+`6e7d51a3`; the G1 durable-contract work remains open.** The landed slice is
+371 lines importing nothing, proved by a differential oracle over real
+compiled workflow graphs including `read_parallel_v1` and verified to bite by
+weakening readiness from `every` to `some` (twelve of sixteen pins failed).
+`getReadyWorkflowGraphNodes` now delegates to it, so the workflow engine
+schedules through the executor while dispatch stays where it is.
+
+That slice is deliberately NOT this milestone. Still open, per the charter's
+sixteen-gap review: the journal is node-ID-only (no admitted identity binding,
+no typed outputs/evidence, no causal validation), settlement persistence is a
+best-effort `onStep` rather than an awaited durable boundary, a rejected
+runner tears down the executor instead of becoming a typed outcome, and there
+is no lease/cancellation or dynamic graph-patch protocol. Stage 1 closes these
+with zero production callers.
+
 The keystone. A single module that walks a typed graph: node kinds from P1,
 typed edges, durable per-node events, restart materialization, budget
 enforcement, and one terminal reduction.
@@ -268,7 +284,30 @@ budget from G0 improves on the fact-lookup and connected-app-read fixtures.
 and the JIT / tool-search / MCP-scope / fail-open switches that collapse into
 the capability resolver.
 
-### G5 — Chat executes on the executor
+### G5a — The chat compiler emits real topology
+
+Discovered while proving the executor could drive chat shapes (`464df242`,
+`turn-graph-executable.test.ts`): **every compiled chat graph is a linear
+path.** The compiler chains each node to its predecessor from a single
+`edges.push`, so a twelve-item fan-out compiles to one `fanout` node carrying
+`multiplicity: { estimatedItems: 12, maxConcurrency: 8 }` followed by one
+`execute` node, in sequence.
+
+Multiplicity is a *number on a node*, not a *set of nodes*. There is nothing
+for a scheduler to spread. Wiring the executor into chat without changing the
+compiler would therefore parallelize nothing and improve no latency — the
+executor already supports siblings, as the workflow lane's `read_parallel_v1`
+fixtures demonstrate.
+
+So this milestone comes first: the compiler emits per-item nodes and a reducer
+for the fan-out shape, the way the workflow compiler already does.
+
+**Accepts when:** a twelve-item request compiles to twelve sibling nodes joined
+by one reducer, the widest scheduling wave is greater than one, and the pins in
+`turn-graph-executable.test.ts` that currently assert linearity are inverted.
+**Deletes:** the `multiplicity` field once real siblings replace it.
+
+### G5b — Chat executes on the executor
 
 Route the accepted chat turn through the executor. `recordTurnGraphShadow`
 becomes a real compile-and-run. Fast paths land here: conversation and grounded
@@ -317,8 +356,9 @@ flowchart LR
   G0[G0 characterize] --> G1[G1 executor]
   G1 --> G2[G2 workflows on executor]
   G2 --> G4[G4 chat context nodes]
-  G4 --> G5[G5 chat on executor]
-  G5 --> G6[G6 graph-owned effects]
+  G4 --> G5a[G5a chat compiler emits topology]
+  G5a --> G5b[G5b chat on executor]
+  G5b --> G6[G6 graph-owned effects]
   G6 --> G7[G7 one node lifecycle]
   G7 --> G8[G8 subtraction / 4.0]
   G3[G3 procedural memory] -.independent.-> G4
