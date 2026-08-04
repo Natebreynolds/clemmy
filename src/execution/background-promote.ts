@@ -93,6 +93,32 @@ function startsAsForegroundDiscussion(text: string): boolean {
   return /^(?:please\s+)?(?:summarize|review|discuss|explain|tell me about|walk me through)\b/.test(text);
 }
 
+/**
+ * Information-seeking, as opposed to a request. "Can/could/would/will you …"
+ * is a REQUEST wearing a question mark, so it is excluded here and flows
+ * through the ordinary directive rules.
+ */
+export function isInformationQuestion(text: string): boolean {
+  const trimmed = text.trim();
+  if (/^(?:ok(?:ay)?[,.!\s]+)?(?:please\s+)?(?:can|could|would|will)\s+(?:you|u)\b/.test(trimmed)) return false;
+  if (/\?\s*$/.test(trimmed)) return true;
+  return /^(?:ok(?:ay)?[,.!\s]+)?(?:so\s+)?(?:what|what's|whats|how|hows|how's|why|when|where|who|whose|which|is there|are there|is it|was|were|does|did|do i|do we|any update|status)\b/.test(trimmed);
+}
+
+/** Any not-yet-settled task this interactive session already spawned. Failure
+ *  to read the board answers false — uncertainty must never LOCK promotion,
+ *  only certainty may redirect it. */
+export function hasActiveBackgroundTaskForSession(sessionId: string): boolean {
+  try {
+    return listBackgroundTasks({})
+      .some((task) => task.originSessionId === sessionId
+        && (task.status === 'pending' || task.status === 'running'
+          || task.status === 'awaiting_approval' || task.status === 'cancelling'));
+  } catch {
+    return false;
+  }
+}
+
 function hasDirectDurableDirective(text: string): boolean {
   return hasExplicitBackgroundDirective(text) || hasSoftDurableDirective(text);
 }
@@ -116,7 +142,10 @@ function hasSoftDurableDirective(text: string): boolean {
   if (/\b(?:this|that|it|task|job|request|work|process|run)\b.{0,30}\blong[- ]running\b/.test(text)
     || /\blong[- ]running\b.{0,30}\b(?:task|job|request|work|process|run)\b/.test(text)) return true;
   if (/\b(from start to finish|end to end|get it done|finish this|finish it all)\b/.test(text)) {
-    return /\b(build|implement|migrate|refactor|wire|ship|deploy|fix|create|set up|setup|finish)\b/.test(text);
+    // "finish" must NOT be in this verb list: "finish this" would then satisfy
+    // its own guard, and a bare question like "what needs to be done to finish
+    // this task?" would read as durable work intent (live 2026-08-04).
+    return /\b(build|implement|migrate|refactor|wire|ship|deploy|fix|create|set up|setup)\b/.test(text);
   }
   return false;
 }
@@ -262,6 +291,30 @@ export function durableExecutionDecision(
   }
   const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
   const intentText = stripNegatedDurableIntent(lower);
+
+  // An information question is a conversation turn, never a work order. Live
+  // 2026-08-04 (desktop): "Okay what needs to be done to finish this task?"
+  // matched the finish-this soft directive and minted a background task TITLED
+  // with the question. Only an explicitly named lane overrides this — a
+  // request shape ("can you …") is not a question for this purpose.
+  if (isInformationQuestion(intentText) && !hasExplicitBackgroundDirective(intentText)) {
+    return { lane: 'foreground', reason: 'question_stays_conversational' };
+  }
+
+  // A continuation of work this session ALREADY runs in the background must
+  // steer that run, not mint a sibling. Live 2026-08-04 (desktop): "Okay keep
+  // working and get this done, reminder, do not do any accounts that are
+  // customer…" — a policy reminder for the active task — became a SECOND
+  // background task titled with the reminder text. Explicit lane naming wins;
+  // a lookup failure falls through to the ordinary rules (never blocks).
+  if (
+    opts?.sessionId
+    && isContinuationDirective(message)
+    && !hasExplicitBackgroundDirective(intentText)
+    && hasActiveBackgroundTaskForSession(opts.sessionId)
+  ) {
+    return { lane: 'foreground', reason: 'continuation_of_active_run' };
+  }
 
   // A space session has always required the user to name the lane explicitly.
   if (isSpaceSession(opts?.sessionId)) {

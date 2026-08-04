@@ -492,3 +492,48 @@ test('ordinary turns and explicit directives are unchanged', () => {
   assert.equal(durableExecutionDecision('pull all salesforce leads and sync to airtable', space).lane, 'foreground');
   assert.equal(durableExecutionDecision('/background pull all salesforce leads', space).lane, 'background');
 });
+
+test('an information question never mints a background task (live 2026-08-04 desktop)', () => {
+  // The exact messages from the live incident: a status question and a
+  // progress question, each of which became a background task titled with the
+  // question text.
+  assert.equal(shouldPromoteToDurable('Okay what needs to be done to finish this task?'), false,
+    'a question about finishing became a work order');
+  assert.equal(durableExecutionDecision('Okay what needs to be done to finish this task?').reason,
+    'question_stays_conversational');
+  assert.equal(shouldPromoteToDurable('hows it going'), false);
+  assert.equal(shouldPromoteToDurable('How is the migration coming along?'), false);
+
+  // A question mark on an explicitly named lane is still the user naming the
+  // lane — a REQUEST, not an information question.
+  assert.equal(shouldPromoteToDurable('can you run this in the background?'), true);
+  assert.equal(shouldPromoteToDurable('could you queue the audit as a job overnight?'), true);
+});
+
+test('"finish this" alone is not durable intent — the guard verb must be a build verb', () => {
+  assert.equal(shouldPromoteToDurable('finish this task'), false,
+    '"finish" satisfied its own build-verb guard');
+  // With a genuine build verb the soft directive still promotes.
+  assert.equal(shouldPromoteToDurable('finish this migration and deploy it end to end'), true);
+});
+
+test('a continuation directive steers the ACTIVE run instead of minting a sibling task', () => {
+  const sess = createSession({ kind: 'chat' });
+  const reminder = 'Okay keep working and get this done, reminder, do not do any accounts that are customer you must remember this.';
+
+  // No active task for the session → the soft "keep working" directive still
+  // promotes exactly as before (the user chose to let it run long).
+  assert.equal(shouldPromoteToDurable(reminder, { sessionId: sess.id }), true,
+    'the pre-existing soft-directive behavior regressed');
+
+  // Spawn the run the user is talking about; the same reminder must now stay
+  // conversational so the ordinary turn can steer the EXISTING task.
+  enqueueDurableChatTask({ message: 'draft outreach for the eligible accounts', sessionId: sess.id });
+  const decision = durableExecutionDecision(reminder, { sessionId: sess.id });
+  assert.equal(decision.lane, 'foreground',
+    'a policy reminder for the active run minted a second background task');
+  assert.equal(decision.reason, 'continuation_of_active_run');
+
+  // Explicit lane naming still wins even mid-run.
+  assert.equal(shouldPromoteToDurable('also run the report rebuild in the background', { sessionId: sess.id }), true);
+});
