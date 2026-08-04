@@ -38,6 +38,7 @@ import { approvalParkResume } from './scenarios/approval-park-resume.js';
 import { cronReportBack } from './scenarios/cron-report-back.js';
 import { gatedMutation } from './scenarios/gated-mutation.js';
 import { converseFirst } from './scenarios/converse-first.js';
+import { chatSpineGraphDrive } from './scenarios/chat-spine-graph-drive.js';
 import { clarifyThenExecute } from './scenarios/clarify-then-execute.js';
 import { workspaceBuild } from './scenarios/workspace-build.js';
 import { teamAgentHandoff } from './scenarios/team-agent-handoff.js';
@@ -69,6 +70,7 @@ const DEFAULT_SCENARIOS: ScenarioDef[] = [
   cronReportBack,
   gatedMutation,
   converseFirst,
+  chatSpineGraphDrive,
   clarifyThenExecute,
   workspaceBuild,
   teamAgentHandoff,
