@@ -76,8 +76,9 @@ export interface ChatTurnSpineResult<CoreResult> {
  * route fires: evidence_sufficient into compose_reply, or
  * evidence_insufficient into compose_blocked, converging on the single
  * any-join publish node. Remaining pass-throughs (context, capability,
- * verify itself) are the later interior slices; their conditions are the
- * only ones still interim-granted.
+ * verify itself) are the later interior slices. NOTHING is interim-granted:
+ * unknown edge conditions fail closed, so a future compiled gate cannot
+ * silently open before its phase extracts.
  */
 export async function driveChatTurnSpine<CoreResult>(
   spine: ChatTurnSpineInput<CoreResult>,
@@ -171,14 +172,16 @@ export async function driveChatTurnSpine<CoreResult>(
           // Interim pass-through: the core still owns this phase internally.
           return { status: 'completed' };
         },
-        // The verdict routes follow the REAL delivery verdict (phase 1b).
-        // input_available / authority_available remain interim-granted until
-        // their phases extract; unknown conditions stay closed by default in
-        // the executor, so listing them here is deliberate.
+        // The verdict routes follow the REAL delivery verdict (phase 1b), and
+        // everything else FAILS CLOSED — the compiler emits no other typed
+        // condition today, so a blanket grant here would guard nothing while
+        // silently opening any gate a future compiler emits before its phase
+        // extracts. When await_input/await_approval topology lands, its
+        // condition gets granted here from its own real signal, on purpose.
         edgeSatisfied: (edge) => {
           if (edge.when === 'evidence_sufficient') return coreRan && coreDelivered;
           if (edge.when === 'evidence_insufficient') return coreRan && !coreDelivered;
-          return true;
+          return false;
         },
       },
       budget: { maxConcurrency: 1 },

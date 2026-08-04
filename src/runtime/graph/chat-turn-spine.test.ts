@@ -158,3 +158,23 @@ test('the verdict routes are REAL: undelivered fires compose_blocked, publish st
   assert.equal(kinds2.get('publish')?.status, 'completed');
 });
 
+test('the spine grants nothing it does not understand — future gates fail closed', async () => {
+  // The compiler emits no input_available/authority_available edges today;
+  // this pin exists so that when it DOES, the turn visibly stalls into the
+  // legacy-order fallback instead of silently sailing through an unowned
+  // gate. A fail-open here is how an approval gate would vanish.
+  const { compileTurnGraph, snapshotTurnGraphPolicy } = await import('./turn-graph-compiler.js');
+  const compiled = compileTurnGraph({
+    identity: { sessionId: 'strict', turn: 1, sourceUserSeq: 3 },
+    input: 'What is the current status of the Acme account?',
+    sessionKind: 'chat',
+    surface: 'direct',
+    policy: snapshotTurnGraphPolicy(POLICY),
+  });
+  const conditions = new Set(compiled.graph.edges.map((edge) => edge.when));
+  assert.deepEqual(
+    [...conditions].sort(),
+    ['evidence_insufficient', 'evidence_sufficient', 'success'],
+    'the compiler emits a condition the spine has no real signal for — grant it from its OWN signal, never blanket',
+  );
+});
