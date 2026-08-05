@@ -81,15 +81,25 @@ function pair(input: {
   ];
 }
 
+let headerSeq = 0;
+function withHeader(admission: GraphAdmission, entries: GraphJournalEntry[]): GraphJournalEntry[] {
+  if (entries[0]?.type === 'run_header') return entries;
+  return [{
+    type: 'run_header', admissionDigest: admission.admissionDigest,
+    journalSchemaVersion: admission.journalSchemaVersion,
+    activationId: `act-${(headerSeq += 1)}`,
+  }, ...entries];
+}
+
 function refuses(entries: GraphJournalEntry[], why: RegExp, graph = GRAPH, admission = ADMISSION): void {
-  const result = reconstructAdmittedResume(graph, admission, entries);
+  const result = reconstructAdmittedResume(graph, admission, withHeader(admission, entries));
   assert.equal(result.ok, false, 'an impossible history was accepted');
   const errors = (result as Extract<typeof result, { ok: false }>).errors;
   assert.ok(errors.some((error) => why.test(error)), `no error matched ${why}: ${JSON.stringify(errors)}`);
 }
 
 function accepts(entries: GraphJournalEntry[], graph = GRAPH, admission = ADMISSION): ResumeReconstruction {
-  const result = reconstructAdmittedResume(graph, admission, entries);
+  const result = reconstructAdmittedResume(graph, admission, withHeader(admission, entries));
   assert.equal(result.ok, true, JSON.stringify(result));
   return result as ResumeReconstruction;
 }
@@ -465,7 +475,7 @@ test('graph-resume imports only pure siblings and observes nothing', async () =>
   const source = readFileSync(path.join(here, 'graph-resume.ts'), 'utf-8');
   assert.deepEqual(
     [...source.matchAll(/^import (?!type ).*?from '([^']+)';$/gms)].map((m) => m[1]).sort(),
-    ['./graph-admission.js', './graph-node-identity.js'],
+    ['./graph-admission.js', './graph-journal.js', './graph-node-identity.js'],
     'reconstruction grew a dependency — replay must stay a pure function of graph, admission, and journal',
   );
   for (const forbidden of ['process.env', 'readFileSync', 'Date.now', 'new Date(', 'fetch(', 'Math.random', 'edgeSatisfied']) {

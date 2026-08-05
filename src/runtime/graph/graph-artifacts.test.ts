@@ -334,7 +334,8 @@ test('crash after artifact commit but before settlement: the node reruns and ide
     });
     // Keep only the producer's start: the settlement that DID get journaled is
     // the infrastructure failure, which a real crash would never have written.
-    journal.push(...entries.filter((e) => e.type === 'node_started' && e.nodeId === 'producer'));
+    journal.push(...entries.filter((e) => e.type === 'run_header'
+      || (e.type === 'node_started' && e.nodeId === 'producer')));
   })();
   const { ran, result } = await resumeWith(admission, store, journal, 'sha256-content-a');
   assert.equal(result.status, 'completed', result.haltReason ?? '');

@@ -85,6 +85,21 @@ export async function verifyArtifact(
   if (!record) {
     return { ok: false, kind: 'uncommitted', reason: `artifact "${ref}" has no durable commit record` };
   }
+  if (record.ref !== ref) {
+    return { ok: false, kind: 'wrong-store', reason: `the commit record for "${ref}" names a different ref "${record.ref}"` };
+  }
+  for (const [field, value] of Object.entries({
+    contentDigest: record.contentDigest, storeId: record.storeId,
+    storeContract: record.storeContract, mediaType: record.mediaType,
+    scopeDigest: record.scopeDigest, commitId: record.commitId,
+  })) {
+    if (typeof value !== 'string' || !value.trim()) {
+      return { ok: false, kind: 'uncommitted', reason: `artifact "${ref}" commit record has an empty ${field} — an incomplete commit is no commit` };
+    }
+  }
+  if (!Number.isFinite(record.byteLength) || record.byteLength < 0) {
+    return { ok: false, kind: 'uncommitted', reason: `artifact "${ref}" commit record has an invalid byte length` };
+  }
   if (record.producedBy.admissionDigest !== expect.admissionDigest
     || record.producedBy.nodeId !== expect.nodeId
     || (expect.attemptId !== undefined && record.producedBy.attemptId !== expect.attemptId)) {
@@ -119,16 +134,38 @@ function refsOf(entry: { outputRef?: string; evidenceRefs?: readonly string[] })
  * is durable only after its artifacts are. An unproven claim fails the NODE:
  * asserting outputs that do not verifiably exist is node logic, not weather.
  */
+/**
+ * The authority a commit boundary requires (E1.5/F10): who may commit, under
+ * which lease fence, and against which cancellation generation. A late or
+ * uncooperative runner cannot bless artifacts after cancellation or lease
+ * loss — the boundary refuses BEFORE any verification counts as a commit.
+ */
+export interface CommitAuthority {
+  /** Live cancellation: an aborted signal refuses every later commit. */
+  signal?: AbortSignal;
+  /** Lease truth: false means the fence was reclaimed — refuse the commit. */
+  holdsLease?: () => Promise<boolean>;
+}
+
 export function withArtifactCommit(
   runner: NodeRunner,
   port: ArtifactStorePort,
   admission: GraphAdmission,
+  authority?: CommitAuthority,
 ): NodeRunner {
   return {
     ...runner,
     async run(node: ExecutableNode, context: NodeRunContext): Promise<NodeOutcome> {
       const outcome = await runner.run(node, context);
       if (outcome.status !== 'completed') return outcome;
+      // The fence/cancellation gate: a post-cancellation or post-reclaim
+      // completion may return locally but can never bless its artifacts.
+      if (authority?.signal?.aborted) {
+        return { status: 'failed', reason: 'artifact commit refused: the run was cancelled before the commit', settlementClass: 'cancelled' };
+      }
+      if (authority?.holdsLease && !(await authority.holdsLease())) {
+        return { status: 'failed', reason: 'artifact commit refused: the lease fence was reclaimed', settlementClass: 'infrastructure' };
+      }
       for (const ref of refsOf(outcome)) {
         const verified = await verifyArtifact(port, ref, {
           admissionDigest: admission.admissionDigest,

@@ -39,6 +39,16 @@ function attempts(prefix: string): () => string {
   return () => `${prefix}-${(n += 1)}`;
 }
 
+let headerSeq = 0;
+function withHeader(admission: GraphAdmission, entries: GraphJournalEntry[]): GraphJournalEntry[] {
+  if (entries[0]?.type === 'run_header') return entries;
+  return [{
+    type: 'run_header', admissionDigest: admission.admissionDigest,
+    journalSchemaVersion: admission.journalSchemaVersion,
+    activationId: `hdr-${(headerSeq += 1)}`,
+  } as GraphJournalEntry, ...entries];
+}
+
 function memoryAdapter() {
   const entries: GraphJournalEntry[] = [];
   return { entries, adapter: { async append(entry: GraphJournalEntry) { entries.push(entry); } } };
@@ -224,16 +234,18 @@ test('F5: negative, fractional, and emitter-preceding waves refuse at reconstruc
   };
   const admission = admitted(graph);
   for (const wave of [-1, 2.5, Number.NaN]) {
-    const journal = pair({
+    const journal = withHeader(admission, pair({
       admission, node: graph.nodes[0]!, inputDigest: computeInputDigest([]),
       attemptId: `t-${wave}`, wave, outputRef: 'art', firedEdgeIds: ['e'],
-    });
+    }));
     const result = await runGraph(graph, {
       runner: { run: () => ({ status: 'completed' }) },
       admission, journalAdapter: memoryAdapter().adapter, clock: () => 0,
       attemptIds: attempts('a'), resumeEntries: journal,
     });
     assert.equal(result.status, 'halted', `wave ${wave} was accepted as history`);
+    assert.match(result.haltReason ?? '', /wave/,
+      `wave ${wave} was refused for a non-wave reason: ${result.haltReason}`);
   }
   // A child that settled in a wave <= its predecessor's settlement wave is an
   // impossible causal relationship.
@@ -251,9 +263,11 @@ test('F5: negative, fractional, and emitter-preceding waves refuse at reconstruc
   const result = await runGraph(graph, {
     runner: { run: () => ({ status: 'completed' }) },
     admission, journalAdapter: memoryAdapter().adapter, clock: () => 0,
-    attemptIds: attempts('a'), resumeEntries: twisted,
+    attemptIds: attempts('a'), resumeEntries: withHeader(admission, twisted),
   });
   assert.equal(result.status, 'halted', 'a child settled in an earlier wave than its parent and history was accepted');
+  assert.match(result.haltReason ?? '', /wave/,
+    `the twisted causal order was refused for a non-wave reason: ${result.haltReason}`);
 });
 
 // ─── Finding 6: shallow identity freeze ──────────────────────────────────────
@@ -276,13 +290,17 @@ test('F6: sealed semantic identity is deep-immutable — mutating the caller\'s 
   const before = nodeDigestFor(admission, graph.nodes[0]!);
 
   // The attack: the caller mutates ITS OWN nested objects after sealing.
-  assert.throws(
-    () => { callerOwned.nodes.n!.runner.version = '999'; },
-    /read only|frozen|Cannot assign/i,
-    'the sealed identity still shares the caller\'s mutable nested runner object',
-  );
+  // Deep-copy isolation means the mutation cannot reach the sealed identity
+  // (whether or not the caller's copy throws), and the admission's own view
+  // is deep-frozen.
+  try { callerOwned.nodes.n!.runner.version = '999'; } catch { /* frozen caller copy is also acceptable */ }
   assert.equal(nodeDigestFor(admission, graph.nodes[0]!), before,
     'a caller-side mutation drifted the node digest away from the sealed admission digest');
+  assert.throws(
+    () => { (admission.identity!.nodes.n!.runner as { version: string }).version = 'x'; },
+    /read only|frozen|Cannot assign/i,
+    'the ADMISSION\'s sealed identity is not deep-frozen',
+  );
 });
 
 // ─── Finding 7: structural fallback must be explicit, never silent ───────────
@@ -333,16 +351,41 @@ function racyLeaseStore(): LeaseStorePort & {
   onNextCas?: (key: string) => Promise<void>;
 } {
   const records = new Map<string, LeaseRecord>();
+  let serial: Promise<unknown> = Promise.resolve();
+  const serialize = async <T,>(work: () => Promise<T>): Promise<T> => {
+    const next = serial.then(work);
+    serial = next.catch(() => undefined);
+    return next;
+  };
   const self: ReturnType<typeof racyLeaseStore> = {
     async read(key) { return records.get(key); },
-    async cas(key, expectedFence, next) {
+    async cas(key, expected, next) {
       const hook = self.onNextCas;
       self.onNextCas = undefined;
       if (hook) await hook(key);
-      const current = records.get(key);
-      if (expectedFence === undefined ? current !== undefined : current?.fence !== expectedFence) return false;
-      records.set(key, next);
-      return true;
+      return serialize(async () => {
+        const current = records.get(key);
+        if (expected === undefined
+          ? current !== undefined
+          : current?.fence !== expected.fence || current?.revision !== expected.revision) return false;
+        records.set(key, next);
+        return true;
+      });
+    },
+    async transact(key, expected, now, work) {
+      const hook = self.onNextCas;
+      self.onNextCas = undefined;
+      if (hook) await hook(key); // a competing writer may land FIRST
+      return serialize(async () => {
+        const current = records.get(key);
+        if (!current || current.owner !== expected.owner || current.fence !== expected.fence
+          || current.released || current.expiresAt <= now) {
+          return { ok: false, reason: `not live-held by "${expected.owner}" at fence ${expected.fence}` };
+        }
+        await work();
+        records.set(key, { ...current, revision: current.revision + 1 });
+        return { ok: true };
+      });
     },
     dump() { return records; },
   };
@@ -375,23 +418,25 @@ test('F9b: settlement append and lease validation are one conditional operation 
   const old = createLeaseManager({ store, owner: 'old', clock: () => clock.now, ttlMs: 1_000 });
   const thief = createLeaseManager({ store, owner: 'new', clock: () => clock.now, ttlMs: 60_000 });
   const { entries, adapter } = memoryAdapter();
-  // The inner adapter is where withNodeLeases appends AFTER its holds()
-  // check passed. Interleave the expiry + reclaim exactly there.
-  let reclaimed = false;
-  const innerAdapter = {
-    async append(entry: GraphJournalEntry) {
-      if (entry.type === 'node_settled' && !reclaimed) {
-        reclaimed = true;
-        clock.now = 5_000; // the old lease is now provably expired
-        const theft = await thief.acquire('node:n');
-        assert.equal(theft.ok, true, JSON.stringify(theft));
-      }
-      await adapter.append(entry);
-    },
-  };
-  const leased = withNodeLeases(innerAdapter, old);
+  // The reclaim interleaves exactly between the old owner's lease check and
+  // its append: the store hook fires as the conditional commit BEGINS, the
+  // lease has expired, and the thief takes the fence FIRST. One conditional
+  // operation means the old owner's append must lose, not land late.
+  const leased = withNodeLeases(adapter, old);
   await runGraph(graph, {
-    runner: { run: (): NodeOutcome => ({ status: 'completed', outputRef: 'late' }) },
+    runner: {
+      run: (): NodeOutcome => {
+        // The claim already succeeded; arm the interposition so the NEXT
+        // lease-store operation — the settlement's conditional commit —
+        // races a reclaim that lands first.
+        store.onNextCas = async () => {
+          clock.now = 5_000; // provably expired mid-commit
+          const theft = await thief.acquire('node:n');
+          assert.equal(theft.ok, true, JSON.stringify(theft));
+        };
+        return { status: 'completed', outputRef: 'late' };
+      },
+    },
     admission, journalAdapter: leased, clock: () => 0, attemptIds: attempts('a'),
   });
   assert.equal(entries.some((entry) => entry.type === 'node_settled'), false,

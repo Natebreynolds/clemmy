@@ -23,10 +23,11 @@
  * cannot be decided from the journal alone, because it depends on what this
  * run's predecessors actually produce.
  */
-import { computeGraphDigest, validateGraphPatch } from './graph-admission.js';
+import { computeGraphDigest, validateGraphPatch, GRAPH_JOURNAL_SCHEMA_VERSION } from './graph-admission.js';
 import { nodeDigestFor } from './graph-node-identity.js';
 import type { GraphAdmission } from './graph-admission.js';
 import type { NodeOutcome } from './graph-executor.js';
+import { validDurableId, validWave } from './graph-journal.js';
 import type {
   GraphJournalEntry,
   NodeSettledEntry,
@@ -60,8 +61,21 @@ export interface ResumeReconstruction {
    */
   orphanPatchByEmitter: Map<string, string>;
   /** Expansion units the journal has durably consumed: one per unique patch
-   *  admission, applied or orphaned. An orphan's debit survives the crash. */
+   *  admission, applied or orphaned. An orphan's debit survives the crash.
+   *  NOTE: the LIVE ceiling is per activation (E1.1); this figure is history. */
   expansionsDebited: number;
+  /**
+   * Applied (proven) patch generations grouped by emitter node. When the
+   * emitter's trusted settlement is refused reuse at readiness (changed
+   * input or definition), the executor RETIRES these generations from the
+   * runnable topology — an old proven patch may not execute under an input
+   * that never emitted it.
+   */
+  patchesByEmitter: Map<string, Array<{
+    digest: string;
+    nodes: ExecutableNode[];
+    edges: ExecutableEdge[];
+  }>>;
   /** Every attempt id the journal has claimed — a resumed activation must
    *  never mint one of these again. */
   usedAttemptIds: Set<string>;
@@ -83,6 +97,7 @@ interface PatchRecord {
 
 function describeEntry(entry: GraphJournalEntry): string {
   if (entry.type === 'patch_admitted') return `patch from "${entry.emittedBy}"`;
+  if (entry.type === 'run_header') return `run header (activation ${entry.activationId})`;
   return `${entry.type === 'node_started' ? 'start' : 'settlement'} of "${entry.nodeId}" (attempt ${entry.attemptId})`;
 }
 
@@ -116,13 +131,52 @@ export function reconstructAdmittedResume(
   /** Trusted completions in order, for detecting an ignored orphan patch. */
   const trustedCompletions: Array<{ nodeId: string; index: number; emittedPatchDigest?: string }> = [];
 
+  /** Segment index (per run_header) and per-segment bookkeeping. */
+  let segment = -1;
+  const activationIds = new Set<string>();
+  let segmentPatchAdmissions = 0;
+  /** Fired-edge source settlement wave + segment, for causal wave order. */
+  const firedEdgeSettlement = new Map<string, { wave: number; segment: number }>();
+  const startSegments = new Map<string, number>();
+
   entries.forEach((entry, index) => {
     if (entry.admissionDigest !== admission.admissionDigest) {
       errors.push(`${describeEntry(entry)} carries admission ${entry.admissionDigest.slice(0, 12)}…, expected ${admission.admissionDigest.slice(0, 12)}… — a different run`);
       return;
     }
 
+    if (entry.type === 'run_header') {
+      if (entry.journalSchemaVersion !== GRAPH_JOURNAL_SCHEMA_VERSION) {
+        errors.push(`run header declares journal schema v${String(entry.journalSchemaVersion)}; this build replays v${GRAPH_JOURNAL_SCHEMA_VERSION} only`);
+        return;
+      }
+      if (!validDurableId(entry.activationId)) {
+        errors.push('run header carries an invalid activation id');
+        return;
+      }
+      if (activationIds.has(entry.activationId)) {
+        errors.push(`activation "${entry.activationId}" opened twice`);
+        return;
+      }
+      activationIds.add(entry.activationId);
+      segment += 1;
+      segmentPatchAdmissions = 0;
+      return;
+    }
+    if (segment < 0) {
+      errors.push(`${describeEntry(entry)} precedes the activation's run_header — the journal version must be durable before any claim`);
+      return;
+    }
+
     if (entry.type === 'node_started') {
+      if (!validDurableId(entry.attemptId)) {
+        errors.push(`start of "${entry.nodeId}" carries an invalid attempt id`);
+        return;
+      }
+      if (!validWave(entry.wave)) {
+        errors.push(`start of "${entry.nodeId}" carries wave ${String(entry.wave)} — waves are non-negative safe integers`);
+        return;
+      }
       if (!entry.attemptId) {
         errors.push(`start of "${entry.nodeId}" has no attempt id`);
         return;
@@ -157,8 +211,19 @@ export function reconstructAdmittedResume(
           errors.push(`start of "${entry.nodeId}" (attempt ${entry.attemptId}) was not ready at its journal position (its ${def.joinMode === 'any' ? 'any-join has no' : 'all-join is missing a'} durably fired incoming edge) — a future route cannot authorize a past start`);
           return;
         }
+        // Journal order and wave order must agree WITHIN an activation: a
+        // child cannot start in the same or an earlier wave than the fired
+        // predecessor that authorized it settled in.
+        for (const edge of enabledIn) {
+          const source = firedEdgeSettlement.get(edge.id);
+          if (source && source.segment === segment && entry.wave <= source.wave) {
+            errors.push(`start of "${entry.nodeId}" at wave ${entry.wave} precedes or shares the wave of its fired predecessor's settlement (wave ${source.wave}) — an order the executor cannot produce`);
+            return;
+          }
+        }
       }
       starts.set(entry.attemptId, { entry, index });
+      startSegments.set(entry.attemptId, segment);
       return;
     }
 
@@ -191,8 +256,12 @@ export function reconstructAdmittedResume(
         errors.push(`settlement of "${entry.nodeId}" is ${entry.status}${clazz ? ` (${clazz})` : ''} yet records fired edges — only a completion or the node's own failure routes topology`);
         return;
       }
-      if (!['completed', 'failed', 'blocked', 'paused'].includes(entry.status)) {
+      if (!['completed', 'failed', 'blocked', 'paused', 'cancelled'].includes(entry.status)) {
         errors.push(`settlement of "${entry.nodeId}" has status "${entry.status}", which the executor never journals`);
+        return;
+      }
+      if (!validWave(entry.wave)) {
+        errors.push(`settlement of "${entry.nodeId}" carries wave ${String(entry.wave)} — waves are non-negative safe integers`);
         return;
       }
       const seen = new Set<string>();
@@ -255,7 +324,10 @@ export function reconstructAdmittedResume(
       }
       settledAttempts.add(entry.attemptId);
       settledNodes.add(entry.nodeId);
-      for (const edgeId of entry.firedEdgeIds) allFired.add(edgeId);
+      for (const edgeId of entry.firedEdgeIds) {
+        allFired.add(edgeId);
+        firedEdgeSettlement.set(edgeId, { wave: entry.wave, segment });
+      }
       if (routes) latestTrusted.set(entry.nodeId, { entry, index });
       if (entry.status === 'completed') {
         trustedCompletions.push({ nodeId: entry.nodeId, index, emittedPatchDigest: entry.emittedPatchDigest });
@@ -318,6 +390,11 @@ export function reconstructAdmittedResume(
           return;
         }
       }
+      segmentPatchAdmissions += 1;
+      if (segmentPatchAdmissions > admission.budget.maxExpansions) {
+        errors.push(`activation admits ${segmentPatchAdmissions} patches but the admission allows ${admission.budget.maxExpansions} expansions per activation — not this admission's history`);
+        return;
+      }
       nodes.push(...entry.nodes);
       edges.push(...entry.edges);
       for (const node of entry.nodes) { nodeIds.add(node.id); nodeById.set(node.id, node); }
@@ -338,14 +415,9 @@ export function reconstructAdmittedResume(
 
   if (errors.length > 0) return { ok: false, errors };
 
-  // ── expansion debit ────────────────────────────────────────────────────────
-  // A5: every unique durable patch admission consumed one expansion unit when
-  // it was journaled, whether it was later applied or orphaned. A history with
-  // more admissions than the sealed budget is not this admission's history.
-  if (patchDigests.size > admission.budget.maxExpansions) {
-    errors.push(`journal admits ${patchDigests.size} patches but the admission allows ${admission.budget.maxExpansions} expansions — not this admission's history`);
-    return { ok: false, errors };
-  }
+  // A5 note: expansion admission is debited PER ACTIVATION (checked above at
+  // each patch entry against its segment); the live ceiling is an activation
+  // budget, never a whole-run item ceiling.
 
   // ── orphan patches and promotion proof ─────────────────────────────────────
   // A4: a patch is REAL only when a completed settlement of its emitter, at a
@@ -431,6 +503,19 @@ export function reconstructAdmittedResume(
     journaledPatchDigests: patchDigests,
     orphanPatchByEmitter,
     expansionsDebited: patchDigests.size,
+    patchesByEmitter: (() => {
+      const byEmitter = new Map<string, Array<{ digest: string; nodes: ExecutableNode[]; edges: ExecutableEdge[] }>>();
+      for (const patch of applied) {
+        const list = byEmitter.get(patch.entry.emittedBy) ?? [];
+        list.push({
+          digest: patch.entry.patchDigest,
+          nodes: [...patch.entry.nodes],
+          edges: [...patch.entry.edges],
+        });
+        byEmitter.set(patch.entry.emittedBy, list);
+      }
+      return byEmitter;
+    })(),
     usedAttemptIds: new Set(starts.keys()),
   };
 }
@@ -479,6 +564,9 @@ export function admittedRunPrecondition(
     patchAdmitter: boolean;
   },
 ): string | undefined {
+  if (admission.journalSchemaVersion !== GRAPH_JOURNAL_SCHEMA_VERSION) {
+    return `admitted run refuses journal schema v${String(admission.journalSchemaVersion)}: this build writes and replays v${GRAPH_JOURNAL_SCHEMA_VERSION} only`;
+  }
   if (computeGraphDigest(graph) !== admission.graphDigest) {
     return 'admitted run refuses this graph: its digest does not match the admitted graph';
   }

@@ -83,6 +83,16 @@ function attempts(prefix: string): () => string {
   return () => `${prefix}-${(n += 1)}`;
 }
 
+let headerSeq = 0;
+function withHeader(admission: GraphAdmission, entries: GraphJournalEntry[]): GraphJournalEntry[] {
+  if (entries[0]?.type === 'run_header') return entries;
+  return [{
+    type: 'run_header', admissionDigest: admission.admissionDigest,
+    journalSchemaVersion: admission.journalSchemaVersion,
+    activationId: `hdr-${(headerSeq += 1)}`,
+  } as GraphJournalEntry, ...entries];
+}
+
 function adapter() {
   const entries: GraphJournalEntry[] = [];
   return { entries, adapter: { async append(entry: GraphJournalEntry) { entries.push(entry); } } };
@@ -182,7 +192,7 @@ test('changed tenancy, authority, catalog, ceiling, revision, or budget version 
     const result = await runGraph(CONE, {
       runner: { run: (): NodeOutcome => ({ status: 'completed' }) },
       admission: changed, journalAdapter, clock: () => 0,
-      attemptIds: attempts('n'), resumeEntries: journal,
+      attemptIds: attempts('n'), resumeEntries: withHeader(changed, journal),
     });
     assert.equal(result.status, 'halted', `${label}: the old journal was accepted under a changed scope`);
     assert.match(result.haltReason ?? '', /different run/);
@@ -206,7 +216,7 @@ test('changed semantic config or runner version is a different run — never sil
     const result = await runGraph(CONE, {
       runner: { run: (): NodeOutcome => ({ status: 'completed' }) },
       admission: changed, journalAdapter, clock: () => 0,
-      attemptIds: attempts('n'), resumeEntries: journal,
+      attemptIds: attempts('n'), resumeEntries: withHeader(changed, journal),
     });
     assert.equal(result.status, 'halted', `${label}: old work was reusable under a changed definition`);
   }
@@ -243,7 +253,7 @@ test('a changed root input manifest is the SAME run and reruns exactly its depen
       },
     },
     admission: after, journalAdapter, clock: () => 0,
-    attemptIds: attempts('n'), resumeEntries: journal,
+    attemptIds: attempts('n'), resumeEntries: withHeader(after, journal),
   });
   assert.equal(result.status, 'completed', result.haltReason ?? '');
   assert.deepEqual(ran, ['r1', 'c1'],
@@ -260,7 +270,7 @@ test('identical root and semantic identities reuse exactly — zero dispatch', a
   const result = await runGraph(CONE, {
     runner: { run: (node): NodeOutcome => { ran.push(node.id); return { status: 'completed' }; } },
     admission, journalAdapter, clock: () => 0,
-    attemptIds: attempts('n'), resumeEntries: journal,
+    attemptIds: attempts('n'), resumeEntries: withHeader(admission, journal),
   });
   assert.equal(result.status, 'completed', result.haltReason ?? '');
   assert.deepEqual(ran, [], 'identical identities re-dispatched settled work');
@@ -290,7 +300,7 @@ test('a structural-only digest cannot impersonate a semantic identity — forged
   const result = await runGraph(CONE, {
     runner: { run: (): NodeOutcome => ({ status: 'completed' }) },
     admission, journalAdapter, clock: () => 0,
-    attemptIds: attempts('n'), resumeEntries: journal,
+    attemptIds: attempts('n'), resumeEntries: withHeader(admission, journal),
   });
   assert.equal(result.status, 'halted', 'a structural digest was trusted under a semantic admission');
   assert.match(result.haltReason ?? '', /does not match the definition/);

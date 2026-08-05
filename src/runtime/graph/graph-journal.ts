@@ -42,6 +42,21 @@ export type SettlementClass =
   /** The run's cancellation signal stopped it. */
   | 'cancelled';
 
+/**
+ * The activation opener (journal schema v4). One per activation, appended
+ * BEFORE any claim: replay refuses a journal whose segments lack a supported
+ * header, and a running executor refuses to append under an unsupported
+ * version — the version lives in the DURABLE stream, not only in the
+ * admission object a caller could forge.
+ */
+export interface RunHeaderEntry {
+  type: 'run_header';
+  admissionDigest: string;
+  journalSchemaVersion: number;
+  /** The finite activation this segment belongs to. Waves reset per segment. */
+  activationId: string;
+}
+
 export interface NodeStartedEntry {
   type: 'node_started';
   admissionDigest: string;
@@ -106,7 +121,22 @@ export interface PatchAdmittedEntry {
   edges: ExecutableEdge[];
 }
 
-export type GraphJournalEntry = NodeStartedEntry | NodeSettledEntry | PatchAdmittedEntry;
+export type GraphJournalEntry = RunHeaderEntry | NodeStartedEntry | NodeSettledEntry | PatchAdmittedEntry;
+
+/** Bounded, printable, non-empty identifier — the shape every attempt and
+ *  activation id must satisfy BEFORE it becomes durable. */
+export function validDurableId(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.trim().length > 0
+    && value.length <= 128
+    // eslint-disable-next-line no-control-regex
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+/** Wave identity: a non-negative safe integer, nothing else. */
+export function validWave(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
 
 /**
  * The durable boundary. `append` RESOLVES only when the entry is durable —

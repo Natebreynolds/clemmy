@@ -41,6 +41,16 @@ function admitted(graph: ExecutableGraph = CHAIN, budget: AdmittedBudget = BUDGE
   return (result as Extract<typeof result, { ok: true }>).admission;
 }
 
+let headerSeq = 0;
+function withHeader(admission: GraphAdmission, entries: GraphJournalEntry[]): GraphJournalEntry[] {
+  if (entries[0]?.type === 'run_header') return entries;
+  return [{
+    type: 'run_header', admissionDigest: admission.admissionDigest,
+    journalSchemaVersion: admission.journalSchemaVersion,
+    activationId: `hdr-${(headerSeq += 1)}`,
+  } as GraphJournalEntry, ...entries];
+}
+
 /** In-memory adapter that records everything and can fail on command. */
 function memoryAdapter(failOn?: (entry: GraphJournalEntry) => boolean) {
   const entries: GraphJournalEntry[] = [];
@@ -52,7 +62,7 @@ function memoryAdapter(failOn?: (entry: GraphJournalEntry) => boolean) {
       async append(entry: GraphJournalEntry): Promise<void> {
         if (failOn?.(entry)) throw new Error('durable store unavailable');
         entries.push(entry);
-        sequence.push(`journal:${entry.type}:${'nodeId' in entry ? entry.nodeId : entry.emittedBy}`);
+        sequence.push(`journal:${entry.type}:${'nodeId' in entry ? entry.nodeId : 'emittedBy' in entry ? entry.emittedBy : 'activation'}`);
       },
     },
   };
@@ -88,6 +98,7 @@ test('the durable claim precedes dispatch, and settlement precedes dependents', 
   });
   assert.equal(result.status, 'completed');
   assert.deepEqual(sequence, [
+    'journal:run_header:activation',
     'journal:node_started:a', 'run:a', 'journal:node_settled:a',
     'journal:node_started:b', 'run:b', 'journal:node_settled:b',
     'journal:node_started:c', 'run:c', 'journal:node_settled:c',
@@ -165,9 +176,9 @@ test('a reused node restores its artifact refs at zero dispatch cost', async () 
     journalAdapter: adapter,
     clock: CLOCK,
     attemptIds: attempts(),
-    resumeEntries: settledPair(admission, 'a', {
+    resumeEntries: withHeader(admission, settledPair(admission, 'a', {
       outputRef: 'art-a', evidenceRefs: ['ev-a'], firedEdgeIds: ['e1'],
-    }),
+    })),
   });
   assert.equal(result.status, 'completed');
   assert.equal(sequence.includes('run:a'), false, 'a journaled completion was re-dispatched');
@@ -210,7 +221,7 @@ test('a journal from another admission refuses the whole resume', async () => {
     journalAdapter: adapter,
     clock: CLOCK,
     attemptIds: attempts(),
-    resumeEntries: settledPair(admission, 'a')
+    resumeEntries: withHeader(admission, settledPair(admission, 'a'))
       .map((entry) => ({ ...entry, admissionDigest: 'someone-elses-run' })),
   });
   assert.equal(result.status, 'halted');
@@ -298,13 +309,12 @@ test('cancellation stops dispatch at the next boundary, and a post-abort outcome
   });
   assert.equal(result.status, 'cancelled');
   assert.deepEqual(dispatched, ['a'], 'dispatch continued after the cancellation signal');
-  // B3: an outcome that arrives after cancellation settles as a typed
-  // cancellation — an uncooperative runner may return locally, but it cannot
-  // commit success or route topology once the run is cancelled.
+  // E1/F11: an outcome that arrives after cancellation settles as a
+  // first-class CANCELLED status — journal, run result, and trace agree.
   assert.deepEqual(result.completed, [], 'post-abort work committed success');
-  assert.deepEqual(result.failed, ['a']);
+  assert.deepEqual(result.cancelled, ['a'], 'cancellation is not a coherent node status');
   const aTrace = result.trace.find((t) => t.nodeId === 'a');
-  assert.equal(aTrace?.status, 'failed');
+  assert.equal(aTrace?.status, 'cancelled');
   assert.match(aTrace?.reason ?? '', /cancelled/);
 });
 

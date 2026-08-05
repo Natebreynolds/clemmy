@@ -44,9 +44,11 @@ function memoryLeaseStore(): LeaseStorePort & { dump(): Map<string, LeaseRecord>
   const records = new Map<string, LeaseRecord>();
   return {
     async read(key) { return records.get(key); },
-    async cas(key, expectedFence, next) {
+    async cas(key, expected, next) {
       const current = records.get(key);
-      if (expectedFence === undefined ? current !== undefined : current?.fence !== expectedFence) {
+      if (expected === undefined
+        ? current !== undefined
+        : current?.fence !== expected.fence || current?.revision !== expected.revision) {
         return false;
       }
       records.set(key, next);
@@ -178,7 +180,10 @@ test('two-owner race at the durable boundary: the loser halts before its claim b
   assert.equal(result.status, 'halted');
   assert.match(result.haltReason ?? '', /lease unavailable .* live-leased by "activation-1"/s);
   assert.equal(ran, 0, 'the loser dispatched work another owner holds');
-  assert.equal(entries.length, 0, 'the losing claim became durable');
+  // The losing activation's HEADER may land (it claims nothing); what must
+  // never land is a node claim or settlement.
+  assert.equal(entries.some((e) => e.type === 'node_started' || e.type === 'node_settled'), false,
+    'the losing claim became durable');
 });
 
 test('a late settlement from a superseded fence is rejected before it rewrites history', async () => {
@@ -254,8 +259,7 @@ test('the ACTIVE runner receives a real AbortSignal, and the post-abort outcome 
   const settled = entries.find(
     (e): e is NodeSettledEntry => e.type === 'node_settled' && e.nodeId === 'a',
   );
-  assert.equal(settled?.status, 'failed');
-  assert.equal(settled?.settlementClass, 'cancelled', 'cancellation was not journaled as a typed settlement');
+  assert.equal(settled?.status, 'cancelled', 'cancellation was not journaled as a first-class status');
   assert.deepEqual(settled?.firedEdgeIds, [], 'a cancelled settlement routed topology');
   assert.ok(result.unreached.includes('b'), 'work advanced past a cancellation');
 });

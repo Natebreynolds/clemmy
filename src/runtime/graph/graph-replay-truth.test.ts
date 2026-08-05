@@ -59,6 +59,15 @@ function admitted(graph: ExecutableGraph, budget: AdmittedBudget = BUDGET): Grap
   return (result as Extract<typeof result, { ok: true }>).admission;
 }
 
+let headerSeq = 0;
+function withHeader(admission: GraphAdmission, entries: GraphJournalEntry[]): GraphJournalEntry[] {
+  return [{
+    type: 'run_header', admissionDigest: admission.admissionDigest,
+    journalSchemaVersion: admission.journalSchemaVersion,
+    activationId: `hdr-${(headerSeq += 1)}`,
+  } as GraphJournalEntry, ...entries];
+}
+
 function memoryAdapter() {
   const entries: GraphJournalEntry[] = [];
   return {
@@ -162,7 +171,7 @@ test('R1A bite 1: a dependent whose journaled input digest names OLD predecessor
   const { adapter } = memoryAdapter();
   const result = await runGraph(graph, {
     runner, admission, journalAdapter: adapter, clock: () => 0,
-    resumeEntries: journal, attemptIds: attempts('r'),
+    resumeEntries: withHeader(admission, journal), attemptIds: attempts('r'),
   });
   assert.equal(result.status, 'completed', result.haltReason ?? '');
   assert.deepEqual(ran, ['b', 'm'],
@@ -200,7 +209,7 @@ test('R1A bite 1b: identical identity and inputs reuse everything at zero dispat
   const { adapter } = memoryAdapter();
   const result = await runGraph(graph, {
     runner, admission, journalAdapter: adapter, clock: () => 0,
-    resumeEntries: journal, attemptIds: attempts('r'),
+    resumeEntries: withHeader(admission, journal), attemptIds: attempts('r'),
   });
   assert.equal(result.status, 'completed', result.haltReason ?? '');
   assert.deepEqual(ran, [], 'identical identity and inputs: everything reuses, nothing dispatches');
@@ -273,7 +282,7 @@ test('R1A bite 2: a journaled patch that joins an EXISTING reducer replays witho
     admission,
     journalAdapter: adapter,
     clock: () => 0,
-    resumeEntries: journal,
+    resumeEntries: withHeader(admission, journal),
     patchAdmitter: () => ({ ok: true }),
     attemptIds: attempts('live'),
   });
@@ -332,7 +341,7 @@ test('R1A bite 3: an unfired conditional alternative into a joinMode:any merge i
   const { adapter } = memoryAdapter();
   const result = await runGraph(graph, {
     runner, admission, journalAdapter: adapter, clock: () => 0,
-    resumeEntries: journal, attemptIds: attempts('r'),
+    resumeEntries: withHeader(admission, journal), attemptIds: attempts('r'),
   });
 
   assert.equal(
@@ -405,7 +414,7 @@ async function runCone(mOutput: string) {
   const { adapter } = memoryAdapter();
   const result = await runGraph(graph, {
     runner, admission, journalAdapter: adapter, clock: () => 0,
-    resumeEntries: journal, attemptIds: attempts('r'),
+    resumeEntries: withHeader(admission, journal), attemptIds: attempts('r'),
   });
   assert.equal(result.status, 'completed', result.haltReason ?? '');
   return { ran, result };
@@ -479,7 +488,7 @@ async function runOrphanResume(reEmit: { nodes: ExecutableNode[]; edges: Executa
   };
   const { adapter, entries } = memoryAdapter();
   const result = await runGraph(graph, {
-    runner, admission, journalAdapter: adapter, clock: () => 0, resumeEntries: journal,
+    runner, admission, journalAdapter: adapter, clock: () => 0, resumeEntries: withHeader(admission, journal),
     patchAdmitter: () => ({ ok: true }),
     attemptIds: attempts('live'),
   });
@@ -546,7 +555,7 @@ test('C: a durably fired FAILURE route replays exactly — the failed node is re
   const { adapter } = memoryAdapter();
   const result = await runGraph(graph, {
     runner, admission, journalAdapter: adapter, clock: () => 0,
-    resumeEntries: journal, attemptIds: attempts('r'),
+    resumeEntries: withHeader(admission, journal), attemptIds: attempts('r'),
   });
   assert.equal(result.status, 'completed', result.haltReason ?? '');
   assert.deepEqual(ran, [], 'a durably settled failure route was re-dispatched');
@@ -594,7 +603,7 @@ test('D: a durably fired opaque edge replays even when today\'s closure would sa
   const { adapter } = memoryAdapter();
   const result = await runGraph(graph, {
     runner, admission, journalAdapter: adapter, clock: () => 0,
-    resumeEntries: journal, attemptIds: attempts('r'),
+    resumeEntries: withHeader(admission, journal), attemptIds: attempts('r'),
   });
   assert.equal(result.status, 'completed', result.haltReason ?? '');
   assert.deepEqual(ran, [], 'reused work was re-dispatched');
@@ -614,7 +623,7 @@ test('D: a durably UNFIRED opaque edge stays unfired even when today\'s closure 
   const { adapter } = memoryAdapter();
   const result = await runGraph(graph, {
     runner, admission, journalAdapter: adapter, clock: () => 0,
-    resumeEntries: journal, attemptIds: attempts('r'),
+    resumeEntries: withHeader(admission, journal), attemptIds: attempts('r'),
   });
   assert.equal(result.status, 'completed', result.haltReason ?? '');
   assert.deepEqual(ran, [], 'x was re-dispatched or y ran through an edge history says never fired');

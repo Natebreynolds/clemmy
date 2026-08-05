@@ -28,8 +28,17 @@ import type { AdmittedExecutionIdentity } from './graph-node-identity.js';
  * v3: settlements carry durable fired-edge verdicts with route COMPLETENESS
  * plus `emittedPatchDigest` promotion proof; starts are readiness-checked at
  * their journal position; patch admissions debit expansions even orphaned.
+ *
+ * v4 (E1): every activation opens with a durable `run_header` naming the
+ * schema version, admission digest, and activation identity — replay and
+ * append REQUIRE a supported header before any claim (a field minted inside
+ * GraphAdmission is not a journal-version proof). Attempt and activation ids
+ * are runtime-validated bounded identifiers; waves are non-negative safe
+ * integers with causal ordering inside an activation; cancellation is a
+ * first-class settlement status; patch entries carry generation identity and
+ * (in semantic mode) narrowing node identity.
  */
-export const GRAPH_JOURNAL_SCHEMA_VERSION = 3;
+export const GRAPH_JOURNAL_SCHEMA_VERSION = 4;
 
 /**
  * Every ceiling an admitted run carries. All finite — an admitted production
@@ -47,9 +56,21 @@ export interface AdmittedBudget {
   maxExpansions: number;
 }
 
+/**
+ * How strictly this admission binds identity.
+ *  - 'structural_test_only': no semantic identity — the pure-walker/test
+ *    shape. NEVER a silent production fallback; the name is the warning.
+ *  - 'semantic': semantic identity sealed; verification ports optional
+ *    (the substrate-testing shape).
+ *  - 'production': semantic identity sealed AND patch nodes must carry
+ *    narrowing identity AND the artifact verification port is mandatory.
+ */
+export type AdmissionMode = 'structural_test_only' | 'semantic' | 'production';
+
 export interface GraphAdmission {
   /** Digest over everything below — the run's identity. */
   admissionDigest: string;
+  mode: AdmissionMode;
   /** The journal contract this run writes and replays. Part of the digest, so
    *  history from an older contract is a different run and refuses wholesale. */
   journalSchemaVersion: number;
@@ -155,6 +176,9 @@ export function admitGraph(input: {
   budget: AdmittedBudget;
   /** Sealed via sealExecutionIdentity — the seal is the validation boundary. */
   identity?: AdmittedExecutionIdentity;
+  /** Defaults: identity present → 'semantic'; absent → 'structural_test_only'.
+   *  'production' REQUIRES identity. */
+  mode?: AdmissionMode;
 }): AdmissionResult {
   const errors: string[] = [];
   for (const field of BUDGET_FIELDS) {
@@ -163,6 +187,9 @@ export function admitGraph(input: {
     if (!Number.isFinite(value) || value < floor) {
       errors.push(`budget.${field} must be a finite number >= ${floor}; got ${String(value)}`);
     }
+  }
+  if (input.mode === 'production' && !input.identity) {
+    errors.push("mode 'production' requires sealed semantic identity — structural identity is test-only and never a silent production fallback");
   }
   if (!input.compilerVersion.trim()) errors.push('compilerVersion is required');
   if (!input.policyHash.trim()) errors.push('policyHash is required');
@@ -177,8 +204,10 @@ export function admitGraph(input: {
     maxElapsedMs: Math.floor(input.budget.maxElapsedMs),
     maxExpansions: Math.floor(input.budget.maxExpansions),
   };
+  const mode: AdmissionMode = input.mode ?? (input.identity ? 'semantic' : 'structural_test_only');
   const admissionDigest = sha256(JSON.stringify({
     journalSchemaVersion: GRAPH_JOURNAL_SCHEMA_VERSION,
+    mode,
     graphDigest,
     compilerVersion: input.compilerVersion,
     policyHash: input.policyHash,
@@ -190,6 +219,7 @@ export function admitGraph(input: {
     ok: true,
     admission: {
       admissionDigest,
+      mode,
       journalSchemaVersion: GRAPH_JOURNAL_SCHEMA_VERSION,
       graphDigest,
       ...(input.identity ? { identity: input.identity } : {}),

@@ -44,6 +44,8 @@ import {
   type GraphAdmission,
   type GraphPatch,
 } from './graph-admission.js';
+import { appendActivationHeader, applyGenerationRetirement, computeEdgeVerdict, edgeFires, type PatchGenerations } from './graph-activation.js';
+import { validDurableId } from './graph-journal.js';
 import type {
   GraphJournalAdapter,
   GraphJournalEntry,
@@ -280,22 +282,13 @@ function enabledEdges(graph: ExecutableGraph): ExecutableEdge[] {
 }
 
 /**
- * Which nodes can run now?
- *
- * A node is ready when every enabled incoming edge has FIRED. An edge fires
- * only when its source reached a terminal state the condition accepts, so a
- * `failure` edge holds its target back until the source actually fails.
- *
- * A node whose structural incoming edges were all disabled is never ready —
- * disabling the last route into a node removes it from the run rather than
- * promoting it to a root.
- *
- * Incoming edges are ANDed by default, deliberately matching the existing
- * workflow engine (`every(edge => completed.has(edge.source))`) so the
- * executor is provably equivalent to it — a join is a rendezvous. A node may
- * OPT INTO `joinMode: 'any'`, firing on the first satisfied incoming edge:
- * the branch-merge shape, where alternative verdict routes converge and
- * exactly one fires. The default never changed, so workflow parity holds.
+ * Which nodes can run now? A node is ready when every enabled incoming edge
+ * has FIRED (a `failure` edge holds its target until the source fails). A
+ * node whose structural incoming edges were all disabled is never ready.
+ * Incoming edges are ANDed by default, deliberately matching the workflow
+ * engine so the executor is provably equivalent — a join is a rendezvous;
+ * `joinMode: 'any'` is the explicit branch-merge opt-in. The default never
+ * changed, so workflow parity holds.
  */
 export function readyExecutableNodes(
   graph: ExecutableGraph,
@@ -315,22 +308,6 @@ export function readyExecutableNodes(
       ? incoming.some((edge) => fired.has(edge.id))
       : incoming.every((edge) => fired.has(edge.id));
   });
-}
-
-function edgeFires(
-  edge: ExecutableEdge,
-  outcome: NodeOutcome,
-  runner: NodeRunner,
-): boolean {
-  const when = edge.when ?? 'success';
-  if (when === 'success') return outcome.status === 'completed';
-  if (when === 'failure') {
-    // Only the node's OWN failure routes recovery topology. Infrastructure,
-    // policy, and cancellation are not evidence about the work.
-    return outcome.status === 'failed' && (outcome.settlementClass ?? 'node') === 'node';
-  }
-  // Opaque condition: only the runner can judge it, and silence means no.
-  return runner.edgeSatisfied?.(edge, outcome) === true;
 }
 
 /**
@@ -355,7 +332,7 @@ export async function runGraph(
     nodes: [...graph.nodes],
     edges: [...graph.edges],
   };
-  // Run state, declared BEFORE any closure that reads it (the R1A TDZ fix).
+  // Run state, declared BEFORE any closure reads it (the R1A TDZ fix).
   const trace: GraphTraceEntry[] = [];
   const completed = new Set<string>();
   const failed = new Set<string>();
@@ -370,6 +347,8 @@ export async function runGraph(
   const artifactRefs = new Map<string, { outputRef?: string; evidenceRefs?: readonly string[] }>();
   /** Why a journaled settlement was NOT reused, per node — trace diagnostics. */
   const reuseRefusals = new Map<string, string>();
+  /** Claimed/dispatched this wave, unsettled — patches may not join these. */
+  const inFlight = new Set<string>();
 
   const appliedPatchDigests: string[] = [];
   /** Digests already durable in the journal (applied or orphaned) — a
@@ -393,6 +372,9 @@ export async function runGraph(
       if (!joinsExisting) continue;
       if (settled.has(edge.target)) {
         return { ok: false, reason: `edge "${edge.id}" joins "${edge.target}", which has already settled` };
+      }
+      if (inFlight.has(edge.target)) {
+        return { ok: false, reason: `edge "${edge.id}" joins "${edge.target}", which is claimed/in flight in the current wave — its scheduling future is closed` };
       }
       const firedIncoming = working.edges.some(
         (incoming) => !incoming.disabled && incoming.target === edge.target && fired.has(incoming.id),
@@ -441,6 +423,8 @@ export async function runGraph(
   let trusted = new Map<string, NodeSettledEntry>();
   /** Attempt ids history has claimed; grows with this run's own claims. */
   let usedAttemptIds = new Set<string>();
+  /** Proven patch generations per emitter, retired when the emitter loses reuse. */
+  let patchesByEmitter: PatchGenerations = new Map();
   if (admission) {
     haltReason = admittedRunPrecondition(graph, admission, {
       journalAdapter: !!options.journalAdapter,
@@ -457,8 +441,10 @@ export async function runGraph(
         working.nodes = [...resume.nodes];
         working.edges = [...resume.edges];
         appliedPatchDigests.push(...resume.appliedPatchDigests);
-        expansions = resume.expansionsDebited;
+        expansions = 0; // the expansion ceiling is an ACTIVATION budget
+
         usedAttemptIds = new Set(resume.usedAttemptIds);
+        patchesByEmitter = new Map(resume.patchesByEmitter);
         for (const digest of resume.journaledPatchDigests) journaledPatchDigests.add(digest);
         for (const [emitter, digest] of resume.orphanPatchByEmitter) {
           orphanPatchByEmitter.set(emitter, digest);
@@ -480,6 +466,11 @@ export async function runGraph(
   let attemptCounter = 0;
   const nextAttemptId = options.attemptIds ?? (() => `attempt-${(attemptCounter += 1)}`);
 
+  // The activation opener (journal v4): version durable before any claim.
+  if (!haltReason && admission && options.journalAdapter) {
+    haltReason = await appendActivationHeader(admission, options.journalAdapter, nextAttemptId());
+  }
+
   const pureJournal = new Set(admission ? [] : options.journal ?? []);
   let dispatched = 0;
   let wave = 0;
@@ -487,12 +478,8 @@ export async function runGraph(
 
   const record = (entry: GraphTraceEntry): void => { trace.push(entry); onStep?.(entry); };
 
-  /** The edge verdict, computed ONCE from the live outcome — persisted with
-   *  the settlement and consumed by live scheduling: zero drift. */
   const edgeVerdict = (nodeId: string, outcome: NodeOutcome): string[] =>
-    enabledEdges(working)
-      .filter((edge) => edge.source === nodeId && edgeFires(edge, outcome, runner))
-      .map((edge) => edge.id);
+    computeEdgeVerdict(working, nodeId, outcome, runner);
 
   const settle = (
     node: ExecutableNode,
@@ -502,11 +489,15 @@ export async function runGraph(
     firedEdgeIds?: readonly string[],
   ): void => {
     settled.add(node.id);
-    if (outcome.status === 'completed') {
+    inFlight.delete(node.id);
+    const status = (outcome as { status: NodeStatus }).status;
+    if (status === 'completed') {
+      const done = outcome as Extract<NodeOutcome, { status: 'completed' }>;
       completed.add(node.id);
-      artifactRefs.set(node.id, { outputRef: outcome.outputRef, evidenceRefs: outcome.evidenceRefs });
-    } else if (outcome.status === 'failed') failed.add(node.id);
-    else if (outcome.status === 'blocked') blocked.add(node.id);
+      artifactRefs.set(node.id, { outputRef: done.outputRef, evidenceRefs: done.evidenceRefs });
+    } else if (status === 'failed') failed.add(node.id);
+    else if (status === 'blocked') blocked.add(node.id);
+    else if (status === 'cancelled') cancelled.add(node.id);
     else paused.add(node.id);
     for (const edgeId of firedEdgeIds ?? edgeVerdict(node.id, outcome)) fired.add(edgeId);
     const reuseRefused = reuseRefusals.get(node.id);
@@ -514,9 +505,9 @@ export async function runGraph(
       wave,
       nodeId: node.id,
       kind: node.kind,
-      status: outcome.status,
+      status,
       ...(reused ? { reused } : {}),
-      ...(outcome.status === 'completed' ? {} : { reason: outcome.reason }),
+      ...(status === 'completed' ? {} : { reason: (outcome as { reason?: string }).reason }),
       ...(reuseRefused && !reused ? { reuseRefused } : {}),
     });
   };
@@ -539,11 +530,19 @@ export async function runGraph(
     // budget. Reuse is decided HERE, at readiness, by decideTrustedReuse —
     // exact identity replays durable verdicts; anything less is fresh work.
     const fresh: ExecutableNode[] = [];
+    let retiredGenerations = false;
     for (const node of ready) {
       const journaled = trusted.get(node.id);
       const verdict = journaled
         ? decideTrustedReuse(journaled, node, inputDigestFor(admission, node.id, predecessorRefsFor(node)), admission)
         : undefined;
+      // E1.1: a reuse refusal retires the node's proven patch generations —
+      // old emitted topology may not run under an input that never emitted it.
+      if (verdict && 'refusal' in verdict && patchesByEmitter.has(node.id)) {
+        retiredGenerations = applyGenerationRetirement(
+          { working, trusted, appliedPatchDigests, patchesByEmitter }, node.id,
+        ) || retiredGenerations;
+      }
       if (verdict && 'reuse' in verdict) {
         const artifacts = options.reuseVerifier && journaled
           ? await options.reuseVerifier(journaled)
@@ -565,6 +564,8 @@ export async function runGraph(
         fresh.push(node);
       }
     }
+    // Retired topology changes readiness: recompute before dispatching.
+    if (retiredGenerations) continue;
     if (fresh.length === 0) { wave += 1; continue; }
 
     // A wave that would exceed the node budget parks BEFORE dispatching any of
@@ -591,6 +592,11 @@ export async function runGraph(
       });
       if (admission && options.journalAdapter) {
         for (const p of prepared) {
+          if (!validDurableId(p.attemptId)) {
+            haltReason = `attempt id ${JSON.stringify(String(p.attemptId).slice(0, 32))} is not a bounded printable identifier — refuse before the durable claim`;
+            status = 'halted';
+            break main;
+          }
           // A colliding attempt id would make the next replay refuse itself.
           if (usedAttemptIds.has(p.attemptId)) {
             haltReason = `attempt id "${p.attemptId}" already appears in journaled history — attempt identity must be collision-free`;
@@ -616,6 +622,7 @@ export async function runGraph(
         }
       }
 
+      for (const p of prepared) inFlight.add(p.node.id);
       const resolved = await Promise.all(prepared.map(async (p) => {
         let outcome: NodeOutcome;
         try {
@@ -638,10 +645,10 @@ export async function runGraph(
             settlementClass: 'infrastructure',
           };
         }
-        // An outcome that arrives AFTER cancellation may not commit success
-        // or route topology — it settles as a typed, durable cancellation.
+        // A post-abort outcome settles as first-class CANCELLED — journal,
+        // run result, and trace agree; nothing routes.
         if (options.signal?.aborted) {
-          outcome = { status: 'failed', reason: 'cancelled while running', settlementClass: 'cancelled' };
+          outcome = { status: 'cancelled' as never, reason: 'cancelled while running', settlementClass: 'cancelled' } as NodeOutcome;
         }
         return { ...p, outcome };
       }));

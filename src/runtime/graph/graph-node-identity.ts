@@ -193,14 +193,34 @@ export function sealExecutionIdentity(
     budgetVersion: identity.budgetVersion,
     nodes: digestNodes,
   }));
+  // Deep-copy THEN deep-freeze: no caller-owned nested reference survives
+  // sealing, so a later caller-side mutation can neither drift digests nor
+  // mutate the admission's view (F6).
+  const frozenNodes: Record<string, NodeSemanticIdentity> = {};
+  for (const [nodeId, semantic] of Object.entries(identity.nodes)) {
+    frozenNodes[nodeId] = Object.freeze({
+      ...semantic,
+      runner: Object.freeze({ ...semantic.runner }),
+    });
+  }
   return {
     ok: true,
     identity: Object.freeze({
       ...identity,
-      nodes: Object.freeze({ ...identity.nodes }),
+      nodes: Object.freeze(frozenNodes),
       identityDigest,
     }),
   };
+}
+
+/** Semantic digest for a PATCH-added node whose identity travels with the
+ *  patch (production mode). Same shape as nodeDigestFor's semantic branch. */
+export function semanticNodeDigest(node: ExecutableNode, semantic: NodeSemanticIdentity): string {
+  return sha256(stableJson({
+    structural: computeNodeDigest(node),
+    semantic: semantic.semanticDigest,
+    runner: semantic.runner,
+  }));
 }
 
 /**
