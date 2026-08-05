@@ -1974,7 +1974,15 @@ export function matchToolChoicesForStep(
     // that cannot run must never read as validation that passed.
     const storedFingerprint = (rec.choice.schemaFingerprint
       ?? (rec as { schemaFingerprint?: string }).schemaFingerprint)?.trim();
-    if (storedFingerprint && rec.choice.kind === 'composio') {
+    // BINDING requires live catalog authority that matches the stored contract
+    // — absence of proof declines. ADVERTISING does not bind: surfacing the
+    // memo (or pinning its carrier tool into the JIT schema surface) grants no
+    // execution authority, and the call path still fetches + validates the
+    // live schema. Gating the advertise tier on a cache that is empty at turn
+    // start disabled the warm path precisely when it mattered: the freshest
+    // proven memo vanished before discovery had run (live 2026-08-05, the
+    // 43-second "whats on my calendar" turn).
+    if (storedFingerprint && rec.choice.kind === 'composio' && !advertiseOnly) {
       const live = liveFingerprintFor(rec.choice.identifier);
       if (!live || live !== storedFingerprint) continue;
     }

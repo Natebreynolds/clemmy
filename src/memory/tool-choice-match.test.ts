@@ -287,3 +287,58 @@ test('precision: an incidental shared DESCRIPTION word never clears the floor on
     [],
   );
 });
+
+// ── the 2026-08-05 warm-path regression ──────────────────────────────────────
+// "hey whats on my calendar tomorrow" took 43 seconds against a memo proven 5
+// times, because (a) the bind-tier matcher demanded an operation token a
+// conversational ask never carries, and (b) the composio fingerprint gate
+// consulted a live-catalog cache that is EMPTY at turn start, deleting the
+// freshest memo before discovery had run. Advertising is not binding: the
+// advertise tier must survive both conditions so the JIT pin can pre-expose
+// the carrier tool.
+
+const OUTLOOK_CAL = ((): ToolChoiceRecord => {
+  const r = rec(
+    'outlook.list_calendar_calendar_view',
+    'composio',
+    'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+    undefined,
+    'List Outlook calendar events for a date range (calendar view)',
+  );
+  r.choice!.schemaFingerprint = 'b51942880b1f034fafbd4463a7bf31b8';
+  return r;
+})();
+
+test('advertise tier: a conversational service ask matches without an operation token', () => {
+  const matches = matchToolChoicesForStep(
+    'hey whats on my calendar tomorrow',
+    {
+      choices: [OUTLOOK_CAL],
+      purpose: 'advertise',
+      // Turn-start reality: no live catalog authority has been fetched yet.
+      liveSchemaFingerprintFor: () => null,
+    },
+  );
+  assert.equal(matches.length, 1, 'the proven memo must surface at advertise tier');
+  assert.equal(matches[0].identifier, 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW');
+  assert.equal(matches[0].autoBindable, false, 'advertising never auto-binds composio');
+});
+
+test('bind tier still fails closed on a missing/mismatched live fingerprint', () => {
+  assert.deepEqual(
+    matchToolChoicesForStep(
+      'List outlook calendar events for tomorrow in the calendar view',
+      { choices: [OUTLOOK_CAL], liveSchemaFingerprintFor: () => null },
+    ),
+    [],
+    'no live authority → binding declines',
+  );
+  assert.deepEqual(
+    matchToolChoicesForStep(
+      'List outlook calendar events for tomorrow in the calendar view',
+      { choices: [OUTLOOK_CAL], liveSchemaFingerprintFor: () => 'a-moved-contract' },
+    ),
+    [],
+    'a moved contract → binding declines',
+  );
+});

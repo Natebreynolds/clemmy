@@ -1332,3 +1332,24 @@ test('the validated contract fingerprint round-trips to disk', () => {
   assert.equal(recallToolChoice(intent)?.choice?.schemaFingerprint, 'sha256:contract-a',
     're-validation erased the recorded contract');
 });
+
+test('JIT recall pin: a proven fingerprinted composio memo pins its carrier for a conversational ask', async () => {
+  // End-to-end half of the 2026-08-05 warm-path pin: remember a proven
+  // calendar read, then ask the way a person actually asks — with no live
+  // catalog authority fetched yet. The JIT pin must name the carrier tool so
+  // the turn starts with composio_execute_tool first-class instead of being
+  // forced through a discovery round.
+  const { recallPinnedBuiltinTools } = await import('../agents/tool-jit.js');
+  rememberToolChoice({
+    intent: 'outlook.calendar.view_day',
+    description: 'List Outlook calendar events for a date range (calendar view)',
+    choice: {
+      kind: 'composio',
+      identifier: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+      accountIdentity: 'user@example.com',
+      schemaFingerprint: 'deadbeefdeadbeefdeadbeefdeadbeef',
+    },
+  });
+  const pins = recallPinnedBuiltinTools('hey whats on my calendar tomorrow');
+  assert.ok(pins.includes('composio_execute_tool'), `carrier tool pinned (got: ${JSON.stringify(pins)})`);
+});

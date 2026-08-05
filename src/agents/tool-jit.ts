@@ -374,7 +374,13 @@ export function recallPinnedBuiltinTools(userInput?: string | null): string[] {
   const query = (userInput ?? '').trim();
   if (!query) return [];
   try {
-    const matches = matchToolChoicesForStep(query, { limit: 5 });
+    // 'advertise': exposing a schema is not binding a tool. The bind-tier
+    // matcher (≥2 core tokens + operation gates) is right for auto-binding,
+    // but a conversational ask ("whats on my calendar tomorrow") names the
+    // service without the operation — it cleared only the advertise tier, so
+    // the proven memo never pinned its carrier and the model was FORCED into
+    // a discovery round it did not need (live 2026-08-05).
+    const matches = matchToolChoicesForStep(query, { limit: 5, purpose: 'advertise' });
     const names = new Set<string>();
     for (const m of matches) {
       for (const fam of m.family) names.add(fam);
