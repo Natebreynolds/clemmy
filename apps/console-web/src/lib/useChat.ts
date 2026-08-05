@@ -400,6 +400,38 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
           }
         : a));
     }
+    case 'capability_resolution': {
+      // The typed "what Clem knows going in" frame: proven procedures, paths
+      // that failed before, missing connections — resolved by the runtime at
+      // turn start. One plain-voice row; the trace drawer holds the raw event.
+      const entries = Array.isArray(d.entries) ? (d.entries as Array<Record<string, unknown>>) : [];
+      if (entries.length === 0) return prev;
+      const human = (e: Record<string, unknown>): string =>
+        String(e.intent ?? e.identifier ?? 'a tool').replace(/[._]/g, ' ').trim();
+      const proven = entries.filter((e) => e.status === 'proven');
+      const shaky = entries.filter((e) => e.status === 'previously_failed');
+      const disconnected = entries.filter((e) => e.connection === 'missing');
+      const parts: string[] = [];
+      if (proven.length) parts.push(`${proven.length} proven tool${proven.length === 1 ? '' : 's'}`);
+      if (shaky.length) parts.push(`${shaky.length} need${shaky.length === 1 ? 's' : ''} a re-check`);
+      if (disconnected.length) parts.push(`${disconnected.length} not connected`);
+      const detailParts: string[] = [];
+      for (const e of proven.slice(0, 3)) detailParts.push(`${human(e)} ✓`);
+      for (const e of shaky.slice(0, 2)) {
+        const when = typeof e.failedAt === 'string' ? ` (failed ${e.failedAt.slice(0, 10)})` : '';
+        detailParts.push(`${human(e)} — re-checking${when}`);
+      }
+      for (const e of disconnected.slice(0, 2)) detailParts.push(`${human(e)} — not connected`);
+      return [...prev, {
+        id: `cap-${prev.length}`,
+        kind: 'event',
+        variant: 'lifecycle',
+        tone: disconnected.length ? 'danger' : shaky.length ? 'warning' : 'success',
+        label: `Grounded in what's proven: ${parts.join(', ')}`,
+        ...(detailParts.length ? { detail: detailParts.join(' · ') } : {}),
+        status: 'done',
+      }];
+    }
     case 'tool_called': {
       if (!tool || tool === 'run_worker' || /run_worker/.test(tool)) return prev; // agents render as agents, not a tool row
       if (d.batchMode === true) return prev; // batch items render as ONE live meter row, not N tool rows

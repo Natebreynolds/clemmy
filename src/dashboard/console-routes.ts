@@ -13602,6 +13602,9 @@ export function registerConsoleRoutes(
     'step_started', 'heartbeat',
     'external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned',
     'verdict_recorded',
+    // Typed capability grounding — the origin chat should see what the
+    // promoted run resolved as proven / shaky / disconnected going in.
+    'capability_resolution',
   ]);
 
   /**
