@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR } from '../config.js';
@@ -272,7 +272,47 @@ function filePathFor(intent: string): string {
   return path.join(machineDir(), `${slug}.md`);
 }
 
+/**
+ * mtime+size-keyed parse cache. The store is consulted several times per turn
+ * (JIT recall pin, context render, composio search recall, workflow binding),
+ * and re-parsing ~200 markdown files cost ~70ms PER CALL on a real store
+ * (measured 2026-08-05) — a repeating per-turn tax on the exact hot path the
+ * latency work is trimming. Writers go through writeFileSync, which bumps
+ * mtime and invalidates naturally; a torn write degrades to null exactly as
+ * the uncached parse did. Cache hits return a shallow copy so one caller's
+ * top-level mutation can never leak into another's read.
+ */
+const parseFileCache = new Map<string, { mtimeMs: number; size: number; value: unknown }>();
+
+function cachedFileParse<T>(filePath: string, parse: (fp: string) => T | null): T | null {
+  let stat;
+  try {
+    stat = statSync(filePath);
+  } catch {
+    parseFileCache.delete(filePath);
+    return null;
+  }
+  const hit = parseFileCache.get(filePath);
+  if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) {
+    const value = hit.value as T | null;
+    return value === null ? null : { ...(value as object) } as T;
+  }
+  const value = parse(filePath);
+  parseFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+  return value === null ? null : { ...(value as object) } as T;
+}
+
+/** Test-only: drop every cached parse so a test that rewrites the store
+ *  out-of-band observes the disk truth. */
+export function _resetToolChoiceParseCacheForTest(): void {
+  parseFileCache.clear();
+}
+
 function parseRecordRaw(filePath: string): ToolChoiceRecord | null {
+  return cachedFileParse(filePath, parseRecordRawUncached);
+}
+
+function parseRecordRawUncached(filePath: string): ToolChoiceRecord | null {
   if (!existsSync(filePath)) return null;
   try {
     const raw = readFileSync(filePath, 'utf-8');
@@ -491,6 +531,10 @@ function parseEvidence(raw: unknown): ToolProcedureEvidence | null {
 }
 
 function parseProcedure(filePath: string): ToolProcedureRecord | null {
+  return cachedFileParse(filePath, parseProcedureUncached);
+}
+
+function parseProcedureUncached(filePath: string): ToolProcedureRecord | null {
   if (!existsSync(filePath)) return null;
   try {
     const parsed = matter(readFileSync(filePath, 'utf-8'));
