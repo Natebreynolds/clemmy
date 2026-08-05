@@ -5,6 +5,7 @@ import { Pin, Loader2 } from 'lucide-react';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { chatApprovalReply, useChat, pendingActionFromEvent, type ChatMessage } from '@/lib/useChat';
+import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
@@ -78,6 +79,11 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
   const chat = useChat({
     initialSessionId: rawId(session.id),
     initialMessages: historyToMessages(history),
+    // This IS the user's active conversation now — the index returns here,
+    // and a turn left running server-side reattaches its live stream instead
+    // of rendering a dead transcript with an enabled composer.
+    rememberAsLastSession: true,
+    reattachActiveRun: true,
   });
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -161,6 +167,8 @@ export function ConversationThread() {
     );
   }
   if (detail.isError || !detail.data) {
+    // A dead pointer must not keep bouncing the chat index back here.
+    if (sessionId && lastChatSession() === sessionId) rememberLastChatSession(null);
     return (
       <div className="flex flex-1 items-center justify-center px-6 text-center text-muted">
         <p>This conversation could not be found.</p>

@@ -1266,3 +1266,65 @@ test('a gateway refusal is a nominal pre-dispatch throw and performs zero provid
   );
   assert.equal(dispatches, 0);
 });
+
+test('connection ground truth: active-but-failing vs truly-absent are told apart in plain words', async () => {
+  const { connectionGroundTruthNote, _setConnectedToolkitsLoaderForTests } = await import('./composio-tools.js');
+  const stub = (rows: unknown[]) => {
+    _setConnectedToolkitsLoaderForTests((async () => rows) as never);
+  };
+  try {
+    // The live 2026-08-04 shape: Connect screen shows ACTIVE, execution fails.
+    stub([{ slug: 'outlook', connectionId: 'ca_live', status: 'ACTIVE', accountEmail: 'travis@example.com' }]);
+    const activeNote = await connectionGroundTruthNote('OUTLOOK_CREATE_DRAFT');
+    assert.match(activeNote, /DOES list an ACTIVE OUTLOOK connection \(travis@example\.com\)/);
+    assert.match(activeNote, /reconnect OUTLOOK even though it looks connected/);
+    assert.match(activeNote, /reply "continue"/);
+    assert.match(activeNote, /Never describe this in API or lane terms/);
+
+    stub([]);
+    const absentNote = await connectionGroundTruthNote('OUTLOOK_CREATE_DRAFT');
+    assert.match(absentNote, /NO usable OUTLOOK connection/);
+    assert.match(absentNote, /open the Connect screen \(left sidebar\), connect OUTLOOK/);
+  } finally {
+    _setConnectedToolkitsLoaderForTests(null);
+  }
+});
+
+test('ambiguous identities produce the mailbox question, never a doomed bare dispatch', async () => {
+  const { bareDispatchDoomedQuestion } = await import('../integrations/composio/client.js');
+  const conns = [
+    { slug: 'outlook', connectionId: 'ca_a', status: 'ACTIVE', accountEmail: 'travis@work.com', ownerUserId: 'entity-a' },
+    { slug: 'outlook', connectionId: 'ca_b', status: 'ACTIVE', accountEmail: 'travis@personal.com', ownerUserId: 'entity-b' },
+  ] as never[];
+  const ambiguous = {
+    kind: 'ambiguous' as const,
+    candidates: [
+      { email: 'travis@work.com', connectionId: 'ca_a' },
+      { email: 'travis@personal.com', connectionId: 'ca_b' },
+    ],
+  };
+  // Dispatch entity owns NEITHER → bare dispatch is doomed → the real question.
+  const q = bareDispatchDoomedQuestion(ambiguous as never, conns as never, 'OUTLOOK_CREATE_DRAFT', 'clementine-machine');
+  assert.ok(q, 'a doomed bare dispatch is converted to a question');
+  assert.match(q!, /travis@work\.com, travis@personal\.com/);
+  assert.match(q!, /do NOT report the toolkit as disconnected/i);
+
+  // Dispatch entity owns one of them → bare dispatch may succeed → no override.
+  assert.equal(
+    bareDispatchDoomedQuestion(ambiguous as never, conns as never, 'OUTLOOK_CREATE_DRAFT', 'entity-a'),
+    null,
+  );
+
+  // A resolved outcome never questions.
+  assert.equal(
+    bareDispatchDoomedQuestion({ kind: 'resolved', connectionId: 'ca_a' } as never, conns as never, 'OUTLOOK_CREATE_DRAFT', 'x'),
+    null,
+  );
+
+  // identity-absent names the remembered mailbox and the live candidates.
+  const absent = bareDispatchDoomedQuestion(
+    { kind: 'identity-absent', want: 'old@work.com', candidates: ambiguous.candidates } as never,
+    conns as never, 'OUTLOOK_CREATE_DRAFT', 'clementine-machine',
+  );
+  assert.match(absent!, /old@work\.com.*no longer connected/);
+});

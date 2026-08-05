@@ -8,6 +8,7 @@ import {
   subscribeChatStream,
   type ChatEvent,
 } from '../lib/api';
+import { reduceStreamingText } from '../lib/streaming';
 
 interface Props {
   sessionId?: string;
@@ -39,6 +40,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   // Text arriving live from the model. Cleared the moment the durable event
   // lands, so the finished message is always the persisted one, never this.
   const [streaming, setStreaming] = useState('');
+  // Mirror for the SSE closure — onEvent fires outside the render cycle and
+  // must accumulate deltas without stale-state races.
+  const streamingRef = useRef('');
   const [planActing, setPlanActing] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -68,11 +72,22 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             setEvents((current) => mergeEventsBySeq(current, replay));
             for (const e of replay) latestSeq = Math.max(latestSeq, e.seq);
           },
-          onDelta: (text) => { setStreaming((current) => current + text); },
+          onDelta: (text) => {
+            streamingRef.current += text;
+            setStreaming(streamingRef.current);
+          },
           onEvent: (event) => {
-            // The real message has landed; stop showing the provisional text.
-            setStreaming('');
             if (cancelled) return;
+            // Token deltas ride the public stream as `stream_token` rows (see
+            // lib/streaming.ts) — consumed into the provisional bubble, never
+            // merged into the transcript.
+            const frame = reduceStreamingText(streamingRef.current, event);
+            streamingRef.current = frame.streaming;
+            setStreaming(frame.streaming);
+            if (frame.consumed) {
+              latestSeq = Math.max(latestSeq, event.seq);
+              return;
+            }
             setEvents((current) => mergeEventsBySeq(current, [event]));
             latestSeq = Math.max(latestSeq, event.seq);
             // When the server confirms a user message echo, drop the
@@ -119,6 +134,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       sentAt: Date.now(),
     };
     setPending((current) => [...current, echo]);
+    streamingRef.current = '';
     setStreaming('');
     setDraft('');
     setSending(true);

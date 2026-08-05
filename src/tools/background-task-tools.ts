@@ -185,7 +185,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       'After it returns: confirm to the user that it is running and that you will report back, then STOP — do NOT do the work yourself this turn, do NOT poll. The user is free to fire another task immediately.',
     ].join('\n'),
     {
-      objective: z.string().min(4).describe('One line: what this run must achieve.'),
+      objective: z.string().min(4).describe('One line naming the JOB this run must achieve (e.g. "Write 5 demo-firm profiles plus an index in demo-firms/"). This becomes the task\'s visible title on the board and in the chat — NEVER an echo of the user\'s message ("Perfect - go with your suggestion" is not an objective).'),
       handoff_note: z.string().nullable().describe('YOUR OWN WORDS to the user confirming the handoff — the exact message they will read as your reply. Rubric: confirm it is running in the background, that you will report back here, and anything worth noting in your own voice. Null falls back to a plain generated line — always prefer writing this yourself.'),
       plan: z.string().min(1).describe('The agreed steps/approach to execute (markdown bullets are fine). This was settled with the user — the worker follows it, it does not re-derive a different approach.'),
       success_criteria: z.array(z.string()).nullable().describe('Concrete done-checks; the run is complete only when all hold.'),

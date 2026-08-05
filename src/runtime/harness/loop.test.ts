@@ -10104,3 +10104,90 @@ test('primer recall ceiling covers measured p90 and matches the Claude lane (202
   assert.ok(TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS >= 1500,
     'the Codex-lane primer ceiling must cover measured p90 recall latency');
 });
+
+// 2026-08-04: the self-resolve continuation was chat-only at birth, which
+// inverted its intent for background tasks — the unattended lane skipped
+// self-settlement and parked ambiguous work on a NEEDS-YOU card ("keep
+// working" homework). Background run sessions are kind 'execution'; they get
+// the same one-shot self-resolve beat before any park.
+test('a background (execution-kind) run gets the SELF-RESOLVE continuation too — unattended work settles itself', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'execution' });
+  const rootScopeId = `${sess.id}::turn:1`;
+  const inputs: string[] = [];
+  let bgCalls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const last = items.at(-1) as { content?: string } | undefined;
+    if (typeof last?.content === 'string') inputs.push(last.content);
+    bgCalls += 1;
+    if (bgCalls === 1) {
+      artifactLedger.claimArtifactSlot(sess.id, {
+        kind: 'google_doc',
+        provider: 'Google Docs',
+        slotKey: 'google_doc:bg-selfresolve',
+        title: 'Background self-resolve report',
+        createShape: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      }, 'create-bg-selfresolve-doc', rootScopeId);
+    }
+    return {
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Created the requested report.',
+        reply: 'Done — I created the Google Doc.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create a Google Doc report for the dormant accounts',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const selfResolveInput = inputs.find((i) => i.includes('[self-resolve]'));
+  assert.ok(selfResolveInput, 'the self-resolve continuation fires for execution-kind sessions');
+  assert.match(selfResolveInput!, /Do NOT hand this uncertainty to the user/i);
+  assert.equal(result.status, 'awaiting_user_input', 'the honest park is still the fallback when unresolved');
+});
+
+// 2026-08-04: a proactive report-back relay (synthetic directive input) that
+// hit a transient model error asked the USER "retry / switch / stop?" about a
+// turn they never sent — the passive outcome staging already guarantees the
+// content. A synthetic-input turn is unattended: quiet auto-retry, then an
+// honest run_failed, never the interactive infra ask.
+test('a failing synthetic-directive turn on a chat session never surfaces the infra ask', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id, turn: 0, role: 'user', type: 'user_input_received',
+    data: { text: '[background task bg-x] Relay the outcome…', synthetic: true, source: 'outcome', deliveryPhase: 'directive' },
+  });
+  // Exhaust the unattended auto-recover budget so the terminal branch runs.
+  for (let i = 0; i < 8; i += 1) {
+    appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'infra_auto_recover', data: { kind: 'model.transport_timeout' } });
+  }
+  const runRunner: RunRunnerFn = async () => {
+    throw BoundaryError.from(new Error('model transport timeout'), {
+      kind: 'model.transport_timeout', retryable: true, userMessage: 'The model runtime is temporarily unavailable.',
+    });
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: '[background task bg-x] Relay the outcome…',
+    reuseRecordedUserInput: true,
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  const asks = listEvents(sess.id, { types: ['awaiting_user_input'] })
+    .filter((e) => (e.data as { source?: string }).source === 'infra_error_recovery');
+  assert.equal(asks.length, 0, 'no retry/switch/stop ask for a turn the user never sent');
+  assert.notEqual(result.status, 'awaiting_user_input', 'the relay fails quiet, not interactive');
+});

@@ -11,11 +11,14 @@ import {
   readdirSync,
   renameSync,
   rmdirSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import pino from 'pino';
+import { extractDeliverablePointers } from '../runtime/harness/claim-grounding.js';
 import {
   BASE_DIR,
   MODELS,
@@ -389,6 +392,25 @@ function backgroundSelfResumeEnabled(): boolean {
  *  verdict for the cheap cases, or {needJudge:true} when only an independent
  *  progress judge can decide. Fail-safe by construction: disabled, at the hard
  *  ceiling, or a cycle with no new tool activity all → park. Exported + tested. */
+/**
+ * FREE auto-continues cover the time the user already GRANTED. A continue is
+ * consumed roughly once per wall-clock slice (~10 min), so a flat cap of 4
+ * parked a healthy 90-minute run at minute ~40 purely by time arithmetic and
+ * handed the rest to a fail-closed network judge (2026-08-04 audit headline).
+ * The granted maxMinutes IS the user's consent to run that long; free
+ * continues scale to it, bounded by the hard self-resume ceiling. Pure +
+ * exported for the pin test.
+ */
+export function freeAutoContinueCapForTask(
+  maxMinutes: number | undefined,
+  base: number = BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP,
+  hardCap: number = BACKGROUND_SELF_RESUME_HARD_CAP,
+): number {
+  const sliceMinutes = Math.max(1, Math.round(BACKGROUND_STEP_WALL_CLOCK_MS / 60_000));
+  const fromGrant = maxMinutes && maxMinutes > 0 ? Math.ceil(maxMinutes / sliceMinutes) : 0;
+  return Math.min(hardCap, Math.max(base, fromGrant));
+}
+
 export function selfResumeDecision(p: {
   /** Stage 4 — the run's aggregate token window is exhausted: park
    *  unconditionally (a user continue is the only re-arm; checked FIRST so
@@ -3134,7 +3156,10 @@ function defaultBackgroundNextAction(
   if (outcome === 'done') return {};
   if (blockerType === 'permission') {
     return {
-      nextAction: 'Authenticate or reconnect the service named in the concrete tool failure above, then reply `continue`. Clementine will resume this same saved task.',
+      // The user's recovery door has a NAME — "authenticate the service" with
+      // no path is a dead end (live 2026-08-04: an invite blast parked on a
+      // dropped Outlook connection and the user had to ask HOW to reconnect).
+      nextAction: 'Open the Connect screen (left sidebar), reconnect the service named above, then reply `continue` here. This saved task resumes exactly where it left off — nothing already done is redone.',
       resumable: true,
     };
   }
@@ -3235,10 +3260,59 @@ function workManifestHasDurableCompletionEvidence(manifest: WorkManifestSummary)
   ));
 }
 
-function taskRequiresExternalSendReceipt(
+export function taskRequiresExternalSendReceipt(
   task: Pick<BackgroundTaskRecord, 'prompt' | 'title'>,
 ): boolean {
-  return stepLooksLikeIrreversibleSend(`${task.title}\n${task.prompt}`);
+  // Phrases that LOOK like sends but create no external obligation must not
+  // demand a receipt the task can never produce — an unsatisfiable gate that
+  // false-blocks verified-complete work (live 2026-08-04, twice):
+  //  (a) negated mentions — "no emails, no drafts, local file only";
+  //  (b) REPORT-BACK requests — "send me a summary message here", "deliver
+  //      the findings back to this chat": that delivery is the runtime's own
+  //      report-back, not an external send. The north-star instruction
+  //      ("always report back") must never block the task that obeyed it.
+  //  (c) user self-commitments — "I will send the emails myself".
+  // Every strip is clause-scoped (stops at sentence end), so a real send
+  // elsewhere in the prompt still gates.
+  const text = `${task.title}\n${task.prompt}`
+    .replace(/\b(?:no|not|never|don'?t|do not|without(?: any)?)\s+(?:external\s+)?(?:emails?|sends?|sending|drafts?|publish(?:ing)?|posts?|messages?|external (?:writes?|services?|systems?))\b/gi, '')
+    .replace(/\breport(?:ing)?\s+back\b[^.\n!?]*/gi, '')
+    .replace(/\b(?:send|deliver|post|give|message)\b[^.\n!?]{0,60}\b(?:here|back here|back to (?:me|this chat|the chat)|in (?:the|this) chat|to this chat)\b[^.\n!?]*/gi, '')
+    .replace(/\b(?:send|message|ping)\s+me\b(?![^.\n!?]{0,50}\b(?:e-?mail|sms|text)s?\b)[^.\n!?]*/gi, '')
+    .replace(/\bI(?:['’]ll| will)?\s*(?:will\s+)?send\b[^.\n!?]{0,80}\bmyself\b[^.\n!?]*/gi, '');
+  return stepLooksLikeIrreversibleSend(text);
+}
+
+/**
+ * Reality check for the deliverable-evidence gates (live 2026-08-04): a run
+ * that wrote its files through shell/python leaves no artifact binding, no
+ * extracted deliverable, and no external-write receipt, so the ledger read
+ * alone false-blocked genuinely complete work — "no file written" while the
+ * files sat verified on disk. The completion text names concrete paths; stat
+ * them. A named path that exists and was modified after the task started IS
+ * durable deliverable evidence: the filesystem outranks the ledger.
+ */
+export function verifiedOnDiskDeliverables(finalText: string, startedAt?: string): number {
+  let pointers: ReturnType<typeof extractDeliverablePointers>;
+  try { pointers = extractDeliverablePointers(finalText ?? ''); } catch { return 0; }
+  const startedMs = startedAt ? Date.parse(startedAt) : NaN;
+  let count = 0;
+  for (const pointer of pointers.slice(0, 25)) {
+    if (pointer.kind !== 'path') continue;
+    const raw = pointer.raw.startsWith('~/')
+      ? path.join(os.homedir(), pointer.raw.slice(2))
+      : pointer.raw;
+    if (!path.isAbsolute(raw)) continue; // relative claims have no anchor to verify against
+    try {
+      const stats = statSync(raw);
+      if (!stats.isFile() && !stats.isDirectory()) continue;
+      // A file that predates the task is context, not this run's deliverable.
+      // One-minute skew tolerance for clock/fs rounding.
+      if (Number.isFinite(startedMs) && stats.mtimeMs < startedMs - 60_000) continue;
+      count += 1;
+    } catch { /* not on disk — no credit */ }
+  }
+  return count;
 }
 
 export function completionLacksDeliverableEvidence(
@@ -3253,13 +3327,37 @@ export function completionLacksDeliverableEvidence(
   }
 }
 
-async function verifyBackgroundTaskDelivery(
-  task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title'>,
+export async function verifyBackgroundTaskDelivery(
+  task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title' | 'startedAt' | 'createdAt'>,
   finalText: string,
   stoppedReason?: RunStoppedReason,
 ): Promise<{ outcome: 'done' | 'blocked'; reason?: string; blockerType?: BlockerType }> {
-  const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
-  if (classified.outcome === 'blocked') return classified;
+  // The on-disk mtime floor is the TASK's birth, not the current attempt's
+  // start: a resume resets startedAt, which disqualified files a PRIOR attempt
+  // of the same task legitimately wrote (proved live 2026-08-04 — the resumed
+  // run re-verified its own deliverables and the floor rejected them).
+  const deliverableFloor = task.createdAt ?? task.startedAt;
+  let classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
+  if (classified.outcome === 'blocked') {
+    // The self-reported-blocked TEXT heuristic is past-tense-blind: an honest
+    // success narrative recounting an obstacle it already OVERCAME ("the
+    // earlier report was wrong — nothing had been written — so I wrote all
+    // five files fresh; verified on disk") matches the same phrases as a live
+    // blocker (proved live 2026-08-04, stoppedReason 'success'). When the
+    // block came ONLY from the text read — the structural signals (blocked
+    // execution row, stoppedReason, fake transcript) all say done — and the
+    // named deliverables verify on disk, reality outranks the prose. The
+    // structural block paths are untouched.
+    const structural = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, {
+      ignoreFanoutCoverage: true,
+      ignoreSelfReportedBlockedText: true,
+    });
+    if (structural.outcome === 'done' && verifiedOnDiskDeliverables(finalText, deliverableFloor) > 0) {
+      classified = structural;
+    } else {
+      return classified;
+    }
+  }
   if (backgroundCompletionVerificationPauseForTests) await backgroundCompletionVerificationPauseForTests();
 
   const completionEvidence = backgroundCompletionEvidence(task);
@@ -3277,7 +3375,8 @@ async function verifyBackgroundTaskDelivery(
       blockerType: 'unknown',
     };
   }
-  if (completionLacksDeliverableEvidence(task)) {
+  if (completionLacksDeliverableEvidence(task)
+    && verifiedOnDiskDeliverables(finalText, deliverableFloor) === 0) {
     return {
       outcome: 'blocked',
       reason: 'Completion claimed, but the task promised an external deliverable and the run shows no evidence of one (no artifact, no external write, no file written).',
@@ -4866,7 +4965,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          });
 	          break;
 	        }
-	        if (autoContinueAttempts >= BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP) {
+	        if (autoContinueAttempts >= freeAutoContinueCapForTask(task.maxMinutes)) {
 	          // Wave 3 Move A: past the free auto-continue cap, SELF-RESUME only if an
 	          // independent cross-family judge confirms genuine PROGRESS, under the hard
 	          // ceiling, with new tool activity — else park (baseline). Cheap checks first
@@ -4879,8 +4978,19 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          if (dec.needJudge) {
 	            const objective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
 	            const prog = await runProgressJudgeImpl(objective, response.text ?? '', cycleToolCalls);
-	            selfResumeOk = prog.verdict?.progressing === true;
-	            progressReason = prog.verdict?.reason ?? `progress judge ${prog.failure ?? 'no-verdict'} → park`;
+	            if (prog.verdict) {
+	              selfResumeOk = prog.verdict.progressing === true;
+	              progressReason = prog.verdict.reason ?? 'progress judge verdict';
+	            } else {
+	              // Judge INFRA failure (timeout / unavailable / no verdict) is not
+	              // evidence of a stall — parking healthy work on the judge's own
+	              // outage punished the run for the judge's problem (2026-08-04
+	              // audit). Deterministic evidence decides instead: new tool
+	              // activity this cycle → continue; none → park. A real NEGATIVE
+	              // verdict above still parks, and the hard ceiling still bounds.
+	              selfResumeOk = cycleToolCalls > 0;
+	              progressReason = `progress judge ${prog.failure ?? 'no-verdict'} — deterministic fallback (${cycleToolCalls} new tool calls) → ${selfResumeOk ? 'continue' : 'park'}`;
+	            }
 	            emitBackgroundTaskOperational('background_self_resume_check', task, { progressing: selfResumeOk, attempt: autoContinueAttempts, hardCap: BACKGROUND_SELF_RESUME_HARD_CAP, cycleToolCalls, reason: progressReason, selfJudge: prog.selfJudge, judgeFailure: prog.failure ?? null }, selfResumeOk ? 'info' : 'warn');
 	          }
 	          addRunEvent(run.id, { type: 'status', message: `Self-resume at continue ${autoContinueAttempts}: ${selfResumeOk ? 'PROGRESSING → continuing unattended' : 'STOP → parking'} — ${progressReason}`, data: { selfResume: selfResumeOk, autoContinueAttempts, reason: progressReason, cycleToolCalls } });
@@ -4891,7 +5001,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        toolCountAtLastCap = toolCount;
 	        addRunEvent(run.id, {
 	          type: 'status',
-	          message: `Background task hit an internal run budget; continuing automatically (${autoContinueAttempts}/${BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP}).`,
+	          message: `Background task hit an internal run budget; continuing automatically (${autoContinueAttempts}/${freeAutoContinueCapForTask(task.maxMinutes)}).`,
 	          data: { stoppedReason: response.stoppedReason, autoContinueAttempts },
 	        });
 	        const latestTask = getBackgroundTask(task.id) ?? task;
@@ -4901,7 +5011,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          body: [
 	            `Task ${latestTask.id} hit an internal run budget before finishing.`,
 	            `Run: ${run.id}`,
-	            `Automatic continuation: ${autoContinueAttempts}/${BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP}`,
+	            `Automatic continuation: ${autoContinueAttempts}/${freeAutoContinueCapForTask(task.maxMinutes)}`,
 	          ].join('\n'),
 	          runId: run.id,
 	          metadata: {
@@ -5017,6 +5127,26 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	            continue;
 	          }
 	        }
+	      }
+	      // A soft time-budget stop is a PAUSE, not a death (2026-08-04 audit
+	      // rank-2 hazard: a 60-minute task was killed at exactly minute 60,
+	      // mid-work, discarding a resumable run). The granted minutes are spent
+	      // — stop spending — but the work is preserved and one resume/"continue"
+	      // picks it back up. A genuine user cancel still aborts.
+	      const timeBudgetPause = cancelled
+	        && /Exceeded soft max runtime/i.test(latestTask?.cancellationReason ?? '');
+	      if (timeBudgetPause) {
+	        markBackgroundTaskAwaitingContinue(
+	          task.id,
+	          `time budget (${task.maxMinutes} minutes)`,
+	          `Paused at its ${task.maxMinutes}-minute time budget. Progress is saved — resume (or reply "continue") to keep going; finished work stays done.`,
+	        );
+	        finishRun(run.id, {
+	          status: 'cancelled',
+	          message: `Paused at its ${task.maxMinutes}-minute time budget; resumable with progress preserved.`,
+	        });
+	        logger.info({ taskId: task.id, maxMinutes: task.maxMinutes }, 'Background task paused at its time budget (resumable)');
+	        continue;
 	      }
 	      markBackgroundTaskFailed(
 	        task.id,

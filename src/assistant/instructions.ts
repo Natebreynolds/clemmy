@@ -11,6 +11,7 @@ import { renderLearnedBlocks, renderAutonomy, renderCurrentTimeForInstructions, 
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
 import { renderProvenSkillForPrompt } from '../memory/skill-choice-store.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
+import { renderActiveBackgroundWorkForInstructions } from '../execution/background-task-status.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
 import type { MessageIntent } from './message-intent.js';
 
@@ -253,6 +254,10 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const nowBlock = parityOn ? section('Now', renderCurrentTimeForInstructions()) : '';
   const autonomyBlock = parityOn ? section('Autonomy', renderAutonomy()) : '';
   const focusBlock = parityOn ? section('Current Focus', renderFocusForInstructions()) : '';
+  // Running-work visibility is NOT parity-gated: a spawned task the model
+  // cannot see produces "are you working on this?" answers invented from chat
+  // history (live 2026-08-04). Empty when nothing is active.
+  const activeWorkBlock = section('Active Background Work', renderActiveBackgroundWorkForInstructions());
   let skillsBlock = '';
   let relevantSkillsBlock = '';
   if (parityOn) {
@@ -339,6 +344,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
     longTermMemory,
     section('Active Goals', buildGoalsContext()),
     focusBlock,
+    activeWorkBlock,
     relevantSkillsBlock,
     skillsBlock,
     connectedTools,
@@ -396,6 +402,7 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
     section('Working Memory', context.workingMemory),
     section('Active Goals', buildGoalsContext()),
     parityOn ? section('Current Focus', renderFocusForInstructions()) : '',
+    section('Active Background Work', renderActiveBackgroundWorkForInstructions()),
     relevantSkills,
   ].filter(Boolean);
   if (blocks.length === 0) return '';

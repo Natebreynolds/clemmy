@@ -956,7 +956,9 @@ test('background task cockpit exposes logical progress and course-corrects a par
       cards: Array<{ id: string; progressHint: string; raw?: { outcomeSnapshot?: unknown } }>;
     };
     const card = boardBody.cards.find((candidate) => candidate.id === task.id);
-    assert.match(card?.progressHint ?? '', /Do not recreate proven work/i);
+    // The snapshot's nextAction is model-facing resume guidance; the card
+    // renders its plain-voice translation (2026-08-04 jargon cleanup).
+    assert.match(card?.progressHint ?? '', /Paused with progress saved/i);
     assert.ok(card?.raw?.outcomeSnapshot, 'board card carries the durable evidence-first snapshot');
 
     const reviseRes = await fetch(`${h.url}/api/console/background-tasks/${task.id}/contract-revisions`, {
@@ -3369,5 +3371,60 @@ test('guest CLI runs surface as board cards with a working kill endpoint and dra
     updateEnvKey('WORKSPACE_DIRS', '');
     clearWorkspaceProjectCache();
     rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('a running fan-out card leads with the counts so panel truncation can never eat them', async () => {
+  const task = createBackgroundTask({
+    title: 'Research 29 dormant accounts',
+    prompt: 'Research each firm and draft outreach.',
+  });
+  markBackgroundTaskRunning(task.id);
+  declareWorkManifest({
+    sessionId: task.runSessionId,
+    manifestId: 'dormant-accounts',
+    contractVersion: 1,
+    phases: [{ id: 'validate', label: 'Validate contact, duplicate, and draft status' }],
+    items: [{ id: 'firm-a' }, { id: 'firm-b' }, { id: 'firm-c' }],
+  });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    const body = await res.json() as { cards: Array<{ id: string; progressHint: string }> };
+    const card = body.cards.find((candidate) => candidate.id === task.id);
+    assert.ok(card, 'running task is on the board');
+    // The docked panel truncates this string from the RIGHT; the numbers must
+    // lead (live 2026-08-04: "Validate contact, duplicat…" with 12/29 clipped).
+    assert.match(card.progressHint, /^\d+\/\d+ /, `counts lead the hint (got: "${card.progressHint}")`);
+    assert.match(card.progressHint, /Validate contact/, 'the phase label still elaborates after the counts');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a blocked task card speaks plain voice, not runtime reconciliation jargon', async () => {
+  const task = createBackgroundTask({
+    title: 'Draft outreach for dormant accounts',
+    prompt: 'draft the outreach',
+  });
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskBlocked(
+    task.id,
+    'An external-write outcome remains ambiguous. The exact target requires read-only reconciliation before this execution can be called complete.',
+    'Saved partial drafts.',
+  );
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    const body = await res.json() as { cards: Array<{ id: string; progressHint: string; nextSafeAction?: string }> };
+    const card = body.cards.find((candidate) => candidate.id === task.id);
+    assert.ok(card, 'blocked task is on the board');
+    assert.doesNotMatch(card.progressHint, /read-only reconciliation|external-write|execution/i,
+      `runtime jargon never reaches the card (got: "${card.progressHint}")`);
+    assert.doesNotMatch(card.nextSafeAction ?? '', /budget/i, 'continue affordance speaks plain voice');
+  } finally {
+    await h.close();
   }
 });

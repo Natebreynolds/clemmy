@@ -5609,7 +5609,14 @@ async function runConversationCore(
       ) {
         const selfResolve = (() => {
           try {
-            if (HarnessSession.load(options.sessionId)?.sessionRow.kind !== 'chat') return null;
+            // Chat AND background/execution runs. This was chat-only at birth,
+            // which inverted the intent for background tasks: the lane with
+            // NOBODY watching skipped self-settlement, parked on an ambiguous
+            // draft-write, and handed the user "keep working" homework from a
+            // NEEDS-YOU card (live 2026-08-04). Workflow runs keep their own
+            // judge machinery.
+            const sessionKind = HarnessSession.load(options.sessionId)?.sessionRow.kind;
+            if (sessionKind !== 'chat' && sessionKind !== 'execution') return null;
             const parts: string[] = [];
             let unresolved: ReturnType<typeof trulyUnresolvedArtifactClaims> = [];
             try {
@@ -6758,7 +6765,24 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const syntheticRetryOriginalInput = isSyntheticStallRetryInput(options.input)
     ? latestHumanInputForStallRetry(options.sessionId)
     : undefined;
-  const semanticInput = syntheticRetryOriginalInput ?? options.authoritativeUserInput ?? options.input;
+  let semanticInput = syntheticRetryOriginalInput ?? options.authoritativeUserInput ?? options.input;
+  // On a self-continuation the input is the canned nudge, so the memory primer
+  // and tool-recall breadcrumbs were querying "Continue with the next step of
+  // your plan…" on nearly EVERY step of a long unattended run — boilerplate
+  // in, boilerplate out (2026-08-04 efficiency audit). Anchor the semantic
+  // query to the real objective instead: the session goal when one exists,
+  // else the last real human input (for an ad-hoc background task that is its
+  // own composed task prompt). The classifier substitution ~300 lines below
+  // already did this for the context packet; the primer needed it too.
+  if (continuationClassifyEnabled() && semanticInput === CONTINUATION_INPUT) {
+    let anchor = '';
+    try {
+      const goal = safeActiveGoal(options.sessionId);
+      anchor = (goal ? goalObjectiveString(goal) : '') ?? '';
+    } catch { anchor = ''; }
+    if (!anchor) anchor = latestHumanInputForStallRetry(options.sessionId) ?? '';
+    if (anchor) semanticInput = anchor;
+  }
   // The recall-vector embed is FIRE-AND-FORGET, not awaited: it stashes into a
   // TTL'd slot that per-turn fact recall reads OPPORTUNISTICALLY (late arrival
   // still helps mid-turn recalls; absence just drops the relevance term). The
@@ -9064,10 +9088,23 @@ function unattendedAutoRecoverEnabled(): boolean {
 
 /** An unattended run has no human to answer an infra ask. Signalled by the run
  *  session id prefix (`workflow:` / `background:`) — the robust allocation-time
- *  signal — with an execution-kind fallback. Interactive sessions are attended. */
+ *  signal — with an execution-kind fallback. Interactive sessions are attended,
+ *  UNLESS the turn currently failing was daemon-driven: a synthetic directive
+ *  (a proactive report-back relay) runs ON the chat session, and asking the
+ *  user "retry / switch / stop?" about a turn they never sent is pure noise —
+ *  the passive outcome staging already guarantees the content (live
+ *  2026-08-04: a blocked task's report relay hit a transient model error and
+ *  handed the user an infra question). Fail quiet; the deferred-report queue
+ *  and the passive turn remain the floor. */
 function isUnattendedSession(sessionId: string): boolean {
   if (sessionId.startsWith('workflow:') || sessionId.startsWith('background:')) return true;
-  try { return getSession(sessionId)?.kind === 'execution'; } catch { return false; }
+  try {
+    if (getSession(sessionId)?.kind === 'execution') return true;
+  } catch { return false; }
+  try {
+    const lastInput = listEvents(sessionId, { types: ['user_input_received'], desc: true, limit: 1 })[0];
+    return (lastInput?.data as { synthetic?: boolean } | undefined)?.synthetic === true;
+  } catch { return false; }
 }
 
 function countInfraAutoRecover(sessionId: string): number {

@@ -8,6 +8,7 @@ import {
   connectedToolkits,
   reconnectComposio,
   reconnectConnectionId,
+  staleConnectionStory,
   toolkitStatus,
   type ComposioToolkit,
 } from './connect';
@@ -73,4 +74,22 @@ test('reconnect still authorizes when Composio refuses legacy-record deletion', 
   assert.deepEqual(calls, ['disconnect', 'authorize']);
   assert.equal(result.staleRemoved, false);
   assert.equal(result.url, 'https://connect.example.test/gmail');
+});
+
+test('a stale connection tells what broke and when; healthy rows stay quiet (2026-08-04 dead-login-behind-green-light)', () => {
+  const now = Date.parse('2026-08-04T20:00:00Z');
+  assert.equal(
+    staleConnectionStory({ needsReconnect: true, suppressionReason: 'expired', lastFailureAt: '2026-08-04T19:35:00Z' }, now),
+    'Login expired — stopped working 25m ago. Reconnect to keep things running.',
+  );
+  assert.equal(
+    staleConnectionStory({ needsReconnect: true, suppressionReason: 'entity-mismatch', lastFailureAt: '2026-08-02T20:00:00Z' }, now),
+    'Connected under a different identity — stopped working 2d ago. Reconnect to keep things running.',
+  );
+  assert.equal(
+    staleConnectionStory({ status: 'NEEDS_RECONNECT' }, now),
+    'Login expired — reconnect to keep things running.',
+    'a provider-flagged stale row still gets a story without suppression data',
+  );
+  assert.equal(staleConnectionStory({ usable: true, status: 'ACTIVE' }, now), null);
 });

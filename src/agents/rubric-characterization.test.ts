@@ -106,13 +106,25 @@ const GOLDEN = {
   // 2026-08-01 workflow authority subtraction: an exact/unambiguous imperative
   // dispatches the named workflow immediately; only ambiguous thematic matches
   // receive an identifying clarification.
-  instructions: { len: 35006, sha16: '5d066cc63dbf16c9' },
-  native: { len: 34109, sha16: 'f04c8e5d52555c0b' },
-  claudeBrain: { len: 6856, sha16: 'c2d53a0c66080fa6' },
+  // 2026-08-04 grounded status answers: BACKGROUND STATUS is now a SHARED
+  // rubric line (both variants). It previously lived only in the legacy head,
+  // so the default lean install answered "how's it going?" from chat history
+  // — vague reassurance instead of read state. The line also now requires
+  // concrete numbers (items done vs total, current phase, elapsed) over
+  // generic comfort.
+  // 2026-08-04 tool-memory loop restored to the LEAN variant (efficiency
+  // audit): the default rubric had dropped all three operative instructions
+  // (read the injected block, tool_choice_recall before discovery,
+  // tool_choice_remember on success) — the write side of the learning loop
+  // was never requested, so long runs re-discovered per item. Compact shared
+  // line added; the legacy head keeps its verbose original.
+  instructions: { len: 35242, sha16: 'fa01ba7c201ee349' },
+  native: { len: 34345, sha16: '1bbccddf98984ebd' },
+  claudeBrain: { len: 8174, sha16: '837d5fe4608c35ce' },
   // 2026-07-27 live efficiency proof: execution_create already guards against
   // a duplicate active lane, so the lean rubric no longer makes the model dump
   // every user's old executions before opening/reusing the current one.
-  lean: { len: 10401, sha16: 'a64f695fb277ce5a' },
+  lean: { len: 11719, sha16: '5b461b5ea9184f0a' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

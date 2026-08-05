@@ -3486,4 +3486,158 @@ test('a parked task is re-queued rather than counted as undelivered', () => {
     assert.equal(revised?.status, 'pending', `round ${round} did not re-queue a parked task`);
     updateBackgroundTask(task.id, { status: 'blocked' });
   }
+test('a deliverable verified on disk satisfies the completion-evidence gate (shell-written files)', async () => {
+  const { verifiedOnDiskDeliverables } = await import('./background-tasks.js');
+  const { mkdirSync: mkdir2, writeFileSync: write2 } = await import('node:fs');
+  const os2 = await import('node:os');
+  const path2 = await import('node:path');
+  const dir = path2.join(os2.tmpdir(), `clemmy-ondisk-${Date.now()}`);
+  mkdir2(dir, { recursive: true });
+  const file = path2.join(dir, 'example-firms-index.md');
+  const startedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+  write2(file, '# index\n');
+
+  // The exact live 2026-08-04 shape: files written via shell, named in the
+  // completion text, present on disk — previously counted as "no file written".
+  const finalText = `Objective met and verified. Files:\n- \`${file}\`\n- also see ${dir}/missing-file.md`;
+  assert.equal(verifiedOnDiskDeliverables(finalText, startedAt), 1, 'the existing file counts; the missing one does not');
+
+  // A file that predates the task is context, not this run's deliverable.
+  const future = new Date(Date.now() + 10 * 60_000).toISOString();
+  assert.equal(verifiedOnDiskDeliverables(finalText, future), 0, 'pre-existing files earn no credit');
+
+  // Relative paths have no anchor to verify — conservative zero.
+  assert.equal(verifiedOnDiskDeliverables('Wrote ./notes/summary.md', startedAt), 0);
+});
+
+test('negated send mentions create no send-receipt obligation; real send intent still does', async () => {
+  const { taskRequiresExternalSendReceipt } = await import('./background-tasks.js');
+  // Live 2026-08-04: "no emails, no drafts, local file only" matched the
+  // send-intent words and demanded a receipt the task was FORBIDDEN to
+  // produce — an unsatisfiable gate.
+  assert.equal(
+    taskRequiresExternalSendReceipt({
+      title: 'Write local firm profiles',
+      prompt: 'Write markdown files. Local files only — no web, no emails, no drafts, no external services.',
+    }),
+    false,
+    'explicitly forbidden sends are not an obligation',
+  );
+  assert.equal(
+    taskRequiresExternalSendReceipt({
+      title: 'Re-engage dormant accounts',
+      prompt: 'Send the outreach email to each of the 29 accounts.',
+    }),
+    true,
+    'a real send commitment still requires a receipt',
+  );
+});
+
+test('an honest overcame-the-obstacle success narrative with verified files completes done', async () => {
+  const { verifyBackgroundTaskDelivery, createBackgroundTask: create9, markBackgroundTaskRunning: run9 } = await import('./background-tasks.js');
+  const { mkdirSync: mkdir9, writeFileSync: write9 } = await import('node:fs');
+  const os9 = await import('node:os');
+  const path9 = await import('node:path');
+
+  const dir = path9.join(os9.tmpdir(), `clemmy-narrative-${Date.now()}`);
+  mkdir9(dir, { recursive: true });
+  const file = path9.join(dir, 'index.md');
+  write9(file, '# index\n');
+
+  const task = create9({
+    title: 'Write 4 firm profiles plus an index',
+    prompt: 'Write one local markdown file per firm plus an index file. Local files only.',
+  });
+  run9(task.id);
+
+  // The live 2026-08-04 shape: stoppedReason SUCCESS, files verified on disk,
+  // but the narrative recounts a fixed failure ("nothing had been written")
+  // and text-classified as a live blocker.
+  const finalText = [
+    'Done — objective met, and the files genuinely exist on disk (verified before reporting).',
+    'One honest correction: the earlier report was wrong — the folder was not actually there and nothing had been written.',
+    `So I wrote all files fresh just now. Folder: \`${dir}\` — index: \`${file}\``,
+  ].join('\n');
+
+  const outcome = await verifyBackgroundTaskDelivery(
+    { ...task, startedAt: new Date(Date.now() - 60_000).toISOString() },
+    finalText,
+    'success' as never,
+  );
+  assert.equal(outcome.outcome, 'done', `reality outranks the prose read (got: ${outcome.reason ?? ''})`);
+
+  // Without on-disk evidence the text heuristic still protects against
+  // fake-done: same narrative, no files.
+  const hollow = await verifyBackgroundTaskDelivery(
+    { ...task, startedAt: new Date().toISOString() },
+    'I could not finish — the source was unavailable and nothing had been written.',
+    'success' as never,
+  );
+  assert.equal(hollow.outcome, 'blocked', 'a live blocker narrative with no deliverable still blocks');
+});
+
+test('a resumed task credits files a PRIOR attempt wrote (floor = task creation, not attempt start)', async () => {
+  const { verifyBackgroundTaskDelivery: verify10, createBackgroundTask: create10 } = await import('./background-tasks.js');
+  const { mkdirSync: mkdir10, writeFileSync: write10 } = await import('node:fs');
+  const os10 = await import('node:os');
+  const path10 = await import('node:path');
+
+  const dir = path10.join(os10.tmpdir(), `clemmy-resume-floor-${Date.now()}`);
+  mkdir10(dir, { recursive: true });
+  const file = path10.join(dir, 'index.md');
+  write10(file, '# index\n'); // written "by the prior attempt", i.e. before the resume
+
+  const task = create10({
+    title: 'Write firm profiles plus an index file',
+    prompt: 'Write one local markdown file per firm plus an index file. Local files only.',
+  });
+  const outcome = await verify10(
+    {
+      ...task,
+      // The resume path resets startedAt to NOW — after the files were written.
+      startedAt: new Date(Date.now() + 5_000).toISOString(),
+      createdAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+    },
+    `Done — verified fresh on disk. Folder: \`${dir}\` — index: \`${file}\`. Earlier attempt had written nothing, so these were re-created.`,
+    'success' as never,
+  );
+  assert.equal(outcome.outcome, 'done', `prior-attempt files count as this task's deliverables (got: ${outcome.reason ?? ''})`);
+});
+
+test('report-back and self-send phrasing never creates a send obligation; real sends still gate', async () => {
+  const { taskRequiresExternalSendReceipt: gate } = await import('./background-tasks.js');
+  // The three live 2026-08-04 audit repros — all local-only work:
+  assert.equal(gate({
+    title: 'Research firms',
+    prompt: 'Research 20 firms, write /tmp/brief.md, then send me a summary message here when done.',
+  }), false, 'asking for the report-back is the north star, not an external send');
+  assert.equal(gate({
+    title: 'Draft emails locally',
+    prompt: 'Draft the emails and save them locally as files; I will send the emails myself later.',
+  }), false, 'the user sending it themselves is not the run\'s obligation');
+  assert.equal(gate({
+    title: 'Compile findings',
+    prompt: 'Compile findings and deliver the final message back to this chat.',
+  }), false, 'delivery back to the chat is the runtime report-back');
+  // Clause scoping: a REAL send elsewhere in the same prompt still gates.
+  assert.equal(gate({
+    title: 'Invite blast',
+    prompt: 'Send the invite emails to all 40 accounts. Then send me a summary message here.',
+  }), true, 'a genuine outbound send still requires its receipt');
+  assert.equal(gate({
+    title: 'Email me',
+    prompt: 'Send me an email with the compiled report attached.',
+  }), true, 'emailing the user IS a real send — only chat report-back is exempt');
+});
+
+test('free auto-continues cover the granted minutes (no more time-arithmetic park at minute 40)', async () => {
+  const { freeAutoContinueCapForTask } = await import('./background-tasks.js');
+  // The audit headline: 4 free continues × ~10-min slices parked a healthy
+  // 90-minute grant at ~minute 40. The grant now sets the floor.
+  assert.equal(freeAutoContinueCapForTask(90), 9, 'a 90-minute grant earns 9 ~10-min slices');
+  assert.equal(freeAutoContinueCapForTask(60), 6);
+  assert.equal(freeAutoContinueCapForTask(20), 4, 'short grants keep the base cap');
+  assert.equal(freeAutoContinueCapForTask(undefined), 4, 'no grant → base cap');
+  assert.equal(freeAutoContinueCapForTask(240), 24, 'bounded by the hard self-resume ceiling');
+  assert.equal(freeAutoContinueCapForTask(100000), 24, 'never exceeds the hard ceiling');
 });

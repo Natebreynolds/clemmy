@@ -520,6 +520,7 @@ import {
   type ListTraceOptions,
 } from '../runtime/harness/trace-lab.js';
 import { buildStartupDoctor } from '../runtime/startup-doctor.js';
+import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
 
 function toolEventsDir(): string {
   return path.join(process.env.CLEMENTINE_HOME || BASE_DIR, 'state', 'tool-events');
@@ -1727,7 +1728,7 @@ function boardActionForStatus(sourceKind: BoardCard['sourceKind'], status: strin
     return {
       primaryAction: 'continue',
       continueMode: sourceKind === 'background' ? 'background' : 'workflow_resume',
-      nextSafeAction: 'Continue with a fresh budget from the last saved state.',
+      nextSafeAction: 'Pick up where it left off — finished work stays done.',
     };
   }
   if (sourceKind === 'background' && status === 'awaiting_input') {
@@ -10943,6 +10944,29 @@ export function registerConsoleRoutes(
         });
       }
 
+      // Runtime blocker/next-step strings are MODEL-facing resume context
+      // ("read-only reconciliation", "execution", "external write") and are
+      // load-bearing there — but on a board card they read as jargon soup
+      // (live 2026-08-04 screenshot). Translate the known classes to plain
+      // voice at this presentation boundary only; the stored strings the
+      // model resumes from are untouched.
+      const humanizeCardHint = (hint: string): string => {
+        if (!hint) return hint;
+        if (/external.write outcome remains ambiguous/i.test(hint)) {
+          return 'Double-checking whether one of the updates actually went through before calling this done.';
+        }
+        if (/required external write failed/i.test(hint)) {
+          return "One update didn't go through — it needs a fix before this can finish.";
+        }
+        if (/reconcile the ambiguous external write/i.test(hint)) {
+          return 'Verifying the uncertain update without redoing it.';
+        }
+        if (/inspect the saved evidence/i.test(hint)) {
+          return 'Paused with progress saved — resume to finish the remaining items.';
+        }
+        return hint;
+      };
+
       // 1) Background tasks — the autonomous "go do this while I'm away" work.
       //    ?includeArchived=1 surfaces soft-deleted tasks (restore-only) for a
       //    future "Archived" view; default hides them.
@@ -10952,10 +10976,15 @@ export function registerConsoleRoutes(
       for (const task of backgroundTasks) {
         const logicalManifest = summarizeWorkManifests(task.runSessionId).at(-1);
         const logicalPhase = logicalManifest?.phases.find((phase) => phase.id === logicalManifest.currentPhase);
+        // COUNTS FIRST: the docked panel single-line-truncates this string at
+        // ~320px, and with the phase label leading, the numbers were the first
+        // thing clipped — the user saw "Validate contact, duplicat…" while
+        // "12/29" sat dead on the wire (live 2026-08-04). The quantitative
+        // signal must survive any truncation; the label is the elaboration.
         const logicalProgressHint = logicalManifest && logicalPhase
-          ? `${logicalPhase.label}: ${logicalPhase.succeeded}/${logicalPhase.total} · ${logicalManifest.completed}/${logicalManifest.total} through every phase`
+          ? `${logicalPhase.succeeded}/${logicalPhase.total} ${logicalPhase.label} · ${logicalManifest.completed}/${logicalManifest.total} through every phase`
           : logicalManifest && logicalManifest.remaining === 0
-            ? `Logical work complete: ${logicalManifest.completed}/${logicalManifest.total} items through every phase.`
+            ? `All ${logicalManifest.completed}/${logicalManifest.total} items complete through every phase.`
             : '';
         const terminal = task.status === 'done' || task.status === 'failed'
           || task.status === 'aborted' || task.status === 'interrupted';
@@ -10995,7 +11024,7 @@ export function registerConsoleRoutes(
           // Terminal cards must tell terminal truth — a done card carrying a
           // stale "is still running" lastCheckInMessage is a lie (live
           // 2026-07-22). Waiting-question > terminal truth > live check-in.
-          progressHint: (task.status === 'awaiting_input' && task.pendingQuestion
+          progressHint: humanizeCardHint((task.status === 'awaiting_input' && task.pendingQuestion
             ? `Waiting on you: ${task.pendingQuestion.slice(0, 240)}`
             : '')
             || (task.status === 'blocked'
@@ -11004,7 +11033,7 @@ export function registerConsoleRoutes(
             || (terminal
               ? (task.error || (task.status === 'done' ? 'Completed.' : ''))
               : logicalProgressHint || task.lastCheckInMessage)
-            || '',
+            || ''),
           sessionId: task.runSessionId,
           ageMs: ageMs(task.updatedAt),
           updatedAt: task.updatedAt,
@@ -13558,6 +13587,24 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Event types a promoted background task is allowed to mirror onto its
+   * origin chat session's stream. Strictly the "work is happening" shapes:
+   * tools, fan-out counters, workers, steps, heartbeats, external writes,
+   * gate verdicts. Never stream_token (would append to the origin bubble's
+   * text) and never turn-lifecycle types (conversation_completed,
+   * awaiting_user_input, approval_requested) — those belong to the session
+   * that owns the turn, and the client treats them as terminal frames.
+   */
+  const BRIDGED_BACKGROUND_ACTIVITY_TYPES = new Set([
+    'tool_called', 'tool_returned',
+    'worker_started', 'worker_result', 'worker_capped',
+    'batch_started', 'batch_progress', 'batch_completed',
+    'step_started', 'heartbeat',
+    'external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned',
+    'verdict_recorded',
+  ]);
+
+  /**
    * Per-session harness event stream.
    *
    * Used by the desktop chat and the Discord bot to watch a long-
@@ -13607,10 +13654,38 @@ export function registerConsoleRoutes(
       writeEvent('replay', { sessionId, events: [], error: PUBLIC_RUN_FAILURE_TEXT });
     }
 
-    // 2) Live subscription.
+    // 2) Live subscription. Besides the session's own events, forward
+    // activity-shaped events from background tasks this chat spawned: the
+    // promoted run continues under `background:<taskId>`, and without the
+    // bridge this stream is silent for the whole run while the user sits on
+    // the origin chat asking "are you working on this?" (live 2026-08-04).
+    // Turn-lifecycle types are NOT bridged — the origin session owns its own
+    // turn state, and the task's terminal report-back already lands here as
+    // a real turn. Bridged frames keep their own sessionId so clients can
+    // tell delegated work from the foreground turn.
+    const bridgeOriginCache = new Map<string, string | null>();
+    const bridgesToThisSession = (eventSessionId: string): boolean => {
+      if (!eventSessionId.startsWith('background:')) return false;
+      let origin = bridgeOriginCache.get(eventSessionId);
+      if (origin === undefined) {
+        try {
+          origin = getBackgroundTask(eventSessionId.slice('background:'.length))?.originSessionId ?? null;
+        } catch { origin = null; }
+        bridgeOriginCache.set(eventSessionId, origin);
+      }
+      return origin === sessionId;
+    };
     const unsubscribe = actionBus.subscribe((event) => {
       if (event.kind !== 'harness.public_event') return;
-      if (event.sessionId !== sessionId) return;
+      if (event.sessionId !== sessionId) {
+        if (!BRIDGED_BACKGROUND_ACTIVITY_TYPES.has(event.event.type)) return;
+        // One logical call = one row: the native lane also logs a transport-
+        // mirror copy of each MCP tool call, which painted every bridged tool
+        // twice in the chat's live strip (seen 2026-08-04).
+        if ((event.event.type === 'tool_called' || event.event.type === 'tool_returned')
+          && !isCanonicalTopLevelToolEvent(event.event)) return;
+        if (!bridgesToThisSession(event.sessionId)) return;
+      }
       writeEvent('event', event.event);
     });
 

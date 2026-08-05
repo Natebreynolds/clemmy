@@ -9,6 +9,9 @@ export interface HarnessEvent {
   type: string;
   createdAt?: number | string;
   data?: Record<string, unknown>;
+  /** Present on frames bridged from a session other than the subscribed one —
+   * a background task this chat spawned mirroring its live activity here. */
+  sessionId?: string;
 }
 
 export interface ChatPostResult {

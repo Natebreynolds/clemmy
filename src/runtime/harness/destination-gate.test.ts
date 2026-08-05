@@ -401,3 +401,34 @@ test('publishProjectKeyFromCommand: cwd wins; cwd-null derives the PROJECT from 
   assert.equal(publishProjectKeyFromCommand(undefined, 'wrangler pages deploy ./out --project-name x'), undefined, 'no recognized path flag → no key (status quo)');
   assert.equal(publishProjectKeyFromCommand(undefined, ''), undefined);
 });
+
+test('heredoc BODIES are document content, never commands (2026-08-04 markdown-plan false deploy)', () => {
+  // The live repro: a background run writing its own plan file classified as a
+  // `ship` deploy because "1. Ship the draft…" became a pseudo-command.
+  const plan = [
+    "cat > /tmp/plan.md <<'EOF'",
+    '## Next steps',
+    '1. Ship the draft to the team by Friday',
+    '2. Deploy more research on the promoted accounts',
+    'EOF',
+  ].join('\n');
+  const shape = classifyShellCommand(plan);
+  assert.equal(shape.isPublish, false, `prose in a heredoc is not a publish (got verb=${shape.verb} binary=${shape.binary})`);
+
+  // "--prod" inside authored prose must not hard-block either — even when the
+  // COMMAND half legitimately publishes.
+  const deployWithNotes = [
+    "cat > notes.md <<'DOC'",
+    'Later we could run with --prod once approved.',
+    'DOC',
+    'netlify deploy --site fixed-site',
+  ].join('\n');
+  const withNotes = classifyShellCommand(deployWithNotes);
+  assert.equal(withNotes.isPublish, true, 'the real deploy command still classifies');
+  assert.equal(withNotes.isProd, false, 'prose --prod inside the heredoc never upgrades to a hard block');
+
+  // A REAL publish command outside any heredoc still gates exactly as before.
+  const real = classifyShellCommand('netlify deploy --prod --site fixed-site');
+  assert.equal(real.isPublish, true);
+  assert.equal(real.isProd, true);
+});

@@ -54,9 +54,12 @@ function AgentRow({ row, onOpen }: { row: LiveAgentRow; onOpen: () => void }) {
             <span className="min-w-0 flex-1 truncate text-small font-medium text-fg" title={row.title}>{row.title}</span>
             <span className="shrink-0 text-caption text-faint">{row.updatedLabel}</span>
           </span>
-          <span className="mt-1 flex min-w-0 items-center gap-2 pl-4">
+          <span className="mt-1 flex min-w-0 items-start gap-2 pl-4">
             <span className="shrink-0 rounded border border-border px-1.5 py-px text-caption text-muted">{sourceKindLabel(row.sourceKind)}</span>
-            <span className="min-w-0 flex-1 truncate text-caption text-muted" title={row.statusLine}>
+            {/* line-clamp-2, NOT truncate: the status line carries the progress
+                counts, and a single-line ellipsis in a 320px panel cut them off —
+                the board card already clamps this same field to two lines. */}
+            <span className="min-w-0 flex-1 line-clamp-2 text-caption text-muted" title={row.statusLine}>
               {row.statusLine || 'Working…'}
             </span>
             <ArrowRight className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden />

@@ -410,3 +410,52 @@ export function watchForLateCompletion(
   setTimeout(() => { void tick(); }, intervalMs);
   return { cancel: () => { cancelled = true; } };
 }
+
+/**
+ * Idle-chat window onto delegated work (2026-08-04). When a turn promotes its
+ * work to a background task, the run continues under `background:<taskId>` and
+ * the server bridges that task's activity-shaped public events onto the origin
+ * session's stream. This subscription is how the idle chat sees them: it
+ * listens ONLY for bridged frames (sessionId present and ≠ the subscribed
+ * session) and ignores replay + own-session frames entirely, so it can never
+ * interfere with the per-turn stream's transcript or terminal handling.
+ * Keeping this EventSource open while the chat is on screen also registers the
+ * viewer presence the terminal report-back uses to decide whether a finished
+ * run still owes an out-of-band ping.
+ */
+export function subscribeDelegatedActivity(
+  sessionId: string,
+  onEvent: (ev: HarnessEvent) => void,
+): () => void {
+  let closed = false;
+  let es: EventSource | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (closed) return;
+    es = new EventSource(withToken(`/api/sessions/${encodeURIComponent(sessionId)}/events`));
+    es.addEventListener('event', (e) => {
+      try {
+        const ev = JSON.parse((e as MessageEvent).data) as HarnessEvent;
+        if (!ev || typeof ev.type !== 'string') return;
+        if (!ev.sessionId || ev.sessionId === sessionId) return; // own-turn frames belong to the turn stream
+        onEvent(ev);
+      } catch { /* malformed frame — skip */ }
+    });
+    es.onerror = () => {
+      // Missing session (fresh chat) or daemon restart — back off and retry
+      // while the chat stays open; the strip is a best-effort live view.
+      try { es?.close(); } catch { /* already closed */ }
+      es = null;
+      if (!closed) retryTimer = setTimeout(connect, 30_000);
+    };
+  };
+  connect();
+
+  return () => {
+    closed = true;
+    if (retryTimer) clearTimeout(retryTimer);
+    try { es?.close(); } catch { /* already closed */ }
+    es = null;
+  };
+}

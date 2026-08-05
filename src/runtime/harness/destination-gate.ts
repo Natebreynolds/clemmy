@@ -488,8 +488,24 @@ function tokenize(segment: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Remove heredoc BODIES before segmenting. A heredoc body is document content,
+ * not commands — splitting it on newlines turned every prose line into a
+ * pseudo-command, so a markdown plan written via `cat > plan.md <<'EOF'`
+ * containing "1. Ship the draft to the team" classified as a `ship` deploy
+ * (binary "1."), and any `--prod` in the prose upgraded it to a hard block
+ * (live 2026-08-04 repro). The `cat > …` command line itself stays; only the
+ * lines between <<DELIM and the closing DELIM are excised.
+ */
+export function stripHeredocBodies(command: string): string {
+  return command.replace(
+    /<<-?\s*(["']?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\s*(?:[\r\n]|$))/g,
+    '<<HEREDOC_BODY_ELIDED',
+  );
+}
+
 function shellSegments(command: string): string[] {
-  return command.split(/&&|\|\||;|\||[\r\n]+/);
+  return stripHeredocBodies(command).split(/&&|\|\||;|\||[\r\n]+/);
 }
 
 function normalizedBinaryName(token: string | undefined): string | undefined {
@@ -549,8 +565,10 @@ function classifyOneShellCommand(command: string): ShellWriteShape {
   if (!command || typeof command !== 'string') {
     return { isPublish: false, verb: undefined, binary: undefined, hasExplicitDestination: false, isProd: false };
   }
-  // Strip quoted regions so verbs inside messages/strings don't match.
-  const unquoted = command.replace(/"[^"]*"/g, ' ').replace(/'[^']*'/g, ' ');
+  // Heredoc bodies FIRST (they are document content, and the quote-strip below
+  // would eat a quoted delimiter like <<'EOF' before the excision could match),
+  // THEN quoted regions so verbs inside messages/strings don't match.
+  const unquoted = stripHeredocBodies(command).replace(/"[^"]*"/g, ' ').replace(/'[^']*'/g, ' ');
   const segments = shellSegments(unquoted);
 
   let verb: string | undefined;
@@ -590,7 +608,9 @@ function classifyOneShellCommand(command: string): ShellWriteShape {
   // downgrade to a one-shot draft block. Re-check the RAW command for --prod. We
   // only reach here when a publish verb was already found, so a stray --prod in
   // an unrelated quoted string can't trip this (isPublish would be false).
-  const isProdRaw = isProd || /(?:^|[\s"'=])--(prod|production)\b/i.test(command);
+  // Heredoc bodies are excised first — "--prod" inside authored document text
+  // must never upgrade a draft flag to a hard block (2026-08-04).
+  const isProdRaw = isProd || /(?:^|[\s"'=])--(prod|production)\b/i.test(stripHeredocBodies(command));
   return { isPublish: true, verb, binary, hasExplicitDestination, isProd: isProdRaw };
 }
 

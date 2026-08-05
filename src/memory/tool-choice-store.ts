@@ -4,6 +4,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
+import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { liveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import {
@@ -1317,6 +1318,13 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
     aliases: procedure.aliases,
   });
   emitToolChoiceEvent('remember', input.intent, choice.identifier);
+  // A newly-proven tool choice is an EXPLICIT stable-context mutation: the
+  // Claude-brain lane freezes its "Remembered Tool Choices" block per session,
+  // and without this bump a slug proven on item 1 of a 30-item background run
+  // stayed invisible for items 2–30 — every item re-paid discovery
+  // (2026-08-04 efficiency audit). Covers both the tool_choice_remember tool
+  // and the composio auto-remember, which route through here.
+  try { bumpStableContextGeneration(); } catch { /* generation bump is best-effort */ }
   return saved;
 }
 

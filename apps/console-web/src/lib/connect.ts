@@ -32,6 +32,9 @@ export interface ComposioConnection {
   usable?: boolean;
   needsReconnect?: boolean;
   suppressionReason?: string | null;
+  /** When execution last proved this connection broken — drives the
+   *  "stopped working Xm ago" line. */
+  lastFailureAt?: string | null;
   accountEmail?: string | null;
   accountName?: string | null;
   /** The user's memory label for this account ("work", "personal"), from
@@ -466,4 +469,28 @@ export function isConnected(row: { connected?: boolean; configured?: boolean; st
   const s = (row.status ?? '').toLowerCase();
   if (s === 'connected' || s === 'env_only') return true;      // SecretHealthRow statuses
   return /connect|ready|ok|configured|enabled|active|set/.test(s) && !/missing|needs|not|error|down/.test(s);
+}
+
+/**
+ * The plain-words story for a connection that needs reconnecting (the pill
+ * alone said "Reconnect" with no why — and a dead login can sit behind a
+ * provider label that still reads Active). Returns null for healthy rows.
+ */
+export function staleConnectionStory(conn: ComposioConnection, nowMs = Date.now()): string | null {
+  const needsReconnect = conn.needsReconnect === true || (conn.status ?? '').toUpperCase() === 'NEEDS_RECONNECT';
+  if (!needsReconnect) return null;
+  const why = conn.suppressionReason === 'entity-mismatch'
+    ? 'Connected under a different identity'
+    : conn.suppressionReason === 'not-connected'
+      ? 'Connection lost'
+      : 'Login expired';
+  const at = conn.lastFailureAt ? Date.parse(conn.lastFailureAt) : NaN;
+  if (!Number.isFinite(at)) return `${why} — reconnect to keep things running.`;
+  const minutes = Math.max(1, Math.round((nowMs - at) / 60_000));
+  const ago = minutes < 60
+    ? `${minutes}m ago`
+    : minutes < 48 * 60
+      ? `${Math.round(minutes / 60)}h ago`
+      : `${Math.round(minutes / (60 * 24))}d ago`;
+  return `${why} — stopped working ${ago}. Reconnect to keep things running.`;
 }

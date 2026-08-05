@@ -642,13 +642,20 @@ export function buildAgentContextPacket(
   const agentSystem = renderAgentSystemGuidance(input, opts?.sessionKind);
   const fanoutPosture = agentSystem.policy?.fanoutPosture ?? 'unknown';
   const recommendedWorkerWaveSize = agentSystem.policy?.recommendedWorkerWaveSize ?? 8;
+  // The count-aware fan-out directive belongs to EVERY non-workflow lane.
+  // It was chat-only, so a 30-item BACKGROUND task — the lane built for big
+  // work — detected the 30 items, logged the detection, and then silently
+  // withheld the one instruction that names the count and says "run_worker
+  // with the full items array" (2026-08-04 efficiency audit; matches the
+  // measured chat-runs-heavy-work-as-one-loop pattern). Workflow keeps its
+  // own line; the policy block applies wherever the directive can fire.
+  const fanoutLaneEligible = multiItem.isMultiItem && opts?.sessionKind !== 'workflow';
   const fanoutBlockedByPolicy = Boolean(
-    multiItem.isMultiItem &&
-    opts?.sessionKind === 'chat' &&
+    fanoutLaneEligible &&
     agentSystem.policy &&
     (agentSystem.policy.fanoutPosture === 'block' || agentSystem.policy.fanoutPosture === 'constrain'),
   );
-  const offerFanout = multiItem.isMultiItem && opts?.sessionKind === 'chat' && !fanoutBlockedByPolicy;
+  const offerFanout = fanoutLaneEligible && !fanoutBlockedByPolicy;
   const parallelismLine = opts?.sessionKind === 'workflow'
     ? WORKFLOW_PARALLELISM_LINE
     : offerFanout

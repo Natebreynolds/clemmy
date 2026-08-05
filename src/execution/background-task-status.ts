@@ -258,7 +258,6 @@ function latestActivity(details: Omit<BackgroundTaskStatusDetails, 'latestActivi
 } {
   const candidates: Array<{ at: string; summary: string }> = [];
   const task = details.task;
-  if (task.updatedAt) candidates.push({ at: task.updatedAt, summary: `Task status is ${task.status}.` });
   if (task.lastCheckInAt && task.lastCheckInMessage) {
     candidates.push({ at: task.lastCheckInAt, summary: task.lastCheckInMessage });
   }
@@ -278,6 +277,13 @@ function latestActivity(details: Omit<BackgroundTaskStatusDetails, 'latestActivi
     candidates.push({ at: notification.createdAt, summary: notification.title });
   }
   candidates.sort((left, right) => right.at.localeCompare(left.at));
+  // The bare task record is a FALLBACK, not activity: any record write bumps
+  // updatedAt, so seeding it as a candidate made "Latest activity" collapse to
+  // the literal "Task status is running." whenever real events were sparse —
+  // exactly the useless answer a user asking "how's it going?" already has.
+  if (!candidates.length && task.updatedAt) {
+    candidates.push({ at: task.updatedAt, summary: `Task status is ${task.status}; no run activity recorded yet.` });
+  }
   return {
     latestActivityAt: candidates[0]?.at,
     latestActivitySummary: candidates[0]?.summary,
@@ -336,6 +342,16 @@ function timeOnly(value?: string): string {
   return value ? value.slice(11, 19) : '--:--:--';
 }
 
+function elapsedLabel(startedAt: string): string {
+  const startedMs = Date.parse(startedAt);
+  if (!Number.isFinite(startedMs)) return 'unknown';
+  const totalMinutes = Math.max(0, Math.floor((Date.now() - startedMs) / 60_000));
+  if (totalMinutes < 1) return 'under a minute';
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
 function renderApproval(approval: PendingApprovalRow): string {
   const tool = approval.tool ? ` via ${approval.tool}` : '';
   return `- ${approval.approvalId}${tool}: ${approval.subject}`;
@@ -359,6 +375,11 @@ export function renderBackgroundTaskStatus(details: BackgroundTaskStatusDetails)
     `Run: ${details.runId}`,
     `Session: ${task.runSessionId}`,
     task.startedAt ? `Started: ${task.startedAt}` : '',
+    task.startedAt && !task.completedAt ? `Elapsed: ${elapsedLabel(task.startedAt)}` : '',
+    // The truthful total (housekeeping included) — the humanized feed below is
+    // filtered, so without this line the model reads 12 rows and reports "a
+    // dozen calls" for a 200-call run.
+    details.toolCallCount > 0 ? `Tool calls so far: ${details.toolCallCount}` : '',
     task.completedAt ? `Completed: ${task.completedAt}` : '',
     task.error ? `Error: ${task.error}` : '',
     `Contract: v${task.contractVersion ?? 1}${task.pendingContractRevision ? ` (v${task.pendingContractRevision.version} queued for the next model boundary)` : ''}`,
@@ -382,6 +403,29 @@ export function renderBackgroundTaskStatus(details: BackgroundTaskStatusDetails)
     }
   }
 
+  // Progress-shaped run events (fan-out counters, heartbeats, step starts) —
+  // previously fetched and silently dropped, leaving the model nothing
+  // quantitative for runs without a work manifest (any single-loop run).
+  const progressEvents = details.harnessEvents
+    .filter((event) => event.type === 'batch_progress' || event.type === 'step_started'
+      || (event.type === 'heartbeat' && (event.data as { kind?: unknown } | undefined)?.kind === 'progress_check_in'))
+    .slice(0, 5)
+    .reverse();
+  if (progressEvents.length > 0) {
+    lines.push('', 'Run progress:', ...progressEvents.map((event) => {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      if (event.type === 'batch_progress') {
+        const failed = typeof data.failed === 'number' && data.failed > 0 ? ` (${data.failed} failed)` : '';
+        return `- ${timeOnly(event.createdAt)} items: ${data.done ?? '?'}/${data.total ?? '?'} done${failed}`;
+      }
+      if (event.type === 'step_started') {
+        return `- ${timeOnly(event.createdAt)} step: ${typeof data.title === 'string' ? data.title : 'next step'}`;
+      }
+      const message = typeof data.message === 'string' ? data.message : `${data.steps ?? '?'} steps completed`;
+      return `- ${timeOnly(event.createdAt)} ${message}`;
+    }));
+  }
+
   const recentTools = details.toolEvents.slice(-12);
   if (recentTools.length > 0) {
     lines.push('', 'Recent tool activity:', ...recentTools.map(renderToolEvent));
@@ -402,4 +446,47 @@ export function renderBackgroundTaskStatus(details: BackgroundTaskStatusDetails)
   }
 
   return lines.join('\n');
+}
+
+/**
+ * One-glance snapshot of active background work for the CHAT prompt. Until now
+ * the only per-turn signal that spawned work existed was an optional focus
+ * "Linked actions" line that frequently was not written (no pin, stale focus,
+ * different surface) — so the model answered "are you working on this?" with
+ * no evidence a task even existed (live 2026-08-04). This block gives every
+ * chat turn the running work's title, elapsed time, and item counts, and the
+ * BACKGROUND STATUS rubric line points at `background_task_status` for depth.
+ * Empty string when nothing is active — casual chats carry zero overhead.
+ */
+export function renderActiveBackgroundWorkForInstructions(): string {
+  let tasks: BackgroundTaskRecord[];
+  try {
+    tasks = listBackgroundTasks().filter((task) => task.status === 'pending'
+      || task.status === 'running'
+      || task.status === 'awaiting_approval'
+      || task.status === 'awaiting_input'
+      || task.status === 'awaiting_continue');
+  } catch {
+    return '';
+  }
+  if (tasks.length === 0) return '';
+  const lines = tasks.slice(0, 3).map((task) => {
+    const parts: string[] = [`- [${task.status.replace(/_/g, ' ')}] ${task.title}`];
+    if (task.startedAt && !task.completedAt) parts.push(`${elapsedLabel(task.startedAt)} in`);
+    try {
+      const manifest = summarizeWorkManifests(task.runSessionId)[0];
+      if (manifest && manifest.total > 0) {
+        const phase = manifest.phases.find((p) => p.running > 0 || p.succeeded < p.total);
+        parts.push(`${manifest.completed}/${manifest.total} items through every phase${phase ? `; now: ${phase.label} ${phase.succeeded}/${phase.total}` : ''}`);
+      }
+    } catch { /* manifest read is best-effort */ }
+    if (task.status === 'awaiting_approval') parts.push('waiting on an approval from the user');
+    if (task.status === 'awaiting_input') parts.push('waiting on an answer from the user');
+    return parts.join(' — ');
+  });
+  const overflow = tasks.length > 3 ? `\n(${tasks.length - 3} more — \`background_tasks_recent\` lists them.)` : '';
+  return [
+    'Background work you already have in flight (when asked how it is going, answer from THIS and `background_task_status` — never guess):',
+    ...lines,
+  ].join('\n') + overflow;
 }

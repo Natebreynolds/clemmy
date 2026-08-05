@@ -809,6 +809,11 @@ export function invalidateStableMemorySnapshot(sessionId?: string): void {
 function renderStableMemoryFrozen(request: AssistantRequest): string {
   const render = (): string => renderCanonicalMemoryContext({
     sessionId: request.sessionId,
+    // Rank tool choices/facts against THIS request. Without it the block fell
+    // back to the machine-wide focus — for an unattended background run that
+    // is whatever the user last touched in chat, so the proven memo for the
+    // task at hand rarely made the 12-entry recency fold (2026-08-04 audit).
+    focusInput: request.message,
     partition: 'stable',
     includeSessionActions: false,
   });

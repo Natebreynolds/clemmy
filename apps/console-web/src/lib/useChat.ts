@@ -8,8 +8,11 @@ import {
   cancelPendingChatRequest,
   moveSessionToBackground,
   humanHarnessText,
+  subscribeDelegatedActivity,
+  isTerminalEvent,
   type StreamHandle,
 } from './chat';
+import { rememberLastChatSession, unifiedChatSessionId } from './last-session';
 import { apiGet, type ApiError } from './api';
 import { getPendingActionStatus } from './pendingActions';
 import { humanToolLabel, salientArgDetail, describeExternalWrite } from './toolLabels';
@@ -53,6 +56,11 @@ export interface ChatMessage {
   /** Live, accumulated tool calls + spawned agents for THIS turn — the premium
    *  "watch the team work" strip (vs. a single rolling label). */
   activity?: ActivityItem[];
+  /** Set on the delegated-work live strip only: this bubble is a real-time
+   *  window onto a background task, not a turn reply. Carries what the premium
+   *  frame needs — a ticking elapsed anchor and the task id for the
+   *  watch-the-full-run deep link. */
+  delegated?: { startedAt: number; taskId?: string };
   approval?: {
     subject: string;
     reason?: string;
@@ -120,6 +128,11 @@ export function appendLiveApprovalCard(
 let idSeq = 0;
 const nextId = () => `m${++idSeq}-${performance.now().toFixed(0)}`;
 const EMPTY_ACTIVITY: ActivityItem[] = [];
+
+/** Client-only synthetic bubble that shows a spawned background task's live
+ *  activity while this chat is idle. Never persisted — the server bridge
+ *  re-seeds it on the next bridged frame after a reopen. */
+const DELEGATED_STRIP_ID = 'delegated-work-live';
 
 function providerFromModel(model: string): ActivityItem['provider'] {
   const id = model.toLowerCase();
@@ -629,6 +642,31 @@ export interface UseChatOptions {
   initialSessionId?: string | null;
   /** Seed the thread with already-loaded history (e.g. a reopened session). */
   initialMessages?: ChatMessage[];
+  /** Record this conversation as the user's active chat (survives navigation;
+   *  the chat index returns to it). Main chat surfaces only — auxiliary docks
+   *  like the workspace panel must not steal the pointer. */
+  rememberAsLastSession?: boolean;
+  /** On mount with an in-flight turn server-side, reattach to its live stream
+   *  instead of showing a dead transcript with an enabled composer. */
+  reattachActiveRun?: boolean;
+}
+
+/**
+ * The reattach predicate: the seq of the last REAL user input (synthetic
+ * outcome turns are report-backs, not the user) when no terminal event
+ * follows it — i.e. a turn is still running server-side — else null.
+ */
+export function inFlightTurnSince(
+  events: Array<{ seq: number; type: string; data?: Record<string, unknown> }>,
+): number | null {
+  let lastUserSeq = -1;
+  for (const ev of events) {
+    if (ev.type === 'user_input_received' && !(ev.data as { synthetic?: boolean } | undefined)?.synthetic) {
+      lastUserSeq = ev.seq;
+    }
+  }
+  if (lastUserSeq < 0) return null;
+  return events.some((ev) => ev.seq > lastUserSeq && isTerminalEvent(ev.type)) ? null : lastUserSeq;
 }
 
 export function useChat(options?: UseChatOptions) {
@@ -726,7 +764,10 @@ export function useChat(options?: UseChatOptions) {
             const seenApprovals = new Set(prev.map((m) => m.approval?.approvalId).filter(Boolean));
             const fresh = additions.filter((m) => !seenIds.has(m.id)
               && (!m.approval?.approvalId || !seenApprovals.has(m.approval.approvalId)));
-            return fresh.length ? [...prev, ...fresh] : prev;
+            if (!fresh.length) return prev;
+            // A report-back or approval card landing supersedes the live
+            // delegated-work strip — the real outcome replaces the live view.
+            return [...prev.filter((m) => m.id !== DELEGATED_STRIP_ID), ...fresh];
           });
         }
       } catch { /* transient poll failure — next tick retries; reopen remains the floor */ }
@@ -734,6 +775,129 @@ export function useChat(options?: UseChatOptions) {
     void tick();
     const timer = window.setInterval(() => { void tick(); }, 5000);
     return () => { stopped = true; window.clearInterval(timer); };
+  }, [busy]);
+
+  // Mount identity + teardown (2026-08-04 static-window work). Recording the
+  // restored session keeps the chat index pointing at the conversation the
+  // user actually has open; the cleanup closes the turn's EventSource and
+  // late-completion watch, which previously outlived the component and kept
+  // writing into a dead tree for up to the reconnect window. Server-side, the
+  // run is untouched by this teardown.
+  useEffect(() => {
+    if (options?.rememberAsLastSession && options?.initialSessionId) {
+      rememberLastChatSession(unifiedChatSessionId(options.initialSessionId));
+    }
+    return () => {
+      streamRef.current?.stop();
+      streamRef.current = null;
+      lateWatchRef.current?.cancel();
+      lateWatchRef.current = null;
+    };
+    // Mount/unmount lifecycle only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Live-run reattach (2026-08-04): a thread reopened WHILE its turn runs
+  // server-side previously showed the user's message with no reply, an
+  // enabled composer, and never updated — the stream was only ever attached
+  // by send(). On mount, detect an in-flight turn (a real user input with no
+  // terminal event after it) and resume its stream from that point, which
+  // also replays the partial reply text and activity into a live bubble.
+  useEffect(() => {
+    if (!options?.reattachActiveRun || !options?.initialSessionId) return;
+    const sid = options.initialSessionId;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const out = await apiGet<{ latestSeq: number; events: Array<{ seq: number; type: string; data?: Record<string, unknown> }> }>(
+          `/api/sessions/${encodeURIComponent(sid)}/events/recent?limit=200`,
+        );
+        if (cancelled) return;
+        const lastUserSeq = inFlightTurnSince(out.events ?? []);
+        if (lastUserSeq === null) return;
+        const assistantId = `reattach-${Date.now().toString(36)}`;
+        setBusy(true);
+        activeAssistantId.current = assistantId;
+        setMessages((prev) => [...prev, {
+          id: assistantId,
+          role: 'assistant' as const,
+          text: '',
+          status: 'thinking' as const,
+          progress: 'Reconnecting to the run…',
+        }]);
+        const handle = runHarnessStream(sid, { sinceSeq: lastUserSeq, onEvent: (ev) => applyEvent(assistantId, ev) });
+        streamRef.current = handle;
+        const result = await handle.promise;
+        if (cancelled) return;
+        if (!result.ok) {
+          // Stream gave up but the run may still finish — same late-recovery
+          // net send() uses.
+          lateWatchRef.current = watchForLateCompletion(sid, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev));
+        }
+        setBusy(false);
+      } catch {
+        // Reattach is best-effort; the transcript remains readable either way.
+        if (!cancelled) setBusy(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // Mount-time recovery only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Delegated-work live strip (2026-08-04): a promoted task keeps running
+  // under its own background session while this chat sits idle, and until now
+  // the chat showed NOTHING for the whole run — the user's only recourse was
+  // asking "are you working on this?". The server now bridges the task's
+  // activity-shaped events onto this session's stream; while idle, render
+  // them as one live "working" bubble at the end of the transcript. The strip
+  // is client-only: a new turn or a landed report-back removes it.
+  useEffect(() => {
+    if (busy) {
+      // The per-turn stream owns the screen during a live turn.
+      setMessages((prev) => (prev.some((m) => m.id === DELEGATED_STRIP_ID)
+        ? prev.filter((m) => m.id !== DELEGATED_STRIP_ID)
+        : prev));
+      return;
+    }
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    return subscribeDelegatedActivity(sid, (ev) => {
+      const label = progressLabel(ev);
+      const taskId = ev.sessionId?.startsWith('background:')
+        ? ev.sessionId.slice('background:'.length)
+        : undefined;
+      setMessages((prev) => {
+        const idx = prev.findIndex((m) => m.id === DELEGATED_STRIP_ID);
+        if (idx === -1) {
+          const seeded = reduceActivity(EMPTY_ACTIVITY, ev);
+          if (!seeded.length && !label) return prev;
+          return [...prev, {
+            id: DELEGATED_STRIP_ID,
+            role: 'assistant' as const,
+            text: '',
+            status: 'thinking' as const,
+            progress: label ?? 'Working on this in the background…',
+            delegated: { startedAt: Date.now(), ...(taskId ? { taskId } : {}) },
+            ...(seeded.length ? { activity: seeded } : {}),
+          }];
+        }
+        const cur = prev[idx];
+        const before = cur.activity ?? EMPTY_ACTIVITY;
+        const activity = reduceActivity(before, ev);
+        if (activity === before && !label) return prev;
+        const next = [...prev];
+        next[idx] = {
+          ...cur,
+          ...(activity !== before ? { activity } : {}),
+          ...(label ? { progress: label } : {}),
+          ...(cur.delegated && !cur.delegated.taskId && taskId
+            ? { delegated: { ...cur.delegated, taskId } }
+            : {}),
+        };
+        return next;
+      });
+    });
   }, [busy]);
 
   const applyEvent = useCallback((assistantId: string, ev: HarnessEvent) => {
@@ -869,6 +1033,7 @@ export function useChat(options?: UseChatOptions) {
       // bound. Until then it remains reusable for an explicit resend.
       if (pendingPostRef.current === pending) pendingPostRef.current = null;
       sessionIdRef.current = body.sessionId;
+      if (options?.rememberAsLastSession) rememberLastChatSession(unifiedChatSessionId(body.sessionId));
       activeRunRef.current = body;
       // The background button is available immediately for responsiveness,
       // but authority arrives only in the 202. Queue an early click and apply
@@ -904,7 +1069,12 @@ export function useChat(options?: UseChatOptions) {
       // Validation/conflict errors prove the server did not accept this exact
       // request. Transport/restart failures retain it for a safe replay.
       if (!isRetryableChatPostError(e) && postAbortRef.current === postAbort) pendingPostRef.current = null;
-      if (e.status === 404) sessionIdRef.current = null;
+      if (e.status === 404) {
+        sessionIdRef.current = null;
+        // The session is gone server-side — a stale pointer would bounce the
+        // chat index into a dead thread forever.
+        if (options?.rememberAsLastSession) rememberLastChatSession(null);
+      }
       const msg = (e.message || '').trim();
       const text = !msg || looksRawError(msg) ? GENERIC_TURN_ERROR : `Couldn't send: ${msg}`;
       patch(assistantId, { text, status: 'failed', progress: undefined });

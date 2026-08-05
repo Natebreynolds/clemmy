@@ -232,6 +232,10 @@ export interface ComposioDashboardConnection {
   needsReconnect: boolean;
   suppressionReason: string | null;
   suppressUntil: string | null;
+  /** When execution last proved this connection broken (suppression evidence).
+   *  Null while the connection is healthy. Drives the Connect screen's
+   *  "stopped working Xm ago" honesty line. */
+  lastFailureAt: string | null;
   alias: string | null;
   accountLabel: string | null;
   accountEmail: string | null;
@@ -441,7 +445,7 @@ export class ComposioDispatchUncertainError extends Error {
  * mutation committed; it cannot become an instance created by this process
  * before dispatch. */
 export class ComposioPreDispatchError extends ExternalWritePreDispatchError {
-  readonly reason: 'cli-unavailable' | 'cli-auth' | 'sdk-unavailable' | 'tool-not-found';
+  readonly reason: 'cli-unavailable' | 'cli-auth' | 'sdk-unavailable' | 'tool-not-found' | 'connection-ambiguous';
 
   constructor(
     reason: ComposioPreDispatchError['reason'],
@@ -934,6 +938,37 @@ async function loadConnectedAccountItems(): Promise<Array<Record<string, unknown
 
 /** Dispatch entity for a resolved/pinned connection: the userId that OWNS it
  *  (from the snapshot), else the configured/derived fallback. Pure. */
+/**
+ * When identity resolution ends ambiguous (2+ distinct connected accounts) or
+ * identity-absent (the remembered mailbox is gone) AND the dispatch entity owns
+ * none of the toolkit's connections, a bare dispatch is provably doomed — the
+ * backend answers "no active connection", which reads as NOT CONNECTED to a
+ * user whose Connect screen shows Active (live 2026-08-04 invite blast).
+ * Returns the REAL question to surface instead, or null when a bare dispatch
+ * might legitimately succeed. Pure + exported for the pin test.
+ */
+export function bareDispatchDoomedQuestion(
+  outcome: ToolkitConnectionOutcome,
+  snapshotConns: ConnectedToolkit[],
+  toolSlug: string,
+  dispatchUserId: string,
+): string | null {
+  if (outcome.kind !== 'ambiguous' && outcome.kind !== 'identity-absent') return null;
+  const toolLower = toolSlug.toLowerCase();
+  const entityOwnsOne = snapshotConns.some((c) => c.connectionId
+    && toolMatchesConnection(toolLower, (c.slug ?? '').toLowerCase())
+    && (c.ownerUserId ?? '') === dispatchUserId);
+  if (entityOwnsOne) return null;
+  const candidates = outcome.candidates
+    .map((c) => c.email || c.wordId || c.connectionId)
+    .filter(Boolean)
+    .slice(0, 6)
+    .join(', ');
+  return outcome.kind === 'identity-absent'
+    ? `The remembered account (${outcome.want}) is no longer connected for this toolkit. Connected now: ${candidates || 'none'}. Ask the user which account to use (or to reconnect the remembered one) — do NOT retry unchanged and do NOT report the toolkit as disconnected.`
+    : `Multiple accounts are connected for this toolkit (${candidates}). Ask the user which one to use — do NOT retry unchanged and do NOT report the toolkit as disconnected.`;
+}
+
 export function dispatchUserIdFor(
   connectionId: string | undefined,
   conns: ConnectedToolkit[],
@@ -1084,6 +1119,7 @@ export function toComposioDashboardConnection(
     needsReconnect,
     suppressionReason: suppressed ? suppression.reason ?? 'suppressed' : null,
     suppressUntil: suppressed ? suppression.suppressUntil : null,
+    lastFailureAt: suppressed ? suppression.lastErrorAt ?? null : null,
     alias: connection.alias ?? null,
     accountLabel: connection.accountLabel ?? null,
     accountEmail: connection.accountEmail ?? null,
@@ -1908,7 +1944,11 @@ export async function executeComposioTool(
   // opaque user_id default. Served SWR-instant from the cached snapshot (E1);
   // the self-heal below backstops a just-changed connection.
   let selfHealedConnection = false;
-  let resolvedConnection = pinnedAccountId ?? (await resolveToolkitConnectionId(toolSlug, preferredIdentity));
+  const resolutionOutcome = pinnedAccountId
+    ? null
+    : await resolveToolkitConnectionOutcome(toolSlug, preferredIdentity);
+  let resolvedConnection = pinnedAccountId
+    ?? (resolutionOutcome?.kind === 'resolved' ? resolutionOutcome.connectionId : undefined);
   // OWNER-PAIR dispatch: Composio validates that userId and connectedAccountId
   // MATCH — a pinned connection dispatched under a different entity 400s with
   // ConnectedAccountEntityIdMismatch. So the dispatch userId is the entity that
@@ -1928,6 +1968,19 @@ export async function executeComposioTool(
   // dispatch and fail legibly. Kill-switch: CLEMMY_COMPOSIO_LONE_CONN_DISPATCH=off.
   if (!resolvedConnection && (process.env.CLEMMY_COMPOSIO_LONE_CONN_DISPATCH ?? 'on').toLowerCase() !== 'off') {
     resolvedConnection = loneToolkitConnection(toolSlug, snapshotConns) ?? resolvedConnection;
+  }
+  // AMBIGUITY IS A QUESTION, NOT "NOT CONNECTED" (live 2026-08-04: a user with
+  // multiple Outlook identities got "no active Outlook connection" on an
+  // invite blast while their Connect screen showed Active). The legacy
+  // resolveToolkitConnectionId wrapper collapsed `ambiguous`/`identity-absent`
+  // to undefined, so the doomed bare dispatch under an entity owning none of
+  // the candidates produced the FAKE not-connected error. When the bare
+  // dispatch is provably doomed — 2+ distinct identities matched and the
+  // dispatch entity owns none of them — fail pre-dispatch with the real
+  // question, naming the mailboxes so the model can ask the user which to use.
+  if (!resolvedConnection && resolutionOutcome) {
+    const doomed = bareDispatchDoomedQuestion(resolutionOutcome, snapshotConns, toolSlug, userId);
+    if (doomed) throw new ComposioPreDispatchError('connection-ambiguous', doomed);
   }
   const body: Record<string, unknown> = {
     userId: dispatchUserIdFor(resolvedConnection, snapshotConns, userId),

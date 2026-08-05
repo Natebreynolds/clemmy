@@ -63,7 +63,7 @@ type ModelFilter = (a: { modelData: { input: AgentInputItem[]; instructions?: st
  * model's fan-out behavior for coverage assertions.
  */
 async function runTurnCapturingModelInput(args: {
-  kind: 'chat' | 'workflow';
+  kind: 'chat' | 'workflow' | 'execution';
   input: string;
   onTurn?: () => void;
 }): Promise<{ status: string; modelInputText: string }> {
@@ -181,4 +181,17 @@ test('SMOKE: workflow turn gets runner-owned topology guidance without unavailab
   assert.doesNotMatch(modelInputText, /call run_worker/);
   assert.doesNotMatch(modelInputText, /Parallelism reminder:/);
   assert.ok(!/Fan-out directive/.test(modelInputText), 'workflow step must not get the run_worker directive');
+});
+
+test('SMOKE: an EXECUTION (background) multi-item turn gets the count-aware directive too — the unattended lane must never serialize silently', async () => {
+  // 2026-08-04 efficiency audit: the directive was chat-only, so background
+  // tasks — the lane built for big work — detected the items, logged the
+  // detection, and withheld the instruction. This pins the execution lane in.
+  const { modelInputText } = await runTurnCapturingModelInput({
+    kind: 'execution',
+    input: 'Research these 12 prospects and capture each firm\'s SEO posture.',
+  });
+  assert.match(modelInputText, /Fan-out directive: this turn names 12 independent same-shape prospects/);
+  assert.match(modelInputText, /Do NOT serialize/);
+  assert.ok(!/Parallelism reminder:/.test(modelInputText), 'the static line is replaced by the directive');
 });

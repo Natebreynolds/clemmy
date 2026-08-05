@@ -24,7 +24,7 @@ import {
   setAccountLabel, setComposioApiKey, setupComposioCredentials,
   getCredentials, setCredential, setDiscordOwner,
   normalizeCredentialRows, isConnected, CODEX_MANAGED_SECRETS,
-  connectedToolkits, reconnectConnectionId, searchToolkits, toolkitStatus,
+  connectedToolkits, reconnectConnectionId, searchToolkits, staleConnectionStory, toolkitStatus,
   type CredentialRow, type CredentialDescriptor, type ComposioToolkit, type ComposioConnection,
   type ComposioAuthorization, type ComposioConnectResult, type ComposioSetupMeta,
   type ComposioCliDefaultAccountAuthority,
@@ -536,8 +536,15 @@ function AccountRow({ slug, conn, onDisconnect, onSaveLabel }: {
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
           <span className="truncate text-small text-fg" title={id}>{who}</span>
-          {needsReconnect && <StatusPill tone="warning">Reconnect</StatusPill>}
+          {needsReconnect && <StatusPill tone="warning">Needs reconnecting</StatusPill>}
         </div>
+        {/* The pill names the state; this line tells the story — what broke and
+            when — so a dead login never hides behind a quiet label. */}
+        {needsReconnect && (
+          <p className="mt-0.5 truncate text-caption text-warning" title={staleConnectionStory(conn) ?? undefined}>
+            {staleConnectionStory(conn)}
+          </p>
+        )}
         {editing ? (
           <div className="mt-1 flex items-center gap-1.5">
             <Tag className="h-3 w-3 shrink-0 text-faint" aria-hidden />

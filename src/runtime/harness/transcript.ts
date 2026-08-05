@@ -10,6 +10,7 @@
 import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents } from './eventlog.js';
 import {
+  PUBLIC_RUN_FAILURE_TEXT,
   publicCompletionText,
   publicReplyText,
   publicUserInputText,
@@ -183,6 +184,13 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       ? [{ role: 'user', text: source.userText, createdAt: source.event.createdAt }]
       : [];
     if (assistant) {
+      // A DAEMON-DRIVEN turn (synthetic source — an outcome relay the user
+      // never typed) that FAILED renders nothing: painting "Something went
+      // wrong on that turn" over a task whose outcome was already delivered
+      // passively reads as the work failing (live 2026-08-04, a rate-limited
+      // relay). The deferred re-fire speaks the real outcome once the brain
+      // recovers; a successful relay reply still renders normally.
+      if (userTurns.length === 0 && assistant.text === PUBLIC_RUN_FAILURE_TEXT) continue;
       settled.push({
         order: source.event.seq,
         turns: [

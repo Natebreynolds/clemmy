@@ -1,9 +1,11 @@
 import { Fragment, useState, type ReactNode } from 'react';
-import { Check, Send, X } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { ArrowUpRight, Check, Send, X } from 'lucide-react';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { TurnActivity } from '@/components/chat/TurnActivity';
+import { useNowTick } from '@/components/chat/ActivityFeed';
 import { TaskEvidenceFooter } from '@/components/chat/TaskEvidenceFooter';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
@@ -211,6 +213,10 @@ export function ChatBubble({
     );
   }
 
+  if (message.delegated) {
+    return <DelegatedWorkCard message={message} delegated={message.delegated} />;
+  }
+
   const thinking = message.status === 'thinking';
   const pendingAction = message.approval?.pendingAction;
   return (
@@ -373,6 +379,55 @@ export function ChatBubble({
             {message.status === 'failed' && <StatusPill tone="danger">Didn't finish</StatusPill>}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The delegated-work live card (2026-08-04): a real-time window in the chat
+ * onto a background task this conversation spawned. Visually distinct from a
+ * turn reply — breathing status dot, its own header, a ticking elapsed clock,
+ * the shared TurnActivity feed (batch meters, per-tool rows, agent dots), a
+ * deep link to the full run on the Tasks board, and the steering affordance:
+ * the conversation stays live, so a reply redirects the running work.
+ */
+function DelegatedWorkCard({ message, delegated }: {
+  message: ChatMessage;
+  delegated: NonNullable<ChatMessage['delegated']>;
+}) {
+  const now = useNowTick(true);
+  const elapsedMin = Math.max(0, Math.floor((now - delegated.startedAt) / 60_000));
+  const elapsedSec = Math.max(0, Math.floor((now - delegated.startedAt) / 1000) % 60);
+  const elapsed = elapsedMin > 0 ? `${elapsedMin}m ${elapsedSec}s` : `${elapsedSec}s`;
+  const traceHref = delegated.taskId ? `/tasks?select=${encodeURIComponent(delegated.taskId)}` : '/tasks';
+  return (
+    <div className="flex gap-3">
+      <DogMark size={28} className="mt-0.5 self-start" />
+      <div className="min-w-0 max-w-[80%] flex-1">
+        <div className="rounded-lg rounded-tl-sm border border-primary/30 bg-surface px-4 py-3 shadow-xs">
+          <div className="flex items-center gap-2">
+            <span className="h-2 w-2 shrink-0 animate-breathe rounded-full bg-success" aria-hidden />
+            <span className="min-w-0 truncate text-small font-semibold text-fg">Working on this in the background</span>
+            <span className="ml-auto shrink-0 text-caption tabular-nums text-faint" title="time since this live view opened">{elapsed}</span>
+          </div>
+          {message.progress && (
+            <p className="mt-1.5 text-body text-muted">{message.progress}</p>
+          )}
+          {message.activity && message.activity.length > 0 && (
+            <TurnActivity items={message.activity} live />
+          )}
+          <div className="mt-2.5 flex items-center justify-between gap-3 border-t border-border/60 pt-2">
+            <span className="min-w-0 truncate text-caption text-faint">Reply anytime to steer or adjust — the work picks up your change.</span>
+            <Link
+              to={traceHref}
+              className="inline-flex shrink-0 items-center gap-1 text-caption font-medium text-primary transition-colors hover:text-primary/80"
+            >
+              Watch the full run
+              <ArrowUpRight className="h-3 w-3" aria-hidden />
+            </Link>
+          </div>
+        </div>
       </div>
     </div>
   );

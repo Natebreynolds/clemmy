@@ -19,6 +19,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { humanHarnessText, reconstructHarnessTranscript } = await import('./transcript.js');
+const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
 const { createSession, appendEvent, openEventLog, listEvents } = await import('./eventlog.js');
 
 function typedTerminalData(input: {
@@ -287,4 +288,27 @@ test('reconstructHarnessTranscript suppresses a historical rolling-upgrade dupli
     2,
     'the private ledger keeps both historical rows',
   );
+});
+
+test('a FAILED daemon-driven relay turn renders no error bubble; a successful relay still speaks', () => {
+  const sid = 'console:relay-failure-render';
+  createSession({ id: sid, kind: 'chat' });
+  // Real user turn + its reply.
+  appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'run it in the background' } });
+  appendEvent({ sessionId: sid, turn: 1, role: 'Clem', type: 'conversation_completed', data: { reply: 'On it — running in the background.', sourceUserSeq: 1 } });
+  // Synthetic outcome relay whose processing turn FAILED under a rate limit —
+  // its generic failure text must NOT paint the transcript (live 2026-08-04).
+  appendEvent({ sessionId: sid, turn: 2, role: 'user', type: 'user_input_received', data: { text: '[background task bg-1] Relay the outcome…', synthetic: true, source: 'outcome', deliveryPhase: 'directive' } });
+  const failSeq = listEvents(sid, { types: ['user_input_received'], desc: true, limit: 1 })[0]!.seq;
+  appendEvent({ sessionId: sid, turn: 2, role: 'Clem', type: 'conversation_completed', data: { reply: PUBLIC_RUN_FAILURE_TEXT, sourceUserSeq: failSeq } });
+  // A later SUCCESSFUL relay renders its spoken outcome normally.
+  appendEvent({ sessionId: sid, turn: 3, role: 'user', type: 'user_input_received', data: { text: '[background task bg-1] Relay the outcome…', synthetic: true, source: 'outcome', deliveryPhase: 'directive' } });
+  const okSeq = listEvents(sid, { types: ['user_input_received'], desc: true, limit: 1 })[0]!.seq;
+  appendEvent({ sessionId: sid, turn: 3, role: 'Clem', type: 'conversation_completed', data: { reply: 'Your demo-firm profiles are ready — 5 files in demo-firms/.', sourceUserSeq: okSeq } });
+
+  const turns = reconstructHarnessTranscript(sid);
+  const texts = turns.map((t) => t.text);
+  assert.ok(!texts.includes(PUBLIC_RUN_FAILURE_TEXT), 'no generic error bubble for a turn the user never sent');
+  assert.ok(texts.some((t) => t.includes('profiles are ready')), 'the successful relay reply still renders');
+  assert.ok(texts.some((t) => t.includes('running in the background')), 'the real turn pair is untouched');
 });

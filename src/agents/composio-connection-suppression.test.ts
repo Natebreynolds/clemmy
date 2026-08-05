@@ -169,3 +169,25 @@ test('mergeConnectionSuppressions keeps the active record with the furthest supp
   assert.equal(target.suppressedConnections.ca_same.failures, 2);
   assert.equal((target.suppressedConnections as Record<string, unknown>).ca_expired_old, undefined);
 });
+
+test('provider-shaped token death classifies as expired; resource 403s never suppress', () => {
+  const state: import('./composio-connection-suppression.js').ComposioConnectionSuppressionState = {};
+  const now = Date.now();
+  // The live 2026-08-04 shape: dead Microsoft token behind an ACTIVE label.
+  const graphDead = suppressConnectionAfterHardAuthFailure(
+    state, 'ca_outlook', new Error('Graph error: InvalidAuthenticationToken - Access token has expired or is not yet valid.'), now,
+  );
+  assert.equal(graphDead?.reason, 'expired', 'a provider token-death error marks the connection stale');
+
+  const oauthDead = suppressConnectionAfterHardAuthFailure(
+    state, 'ca_gmail', new Error('{"error":"invalid_grant","error_description":"Token has been expired or revoked."}'), now,
+  );
+  assert.equal(oauthDead?.reason, 'expired');
+
+  // A resource-level denial is NOT token death — a healthy connection must
+  // never be suppressed for it.
+  const forbidden = suppressConnectionAfterHardAuthFailure(
+    state, 'ca_ok', new Error('403 Forbidden: caller does not have permission to access folder X'), now,
+  );
+  assert.equal(forbidden, undefined, 'permission-denied on a resource never suppresses the connection');
+});

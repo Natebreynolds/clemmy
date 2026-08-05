@@ -603,6 +603,38 @@ const lastComposioSearchBySession = new Map<string, {
 // connectionId) so it fires even when nothing resolved. Once a toolkit has failed
 // reconnect-required this session, later attempts short-circuit deterministically
 // (no network) until a successful execute or a cache invalidation clears it.
+/**
+ * Ground truth appended to a NOT-CONNECTED failure (live 2026-08-04: an invite
+ * blast parked on "no active Outlook connection" while the user's Connect
+ * screen showed Outlook ACTIVE — the model relayed a jargon dead-end and the
+ * user had to ask HOW to reconnect). The daemon can simply look: fetch the
+ * account list FRESH and state what it says, so the model tells the user the
+ * true story in plain words instead of guessing between "you never connected"
+ * and "something in my session broke".
+ */
+let connectedToolkitsForGroundTruth: typeof listUsableConnectedToolkits = listUsableConnectedToolkits;
+/** Test seam (ESM modules are frozen; mirrors setRuntimeStatusLoader). */
+export function _setConnectedToolkitsLoaderForTests(loader: typeof listUsableConnectedToolkits | null): void {
+  connectedToolkitsForGroundTruth = loader ?? listUsableConnectedToolkits;
+}
+
+export async function connectionGroundTruthNote(toolSlug: string): Promise<string> {
+  try {
+    const toolkit = registeredToolkitOfSlug(toolSlug).toUpperCase();
+    const conns = await connectedToolkitsForGroundTruth({ requireFresh: true });
+    const toolLower = toolSlug.toLowerCase();
+    const matched = conns.filter((c) => c.slug && c.connectionId && toolLower.startsWith(c.slug.toLowerCase()));
+    const active = matched.filter((c) => /active|enabled/i.test(c.status ?? ''));
+    if (active.length > 0) {
+      const who = active.map((c) => c.accountEmail || c.connectionId).slice(0, 3).join(', ');
+      return `\n\n[connection-ground-truth] Composio DOES list an ACTIVE ${toolkit} connection (${who}), but executing under it failed with a connection error — the stored login has likely expired server-side even though the Connect screen shows Active. Tell the user in plain words: open the Connect screen (left sidebar), reconnect ${toolkit} even though it looks connected, then reply "continue" — the saved work resumes where it left off. Never describe this in API or lane terms.`;
+    }
+    return `\n\n[connection-ground-truth] Composio currently lists NO usable ${toolkit} connection for this assistant. Tell the user in plain words: open the Connect screen (left sidebar), connect ${toolkit}, then reply "continue" — the saved work resumes where it left off. Never describe this in API or lane terms.`;
+  } catch {
+    return ''; // the probe is best-effort; the base corrective still stands
+  }
+}
+
 const RECONNECT_BREAKER_TTL_MS = 3 * 60 * 1000;
 const reconnectBreakerBySession = new Map<string, number>();
 type ComposioRuntimeStatus = Awaited<ReturnType<typeof getComposioRuntimeStatus>>;
@@ -1994,6 +2026,7 @@ async function runComposioExecute(
         output += suppressComposioConnectionAfterHardFailure(effectiveConnectionId, result);
         // F2: a not-connected RESULT (returned, not thrown) also trips the breaker.
         if (isComposioReconnectRequiredError(result)) recordReconnectBreaker(sid, toolSlug);
+        if (failure.notConnected) output += await connectionGroundTruthNote(toolSlug);
       } else {
         // F2: a genuine success proves the toolkit is reachable again → reset.
         clearReconnectBreaker(sid, toolSlug);

@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, Sparkles, X } from 'lucide-react';
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
@@ -8,6 +8,7 @@ import { getContext } from '@/lib/memory';
 import { greetingName, timeGreeting } from '@/lib/greeting';
 import { dismissInboxItem } from '@/lib/inbox';
 import { chatApprovalReply, useChat } from '@/lib/useChat';
+import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
 import type { CommandCenter, CommandCenterItem } from '@/lib/types';
 import { DogMark } from '@/components/DogMark';
 import { Composer } from '@/components/chat/Composer';
@@ -87,7 +88,7 @@ export function Chat() {
       void qc.invalidateQueries({ queryKey: ['notifications'] });
     }
   };
-  const chat = useChat();
+  const chat = useChat({ rememberAsLastSession: true });
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // Whether the view is "stuck" to the bottom. True by default so the initial
@@ -125,6 +126,9 @@ export function Chat() {
     if (stamp && stamp !== lastNewChatRef.current) {
       lastNewChatRef.current = stamp;
       resetChat();
+      // An explicit "New chat" releases the active-conversation pointer — the
+      // index must not bounce straight back into the thread being left.
+      rememberLastChatSession(null);
       stickRef.current = true;
     }
   }, [location.state, resetChat]);
@@ -141,6 +145,21 @@ export function Chat() {
       setSearchParams(next, { replace: true });
     }
   }, [searchParams, chat, setSearchParams]);
+
+  // Static-window return (2026-08-04): the chat index used to greet with a
+  // blank hero even while the user's conversation — possibly mid-run — sat
+  // one navigation away, and the next message would mint a NEW session (the
+  // dominant sidebar-clutter source). With no thread on screen, no deep-link
+  // seed, and no explicit "New chat", return to the active conversation.
+  const activeConversation = lastChatSession();
+  if (
+    !hasThread
+    && activeConversation
+    && !searchParams.get('prompt')
+    && !(location.state as { newChat?: number } | null)?.newChat
+  ) {
+    return <Navigate to={`/chat/${encodeURIComponent(activeConversation)}`} replace />;
+  }
 
   if (!hasThread) {
     return (

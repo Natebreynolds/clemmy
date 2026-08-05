@@ -109,6 +109,17 @@ function classifyHardAuthFailure(err: unknown): ComposioConnectionSuppressionRea
   if (/ConnectedAccountNotFound|no connected account (?:found|exists)|ToolRouterV2[_-]?NoActiveConnection|\bNoActiveConnection\b|code['"]?\s*:?\s*1810/i.test(text)) {
     return 'not-connected';
   }
+  // PROVIDER-shaped token death (live 2026-08-04): a dead OAuth token often
+  // surfaces as the downstream provider's own auth error inside the tool
+  // result — Microsoft Graph `InvalidAuthenticationToken`, an OAuth
+  // `invalid_grant`, "token is expired" — none of which are Composio's codes,
+  // so nothing ever suppressed the connection and the Connect screen kept a
+  // green ACTIVE light on a dead login. Deliberately tight: token/grant idioms
+  // only — a permission-denied 403 on a specific resource is NOT token death
+  // and must never suppress a healthy connection.
+  if (/InvalidAuthenticationToken|invalid[_ ]grant|(?:access |refresh |auth )?token (?:is |has )?(?:expired|invalid|revoked)|re-?authenticat(?:e|ion) (?:is )?required/i.test(text)) {
+    return 'expired';
+  }
   return undefined;
 }
 
