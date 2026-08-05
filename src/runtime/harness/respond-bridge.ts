@@ -39,6 +39,7 @@
  *     best-effort from harness events for legacy progress surfaces.
  */
 import { runConversation, verifiedWorkflowRunDispatchReceipts } from './loop.js';
+import { resolveAcceptedTurnRead, type AcceptedTurnReadPorts, type AcceptedTurnReadResult } from '../read-path/read-lane-chat.js';
 import {
   PendingWorkflowChatDispatchOwnershipError,
   readPendingWorkflowChatDispatchOwnership,
@@ -321,6 +322,104 @@ function blockedPreRunResponse(
   });
 }
 
+/**
+ * Serve a verified warm read as the whole turn (E4). Returns null on any
+ * decline — the ordinary brain then runs unchanged with the same request.
+ * The accepted source and the exactly-once TurnOutcome commit use the SAME
+ * machinery as every other bridge terminal: nothing here is a second
+ * committer.
+ */
+async function tryServeAcceptedTurnRead(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+): Promise<AssistantResponse | null> {
+  let ports: AcceptedTurnReadPorts | null = null;
+  try {
+    ports = acceptedTurnReadPortsImpl(surface, request);
+  } catch { ports = null; }
+  if (!ports) return null; // fail closed: no derived authority, no lane
+  let served: AcceptedTurnReadResult;
+  try {
+    served = await resolveAcceptedTurnRead(
+      { sessionId: request.sessionId, message: request.message, seq: `${Date.now().toString(36)}` },
+      ports,
+    );
+  } catch {
+    return null; // typed resolver trouble never breaks an ordinary turn
+  }
+  if (served.kind !== 'served') return null;
+  try {
+    if (!getSession(request.sessionId)) {
+      const config = SURFACE_CONFIG[surface];
+      const titleSeed = (request.displayMessage ?? request.message).trim().replace(/\s+/g, ' ');
+      createSession({
+        id: request.sessionId,
+        kind: config.kind,
+        channel: request.channel,
+        userId: request.userId,
+        title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
+        metadata: { source: `bridge:${surface}` },
+      });
+    }
+    const attempt = beginRunAttempt(request.sessionId, { runId: request.runId });
+    const sourceUserEvent = recordRunAttemptUserInput(attempt, {
+      turn: 1,
+      role: 'user',
+      data: {
+        text: request.displayMessage ?? request.message,
+        ...(request.runId ? { runId: request.runId } : {}),
+        attemptId: attempt.attemptId,
+        source: `bridge:${surface}`,
+      },
+    }, { existingEventSeq: request.sourceUserSeq, armRunInFlight: true });
+    const identity: TurnIdentity = {
+      sessionId: request.sessionId,
+      turn: sourceUserEvent.turn,
+      sourceUserSeq: sourceUserEvent.seq,
+    };
+    const committed = commitTurnOutcomeImpl({
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'done',
+      resumable: false,
+      presentation: { kind: 'answer', text: served.draft },
+    }, {
+      metadata: {
+        transport: 'read_lane_warm',
+        artifactId: served.artifactId,
+        laneDigest: served.laneDigest,
+        counters: served.counters as unknown as Record<string, unknown>,
+      },
+    });
+    try { finishRunAttempt(attempt, 'completed'); } catch { /* telemetry */ }
+    markRunInFlight(request.sessionId, false);
+    return withRouteDiagnostics({
+      text: committed.presentation.text,
+      sessionId: request.sessionId,
+      raw: {
+        readLane: {
+          warm: true,
+          artifactId: served.artifactId,
+          counters: served.counters,
+        },
+      },
+    }, {
+      routeKind: 'harness',
+      surface,
+      requestedModel: request.model,
+      effectiveModel: 'read-lane-warm',
+      provider: 'verified-procedure',
+      transport: 'read_lane_warm',
+      mode: getModelRoutingMode(),
+    });
+  } catch {
+    // The commit machinery refused (duplicate source, kill, ...): let the
+    // ordinary brain own the turn rather than inventing a second terminal.
+    return null;
+  }
+}
+
 function routeForHarness(surface: HarnessSurface, request: AssistantRequest, modelOverride?: string): AssistantRouteDiagnostics {
   const config = SURFACE_CONFIG[surface];
   const effectiveModel = modelOverride
@@ -361,12 +460,19 @@ type ConfigureFn = typeof configureHarnessRuntime;
 type ClaudeAgentBrainFn = typeof respondViaClaudeAgentSdkBrain;
 type RecoveryListEventsFn = typeof listEvents;
 type CommitTurnOutcomeFn = typeof commitTurnOutcome;
+/** The shared accepted-turn read resolver (E4). Production default builds
+ *  fail-closed ports; tests inject deterministic ones. */
+type AcceptedTurnReadFn = (
+  surface: HarnessSurface,
+  request: AssistantRequest,
+) => Promise<AcceptedTurnReadResult | null>;
 let runConversationImpl: RunConversationFn = runConversation;
 let buildAgentImpl: BuildAgentFn = buildOrchestratorAgent;
 let configureImpl: ConfigureFn = configureHarnessRuntime;
 let claudeAgentBrainImpl: ClaudeAgentBrainFn = respondViaClaudeAgentSdkBrain;
 let recoveryListEventsImpl: RecoveryListEventsFn = listEvents;
 let commitTurnOutcomeImpl: CommitTurnOutcomeFn = commitTurnOutcome;
+let acceptedTurnReadPortsImpl: ((surface: HarnessSurface, request: AssistantRequest) => AcceptedTurnReadPorts | null) = () => null;
 export function _setBridgeImplsForTests(impls: {
   runConversation?: RunConversationFn | null;
   buildAgent?: BuildAgentFn | null;
@@ -374,6 +480,7 @@ export function _setBridgeImplsForTests(impls: {
   claudeAgentBrain?: ClaudeAgentBrainFn | null;
   recoveryListEvents?: RecoveryListEventsFn | null;
   commitTurnOutcome?: CommitTurnOutcomeFn | null;
+  acceptedTurnReadPorts?: ((surface: HarnessSurface, request: AssistantRequest) => AcceptedTurnReadPorts | null) | null;
 }): void {
   runConversationImpl = impls.runConversation ?? runConversation;
   buildAgentImpl = impls.buildAgent ?? buildOrchestratorAgent;
@@ -381,6 +488,7 @@ export function _setBridgeImplsForTests(impls: {
   claudeAgentBrainImpl = impls.claudeAgentBrain ?? respondViaClaudeAgentSdkBrain;
   recoveryListEventsImpl = impls.recoveryListEvents ?? listEvents;
   commitTurnOutcomeImpl = impls.commitTurnOutcome ?? commitTurnOutcome;
+  acceptedTurnReadPortsImpl = impls.acceptedTurnReadPorts ?? (() => null);
 }
 
 /** Poll cadence for mapping the legacy `shouldCancel` callback onto the
@@ -1247,6 +1355,14 @@ export async function respondPreferHarness(
       { reason: 'harness_auth_unavailable', authReason: auth.reason },
     );
   }
+  // E4: the shared accepted-turn READ resolver — ONE provider-neutral entry
+  // both brains flow through with the same accepted source. A deterministic
+  // decline costs ordinary chat nothing (no model call, no tool schema, no
+  // discovery); a verified warm read commits ONE typed terminal through the
+  // existing exactly-once committer and no brain runs at all.
+  const readServed = await tryServeAcceptedTurnRead(surface, request);
+  if (readServed) return readServed;
+
   if (claudeAgentSdkBrainEnabled(surface)) {
     const detachProgressRelay = attachLegacyProgressRelay(request);
     // Whole-turn recovery may re-drive every tool call on another brain. Bind

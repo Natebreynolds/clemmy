@@ -381,6 +381,10 @@ export const EVENT_TYPES = [
   // selfJudge, durationMs?, detail?} so run views and forensics read verdicts
   // from the event log instead of scraping heartbeats and prose.
   'verdict_recorded',
+  // E4 read lane: the durable receipt row a verified read dispatch appends —
+  // the promotion/verification authority the resolver reads back by id.
+  // Internal evidence: the public-presentation allowlist does not carry it.
+  'read_receipt',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

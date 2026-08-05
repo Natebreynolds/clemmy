@@ -126,3 +126,12 @@ export function promoteTransactionally(input: {
   });
   return run();
 }
+
+/** Every ACTIVE artifact document (validated by the caller). */
+export function listActiveArtifactRows(): unknown[] {
+  const rows = db().prepare("SELECT document FROM artifacts WHERE status = 'active'").all() as
+    Array<{ document: string }>;
+  return rows.map((row) => {
+    try { return JSON.parse(row.document); } catch { return null; }
+  }).filter((document) => document !== null);
+}

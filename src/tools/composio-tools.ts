@@ -1,4 +1,5 @@
 import { readHarnessCapabilityHealth, recordHarnessCapabilityHealth } from '../runtime/harness/capability-health.js';
+import { hasActiveStructuralProcedureForIdentifier } from '../memory/procedure-receipts.js';
 import { createHash } from 'node:crypto';
 
 import {
@@ -2507,13 +2508,24 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
               query,
               fromMemory: true,
               count: remembered.length,
-              matches: remembered.map((m) => ({
-                toolkit: registeredToolkitOfSlug(m.slug),
-                slug: m.slug,
-                name: m.slug,
-                score: 1,
-                description: `Remembered from ${m.successCount} prior success${m.successCount === 1 ? '' : 'es'} on this machine (matched intent "${m.intent}"). Call composio_execute_tool with this slug — no rediscovery needed.${m.invocationTemplate ? ` Prior args template: ${m.invocationTemplate.slice(0, 400)}` : ''}`,
-              })),
+              matches: remembered.map((m) => {
+                // E4 subtraction: a slug with an ACTIVE structural procedure
+                // artifact is owned by the verified read lane — the prose
+                // args-template advisory is subtracted for that key so two
+                // authorities never serve one eligible operation. Slugs
+                // without a proven artifact keep the historical advisory.
+                const structurallyOwned = hasActiveStructuralProcedureForIdentifier(m.slug);
+                const template = !structurallyOwned && m.invocationTemplate
+                  ? ` Prior args template: ${m.invocationTemplate.slice(0, 400)}`
+                  : '';
+                return {
+                  toolkit: registeredToolkitOfSlug(m.slug),
+                  slug: m.slug,
+                  name: m.slug,
+                  score: 1,
+                  description: `Remembered from ${m.successCount} prior success${m.successCount === 1 ? '' : 'es'} on this machine (matched intent "${m.intent}"). Call composio_execute_tool with this slug — no rediscovery needed.${template}`,
+                };
+              }),
               message:
                 `Matched ${remembered.length} tool(s) from tool-choice memory — skipped Composio discovery (saved a multi-call search). ` +
                 'If a remembered slug fails on execute, call composio_search_tools again with a more specific query, or tool_choice_invalidate to force fresh discovery.',

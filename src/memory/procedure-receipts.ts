@@ -33,6 +33,7 @@
 import { createHash } from 'node:crypto';
 import {
   clearPointer,
+  listActiveArtifactRows,
   loadArtifactRow,
   loadPointer,
   promoteTransactionally,
@@ -396,3 +397,20 @@ export function activeArtifactForKey(input: {
 }
 
 export { computeArtifactId };
+
+/**
+ * E4 advisory subtraction: an identifier with an ACTIVE structural artifact
+ * is owned by the structural lane — the prose invocation advisory for that
+ * key is subtracted so two authorities never serve one eligible key.
+ * Unsupported identifiers keep the historical advisory until parity.
+ */
+export function hasActiveStructuralProcedureForIdentifier(identifier: string): boolean {
+  try {
+    return listActiveArtifactRows().some((document) => {
+      const parsed = parseProcedureArtifactDocument(document);
+      return parsed.ok && parsed.artifact.identifier === identifier;
+    });
+  } catch {
+    return false;
+  }
+}
