@@ -14,6 +14,13 @@
  * Journal entries are authored in the v2 shape (exact start/settlement pairs,
  * durable fired-edge verdicts, patch emitter attempts). At the predecessor the
  * extra fields were ignored at runtime, which is exactly why these bite.
+ *
+ * Beyond the reproductions, this file carries the executor-level R1A suites:
+ * A (dependency-cone reuse decided independently per descendant), B (patch
+ * restart and the patch-before-emitter-settlement crash window), C (durably
+ * fired conditional routes, both directions), D (opaque edge verdicts are
+ * history — a changed closure cannot rewrite them). The pure refusal matrix
+ * (suite E) lives in graph-resume.test.ts.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -28,6 +35,7 @@ import {
 import type { GraphJournalEntry } from './graph-journal.js';
 import {
   runGraph,
+  type ExecutableEdge,
   type ExecutableGraph,
   type ExecutableNode,
   type NodeOutcome,
@@ -320,4 +328,279 @@ test('R1A bite 3: an unfired conditional alternative into a joinMode:any merge i
   assert.deepEqual(ran, [], 'nothing reruns: the fired route is fully settled history');
   assert.equal(result.trace.filter((entry) => entry.reused).length, 3);
   assert.ok(result.unreached.includes('fail_route'), 'the unfired alternative stays unreached by design');
+});
+
+// ─── Suite A: dependency-cone reuse ──────────────────────────────────────────
+
+/** a -> b -> c with a's CURRENT definition changed so it must rerun. */
+function coneFixture() {
+  const oldA: ExecutableNode = { id: 'a', kind: 'step-v1' };
+  const newA: ExecutableNode = { id: 'a', kind: 'step-v2' };
+  const b: ExecutableNode = { id: 'b', kind: 'step' };
+  const c: ExecutableNode = { id: 'c', kind: 'step' };
+  const graph: ExecutableGraph = {
+    graphId: 'cone',
+    nodes: [newA, b, c],
+    edges: [
+      { id: 'e-ab', source: 'a', target: 'b' },
+      { id: 'e-bc', source: 'b', target: 'c' },
+    ],
+  };
+  const admission = admitted(graph);
+  const journal: GraphJournalEntry[] = [
+    ...settledPair({
+      admission, node: oldA, inputDigest: computeInputDigest([]),
+      attemptId: 'old-a', wave: 0, outputRef: 'art-a-old', firedEdgeIds: ['e-ab'],
+    }),
+    ...settledPair({
+      admission, node: b,
+      inputDigest: computeInputDigest([{ nodeId: 'a', outputRef: 'art-a-old', evidenceRefs: [] }]),
+      attemptId: 'old-b', wave: 1, outputRef: 'art-b', firedEdgeIds: ['e-bc'],
+    }),
+    ...settledPair({
+      admission, node: c,
+      inputDigest: computeInputDigest([{ nodeId: 'b', outputRef: 'art-b', evidenceRefs: [] }]),
+      attemptId: 'old-c', wave: 2, outputRef: 'art-c', firedEdgeIds: [],
+    }),
+  ];
+  return { graph, admission, journal };
+}
+
+async function runCone(bOutput: string) {
+  const { graph, admission, journal } = coneFixture();
+  const ran: string[] = [];
+  const runner: NodeRunner = {
+    run(node): NodeOutcome {
+      ran.push(node.id);
+      if (node.id === 'a') return { status: 'completed', outputRef: 'art-a-new' };
+      if (node.id === 'b') return { status: 'completed', outputRef: bOutput };
+      return { status: 'completed', outputRef: 'art-c-new' };
+    },
+  };
+  const { adapter } = memoryAdapter();
+  const result = await runGraph(graph, {
+    runner, admission, journalAdapter: adapter, clock: () => 0, resumeEntries: journal,
+  });
+  assert.equal(result.status, 'completed', result.haltReason ?? '');
+  return { ran, result };
+}
+
+test('A: descendants are decided independently — a rerun that REPRODUCES the same content-addressed output lets the next descendant reuse', async () => {
+  // a reruns (definition changed), b reruns (input changed) but reproduces
+  // art-b exactly. c's current input digest equals its journaled one: reuse.
+  const { ran, result } = await runCone('art-b');
+  assert.deepEqual(ran, ['a', 'b'], 'c was dispatched despite an identical current input digest');
+  assert.equal(result.trace.find((entry) => entry.nodeId === 'c')?.reused, true);
+});
+
+test('A: a rerun that changes the output invalidates the next descendant too', async () => {
+  const { ran, result } = await runCone('art-b-changed');
+  assert.deepEqual(ran, ['a', 'b', 'c'], 'c reused stale evidence after its predecessor changed output');
+  assert.equal(result.trace.find((entry) => entry.nodeId === 'c')?.reused, undefined);
+});
+
+test('A: the reuse refusal is visible on the trace in digests only — never payload bytes', async () => {
+  const { result } = await runCone('art-b-changed');
+  const bTrace = result.trace.find((entry) => entry.nodeId === 'b');
+  assert.match(bTrace?.reuseRefused ?? '', /input digest [0-9a-f]{12}… does not match journaled [0-9a-f]{12}…/);
+  assert.equal((bTrace?.reuseRefused ?? '').includes('art-'), false, 'artifact refs leaked into diagnostics');
+  const aTrace = result.trace.find((entry) => entry.nodeId === 'a');
+  assert.match(aTrace?.reuseRefused ?? '', /node definition digest changed/);
+});
+
+// ─── Suite B5: the patch-before-emitter-settlement crash window ──────────────
+
+function orphanFixture() {
+  const planner: ExecutableNode = { id: 'planner', kind: 'planner' };
+  const reducer: ExecutableNode = { id: 'reducer', kind: 'reduce' };
+  const w1: ExecutableNode = { id: 'w1', kind: 'worker' };
+  const patchEdges = [
+    { id: 'p-w1', source: 'planner', target: 'w1' },
+    { id: 'j-w1', source: 'w1', target: 'reducer' },
+  ];
+  const graph: ExecutableGraph = {
+    graphId: 'orphan-window',
+    nodes: [planner, reducer],
+    edges: [{ id: 'e-pr', source: 'planner', target: 'reducer' }],
+  };
+  const admission = admitted(graph, { ...BUDGET, maxExpansions: 1 });
+  return { graph, admission, planner, w1, patchEdges };
+}
+
+async function runOrphanResume(reEmit: { nodes: ExecutableNode[]; edges: ExecutableEdge[] }) {
+  const { graph, admission, planner, w1, patchEdges } = orphanFixture();
+  const { validateGraphPatch } = await import('./graph-admission.js');
+  const validated = validateGraphPatch(graph, { emittedBy: 'planner', nodes: [w1], edges: patchEdges });
+  assert.equal(validated.ok, true, JSON.stringify(validated));
+  const patchDigest = (validated as Extract<typeof validated, { ok: true }>).patchDigest;
+
+  // The crash window: the patch is durable, the emitter settlement is not.
+  const journal: GraphJournalEntry[] = [
+    {
+      type: 'node_started', admissionDigest: admission.admissionDigest, nodeId: 'planner',
+      nodeDigest: computeNodeDigest(planner), inputDigest: computeInputDigest([]),
+      attemptId: 't-planner-1', wave: 0,
+    },
+    {
+      type: 'patch_admitted', admissionDigest: admission.admissionDigest,
+      emittedBy: 'planner', emitterAttemptId: 't-planner-1', patchDigest,
+      nodes: [w1], edges: patchEdges,
+    } as GraphJournalEntry,
+  ];
+
+  const ran: string[] = [];
+  const runner: NodeRunner = {
+    run(node): NodeOutcome {
+      ran.push(node.id);
+      if (node.id === 'planner') return { status: 'completed', outputRef: 'plan', emitPatch: reEmit };
+      return { status: 'completed', outputRef: `art-${node.id}` };
+    },
+  };
+  const { adapter, entries } = memoryAdapter();
+  const result = await runGraph(graph, {
+    runner, admission, journalAdapter: adapter, clock: () => 0, resumeEntries: journal,
+    patchAdmitter: () => ({ ok: true }),
+  });
+  return { ran, result, entries, patchDigest };
+}
+
+test('B5: an orphan patch makes no child eligible; the re-run emitter reproducing it replays without journaling twice', async () => {
+  const fixture = orphanFixture();
+  const { ran, result, entries, patchDigest } = await runOrphanResume({
+    nodes: [fixture.w1], edges: fixture.patchEdges,
+  });
+  assert.equal(result.status, 'completed', result.haltReason ?? '');
+  // The planner ran FIRST — no worker existed before its re-emission.
+  assert.deepEqual(ran, ['planner', 'w1', 'reducer']);
+  assert.deepEqual(result.patches, [patchDigest], 'the reproduced patch applies exactly once');
+  assert.equal(
+    entries.filter((entry) => entry.type === 'patch_admitted').length, 0,
+    'a re-emission of a journaled patch was journaled again — the digest would appear twice on the next resume',
+  );
+});
+
+test('B5: a re-run emitter that emits a DIFFERENT patch fails as node logic — never two child graphs', async () => {
+  const { ran, result } = await runOrphanResume({
+    nodes: [{ id: 'w-other', kind: 'worker' }],
+    edges: [{ id: 'p-other', source: 'planner', target: 'w-other' }],
+  });
+  assert.equal(result.status, 'completed', result.haltReason ?? '');
+  assert.deepEqual(result.failed, ['planner']);
+  const plannerTrace = result.trace.find((entry) => entry.nodeId === 'planner');
+  assert.match(plannerTrace?.reason ?? '', /must reproduce it exactly/);
+  assert.deepEqual(ran, ['planner'], 'children ran from a refused divergent emission');
+  assert.ok(result.unreached.includes('reducer'), 'the reducer advanced without its planner');
+});
+
+// ─── Suite C3: the failure route mirror ──────────────────────────────────────
+
+test('C: a durably fired FAILURE route replays exactly — the failed node is reused as failed, the recovery route reuses, the success alternative stays unreached', async () => {
+  const src: ExecutableNode = { id: 'src', kind: 'step' };
+  const okRoute: ExecutableNode = { id: 'ok_route', kind: 'step' };
+  const failRoute: ExecutableNode = { id: 'fail_route', kind: 'step' };
+  const merge: ExecutableNode = { id: 'merge', kind: 'reduce', joinMode: 'any' };
+  const graph: ExecutableGraph = {
+    graphId: 'any-join-failure',
+    nodes: [src, okRoute, failRoute, merge],
+    edges: [
+      { id: 'e-ok', source: 'src', target: 'ok_route', when: 'success' },
+      { id: 'e-fail', source: 'src', target: 'fail_route', when: 'failure' },
+      { id: 'e-ok-merge', source: 'ok_route', target: 'merge' },
+      { id: 'e-fail-merge', source: 'fail_route', target: 'merge' },
+    ],
+  };
+  const admission = admitted(graph);
+  const journal: GraphJournalEntry[] = [
+    ...settledPair({
+      admission, node: src, inputDigest: computeInputDigest([]), attemptId: 't-src', wave: 0,
+      status: 'failed', reason: 'provider refused the request', firedEdgeIds: ['e-fail'],
+    }),
+    ...settledPair({
+      admission, node: failRoute, inputDigest: computeInputDigest([]), attemptId: 't-fr', wave: 1,
+      outputRef: 'recovered', firedEdgeIds: ['e-fail-merge'],
+    }),
+    ...settledPair({
+      admission, node: merge,
+      inputDigest: computeInputDigest([{ nodeId: 'fail_route', outputRef: 'recovered', evidenceRefs: [] }]),
+      attemptId: 't-m', wave: 2, outputRef: 'merged', firedEdgeIds: [],
+    }),
+  ];
+  const ran: string[] = [];
+  const runner: NodeRunner = {
+    run(node): NodeOutcome { ran.push(node.id); return { status: 'completed' }; },
+  };
+  const { adapter } = memoryAdapter();
+  const result = await runGraph(graph, {
+    runner, admission, journalAdapter: adapter, clock: () => 0, resumeEntries: journal,
+  });
+  assert.equal(result.status, 'completed', result.haltReason ?? '');
+  assert.deepEqual(ran, [], 'a durably settled failure route was re-dispatched');
+  const srcTrace = result.trace.find((entry) => entry.nodeId === 'src');
+  assert.equal(srcTrace?.reused, true, 'the failed settlement is trusted history, replayed not re-run');
+  assert.equal(srcTrace?.status, 'failed');
+  assert.ok(result.unreached.includes('ok_route'), 'the success alternative stays unreached');
+});
+
+// ─── Suite D: opaque edge stability ──────────────────────────────────────────
+
+function opaqueFixture(firedEdgeIds: string[], includeY: boolean) {
+  const x: ExecutableNode = { id: 'x', kind: 'step' };
+  const y: ExecutableNode = { id: 'y', kind: 'step' };
+  const graph: ExecutableGraph = {
+    graphId: 'opaque',
+    nodes: [x, y],
+    edges: [{ id: 'e-v', source: 'x', target: 'y', when: 'verified' }],
+  };
+  const admission = admitted(graph);
+  const journal: GraphJournalEntry[] = [
+    ...settledPair({
+      admission, node: x, inputDigest: computeInputDigest([]), attemptId: 't-x', wave: 0,
+      outputRef: 'art-x', firedEdgeIds,
+    }),
+    ...(includeY
+      ? settledPair({
+        admission, node: y,
+        inputDigest: computeInputDigest([{ nodeId: 'x', outputRef: 'art-x', evidenceRefs: [] }]),
+        attemptId: 't-y', wave: 1, outputRef: 'art-y', firedEdgeIds: [],
+      })
+      : []),
+  ];
+  return { graph, admission, journal };
+}
+
+test('D: a durably fired opaque edge replays even when today\'s closure would say no — and the closure is never consulted for reused work', async () => {
+  const { graph, admission, journal } = opaqueFixture(['e-v'], true);
+  let closureCalls = 0;
+  const ran: string[] = [];
+  const runner: NodeRunner = {
+    run(node): NodeOutcome { ran.push(node.id); return { status: 'completed' }; },
+    edgeSatisfied: () => { closureCalls += 1; return false; },
+  };
+  const { adapter } = memoryAdapter();
+  const result = await runGraph(graph, {
+    runner, admission, journalAdapter: adapter, clock: () => 0, resumeEntries: journal,
+  });
+  assert.equal(result.status, 'completed', result.haltReason ?? '');
+  assert.deepEqual(ran, [], 'reused work was re-dispatched');
+  assert.equal(result.trace.find((entry) => entry.nodeId === 'y')?.reused, true,
+    'the historically fired opaque route did not replay');
+  assert.equal(closureCalls, 0, 'a present-day closure was consulted for durable history');
+});
+
+test('D: a durably UNFIRED opaque edge stays unfired even when today\'s closure would say yes', async () => {
+  const { graph, admission, journal } = opaqueFixture([], false);
+  let closureCalls = 0;
+  const ran: string[] = [];
+  const runner: NodeRunner = {
+    run(node): NodeOutcome { ran.push(node.id); return { status: 'completed' }; },
+    edgeSatisfied: () => { closureCalls += 1; return true; },
+  };
+  const { adapter } = memoryAdapter();
+  const result = await runGraph(graph, {
+    runner, admission, journalAdapter: adapter, clock: () => 0, resumeEntries: journal,
+  });
+  assert.equal(result.status, 'completed', result.haltReason ?? '');
+  assert.deepEqual(ran, [], 'x was re-dispatched or y ran through an edge history says never fired');
+  assert.equal(closureCalls, 0, 'a present-day closure was consulted for durable history');
+  assert.ok(result.unreached.includes('y'), 'y became reachable through a rewritten verdict');
 });
