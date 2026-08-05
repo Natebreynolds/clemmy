@@ -102,7 +102,12 @@ import {
 } from '../runtime/harness/public-presentation.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
-import { advanceTransportProgress, type TransportProgressAction, type TransportProgressState } from './transport-progress.js';
+import {
+  advanceTransportProgress,
+  shouldPaintChannelBody,
+  type TransportProgressAction,
+  type TransportProgressState,
+} from './transport-progress.js';
 import { projectChatAttemptActivity } from '../dashboard/activity-projection.js';
 import type {
   SurfaceActivityLabel,
@@ -3118,6 +3123,9 @@ export async function runDiscordHarnessConversation(opts: {
   });
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
+  // The body Discord/Slack is currently showing. An edit that would repaint it
+  // byte-for-byte is not a progress update.
+  let lastPaintedBody = '';
   // Track which approval the LAST flush attached buttons for, so a
   // subsequent flush after the approval resolves (or a new approval
   // arrives) clears/replaces them — passing components:[] drops them.
@@ -3209,17 +3217,25 @@ export async function runDiscordHarnessConversation(opts: {
       }
       return;
     }
+    const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
+    const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
+    const body = renderBody(state);
+    if (!shouldPaintChannelBody({
+      action: milestone.action,
+      approvalChanged: needsUpdate,
+      body,
+      lastPaintedBody,
+    })) return;
     try {
-      const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
-      const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
       if (components || needsUpdate) {
         // Pass components (or an empty array when we need to clear
         // previously-attached buttons).
-        await handle.edit(renderBody(state), { components: components ?? [] });
+        await handle.edit(body, { components: components ?? [] });
         lastAttachedApprovalId = state.pendingApprovalId;
       } else {
-        await handle.edit(renderBody(state));
+        await handle.edit(body);
       }
+      lastPaintedBody = body;
     } catch (err) {
       // Discord can transiently refuse edits (network blip, rate
       // limit, or — at minute 15+ — interaction-token expiry). The
@@ -3262,7 +3278,10 @@ export async function runDiscordHarnessConversation(opts: {
     // Exactly one final replacement: a second settle (the safety timer racing
     // the terminal event) finds the lane already finalized and stays quiet.
     if (progressLane.finalized) return;
-    progressLane.settle(state, lastEditAt);
+    // The lane is marked final only once the reply is actually DELIVERED — each
+    // send path settles it for itself below. A send that threw left the user
+    // looking at a placeholder, and a lane that called itself finished there
+    // would lock the message against every retry.
     if (!state.asyncWorkDispatched) await refreshPendingApprovalDisplay(state, session.id);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
@@ -3279,6 +3298,7 @@ export async function runDiscordHarnessConversation(opts: {
           for (const chunk of chunks) {
             await transport.sendFollowup(chunk);
           }
+          progressLane.settle(state, Date.now());
         } catch (err) {
           logger.warn(
             { err: err instanceof Error ? err.message : String(err), sessionId: session.id, stage: 'finalFlush-postExpiry' },
@@ -3301,6 +3321,8 @@ export async function runDiscordHarnessConversation(opts: {
           await transport.sendFollowup(chunks[i]);
         }
       }
+      lastPaintedBody = chunks[0] ?? '';
+      progressLane.settle(state, Date.now());
     } catch (err) {
       // Token expired DURING the final flush (run was just at the 15-min
       // boundary). Try the whole thing via followup so the user still
@@ -3316,6 +3338,7 @@ export async function runDiscordHarnessConversation(opts: {
             for (const chunk of chunks) {
               await transport.sendFollowup(chunk);
             }
+            progressLane.settle(state, Date.now());
           } catch (followupErr) {
             logger.warn(
               { err: followupErr instanceof Error ? followupErr.message : String(followupErr), sessionId: session.id, stage: 'finalFlush-fallback' },
@@ -3964,6 +3987,8 @@ async function runDiscordHarnessResume(opts: {
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
   let lastAttachedApprovalId: string | undefined;
+  // The body currently on screen; an identical repaint is not an update.
+  let lastPaintedBody = '';
   // Token streaming: accumulate deltas here, flush periodically
   let streamBuffer = '';
   let pendingStreamFlush: NodeJS.Timeout | null = null;
@@ -3991,15 +4016,23 @@ async function runDiscordHarnessResume(opts: {
     if (milestone.action === 'kickoff' || milestone.action === 'edit') {
       state.activityLine = milestone.text;
     }
+    const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
+    const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
+    const body = renderBody(state);
+    if (!shouldPaintChannelBody({
+      action: milestone.action,
+      approvalChanged: needsUpdate,
+      body,
+      lastPaintedBody,
+    })) return;
     try {
-      const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
-      const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
       if (components || needsUpdate) {
-        await handle.edit(renderBody(state), { components: components ?? [] });
+        await handle.edit(body, { components: components ?? [] });
         lastAttachedApprovalId = state.pendingApprovalId;
       } else {
-        await handle.edit(renderBody(state));
+        await handle.edit(body);
       }
+      lastPaintedBody = body;
     } catch {
       /* transient — next event retries */
     }
@@ -4012,7 +4045,6 @@ async function runDiscordHarnessResume(opts: {
     pendingEdit = null;
     lastEditAt = Date.now();
     if (progressLane.finalized) return;
-    progressLane.settle(state, lastEditAt);
     if (!state.asyncWorkDispatched) await refreshPendingApprovalDisplay(state, sessionId);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
@@ -4030,6 +4062,10 @@ async function runDiscordHarnessResume(opts: {
           await transport.sendFollowup(chunks[i]);
         }
       }
+      lastPaintedBody = chunks[0] ?? '';
+      // Final only after the reply actually landed — a failed send leaves the
+      // lane open so the next attempt can still deliver.
+      progressLane.settle(state, Date.now());
     } catch {
       /* transient — user can re-ping if they don't see the full reply */
     }

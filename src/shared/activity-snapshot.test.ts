@@ -25,7 +25,6 @@ const {
   buildActivitySnapshot,
   formatElapsed,
   formatNextRun,
-  isHarnessTerminalEvent,
 } = await import('./activity-snapshot.js');
 const bg = await import('../execution/background-tasks.js');
 const { recordOperationalEvent } = await import('../runtime/operational-telemetry.js');
@@ -81,18 +80,20 @@ test('live worker counts are folded from recent operational events onto the owni
   assert.equal(row?.workers?.queued, 1);
 });
 
-test('an open approval on a running session sets needsApproval; a resolved one clears it', () => {
+test('an open approval sets needsApproval from durable status; resuming clears it', () => {
+  // The marker follows the run's own durable state, not a telemetry window: a
+  // task parked on an approval says so, and one that resumed does not.
   const task = bg.createBackgroundTask({ title: 'Gated write', prompt: 'write', maxMinutes: 30 });
   bg.markBackgroundTaskRunning(task.id);
-  const sessionId = task.runSessionId;
+  bg.markBackgroundTaskAwaitingApproval(task.id, 'apr-activity-snapshot', 'Send the summary?');
 
-  recordOperationalEvent({ source: 'safety', type: 'approval_required', sessionId });
   let row = buildActivitySnapshot().runningNow.find((r) => r.id === task.id);
   assert.equal(row?.needsApproval, true);
 
-  recordOperationalEvent({ source: 'safety', type: 'approval_resolved', sessionId });
+  bg.queueBackgroundTaskApprovalResolution('apr-activity-snapshot', true);
   row = buildActivitySnapshot().runningNow.find((r) => r.id === task.id);
-  assert.notEqual(row?.needsApproval, true, 'resolved approval clears the marker');
+  assert.notEqual(row?.needsApproval, true, 'a resumed run no longer asks for approval');
+  assert.equal(row?.kind, 'queued', 'a task waiting on the drain is queued, not running');
 });
 
 test('recentDone carries finished tasks with an ok flag, and doneToday counts today', () => {
@@ -121,10 +122,3 @@ test('formatElapsed / formatNextRun produce compact, bounded strings', () => {
   assert.equal(formatNextRun(new Date(now.getTime() + 3 * 60 * 60_000).toISOString(), now), 'in 3h');
 });
 
-test('isHarnessTerminalEvent marks run/approval boundaries terminal, in-flight events not', () => {
-  assert.equal(isHarnessTerminalEvent('run_completed'), true);
-  assert.equal(isHarnessTerminalEvent('approval_requested'), true);
-  assert.equal(isHarnessTerminalEvent('awaiting_user_input'), true);
-  assert.equal(isHarnessTerminalEvent('tool_called'), false);
-  assert.equal(isHarnessTerminalEvent('turn_started'), false);
-});

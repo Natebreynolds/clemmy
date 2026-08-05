@@ -76,6 +76,7 @@ import {
   shouldSurfaceInWorkingNow,
   type ActivityEntry,
 } from './activity-projection.js';
+import { settleFocusActionsForTerminals } from './activity-settlement.js';
 import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
   listWorkflows,
@@ -1786,11 +1787,6 @@ function harnessSessionSourceLabel(session: HarnessSessionRow): string {
   if (session.kind === 'workflow' || session.channel === 'workflow' || session.metadata.source === 'workflow') return 'Workflow';
   return session.channel || session.kind;
 }
-
-// isHarnessSessionCurrentlyWorking (+ its terminal-event helper) moved to
-// src/shared/activity-snapshot.ts so the command center, Slack, and Discord
-// share one definition of "mid-turn right now". Imported above; behavior is
-// identical (status='active' + fresh non-terminal event within the window).
 
 const ACTIVE_WORK_SESSION_PAGE_SIZE = 500;
 
@@ -5718,6 +5714,12 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const snapshot = projectActivitySnapshot({ limit: 100 });
+      // A run that settled takes its linked notebook actions with it. Done over
+      // the UNFILTERED snapshot, because the terminals that settle an action are
+      // exactly the entries the Working Now filter is about to drop.
+      try {
+        settleFocusActionsForTerminals(snapshot.entries);
+      } catch { /* the notebook is best-effort; the projection stays the truth */ }
       const workingNowOnly = req.query.workingNow === '1' || req.query.workingNow === 'true';
       const observedAtMs = Date.parse(snapshot.observedAt);
       const entries = workingNowOnly

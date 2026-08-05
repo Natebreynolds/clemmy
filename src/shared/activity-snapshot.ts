@@ -12,20 +12,20 @@
  * missing store or bad row degrades to an empty section, never a throw. Callers
  * on a live surface must never crash because the snapshot couldn't be built.
  *
- * The mid-turn harness heuristic (isHarnessSessionCurrentlyWorking) lives here
- * so console-routes and the channel surfaces share one definition of "a session
- * the daemon is executing on RIGHT NOW" (status='active' + a fresh non-terminal
- * event), rather than each re-deriving it.
+ * "Running now" is NOT decided here. It comes from the server activity
+ * projection, which derives membership from durable leases and settled
+ * terminals. The old rule — active session plus an event inside a 60-second
+ * window — could not tell a 90-second provider call from a dead run, so it is
+ * gone rather than kept alongside a second opinion.
  */
 import { listPending as listPendingHarnessApprovals } from '../runtime/harness/approval-registry.js';
-import {
-  listSessions as listHarnessSessions,
-  listEvents as listHarnessEvents,
-  type SessionRow as HarnessSessionRow,
-  type EventRow as HarnessEventRow,
-} from '../runtime/harness/eventlog.js';
 import { listOperationalEvents } from '../runtime/operational-telemetry.js';
 import { listBackgroundTasks } from '../execution/background-tasks.js';
+import {
+  projectActivitySnapshot,
+  shouldSurfaceInWorkingNow,
+  type ActivityEntry,
+} from '../dashboard/activity-projection.js';
 import { loadCronJobs, loadWorkflows } from '../dashboard/state.js';
 import { getNextRun } from './cron.js';
 import { listOpenCheckIns } from '../agents/check-ins.js';
@@ -75,38 +75,6 @@ export interface ActivitySnapshot {
   };
 }
 
-/** Only sessions the daemon is genuinely mid-turn on count as "working now". */
-const HARNESS_TERMINAL_EVENT_TYPES: ReadonlySet<HarnessEventRow['type']> = new Set<HarnessEventRow['type']>([
-  'conversation_completed',
-  'run_completed',
-  'run_failed',
-  'approval_requested',
-  'awaiting_user_input',
-]);
-
-export function isHarnessTerminalEvent(type: HarnessEventRow['type']): boolean {
-  return HARNESS_TERMINAL_EVENT_TYPES.has(type);
-}
-
-/**
- * True when the daemon is executing a turn on this session RIGHT NOW. Chat
- * sessions stay status='active' BETWEEN turns (active = open + addressable, not
- * necessarily executing), so "active" alone over-reports. Heuristic: active AND
- * last event within `activeWindowCutoff` AND that last event is not terminal.
- *
- * Moved here from console-routes so every surface shares one definition.
- */
-export function isHarnessSessionCurrentlyWorking(session: HarnessSessionRow, activeWindowCutoff: number): boolean {
-  if (session.status !== 'active') return false;
-  const updatedMs = Date.parse(session.updatedAt);
-  if (!Number.isFinite(updatedMs) || updatedMs < activeWindowCutoff) return false;
-  const latest = listHarnessEvents(session.id, { limit: 1, desc: true })[0];
-  if (!latest) return false;
-  return !isHarnessTerminalEvent(latest.type);
-}
-
-/** The active window for "mid-turn" — covers an LLM turn plus a slow tool call. */
-const ACTIVE_WINDOW_MS = 60_000;
 /** How far back to scan operational events for live worker / approval counts. */
 const WORKER_WINDOW_MS = 10 * 60_000;
 /** "Recent failures" window for the needs-attention count (mirrors Slack's 14d). */
@@ -173,11 +141,20 @@ function computeSessionActivity(sinceIso: string): Map<string, SessionActivity> 
   return map;
 }
 
-/** Friendly kind label for a harness session row. */
-function harnessKindLabel(session: HarnessSessionRow): string {
-  if (session.channel === 'discord' || session.channel === 'discord-dm' || session.metadata?.source === 'discord') return 'discord';
-  if (session.kind === 'workflow' || session.channel === 'workflow' || session.metadata?.source === 'workflow') return 'workflow';
-  return session.kind || 'session';
+/**
+ * Friendly kind label for a running row, from the projection's own vocabulary:
+ * queued work says queued, detached work says task, and a chat turn says where
+ * it is being held.
+ */
+function runningKindLabel(entry: ActivityEntry): string {
+  if (entry.lifecycle === 'queued') return 'queued';
+  if (entry.kind === 'fanout') return 'plan';
+  if (entry.kind === 'background') return 'task';
+  const origin = (entry.origin ?? '').toLowerCase();
+  if (origin.startsWith('discord')) return 'discord';
+  if (origin.startsWith('slack')) return 'slack';
+  if (origin === 'workflow') return 'workflow';
+  return origin || 'session';
 }
 
 function elapsedFrom(startedAt: string | undefined, nowMs: number): number | undefined {
@@ -205,44 +182,44 @@ export function buildActivitySnapshot(now: Date = new Date()): ActivitySnapshot 
   const approvalOpenFor = (sessionId: string | undefined): boolean =>
     !!sessionId && (activity.get(sessionId)?.approvalsOpen ?? 0) > 0;
 
-  // ── Running background tasks (genuinely active + queued-to-start) ──
-  const bgRunning = safe(() => listBackgroundTasks({ status: 'running' }), []);
-  const bgPending = safe(() => listBackgroundTasks({ status: 'pending' }), []);
-  const runningNow: RunningNowItem[] = [];
-  const seenRunSessionIds = new Set<string>();
-  for (const task of [...bgRunning, ...bgPending]) {
-    if (task.runSessionId) seenRunSessionIds.add(task.runSessionId);
-    const startedAt = task.startedAt ?? task.createdAt;
-    runningNow.push({
-      kind: task.status === 'pending' ? 'queued' : 'task',
-      id: task.id,
-      title: task.title || 'Task',
-      sessionId: task.runSessionId || undefined,
-      startedAt,
-      elapsedMs: elapsedFrom(startedAt, nowMs),
-      workers: workersFor(task.runSessionId),
-      needsApproval: approvalOpenFor(task.runSessionId) || undefined,
-    });
-  }
-
-  // ── Mid-turn harness sessions the daemon is executing right now ──
-  const activeWindowCutoff = nowMs - ACTIVE_WINDOW_MS;
-  const harnessSessions = safe(
-    () => listHarnessSessions({ limit: 60 }).filter((s) => isHarnessSessionCurrentlyWorking(s, activeWindowCutoff)),
-    [] as HarnessSessionRow[],
+  // ── What the daemon is running, from the ONE durable projection ──
+  // Every surface that shows "running now" — the notch, Slack App Home,
+  // Discord status — reads this list, and the list is the server projection's
+  // Working Now gate: detached and scheduled work always, a foreground chat
+  // turn only once it has run long enough to be work the user may have walked
+  // away from. Membership is lease truth, never "no event for N seconds".
+  // Plans are included because their worker windows are NOT: a window is an
+  // internal sub-unit the projection deliberately hides, so without the plan
+  // itself these surfaces would go blank while a fan-out ran.
+  const activityEntries = safe(
+    () => projectActivitySnapshot({
+      observedAt: now.toISOString(),
+      kinds: ['chat', 'background', 'fanout'],
+    }).entries,
+    [] as ActivityEntry[],
   );
-  for (const session of harnessSessions) {
-    // A background task's own run session is already represented above.
-    if (seenRunSessionIds.has(session.id)) continue;
+  const runningNow: RunningNowItem[] = [];
+  for (const entry of activityEntries) {
+    if (!shouldSurfaceInWorkingNow(entry, nowMs)) continue;
+    const sessionId = entry.sessionId || undefined;
     runningNow.push({
-      kind: harnessKindLabel(session),
-      id: session.id,
-      title: session.title || session.objective || 'Clementine run',
-      sessionId: session.id,
-      startedAt: session.createdAt,
-      elapsedMs: elapsedFrom(session.createdAt, nowMs),
-      workers: workersFor(session.id),
-      needsApproval: approvalOpenFor(session.id) || undefined,
+      kind: runningKindLabel(entry),
+      id: entry.planId ?? entry.taskId ?? sessionId ?? entry.runKey,
+      title: entry.headline,
+      sessionId,
+      startedAt: entry.startedAt,
+      elapsedMs: elapsedFrom(entry.startedAt, nowMs),
+      // A plan's fan-out is its journal's, not a telemetry fold over its origin
+      // session: settled items are the honest count, and the origin session's
+      // worker events belong to whatever else that chat is doing.
+      workers: entry.kind === 'fanout'
+        ? (entry.progress
+          ? { active: Math.max(0, entry.progress.total - entry.progress.completed), queued: 0 }
+          : undefined)
+        : workersFor(sessionId),
+      // Blocked on a person is the projection's call, from the approval
+      // registry and the run's own lifecycle — not a telemetry window.
+      needsApproval: entry.lifecycle === 'awaiting_approval' || undefined,
     });
   }
 

@@ -25,7 +25,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 type DisplayState = import('./discord-harness.js').DisplayState;
 const { __test__ } = await import('./discord-harness.js');
-const { MILESTONE_EDIT_INTERVAL_MS } = await import('./transport-progress.js');
+const { MILESTONE_EDIT_INTERVAL_MS, shouldPaintChannelBody } = await import('./transport-progress.js');
 const { beginRunAttempt, createSession, finishRunAttempt } = await import('../runtime/harness/eventlog.js');
 
 test.after(() => {
@@ -161,6 +161,22 @@ test('the rendered message body carries the milestone the lane decided on', () =
     'the raw event status outranked the shared milestone');
 });
 
+test('silence is silence: no edit when the reducer declines and nothing changed', () => {
+  const same = {
+    action: 'none' as const,
+    approvalChanged: false,
+    body: '_working… · 2m_',
+    lastPaintedBody: '_working… · 2m_',
+  };
+  assert.equal(shouldPaintChannelBody(same), false, 'an identical repaint was sent as progress');
+  assert.equal(shouldPaintChannelBody({ ...same, body: '_working… · 3m_' }), true,
+    'the message froze even though its body had changed');
+  assert.equal(shouldPaintChannelBody({ ...same, approvalChanged: true }), true,
+    'approval buttons could not be attached or cleared');
+  assert.equal(shouldPaintChannelBody({ ...same, action: 'kickoff' }), true);
+  assert.equal(shouldPaintChannelBody({ ...same, action: 'edit' }), true);
+});
+
 test('the live sender path — both flush machines — decides through the lane', () => {
   const source = readFileSync(
     path.join(path.dirname(fileURLToPath(import.meta.url)), 'discord-harness.ts'),
@@ -171,10 +187,31 @@ test('the live sender path — both flush machines — decides through the lane'
   // to narrating from its own events.
   assert.equal((source.match(/progressLane\.milestone\(/g) ?? []).length, 2,
     'a flush path edits the message without asking the shared reducer');
-  assert.equal((source.match(/progressLane\.settle\(/g) ?? []).length, 2,
-    'a final replacement is sent without the reducer marking the run settled');
+  assert.equal((source.match(/progressLane\.settle\(/g) ?? []).length, 4,
+    'a delivery path completes without the reducer marking the run settled');
   assert.equal((source.match(/if \(progressLane\.finalized\) return;/g) ?? []).length, 4,
     'a flush path can still repaint a settled message');
+  // Every handle.edit is gated by the shared paint decision.
+  assert.equal((source.match(/shouldPaintChannelBody\(\{/g) ?? []).length, 2,
+    'a progress edit is sent without asking whether there is anything to say');
   // The caller-less exported wrappers the reducer used to hide behind are gone.
   assert.equal(source.includes('nextDiscordProgressAction'), false);
+});
+
+test('a final message is only recorded as final once it has actually been delivered', () => {
+  const source = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), 'discord-harness.ts'),
+    'utf-8',
+  );
+  // In each finalFlush, the send happens BEFORE the lane is told it is final. A
+  // lane marked final on a throw would lock the message against every retry and
+  // leave the user staring at a placeholder.
+  for (const block of source.split('const finalFlush = async ()').slice(1)) {
+    const body = block.slice(0, block.indexOf('\n  };'));
+    const send = body.search(/await (handle\.edit|transport\.sendFollowup)/);
+    const settle = body.search(/progressLane\.settle\(/);
+    assert.ok(send >= 0, 'a final flush that never sends anything');
+    assert.ok(settle > send,
+      'the lane was marked final before the reply was delivered — a failed send would be unrecoverable');
+  }
 });

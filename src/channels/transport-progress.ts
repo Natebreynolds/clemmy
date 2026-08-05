@@ -84,6 +84,26 @@ export function advanceTransportProgress(
   return { action, state: applyTransportProgress(state, action, nowMs) };
 }
 
+/**
+ * Does this flush have anything to say?
+ *
+ * An edit is justified by exactly three things: the reducer emitting a
+ * milestone, the approval buttons needing to change, or a body that actually
+ * differs from what the surface already shows. Absent all three the transport
+ * stays silent — repainting an identical message is not progress, it only
+ * spends the surface's rate limit.
+ */
+export function shouldPaintChannelBody(input: {
+  action: TransportProgressAction['action'];
+  approvalChanged: boolean;
+  body: string;
+  lastPaintedBody: string;
+}): boolean {
+  if (input.action !== 'none') return true;
+  if (input.approvalChanged) return true;
+  return input.body !== input.lastPaintedBody;
+}
+
 /** Fold an emitted action back into the transport's durable-ish state. */
 export function applyTransportProgress(
   state: TransportProgressState,

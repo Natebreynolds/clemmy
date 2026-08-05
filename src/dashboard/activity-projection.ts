@@ -45,7 +45,16 @@ import {
   type RunAttemptRecord,
   type SessionRow,
 } from '../runtime/harness/eventlog.js';
+import { listPending as listPendingHarnessApprovals } from '../runtime/harness/approval-registry.js';
 import { listBackgroundTasks, type BackgroundTaskRecord } from '../execution/background-tasks.js';
+import {
+  listFanoutActivations,
+  listFanoutPlans,
+  listFanoutWindows,
+  type FanoutActivationRow,
+  type FanoutPlanRow,
+  type FanoutWindowRow,
+} from '../execution/durable-fanout.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 
 interface RawRunRecordLike {
@@ -137,12 +146,16 @@ export function projectWorkflowRunActivity(
     revision: revisionFromEvidence(lastEvidenceAt),
     ...(terminal ? { typedTerminal: terminal } : {}),
   });
-  return asEntry(snapshot, 'workflow', { runId: id });
+  return asEntry(snapshot, 'workflow', {
+    runId: id,
+    origin: text(raw.source) ?? 'workflow',
+    ...(nextActionFor(lifecycle, terminal) ? { nextAction: nextActionFor(lifecycle, terminal)! } : {}),
+  });
 }
 
 // ── the unified projection ───────────────────────────────────────────────────
 
-export type ActivityKind = 'chat' | 'background' | 'workflow';
+export type ActivityKind = 'chat' | 'background' | 'workflow' | 'fanout';
 
 /**
  * One row of the unified projection: the shared snapshot plus the identity a
@@ -153,9 +166,19 @@ export interface ActivityEntry extends SurfaceRunSnapshot {
   kind: ActivityKind;
   /** A human is the blocker, or the owner stopped proving it is alive. */
   needsAttention: boolean;
+  /** Where the work came from — the channel or task source a surface labels its
+   *  rows with. Already-public routing vocabulary, never content. */
+  origin?: string;
+  /** The one thing that would move this forward, when the run's own durable
+   *  state names it. Absent when nothing is being waited on. */
+  nextAction?: string;
+  /** The durable owner currently holding this run, when a lease names one. */
+  owner?: string;
   sessionId?: string;
   taskId?: string;
   runId?: string;
+  /** The durable fan-out plan this row IS, when the row is a plan. */
+  planId?: string;
 }
 
 export interface ActivitySnapshot {
@@ -188,7 +211,15 @@ function revisionFromEvidence(...times: Array<string | null | undefined>): numbe
 function asEntry(
   snapshot: SurfaceRunSnapshot,
   kind: ActivityKind,
-  identity: { sessionId?: string; taskId?: string; runId?: string } = {},
+  identity: {
+    sessionId?: string;
+    taskId?: string;
+    runId?: string;
+    planId?: string;
+    origin?: string;
+    nextAction?: string;
+    owner?: string;
+  } = {},
 ): ActivityEntry {
   // A person is the blocker when the run is waiting on one, when the owner
   // stopped proving it is alive, or when it settled short of success and can
@@ -201,10 +232,31 @@ function asEntry(
     ...snapshot,
     kind,
     needsAttention,
+    ...(identity.origin ? { origin: identity.origin } : {}),
+    ...(identity.nextAction ? { nextAction: identity.nextAction } : {}),
+    ...(identity.owner ? { owner: identity.owner } : {}),
     ...(identity.sessionId ? { sessionId: identity.sessionId } : {}),
     ...(identity.taskId ? { taskId: identity.taskId } : {}),
     ...(identity.runId ? { runId: identity.runId } : {}),
+    ...(identity.planId ? { planId: identity.planId } : {}),
   };
+}
+
+/**
+ * The one move that would unblock this run, from its own durable state. Never
+ * invented: a run that is simply working has no next action, and saying "waiting
+ * on you" about work nobody is blocking is how a panel trains people to ignore it.
+ */
+function nextActionFor(lifecycle: SurfaceLifecycle, terminal?: SurfaceTerminal): string | undefined {
+  switch (lifecycle) {
+    case 'awaiting_approval': return 'Approve or reject to continue.';
+    case 'awaiting_input': return 'Answer the question to continue.';
+    case 'paused_budget': return 'Continue the run to pick it back up.';
+    case 'blocked': return 'Clear the blocker, then resume.';
+    default: break;
+  }
+  if (terminal && terminal.status !== 'completed' && terminal.resumable) return 'Review and resume.';
+  return undefined;
 }
 
 /**
@@ -263,6 +315,8 @@ export interface ChatActivityInput {
   presentationLane?: 'foreground' | 'detached' | 'scheduled';
   startedAt?: string;
   lastEvidenceAt?: string;
+  /** Channel/source label the surfaces tag rows with. */
+  origin?: string;
 }
 
 /**
@@ -290,7 +344,15 @@ export function projectChatAttemptActivity(input: ChatActivityInput): ActivityEn
     ...(input.activityLabel ? { activityLabel: input.activityLabel } : {}),
     ...(terminal ? { typedTerminal: terminal } : {}),
   });
-  return asEntry(snapshot, 'chat', { sessionId: input.sessionId, runId: attempt?.runId ?? undefined });
+  const nextAction = nextActionFor(snapshot.lifecycle, terminal);
+  return asEntry(snapshot, 'chat', {
+    sessionId: input.sessionId,
+    runId: attempt?.runId ?? undefined,
+    ...(input.origin ? { origin: input.origin } : {}),
+    ...(nextAction ? { nextAction } : {}),
+    // The owner is named only while it actually holds the lease.
+    ...(attempt?.leaseOwner && !attempt.finishedAt ? { owner: attempt.leaseOwner } : {}),
+  });
 }
 
 /** Background statuses → lifecycle. Anything unrecognized is 'accepted'. */
@@ -340,7 +402,114 @@ export function projectBackgroundTaskActivity(
     revision: revisionFromEvidence(lastEvidenceAt),
     ...(terminal ? { typedTerminal: terminal } : {}),
   });
-  return asEntry(snapshot, 'background', { taskId: task.id, sessionId: task.runSessionId });
+  const nextAction = task.pendingQuestion && lifecycle === 'awaiting_input'
+    ? 'Answer the question to continue.'
+    : nextActionFor(lifecycle, terminal);
+  return asEntry(snapshot, 'background', {
+    taskId: task.id,
+    sessionId: task.runSessionId,
+    origin: task.source,
+    ...(nextAction ? { nextAction } : {}),
+  });
+}
+
+// ── durable fan-out plans ────────────────────────────────────────────────────
+
+const FANOUT_TERMINALS: Record<string, SurfaceTerminal> = {
+  reduced: { status: 'completed', kind: 'reduced', text: 'All items settled and the result was combined.', resumable: false },
+  failed: { status: 'failed', kind: 'failed', text: 'The plan stopped before every item settled.', resumable: true },
+  superseded: { status: 'cancelled', kind: 'superseded', text: 'Replaced by a newer plan.', resumable: false },
+};
+
+/**
+ * Where an active plan is in its own lifecycle. The reducer's state outranks
+ * the item phase, because a plan whose items are all settled is no longer
+ * fanning out — it is combining, and a user watching "3 of 40" turn into
+ * "combining results" is watching the truth.
+ */
+function fanoutLifecycle(plan: FanoutPlanRow, windows: readonly FanoutWindowRow[]): SurfaceLifecycle {
+  switch (plan.reducerState) {
+    case 'failed': return 'blocked';
+    case 'running':
+    case 'admitted':
+    case 'leased':
+    case 'ready': return 'reducing';
+    case 'completed': return 'completing';
+    default: break;
+  }
+  // Nothing claimed yet is queued, not running: a plan waiting for its first
+  // worker window has not started, whatever the board would prefer to show.
+  return windows.some((window) => window.status === 'claimed' || window.status === 'done')
+    ? 'fanout'
+    : 'queued';
+}
+
+/**
+ * Project ONE durable fan-out plan.
+ *
+ * The counts are canonical because they are the journal's: every item × phase
+ * tuple the admitted contract owns, and the subset the journal has settled.
+ * Nothing is estimated, and a plan with no admitted tuples reports no
+ * denominator rather than a reassuring zero.
+ */
+export function projectFanoutPlanActivity(
+  plan: FanoutPlanRow,
+  activations: readonly FanoutActivationRow[],
+  windows: readonly FanoutWindowRow[],
+  observedAt: string,
+): ActivityEntry {
+  const terminal = FANOUT_TERMINALS[plan.status];
+  const lifecycle = terminal ? terminal.status : fanoutLifecycle(plan, windows);
+  const settled = activations.filter((row) => row.status === 'done').length;
+  const failedWindows = windows.filter((window) => window.status === 'failed').length;
+
+  const nextAction = plan.reducerState === 'failed'
+    ? 'Review the combine step, then resume the plan.'
+    : failedWindows > 0 && !terminal
+      ? 'A worker window stopped; retry it or clear the plan.'
+      : nextActionFor(lifecycle, terminal);
+
+  const snapshot = projectRunSnapshot({
+    runKey: `fanout:${plan.planId}`,
+    attemptId: plan.attemptId ?? plan.planId,
+    presentationLane: plan.route.source === 'daemon' || plan.route.source === 'workflow'
+      ? 'scheduled'
+      : 'detached',
+    lifecycle,
+    headline: plan.objective,
+    ...(failedWindows > 0 && !terminal
+      ? { detail: `${failedWindows} worker window${failedWindows === 1 ? '' : 's'} stopped without settling.` }
+      : {}),
+    startedAt: plan.createdAt,
+    lastEvidenceAt: plan.updatedAt,
+    connectivity: 'connected',
+    observedAt,
+    revision: revisionFromEvidence(plan.updatedAt, plan.createdAt),
+    // The denominator is the admitted contract's, so the ratio cannot drift.
+    ...(activations.length > 0 ? { admittedTotal: activations.length, completedCount: settled } : {}),
+    // A held reducer lease is ownership: the combine step is quiet by nature,
+    // and quiet under a lease is live. A lease that actually died is recovered
+    // by the fan-out's own reconciler, which is what moves this row.
+    ...(plan.reducerState === 'leased' && plan.reducerLeaseOwner ? { leaseHeld: true } : {}),
+    ...(terminal ? { typedTerminal: terminal } : {}),
+    activityLabel: terminal
+      ? { phase: 'delivering' }
+      : lifecycle === 'reducing'
+        ? { phase: 'combining' }
+        : { phase: 'working_items', completed: settled, total: activations.length },
+  });
+
+  const entry = asEntry(snapshot, 'fanout', {
+    planId: plan.planId,
+    ...(plan.originSessionId ? { sessionId: plan.originSessionId } : {}),
+    ...(plan.reducerTaskId ? { taskId: plan.reducerTaskId } : {}),
+    origin: plan.route.source ?? 'plan',
+    ...(nextAction ? { nextAction } : {}),
+    ...(plan.reducerLeaseOwner ? { owner: plan.reducerLeaseOwner } : {}),
+  });
+  // A window that stopped without settling needs a person even though the plan
+  // itself has not given up yet.
+  return failedWindows > 0 && !terminal ? { ...entry, needsAttention: true } : entry;
 }
 
 /** Sessions whose work is already projected by the background lane. */
@@ -350,6 +519,13 @@ function isBackgroundRunSession(session: SessionRow): boolean {
 
 function chatHeadline(session: SessionRow): string {
   return session.title?.trim() || session.objective?.trim() || 'Chat turn';
+}
+
+/** The routing label a surface tags the row with — channel first, then the
+ *  session's own kind. Public routing vocabulary only. */
+function chatOrigin(session: SessionRow): string {
+  const source = typeof session.metadata?.source === 'string' ? session.metadata.source : '';
+  return session.channel?.trim() || source.trim() || session.kind || 'chat';
 }
 
 /**
@@ -389,14 +565,38 @@ export function projectActivitySnapshot(
 
   if (wants('background')) try {
     for (const task of listBackgroundTasks()) {
+      // An internal worker task is a SUB-UNIT of a plan, not work in its own
+      // right. Projecting one would put a window on the board beside the plan
+      // that owns it and count the same work twice.
+      if (task.internal) continue;
       entries.push(projectBackgroundTaskActivity(task, observedAt));
     }
   } catch { /* the task store is optional */ }
+
+  if (wants('fanout')) try {
+    for (const plan of listFanoutPlans()) {
+      entries.push(projectFanoutPlanActivity(
+        plan,
+        listFanoutActivations(plan.planId),
+        listFanoutWindows(plan.planId),
+        observedAt,
+      ));
+    }
+  } catch { /* the fan-out journal is optional */ }
 
   if (wants('chat')) try {
     const sessions = listHarnessSessions({ limit: options.sessionLimit ?? 60 })
       .filter((session) => !isBackgroundRunSession(session));
     const attempts = listLatestRunAttemptsForSessions(sessions.map((session) => session.id));
+    // A pending approval is DURABLE truth about who the run is waiting on —
+    // the registry says so directly, so no surface has to infer it from how
+    // long the message has been quiet.
+    const awaitingApproval = new Set<string>();
+    try {
+      for (const approval of listPendingHarnessApprovals({ status: 'pending' })) {
+        awaitingApproval.add(approval.sessionId);
+      }
+    } catch { /* the approval registry is optional */ }
     for (const session of sessions) {
       const attempt = attempts.get(session.id);
       // A session that never ran an attempt has no activity to project.
@@ -407,6 +607,10 @@ export function projectActivitySnapshot(
         attempt,
         observedAt,
         revision: latestSeqFor(session.id),
+        origin: chatOrigin(session),
+        ...(awaitingApproval.has(session.id) && !attempt.finishedAt
+          ? { lifecycleHint: 'awaiting_approval' as SurfaceLifecycle }
+          : {}),
       }));
     }
   } catch { /* the event log is optional */ }

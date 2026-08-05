@@ -1,84 +1,45 @@
 /**
- * NowStrip — a live one-line-per-lane rail of everything the daemon is running
- * RIGHT NOW, above the Tasks board. It rides the same operational-telemetry SSE
- * feed the ObservabilityView uses (lib/telemetry.subscribeTelemetry) and folds
- * events through the pure lib/activity-lanes reducer, so it shows swarm fan-out,
- * open tool calls, brain switches, and auto-continues as they happen — signal
- * the 4s board poll can't surface.
+ * NowStrip — a live one-line-per-run rail of what the daemon is working on,
+ * above the Tasks board.
  *
- * Clicking a lane that maps to a board card opens the existing LiveTraceDrawer
- * (via the card's onOpen), so "watch it live" is one click from the rail.
+ * It renders the SERVER activity projection and decides nothing itself. It used
+ * to subscribe to the raw telemetry stream, fold events into its own lane map,
+ * and drop lanes it judged stale after fifteen minutes — so the rail could show
+ * work the server considered finished, hide work the server considered live,
+ * and disagree with Slack and Discord about the same run. Membership, liveness,
+ * counts, and the terminal now all come from /api/console/activity/v2.
+ *
+ * Clicking a row that maps to a board card opens the existing LiveTraceDrawer.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Radio, Wrench, Users, GitBranch, RefreshCw, Hand } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Radio, Users, Hand, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/cn';
-import { subscribeTelemetry } from '@/lib/telemetry';
-import { foldOperationalEvent, lanesToSortedArray, workerRowsForDisplay, type ActivityLane, type WorkerRow } from '@/lib/activity-lanes';
+import { usePoll } from '@/lib/poll';
+import { activityCounts, elapsedLabel, listWorkingNow, type ActivityEntry } from '@/lib/activity';
 import type { BoardCard } from '@/lib/board';
 
-/** Drop terminal lanes shortly after they finish, and stale non-terminal lanes,
- *  so the rail stays a "now" view and the map can't grow unbounded. */
-const TERMINAL_KEEP_MS = 90_000;
-const STALE_LANE_MS = 15 * 60_000;
-
-/** How many per-worker rows to show before collapsing the rest into "+N more",
- *  so a 30-worker wave can't blow up the rail. */
-const WORKER_ROWS_MAX = 8;
-
-/** Glyph + tone per worker status, matching the count-badge idiom (⚙⏳✕). */
-const WORKER_STATUS_GLYPH: Record<WorkerRow['status'], { glyph: string; className: string }> = {
-  running: { glyph: '⚙', className: 'text-primary' },
-  queued: { glyph: '⏳', className: 'text-muted' },
-  failed: { glyph: '✕', className: 'text-danger' },
-  capped: { glyph: '⚠', className: 'text-warning' },
-};
-
-function elapsedLabel(startedAt: string | undefined, nowMs: number): string {
-  if (!startedAt) return '';
-  const ms = nowMs - Date.parse(startedAt);
-  if (!Number.isFinite(ms) || ms < 0) return '';
-  if (ms < 60_000) return '<1m';
-  const min = Math.round(ms / 60_000);
-  if (min < 60) return `${min}m`;
-  const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr}h`;
-  return `${Math.round(hr / 24)}d`;
-}
-
-function prune(lanes: Map<string, ActivityLane>, nowMs: number): void {
-  for (const [key, lane] of lanes) {
-    const age = nowMs - Date.parse(lane.lastEventAt);
-    if (!Number.isFinite(age)) continue;
-    if (lane.terminal && age > TERMINAL_KEEP_MS) lanes.delete(key);
-    else if (!lane.terminal && age > STALE_LANE_MS) lanes.delete(key);
-  }
-}
+/** Matches the board's own poll: the rail and the cards move together. */
+const POLL_MS = 4_000;
 
 export function NowStrip({ cards, onOpen }: { cards: BoardCard[]; onOpen: (card: BoardCard) => void }) {
-  const lanesRef = useRef<Map<string, ActivityLane>>(new Map());
-  const [rows, setRows] = useState<ActivityLane[]>([]);
+  const query = usePoll(['activity-working-now'], listWorkingNow, POLL_MS);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
+  // Tick only the elapsed LABEL. Nothing here may change which rows exist or
+  // what state they are in — that is the server's call.
   useEffect(() => {
-    const refresh = () => {
-      prune(lanesRef.current, Date.now());
-      setRows(lanesToSortedArray(lanesRef.current).filter((l) => !l.terminal));
-    };
-    const unsub = subscribeTelemetry({
-      onReplay: (events) => { for (const e of events) foldOperationalEvent(lanesRef.current, e); refresh(); },
-      onEvent: (e) => { foldOperationalEvent(lanesRef.current, e); refresh(); },
-    });
-    // Tick elapsed labels (and re-prune) without needing a new event.
-    const timer = window.setInterval(() => { setNowMs(Date.now()); refresh(); }, 30_000);
-    return () => { unsub(); window.clearInterval(timer); };
+    const timer = window.setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
   }, []);
 
-  // Map a lane to a board card so a click can open the existing live drawer.
-  const cardForLane = useMemo(() => {
-    return (lane: ActivityLane): BoardCard | undefined =>
-      cards.find((c) =>
-        (!!lane.sessionId && c.sessionId === lane.sessionId)
-        || (!!lane.workflowRunId && c.raw.runId === lane.workflowRunId));
+  const rows = query.data ?? [];
+
+  const cardForEntry = useMemo(() => {
+    return (entry: ActivityEntry): BoardCard | undefined =>
+      cards.find((card) =>
+        (!!entry.sessionId && card.sessionId === entry.sessionId)
+        || (!!entry.taskId && card.id === entry.taskId)
+        || (!!entry.runId && card.raw.runId === entry.runId));
   }, [cards]);
 
   if (rows.length === 0) return null;
@@ -90,14 +51,13 @@ export function NowStrip({ cards, onOpen }: { cards: BoardCard[]; onOpen: (card:
         Now · {rows.length}
       </div>
       <ul className="flex flex-col gap-1.5">
-        {rows.map((lane) => {
-          const card = cardForLane(lane);
+        {rows.map((entry) => {
+          const card = cardForEntry(entry);
           const clickable = !!card;
-          const workerRows = workerRowsForDisplay(lane);
-          const visibleWorkers = workerRows.slice(0, WORKER_ROWS_MAX);
-          const hiddenWorkers = workerRows.length - visibleWorkers.length;
+          const counts = activityCounts(entry);
+          const stale = entry.liveness === 'stale';
           return (
-            <li key={lane.key}>
+            <li key={entry.runKey}>
               <div
                 role={clickable ? 'button' : undefined}
                 tabIndex={clickable ? 0 : undefined}
@@ -108,64 +68,42 @@ export function NowStrip({ cards, onOpen }: { cards: BoardCard[]; onOpen: (card:
                   clickable ? 'cursor-pointer hover:bg-hover' : 'cursor-default',
                 )}
               >
-                <span className="rounded-sm bg-subtle px-1.5 py-0.5 text-caption font-semibold text-muted">{lane.kind}</span>
-                <span className="min-w-0 flex-1 truncate font-medium text-fg">{lane.title}</span>
+                <span className="rounded-sm bg-subtle px-1.5 py-0.5 text-caption font-semibold text-muted">
+                  {entry.origin || entry.kind}
+                </span>
+                <span className="min-w-0 flex-1 truncate font-medium text-fg">{entry.headline}</span>
 
-                {lane.model && <span className="hidden text-caption text-faint sm:inline">{lane.model}</span>}
-
-                {lane.openTool && (
-                  <span className="inline-flex items-center gap-1 text-caption text-primary">
-                    <Wrench className="h-3 w-3" />
-                    <span className="max-w-[10rem] truncate">{lane.openTool.name}</span>
-                    <Radio className="h-3 w-3 animate-breathe" />
+                {entry.activity?.text && (
+                  <span className="hidden max-w-[14rem] truncate text-caption text-primary sm:inline">
+                    {entry.activity.text}
                   </span>
                 )}
 
-                {(lane.workers.active > 0 || lane.workers.queued > 0 || lane.workers.failed > 0) && (
-                  <span className="inline-flex items-center gap-1 text-caption text-muted" title="workers: active · queued · failed">
-                    <Users className="h-3 w-3" />
-                    {lane.workers.active > 0 && <span>{lane.workers.active}⚙</span>}
-                    {lane.workers.queued > 0 && <span>{lane.workers.queued}⏳</span>}
-                    {lane.workers.failed > 0 && <span className="text-danger">{lane.workers.failed}✕</span>}
+                {counts && (
+                  <span className="inline-flex items-center gap-1 text-caption text-muted" title="settled of admitted">
+                    <Users className="h-3 w-3" />{counts}
                   </span>
                 )}
 
-                {lane.badges.fallover > 0 && (
-                  <span className="inline-flex items-center gap-1 text-caption text-warning" title="brain switched">
-                    <GitBranch className="h-3 w-3" />{lane.badges.fallover}
+                {stale && (
+                  <span className="inline-flex items-center gap-1 text-caption text-warning" title="the owner stopped renewing its lease">
+                    <AlertTriangle className="h-3 w-3" />stalled
                   </span>
                 )}
-                {lane.badges.autoContinues > 0 && (
-                  <span className="inline-flex items-center gap-1 text-caption text-faint" title="auto-continued">
-                    <RefreshCw className="h-3 w-3" />{lane.badges.autoContinues}
-                  </span>
-                )}
-                {lane.needsApproval && (
-                  <span className="inline-flex items-center gap-1 text-caption text-warning" title="needs your approval">
+
+                {entry.needsAttention && !stale && (
+                  <span className="inline-flex items-center gap-1 text-caption text-warning" title={entry.nextAction ?? 'needs you'}>
                     <Hand className="h-3 w-3" />
                   </span>
                 )}
 
-                <span className="w-9 shrink-0 text-right text-caption text-faint">{elapsedLabel(lane.startedAt, nowMs)}</span>
+                <span className="w-9 shrink-0 text-right text-caption text-faint">
+                  {elapsedLabel(entry.startedAt, nowMs)}
+                </span>
               </div>
 
-              {workerRows.length > 0 && (
-                <ul className="mb-1 ml-8 mt-0.5 flex flex-col gap-0.5" aria-label="Swarm workers">
-                  {visibleWorkers.map((worker) => {
-                    const status = WORKER_STATUS_GLYPH[worker.status];
-                    return (
-                      <li key={worker.item} className="flex items-center gap-1.5 text-caption text-muted">
-                        <span className={cn('w-3 shrink-0 text-center', status.className, worker.status === 'running' && 'animate-breathe')}>{status.glyph}</span>
-                        <span className="min-w-0 flex-1 truncate">{worker.item}</span>
-                        {worker.model && <span className="hidden text-faint sm:inline">{worker.model}</span>}
-                        <span className="w-8 shrink-0 text-right text-faint">{elapsedLabel(worker.sinceTs, nowMs)}</span>
-                      </li>
-                    );
-                  })}
-                  {hiddenWorkers > 0 && (
-                    <li className="pl-[1.125rem] text-caption text-faint">+{hiddenWorkers} more</li>
-                  )}
-                </ul>
+              {entry.nextAction && (
+                <p className="ml-8 mt-0.5 truncate text-caption text-muted">{entry.nextAction}</p>
               )}
             </li>
           );

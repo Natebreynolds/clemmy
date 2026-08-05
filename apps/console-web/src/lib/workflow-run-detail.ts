@@ -8,7 +8,7 @@
  * FINISHED run (not just a flat milestone list).
  *
  * No React, no I/O — kept pure so it is unit-testable and the component stays a
- * thin renderer (same split as activity-lanes.ts / NowStrip).
+ * thin renderer.
  */
 
 export interface WorkflowAttemptRecord {
