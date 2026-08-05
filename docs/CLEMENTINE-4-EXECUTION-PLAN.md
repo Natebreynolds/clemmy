@@ -205,13 +205,28 @@ weakening readiness from `every` to `some` (twelve of sixteen pins failed).
 `getReadyWorkflowGraphNodes` now delegates to it, so the workflow engine
 schedules through the executor while dispatch stays where it is.
 
-That slice is deliberately NOT this milestone. Still open, per the charter's
-sixteen-gap review: the journal is node-ID-only (no admitted identity binding,
-no typed outputs/evidence, no causal validation), settlement persistence is a
-best-effort `onStep` rather than an awaited durable boundary, a rejected
-runner tears down the executor instead of becoming a typed outcome, and there
-is no lease/cancellation or dynamic graph-patch protocol. Stage 1 closes these
-with zero production callers.
+That slice is deliberately NOT this milestone. The durable-contract slice
+(admitted identity, awaited journal boundary, typed infrastructure outcomes,
+dynamic patch admission) landed on this line, and **R1A (admitted journal and
+replay truth) landed as `02df6c4f` + `6acb7ad8` + `01c03929`**: settlements
+carry durable fired-edge verdicts, patches bind to their emitter attempt,
+resume is a pure ordered reconstruction (`graph-resume.ts`) with exact
+start/settlement pairing and join-aware causal closure, and reuse is decided
+at readiness by node AND current-input digest. The three predecessor defects
+(stale dependent reuse, patch-replay TDZ crash, valid any-join history
+refused) were reproduced red against `f2f34778` and are pinned green in
+`graph-replay-truth.test.ts`; the refusal matrix lives in
+`graph-resume.test.ts`. Still zero production callers of `admitGraph` — R1A
+is correctness, not activation.
+
+Still open for R1B before any admitted production caller: semantic
+runner/adapter and node-definition identity beyond id/kind; root/admitted
+input digest; authority, policy, catalog, schema, account, and root-scope
+identity; output/evidence artifact existence and content-digest verification;
+lease ownership, expiry, reclaim, and fencing; active runner AbortSignal and
+cancellation settlement; non-structural budgets (tokens, model/tool calls,
+retries, repairs, artifacts, effects). R2 owns provider cache semantics and
+usage budgets; R3 owns the enforced read-only procedure path.
 
 The keystone. A single module that walks a typed graph: node kinds from P1,
 typed edges, durable per-node events, restart materialization, budget
