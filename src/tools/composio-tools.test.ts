@@ -18,7 +18,6 @@ import assert from 'node:assert/strict';
 
 const {
   formatComposioToolOutput,
-  composioFailureIsPreDispatchRejection,
   formatComposioExecuteOutput,
   detectComposioFailure,
   composioDispatchErrorProvesNoCommit,
@@ -671,11 +670,10 @@ test('detectComposioFailure: successful:true with an advisory error string is NO
 
 test('formatComposioExecuteOutput: header names the actual tool (cx_<slug> path), not always composio_execute_tool', () => {
   resetEventLog();
-  // A validation rejection → the pre-dispatch REJECTED corrective, named by
-  // the actual tool (2026-08-04: refused requests no longer read as ambiguous).
+  // A generic (non-not-found) validation error → the "FAILED" corrective, named by the actual tool.
   const failed = { successful: false, data: { status_code: 400, message: 'missing required field title' } };
   const out = formatComposioExecuteOutput(failed, { toolName: 'cx_airtable_create_records', toolSlug: 'AIRTABLE_CREATE_RECORDS' });
-  assert.match(out, /cx_airtable_create_records REJECTED before dispatch \(slug=AIRTABLE_CREATE_RECORDS\)/);
+  assert.match(out, /cx_airtable_create_records FAILED \(slug=AIRTABLE_CREATE_RECORDS\)/);
 });
 
 test('composioThrownErrorOutput: version/not-found mutation text stays ambiguous instead of authorizing rediscovery replay', () => {
@@ -984,25 +982,16 @@ test('transient correction retries reads once but never replays an ambiguous mut
   }
 });
 
-test('a thrown validation 4xx is rejected-not-ambiguous; non-validation mutations stay ambiguous', async () => {
+test('a thrown 4xx mutation stays ambiguous while a read keeps deterministic corrective copy', async () => {
   const { composioThrownErrorOutput } = await import('./composio-tools.js');
   const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
   process.env.CLEMMY_WORKER_THRASH_GUARD = 'on';
   try {
-    // CONTRACT CHANGE 2026-08-04: a validator rejection cannot follow a
-    // dispatch — even on an irreversible send it is safe to fix args and
-    // retry, so it must not enter the ambiguous-write protocol.
     const schemaErr = new Error('Bad request: missing required field "subject"');
     const mutation = composioThrownErrorOutput(schemaErr, { toolSlug: 'OUTLOOK_SEND_EMAIL' });
-    assert.match(mutation, /\[provider-dispatch:rejected\]/);
-    assert.match(mutation, /nothing external was changed/i);
-
-    // A non-validation mutation failure keeps every protection.
-    const ambiguousErr = new Error('Request failed with status code 504 (upstream timeout)');
-    const ambiguous = composioThrownErrorOutput(ambiguousErr, { toolSlug: 'OUTLOOK_SEND_EMAIL' });
-    assert.match(ambiguous, /\[provider-dispatch:uncertain\]/);
-    assert.match(ambiguous, /Do NOT repeat this mutation/);
-    assert.ok(!/TRANSIENT/.test(ambiguous));
+    assert.match(mutation, /\[provider-dispatch:uncertain\]/);
+    assert.match(mutation, /Do NOT repeat this mutation/);
+    assert.ok(!/TRANSIENT/.test(mutation));
 
     const read = composioThrownErrorOutput(schemaErr, { toolSlug: 'AIRTABLE_GET_BASE_SCHEMA' });
     assert.match(read, /HARD failure/);
@@ -1284,64 +1273,4 @@ test('a gateway refusal is a nominal pre-dispatch throw and performs zero provid
     },
   );
   assert.equal(dispatches, 0);
-});
-
-test('a validator-rejected mutation is proven no-dispatch — never the ambiguous-write protocol (Platform 49, 2026-08-04)', () => {
-  // The exact live error: Composio's schema check refused the request before
-  // any dispatch, so no external effect can exist.
-  const summary = "Invalid request data provided - Following fields are missing: {'insert_dimension'}";
-  assert.equal(composioFailureIsPreDispatchRejection(summary), true);
-  const out = formatComposioExecuteOutput(
-    { successful: false, error: summary },
-    { toolSlug: 'GOOGLESHEETS_INSERT_DIMENSION', toolName: 'composio_execute_tool' },
-  );
-  assert.match(out, /\[provider-dispatch:rejected\]/);
-  assert.match(out, /nothing external was changed/i, 'the corrective must license the safe retry');
-  assert.doesNotMatch(out, /\[provider-dispatch:uncertain\]/,
-    'a refused request entered the ambiguous-write protocol');
-
-  // A genuinely ambiguous transport failure keeps the uncertainty protocol.
-  assert.equal(composioFailureIsPreDispatchRejection('Request failed with status code 504 (gateway timeout)'), false);
-  const uncertain = formatComposioExecuteOutput(
-    { successful: false, error: 'Request failed with status code 504 (gateway timeout)' },
-    { toolSlug: 'GOOGLESHEETS_INSERT_DIMENSION', toolName: 'composio_execute_tool' },
-  );
-  assert.match(uncertain, /\[provider-dispatch:uncertain\]/,
-    'a real post-dispatch ambiguity lost its protection');
-});
-
-test('both rejection channels carry the typed no-dispatch proof to the write boundary', async () => {
-  const { runComposioExecuteForTest } = await import('./composio-tools.js');
-  const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
-
-  // Returned-envelope channel (the live Platform 49 shape).
-  const returned = await runComposioExecuteForTest(
-    'GOOGLESHEETS_INSERT_DIMENSION',
-    { spreadsheet_id: 'sheet-1' },
-    (async () => ({
-      successful: false,
-      error: "Invalid request data provided - Following fields are missing: {'insert_dimension'}",
-    })) as never,
-  );
-  assert.ok(returned instanceof ExternalWritePreDispatchResult,
-    'a validator-rejected envelope lost its no-dispatch proof (the boundary would orphan it)');
-  assert.match(String(returned), /\[provider-dispatch:rejected\]/);
-
-  // Thrown channel.
-  const thrown = await runComposioExecuteForTest(
-    'GOOGLESHEETS_INSERT_DIMENSION',
-    { spreadsheet_id: 'sheet-1' },
-    (async () => { throw new Error("Invalid request data provided - Following fields are missing: {'insert_dimension'}"); }) as never,
-  );
-  assert.ok(thrown instanceof ExternalWritePreDispatchResult,
-    'a thrown validator rejection lost its no-dispatch proof');
-
-  // A non-validation failure must NOT gain the proof.
-  const ambiguous = await runComposioExecuteForTest(
-    'GOOGLESHEETS_INSERT_DIMENSION',
-    { spreadsheet_id: 'sheet-1' },
-    (async () => { throw new Error('Request failed with status code 504'); }) as never,
-  );
-  assert.equal(ambiguous instanceof ExternalWritePreDispatchResult, false,
-    'a genuinely ambiguous failure was upgraded to proven-no-dispatch');
 });

@@ -75,7 +75,7 @@ import {
   type ComposioConnectionSuppressionState,
 } from '../agents/composio-connection-suppression.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
-import { ExternalWritePreDispatchError, ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
+import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
 import { getComposioCliDefaultAccountAuthority } from '../integrations/composio/cli-default-account-authority.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 
@@ -444,21 +444,6 @@ export function formatComposioToolOutput(
  * retrying identical args into the loop guard. Use this only for paths that
  * run executeComposioTool — NOT for synthesized status/search/list outputs.
  */
-/**
- * The provider's own request validator REJECTED the call before dispatching
- * anything — no external effect can exist, so the ambiguous-write protocol
- * (verify, never retry) is the WRONG medicine: it freezes a failure that a
- * corrected re-call fixes in one step. Live 2026-08-04 (Platform 49): a
- * Sheets insert missing its `insert_dimension` wrapper was stamped
- * dispatch-uncertain, the run minted an orphan, reconciliation had nothing to
- * reconcile, and the workflow blocked instead of fixing two arguments.
- * Patterns are TIGHT and fail closed: anything unmatched stays uncertain.
- */
-export function composioFailureIsPreDispatchRejection(summary: string): boolean {
-  return /invalid request data provided|following fields are missing|missing required (?:field|parameter|argument)|required (?:field|parameter|property) ['"«\w]|failed schema validation|schema validation failed/i
-    .test(summary);
-}
-
 export function formatComposioExecuteOutput(
   value: unknown,
   options: FormatComposioToolOutputOptions = {},
@@ -466,20 +451,6 @@ export function formatComposioExecuteOutput(
   const body = formatComposioToolOutput(value, options);
   const { failed, summary, notFound, notConnected } = detectComposioFailure(value);
   if (!failed) return body; // success: the GLOBAL id-index (formatRecallableToolText) handles resource lists
-  if (
-    options.toolSlug
-    && !composioSlugIsReadOnly(options.toolSlug)
-    && !notConnected
-    && composioFailureIsPreDispatchRejection(summary)
-  ) {
-    const label = options.toolName || 'composio_execute_tool';
-    return [
-      '[provider-dispatch:rejected]',
-      `⚠️ ${label} REJECTED before dispatch (slug=${options.toolSlug}): ${summary}. The provider refused the request — nothing external was changed, so it is safe to retry ONCE with corrected arguments.`,
-      'Fix exactly the fields the error names and re-call the same action with the same target. If the argument shape is unclear, fetch the tool schema first instead of guessing.',
-      body,
-    ].join('\n\n');
-  }
   if (options.toolSlug && !composioSlugIsReadOnly(options.toolSlug)) {
     const label = options.toolName || 'composio_execute_tool';
     const where = ` (slug=${options.toolSlug})`;
@@ -582,21 +553,6 @@ export function composioUncertainMutationOutput(
   const where = options.toolSlug ? ` (slug=${options.toolSlug})` : '';
   const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(message) || isComposioReconnectRequiredError(err);
   const toolkit = options.toolSlug ? registeredToolkitOfSlug(options.toolSlug).toUpperCase() : 'this toolkit';
-  // The thrown channel carries validator rejections too (the SDK surfaces
-  // Composio 400s as APIError throws). Same rule: a refused request has no
-  // external effect and must not enter the ambiguous-write protocol.
-  if (!notConnected && composioFailureIsPreDispatchRejection(message)) {
-    return [
-      '[provider-dispatch:rejected]',
-      `⚠️ ${label} REJECTED before dispatch${where}: ${message}. The provider refused the request — nothing external was changed, so it is safe to retry ONCE with corrected arguments.`,
-      'Fix exactly the fields the error names and re-call the same action with the same target. If the argument shape is unclear, fetch the tool schema first instead of guessing.',
-      formatComposioToolOutput({
-        error: message || 'unknown provider error',
-        toolSlug: options.toolSlug ?? null,
-        dispatch: 'rejected_pre_dispatch',
-      }, options),
-    ].join('\n\n');
-  }
   const body = formatComposioToolOutput({
     error: message || 'unknown provider error',
     toolSlug: options.toolSlug ?? null,
@@ -2200,22 +2156,6 @@ async function runComposioExecute(
         );
         if (advisory) return output + advisory;
       }
-      // A validator-rejected mutation is locally proven no-dispatch: the
-      // request was refused before any effect could exist (Composio's own
-      // schema check, or a provider 4xx validation error — both reject before
-      // acting). Returning the corrective as a bare string would let the
-      // shared write boundary read it as an ambiguous orphan (live 2026-08-04,
-      // Platform 49: a Sheets insert missing `insert_dimension` froze the run
-      // in the reconciliation protocol). The nominal class is the only
-      // provenance the boundary trusts — provider prose can never forge it.
-      if (
-        failure.failed
-        && !failure.notConnected
-        && !composioSlugIsReadOnly(toolSlug)
-        && composioFailureIsPreDispatchRejection(failure.summary)
-      ) {
-        return new ExternalWritePreDispatchResult(output, 'provider_rejected_request') as unknown as string;
-      }
       return output;
     } catch (err) {
       lastError = err;
@@ -2238,13 +2178,7 @@ async function runComposioExecute(
       }
 
       if (!composioSlugIsReadOnly(toolSlug)) {
-        const output = composioUncertainMutationOutput(err, { ...options, toolSlug });
-        // The thrown validator rejection carries the same no-dispatch proof as
-        // the returned envelope; only the typed class conveys it to the write
-        // boundary (a bare string strands the reservation as ambiguous).
-        return composioFailureIsPreDispatchRejection(errorMsg)
-          ? new ExternalWritePreDispatchResult(output, 'provider_rejected_request') as unknown as string
-          : output;
+        return composioUncertainMutationOutput(err, { ...options, toolSlug });
       }
 
       // Check if we should retry
