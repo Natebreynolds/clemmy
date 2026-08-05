@@ -398,7 +398,11 @@ export function _setRunProgressJudgeForTests(fn: RunProgressJudgeFn | null): voi
 const DAEMON_RESTART_INTERRUPT_REASON = 'Daemon restarted while task was running.';
 const RESTART_VERIFICATION_ERROR =
   'Daemon restarted after this task reached or may have reached an external-write boundary. Verify the external outcome before resuming; recovery will continue on the original receipt-bearing run session.';
-let backgroundProcessorInFlight = false;
+/** Drains currently awaiting worker turns. The concurrency authority is the
+ * DURABLE claim (markBackgroundTaskRunning) plus the policy cap measured
+ * against the durable running count — this counter only stops a stacked
+ * timer tick from burning a scan when nothing could be claimed anyway. */
+let backgroundDrainsInFlight = 0;
 
 // ── Immediate drain kick ──────────────────────────────────────────────────────
 // A newly enqueued background task used to fire ONLY on the daemon's 15s tick (or
@@ -3835,8 +3839,8 @@ function reattachBackgroundTaskInPlace(
     // alone relied on the next drain tick; a manual resume (runtime, drain kick
     // registered) now re-enters immediately, and on boot the setImmediate drain
     // still covers it (the kick is a no-op until registered). Idempotent — the
-    // drain is guarded by backgroundProcessorInFlight and markRunning(pending),
-    // so a task already being drained is never double-run.
+    // drain claims durably via markRunning(pending) under the policy capacity
+    // check, so a task already being drained is never double-run.
     requestBackgroundDrain(1);
   }
   return updated;
@@ -4248,16 +4252,22 @@ async function finishWorkerRun(
 }
 
 export async function processBackgroundTasks(assistant: ClementineAssistant, limit?: number): Promise<number> {
-  if (backgroundProcessorInFlight) return 0;
-  backgroundProcessorInFlight = true;
   try {
+    backgroundDrainsInFlight += 1;
     const policy = loadProactivityPolicy();
     const requestedLimit = typeof limit === 'number' ? limit : policy.maxConcurrentBackgroundTasks;
     const effectiveLimit = Math.max(1, Math.min(requestedLimit, policy.maxConcurrentBackgroundTasks));
+    // Concurrency is a durable fact, not a process flag: a second drain tick
+    // that arrives while workers are mid-turn claims only the capacity the
+    // policy still allows. That is what lets two fan-out windows genuinely
+    // OVERLAP (each tick drives one) while the cap keeps thrash out.
+    const running = listBackgroundTasks({ status: 'running' }).length;
+    const capacity = Math.max(0, effectiveLimit - running);
+    if (capacity === 0) return 0;
     const progressCheckInMinMs = getBackgroundCheckInMs(policy);
     const pending = listBackgroundTasks({ status: 'pending' })
       .filter((t) => !t.transientRetry || Date.parse(t.transientRetry.notBefore) <= Date.now())
-      .slice(0, effectiveLimit);
+      .slice(0, capacity);
     let processed = 0;
 
 	  for (const queued of pending) {
@@ -4899,8 +4909,13 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 
     return processed;
   } finally {
-    backgroundProcessorInFlight = false;
+    backgroundDrainsInFlight -= 1;
   }
+}
+
+/** Test/diagnostic visibility into how many drains are currently awaiting. */
+export function backgroundDrainsCurrentlyInFlight(): number {
+  return backgroundDrainsInFlight;
 }
 
 export function renderBackgroundTask(task: BackgroundTaskRecord): string {
