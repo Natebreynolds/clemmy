@@ -236,6 +236,29 @@ function teeFileDeliverable(filePath: string): void {
         recordDeliverable({ kind: 'file', target: filePath, why, sessionId: ctx?.sessionId ?? null, lane: 'local' });
       })
       .catch(() => { /* best-effort */ });
+    // Live visibility (2026-08-05): the durable index above answers "find
+    // those drafts later"; this event answers "I can SEE them landing". The
+    // write already succeeded, so name + parent dir + size are runtime truth.
+    // Only the basename and one parent segment ship — never the full path.
+    if (ctx?.sessionId) {
+      void import('../runtime/harness/eventlog.js')
+        .then(({ appendEvent }) => {
+          let bytes = 0;
+          try { bytes = statSync(filePath).size; } catch { /* size is enrichment */ }
+          appendEvent({
+            sessionId: ctx.sessionId as string,
+            turn: 0,
+            role: 'system',
+            type: 'deliverable_saved',
+            data: {
+              name: path.basename(filePath),
+              dir: path.basename(path.dirname(filePath)),
+              bytes,
+            },
+          });
+        })
+        .catch(() => { /* best-effort */ });
+    }
   } catch { /* never affect the write result */ }
 }
 
@@ -938,6 +961,7 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
   }
   return new Promise((resolve, reject) => {
     let settled = false;
+    const commandStartedAtMs = Date.now();
     const child = spawn(command, {
       cwd,
       shell: true,
@@ -987,6 +1011,27 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      // Deliverable visibility for shell-written files (live 2026-08-05: the
+      // model drafted three markdown files via a heredoc and the feed showed
+      // nothing — only write_file had the tee). Redirect targets parsed from
+      // the command are LEADS, not truth; a lead becomes a deliverable only
+      // when the file provably exists with an mtime at/after command start.
+      if ((code ?? 0) === 0) {
+        try {
+          const seen = new Set<string>();
+          for (const token of outputRedirectionTargets(command).slice(0, 10)) {
+            const resolved = resolveShellPathToken(token, cwd);
+            if (!resolved || seen.has(resolved)) continue;
+            seen.add(resolved);
+            try {
+              const stat = statSync(resolved);
+              if (stat.isFile() && stat.mtimeMs >= commandStartedAtMs - 2_000) {
+                teeFileDeliverable(resolved);
+              }
+            } catch { /* a lead that never landed is not a deliverable */ }
+          }
+        } catch { /* visibility must never affect the command result */ }
+      }
       const annotated = annotateShellStderr(stderr, command);
       // Interactive-prompt detection (2026-07-22 Netlify deploy incident): a
       // CLI that opens an interactive picker ("? Team: Use arrow keys") in this

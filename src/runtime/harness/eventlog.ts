@@ -391,6 +391,11 @@ export const EVENT_TYPES = [
   // live "what Clem knows going in" frame and the graph's future admission
   // input. Carries {entries, registryAvailable, sourceUserSeq?}.
   'capability_resolution',
+  // A file the runtime ACTUALLY wrote (local deliverable). Emitted by the
+  // write path after the filesystem write succeeds — runtime truth, not model
+  // prose — so drafted emails / reports appear in the live feed as they land
+  // instead of vanishing into a folder. Carries {name, dir, bytes}.
+  'deliverable_saved',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

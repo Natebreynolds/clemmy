@@ -422,6 +422,29 @@ function publicToolProgressLabel(toolValue: unknown): string {
   return `using ${tool}`.slice(0, 110);
 }
 
+/** Strict provider-slug grammar: uppercase snake with at least two segments
+ *  (`OUTLOOK_SEND_EMAIL`). This is the NAME shape, never a value shape — no
+ *  real secret is all-uppercase-with-underscores — so a slug the runtime's
+ *  accounting layer attached (data.toolSlug / effectiveTool) may ship as the
+ *  call's public identity. This is the "separately validated public identity"
+ *  the privacy note below anticipated; free-text arguments stay private. */
+const PUBLIC_DISPATCH_SLUG_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/;
+
+function publicDispatchSlug(data: Record<string, unknown>): string {
+  const candidate = firstString(data.toolSlug, data.effectiveTool);
+  if (!candidate || candidate.length > 64) return '';
+  return PUBLIC_DISPATCH_SLUG_RE.test(candidate) ? candidate : '';
+}
+
+/** Runtime-owned effect classification (a closed enum, never model text). */
+function publicToolEffect(data: Record<string, unknown>): string {
+  const effect = firstString(data.effect);
+  return effect === 'read' || effect === 'compute' || effect === 'local_write'
+    || effect === 'external_write' || effect === 'admin'
+    ? effect
+    : '';
+}
+
 function projectData(event: EventRow): Record<string, unknown> | null {
   const data = event.data ?? {};
   switch (event.type) {
@@ -473,13 +496,36 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'tool_called': {
       const tool = firstString(data.tool, data.toolName, data.name) || 'tool';
       const progress = publicToolProgressLabel(tool);
+      const publicSlug = publicDispatchSlug(data);
       return {
         ...selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'batchMode', 'accounting']),
         ...(progress ? { progress } : {}),
+        ...(publicSlug ? { publicSlug } : {}),
+        ...(publicToolEffect(data) ? { effect: publicToolEffect(data) } : {}),
       };
     }
-    case 'tool_returned':
-      return selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'ok', 'success', 'batchMode', 'accounting']);
+    case 'tool_returned': {
+      const publicSlug = publicDispatchSlug(data);
+      return {
+        ...selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'ok', 'success', 'batchMode', 'accounting']),
+        ...(publicSlug ? { publicSlug } : {}),
+        ...(publicToolEffect(data) ? { effect: publicToolEffect(data) } : {}),
+      };
+    }
+    case 'deliverable_saved': {
+      // Runtime truth: the write path emits this only after the filesystem
+      // write succeeded, with basename + one parent segment — never a full
+      // path. Both are still validated here so a malformed producer cannot
+      // leak an absolute path onto the public bus.
+      const name = firstString(data.name);
+      if (!name || name.includes('/') || name.includes('\\') || name.length > 120) return null;
+      const dir = firstString(data.dir);
+      return {
+        name,
+        ...(dir && !dir.includes('/') && !dir.includes('\\') && dir.length <= 80 ? { dir } : {}),
+        ...(typeof data.bytes === 'number' && Number.isFinite(data.bytes) ? { bytes: data.bytes } : {}),
+      };
+    }
     case 'handoff':
       return selected(data, ['from', 'to', 'target']);
     case 'step_started':

@@ -556,3 +556,40 @@ test('capability_resolution projects bounded typed entries and drops junk', asyn
   const empty = projectHarnessEventForPublic({ ...row, data: { entries: [] } } as never);
   assert.equal(empty, null, 'an empty resolution never reaches the public bus');
 });
+
+test('tool events ship the runtime-validated dispatch slug and effect; free-text args stay private', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const projected = projectHarnessEventForPublic({
+    sessionId: 's', seq: 2, turn: 0, role: 'Clem', type: 'tool_called',
+    data: {
+      tool: 'composio_execute_tool', callId: 'c1', accounting: 'top_level',
+      toolSlug: 'OUTLOOK_SEND_EMAIL', effect: 'external_write',
+      arguments: '{"to":"secret@example.com"}',
+    },
+  } as never);
+  const data = projected?.data as Record<string, unknown>;
+  assert.equal(data.publicSlug, 'OUTLOOK_SEND_EMAIL');
+  assert.equal(data.effect, 'external_write');
+  assert.equal(data.arguments, undefined, 'model-supplied args never reach the public bus');
+
+  const badSlug = projectHarnessEventForPublic({
+    sessionId: 's', seq: 3, turn: 0, role: 'Clem', type: 'tool_called',
+    data: { tool: 'call_tool', callId: 'c2', accounting: 'top_level', toolSlug: 'sk-live-abc123_XY' },
+  } as never);
+  assert.equal((badSlug?.data as Record<string, unknown>).publicSlug, undefined, 'a value-shaped string fails the slug grammar');
+});
+
+test('deliverable_saved projects basename-only truth and rejects path leakage', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const ok = projectHarnessEventForPublic({
+    sessionId: 's', seq: 4, turn: 0, role: 'system', type: 'deliverable_saved',
+    data: { name: 'client-brief.md', dir: 'drafts', bytes: 2048 },
+  } as never);
+  assert.deepEqual(ok?.data, { name: 'client-brief.md', dir: 'drafts', bytes: 2048 });
+
+  const leak = projectHarnessEventForPublic({
+    sessionId: 's', seq: 5, turn: 0, role: 'system', type: 'deliverable_saved',
+    data: { name: '/Users/someone/secret/file.md' },
+  } as never);
+  assert.equal(leak, null, 'a path-shaped name never ships');
+});

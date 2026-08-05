@@ -13605,6 +13605,9 @@ export function registerConsoleRoutes(
     // Typed capability grounding — the origin chat should see what the
     // promoted run resolved as proven / shaky / disconnected going in.
     'capability_resolution',
+    // Files landing in a promoted run belong in the origin chat's live feed —
+    // the drafting-emails scenario is exactly the work users background.
+    'deliverable_saved',
   ]);
 
   /**
