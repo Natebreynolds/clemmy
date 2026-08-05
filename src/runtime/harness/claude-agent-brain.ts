@@ -53,7 +53,12 @@ import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
-import { effectiveTurnObjective } from './turn-control.js';
+import {
+  classifyTurnPreflight,
+  effectiveTurnObjective,
+  recordTurnPreflightDecision,
+  standardAwareBeatText,
+} from './turn-control.js';
 import {
   pullRecentTurnsForSession,
   renderRecentActionsForHarnessHistory,
@@ -942,6 +947,7 @@ interface ClaudeTurnMemoryPrimerTelemetry {
 
 async function buildClaudeAgentBrainTurnContext(
   request: AssistantRequest,
+  opts?: { sourceUserSeq?: number },
 ): Promise<{
   text: string;
   memoryPrimer: ClaudeTurnMemoryPrimerTelemetry;
@@ -1109,11 +1115,47 @@ async function buildClaudeAgentBrainTurnContext(
   // step cap and parked at ~item #15. Now a detected multi-item turn gets the loud
   // "do NOT serialize — run_worker in parallel waves" directive so she actually swarms.
   let fanoutDirective = '';
+  // Confirm beat (parity with the context packet — this lane doesn't consume
+  // the packet): a fresh execution-shaped chat request gets ONE conversational
+  // alignment beat before autonomous execution. Continuations, questions,
+  // pre-authorized hand-offs, and non-chat kinds stay silent.
+  let confirmBeat = '';
+  const sourceBoundTurn = Number.isSafeInteger(opts?.sourceUserSeq)
+    && Number(opts?.sourceUserSeq) > 0;
+  let preflightSessionKind: NonNullable<ReturnType<typeof getSession>>['kind'] | undefined;
+  try {
+    preflightSessionKind = getSession(request.sessionId)?.kind;
+  } catch (error) {
+    // A source-bound dispatch whose durable session cannot be read cannot prove
+    // whether confirm-first authority applies, so it must stop before the model.
+    if (sourceBoundTurn) throw error;
+  }
   try {
     const multi = detectMultiItemIntent(request.message ?? '');
     if (multi.isMultiItem) fanoutDirective = fanoutDirectiveLine(multi);
+    const preflight = classifyTurnPreflight({
+      message: request.message ?? '',
+      sessionId: request.sessionId,
+      sessionKind: preflightSessionKind,
+      isMultiItem: multi.isMultiItem,
+      itemCount: multi.itemCount,
+      sourceUserSeq: opts?.sourceUserSeq,
+    });
+    // Persist only for a real durable chat session. Render-only probes commonly
+    // use display ids with no session row and stay pure; the live SDK path also
+    // supplies the exact accepted source row before model/tool dispatch.
+    if (preflightSessionKind === 'chat') {
+      recordTurnPreflightDecision(request.sessionId, preflight, opts?.sourceUserSeq);
+    }
+    // Standard-aware on BOTH lanes — a beat that names the governing standard
+    // on one brain and not the other is the two-lane trap in miniature.
+    confirmBeat = preflight.phase === 'align' ? standardAwareBeatText(request.message) : '';
   } catch {
+    // Preflight state is directive/telemetry, not execution authority — a
+    // classify/persist failure degrades to no beat, never a failed turn.
+    // Consent enforcement lives in plan-scope/approvals.
     fanoutDirective = '';
+    confirmBeat = '';
   }
   // Pre-flight error library (parity with the context packet's Known-pitfalls
   // line — this lane doesn't consume the packet): the freshest distilled
@@ -1148,6 +1190,7 @@ async function buildClaudeAgentBrainTurnContext(
       prospectiveCapture,
       sessionActions,
       fanoutDirective,
+      confirmBeat,
       pitfalls,
       projectRoutes,
     ].filter(Boolean).join('\n\n'),
@@ -1157,8 +1200,9 @@ async function buildClaudeAgentBrainTurnContext(
 
 export async function renderClaudeAgentBrainTurnContext(
   request: AssistantRequest,
+  opts?: { sourceUserSeq?: number },
 ): Promise<string> {
-  return (await buildClaudeAgentBrainTurnContext(request)).text;
+  return (await buildClaudeAgentBrainTurnContext(request, opts)).text;
 }
 
 function emitClaudeAgentSdkBrainContextTelemetry(
@@ -1721,7 +1765,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // Provider text remains private until the graph reduces the run to a typed
   // TurnOutcome. Long-running feedback comes from typed tool/progress events,
   // not speculative prose that a retry or completion judge may invalidate.
-  const renderedTurnContext = await buildClaudeAgentBrainTurnContext(request);
+  const renderedTurnContext = await buildClaudeAgentBrainTurnContext(request, { sourceUserSeq: userInputEvent.seq });
   const turnContext = renderedTurnContext.text;
   emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer);
   const attemptTrackerScopeId = `${sessionId}::brain:${attempt.runId ?? attempt.attemptId}`;

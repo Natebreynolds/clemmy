@@ -862,14 +862,33 @@ test('CONVERGE guard: an answer carries forward without forcing exploratory work
   delete process.env.CLEMMY_BRAIN_CONVERGE;
 });
 
-test('Claude turn context neither injects nor persists a ceremonial confirmation beat', async () => {
+test('Claude turn context injects ONE alignment beat on a fresh execution-shaped chat request', async () => {
+  // The v3.6 freeze removed the beat as "ceremonial" expecting the graph lane
+  // to own alignment; the graph lane never landed, so v3.7/v3.8 executed
+  // consequential asks with zero conversation (live 2026-08-05, the owner's
+  // scrape-and-sheet request). The beat is restored and this pin holds it.
   const sid = createSession({ kind: 'chat' }).id;
+  const request = appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the approved outreach emails to the named recipients.' },
+  });
   const context = await renderClaudeAgentBrainTurnContext({
     message: 'Send the approved outreach emails to the named recipients.',
     sessionId: sid,
+  }, { sourceUserSeq: request.seq });
+  assert.match(context, /\[confirm-first\]/, 'a consequential send earns the conversational beat');
+  assert.equal(listEvents(sid, { types: ['turn_preflight_decision'] }).length, 1, 'the typed decision persists');
+
+  // A plain lookup stays silent — the beat must never tax reads.
+  const readSid = createSession({ kind: 'chat' }).id;
+  const readContext = await renderClaudeAgentBrainTurnContext({
+    message: 'whats on my calendar tomorrow',
+    sessionId: readSid,
   });
-  assert.doesNotMatch(context, /\[confirm-first\]|confirmation beat|go-ahead before/i);
-  assert.equal(listEvents(sid, { types: ['turn_preflight_decision'] }).length, 0);
+  assert.doesNotMatch(readContext, /\[confirm-first\]/);
 });
 
 test('Claude SDK dispatch receives non-coercive convergence state on a clarification answer', async () => {
@@ -1310,10 +1329,12 @@ test('an in-flight legacy go-ahead preserves the multi-document objective for SD
   await respondViaClaudeAgentSdkBrain('home', { message: 'Go ahead.', sessionId: sid, runId: 'confirm-execute' });
 
   assert.equal(captured.length, 1);
+  // The restored live beat records the go-ahead turn's own typed decision;
+  // the legacy align row stays untouched beside it.
   assert.equal(
     listEvents(sid, { types: ['turn_preflight_decision'] }).length,
-    1,
-    'the compatibility read does not persist a new execute row',
+    2,
+    'the acknowledgement turn records its typed decision without rewriting the legacy row',
   );
   assert.equal(captured[0]?.artifactObjective, original);
   assert.equal(captured[0]?.nativeMcpScopeInput, original, 'tool scoping sees the approved task, not only the control phrase');

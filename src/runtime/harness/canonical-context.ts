@@ -31,6 +31,9 @@ export interface BuildCanonicalContextPackOptions {
   sessionId?: string;
   sessionKind?: string;
   sourceUserSeq?: number;
+  /** True for synthetic continuation/retry inputs — the alignment beat must
+   *  only ever evaluate a REAL user message. */
+  suppressConfirmBeat?: boolean;
   includeMemoryDiagnostics?: boolean;
 }
 
@@ -55,6 +58,7 @@ export function buildCanonicalContextPack(opts: BuildCanonicalContextPackOptions
     sessionId: opts.sessionId,
     sessionKind: opts.sessionKind,
     sourceUserSeq: opts.sourceUserSeq,
+    suppressConfirmBeat: opts.suppressConfirmBeat,
   });
 
   let stableMemoryAvailable = false;

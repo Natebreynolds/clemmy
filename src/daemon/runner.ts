@@ -96,7 +96,7 @@ import {
 import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decision.js';
 import { migrateToolChoicesToCanonicalProcedures, reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
-import { reapDeadSkillChoices } from '../memory/skill-choice-store.js';
+import { installProvenStandardBeatLine, reapDeadSkillChoices } from '../memory/skill-choice-store.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
@@ -1816,6 +1816,9 @@ export async function startDaemon(
   // an exact non-generic personal email. This makes identity readiness true on
   // first boot instead of waiting for the 4:40 AM maintenance window.
   try {
+    // The alignment beat names the standard governing the work; wire that
+    // lookup at boot so turn-control keeps no memory-layer dependency.
+    try { installProvenStandardBeatLine(); } catch { /* beat degrades to generic */ }
     const identityFinalization = finalizeMemoryIdentityOnBoot();
     if (identityFinalization.reason === 'backup_failed') {
       logger.warn(identityFinalization, 'Withheld boot identity reconciliation because the safety backup failed');

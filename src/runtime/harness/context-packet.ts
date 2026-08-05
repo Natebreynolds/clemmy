@@ -22,6 +22,11 @@ import {
 } from './focus-projection.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import {
+  classifyTurnPreflight,
+  confirmBeatDirective,
+  recordTurnPreflightDecision,
+} from './turn-control.js';
+import {
   buildProspectiveIntentionContext,
   prospectiveCaptureDirective,
 } from '../prospective-intentions.js';
@@ -96,6 +101,10 @@ export interface AgentContextPacket {
     fanoutPosture: FanoutPosture | 'unknown';
     recommendedWorkerWaveSize: number;
   };
+  /** True when the conversational alignment beat was injected this turn. */
+  confirmBeatOffered: boolean;
+  /** The typed preflight phase this turn classified into. */
+  preflightPhase: 'read' | 'align' | 'execute';
   text: string;
 }
 
@@ -572,7 +581,7 @@ function providerAccessLine(): string {
 export function buildAgentContextPacket(
   input: string,
   memory: MemoryPrimerSummary,
-  opts?: { sessionKind?: string; sessionId?: string; sourceUserSeq?: number },
+  opts?: { sessionKind?: string; sessionId?: string; sourceUserSeq?: number; suppressConfirmBeat?: boolean },
 ): AgentContextPacket {
   const complexity = classifyComplexity(input);
   // Pure-Q&A turns skip ONLY the health probes (disk + MCP I/O) — pure telemetry
@@ -664,6 +673,46 @@ export function buildAgentContextPacket(
         ? fanoutPolicyLine(multiItem, agentSystem)
         : STATIC_PARALLELISM_LINE;
 
+  // TURN-CONTROL SPINE confirm beat: a fresh execution-shaped chat request
+  // gets ONE conversational alignment beat before autonomous execution;
+  // continuations, questions, pre-authorized hand-offs, and non-chat kinds
+  // classify 'execute'/'read' and stay silent.
+  // suppressConfirmBeat: the loop substitutes a goal OBJECTIVE for synthetic
+  // continuation/retry inputs — the beat must only ever evaluate a REAL user
+  // message, never a substituted one mid-run.
+  const preflightDecision = opts?.suppressConfirmBeat
+    ? { phase: 'execute', consequential: false, reason: 'ordinary_execution' } as const
+    : classifyTurnPreflight({
+        message: input,
+        sessionId: opts?.sessionId,
+        sessionKind: opts?.sessionKind,
+        isMultiItem: multiItem.isMultiItem,
+        itemCount: multiItem.itemCount,
+        sourceUserSeq: opts?.sourceUserSeq,
+      });
+  // Persistence is execution authority, so write it only on a live chat turn
+  // with the exact accepted source row. Pure previews/context probes frequently
+  // pass a display-only session id; they do not dispatch tools and must not mint
+  // orphan event rows. runTurn always supplies this exact source identity.
+  if (
+    !opts?.suppressConfirmBeat
+    && opts?.sessionKind === 'chat'
+    && Number.isSafeInteger(opts?.sourceUserSeq)
+    && (opts?.sourceUserSeq ?? 0) > 0
+  ) {
+    recordTurnPreflightDecision(opts.sessionId, preflightDecision, opts.sourceUserSeq);
+  }
+  const confirmBeat = preflightDecision.phase === 'align'
+    ? confirmBeatDirective({
+        message: input,
+        sessionId: opts?.sessionId,
+        sessionKind: opts?.sessionKind,
+        isMultiItem: multiItem.isMultiItem,
+        itemCount: multiItem.itemCount,
+        sourceUserSeq: opts?.sourceUserSeq,
+      })
+    : null;
+
   const lines = [
     '[AGENT CONTEXT PACKET]',
     'This deterministic preflight ran before the model call. Use it to choose memory, skills, workflows, and tools instead of guessing.',
@@ -685,6 +734,7 @@ export function buildAgentContextPacket(
     healthWarnings.length > 0 ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}` : 'Health warnings: none.',
     agentSystem.text,
     parallelismLine,
+    confirmBeat,
     'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
   ].filter((line): line is string => Boolean(line));
 
@@ -719,6 +769,8 @@ export function buildAgentContextPacket(
       fanoutPosture,
       recommendedWorkerWaveSize,
     },
+    confirmBeatOffered: Boolean(confirmBeat),
+    preflightPhase: preflightDecision.phase,
     text: lines.join('\n'),
   };
 }
