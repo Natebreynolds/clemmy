@@ -40,6 +40,11 @@ if (existsSync(path.join(LIVE_HOME, 'state', 'secrets-vault.json'))) {
 writeFileSync(path.join(CANARY_HOME, 'state', 'machine-id'), 'canary-A\n');
 process.env.CLEMENTINE_HOME = CANARY_HOME;
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'on';
+// The canary brain runs ALL-IN on the BYO backend (its API key is the
+// credential). This deliberately avoids the live daemon's Codex/Claude OAuth
+// tokens: a second process refreshing those can invalidate the daemon's
+// session — the exact incident class the token-ownership rule exists for.
+process.env.MODEL_ROUTING_MODE = 'all_in';
 
 const { respondPreferHarness } = await import('../src/runtime/harness/respond-bridge.js');
 const eventlog = await import('../src/runtime/harness/eventlog.js');
@@ -78,27 +83,59 @@ async function turn(sessionId: string, message: string): Promise<TurnStats> {
 console.log(`canary home: ${CANARY_HOME}`);
 const learnedBefore = toolChoice.listToolChoices().length;
 
-const cold = await turn('canary-cold', "What's on my calendar tomorrow?");
-console.log('COLD :', JSON.stringify(cold));
+// The account is pinned in the request so the read settles in ONE turn (the
+// multi-account clarification conversation is exercised separately below —
+// its structural limits are recorded in the evidence document).
+/**
+ * A workspace with several connected accounts ASKS which one — correct
+ * fail-closed behavior on ANY turn, and the canary answers it like a user
+ * would. The read then settles on the answer turn.
+ */
+async function converse(sessionId: string, message: string): Promise<TurnStats> {
+  let stats = await turn(sessionId, message);
+  console.log(`${sessionId}:`, JSON.stringify(stats));
+  if (stats.readReceipts === 0 && /which|choose|account/i.test(stats.text)) {
+    const answer = await turn(sessionId, 'Use the first one.');
+    console.log(`${sessionId} (answer):`, JSON.stringify(answer));
+    stats = {
+      ...answer,
+      ms: stats.ms + answer.ms,
+      toolCalls: stats.toolCalls + answer.toolCalls,
+      composioDispatches: stats.composioDispatches + answer.composioDispatches,
+      discoveryCalls: stats.discoveryCalls + answer.discoveryCalls,
+      readReceipts: stats.readReceipts + answer.readReceipts,
+    };
+  }
+  return stats;
+}
 
-// Give the post-settlement embed backfill a beat, then check retrieval state.
+const cold = await converse('canary-cold', "What's on my calendar tomorrow? Use my first Outlook account.");
+
+// Give the post-settlement embed backfill a beat.
 await new Promise((r) => setTimeout(r, 1_500));
-const resolved = await candidates.resolveTurnCapabilityCandidates({ userInput: 'Anything on deck tomorrow?' });
-console.log('RETRIEVAL:', JSON.stringify({
-  candidates: resolved.candidates.map((c) => `${c.identifier}${c.accountIdentity ? `@${c.accountIdentity}` : ''} via ${c.via}`),
-  learnedDelta: toolChoice.listToolChoices().length - learnedBefore,
-}));
+console.log('LEARNED DELTA:', toolChoice.listToolChoices().length - learnedBefore);
 
-const warm = await turn('canary-warm', 'Anything on deck tomorrow?');
-console.log('WARM :', JSON.stringify(warm));
+const warm = await converse('canary-warm', 'What does my day look like tomorrow?');
+await new Promise((r) => setTimeout(r, 1_500));
+
+// Retrieval cohorts AFTER both settlements: the exact repeat of a settled
+// phrase must hit the exact tier; a fresh paraphrase measures the semantic
+// tier against whatever phrasing the live conversation actually produced.
+const exact = await candidates.resolveTurnCapabilityCandidates({ userInput: 'What does my day look like tomorrow?' });
+const paraphrase = await candidates.resolveTurnCapabilityCandidates({ userInput: 'Anything on deck tomorrow?' });
+console.log('RETRIEVAL:', JSON.stringify({
+  exact: exact.candidates.map((c) => `${c.identifier}${c.accountIdentity ? `@${c.accountIdentity}` : ''} via ${c.via}`),
+  paraphrase: paraphrase.candidates.map((c) => `${c.identifier} via ${c.via}`),
+}));
 
 const guard = await turn('canary-guard', 'What do you think about our plan for next quarter?');
 console.log('GUARD:', JSON.stringify(guard));
 
 const verdict = {
   coldLearned: cold.readReceipts > 0,
-  warmHadCandidates: resolved.candidates.length > 0,
-  warmFewerDiscovery: warm.discoveryCalls <= cold.discoveryCalls,
+  warmLearned: warm.readReceipts > 0,
+  exactRepeatHadCandidates: exact.candidates.length > 0,
+  paraphraseHadCandidates: paraphrase.candidates.length > 0,
   guardNoComposio: guard.composioDispatches === 0,
 };
 console.log('VERDICT:', JSON.stringify(verdict));

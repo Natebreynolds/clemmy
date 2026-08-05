@@ -1668,6 +1668,36 @@ export async function setupApiKeyToolkit(
   });
 }
 
+/**
+ * Fetch ONE tool's raw definition by exact slug. The per-toolkit listing is
+ * capped and large toolkits (Outlook alone clears 200 actions) can miss the
+ * one slug a settlement needs to bind its contract to — the exact-slug filter
+ * asks the API for precisely that tool. Falls back to a deep toolkit listing
+ * because some SDK versions ignore the `tools` filter.
+ */
+export async function getComposioToolBySlug(slug: string): Promise<ComposioToolkitTool | null> {
+  const composio = getComposio() as any;
+  if (!composio || !slug) return null;
+  const wanted = slug.toUpperCase();
+  try {
+    const raw = await composio.tools.getRawComposioTools({ tools: [wanted] });
+    const list = Array.isArray(raw) ? raw : (raw?.items ?? []);
+    for (const item of list) {
+      if (String(item?.slug ?? '').toUpperCase() === wanted) {
+        return { slug: item.slug, name: item.name ?? item.slug, description: item.description ?? '', inputParameters: item.inputParameters ?? item.input_parameters } as ComposioToolkitTool;
+      }
+    }
+  } catch { /* fall through to the toolkit listing */ }
+  const toolkit = (slug.split('_')[0] ?? '').toLowerCase();
+  if (!toolkit) return null;
+  try {
+    const tools = await listComposioToolkitTools(toolkit, 500);
+    return tools.find((tool) => String(tool.slug ?? '').toUpperCase() === wanted) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function listComposioToolkitTools(
   slug: string,
   limit = 80,

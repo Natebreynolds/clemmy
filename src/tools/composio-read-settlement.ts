@@ -29,7 +29,8 @@ import {
   settlementCarriesVerifiedData,
   type LearningVerdict,
 } from '../memory/verified-read-learning.js';
-import { liveComposioSchemaFingerprint } from './composio-schema-cache.js';
+import { liveComposioSchemaFingerprint, rememberToolSchema } from './composio-schema-cache.js';
+import { getComposioToolBySlug } from '../integrations/composio/client.js';
 
 function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -47,10 +48,28 @@ export interface VerifiedComposioSettlementInput {
 }
 
 /**
+ * A brain that already knows a slug can dispatch it without ever fetching its
+ * schema, so an empty cache at settlement is the COMMON verified-read case,
+ * not an edge (observed live: a direct calendar read with zero discovery
+ * calls). Fetch the live contract once, post-settlement and off the hot path
+ * — the fail-closed rule stays (no contract obtainable, no capability), it
+ * just gets its one honest chance to obtain one.
+ */
+async function ensureLiveSchemaContract(toolSlug: string): Promise<string | undefined> {
+  const cached = liveComposioSchemaFingerprint(toolSlug);
+  if (cached) return cached;
+  try {
+    const match = await getComposioToolBySlug(toolSlug);
+    if (match?.inputParameters) rememberToolSchema(toolSlug, match.inputParameters);
+  } catch { /* fail closed below */ }
+  return liveComposioSchemaFingerprint(toolSlug);
+}
+
+/**
  * Create the durable receipt and learn from it. Fail-closed at every step;
  * a decline is a normal outcome, never an error surfaced to the tool call.
  */
-export function settleVerifiedComposioRead(input: VerifiedComposioSettlementInput): LearningVerdict {
+export async function settleVerifiedComposioRead(input: VerifiedComposioSettlementInput): Promise<LearningVerdict> {
   const toolSlug = input.toolSlug?.trim();
   if (!toolSlug || !input.sessionId) return { learned: false, reason: 'no identifier or session' };
   if (classifyComposioSlugEffect(toolSlug) !== 'read') {
@@ -59,7 +78,7 @@ export function settleVerifiedComposioRead(input: VerifiedComposioSettlementInpu
   if (!settlementCarriesVerifiedData(input.result)) {
     return { learned: false, reason: 'settlement carries no verified returned data' };
   }
-  const schemaFingerprint = liveComposioSchemaFingerprint(toolSlug);
+  const schemaFingerprint = await ensureLiveSchemaContract(toolSlug);
   if (!schemaFingerprint) {
     return { learned: false, reason: 'no live schema contract to bind the capability to' };
   }

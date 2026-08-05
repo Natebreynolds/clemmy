@@ -2160,7 +2160,7 @@ async function runComposioExecute(
         if (sid && settledForLearning !== null && settledForLearning !== undefined
           && !detectJobReceipt(toolSlug, settledForLearning)) {
           const runContext = harnessRunContextStorage.getStore();
-          settleVerifiedComposioRead({
+          await settleVerifiedComposioRead({
             toolSlug,
             sessionId: sid,
             result: settledForLearning,

@@ -32,6 +32,7 @@ import {
   getRunAttemptSourceUserEvent,
   listEvents,
 } from '../runtime/harness/eventlog.js';
+import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
 import {
   acceptedPhraseDigest,
   boundedAliasTerms,
@@ -78,6 +79,33 @@ function eventText(data: unknown): string | undefined {
 }
 
 export type AcceptedSource = { sourceUserSeq: number; phrase: string };
+
+/**
+ * The INTENT-carrying phrase for a settlement that landed on an ANSWER turn.
+ *
+ * When the previous turn ended by asking the user a clarifying question
+ * ("which of your three accounts?"), the turn that finally settles the read
+ * carries only the answer ("use the first one") — an alias learned from that
+ * would never retrieve anything. The same structural predicate the scope
+ * resolvers already trust decides continuity, and the QUESTION turn's phrase
+ * (the request that actually names the intent) becomes the alias source. The
+ * exactly-once claim stays keyed on the settling turn, so a replay still
+ * loses.
+ */
+function intentPhraseFor(sessionId: string, source: AcceptedSource): string {
+  try {
+    if (!priorTurnEndedAwaitingClarification(sessionId)) return source.phrase;
+    const users = listEvents(sessionId, { types: ['user_input_received'] })
+      .filter((event) => (event.data as { synthetic?: boolean } | undefined)?.synthetic !== true)
+      .sort((a, b) => a.seq - b.seq);
+    const index = users.findIndex((event) => event.seq === source.sourceUserSeq);
+    if (index <= 0) return source.phrase;
+    const previous = eventText(users[index - 1]!.data);
+    return previous ?? source.phrase;
+  } catch {
+    return source.phrase;
+  }
+}
 
 /**
  * The EXACT accepted source this settlement belongs to.
@@ -170,7 +198,7 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
 
   const source = resolveAcceptedSource(input.sessionId, input.sourceUserSeq);
   if (!source) return { learned: false, reason: 'no exact accepted source phrase' };
-  const { phrase } = source;
+  const phrase = intentPhraseFor(input.sessionId, source);
 
   const intent = canonicalIntentSlug(identifier);
   if (!intent) return { learned: false, reason: 'identifier has no canonical slug' };
