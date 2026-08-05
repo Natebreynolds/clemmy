@@ -151,10 +151,14 @@ test('E5.2: the handoff state machine repairs deterministically to ONE owner', (
     sessionId: 'sess-1', sourceUserSeq: 7,
   };
   assert.equal(repairHandoff(undefined).action, 'start_fresh');
+  // The ladder is the order the detach path actually performs: the transfer
+  // intent and the capsule become durable BEFORE the foreground is fenced, so
+  // a crash inside the fence window still names an owner. A fence reached with
+  // no durable capsule is therefore not a state this ladder can be in.
   for (const [state, action] of [
     ['requested', 'checkpoint_then_admit'],
-    ['foreground_commit_fenced', 'checkpoint_then_admit'],
     ['capsule_checkpointed', 'resume_admission'],
+    ['foreground_commit_fenced', 'resume_admission'],
     ['background_admitted', 'rejoin_existing'],
     ['background_owner_active', 'rejoin_existing'],
     ['foreground_released', 'rejoin_existing'],
@@ -167,6 +171,10 @@ test('E5.2: the handoff state machine repairs deterministically to ONE owner', (
   // A double-click on the same accepted attempt REJOINS rather than forking.
   recordHandoffState({ ...base, state: 'background_owner_active', backgroundTaskId: 'bg-1' });
   assert.equal(repairHandoff(loadHandoffState('attempt-9')).action, 'rejoin_existing');
+  // A handoff that ended without a background owner owns nothing; the next
+  // request for this work starts rather than rejoining a worker that is not there.
+  recordHandoffState({ ...base, state: 'terminal' });
+  assert.equal(repairHandoff(loadHandoffState('attempt-9')).action, 'start_fresh');
 });
 
 // ─── E6: typed disposition and the durable fan-out adapter ───────────────────

@@ -49,6 +49,10 @@ const DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   'planProposalStatus',
   'planProposalNeedsUserInput',
   'queuedTaskId',
+  // A stop that HANDED the work to a durable background owner is not a
+  // cancellation: the id names who is still running it, so clients can link the
+  // turn to live work instead of showing it as abandoned.
+  'transferredToTaskId',
 ]);
 const DELIVERY_METADATA_MAX_BYTES = 64 * 1024;
 
@@ -205,6 +209,14 @@ function presentationFromLegacyWinner(event: EventRow, proposed: PresentationEve
     kind = 'question';
     needs = { kind: 'input' };
     resumable = true;
+  } else if (/transferred/.test(reason)) {
+    // The foreground stopped, but the work did not: a legacy row that says
+    // transferred must keep saying transferred rather than being re-read as an
+    // abandoned turn by the cancelled branch below.
+    status = 'cancelled';
+    kind = 'stopped';
+    needs = undefined;
+    resumable = false;
   } else if (/cancelled|canceled|aborted|stopped|rejected_by_user/.test(reason)) {
     status = 'cancelled';
     kind = 'stopped';

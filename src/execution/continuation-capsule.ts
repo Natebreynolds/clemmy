@@ -15,13 +15,34 @@
  * per-item entries are ids plus a receipt/artifact ref.
  *
  * Storage is one JSON document per logical task under CLEMENTINE_HOME,
- * written atomically (tmp + rename) and validated on every load.
+ * written atomically (tmp + rename) and validated on every load. The HANDOFF
+ * state that decides which executor owns the task lives in a transactional
+ * store instead (handoff-store.ts): a capsule is content that verifies itself,
+ * but ownership is a compare-and-swap and needs a real transaction.
  */
 import { randomUUID, createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
+import { listEvents } from '../runtime/harness/eventlog.js';
+import { summarizeWorkManifest } from '../runtime/harness/work-manifest.js';
+import { presentationEventFromCompletionData } from '../runtime/harness/turn-outcome.js';
+import { getActiveGoalForSession } from '../agents/plan-proposals.js';
+import {
+  advanceHandoff,
+  handoffRank,
+  importLegacyHandoffRecord,
+  listHandoffRecords,
+  listUnsettledHandoffRecords,
+  loadHandoffRecord,
+  type HandoffProposal,
+  type HandoffRecord,
+  type HandoffState,
+  type HandoffWrite,
+} from './handoff-store.js';
+
+export type { HandoffRecord, HandoffState, HandoffWrite } from './handoff-store.js';
 
 export const CONTINUATION_CAPSULE_VERSION = 1;
 
@@ -164,53 +185,63 @@ export function completedItemIds(capsule: ContinuationCapsule | undefined): stri
  * is durable; a crash at any point resumes or repairs exactly ONE owner,
  * and the background task record carries the capsule id rather than an
  * instruction to infer completed work from history.
+ *
+ * The state itself lives in a transactional store (handoff-store.ts) because
+ * ownership is decided by a compare-and-swap, and a CAS spread across a file
+ * read and a file rename is not a CAS at all. This module keeps the public
+ * shape and adds the durable-projection and reconciliation entry points.
  */
-export type HandoffState =
-  | 'requested'
-  | 'foreground_commit_fenced'
-  | 'capsule_checkpointed'
-  | 'background_admitted'
-  | 'background_owner_active'
-  | 'foreground_released';
 
-export interface HandoffRecord {
-  version: 1;
-  logicalTaskId: string;
-  /** The exact accepted attempt — also the idempotency key: a double-click,
-   *  lost response, or restart REJOINS this task instead of forking one. */
-  acceptedAttemptId: string;
-  sessionId: string;
-  sourceUserSeq: number;
-  capsuleId?: string;
-  backgroundTaskId?: string;
-  state: HandoffState;
-  /** Monotonic, opaque to callers. A writer that does not hold the current
-   *  revision is a writer working from a stale view of who owns this task. */
-  revision: number;
-  updatedAt: string;
-}
-
-/** The state machine is a LADDER: ownership only ever moves forward. */
-const HANDOFF_ORDER: HandoffState[] = [
-  'requested',
-  'foreground_commit_fenced',
-  'capsule_checkpointed',
-  'background_admitted',
-  'background_owner_active',
-  'foreground_released',
-];
-
-function handoffRank(state: HandoffState): number {
-  const index = HANDOFF_ORDER.indexOf(state);
-  return index < 0 ? -1 : index;
-}
-
-export type HandoffWrite =
-  | { ok: true; record: HandoffRecord }
-  | { ok: false; reason: string; current: HandoffRecord | undefined };
-
-function handoffPath(acceptedAttemptId: string): string {
+function legacyHandoffPath(acceptedAttemptId: string): string {
   return path.join(capsuleDir(), `handoff-${encodeURIComponent(acceptedAttemptId)}.json`);
+}
+
+function parseLegacyHandoffFile(file: string): HandoffRecord | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as HandoffRecord;
+    if (parsed?.version !== 1 || !parsed.acceptedAttemptId || !parsed.state) return undefined;
+    // Records written before revisions existed start at 1 rather than
+    // disappearing: an in-flight handoff must survive the upgrade.
+    return { ...parsed, revision: Number.isInteger(parsed.revision) && parsed.revision > 0 ? parsed.revision : 1 };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Adopt a handoff written by an older build exactly once. The file is renamed
+ * after import so a later crash cannot re-import a state the store has since
+ * moved past — a re-import would be a regression wearing a migration's clothes.
+ */
+function migrateLegacyHandoffFile(file: string): HandoffRecord | undefined {
+  const legacy = parseLegacyHandoffFile(file);
+  if (!legacy) return undefined;
+  try {
+    importLegacyHandoffRecord(legacy);
+  } catch {
+    return undefined;
+  }
+  try { renameSync(file, `${file}.imported`); } catch { /* the row is durable; the file is now inert */ }
+  return loadHandoffRecord(legacy.acceptedAttemptId);
+}
+
+function adoptLegacyHandoffIfPresent(acceptedAttemptId: string): HandoffRecord | undefined {
+  const file = legacyHandoffPath(acceptedAttemptId);
+  if (!existsSync(file)) return undefined;
+  return migrateLegacyHandoffFile(file);
+}
+
+/** Import every legacy JSON handoff still on disk. Reconciliation runs this
+ *  first so a pre-upgrade in-flight transfer is reconciled, not stranded. */
+function adoptAllLegacyHandoffs(): void {
+  const dir = capsuleDir();
+  if (!existsSync(dir)) return;
+  let entries: string[] = [];
+  try { entries = readdirSync(dir); } catch { return; }
+  for (const entry of entries) {
+    if (!entry.startsWith('handoff-') || !entry.endsWith('.json')) continue;
+    migrateLegacyHandoffFile(path.join(dir, entry));
+  }
 }
 
 /**
@@ -223,32 +254,15 @@ function handoffPath(acceptedAttemptId: string): string {
  *
  *   CAS — a caller may pin the revision it read. Two activations racing to
  *   claim the same attempt cannot both win, because the loser's expected
- *   revision is already spent.
+ *   revision is already spent. Both rules are evaluated inside the store's
+ *   single transaction, so they hold across processes and not merely inside one.
  */
 export function advanceHandoffState(
   record: Omit<HandoffRecord, 'version' | 'revision' | 'updatedAt'>,
   options: { expectedRevision?: number; now?: string } = {},
 ): HandoffWrite {
-  const dir = capsuleDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const current = loadHandoffState(record.acceptedAttemptId);
-  if (current && options.expectedRevision !== undefined && options.expectedRevision !== current.revision) {
-    return { ok: false, reason: `expected revision ${options.expectedRevision}, found ${current.revision}`, current };
-  }
-  if (current && handoffRank(record.state) < handoffRank(current.state)) {
-    return { ok: false, reason: `handoff cannot regress from ${current.state} to ${record.state}`, current };
-  }
-  const next: HandoffRecord = {
-    version: 1,
-    ...record,
-    revision: (current?.revision ?? 0) + 1,
-    updatedAt: options.now ?? new Date().toISOString(),
-  };
-  const file = handoffPath(record.acceptedAttemptId);
-  const temporary = path.join(dir, `.handoff-${encodeURIComponent(record.acceptedAttemptId)}.${randomUUID()}.tmp`);
-  writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, 'utf-8');
-  renameSync(temporary, file);
-  return { ok: true, record: next };
+  if (!loadHandoffRecord(record.acceptedAttemptId)) adoptLegacyHandoffIfPresent(record.acceptedAttemptId);
+  return advanceHandoff(record as HandoffProposal, options);
 }
 
 /** Advance, keeping the durable record when the write is refused. Callers that
@@ -263,17 +277,7 @@ export function recordHandoffState(
 }
 
 export function loadHandoffState(acceptedAttemptId: string): HandoffRecord | undefined {
-  try {
-    const file = handoffPath(acceptedAttemptId);
-    if (!existsSync(file)) return undefined;
-    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as HandoffRecord;
-    if (parsed?.version !== 1) return undefined;
-    // Records written before revisions existed start at 0 rather than
-    // disappearing: an in-flight handoff must survive the upgrade.
-    return { ...parsed, revision: Number.isInteger(parsed.revision) ? parsed.revision : 0 };
-  } catch {
-    return undefined;
-  }
+  return loadHandoffRecord(acceptedAttemptId) ?? adoptLegacyHandoffIfPresent(acceptedAttemptId);
 }
 
 /**
@@ -288,16 +292,390 @@ export function repairHandoff(record: HandoffRecord | undefined): {
   switch (record.state) {
     case 'requested':
       return { action: 'checkpoint_then_admit', reason: 'the handoff was requested but nothing was checkpointed' };
-    case 'foreground_commit_fenced':
-      return { action: 'checkpoint_then_admit', reason: 'the foreground fenced its commit; the capsule is not yet durable' };
     case 'capsule_checkpointed':
       return { action: 'resume_admission', reason: 'the capsule is durable; admit the background task with the same identities' };
+    case 'foreground_commit_fenced':
+      return { action: 'resume_admission', reason: 'the foreground is fenced against a durable capsule; admission is the only step left' };
     case 'background_admitted':
     case 'background_owner_active':
       return { action: 'rejoin_existing', reason: 'a background owner already exists for this accepted attempt' };
     case 'foreground_released':
       return { action: 'rejoin_existing', reason: 'the handoff completed; the background task owns the work' };
+    case 'terminal':
+      return { action: 'start_fresh', reason: 'the handoff ended without a background owner; nothing is running for it' };
     default:
       return { action: 'start_fresh', reason: 'unknown handoff state' };
   }
+}
+
+// ── Projecting a capsule from durable state ──────────────────────────────────
+
+/** The subset of the durable background-task record a capsule projects from.
+ *  Structural on purpose: background-tasks.ts already imports this module, so
+ *  a type-only shape keeps the dependency one-directional. */
+export interface DurableHandoffTask {
+  id: string;
+  prompt?: string;
+  foregroundHandoff?: {
+    sourceUserSeq?: number;
+    throughSeq?: number;
+    capsuleId?: string;
+    logicalTaskId?: string;
+  };
+}
+
+function acceptedUserEventText(sessionId: string, sourceUserSeq: number | undefined): string {
+  if (!sessionId || sourceUserSeq === undefined) return '';
+  try {
+    const accepted = listEvents(sessionId, {
+      sinceSeq: sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    })[0];
+    if (!accepted || accepted.seq !== sourceUserSeq) return '';
+    const data = accepted.data as { text?: unknown; displayText?: unknown };
+    const displayText = typeof data.displayText === 'string' ? data.displayText.trim() : '';
+    const text = typeof data.text === 'string' ? data.text.trim() : '';
+    return displayText || text;
+  } catch {
+    return '';
+  }
+}
+
+function durableItemStatus(
+  phases: Record<string, { status: string }>,
+  complete: boolean,
+): CapsuleItemProgress['status'] {
+  if (complete) return 'completed';
+  const states = Object.values(phases ?? {}).map((phase) => phase.status);
+  if (states.some((status) => status === 'failed' || status === 'invalidated')) return 'failed';
+  if (states.some((status) => status === 'running')) return 'running';
+  return 'pending';
+}
+
+/**
+ * Project a capsule from what the system durably RECORDED, not from what a
+ * caller narrated. A capsule is resume authority, so every field it carries
+ * must be traceable to a durable source: the work manifest reduced from the
+ * event log, the read receipts that lane appended, the last committed terminal,
+ * and the session's active goal contract. Where a durable source is absent the
+ * field stays EMPTY — an invented success criterion or a guessed completed item
+ * is worse than an honest gap, because a resume would act on it.
+ *
+ * `objective` is accepted from the caller only when the caller resolved it from
+ * durable identity (the accepted user event, the goal contract); otherwise the
+ * accepted user event's own text is used.
+ */
+export function projectCapsuleFromDurableState(
+  logicalTaskId: string,
+  sessionId: string,
+  acceptedAttemptId: string,
+  durable: {
+    objective?: string;
+    sourceUserSeq?: number;
+    throughSeq?: number;
+    capsuleId?: string;
+    backgroundTask?: DurableHandoffTask;
+  } = {},
+): CapsuleInput {
+  const sourceUserSeq = durable.sourceUserSeq ?? durable.backgroundTask?.foregroundHandoff?.sourceUserSeq;
+  const objective = (durable.objective ?? '').trim() || acceptedUserEventText(sessionId, sourceUserSeq);
+
+  let successCriteria: string[] = [];
+  try {
+    const goal = getActiveGoalForSession(sessionId);
+    const plan = goal ? (goal.approvedPlan ?? goal.plan) : undefined;
+    successCriteria = Array.isArray(plan?.successCriteria) ? [...plan.successCriteria] : [];
+  } catch { /* no durable goal contract ⇒ no criteria, never invented ones */ }
+
+  let manifest: ContinuationCapsule['manifest'];
+  try {
+    const summary = summarizeWorkManifest(sessionId);
+    if (summary) {
+      manifest = {
+        manifestId: summary.manifestId,
+        contractVersion: summary.contractVersion,
+        items: summary.items.map((item) => ({
+          itemId: item.id,
+          status: durableItemStatus(item.phases as Record<string, { status: string }>, item.complete),
+        })),
+      };
+    }
+  } catch { /* no durable manifest ⇒ no item progress */ }
+
+  const effectRefs: ContinuationCapsule['effectRefs'] = [];
+  let pending: ContinuationCapsule['pending'];
+  let lastTerminal: ContinuationCapsule['lastTerminal'];
+  try {
+    for (const event of listEvents(sessionId, { types: ['read_receipt', 'conversation_completed'] })) {
+      if (durable.throughSeq !== undefined && event.seq > durable.throughSeq) break;
+      if (event.type === 'read_receipt') {
+        const record = (event.data as { record?: { receiptId?: string; identifier?: string } }).record;
+        if (record?.receiptId) {
+          effectRefs.push({
+            reservationRef: record.identifier ?? record.receiptId,
+            receiptRef: record.receiptId,
+          });
+        }
+        continue;
+      }
+      const presentation = presentationEventFromCompletionData(event.data);
+      if (!presentation) continue;
+      lastTerminal = {
+        outcomeId: presentation.outcomeId,
+        status: presentation.status,
+        pendingEdge: presentation.status === 'needs_input',
+      };
+      pending = presentation.status === 'needs_input'
+        ? {
+            kind: presentation.needs?.kind === 'approval' ? 'approval' : 'question',
+            prompt: presentation.text,
+            ...(presentation.approvalId ? { authorityRef: presentation.approvalId } : {}),
+          }
+        : undefined;
+    }
+  } catch { /* an unreadable event log yields an empty projection, not a guess */ }
+
+  return {
+    ...(durable.capsuleId ? { capsuleId: durable.capsuleId } : {}),
+    logicalTaskId,
+    sessionId,
+    acceptedSource: sourceUserSeq === undefined ? sessionId : `${sessionId}:${sourceUserSeq}`,
+    activationId: acceptedAttemptId,
+    objective,
+    successCriteria,
+    constraints: [],
+    decisions: [],
+    ...(pending ? { pending } : {}),
+    scopeRefs: {},
+    capabilityRefs: {},
+    ...(manifest ? { manifest } : {}),
+    effectRefs,
+    deliverableRefs: [],
+    ...(lastTerminal ? { lastTerminal } : {}),
+    nextSafeActions: ['continue from the last durable settlement recorded for this task'],
+    ...(durable.throughSeq !== undefined ? { compactionWatermark: durable.throughSeq } : {}),
+  };
+}
+
+// ── Boot reconciliation ──────────────────────────────────────────────────────
+
+export interface HandoffReconciliation {
+  acceptedAttemptId: string;
+  from: HandoffState;
+  action: 'released_foreground' | 'confirmed_background_owner' | 'reenqueued' | 'ended';
+  reason: string;
+  backgroundTaskId?: string;
+}
+
+/**
+ * Converge every unsettled handoff to exactly ONE owner at boot.
+ *
+ * A handoff is the only durable record that a turn changed hands, so a daemon
+ * that starts without reading it can leave the previous process's outcome
+ * standing forever: a foreground fenced by a kill latch nobody will clear, or a
+ * transfer intent whose background task never got admitted. Each rung has one
+ * correct convergence and it is derived from repairHandoff, so the crash-repair
+ * decision and the boot action can never drift apart.
+ *
+ * Dynamic imports: background-tasks.ts and background-promote.ts both import
+ * this module, and boot reconciliation is the one place that needs to call back
+ * into them.
+ */
+export async function reconcileIncompleteHandoffs(): Promise<HandoffReconciliation[]> {
+  adoptAllLegacyHandoffs();
+  const unsettled = listUnsettledHandoffRecords();
+  if (unsettled.length === 0) return [];
+
+  const { listBackgroundTasks } = await import('./background-tasks.js');
+  const tasks = listBackgroundTasks({ includeArchived: true });
+  const { clearKill, getActiveRunAttempt } = await import('../runtime/harness/eventlog.js');
+  const results: HandoffReconciliation[] = [];
+
+  for (const record of unsettled) {
+    const task = record.backgroundTaskId
+      ? tasks.find((candidate) => candidate.id === record.backgroundTaskId)
+      : tasks.find((candidate) => candidate.foregroundHandoff?.attemptId === record.acceptedAttemptId);
+    const repair = repairHandoff(record);
+
+    // A durable background task IS the owner, whatever rung the crash left
+    // behind. Confirm it and stop, so nothing re-enqueues a second worker. A
+    // handoff already at or past active ownership needs no write at all —
+    // re-stating a rung it has passed would be a regression.
+    if (task) {
+      const write = handoffRank(record.state) >= handoffRank('background_owner_active')
+        ? undefined
+        : advanceHandoff(
+            { ...record, backgroundTaskId: task.id, state: 'background_owner_active' },
+            { expectedRevision: record.revision },
+          );
+      results.push({
+        acceptedAttemptId: record.acceptedAttemptId,
+        from: record.state,
+        action: 'confirmed_background_owner',
+        reason: !write || write.ok ? repair.reason : write.reason,
+        backgroundTaskId: task.id,
+      });
+      continue;
+    }
+
+    // No background task exists. Either the foreground is still alive and must
+    // be handed its work back, or the transfer died and nothing owns it.
+    if (repair.action === 'checkpoint_then_admit' || repair.action === 'resume_admission') {
+      const capsule = loadCapsule(record.logicalTaskId);
+      let live = false;
+      try { live = getActiveRunAttempt(record.sessionId)?.attemptId === record.acceptedAttemptId; } catch { live = false; }
+      if (live) {
+        // The fence was latched for a transfer that never happened. Clearing it
+        // returns the turn to its original owner rather than leaving it stopped.
+        try { clearKill(record.sessionId, { attemptId: record.acceptedAttemptId }); } catch { /* best effort */ }
+        advanceHandoff(
+          { ...record, state: 'terminal', reason: 'no background owner was admitted; the live foreground keeps the work' },
+          { expectedRevision: record.revision },
+        );
+        results.push({
+          acceptedAttemptId: record.acceptedAttemptId,
+          from: record.state,
+          action: 'released_foreground',
+          reason: 'the foreground attempt is still live; its stop latch was cleared',
+        });
+        continue;
+      }
+      if (capsule?.objective) {
+        // CAS guards the re-enqueue: only the reconciler holding this exact
+        // revision may admit, so two daemons cannot both create a worker.
+        const claim = advanceHandoff(
+          { ...record, state: 'foreground_commit_fenced' },
+          { expectedRevision: record.revision },
+        );
+        if (!claim.ok) {
+          results.push({
+            acceptedAttemptId: record.acceptedAttemptId,
+            from: record.state,
+            action: 'confirmed_background_owner',
+            reason: claim.reason,
+          });
+          continue;
+        }
+        const { enqueueDurableChatTask } = await import('./background-promote.js');
+        try {
+          const admitted = enqueueDurableChatTask({
+            message: capsule.objective,
+            composedPrompt: [
+              `Objective: ${capsule.objective}`,
+              '',
+              'You are RESUMING this task after a restart interrupted its handoff.',
+              'The durable continuation capsule is authoritative for what is already done; do not redo completed work.',
+            ].join('\n'),
+            sessionId: record.sessionId,
+            source: 'daemon',
+            goal: { objective: capsule.objective },
+            foregroundHandoff: {
+              sessionId: record.sessionId,
+              attemptId: record.acceptedAttemptId,
+              sourceUserSeq: record.sourceUserSeq,
+              throughSeq: capsule.compactionWatermark ?? 0,
+              capsuleId: capsule.capsuleId,
+              logicalTaskId: record.logicalTaskId,
+            },
+          });
+          advanceHandoff(
+            { ...record, capsuleId: capsule.capsuleId, backgroundTaskId: admitted.id, state: 'background_admitted' },
+            { expectedRevision: claim.record.revision },
+          );
+          results.push({
+            acceptedAttemptId: record.acceptedAttemptId,
+            from: record.state,
+            action: 'reenqueued',
+            reason: 'the capsule was durable but no background owner existed',
+            backgroundTaskId: admitted.id,
+          });
+          continue;
+        } catch (error) {
+          advanceHandoff(
+            {
+              ...record,
+              state: 'terminal',
+              reason: `re-enqueue failed: ${error instanceof Error ? error.message : String(error)}`,
+            },
+            { expectedRevision: claim.record.revision },
+          );
+          results.push({
+            acceptedAttemptId: record.acceptedAttemptId,
+            from: record.state,
+            action: 'ended',
+            reason: 'the capsule could not be re-admitted; the handoff owns nothing',
+          });
+          continue;
+        }
+      }
+    }
+
+    advanceHandoff(
+      { ...record, state: 'terminal', reason: `${repair.reason}; no durable owner remains` },
+      { expectedRevision: record.revision },
+    );
+    results.push({
+      acceptedAttemptId: record.acceptedAttemptId,
+      from: record.state,
+      action: 'ended',
+      reason: repair.reason,
+    });
+  }
+  return results;
+}
+
+// ── The transferred foreground terminal ──────────────────────────────────────
+
+export interface HandoffTransfer {
+  backgroundTaskId: string;
+  logicalTaskId: string;
+  /** What the background now owns, taken from the capsule the handoff wrote. */
+  objective: string;
+  /** Public terminal text. It names the WORK rather than the task id: the id is
+   *  carried as typed metadata for clients, not read out to the user. */
+  text: string;
+}
+
+/**
+ * A foreground attempt that was stopped to hand its work to the background did
+ * not get CANCELLED — it changed owners. The terminal committer asks this
+ * before it publishes a stopped terminal, so the user reads "this moved to the
+ * background" instead of "this was cancelled" for work that is still running.
+ * Only a handoff that reached a durable background owner qualifies; a fenced
+ * intent with no admitted task really is a stop.
+ */
+export function handoffTransferForAttempt(
+  sessionId: string,
+  acceptedAttemptId: string | undefined,
+): HandoffTransfer | undefined {
+  if (!sessionId || !acceptedAttemptId) return undefined;
+  return transferFor(sessionId, loadHandoffState(acceptedAttemptId));
+}
+
+/** Same question asked by accepted SOURCE event, for terminal committers that
+ *  reduce a turn without a physical attempt id in hand. */
+export function handoffTransferForSource(
+  sessionId: string,
+  sourceUserSeq: number | undefined,
+): HandoffTransfer | undefined {
+  if (!sessionId || sourceUserSeq === undefined) return undefined;
+  const record = listHandoffRecords()
+    .filter((row) => row.sessionId === sessionId && row.sourceUserSeq === sourceUserSeq)
+    .at(-1);
+  return transferFor(sessionId, record);
+}
+
+function transferFor(sessionId: string, record: HandoffRecord | undefined): HandoffTransfer | undefined {
+  if (!record || record.sessionId !== sessionId || !record.backgroundTaskId) return undefined;
+  if (record.state === 'terminal') return undefined;
+  const objective = loadCapsule(record.logicalTaskId)?.objective?.trim() ?? '';
+  return {
+    backgroundTaskId: record.backgroundTaskId,
+    logicalTaskId: record.logicalTaskId,
+    objective,
+    text: objective
+      ? `Moved to the background — I'm still working on "${objective}" there, and I'll report back here when it's done.`
+      : 'Moved to the background — I\'m still working on this there, and I\'ll report back here when it\'s done.',
+  };
 }

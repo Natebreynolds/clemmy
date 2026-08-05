@@ -37,7 +37,7 @@ import {
 import { getActiveObjective } from '../memory/focus.js';
 import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
 import { effectiveTurnObjective } from '../runtime/harness/turn-control.js';
-import { advanceHandoffState, checkpointCapsule } from './continuation-capsule.js';
+import { advanceHandoffState, checkpointCapsule, projectCapsuleFromDurableState } from './continuation-capsule.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 
@@ -578,15 +578,16 @@ export function detachRunningTurnToBackground(
   if (!resolved) return null;
   const throughSeq = getLatestEventSeq(sessionId);
 
-  // Latch the exact foreground attempt before making its durable replacement.
-  // If persistence fails synchronously, release only this latch so foreground
-  // work is not silently lost. enqueue's drain yields after this call stack.
-  requestKill(sessionId, 'moved to background by user', active);
-
-  // Structural continuation, checkpointed BEFORE the acknowledgement: an
-  // acknowledgement is only honest once what the background inherits is
-  // durable. The logical task id is derived from the accepted attempt, so a
-  // double-click, a lost response, or a restart rejoins this exact task.
+  // ORDER IS THE INVARIANT. The durable transfer intent and the capsule are
+  // written FIRST; only then is the foreground fenced. Fencing first means a
+  // crash in the window between the kill and the enqueue leaves a stopped
+  // foreground and no background task — the user's work has no owner at all,
+  // and nothing durable records that it ever changed hands. With the intent
+  // durable first, the worst crash leaves a recorded handoff that boot
+  // reconciliation converges to exactly one owner.
+  //
+  // The logical task id is derived from the accepted attempt, so a double-click,
+  // a lost response, or a restart rejoins this exact task.
   const logicalTaskId = `handoff:${sessionId}:${active.attemptId}`;
   const handoffIdentity = {
     logicalTaskId,
@@ -594,26 +595,29 @@ export function detachRunningTurnToBackground(
     sessionId,
     sourceUserSeq: resolved.sourceUserSeq,
   };
-  advanceHandoffState({ ...handoffIdentity, state: 'requested' });
+  const requested = advanceHandoffState({ ...handoffIdentity, state: 'requested' });
+  // An existing record means a previous activation got part-way; resuming it is
+  // correct. A record that already ENDED owns nothing and must not be revived
+  // under the same identity — the caller falls back to an ordinary turn.
+  if (!requested.ok && (!requested.current || requested.current.state === 'terminal')) return null;
+
   const capsule = checkpointCapsule({
-    logicalTaskId,
-    sessionId,
-    acceptedSource: `${sessionId}:${resolved.sourceUserSeq}`,
-    activationId: active.attemptId,
-    objective: resolved.objective,
-    successCriteria: [],
-    constraints: [],
-    decisions: [],
-    scopeRefs: {},
-    capabilityRefs: {},
-    effectRefs: [],
-    deliverableRefs: [],
-    nextSafeActions: ['continue from the last durable settlement recorded for this task'],
-    // History below this boundary is context; later turns in the reusable
-    // origin chat are not this task's input.
-    compactionWatermark: throughSeq,
+    ...projectCapsuleFromDurableState(logicalTaskId, sessionId, active.attemptId, {
+      objective: resolved.objective,
+      sourceUserSeq: resolved.sourceUserSeq,
+      // History below this boundary is context; later turns in the reusable
+      // origin chat are not this task's input.
+      throughSeq,
+    }),
+    ...(requested.ok ? {} : { capsuleId: requested.current?.capsuleId }),
   });
   advanceHandoffState({ ...handoffIdentity, capsuleId: capsule.capsuleId, state: 'capsule_checkpointed' });
+
+  // Latch the exact foreground attempt now that its durable replacement exists.
+  // If persistence fails synchronously, release only this latch so foreground
+  // work is not silently lost. enqueue's drain yields after this call stack.
+  requestKill(sessionId, 'moved to background by user', active);
+  advanceHandoffState({ ...handoffIdentity, capsuleId: capsule.capsuleId, state: 'foreground_commit_fenced' });
 
   const composedPrompt = [
     `Objective: ${resolved.objective}`,
@@ -650,7 +654,18 @@ export function detachRunningTurnToBackground(
     });
     return backgroundItResult(task, active.attemptId, false);
   } catch (error) {
+    // Both halves matter. Clearing the latch returns the turn to the live
+    // foreground; ending the handoff stops boot reconciliation from later
+    // resurrecting a transfer that already failed and was handed back.
     try { clearKill(sessionId, active); } catch { /* preserve original error */ }
+    try {
+      advanceHandoffState({
+        ...handoffIdentity,
+        capsuleId: capsule.capsuleId,
+        state: 'terminal',
+        reason: `admission failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    } catch { /* preserve original error */ }
     throw error;
   }
 }

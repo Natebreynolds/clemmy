@@ -133,6 +133,7 @@ import {
 } from '../../memory/learning-receipt.js';
 import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
 import { isUserFacingSession } from '../../execution/scope.js';
+import { handoffTransferForSource } from '../../execution/continuation-capsule.js';
 import { primeTurnRecallVector, recordFactImpression, searchFactsByText } from '../../memory/facts.js';
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
 import { recordRecallRun } from '../../memory/recall-usage.js';
@@ -584,6 +585,7 @@ function reduceStandardConversationTerminal(input: {
 
   let outcome: TurnOutcome;
   let legacyReason: string;
+  let transferredToTaskId: string | undefined;
   switch (result.status) {
     case 'dispatched':
       // A durable async edge is deliberately nonterminal. Callers must release
@@ -668,7 +670,12 @@ function reduceStandardConversationTerminal(input: {
       };
       legacyReason = 'awaiting_continue';
       break;
-    case 'killed':
+    case 'killed': {
+      // A stop that handed this turn to a durable background owner is a
+      // TRANSFER, not a cancellation: the work is still running elsewhere.
+      const transfer = (() => {
+        try { return handoffTransferForSource(result.sessionId, sourceUserSeq); } catch { return undefined; }
+      })();
       outcome = {
         version: 2,
         id: turnOutcomeId(identity),
@@ -677,11 +684,13 @@ function reduceStandardConversationTerminal(input: {
         resumable: false,
         presentation: {
           kind: 'stopped',
-          text: 'Stopped — this turn was cancelled. Nothing further will execute.',
+          text: transfer ? transfer.text : 'Stopped — this turn was cancelled. Nothing further will execute.',
         },
       };
-      legacyReason = 'cancelled';
+      legacyReason = transfer ? 'transferred' : 'cancelled';
+      transferredToTaskId = transfer?.backgroundTaskId;
       break;
+    }
     case 'failed':
       outcome = {
         version: 2,
@@ -700,6 +709,7 @@ function reduceStandardConversationTerminal(input: {
     metadata: {
       steps: result.steps,
       ...(result.limitKind ? { limitKind: result.limitKind } : {}),
+      ...(transferredToTaskId ? { transferredToTaskId } : {}),
     },
   });
   return { ...result, publicPresentation: committed.presentation };
