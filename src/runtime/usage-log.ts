@@ -3,6 +3,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { recordOperationalEvent } from './operational-telemetry.js';
 import { accrueSessionTokens, getSession, type SessionKind } from './harness/eventlog.js';
+import type { TraceEnvelope } from './trace-envelope.js';
 
 /**
  * Token-usage observability log. Append-only NDJSON per day.
@@ -62,6 +63,10 @@ export interface UsageEvent {
     uncachedInputTokens: number;
     uncachedWorkTokens: number;
   };
+  /** Explicit trace identity joining this call to its accepted source, turn,
+   *  attempt, admission, and lane — replaces source-prefix inference where a
+   *  lane supplies it. Identifiers and digests only, never content. */
+  trace?: TraceEnvelope;
   /** RAW provider-shaped prompt (input) tokens under the declared dialect. */
   inputTokens: number;
   /** The cached-read subset of inputTokens (prompt-cache hits). cacheHitRate =
@@ -373,6 +378,8 @@ export function recordModelUsage(args: {
   /** Declared by the adapter that owns the wire format. Absent = 'unknown'
    *  (legacy): visible, uncertifiable, conservatively debited. */
   cacheDialect?: CacheDialectProvenance;
+  /** Explicit trace identity where the lane has one (identifiers only). */
+  trace?: TraceEnvelope;
   inputTokens: number;
   cachedInputTokens?: number;
   outputTokens: number;
@@ -406,6 +413,7 @@ export function recordModelUsage(args: {
     kindReason: resolution.reason,
     model: args.model,
     cacheDialect: args.cacheDialect ?? 'unknown' as const,
+    ...(args.trace ? { trace: args.trace } : {}),
     canonical: {
       certified: canonical.certified,
       promptTokens: canonical.promptTokens,
