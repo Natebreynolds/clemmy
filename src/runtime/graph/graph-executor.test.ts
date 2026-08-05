@@ -487,4 +487,3 @@ test('an ANY-join fires on the first satisfied route; the rendezvous default is 
   assert.deepEqual(blockedRoute.completed.sort(), ['blocked', 'publish', 'verify'],
     'the blocked route did not reach the shared publish node');
 });
-

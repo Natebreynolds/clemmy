@@ -260,4 +260,3 @@ test('latency PRESENCE is visible per lane, not assumed', () => {
   assert.equal(r.byKind.chat!.durationSamples, 2);
   assert.equal(r.byKind.chat!.totalDurationMs, 2000);
 });
-
