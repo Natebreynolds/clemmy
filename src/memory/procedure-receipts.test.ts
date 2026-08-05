@@ -114,7 +114,7 @@ test('parse validates every load-bearing field and refuses unknown versions', ()
   assert.equal(missing.ok, false);
 });
 
-test('a torn active artifact quarantines ON DISK with a typed reason, and resolution reports the miss', async () => {
+test('a torn active artifact row quarantines with a typed reason, and resolution reports the miss', async () => {
   const store = receiptStore();
   const record = store.mint({ operation: 'torn_case', identifier: 'PROVIDERX_TORN_CASE' });
   const promoted = await promoteFromVerifiedReceipt(promotionInput(record.receiptId, {
@@ -123,17 +123,18 @@ test('a torn active artifact quarantines ON DISK with a typed reason, and resolu
   assert.equal(promoted.ok, true);
   const artifactId = (promoted as Extract<typeof promoted, { ok: true }>).artifact.artifactId;
 
-  // Tear the file the pointer names.
-  const dir = path.join(TMP_HOME, 'memory', 'procedure-artifacts', 'machine-A');
-  writeFileSync(path.join(dir, `${artifactId}.json`), '{ torn json', 'utf-8');
+  // Tear the ROW the pointer names (direct surgery on the store).
+  const Database = (await import('better-sqlite3')).default;
+  const database = new Database(path.join(TMP_HOME, 'memory', 'procedure-artifacts', 'machine-A', 'procedures.db'));
+  database.prepare('UPDATE artifacts SET document = ? WHERE artifact_id = ?').run('{ torn json', artifactId);
+  database.close();
 
   const resolved = resolveActiveProcedure({
     scope: SCOPE, provider: 'providerx', operation: 'torn_case', effectClass: 'read',
   });
   assert.equal(resolved.outcome, 'miss');
-  assert.match((resolved as { quarantined?: { reason: string } }).quarantined?.reason ?? '', /unreadable|torn/);
-  const files = readdirSync(dir);
-  assert.ok(files.includes(`${artifactId}.json.quarantined`), 'the torn file was not quarantined on disk');
+  assert.ok((resolved as { quarantined?: { reason: string } }).quarantined,
+    'the torn row did not report a typed quarantine');
   // The pointer is cleared: the next resolution is a clean miss, not a crash loop.
   assert.equal(resolveActiveProcedure({
     scope: SCOPE, provider: 'providerx', operation: 'torn_case', effectClass: 'read',
@@ -165,15 +166,18 @@ test('concurrent promotions for one logical key leave exactly ONE active canonic
     slotValues: {},
   });
   assert.equal(resolved.outcome, 'bound', JSON.stringify(resolved));
-  // One pointer file, one winner — never two actives.
-  const pointers = readdirSync(path.join(TMP_HOME, 'memory', 'procedure-artifacts', 'machine-A', 'logical-keys'))
-    .filter((name) => !name.startsWith('.'));
+  // One pointer row, one winner — never two actives.
+  const Database = (await import('better-sqlite3')).default;
+  const database = new Database(path.join(TMP_HOME, 'memory', 'procedure-artifacts', 'machine-A', 'procedures.db'));
   const key = logicalKeyDigest({ scope: SCOPE, provider: 'providerx', operation: 'contended', effectClass: 'read' });
-  assert.ok(pointers.includes(`${key}.json`));
-  const pointer = JSON.parse(readFileSync(
-    path.join(TMP_HOME, 'memory', 'procedure-artifacts', 'machine-A', 'logical-keys', `${key}.json`), 'utf-8',
-  )) as { activeArtifactId: string };
-  assert.equal(pointer.activeArtifactId, active!.artifactId);
+  const pointer = database.prepare('SELECT active_artifact_id FROM pointers WHERE key_digest = ?').get(key) as
+    { active_artifact_id: string };
+  const activeCount = database.prepare(
+    "SELECT COUNT(*) AS n FROM artifacts a JOIN pointers p ON p.active_artifact_id = a.artifact_id WHERE p.key_digest = ? AND a.status = 'active'",
+  ).get(key) as { n: number };
+  database.close();
+  assert.equal(pointer.active_artifact_id, active!.artifactId);
+  assert.equal(activeCount.n, 1, 'more than one active canonical artifact for the key');
 });
 
 // ─── drift quarantines before dispatch; a fresh receipt re-promotes ──────────

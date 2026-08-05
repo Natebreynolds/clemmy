@@ -90,7 +90,7 @@ function portsWith(over: Partial<ReadLanePorts> & { records?: Map<string, Receip
       return { receiptId: record.receiptId };
     },
     receipts: { resolve: (id) => records.get(id) },
-    async compose() { return 'Done.'; },
+    async present() { return { draft: 'Done.' }; },
     ...over,
   };
 }
@@ -278,21 +278,20 @@ test('F27: a tampered artifact whose provider/scope fields changed cannot resolv
   assert.equal(promoted.ok, true);
   const artifactId = (promoted as Extract<typeof promoted, { ok: true }>).artifact.artifactId;
 
-  // Tamper: rewrite provider/operation INSIDE the stored artifact while
-  // keeping the file at the same content-addressed name and pointer.
-  const dir = path.join(TMP_HOME, 'memory', 'procedure-artifacts', 'machine-A');
-  const file = path.join(dir, `${artifactId}.json`);
-  const document = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  // Tamper: rewrite provider/operation INSIDE the stored document while the
+  // pointer still names the same content-addressed id (direct row surgery on
+  // the transactional store).
+  const Database = (await import('better-sqlite3')).default;
+  const dbPath = path.join(TMP_HOME, 'memory', 'procedure-artifacts', 'machine-A', 'procedures.db');
+  const database = new Database(dbPath);
+  const row = database.prepare('SELECT document FROM artifacts WHERE artifact_id = ?').get(artifactId) as { document: string };
+  const document = JSON.parse(row.document) as Record<string, unknown>;
   document.provider = 'mailco';
   document.operation = 'send_mail';
-  writeFileSync(file, JSON.stringify(document, null, 2), 'utf-8');
-  // Re-point the tampered content at the ORIGINAL logical key.
-  const key = logicalKeyDigest({ scope: { ...SCOPE_A }, provider: 'providerx', operation: 'list_items', effectClass: 'read' });
-  writeFileSync(
-    path.join(dir, 'logical-keys', `${key}.json`),
-    JSON.stringify({ activeArtifactId: artifactId, updatedAt: new Date().toISOString() }),
-    'utf-8',
-  );
+  database.prepare('UPDATE artifacts SET document = ? WHERE artifact_id = ?')
+    .run(JSON.stringify(document), artifactId);
+  database.close();
+  void logicalKeyDigest;
 
   const resolved = resolveActiveProcedure({
     scope: { ...SCOPE_A }, provider: 'providerx', operation: 'list_items', effectClass: 'read',
@@ -325,6 +324,9 @@ test('F29: the lane produces a typed presentation INPUT for the existing termina
 
 test('F30: a cold missing-slot acquisition persists a durable pending state the next answer structurally joins', async () => {
   const result = await run(portsWith({
+    async resolveIntent() {
+      return { kind: 'read', provider: 'providerx', operation: 'slot_case', slotValues: {} };
+    },
     async discover() {
       return { identifier: IDENTIFIER, schemaFingerprint: 'fp-live', templateArgs: { when: '{{when}}' }, kind: 'composio' };
     },

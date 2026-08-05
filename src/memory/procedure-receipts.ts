@@ -30,21 +30,23 @@
  * rate limits, and provider 5xx never poison a structurally valid artifact
  * (recordProcedureUse already pins that).
  */
-import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
-import { BASE_DIR } from '../config.js';
-import { getMachineId } from '../runtime/machine-id.js';
+import { createHash } from 'node:crypto';
+import {
+  clearPointer,
+  loadArtifactRow,
+  loadPointer,
+  promoteTransactionally,
+  updateArtifactRow,
+} from './procedure-store.js';
 import {
   computeArtifactId,
-  promoteProcedureArtifact,
-  readArtifact,
   templateSlots,
   type ProcedureArtifact,
   type ProcedureResolution,
   type ProcedureScope,
 } from './procedure-artifact.js';
-import type { ProcedureKind } from './procedure-validity.js';
+import { isPlaceholderToken, type ProcedureKind } from './procedure-validity.js';
+import { composioSlugIsDispatchable, stripVolatileConnectionArgs } from '../tools/composio-carrier.js';
 
 export const PROCEDURE_ARTIFACT_VERSION = 1;
 
@@ -137,11 +139,7 @@ export type ReceiptPromotionResult =
   | { ok: true; artifact: ProcedureArtifact; superseded?: string }
   | { ok: false; errors: string[] };
 
-// ── storage: logical-key pointers ────────────────────────────────────────────
-
-function pointerDir(): string {
-  return path.join(BASE_DIR, 'memory', 'procedure-artifacts', getMachineId(), 'logical-keys');
-}
+// ── the transactional promotion path ─────────────────────────────────────────
 
 function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -163,59 +161,17 @@ export function logicalKeyDigest(input: {
   })).slice(0, 40);
 }
 
-interface LogicalKeyPointer {
-  activeArtifactId: string;
-  updatedAt: string;
+function isNonEmptyStringLocal(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
-
-function pointerPath(keyDigest: string): string {
-  return path.join(pointerDir(), `${keyDigest}.json`);
-}
-
-function readPointer(keyDigest: string): LogicalKeyPointer | null {
-  try {
-    const file = pointerPath(keyDigest);
-    if (!existsSync(file)) return null;
-    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as LogicalKeyPointer;
-    return isNonEmptyString(parsed?.activeArtifactId) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function writePointer(keyDigest: string, pointer: LogicalKeyPointer | null): void {
-  const dir = pointerDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const file = pointerPath(keyDigest);
-  const temporary = path.join(dir, `.${keyDigest}.${randomUUID()}.tmp`);
-  writeFileSync(temporary, `${JSON.stringify(pointer ?? { activeArtifactId: '', updatedAt: new Date().toISOString() })}\n`, 'utf-8');
-  renameSync(temporary, file); // rename is the atomic commit
-}
-
-/** In-process per-key mutex: promotions for one logical key serialize. */
-const KEY_LOCKS = new Map<string, Promise<unknown>>();
-
-async function withKeyLock<T>(keyDigest: string, work: () => Promise<T> | T): Promise<T> {
-  const previous = KEY_LOCKS.get(keyDigest) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
-  KEY_LOCKS.set(keyDigest, previous.then(() => gate));
-  await previous;
-  try {
-    return await work();
-  } finally {
-    release();
-    if (KEY_LOCKS.get(keyDigest) === gate) KEY_LOCKS.delete(keyDigest);
-  }
-}
-
-// ── the transactional promotion path ─────────────────────────────────────────
 
 /**
  * Promote from a DURABLE receipt. The caller supplies its CLAIM (what it
  * believes ran) and the resolver supplies the truth; any disagreement
- * refuses. The logical-key pointer flips atomically under the key mutex, so
- * concurrency leaves exactly one active canonical artifact.
+ * refuses — including a schema the acquisition never proved (F23). The
+ * artifact insert, supersession, and pointer swap are ONE SQLite/WAL
+ * transaction (F28): cross-process concurrency and crashes leave exactly
+ * one active canonical artifact.
  */
 export async function promoteFromVerifiedReceipt(
   input: {
@@ -227,6 +183,9 @@ export async function promoteFromVerifiedReceipt(
     identifier: string;
     templateArgs: Record<string, unknown>;
     receiptId: string;
+    /** The schema the ACQUISITION proved. When present, the receipt must
+     *  prove the same contract — never promote under undischarged drift. */
+    acquiredSchemaFingerprint?: string;
     now?: string;
   },
   resolver: ReceiptResolver,
@@ -253,66 +212,89 @@ export async function promoteFromVerifiedReceipt(
     || record.scope.accountIdentity !== input.scope.accountIdentity) {
     errors.push('receipt scope (tenant/workspace/account) does not match the promotion scope');
   }
-  if (record.effectClass === 'read' && !isNonEmptyString(record.readEvidenceRef)) {
+  if (record.effectClass === 'read' && !isNonEmptyStringLocal(record.readEvidenceRef)) {
     errors.push('a read receipt without read evidence proves a dispatch, not returned data');
+  }
+  if (input.acquiredSchemaFingerprint !== undefined
+    && record.schemaFingerprint !== input.acquiredSchemaFingerprint) {
+    errors.push(`receipt proves schema ${record.schemaFingerprint}, but the acquisition bound ${input.acquiredSchemaFingerprint} — a promotion under undischarged drift is refused`);
+  }
+  const identifier = input.identifier.trim();
+  if (isPlaceholderToken(identifier)) errors.push(`identifier "${identifier}" is filler, not a tool`);
+  else if (input.kind === 'composio' && !composioSlugIsDispatchable(identifier)) {
+    errors.push(`identifier "${identifier}" cannot name a provider action`);
+  }
+  if (/^ca_/i.test(input.scope.accountIdentity)) {
+    errors.push('scope.accountIdentity is a rotating connection id; use the stable account identity');
   }
   if (errors.length > 0) return { ok: false, errors };
 
-  const keyDigest = logicalKeyDigest(input);
-  return withKeyLock(keyDigest, () => {
-    const promoted = promoteProcedureArtifact({
-      scope: input.scope,
-      provider: input.provider,
-      operation: input.operation,
-      effectClass: input.effectClass,
-      kind: input.kind,
-      identifier: input.identifier,
-      templateArgs: input.templateArgs,
-      receipt: {
-        receiptId: record.receiptId,
-        at: record.at,
-        schemaFingerprint: record.schemaFingerprint,
-        ...(record.observationRef ? { observationRef: record.observationRef } : {}),
-      },
-      now: input.now,
-    });
-    if (!promoted.ok) return promoted;
-    stampVersion(promoted.artifact.artifactId);
-    writePointer(keyDigest, {
-      activeArtifactId: promoted.artifact.artifactId,
-      updatedAt: input.now ?? new Date().toISOString(),
-    });
-    return promoted;
+  const { args } = stripVolatileConnectionArgs(input.templateArgs);
+  const template = { args, slots: templateSlots(args) };
+  const now = input.now ?? new Date().toISOString();
+  const artifactId = computeArtifactId({
+    scope: input.scope, provider: input.provider, operation: input.operation,
+    effectClass: input.effectClass, kind: input.kind, identifier, template,
   });
-}
-
-/** Write the version stamp into the stored artifact document (the base module
- *  predates versioning; the transactional layer requires it). */
-function stampVersion(artifactId: string): void {
-  const dir = path.join(BASE_DIR, 'memory', 'procedure-artifacts', getMachineId());
-  const file = path.join(dir, `${artifactId}.json`);
-  try {
-    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
-    parsed.artifactVersion = PROCEDURE_ARTIFACT_VERSION;
-    const temporary = path.join(dir, `.${artifactId}.${randomUUID()}.tmp`);
-    writeFileSync(temporary, `${JSON.stringify(parsed, null, 2)}\n`, 'utf-8');
-    renameSync(temporary, file);
-  } catch { /* the pointer still names it; the validated read reports precisely */ }
+  const artifact: ProcedureArtifact & { artifactVersion: number } = {
+    artifactVersion: PROCEDURE_ARTIFACT_VERSION,
+    artifactId,
+    scope: { ...input.scope },
+    provider: input.provider,
+    operation: input.operation,
+    effectClass: input.effectClass,
+    kind: input.kind,
+    identifier,
+    template,
+    schemaFingerprint: record.schemaFingerprint,
+    promotedBy: {
+      receiptId: record.receiptId,
+      at: record.at,
+      schemaFingerprint: record.schemaFingerprint,
+      ...(record.observationRef ? { observationRef: record.observationRef } : {}),
+    },
+    status: 'active',
+    validAt: now,
+    evidence: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+  const { superseded } = promoteTransactionally({
+    keyDigest: logicalKeyDigest(input), artifact, now,
+  });
+  return superseded ? { ok: true, artifact, superseded } : { ok: true, artifact };
 }
 
 // ── the validated, pointer-first read path ───────────────────────────────────
 
 export type TransactionalResolution =
   | ProcedureResolution
-  /** The pointer or its artifact is malformed/torn/unknown-version — the file
-   *  is quarantined on disk with the reason, and resolution says so. */
+  /** The pointer's artifact is malformed/torn/tampered/unknown-version — it
+   *  is quarantined in the store with the reason, and resolution says so. */
   | { outcome: 'miss'; quarantined?: { artifactId: string; reason: string } };
+
+function quarantineRow(artifact: ProcedureArtifact, keyDigest: string, reason: string): void {
+  const now = new Date().toISOString();
+  updateArtifactRow({
+    ...artifact,
+    status: 'quarantined',
+    statusReason: reason,
+    invalidAt: now,
+    updatedAt: now,
+    artifactVersion: PROCEDURE_ARTIFACT_VERSION,
+  } as ProcedureArtifact & { artifactVersion: number });
+  clearPointer(keyDigest);
+}
 
 /**
  * Resolve through the logical-key pointer: at most ONE artifact is ever the
- * canonical answer for a key, and it is runtime-validated before anything
- * binds. Schema drift quarantines durably (artifact + pointer) BEFORE any
- * dispatch; only a new verified receipt re-promotes.
+ * canonical answer for a key, runtime-validated AND content-verified before
+ * anything binds. Content identity is recomputed on every load (F27): a
+ * tampered document whose logical fields changed cannot resolve as bound,
+ * because both the recomputed content address and the requested logical key
+ * are compared against what the document actually says. Schema drift
+ * quarantines durably BEFORE dispatch; only a new verified receipt
+ * re-promotes.
  */
 export function resolveActiveProcedure(input: {
   scope: ProcedureScope;
@@ -324,26 +306,46 @@ export function resolveActiveProcedure(input: {
   slotValues?: Record<string, string>;
 }): TransactionalResolution {
   const keyDigest = logicalKeyDigest(input);
-  const pointer = readPointer(keyDigest);
-  if (!pointer || !pointer.activeArtifactId) return { outcome: 'miss' };
+  const activeId = loadPointer(keyDigest);
+  if (!activeId) return { outcome: 'miss' };
 
-  const dir = path.join(BASE_DIR, 'memory', 'procedure-artifacts', getMachineId());
-  const file = path.join(dir, `${pointer.activeArtifactId}.json`);
-  let document: unknown;
-  try {
-    document = JSON.parse(readFileSync(file, 'utf-8'));
-  } catch (error) {
-    quarantineFile(file, pointer.activeArtifactId, `unreadable: ${error instanceof Error ? error.message : 'torn file'}`);
-    writePointer(keyDigest, null);
-    return { outcome: 'miss', quarantined: { artifactId: pointer.activeArtifactId, reason: 'unreadable or torn artifact file' } };
+  const document = loadArtifactRow(activeId);
+  if (document === undefined) {
+    clearPointer(keyDigest);
+    return { outcome: 'miss', quarantined: { artifactId: activeId, reason: 'pointer names a missing artifact row' } };
   }
   const parsed = parseProcedureArtifactDocument(document);
   if (!parsed.ok) {
-    quarantineFile(file, pointer.activeArtifactId, parsed.reason);
-    writePointer(keyDigest, null);
-    return { outcome: 'miss', quarantined: { artifactId: pointer.activeArtifactId, reason: parsed.reason } };
+    clearPointer(keyDigest);
+    return { outcome: 'miss', quarantined: { artifactId: activeId, reason: parsed.reason } };
   }
   const artifact = parsed.artifact;
+
+  // F27: recompute the content address from the DOCUMENT's own fields and
+  // compare it to the id the pointer named, then compare the document's
+  // logical key to the REQUESTED one. Tampering either way de-activates.
+  const recomputed = computeArtifactId({
+    scope: artifact.scope,
+    provider: artifact.provider,
+    operation: artifact.operation,
+    effectClass: artifact.effectClass,
+    kind: artifact.kind,
+    identifier: artifact.identifier,
+    template: artifact.template,
+  });
+  if (recomputed !== artifact.artifactId || artifact.artifactId !== activeId) {
+    quarantineRow(artifact, keyDigest, 'content identity mismatch — the stored document does not hash to its own id');
+    return { outcome: 'miss', quarantined: { artifactId: activeId, reason: 'content identity mismatch' } };
+  }
+  if (artifact.provider !== input.provider
+    || artifact.operation !== input.operation
+    || artifact.effectClass !== input.effectClass
+    || artifact.scope.tenant !== input.scope.tenant
+    || artifact.scope.workspace !== input.scope.workspace
+    || artifact.scope.accountIdentity !== input.scope.accountIdentity) {
+    quarantineRow(artifact, keyDigest, 'logical-key mismatch — the pointer names an artifact for a different operation or scope');
+    return { outcome: 'miss', quarantined: { artifactId: activeId, reason: 'logical-key mismatch' } };
+  }
   if (artifact.status !== 'active') return { outcome: 'miss' };
 
   if (input.accountConnected === false) {
@@ -355,14 +357,7 @@ export function resolveActiveProcedure(input: {
   }
   if (input.liveSchemaFingerprint && input.liveSchemaFingerprint !== artifact.schemaFingerprint) {
     const reason = `proven against ${artifact.schemaFingerprint}, live contract is ${input.liveSchemaFingerprint}`;
-    const now = new Date().toISOString();
-    const quarantined = { ...artifact, status: 'quarantined' as const, statusReason: reason, invalidAt: now, updatedAt: now };
-    const temporary = path.join(dir, `.${artifact.artifactId}.${randomUUID()}.tmp`);
-    try {
-      writeFileSync(temporary, `${JSON.stringify({ ...quarantined, artifactVersion: PROCEDURE_ARTIFACT_VERSION }, null, 2)}\n`, 'utf-8');
-      renameSync(temporary, file);
-    } catch { /* the pointer clear below still de-activates it */ }
-    writePointer(keyDigest, null);
+    quarantineRow(artifact, keyDigest, reason);
     return { outcome: 'stale', artifactId: artifact.artifactId, reason };
   }
   const missing = artifact.template.slots.filter((slot) => !(slot in (input.slotValues ?? {})));
@@ -370,12 +365,21 @@ export function resolveActiveProcedure(input: {
   return { outcome: 'bound', artifact, requiredSlots: artifact.template.slots };
 }
 
-function quarantineFile(file: string, artifactId: string, reason: string): void {
-  try {
-    renameSync(file, `${file}.quarantined`);
-    writeFileSync(`${file}.quarantined.reason`, `${reason}\n`, 'utf-8');
-  } catch { /* quarantine is best-effort; the cleared pointer is the gate */ }
-  void artifactId;
+/** Record a successful warm use by exact artifact id (credit, not prose). */
+export function recordWarmProcedureUse(artifactId: string): void {
+  const document = loadArtifactRow(artifactId);
+  if (document === undefined) return;
+  const parsed = parseProcedureArtifactDocument(document);
+  if (!parsed.ok) return;
+  const now = new Date().toISOString();
+  updateArtifactRow({
+    ...parsed.artifact,
+    evidence: [...parsed.artifact.evidence, {
+      useId: `use_${now}_${parsed.artifact.evidence.length}`, at: now, kind: 'success' as const,
+    }].slice(-200),
+    updatedAt: now,
+    artifactVersion: PROCEDURE_ARTIFACT_VERSION,
+  } as ProcedureArtifact & { artifactVersion: number });
 }
 
 /** Read the current pointer target (validated), for tests and diagnostics. */
@@ -385,9 +389,10 @@ export function activeArtifactForKey(input: {
   operation: string;
   effectClass: string;
 }): ProcedureArtifact | null {
-  const pointer = readPointer(logicalKeyDigest(input));
-  if (!pointer?.activeArtifactId) return null;
-  return readArtifact(pointer.activeArtifactId);
+  const activeId = loadPointer(logicalKeyDigest(input));
+  if (!activeId) return null;
+  const parsed = parseProcedureArtifactDocument(loadArtifactRow(activeId));
+  return parsed.ok ? parsed.artifact : null;
 }
 
 export { computeArtifactId };

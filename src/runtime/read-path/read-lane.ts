@@ -44,7 +44,12 @@ import {
 } from '../../memory/procedure-receipts.js';
 import type { ProcedureScope } from '../../memory/procedure-artifact.js';
 import type { ProcedureKind } from '../../memory/procedure-validity.js';
-import { laneAdmitsDispatch, type ReadLaneEnvelope } from './read-envelope.js';
+import { boundDispatchFor, laneAdmitsDispatch, type BoundReadDispatch, type ReadLaneEnvelope } from './read-envelope.js';
+import { recordWarmProcedureUse } from '../../memory/procedure-receipts.js';
+import {
+  consumePendingCapabilityTurn,
+  persistPendingCapabilityTurn,
+} from '../../memory/pending-capability-turns.js';
 
 /** Semantic intent resolution — the ONLY model-shaped judgment in the lane,
  *  injected. It maps a paraphrase onto a logical operation WITHIN the sealed
@@ -77,14 +82,17 @@ export interface ReadLanePorts {
   accountConnected(): boolean;
   /** The ONE generic discovery/schema acquisition the cold path may make. */
   discover(provider: string, operation: string): Promise<DiscoveryAcquisition | undefined>;
-  /** Dispatch the selected read exactly once; returns the durable receipt id. */
-  dispatch(input: {
-    identifier: string;
-    args: Record<string, unknown>;
-  }): Promise<{ receiptId: string } | { error: string; transient: boolean }>;
+  /** Dispatch the selected read exactly once, under the FULL bound-dispatch
+   *  identity (F26); returns the durable receipt id. */
+  dispatch(bound: BoundReadDispatch): Promise<{ receiptId: string } | { error: string; transient: boolean }>;
   receipts: ReceiptResolver;
-  /** Compose the ONE public terminal from read evidence. */
-  compose(evidence: DurableReceiptRecord): Promise<string>;
+  /**
+   * Produce the evidence-grounded PRESENTATION INPUT (a draft, never a
+   * terminal). Actual success/needs-input/failure flows through the existing
+   * typed TurnOutcome/commit machinery at the consumer (F29) — this port has
+   * no terminal authority.
+   */
+  present(evidence: DurableReceiptRecord): Promise<{ draft: string }>;
 }
 
 export interface ReadLaneCounters {
@@ -158,6 +166,18 @@ export async function runColdToWarmRead(run: ReadLaneRun): Promise<ReadLaneOutco
     budget.debit('elapsedMs', Math.max(0, clock() - startedAt));
     return outcome;
   };
+  // F21: lane and scope are ONE sealed authority. A byte-for-byte mismatch
+  // refuses before intent, discovery, or dispatch.
+  if (run.scope.tenant !== run.lane.identity.tenant
+    || run.scope.workspace !== run.lane.identity.workspace
+    || run.scope.accountIdentity !== run.lane.identity.accountIdentity) {
+    return withElapsed({
+      outcome: 'failed',
+      reason: 'lane/scope divergence: the run scope does not match the sealed lane identity byte-for-byte',
+      transient: false,
+      counters: c,
+    });
+  }
 
   // 1. Semantic intent resolution against the sealed universe.
   spans.mark('capability_resolution');
@@ -204,6 +224,9 @@ export async function runColdToWarmRead(run: ReadLaneRun): Promise<ReadLaneOutco
       args,
       warm: true,
       artifactId: resolved.artifact.artifactId,
+      warmProvider: resolved.artifact.provider,
+      warmOperation: resolved.artifact.operation,
+      provenSchemaFingerprint: resolved.artifact.schemaFingerprint,
     }));
   }
 
@@ -228,6 +251,25 @@ export async function runColdToWarmRead(run: ReadLaneRun): Promise<ReadLaneOutco
   const missingSlots = unboundSlots(coldArgs);
   spans.finish('slot_binding');
   if (missingSlots.length > 0) {
+    // F30: the acquisition is DURABLE — the next answer joins it
+    // structurally instead of rerunning discovery.
+    try {
+      persistPendingCapabilityTurn({
+        version: 1,
+        acceptedSource: run.lane.identity.acceptedTurnId,
+        scope: { ...run.scope },
+        provider: intent.provider,
+        operation: intent.operation,
+        identifier: acquired.identifier,
+        schemaFingerprint: acquired.schemaFingerprint,
+        kind: acquired.kind,
+        templateArgs: acquired.templateArgs,
+        missingSlots,
+        knownSlotValues: intent.slotValues,
+        authorityDigest: run.lane.laneDigest,
+        createdAt: new Date().toISOString(),
+      });
+    } catch { /* the question still goes out; persistence is best-effort-loud elsewhere */ }
     return withElapsed({
       outcome: 'needs_slots',
       missingSlots,
@@ -261,7 +303,15 @@ function resolveWithLiveFingerprint(
   });
   if (preliminary.outcome !== 'bound' && preliminary.outcome !== 'needs_slots') return preliminary;
   const live = run.ports.liveSchemaFingerprint(preliminary.artifact.identifier);
-  if (live === undefined || live === preliminary.artifact.schemaFingerprint) return preliminary;
+  if (live === undefined) {
+    // No live schema means no warm dispatch (F22): typed cold reacquisition.
+    return {
+      outcome: 'stale',
+      artifactId: preliminary.artifact.artifactId,
+      reason: 'live schema fingerprint unknown — cold reacquisition required before dispatch',
+    };
+  }
+  if (live === preliminary.artifact.schemaFingerprint) return preliminary;
   // Drift: re-resolve WITH the fingerprint so the quarantine is durable and
   // typed at the artifact layer (the only place that owns it).
   return resolveActiveProcedure({
@@ -283,6 +333,11 @@ async function dispatchOnce(
     args: Record<string, unknown>;
     warm: boolean;
     artifactId?: string;
+    /** The warm artifact's logical operation, for the bound dispatch. */
+    warmProvider?: string;
+    warmOperation?: string;
+    /** The schema the WARM artifact was proven under. */
+    provenSchemaFingerprint?: string;
     promote?: {
       intent: Extract<IntentResolution, { kind: 'read' }>;
       acquired: DiscoveryAcquisition;
@@ -293,29 +348,53 @@ async function dispatchOnce(
   const toolBudget = budget.debit('toolCalls', 1);
   if (!toolBudget.ok) return { outcome: 'failed', reason: toolBudget.reason, transient: false, counters: c };
 
+  // F26: the dispatch is a typed BOUND contract, never a bare name.
+  const bound = boundDispatchFor(run.lane, {
+    identifier: input.identifier,
+    provider: input.promote?.intent.provider ?? input.warmProvider ?? '',
+    operation: input.promote?.intent.operation ?? input.warmOperation ?? '',
+    args: input.args,
+  });
+  if (!bound.ok) {
+    return { outcome: 'requires_readmission', outside: [input.identifier], counters: c };
+  }
+
   spans.mark('tool_provider');
   c.provider_dispatches += 1;
-  const dispatched = await ports.dispatch({ identifier: input.identifier, args: input.args });
+  let dispatched: Awaited<ReturnType<ReadLanePorts['dispatch']>>;
+  try {
+    dispatched = await ports.dispatch(bound.dispatch);
+  } catch (error) {
+    spans.finish('tool_provider');
+    return { outcome: 'failed', reason: `dispatch port threw: ${error instanceof Error ? error.message : String(error)}`, transient: true, counters: c };
+  }
   spans.finish('tool_provider');
   if ('error' in dispatched) {
     // Transient provider trouble never poisons a structurally valid artifact.
     return { outcome: 'failed', reason: dispatched.error, transient: dispatched.transient, counters: c };
   }
 
+  // ONE receipt verifier for cold and warm (F20): the durable record must
+  // prove THIS provider, operation, identifier, schema, scope, and the read
+  // effect class — a succeeded send from anywhere composes nothing.
   spans.mark('verification');
   const record = ports.receipts.resolve(dispatched.receiptId);
   spans.finish('verification');
-  if (!record || record.dispatchOutcome !== 'succeeded' || !record.readEvidenceRef) {
-    return {
-      outcome: 'failed',
-      reason: `dispatch returned receipt "${dispatched.receiptId}" but no durable verified read evidence resolves for it`,
-      transient: false,
-      counters: c,
-    };
+  const expectSchema = input.warm ? input.provenSchemaFingerprint : input.promote?.acquired.schemaFingerprint;
+  const verifyFailure = verifyReadReceipt(record, {
+    provider: bound.dispatch.provider,
+    operation: bound.dispatch.operation,
+    identifier: input.identifier,
+    schemaFingerprint: expectSchema,
+    scope: run.scope,
+  });
+  if (verifyFailure) {
+    return { outcome: 'failed', reason: verifyFailure, transient: false, counters: c };
   }
 
   if (!input.warm && input.promote) {
-    // Verified cold success promotes exactly ONE content-addressed artifact.
+    // Verified cold success promotes exactly ONE content-addressed artifact,
+    // under the schema the ACQUISITION proved (F23).
     const promoted = await promoteFromVerifiedReceipt({
       scope: run.scope,
       provider: input.promote.intent.provider,
@@ -325,6 +404,7 @@ async function dispatchOnce(
       identifier: input.identifier,
       templateArgs: input.promote.acquired.templateArgs,
       receiptId: dispatched.receiptId,
+      acquiredSchemaFingerprint: input.promote.acquired.schemaFingerprint,
     }, ports.receipts);
     if (!promoted.ok) {
       return {
@@ -334,13 +414,60 @@ async function dispatchOnce(
         counters: c,
       };
     }
+    consumePendingCapabilityTurn({
+      scope: run.scope, provider: input.promote.intent.provider, operation: input.promote.intent.operation,
+    });
+  }
+  if (input.warm && input.artifactId) {
+    // E3.5: credit the EXACT artifact that carried the warm hit.
+    recordWarmProcedureUse(input.artifactId);
   }
 
   spans.mark('terminal_commit');
-  const text = await ports.compose(record);
+  let presentation: { draft: string };
+  try {
+    presentation = await ports.present(record!);
+  } catch (error) {
+    spans.finish('terminal_commit');
+    return { outcome: 'failed', reason: `presentation port threw: ${error instanceof Error ? error.message : String(error)}`, transient: false, counters: c };
+  }
   spans.finish('terminal_commit');
   c.public_terminals += 1;
-  return { outcome: 'terminal', text, counters: c, warm: input.warm };
+  return { outcome: 'terminal', text: presentation.draft, counters: c, warm: input.warm };
+}
+
+/** The one verifier (F20/F22/F23): returns the refusal reason or undefined. */
+function verifyReadReceipt(
+  record: DurableReceiptRecord | undefined,
+  expect: {
+    provider: string;
+    operation: string;
+    identifier: string;
+    schemaFingerprint?: string;
+    scope: ProcedureScope;
+  },
+): string | undefined {
+  if (!record) return 'dispatch returned a receipt id that resolves to no durable record';
+  if (record.dispatchOutcome !== 'succeeded') return `receipt records dispatch outcome "${record.dispatchOutcome}"`;
+  if (record.effectClass !== 'read') {
+    return `receipt proves a ${record.effectClass} effect — a read lane composes nothing from it`;
+  }
+  if (!record.readEvidenceRef) return 'receipt carries no verified read evidence';
+  if (record.provider !== expect.provider || record.operation !== expect.operation) {
+    return `receipt proves ${record.provider}/${record.operation}, not the bound ${expect.provider}/${expect.operation}`;
+  }
+  if (record.identifier !== expect.identifier) {
+    return `receipt proves identifier "${record.identifier}", not the bound "${expect.identifier}"`;
+  }
+  if (expect.schemaFingerprint !== undefined && record.schemaFingerprint !== expect.schemaFingerprint) {
+    return `receipt proves schema ${record.schemaFingerprint}, not the bound ${expect.schemaFingerprint}`;
+  }
+  if (record.scope.tenant !== expect.scope.tenant
+    || record.scope.workspace !== expect.scope.workspace
+    || record.scope.accountIdentity !== expect.scope.accountIdentity) {
+    return 'receipt scope does not match the lane scope';
+  }
+  return undefined;
 }
 
 // ── slot binding (pure) ──────────────────────────────────────────────────────

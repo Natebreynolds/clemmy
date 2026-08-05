@@ -168,9 +168,9 @@ function shimWorld(input?: { fingerprintFor?: (identifier: string) => string }) 
         return { receiptId: record.receiptId };
       },
       receipts: { resolve: (id) => receipts.get(id) },
-      async compose(evidence) {
+      async present(evidence) {
         const fixture = OPERATIONS.find((candidate) => candidate.provider === evidence.provider);
-        return fixture?.evidenceText ?? 'Done.';
+        return { draft: fixture?.evidenceText ?? 'Done.' };
       },
     };
     return { ports, scope };
@@ -180,11 +180,12 @@ function shimWorld(input?: { fingerprintFor?: (identifier: string) => string }) 
 }
 
 function laneFor(over: Partial<Parameters<typeof sealReadLaneEnvelope>[0]['identity']> = {}): ReadLaneEnvelope {
+  const account = over.accountIdentity ?? 'person@example.com';
   const sealed = sealReadLaneEnvelope({
     identity: {
       tenant: 'tenant-1', workspace: 'ws-1',
       acceptedTurnId: 'turn-1', activationId: 'act-1',
-      accountIdentity: 'person@example.com',
+      accountIdentity: account,
       policyHash: 'policy-1', budgetVersion: 'v1',
       ...over,
     },
@@ -192,7 +193,7 @@ function laneFor(over: Partial<Parameters<typeof sealReadLaneEnvelope>[0]['ident
       name: operation.identifier,
       schemaFingerprint: `fp-${operation.identifier}`,
       effectClass: 'read' as const,
-      accountIdentity: 'person@example.com',
+      accountIdentity: account,
     })),
     activeCapabilityNames: OPERATIONS.map((operation) => operation.identifier),
     budget: { maxUncachedTokens: 100_000, maxModelCalls: 10, maxToolCalls: 10, maxElapsedMs: 60_000 },
@@ -342,7 +343,7 @@ test('D4: schema drift quarantines BEFORE dispatch and falls back to the generic
   assert.deepEqual((rewarmed.result as Extract<typeof rewarmed.result, { outcome: 'terminal' }>).counters, WARM_GATE);
 });
 
-test('D4: wrong tenant, workspace, or account never reuses — every foreign scope goes cold', async () => {
+test('D4: wrong tenant, workspace, or account never reuses — every foreign AUTHORITY goes cold', async () => {
   const operation = OPERATIONS[2]!;
   const world = shimWorld();
   await runLane({ world, brain: 'claude', text: operation.paraphrases.claude[0]! });
@@ -351,10 +352,18 @@ test('D4: wrong tenant, workspace, or account never reuses — every foreign sco
     { brain: 'codex' as const, workspace: 'ws-2' },
     { brain: 'codex' as const, account: 'other@example.com' },
   ]) {
-    const foreign = await runLane({
-      world, brain: 'codex', text: operation.paraphrases.codex[0]!, portsOptions,
+    // E3.1: lane and scope are ONE sealed authority, so the foreign run
+    // seals its own lane for its own identity — and still never reuses
+    // tenant-1's proven procedure.
+    const foreignLane = laneFor({
+      tenant: portsOptions.tenant ?? 'tenant-1',
+      workspace: portsOptions.workspace ?? 'ws-1',
+      accountIdentity: portsOptions.account ?? 'person@example.com',
     });
-    assert.equal(foreign.result.outcome, 'terminal');
+    const foreign = await runLane({
+      world, brain: 'codex', text: operation.paraphrases.codex[0]!, portsOptions, lane: foreignLane,
+    });
+    assert.equal(foreign.result.outcome, 'terminal', JSON.stringify(foreign.result));
     assert.equal((foreign.result as Extract<typeof foreign.result, { outcome: 'terminal' }>).warm, false,
       `${JSON.stringify(portsOptions)}: a foreign scope reused a proven procedure`);
   }
@@ -478,7 +487,7 @@ test('D1: MCP scope composes by intersection — neither authority can widen the
   const withScope = intersectWithMcpScope(lane, [OPERATIONS[0]!.identifier, 'mcp-only-tool']);
   assert.deepEqual([...withScope], [OPERATIONS[0]!.identifier]);
   const noScope = intersectWithMcpScope(lane, null);
-  assert.equal(noScope.size, OPERATIONS.length, 'an absent MCP scope must contribute nothing, not everything');
+  assert.equal(noScope.size, 0, 'null MCP authority is DENY under the existing MCP contract — never everything');
 });
 
 test('D1: outside-universe acquisition returns typed requires_readmission; inside-universe acquisition is a monotonic revision', async () => {
@@ -490,7 +499,7 @@ test('D1: outside-universe acquisition returns typed requires_readmission; insid
   // rest monotonically.
   const sealed = sealReadLaneEnvelope({
     identity: {
-      tenant: 't', workspace: 'w', acceptedTurnId: 'turn', activationId: 'act',
+      tenant: 'tenant-1', workspace: 'ws-1', acceptedTurnId: 'turn-narrow', activationId: 'act',
       accountIdentity: 'person@example.com', policyHash: 'p', budgetVersion: 'v1',
     },
     capabilities: OPERATIONS.map((operation) => ({
