@@ -22,6 +22,7 @@ import {
   getEmbeddingHealth,
   isEmbeddingsEnabled,
   localEmbeddingCacheDir,
+  resolveLocalEmbeddingCacheDir,
   localEmbeddingRuntime,
   vectorToBuffer,
   _resetEmbeddingHealthForTest,
@@ -46,7 +47,39 @@ test('Intel macOS local embeddings select WASM while all native-supported target
   assert.equal(localEmbeddingRuntime('darwin', 'arm64'), 'native');
   assert.equal(localEmbeddingRuntime('linux', 'x64'), 'native');
   assert.equal(path.isAbsolute(localEmbeddingCacheDir()), true);
-  assert.equal(localEmbeddingCacheDir().endsWith(path.join('cache', 'transformers')), true);
+  assert.equal(path.basename(localEmbeddingCacheDir()), 'transformers');
+});
+
+test('model weights are cached per MACHINE, so a second home is not a second download', () => {
+  // Immutable vendor bytes are not user state. Under the home, every fresh
+  // install, extra workspace, and disposable test home paid ~130 MB again.
+  const fresh = resolveLocalEmbeddingCacheDir({
+    baseDir: '/homes/alice/.clementine-next',
+    cacheHome: '/machine/cache',
+    homeDir: '/homes/alice',
+    legacyExists: () => false,
+  });
+  assert.equal(fresh, path.join('/machine/cache', 'clementine', 'transformers'));
+  assert.equal(fresh.startsWith('/homes/alice/.clementine-next'), false);
+
+  // With no XDG cache home, it still lands on the machine, not in the home's
+  // Clementine state directory.
+  assert.equal(
+    resolveLocalEmbeddingCacheDir({
+      baseDir: '/homes/alice/.clementine-next', homeDir: '/homes/alice', legacyExists: () => false,
+    }),
+    path.join('/homes/alice', '.cache', 'clementine', 'transformers'),
+  );
+
+  // An install that already downloaded into its home keeps using it — an
+  // upgrade must not re-fetch weights the machine already has.
+  assert.equal(
+    resolveLocalEmbeddingCacheDir({
+      baseDir: '/homes/alice/.clementine-next', cacheHome: '/machine/cache',
+      homeDir: '/homes/alice', legacyExists: () => true,
+    }),
+    path.join('/homes/alice/.clementine-next', 'cache', 'transformers'),
+  );
 });
 
 test('embedQuery in-flight cache: two CONCURRENT identical embeds make ONE provider call (the per-turn double-embed)', async () => {

@@ -50,14 +50,24 @@ const INTEL_TRANSFORMERS_ENTRY = 'transformers.clementine-wasm.mjs';
  * existing home cache is still honored so an upgraded install does not
  * re-fetch what it already has.
  */
-function resolveLocalEmbeddingCacheDir(): string {
-  const legacy = path.join(BASE_DIR, 'cache', 'transformers');
-  if (existsSync(legacy)) return legacy;
-  const base = getRuntimeEnv('XDG_CACHE_HOME', '') || path.join(os.homedir(), '.cache');
+export function resolveLocalEmbeddingCacheDir(input: {
+  baseDir: string;
+  cacheHome?: string | undefined;
+  homeDir: string;
+  legacyExists: (dir: string) => boolean;
+}): string {
+  const legacy = path.join(input.baseDir, 'cache', 'transformers');
+  if (input.legacyExists(legacy)) return legacy;
+  const base = input.cacheHome?.trim() || path.join(input.homeDir, '.cache');
   return path.join(base, 'clementine', 'transformers');
 }
 
-const LOCAL_EMBEDDING_CACHE_DIR = resolveLocalEmbeddingCacheDir();
+const LOCAL_EMBEDDING_CACHE_DIR = resolveLocalEmbeddingCacheDir({
+  baseDir: BASE_DIR,
+  cacheHome: getRuntimeEnv('XDG_CACHE_HOME', '') || undefined,
+  homeDir: os.homedir(),
+  legacyExists: existsSync,
+});
 
 export function localEmbeddingRuntime(
   platform: NodeJS.Platform = process.platform,

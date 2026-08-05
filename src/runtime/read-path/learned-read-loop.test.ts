@@ -22,6 +22,11 @@ import path from 'node:path';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-f0-loop-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT = 'off';
+// The corpus runner disables local embeddings by default. These suites are
+// ABOUT the local semantic tier, so they turn it on and assert hard: a model
+// that will not load means paraphrase retrieval is genuinely unavailable, and
+// that must fail loudly rather than pass quietly.
+process.env.CLEMMY_LOCAL_EMBEDDINGS = 'on';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-A\n');
 
