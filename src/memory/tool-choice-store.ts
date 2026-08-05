@@ -5,9 +5,11 @@ import matter from 'gray-matter';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
+import { liveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import {
   acceptedPhraseDigest,
-  lookupExactCapabilityAlias,
+  daemonAliasScope,
+  lookupExactCapabilityAliases,
   type CapabilityAliasScope,
 } from './capability-alias-index.js';
 import {
@@ -1868,8 +1870,12 @@ export interface StepToolChoiceMatch {
 
 export interface MatchToolChoicesOptions {
   limit?: number;
-  /** The privacy partition the exact-alias tier may read (default: unscoped). */
+  /** The privacy partition the exact-alias tier may read (default: this
+   *  daemon's own installation scope). */
   scope?: CapabilityAliasScope;
+  /** Live provider contract lookup — a stored capability whose contract no
+   *  longer matches the live one for its identifier is not served. */
+  liveSchemaFingerprintFor?: (identifier: string) => string | null | undefined;
   /** Override the store read (tests). */
   choices?: ToolChoiceRecord[];
   /**
@@ -1945,10 +1951,21 @@ export function matchToolChoicesForStep(
   }
 
   const out: StepToolChoiceMatch[] = [];
+  const liveFingerprintFor = opts.liveSchemaFingerprintFor ?? liveComposioSchemaFingerprint;
   for (const rec of records) {
     if (!rec.choice) continue; // inactive (invalidated, not yet rediscovered)
     if (placeholderChoiceString(rec.choice.identifier)) continue;
     if (rec.choice.kind === 'mcp' && !validCallableMcpIdentifier(rec.choice.identifier)) continue;
+    // A capability bound to a provider contract stops serving when the LIVE
+    // contract for its identifier has moved — a stale procedure is a wrong
+    // answer waiting to be argued for. No live contract known ⇒ nothing is
+    // proven either way and the record serves normally.
+    const storedFingerprint = (rec.choice.schemaFingerprint
+      ?? (rec as { schemaFingerprint?: string }).schemaFingerprint)?.trim();
+    if (storedFingerprint && rec.choice.kind === 'composio') {
+      const live = liveFingerprintFor(rec.choice.identifier);
+      if (live && live !== storedFingerprint) continue;
+    }
     const identity = identityChoiceTokens(rec);
     if (identity.size === 0) continue;
     const core = coreChoiceTokens(rec);
@@ -2018,26 +2035,31 @@ export function matchToolChoicesForStep(
   // is its own evidence, so its proven capability is retrievable on repeat.
   // Retrieval only: the hit is advisory, never auto-bindable, and carries no
   // arguments — the brain still chooses, and the governed boundary still gates.
-  const aliasHit = lookupExactCapabilityAlias(acceptedPhraseDigest(promptText), { scope: opts.scope });
-  if (aliasHit && !out.some((m) => m.identifier === aliasHit.identifier)) {
+  const aliasHits = lookupExactCapabilityAliases(acceptedPhraseDigest(promptText), {
+    scope: opts.scope ?? daemonAliasScope(),
+    // A stored capability whose provider contract has moved is not served —
+    // absence of a live contract proves nothing and passes through.
+    liveSchemaFingerprintFor: opts.liveSchemaFingerprintFor ?? liveComposioSchemaFingerprint,
+  });
+  for (const aliasHit of aliasHits) {
+    if (out.some((m) => m.identifier === aliasHit.identifier)) continue;
     const rec = records.find((r) => r.intent === aliasHit.intent
       && r.choice?.identifier === aliasHit.identifier);
-    if (rec?.choice) {
-      out.push({
-        intent: rec.intent,
-        procedureId: rec.procedureId,
-        kind: rec.choice.kind,
-        identifier: rec.choice.identifier,
-        invocationTemplate: rec.choice.invocationTemplate,
-        score: EXACT_ALIAS_SCORE,
-        tier: 'medium',
-        matched: aliasHit.terms.filter((t) => prompt.has(t)),
-        alreadyBound: false,
-        autoBindable: false,
-        family: toolFamilyForChoice(rec.choice),
-        command: boundCommandForChoice(rec.choice),
-      });
-    }
+    if (!rec?.choice) continue;
+    out.push({
+      intent: rec.intent,
+      procedureId: rec.procedureId,
+      kind: rec.choice.kind,
+      identifier: rec.choice.identifier,
+      invocationTemplate: rec.choice.invocationTemplate,
+      score: EXACT_ALIAS_SCORE,
+      tier: 'medium',
+      matched: aliasHit.terms.filter((t: string) => prompt.has(t)),
+      alreadyBound: false,
+      autoBindable: false,
+      family: toolFamilyForChoice(rec.choice),
+      command: boundCommandForChoice(rec.choice),
+    });
   }
 
   out.sort((a, b) => {

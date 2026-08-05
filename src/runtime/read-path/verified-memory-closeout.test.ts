@@ -185,6 +185,9 @@ test('the same phrase proven against two accounts keeps both, each with its own 
   const sessionId = freshSession('sess-accounts');
   const phrase = 'any new invoices in the inbox?';
   acceptSource(sessionId, phrase);
+  schemaCache.rememberToolSchema('MAILCO_FETCH_INVOICES', {
+    type: 'object', properties: { query: { type: 'string' } },
+  });
   await composio._settleVerifiedComposioReadForTest({
     toolSlug: 'MAILCO_FETCH_INVOICES', sessionId,
     result: { successful: true, data: { items: [{ id: 'i-1' }] } },
@@ -211,20 +214,20 @@ test('a learned paraphrase is semantically retrievable without restart or a manu
   assert.equal(await candidates.warmCapabilityRetrieval(), true, 'the local model did not load');
 
   const sessionId = freshSession('sess-nextturn');
-  // A capability no earlier test has touched, so nothing pre-warmed can serve
-  // this paraphrase — only an embedding attached AFTER this settlement can.
-  const phrase = 'how are our support queues holding up right now?';
+  // A capability no earlier test has touched, so only an embedding attached
+  // AFTER this settlement can serve the paraphrase under this identifier.
+  const phrase = 'what does my schedule look like tomorrow?';
   acceptSource(sessionId, phrase);
-  await governedRead(sessionId, 'DESKCO_LIST_TICKET_QUEUES', {
-    successful: true, data: { queues: [{ id: 'q1', backlog: 4 }] },
-  }, { schema: { type: 'object', properties: { view: { type: 'string' } } } });
+  await governedRead(sessionId, 'PLANNERCO_LIST_AGENDA', {
+    successful: true, data: { items: [{ id: 'a1', title: 'kickoff' }] },
+  }, { schema: { type: 'object', properties: { day: { type: 'string' } } } });
 
   // The next turn arrives shortly after settlement. Bounded wait, no warm call.
-  const paraphrase = 'is the helpdesk backlog under control?';
+  const paraphrase = 'anything on deck tomorrow?';
   let found = false;
   for (let i = 0; i < 30 && !found; i += 1) {
     const resolved = await candidates.resolveTurnCapabilityCandidates({ userInput: paraphrase });
-    found = resolved.candidates.some((c) => c.identifier === 'DESKCO_LIST_TICKET_QUEUES');
+    found = resolved.candidates.some((c) => c.identifier === 'PLANNERCO_LIST_AGENDA');
     if (!found) await new Promise((r) => setTimeout(r, 200));
   }
   assert.equal(found, true,

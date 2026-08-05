@@ -25,13 +25,17 @@ const {
   boundedAliasTerms,
   claimAcceptedSourceForLearning,
   listCapabilityAliases,
-  lookupExactCapabilityAlias,
+  lookupExactCapabilityAliases,
   recordCapabilityAlias,
   semanticCapabilityAliases,
   DEFAULT_SEMANTIC_FLOOR,
 } = await import('./capability-alias-index.js');
 
-const SCOPE = { tenant: 'tenant-1', workspace: 'ws-1', accountIdentity: 'person@example.com' };
+const SCOPE = { tenant: 'tenant-1', workspace: 'ws-1' };
+
+function firstExact(aliasDigest: string, options: Record<string, unknown> = {}) {
+  return lookupExactCapabilityAliases(aliasDigest, { scope: SCOPE, ...options })[0] ?? null;
+}
 const DB_FILE = path.join(TMP_HOME, 'memory', 'capability-aliases', 'machine-A', 'aliases.db');
 
 async function openDb() {
@@ -60,7 +64,7 @@ test('a capability_only alias can never be promoted to executable', async () => 
   const promotion = record({ aliasDigest: 'alias-class', klass: 'executable' });
   assert.equal(promotion.stored, false);
   assert.match((promotion as { reason: string }).reason, /immutable/);
-  assert.equal(lookupExactCapabilityAlias('alias-class', { scope: SCOPE })?.klass, 'capability_only');
+  assert.equal(firstExact('alias-class')?.klass, 'capability_only');
 
   // And the reverse: a genuinely executable row is never demoted in place
   // either — the class is decided once, by whatever proved it.
@@ -74,9 +78,9 @@ test('a capability_only alias can never be promoted to executable', async () => 
 test('the store itself refuses a class it does not know', async () => {
   const db = await openDb();
   assert.throws(() => db.prepare(`
-    INSERT INTO aliases (alias_digest, scope_digest, intent, kind, identifier, klass, terms,
+    INSERT INTO aliases (alias_digest, scope_digest, intent, kind, identifier, account_identity, klass, terms,
                          schema_fingerprint, created_at, updated_at, row_digest)
-    VALUES ('forged', ?, 'i', 'composio', 'X', 'authorized', '[]', NULL, 'n', 'n', 'd')
+    VALUES ('forged', ?, 'i', 'composio', 'X', '', 'authorized', '[]', NULL, 'n', 'n', 'd')
   `).run(aliasScopeDigest(SCOPE)), /CHECK/);
   db.close();
 });
@@ -92,7 +96,7 @@ test('concurrent writes for one alias leave exactly one consistent row', async (
   const rows = db.prepare('SELECT COUNT(*) AS n FROM aliases WHERE alias_digest = ?').get('alias-race') as { n: number };
   db.close();
   assert.equal(rows.n, 1, 'contention produced more than one row for one alias');
-  assert.ok(lookupExactCapabilityAlias('alias-race', { scope: SCOPE }), 'the surviving row does not resolve');
+  assert.ok(firstExact('alias-race'), 'the surviving row does not resolve');
 });
 
 test('an accepted source is owned exactly once, whoever settles first', () => {
@@ -104,6 +108,16 @@ test('an accepted source is owned exactly once, whoever settles first', () => {
   assert.equal(claimAcceptedSourceForLearning({
     sessionId: 'sess-race', sourceUserSeq: 8, identifier: 'PROVIDERX_LIST_ITEMS',
   }), true);
+  // A different ACCOUNT is a different settlement: a brief that read two
+  // mailboxes teaches both, once each.
+  assert.equal(claimAcceptedSourceForLearning({
+    sessionId: 'sess-race', sourceUserSeq: 7, identifier: 'PROVIDERX_LIST_ITEMS',
+    accountIdentity: 'b@example.com',
+  }), true);
+  assert.equal(claimAcceptedSourceForLearning({
+    sessionId: 'sess-race', sourceUserSeq: 7, identifier: 'PROVIDERX_LIST_ITEMS',
+    accountIdentity: 'b@example.com',
+  }), false);
 });
 
 // ─── tamper evidence ─────────────────────────────────────────────────────────
@@ -115,7 +129,7 @@ test('a row edited underneath the index misses and is removed, never served', as
     .run('PROVIDERX_DELETE_EVERYTHING', 'alias-tamper');
   db.close();
 
-  assert.equal(lookupExactCapabilityAlias('alias-tamper', { scope: SCOPE }), null,
+  assert.equal(firstExact('alias-tamper'), null,
     'a forged identifier was served as a retrieval candidate');
   const after = await openDb();
   const remaining = after.prepare('SELECT COUNT(*) AS n FROM aliases WHERE alias_digest = ?')
@@ -128,29 +142,40 @@ test('a row edited underneath the index misses and is removed, never served', as
 
 test('a row whose provider contract moved stops being retrievable until it is re-proven', () => {
   assert.equal(record({ aliasDigest: 'alias-drift', schemaFingerprint: 'fp-1' }).stored, true);
-  assert.ok(lookupExactCapabilityAlias('alias-drift', { scope: SCOPE, liveSchemaFingerprint: 'fp-1' }));
-  assert.equal(lookupExactCapabilityAlias('alias-drift', { scope: SCOPE, liveSchemaFingerprint: 'fp-2' }), null,
+  assert.ok(firstExact('alias-drift', { liveSchemaFingerprintFor: () => 'fp-1' }));
+  assert.equal(firstExact('alias-drift', { liveSchemaFingerprintFor: () => 'fp-2' }), null,
     'a stale capability was still retrievable after the contract changed');
   assert.equal(record({ aliasDigest: 'alias-drift', schemaFingerprint: 'fp-2' }).stored, true);
-  assert.ok(lookupExactCapabilityAlias('alias-drift', { scope: SCOPE, liveSchemaFingerprint: 'fp-2' }),
+  assert.ok(firstExact('alias-drift', { liveSchemaFingerprintFor: () => 'fp-2' }),
     'a re-proven capability did not come back');
 });
 
 // ─── privacy ─────────────────────────────────────────────────────────────────
 
-test('scope isolation is structural: another tenant, workspace, or account retrieves nothing', () => {
+test('scope isolation is structural: another tenant or workspace retrieves nothing', () => {
   assert.equal(record({ aliasDigest: 'alias-scoped' }).stored, true);
   for (const other of [
     { ...SCOPE, tenant: 'tenant-2' },
     { ...SCOPE, workspace: 'ws-2' },
-    { ...SCOPE, accountIdentity: 'someone@else.com' },
     undefined,
   ]) {
-    assert.equal(lookupExactCapabilityAlias('alias-scoped', { scope: other }), null,
+    assert.equal(lookupExactCapabilityAliases('alias-scoped', { scope: other }).length, 0,
       `${JSON.stringify(other)} crossed a privacy boundary`);
     assert.equal(listCapabilityAliases({ scope: other }).some((r) => r.aliasDigest === 'alias-scoped'), false,
       `${JSON.stringify(other)} enumerated another scope's aliases`);
   }
+});
+
+test('one phrase may prove many capabilities and many accounts, each its own row', () => {
+  assert.equal(record({ aliasDigest: 'alias-many', identifier: 'PROVIDERX_LIST_ITEMS' }).stored, true);
+  assert.equal(record({ aliasDigest: 'alias-many', identifier: 'PROVIDERY_GET_FORECAST' }).stored, true);
+  assert.equal(record({
+    aliasDigest: 'alias-many', identifier: 'PROVIDERX_LIST_ITEMS', accountIdentity: 'b@example.com',
+  }).stored, true);
+  const rows = lookupExactCapabilityAliases('alias-many', { scope: SCOPE });
+  assert.equal(rows.length, 3, 'rows for one phrase displaced each other');
+  const identities = new Set(rows.map((r) => `${r.identifier}::${r.accountIdentity}`));
+  assert.equal(identities.size, 3);
 });
 
 test('the accepted phrase is never recoverable from the index', async () => {
@@ -201,8 +226,10 @@ test('semantic retrieval is bounded by scope, space, and floor', () => {
     return vector.map((v) => v / norm) as Float32Array;
   };
   const stored = unit([1, 1, 0, 0]);
-  assert.equal(record({ aliasDigest: 'alias-vec' }).stored, true);
-  assert.equal(attachCapabilityAliasEmbedding('alias-vec', SCOPE, stored, 'space-A'), true);
+  const written = record({ aliasDigest: 'alias-vec' });
+  assert.equal(written.stored, true);
+  const row = (written as Extract<typeof written, { stored: true }>).row;
+  assert.equal(attachCapabilityAliasEmbedding(row, stored, 'space-A'), true);
 
   const near = semanticCapabilityAliases(unit([1, 0.9, 0, 0]), { scope: SCOPE, embeddingSpace: 'space-A' });
   assert.equal(near[0]?.row.aliasDigest, 'alias-vec');

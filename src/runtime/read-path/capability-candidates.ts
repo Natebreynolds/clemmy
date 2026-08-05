@@ -22,8 +22,8 @@
  *   one cold turn rather than breaking it.
  */
 import {
-  aliasRowsMissingEmbedding,
-  attachCapabilityAliasEmbedding,
+  backfillCapabilityAliasEmbeddings,
+  daemonAliasScope,
   semanticCapabilityAliases,
   type CapabilityAliasRow,
   type CapabilityAliasScope,
@@ -34,6 +34,7 @@ import {
   localEmbeddingSpaceKey,
 } from '../../memory/embeddings.js';
 import { cacheTurnCandidates } from './capability-candidate-cache.js';
+import { liveComposioSchemaFingerprint } from '../../tools/composio-schema-cache.js';
 import {
   listToolChoices,
   matchToolChoicesForStep,
@@ -49,6 +50,8 @@ export type CapabilityCandidate = {
   intent: string;
   /** Always `capability_only` today: retrieval never carries execution rights. */
   klass: string;
+  /** The stable account this capability was proven against, when bound. */
+  accountIdentity?: string;
   via: CapabilityCandidateTier;
   score: number;
 };
@@ -85,6 +88,7 @@ function candidateFromAlias(row: CapabilityAliasRow, score: number): CapabilityC
     kind: row.kind,
     intent: row.intent,
     klass: row.klass,
+    ...(row.accountIdentity ? { accountIdentity: row.accountIdentity } : {}),
     via: 'semantic',
     score,
   };
@@ -105,34 +109,14 @@ async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | null> 
 
 /**
  * Load the local model and give every stored alias a vector in the current
- * space. Production calls this once at startup (fire-and-forget); a caller that
- * needs semantic retrieval to be live right now awaits it.
+ * space. Production calls this once at startup (fire-and-forget); settlements
+ * schedule their own incremental backfill so a mid-life learning event never
+ * waits for the next boot.
  */
 export async function warmCapabilityRetrieval(
   options: { scope?: CapabilityAliasScope } = {},
 ): Promise<boolean> {
-  const provider = await getLocalEmbeddingProvider();
-  if (!provider) return false;
-  const space = localEmbeddingSpaceKey();
-  for (;;) {
-    const pending = aliasRowsMissingEmbedding(space, { ...options, limit: 32 });
-    if (pending.length === 0) return true;
-    let vectors: Float32Array[] | null = null;
-    try {
-      vectors = await provider.embed(pending.map((row) => row.terms.join(' ')));
-    } catch {
-      return false;
-    }
-    if (!vectors || vectors.length !== pending.length) return false;
-    let wrote = 0;
-    pending.forEach((row, index) => {
-      const vector = vectors![index];
-      if (!vector) return;
-      if (attachCapabilityAliasEmbedding(row.aliasDigest, options.scope, vector, space)) wrote += 1;
-    });
-    // A row that will not take a vector must not spin this loop forever.
-    if (wrote === 0) return false;
-  }
+  return backfillCapabilityAliasEmbeddings(options);
 }
 
 /**
@@ -143,7 +127,7 @@ export async function resolveTurnCapabilityCandidates(options: {
   scope?: CapabilityAliasScope;
   limit?: number;
   deadlineMs?: number;
-  liveSchemaFingerprint?: string | null;
+  liveSchemaFingerprintFor?: (identifier: string) => string | null | undefined;
 }): Promise<TurnCapabilityCandidates> {
   const empty: TurnCapabilityCandidates = {
     candidates: [], matches: [], pinnedTools: [], semanticApplied: false,
@@ -151,10 +135,11 @@ export async function resolveTurnCapabilityCandidates(options: {
   const input = options.userInput?.trim();
   if (!input) return empty;
   const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_LIMIT, 10));
+  const scope = options.scope ?? daemonAliasScope();
 
   let matches: StepToolChoiceMatch[] = [];
   try {
-    matches = matchToolChoicesForStep(input, { limit, scope: options.scope });
+    matches = matchToolChoicesForStep(input, { limit, scope });
   } catch { /* retrieval never fails a turn */ }
 
   const byIdentifier = new Map<string, CapabilityCandidate>();
@@ -173,12 +158,12 @@ export async function resolveTurnCapabilityCandidates(options: {
     if (query) {
       semanticApplied = true;
       const hits = semanticCapabilityAliases(query, {
-        scope: options.scope,
+        scope,
         embeddingSpace: localEmbeddingSpaceKey(),
         limit,
-        ...(options.liveSchemaFingerprint !== undefined
-          ? { liveSchemaFingerprint: options.liveSchemaFingerprint }
-          : {}),
+        // A moved provider contract stops a stored capability from serving;
+        // an unknown contract proves nothing and passes through.
+        liveSchemaFingerprintFor: options.liveSchemaFingerprintFor ?? liveComposioSchemaFingerprint,
       });
       for (const hit of hits) {
         if (byIdentifier.has(hit.row.identifier)) continue;

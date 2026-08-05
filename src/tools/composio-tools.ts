@@ -1,6 +1,6 @@
 import { readHarnessCapabilityHealth, recordHarnessCapabilityHealth } from '../runtime/harness/capability-health.js';
 import { hasActiveStructuralProcedureForIdentifier } from '../memory/procedure-receipts.js';
-import { learnVerifiedReadSettlement } from '../memory/verified-read-learning.js';
+import { settleVerifiedComposioRead } from './composio-read-settlement.js';
 import { createHash } from 'node:crypto';
 
 import {
@@ -764,6 +764,34 @@ export function isCrossServiceToolkitMismatch(query: string, slug: string, known
   });
 }
 
+/**
+ * The STABLE account identity behind a dispatch: the connected account's
+ * email, never the rotating ca_ connection id. Only meaningful when the
+ * toolkit has >1 connection (a single-account toolkit needs no
+ * disambiguation, and binding it would just go stale). Zero network — the
+ * connections snapshot is the SWR cache already in hand. Fail-open: identity
+ * capture must never break learning or a tool call.
+ */
+async function stableComposioAccountIdentity(
+  toolSlug: string,
+  connectionId: string | undefined,
+): Promise<string | undefined> {
+  if (!connectionId) return undefined;
+  try {
+    const conns = await listUsableConnectedToolkits();
+    const lower = toolSlug.toLowerCase();
+    const forToolkit = conns.filter((c) => {
+      const s = (c.slug ?? '').toLowerCase();
+      return s && (lower === s || lower.startsWith(`${s}_`));
+    });
+    if (forToolkit.length <= 1) return undefined;
+    const email = forToolkit.find((c) => c.connectionId === connectionId)?.accountEmail?.trim().toLowerCase();
+    return email && email.includes('@') ? email : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** On a SUCCESSFUL execute that followed a fresh discovery, memorize the choice.
  *  Exported for tests. */
 export async function maybeAutoRememberComposioChoice(
@@ -850,21 +878,7 @@ export async function maybeAutoRememberComposioChoice(
     // binding actually disambiguates). Single-account toolkits stay byte-
     // identical; a genuinely-ambiguous execute never reaches here with a pinned
     // connectionId. Zero network (SWR cache in hand).
-    let accountIdentity: string | undefined;
-    if (connectionId) {
-      try {
-        const conns = await listUsableConnectedToolkits();
-        const lower = toolSlug.toLowerCase();
-        const forToolkit = conns.filter((c) => {
-          const s = (c.slug ?? '').toLowerCase();
-          return s && (lower === s || lower.startsWith(`${s}_`));
-        });
-        if (forToolkit.length > 1) {
-          const email = forToolkit.find((c) => c.connectionId === connectionId)?.accountEmail?.trim().toLowerCase();
-          if (email && email.includes('@')) accountIdentity = email;
-        }
-      } catch { /* fail-open: identity capture must never break learning */ }
-    }
+    const accountIdentity = await stableComposioAccountIdentity(toolSlug, connectionId);
     rememberToolChoice({
       intent,
       description: 'Auto-remembered: this Composio slug satisfied the searched intent.',
@@ -1999,32 +2013,13 @@ async function runComposioExecute(
       // search entry — the fresh search query is the honest intent behind this execute.
       const executionIntent = executionIntentForSession(sid, toolSlug);
       maybeAutoRememberComposioChoice(toolSlug, args, result, sid, effectiveConnectionId);
-      // F3: learn from ONE verified successful top-level READ settlement even
-      // when no discovery search preceded it — the ordinary case the
-      // discovery-gated path above can never teach. Bound to the EXACT
-      // accepted source ({sessionId, sourceUserSeq}) from the run context, so
-      // a newer foreground message can never be credited for an older or
-      // background dispatch. Fail-closed and best-effort: learning must never
-      // affect the tool result.
-      try {
-        const runContext = harnessRunContextStorage.getStore();
-        if (sid) {
-          learnVerifiedReadSettlement({
-            identifier: toolSlug,
-            kind: 'composio',
-            result,
-            sessionId: sid,
-            // The run context's sequence is authoritative when this dispatch
-            // runs inside the accepted turn. Without it, the session's LIVE
-            // attempt row supplies its own durably bound source — still the
-            // exact accepted turn, and a finished attempt supplies nothing.
-            ...(runContext?.sessionId === sid ? { sourceUserSeq: runContext.sourceUserSeq } : {}),
-          });
-        }
-      } catch { /* learning never breaks a tool call */ }
 
       // PHASE 5: Record outcome for adaptive tool selection & learning
       const failure = detectComposioFailure(result);
+      // What (if anything) this dispatch SETTLED to. Learning consumes only
+      // this, and only after failure detection and async resolution have had
+      // their say — a wire result is not a settlement.
+      let settledForLearning: unknown = failure.failed ? null : result;
       if (failure.failed) {
         output += suppressComposioConnectionAfterHardFailure(effectiveConnectionId, result);
         // F2: a not-connected RESULT (returned, not thrown) also trips the breaker.
@@ -2054,6 +2049,9 @@ async function runComposioExecute(
       if (!failure.failed && composioAsyncResolveEnabled()) {
         const receipt = detectJobReceipt(toolSlug, result);
         if (receipt) {
+          // A receipt is a HANDLE, not an answer: unless the poll below
+          // resolves it inline, this dispatch settled to nothing learnable.
+          settledForLearning = null;
           // For the one UNAMBIGUOUS case (an Apify async run), the harness polls to
           // completion itself and returns the REAL output — the model never has to
           // know it was async. Any other family / a poll overrun falls back to the
@@ -2068,6 +2066,7 @@ async function runComposioExecute(
           );
           const reason = poll.reason ?? '';
           if (poll.resolved) {
+            settledForLearning = poll.result;
             const n = asyncResultItemCount(poll.result);
             // Requested-vs-returned nudge: a "SUCCEEDED but only 40 of the 100 you wanted"
             // partial scrape must NOT silently read as complete. We can't know the requested
@@ -2151,6 +2150,30 @@ async function runComposioExecute(
           }
         }
       }
+
+      // Verified-read settlement (A-series): learning happens HERE — after
+      // canonical failure detection and async-receipt resolution — from the
+      // FINAL settled payload, through a durable receipt. A receipt shape that
+      // slipped past the resolve gate (flag off, unknown family) still never
+      // reads as data. Best-effort: learning never affects the tool result.
+      try {
+        if (sid && settledForLearning !== null && settledForLearning !== undefined
+          && !detectJobReceipt(toolSlug, settledForLearning)) {
+          const runContext = harnessRunContextStorage.getStore();
+          settleVerifiedComposioRead({
+            toolSlug,
+            sessionId: sid,
+            result: settledForLearning,
+            // The run context's sequence is authoritative when this dispatch
+            // runs inside the accepted turn. Without it, the session's LIVE
+            // attempt row supplies its own durably bound source.
+            ...(runContext?.sessionId === sid && typeof runContext.sourceUserSeq === 'number'
+              ? { sourceUserSeq: runContext.sourceUserSeq }
+              : {}),
+            accountIdentity: await stableComposioAccountIdentity(toolSlug, effectiveConnectionId),
+          });
+        }
+      } catch { /* learning never breaks a tool call */ }
 
       // Only count/advise on SUCCESS — a failed call isn't "an item processed".
       //
@@ -2761,4 +2784,20 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
   });
 
   return [composio_status, composio_search_tools, composio_list_tools, composio_execute_tool];
+}
+
+/**
+ * Test twin for the settlement seam itself: identical to the production call
+ * above except the stable account identity is supplied by the test (the
+ * connections snapshot behind stableComposioAccountIdentity is provider
+ * state the test already owns).
+ */
+export function _settleVerifiedComposioReadForTest(input: {
+  toolSlug: string;
+  sessionId: string;
+  result: unknown;
+  sourceUserSeq?: number;
+  accountIdentity?: string;
+}): ReturnType<typeof settleVerifiedComposioRead> {
+  return settleVerifiedComposioRead(input);
 }

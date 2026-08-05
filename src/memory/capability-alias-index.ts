@@ -32,7 +32,13 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
-import { bufferToVector, cosine, vectorToBuffer } from './embeddings.js';
+import {
+  bufferToVector,
+  cosine,
+  getLocalEmbeddingProvider,
+  localEmbeddingSpaceKey,
+  vectorToBuffer,
+} from './embeddings.js';
 
 /** How much of an accepted phrase may become retrievable lexical features. */
 const MAX_ALIAS_TERMS = 12;
@@ -106,11 +112,22 @@ export function boundedAliasTerms(text: string): string[] {
 
 export type CapabilityAliasClass = 'capability_only' | 'executable';
 
+/**
+ * The PRIVACY PARTITION for retrieval: which installation/workspace may ever
+ * see a row. The connected ACCOUNT is deliberately not part of the partition —
+ * at retrieval time nobody has chosen an account yet, and retrieval choosing
+ * one would be authority. Account identity rides ON each row as provenance the
+ * brain can read.
+ */
 export type CapabilityAliasScope = {
   tenant?: string | null;
   workspace?: string | null;
-  accountIdentity?: string | null;
 };
+
+/** The daemon's own durable identity partition: this machine, this home. */
+export function daemonAliasScope(): CapabilityAliasScope {
+  return { tenant: getMachineId(), workspace: BASE_DIR };
+}
 
 export type CapabilityAliasRow = {
   aliasDigest: string;
@@ -118,6 +135,8 @@ export type CapabilityAliasRow = {
   intent: string;
   kind: string;
   identifier: string;
+  /** The stable account this capability was PROVEN against ('' = unbound). */
+  accountIdentity: string;
   klass: CapabilityAliasClass;
   terms: string[];
   schemaFingerprint: string | null;
@@ -141,6 +160,26 @@ function db(): Database.Database {
   handle = new Database(file);
   handlePath = file;
   handle.pragma('journal_mode = WAL');
+  // One row per (phrase, scope, identifier, account): a multi-read turn keeps
+  // EVERY capability it proved, and the same phrase proven against two
+  // accounts keeps both provenances. The earlier one-row-per-phrase shape is
+  // rebuilt in place — its rows are re-learnable evidence, not user data.
+  const legacy = handle.prepare(
+    "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'aliases'",
+  ).get() as { n: number };
+  if (legacy.n > 0) {
+    const columns = (handle.prepare('PRAGMA table_info(aliases)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    if (!columns.includes('account_identity')) handle.exec('DROP TABLE aliases');
+  }
+  const legacyClaims = handle.prepare(
+    "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'alias_claims'",
+  ).get() as { n: number };
+  if (legacyClaims.n > 0) {
+    const claimColumns = (handle.prepare('PRAGMA table_info(alias_claims)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    if (!claimColumns.includes('account_identity')) handle.exec('DROP TABLE alias_claims');
+  }
   handle.exec(`
     CREATE TABLE IF NOT EXISTS aliases (
       alias_digest       TEXT NOT NULL,
@@ -148,6 +187,7 @@ function db(): Database.Database {
       intent             TEXT NOT NULL,
       kind               TEXT NOT NULL,
       identifier         TEXT NOT NULL,
+      account_identity   TEXT NOT NULL DEFAULT '',
       klass              TEXT NOT NULL CHECK (klass IN ('capability_only', 'executable')),
       terms              TEXT NOT NULL,
       schema_fingerprint TEXT,
@@ -156,15 +196,16 @@ function db(): Database.Database {
       created_at         TEXT NOT NULL,
       updated_at         TEXT NOT NULL,
       row_digest         TEXT NOT NULL,
-      PRIMARY KEY (alias_digest, scope_digest)
+      PRIMARY KEY (alias_digest, scope_digest, identifier, account_identity)
     );
     CREATE INDEX IF NOT EXISTS aliases_by_scope ON aliases (scope_digest);
     CREATE TABLE IF NOT EXISTS alias_claims (
-      session_id      TEXT NOT NULL,
-      source_user_seq INTEGER NOT NULL,
-      identifier      TEXT NOT NULL,
-      claimed_at      TEXT NOT NULL,
-      PRIMARY KEY (session_id, source_user_seq, identifier)
+      session_id       TEXT NOT NULL,
+      source_user_seq  INTEGER NOT NULL,
+      identifier       TEXT NOT NULL,
+      account_identity TEXT NOT NULL DEFAULT '',
+      claimed_at       TEXT NOT NULL,
+      PRIMARY KEY (session_id, source_user_seq, identifier, account_identity)
     );
   `);
   return handle;
@@ -186,24 +227,25 @@ export function aliasScopeDigest(scope: CapabilityAliasScope | undefined): strin
   return sha256(JSON.stringify({
     tenant: scope?.tenant ?? '',
     workspace: scope?.workspace ?? '',
-    account: scope?.accountIdentity ?? '',
   })).slice(0, 40);
 }
 
 /** Tamper evidence over exactly the fields retrieval trusts. */
 function rowDigest(row: {
   aliasDigest: string; scopeDigest: string; intent: string; kind: string;
-  identifier: string; klass: string; terms: string[]; schemaFingerprint: string | null;
+  identifier: string; accountIdentity: string; klass: string; terms: string[];
+  schemaFingerprint: string | null;
 }): string {
   return sha256(JSON.stringify([
-    row.aliasDigest, row.scopeDigest, row.intent, row.kind,
-    row.identifier, row.klass, row.terms, row.schemaFingerprint ?? '',
+    row.aliasDigest, row.scopeDigest, row.intent, row.kind, row.identifier,
+    row.accountIdentity, row.klass, row.terms, row.schemaFingerprint ?? '',
   ])).slice(0, 40);
 }
 
 type RawRow = {
   alias_digest: string; scope_digest: string; intent: string; kind: string;
-  identifier: string; klass: string; terms: string; schema_fingerprint: string | null;
+  identifier: string; account_identity: string; klass: string; terms: string;
+  schema_fingerprint: string | null;
   embedding: Buffer | null; embedding_space: string | null;
   created_at: string; updated_at: string; row_digest: string;
 };
@@ -224,6 +266,7 @@ function hydrate(raw: RawRow): CapabilityAliasRow | null {
     intent: raw.intent,
     kind: raw.kind,
     identifier: raw.identifier,
+    accountIdentity: raw.account_identity,
     klass: raw.klass,
     terms,
     schemaFingerprint: raw.schema_fingerprint,
@@ -237,10 +280,11 @@ function hydrate(raw: RawRow): CapabilityAliasRow | null {
 
 /** A row that fails verification is removed, so the next read is a clean miss
  *  rather than a permanent poisoned hit. */
-function dropRow(aliasDigest: string, scopeDigest: string): void {
+function dropRow(raw: Pick<RawRow, 'alias_digest' | 'scope_digest' | 'identifier' | 'account_identity'>): void {
   try {
-    db().prepare('DELETE FROM aliases WHERE alias_digest = ? AND scope_digest = ?')
-      .run(aliasDigest, scopeDigest);
+    db().prepare(
+      'DELETE FROM aliases WHERE alias_digest = ? AND scope_digest = ? AND identifier = ? AND account_identity = ?',
+    ).run(raw.alias_digest, raw.scope_digest, raw.identifier, raw.account_identity);
   } catch { /* a failed cleanup must never fail a turn */ }
 }
 
@@ -255,6 +299,9 @@ export function recordCapabilityAlias(input: {
   intent: string;
   kind: string;
   identifier: string;
+  /** The stable account the settlement was proven against (never a rotating
+   *  connection id). Part of the row identity: two accounts, two rows. */
+  accountIdentity?: string | null;
   klass: CapabilityAliasClass;
   terms: string[];
   schemaFingerprint?: string | null;
@@ -267,12 +314,13 @@ export function recordCapabilityAlias(input: {
   if (!intent) return { stored: false, reason: 'no intent' };
   if (!identifier) return { stored: false, reason: 'no identifier' };
   const scopeDigest = aliasScopeDigest(input.scope);
+  const accountIdentity = input.accountIdentity?.trim() ?? '';
   const terms = input.terms.filter((t) => typeof t === 'string' && t.length > 0);
   const now = input.now ?? new Date().toISOString();
   const schemaFingerprint = input.schemaFingerprint?.trim() || null;
 
   const candidate: CapabilityAliasRow = {
-    aliasDigest, scopeDigest, intent, kind: input.kind, identifier,
+    aliasDigest, scopeDigest, intent, kind: input.kind, identifier, accountIdentity,
     klass: input.klass, terms, schemaFingerprint,
     embeddingSpace: null, createdAt: now, updatedAt: now,
   };
@@ -281,8 +329,8 @@ export function recordCapabilityAlias(input: {
     const database = db();
     const write = database.transaction((): CapabilityAliasWrite => {
       const existing = database.prepare(
-        'SELECT * FROM aliases WHERE alias_digest = ? AND scope_digest = ?',
-      ).get(aliasDigest, scopeDigest) as RawRow | undefined;
+        'SELECT * FROM aliases WHERE alias_digest = ? AND scope_digest = ? AND identifier = ? AND account_identity = ?',
+      ).get(aliasDigest, scopeDigest, identifier, accountIdentity) as RawRow | undefined;
       if (existing && existing.klass !== input.klass) {
         return { stored: false, reason: `alias class is immutable (stored ${existing.klass})` };
       }
@@ -293,16 +341,16 @@ export function recordCapabilityAlias(input: {
       const keepEmbedding = existing && existing.terms === JSON.stringify(terms);
       database.prepare(`
         INSERT INTO aliases (
-          alias_digest, scope_digest, intent, kind, identifier, klass, terms,
+          alias_digest, scope_digest, intent, kind, identifier, account_identity, klass, terms,
           schema_fingerprint, embedding, embedding_space, created_at, updated_at, row_digest
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (alias_digest, scope_digest) DO UPDATE SET
-          intent = excluded.intent, kind = excluded.kind, identifier = excluded.identifier,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (alias_digest, scope_digest, identifier, account_identity) DO UPDATE SET
+          intent = excluded.intent, kind = excluded.kind,
           terms = excluded.terms, schema_fingerprint = excluded.schema_fingerprint,
           embedding = excluded.embedding, embedding_space = excluded.embedding_space,
           updated_at = excluded.updated_at, row_digest = excluded.row_digest
       `).run(
-        aliasDigest, scopeDigest, intent, input.kind, identifier, input.klass,
+        aliasDigest, scopeDigest, intent, input.kind, identifier, accountIdentity, input.klass,
         JSON.stringify(terms), schemaFingerprint,
         keepEmbedding ? existing.embedding : null,
         keepEmbedding ? existing.embedding_space : null,
@@ -321,25 +369,38 @@ function schemaIsCurrent(row: CapabilityAliasRow, live: string | null | undefine
   return row.schemaFingerprint === live;
 }
 
-/** Exact repeat of a phrase that already settled successfully. */
-export function lookupExactCapabilityAlias(
+/**
+ * Exact repeat of a phrase that already settled successfully. Returns EVERY
+ * capability the phrase proved (a brief can prove several; the same phrase
+ * can be proven against several accounts) — choosing among them is the
+ * brain's job, never retrieval's.
+ */
+export function lookupExactCapabilityAliases(
   aliasDigest: string,
-  options: { scope?: CapabilityAliasScope; liveSchemaFingerprint?: string | null } = {},
-): CapabilityAliasRow | null {
-  if (!aliasDigest) return null;
+  options: {
+    scope?: CapabilityAliasScope;
+    /** identifier -> live fingerprint. A row whose stored contract differs
+     *  from the live one for ITS identifier is excluded. */
+    liveSchemaFingerprintFor?: (identifier: string) => string | null | undefined;
+  } = {},
+): CapabilityAliasRow[] {
+  if (!aliasDigest) return [];
   const scopeDigest = aliasScopeDigest(options.scope);
-  let raw: RawRow | undefined;
+  let raws: RawRow[];
   try {
-    raw = db().prepare('SELECT * FROM aliases WHERE alias_digest = ? AND scope_digest = ?')
-      .get(aliasDigest, scopeDigest) as RawRow | undefined;
+    raws = db().prepare('SELECT * FROM aliases WHERE alias_digest = ? AND scope_digest = ?')
+      .all(aliasDigest, scopeDigest) as RawRow[];
   } catch {
-    return null;
+    return [];
   }
-  if (!raw) return null;
-  const row = hydrate(raw);
-  if (!row) { dropRow(aliasDigest, scopeDigest); return null; }
-  if (!schemaIsCurrent(row, options.liveSchemaFingerprint)) return null;
-  return row;
+  const rows: CapabilityAliasRow[] = [];
+  for (const raw of raws) {
+    const row = hydrate(raw);
+    if (!row) { dropRow(raw); continue; }
+    if (!schemaIsCurrent(row, options.liveSchemaFingerprintFor?.(row.identifier))) continue;
+    rows.push(row);
+  }
+  return rows;
 }
 
 export type SemanticAliasHit = { row: CapabilityAliasRow; score: number };
@@ -357,7 +418,7 @@ export function semanticCapabilityAliases(
     embeddingSpace: string;
     limit?: number;
     floor?: number;
-    liveSchemaFingerprint?: string | null;
+    liveSchemaFingerprintFor?: (identifier: string) => string | null | undefined;
   },
 ): SemanticAliasHit[] {
   const scopeDigest = aliasScopeDigest(options.scope);
@@ -374,8 +435,8 @@ export function semanticCapabilityAliases(
   const hits: SemanticAliasHit[] = [];
   for (const raw of raws) {
     const row = hydrate(raw);
-    if (!row) { dropRow(raw.alias_digest, raw.scope_digest); continue; }
-    if (!schemaIsCurrent(row, options.liveSchemaFingerprint)) continue;
+    if (!row) { dropRow(raw); continue; }
+    if (!schemaIsCurrent(row, options.liveSchemaFingerprintFor?.(row.identifier))) continue;
     if (!raw.embedding) continue;
     let score: number;
     try {
@@ -421,7 +482,7 @@ export function aliasRowsMissingEmbedding(
   const rows: CapabilityAliasRow[] = [];
   for (const raw of raws) {
     const row = hydrate(raw);
-    if (!row) { dropRow(raw.alias_digest, raw.scope_digest); continue; }
+    if (!row) { dropRow(raw); continue; }
     rows.push(row);
   }
   return rows;
@@ -430,15 +491,14 @@ export function aliasRowsMissingEmbedding(
 /** Attach a vector. Never changes a load-bearing field, so the row digest —
  *  and therefore what retrieval trusts — is unaffected. */
 export function attachCapabilityAliasEmbedding(
-  aliasDigest: string,
-  scope: CapabilityAliasScope | undefined,
+  row: Pick<CapabilityAliasRow, 'aliasDigest' | 'scopeDigest' | 'identifier' | 'accountIdentity'>,
   vector: Float32Array,
   embeddingSpace: string,
 ): boolean {
   try {
     const result = db().prepare(
-      'UPDATE aliases SET embedding = ?, embedding_space = ? WHERE alias_digest = ? AND scope_digest = ?',
-    ).run(vectorToBuffer(vector), embeddingSpace, aliasDigest, aliasScopeDigest(scope));
+      'UPDATE aliases SET embedding = ?, embedding_space = ? WHERE alias_digest = ? AND scope_digest = ? AND identifier = ? AND account_identity = ?',
+    ).run(vectorToBuffer(vector), embeddingSpace, row.aliasDigest, row.scopeDigest, row.identifier, row.accountIdentity);
     return result.changes > 0;
   } catch {
     return false;
@@ -461,7 +521,7 @@ export function listCapabilityAliases(
   const rows: CapabilityAliasRow[] = [];
   for (const raw of raws) {
     const row = hydrate(raw);
-    if (!row) { dropRow(raw.alias_digest, raw.scope_digest); continue; }
+    if (!row) { dropRow(raw); continue; }
     rows.push(row);
   }
   return rows;
@@ -477,15 +537,82 @@ export function claimAcceptedSourceForLearning(input: {
   sessionId: string;
   sourceUserSeq: number;
   identifier: string;
+  /** A settlement against a DIFFERENT account is a different settlement — a
+   *  brief that read two mailboxes teaches both, exactly once each. */
+  accountIdentity?: string;
   now?: string;
 }): boolean {
   if (!input.sessionId || !Number.isInteger(input.sourceUserSeq) || !input.identifier) return false;
   try {
     const result = db().prepare(
-      'INSERT OR IGNORE INTO alias_claims (session_id, source_user_seq, identifier, claimed_at) VALUES (?, ?, ?, ?)',
-    ).run(input.sessionId, input.sourceUserSeq, input.identifier, input.now ?? new Date().toISOString());
+      'INSERT OR IGNORE INTO alias_claims (session_id, source_user_seq, identifier, account_identity, claimed_at) VALUES (?, ?, ?, ?, ?)',
+    ).run(
+      input.sessionId, input.sourceUserSeq, input.identifier,
+      input.accountIdentity?.trim() ?? '', input.now ?? new Date().toISOString(),
+    );
     return result.changes > 0;
   } catch {
     return false;
   }
+}
+
+// ── the durable embedding backfill ───────────────────────────────────────────
+//
+// A row without a vector IS the queue: it persists in SQLite until a backfill
+// attaches one, so a crash between learning and embedding loses nothing — the
+// next backfill (scheduled post-settlement, or the boot warm) finds the same
+// rows again. Idempotent by construction: attaching is an UPDATE keyed by the
+// row identity, and an already-embedded row never reappears in the scan.
+
+/** Embed every alias row still missing a vector in the CURRENT local space. */
+export async function backfillCapabilityAliasEmbeddings(
+  options: { scope?: CapabilityAliasScope } = {},
+): Promise<boolean> {
+  const provider = await getLocalEmbeddingProvider();
+  if (!provider) return false;
+  const space = localEmbeddingSpaceKey();
+  for (;;) {
+    const pending = aliasRowsMissingEmbedding(space, { ...options, limit: 32 });
+    if (pending.length === 0) return true;
+    let vectors: Float32Array[] | null = null;
+    try {
+      vectors = await provider.embed(pending.map((row) => row.terms.join(' ')));
+    } catch {
+      return false;
+    }
+    if (!vectors || vectors.length !== pending.length) return false;
+    let wrote = 0;
+    pending.forEach((row, index) => {
+      const vector = vectors![index];
+      if (!vector) return;
+      if (attachCapabilityAliasEmbedding(row, vector, space)) wrote += 1;
+    });
+    // A row that will not take a vector must not spin this loop forever.
+    if (wrote === 0) return false;
+  }
+}
+
+let backfillTimer: NodeJS.Timeout | null = null;
+let backfillRunning = false;
+let backfillRerun = false;
+
+/**
+ * Post-settlement hook: a paraphrase learned NOW must work on the NEXT turn,
+ * not after a daemon restart. Debounced so a multi-read settlement schedules
+ * one pass; re-armed if learning lands while a pass is running.
+ */
+export function scheduleCapabilityAliasEmbedBackfill(delayMs = 50): void {
+  if (backfillTimer) return;
+  backfillTimer = setTimeout(() => {
+    backfillTimer = null;
+    if (backfillRunning) { backfillRerun = true; return; }
+    backfillRunning = true;
+    void backfillCapabilityAliasEmbeddings()
+      .catch(() => false)
+      .finally(() => {
+        backfillRunning = false;
+        if (backfillRerun) { backfillRerun = false; scheduleCapabilityAliasEmbedBackfill(delayMs); }
+      });
+  }, delayMs);
+  backfillTimer.unref?.();
 }

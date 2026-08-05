@@ -31,6 +31,7 @@ import assert from 'node:assert/strict';
 const { respondPreferHarness, _setBridgeImplsForTests } = await import('../harness/respond-bridge.js');
 const eventlog = await import('../harness/eventlog.js');
 const composio = await import('../../tools/composio-tools.js');
+const schemaCache = await import('../../tools/composio-schema-cache.js');
 const jit = await import('../../agents/tool-jit.js');
 const mcpScope = await import('../mcp-tool-scope.js');
 const candidates = await import('./capability-candidates.js');
@@ -51,6 +52,9 @@ async function teachOneVerifiedRead(): Promise<void> {
   eventlog.recordRunAttemptUserInput(attempt, {
     turn: 1, role: 'user', data: { text: COLD_PHRASE, attemptId: attempt.attemptId, source: 'home' },
   }, { armRunInFlight: true });
+  schemaCache.rememberToolSchema(CALENDAR_SLUG, {
+    type: 'object', properties: { timeMin: { type: 'string' }, timeMax: { type: 'string' } },
+  });
   const exec = (async () => ({
     successful: true,
     data: { items: [{ id: 'evt-1', summary: 'Standup', start: '2026-08-06T09:00:00-07:00' }] },

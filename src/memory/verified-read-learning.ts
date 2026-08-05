@@ -26,8 +26,7 @@
  *  - no concrete argument value is ever stored as replayable state, so a
  *    resolved "tomorrow" date can never be replayed on a later turn.
  */
-import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
-import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
+
 import {
   getActiveRunAttempt,
   getRunAttemptSourceUserEvent,
@@ -37,9 +36,11 @@ import {
   acceptedPhraseDigest,
   boundedAliasTerms,
   claimAcceptedSourceForLearning,
+  daemonAliasScope,
   recordCapabilityAlias,
-  type CapabilityAliasScope,
+  scheduleCapabilityAliasEmbedBackfill,
 } from './capability-alias-index.js';
+import type { ReceiptResolver } from './procedure-receipts.js';
 import { rememberToolChoice, type ToolChoiceKind } from './tool-choice-store.js';
 
 /** The canonical procedure slug for a dispatchable identifier. */
@@ -121,17 +122,14 @@ export function acceptedPhraseFor(sessionId: string, sourceUserSeq: number | und
 export { acceptedPhraseDigest, boundedAliasTerms, normalizeAcceptedPhrase } from './capability-alias-index.js';
 
 export interface VerifiedReadLearningInput {
-  identifier: string;
+  /** The durable receipt this learning cites — resolved BY ID, never trusted
+   *  as a caller-constructed object. */
+  receiptId: string;
+  receipts: ReceiptResolver;
   kind: ToolChoiceKind;
-  result: unknown;
-  sessionId?: string;
+  sessionId: string;
   /** The EXACT accepted user event this dispatch belongs to. */
   sourceUserSeq?: number;
-  /** Stable logical account identity (never a rotating connection id). */
-  accountIdentity?: string;
-  schemaFingerprint?: string;
-  /** The privacy partition this alias may ever be retrieved from. */
-  scope?: CapabilityAliasScope;
 }
 
 export type LearningVerdict =
@@ -140,28 +138,37 @@ export type LearningVerdict =
 
 /**
  * Learn a capability + accepted-source alias from ONE verified successful
- * top-level READ settlement. Everything about this is fail-closed: any
- * missing evidence declines, and the class is always `capability_only` —
+ * top-level READ settlement, PROVEN by a durable receipt. Everything about
+ * this is fail-closed: the receipt must resolve by id through the injected
+ * resolver, must be a succeeded read with evidence and a schema contract, and
+ * any missing piece declines. The class is always `capability_only` —
  * promotion to executable requires typed provenance for constants, slots,
  * resolvers, and presentation, which a cold brain call cannot supply.
  */
 export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): LearningVerdict {
-  const identifier = input.identifier?.trim();
-  if (!identifier) return { learned: false, reason: 'no identifier' };
-  // The SEALED effect taxonomies own effect safety — no verb list anywhere.
-  // Composio slugs are classified by the same evidence the confirm-first gate
-  // uses; every other carrier goes through the runtime tool classifier. Both
-  // fail closed: anything not provably a read declines to learn.
-  const effect = input.kind === 'composio'
-    ? classifyComposioSlugEffect(identifier)
-    : classifyRuntimeToolEffect(identifier, undefined).effect;
-  if (effect !== 'read' && effect !== 'compute') {
-    return { learned: false, reason: `effect class "${effect}" is not a read` };
+  let receipt;
+  try {
+    receipt = input.receipts.resolve(input.receiptId);
+  } catch {
+    receipt = undefined;
   }
-  if (!settlementCarriesVerifiedData(input.result)) {
-    return { learned: false, reason: 'settlement carries no verified returned data' };
+  if (!receipt) return { learned: false, reason: 'the cited receipt does not resolve' };
+  if (receipt.dispatchOutcome !== 'succeeded') {
+    return { learned: false, reason: `the receipt records "${receipt.dispatchOutcome}", not a verified success` };
   }
-  const source = resolveAcceptedSource(input.sessionId ?? '', input.sourceUserSeq);
+  if (receipt.effectClass !== 'read') {
+    return { learned: false, reason: `the receipt proves effect class "${receipt.effectClass}", not a read` };
+  }
+  if (!receipt.readEvidenceRef) {
+    return { learned: false, reason: 'the receipt carries no read evidence' };
+  }
+  if (!receipt.schemaFingerprint) {
+    return { learned: false, reason: 'the receipt binds no schema contract' };
+  }
+  const identifier = receipt.identifier?.trim();
+  if (!identifier) return { learned: false, reason: 'the receipt names no identifier' };
+
+  const source = resolveAcceptedSource(input.sessionId, input.sourceUserSeq);
   if (!source) return { learned: false, reason: 'no exact accepted source phrase' };
   const { phrase } = source;
 
@@ -172,13 +179,17 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
   const aliasDigest = acceptedPhraseDigest(phrase);
 
   // Exactly-once: the first settlement to claim this accepted source learns; a
-  // retry or a replayed frame is told it lost rather than re-teaching.
+  // retry or a replayed frame is told it lost rather than re-teaching. The
+  // account is part of the claim: reading two mailboxes is two settlements.
+  const claimAccount = receipt.scope?.accountIdentity?.trim() ?? '';
   if (!claimAcceptedSourceForLearning({
-    sessionId: input.sessionId ?? '', sourceUserSeq: source.sourceUserSeq, identifier,
+    sessionId: input.sessionId, sourceUserSeq: source.sourceUserSeq, identifier,
+    accountIdentity: claimAccount,
   })) {
     return { learned: false, reason: 'accepted source already owned by an earlier settlement' };
   }
 
+  const accountIdentity = receipt.scope?.accountIdentity?.trim() || undefined;
   try {
     rememberToolChoice({
       intent,
@@ -190,24 +201,28 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
         identifier,
         // Deliberately NO invocationTemplate: a proven capability is
         // capability_only, so no concrete argument value can be replayed.
-        ...(input.accountIdentity ? { accountIdentity: input.accountIdentity } : {}),
+        ...(accountIdentity ? { accountIdentity } : {}),
       },
       aliasSource: 'verified_read',
-      ...(input.schemaFingerprint ? { schemaFingerprint: input.schemaFingerprint } : {}),
+      schemaFingerprint: receipt.schemaFingerprint,
     });
     // The separate, scoped, class-locked retrieval index. Its write is not
     // allowed to undo the capability memo above, so a refusal here (a class
     // conflict, a locked file) degrades retrieval, never learning.
     recordCapabilityAlias({
       aliasDigest,
-      scope: input.scope,
+      scope: daemonAliasScope(),
       intent,
       kind: input.kind,
       identifier,
+      accountIdentity: accountIdentity ?? '',
       klass: 'capability_only',
       terms,
-      schemaFingerprint: input.schemaFingerprint ?? null,
+      schemaFingerprint: receipt.schemaFingerprint,
     });
+    // A paraphrase learned NOW must retrieve on the NEXT turn: the missing
+    // embedding rows are the durable queue, this arms the drain.
+    scheduleCapabilityAliasEmbedBackfill();
     return { learned: true, intent, aliasDigest, klass: 'capability_only' };
   } catch (error) {
     return { learned: false, reason: error instanceof Error ? error.message : 'remember refused' };

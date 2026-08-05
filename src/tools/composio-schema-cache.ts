@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * In-memory cache of Composio action input schemas, keyed by tool slug.
  *
@@ -74,4 +75,31 @@ export function getCachedToolSchema(toolSlug: string): Record<string, unknown> |
 /** Test hook. */
 export function resetToolSchemaCache(): void {
   cache.clear();
+}
+
+/**
+ * The live contract digest for one identifier — sorted-key canonical JSON, so
+ * two loads of an identical contract agree and any structural change moves
+ * the digest. Undefined when no live schema is known this session: absence of
+ * a contract is absence of proof, and consumers treat it accordingly
+ * (learning fails closed; retrieval cannot prove a mismatch and serves).
+ */
+export function liveComposioSchemaFingerprint(toolSlug: string): string | undefined {
+  const schema = getCachedToolSchema(toolSlug);
+  if (!schema) return undefined;
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.keys(value as Record<string, unknown>).sort()
+          .map((key) => [key, canonical((value as Record<string, unknown>)[key])]),
+      );
+    }
+    return value;
+  };
+  try {
+    return createHash('sha256').update(JSON.stringify(canonical(schema)), 'utf-8').digest('hex').slice(0, 32);
+  } catch {
+    return undefined;
+  }
 }

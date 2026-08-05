@@ -34,6 +34,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const composio = await import('../../tools/composio-tools.js');
+const schemaCache = await import('../../tools/composio-schema-cache.js');
 const jit = await import('../../agents/tool-jit.js');
 const mcpScope = await import('../mcp-tool-scope.js');
 const toolChoice = await import('../../memory/tool-choice-store.js');
@@ -59,6 +60,12 @@ function calendarPayload() {
 
 /** Drive ONE governed read through the production gateway for a session. */
 async function governedRead(sessionId: string, args: Record<string, unknown>): Promise<{ output: string; dispatches: number }> {
+  // The live contract the capability binds to — production deposits this at
+  // discovery time; the test owns the provider catalog the same way it owns
+  // the network function.
+  schemaCache.rememberToolSchema(CALENDAR_SLUG, {
+    type: 'object', properties: { timeMin: { type: 'string' }, timeMax: { type: 'string' } },
+  });
   let dispatches = 0;
   const exec = (async () => { dispatches += 1; return calendarPayload(); }) as never;
   const output = await composio.runComposioExecuteForTestInSession(CALENDAR_SLUG, args, exec, sessionId);
