@@ -37,7 +37,8 @@ import {
 import { getActiveObjective } from '../memory/focus.js';
 import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
 import { effectiveTurnObjective } from '../runtime/harness/turn-control.js';
-import { advanceHandoffState, checkpointCapsule, projectCapsuleFromDurableState } from './continuation-capsule.js';
+import { checkpointCapsule, endHandoff, projectCapsuleFromDurableState, stepHandoff } from './continuation-capsule.js';
+import { handoffRank, reservedBackgroundTaskId } from './handoff-store.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 
@@ -337,6 +338,8 @@ export interface EnqueueDurableChatTaskInput {
   /** Exact foreground provenance when this task is a user-requested handoff.
    * Persisted on the task so a lost response can safely rejoin it. */
   foregroundHandoff?: BackgroundTaskRecord['foregroundHandoff'];
+  /** A task id reserved from durable identity before the task existed. */
+  explicitId?: string;
   userId?: string;
   channel?: string;
   reportBackTarget?: BackgroundReportBackTarget;
@@ -386,6 +389,7 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     prompt,
     originSessionId: input.sessionId,
     foregroundHandoff: input.foregroundHandoff,
+    ...(input.explicitId ? { explicitId: input.explicitId } : {}),
     userId: input.userId,
     channel: input.channel,
     reportBackTarget: input.reportBackTarget,
@@ -595,11 +599,18 @@ export function detachRunningTurnToBackground(
     sessionId,
     sourceUserSeq: resolved.sourceUserSeq,
   };
-  const requested = advanceHandoffState({ ...handoffIdentity, state: 'requested' });
-  // An existing record means a previous activation got part-way; resuming it is
-  // correct. A record that already ENDED owns nothing and must not be revived
-  // under the same identity — the caller falls back to an ordinary turn.
-  if (!requested.ok && (!requested.current || requested.current.state === 'terminal')) return null;
+  const requested = stepHandoff({ ...handoffIdentity, state: 'requested' });
+  // Every ladder write is a value to act on, never fire-and-forget. A refusal
+  // means someone else owns this attempt's transfer: the only safe answers are
+  // to follow them or to decline, and admitting a worker anyway is how one
+  // accepted turn ends up with two.
+  const existingRung = requested.ok ? requested.record : requested.current;
+  if (!existingRung || existingRung.state === 'terminal') return null;
+  if (!requested.ok && handoffRank(existingRung.state) >= handoffRank('background_admitted')) {
+    // Already admitted elsewhere. The task lookup above did not see it, so the
+    // honest answer is to decline rather than mint a rival owner.
+    return null;
+  }
 
   const capsule = checkpointCapsule({
     ...projectCapsuleFromDurableState(logicalTaskId, sessionId, active.attemptId, {
@@ -609,15 +620,12 @@ export function detachRunningTurnToBackground(
       // origin chat are not this task's input.
       throughSeq,
     }),
-    ...(requested.ok ? {} : { capsuleId: requested.current?.capsuleId }),
+    ...(existingRung.capsuleId ? { capsuleId: existingRung.capsuleId } : {}),
   });
-  advanceHandoffState({ ...handoffIdentity, capsuleId: capsule.capsuleId, state: 'capsule_checkpointed' });
-
-  // Latch the exact foreground attempt now that its durable replacement exists.
-  // If persistence fails synchronously, release only this latch so foreground
-  // work is not silently lost. enqueue's drain yields after this call stack.
-  requestKill(sessionId, 'moved to background by user', active);
-  advanceHandoffState({ ...handoffIdentity, capsuleId: capsule.capsuleId, state: 'foreground_commit_fenced' });
+  if (existingRung.state === 'requested') {
+    const checkpointed = stepHandoff({ ...handoffIdentity, capsuleId: capsule.capsuleId, state: 'capsule_checkpointed' });
+    if (!checkpointed.ok) return null;
+  }
 
   const composedPrompt = [
     `Objective: ${resolved.objective}`,
@@ -628,6 +636,9 @@ export function detachRunningTurnToBackground(
     'Work through to completion, then report the result back.',
   ].join('\n');
   try {
+    // The id was decided by the accepted attempt, not minted here, so two
+    // processes racing this exact detach contend for ONE task file instead of
+    // each creating a runnable worker that will report back separately.
     const task = enqueueDurableChatTask({
       message: resolved.objective,
       composedPrompt,
@@ -635,6 +646,7 @@ export function detachRunningTurnToBackground(
       source: options.source ?? 'desktop',
       channel: options.channel,
       userId: options.userId,
+      explicitId: reservedBackgroundTaskId(active.attemptId),
       goal: { objective: resolved.objective },
       foregroundHandoff: {
         sessionId,
@@ -643,15 +655,25 @@ export function detachRunningTurnToBackground(
         sourceUserSeq: resolved.sourceUserSeq,
         throughSeq,
         capsuleId: capsule.capsuleId,
+        // The worker validates against these before it resumes; a capsule that
+        // no longer matches is a continuation nobody verified.
+        capsuleDigest: capsule.digest,
         logicalTaskId,
       },
     });
-    advanceHandoffState({
+    const admitted = stepHandoff({
       ...handoffIdentity,
       capsuleId: capsule.capsuleId,
       backgroundTaskId: task.id,
       state: 'background_admitted',
     });
+    if (!admitted.ok && admitted.current?.state === 'terminal') return null;
+
+    // Fence the foreground only once its durable replacement is admitted. The
+    // fence RUNG itself is written by the terminal committer, where the
+    // foreground actually stops — asserting it here would claim a boundary this
+    // call has not reached.
+    requestKill(sessionId, 'moved to background by user', active);
     return backgroundItResult(task, active.attemptId, false);
   } catch (error) {
     // Both halves matter. Clearing the latch returns the turn to the live
@@ -659,12 +681,7 @@ export function detachRunningTurnToBackground(
     // resurrecting a transfer that already failed and was handed back.
     try { clearKill(sessionId, active); } catch { /* preserve original error */ }
     try {
-      advanceHandoffState({
-        ...handoffIdentity,
-        capsuleId: capsule.capsuleId,
-        state: 'terminal',
-        reason: `admission failed: ${error instanceof Error ? error.message : String(error)}`,
-      });
+      endHandoff(handoffIdentity, `admission failed: ${error instanceof Error ? error.message : String(error)}`);
     } catch { /* preserve original error */ }
     throw error;
   }

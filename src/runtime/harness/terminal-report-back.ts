@@ -297,6 +297,9 @@ function emitTerminalReportBack(
     blocked: 'Chat run blocked',
     failed: 'Chat run failed',
     cancelled: 'Chat run cancelled',
+    // Not "cancelled": the work is still running under a background owner, and
+    // the report-back the user gets has to say which of those two happened.
+    transferred: 'Chat run moved to the background',
   };
   const title = `${titlePrefix[facts.outcome]}: ${label}`;
   addNotification({

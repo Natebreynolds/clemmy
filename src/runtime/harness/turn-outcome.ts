@@ -14,7 +14,13 @@ import { parseNarratedEnvelope } from './envelope-narration.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { looksLikeCompactDecisionProtocol } from './presentation-hygiene.js';
 
-export type TurnOutcomeStatus = 'done' | 'needs_input' | 'blocked' | 'failed' | 'cancelled';
+// 'transferred' is deliberately its own status rather than a cancellation
+// carrying a note. A cancelled turn is work that STOPPED; a transferred turn is
+// work that changed owners and is still running. Every reader downstream — the
+// board, report-back, resume, and the sentence the user reads — acts on that
+// difference, so collapsing the two makes the taxonomy misstate the one fact it
+// exists to carry.
+export type TurnOutcomeStatus = 'done' | 'needs_input' | 'blocked' | 'failed' | 'cancelled' | 'transferred';
 
 export type TurnNeed =
   | { kind: 'input' }
@@ -59,7 +65,8 @@ export type PublicPresentation =
   | { kind: 'continue'; text: string }
   | { kind: 'blocked'; text: string }
   | { kind: 'error'; text: string }
-  | { kind: 'stopped'; text: string };
+  | { kind: 'stopped'; text: string }
+  | { kind: 'transferred'; text: string };
 
 interface TurnOutcomeBase {
   version: 2;
@@ -116,6 +123,12 @@ export type TurnOutcome = TurnOutcomeBase & (
       resumable: false;
       needs?: never;
       presentation: Extract<PublicPresentation, { kind: 'stopped' }>;
+    }
+  | {
+      status: 'transferred';
+      resumable: false;
+      needs?: never;
+      presentation: Extract<PublicPresentation, { kind: 'transferred' }>;
     }
 );
 
@@ -253,7 +266,9 @@ export function presentationEventForOutcome(outcome: TurnOutcome): PresentationE
         ? outcome.presentation.kind === 'blocked' && needs === undefined
         : outcome.status === 'failed'
           ? outcome.presentation.kind === 'error' && outcome.resumable === false && needs === undefined
-          : outcome.presentation.kind === 'stopped' && outcome.resumable === false && needs === undefined;
+          : outcome.status === 'transferred'
+            ? outcome.presentation.kind === 'transferred' && outcome.resumable === false && needs === undefined
+            : outcome.presentation.kind === 'stopped' && outcome.resumable === false && needs === undefined;
   if (!shapeIsValid) {
     throw new InvalidTurnOutcomeError('TurnOutcome status, need, presentation, and resumable fields disagree.');
   }
@@ -289,11 +304,12 @@ function isTurnOutcomeStatus(value: unknown): value is TurnOutcomeStatus {
     || value === 'needs_input'
     || value === 'blocked'
     || value === 'failed'
-    || value === 'cancelled';
+    || value === 'cancelled'
+    || value === 'transferred';
 }
 
 const PRESENTATION_KINDS: ReadonlySet<string> = new Set([
-  'answer', 'question', 'approval', 'continue', 'blocked', 'error', 'stopped',
+  'answer', 'question', 'approval', 'continue', 'blocked', 'error', 'stopped', 'transferred',
 ]);
 
 function owns(record: Record<string, unknown>, key: string): boolean {
@@ -505,7 +521,9 @@ export function presentationEventFromCompletionData(value: unknown): Presentatio
         ? raw.kind === 'blocked' && needs === undefined && approvalId === undefined
         : raw.status === 'failed'
           ? raw.kind === 'error' && raw.resumable === false && needs === undefined && approvalId === undefined
-          : raw.kind === 'stopped' && raw.resumable === false && needs === undefined && approvalId === undefined;
+          : raw.status === 'transferred'
+            ? raw.kind === 'transferred' && raw.resumable === false && needs === undefined && approvalId === undefined
+            : raw.kind === 'stopped' && raw.resumable === false && needs === undefined && approvalId === undefined;
   if (!shapeIsValid) {
     throw new InvalidTurnOutcomeError('Persisted presentation status and shape disagree.');
   }

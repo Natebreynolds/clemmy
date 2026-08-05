@@ -24,6 +24,7 @@ import {
   type TurnOutcomeStatus,
 } from './turn-outcome.js';
 import { assertNoPendingWorkflowChatDispatchOwnership } from '../../tools/workflow-run-queue.js';
+import { fenceAndReleaseHandoffAtTerminal } from '../../execution/continuation-capsule.js';
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -86,6 +87,8 @@ function legacyReason(presentation: PresentationEvent): string {
       return 'failed';
     case 'cancelled':
       return 'cancelled';
+    case 'transferred':
+      return 'transferred';
   }
 }
 
@@ -210,11 +213,11 @@ function presentationFromLegacyWinner(event: EventRow, proposed: PresentationEve
     needs = { kind: 'input' };
     resumable = true;
   } else if (/transferred/.test(reason)) {
-    // The foreground stopped, but the work did not: a legacy row that says
+    // The foreground stopped, but the work did not. A legacy row that says
     // transferred must keep saying transferred rather than being re-read as an
     // abandoned turn by the cancelled branch below.
-    status = 'cancelled';
-    kind = 'stopped';
+    status = 'transferred';
+    kind = 'transferred';
     needs = undefined;
     resumable = false;
   } else if (/cancelled|canceled|aborted|stopped|rejected_by_user/.test(reason)) {
@@ -331,6 +334,15 @@ export function commitTurnOutcome(
     role: 'system',
     data,
   }, proposed.outcomeId);
+  // THE FENCE IS WRITTEN WHERE THE FOREGROUND ACTUALLY STOPS. Detach cannot
+  // assert it: at that point the run is still executing and may yet complete an
+  // in-flight tool call. Only the committer knows the final model/tool boundary
+  // has been crossed and no further foreground work can occur for this turn,
+  // which is exactly what the fence rung claims. Both brain lanes reduce through
+  // here, so neither can transfer a turn without fencing and releasing it.
+  try {
+    fenceAndReleaseHandoffAtTerminal(proposed.identity.sessionId, proposed.identity.sourceUserSeq);
+  } catch { /* the terminal is durable; ownership converges at boot reconciliation */ }
   const decoded = presentationEventFromCompletionData(terminal.event.data);
   let persisted: PresentationEvent;
   if (decoded) {

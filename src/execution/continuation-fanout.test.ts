@@ -158,9 +158,8 @@ test('E5.2: the handoff state machine repairs deterministically to ONE owner', (
   for (const [state, action] of [
     ['requested', 'checkpoint_then_admit'],
     ['capsule_checkpointed', 'resume_admission'],
-    ['foreground_commit_fenced', 'resume_admission'],
     ['background_admitted', 'rejoin_existing'],
-    ['background_owner_active', 'rejoin_existing'],
+    ['foreground_commit_fenced', 'rejoin_existing'],
     ['foreground_released', 'rejoin_existing'],
   ] as const) {
     recordHandoffState({ ...base, state });
@@ -169,7 +168,6 @@ test('E5.2: the handoff state machine repairs deterministically to ONE owner', (
     assert.equal(repairHandoff(loaded).action, action, `${state} repaired wrongly`);
   }
   // A double-click on the same accepted attempt REJOINS rather than forking.
-  recordHandoffState({ ...base, state: 'background_owner_active', backgroundTaskId: 'bg-1' });
   assert.equal(repairHandoff(loadHandoffState('attempt-9')).action, 'rejoin_existing');
   // A handoff that ended without a background owner owns nothing; the next
   // request for this work starts rather than rejoining a worker that is not there.

@@ -36,6 +36,9 @@ import {
   listHandoffRecords,
   listUnsettledHandoffRecords,
   loadHandoffRecord,
+  bindHandoffBackgroundTask,
+  reservedBackgroundTaskId,
+  HANDOFF_ORDER,
   type HandoffProposal,
   type HandoffRecord,
   type HandoffState,
@@ -259,10 +262,40 @@ function adoptAllLegacyHandoffs(): void {
  */
 export function advanceHandoffState(
   record: Omit<HandoffRecord, 'version' | 'revision' | 'updatedAt'>,
-  options: { expectedRevision?: number; now?: string } = {},
+  options: { expectedRevision: number; now?: string },
 ): HandoffWrite {
   if (!loadHandoffRecord(record.acceptedAttemptId)) adoptLegacyHandoffIfPresent(record.acceptedAttemptId);
   return advanceHandoff(record as HandoffProposal, options);
+}
+
+/**
+ * Take ONE rung, pinned to what is durably there right now.
+ *
+ * Callers read-then-pin through this helper rather than firing an unpinned
+ * write and moving on, so a refusal is a value they have to look at. Returning
+ * the CURRENT record on refusal is deliberate: the only safe response to losing
+ * a rung is to follow the owner that won it, and that needs its record.
+ */
+export function stepHandoff(
+  proposal: Omit<HandoffRecord, 'version' | 'revision' | 'updatedAt'>,
+  now = new Date().toISOString(),
+): HandoffWrite {
+  const current = loadHandoffState(proposal.acceptedAttemptId);
+  return advanceHandoffState(proposal, { expectedRevision: current?.revision ?? 0, now });
+}
+
+/** End a handoff from wherever it is. The abort edge, pinned like every other
+ *  write so it cannot stomp a concurrent owner that is still making progress. */
+export function endHandoff(
+  proposal: Omit<HandoffRecord, 'version' | 'revision' | 'updatedAt' | 'state'>,
+  reason: string,
+  now = new Date().toISOString(),
+): HandoffWrite {
+  const current = loadHandoffState(proposal.acceptedAttemptId);
+  return advanceHandoffState(
+    { ...proposal, state: 'terminal', reason },
+    { expectedRevision: current?.revision ?? 0, now },
+  );
 }
 
 /** Advance, keeping the durable record when the write is refused. Callers that
@@ -271,7 +304,7 @@ export function recordHandoffState(
   record: Omit<HandoffRecord, 'version' | 'revision' | 'updatedAt'>,
   now = new Date().toISOString(),
 ): HandoffRecord {
-  const written = advanceHandoffState(record, { now });
+  const written = stepHandoff(record, now);
   if (written.ok) return written.record;
   return written.current ?? { version: 1, ...record, revision: 0, updatedAt: now };
 }
@@ -294,10 +327,8 @@ export function repairHandoff(record: HandoffRecord | undefined): {
       return { action: 'checkpoint_then_admit', reason: 'the handoff was requested but nothing was checkpointed' };
     case 'capsule_checkpointed':
       return { action: 'resume_admission', reason: 'the capsule is durable; admit the background task with the same identities' };
-    case 'foreground_commit_fenced':
-      return { action: 'resume_admission', reason: 'the foreground is fenced against a durable capsule; admission is the only step left' };
     case 'background_admitted':
-    case 'background_owner_active':
+    case 'foreground_commit_fenced':
       return { action: 'rejoin_existing', reason: 'a background owner already exists for this accepted attempt' };
     case 'foreground_released':
       return { action: 'rejoin_existing', reason: 'the handoff completed; the background task owns the work' };
@@ -407,7 +438,15 @@ export function projectCapsuleFromDurableState(
   let pending: ContinuationCapsule['pending'];
   let lastTerminal: ContinuationCapsule['lastTerminal'];
   try {
-    for (const event of listEvents(sessionId, { types: ['read_receipt', 'conversation_completed'] })) {
+    // THE ACTIVATION INTERVAL, not the session. A reusable chat carries earlier
+    // turns' receipts, approvals and terminals; sweeping those in would tell the
+    // resume that work belonging to a different request was already done for
+    // THIS one. The interval opens at the accepted source event and closes at
+    // the detach boundary.
+    for (const event of listEvents(sessionId, {
+      types: ['read_receipt', 'conversation_completed'],
+      ...(sourceUserSeq === undefined ? {} : { sinceSeq: sourceUserSeq }),
+    })) {
       if (durable.throughSeq !== undefined && event.seq > durable.throughSeq) break;
       if (event.type === 'read_receipt') {
         const record = (event.data as { record?: { receiptId?: string; identifier?: string } }).record;
@@ -493,136 +532,167 @@ export async function reconcileIncompleteHandoffs(): Promise<HandoffReconciliati
   const results: HandoffReconciliation[] = [];
 
   for (const record of unsettled) {
-    const task = record.backgroundTaskId
-      ? tasks.find((candidate) => candidate.id === record.backgroundTaskId)
-      : tasks.find((candidate) => candidate.foregroundHandoff?.attemptId === record.acceptedAttemptId);
+    // The reserved id makes "does an owner exist" answerable without trusting
+    // the row to have recorded it: a crash between admitting the task and
+    // naming it on the handoff is exactly the window this closes.
+    const reservedId = reservedBackgroundTaskId(record.acceptedAttemptId);
+    const task = tasks.find((candidate) => candidate.id === reservedId)
+      ?? (record.backgroundTaskId ? tasks.find((candidate) => candidate.id === record.backgroundTaskId) : undefined)
+      ?? tasks.find((candidate) => candidate.foregroundHandoff?.attemptId === record.acceptedAttemptId);
     const repair = repairHandoff(record);
 
     // A durable background task IS the owner, whatever rung the crash left
-    // behind. Confirm it and stop, so nothing re-enqueues a second worker. A
-    // handoff already at or past active ownership needs no write at all —
-    // re-stating a rung it has passed would be a regression.
+    // behind. Walk the ladder up to admission so the row agrees with reality,
+    // then stop — nothing here may enqueue a second worker.
     if (task) {
-      const write = handoffRank(record.state) >= handoffRank('background_owner_active')
-        ? undefined
-        : advanceHandoff(
-            { ...record, backgroundTaskId: task.id, state: 'background_owner_active' },
-            { expectedRevision: record.revision },
-          );
+      let cursor: HandoffRecord | undefined = record;
+      let refusal = '';
+      while (cursor && handoffRank(cursor.state) < handoffRank('background_admitted')) {
+        const next = HANDOFF_ORDER[handoffRank(cursor.state) + 1];
+        const write = advanceHandoff(
+          { ...cursor, backgroundTaskId: task.id, state: next },
+          { expectedRevision: cursor.revision },
+        );
+        if (!write.ok) { refusal = write.reason; break; }
+        cursor = write.record;
+      }
       results.push({
         acceptedAttemptId: record.acceptedAttemptId,
         from: record.state,
         action: 'confirmed_background_owner',
-        reason: !write || write.ok ? repair.reason : write.reason,
+        reason: refusal || repair.reason,
         backgroundTaskId: task.id,
       });
       continue;
     }
 
     // No background task exists. Either the foreground is still alive and must
-    // be handed its work back, or the transfer died and nothing owns it.
-    if (repair.action === 'checkpoint_then_admit' || repair.action === 'resume_admission') {
-      const capsule = loadCapsule(record.logicalTaskId);
-      let live = false;
-      try { live = getActiveRunAttempt(record.sessionId)?.attemptId === record.acceptedAttemptId; } catch { live = false; }
-      if (live) {
-        // The fence was latched for a transfer that never happened. Clearing it
-        // returns the turn to its original owner rather than leaving it stopped.
-        try { clearKill(record.sessionId, { attemptId: record.acceptedAttemptId }); } catch { /* best effort */ }
-        advanceHandoff(
-          { ...record, state: 'terminal', reason: 'no background owner was admitted; the live foreground keeps the work' },
-          { expectedRevision: record.revision },
-        );
+    // be handed its work back, or nothing owns the turn and one owner must be
+    // created from durable state.
+    let live = false;
+    try { live = getActiveRunAttempt(record.sessionId)?.attemptId === record.acceptedAttemptId; } catch { live = false; }
+    if (live) {
+      // The fence was latched for a transfer that never happened. Clearing it
+      // returns the turn to its original owner rather than leaving it stopped.
+      try { clearKill(record.sessionId, { attemptId: record.acceptedAttemptId }); } catch { /* best effort */ }
+      endHandoff(record, 'no background owner was admitted; the live foreground keeps the work');
+      results.push({
+        acceptedAttemptId: record.acceptedAttemptId,
+        from: record.state,
+        action: 'released_foreground',
+        reason: 'the foreground attempt is still live; its stop latch was cleared',
+      });
+      continue;
+    }
+
+    // A handoff that never got its capsule written is still ACCEPTED WORK. The
+    // user asked for it and the system recorded that it did; rebuilding the
+    // capsule from the accepted event and the durable goal is recovery, not
+    // invention, and it is strictly better than discarding the request because
+    // the process happened to die one instruction early.
+    let built = loadCapsule(record.logicalTaskId);
+    let cursor: HandoffRecord = record;
+    if (!built) {
+      const rebuilt = projectCapsuleFromDurableState(
+        record.logicalTaskId,
+        record.sessionId,
+        record.acceptedAttemptId,
+        { sourceUserSeq: record.sourceUserSeq },
+      );
+      if (rebuilt.objective) built = checkpointCapsule(rebuilt);
+    }
+    if (!built?.objective) {
+      endHandoff(record, `${repair.reason}; nothing durable names what the work was`);
+      results.push({
+        acceptedAttemptId: record.acceptedAttemptId,
+        from: record.state,
+        action: 'ended',
+        reason: 'no durable objective survives for this handoff',
+      });
+      continue;
+    }
+    if (cursor.state === 'requested') {
+      const checkpointed = stepHandoff({ ...cursor, capsuleId: built.capsuleId, state: 'capsule_checkpointed' });
+      if (!checkpointed.ok) {
         results.push({
           acceptedAttemptId: record.acceptedAttemptId,
           from: record.state,
-          action: 'released_foreground',
-          reason: 'the foreground attempt is still live; its stop latch was cleared',
+          action: 'confirmed_background_owner',
+          reason: checkpointed.reason,
         });
         continue;
       }
-      if (capsule?.objective) {
-        // CAS guards the re-enqueue: only the reconciler holding this exact
-        // revision may admit, so two daemons cannot both create a worker.
-        const claim = advanceHandoff(
-          { ...record, state: 'foreground_commit_fenced' },
-          { expectedRevision: record.revision },
-        );
-        if (!claim.ok) {
-          results.push({
-            acceptedAttemptId: record.acceptedAttemptId,
-            from: record.state,
-            action: 'confirmed_background_owner',
-            reason: claim.reason,
-          });
-          continue;
-        }
-        const { enqueueDurableChatTask } = await import('./background-promote.js');
-        try {
-          const admitted = enqueueDurableChatTask({
-            message: capsule.objective,
-            composedPrompt: [
-              `Objective: ${capsule.objective}`,
-              '',
-              'You are RESUMING this task after a restart interrupted its handoff.',
-              'The durable continuation capsule is authoritative for what is already done; do not redo completed work.',
-            ].join('\n'),
-            sessionId: record.sessionId,
-            source: 'daemon',
-            goal: { objective: capsule.objective },
-            foregroundHandoff: {
-              sessionId: record.sessionId,
-              attemptId: record.acceptedAttemptId,
-              sourceUserSeq: record.sourceUserSeq,
-              throughSeq: capsule.compactionWatermark ?? 0,
-              capsuleId: capsule.capsuleId,
-              logicalTaskId: record.logicalTaskId,
-            },
-          });
-          advanceHandoff(
-            { ...record, capsuleId: capsule.capsuleId, backgroundTaskId: admitted.id, state: 'background_admitted' },
-            { expectedRevision: claim.record.revision },
-          );
-          results.push({
-            acceptedAttemptId: record.acceptedAttemptId,
-            from: record.state,
-            action: 'reenqueued',
-            reason: 'the capsule was durable but no background owner existed',
-            backgroundTaskId: admitted.id,
-          });
-          continue;
-        } catch (error) {
-          advanceHandoff(
-            {
-              ...record,
-              state: 'terminal',
-              reason: `re-enqueue failed: ${error instanceof Error ? error.message : String(error)}`,
-            },
-            { expectedRevision: claim.record.revision },
-          );
-          results.push({
-            acceptedAttemptId: record.acceptedAttemptId,
-            from: record.state,
-            action: 'ended',
-            reason: 'the capsule could not be re-admitted; the handoff owns nothing',
-          });
-          continue;
-        }
-      }
+      cursor = checkpointed.record;
     }
 
-    advanceHandoff(
-      { ...record, state: 'terminal', reason: `${repair.reason}; no durable owner remains` },
-      { expectedRevision: record.revision },
-    );
-    results.push({
-      acceptedAttemptId: record.acceptedAttemptId,
-      from: record.state,
-      action: 'ended',
-      reason: repair.reason,
-    });
+    const { enqueueDurableChatTask } = await import('./background-promote.js');
+    try {
+      const admitted = enqueueDurableChatTask({
+        message: built.objective,
+        composedPrompt: [
+          `Objective: ${built.objective}`,
+          '',
+          'You are RESUMING this task after a restart interrupted its handoff.',
+          'The durable continuation capsule is authoritative for what is already done; do not redo completed work.',
+        ].join('\n'),
+        sessionId: record.sessionId,
+        source: 'daemon',
+        explicitId: reservedId,
+        goal: { objective: built.objective },
+        foregroundHandoff: {
+          sessionId: record.sessionId,
+          attemptId: record.acceptedAttemptId,
+          sourceUserSeq: record.sourceUserSeq,
+          throughSeq: built.compactionWatermark ?? 0,
+          capsuleId: built.capsuleId,
+          capsuleDigest: built.digest,
+          logicalTaskId: record.logicalTaskId,
+        },
+      });
+      // A row below admission takes the rung; one already past it only needs to
+      // NAME the owner it now has, which is identity rather than a state change.
+      if (handoffRank(cursor.state) < handoffRank('background_admitted')) {
+        advanceHandoff(
+          { ...cursor, capsuleId: built.capsuleId, backgroundTaskId: admitted.id, state: 'background_admitted' },
+          { expectedRevision: cursor.revision },
+        );
+      } else {
+        bindHandoffBackgroundTask(record.acceptedAttemptId, admitted.id);
+      }
+      results.push({
+        acceptedAttemptId: record.acceptedAttemptId,
+        from: record.state,
+        action: 'reenqueued',
+        reason: 'accepted work had no owner; exactly one was admitted from durable state',
+        backgroundTaskId: admitted.id,
+      });
+      continue;
+    } catch (error) {
+      endHandoff(cursor, `re-enqueue failed: ${error instanceof Error ? error.message : String(error)}`);
+      results.push({
+        acceptedAttemptId: record.acceptedAttemptId,
+        from: record.state,
+        action: 'ended',
+        reason: 'the capsule could not be re-admitted; the handoff owns nothing',
+      });
+      continue;
+    }
   }
   return results;
+}
+
+/**
+ * Boot gate. Reconciliation is not optional background hygiene: until it runs,
+ * the daemon cannot say which turns still have an owner, and accepting fresh
+ * ingress in that state is how a resumed worker and a live foreground end up
+ * both writing. A failure here therefore fails READINESS — reporting healthy
+ * while unable to read the ownership record is the dishonest option.
+ */
+export async function reconcileHandoffsForBoot(
+  options: { probe?: () => void } = {},
+): Promise<HandoffReconciliation[]> {
+  (options.probe ?? (() => { listUnsettledHandoffRecords(); }))();
+  return reconcileIncompleteHandoffs();
 }
 
 // ── The transferred foreground terminal ──────────────────────────────────────
@@ -653,6 +723,33 @@ export function handoffTransferForAttempt(
   return transferFor(sessionId, loadHandoffState(acceptedAttemptId));
 }
 
+/**
+ * Called by the ONE terminal-commit authority once a turn's final public
+ * outcome is durable. If that turn was transferred, its foreground has now
+ * genuinely stopped — no further model or tool work can occur for it — so the
+ * fence and the release are recorded here rather than optimistically at detach,
+ * where the run was still executing.
+ *
+ * Both rungs at one seam because they describe the same instant from two sides:
+ * the foreground can no longer act, and the background is now sole owner.
+ */
+export function fenceAndReleaseHandoffAtTerminal(sessionId: string, sourceUserSeq: number | undefined): void {
+  if (!sessionId || sourceUserSeq === undefined) return;
+  const record = listHandoffRecords()
+    .filter((row) => row.sessionId === sessionId && row.sourceUserSeq === sourceUserSeq)
+    .at(-1);
+  if (!record || !record.backgroundTaskId) return;
+  let cursor: HandoffRecord = record;
+  for (const rung of ['foreground_commit_fenced', 'foreground_released'] as const) {
+    if (handoffRank(cursor.state) >= handoffRank(rung)) continue;
+    const write = stepHandoff({ ...cursor, state: rung });
+    // A refusal means another owner moved this handoff already. Following it is
+    // correct; forcing our rung over it is not.
+    if (!write.ok) return;
+    cursor = write.record;
+  }
+}
+
 /** Same question asked by accepted SOURCE event, for terminal committers that
  *  reduce a turn without a physical attempt id in hand. */
 export function handoffTransferForSource(
@@ -664,6 +761,27 @@ export function handoffTransferForSource(
     .filter((row) => row.sessionId === sessionId && row.sourceUserSeq === sourceUserSeq)
     .at(-1);
   return transferFor(sessionId, record);
+}
+
+/**
+ * The typed terminal a moved turn commits. 'transferred' is its own status
+ * rather than a cancellation carrying a note: a cancelled turn is work that
+ * stopped, and every reader downstream — board, report-back, resume, the user —
+ * acts on that difference. Encoding a live transfer as cancelled makes the
+ * taxonomy lie about the one thing it exists to state.
+ */
+export function transferredTurnOutcome(
+  sessionId: string,
+  acceptedAttemptId: string,
+): { status: 'transferred'; text: string; transferredToTaskId: string; logicalTaskId: string } | undefined {
+  const transfer = handoffTransferForAttempt(sessionId, acceptedAttemptId);
+  if (!transfer) return undefined;
+  return {
+    status: 'transferred',
+    text: transfer.text,
+    transferredToTaskId: transfer.backgroundTaskId,
+    logicalTaskId: transfer.logicalTaskId,
+  };
 }
 
 function transferFor(sessionId: string, record: HandoffRecord | undefined): HandoffTransfer | undefined {

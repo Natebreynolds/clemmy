@@ -103,25 +103,25 @@ test('completed work survives a rewrite of the same capsule and is never redone'
 // ─── exactly one owner ───────────────────────────────────────────────────────
 
 test('handoff state moves forward only — a late writer cannot hand the task back', () => {
-  assert.equal(capsule.advanceHandoffState(handoff('requested')).ok, true);
-  assert.equal(capsule.advanceHandoffState(handoff('capsule_checkpointed')).ok, true);
-  assert.equal(capsule.advanceHandoffState(handoff('background_owner_active')).ok, true);
+  assert.equal(capsule.stepHandoff(handoff('requested')).ok, true);
+  assert.equal(capsule.stepHandoff(handoff('capsule_checkpointed')).ok, true);
+  assert.equal(capsule.stepHandoff(handoff('background_admitted')).ok, true);
 
-  const regression = capsule.advanceHandoffState(handoff('requested'));
+  const regression = capsule.stepHandoff(handoff('requested'));
   assert.equal(regression.ok, false, 'the handoff regressed — foreground and background can both claim ownership');
-  assert.match((regression as { reason: string }).reason, /regress/);
-  assert.equal(capsule.loadHandoffState('attempt-1')?.state, 'background_owner_active');
+  assert.match((regression as { reason: string }).reason, /adjacent/);
+  assert.equal(capsule.loadHandoffState('attempt-1')?.state, 'background_admitted');
 });
 
 test('two activations racing to claim one attempt: exactly one wins', () => {
   const attempt = { acceptedAttemptId: 'attempt-race' };
-  assert.equal(capsule.advanceHandoffState(handoff('requested', attempt)).ok, true);
+  assert.equal(capsule.stepHandoff(handoff('requested', attempt)).ok, true);
   const seen = capsule.loadHandoffState('attempt-race')!;
 
-  const first = capsule.advanceHandoffState(handoff('background_admitted', attempt), {
+  const first = capsule.advanceHandoffState(handoff('capsule_checkpointed', attempt), {
     expectedRevision: seen.revision,
   });
-  const second = capsule.advanceHandoffState(handoff('background_owner_active', attempt), {
+  const second = capsule.advanceHandoffState(handoff('capsule_checkpointed', attempt), {
     expectedRevision: seen.revision,
   });
   assert.equal(first.ok, true);
@@ -132,7 +132,7 @@ test('two activations racing to claim one attempt: exactly one wins', () => {
 test('revisions are monotonic, so a stale reader can always tell it is stale', () => {
   const attempt = { acceptedAttemptId: 'attempt-rev' };
   const revisions = (['requested', 'capsule_checkpointed', 'background_admitted'] as const)
-    .map((state) => capsule.advanceHandoffState(handoff(state, attempt)))
+    .map((state) => capsule.stepHandoff(handoff(state, attempt)))
     .map((write) => (write.ok ? write.record.revision : -1));
   assert.deepEqual(revisions, [1, 2, 3]);
 });
@@ -140,8 +140,8 @@ test('revisions are monotonic, so a stale reader can always tell it is stale', (
 test('crash repair converges every durable state to one owner', () => {
   const seen = new Set<string>();
   for (const state of [
-    'requested', 'foreground_commit_fenced', 'capsule_checkpointed',
-    'background_admitted', 'background_owner_active', 'foreground_released',
+    'requested', 'capsule_checkpointed', 'background_admitted',
+    'foreground_commit_fenced', 'foreground_released', 'terminal',
   ] as const) {
     const repair = capsule.repairHandoff({
       version: 1, logicalTaskId: 't', acceptedAttemptId: 'a', sessionId: 's',

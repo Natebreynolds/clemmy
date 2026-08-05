@@ -19,7 +19,16 @@
  * plausible-sounding order: durable transfer intent is recorded and the capsule
  * checkpointed BEFORE the foreground is fenced, because a fence with no durable
  * intent is work with no owner at all.
+ *
+ * The ladder models ONE track — the foreground's transfer of ownership — and
+ * every forward step is EXACTLY ONE rung with the caller's observed revision
+ * pinned. Worker ownership is deliberately not a rung: the worker starting and
+ * the foreground committing its terminal are independent events with no
+ * guaranteed order, so folding them into one line would force a legal
+ * production interleaving to be refused. Worker ownership is a separate durable
+ * fact on the same row, set idempotently at the worker-start boundary.
  */
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -29,27 +38,39 @@ import { getMachineId } from '../runtime/machine-id.js';
 export type HandoffState =
   | 'requested'
   | 'capsule_checkpointed'
-  | 'foreground_commit_fenced'
   | 'background_admitted'
-  | 'background_owner_active'
+  | 'foreground_commit_fenced'
   | 'foreground_released'
   | 'terminal';
 
-/** The ladder: ownership only ever moves forward, and 'terminal' is the rung
- *  that means "this handoff will never produce a background owner" — a boot
- *  reconciler must be able to stop resurrecting an abandoned transfer. */
+/** The ladder: ownership moves forward one rung at a time. 'terminal' is the
+ *  abort target rather than a rung — it means "this handoff will never produce
+ *  a background owner", and a boot reconciler must be able to reach it from
+ *  wherever a crash left the row so it stops resurrecting an abandoned
+ *  transfer. Every OTHER step is strictly adjacent. */
 export const HANDOFF_ORDER: readonly HandoffState[] = [
   'requested',
   'capsule_checkpointed',
-  'foreground_commit_fenced',
   'background_admitted',
-  'background_owner_active',
+  'foreground_commit_fenced',
   'foreground_released',
   'terminal',
 ];
 
 export function handoffRank(state: HandoffState): number {
   return HANDOFF_ORDER.indexOf(state);
+}
+
+/**
+ * The background task id this handoff will admit, decided BEFORE any task
+ * exists and derived only from the accepted attempt. Two processes racing to
+ * admit the same transfer therefore compute the SAME id and contend for one
+ * task file, instead of each minting a random id and creating a runnable
+ * duplicate that both report back.
+ */
+export function reservedBackgroundTaskId(acceptedAttemptId: string): string {
+  const digest = createHash('sha256').update(acceptedAttemptId, 'utf-8').digest('hex').slice(0, 12);
+  return `bg-h${digest}`;
 }
 
 export interface HandoffRecord {
@@ -63,6 +84,9 @@ export interface HandoffRecord {
   capsuleId?: string;
   backgroundTaskId?: string;
   state: HandoffState;
+  /** When the admitted worker actually took the run. Not a rung: it races the
+   *  foreground's own terminal and neither order is wrong. */
+  ownerActiveAt?: string;
   /** Why this handoff reached a rung that ends it. Only meaningful for
    *  'terminal'; carried so reconciliation reports a cause instead of a state. */
   reason?: string;
@@ -96,6 +120,7 @@ interface HandoffRow {
   capsule_id: string | null;
   background_task_id: string | null;
   state: HandoffState;
+  owner_active_at: string | null;
   reason: string | null;
   revision: number;
   updated_at: string;
@@ -124,9 +149,10 @@ function db(): Database.Database {
       capsule_id          TEXT,
       background_task_id  TEXT,
       state               TEXT NOT NULL CHECK(state IN (
-        'requested','capsule_checkpointed','foreground_commit_fenced',
-        'background_admitted','background_owner_active','foreground_released','terminal'
+        'requested','capsule_checkpointed','background_admitted',
+        'foreground_commit_fenced','foreground_released','terminal'
       )),
+      owner_active_at     TEXT,
       reason              TEXT,
       revision            INTEGER NOT NULL,
       updated_at          TEXT NOT NULL
@@ -152,6 +178,7 @@ function toRecord(row: HandoffRow): HandoffRecord {
     ...(row.capsule_id ? { capsuleId: row.capsule_id } : {}),
     ...(row.background_task_id ? { backgroundTaskId: row.background_task_id } : {}),
     state: row.state,
+    ...(row.owner_active_at ? { ownerActiveAt: row.owner_active_at } : {}),
     ...(row.reason ? { reason: row.reason } : {}),
     revision: row.revision,
     updatedAt: row.updated_at,
@@ -218,10 +245,22 @@ export function listHandoffRecords(): HandoffRecord[] {
  */
 export function advanceHandoff(
   proposal: HandoffProposal,
-  options: { expectedRevision?: number; now?: string } = {},
+  options: { expectedRevision: number; now?: string },
 ): HandoffWrite {
   const database = db();
-  const now = options.now ?? new Date().toISOString();
+  const now = options?.now ?? new Date().toISOString();
+  const expectedRevision = options?.expectedRevision;
+  // A caller that cannot name the revision it read cannot know whether it is
+  // racing another owner. Refusing the write is the whole mechanism; making the
+  // pin optional would quietly restore last-writer-wins for the one decision
+  // this store exists to serialize.
+  if (!Number.isInteger(expectedRevision) || (expectedRevision as number) < 0) {
+    return {
+      ok: false,
+      reason: 'every handoff transition must pin the revision it observed',
+      current: readRow(database, proposal.acceptedAttemptId),
+    };
+  }
   const tx = database.transaction((): HandoffWrite => {
     const current = readRow(database, proposal.acceptedAttemptId);
     if (!current) {
@@ -232,14 +271,14 @@ export function advanceHandoff(
           current: undefined,
         };
       }
-      if (options.expectedRevision !== undefined && options.expectedRevision !== 0) {
-        return { ok: false, reason: `expected revision ${options.expectedRevision}, found none`, current: undefined };
+      if (expectedRevision !== 0) {
+        return { ok: false, reason: `expected revision ${expectedRevision}, found none`, current: undefined };
       }
       database.prepare(
         `INSERT INTO handoffs
            (accepted_attempt_id, logical_task_id, session_id, source_user_seq,
-            capsule_id, background_task_id, state, reason, revision, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+            capsule_id, background_task_id, state, owner_active_at, reason, revision, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, 1, ?)`,
       ).run(
         proposal.acceptedAttemptId,
         proposal.logicalTaskId,
@@ -253,8 +292,8 @@ export function advanceHandoff(
       );
       return { ok: true, record: readRow(database, proposal.acceptedAttemptId)! };
     }
-    if (options.expectedRevision !== undefined && options.expectedRevision !== current.revision) {
-      return { ok: false, reason: `expected revision ${options.expectedRevision}, found ${current.revision}`, current };
+    if (expectedRevision !== current.revision) {
+      return { ok: false, reason: `expected revision ${expectedRevision}, found ${current.revision}`, current };
     }
     if (current.logicalTaskId !== proposal.logicalTaskId || current.sessionId !== proposal.sessionId) {
       return {
@@ -263,8 +302,20 @@ export function advanceHandoff(
         current,
       };
     }
-    if (handoffRank(proposal.state) < handoffRank(current.state)) {
-      return { ok: false, reason: `handoff cannot regress from ${current.state} to ${proposal.state}`, current };
+    // EXACTLY ONE RUNG. A skip asserts durable state for a step nothing
+    // performed; a same-rung rewrite lets two callers each believe they hold
+    // the rung and is last-writer-wins by another name. 'terminal' is the one
+    // abort edge and is reachable from anywhere, because a crash has to be
+    // able to end a transfer from wherever it left the row.
+    const forward = handoffRank(proposal.state) - handoffRank(current.state);
+    if (proposal.state !== 'terminal' && forward !== 1) {
+      return {
+        ok: false,
+        reason: forward <= 0
+          ? `handoff cannot regress or restate ${current.state} as ${proposal.state}; transitions are adjacent`
+          : `handoff cannot skip from ${current.state} to ${proposal.state}; transitions are adjacent`,
+        current,
+      };
     }
     const changed = database.prepare(
       `UPDATE handoffs
@@ -296,6 +347,46 @@ export function advanceHandoff(
 }
 
 /**
+ * Record that the admitted worker actually took the run. Idempotent and
+ * revision-free on purpose: this is an observation of a boundary that already
+ * happened, not a claim of ownership, and it races the foreground's own
+ * terminal with no correct order between them. The first writer wins; a later
+ * worker restart does not rewrite when the run was first taken.
+ */
+export function markHandoffOwnerActive(acceptedAttemptId: string, now = new Date().toISOString()): boolean {
+  try {
+    return db().prepare(
+      'UPDATE handoffs SET owner_active_at = ? WHERE accepted_attempt_id = ? AND owner_active_at IS NULL',
+    ).run(now, acceptedAttemptId).changes === 1;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Name the owner on a handoff that already passed admission. Write-once: the
+ * task id is identity, not state, so binding it is not a rung and may never
+ * REPLACE an owner already named — that would be a silent change of who is
+ * running the work.
+ */
+export function bindHandoffBackgroundTask(acceptedAttemptId: string, backgroundTaskId: string): boolean {
+  try {
+    return db().prepare(
+      `UPDATE handoffs SET background_task_id = ?, revision = revision + 1, updated_at = ?
+        WHERE accepted_attempt_id = ? AND background_task_id IS NULL`,
+    ).run(backgroundTaskId, new Date().toISOString(), acceptedAttemptId).changes === 1;
+  } catch {
+    return false;
+  }
+}
+
+/** A handoff whose admitted worker is live. Derived rather than stored as a
+ *  rung so it can be true at any point after admission. */
+export function isBackgroundOwnerActive(record: HandoffRecord | undefined): boolean {
+  return Boolean(record?.ownerActiveAt) && record?.state !== 'terminal';
+}
+
+/**
  * Import a handoff written by an older build's JSON record. This is the only
  * path that may admit a row above 'requested', because the state it carries is
  * durable history rather than an assertion. Idempotent: an attempt that already
@@ -308,8 +399,8 @@ export function importLegacyHandoffRecord(record: HandoffRecord): boolean {
     database.prepare(
       `INSERT INTO handoffs
          (accepted_attempt_id, logical_task_id, session_id, source_user_seq,
-          capsule_id, background_task_id, state, reason, revision, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          capsule_id, background_task_id, state, owner_active_at, reason, revision, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       record.acceptedAttemptId,
       record.logicalTaskId,
@@ -317,7 +408,11 @@ export function importLegacyHandoffRecord(record: HandoffRecord): boolean {
       record.sourceUserSeq,
       record.capsuleId ?? null,
       record.backgroundTaskId ?? null,
-      record.state,
+      // A rung this build no longer has is mapped to the nearest rung that
+      // means the same thing about OWNERSHIP. Dropping the row instead would
+      // strand an in-flight transfer across the upgrade.
+      record.state === ('background_owner_active' as HandoffState) ? 'background_admitted' : record.state,
+      record.state === ('background_owner_active' as HandoffState) ? (record.updatedAt || null) : null,
       record.reason ?? null,
       Number.isInteger(record.revision) && record.revision > 0 ? record.revision : 1,
       record.updatedAt || new Date().toISOString(),

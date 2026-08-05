@@ -1274,14 +1274,23 @@ function cancelledBrainResponse(
   const transfer = (() => {
     try { return handoffTransferForAttempt(sessionId, attempt.attemptId); } catch { return undefined; }
   })();
-  const terminal = commitTurnOutcome({
-    version: 2,
-    id: turnOutcomeId(identity),
-    identity,
-    status: 'cancelled',
-    resumable: false,
-    presentation: { kind: 'stopped', text: transfer ? transfer.text : text },
-  }, {
+  const terminal = commitTurnOutcome(transfer
+    ? {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'transferred',
+        resumable: false,
+        presentation: { kind: 'transferred', text: transfer.text },
+      }
+    : {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'cancelled',
+        resumable: false,
+        presentation: { kind: 'stopped', text },
+      }, {
     legacyReason: transfer ? 'transferred' : 'cancelled',
     metadata: {
       transport: 'claude_agent_sdk_brain',

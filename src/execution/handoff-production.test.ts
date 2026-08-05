@@ -99,12 +99,14 @@ test('the durable transfer intent is written before the kill, never after', () =
   promote.detachRunningTurnToBackground(sessionId, { attemptId: attempt.attemptId });
 
   const handoff = capsule.loadHandoffState(attempt.attemptId)!;
-  // Four rungs: requested → capsule_checkpointed → foreground_commit_fenced →
-  // background_admitted. A fence-first order would have produced three, and a
-  // crash in its window would have left a stopped turn with no owner at all.
-  assert.equal(handoff.revision, 4,
-    'the detach did not climb intent → capsule → fence → admission in that order');
-  assert.ok(handoff.capsuleId, 'the fence was latched against no durable capsule');
+  // Three rungs: requested → capsule_checkpointed → background_admitted. The
+  // fence is NOT one of them: it belongs to the terminal committer, where the
+  // foreground actually stops. A fence-first order would have let a crash leave
+  // a stopped turn with no owner at all.
+  assert.equal(handoff.revision, 3,
+    'the detach did not climb intent → capsule → admission in that order');
+  assert.equal(handoff.state, 'background_admitted');
+  assert.ok(handoff.capsuleId, 'the turn was admitted against no durable capsule');
 });
 
 test('the capsule a detach writes is projected from durable state, not from prose', () => {
@@ -143,10 +145,10 @@ function crashedHandoffAt(sessionId: string, state: string): { attemptId: string
     }),
   );
   for (const rung of [
-    'requested', 'capsule_checkpointed', 'foreground_commit_fenced',
-    'background_admitted', 'background_owner_active', 'foreground_released',
+    'requested', 'capsule_checkpointed', 'background_admitted',
+    'foreground_commit_fenced', 'foreground_released',
   ] as const) {
-    capsule.advanceHandoffState({ ...identity, capsuleId: written.capsuleId, state: rung });
+    capsule.stepHandoff({ ...identity, capsuleId: written.capsuleId, state: rung });
     if (rung === state) break;
   }
   return { attemptId: attempt.attemptId, logicalTaskId };
@@ -200,8 +202,8 @@ test('a fenced handoff whose foreground is still live hands the turn back and cl
 
 test('boot reconciliation converges every unsettled rung to exactly one owner', async () => {
   const rungs = [
-    'requested', 'capsule_checkpointed', 'foreground_commit_fenced',
-    'background_admitted', 'background_owner_active', 'foreground_released',
+    'requested', 'capsule_checkpointed', 'background_admitted',
+    'foreground_commit_fenced', 'foreground_released',
   ] as const;
   const crashed = rungs.map((rung, index) => ({
     rung,
@@ -296,15 +298,15 @@ test('a handoff written by an older build as a JSON file is adopted exactly once
   assert.equal(existsSync(file), false, 'the legacy file can still be re-imported over a newer state');
 
   // Move past the imported state, then prove a stray re-import cannot regress it.
-  capsule.advanceHandoffState({
+  capsule.stepHandoff({
     logicalTaskId: 'handoff:sess-legacy:legacy-attempt',
     acceptedAttemptId: 'legacy-attempt',
     sessionId: 'sess-legacy',
     sourceUserSeq: 3,
-    state: 'background_owner_active',
+    state: 'foreground_commit_fenced',
   });
   writeFileSync(file, readFileSync(`${file}.imported`, 'utf-8'), 'utf-8');
-  assert.equal(capsule.loadHandoffState('legacy-attempt')?.state, 'background_owner_active',
+  assert.equal(capsule.loadHandoffState('legacy-attempt')?.state, 'foreground_commit_fenced',
     'a replayed legacy file regressed a live handoff');
 });
 

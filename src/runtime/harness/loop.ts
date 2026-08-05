@@ -676,17 +676,26 @@ function reduceStandardConversationTerminal(input: {
       const transfer = (() => {
         try { return handoffTransferForSource(result.sessionId, sourceUserSeq); } catch { return undefined; }
       })();
-      outcome = {
-        version: 2,
-        id: turnOutcomeId(identity),
-        identity,
-        status: 'cancelled',
-        resumable: false,
-        presentation: {
-          kind: 'stopped',
-          text: transfer ? transfer.text : 'Stopped — this turn was cancelled. Nothing further will execute.',
-        },
-      };
+      outcome = transfer
+        ? {
+            version: 2,
+            id: turnOutcomeId(identity),
+            identity,
+            status: 'transferred',
+            resumable: false,
+            presentation: { kind: 'transferred', text: transfer.text },
+          }
+        : {
+            version: 2,
+            id: turnOutcomeId(identity),
+            identity,
+            status: 'cancelled',
+            resumable: false,
+            presentation: {
+              kind: 'stopped',
+              text: 'Stopped — this turn was cancelled. Nothing further will execute.',
+            },
+          };
       legacyReason = transfer ? 'transferred' : 'cancelled';
       transferredToTaskId = transfer?.backgroundTaskId;
       break;
