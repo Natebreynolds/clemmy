@@ -56,11 +56,31 @@ export function acceptedPhraseDigest(text: string): string {
 }
 
 /**
- * A token that could carry personal or secret content rather than intent.
- * Normalization has already stripped punctuation, so an address or key arrives
- * here as its parts: what remains distinguishing is length, digit density, and
- * mixed alphanumerics. Intent words ("calendar", "tomorrow", "q3") pass; an
- * identifier, order number, token fragment, or long opaque string does not.
+ * Spans that carry a PARTICULAR person, place, or secret rather than an intent.
+ *
+ * These must be removed BEFORE normalization: once punctuation is gone,
+ * "dana.wexler@northwind-industries.com" is indistinguishable from five
+ * ordinary words, and each of those words would become a retrievable feature.
+ * Structure is the evidence, so it is read while it still exists.
+ */
+const SENSITIVE_SPANS: RegExp[] = [
+  /\S+@\S+/g,                          // addresses
+  /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi,      // URLs
+  /\b[\w-]+(?:\.[\w-]+)+\b/g,          // bare hosts and dotted identifiers
+  /\b[A-Za-z0-9_-]{16,}\b/g,           // keys, tokens, opaque ids
+  /\b\d{4,}\b/g,                       // account, order, and phone numbers
+];
+
+function stripSensitiveSpans(text: string): string {
+  let out = text;
+  for (const pattern of SENSITIVE_SPANS) out = out.replace(pattern, ' ');
+  return out;
+}
+
+/**
+ * A token that could still carry personal or secret content once the
+ * structured spans above are gone: what remains distinguishing is length and
+ * digit density. Intent words ("calendar", "tomorrow", "q3") pass.
  */
 function tokenLooksSensitive(token: string): boolean {
   const digits = (token.match(/[0-9]/g) ?? []).length;
@@ -76,7 +96,7 @@ function tokenLooksSensitive(token: string): boolean {
  * past the cap are dropped, so an alias can never become a copy of the message.
  */
 export function boundedAliasTerms(text: string): string[] {
-  return [...new Set((normalizeAcceptedPhrase(text).match(/[a-z0-9]+/g) ?? [])
+  return [...new Set((normalizeAcceptedPhrase(stripSensitiveSpans(text)).match(/[a-z0-9]+/g) ?? [])
     .filter((token) => token.length > 2
       && token.length <= MAX_TERM_LENGTH
       && !ALIAS_STOPWORDS.has(token)
