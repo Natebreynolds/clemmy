@@ -242,6 +242,23 @@ would break forward-only), and the live measured cohorts
 (docs/READ-LANE-CANARY-PLAN.md is the opt-in plan; percentiles stay
 uncertified until it runs).
 
+**v3.8.0 final integration (branch codex/v3.8.0-final-integration).** All 38
+independently reproduced findings carry biting regressions and fixed results
+(docs/releases/v3.8.0-final-integration-evidence.md). Honest reachability at
+this SHA: the generic read lane HAS one shared production caller before the
+brain split (respond-bridge), serving verified warm reads on both brains and
+committing through the existing exactly-once TurnOutcome machinery; ordinary
+chat pays no extra model call, tool schema, or dispatch. `admitGraph` still
+has ZERO production callers and the admitted graph is NOT activated for
+effectful production — the workflow runner continues to use `runGraph` as a
+scheduling helper WITHOUT the new admitted journal/lease/resume ports, which
+is deliberate for this release. Chat fan-out dispatches through the durable
+manifest adapter over the mature background/workflow substrate; it is NOT
+graph-native worker siblings. UI migration (U2–U6) has not happened: the
+server projection now carries privacy-safe labels and lease-derived liveness,
+and the shared transport reducer exists, but console/desktop client reducers
+are unchanged in this candidate.
+
 **R1A independently closed (v3.8.0 Stage A).** An independent audit
 reproduced seven further replay-truth defects against `ee4b132e`; all seven
 are reproduced red and pinned green in `graph-replay-closeout.test.ts`:
