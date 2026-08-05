@@ -26,6 +26,11 @@
  */
 import type { ExecutableEdge, ExecutableGraph, ExecutableNode, NodeStatus } from './graph-executor.js';
 
+/** The journal contract revision — minted into every admission digest; see
+ *  graph-admission.ts for the version history. Re-exported here because the
+ *  journal is the contract the version names. */
+export { GRAPH_JOURNAL_SCHEMA_VERSION } from './graph-admission.js';
+
 /** Why a non-completed settlement happened, for retry policy OUTSIDE the walker. */
 export type SettlementClass =
   /** The node ran and its own logic failed — routes failure edges. */
@@ -66,9 +71,20 @@ export interface NodeSettledEntry {
    * once from the live outcome and persisted with the awaited settlement.
    * Live scheduling and replay both consume these IDs — durable history, not
    * today's closure, decides what fired. Empty is a verdict too: a blocked,
-   * paused, or non-node-class settlement fires nothing.
+   * paused, or non-node-class settlement fires nothing. Completeness is part
+   * of the contract: a completion must record every enabled built-in success
+   * route and a node-class failure every enabled failure route — an omitted
+   * route is silently deleted work, refused on replay.
    */
   firedEdgeIds: string[];
+  /**
+   * Present iff THIS completed settlement admitted or exactly reconciled a
+   * patch: that patch's digest. The only promotion proof replay accepts — an
+   * orphan patch (durable admission, emitter crashed before settling) becomes
+   * real solely through a settlement carrying its exact digest, never through
+   * an ordinary later completion of the same node.
+   */
+  emittedPatchDigest?: string;
 }
 
 export interface PatchAdmittedEntry {

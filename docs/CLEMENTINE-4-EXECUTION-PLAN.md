@@ -219,6 +219,23 @@ refused) were reproduced red against `f2f34778` and are pinned green in
 `graph-resume.test.ts`. Still zero production callers of `admitGraph` — R1A
 is correctness, not activation.
 
+**R1A independently closed (v3.8.0 Stage A).** An independent audit
+reproduced seven further replay-truth defects against `ee4b132e`; all seven
+are reproduced red and pinned green in `graph-replay-closeout.test.ts`:
+A1 the runtime graph is digest-bound to the admission (zero appends, zero
+runner calls on mismatch); A2 built-in route completeness (a settlement
+cannot silently delete its success or failure routes; opaque labels stay
+optional); A3 ordered readiness (a start must have been ready given only the
+journal prefix — a future route cannot authorize a past start); A4 patch
+promotion requires a settlement carrying the exact `emittedPatchDigest`, a
+completion that ignores its durable orphan refuses, and historical
+reconciliation never re-consults today's patch admitter; A5 every unique
+durable patch admission debits one expansion, applied or orphaned; A6
+admitted attempt identity is injected and collision-checked (the default
+counter is pure-walker only); A7 journaled digests must match the admitted
+definition at their journal position. The journal contract is version 3,
+folded into the admission digest, so pre-version history refuses wholesale.
+
 Still open for R1B before any admitted production caller: semantic
 runner/adapter and node-definition identity beyond id/kind; root/admitted
 input digest; authority, policy, catalog, schema, account, and root-scope

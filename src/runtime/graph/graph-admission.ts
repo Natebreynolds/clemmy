@@ -18,6 +18,19 @@ import { createHash } from 'node:crypto';
 import type { ExecutableEdge, ExecutableGraph, ExecutableNode } from './graph-executor.js';
 
 /**
+ * The journal contract revision this admission mints identity for. Folded
+ * into the admission digest, so history written under an older contract
+ * carries an older admission identity and refuses wholesale — pre-version
+ * journals are a different run, never a migration target. Lives here (and is
+ * re-exported by graph-journal) so admission stays a crypto-only module.
+ *
+ * v3: settlements carry durable fired-edge verdicts with route COMPLETENESS
+ * plus `emittedPatchDigest` promotion proof; starts are readiness-checked at
+ * their journal position; patch admissions debit expansions even orphaned.
+ */
+export const GRAPH_JOURNAL_SCHEMA_VERSION = 3;
+
+/**
  * Every ceiling an admitted run carries. All finite — an admitted production
  * run with an infinite budget is the "runaway loop with no exit" defect the
  * charter forbids. A legitimate long task does not get a bigger infinity; it
@@ -36,6 +49,9 @@ export interface AdmittedBudget {
 export interface GraphAdmission {
   /** Digest over everything below — the run's identity. */
   admissionDigest: string;
+  /** The journal contract this run writes and replays. Part of the digest, so
+   *  history from an older contract is a different run and refuses wholesale. */
+  journalSchemaVersion: number;
   graphDigest: string;
   compilerVersion: string;
   /** Immutable policy snapshot hash. Opaque here; owned by the admission boundary. */
@@ -150,6 +166,7 @@ export function admitGraph(input: {
     maxExpansions: Math.floor(input.budget.maxExpansions),
   };
   const admissionDigest = sha256(JSON.stringify({
+    journalSchemaVersion: GRAPH_JOURNAL_SCHEMA_VERSION,
     graphDigest,
     compilerVersion: input.compilerVersion,
     policyHash: input.policyHash,
@@ -160,6 +177,7 @@ export function admitGraph(input: {
     ok: true,
     admission: {
       admissionDigest,
+      journalSchemaVersion: GRAPH_JOURNAL_SCHEMA_VERSION,
       graphDigest,
       compilerVersion: input.compilerVersion,
       policyHash: input.policyHash,

@@ -353,12 +353,14 @@ test('E: an orphan patch cannot make children eligible, and their history refuse
     'orphan topology leaked into the resumed graph');
   assert.equal(resume.orphanPatchByEmitter.get('planner'), patchDigestFor(PATCH_GRAPH));
   assert.deepEqual(resume.appliedPatchDigests, [], 'an orphan counted against the expansion history');
-  // A child claiming history under an orphan patch: impossible.
+  // A child claiming history under an orphan patch: impossible. (Since the
+  // Stage A closeout this bites at the earliest possible check — the child's
+  // start was never READY, because the orphan's routes never fired.)
   refuses(
     [started!, patchEntry(), ...pair({
       node: W1, attemptId: 't-w1', wave: 1, admission: PATCH_ADMISSION,
     })],
-    /orphan|never durably completed/, PATCH_GRAPH, PATCH_ADMISSION,
+    /orphan|never durably completed|not ready at its journal position/, PATCH_GRAPH, PATCH_ADMISSION,
   );
 });
 
@@ -432,7 +434,7 @@ test('closure: the equivalent incomplete all-join refuses precisely', () => {
   refuses(forkEntries(admission, allJoin), /all-join is missing/, allJoin, admission);
 });
 
-test('closure: a settled node with no durably fired route at all refuses', () => {
+test('closure: a settled node with no durably fired route refuses — at the earliest check that sees it', () => {
   const admission = admitted(FORK);
   refuses(
     [
@@ -446,7 +448,10 @@ test('closure: a settled node with no durably fired route at all refuses', () =>
         admission,
       }),
     ],
-    /not causally closed/, FORK, admission,
+    // Since the Stage A closeout, route-completeness (A2) and ordered
+    // readiness (A3) catch this before final closure; closure remains as
+    // defense-in-depth behind them.
+    /omits enabled success route|not ready at its journal position|not causally closed/, FORK, admission,
   );
 });
 

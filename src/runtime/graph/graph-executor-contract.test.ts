@@ -69,6 +69,12 @@ function completingRunner(sequence: string[], outcomes: Record<string, NodeOutco
 
 const CLOCK = () => 1_000; // frozen injected time; the executor never reads one
 
+/** A6: admitted attempt identity is injected, never the default counter. */
+function attempts(prefix = 'at'): () => string {
+  let n = 0;
+  return () => `${prefix}-${(n += 1)}`;
+}
+
 // ── durability ordering ──────────────────────────────────────────────────────
 
 test('the durable claim precedes dispatch, and settlement precedes dependents', async () => {
@@ -78,6 +84,7 @@ test('the durable claim precedes dispatch, and settlement precedes dependents', 
     admission: admitted(),
     journalAdapter: adapter,
     clock: CLOCK,
+    attemptIds: attempts(),
   });
   assert.equal(result.status, 'completed');
   assert.deepEqual(sequence, [
@@ -96,6 +103,7 @@ test('a failed settle append halts the run — dependents never advance past it'
     admission: admitted(),
     journalAdapter: adapter,
     clock: CLOCK,
+    attemptIds: attempts(),
   });
   assert.equal(result.status, 'halted');
   assert.match(result.haltReason ?? '', /settling "b"/);
@@ -112,6 +120,7 @@ test('a failed claim append halts BEFORE the runner is invoked', async () => {
     admission: admitted(),
     journalAdapter: adapter,
     clock: CLOCK,
+    attemptIds: attempts(),
   });
   assert.equal(result.status, 'halted');
   assert.equal(sequence.includes('run:b'), false,
@@ -155,6 +164,7 @@ test('a reused node restores its artifact refs at zero dispatch cost', async () 
     admission,
     journalAdapter: adapter,
     clock: CLOCK,
+    attemptIds: attempts(),
     resumeEntries: settledPair(admission, 'a', {
       outputRef: 'art-a', evidenceRefs: ['ev-a'], firedEdgeIds: ['e1'],
     }),
@@ -167,21 +177,28 @@ test('a reused node restores its artifact refs at zero dispatch cost', async () 
   assert.equal(result.trace.find((t) => t.nodeId === 'a')?.reused, true);
 });
 
-test('a changed node definition refuses reuse — same id, different work', async () => {
-  const admission = admitted();
+test('a changed node definition is a different graph — the admission refuses it wholesale', async () => {
+  // Pre-closeout this scenario "refused reuse" and reran the node. Under the
+  // A1/A7 contract it cannot even start: a changed definition changes the
+  // graph digest, so the admission no longer describes this graph (A1); and a
+  // journaled pair carrying a digest the admitted topology never contained is
+  // forged history (A7), pinned in graph-replay-closeout.test.ts.
+  const changed: ExecutableGraph = {
+    ...CHAIN,
+    nodes: CHAIN.nodes.map((node) => (node.id === 'a' ? { id: 'a', kind: 'step-v2' } : node)),
+  };
+  const admission = admitted(); // admits CHAIN, not `changed`
   const { adapter, sequence } = memoryAdapter();
-  const result = await runGraph(CHAIN, {
+  const result = await runGraph(changed, {
     runner: completingRunner(sequence),
     admission,
     journalAdapter: adapter,
     clock: CLOCK,
-    resumeEntries: settledPair(admission, 'a', {
-      nodeDigest: 'digest-of-an-older-definition', firedEdgeIds: ['e1'],
-    }),
+    attemptIds: attempts(),
   });
-  assert.equal(result.status, 'completed');
-  assert.equal(sequence.includes('run:a'), true,
-    'a settlement whose node digest does not match the current definition was reused');
+  assert.equal(result.status, 'halted');
+  assert.match(result.haltReason ?? '', /does not match the admitted graph/);
+  assert.deepEqual(sequence, [], 'work ran under an admission that never admitted this graph');
 });
 
 test('a journal from another admission refuses the whole resume', async () => {
@@ -192,6 +209,7 @@ test('a journal from another admission refuses the whole resume', async () => {
     admission,
     journalAdapter: adapter,
     clock: CLOCK,
+    attemptIds: attempts(),
     resumeEntries: settledPair(admission, 'a')
       .map((entry) => ({ ...entry, admissionDigest: 'someone-elses-run' })),
   });
@@ -205,6 +223,7 @@ test('an admitted run refuses the node-id journal and missing ports', async () =
 
   const idJournal = await runGraph(CHAIN, {
     runner: completingRunner([]), admission, journalAdapter: adapter, clock: CLOCK,
+    attemptIds: attempts(),
     journal: ['a'],
   });
   assert.equal(idJournal.status, 'halted', 'node-id reuse identity was accepted under admission');
@@ -216,6 +235,12 @@ test('an admitted run refuses the node-id journal and missing ports', async () =
   const noClock = await runGraph(CHAIN, { runner: completingRunner([]), admission, journalAdapter: adapter });
   assert.equal(noClock.status, 'halted');
   assert.match(noClock.haltReason ?? '', /clock/);
+
+  const noAttempts = await runGraph(CHAIN, {
+    runner: completingRunner([]), admission, journalAdapter: adapter, clock: CLOCK,
+  });
+  assert.equal(noAttempts.status, 'halted');
+  assert.match(noAttempts.haltReason ?? '', /attempt-id source/);
 });
 
 // ── outcome semantics ────────────────────────────────────────────────────────
@@ -290,6 +315,7 @@ test('elapsed time is measured by the injected clock, never observed', async () 
     admission: admitted(CHAIN, { ...BUDGET, maxElapsedMs: 50_000 }),
     journalAdapter: memoryAdapter().adapter,
     clock: () => now,
+    attemptIds: attempts(),
   });
   assert.equal(result.status, 'budget_exhausted');
   // The ceiling parks at the next wave boundary: `b` was dispatched at 40s
@@ -363,6 +389,7 @@ test('the journal alone reconstructs the run: claims, settlements, refs, classes
     admission,
     journalAdapter: adapter,
     clock: CLOCK,
+    attemptIds: attempts(),
   });
   const started = entries.filter((entry) => entry.type === 'node_started');
   const settledEntries = entries.filter((entry) => entry.type === 'node_settled');
@@ -370,7 +397,7 @@ test('the journal alone reconstructs the run: claims, settlements, refs, classes
   assert.equal(settledEntries.length, 3);
   for (const entry of settledEntries) {
     assert.equal(entry.admissionDigest, admission.admissionDigest);
-    assert.match(entry.attemptId, /^attempt-\d+$/);
+    assert.match(entry.attemptId, /^at-\d+$/);
   }
   const settledC = settledEntries.find((entry) => entry.type === 'node_settled' && entry.nodeId === 'c');
   assert.equal(settledC?.type === 'node_settled' && settledC.status, 'failed');

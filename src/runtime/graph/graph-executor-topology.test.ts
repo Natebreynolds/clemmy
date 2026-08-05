@@ -85,6 +85,12 @@ function planningRunner(sequence: string[], count: number): NodeRunner {
 const CLOCK = () => 0;
 const ALLOW_ALL = () => ({ ok: true as const });
 
+/** A6: admitted attempt identity is injected, never the default counter. */
+function attempts(prefix: string): () => string {
+  let n = 0;
+  return () => `${prefix}-${(n += 1)}`;
+}
+
 // ── the fan-out the goal describes ──────────────────────────────────────────
 
 test('a planner emits per-item siblings and a reducer joins them', async () => {
@@ -95,6 +101,7 @@ test('a planner emits per-item siblings and a reducer joins them', async () => {
     journalAdapter: adapter,
     clock: CLOCK,
     patchAdmitter: ALLOW_ALL,
+    attemptIds: attempts('fan'),
   });
   assert.equal(result.status, 'completed');
   assert.equal(result.completed.length, 2 + 12 + 1, 'not every emitted node ran');
@@ -118,6 +125,7 @@ test('the patch is durable BEFORE any child starts', async () => {
     journalAdapter: adapter,
     clock: CLOCK,
     patchAdmitter: ALLOW_ALL,
+    attemptIds: attempts('durable'),
   });
   const patchAt = sequence.indexOf('journal:patch_admitted:planner');
   const firstChildStart = sequence.findIndex((s) => s.startsWith('journal:node_started:item-'));
@@ -133,6 +141,7 @@ test('a failed patch append halts before any child exists', async () => {
     journalAdapter: adapter,
     clock: CLOCK,
     patchAdmitter: ALLOW_ALL,
+    attemptIds: attempts('crash'),
   });
   assert.equal(result.status, 'halted');
   assert.equal(sequence.some((s) => s.includes('item-')), false,
@@ -185,6 +194,7 @@ test('the expansion budget debits, and exhaustion refuses further growth', async
     journalAdapter: memoryAdapter().adapter,
     clock: CLOCK,
     patchAdmitter: ALLOW_ALL,
+    attemptIds: attempts('greedy'),
   });
   assert.equal(result.patches.length, 1, 'the expansion budget did not debit');
   assert.deepEqual(result.failed, ['p2'], 'a beyond-budget emission did not fail its emitter');
@@ -202,6 +212,7 @@ test('the injected admitter can veto — authority is not the executor to decide
     journalAdapter: adapter,
     clock: CLOCK,
     patchAdmitter: () => ({ ok: false, reason: 'workers would widen the write class' }),
+    attemptIds: attempts('veto'),
   });
   assert.deepEqual(result.failed, ['planner']);
   assert.equal(entries.some((entry) => entry.type === 'patch_admitted'), false,
@@ -214,6 +225,7 @@ test('an admitted run that allows expansions must supply an admitter', async () 
     admission: admitted(),
     journalAdapter: memoryAdapter().adapter,
     clock: CLOCK,
+    attemptIds: attempts('noadm'),
     // no patchAdmitter
   });
   assert.equal(result.status, 'halted');
@@ -234,6 +246,7 @@ test('resume replays the patch and reuses completed children', async () => {
     journalAdapter: first.adapter,
     clock: CLOCK,
     patchAdmitter: ALLOW_ALL,
+    attemptIds: attempts('run1'),
   });
   assert.equal(firstRun.status, 'halted');
 
@@ -245,6 +258,7 @@ test('resume replays the patch and reuses completed children', async () => {
     journalAdapter: second.adapter,
     clock: CLOCK,
     patchAdmitter: ALLOW_ALL,
+    attemptIds: attempts('run2'),
     resumeEntries: first.entries,
   });
   assert.equal(resumed.status, 'completed', resumed.haltReason ?? '');
@@ -265,6 +279,7 @@ test('a tampered journaled patch refuses resume', async () => {
     journalAdapter: store.adapter,
     clock: CLOCK,
     patchAdmitter: ALLOW_ALL,
+    attemptIds: attempts('base'),
   });
   const tampered = store.entries.map((entry) => (
     entry.type === 'patch_admitted'
@@ -277,6 +292,7 @@ test('a tampered journaled patch refuses resume', async () => {
     journalAdapter: memoryAdapter().adapter,
     clock: CLOCK,
     patchAdmitter: ALLOW_ALL,
+    attemptIds: attempts('tamper'),
     resumeEntries: tampered,
   });
   assert.equal(resumed.status, 'halted', 'tampered patch content was replayed');
@@ -293,6 +309,7 @@ test('a 1,000-item fan-out runs under bounded concurrency', async () => {
     journalAdapter: adapter,
     clock: CLOCK,
     patchAdmitter: ALLOW_ALL,
+    attemptIds: attempts('scale'),
   });
   assert.equal(result.status, 'completed', result.haltReason ?? result.stalledDetail ?? '');
   assert.equal(result.completed.length, 2 + 1_000 + 1,

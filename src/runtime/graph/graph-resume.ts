@@ -23,8 +23,9 @@
  * cannot be decided from the journal alone, because it depends on what this
  * run's predecessors actually produce.
  */
-import { validateGraphPatch } from './graph-admission.js';
+import { computeGraphDigest, computeNodeDigest, validateGraphPatch } from './graph-admission.js';
 import type { GraphAdmission } from './graph-admission.js';
+import type { NodeOutcome } from './graph-executor.js';
 import type {
   GraphJournalEntry,
   NodeSettledEntry,
@@ -57,6 +58,12 @@ export interface ResumeReconstruction {
    * not create two child graphs.
    */
   orphanPatchByEmitter: Map<string, string>;
+  /** Expansion units the journal has durably consumed: one per unique patch
+   *  admission, applied or orphaned. An orphan's debit survives the crash. */
+  expansionsDebited: number;
+  /** Every attempt id the journal has claimed — a resumed activation must
+   *  never mint one of these again. */
+  usedAttemptIds: Set<string>;
 }
 
 export interface ResumeRefusal {
@@ -90,6 +97,7 @@ export function reconstructAdmittedResume(
   const nodes: ExecutableNode[] = [...graph.nodes];
   const edges: ExecutableEdge[] = [...graph.edges];
   const nodeIds = new Set(nodes.map((node) => node.id));
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const edgeById = new Map(edges.map((edge) => [edge.id, edge]));
 
   const starts = new Map<string, { entry: NodeStartedEntry; index: number }>();
@@ -101,6 +109,11 @@ export function reconstructAdmittedResume(
   const patches: PatchRecord[] = [];
   const patchDigests = new Set<string>();
   const patchByEmitterAttempt = new Map<string, string>();
+  /** Patch digests a completed settlement has durably proven (emitted or
+   *  exactly reconciled) — the ONLY promotion authority replay accepts. */
+  const provenPatchDigests = new Set<string>();
+  /** Trusted completions in order, for detecting an ignored orphan patch. */
+  const trustedCompletions: Array<{ nodeId: string; index: number; emittedPatchDigest?: string }> = [];
 
   entries.forEach((entry, index) => {
     if (entry.admissionDigest !== admission.admissionDigest) {
@@ -113,13 +126,35 @@ export function reconstructAdmittedResume(
         errors.push(`start of "${entry.nodeId}" has no attempt id`);
         return;
       }
-      if (!nodeIds.has(entry.nodeId)) {
+      const def = nodeById.get(entry.nodeId);
+      if (!def) {
         errors.push(`start of "${entry.nodeId}" names a node the topology did not contain at that position — an order the executor cannot produce`);
         return;
       }
       if (starts.has(entry.attemptId)) {
         errors.push(`attempt "${entry.attemptId}" was started twice — duplicate durable claims are refused, not collapsed`);
         return;
+      }
+      // A7: identity is the admitted definition, not internal agreement. A
+      // forged pair whose digest never described this topology authorizes
+      // nothing — not routing, not reuse, not patch causality.
+      if (entry.nodeDigest !== computeNodeDigest(def)) {
+        errors.push(`start of "${entry.nodeId}" carries node digest ${entry.nodeDigest.slice(0, 12)}…, which does not match the definition at that journal position`);
+        return;
+      }
+      // A3: journal order IS causality. The node must have been ready given
+      // only the durable route evidence in the journal prefix — a future
+      // route cannot authorize a past start.
+      const structuralIn = edges.filter((edge) => edge.target === entry.nodeId);
+      if (structuralIn.length > 0) {
+        const enabledIn = structuralIn.filter((edge) => !edge.disabled);
+        const ready = enabledIn.length > 0 && (def.joinMode === 'any'
+          ? enabledIn.some((edge) => allFired.has(edge.id))
+          : enabledIn.every((edge) => allFired.has(edge.id)));
+        if (!ready) {
+          errors.push(`start of "${entry.nodeId}" (attempt ${entry.attemptId}) was not ready at its journal position (its ${def.joinMode === 'any' ? 'any-join has no' : 'all-join is missing a'} durably fired incoming edge) — a future route cannot authorize a past start`);
+          return;
+        }
       }
       starts.set(entry.attemptId, { entry, index });
       return;
@@ -188,10 +223,41 @@ export function reconstructAdmittedResume(
           return;
         }
       }
+      // A2: built-in route completeness. A completion must fire every enabled
+      // success route that existed at this position, a node-class failure
+      // every failure route — an omitted route is silently deleted work.
+      if (routes) {
+        const requiredWhen = entry.status === 'completed' ? 'success' : 'failure';
+        for (const edge of edges) {
+          if (edge.disabled || edge.source !== entry.nodeId) continue;
+          if ((edge.when ?? 'success') !== requiredWhen) continue;
+          if (!seen.has(edge.id)) {
+            errors.push(`${entry.status} settlement of "${entry.nodeId}" omits enabled ${requiredWhen} route "${edge.id}" — a settlement cannot silently delete work`);
+            return;
+          }
+        }
+      }
+      // A4: a settlement may claim patch emission only for a patch this
+      // journal durably admitted, by this node, at an earlier position.
+      if (entry.emittedPatchDigest !== undefined) {
+        if (entry.status !== 'completed') {
+          errors.push(`settlement of "${entry.nodeId}" is ${entry.status} yet claims an emitted patch — only a completion emits topology`);
+          return;
+        }
+        const claimed = patches.find((patch) => patch.entry.patchDigest === entry.emittedPatchDigest);
+        if (!claimed || claimed.entry.emittedBy !== entry.nodeId) {
+          errors.push(`settlement of "${entry.nodeId}" claims patch ${entry.emittedPatchDigest.slice(0, 12)}…, which this journal never admitted for it`);
+          return;
+        }
+        provenPatchDigests.add(entry.emittedPatchDigest);
+      }
       settledAttempts.add(entry.attemptId);
       settledNodes.add(entry.nodeId);
       for (const edgeId of entry.firedEdgeIds) allFired.add(edgeId);
       if (routes) latestTrusted.set(entry.nodeId, { entry, index });
+      if (entry.status === 'completed') {
+        trustedCompletions.push({ nodeId: entry.nodeId, index, emittedPatchDigest: entry.emittedPatchDigest });
+      }
       return;
     }
 
@@ -252,7 +318,7 @@ export function reconstructAdmittedResume(
       }
       nodes.push(...entry.nodes);
       edges.push(...entry.edges);
-      for (const node of entry.nodes) nodeIds.add(node.id);
+      for (const node of entry.nodes) { nodeIds.add(node.id); nodeById.set(node.id, node); }
       for (const edge of entry.edges) edgeById.set(edge.id, edge);
       patches.push({
         entry,
@@ -270,21 +336,33 @@ export function reconstructAdmittedResume(
 
   if (errors.length > 0) return { ok: false, errors };
 
-  // ── orphan patches ─────────────────────────────────────────────────────────
-  // A patch is REAL only when its emitter reached a durable completed
-  // settlement after the patch was admitted (the emitting attempt itself, or a
-  // later attempt that re-emitted the identical digest without re-journaling).
-  // An orphan's topology is withheld: no child may run merely because the
-  // patch entry survived the crash.
+  // ── expansion debit ────────────────────────────────────────────────────────
+  // A5: every unique durable patch admission consumed one expansion unit when
+  // it was journaled, whether it was later applied or orphaned. A history with
+  // more admissions than the sealed budget is not this admission's history.
+  if (patchDigests.size > admission.budget.maxExpansions) {
+    errors.push(`journal admits ${patchDigests.size} patches but the admission allows ${admission.budget.maxExpansions} expansions — not this admission's history`);
+    return { ok: false, errors };
+  }
+
+  // ── orphan patches and promotion proof ─────────────────────────────────────
+  // A4: a patch is REAL only when a completed settlement of its emitter, at a
+  // later position, carries its exact digest — the original emitting attempt
+  // or an exact reconciliation. An ordinary later completion proves nothing,
+  // and a completion that IGNORED its durable orphan patch is a history the
+  // fixed executor refuses to write.
   const orphanPatchByEmitter = new Map<string, string>();
   const applied: PatchRecord[] = [];
   for (const patch of patches) {
-    const emitter = latestTrusted.get(patch.entry.emittedBy);
-    const isReal = emitter !== undefined
-      && emitter.entry.status === 'completed'
-      && emitter.index > patch.index;
-    if (isReal) {
+    if (provenPatchDigests.has(patch.entry.patchDigest)) {
       applied.push(patch);
+      continue;
+    }
+    const ignoringCompletion = trustedCompletions.find(
+      (completion) => completion.nodeId === patch.entry.emittedBy && completion.index > patch.index,
+    );
+    if (ignoringCompletion) {
+      errors.push(`completion of "${patch.entry.emittedBy}" ignored its durable orphan patch ${patch.entry.patchDigest.slice(0, 12)}… — a completion must reproduce the exact digest or refuse`);
       continue;
     }
     for (const { entry: start } of starts.values()) {
@@ -303,11 +381,6 @@ export function reconstructAdmittedResume(
     orphanPatchByEmitter.set(patch.entry.emittedBy, patch.entry.patchDigest);
   }
   if (errors.length > 0) return { ok: false, errors };
-
-  if (applied.length > admission.budget.maxExpansions) {
-    errors.push(`journal applies ${applied.length} patches but the admission allows ${admission.budget.maxExpansions} — not this admission's history`);
-    return { ok: false, errors };
-  }
 
   const orphanNodeIds = new Set<string>();
   const orphanEdgeIds = new Set<string>();
@@ -355,5 +428,66 @@ export function reconstructAdmittedResume(
     appliedPatchDigests: applied.map((patch) => patch.entry.patchDigest),
     journaledPatchDigests: patchDigests,
     orphanPatchByEmitter,
+    expansionsDebited: patchDigests.size,
+    usedAttemptIds: new Set(starts.keys()),
   };
+}
+
+/**
+ * The reuse decision for one trusted settlement, made at READINESS when the
+ * resumed run's current input digest is known. Reuse demands exact identity —
+ * the admitted definition and the current inputs — and rebuilds the outcome
+ * from durable history alone. Anything less exact is a refusal whose reason
+ * travels the trace in digest prefixes, never payload bytes.
+ */
+export function decideTrustedReuse(
+  journaled: NodeSettledEntry,
+  node: { id: string; kind: string; joinMode?: 'all' | 'any' },
+  currentInputDigest: string,
+): { reuse: NodeOutcome } | { refusal: string } {
+  if (journaled.nodeDigest !== computeNodeDigest(node)) {
+    return { refusal: 'node definition digest changed — same id, different work' };
+  }
+  if (currentInputDigest !== journaled.inputDigest) {
+    return { refusal: `current input digest ${currentInputDigest.slice(0, 12)}… does not match journaled ${journaled.inputDigest.slice(0, 12)}…` };
+  }
+  return {
+    reuse: journaled.status === 'completed'
+      ? { status: 'completed', outputRef: journaled.outputRef, evidenceRefs: journaled.evidenceRefs }
+      : { status: 'failed', reason: journaled.reason ?? 'failed', settlementClass: 'node' },
+  };
+}
+
+/**
+ * The admitted-mode precondition: what must be true and injected BEFORE an
+ * admitted run reads history, appends a claim, or dispatches a runner. The
+ * runtime graph must BE the admitted graph; durability, time, attempt
+ * identity, and (when growth is allowed) patch authority must be injected.
+ * Returns the typed refusal, or undefined when the run may proceed.
+ */
+export function admittedRunPrecondition(
+  graph: ExecutableGraph,
+  admission: GraphAdmission,
+  ports: {
+    journalAdapter: boolean;
+    clock: boolean;
+    nodeIdJournal: boolean;
+    attemptIds: boolean;
+    patchAdmitter: boolean;
+  },
+): string | undefined {
+  if (computeGraphDigest(graph) !== admission.graphDigest) {
+    return 'admitted run refuses this graph: its digest does not match the admitted graph';
+  }
+  if (!ports.journalAdapter) return 'admitted run requires a journal adapter';
+  if (!ports.clock) return 'admitted run requires a clock (a ceiling needs one)';
+  if (ports.nodeIdJournal) return 'admitted run refuses a node-id journal; supply resumeEntries';
+  // The default counter restarts every activation and rewrites journaled
+  // attempt identity on resume — admitted attempt ids are injected.
+  if (!ports.attemptIds) return 'admitted run requires an injected attempt-id source';
+  if (admission.budget.maxExpansions > 0 && !ports.patchAdmitter) {
+    // Fail closed: a run allowed to grow must have an authority judge.
+    return 'admitted run allows expansions but has no patch admitter';
+  }
+  return undefined;
 }
