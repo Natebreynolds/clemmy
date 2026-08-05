@@ -33,6 +33,7 @@ const jit = await import('../../agents/tool-jit.js');
 const mcpScope = await import('../mcp-tool-scope.js');
 const toolChoice = await import('../../memory/tool-choice-store.js');
 const eventlog = await import('../harness/eventlog.js');
+const candidates = await import('./capability-candidates.js');
 
 const CALENDAR_SLUG = 'SCHEDULERCO_LIST_EVENTS';
 const COLD_PHRASE = "What's on my calendar tomorrow?";
@@ -93,20 +94,41 @@ test('A1: one verified governed read teaches memory the exact capability for thi
 
 // ─── A2: the paraphrase RETRIEVES the capability (advisory, not authority) ───
 
-test('A2: a natural paraphrase retrieves the learned capability into the real JIT/MCP surfaces', async () => {
+test('A2: a natural paraphrase retrieves the learned capability into the real JIT surface', async () => {
   const sessionId = 'sess-a2-home';
   acceptSource(sessionId, COLD_PHRASE);
   await governedRead(sessionId, { timeMin: '2026-08-06', timeMax: '2026-08-07' });
 
-  // The REAL built-in JIT recall seam.
-  const pinnedBuiltins = jit.recallPinnedBuiltinTools(PARAPHRASE);
-  // The REAL MCP scope recall seam.
-  const scope = mcpScope.resolveMcpToolScopeWithRecall({ userInput: PARAPHRASE });
-  const scopeNames = scope.allowAll ? [CALENDAR_SLUG] : [...(scope.allowedNames ?? [])];
+  // The paraphrase shares ONE token with what the user actually said and names
+  // neither the provider nor the operation. Lexical retrieval cannot bridge it.
+  const lexicalOnly = toolChoice.matchToolChoicesForStep(PARAPHRASE, { limit: 5 });
+  assert.equal(lexicalOnly.some((m) => m.identifier === CALENDAR_SLUG), false,
+    'this test no longer proves the semantic tier — the paraphrase now matches lexically');
 
-  const retrieved = pinnedBuiltins.includes(CALENDAR_SLUG) || scopeNames.includes(CALENDAR_SLUG);
-  assert.equal(retrieved, true,
-    'the paraphrase retrieved no candidate — the learned capability is not reachable from the brain surface on a later turn');
+  assert.equal(await candidates.warmCapabilityRetrieval(), true,
+    'the bundled local retrieval model did not load — semantic candidates are unavailable');
+  const resolved = await candidates.resolveTurnCapabilityCandidates({ userInput: PARAPHRASE });
+  assert.equal(resolved.semanticApplied, true, 'the semantic tier did not run for this turn');
+  assert.ok(resolved.candidates.some((c) => c.identifier === CALENDAR_SLUG && c.via === 'semantic'),
+    'the paraphrase retrieved no candidate — the learned capability is not reachable on a later turn');
+
+  // Reachability is the point: the carrier must survive JIT pruning so the
+  // brain can actually call what retrieval surfaced.
+  const surface = [
+    { name: 'composio_execute_tool', description: 'execute a connected app tool' },
+    ...Array.from({ length: 40 }, (_, i) => ({ name: `filler_tool_${i}`, description: 'unrelated' })),
+  ];
+  const selection = await jit.selectToolsForTurn({
+    userInput: PARAPHRASE, tools: surface, recallPinned: resolved.pinnedTools,
+  });
+  assert.equal(selection.exposed.has('composio_execute_tool'), true,
+    'the retrieved capability’s carrier was pruned from the turn — the brain cannot reach it');
+
+  // Retrieval is ADVISORY: it may not narrow what the brain is allowed to pick.
+  const scope = mcpScope.resolveMcpToolScopeWithRecall({
+    userInput: PARAPHRASE, learnedMatches: resolved.matches,
+  });
+  assert.notEqual(scope.maxTools, 0, 'a retrieved candidate closed the connector surface');
 });
 
 // ─── A3: the exact repeat is an exact alias hit ──────────────────────────────
@@ -168,4 +190,12 @@ test('A6: unrelated ordinary chat retrieves no candidate and adds no catalog wor
   const matches = toolChoice.matchToolChoicesForStep(unrelated, { limit: 5 });
   assert.equal(matches.some((match) => match.identifier === CALENDAR_SLUG), false,
     'an unrelated question matched the learned calendar capability');
+
+  // The semantic tier is the one that could over-reach, so it is checked WARM.
+  await candidates.warmCapabilityRetrieval();
+  const resolved = await candidates.resolveTurnCapabilityCandidates({ userInput: unrelated });
+  assert.equal(resolved.candidates.length, 0,
+    'ordinary chat retrieved a capability candidate — the semantic floor is too low');
+  assert.deepEqual(resolved.pinnedTools, [],
+    'ordinary chat pinned tool schemas it will never use');
 });

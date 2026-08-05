@@ -1,5 +1,6 @@
 import { readHarnessCapabilityHealth, recordHarnessCapabilityHealth } from '../runtime/harness/capability-health.js';
 import { hasActiveStructuralProcedureForIdentifier } from '../memory/procedure-receipts.js';
+import { learnVerifiedReadSettlement } from '../memory/verified-read-learning.js';
 import { createHash } from 'node:crypto';
 
 import {
@@ -1998,6 +1999,29 @@ async function runComposioExecute(
       // search entry — the fresh search query is the honest intent behind this execute.
       const executionIntent = executionIntentForSession(sid, toolSlug);
       maybeAutoRememberComposioChoice(toolSlug, args, result, sid, effectiveConnectionId);
+      // F3: learn from ONE verified successful top-level READ settlement even
+      // when no discovery search preceded it — the ordinary case the
+      // discovery-gated path above can never teach. Bound to the EXACT
+      // accepted source ({sessionId, sourceUserSeq}) from the run context, so
+      // a newer foreground message can never be credited for an older or
+      // background dispatch. Fail-closed and best-effort: learning must never
+      // affect the tool result.
+      try {
+        const runContext = harnessRunContextStorage.getStore();
+        if (sid) {
+          learnVerifiedReadSettlement({
+            identifier: toolSlug,
+            kind: 'composio',
+            result,
+            sessionId: sid,
+            // The run context's sequence is authoritative when this dispatch
+            // runs inside the accepted turn. Without it, the session's LIVE
+            // attempt row supplies its own durably bound source — still the
+            // exact accepted turn, and a finished attempt supplies nothing.
+            ...(runContext?.sessionId === sid ? { sourceUserSeq: runContext.sourceUserSeq } : {}),
+          });
+        }
+      } catch { /* learning never breaks a tool call */ }
 
       // PHASE 5: Record outcome for adaptive tool selection & learning
       const failure = detectComposioFailure(result);

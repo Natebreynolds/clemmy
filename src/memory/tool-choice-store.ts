@@ -6,6 +6,11 @@ import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
 import {
+  acceptedPhraseDigest,
+  lookupExactCapabilityAlias,
+  type CapabilityAliasScope,
+} from './capability-alias-index.js';
+import {
   blockingRefusal,
   describeProcedureValidity,
   validateStoredProcedure,
@@ -115,7 +120,17 @@ export interface ToolChoiceRecord {
 }
 
 export type ToolProcedureAliasStatus = 'active' | 'quarantined' | 'superseded';
-export type ToolProcedureAliasSource = 'manual' | 'composio_search' | 'native_mcp' | 'migration' | 'synthetic';
+export type ToolProcedureAliasSource =
+  | 'manual'
+  | 'composio_search'
+  | 'native_mcp'
+  | 'migration'
+  | 'synthetic'
+  /** F3: learned from ONE verified successful top-level READ settlement bound
+   *  to its exact accepted source. Retrieval-only trust: a `verified_read`
+   *  alias may surface a capability as a candidate, never authorize dispatch
+   *  or replay arguments. */
+  | 'verified_read';
 
 export interface ToolProcedureAlias {
   intent: string;
@@ -1516,9 +1531,12 @@ function preferredProcedureAlias(procedure: ToolProcedureRecord): ToolProcedureA
   const rank: Record<ToolProcedureAliasSource, number> = {
     manual: 0,
     composio_search: 1,
-    synthetic: 2,
-    migration: 3,
-    native_mcp: 4,
+    // A verified settlement is stronger evidence than a synthetic guess and
+    // weaker than an explicit human choice or a discovery-confirmed pick.
+    verified_read: 2,
+    synthetic: 3,
+    migration: 4,
+    native_mcp: 5,
   };
   const active = procedure.aliases.filter((alias) => alias.status === 'active');
   const nonWorkflow = active.filter((alias) => !alias.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
@@ -1850,6 +1868,8 @@ export interface StepToolChoiceMatch {
 
 export interface MatchToolChoicesOptions {
   limit?: number;
+  /** The privacy partition the exact-alias tier may read (default: unscoped). */
+  scope?: CapabilityAliasScope;
   /** Override the store read (tests). */
   choices?: ToolChoiceRecord[];
   /**
@@ -1992,12 +2012,44 @@ export function matchToolChoicesForStep(
     });
   }
 
+  // Exact accepted-source alias tier. Token gates ask "does this prompt name
+  // the tool?"; a real request usually does not ("what's on my calendar" never
+  // says SCHEDULERCO_LIST_EVENTS). A phrase that ALREADY settled successfully
+  // is its own evidence, so its proven capability is retrievable on repeat.
+  // Retrieval only: the hit is advisory, never auto-bindable, and carries no
+  // arguments — the brain still chooses, and the governed boundary still gates.
+  const aliasHit = lookupExactCapabilityAlias(acceptedPhraseDigest(promptText), { scope: opts.scope });
+  if (aliasHit && !out.some((m) => m.identifier === aliasHit.identifier)) {
+    const rec = records.find((r) => r.intent === aliasHit.intent
+      && r.choice?.identifier === aliasHit.identifier);
+    if (rec?.choice) {
+      out.push({
+        intent: rec.intent,
+        procedureId: rec.procedureId,
+        kind: rec.choice.kind,
+        identifier: rec.choice.identifier,
+        invocationTemplate: rec.choice.invocationTemplate,
+        score: EXACT_ALIAS_SCORE,
+        tier: 'medium',
+        matched: aliasHit.terms.filter((t) => prompt.has(t)),
+        alreadyBound: false,
+        autoBindable: false,
+        family: toolFamilyForChoice(rec.choice),
+        command: boundCommandForChoice(rec.choice),
+      });
+    }
+  }
+
   out.sort((a, b) => {
     if (Math.abs(b.score - a.score) > 0.08) return b.score - a.score;
     return choiceKindRank(a.kind) - choiceKindRank(b.kind);
   });
   return out.slice(0, limit);
 }
+
+/** An exact accepted-source repeat ranks with strong token matches, but below
+ *  a prompt that already embeds the command outright. */
+const EXACT_ALIAS_SCORE = 0.9;
 
 export interface RememberedComposioMatch {
   /** The remembered Composio slug (e.g. APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS). */

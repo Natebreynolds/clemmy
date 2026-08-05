@@ -1,0 +1,215 @@
+/**
+ * Verified-read learning (F1 + F3).
+ *
+ * The existing auto-remember seam only learns a capability when the model has
+ * just run a discovery search in the same session window. A cold turn where
+ * the brain already knew the slug — the ordinary case — teaches nothing, so a
+ * later paraphrase can retrieve nothing.
+ *
+ * This module closes that as a narrow, evidence-bound rule: ONE canonical
+ * successful top-level READ settlement teaches the capability and an
+ * accepted-source alias, through the EXISTING tool-choice/procedure store.
+ * Retrieval built on it stays advisory (the brain still chooses); nothing here
+ * authorizes dispatch, binds an account, or stores replayable arguments.
+ *
+ * Safety properties, each pinned by a black-box test:
+ *
+ *  - only a settled SUCCESS with real returned data learns — failures,
+ *    queued/async receipts, empty or unverified payloads never do;
+ *  - only READ-class effects learn; the sealed effect taxonomy decides, not a
+ *    verb list;
+ *  - the alias is bound to the EXACT accepted source ({sessionId,
+ *    sourceUserSeq}), never "the latest message", so a newer foreground turn
+ *    cannot be credited for an older/background tool call;
+ *  - the stored alias is privacy-bounded: a normalized digest for exact
+ *    repeats plus bounded distinctive terms, never unrestricted raw text;
+ *  - no concrete argument value is ever stored as replayable state, so a
+ *    resolved "tomorrow" date can never be replayed on a later turn.
+ */
+import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
+import {
+  getActiveRunAttempt,
+  getRunAttemptSourceUserEvent,
+  listEvents,
+} from '../runtime/harness/eventlog.js';
+import {
+  acceptedPhraseDigest,
+  boundedAliasTerms,
+  claimAcceptedSourceForLearning,
+  recordCapabilityAlias,
+  type CapabilityAliasScope,
+} from './capability-alias-index.js';
+import { rememberToolChoice, type ToolChoiceKind } from './tool-choice-store.js';
+
+/** The canonical procedure slug for a dispatchable identifier. */
+export function canonicalIntentSlug(identifier: string): string {
+  const parts = identifier.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (parts.length === 0) return '';
+  const provider = parts[0]!;
+  const operation = parts.slice(1).join('_') || 'operation';
+  return `${provider}.${operation}`.slice(0, 80);
+}
+
+/**
+ * Did this settlement return real, verified data? A success envelope with no
+ * payload, an async job receipt, or an error shape is not evidence.
+ */
+export function settlementCarriesVerifiedData(result: unknown): boolean {
+  if (!result || typeof result !== 'object') return false;
+  const record = result as Record<string, unknown>;
+  if (record.successful === false || record.error) return false;
+  const data = record.data ?? record.result ?? record.items;
+  if (data === null || data === undefined) return false;
+  if (typeof data === 'object') {
+    const inner = data as Record<string, unknown>;
+    // A queued receipt names a job, not an answer.
+    if (typeof inner.status === 'string' && /queued|pending|running/i.test(inner.status)) return false;
+    if (Array.isArray(data)) return data.length > 0;
+    return Object.keys(inner).length > 0;
+  }
+  return String(data).trim().length > 0;
+}
+
+function eventText(data: unknown): string | undefined {
+  const text = (data as { text?: unknown } | undefined)?.text;
+  return typeof text === 'string' && text.trim().length > 0 ? text.trim() : undefined;
+}
+
+export type AcceptedSource = { sourceUserSeq: number; phrase: string };
+
+/**
+ * The EXACT accepted source this settlement belongs to.
+ *
+ * When the caller knows the sequence (the harness run context carries it), that
+ * exact event is the only candidate. Otherwise the session's LIVE run attempt
+ * supplies it — the attempt row durably binds its own source_user_seq, so this
+ * is still the turn that was accepted, never "whatever message arrived last".
+ * A background call whose attempt has already finished resolves nothing and
+ * therefore learns nothing.
+ */
+export function resolveAcceptedSource(
+  sessionId: string,
+  sourceUserSeq?: number,
+): AcceptedSource | undefined {
+  if (!sessionId) return undefined;
+  try {
+    if (typeof sourceUserSeq === 'number') {
+      for (const event of listEvents(sessionId)) {
+        if (event.seq !== sourceUserSeq) continue;
+        if (event.type !== 'user_input_received') return undefined;
+        const phrase = eventText(event.data);
+        return phrase ? { sourceUserSeq, phrase } : undefined;
+      }
+      return undefined;
+    }
+    const attempt = getActiveRunAttempt(sessionId);
+    if (!attempt) return undefined;
+    const event = getRunAttemptSourceUserEvent(attempt);
+    if (!event) return undefined;
+    const phrase = eventText(event.data);
+    return phrase ? { sourceUserSeq: event.seq, phrase } : undefined;
+  } catch { /* fail closed: no accepted source, no alias */ }
+  return undefined;
+}
+
+/** Load the EXACT accepted phrase for {sessionId, sourceUserSeq}. */
+export function acceptedPhraseFor(sessionId: string, sourceUserSeq: number | undefined): string | undefined {
+  return resolveAcceptedSource(sessionId, sourceUserSeq)?.phrase;
+}
+
+export { acceptedPhraseDigest, boundedAliasTerms, normalizeAcceptedPhrase } from './capability-alias-index.js';
+
+export interface VerifiedReadLearningInput {
+  identifier: string;
+  kind: ToolChoiceKind;
+  result: unknown;
+  sessionId?: string;
+  /** The EXACT accepted user event this dispatch belongs to. */
+  sourceUserSeq?: number;
+  /** Stable logical account identity (never a rotating connection id). */
+  accountIdentity?: string;
+  schemaFingerprint?: string;
+  /** The privacy partition this alias may ever be retrieved from. */
+  scope?: CapabilityAliasScope;
+}
+
+export type LearningVerdict =
+  | { learned: true; intent: string; aliasDigest: string; klass: 'capability_only' }
+  | { learned: false; reason: string };
+
+/**
+ * Learn a capability + accepted-source alias from ONE verified successful
+ * top-level READ settlement. Everything about this is fail-closed: any
+ * missing evidence declines, and the class is always `capability_only` —
+ * promotion to executable requires typed provenance for constants, slots,
+ * resolvers, and presentation, which a cold brain call cannot supply.
+ */
+export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): LearningVerdict {
+  const identifier = input.identifier?.trim();
+  if (!identifier) return { learned: false, reason: 'no identifier' };
+  // The SEALED effect taxonomies own effect safety — no verb list anywhere.
+  // Composio slugs are classified by the same evidence the confirm-first gate
+  // uses; every other carrier goes through the runtime tool classifier. Both
+  // fail closed: anything not provably a read declines to learn.
+  const effect = input.kind === 'composio'
+    ? classifyComposioSlugEffect(identifier)
+    : classifyRuntimeToolEffect(identifier, undefined).effect;
+  if (effect !== 'read' && effect !== 'compute') {
+    return { learned: false, reason: `effect class "${effect}" is not a read` };
+  }
+  if (!settlementCarriesVerifiedData(input.result)) {
+    return { learned: false, reason: 'settlement carries no verified returned data' };
+  }
+  const source = resolveAcceptedSource(input.sessionId ?? '', input.sourceUserSeq);
+  if (!source) return { learned: false, reason: 'no exact accepted source phrase' };
+  const { phrase } = source;
+
+  const intent = canonicalIntentSlug(identifier);
+  if (!intent) return { learned: false, reason: 'identifier has no canonical slug' };
+  const terms = boundedAliasTerms(phrase);
+  if (terms.length === 0) return { learned: false, reason: 'accepted phrase has no distinctive terms' };
+  const aliasDigest = acceptedPhraseDigest(phrase);
+
+  // Exactly-once: the first settlement to claim this accepted source learns; a
+  // retry or a replayed frame is told it lost rather than re-teaching.
+  if (!claimAcceptedSourceForLearning({
+    sessionId: input.sessionId ?? '', sourceUserSeq: source.sourceUserSeq, identifier,
+  })) {
+    return { learned: false, reason: 'accepted source already owned by an earlier settlement' };
+  }
+
+  try {
+    rememberToolChoice({
+      intent,
+      // The description is the retrievable surface: bounded distinctive terms
+      // plus the exact-repeat digest. No raw phrase, no arguments, ever.
+      description: `${terms.join(' ')} [alias:${aliasDigest}]`,
+      choice: {
+        kind: input.kind,
+        identifier,
+        // Deliberately NO invocationTemplate: a proven capability is
+        // capability_only, so no concrete argument value can be replayed.
+        ...(input.accountIdentity ? { accountIdentity: input.accountIdentity } : {}),
+      },
+      aliasSource: 'verified_read',
+      ...(input.schemaFingerprint ? { schemaFingerprint: input.schemaFingerprint } : {}),
+    });
+    // The separate, scoped, class-locked retrieval index. Its write is not
+    // allowed to undo the capability memo above, so a refusal here (a class
+    // conflict, a locked file) degrades retrieval, never learning.
+    recordCapabilityAlias({
+      aliasDigest,
+      scope: input.scope,
+      intent,
+      kind: input.kind,
+      identifier,
+      klass: 'capability_only',
+      terms,
+      schemaFingerprint: input.schemaFingerprint ?? null,
+    });
+    return { learned: true, intent, aliasDigest, klass: 'capability_only' };
+  } catch (error) {
+    return { learned: false, reason: error instanceof Error ? error.message : 'remember refused' };
+  }
+}

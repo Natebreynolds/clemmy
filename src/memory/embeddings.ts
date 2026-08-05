@@ -1,5 +1,6 @@
 import pino from 'pino';
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -39,7 +40,24 @@ export const EMBEDDING_DIM = 1536;
 export const LOCAL_EMBEDDING_MODEL = 'Xenova/bge-small-en-v1.5';
 export const LOCAL_EMBEDDING_DIM = 384;
 const INTEL_TRANSFORMERS_ENTRY = 'transformers.clementine-wasm.mjs';
-const LOCAL_EMBEDDING_CACHE_DIR = path.join(BASE_DIR, 'cache', 'transformers');
+/**
+ * Where the bundled model's weights live.
+ *
+ * These are immutable vendor bytes, not user state, so they belong to the
+ * MACHINE. Keeping them under the Clementine home meant every additional home
+ * — a fresh install, a second workspace, every test run with a temporary home
+ * — re-downloaded ~130 MB before semantic recall could work at all. An
+ * existing home cache is still honored so an upgraded install does not
+ * re-fetch what it already has.
+ */
+function resolveLocalEmbeddingCacheDir(): string {
+  const legacy = path.join(BASE_DIR, 'cache', 'transformers');
+  if (existsSync(legacy)) return legacy;
+  const base = getRuntimeEnv('XDG_CACHE_HOME', '') || path.join(os.homedir(), '.cache');
+  return path.join(base, 'clementine', 'transformers');
+}
+
+const LOCAL_EMBEDDING_CACHE_DIR = resolveLocalEmbeddingCacheDir();
 
 export function localEmbeddingRuntime(
   platform: NodeJS.Platform = process.platform,
@@ -517,6 +535,27 @@ async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
     }
   })();
   return localProbeInFlight;
+}
+
+/**
+ * The BUNDLED LOCAL provider specifically — not "whichever provider recall
+ * uses". Capability retrieval runs on every turn, so it may never pay a
+ * provider round trip (measured at ~1.6s); the local model is ~3ms once warm.
+ */
+export async function getLocalEmbeddingProvider(): Promise<EmbeddingProvider | null> {
+  if (embeddingsDisabledByEnv() || !localEmbeddingsAllowed()) return null;
+  return loadLocalProvider();
+}
+
+/** The local provider IF it is already warm — never triggers a model load. */
+export function localEmbeddingProviderSync(): EmbeddingProvider | null {
+  if (embeddingsDisabledByEnv() || !localEmbeddingsAllowed()) return null;
+  return localProvider ?? null;
+}
+
+/** Vector-space identity for locally embedded rows. */
+export function localEmbeddingSpaceKey(): string {
+  return `local:${LOCAL_EMBEDDING_MODEL}:${LOCAL_EMBEDDING_DIM}`;
 }
 
 /** Hard opt-out (honored for every provider). */
