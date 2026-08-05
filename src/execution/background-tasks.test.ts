@@ -3645,3 +3645,29 @@ test('free auto-continues cover the granted minutes (no more time-arithmetic par
   assert.equal(freeAutoContinueCapForTask(240), 24, 'bounded by the hard self-resume ceiling');
   assert.equal(freeAutoContinueCapForTask(100000), 24, 'never exceeds the hard ceiling');
 });
+
+test('a daemon meeting-analysis task (local JSON + negated sends) creates no send-receipt obligation', async () => {
+  // Live 2026-08-05: two transcript-analysis tasks blocked with "required an
+  // external send or publish, but the run has no committed external-write
+  // receipt". The prompt NEGATES sends ("No external API calls, no sending
+  // messages, no scheduling — analysis only") and the only send-shaped words
+  // are a report-back confirmation line. Local analysis must never owe a
+  // receipt it is forbidden to produce.
+  const { taskRequiresExternalSendReceipt } = await import('./background-tasks.js');
+  assert.equal(
+    taskRequiresExternalSendReceipt({
+      title: 'Analyze meeting transcript: Model-Agnostic Agent Automation Demo',
+      prompt: [
+        'You just received a meeting transcript captured by the desktop SDK.',
+        'Your job: produce a structured analysis the user can act on at a glance.',
+        'Steps:',
+        '1. Read the transcript file end-to-end.',
+        '2. Produce a single JSON object with exactly these keys: {...}',
+        '4. After saving, return a one-line confirmation message — do NOT include the JSON in your response.',
+        '- No external API calls, no sending messages, no scheduling — analysis only.',
+      ].join('\n'),
+    }),
+    false,
+    'negated sends + a report-back confirmation are not an external send obligation',
+  );
+});
