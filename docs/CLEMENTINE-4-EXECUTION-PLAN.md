@@ -219,6 +219,29 @@ refused) were reproduced red against `f2f34778` and are pinned green in
 `graph-resume.test.ts`. Still zero production callers of `admitGraph` — R1A
 is correctness, not activation.
 
+**v3.8.0 candidate stages B–D (this branch).** R1B substrate landed
+unactivated: semantic admission/node identity (graph-node-identity.ts,
+per-field refusal pins), the typed artifact verification port
+(graph-artifacts.ts; a missing artifact is never redispatch authority for an
+effectful node), and leases/fencing/active cancellation (graph-lease.ts; a
+late old-owner settlement is rejected at the durable boundary; post-abort
+outcomes journal as typed cancellations). `admitGraph` still has zero
+production callers. R2 landed: adapter-DECLARED cache dialects with one
+canonical accounting (magnitude guessing deleted; unknown provenance debits
+conservatively), the explicit trace envelope with span certification, and
+the versioned atomic budget contract (enforced only on the R3 lane). R3
+landed as the generic read-only cold-to-warm lane: sealed read-only
+authority (read-envelope.ts), receipt-backed transactional procedures
+(procedure-receipts.ts), and the generic dispatch loop (read-lane.ts) —
+proven by the deterministic three-operation, both-brain matrix with the
+exact warm structural gate. NOT yet done, deliberately: the production chat
+consumer wiring at the capability_resolve seam plus the advisory
+invocationTemplate subtraction (sequenced AFTER Codex reviews the lane —
+deleting the working advisory path before its replacement is live in chat
+would break forward-only), and the live measured cohorts
+(docs/READ-LANE-CANARY-PLAN.md is the opt-in plan; percentiles stay
+uncertified until it runs).
+
 **R1A independently closed (v3.8.0 Stage A).** An independent audit
 reproduced seven further replay-truth defects against `ee4b132e`; all seven
 are reproduced red and pinned green in `graph-replay-closeout.test.ts`:
