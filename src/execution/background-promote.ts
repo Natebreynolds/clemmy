@@ -658,6 +658,7 @@ export function detachRunningTurnToBackground(
         // The worker validates against these before it resumes; a capsule that
         // no longer matches is a continuation nobody verified.
         capsuleDigest: capsule.digest,
+        capsuleRevision: capsule.revision,
         logicalTaskId,
       },
     });

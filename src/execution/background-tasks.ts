@@ -176,6 +176,9 @@ export interface BackgroundTaskRecord {
      */
     capsuleId?: string;
     capsuleDigest?: string;
+    /** The capsule revision at admission. The worker requires the capsule it
+     *  finds to be at or ahead of this — evolution is expected, rollback is not. */
+    capsuleRevision?: number;
     /** The logical task identity the capsule is keyed by. */
     logicalTaskId?: string;
   };
@@ -1931,7 +1934,21 @@ function handoffBindingFailure(task: BackgroundTaskRecord): string | null {
     return 'The continuation capsule for this task is not the one it was admitted against. '
       + 'Parked rather than resume from an unverified record of completed work.';
   }
-  if (binding.capsuleDigest && capsule.digest !== binding.capsuleDigest) {
+  // NOT digest equality. The capsule is re-checkpointed at every durable
+  // lifecycle boundary, so its digest changes legitimately between admission
+  // and worker start; refusing on that would park every task whose work
+  // progressed. What must hold is that the capsule moved FORWARD. Its own
+  // digest was already verified by loadCapsule above, which is what makes a
+  // claimed revision trustworthy rather than merely asserted.
+  if (typeof binding.capsuleRevision === 'number' && capsule.revision < binding.capsuleRevision) {
+    return `The continuation capsule is at revision ${capsule.revision}, older than the revision `
+      + `${binding.capsuleRevision} this task was admitted against. Parked rather than resume from a `
+      + 'rolled-back record of completed work.';
+  }
+  if (typeof binding.capsuleRevision !== 'number' && binding.capsuleDigest
+    && capsule.digest !== binding.capsuleDigest) {
+    // A task admitted by an older build carries no revision; digest equality is
+    // the only ordering it has, so it keeps the stricter rule.
     return 'The continuation capsule changed since this task was admitted (binding digest mismatch). '
       + 'Parked rather than resume from an unverified record of completed work.';
   }

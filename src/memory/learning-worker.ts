@@ -37,6 +37,7 @@ import {
   liveComposioSchemaFingerprint,
   rememberToolSchema,
 } from '../tools/composio-schema-cache.js';
+import { checkpointCapsuleForSession } from '../execution/continuation-capsule.js';
 
 function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -145,6 +146,13 @@ async function materializeOne(pending: PendingLearningRecord): Promise<void> {
     // what the receipt proves. Surface it as a dead row, not a silent skip.
     throw new Error(`learning declined: ${verdict.reason}`);
   }
+  // The receipt is durable, so the effect is settled: re-checkpoint the
+  // continuation capsule for this session if one owns the turn. A capsule that
+  // predates this receipt would let a resume re-issue an effect that already
+  // happened. Best-effort — the settlement above is authoritative either way.
+  try {
+    checkpointCapsuleForSession(pending.sessionId, pending.sourceUserSeq ?? undefined);
+  } catch { /* bookkeeping must never fail a committed settlement */ }
 }
 
 let draining = false;

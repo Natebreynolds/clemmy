@@ -104,6 +104,14 @@ export interface ContinuationCapsule {
   nextSafeActions: string[];
   /** Compaction watermark — history below it is summarized, never required. */
   compactionWatermark?: number;
+  /**
+   * Monotonic version of THIS logical task's capsule. The capsule is
+   * re-checkpointed at every durable lifecycle boundary, so its digest changes
+   * legitimately and cannot be what a worker validates against. The revision is
+   * what orders those rewrites: a worker may follow a capsule that moved
+   * FORWARD since it was admitted, and must refuse one that moved backwards.
+   */
+  revision: number;
   updatedAt: string;
   /** Digest over the structural content above (excluding updatedAt). */
   digest: string;
@@ -121,8 +129,16 @@ function digestOf(capsule: Omit<ContinuationCapsule, 'digest' | 'updatedAt'>): s
   return createHash('sha256').update(JSON.stringify(capsule), 'utf-8').digest('hex').slice(0, 32);
 }
 
-export type CapsuleInput = Omit<ContinuationCapsule, 'version' | 'capsuleId' | 'digest' | 'updatedAt'>
-  & { capsuleId?: string };
+export type CapsuleInput = Omit<ContinuationCapsule, 'version' | 'capsuleId' | 'digest' | 'updatedAt' | 'revision'>
+  & { capsuleId?: string; revision?: number };
+
+/** The revision is never caller-supplied. Spreading a loaded capsule into a new
+ *  checkpoint is the ordinary call shape, and honouring the revision carried in
+ *  that spread would freeze it — every later rewrite would claim to be the same
+ *  version of the record. It always advances from what is durable. */
+function nextCapsuleRevision(logicalTaskId: string): number {
+  return (loadCapsule(logicalTaskId)?.revision ?? 0) + 1;
+}
 
 /**
  * Checkpoint the capsule. Called after every durable work settlement,
@@ -132,10 +148,23 @@ export type CapsuleInput = Omit<ContinuationCapsule, 'version' | 'capsuleId' | '
 export function checkpointCapsule(input: CapsuleInput, now = new Date().toISOString()): ContinuationCapsule {
   const dir = capsuleDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // The revision advances from what is DURABLE, not from what the caller was
+  // holding: two lifecycle boundaries settling close together would otherwise
+  // both write revision N+1 from the same stale read and lose one rewrite.
+  const durable = loadCapsule(input.logicalTaskId);
+  // Spreading a LOADED capsule into a new checkpoint is the natural call shape,
+  // and it carries the previous digest/version/revision along with the content.
+  // Those are computed here, so they are stripped rather than trusted — leaving
+  // a stale digest inside the hashed body produces a capsule that fails its own
+  // verification the moment it is read back.
+  const { digest: _staleDigest, updatedAt: _staleUpdatedAt, version: _staleVersion, revision: _staleRevision,
+    ...content } = input as CapsuleInput & { digest?: string; updatedAt?: string; version?: number };
+  void _staleDigest; void _staleUpdatedAt; void _staleVersion; void _staleRevision;
   const body = {
     version: CONTINUATION_CAPSULE_VERSION as typeof CONTINUATION_CAPSULE_VERSION,
-    capsuleId: input.capsuleId ?? `cap_${randomUUID()}`,
-    ...input,
+    capsuleId: input.capsuleId ?? durable?.capsuleId ?? `cap_${randomUUID()}`,
+    ...content,
+    revision: nextCapsuleRevision(input.logicalTaskId),
   };
   const capsule: ContinuationCapsule = {
     ...body,
@@ -166,6 +195,7 @@ export function loadCapsule(logicalTaskId: string): ContinuationCapsule | undefi
     const parsed = JSON.parse(readFileSync(file, 'utf-8')) as ContinuationCapsule;
     if (parsed?.version !== CONTINUATION_CAPSULE_VERSION) return undefined;
     if (!parsed.logicalTaskId || !parsed.objective || !Array.isArray(parsed.nextSafeActions)) return undefined;
+    if (!Number.isInteger(parsed.revision) || parsed.revision < 1) return undefined;
     if (typeof parsed.digest !== 'string' || !parsed.digest) return undefined;
     const { digest, updatedAt, ...body } = parsed;
     void updatedAt;
@@ -497,6 +527,62 @@ export function projectCapsuleFromDurableState(
   };
 }
 
+/**
+ * Re-checkpoint the live handoff capsule for a session from durable state.
+ *
+ * Called at each durable lifecycle boundary — an item/phase settling, an effect
+ * receipt becoming durable, a committed terminal. A capsule written once at
+ * detach and never again describes the world as it was BEFORE all of that, so a
+ * worker starting later would redo settled work and re-issue settled effects.
+ * Re-projecting from durable state is what keeps "already done" true rather
+ * than merely true-at-detach.
+ *
+ * Deliberately total: no live handoff, no capsule, or an unreadable event log
+ * all return undefined rather than throwing. Every caller is a settlement path
+ * whose own commit already succeeded, and none may fail because bookkeeping did.
+ */
+export function checkpointCapsuleForSession(
+  sessionId: string,
+  sourceUserSeq?: number,
+): ContinuationCapsule | undefined {
+  try {
+    if (!sessionId) return undefined;
+    const record = listHandoffRecords()
+      .filter((row) => row.sessionId === sessionId
+        && row.state !== 'terminal'
+        && (sourceUserSeq === undefined || row.sourceUserSeq === sourceUserSeq))
+      .at(-1);
+    if (!record) return undefined;
+    const existing = loadCapsule(record.logicalTaskId);
+    const projected = projectCapsuleFromDurableState(
+      record.logicalTaskId,
+      record.sessionId,
+      record.acceptedAttemptId,
+      {
+        sourceUserSeq: record.sourceUserSeq,
+        capsuleId: record.capsuleId ?? existing?.capsuleId,
+        // NO upper bound here. The detach watermark bounds how much ORIGIN
+        // HISTORY is context; it is not the end of the activation interval.
+        // Effects this task settles after the handoff are exactly the ones a
+        // resume must not redo, so clipping the scan at detach would leave the
+        // capsule permanently blind to the worker's own work.
+        ...(existing?.objective ? { objective: existing.objective } : {}),
+      },
+    );
+    if (!projected.objective) return undefined;
+    return checkpointCapsule({
+      ...projected,
+      // Carried forward unchanged: the history boundary was decided once, at
+      // the moment the user handed the work over.
+      ...(existing?.compactionWatermark !== undefined
+        ? { compactionWatermark: existing.compactionWatermark }
+        : {}),
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 // ── Boot reconciliation ──────────────────────────────────────────────────────
 
 export interface HandoffReconciliation {
@@ -646,6 +732,7 @@ export async function reconcileIncompleteHandoffs(): Promise<HandoffReconciliati
           throughSeq: built.compactionWatermark ?? 0,
           capsuleId: built.capsuleId,
           capsuleDigest: built.digest,
+          capsuleRevision: built.revision,
           logicalTaskId: record.logicalTaskId,
         },
       });
@@ -739,6 +826,9 @@ export function fenceAndReleaseHandoffAtTerminal(sessionId: string, sourceUserSe
     .filter((row) => row.sessionId === sessionId && row.sourceUserSeq === sourceUserSeq)
     .at(-1);
   if (!record || !record.backgroundTaskId) return;
+  // A committed terminal is a durable lifecycle boundary: the capsule must
+  // record the edge that just settled, or a resume re-opens it.
+  checkpointCapsuleForSession(sessionId, sourceUserSeq);
   let cursor: HandoffRecord = record;
   for (const rung of ['foreground_commit_fenced', 'foreground_released'] as const) {
     if (handoffRank(cursor.state) >= handoffRank(rung)) continue;

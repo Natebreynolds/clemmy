@@ -46,6 +46,7 @@ import {
   requestBackgroundDrain,
   type BackgroundTaskRecord,
 } from './background-tasks.js';
+import { checkpointCapsuleForSession } from './continuation-capsule.js';
 
 export type FanoutPlanStatus = 'active' | 'reduced' | 'failed' | 'superseded';
 export type FanoutActivationStatus = 'pending' | 'running' | 'done' | 'failed';
@@ -488,7 +489,20 @@ export function settleFanoutActivation(input: {
     return { settled: true, alreadySettled: false };
   });
   try {
-    return run();
+    const settlement = run();
+    // An item settling is a durable lifecycle boundary for the continuation
+    // capsule too: a resume that still reads the pre-settlement capsule would
+    // redo this item. Best-effort and strictly after the CAS commits — the
+    // settlement is authoritative whether or not the capsule rewrite succeeds.
+    if (settlement.settled && !settlement.alreadySettled) {
+      try {
+        const plan = loadFanoutPlan(input.planId);
+        if (plan?.originSessionId) {
+          checkpointCapsuleForSession(plan.originSessionId, plan.sourceUserSeq ?? undefined);
+        }
+      } catch { /* bookkeeping must never fail a committed settlement */ }
+    }
+    return settlement;
   } catch (error) {
     return { settled: false, reason: error instanceof Error ? error.message : String(error) };
   }
