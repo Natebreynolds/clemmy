@@ -47,3 +47,21 @@ test('a disconnected toolkit escalates the tone; an empty event renders nothing'
 
   assert.deepEqual(reduceActivity(EMPTY, { type: 'capability_resolution', data: { entries: [] } } as never), EMPTY);
 });
+
+test('deliverable_saved accumulates ONE rolling saved-files row', () => {
+  let rows = reduceActivity(EMPTY, { type: 'deliverable_saved', data: { name: 'acme-corp.md', dir: 'drafts' } } as never);
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].label, /Saved acme-corp\.md in drafts/);
+  rows = reduceActivity(rows, { type: 'deliverable_saved', data: { name: 'baker-llp.md', dir: 'drafts' } } as never);
+  rows = reduceActivity(rows, { type: 'deliverable_saved', data: { name: 'cole-law.md', dir: 'drafts' } } as never);
+  assert.equal(rows.length, 1, 'files roll into one row, never N rows of noise');
+  assert.equal(rows[0].count, 3);
+  assert.match(rows[0].label, /Saved 3 files · latest cole-law\.md/);
+  assert.equal(rows[0].tone, 'success');
+});
+
+test('the runtime publicSlug names the tool row when args are private', async () => {
+  const { humanToolLabel } = await import('./toolLabels');
+  assert.equal(humanToolLabel('composio_execute_tool', undefined, 'OUTLOOK_SEND_EMAIL'), 'outlook send email');
+  assert.equal(humanToolLabel('composio_execute_tool', undefined, undefined), 'composio execute tool');
+});

@@ -9,7 +9,7 @@
  * one-line summary you can expand. Rows render through the shared ActivityFeed
  * primitives so the strip and the board drawer speak ONE visual language.
  */
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Users, ArrowUpRight } from 'lucide-react';
 import { ActivityRow, BatchRow, PROVIDER_DOT, useNowTick } from '@/components/chat/ActivityFeed';
@@ -19,12 +19,17 @@ import {
   type ActivityTerminalOutcome,
 } from '@/lib/activity-presentation';
 
-function summarize(toolCount: number, agentCount: number, batchCount: number): string {
+/** Results first, then effort: "3 files saved · 2 agents · 12 tools". The
+ *  collapsed line is the turn's lasting record — what it PRODUCED outranks
+ *  what it used. */
+function summarize(toolCount: number, agentCount: number, batchCount: number, filesSaved: number): string {
   const parts: string[] = [];
+  if (filesSaved) parts.push(`${filesSaved} file${filesSaved > 1 ? 's' : ''} saved`);
   if (agentCount) parts.push(`${agentCount} agent${agentCount > 1 ? 's' : ''}`);
   if (batchCount) parts.push(`${batchCount} batch${batchCount > 1 ? 'es' : ''}`);
   if (toolCount) parts.push(`${toolCount} tool${toolCount > 1 ? 's' : ''}`);
-  return parts.length ? `Used ${parts.join(' · ')}` : 'Activity';
+  if (parts.length === 0) return 'Activity';
+  return filesSaved ? parts.join(' · ') : `Used ${parts.join(' · ')}`;
 }
 
 export function TurnActivity({ items, live, traceHref, terminalOutcome }: {
@@ -48,9 +53,10 @@ export function TurnActivity({ items, live, traceHref, terminalOutcome }: {
   const agents = view.filter((a) => a.kind === 'agent');
   const tools = view.filter((a) => a.kind === 'tool');
   const batches = view.filter((a) => a.kind === 'batch');
+  const filesSaved = view.find((a) => a.id === 'deliverables')?.count ?? 0;
   const runningAgents = agents.filter((a) => a.status === 'running').length;
 
-  // Finished turn, collapsed: a quiet one-line summary.
+  // Finished turn, collapsed: a quiet one-line record leading with results.
   if (!live && !open) {
     return (
       <button
@@ -59,7 +65,7 @@ export function TurnActivity({ items, live, traceHref, terminalOutcome }: {
         className="mt-2.5 flex items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint transition-colors hover:text-muted"
       >
         <Users className="h-3.5 w-3.5" aria-hidden />
-        <span>{summarize(tools.length, agents.length, batches.length)}</span>
+        <span>{summarize(tools.length, agents.length, batches.length, filesSaved)}</span>
         <span aria-hidden>· show</span>
       </button>
     );
@@ -91,14 +97,43 @@ export function TurnActivity({ items, live, traceHref, terminalOutcome }: {
           )}
         </div>
       )}
-      <ul className="flex max-h-52 flex-col gap-1 overflow-y-auto">
-        {view.map((a) => (a.kind === 'batch'
-          ? <BatchRow key={a.id} a={a} now={now} live={live} />
-          : <ActivityRow key={a.id} a={a} now={now} live={live} />))}
-      </ul>
+      <LiveActivityList view={view} now={now} live={live} />
       {!live && open && (
         <button type="button" onClick={() => setOpen(false)} className="mt-1 text-caption text-faint transition-colors hover:text-muted">hide</button>
       )}
     </div>
+  );
+}
+
+/** The scrolling row list. While live, it stays PINNED to the newest row —
+ *  a capped list that silently hides the current action reads as a stall
+ *  (the newest work sat below the fold while old rows filled the viewport).
+ *  The pin releases the moment the user scrolls up to inspect history and
+ *  re-engages when they return to the bottom. role="log" + polite live region
+ *  narrates new rows to screen readers without interrupting. */
+function LiveActivityList({ view, now, live }: { view: ActivityItem[]; now: number; live: boolean }) {
+  const listRef = useRef<HTMLUListElement | null>(null);
+  const pinnedRef = useRef(true);
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el || !live || !pinnedRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [view, live]);
+  return (
+    <ul
+      ref={listRef}
+      role="log"
+      aria-live={live ? 'polite' : 'off'}
+      aria-relevant="additions text"
+      onScroll={(e) => {
+        const el = e.currentTarget;
+        pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+      }}
+      className="flex max-h-52 flex-col gap-1 overflow-y-auto"
+    >
+      {view.map((a) => (a.kind === 'batch'
+        ? <BatchRow key={a.id} a={a} now={now} live={live} />
+        : <ActivityRow key={a.id} a={a} now={now} live={live} />))}
+    </ul>
   );
 }

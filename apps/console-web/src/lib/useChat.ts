@@ -45,6 +45,9 @@ export interface ActivityItem {
    *  the shared spinner/✓/✗ but the event icon is driven by `tone`. */
   variant?: 'write' | 'program' | 'lifecycle';
   tone?: 'success' | 'danger' | 'warning' | 'live' | 'muted';
+  /** kind 'event' rolling rows only: how many occurrences this row aggregates
+   *  (e.g. files saved this turn). */
+  count?: number;
 }
 
 export interface ChatMessage {
@@ -362,7 +365,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
   const model = typeof d.model === 'string' ? d.model : '';
   // Server names can contain underscores (mcp__some_server__tool) — a non-greedy
   // `.+?` strips the whole `mcp__…__` prefix; `[^_]+` stopped at the first `_`.
-  const toolLabel = humanToolLabel(tool, d.args);
+  const toolLabel = humanToolLabel(tool, d.args, d.publicSlug);
   switch (ev.type) {
     case 'batch_started': {
       const batchId = typeof d.batchId === 'string' ? d.batchId : `${prev.length}`;
@@ -399,6 +402,32 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
             batch: a.batch ? { ...a.batch, done: typeof d.succeeded === 'number' ? (d.succeeded as number) + failed : a.batch.done, failed } : a.batch,
           }
         : a));
+    }
+    case 'deliverable_saved': {
+      // Files landing, live (the drafting-emails scenario): ONE rolling row
+      // that keeps counting — "Saved 3 files · latest client-brief.md" — so
+      // results visibly accumulate instead of vanishing into a folder.
+      const name = typeof d.name === 'string' ? d.name : '';
+      if (!name) return prev;
+      const dir = typeof d.dir === 'string' && d.dir ? d.dir : '';
+      const existing = prev.find((a) => a.id === 'deliverables');
+      const count = (existing?.count ?? 0) + 1;
+      const label = count === 1
+        ? `Saved ${name}${dir ? ` in ${dir}` : ''}`
+        : `Saved ${count} files · latest ${name}`;
+      const row: ActivityItem = {
+        id: 'deliverables',
+        kind: 'event',
+        variant: 'write',
+        tone: 'success',
+        label,
+        ...(dir && count > 1 ? { detail: `in ${dir}` } : {}),
+        status: 'done',
+        count,
+      };
+      return existing
+        ? prev.map((a) => (a.id === 'deliverables' ? row : a))
+        : [...prev, row];
     }
     case 'capability_resolution': {
       // The typed "what Clem knows going in" frame: proven procedures, paths

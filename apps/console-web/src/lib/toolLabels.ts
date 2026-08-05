@@ -60,8 +60,14 @@ export function describeExternalWrite(shapeKey: string | undefined, toolName: st
 }
 
 /** Human label for a tool call: composio calls read as their inner slug
- *  ("outlook send email"), MCP calls drop the server prefix, underscores drop. */
-export function humanToolLabel(tool: string, argsRaw?: unknown): string {
+ *  ("outlook send email"), MCP calls drop the server prefix, underscores drop.
+ *  `publicSlug` is the runtime-validated dispatch identity the public event
+ *  plane attaches (raw args are private there) — it wins when present, so the
+ *  live strip says "outlook send email" instead of "composio execute tool". */
+export function humanToolLabel(tool: string, argsRaw?: unknown, publicSlug?: unknown): string {
+  if (typeof publicSlug === 'string' && publicSlug) {
+    return publicSlug.replace(/_/g, ' ').toLowerCase();
+  }
   if (tool === 'composio_execute_tool' && typeof argsRaw === 'string') {
     try {
       const slug = (JSON.parse(argsRaw) as { tool_slug?: unknown }).tool_slug;
