@@ -3486,6 +3486,10 @@ test('a parked task is re-queued rather than counted as undelivered', () => {
     assert.equal(revised?.status, 'pending', `round ${round} did not re-queue a parked task`);
     updateBackgroundTask(task.id, { status: 'blocked' });
   }
+  const final = getBackgroundTask(task.id);
+  assert.equal(final?.undeliveredContractRevisions ?? 0, 0, 'requeued corrections never count as undelivered');
+});
+
 test('a deliverable verified on disk satisfies the completion-evidence gate (shell-written files)', async () => {
   const { verifiedOnDiskDeliverables } = await import('./background-tasks.js');
   const { mkdirSync: mkdir2, writeFileSync: write2 } = await import('node:fs');

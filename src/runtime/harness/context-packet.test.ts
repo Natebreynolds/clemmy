@@ -847,9 +847,11 @@ test('packet gives workflow nodes truthful runner-owned topology guidance while 
       { sessionKind: kind, sessionId: `${kind === 'workflow' ? 'workflow:run-x:step' : kind}-sess` },
     );
     assert.equal(packet.multiItem.detected, true, `${kind}: still detects`);
-    assert.equal(packet.multiItem.offered, false, `${kind}: directive suppressed`);
-    assert.ok(!/Fan-out directive/.test(packet.text), `${kind}: no directive`);
     if (kind === 'workflow') {
+      // A workflow node cannot restructure its pinned graph — it keeps its
+      // truthful runner-owned line and never sees the fan-out directive.
+      assert.equal(packet.multiItem.offered, false, 'workflow: directive suppressed');
+      assert.ok(!/Fan-out directive/.test(packet.text), 'workflow: no directive');
       assert.match(packet.text, /Workflow parallelism: execute this node as one scoped unit/);
       assert.match(packet.text, /runner owns topology/);
       assert.match(packet.text, /authored forEach step or explicit sibling nodes/);
@@ -860,7 +862,12 @@ test('packet gives workflow nodes truthful runner-owned topology guidance while 
       assert.equal(packet.prospective.injected, false, 'proactive chat intentions do not contaminate a constrained workflow node');
       assert.deepEqual(packet.mcp, [], 'workflow nodes rely on their authored tool scope instead of probing unrelated MCP health');
     } else {
-      assert.match(packet.text, /Parallelism reminder:/, `${kind}: static line preserved (zero-regression)`);
+      // Every NON-workflow lane now receives the count-aware directive: a
+      // 30-item background task used to detect its items and then withhold
+      // the one instruction that says to fan out (2026-08-04 efficiency
+      // audit — chat-runs-heavy-work-as-one-loop).
+      assert.equal(packet.multiItem.offered, true, `${kind}: count-aware directive offered`);
+      assert.match(packet.text, /Fan-out directive/, `${kind}: directive present`);
     }
   }
 });
