@@ -33,7 +33,6 @@ import {
   localEmbeddingProviderSync,
   localEmbeddingSpaceKey,
 } from '../../memory/embeddings.js';
-import { cacheTurnCandidates } from './capability-candidate-cache.js';
 import { liveComposioSchemaFingerprint } from '../../tools/composio-schema-cache.js';
 import {
   listToolChoices,
@@ -212,13 +211,33 @@ export async function resolveTurnCapabilityCandidates(options: {
     });
   }
 
-  const resolved: TurnCapabilityCandidates = {
+  return {
     candidates,
     matches: [...matches, ...semanticMatches],
     pinnedTools: [...pinnedTools],
     semanticApplied,
   };
-  // Leave it where the turn's synchronous tool-surface seams will look.
-  cacheTurnCandidates(input, { pinnedTools: resolved.pinnedTools, matches: resolved.matches });
-  return resolved;
+}
+
+/**
+ * The bounded advisory card a brain sees for its turn's candidates: kind,
+ * exact identifier, intent, provenance — never prior invocation arguments,
+ * which are exactly the thing a stale replay would be made of.
+ */
+export function renderCapabilityCandidateCard(resolved: TurnCapabilityCandidates | undefined): string {
+  const rows = resolved?.candidates.slice(0, 5) ?? [];
+  if (rows.length === 0) return '';
+  const lines = rows.map((c) => {
+    const provenance = [
+      c.klass,
+      c.via === 'semantic' ? `matched by meaning (${c.score.toFixed(2)})` : 'proven for phrasing like this',
+      ...(c.accountIdentity ? [`account ${c.accountIdentity}`] : []),
+    ].join('; ');
+    return `- ${c.kind} \`${c.identifier}\` (${c.intent}) — ${provenance}`;
+  });
+  return [
+    '## Proven capabilities for this request (advisory)',
+    'These worked before for requests like this one. Verify fit and choose your own arguments/account — nothing here is pre-authorized.',
+    ...lines,
+  ].join('\n');
 }

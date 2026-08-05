@@ -952,6 +952,9 @@ export async function respondViaHarness(
       sessionId,
       allowedToolNames: request.allowedToolNames,
       excludeToolNames: request.excludeToolNames,
+      // The turn's advisory capability candidates ride the request into the
+      // agent build — the only delivery path, shared by both brains.
+      ...(request.turnCandidates ? { turnCandidates: request.turnCandidates } : {}),
       // Only surfaces flagged honorModel forward request.model (workflow steps);
       // every other surface keeps the harness's configured model (byte-identical).
       ...(modelForRun ? { model: modelForRun } : {}),
@@ -1364,14 +1367,15 @@ export async function respondPreferHarness(
   const readServed = await tryServeAcceptedTurnRead(surface, request);
   if (readServed) return readServed;
 
-  // F2: when the read lane declines, the ordinary brain runs — but it should
-  // not have to rediscover a capability this workspace has already proven. One
-  // bounded, deadline-capped retrieval here leaves advisory candidates where
-  // BOTH brains' synchronous tool-surface seams already look, so desktop,
-  // Discord, and Slack get the identical surface. Candidates are advisory:
+  // When the read lane declines, the ordinary brain runs — but it should not
+  // have to rediscover a capability this workspace has already proven. One
+  // bounded, deadline-capped retrieval per accepted turn, delivered ON THE
+  // REQUEST into whichever brain serves it, so desktop, Discord, and Slack get
+  // the identical surface from the identical seam. Candidates are advisory:
   // they widen what the brain may choose from and decide nothing.
   try {
-    await resolveTurnCapabilityCandidates({ userInput: request.message });
+    const resolved = await resolveTurnCapabilityCandidates({ userInput: request.message });
+    if (resolved.candidates.length > 0) request = { ...request, turnCandidates: resolved };
   } catch { /* retrieval never blocks a turn */ }
 
   if (claudeAgentSdkBrainEnabled(surface)) {

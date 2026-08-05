@@ -28,6 +28,7 @@ import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
+import { renderCapabilityCandidateCard, type TurnCapabilityCandidates } from '../runtime/read-path/capability-candidates.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 import { createHash } from 'node:crypto';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
@@ -153,6 +154,10 @@ export interface BuildOrchestratorAgentOptions {
    * connected server's schema.
    */
   userInput?: string | null;
+  /** Advisory capability candidates the bridge resolved for THIS accepted
+   * turn. Delivery is the request/build-options path only — candidates widen
+   * the visible surface and the advisory card; they decide nothing. */
+  turnCandidates?: TurnCapabilityCandidates;
   /** Session id for best-effort tool-scope telemetry. */
   sessionId?: string | null;
   /** Test/advanced override. */
@@ -1008,6 +1013,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               userInput: options.userInput,
               priorUserInputs,
               pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+              // The turn's resolved candidates ride in as advisory matches so
+              // the MCP scope sees exactly what the JIT surface sees.
+              ...(options.turnCandidates?.matches.length
+                ? { learnedMatches: options.turnCandidates.matches }
+                : {}),
               // A contentless go-ahead ("go", "ok") is an ANSWER, and an answer
               // must not be scoped as if it were a fresh topic with no keywords.
               // Structural, so it never depends on a list of ways to say yes.
@@ -1993,7 +2003,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           name: (t as { name?: string }).name ?? '',
           description: (t as { description?: string }).description ?? '',
         })),
-        recallPinned: recallPinnedBuiltinTools(jitQuery),
+        recallPinned: [
+          ...recallPinnedBuiltinTools(jitQuery),
+          // Candidates resolved for the accepted turn: the carrier each one
+          // needs must survive pruning or the brain cannot reach it.
+          ...(options.turnCandidates?.pinnedTools ?? []),
+        ],
       });
       jitReason = selection.reason;
       if (selection.reduced) {
@@ -2125,6 +2140,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     rubricChoice.instructions,
     codeModeMandate,
     catalogBlock,
+    renderCapabilityCandidateCard(options.turnCandidates),
   ].filter(Boolean).join('\n\n');
   const instructions = harnessInstructions(staticInstructions, {
     sessionId: options.sessionId ?? undefined,

@@ -3,6 +3,7 @@ import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
 import { codeModeMandateDirective } from '../../tools/code-mode-tool.js';
 import { getComposio } from '../../integrations/composio/client.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from '../../agents/tool-jit.js';
+import { renderCapabilityCandidateCard } from '../read-path/capability-candidates.js';
 import { resolveHotSet } from '../../agents/tool-catalog.js';
 import {
   buildWorkspaceContextPrimer, workspaceSlugFromSessionId,
@@ -19,6 +20,7 @@ import {
 } from '../../memory/learning-receipt.js';
 import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
 import { isUserFacingSession } from '../../execution/scope.js';
+import { handoffTransferForAttempt } from '../../execution/continuation-capsule.js';
 import { searchFactsHybrid } from '../../memory/facts.js';
 import { recallMemory } from '../../memory/recall-memory.js';
 import { isTemporalMeetingQuery } from '../../memory/recall.js';
@@ -870,6 +872,11 @@ export function renderClaudeAgentBrainSystemAppend(
     `Surface: ${surface}`,
     `Session: ${request.sessionId}`,
     `Claude brain mode: ${mode}`,
+    '',
+    // The turn's advisory candidate card: capabilities this workspace already
+    // proved for requests like this one. Volatile per turn by nature, but tiny
+    // and bounded (≤5 lines) — never invocation arguments.
+    renderCapabilityCandidateCard(request.turnCandidates),
     // Dock chat (session "space-<slug>"): tell the brain it is EDITING this
     // Workspace and to change it via space_* tools, never a sandbox/scratch file.
     workspacePrimer ?? '',
@@ -1261,16 +1268,25 @@ function cancelledBrainResponse(
     turn: sourceTurn,
     sourceUserSeq,
   };
+  // A stop that handed this attempt to a durable background owner is a
+  // TRANSFER, not a cancellation. Reporting it as cancelled tells the user
+  // their work stopped while a worker is still running it.
+  const transfer = (() => {
+    try { return handoffTransferForAttempt(sessionId, attempt.attemptId); } catch { return undefined; }
+  })();
   const terminal = commitTurnOutcome({
     version: 2,
     id: turnOutcomeId(identity),
     identity,
     status: 'cancelled',
     resumable: false,
-    presentation: { kind: 'stopped', text },
+    presentation: { kind: 'stopped', text: transfer ? transfer.text : text },
   }, {
-    legacyReason: 'cancelled',
-    metadata: { transport: 'claude_agent_sdk_brain' },
+    legacyReason: transfer ? 'transferred' : 'cancelled',
+    metadata: {
+      transport: 'claude_agent_sdk_brain',
+      ...(transfer ? { transferredToTaskId: transfer.backgroundTaskId } : {}),
+    },
   });
   const committedText = terminal.presentation.text;
   // Only the process that won the durable terminal append may broadcast the
@@ -1634,7 +1650,12 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       const selection = await selectToolsForTurn({
         userInput: jitQuery,
         tools: advertisedUniverse.map((name) => ({ name, description: descByName.get(name) ?? '' })),
-        recallPinned: recallPinnedBuiltinTools(jitQuery),
+        recallPinned: [
+          ...recallPinnedBuiltinTools(jitQuery),
+          // Candidates resolved for the accepted turn ride the REQUEST — the
+          // same delivery the Codex lane gets, so both brains see one surface.
+          ...(request.turnCandidates?.pinnedTools ?? []),
+        ],
       });
       // H1c: a dock chat IS editing a Workspace — pin the space tools so the JIT
       // never drops them (else the model can't persist the edit and sandboxes it).
@@ -1705,6 +1726,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         userInput: turnObjective,
         priorUserInputs: priorBrainInputs,
         pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+        ...(request.turnCandidates?.matches.length
+          ? { learnedMatches: request.turnCandidates.matches }
+          : {}),
         // An answer to Clem's own question keeps the scope the request earned,
         // however the user phrases the go-ahead. Same predicate the CONVERGE
         // steer already uses — the fact was known, just never consulted here.

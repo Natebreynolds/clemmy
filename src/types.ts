@@ -214,7 +214,14 @@ export interface AssembledPromptContext {
   recallId?: string;
 }
 
+import type { TurnCapabilityCandidates } from './runtime/read-path/capability-candidates.js';
+
 export interface AssistantRequest {
+  /** Advisory capability candidates resolved ONCE for this accepted turn by
+   * the shared bridge, delivered to whichever brain serves it. Bound to the
+   * request — never to a phrase, a session global, or a cache. Candidates
+   * widen what the brain can see; they decide nothing. */
+  turnCandidates?: TurnCapabilityCandidates;
   /** Private model directive for this execution. For an ordinary fresh turn it
    * is also the literal user text persisted in the conversation. */
   message: string;

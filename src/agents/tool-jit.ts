@@ -29,7 +29,6 @@ import { getRuntimeEnv } from '../config.js';
 import { WORKSPACE_DOCK_TOOLS } from '../spaces/workspace-context.js';
 import { deriveJitCore } from '../tools/tool-registry.js';
 import { matchToolChoicesForStep } from '../memory/tool-choice-store.js';
-import { cachedTurnCandidates } from '../runtime/read-path/capability-candidate-cache.js';
 
 const logger = pino({ name: 'clementine-next.tool-jit' });
 
@@ -380,10 +379,6 @@ export function recallPinnedBuiltinTools(userInput?: string | null): string[] {
     for (const m of matches) {
       for (const fam of m.family) names.add(fam);
     }
-    // Candidates the shared bridge already resolved for THIS turn, including
-    // the ones only meaning could find. Additive: retrieval widens the surface
-    // the brain may choose from and never narrows it.
-    for (const name of cachedTurnCandidates(query)?.pinnedTools ?? []) names.add(name);
     return [...names];
   } catch {
     return [];
