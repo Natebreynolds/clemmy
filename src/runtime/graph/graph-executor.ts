@@ -137,6 +137,10 @@ export interface NodeRunContext {
   wave: number;
   /** The durable attempt this dispatch runs under (admitted mode only). */
   attemptId?: string;
+  /** Live cancellation for the ACTIVE runner (present when the caller passed
+   *  an AbortSignal). Cooperative runners abort promptly; either way, an
+   *  outcome arriving after abort settles as a typed cancellation. */
+  signal?: AbortSignal;
 }
 
 export interface NodeRunner {
@@ -250,7 +254,8 @@ export interface RunGraphOptions {
   /** Injected time. Mandatory under admission (a ceiling needs a clock);
    *  monotonic ms. The executor itself never reads a clock. */
   clock?: () => number;
-  /** Cancellation port; checked between dispatches, never mid-runner. */
+  /** Cancellation port, checked between dispatches. Pass an AbortSignal to
+   *  ALSO reach the active runner via NodeRunContext.signal. */
   signal?: { readonly aborted: boolean };
   /** Mints attempt ids. Injected so tests are deterministic and the executor
    *  never reaches for randomness. Default: sequential per run. */
@@ -620,6 +625,9 @@ export async function runGraph(
             predecessors: p.predecessors,
             wave,
             ...(admission ? { attemptId: p.attemptId } : {}),
+            ...(typeof AbortSignal !== 'undefined' && options.signal instanceof AbortSignal
+              ? { signal: options.signal }
+              : {}),
           });
         } catch (error) {
           // A throwing runner is infrastructure, not node logic: typed, never
@@ -629,6 +637,11 @@ export async function runGraph(
             reason: error instanceof Error ? error.message : String(error),
             settlementClass: 'infrastructure',
           };
+        }
+        // An outcome that arrives AFTER cancellation may not commit success
+        // or route topology — it settles as a typed, durable cancellation.
+        if (options.signal?.aborted) {
+          outcome = { status: 'failed', reason: 'cancelled while running', settlementClass: 'cancelled' };
         }
         return { ...p, outcome };
       }));

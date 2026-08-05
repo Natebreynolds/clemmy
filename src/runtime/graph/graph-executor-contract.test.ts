@@ -283,7 +283,7 @@ test('a node-logic failure still routes failure edges — the distinction is the
   assert.deepEqual(result.completed, ['recover']);
 });
 
-test('cancellation stops dispatch at the next boundary and is its own status', async () => {
+test('cancellation stops dispatch at the next boundary, and a post-abort outcome cannot commit success', async () => {
   const signal = { aborted: false };
   const dispatched: string[] = [];
   const result = await runGraph(CHAIN, {
@@ -298,7 +298,14 @@ test('cancellation stops dispatch at the next boundary and is its own status', a
   });
   assert.equal(result.status, 'cancelled');
   assert.deepEqual(dispatched, ['a'], 'dispatch continued after the cancellation signal');
-  assert.deepEqual(result.completed, ['a'], 'completed work was not preserved across cancellation');
+  // B3: an outcome that arrives after cancellation settles as a typed
+  // cancellation — an uncooperative runner may return locally, but it cannot
+  // commit success or route topology once the run is cancelled.
+  assert.deepEqual(result.completed, [], 'post-abort work committed success');
+  assert.deepEqual(result.failed, ['a']);
+  const aTrace = result.trace.find((t) => t.nodeId === 'a');
+  assert.equal(aTrace?.status, 'failed');
+  assert.match(aTrace?.reason ?? '', /cancelled/);
 });
 
 // ── budgets and time ─────────────────────────────────────────────────────────
