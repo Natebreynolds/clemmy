@@ -18,11 +18,13 @@ import { linkFocusActionForSession, updateLinkedFocusAction } from '../memory/fo
 import {
   admitDurableFanoutPlan,
   listFanoutActivations,
+  listFanoutSettlements,
   loadFanoutPlan,
-  maybeAdmitFanoutReducer,
   scheduleDurableFanout,
-  settleFanoutActivation,
+  settleFanoutActivationAs,
+  windowAuthorityFor,
 } from '../execution/durable-fanout.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
 
 /** Split an agreed plan (markdown bullets / numbered lines) into discrete next
@@ -213,6 +215,8 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       // contract; missing inputs come back as ONE typed clarification.
       if (manifest) {
         const phases = manifest.phases?.length ? manifest.phases : ['execute'];
+        const originRoute = backgroundRouteForOriginSession(sessionId);
+        const runContext = harnessRunContextStorage.getStore();
         const admitted = admitDurableFanoutPlan({
           kind: 'durable_manifest',
           objective,
@@ -231,14 +235,31 @@ export function registerBackgroundTaskTools(server: McpServer): void {
             })),
             reducer: { id: 'reduce', requiredPhases: phases, outputContract: 'report@1' },
           },
-        }, { originSessionId: sessionId });
+        }, {
+          originSessionId: sessionId,
+          // The accepted activation is part of plan identity: two different
+          // manifests in one turn are two plans; a retried call rejoins.
+          ...(runContext?.sessionId === sessionId && typeof runContext.sourceUserSeq === 'number'
+            ? { sourceUserSeq: runContext.sourceUserSeq }
+            : {}),
+          ...(runContext?.runAttemptId ? { attemptId: runContext.runAttemptId } : {}),
+          // The originating delivery route rides the plan: reducer admission,
+          // restart recovery, and final delivery all reuse it.
+          route: originRoute,
+          contract: {
+            agreedPlan: plan,
+            successCriteria: success_criteria ?? [],
+            contextRefs: context_refs ?? [],
+            maxMinutes: max_minutes ?? null,
+            effectCeiling: 'read',
+          },
+        });
         if (!admitted.ok) {
           return admitted.kind === 'needs_input'
             ? textResult(`Before I can fan this out I need: ${admitted.missing.join('; ')}. Ask the user, then dispatch again with the answers.`)
             : textResult(`The fan-out manifest was refused: ${admitted.errors.join('; ')}. Fix the manifest and dispatch again.`);
         }
-        const originRoute = backgroundRouteForOriginSession(sessionId);
-        const scheduled = scheduleDurableFanout(admitted.plan.planId, originRoute);
+        const scheduled = scheduleDurableFanout(admitted.plan.planId);
         const windows = scheduled?.workerTasks.length ?? 0;
         linkFocusActionForSession(sessionId, {
           id: admitted.plan.planId,
@@ -393,22 +414,25 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       receipt: z.string().nullable().describe('One line of evidence for HOW the item settled (an id, a count, an error). Stored on the durable journal row.'),
     },
     async ({ plan_id, item_id, phase_id, status, receipt }) => {
-      const settled = settleFanoutActivation({
+      const callerRunSessionId = getToolOutputContext()?.sessionId ?? '';
+      // Settlement carries the CALLER's window authority: this worker's run
+      // session must own a claimed window containing the item. Another
+      // window's items, a stale generation, or a non-worker caller refuse.
+      const settled = settleFanoutActivationAs({
         planId: plan_id, itemId: item_id, phaseId: phase_id, status,
         receiptRef: receipt ?? undefined,
+        callerRunSessionId,
       });
       if (!settled.settled) return textResult(`Not settled: ${settled.reason}`);
       if (settled.alreadySettled) {
         return textResult(`Item ${item_id} phase ${phase_id} was ALREADY settled by an earlier attempt — skip it and continue with the next open item.`);
       }
       const open = listFanoutActivations(plan_id).filter((a) => a.status !== 'done').length;
-      // The last settlement admits the reducer. Journal readiness + the
-      // atomic lease make this exactly-once no matter how many workers,
-      // retries, or processes reach zero "simultaneously".
-      if (open === 0) maybeAdmitFanoutReducer(plan_id);
+      // Reducer admission is reconciliation's job (journal-ready + atomic
+      // lease); a settle only nudges the drain so it happens promptly.
       return textResult(
         `Settled ${item_id} × ${phase_id} (${status}). ${open} activation(s) still open on plan ${plan_id}.`
-        + (open === 0 ? ' The plan is complete — the reducer has been admitted and will report back.' : ''),
+        + (open === 0 ? ' The plan is complete — the reducer will be admitted and will report back.' : ''),
       );
     },
   );
@@ -423,12 +447,37 @@ export function registerBackgroundTaskTools(server: McpServer): void {
     async ({ plan_id, limit }) => {
       const plan = loadFanoutPlan(plan_id);
       if (!plan) return textResult(`No durable fan-out plan ${plan_id}.`);
-      const open = listFanoutActivations(plan_id).filter((a) => a.status !== 'done');
+      const callerRunSessionId = getToolOutputContext()?.sessionId ?? '';
+      const authority = windowAuthorityFor(plan_id, callerRunSessionId);
+      const open = listFanoutActivations(plan_id).filter((a) => a.status !== 'done'
+        && (!authority || authority.itemIds.includes(a.itemId)));
       const page = open.slice(0, limit ?? 100);
       return textResult([
-        `Plan ${plan_id} (${plan.status}): ${open.length} open activation(s).`,
+        authority
+          ? `Plan ${plan_id} (${plan.status}), YOUR window ${authority.windowIndex + 1}: ${open.length} open activation(s).`
+          : `Plan ${plan_id} (${plan.status}): ${open.length} open activation(s).`,
         ...page.map((a) => `- ${a.itemId} × ${a.phaseId} [${a.status}]`),
         ...(open.length > page.length ? [`…and ${open.length - page.length} more.`] : []),
+      ].join('\n'));
+    },
+  );
+
+  server.tool(
+    'fanout_list_settlements',
+    'Page through the DURABLE settlements of a fan-out plan (reducer use): every settled item×phase with its receipt. The journal is the complete record — page until an empty page.',
+    {
+      plan_id: z.string().min(1),
+      offset: z.number().int().min(0).nullable(),
+      limit: z.number().int().min(1).max(500).nullable(),
+    },
+    async ({ plan_id, offset, limit }) => {
+      const plan = loadFanoutPlan(plan_id);
+      if (!plan) return textResult(`No durable fan-out plan ${plan_id}.`);
+      const page = listFanoutSettlements(plan_id, { offset: offset ?? 0, limit: limit ?? 200 });
+      return textResult([
+        `Plan ${plan_id}: ${page.length} settlement(s) at offset ${offset ?? 0}.`,
+        ...page.map((s) => `- ${s.itemId} × ${s.phaseId}${s.receiptRef ? `: ${s.receiptRef}` : ''}`),
+        ...(page.length === 0 ? ['(end of journal)'] : []),
       ].join('\n'));
     },
   );

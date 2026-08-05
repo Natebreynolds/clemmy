@@ -291,16 +291,16 @@ test('a window that keeps dying is retried boundedly, then the plan fails honest
   );
   const planId = (admitted as Extract<typeof admitted, { ok: true }>).plan.planId;
 
-  let generations = 0;
+  fanout.scheduleDurableFanout(planId);
+  let generations = 1;
   for (let round = 0; round < 10; round += 1) {
-    const scheduled = fanout.scheduleDurableFanout(planId);
-    if (!scheduled || scheduled.workerTasks.length === 0) break;
-    generations += 1;
-    // Every worker dies without settling anything.
-    fanout.reconcileDurableFanout({
+    // Every worker is dead; ordinary-operation reconciliation both releases
+    // and re-schedules, so it alone drives the retry ladder.
+    const outcome = fanout.reconcileDurableFanout({
       workerTaskAlive: () => false,
       runReducer: () => {},
     });
+    generations += outcome.rescheduled.includes(planId) ? 1 : 0;
     if (fanout.loadFanoutPlan(planId)!.status === 'failed') break;
   }
   const plan = fanout.loadFanoutPlan(planId)!;

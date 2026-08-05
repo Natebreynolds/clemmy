@@ -30,7 +30,17 @@ import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, reapStaleBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks, listBackgroundTasks } from '../execution/background-tasks.js';
-import { reconcileDurableFanout, maybeAdmitFanoutReducer } from '../execution/durable-fanout.js';
+import { reconcileDurableFanout } from '../execution/durable-fanout.js';
+import { scheduleLearningDrain } from '../memory/learning-worker.js';
+
+/** Live scheduler truth for one background task id, for fan-out lifecycle. */
+function fanoutTaskState(taskId: string): 'alive' | 'done' | 'failed' | 'missing' {
+  const task = listBackgroundTasks({ includeArchived: true }).find((t) => t.id === taskId);
+  if (!task) return 'missing';
+  if (task.status === 'pending' || task.status === 'running') return 'alive';
+  if (task.status === 'done') return 'done';
+  return 'failed';
+}
 import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRuns } from '../execution/workflow-runner.js';
 import {
   registerWorkflowRunDrainKick,
@@ -63,7 +73,7 @@ import { listUsableConnectedToolkits } from '../integrations/composio/client.js'
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { reportInterruptedChatRuns } from '../runtime/harness/restart-recovery.js';
-import { reconcileIncompleteHandoffs } from '../execution/continuation-capsule.js';
+import { reconcileHandoffsForBoot } from '../execution/continuation-capsule.js';
 import { startTerminalReportBackWatcher } from '../runtime/harness/terminal-report-back.js';
 import { interruptOrphanedRunAttemptsAtBoot } from '../runtime/harness/eventlog.js';
 import { reconcileDormantTerminalWorkSessions } from '../runtime/harness/session-reconcile.js';
@@ -1917,28 +1927,24 @@ export async function startDaemon(
   }
   // A foreground → background handoff interrupted mid-ladder is the one shape
   // that can leave a turn with NO owner: the foreground fenced, the worker never
-  // admitted. Converge each unsettled handoff to exactly one owner — right after
-  // interrupted tasks are back in the queue, so a handoff whose task already
-  // exists is confirmed rather than duplicated.
-  void reconcileIncompleteHandoffs()
-    .then((reconciled) => {
-      if (reconciled.length > 0) logger.warn({ reconciled }, 'Reconciled incomplete foreground handoffs on boot');
-    })
-    .catch((err) => {
-      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Handoff reconciliation on boot failed');
-    });
+  // admitted. AWAITED, and before generic interrupted-chat recovery is allowed
+  // to resume any model: until this returns, the daemon cannot say which turns
+  // still have an owner, and a recovery that resumes one of them would put a
+  // fresh foreground alongside a live worker. A failure here fails READINESS —
+  // reporting healthy while unable to read the ownership record is the
+  // dishonest option, and this throw is what stops onReady from being reached.
+  const reconciledHandoffs = await reconcileHandoffsForBoot();
+  if (reconciledHandoffs.length > 0) {
+    logger.warn({ reconciled: reconciledHandoffs }, 'Reconciled incomplete foreground handoffs on boot');
+  }
   // The same question one level down: a fan-out plan whose workers died with the
   // previous process holds windows nothing will ever settle. Reconciliation
   // releases those bindings and admits the reducer when the journal already says
   // the work is complete — a worker that is neither pending nor running is not
   // coming back, whatever its activation rows still claim.
   try {
-    const fanout = reconcileDurableFanout({
-      workerTaskAlive: (taskId) => listBackgroundTasks({ includeArchived: true })
-        .some((task) => task.id === taskId && (task.status === 'pending' || task.status === 'running')),
-      runReducer: (plan) => { maybeAdmitFanoutReducer(plan.planId); },
-    });
-    if (fanout.rescheduled.length > 0 || fanout.reduced.length > 0) {
+    const fanout = reconcileDurableFanout({ taskState: fanoutTaskState });
+    if (fanout.rescheduled.length > 0 || fanout.reduced.length > 0 || fanout.failedPlans.length > 0) {
       logger.warn(fanout, 'Reconciled durable fan-out plans on boot');
     }
   } catch (err) {
@@ -2167,6 +2173,22 @@ export async function startDaemon(
         'Independent background task tick failed',
       );
     });
+    // Fan-out plans reconcile during ORDINARY operation, on the same cadence
+    // as the drain that runs their workers: dead windows release (bounded
+    // retries, then an honest failed plan), the reducer's real task terminal
+    // drives its lifecycle, and a complete journal admits its reducer.
+    try {
+      reconcileDurableFanout({ taskState: fanoutTaskState });
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Durable fan-out reconciliation tick failed',
+      );
+    }
+    // Pending-learning rows left by a crash (or a transient materialization
+    // failure) drain on the same heartbeat — settlements arm their own
+    // near-term drain; this is the durable backstop.
+    scheduleLearningDrain();
   };
   setImmediate(drainBackgroundTasks);
   const backgroundTimer = setInterval(drainBackgroundTasks, 15_000);

@@ -233,7 +233,10 @@ export interface LedgerEntry {
 }
 
 function ledgerKey(entry: LedgerEntry): string {
-  return `${entry.itemId}::${entry.phaseId}`;
+  // Encoded tuple, never delimited concatenation: (item "x::y", phase "z")
+  // and (item "x", phase "y::z") are different settlements and must never
+  // flatten to one key an adversarial id could forge.
+  return JSON.stringify([entry.itemId, entry.phaseId]);
 }
 
 /**

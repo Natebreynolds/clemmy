@@ -53,6 +53,7 @@ import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { completedItemIds, loadCapsule } from './continuation-capsule.js';
+import { markHandoffOwnerActive } from './handoff-store.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { resolveWriteEvidence } from '../runtime/harness/work-report.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
@@ -150,6 +151,8 @@ export interface BackgroundTaskOutcomeSnapshot {
 
 export interface BackgroundTaskRecord {
   id: string;
+  /** See CreateBackgroundTaskInput.internal — plan-owned reporting. */
+  internal?: boolean;
   title: string;
   prompt: string;
   status: BackgroundTaskStatus;
@@ -303,6 +306,14 @@ export interface CreateBackgroundTaskInput {
   title: string;
   prompt: string;
   /**
+   * An INTERNAL sub-unit of a larger durable plan (a fan-out worker window).
+   * The user's contract lives at the plan level — one kickoff, aggregate
+   * progress, one reducer terminal — so an internal task never enqueues a
+   * chat report-back, never fires the loud completion notification, and never
+   * settles a focus action; the plan does those exactly once.
+   */
+  internal?: boolean;
+  /**
    * The CHAT session that spawned this task, if any. On completion the task's
    * result is fed back into THIS session's transcript (see
    * enqueueBackgroundTaskResultTurn) so Clementine resumes from it. Pass it
@@ -312,6 +323,10 @@ export interface CreateBackgroundTaskInput {
    */
   originSessionId?: string;
   foregroundHandoff?: BackgroundTaskRecord['foregroundHandoff'];
+  /** A task id RESERVED from durable identity before this task existed. Callers
+   *  that can derive their id (a foreground handoff derives it from the accepted
+   *  attempt) pass it so concurrent materializations converge on one task. */
+  explicitId?: string;
   userId?: string;
   channel?: string;
   reportBackTarget?: BackgroundReportBackTarget;
@@ -618,6 +633,22 @@ function withTaskTransitionLock<T>(id: string, fn: () => T): T | null {
     return fn();
   } finally {
     release();
+  }
+}
+
+/**
+ * Claim a RESERVED task id across processes. The exclusive create is the whole
+ * mechanism: two daemons materializing the same reservation both reach here,
+ * and the kernel picks one. The loser reads the winner's task instead of
+ * writing a second runnable copy of the same work.
+ */
+function claimTaskId(id: string): boolean {
+  ensureTaskDir();
+  try {
+    closeSync(openSync(taskFilePath(id), 'wx', 0o600));
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1340,12 +1371,25 @@ export function deriveTaskTitle(raw: string): string {
 
 export function createBackgroundTask(input: CreateBackgroundTaskInput): BackgroundTaskRecord {
   const createdAt = nowIso();
-  const id = makeTaskId(new Date(createdAt));
+  // An explicit id is a RESERVATION the caller already derived from durable
+  // identity. Materializing it is claim-or-rejoin, never create-another: two
+  // processes racing the same reservation must end with one runnable task, not
+  // two workers that both do the work and both report back.
+  if (input.explicitId) {
+    const existing = getBackgroundTask(input.explicitId);
+    if (existing) return existing;
+    if (!claimTaskId(input.explicitId)) {
+      const winner = getBackgroundTask(input.explicitId);
+      if (winner) return winner;
+    }
+  }
+  const id = input.explicitId ?? makeTaskId(new Date(createdAt));
   const task: BackgroundTaskRecord = {
     id,
     title: deriveTaskTitle(clean(input.title || input.prompt, 200)),
     prompt: input.prompt.trim(),
     status: 'pending',
+    ...(input.internal ? { internal: true } : {}),
     originSessionId: input.originSessionId,
     foregroundHandoff: input.foregroundHandoff,
     runSessionId: `background:${id}`,
@@ -1865,7 +1909,61 @@ export function _setBackgroundTaskStartCasHookForTests(fn: (() => void) | null):
   backgroundTaskStartCasHookForTests = fn;
 }
 
+/**
+ * Does this task's continuation still match what it was ADMITTED against?
+ *
+ * A handoff worker does not start from its prompt — it starts from a capsule
+ * that says which items are already done, which authority is bound, and what is
+ * safe to run next. Resuming against a capsule that is missing, or that no
+ * longer matches the digest and identity recorded at admission, means acting on
+ * a record nobody verified: the redone work would be real, and so would the
+ * skipped work. Uncertainty here parks; it never proceeds.
+ */
+function handoffBindingFailure(task: BackgroundTaskRecord): string | null {
+  const binding = task.foregroundHandoff;
+  if (!binding?.logicalTaskId) return null;
+  const capsule = loadCapsule(binding.logicalTaskId);
+  if (!capsule) {
+    return 'The continuation capsule this task was admitted against is missing or failed its own digest, '
+      + 'so what is already done cannot be established. Parked rather than risk redoing or skipping work.';
+  }
+  if (binding.capsuleId && capsule.capsuleId !== binding.capsuleId) {
+    return 'The continuation capsule for this task is not the one it was admitted against. '
+      + 'Parked rather than resume from an unverified record of completed work.';
+  }
+  if (binding.capsuleDigest && capsule.digest !== binding.capsuleDigest) {
+    return 'The continuation capsule changed since this task was admitted (binding digest mismatch). '
+      + 'Parked rather than resume from an unverified record of completed work.';
+  }
+  if (binding.sessionId && capsule.sessionId !== binding.sessionId) {
+    return 'The continuation capsule belongs to a different session than this task was admitted for. Parked.';
+  }
+  if (binding.attemptId && capsule.activationId !== binding.attemptId) {
+    return 'The continuation capsule belongs to a different accepted attempt than this task. Parked.';
+  }
+  if (typeof binding.sourceUserSeq === 'number'
+    && capsule.acceptedSource !== `${binding.sessionId}:${binding.sourceUserSeq}`) {
+    return 'The continuation capsule is not bound to the accepted user request this task was admitted for. Parked.';
+  }
+  return null;
+}
+
 export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | null {
+  // Validate the continuation BEFORE the status CAS. A task that flips to
+  // running has an owner; parking after the flip would mean the unverified
+  // resume already started.
+  const candidate = getBackgroundTask(id);
+  if (candidate) {
+    const failure = handoffBindingFailure(candidate);
+    if (failure) {
+      updateBackgroundTaskWhere(id, (task) => task.status === 'pending', {
+        status: 'blocked',
+        error: failure,
+      });
+      logger.warn({ taskId: id }, 'Parked a background handoff whose continuation capsule failed its binding');
+      return null;
+    }
+  }
   // Adversarial test seam: pause after a candidate observed `pending` but before
   // the authoritative CAS. Production pays no extra read when the seam is off.
   if (backgroundTaskStartCasHookForTests) {
@@ -1885,6 +1983,12 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     pendingQuestionId: undefined,
     pendingQuestion: undefined,
   });
+  // The worker has the run. Recorded as a durable fact rather than a ladder
+  // rung because it races the foreground's own terminal and neither order is
+  // wrong; reconciliation reads it to tell "admitted" from "actually running".
+  if (updated?.foregroundHandoff?.attemptId) {
+    try { markHandoffOwnerActive(updated.foregroundHandoff.attemptId); } catch { /* observation, never blocking */ }
+  }
   // Pre-register the trace session the instant the card flips to RUNNING, so the board's
   // live-trace SSE (GET /api/sessions/background:<id>/events) never 404s during the startup
   // window. The worker otherwise creates background:<id> lazily on its FIRST
@@ -1947,6 +2051,9 @@ function enqueueBackgroundTaskOutcomeTurn(
   outcome: BackgroundTaskOutcome,
   detail: string,
 ): boolean {
+  // Internal plan units report through their PLAN (journal → aggregate
+  // progress → one reducer terminal), never per task.
+  if (task.internal) return false;
   updateLinkedFocusAction(task.id, {
     status: outcome === 'done' ? 'done' : 'blocked',
     note: outcome === 'done'
@@ -2268,23 +2375,28 @@ export function markBackgroundTaskDone(
     };
   });
   if (updated) {
-    // The HUMAN sees a conversational body: a caller-supplied one when the raw
-    // result is machine-shaped (e.g. the job-watcher's JSON), otherwise the
-    // worker's text with its audit ledger stripped. The MODEL still gets the
-    // full `result` (result file + `enqueueBackgroundTaskOutcomeTurn` below).
-    const notificationBody = opts?.notificationBody ?? humanizeReportBody(result);
-    addNotification({
-      id: `${Date.now()}-background-${updated.id}-done`,
-      kind: 'execution',
-      title: `Background task completed: ${updated.title}`,
-      body: truncateResultBody(notificationBody),
-      createdAt: nowIso(),
-      read: false,
-      metadata: taskNotificationMetadata(updated, { terminalReportBack: true }),
-    });
-    // Async report-back: also feed the result into the origin session's
-    // context so Clementine resumes from it, not just a notification.
-    enqueueBackgroundTaskOutcomeTurn(updated, 'done', result);
+    // User-facing deliveries only for user-facing tasks: an INTERNAL plan
+    // unit reports through its plan (aggregate progress, one reducer
+    // terminal). Operational telemetry and strategy capture stay on.
+    if (!updated.internal) {
+      // The HUMAN sees a conversational body: a caller-supplied one when the raw
+      // result is machine-shaped (e.g. the job-watcher's JSON), otherwise the
+      // worker's text with its audit ledger stripped. The MODEL still gets the
+      // full `result` (result file + `enqueueBackgroundTaskOutcomeTurn` below).
+      const notificationBody = opts?.notificationBody ?? humanizeReportBody(result);
+      addNotification({
+        id: `${Date.now()}-background-${updated.id}-done`,
+        kind: 'execution',
+        title: `Background task completed: ${updated.title}`,
+        body: truncateResultBody(notificationBody),
+        createdAt: nowIso(),
+        read: false,
+        metadata: taskNotificationMetadata(updated, { terminalReportBack: true }),
+      });
+      // Async report-back: also feed the result into the origin session's
+      // context so Clementine resumes from it, not just a notification.
+      enqueueBackgroundTaskOutcomeTurn(updated, 'done', result);
+    }
     emitBackgroundTaskOperational('background_task_finished', updated, { status: 'done' });
     // Learning loop (DREAM): distill this run's SHAPE — real tools used,
     // fan-out width, wall time — into the strategy store so the next similar
