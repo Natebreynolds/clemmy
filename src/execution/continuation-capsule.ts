@@ -125,7 +125,16 @@ export function checkpointCapsule(input: CapsuleInput, now = new Date().toISOStr
   return capsule;
 }
 
-/** Load and VALIDATE a capsule; an unknown version or torn file misses. */
+/**
+ * Load and VALIDATE a capsule; an unknown version, torn file, or content that
+ * no longer matches its own digest misses.
+ *
+ * The digest comparison is the load-bearing half. A capsule is resume
+ * authority — objective, decisions, completed items, next safe actions — so a
+ * capsule edited underneath us (a partial write, a stale sync, an edited file)
+ * would otherwise be obeyed. Recomputing here means the only capsule that can
+ * steer a resume is one this build wrote whole.
+ */
 export function loadCapsule(logicalTaskId: string): ContinuationCapsule | undefined {
   try {
     const file = capsulePath(logicalTaskId);
@@ -133,6 +142,10 @@ export function loadCapsule(logicalTaskId: string): ContinuationCapsule | undefi
     const parsed = JSON.parse(readFileSync(file, 'utf-8')) as ContinuationCapsule;
     if (parsed?.version !== CONTINUATION_CAPSULE_VERSION) return undefined;
     if (!parsed.logicalTaskId || !parsed.objective || !Array.isArray(parsed.nextSafeActions)) return undefined;
+    if (typeof parsed.digest !== 'string' || !parsed.digest) return undefined;
+    const { digest, updatedAt, ...body } = parsed;
+    void updatedAt;
+    if (digestOf(body as Omit<ContinuationCapsule, 'digest' | 'updatedAt'>) !== digest) return undefined;
     return parsed;
   } catch {
     return undefined;
@@ -171,22 +184,82 @@ export interface HandoffRecord {
   capsuleId?: string;
   backgroundTaskId?: string;
   state: HandoffState;
+  /** Monotonic, opaque to callers. A writer that does not hold the current
+   *  revision is a writer working from a stale view of who owns this task. */
+  revision: number;
   updatedAt: string;
 }
+
+/** The state machine is a LADDER: ownership only ever moves forward. */
+const HANDOFF_ORDER: HandoffState[] = [
+  'requested',
+  'foreground_commit_fenced',
+  'capsule_checkpointed',
+  'background_admitted',
+  'background_owner_active',
+  'foreground_released',
+];
+
+function handoffRank(state: HandoffState): number {
+  const index = HANDOFF_ORDER.indexOf(state);
+  return index < 0 ? -1 : index;
+}
+
+export type HandoffWrite =
+  | { ok: true; record: HandoffRecord }
+  | { ok: false; reason: string; current: HandoffRecord | undefined };
 
 function handoffPath(acceptedAttemptId: string): string {
   return path.join(capsuleDir(), `handoff-${encodeURIComponent(acceptedAttemptId)}.json`);
 }
 
-export function recordHandoffState(record: Omit<HandoffRecord, 'version' | 'updatedAt'>, now = new Date().toISOString()): HandoffRecord {
+/**
+ * Advance the handoff. Two rules, and both exist because their absence is how
+ * a task ends up with two live owners:
+ *
+ *   MONOTONIC — the state may only move forward along the ladder. A late
+ *   writer replaying "requested" over "background_owner_active" would hand the
+ *   foreground back a task the background is already running.
+ *
+ *   CAS — a caller may pin the revision it read. Two activations racing to
+ *   claim the same attempt cannot both win, because the loser's expected
+ *   revision is already spent.
+ */
+export function advanceHandoffState(
+  record: Omit<HandoffRecord, 'version' | 'revision' | 'updatedAt'>,
+  options: { expectedRevision?: number; now?: string } = {},
+): HandoffWrite {
   const dir = capsuleDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const next: HandoffRecord = { version: 1, ...record, updatedAt: now };
+  const current = loadHandoffState(record.acceptedAttemptId);
+  if (current && options.expectedRevision !== undefined && options.expectedRevision !== current.revision) {
+    return { ok: false, reason: `expected revision ${options.expectedRevision}, found ${current.revision}`, current };
+  }
+  if (current && handoffRank(record.state) < handoffRank(current.state)) {
+    return { ok: false, reason: `handoff cannot regress from ${current.state} to ${record.state}`, current };
+  }
+  const next: HandoffRecord = {
+    version: 1,
+    ...record,
+    revision: (current?.revision ?? 0) + 1,
+    updatedAt: options.now ?? new Date().toISOString(),
+  };
   const file = handoffPath(record.acceptedAttemptId);
   const temporary = path.join(dir, `.handoff-${encodeURIComponent(record.acceptedAttemptId)}.${randomUUID()}.tmp`);
   writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, 'utf-8');
   renameSync(temporary, file);
-  return next;
+  return { ok: true, record: next };
+}
+
+/** Advance, keeping the durable record when the write is refused. Callers that
+ *  cannot act on a refusal still must not be handed a forged record. */
+export function recordHandoffState(
+  record: Omit<HandoffRecord, 'version' | 'revision' | 'updatedAt'>,
+  now = new Date().toISOString(),
+): HandoffRecord {
+  const written = advanceHandoffState(record, { now });
+  if (written.ok) return written.record;
+  return written.current ?? { version: 1, ...record, revision: 0, updatedAt: now };
 }
 
 export function loadHandoffState(acceptedAttemptId: string): HandoffRecord | undefined {
@@ -194,7 +267,10 @@ export function loadHandoffState(acceptedAttemptId: string): HandoffRecord | und
     const file = handoffPath(acceptedAttemptId);
     if (!existsSync(file)) return undefined;
     const parsed = JSON.parse(readFileSync(file, 'utf-8')) as HandoffRecord;
-    return parsed?.version === 1 ? parsed : undefined;
+    if (parsed?.version !== 1) return undefined;
+    // Records written before revisions existed start at 0 rather than
+    // disappearing: an in-flight handoff must survive the upgrade.
+    return { ...parsed, revision: Number.isInteger(parsed.revision) ? parsed.revision : 0 };
   } catch {
     return undefined;
   }

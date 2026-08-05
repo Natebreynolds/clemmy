@@ -276,7 +276,11 @@ test('detachRunningTurnToBackground: stops the run + enqueues a goal-bound resum
   const task = getBackgroundTask(res!.taskId);
   assert.ok(task);
   assert.match(task!.prompt, /scrape 100 net-new Salesforce accounts/, 'objective = the recent real request, not "background it"');
-  assert.match(task!.prompt, /session_history/, 'prompt tells it to resume from recorded progress');
+  // Continuation is structural now: the task names the durable capsule that
+  // records what is already done, instead of asking the worker to reconstruct
+  // it by reading chat history.
+  assert.ok(task!.foregroundHandoff?.logicalTaskId, 'the task carries no continuation capsule identity');
+  assert.ok(task!.foregroundHandoff?.capsuleId, 'the task carries no checkpointed capsule');
   assert.equal(task!.originSessionId, sess.id, 'reports back to the originating chat');
   assert.equal(task!.source, 'discord', 'handoff preserves its real surface');
   assert.equal(task!.channel, 'discord:test-channel');

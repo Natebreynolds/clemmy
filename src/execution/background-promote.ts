@@ -37,6 +37,7 @@ import {
 import { getActiveObjective } from '../memory/focus.js';
 import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
 import { effectiveTurnObjective } from '../runtime/harness/turn-control.js';
+import { advanceHandoffState, checkpointCapsule } from './continuation-capsule.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 
@@ -525,13 +526,14 @@ function backgroundItResult(
  * the chat. Returns null when there's no resolvable objective to background (the
  * caller then treats the message as an ordinary turn). Shared by every surface.
  *
- * Dedup across the origin→background boundary is SOFT and BOUNDED, not hard:
- * requestKill stops the foreground at its NEXT assertNotKilled (tool-call edge),
- * so one already-in-flight foreground tool call can still complete; and the
- * background task avoids redo only by being told to read session_history first
- * (LLM-honored). So the overlap is bounded to ≤1 in-flight foreground action +
- * soft progress-diffing — acceptable for v1 (this is the resume-not-restart
- * tradeoff). A hard cross-session idempotency key would be the stronger fix.
+ * Continuation is STRUCTURAL. Before the handoff is acknowledged, a durable
+ * capsule is checkpointed and the handoff state machine is advanced, and the
+ * background task carries their identities. What is already done comes from
+ * that capsule, not from asking the model to read history and infer it —
+ * bounded origin history remains context. requestKill still stops the
+ * foreground at its next tool-call edge, so ≤1 in-flight foreground action may
+ * still complete; the durable handoff record is what guarantees exactly one
+ * OWNER from that point on.
  */
 export function detachRunningTurnToBackground(
   sessionId: string,
@@ -580,11 +582,45 @@ export function detachRunningTurnToBackground(
   // If persistence fails synchronously, release only this latch so foreground
   // work is not silently lost. enqueue's drain yields after this call stack.
   requestKill(sessionId, 'moved to background by user', active);
+
+  // Structural continuation, checkpointed BEFORE the acknowledgement: an
+  // acknowledgement is only honest once what the background inherits is
+  // durable. The logical task id is derived from the accepted attempt, so a
+  // double-click, a lost response, or a restart rejoins this exact task.
+  const logicalTaskId = `handoff:${sessionId}:${active.attemptId}`;
+  const handoffIdentity = {
+    logicalTaskId,
+    acceptedAttemptId: active.attemptId,
+    sessionId,
+    sourceUserSeq: resolved.sourceUserSeq,
+  };
+  advanceHandoffState({ ...handoffIdentity, state: 'requested' });
+  const capsule = checkpointCapsule({
+    logicalTaskId,
+    sessionId,
+    acceptedSource: `${sessionId}:${resolved.sourceUserSeq}`,
+    activationId: active.attemptId,
+    objective: resolved.objective,
+    successCriteria: [],
+    constraints: [],
+    decisions: [],
+    scopeRefs: {},
+    capabilityRefs: {},
+    effectRefs: [],
+    deliverableRefs: [],
+    nextSafeActions: ['continue from the last durable settlement recorded for this task'],
+    // History below this boundary is context; later turns in the reusable
+    // origin chat are not this task's input.
+    compactionWatermark: throughSeq,
+  });
+  advanceHandoffState({ ...handoffIdentity, capsuleId: capsule.capsuleId, state: 'capsule_checkpointed' });
+
   const composedPrompt = [
     `Objective: ${resolved.objective}`,
     '',
     'You are CONTINUING this task in the background — the user just moved it here from a live chat.',
-    `Your progress so far is recorded in session "${sessionId}" through event ${throughSeq}. Call session_history with session_id="${sessionId}" and through_seq=${throughSeq} FIRST to see what is already done, then continue from there — do NOT read later turns or redo completed work.`,
+    'The durable continuation capsule below is authoritative for what is already done. '
+      + 'The bounded origin history is context, not proof of completion; do not redo completed work.',
     'Work through to completion, then report the result back.',
   ].join('\n');
   try {
@@ -602,7 +638,15 @@ export function detachRunningTurnToBackground(
         ...(active.runId ? { runId: active.runId } : {}),
         sourceUserSeq: resolved.sourceUserSeq,
         throughSeq,
+        capsuleId: capsule.capsuleId,
+        logicalTaskId,
       },
+    });
+    advanceHandoffState({
+      ...handoffIdentity,
+      capsuleId: capsule.capsuleId,
+      backgroundTaskId: task.id,
+      state: 'background_admitted',
     });
     return backgroundItResult(task, active.attemptId, false);
   } catch (error) {
