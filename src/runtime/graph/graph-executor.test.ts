@@ -422,13 +422,14 @@ test('the executor imports only its pure siblings and reaches nowhere', async ()
   const here = path.dirname(fileURLToPath(import.meta.url));
   const source = readFileSync(path.join(here, 'graph-executor.ts'), 'utf-8');
 
-  // The identity and journal CONTRACTS are pure same-directory modules (crypto
-  // digests and validation only — their own tests pin that). Anything else —
-  // providers, tools, memory, filesystem, environment, UI — belongs in nodes
-  // and adapters, and its appearance here is the executor becoming a runtime.
+  // The identity and replay CONTRACTS are pure same-directory modules (crypto
+  // digests and ordered validation only — their own tests pin that; the
+  // journal itself is a type-only dependency). Anything else — providers,
+  // tools, memory, filesystem, environment, UI — belongs in nodes and
+  // adapters, and its appearance here is the executor becoming a runtime.
   assert.deepEqual(
     [...source.matchAll(/^import (?!type ).*?from '([^']+)';$/gms)].map((m) => m[1]).sort(),
-    ['./graph-admission.js', './graph-journal.js'],
+    ['./graph-admission.js', './graph-resume.js'],
     'the executor grew a dependency — policy, capability and effects belong in nodes',
   );
   for (const forbidden of ['process.env', 'readFileSync', 'Date.now', 'new Date', 'BASE_DIR', 'fetch(', 'Math.random']) {

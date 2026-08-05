@@ -11,7 +11,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { admitGraph, computeNodeDigest, type AdmittedBudget, type GraphAdmission } from './graph-admission.js';
+import { admitGraph, computeInputDigest, computeNodeDigest, type AdmittedBudget, type GraphAdmission } from './graph-admission.js';
 import type { GraphJournalEntry, NodeSettledEntry } from './graph-journal.js';
 import {
   runGraph,
@@ -120,22 +120,24 @@ test('a failed claim append halts BEFORE the runner is invoked', async () => {
 
 // ── identity-bound reuse ─────────────────────────────────────────────────────
 
-function settledEntry(
+/** One exact durable start/settlement pair — the only shape replay trusts. */
+function settledPair(
   admission: GraphAdmission,
   nodeId: string,
   over: Partial<NodeSettledEntry> = {},
-): NodeSettledEntry {
-  return {
-    type: 'node_settled',
+): GraphJournalEntry[] {
+  const identity = {
     admissionDigest: admission.admissionDigest,
     nodeId,
-    nodeDigest: computeNodeDigest({ id: nodeId, kind: 'step' }),
-    inputDigest: 'any',
-    attemptId: `prior-${nodeId}`,
-    wave: 0,
-    status: 'completed',
-    ...over,
+    nodeDigest: over.nodeDigest ?? computeNodeDigest({ id: nodeId, kind: 'step' }),
+    inputDigest: over.inputDigest ?? computeInputDigest([]),
+    attemptId: over.attemptId ?? `prior-${nodeId}`,
+    wave: over.wave ?? 0,
   };
+  return [
+    { type: 'node_started', ...identity },
+    { type: 'node_settled', status: 'completed', firedEdgeIds: [], ...over, ...identity },
+  ];
 }
 
 test('a reused node restores its artifact refs at zero dispatch cost', async () => {
@@ -153,9 +155,9 @@ test('a reused node restores its artifact refs at zero dispatch cost', async () 
     admission,
     journalAdapter: adapter,
     clock: CLOCK,
-    resumeEntries: [
-      settledEntry(admission, 'a', { outputRef: 'art-a', evidenceRefs: ['ev-a'] }),
-    ],
+    resumeEntries: settledPair(admission, 'a', {
+      outputRef: 'art-a', evidenceRefs: ['ev-a'], firedEdgeIds: ['e1'],
+    }),
   });
   assert.equal(result.status, 'completed');
   assert.equal(sequence.includes('run:a'), false, 'a journaled completion was re-dispatched');
@@ -173,9 +175,9 @@ test('a changed node definition refuses reuse — same id, different work', asyn
     admission,
     journalAdapter: adapter,
     clock: CLOCK,
-    resumeEntries: [
-      settledEntry(admission, 'a', { nodeDigest: 'digest-of-an-older-definition' }),
-    ],
+    resumeEntries: settledPair(admission, 'a', {
+      nodeDigest: 'digest-of-an-older-definition', firedEdgeIds: ['e1'],
+    }),
   });
   assert.equal(result.status, 'completed');
   assert.equal(sequence.includes('run:a'), true,
@@ -185,13 +187,13 @@ test('a changed node definition refuses reuse — same id, different work', asyn
 test('a journal from another admission refuses the whole resume', async () => {
   const admission = admitted();
   const { adapter } = memoryAdapter();
-  const foreign = settledEntry(admission, 'a');
   const result = await runGraph(CHAIN, {
     runner: completingRunner([]),
     admission,
     journalAdapter: adapter,
     clock: CLOCK,
-    resumeEntries: [{ ...foreign, admissionDigest: 'someone-elses-run' }],
+    resumeEntries: settledPair(admission, 'a')
+      .map((entry) => ({ ...entry, admissionDigest: 'someone-elses-run' })),
   });
   assert.equal(result.status, 'halted');
   assert.match(result.haltReason ?? '', /resume refused/);

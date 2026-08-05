@@ -48,13 +48,13 @@ import {
   type GraphAdmission,
   type GraphPatch,
 } from './graph-admission.js';
-import {
-  validateJournalForResume,
-  type GraphJournalAdapter,
-  type GraphJournalEntry,
-  type NodeSettledEntry,
-  type SettlementClass,
+import type {
+  GraphJournalAdapter,
+  GraphJournalEntry,
+  NodeSettledEntry,
+  SettlementClass,
 } from './graph-journal.js';
+import { reconstructAdmittedResume } from './graph-resume.js';
 
 /** A node the executor schedules. `kind` is meaningful only to the runner. */
 export interface ExecutableNode {
@@ -156,6 +156,11 @@ export interface GraphTraceEntry {
   /** Present when the node was restored from a journal rather than run. */
   reused?: true;
   reason?: string;
+  /**
+   * Present when a journaled settlement existed but could not be reused: the
+   * node ran fresh and this names why, in digests only — never payload bytes.
+   */
+  reuseRefused?: string;
 }
 
 export interface GraphRunBudget {
@@ -356,29 +361,6 @@ function describeStall(
 }
 
 /**
- * Build the reuse map AFTER journaled patches have been replayed into the
- * working graph, so patch-added completions are reusable too. Reuse requires
- * the settlement's node digest to match the CURRENT definition — a changed
- * node is different work wearing the same id, and stale reuse is refused, not
- * repaired. Input-digest agreement is enforced at schedule time, when this
- * run's predecessor refs are known.
- */
-function reusableSettlements(
-  working: ExecutableGraph,
-  completed: ReadonlyMap<string, NodeSettledEntry>,
-): Map<string, NodeSettledEntry> {
-  const reusable = new Map<string, NodeSettledEntry>();
-  const byId = new Map(working.nodes.map((node) => [node.id, node]));
-  for (const [nodeId, entry] of completed) {
-    const node = byId.get(nodeId);
-    if (!node) continue;
-    if (entry.nodeDigest !== computeNodeDigest(node)) continue; // different work — re-run
-    reusable.set(nodeId, entry);
-  }
-  return reusable;
-}
-
-/**
  * Drive a graph to a terminal state.
  *
  * Deterministic by construction: waves are computed from the graph, nodes
@@ -400,7 +382,29 @@ export async function runGraph(
     nodes: [...graph.nodes],
     edges: [...graph.edges],
   };
+  // Run state, declared BEFORE any closure that reads it — the predecessor put
+  // these after `applyPatch` and resume crashed in the temporal dead zone.
+  const trace: GraphTraceEntry[] = [];
+  const completed = new Set<string>();
+  const failed = new Set<string>();
+  const blocked = new Set<string>();
+  const paused = new Set<string>();
+  const cancelled = new Set<string>();
+  /** Terminal for scheduling purposes — never dispatched again. */
+  const settled = new Set<string>();
+  /** Edge ids whose condition has been satisfied. */
+  const fired = new Set<string>();
+  /** Settled artifact refs, for successors' typed data flow. */
+  const artifactRefs = new Map<string, { outputRef?: string; evidenceRefs?: readonly string[] }>();
+  /** Why a journaled settlement was NOT reused, per node — trace diagnostics. */
+  const reuseRefusals = new Map<string, string>();
+
   const appliedPatchDigests: string[] = [];
+  /** Digests already durable in the journal (applied or orphaned) — a
+   *  re-emission replays history and must not journal again. */
+  const journaledPatchDigests = new Set<string>();
+  /** Emitter → digest of an orphan patch a re-run emitter must reproduce exactly. */
+  const orphanPatchByEmitter = new Map<string, string>();
   let expansions = 0;
   const maxExpansions = admission ? admission.budget.maxExpansions : Number.POSITIVE_INFINITY;
 
@@ -431,6 +435,15 @@ export async function runGraph(
     if (appliedPatchDigests.includes(validated.patchDigest)) {
       return { ok: true, patchDigest: validated.patchDigest };
     }
+    // An emitter whose earlier attempt durably admitted a patch and crashed
+    // must reproduce that exact patch — never a second child graph.
+    const journaledOrphan = orphanPatchByEmitter.get(patch.emittedBy);
+    if (journaledOrphan && journaledOrphan !== validated.patchDigest) {
+      return {
+        ok: false,
+        reason: `"${patch.emittedBy}" previously admitted patch ${journaledOrphan.slice(0, 12)}…; a re-run emitter must reproduce it exactly, not create a second child graph`,
+      };
+    }
     if (expansions >= maxExpansions) {
       return { ok: false, reason: `expansion budget exhausted (${maxExpansions})` };
     }
@@ -441,13 +454,16 @@ export async function runGraph(
     working.nodes.push(...patch.nodes);
     working.edges.push(...patch.edges);
     appliedPatchDigests.push(validated.patchDigest);
+    orphanPatchByEmitter.delete(patch.emittedBy);
     expansions += 1;
     return { ok: true, patchDigest: validated.patchDigest };
   };
 
   // ── mode resolution ────────────────────────────────────────────────────────
   let haltReason: string | undefined;
-  let reusable = new Map<string, NodeSettledEntry>();
+  /** Latest trusted settlement per node. Trusted is not reused: digests are
+   *  compared at READINESS, when this run's predecessor outcomes are known. */
+  let trusted = new Map<string, NodeSettledEntry>();
   if (admission) {
     if (!options.journalAdapter) haltReason = 'admitted run requires a journal adapter';
     else if (!options.clock) haltReason = 'admitted run requires a clock (a ceiling needs one)';
@@ -457,27 +473,20 @@ export async function runGraph(
       // judge for what it grows. Forgetting the admitter must be loud.
       haltReason = 'admitted run allows expansions but has no patch admitter';
     } else if (options.resumeEntries?.length) {
-      const validated = validateJournalForResume(graph, admission, options.resumeEntries);
-      if (!validated.ok) haltReason = `resume refused: ${validated.errors.join('; ')}`;
+      // Pure ordered reconstruction — never the live patch path, never live
+      // temporal state. Durable history decides topology and routing.
+      const resume = reconstructAdmittedResume(graph, admission, options.resumeEntries);
+      if (!resume.ok) haltReason = `resume refused: ${resume.errors.join('; ')}`;
       else {
-        // Replay journaled patches into the working graph before anything
-        // schedules. Content is digest-checked, so a tampered journal refuses.
-        for (const patchEntry of validated.patches) {
-          const replayed = applyPatch({
-            emittedBy: patchEntry.emittedBy,
-            nodes: patchEntry.nodes,
-            edges: patchEntry.edges,
-          });
-          if (!replayed.ok) {
-            haltReason = `resume refused: journaled patch could not replay: ${replayed.reason}`;
-            break;
-          }
-          if (replayed.patchDigest !== patchEntry.patchDigest) {
-            haltReason = 'resume refused: journaled patch content does not match its digest';
-            break;
-          }
+        working.nodes = [...resume.nodes];
+        working.edges = [...resume.edges];
+        appliedPatchDigests.push(...resume.appliedPatchDigests);
+        expansions = resume.appliedPatchDigests.length;
+        for (const digest of resume.journaledPatchDigests) journaledPatchDigests.add(digest);
+        for (const [emitter, digest] of resume.orphanPatchByEmitter) {
+          orphanPatchByEmitter.set(emitter, digest);
         }
-        if (!haltReason) reusable = reusableSettlements(working, validated.completed);
+        trusted = resume.trusted;
       }
     }
   }
@@ -494,19 +503,6 @@ export async function runGraph(
   let attemptCounter = 0;
   const nextAttemptId = options.attemptIds ?? (() => `attempt-${(attemptCounter += 1)}`);
 
-  const trace: GraphTraceEntry[] = [];
-  const completed = new Set<string>();
-  const failed = new Set<string>();
-  const blocked = new Set<string>();
-  const paused = new Set<string>();
-  const cancelled = new Set<string>();
-  /** Terminal for scheduling purposes — never dispatched again. */
-  const settled = new Set<string>();
-  /** Edge ids whose condition has been satisfied. */
-  const fired = new Set<string>();
-  /** Settled artifact refs, for successors' typed data flow. */
-  const artifactRefs = new Map<string, { outputRef?: string; evidenceRefs?: readonly string[] }>();
-
   const pureJournal = new Set(admission ? [] : options.journal ?? []);
   let dispatched = 0;
   let wave = 0;
@@ -517,14 +513,23 @@ export async function runGraph(
     onStep?.(entry);
   };
 
-  const fireEdgesFor = (nodeId: string, outcome: NodeOutcome): void => {
-    for (const edge of enabledEdges(working)) {
-      if (edge.source !== nodeId) continue;
-      if (edgeFires(edge, outcome, runner)) fired.add(edge.id);
-    }
-  };
+  /**
+   * The edge verdict, computed ONCE from the live outcome. The same ordered
+   * IDs are persisted with the settlement and consumed by live scheduling —
+   * one computation, two consumers, zero drift.
+   */
+  const edgeVerdict = (nodeId: string, outcome: NodeOutcome): string[] =>
+    enabledEdges(working)
+      .filter((edge) => edge.source === nodeId && edgeFires(edge, outcome, runner))
+      .map((edge) => edge.id);
 
-  const settle = (node: ExecutableNode, outcome: NodeOutcome, reused?: true): void => {
+  const settle = (
+    node: ExecutableNode,
+    outcome: NodeOutcome,
+    reused?: true,
+    /** Durable verdicts for reused work; absent, the live verdict is computed. */
+    firedEdgeIds?: readonly string[],
+  ): void => {
     settled.add(node.id);
     if (outcome.status === 'completed') {
       completed.add(node.id);
@@ -532,7 +537,8 @@ export async function runGraph(
     } else if (outcome.status === 'failed') failed.add(node.id);
     else if (outcome.status === 'blocked') blocked.add(node.id);
     else paused.add(node.id);
-    fireEdgesFor(node.id, outcome);
+    for (const edgeId of firedEdgeIds ?? edgeVerdict(node.id, outcome)) fired.add(edgeId);
+    const reuseRefused = reuseRefusals.get(node.id);
     record({
       wave,
       nodeId: node.id,
@@ -540,6 +546,7 @@ export async function runGraph(
       status: outcome.status,
       ...(reused ? { reused } : {}),
       ...(outcome.status === 'completed' ? {} : { reason: outcome.reason }),
+      ...(reuseRefused && !reused ? { reuseRefused } : {}),
     });
   };
 
@@ -558,18 +565,31 @@ export async function runGraph(
     if (wave >= maxWaves) { status = 'budget_exhausted'; break; }
 
     // Journal/resume reuse settles without dispatch and without consuming
-    // budget: replaying a completed step must be free, or restart becomes more
-    // expensive than the original run.
+    // budget: replaying a completed step must be free. Reuse is decided HERE,
+    // at readiness, when this run's fired predecessors are known — only when
+    // the node definition AND the current input digest exactly match the
+    // journaled settlement, whose durable fired-edge verdicts then replay as
+    // recorded. Anything less exact is fresh work under a new attempt.
     const fresh: ExecutableNode[] = [];
     for (const node of ready) {
-      const journaled = reusable.get(node.id);
+      const journaled = trusted.get(node.id);
       if (journaled) {
-        settle(node, {
-          status: 'completed',
-          outputRef: journaled.outputRef,
-          evidenceRefs: journaled.evidenceRefs,
-        }, true);
-      } else if (pureJournal.has(node.id)) {
+        if (journaled.nodeDigest !== computeNodeDigest(node)) {
+          reuseRefusals.set(node.id, 'node definition digest changed — same id, different work');
+        } else {
+          const currentInputDigest = computeInputDigest(predecessorRefsFor(node));
+          if (currentInputDigest !== journaled.inputDigest) {
+            reuseRefusals.set(node.id, `current input digest ${currentInputDigest.slice(0, 12)}… does not match journaled ${journaled.inputDigest.slice(0, 12)}…`);
+          } else {
+            const outcome: NodeOutcome = journaled.status === 'completed'
+              ? { status: 'completed', outputRef: journaled.outputRef, evidenceRefs: journaled.evidenceRefs }
+              : { status: 'failed', reason: journaled.reason ?? 'failed', settlementClass: 'node' };
+            settle(node, outcome, true, journaled.firedEdgeIds);
+            continue;
+          }
+        }
+      }
+      if (pureJournal.has(node.id)) {
         settle(node, { status: 'completed' }, true);
       } else {
         fresh.push(node);
@@ -581,7 +601,7 @@ export async function runGraph(
     // it — deterministic, and a partial wave never half-happens.
     if (dispatched + fresh.length > maxNodes) { status = 'budget_exhausted'; break; }
 
-    const outcomes: Array<{ node: ExecutableNode; outcome: NodeOutcome }> = [];
+    const outcomes: Array<{ node: ExecutableNode; outcome: NodeOutcome; firedEdgeIds: string[] }> = [];
     for (let i = 0; i < fresh.length; i += maxConcurrency) {
       if (options.signal?.aborted) { status = 'cancelled'; break main; }
       const slice = fresh.slice(i, i + maxConcurrency);
@@ -663,16 +683,22 @@ export async function runGraph(
           } else if (
             admission && options.journalAdapter
             && appliedPatchDigests.length > patchCountBefore
+            // A re-emission of a patch the journal already holds (the orphan
+            // crash window) replays history — journaling it again would make
+            // the same digest appear twice, which reconstruction refuses.
+            && !journaledPatchDigests.has(applied.patchDigest)
           ) {
             try {
               await options.journalAdapter.append({
                 type: 'patch_admitted',
                 admissionDigest: admission.admissionDigest,
                 emittedBy: p.node.id,
+                emitterAttemptId: p.attemptId,
                 patchDigest: applied.patchDigest,
                 nodes: [...patch.nodes],
                 edges: [...patch.edges],
               });
+              journaledPatchDigests.add(applied.patchDigest);
             } catch (error) {
               // The working copy grew but the durable record did not: halt
               // before scheduling any child. On resume the patch entry is
@@ -683,6 +709,9 @@ export async function runGraph(
             }
           }
         }
+        // One verdict, computed after any emitted patch grew the topology —
+        // journaled below, then consumed by settle(): the same IDs everywhere.
+        const firedEdgeIds = edgeVerdict(p.node.id, p.outcome);
         if (admission && options.journalAdapter) {
           try {
             await options.journalAdapter.append({
@@ -700,6 +729,7 @@ export async function runGraph(
               ...(p.outcome.status === 'failed'
                 ? { settlementClass: p.outcome.settlementClass ?? 'node' }
                 : {}),
+              firedEdgeIds,
             });
           } catch (error) {
             haltReason = `journal append failed while settling "${p.node.id}": ${error instanceof Error ? error.message : String(error)}`;
@@ -707,14 +737,14 @@ export async function runGraph(
             break main;
           }
         }
-        outcomes.push({ node: p.node, outcome: p.outcome });
+        outcomes.push({ node: p.node, outcome: p.outcome, firedEdgeIds });
       }
     }
     dispatched += outcomes.length;
 
     // Settle in declaration order regardless of completion order, so
     // concurrency never reorders a trace.
-    for (const { node, outcome } of outcomes) settle(node, outcome);
+    for (const { node, outcome, firedEdgeIds } of outcomes) settle(node, outcome, undefined, firedEdgeIds);
 
     if (outcomes.some(({ outcome }) => outcome.status === 'paused')) {
       status = 'paused';

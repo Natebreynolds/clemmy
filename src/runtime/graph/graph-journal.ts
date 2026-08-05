@@ -6,14 +6,25 @@
  * be production reuse identity — it says a name completed, not that THIS
  * admitted graph, THIS node definition, and THESE inputs completed, and it
  * cannot prove its own causal integrity after a crash. This module holds the
- * entry shape, the awaited adapter contract (the durable boundary), and the
- * resume validator that refuses a journal it cannot prove belongs to the run.
+ * entry shape and the awaited adapter contract (the durable boundary).
  *
- * Pure: types and validation only. Storage lives behind the adapter, injected
- * by the caller.
+ * R1A extends the settlement contract with durable ROUTING evidence: the exact
+ * ordered outgoing edge IDs that fired for that attempt. Replay follows those
+ * durable verdicts; it never re-evaluates a present-day edge closure for
+ * reused work, because a changed closure on restart must not rewrite history.
+ * A patch entry is bound to the exact emitter attempt for the same reason:
+ * children may exist only because a journaled attempt durably put them there.
+ *
+ * Entries lacking this evidence (pre-R1A journals) REFUSE at reconstruction —
+ * there are no production admitted callers to protect with a permissive
+ * compatibility path, and silently treating old settlements as all-success
+ * would invent routing history.
+ *
+ * Ordered reconstruction and validation live in graph-resume.ts. Pure: types
+ * and the adapter contract only. Storage lives behind the adapter, injected by
+ * the caller.
  */
 import type { ExecutableEdge, ExecutableGraph, ExecutableNode, NodeStatus } from './graph-executor.js';
-import type { GraphAdmission } from './graph-admission.js';
 
 /** Why a non-completed settlement happened, for retry policy OUTSIDE the walker. */
 export type SettlementClass =
@@ -50,12 +61,27 @@ export interface NodeSettledEntry {
   evidenceRefs?: string[];
   reason?: string;
   settlementClass?: SettlementClass;
+  /**
+   * The exact ordered outgoing edge IDs that fired for THIS attempt, computed
+   * once from the live outcome and persisted with the awaited settlement.
+   * Live scheduling and replay both consume these IDs — durable history, not
+   * today's closure, decides what fired. Empty is a verdict too: a blocked,
+   * paused, or non-node-class settlement fires nothing.
+   */
+  firedEdgeIds: string[];
 }
 
 export interface PatchAdmittedEntry {
   type: 'patch_admitted';
   admissionDigest: string;
   emittedBy: string;
+  /**
+   * The exact emitter attempt whose completion admitted this patch. Children
+   * are eligible only through this binding: an orphan patch (emitter attempt
+   * never durably settled) puts nothing into the resumed topology, and the
+   * re-run emitter must reproduce this patch's digest or refuse.
+   */
+  emitterAttemptId: string;
   patchDigest: string;
   /** The FULL patch content — resume must be able to reconstruct the grown
    *  topology from the journal alone, and ids without definitions cannot. The
@@ -75,88 +101,4 @@ export type GraphJournalEntry = NodeStartedEntry | NodeSettledEntry | PatchAdmit
  */
 export interface GraphJournalAdapter {
   append(entry: GraphJournalEntry): Promise<void>;
-}
-
-export interface JournalResumeOk {
-  ok: true;
-  /** Node id → its settled completion entry, identity-verified. */
-  completed: Map<string, NodeSettledEntry>;
-  /** Patches previously admitted, in order, identity-verified. */
-  patches: PatchAdmittedEntry[];
-}
-
-export interface JournalResumeRefusal {
-  ok: false;
-  errors: string[];
-}
-
-export type JournalResumeResult = JournalResumeOk | JournalResumeRefusal;
-
-/**
- * Validate a journal for resume. Refuses rather than repairs:
- *
- *  - an entry stamped with a different admission digest is a different run;
- *  - a completed node the graph does not contain is a corrupt or stale journal
- *    (unless a validated patch in the same journal added it);
- *  - a completed set that is not causally closed — a node completed while a
- *    predecessor did not — cannot have happened under this executor, so the
- *    journal is not this run's history;
- *  - a `node_started` with no settlement is an interrupted attempt: legal,
- *    surfaced as neither completed nor trusted.
- *
- * Only `completed` settlements grant reuse. A failed/blocked/paused settlement
- * is history, not a result.
- */
-export function validateJournalForResume(
-  graph: ExecutableGraph,
-  admission: GraphAdmission,
-  entries: readonly GraphJournalEntry[],
-): JournalResumeResult {
-  const errors: string[] = [];
-  const nodeIds = new Set(graph.nodes.map((node) => node.id));
-  const patches: PatchAdmittedEntry[] = [];
-  const completed = new Map<string, NodeSettledEntry>();
-
-  for (const entry of entries) {
-    if (entry.admissionDigest !== admission.admissionDigest) {
-      errors.push(`entry for "${'nodeId' in entry ? entry.nodeId : entry.emittedBy}" carries admission ${entry.admissionDigest.slice(0, 12)}…, expected ${admission.admissionDigest.slice(0, 12)}…`);
-      continue;
-    }
-    if (entry.type === 'patch_admitted') {
-      for (const added of entry.nodes) nodeIds.add(added.id);
-      patches.push(entry);
-      continue;
-    }
-    if (entry.type === 'node_settled' && entry.status === 'completed') {
-      if (!nodeIds.has(entry.nodeId)) {
-        errors.push(`journal completes "${entry.nodeId}", which the admitted graph does not contain`);
-        continue;
-      }
-      completed.set(entry.nodeId, entry);
-    }
-  }
-
-  // Causal closure over the admitted edges: a completed node's every enabled
-  // incoming edge source must itself be settled in this journal. (Patch-added
-  // edges are re-validated when the patch replays; structural closure over the
-  // base graph is the invariant a crash cannot be allowed to fake.)
-  for (const [nodeId] of completed) {
-    const incoming = graph.edges.filter((edge) => !edge.disabled && edge.target === nodeId);
-    for (const edge of incoming) {
-      if (!completed.has(edge.source)) {
-        // A failure-routed completion is legal: the source settled without
-        // completing. The journal must still contain SOME settlement for it.
-        const sourceSettled = entries.some((entry) =>
-          entry.type === 'node_settled'
-          && entry.admissionDigest === admission.admissionDigest
-          && entry.nodeId === edge.source);
-        if (!sourceSettled) {
-          errors.push(`"${nodeId}" completed but its predecessor "${edge.source}" has no settlement — the journal is not causally closed`);
-        }
-      }
-    }
-  }
-
-  if (errors.length > 0) return { ok: false, errors };
-  return { ok: true, completed, patches };
 }
