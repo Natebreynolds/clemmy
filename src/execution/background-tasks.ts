@@ -52,6 +52,7 @@ import { isPromiseShapedReply, judgeRunProgress } from '../runtime/harness/objec
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { completedItemIds, loadCapsule } from './continuation-capsule.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { resolveWriteEvidence } from '../runtime/harness/work-report.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
@@ -164,6 +165,16 @@ export interface BackgroundTaskRecord {
     /** Inclusive event-log boundary captured when the user requested the
      * handoff. Later turns in the reusable origin chat are not worker input. */
     throughSeq: number;
+    /**
+     * E5.2: the DURABLE continuation capsule this handoff checkpointed
+     * before acknowledging. Completed items, bound authority, pending
+     * questions, and effect receipts come from the capsule — bounded origin
+     * history is optional context, never proof of completed work.
+     */
+    capsuleId?: string;
+    capsuleDigest?: string;
+    /** The logical task identity the capsule is keyed by. */
+    logicalTaskId?: string;
   };
   runSessionId: string;
   /** User-visible, monotonic task contract. The original prompt is v1; later
@@ -1089,7 +1100,32 @@ function renderOriginLineageBlock(
   const throughSeq = task.foregroundHandoff?.throughSeq;
   let history = '';
   try { history = renderSessionHistoryForModel(originSessionId, 8, 6_000, throughSeq); } catch { history = ''; }
+  // E5.2: when a durable capsule exists it is the CONTINUATION AUTHORITY —
+  // completed items, bound authority, and pending questions come from
+  // structural state, not from asking the model to infer them. The bounded
+  // history below remains optional context.
+  const capsule = task.foregroundHandoff?.logicalTaskId
+    ? loadCapsule(task.foregroundHandoff.logicalTaskId)
+    : undefined;
+  const capsuleLines = capsule
+    ? [
+      '## Durable Continuation Capsule (authoritative)',
+      `capsule=${capsule.capsuleId} digest=${capsule.digest}`,
+      `objective: ${capsule.objective}`,
+      ...(capsule.successCriteria.length ? [`success criteria: ${capsule.successCriteria.join('; ')}`] : []),
+      ...(capsule.constraints.length ? [`constraints: ${capsule.constraints.join('; ')}`] : []),
+      ...(capsule.decisions.length ? [`accepted decisions: ${capsule.decisions.join('; ')}`] : []),
+      ...(capsule.manifest
+        ? [`manifest ${capsule.manifest.manifestId} (${capsule.manifest.contractVersion}): `
+          + `${completedItemIds(capsule).length}/${capsule.manifest.items.length} items already complete — `
+          + `START AT THE FIRST INCOMPLETE ITEM. Completed: ${completedItemIds(capsule).slice(0, 40).join(', ') || 'none'}`]
+        : []),
+      ...(capsule.pending ? [`pending ${capsule.pending.kind}: ${capsule.pending.prompt}`] : []),
+      ...(capsule.nextSafeActions.length ? [`next safe actions: ${capsule.nextSafeActions.join('; ')}`] : []),
+    ]
+    : [];
   return [
+    ...capsuleLines,
     '## Origin Session Lineage',
     `This task was spawned from session "${originSessionId}"${throughSeq ? ` at event boundary ${throughSeq}` : ''}. Treat the bounded origin history as authoritative for user decisions, constraints, resource ids, and already-completed external actions.`,
     'Do not redo completed external writes unless the user explicitly asked to do them again.',

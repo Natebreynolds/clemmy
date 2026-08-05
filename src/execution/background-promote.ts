@@ -70,8 +70,14 @@ export function hasDurableExecutionIntent(message: string): boolean {
   // background directive still wins. Live 2026-07-23: a Workspace chat turn
   // saying exactly that was promoted to a durable task.
   if (hasForegroundWatchIntent(intentText)) return hasExplicitBackgroundDirective(intentText);
-  if (hasDirectDurableDirective(intentText)) return true;
-  return hasAutomaticDataPipelineShape(lower);
+  return hasDirectDurableDirective(intentText);
+  // E6.1: the service/verb "data pipeline shape" classifier is RETIRED from
+  // routing. Automatic durable disposition now comes from the typed
+  // WorkDisposition the planner proposes and the runtime validates
+  // deterministically (execution/work-disposition.ts): real canonical item
+  // identities that cannot finish inside one bounded activation window make
+  // the work durable, whatever nouns the request used. Explicit user
+  // directives above still decide their own lane.
 }
 
 /**
@@ -158,61 +164,6 @@ function stripNegatedDurableIntent(lower: string): string {
     .replace(/\bno\s+background\s+tasks?\b/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-}
-
-function hasAutomaticDataPipelineShape(lower: string): boolean {
-  // Skip obvious pure questions/explanations. These can mention several services
-  // without asking Clementine to move data through them.
-  if (/^(?:please\s+)?(?:what|why|how|when|who|where|explain|summarize|tell me about)\b/.test(lower)) return false;
-
-  const serviceHits = countHits(lower, [
-    /\bsalesforce\b/,
-    /\b(?:sf|sfdx)\s+(?:cli|data|org|query)\b/,
-    /\bcli\b/,
-    /\bapify\b/,
-    /\bmcp\b/,
-    /\bairtable\b/,
-    /\bcrm\b/,
-    /\bgoogle\s+(?:reviews?|business|maps?|search)\b/,
-    /\bdataforseo\b/,
-    /\bseo\b/,
-    /\bhubspot\b/,
-    /\blinkedin\b/,
-    /\bsheets?\b|\bgoogle\s+sheets?\b/,
-  ]);
-
-  const actionHits = countHits(lower, [
-    /\bpull\b|\bfetch\b|\bquery\b|\bexport\b|\bimport\b|\bcollect\b|\bgather\b/,
-    /\bscrape\b|\bscrap\b|\bcrawl\b/,
-    /\benrich\b|\banaly[sz]e\b|\bscore\b|\bclassify\b|\bclean\b|\bdedupe\b/,
-    /\brun\b|\buse\b|\bvia\b/,
-    /\badd\b|\bwrite\b|\bupdate\b|\bcreate\b|\binsert\b|\bappend\b|\bsync\b|\bpush\b|\bload\b/,
-  ]);
-
-  const batchHits = countHits(lower, [
-    /\bfull\s+data\b|\ball\s+(?:of\s+)?(?:the\s+)?data\b/,
-    /\ball\s+(?:of\s+)?(?:the\s+)?(?:[\w-]+\s+){0,3}(?:records?|accounts?|leads?|prospects?|companies?)\b/,
-    /\bevery\s+(?:[\w-]+\s+){0,3}(?:records?|accounts?|leads?|prospects?|companies?)\b/,
-    /\bbulk\b|\bbatch\b|\bat\s+scale\b/,
-    /\b\d+\+?\s+(?:different\s+)?(?:actors?|sources?|records?|accounts?|leads?|prospects?|companies?)\b/,
-    /\bmultiple\s+(?:actors?|sources?|systems?|records?|accounts?|leads?)\b/,
-  ]);
-
-  const pipelineHits = countHits(lower, [
-    /\bthen\b|\band\s+then\b|\bafter\b|\bfinally\b|\bonce\b/,
-    /\bfrom\b.{0,80}\b(?:to|into)\b/,
-    /\b(?:add|write|update|create|insert|append|sync|push|load)\b.{0,50}\b(?:to|into|in)\b/,
-    /\bsub-?agents?\b|\bworkers?\b|\bfan\s*out\b|\bactors?\b/,
-  ]);
-
-  const destinationHit = /\b(?:add|write|update|create|insert|append|sync|push|load)\b.{0,80}\b(?:airtable|crm|sheet|database|table|records?)\b/.test(lower)
-    || /\b(?:to|into)\s+(?:my\s+)?(?:airtable|crm|sheet|database)\b/.test(lower);
-
-  if (destinationHit && serviceHits >= 2 && batchHits >= 1 && pipelineHits >= 1 && actionHits >= 2) return true;
-  if (serviceHits >= 3 && actionHits >= 2 && batchHits >= 1 && pipelineHits >= 1) return true;
-  if (lower.length >= 180 && serviceHits >= 2 && actionHits >= 3 && batchHits >= 1) return true;
-
-  return false;
 }
 
 function countHits(text: string, patterns: RegExp[]): number {
@@ -329,11 +280,11 @@ export function durableExecutionDecision(
     return { lane: 'background', reason: 'explicit_directive' };
   }
 
-  // Shape alone. Clementine's inference, not the user's instruction.
-  if (hasAutomaticDataPipelineShape(lower)) {
-    return { lane: 'confirm', reason: 'inferred_pipeline_shape' };
-  }
-
+  // E6.1: shape inference by service/verb nouns is RETIRED. A request whose
+  // TYPED plan proves it exceeds one bounded activation becomes durable
+  // through admitWorkDisposition at the planning seam — this decision only
+  // reads explicit user intent, so an unlisted carrier can never be
+  // misrouted by vocabulary.
   return { lane: 'foreground', reason: 'no_durable_intent' };
 }
 

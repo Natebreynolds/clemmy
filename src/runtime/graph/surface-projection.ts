@@ -67,6 +67,8 @@ export interface SurfaceTerminal {
 }
 
 export interface SurfaceRunSnapshot {
+  /** Privacy-safe activity label + its rendered text (E7.2). */
+  activity?: SurfaceActivityLabel & { text: string };
   schemaVersion: typeof SURFACE_PROJECTION_SCHEMA_VERSION;
   runKey: string;
   attemptId: string;
@@ -93,6 +95,46 @@ export interface SurfaceRunDelta {
   patch: Partial<Omit<SurfaceRunSnapshot, 'schemaVersion' | 'runKey' | 'revision'>>;
 }
 
+/**
+ * A privacy-safe execution label (E7.2). Bounded public data: a phase enum,
+ * safe counts, and nothing else. Raw tool arguments, prompts, targets, and
+ * chain-of-thought never appear — the console renders THIS, not `args`.
+ */
+export interface SurfaceActivityLabel {
+  phase:
+    | 'recalling_context'
+    | 'finding_capability'
+    | 'reading'
+    | 'working_items'
+    | 'combining'
+    | 'verifying'
+    | 'awaiting_approval'
+    | 'awaiting_input'
+    | 'delivering';
+  /** Safe counters only: "3 of 40". */
+  completed?: number;
+  total?: number;
+}
+
+/** Render a bounded human label from safe fields only. */
+export function renderActivityLabel(label: SurfaceActivityLabel): string {
+  const scope = typeof label.completed === 'number' && typeof label.total === 'number'
+    ? ` ${label.completed} of ${label.total}`
+    : '';
+  switch (label.phase) {
+    case 'recalling_context': return 'Checking remembered context';
+    case 'finding_capability': return 'Finding the connected capability';
+    case 'reading': return 'Reading connected data';
+    case 'working_items': return `Working on${scope || ' the items'}`;
+    case 'combining': return 'Combining results';
+    case 'verifying': return 'Verifying the result';
+    case 'awaiting_approval': return 'Waiting for your approval';
+    case 'awaiting_input': return 'Waiting for your answer';
+    case 'delivering': return 'Delivering the result';
+    default: return 'Working';
+  }
+}
+
 export interface ProjectRunInput {
   runKey: string;
   attemptId: string;
@@ -116,6 +158,15 @@ export interface ProjectRunInput {
   childTerminals?: Array<{ status: 'completed' | 'failed' | 'blocked' | 'cancelled' } | null>;
   /** The typed public terminal, when one is committed. NEVER derived here. */
   typedTerminal?: SurfaceTerminal;
+  /** Privacy-safe execution label from the execution boundary (E7.2). */
+  activityLabel?: SurfaceActivityLabel;
+  /**
+   * Durable lease/heartbeat truth for this attempt (E7/F38): when the owner
+   * still holds a live lease, quiet provider time is LIVE, never idle. Only
+   * a proven expiry (or an absent owner past the horizon) is stale.
+   */
+  leaseHeld?: boolean;
+  leaseExpiresAt?: string;
 }
 
 /**
@@ -131,14 +182,13 @@ export function projectRunSnapshot(input: ProjectRunInput): SurfaceRunSnapshot {
   const terminal = input.typedTerminal;
   const lifecycle: SurfaceLifecycle = terminal ? terminal.status : input.lifecycle;
 
-  let liveness: SurfaceLiveness;
-  if (TERMINAL_LIFECYCLES.has(lifecycle)) {
-    liveness = 'live'; // a settled truth is not stale
-  } else if (input.staleAfter) {
-    liveness = input.observedAt > input.staleAfter ? 'stale' : 'live';
-  } else {
-    liveness = 'unknown';
-  }
+  const liveness = deriveRunLiveness({
+    lifecycle,
+    observedAt: input.observedAt,
+    staleAfter: input.staleAfter,
+    leaseHeld: input.leaseHeld,
+    leaseExpiresAt: input.leaseExpiresAt,
+  });
 
   const children = input.childTerminals
     ? {
@@ -171,8 +221,37 @@ export function projectRunSnapshot(input: ProjectRunInput): SurfaceRunSnapshot {
       ? { progress: { completed: input.completedCount ?? 0, total: input.admittedTotal } }
       : {}),
     ...(children ? { children } : {}),
+    ...(input.activityLabel
+      ? { activity: { ...input.activityLabel, text: renderActivityLabel(input.activityLabel) } }
+      : {}),
     ...(terminal ? { terminal } : {}),
   };
+}
+
+/**
+ * Liveness from DURABLE truth (F38), never from "no event for N seconds":
+ *
+ *  - a settled terminal is live (a settled truth is not stale);
+ *  - a held, unexpired lease is LIVE however quiet the provider is;
+ *  - a lease past its expiry, or an explicitly lost lease, is STALE;
+ *  - a declared evidence horizon decides when no lease truth exists;
+ *  - otherwise UNKNOWN — never silently promoted to live or demoted to idle.
+ */
+export function deriveRunLiveness(input: {
+  lifecycle: SurfaceLifecycle;
+  observedAt: string;
+  staleAfter?: string;
+  leaseHeld?: boolean;
+  leaseExpiresAt?: string;
+}): SurfaceLiveness {
+  if (TERMINAL_LIFECYCLES.has(input.lifecycle)) return 'live';
+  if (input.leaseHeld === true) {
+    if (input.leaseExpiresAt && input.observedAt > input.leaseExpiresAt) return 'stale';
+    return 'live';
+  }
+  if (input.leaseHeld === false) return 'stale';
+  if (input.staleAfter) return input.observedAt > input.staleAfter ? 'stale' : 'live';
+  return 'unknown';
 }
 
 /** Is this snapshot RUNNING for counting purposes? Queued is not. */

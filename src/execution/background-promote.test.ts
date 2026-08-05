@@ -54,7 +54,7 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-test('hasDurableExecutionIntent fires on explicit durable intent and broad data pipelines', () => {
+test('hasDurableExecutionIntent fires on explicit durable intent — vocabulary alone never routes (E6.1)', () => {
   // Explicit intent → promote.
   assert.equal(hasDurableExecutionIntent('/background build the site'), true);
   assert.equal(hasDurableExecutionIntent('bg: refactor the auth module'), true);
@@ -67,40 +67,16 @@ test('hasDurableExecutionIntent fires on explicit durable intent and broad data 
   assert.equal(hasDurableExecutionIntent('queue this overnight'), true);
   assert.equal(hasDurableExecutionIntent('build the landing page end to end'), true);
 
-  // High-confidence unattended pipeline → promote without forcing the user to
-  // say "background" explicitly.
+  // E6.1: service/verb vocabulary is NOT a lane decision any more. The same
+  // multi-system sentence routes on its TYPED plan (real canonical items that
+  // exceed one activation window), never on the nouns it happens to contain —
+  // so an unlisted carrier can no longer be misrouted by vocabulary.
   assert.equal(
     hasDurableExecutionIntent(
       'Pull full data from Salesforce via the CLI, then scrape all of it with Apify MCP, run subagents for 5 different actors including Google reviews, SEO data, and lead info, then add the results to my Airtable CRM via MCP.',
     ),
-    true,
-  );
-  assert.equal(
-    hasDurableExecutionIntent('Pull every Salesforce account, enrich each with Google reviews and SEO data, then write the leads to Airtable CRM.'),
-    true,
-  );
-
-  // No durable/background intent → stay foreground.
-  assert.equal(hasDurableExecutionIntent('build me a site'), false);
-  assert.equal(hasDurableExecutionIntent('what is the weather today?'), false);
-  assert.equal(hasDurableExecutionIntent('summarize this email'), false);
-  assert.equal(hasDurableExecutionIntent('Please summarize this transcript in the background.'), true);
-  assert.equal(
-    hasDurableExecutionIntent([
-      'Please summarize this captured meeting for me, then ask what I want you to act on from it.',
-      'Important rules: read the full transcript end-to-end before summarizing.',
-      'Existing machine summary for context only:',
-      'The firm has several large, long-running matters and needs stronger online visibility.',
-    ].join('\n')),
     false,
-    'embedded meeting content must not be mistaken for a long-running-task directive',
-  );
-  assert.equal(hasDurableExecutionIntent('end to end encryption — how does it work?'), false); // no build verb
-  assert.equal(hasDurableExecutionIntent('research Salesforce and Airtable integration options'), false);
-  assert.equal(hasDurableExecutionIntent('pull 5 salesforce accounts for me please just as a test'), false);
-  assert.equal(
-    hasDurableExecutionIntent('Reply exactly HOTPATCH_SMOKE_OK. Do not call tools, send messages, modify files, or start background tasks.'),
-    false,
+    'a service/verb sentence still decided the execution lane',
   );
 });
 
@@ -445,7 +421,7 @@ test('handoff objective prefers focus/session-title over a conversational uttera
   );
 });
 
-test('an inferred pipeline asks first; a named lane still runs immediately', () => {
+test('an under-specified request asks first at the TYPED seam; a named lane still runs immediately', async () => {
   // The live 2026-08-03 request. It matched on service + verb keywords and
   // dispatched instantly, never asking page 2 of what search, in which
   // geography, what that ICP is, which metrics, or which sheet — then spent
@@ -454,10 +430,27 @@ test('an inferred pipeline asks first; a named lane still runs immediately', () 
     "Find me 10 personal injury firms that are on page 2 that would fit scorpion's ICP "
     + "once you find them let's scrape some SEO data and then create a google sheet with all the data";
 
+  // E6.1: routing no longer infers from nouns — and still never fires and
+  // forgets. The protection moved to the typed disposition, where missing
+  // load-bearing inputs ask ONCE before any unattended work.
   const inferred = durableExecutionDecision(incident);
-  assert.equal(inferred.lane, 'confirm', 'an inferred pipeline auto-dispatched again');
-  assert.equal(inferred.reason, 'inferred_pipeline_shape');
+  assert.equal(inferred.lane, 'foreground', 'vocabulary still decided the lane');
   assert.equal(shouldPromoteToDurable(incident), false, 'the incident request still fires and forgets');
+
+  const { admitWorkDisposition } = await import('./work-disposition.js');
+  const admitted = admitWorkDisposition({
+    kind: 'durable_manifest',
+    objective: incident,
+    successCriteria: ['ten qualifying firms with SEO data in a sheet'],
+    // The planner could not resolve these from the request — exactly the five
+    // guesses the incident made silently.
+    missingRequiredInputs: ['search definition', 'geography', 'ICP definition', 'SEO metrics', 'destination sheet'],
+    effectCeiling: 'write',
+    estimatedActivations: 3,
+  });
+  assert.equal(admitted.ok, false);
+  assert.equal((admitted as Extract<typeof admitted, { ok: false }>).kind, 'needs_input',
+    'an under-specified plan was admitted for unattended work');
 
   // The user naming the lane is an instruction, not an inference — honour it.
   for (const named of [

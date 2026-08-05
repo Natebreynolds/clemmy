@@ -100,6 +100,7 @@ import {
 } from '../runtime/harness/public-presentation.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
+import { applyTransportProgress, reduceTransportProgress, type TransportProgressState } from './transport-progress.js';
 import {
   exactOriginDeliveryTargetDigest,
   exactOriginDeliveryTargetFromSessionSnapshot,
@@ -4331,4 +4332,21 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       return;
     }
   }
+}
+
+
+/**
+ * E7.3: the discord transport's progress milestones come from the SHARED
+ * reducer over the server activity projection — one kickoff, rate-limited
+ * milestone edits, one final replacement, and never a message per tool
+ * event. Exported so the surface's sender wires the same truth the console
+ * renders.
+ */
+export function nextDiscordProgressAction(
+  snapshot: Parameters<typeof reduceTransportProgress>[0],
+  state: TransportProgressState,
+  nowMs: number,
+): { action: ReturnType<typeof reduceTransportProgress>; state: TransportProgressState } {
+  const action = reduceTransportProgress(snapshot, state, nowMs);
+  return { action, state: applyTransportProgress(state, action, nowMs) };
 }

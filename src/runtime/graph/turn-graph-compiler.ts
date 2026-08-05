@@ -302,7 +302,11 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
   if (allowedToolNames !== undefined && allowedToolNames.length === 0) warnings.push('explicit_zero_tool_authority');
   if (route === 'act' && routeEffect.kind === 'unknown') warnings.push('effect_requires_runtime_classification');
   if (externalEffect.requested) warnings.push('external_effect_authority_deferred');
-  if (route === 'act' && multiItem.isMultiItem) warnings.push('multi_item_fanout_shadow_only');
+  // E6.2: the fanout node dispatches through the durable manifest adapter
+  // (execution/work-disposition.ts -> the mature background/workflow
+  // substrate). It is no longer a shadow-only annotation on a mega-core, so
+  // the shadow warning is retired; the contract below names the adapter.
+  if (route === 'act' && multiItem.isMultiItem) warnings.push('durable_manifest_dispatch');
 
   const nodes: TurnGraphNode[] = [];
   const edges: TurnGraphEdge[] = [];
@@ -379,12 +383,16 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
     });
   } else if (route === 'act') {
     if (multiItem.isMultiItem) {
-      // G5a: the fanout node is a PLANNER under a runtime-topology contract.
-      // It does not carry a worker clone or an estimated count as executable
-      // shape — at execution it produces the canonical item manifest and emits
-      // one identity-bound worker per REAL item as a graph patch joining at
-      // the reducer. The single execute-with-multiplicity node this replaces
-      // was a number a scheduler could never spread.
+      // G5a + E6.2: the fanout node is a PLANNER under a runtime-topology
+      // contract. At execution it produces the canonical item manifest and
+      // hands it to the DURABLE MANIFEST ADAPTER
+      // (dispositionToDurableWork), which owns item scheduling, bounded
+      // concurrency, retries, checkpointing, and reducer readiness over the
+      // mature background/workflow substrate — the model never has to
+      // remember to call a worker N times, and items beyond one worker
+      // window span additional durable windows rather than refusing.
+      // Graph-native worker siblings remain future work (the admitted
+      // executor is not activated for effects in this release).
       const reduceNodeId = `n${nodes.length + 1}:reduce`;
       addNode({
         kind: 'fanout',
@@ -396,6 +404,8 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
           workerEffect: routeEffect,
           maxConcurrency: 8,
           estimatedItems: multiItem.itemCount,
+          /** The adapter that owns durable dispatch for this node's manifest. */
+          durableAdapter: 'dispositionToDurableWork',
         },
       });
       const reduceNode = addNode({ kind: 'reduce', runner: { kind: 'runtime' } });

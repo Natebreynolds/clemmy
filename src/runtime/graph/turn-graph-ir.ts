@@ -143,6 +143,10 @@ export interface TurnGraphNode {
     workerEffect: TurnGraphEffect;
     maxConcurrency: number;
     estimatedItems: number;
+    /** E6.2: the durable manifest adapter that owns item scheduling,
+     *  bounded concurrency, retries, checkpointing, and reducer readiness
+     *  for this node — the runtime owns dispatch, not the model. */
+    durableAdapter?: 'dispositionToDurableWork';
   };
 }
 
