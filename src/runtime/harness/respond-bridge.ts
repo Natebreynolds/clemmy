@@ -1729,6 +1729,13 @@ type BuiltAgent = Awaited<ReturnType<typeof buildOrchestratorAgent>>;
  * {} so the caller keeps today's ask behavior. `buildAgent` is injected so the
  * caller supplies its own agent builder (and tests can stub it).
  */
+let falloverChainForTest: string[] | null = null;
+/** Test hook: pin a fallover chain so the threading contract is provable
+ *  without ambient model auth deciding whether a chain exists. */
+export function _setFalloverChainForTest(modelIds: string[] | null): void {
+  falloverChainForTest = modelIds;
+}
+
 export function buildChatFalloverWiring(opts: {
   userInput: string;
   sessionId: string;
@@ -1743,6 +1750,21 @@ export function buildChatFalloverWiring(opts: {
 }): { falloverModelIds?: string[]; rebuildAgentForBrain?: (modelId: string) => Promise<BuiltAgent> } {
   if (!chatBrainFalloverEnabled()) return {};
   try {
+    if (falloverChainForTest) {
+      const modelIds = falloverChainForTest;
+      return {
+        falloverModelIds: modelIds,
+        rebuildAgentForBrain: (modelId: string) => opts.buildAgent({
+          userInput: opts.userInput,
+          sessionId: opts.sessionId,
+          ...(opts.turnCandidates ? { turnCandidates: opts.turnCandidates } : {}),
+          allowedToolNames: opts.allowedToolNames,
+          excludeToolNames: opts.excludeToolNames,
+          model: modelId,
+          allowToolJit: opts.allowToolJit,
+        }),
+      };
+    }
     const currentProvider = providerFor(resolveRoleModel('brain').modelId) as BrainProviderClass | undefined;
     if (!currentProvider) return {};
     const nextBrains = falloverBrainModelIds(currentProvider);

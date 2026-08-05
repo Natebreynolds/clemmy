@@ -217,7 +217,10 @@ test('the candidate card names every distinct account provenance for one identif
 // ─── A.9: candidates survive brain fallover ──────────────────────────────────
 
 test('a fallover rebuild receives the same turn candidates as the first brain', async () => {
-  const { buildChatFalloverWiring } = await import('../harness/respond-bridge.js');
+  const { buildChatFalloverWiring, _setFalloverChainForTest } = await import('../harness/respond-bridge.js');
+  // Whether a chain EXISTS depends on ambient model auth; the invariant under
+  // test is the threading, so the chain is pinned.
+  _setFalloverChainForTest(['gpt-5']);
   const seen: Array<unknown> = [];
   const wiring = buildChatFalloverWiring({
     userInput: 'anything on deck tomorrow?',
@@ -236,7 +239,11 @@ test('a fallover rebuild receives the same turn candidates as the first brain', 
     // itself is what matters; exercise the builder directly.
     assert.fail('fallover wiring produced no rebuild path to verify candidate delivery through');
   }
-  await wiring.rebuildAgentForBrain('gpt-5');
+  try {
+    await wiring.rebuildAgentForBrain('gpt-5');
+  } finally {
+    _setFalloverChainForTest(null);
+  }
   assert.equal(seen.length, 1);
   assert.ok(seen[0], 'the fallover rebuild dropped the turn candidates — the second brain pays full discovery');
 });
