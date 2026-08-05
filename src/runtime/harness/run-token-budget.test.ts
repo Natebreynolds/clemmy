@@ -82,7 +82,21 @@ test('accrueSessionTokens: missing session and junk deltas are silent no-ops', (
   assert.equal(getSessionTokensUsed(sess), 0);
 });
 
-test('recordModelUsage accrues UNCACHED tokens to the source session', () => {
+test('recordModelUsage accrues UNCACHED tokens to the source session (declared dialect)', () => {
+  const sess = freshSession();
+  recordModelUsage({
+    sessionId: sess,
+    model: 'test-model',
+    cacheDialect: 'inclusive',
+    inputTokens: 100_000,
+    cachedInputTokens: 80_000,
+    outputTokens: 5_000,
+    totalTokens: 105_000,
+  });
+  assert.equal(getSessionTokensUsed(sess), 25_000, 'cache reads never eat the ceiling');
+});
+
+test('an UNDECLARED cache dialect debits conservatively — a guess never grants a cache credit', () => {
   const sess = freshSession();
   recordModelUsage({
     sessionId: sess,
@@ -92,7 +106,8 @@ test('recordModelUsage accrues UNCACHED tokens to the source session', () => {
     outputTokens: 5_000,
     totalTokens: 105_000,
   });
-  assert.equal(getSessionTokensUsed(sess), 25_000, 'cache reads never eat the ceiling');
+  assert.equal(getSessionTokensUsed(sess), 105_000,
+    'a legacy sample without provenance took a cache credit on a guess');
 });
 
 test('recordCodexHarnessUsage records under the ALS run session (the false-pass fix)', () => {

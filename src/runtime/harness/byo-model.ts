@@ -513,6 +513,7 @@ function recordByoUsage(completion: CompatCompletion, fallbackModel?: unknown): 
     recordModelUsage({
       sessionId,
       model: (completion as { model?: string })?.model || (typeof fallbackModel === 'string' ? fallbackModel : 'byo'),
+      cacheDialect: 'inclusive', // OpenAI-compatible wire: prompt/input ⊇ cached
       inputTokens,
       cachedInputTokens: cached,
       outputTokens,

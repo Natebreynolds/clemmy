@@ -888,6 +888,7 @@ async function performCodexRequest(
 	                sessionId: request.sessionId ?? 'unknown',
 	                channel: request.channel,
 	                model: resolveCodexModel(request.model),
+	                cacheDialect: 'inclusive', // OpenAI Responses wire: input_tokens ⊇ cached
 	                inputTokens,
 	                cachedInputTokens,
 	                outputTokens,

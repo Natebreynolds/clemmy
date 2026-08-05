@@ -12,7 +12,7 @@ const {
   rollupUsage,
   classifyUsageKind,
   resolveUsageKind,
-  normalizeCacheAccounting,
+  canonicalCacheAccounting,
   parseWorkflowSource,
   reconcilePromptComponents,
   uncachedTokensForAccrual,
@@ -24,6 +24,7 @@ function ev(over: Partial<import('./usage-log.js').UsageEvent>): import('./usage
     source: 'console:home',
     kind: 'chat',
     model: 'gpt-5.5',
+    cacheDialect: 'inclusive',
     inputTokens: 1000,
     cachedInputTokens: 0,
     outputTokens: 100,
@@ -120,16 +121,75 @@ test('parseWorkflowSource returns {} for non-workflow sources (join keys absent 
   assert.deepEqual(parseWorkflowSource('warmup-1781833012346'), {});
 });
 
-test('uncachedTokensForAccrual handles BOTH metering dialects (2026-07-30: 8M guest tokens accrued zero)', () => {
+test('uncachedTokensForAccrual reads the DECLARED dialect (2026-07-30: 8M guest tokens accrued zero)', () => {
   // Cached-INCLUSIVE (Codex-style): total covers cache reads — subtract them.
-  assert.equal(uncachedTokensForAccrual({ inputTokens: 91_000, cachedInputTokens: 90_000, outputTokens: 650, totalTokens: 91_650 }), 1_650);
-  // Cached-EXCLUSIVE (Anthropic-style, the live guest row): total < cached —
-  // the old blanket subtraction clamped to ZERO; uncached work is in + out.
-  assert.equal(uncachedTokensForAccrual({ inputTokens: 81, cachedInputTokens: 6_549_707, outputTokens: 75_286, totalTokens: 75_367 }), 75_367);
-  // No cache at all: plain total.
-  assert.equal(uncachedTokensForAccrual({ inputTokens: 1000, cachedInputTokens: 0, outputTokens: 100, totalTokens: 1100 }), 1100);
+  assert.equal(uncachedTokensForAccrual({ cacheDialect: 'inclusive', inputTokens: 91_000, cachedInputTokens: 90_000, outputTokens: 650, totalTokens: 91_650 }), 1_650);
+  // Cached-EXCLUSIVE (Anthropic-style, the live guest row): uncached work is
+  // input + output, whatever the magnitudes look like.
+  assert.equal(uncachedTokensForAccrual({ cacheDialect: 'exclusive', inputTokens: 81, cachedInputTokens: 6_549_707, outputTokens: 75_286, totalTokens: 75_367 }), 75_367);
+  // No cache accounting at all: plain total.
+  assert.equal(uncachedTokensForAccrual({ cacheDialect: 'none', inputTokens: 1000, outputTokens: 100, totalTokens: 1100 }), 1100);
   // Degenerate/absent fields never go negative.
   assert.equal(uncachedTokensForAccrual({}), 0);
+});
+
+test('C1 MANDATORY: an explicitly exclusive sample with cached < uncached input is never treated as inclusive or under-debited', () => {
+  // The audit's non-deterministic case: magnitude guessing classified this as
+  // inclusive (cached 100 < input 900) and debited total - cached = 900. The
+  // declared dialect says EXCLUSIVE: the model read 1000 prompt tokens and the
+  // caller pays input + output = 1000.
+  const sample = { cacheDialect: 'exclusive' as const, inputTokens: 900, cachedInputTokens: 100, outputTokens: 100, totalTokens: 1000 };
+  const canonical = canonicalCacheAccounting(sample);
+  assert.equal(canonical.dialect, 'exclusive');
+  assert.equal(canonical.promptTokens, 1000);
+  assert.equal(canonical.uncachedInputTokens, 900);
+  assert.equal(canonical.uncachedWorkTokens, 1000, 'the exclusive sample was under-debited by a magnitude guess');
+  assert.equal(uncachedTokensForAccrual(sample), 1000);
+  // Mirrors: both dialects, cached smaller AND larger than uncached input.
+  assert.equal(canonicalCacheAccounting({ cacheDialect: 'exclusive', inputTokens: 100, cachedInputTokens: 900, outputTokens: 50 }).promptTokens, 1000);
+  assert.equal(canonicalCacheAccounting({ cacheDialect: 'inclusive', inputTokens: 1000, cachedInputTokens: 100, outputTokens: 50, totalTokens: 1050 }).uncachedWorkTokens, 950);
+  assert.equal(canonicalCacheAccounting({ cacheDialect: 'inclusive', inputTokens: 1000, cachedInputTokens: 900, outputTokens: 50, totalTokens: 1050 }).uncachedWorkTokens, 150);
+});
+
+test('C1: unknown provenance is visible, uncertifiable, and debits conservatively — never a cache credit', () => {
+  const legacy = { inputTokens: 91_000, cachedInputTokens: 90_000, outputTokens: 650, totalTokens: 91_650 };
+  const canonical = canonicalCacheAccounting(legacy);
+  assert.equal(canonical.dialect, 'unknown');
+  assert.equal(canonical.certified, false);
+  assert.equal(canonical.hitRate, 0, 'an unknown dialect certified a hit rate');
+  assert.equal(canonical.uncachedWorkTokens, 91_650,
+    'a legacy sample took a cache credit on a guess — it must never reduce a budget charge');
+  // A declared dialect contradicted by its numbers quarantines.
+  assert.equal(canonicalCacheAccounting({ cacheDialect: 'inclusive', inputTokens: 100, cachedInputTokens: 900 }).invalid, true);
+  assert.equal(canonicalCacheAccounting({ cacheDialect: 'none', inputTokens: 100, cachedInputTokens: 5 }).invalid, true);
+});
+
+test('C1: every model adapter DECLARES its cache dialect at its recordModelUsage call', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const path = await import('node:path');
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const producers = [
+    ['../runtime/codex-native-runtime.ts', 'codex-native-runtime.ts'],
+    ['../runtime/harness/codex-model.ts', 'harness/codex-model.ts'],
+    ['../runtime/harness/claude-agent-sdk.ts', 'harness/claude-agent-sdk.ts'],
+    ['../runtime/harness/claude-headless-model.ts', 'harness/claude-headless-model.ts'],
+    ['../runtime/harness/byo-model.ts', 'harness/byo-model.ts'],
+    ['../execution/guest-harness.ts', 'execution/guest-harness.ts'],
+  ];
+  for (const [rel] of producers) {
+    const source = readFileSync(path.join(here, '..', rel.replace('../', '')), 'utf-8');
+    for (const call of source.split('recordModelUsage({').slice(1)) {
+      const head = call.slice(0, 600);
+      assert.ok(/cacheDialect:\s*'(inclusive|exclusive|none)'/.test(head),
+        `${rel}: a recordModelUsage call does not declare its cache dialect — no consumer may guess it`);
+    }
+  }
+  // And the magnitude guess itself is gone: the old guessed-dialect type
+  // cannot come back without failing this pin.
+  const usageLog = readFileSync(path.join(here, 'usage-log.ts'), 'utf-8');
+  assert.equal(usageLog.includes("'cache_exclusive'"), false,
+    'the magnitude-guessed dialect type returned');
 });
 
 // ── Stage 0: lane attribution is trustworthy ────────────────────────────────
@@ -204,27 +264,23 @@ test('every historical classification still holds', () => {
 // uncached remainder) while OpenAI-style is cache-INCLUSIVE, and summing the
 // two as one convention produced hit rates over 100%.
 
-test('the two cache dialects normalize to one convention', () => {
-  // OpenAI-style: input already contains the cached subset.
-  const inclusive = normalizeCacheAccounting({ inputTokens: 1000, cachedInputTokens: 800 });
-  assert.equal(inclusive.dialect, 'cache_inclusive');
+test('the two cache dialects normalize to one convention — by DECLARATION, not magnitude', () => {
+  const inclusive = canonicalCacheAccounting({ cacheDialect: 'inclusive', inputTokens: 1000, cachedInputTokens: 800 });
   assert.equal(inclusive.promptTokens, 1000);
   assert.equal(inclusive.hitRate, 0.8);
 
-  // Anthropic-style: cached exceeds input, so input was the uncached remainder.
-  const exclusive = normalizeCacheAccounting({ inputTokens: 200, cachedInputTokens: 1800 });
-  assert.equal(exclusive.dialect, 'cache_exclusive');
+  const exclusive = canonicalCacheAccounting({ cacheDialect: 'exclusive', inputTokens: 200, cachedInputTokens: 1800 });
   assert.equal(exclusive.promptTokens, 2000);
   assert.equal(exclusive.hitRate, 0.9);
 
-  assert.equal(normalizeCacheAccounting({ inputTokens: 0, cachedInputTokens: 0 }).hitRate, 0);
+  assert.equal(canonicalCacheAccounting({ cacheDialect: 'inclusive', inputTokens: 0, cachedInputTokens: 0 }).hitRate, 0);
 });
 
 test('a mixed-dialect window cannot certify a hit rate above 100%', () => {
   // Before normalization this window computed cached/input = 2600/1200 ≈ 217%.
   const r = rollupUsage([
-    ev({ inputTokens: 1000, cachedInputTokens: 800 }),          // inclusive
-    ev({ inputTokens: 200, cachedInputTokens: 1800 }),          // exclusive
+    ev({ cacheDialect: 'inclusive', inputTokens: 1000, cachedInputTokens: 800 }),
+    ev({ cacheDialect: 'exclusive', inputTokens: 200, cachedInputTokens: 1800 }),
   ]);
   assert.equal(r.totalPromptTokens, 3000);
   assert.equal(r.totalCachedInputTokens, 2600);
@@ -246,6 +302,18 @@ test('an impossible sample is quarantined, counted, and excluded from sums', () 
   assert.equal(r.totalTokens, 1100, 'a quarantined totalTokens leaked into the rollup');
   // They still happened: total calls includes them so nothing hides.
   assert.equal(r.totalCalls, 3);
+});
+
+test('legacy unknown-dialect rows stay visible in totals but never certify cache sums', () => {
+  const r = rollupUsage([
+    ev({ cacheDialect: 'inclusive', inputTokens: 1000, cachedInputTokens: 800 }),
+    ev({ cacheDialect: undefined, inputTokens: 500, cachedInputTokens: 400, totalTokens: 600 }),
+  ]);
+  assert.equal(r.uncertifiedCalls, 1);
+  assert.equal(r.totalInputTokens, 1500, 'an unknown row vanished from totals');
+  assert.equal(r.totalCachedInputTokens, 800, 'an unknown row certified cached tokens');
+  assert.equal(r.totalPromptTokens, 1000);
+  assert.equal(r.cacheHitRate, 0.8);
 });
 
 test('latency PRESENCE is visible per lane, not assumed', () => {

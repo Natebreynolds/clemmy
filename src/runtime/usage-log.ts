@@ -43,8 +43,26 @@ export interface UsageEvent {
   kindReason?: string;
   /** Model name (gpt-5.4, gpt-5.4-mini, text-embedding-3-small, etc.). */
   model: string;
-  /** Total prompt (input) tokens for the call, INCLUDING any cached subset —
-   *  matching the OpenAI Responses convention (input_tokens ⊇ cached_tokens). */
+  /**
+   * DECLARED cache-accounting provenance, stamped by the model adapter that
+   * owns the wire format — never guessed from magnitudes. 'inclusive':
+   * inputTokens contains the cached subset (OpenAI wire, and the Claude
+   * adapters that pre-fold cache reads). 'exclusive': inputTokens excludes
+   * cache reads (raw Anthropic result JSON). 'none': the provider has no
+   * cache accounting. Absent/'unknown': legacy — visible, uncertifiable,
+   * debited conservatively.
+   */
+  cacheDialect?: CacheDialectProvenance;
+  /** Canonical accounting stored at ingestion for external NDJSON readers.
+   *  Rollups recompute from raw via the same single function. */
+  canonical?: {
+    certified: boolean;
+    promptTokens: number;
+    cachedReadTokens: number;
+    uncachedInputTokens: number;
+    uncachedWorkTokens: number;
+  };
+  /** RAW provider-shaped prompt (input) tokens under the declared dialect. */
   inputTokens: number;
   /** The cached-read subset of inputTokens (prompt-cache hits). cacheHitRate =
    *  cachedInputTokens / inputTokens. Split out when the API reports it. */
@@ -230,79 +248,131 @@ export function reconcilePromptComponents(
  * invisible, so cache-hit-rate was unmeasurable for non-Codex brains). Fails
  * silently — observability must never break the model call path.
  */
-/**
- * Uncached work for the run token meter, across BOTH metering dialects (live
- * audit 2026-07-30: 8M guest-lane tokens silently accrued ZERO):
- *  - cached-INCLUSIVE totals (Codex-style: total covers cache reads) →
- *    subtract the cache reads;
- *  - cached-EXCLUSIVE (Anthropic-style: input/total already exclude cache
- *    reads, so total < cached and the old blanket subtraction clamped to 0) →
- *    the uncached work is simply input + output.
- * `total > cached` identifies the dialect deterministically. Pure.
- */
-export function uncachedTokensForAccrual(event: {
-  inputTokens?: number;
-  cachedInputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-}): number {
-  const total = event.totalTokens ?? 0;
-  const cached = event.cachedInputTokens ?? 0;
-  return total > cached
-    ? total - cached
-    : Math.max(0, event.inputTokens ?? 0) + Math.max(0, event.outputTokens ?? 0);
-}
+export type CacheDialectProvenance = 'inclusive' | 'exclusive' | 'none' | 'unknown';
 
-export type CacheDialect = 'cache_inclusive' | 'cache_exclusive' | 'invalid';
-
-export interface NormalizedCacheAccounting {
-  dialect: CacheDialect;
+export interface CanonicalUsage {
+  dialect: CacheDialectProvenance;
+  /** False when the sample cannot be certified: unknown provenance, or a
+   *  declared dialect whose numbers contradict it. */
+  certified: boolean;
+  /** True when the numbers are not token counts at all — quarantined from
+   *  every certified sum while the raw NDJSON row stays for diagnosis. */
+  invalid: boolean;
   /** Full prompt read by the model, cached + uncached, in ONE convention. */
   promptTokens: number;
   cachedReadTokens: number;
-  /** cachedReadTokens / promptTokens. Structurally within [0, 1]. */
+  uncachedInputTokens: number;
+  /**
+   * What the call actually consumed: uncached input + output (+ reasoning
+   * where the provider reports it separately). THE debit unit for session
+   * accrual and run budgets. Unknown provenance debits CONSERVATIVELY — no
+   * cache credit is ever subtracted on a guess, so a legacy sample can never
+   * reduce a budget charge.
+   */
+  uncachedWorkTokens: number;
+  /** cachedReadTokens / promptTokens; 0 when uncertified. */
   hitRate: number;
 }
 
 /**
- * Normalize the two cache-accounting dialects into one convention.
- *
- * OpenAI-style reporting is cache-INCLUSIVE: `inputTokens` already contains the
- * cached subset, so `cached <= input` and the hit rate is `cached / input`.
- * Anthropic-style reporting is cache-EXCLUSIVE: `inputTokens` counts only the
- * uncached remainder, so cached can far exceed input — and summing the two
- * dialects as though they were one is how the Stage 0 audit found a model
- * aggregate whose cached tokens dwarfed its input tokens, and how a naive
- * `cached / input` can certify a >100% hit rate.
- *
- * `cached > input` identifies the exclusive dialect deterministically — the
- * same rule `uncachedTokensForAccrual` already relies on. A sample that is not
- * arithmetically a token count (negative, NaN, non-finite) is `invalid`:
- * certified rollups exclude it and count it, while its raw NDJSON record stays
- * untouched for diagnosis. Pure.
+ * The ONE canonical cache-accounting function. Every consumer — session
+ * accrual, run budgets, lane/model/source rollups, dashboard summaries, and
+ * measure:efficiency — reads through this. It consumes the adapter-DECLARED
+ * dialect; the previous magnitude guess (`cached > input` ⇒ exclusive) is
+ * deleted, because it is not deterministic: an exclusive sample whose cached
+ * reads are smaller than its uncached input (e.g. input=900, cached=100,
+ * output=100, total=1000) is misclassified as inclusive and under-debited.
+ * Pure.
  */
-export function normalizeCacheAccounting(event: {
+export function canonicalCacheAccounting(event: {
+  cacheDialect?: CacheDialectProvenance;
   inputTokens?: number;
   cachedInputTokens?: number;
-}): NormalizedCacheAccounting {
+  outputTokens?: number;
+  reasoningTokens?: number;
+  totalTokens?: number;
+}): CanonicalUsage {
+  const dialect = event.cacheDialect ?? 'unknown';
   const input = event.inputTokens ?? 0;
   const cached = event.cachedInputTokens ?? 0;
-  if (!Number.isFinite(input) || !Number.isFinite(cached) || input < 0 || cached < 0) {
-    return { dialect: 'invalid', promptTokens: 0, cachedReadTokens: 0, hitRate: 0 };
+  const output = event.outputTokens ?? 0;
+  const reasoning = event.reasoningTokens ?? 0;
+  const total = event.totalTokens ?? 0;
+  const invalid = (base: Partial<CanonicalUsage> = {}): CanonicalUsage => ({
+    dialect, certified: false, invalid: true,
+    promptTokens: 0, cachedReadTokens: 0, uncachedInputTokens: 0,
+    uncachedWorkTokens: 0, hitRate: 0, ...base,
+  });
+  for (const value of [input, cached, output, reasoning, total]) {
+    if (!Number.isFinite(value) || value < 0) return invalid();
   }
-  const promptTokens = cached > input ? input + cached : input;
+  if (dialect === 'inclusive') {
+    if (cached > input) return invalid(); // contradicts the declared dialect
+    return {
+      dialect, certified: true, invalid: false,
+      promptTokens: input,
+      cachedReadTokens: cached,
+      uncachedInputTokens: input - cached,
+      uncachedWorkTokens: Math.max(total, input + output) - cached,
+      hitRate: input > 0 ? cached / input : 0,
+    };
+  }
+  if (dialect === 'exclusive') {
+    const promptTokens = input + cached;
+    return {
+      dialect, certified: true, invalid: false,
+      promptTokens,
+      cachedReadTokens: cached,
+      uncachedInputTokens: input,
+      uncachedWorkTokens: input + output + reasoning,
+      hitRate: promptTokens > 0 ? cached / promptTokens : 0,
+    };
+  }
+  if (dialect === 'none') {
+    if (cached > 0) return invalid(); // a cache read under a no-cache dialect
+    return {
+      dialect, certified: true, invalid: false,
+      promptTokens: input,
+      cachedReadTokens: 0,
+      uncachedInputTokens: input,
+      uncachedWorkTokens: Math.max(total, input + output),
+      hitRate: 0,
+    };
+  }
+  // Unknown/legacy: visible, uncertifiable, conservatively debited.
   return {
-    dialect: cached > input ? 'cache_exclusive' : 'cache_inclusive',
-    promptTokens,
+    dialect: 'unknown', certified: false, invalid: false,
+    promptTokens: Math.max(input, cached),
     cachedReadTokens: cached,
-    hitRate: promptTokens > 0 ? cached / promptTokens : 0,
+    uncachedInputTokens: input,
+    uncachedWorkTokens: Math.max(total, input + output),
+    hitRate: 0,
   };
+}
+
+/**
+ * Uncached work for the run token meter — the canonical debit unit. Reads the
+ * adapter-declared dialect through `canonicalCacheAccounting`; a sample with
+ * no declared provenance debits conservatively (no cache credit).
+ */
+export function uncachedTokensForAccrual(event: {
+  cacheDialect?: CacheDialectProvenance;
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  totalTokens?: number;
+}): number {
+  return canonicalCacheAccounting(event).uncachedWorkTokens;
 }
 
 export function recordModelUsage(args: {
   sessionId: string;
   channel?: string;
   model: string;
+  /** Declared by the adapter that owns the wire format. Absent = 'unknown'
+   *  (legacy): visible, uncertifiable, conservatively debited. */
+  cacheDialect?: CacheDialectProvenance;
   inputTokens: number;
   cachedInputTokens?: number;
   outputTokens: number;
@@ -328,12 +398,21 @@ export function recordModelUsage(args: {
     sessionRowKind = getSession(source)?.kind;
   } catch { /* classification falls back to channel/prefix evidence */ }
   const resolution = resolveUsageKind(source, { channel: args.channel, sessionRowKind });
+  const canonical = canonicalCacheAccounting(args);
   const event = {
     at: new Date().toISOString(),
     source,
     kind: resolution.kind,
     kindReason: resolution.reason,
     model: args.model,
+    cacheDialect: args.cacheDialect ?? 'unknown' as const,
+    canonical: {
+      certified: canonical.certified,
+      promptTokens: canonical.promptTokens,
+      cachedReadTokens: canonical.cachedReadTokens,
+      uncachedInputTokens: canonical.uncachedInputTokens,
+      uncachedWorkTokens: canonical.uncachedWorkTokens,
+    },
     inputTokens: args.inputTokens,
     cachedInputTokens: args.cachedInputTokens,
     outputTokens: args.outputTokens,
@@ -449,9 +528,13 @@ export interface UsageRollup {
   totalPromptTokens: number;
   cacheHitRate: number;
   /** Samples excluded from certified token sums because their token fields are
-   *  not arithmetically token counts. Counted here, never hidden — the raw
-   *  NDJSON record is untouched for diagnosis. */
+   *  not arithmetically token counts (or contradict their declared dialect).
+   *  Counted here, never hidden — the raw NDJSON record is untouched. */
   quarantinedCalls: number;
+  /** Samples with no declared cache provenance (legacy/unknown dialect):
+   *  visible in totals and calls, EXCLUDED from certified cache sums and the
+   *  hit rate, and conservatively debited. */
+  uncertifiedCalls: number;
   /** Tokens grouped by `kind` (chat/cron/autonomy/...). `promptTokens` is
    *  dialect-normalized so each kind's hit-rate (cachedInputTokens /
    *  promptTokens) is certified. `durationSamples`/`totalDurationMs` make
@@ -487,6 +570,7 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
   let totalCachedInputTokens = 0;
   let totalPromptTokens = 0;
   let quarantinedCalls = 0;
+  let uncertifiedCalls = 0;
   const byKind: Record<string, {
     tokens: number; calls: number; inputTokens: number; cachedInputTokens: number;
     promptTokens: number; durationSamples: number; totalDurationMs: number;
@@ -506,19 +590,23 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
   }
 
   for (const ev of events) {
-    const accounting = normalizeCacheAccounting(ev);
-    if (accounting.dialect === 'invalid') {
+    const accounting = canonicalCacheAccounting(ev);
+    if (accounting.invalid) {
       // Excluded from certified token sums, counted so it cannot hide, raw
       // NDJSON record untouched for diagnosis.
       quarantinedCalls += 1;
       continue;
     }
+    if (!accounting.certified) uncertifiedCalls += 1;
     totalTokens += ev.totalTokens;
     totalInputTokens += ev.inputTokens;
     totalOutputTokens += ev.outputTokens;
-    const cached = accounting.cachedReadTokens;
+    // Only CERTIFIED provenance may enter the cache sums the hit rate is
+    // computed over — an unknown dialect is visible, never certified.
+    const cached = accounting.certified ? accounting.cachedReadTokens : 0;
+    const prompt = accounting.certified ? accounting.promptTokens : 0;
     totalCachedInputTokens += cached;
-    totalPromptTokens += accounting.promptTokens;
+    totalPromptTokens += prompt;
 
     const k = ev.kind || 'other';
     if (!byKind[k]) {
@@ -531,7 +619,7 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     byKind[k].calls += 1;
     byKind[k].inputTokens += ev.inputTokens;
     byKind[k].cachedInputTokens += cached;
-    byKind[k].promptTokens += accounting.promptTokens;
+    byKind[k].promptTokens += prompt;
     if (Number.isFinite(ev.durationMs) && (ev.durationMs ?? 0) > 0) {
       byKind[k].durationSamples += 1;
       byKind[k].totalDurationMs += ev.durationMs!;
@@ -554,7 +642,7 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     byModel[m].calls += 1;
     byModel[m].inputTokens += ev.inputTokens;
     byModel[m].cachedInputTokens += cached;
-    byModel[m].promptTokens += accounting.promptTokens;
+    byModel[m].promptTokens += prompt;
 
     try {
       const ts = new Date(ev.at);
@@ -587,6 +675,7 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     // Over normalized prompt tokens, so mixing dialects cannot exceed 1.
     cacheHitRate: totalPromptTokens > 0 ? totalCachedInputTokens / totalPromptTokens : 0,
     quarantinedCalls,
+    uncertifiedCalls,
     byKind,
     bySource,
     byModel,
@@ -626,10 +715,10 @@ export function sumUsageSplitForSource(
   const split = { total: 0, cachedInput: 0, uncachedInput: 0, output: 0 };
   for (const ev of readUsageEventsForDate(date)) {
     if (ev.source !== source) continue;
+    const canonical = canonicalCacheAccounting(ev);
     split.total += ev.totalTokens;
-    const cached = ev.cachedInputTokens ?? 0;
-    split.cachedInput += cached;
-    split.uncachedInput += Math.max(0, (ev.inputTokens ?? 0) - cached);
+    split.cachedInput += canonical.cachedReadTokens;
+    split.uncachedInput += canonical.uncachedInputTokens;
     split.output += ev.outputTokens ?? 0;
   }
   return split;

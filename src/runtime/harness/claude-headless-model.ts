@@ -415,6 +415,8 @@ function recordClaudeHeadlessUsage(state: HeadlessRunState): void {
     recordModelUsage({
       sessionId,
       model: state.model || 'claude-headless',
+      // inputTokens above pre-folds cache_read/cache_creation: inclusive.
+      cacheDialect: 'inclusive',
       inputTokens,
       cachedInputTokens: n(u.cache_read_input_tokens),
       outputTokens,

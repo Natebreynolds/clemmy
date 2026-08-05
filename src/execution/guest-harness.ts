@@ -412,6 +412,9 @@ export async function runGuestHarness(opts: GuestRunOptions): Promise<GuestRunRe
       sessionId: opts.sessionId || 'guest-harness',
       channel: 'guest-harness',
       model: usage.model || `${opts.harness}-guest`,
+      // Parsed from raw Anthropic result JSON: input_tokens EXCLUDES cache
+      // reads. This is the lane the 07-30 audit found accruing zero.
+      cacheDialect: 'exclusive',
       inputTokens: usage.inputTokens,
       cachedInputTokens: usage.cachedInputTokens,
       outputTokens: usage.outputTokens,

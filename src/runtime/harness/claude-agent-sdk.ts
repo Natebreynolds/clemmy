@@ -1646,6 +1646,9 @@ function recordClaudeAgentSdkUsage(
     recordModelUsage({
       sessionId: options.sessionId?.trim() || result?.session_id || init?.session_id || 'unknown',
       model: init?.model || options.modelId || 'claude-agent-sdk',
+      // This adapter pre-folds cache_read/cache_creation into inputTokens, so
+      // its DECLARED convention is inclusive (cached ⊆ input).
+      cacheDialect: 'inclusive',
       inputTokens: totals.inputTokens,
       cachedInputTokens: totals.cachedInputTokens,
       outputTokens: totals.outputTokens,
