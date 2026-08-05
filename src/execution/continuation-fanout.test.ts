@@ -216,10 +216,18 @@ test('E6.3: 40, 120, and 514 items all complete — the worker window routes, it
     for (const window of plan!.windows) {
       assert.ok(window.itemIds.length <= WORKER_WINDOW_ITEMS, `${count}: a window exceeded the worker schema`);
     }
-    // The reducer waits for EVERY canonical item terminal, then runs once.
-    assert.equal(reducerReady({ plan: plan!, completedItemIds: scheduled.slice(0, count - 1), totalItems: count }).ready, false,
+    // The reducer waits for EVERY canonical item x required phase, then runs
+    // once. Readiness is the plan's own ledger, so a caller cannot assert it.
+    const settled = scheduled.flatMap((itemId) => plan!.requiredPhases.map((phaseId) => ({ itemId, phaseId })));
+    assert.equal(reducerReady({ plan: plan!, completed: settled.slice(0, settled.length - 1) }).ready, false,
       `${count}: the reducer was ready with a partial item set`);
-    assert.equal(reducerReady({ plan: plan!, completedItemIds: scheduled, totalItems: count }).ready, true);
+    assert.equal(reducerReady({ plan: plan!, completed: settled }).ready, true);
+    const forged = settled.map((entry, index) => ({ ...entry, itemId: `forged-${index}` }));
+    const forgedVerdict = reducerReady({ plan: plan!, completed: forged });
+    assert.equal(forgedVerdict.ready, false,
+      `${count}: settlements for ids belonging to no item satisfied the reducer`);
+    assert.equal(forgedVerdict.unknown.length, forged.length,
+      `${count}: forged settlements were not reported as unknown`);
   }
 });
 

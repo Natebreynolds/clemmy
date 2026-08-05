@@ -77,6 +77,32 @@ export interface DispositionControls {
  *    window IS durable — no special wording required;
  *  - an explicit user control wins over the inferred kind.
  */
+/** Every dependency cycle among phases, as readable id paths. */
+function phaseDependencyCycles(phases: readonly WorkManifestPhase[]): string[][] {
+  const dependencies = new Map<string, string[]>();
+  for (const phase of phases) dependencies.set(phase.id, [...phase.dependsOn]);
+  const cycles: string[][] = [];
+  const state = new Map<string, 'visiting' | 'done'>();
+  const stack: string[] = [];
+  const walk = (id: string): void => {
+    if (state.get(id) === 'done') return;
+    if (state.get(id) === 'visiting') {
+      const start = stack.indexOf(id);
+      if (start >= 0) cycles.push([...stack.slice(start), id]);
+      return;
+    }
+    state.set(id, 'visiting');
+    stack.push(id);
+    for (const next of dependencies.get(id) ?? []) {
+      if (dependencies.has(next)) walk(next);
+    }
+    stack.pop();
+    state.set(id, 'done');
+  };
+  for (const phase of phases) walk(phase.id);
+  return cycles;
+}
+
 export function admitWorkDisposition(
   proposed: WorkDisposition,
   controls: DispositionControls = {},
@@ -118,11 +144,26 @@ export function admitWorkDisposition(
       if (seen.has(id)) errors.push(`canonical item "${id}" appears twice`);
       seen.add(id);
     }
-    const phaseIds = new Set(manifest.phases.map((phase) => phase.id));
+    const phaseIds = new Set<string>();
+    for (const phase of manifest.phases) {
+      const id = String(phase.id ?? '').trim();
+      if (!id) { errors.push('a phase has no identity'); continue; }
+      // A duplicate phase id makes the item x phase ledger ambiguous: two
+      // different runners would settle the same ledger key, and the reducer
+      // could not tell whether both ran or one ran twice.
+      if (phaseIds.has(id)) errors.push(`phase "${id}" appears twice`);
+      phaseIds.add(id);
+    }
     for (const phase of manifest.phases) {
       for (const dependency of phase.dependsOn) {
         if (!phaseIds.has(dependency)) errors.push(`phase "${phase.id}" depends on unknown phase "${dependency}"`);
       }
+    }
+    // A dependency cycle never becomes runnable — every phase in it waits for
+    // another phase in it. Rejecting at admission beats a plan that schedules
+    // cleanly and then never finishes.
+    for (const cycle of phaseDependencyCycles(manifest.phases)) {
+      errors.push(`phases form a dependency cycle: ${cycle.join(' -> ')}`);
     }
     for (const required of manifest.reducer.requiredPhases) {
       if (!phaseIds.has(required)) errors.push(`the reducer requires unknown phase "${required}"`);
@@ -137,7 +178,11 @@ export function admitWorkDisposition(
   const windows = manifestWindows(itemCount);
   let kind: DispositionKind = proposed.kind;
   if (manifest && (windows > 1 || proposed.estimatedActivations > 1)) kind = 'durable_manifest';
-  if (controls.explicit === 'background') kind = manifest ? 'durable_manifest' : 'bounded_foreground';
+  // An explicit "do this in the background" is a decision the user made, not
+  // an estimate to re-derive. Without a manifest there are no canonical items
+  // to fan out, but the work still runs durably — demoting it to foreground
+  // would silently give back the thing that was asked for.
+  if (controls.explicit === 'background') kind = 'durable_manifest';
   if (controls.explicit === 'foreground' && kind === 'durable_manifest' && windows === 1) {
     kind = 'bounded_foreground';
   }
@@ -181,13 +226,52 @@ export function dispositionToDurableWork(disposition: WorkDisposition): DurableW
   };
 }
 
-/** Reducer readiness: every canonical item terminal exists, exactly once. */
+/** One settled unit of durable work: this item, in this phase. */
+export interface LedgerEntry {
+  itemId: string;
+  phaseId: string;
+}
+
+function ledgerKey(entry: LedgerEntry): string {
+  return `${entry.itemId}::${entry.phaseId}`;
+}
+
+/**
+ * Exactly what must have settled before the reducer may run: every canonical
+ * item, in every phase the reducer requires. This is derived from the PLAN, so
+ * no caller can define readiness by asserting a total.
+ */
+export function expectedLedger(plan: DurableWorkPlan): LedgerEntry[] {
+  const entries: LedgerEntry[] = [];
+  for (const window of plan.windows) {
+    for (const itemId of window.itemIds) {
+      for (const phaseId of plan.requiredPhases) entries.push({ itemId, phaseId });
+    }
+  }
+  return entries;
+}
+
+/**
+ * Reducer readiness against the EXACT expected ledger.
+ *
+ * Counting was the bug: three settlements for ids belonging to no item in the
+ * plan satisfied a three-item plan, so a reducer could run over work that
+ * never happened. Readiness now asks whether each expected item x phase
+ * settled; anything else is reported as unknown and never counts toward it.
+ */
 export function reducerReady(input: {
   plan: DurableWorkPlan;
-  completedItemIds: readonly string[];
-  totalItems: number;
-}): { ready: boolean; missing: number } {
-  const completed = new Set(input.completedItemIds);
-  const missing = input.totalItems - completed.size;
-  return { ready: missing <= 0, missing: Math.max(0, missing) };
+  completed: readonly LedgerEntry[];
+}): { ready: boolean; missing: LedgerEntry[]; unknown: LedgerEntry[] } {
+  const expected = expectedLedger(input.plan);
+  const expectedKeys = new Set(expected.map(ledgerKey));
+  const settled = new Set<string>();
+  const unknown: LedgerEntry[] = [];
+  for (const entry of input.completed) {
+    const key = ledgerKey(entry);
+    if (expectedKeys.has(key)) settled.add(key);
+    else unknown.push(entry);
+  }
+  const missing = expected.filter((entry) => !settled.has(ledgerKey(entry)));
+  return { ready: missing.length === 0, missing, unknown };
 }
