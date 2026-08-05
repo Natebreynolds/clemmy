@@ -71,7 +71,11 @@ import { promoteReflectionCandidateById, rejectReflectionCandidateClusterById } 
 import { approveIdentityProposal, listIdentityProposals, rejectIdentityProposal } from '../memory/identity-evolution.js';
 import { composeCuratedMemory, IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, splitCuratedMemory, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { resolveWorkingMemoryForConsole } from '../memory/working-memory.js';
-import { projectWorkflowRunActivity } from './activity-projection.js';
+import {
+  projectActivitySnapshot,
+  shouldSurfaceInWorkingNow,
+  type ActivityEntry,
+} from './activity-projection.js';
 import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
   listWorkflows,
@@ -365,7 +369,7 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
 import { selectAddressedApproval } from '../runtime/harness/approval-addressing.js';
 import { attachSessionViewer } from '../runtime/harness/session-viewers.js';
-import { buildActivitySnapshot, formatElapsed, isHarnessSessionCurrentlyWorking } from '../shared/activity-snapshot.js';
+import { buildActivitySnapshot, formatElapsed } from '../shared/activity-snapshot.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
@@ -5702,28 +5706,31 @@ export function registerConsoleRoutes(
    * are reduced to a safe summary; definitions, prompts, inputs, and step
    * outputs stay on disk and run-scoped compiled projects stay out of Studio.
    */
-  // U1 (Clem 4, Stage 9): the shared activity projection, behind current
-  // rendering. Nothing consumes this yet; U2+ migrates surfaces onto it one
-  // at a time, each deleting its private reducer. Snapshots only — the delta
-  // stream arrives with the durable journal's event feed.
+  /**
+   * The unified activity projection: workflow runs, detached background work,
+   * and chat attempts in ONE server-owned list. Desktop, console, and the
+   * channel senders read the same entries, so liveness, counts, and terminals
+   * cannot disagree across surfaces. `?workingNow=1` applies the server's own
+   * Working Now gate — ordinary foreground chat stays in the conversation
+   * until it has run long enough to be work a user could have walked away from.
+   */
   app.get('/api/console/activity/v2', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const observedAt = new Date().toISOString();
-      const snapshots: unknown[] = [];
-      if (fs.existsSync(WORKFLOW_RUNS_DIR)) {
-        const files = fs.readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json'));
-        for (const file of files) {
-          try {
-            const data = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
-            const snapshot = projectWorkflowRunActivity(data, observedAt);
-            if (snapshot) snapshots.push(snapshot);
-          } catch { /* skip malformed */ }
-        }
-      }
-      snapshots.sort((a, b) => String((b as { startedAt?: string }).startedAt ?? '')
-        .localeCompare(String((a as { startedAt?: string }).startedAt ?? '')));
-      res.json({ schemaVersion: 1, observedAt, snapshots: snapshots.slice(0, 100) });
+      const snapshot = projectActivitySnapshot({ limit: 100 });
+      const workingNowOnly = req.query.workingNow === '1' || req.query.workingNow === 'true';
+      const observedAtMs = Date.parse(snapshot.observedAt);
+      const entries = workingNowOnly
+        ? snapshot.entries.filter((entry) => shouldSurfaceInWorkingNow(entry, observedAtMs))
+        : snapshot.entries;
+      // `snapshots` is the shipped field name; `entries` is the projection's
+      // own vocabulary. Both are the same array.
+      res.json({
+        schemaVersion: snapshot.schemaVersion,
+        observedAt: snapshot.observedAt,
+        snapshots: entries,
+        entries,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -12532,16 +12539,21 @@ export function registerConsoleRoutes(
       // Chat sessions stay status='active' BETWEEN turns (see
       // project_session_status_semantics memory: that's what session
       // 'active' actually means — open + addressable, not necessarily
-      // executing). For WORKING NOW we want only sessions the daemon
-      // is mid-turn on RIGHT NOW. Heuristic: status='active' AND last
-      // event within the last 60s (covers an LLM turn + a slow tool
-      // call). Idle sessions, even if 'active', live in Activity for
-      // resume/clear actions.
-      const activeWindowMs = 60_000;
-      const activeWindowCutoff = Date.now() - activeWindowMs;
-      const activeHarnessSessions = recentHarnessSessions.filter((session) =>
-        isHarnessSessionCurrentlyWorking(session, activeWindowCutoff),
-      );
+      // executing). Which of them belongs in WORKING NOW is the server
+      // projection's call, not a wall-clock guess here: an unsettled attempt
+      // under a held lease is live however quiet the provider is, a lost lease
+      // is stale, and an ordinary foreground turn stays in the conversation
+      // until it has run long enough to be work the user may have left behind.
+      const activitySnapshot = projectActivitySnapshot({ kinds: ['chat'] });
+      const activityObservedMs = Date.parse(activitySnapshot.observedAt);
+      const chatActivityBySession = new Map<string, ActivityEntry>();
+      for (const entry of activitySnapshot.entries) {
+        if (entry.kind === 'chat' && entry.sessionId) chatActivityBySession.set(entry.sessionId, entry);
+      }
+      const activeHarnessSessions = recentHarnessSessions.filter((session) => {
+        const entry = chatActivityBySession.get(session.id);
+        return !!entry && shouldSurfaceInWorkingNow(entry, activityObservedMs);
+      });
 
       // Uncapped per-source (was sliced) — the NEEDS YOU header count
       // (counts.waiting = needsYou.length) is computed from this array,
@@ -12710,11 +12722,15 @@ export function registerConsoleRoutes(
           }))
           .map((session) => {
             const attempt = getActiveHarnessRunAttempt(session.id);
+            const activity = chatActivityBySession.get(session.id);
             return {
               kind: isDiscordHarnessSession(session) ? 'discord' : session.kind,
               title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine run'),
               meta: `${harnessSessionSourceLabel(session)} · ${session.status} · ${session.updatedAt.slice(11, 16)}`,
               panel: 'activity',
+              // Server-owned liveness: the client renders this, it does not
+              // re-derive "working" from how old the last event looks.
+              ...(activity ? { liveness: activity.liveness, needsAttention: activity.needsAttention } : {}),
               actionKind: 'harness-session',
               sessionId: session.id,
               ...(attempt

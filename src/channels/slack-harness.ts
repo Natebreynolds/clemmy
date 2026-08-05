@@ -9,7 +9,6 @@ import {
 } from './discord-harness.js';
 import { SLACK_BOT_TOKEN } from '../config.js';
 import { isStatusCommand, buildBoardSummary, formatBoardSummaryText } from '../dashboard/board-summary.js';
-import { applyTransportProgress, reduceTransportProgress, type TransportProgressState } from './transport-progress.js';
 
 const logger = pino({ name: 'clementine-next.slack-harness' });
 
@@ -209,7 +208,9 @@ export function deriveAssistantStatus(state: DisplayState): string {
 export function renderAssistantProgress(state: DisplayState): string {
   if (state.progressPresentation === 'quiet') return '🍊 *Clem is working…*';
   const agent = (state.currentAgent ?? '').trim();
-  const detail = (state.status ?? '').trim() || 'working…';
+  // The shared milestone when the message lane has asserted one, so the native
+  // pane says the same thing as Discord and the console about the same run.
+  const detail = (state.activityLine ?? '').trim() || (state.status ?? '').trim() || 'working…';
   const tools = (state.toolsCalled ?? []).map(prettyTool).filter(Boolean).slice(-8);
   const head = agent ? `🍊 *${agent}*` : '🍊 *Clem is working…*';
   const meta = [detail, state.toolCount >= 3 ? `${state.toolCount} tools` : '']
@@ -440,21 +441,4 @@ export async function handleSlackHarnessMessage(opts: {
     channelLabel: `slack:${conversationId}`,
     durableRequest: opts.durableRequest,
   });
-}
-
-
-/**
- * E7.3: the slack transport's progress milestones come from the SHARED
- * reducer over the server activity projection — one kickoff, rate-limited
- * milestone edits, one final replacement, and never a message per tool
- * event. Exported so the surface's sender wires the same truth the console
- * renders.
- */
-export function nextSlackProgressAction(
-  snapshot: Parameters<typeof reduceTransportProgress>[0],
-  state: TransportProgressState,
-  nowMs: number,
-): { action: ReturnType<typeof reduceTransportProgress>; state: TransportProgressState } {
-  const action = reduceTransportProgress(snapshot, state, nowMs);
-  return { action, state: applyTransportProgress(state, action, nowMs) };
 }

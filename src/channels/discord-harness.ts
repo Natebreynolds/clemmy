@@ -31,6 +31,8 @@ import {
   createSession as createHarnessSession,
   finishRunAttempt,
   getActiveRunAttempt,
+  getLatestEventSeq,
+  getLatestRunAttempt,
   getLatestRunAttemptByRunId,
   getSession as getHarnessSession,
   listEvents as listHarnessEvents,
@@ -100,7 +102,13 @@ import {
 } from '../runtime/harness/public-presentation.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
-import { applyTransportProgress, reduceTransportProgress, type TransportProgressState } from './transport-progress.js';
+import { advanceTransportProgress, type TransportProgressAction, type TransportProgressState } from './transport-progress.js';
+import { projectChatAttemptActivity } from '../dashboard/activity-projection.js';
+import type {
+  SurfaceActivityLabel,
+  SurfaceLifecycle,
+  SurfaceTerminal,
+} from '../runtime/graph/surface-projection.js';
 import {
   exactOriginDeliveryTargetDigest,
   exactOriginDeliveryTargetFromSessionSnapshot,
@@ -1703,6 +1711,9 @@ export const __test__ = {
   commitDiscordAnswerForTest: commitDiscordAnswer,
   acceptedChannelOutcome,
   applyEventToAcceptedChannelState,
+  createChannelProgressLane,
+  channelActivityForState,
+  channelTerminalForState,
   tryHandleBackgroundItControl,
   /** Inject a fresh channel→session mapping (Step 5 typed-plan-approval tests). */
   setChannelSessionForTest(channelId: string, sessionId: string): void {
@@ -2082,6 +2093,131 @@ export interface DisplayState {
   // 42%]` footer so the user sees the context filling up before it
   // explodes. Only shown when > 30%.
   contextPct?: number;
+  /**
+   * The milestone line the SHARED activity projection asserts, refreshed at the
+   * reducer's cadence rather than once per event. `status` remains the raw
+   * event vocabulary the state machine writes; the rendered line prefers this
+   * so every surface says the same thing about the same run.
+   */
+  activityLine?: string;
+}
+
+/**
+ * The channel message lane's link to the server activity projection.
+ *
+ * Both transports run through this one state machine, so this is where they
+ * stop narrating from their own event handling: the display state says which
+ * phase the turn is in, the durable attempt row says who owns it, and the
+ * shared reducer decides whether that adds up to anything worth saying. Two
+ * invariants come out of it — milestone text changes at the reducer's cadence
+ * (never once per tool event) and the settled message is replaced exactly once.
+ */
+interface ChannelProgressLane {
+  /** Progress only: kickoff, a rate-limited milestone edit, or silence. */
+  milestone(state: DisplayState, nowMs: number): TransportProgressAction;
+  /** The single final replacement. Emits 'final' once; later calls are 'none'. */
+  settle(state: DisplayState, nowMs: number): TransportProgressAction;
+  readonly finalized: boolean;
+}
+
+/**
+ * Map the display state onto the projection's public vocabulary. Bounded
+ * phases only: tool names, arguments, and targets stay out of the label because
+ * they are not in the type the transport renders.
+ */
+function channelActivityForState(
+  state: DisplayState,
+): { lifecycle: SurfaceLifecycle; label: SurfaceActivityLabel } {
+  if (state.pendingApprovalId) return { lifecycle: 'awaiting_approval', label: { phase: 'awaiting_approval' } };
+  if (state.status === 'awaiting reply') return { lifecycle: 'awaiting_input', label: { phase: 'awaiting_input' } };
+  if (state.asyncWorkDispatched) return { lifecycle: 'completing', label: { phase: 'delivering' } };
+  if (state.toolCount > 0) return { lifecycle: 'using_tool', label: { phase: 'working_items' } };
+  return { lifecycle: 'reasoning', label: { phase: 'thinking' } };
+}
+
+/**
+ * The typed terminal for THIS message. A pause on a person is a settled
+ * message, not a completed run, and neither is ever rendered as success.
+ */
+function channelTerminalForState(state: DisplayState): SurfaceTerminal | undefined {
+  if (state.asyncWorkDispatched) {
+    return { status: 'completed', kind: 'handed_off', text: state.summary || 'Started.', resumable: false };
+  }
+  if (!state.done) return undefined;
+  const text = state.summary || 'Done.';
+  if (state.pendingApprovalId) return { status: 'blocked', kind: 'awaiting_approval', text, resumable: true };
+  const status = state.status ?? '';
+  if (status === 'awaiting reply') return { status: 'blocked', kind: 'awaiting_input', text, resumable: true };
+  if (status === 'rejected' || status.startsWith('stopped:')) {
+    return { status: 'cancelled', kind: status, text, resumable: true };
+  }
+  if (status === 'abandoned' || status === 'stalled' || status.startsWith('timed out')) {
+    return { status: 'failed', kind: status, text, resumable: true };
+  }
+  return { status: 'completed', kind: 'complete', text, resumable: false };
+}
+
+function createChannelProgressLane(input: {
+  sessionId: string;
+  attemptId: string;
+  startedAt: string;
+}): ChannelProgressLane {
+  let progress: TransportProgressState = {};
+
+  const project = (state: DisplayState, nowMs: number, withTerminal: boolean) => {
+    // The durable attempt carries the ownership truth: quiet provider time
+    // under a held lease is live, an expired one is stale, and an attempt that
+    // never claimed a lease says nothing either way.
+    let attempt = null as ReturnType<typeof getLatestRunAttempt>;
+    try {
+      const latest = getLatestRunAttempt(input.sessionId);
+      attempt = latest && latest.attemptId === input.attemptId ? latest : null;
+    } catch {
+      attempt = null;
+    }
+    const activity = channelActivityForState(state);
+    const terminal = withTerminal ? channelTerminalForState(state) : undefined;
+    return projectChatAttemptActivity({
+      sessionId: input.sessionId,
+      headline: 'Chat turn',
+      attempt,
+      observedAt: new Date(nowMs).toISOString(),
+      revision: safeLatestEventSeq(input.sessionId),
+      lifecycleHint: activity.lifecycle,
+      activityLabel: activity.label,
+      startedAt: input.startedAt,
+      ...(terminal ? { terminalHint: terminal } : {}),
+    });
+  };
+
+  return {
+    get finalized(): boolean {
+      return progress.finalized === true;
+    },
+    milestone(state, nowMs) {
+      if (progress.finalized) return { action: 'none' };
+      const entry = project(state, nowMs, false);
+      // A settled run's message belongs to the final replacement, never to a
+      // progress edit that happened to observe the terminal first.
+      if (entry.terminal) return { action: 'none' };
+      const advanced = advanceTransportProgress(entry, progress, nowMs);
+      progress = advanced.state;
+      return advanced.action;
+    },
+    settle(state, nowMs) {
+      const advanced = advanceTransportProgress(project(state, nowMs, true), progress, nowMs);
+      progress = advanced.state;
+      return advanced.action;
+    },
+  };
+}
+
+function safeLatestEventSeq(sessionId: string): number {
+  try {
+    return getLatestEventSeq(sessionId);
+  } catch {
+    return 0;
+  }
 }
 
 async function sendParkedBackgroundAck(
@@ -2436,7 +2572,10 @@ function renderBody(state: DisplayState): string {
   // happening." Tool count is included once 3+ tools have fired —
   // signals real progress, not churn. Still no full tool-call
   // history — that read as "the agent is confused" in earlier UX.
-  const verb = state.currentAgent ? `${state.currentAgent} · ${state.status || 'working…'}` : (state.status || 'working…');
+  // The milestone line is the shared projection's when the lane has asserted
+  // one; the raw event status is the fallback for states it does not cover.
+  const line = state.activityLine || state.status || 'working…';
+  const verb = state.currentAgent ? `${state.currentAgent} · ${line}` : line;
   const elapsed = formatElapsedMs(state.turnStartedAt ? Date.now() - state.turnStartedAt : 0);
   const counter = state.toolCount >= 3 ? ` · ${state.toolCount} tools` : '';
   // Context-window footer: surfaces when auto-compact has reported the
@@ -2969,6 +3108,14 @@ export async function runDiscordHarnessConversation(opts: {
     toolsCalled: [],
     toolCount: 0,
   };
+  // Every progress decision on this message — speak or stay quiet, what the
+  // milestone says, whether the run is already settled — comes from the shared
+  // reducer over the server activity projection, not from event handling here.
+  const progressLane = createChannelProgressLane({
+    sessionId: session.id,
+    attemptId: activeRun.attemptId,
+    startedAt: activeRun.startedAt,
+  });
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
   // Track which approval the LAST flush attached buttons for, so a
@@ -3024,6 +3171,12 @@ export async function runDiscordHarnessConversation(opts: {
   const flush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
+    // The settled message is never repainted by a straggling progress edit.
+    if (progressLane.finalized) return;
+    const milestone = progressLane.milestone(state, lastEditAt);
+    if (milestone.action === 'kickoff' || milestone.action === 'edit') {
+      state.activityLine = milestone.text;
+    }
     // Progress sink (Slack AI-Assistant setStatus). Fires on every flush with the
     // live state, independent of message-edit token expiry. No-op for Discord.
     try { transport.onState?.(state); } catch { /* progress sink must never break the run */ }
@@ -3106,6 +3259,10 @@ export async function runDiscordHarnessConversation(opts: {
   const finalFlush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
+    // Exactly one final replacement: a second settle (the safety timer racing
+    // the terminal event) finds the lane already finalized and stays quiet.
+    if (progressLane.finalized) return;
+    progressLane.settle(state, lastEditAt);
     if (!state.asyncWorkDispatched) await refreshPendingApprovalDisplay(state, session.id);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
@@ -3797,6 +3954,13 @@ async function runDiscordHarnessResume(opts: {
     toolsCalled: [],
     toolCount: 0,
   };
+  // The resumed turn narrates from the same shared reducer as the first turn —
+  // a resume is not a second progress vocabulary.
+  const progressLane = createChannelProgressLane({
+    sessionId,
+    attemptId: resumeAttempt.attemptId,
+    startedAt: resumeAttempt.startedAt,
+  });
   let lastEditAt = 0;
   let pendingEdit: NodeJS.Timeout | null = null;
   let lastAttachedApprovalId: string | undefined;
@@ -3822,6 +3986,11 @@ async function runDiscordHarnessResume(opts: {
   const flush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
+    if (progressLane.finalized) return;
+    const milestone = progressLane.milestone(state, lastEditAt);
+    if (milestone.action === 'kickoff' || milestone.action === 'edit') {
+      state.activityLine = milestone.text;
+    }
     try {
       const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
       const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
@@ -3842,6 +4011,8 @@ async function runDiscordHarnessResume(opts: {
   const finalFlush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
+    if (progressLane.finalized) return;
+    progressLane.settle(state, lastEditAt);
     if (!state.asyncWorkDispatched) await refreshPendingApprovalDisplay(state, sessionId);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
@@ -4332,21 +4503,4 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       return;
     }
   }
-}
-
-
-/**
- * E7.3: the discord transport's progress milestones come from the SHARED
- * reducer over the server activity projection — one kickoff, rate-limited
- * milestone edits, one final replacement, and never a message per tool
- * event. Exported so the surface's sender wires the same truth the console
- * renders.
- */
-export function nextDiscordProgressAction(
-  snapshot: Parameters<typeof reduceTransportProgress>[0],
-  state: TransportProgressState,
-  nowMs: number,
-): { action: ReturnType<typeof reduceTransportProgress>; state: TransportProgressState } {
-  const action = reduceTransportProgress(snapshot, state, nowMs);
-  return { action, state: applyTransportProgress(state, action, nowMs) };
 }

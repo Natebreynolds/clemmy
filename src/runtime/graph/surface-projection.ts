@@ -102,6 +102,7 @@ export interface SurfaceRunDelta {
  */
 export interface SurfaceActivityLabel {
   phase:
+    | 'thinking'
     | 'recalling_context'
     | 'finding_capability'
     | 'reading'
@@ -122,6 +123,7 @@ export function renderActivityLabel(label: SurfaceActivityLabel): string {
     ? ` ${label.completed} of ${label.total}`
     : '';
   switch (label.phase) {
+    case 'thinking': return 'Thinking it through';
     case 'recalling_context': return 'Checking remembered context';
     case 'finding_capability': return 'Finding the connected capability';
     case 'reading': return 'Reading connected data';

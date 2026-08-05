@@ -68,6 +68,22 @@ export function reduceTransportProgress(
   return { action: 'edit', text };
 }
 
+/**
+ * Reduce and fold in one step — the ONE call a transport makes per flush.
+ *
+ * Both channel surfaces run through the same message state machine, so this is
+ * their single decision point: whether to speak at all, what the milestone text
+ * is, and whether the run has already been replaced by its final message.
+ */
+export function advanceTransportProgress(
+  snapshot: SurfaceRunSnapshot,
+  state: TransportProgressState,
+  nowMs: number,
+): { action: TransportProgressAction; state: TransportProgressState } {
+  const action = reduceTransportProgress(snapshot, state, nowMs);
+  return { action, state: applyTransportProgress(state, action, nowMs) };
+}
+
 /** Fold an emitted action back into the transport's durable-ish state. */
 export function applyTransportProgress(
   state: TransportProgressState,

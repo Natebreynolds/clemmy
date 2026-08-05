@@ -22,7 +22,14 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
-const { appendEvent, createSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const {
+  appendEvent,
+  claimRunAttemptLease,
+  createSession,
+  finishRunAttempt,
+  listEvents,
+  resetEventLog,
+} = await import('../runtime/harness/eventlog.js');
 const { archiveBackgroundTask, listBackgroundTasks } = await import('../execution/background-tasks.js');
 
 type StubAssistantRequest = { sessionId: string; onReasoning?: (text: string) => void };
@@ -186,6 +193,17 @@ test('command center keeps limit-exceeded harness sessions working until complet
     title: 'Long research loop',
     metadata: { source: 'desktop' },
   });
+  // Working Now is fed by the durable attempt and its lease, not by how fresh
+  // the last event looks: a long turn under a held lease stays live however
+  // quiet the provider goes, and it leaves the panel when the attempt settles.
+  const claim = claimRunAttemptLease({
+    sessionId: session.id,
+    runId: 'limit-loop',
+    ownerId: 'test-daemon',
+    leaseMs: 30 * 60_000,
+    nowMs: Date.now() - 5 * 60_000,
+  });
+  assert.ok(claim.attempt, 'the fixture must own the run it claims to be executing');
   appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
   appendEvent({
     sessionId: session.id,
@@ -215,6 +233,7 @@ test('command center keeps limit-exceeded harness sessions working until complet
       type: 'conversation_completed',
       data: { summary: 'complete' },
     });
+    finishRunAttempt(claim.attempt!, 'completed');
     const second = await fetch(`${h.url}/api/console/home/command-center`);
     assert.equal(second.status, 200);
     const completedBody = await second.json() as {
