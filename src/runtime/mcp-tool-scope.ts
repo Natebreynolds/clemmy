@@ -1,4 +1,5 @@
 import { matchToolChoicesForStep, type StepToolChoiceMatch } from '../memory/tool-choice-store.js';
+import { cachedTurnCandidates } from './read-path/capability-candidate-cache.js';
 
 export interface McpToolScope {
   /**
@@ -608,6 +609,14 @@ export function resolveMcpToolScopeWithRecall(
       matches = matchToolChoicesForStep(input);
     } catch {
       matches = [];
+    }
+    // Candidates the shared bridge already resolved for this accepted turn —
+    // including the ones only meaning could find. Advisory, and merged rather
+    // than substituted, so keyword routing keeps everything it earned.
+    const cached = cachedTurnCandidates(input)?.matches ?? [];
+    if (cached.length > 0) {
+      const seen = new Set(matches.map((m) => m.identifier));
+      matches = [...matches, ...cached.filter((m) => !seen.has(m.identifier))];
     }
   } else {
     matches = [];

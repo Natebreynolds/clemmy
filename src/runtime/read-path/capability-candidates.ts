@@ -33,6 +33,7 @@ import {
   localEmbeddingProviderSync,
   localEmbeddingSpaceKey,
 } from '../../memory/embeddings.js';
+import { cacheTurnCandidates } from './capability-candidate-cache.js';
 import {
   listToolChoices,
   matchToolChoicesForStep,
@@ -226,10 +227,13 @@ export async function resolveTurnCapabilityCandidates(options: {
     });
   }
 
-  return {
+  const resolved: TurnCapabilityCandidates = {
     candidates,
     matches: [...matches, ...semanticMatches],
     pinnedTools: [...pinnedTools],
     semanticApplied,
   };
+  // Leave it where the turn's synchronous tool-surface seams will look.
+  cacheTurnCandidates(input, { pinnedTools: resolved.pinnedTools, matches: resolved.matches });
+  return resolved;
 }

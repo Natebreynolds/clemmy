@@ -24,6 +24,7 @@ import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
 import { MODELS, getActiveAuthMode, getByoBackendConfig, getModelRoutingMode, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { warmCapabilityRetrieval } from '../runtime/read-path/capability-candidates.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { processExecutionController } from '../execution/controller.js';
@@ -1742,6 +1743,11 @@ export async function startDaemon(
     'Model catalog discovery initialized',
   );
   ensureDir(CRON_PROGRESS_DIR);
+  // Warm capability retrieval OFF the request path. The local model takes a few
+  // seconds the first time and milliseconds afterwards; doing it here means the
+  // first real request finds it ready instead of paying for it, and a failure
+  // to load simply leaves retrieval on its exact/lexical tier.
+  void warmCapabilityRetrieval().catch(() => false);
   const state = loadState();
   // Canonical tool-memory migration is an explicit boot phase. Never hide it
   // behind list/recall/pre-warm: those hot paths must remain read-only. A

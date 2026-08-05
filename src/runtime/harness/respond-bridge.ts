@@ -40,6 +40,7 @@
  */
 import { runConversation, verifiedWorkflowRunDispatchReceipts } from './loop.js';
 import { resolveAcceptedTurnRead, type AcceptedTurnReadPorts, type AcceptedTurnReadResult } from '../read-path/read-lane-chat.js';
+import { resolveTurnCapabilityCandidates } from '../read-path/capability-candidates.js';
 import {
   PendingWorkflowChatDispatchOwnershipError,
   readPendingWorkflowChatDispatchOwnership,
@@ -1362,6 +1363,16 @@ export async function respondPreferHarness(
   // existing exactly-once committer and no brain runs at all.
   const readServed = await tryServeAcceptedTurnRead(surface, request);
   if (readServed) return readServed;
+
+  // F2: when the read lane declines, the ordinary brain runs — but it should
+  // not have to rediscover a capability this workspace has already proven. One
+  // bounded, deadline-capped retrieval here leaves advisory candidates where
+  // BOTH brains' synchronous tool-surface seams already look, so desktop,
+  // Discord, and Slack get the identical surface. Candidates are advisory:
+  // they widen what the brain may choose from and decide nothing.
+  try {
+    await resolveTurnCapabilityCandidates({ userInput: request.message });
+  } catch { /* retrieval never blocks a turn */ }
 
   if (claudeAgentSdkBrainEnabled(surface)) {
     const detachProgressRelay = attachLegacyProgressRelay(request);
