@@ -23,7 +23,8 @@
  * cannot be decided from the journal alone, because it depends on what this
  * run's predecessors actually produce.
  */
-import { computeGraphDigest, computeNodeDigest, validateGraphPatch } from './graph-admission.js';
+import { computeGraphDigest, validateGraphPatch } from './graph-admission.js';
+import { nodeDigestFor } from './graph-node-identity.js';
 import type { GraphAdmission } from './graph-admission.js';
 import type { NodeOutcome } from './graph-executor.js';
 import type {
@@ -137,8 +138,9 @@ export function reconstructAdmittedResume(
       }
       // A7: identity is the admitted definition, not internal agreement. A
       // forged pair whose digest never described this topology authorizes
-      // nothing — not routing, not reuse, not patch causality.
-      if (entry.nodeDigest !== computeNodeDigest(def)) {
+      // nothing — not routing, not reuse, not patch causality. Under a
+      // semantic admission the definition includes semantics and runner.
+      if (entry.nodeDigest !== nodeDigestFor(admission, def)) {
         errors.push(`start of "${entry.nodeId}" carries node digest ${entry.nodeDigest.slice(0, 12)}…, which does not match the definition at that journal position`);
         return;
       }
@@ -444,8 +446,9 @@ export function decideTrustedReuse(
   journaled: NodeSettledEntry,
   node: { id: string; kind: string; joinMode?: 'all' | 'any' },
   currentInputDigest: string,
+  admission?: GraphAdmission,
 ): { reuse: NodeOutcome } | { refusal: string } {
-  if (journaled.nodeDigest !== computeNodeDigest(node)) {
+  if (journaled.nodeDigest !== nodeDigestFor(admission, node)) {
     return { refusal: 'node definition digest changed — same id, different work' };
   }
   if (currentInputDigest !== journaled.inputDigest) {

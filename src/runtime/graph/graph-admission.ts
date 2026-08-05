@@ -16,6 +16,7 @@
 import { createHash } from 'node:crypto';
 
 import type { ExecutableEdge, ExecutableGraph, ExecutableNode } from './graph-executor.js';
+import type { AdmittedExecutionIdentity } from './graph-node-identity.js';
 
 /**
  * The journal contract revision this admission mints identity for. Folded
@@ -53,6 +54,15 @@ export interface GraphAdmission {
    *  history from an older contract is a different run and refuses wholesale. */
   journalSchemaVersion: number;
   graphDigest: string;
+  /**
+   * Semantic execution identity, sealed by graph-node-identity BEFORE
+   * admission. Its identityDigest folds into the admission digest: changed
+   * semantics, runner contracts, tenancy, authority, catalog, schema
+   * universe, effect ceiling, binding revision, or budget version make the
+   * old journal a different run. Absent = structural-only admission (the
+   * pre-R1B shape, still lawful for tests and the pure differential).
+   */
+  identity?: AdmittedExecutionIdentity;
   compilerVersion: string;
   /** Immutable policy snapshot hash. Opaque here; owned by the admission boundary. */
   policyHash: string;
@@ -143,6 +153,8 @@ export function admitGraph(input: {
   policyHash: string;
   catalogHash: string;
   budget: AdmittedBudget;
+  /** Sealed via sealExecutionIdentity — the seal is the validation boundary. */
+  identity?: AdmittedExecutionIdentity;
 }): AdmissionResult {
   const errors: string[] = [];
   for (const field of BUDGET_FIELDS) {
@@ -172,6 +184,7 @@ export function admitGraph(input: {
     policyHash: input.policyHash,
     catalogHash: input.catalogHash,
     budget,
+    identityDigest: input.identity?.identityDigest ?? null,
   }));
   return {
     ok: true,
@@ -179,6 +192,7 @@ export function admitGraph(input: {
       admissionDigest,
       journalSchemaVersion: GRAPH_JOURNAL_SCHEMA_VERSION,
       graphDigest,
+      ...(input.identity ? { identity: input.identity } : {}),
       compilerVersion: input.compilerVersion,
       policyHash: input.policyHash,
       catalogHash: input.catalogHash,

@@ -465,7 +465,7 @@ test('graph-resume imports only pure siblings and observes nothing', async () =>
   const source = readFileSync(path.join(here, 'graph-resume.ts'), 'utf-8');
   assert.deepEqual(
     [...source.matchAll(/^import (?!type ).*?from '([^']+)';$/gms)].map((m) => m[1]).sort(),
-    ['./graph-admission.js'],
+    ['./graph-admission.js', './graph-node-identity.js'],
     'reconstruction grew a dependency — replay must stay a pure function of graph, admission, and journal',
   );
   for (const forbidden of ['process.env', 'readFileSync', 'Date.now', 'new Date(', 'fetch(', 'Math.random', 'edgeSatisfied']) {

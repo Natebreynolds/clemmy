@@ -429,7 +429,7 @@ test('the executor imports only its pure siblings and reaches nowhere', async ()
   // adapters, and its appearance here is the executor becoming a runtime.
   assert.deepEqual(
     [...source.matchAll(/^import (?!type ).*?from '([^']+)';$/gms)].map((m) => m[1]).sort(),
-    ['./graph-admission.js', './graph-resume.js'],
+    ['./graph-admission.js', './graph-node-identity.js', './graph-resume.js'],
     'the executor grew a dependency — policy, capability and effects belong in nodes',
   );
   for (const forbidden of ['process.env', 'readFileSync', 'Date.now', 'new Date', 'BASE_DIR', 'fetch(', 'Math.random']) {

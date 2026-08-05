@@ -40,8 +40,6 @@
  *     dependents; resume trusts only ordered, identity-validated history.
  */
 import {
-  computeInputDigest,
-  computeNodeDigest,
   validateGraphPatch,
   type GraphAdmission,
   type GraphPatch,
@@ -52,6 +50,7 @@ import type {
   NodeSettledEntry,
   SettlementClass,
 } from './graph-journal.js';
+import { inputDigestFor, nodeDigestFor } from './graph-node-identity.js';
 import { admittedRunPrecondition, decideTrustedReuse, reconstructAdmittedResume } from './graph-resume.js';
 
 /** A node the executor schedules. `kind` is meaningful only to the runner. */
@@ -567,7 +566,7 @@ export async function runGraph(
     for (const node of ready) {
       const journaled = trusted.get(node.id);
       const verdict = journaled
-        ? decideTrustedReuse(journaled, node, computeInputDigest(predecessorRefsFor(node)))
+        ? decideTrustedReuse(journaled, node, inputDigestFor(admission, node.id, predecessorRefsFor(node)), admission)
         : undefined;
       if (verdict && 'reuse' in verdict) {
         settle(node, verdict.reuse, true, journaled!.firedEdgeIds);
@@ -599,8 +598,8 @@ export async function runGraph(
         return {
           node,
           predecessors,
-          nodeDigest: computeNodeDigest(node),
-          inputDigest: computeInputDigest(predecessors),
+          nodeDigest: nodeDigestFor(admission, node),
+          inputDigest: inputDigestFor(admission, node.id, predecessors),
           attemptId: nextAttemptId(),
         };
       });
