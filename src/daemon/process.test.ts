@@ -334,3 +334,40 @@ test('daemon lease: malformed or multiple-owner state fails closed', () => {
   writeFileSync(path.join(DAEMON_LEASE_DIR, 'owner-also-bad.json'), '{}');
   assert.equal(acquireDaemonLease(process.pid), false);
 });
+
+test('daemon lease: a ZOMBIE owner pid is provably dead and taken over', async () => {
+  // Live 2026-08-05: after an ENOSPC crash loop the packaged app held a
+  // defunct daemon child for over an hour; kill(pid, 0) succeeds for a zombie,
+  // so the lease refused every restart while nothing listened on the port. A
+  // pid in ps state 'Z' can never serve again and must not block.
+  const { _setPsStateReaderForTest } = await import('./process.js');
+  const child = await spawnSameUserSleeper();
+  try {
+    const token = '44444444-4444-4444-8444-444444444444';
+    rmSync(DAEMON_LEASE_DIR, { recursive: true, force: true });
+    mkdirSync(DAEMON_LEASE_DIR, { recursive: true });
+    writeFileSync(path.join(DAEMON_LEASE_DIR, `owner-${token}.json`), JSON.stringify({
+      version: 1,
+      pid: child.pid,
+      token,
+      startedAt: new Date().toISOString(),
+    }));
+    // Node reaps its own children, so simulate the zombie state via the seam.
+    _setPsStateReaderForTest((pid) => (pid === child.pid ? 'Z+' : null));
+    assert.equal(acquireDaemonLease(process.pid), true, 'a defunct owner must never retain the lease');
+    assert.equal(readDaemonPid(), process.pid);
+    // Sanity: with a LIVE state the same owner still blocks (the fix is
+    // zombie-narrow, not a loosening of liveness).
+    clearDaemonPid(process.pid);
+    rmSync(DAEMON_LEASE_DIR, { recursive: true, force: true });
+    mkdirSync(DAEMON_LEASE_DIR, { recursive: true });
+    writeFileSync(path.join(DAEMON_LEASE_DIR, `owner-${token}.json`), JSON.stringify({
+      version: 1, pid: child.pid, token, startedAt: new Date().toISOString(),
+    }));
+    _setPsStateReaderForTest((pid) => (pid === child.pid ? 'S+' : null));
+    assert.equal(acquireDaemonLease(process.pid), false, 'a live owner still blocks');
+  } finally {
+    _setPsStateReaderForTest(null);
+    child.kill('SIGKILL');
+  }
+});

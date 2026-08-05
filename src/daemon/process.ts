@@ -136,6 +136,29 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+/** `ps` state letter for a pid ('Z…' = zombie), or null when unreadable. */
+function processPsState(pid: number): string | null {
+  if (process.platform === 'win32') return null;
+  if (psStateReaderForTest) return psStateReaderForTest(pid);
+  try {
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'state='], {
+      encoding: 'utf-8',
+      timeout: 2_000,
+    });
+    return out.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+let psStateReaderForTest: ((pid: number) => string | null) | null = null;
+
+/** Test-only: substitute the ps state reader (Node reaps its own children, so
+ *  a hermetic test cannot manufacture a real zombie). */
+export function _setPsStateReaderForTest(fn: ((pid: number) => string | null) | null): void {
+  psStateReaderForTest = fn;
+}
+
 /** Whether `pid` may be THIS installation's live daemon — the only thing allowed
  *  to block a lease takeover. Our daemon always runs as the current user, so a
  *  pid we cannot signal (EPERM — another user, typically a root process that
@@ -145,7 +168,6 @@ function pidBlocksLeaseAcquisition(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     // ESRCH: gone. EPERM: owned by another user, so never our daemon. Both are
@@ -153,6 +175,15 @@ function pidBlocksLeaseAcquisition(pid: number): boolean {
     // than risk evicting a genuinely live owner.
     return code !== 'ESRCH' && code !== 'EPERM';
   }
+  // kill(pid, 0) succeeds for a ZOMBIE — a dead child still in the process
+  // table because its parent never reaped it. A zombie can never serve again,
+  // so it must not block. Live 2026-08-05: after the ENOSPC crash loop, the
+  // packaged app held a defunct daemon child for 1h+ and the lease refused
+  // every restart while nothing listened on the port. An unreadable state
+  // (ps missing/timeout) keeps blocking — provability is the eviction bar.
+  const state = processPsState(pid);
+  if (state && state.toUpperCase().startsWith('Z')) return false;
+  return true;
 }
 
 /** Argv signature of the real daemon: it always runs its entrypoint with a
