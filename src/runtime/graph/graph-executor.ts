@@ -51,7 +51,9 @@ import type {
   SettlementClass,
 } from './graph-journal.js';
 import { inputDigestFor, nodeDigestFor } from './graph-node-identity.js';
-import { admittedRunPrecondition, decideTrustedReuse, reconstructAdmittedResume } from './graph-resume.js';
+import { admittedRunPrecondition, decideTrustedReuse, describeStall, reconstructAdmittedResume } from './graph-resume.js';
+
+export { firedEdgesFromCompleted } from './graph-resume.js';
 
 /** A node the executor schedules. `kind` is meaningful only to the runner. */
 export interface ExecutableNode {
@@ -133,6 +135,8 @@ export interface NodeRunContext {
   predecessors: readonly PredecessorRef[];
   /** 0-based scheduling wave, for telemetry and trace stability. */
   wave: number;
+  /** The durable attempt this dispatch runs under (admitted mode only). */
+  attemptId?: string;
 }
 
 export interface NodeRunner {
@@ -253,6 +257,10 @@ export interface RunGraphOptions {
   attemptIds?: () => string;
   /** Turns node outcomes into ONE typed verdict. Policy, injected. */
   terminalReducer?: (result: Omit<GraphRunResult, 'terminal'>) => GraphTerminal;
+  /** Artifact reuse verification (graph-artifacts.ts): 'verified' reuses,
+   *  'rerun' dispatches fresh work, 'refuse' halts with the typed reason. */
+  reuseVerifier?: (entry: NodeSettledEntry) => Promise<
+    { verdict: 'verified' } | { verdict: 'rerun'; reason: string } | { verdict: 'refuse'; reason: string }>;
   /**
    * Authority judgment for a runtime-emitted patch — the dimension the
    * executor cannot own. Structural validity is checked here regardless;
@@ -304,26 +312,6 @@ export function readyExecutableNodes(
   });
 }
 
-/**
- * Edge ids that count as fired when all that is known is which nodes completed.
- *
- * The bridge for callers whose state is a completed-node set rather than an
- * edge set. Every enabled edge out of a completed node fires, which is exactly
- * the current engine's rule: it ignores edge type and asks only whether the
- * source completed.
- */
-export function firedEdgesFromCompleted(
-  graph: ExecutableGraph,
-  completed: Iterable<string>,
-): Set<string> {
-  const done = new Set(completed);
-  return new Set(
-    enabledEdges(graph)
-      .filter((edge) => done.has(edge.source))
-      .map((edge) => edge.id),
-  );
-}
-
 function edgeFires(
   edge: ExecutableEdge,
   outcome: NodeOutcome,
@@ -338,23 +326,6 @@ function edgeFires(
   }
   // Opaque condition: only the runner can judge it, and silence means no.
   return runner.edgeSatisfied?.(edge, outcome) === true;
-}
-
-function describeStall(
-  graph: ExecutableGraph,
-  settled: ReadonlySet<string>,
-  fired: ReadonlySet<string>,
-): string {
-  const enabled = enabledEdges(graph);
-  return graph.nodes
-    .filter((node) => !settled.has(node.id))
-    .map((node) => {
-      const waiting = enabled
-        .filter((edge) => edge.target === node.id && !fired.has(edge.id))
-        .map((edge) => edge.source);
-      return `${node.id} waits for ${[...new Set(waiting)].join(', ') || '(no enabled route)'}`;
-    })
-    .join('; ');
 }
 
 /**
@@ -569,10 +540,20 @@ export async function runGraph(
         ? decideTrustedReuse(journaled, node, inputDigestFor(admission, node.id, predecessorRefsFor(node)), admission)
         : undefined;
       if (verdict && 'reuse' in verdict) {
-        settle(node, verdict.reuse, true, journaled!.firedEdgeIds);
-        continue;
-      }
-      if (verdict) reuseRefusals.set(node.id, verdict.refusal);
+        const artifacts = options.reuseVerifier && journaled
+          ? await options.reuseVerifier(journaled)
+          : { verdict: 'verified' as const };
+        if (artifacts.verdict === 'refuse') {
+          haltReason = `reuse refused for "${node.id}": ${artifacts.reason}`;
+          status = 'halted';
+          break main;
+        }
+        if (artifacts.verdict === 'verified') {
+          settle(node, verdict.reuse, true, journaled!.firedEdgeIds);
+          continue;
+        }
+        reuseRefusals.set(node.id, artifacts.reason);
+      } else if (verdict) reuseRefusals.set(node.id, verdict.refusal);
       if (pureJournal.has(node.id)) {
         settle(node, { status: 'completed' }, true);
       } else {
@@ -638,6 +619,7 @@ export async function runGraph(
             completed: completedSnapshot,
             predecessors: p.predecessors,
             wave,
+            ...(admission ? { attemptId: p.attemptId } : {}),
           });
         } catch (error) {
           // A throwing runner is infrastructure, not node logic: typed, never

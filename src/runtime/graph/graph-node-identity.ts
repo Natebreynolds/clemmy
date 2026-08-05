@@ -51,6 +51,12 @@ export interface NodeSemanticIdentity {
   semanticDigest: string;
   runner: RunnerContract;
   /**
+   * The widest effect this node may perform. Replay policy depends on it:
+   * only a `read` node may rerun to regenerate a missing artifact — a
+   * missing artifact is never redispatch authority for an effectful node.
+   */
+  effectClass?: 'read' | 'write' | 'send';
+  /**
    * ROOT nodes only: deterministic digest of the root's input/artifact
    * manifest. Sealed in the admission STRUCT but excluded from the identity
    * digest — it binds at the input-digest layer so a changed root input
@@ -173,6 +179,7 @@ export function sealExecutionIdentity(
     Object.entries(identity.nodes).map(([nodeId, semantic]) => [nodeId, {
       semanticDigest: semantic.semanticDigest,
       runner: { ...semantic.runner },
+      effectClass: semantic.effectClass ?? null,
     }]),
   );
   const identityDigest = sha256(stableJson({

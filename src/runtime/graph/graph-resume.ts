@@ -494,3 +494,39 @@ export function admittedRunPrecondition(
   }
   return undefined;
 }
+
+/**
+ * Edge ids that count as fired when all that is known is which nodes
+ * completed — the bridge for callers whose state is a completed-node set.
+ * Every enabled edge out of a completed node fires, exactly the workflow
+ * engine's rule.
+ */
+export function firedEdgesFromCompleted(
+  graph: ExecutableGraph,
+  completed: Iterable<string>,
+): Set<string> {
+  const done = new Set(completed);
+  return new Set(
+    graph.edges
+      .filter((edge) => !edge.disabled && done.has(edge.source))
+      .map((edge) => edge.id),
+  );
+}
+
+/** Name what each unsettled node is waiting on — the stall diagnostic. */
+export function describeStall(
+  graph: ExecutableGraph,
+  settled: ReadonlySet<string>,
+  fired: ReadonlySet<string>,
+): string {
+  const enabled = graph.edges.filter((edge) => !edge.disabled);
+  return graph.nodes
+    .filter((node) => !settled.has(node.id))
+    .map((node) => {
+      const waiting = enabled
+        .filter((edge) => edge.target === node.id && !fired.has(edge.id))
+        .map((edge) => edge.source);
+      return `${node.id} waits for ${[...new Set(waiting)].join(', ') || '(no enabled route)'}`;
+    })
+    .join('; ');
+}
