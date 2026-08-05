@@ -690,6 +690,8 @@ class RawClaudeUsageRecordingModel implements Model {
       this.usageRecorder({
         sessionId: context?.sessionId ?? 'unknown',
         model: this.modelId,
+        // Raw Anthropic Messages wire: input_tokens EXCLUDES cache reads.
+        cacheDialect: 'exclusive',
         ...fields,
         durationMs: Math.max(0, Date.now() - startedAt),
         promptComponents: context?.promptComponents,

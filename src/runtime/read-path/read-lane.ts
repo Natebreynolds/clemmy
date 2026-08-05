@@ -34,7 +34,7 @@
  *   validation_repairs = 0, public_terminals = 1,
  *   external_write_or_send_dispatches = 0.
  */
-import type { BudgetMeter } from '../budget-contract.js';
+import type { BudgetMeter, DebitResult } from '../budget-contract.js';
 import type { createSpanRecorder } from '../trace-envelope.js';
 import type { DurableReceiptRecord, ReceiptResolver } from '../../memory/procedure-receipts.js';
 import {
@@ -119,6 +119,8 @@ export interface ReadLaneRun {
   budget: BudgetMeter;
   spans: ReturnType<typeof createSpanRecorder>;
   ports: ReadLanePorts;
+  /** Injected monotonic clock for the elapsed-time debit. */
+  clock?: () => number;
 }
 
 function counters(): ReadLaneCounters {
@@ -136,85 +138,109 @@ function counters(): ReadLaneCounters {
 export async function runColdToWarmRead(run: ReadLaneRun): Promise<ReadLaneOutcome> {
   const c = counters();
   const { ports, budget, spans } = run;
+  const clock = run.clock ?? (() => 0);
+  const startedAt = clock();
+  /** Every owned resource debits at its boundary (F19): tokens from port
+   *  usage reports, elapsed time at exit. A refused debit parks the lane. */
+  const debitUsage = (usage?: { uncachedInputTokens?: number; outputTokens?: number }): Extract<DebitResult, { ok: false }> | undefined => {
+    if (!usage) return undefined;
+    if (usage.uncachedInputTokens) {
+      const tokens = budget.debit('uncachedInputTokens', usage.uncachedInputTokens);
+      if (!tokens.ok) return tokens;
+    }
+    if (usage.outputTokens) {
+      const out = budget.debit('outputTokens', usage.outputTokens);
+      if (!out.ok) return out;
+    }
+    return undefined;
+  };
+  const withElapsed = <T extends ReadLaneOutcome>(outcome: T): T => {
+    budget.debit('elapsedMs', Math.max(0, clock() - startedAt));
+    return outcome;
+  };
 
   // 1. Semantic intent resolution against the sealed universe.
   spans.mark('capability_resolution');
   const modelBudget = budget.debit('modelCalls', 1);
-  if (!modelBudget.ok) return { outcome: 'failed', reason: modelBudget.reason, transient: false, counters: c };
+  if (!modelBudget.ok) return withElapsed({ outcome: 'failed', reason: modelBudget.reason, transient: false, counters: c });
   const intent = await ports.resolveIntent(run.input);
   spans.finish('capability_resolution');
+  const intentUsageRefused = debitUsage((intent as { usage?: { uncachedInputTokens?: number; outputTokens?: number } }).usage);
+  if (intentUsageRefused) {
+    return withElapsed({ outcome: 'failed', reason: intentUsageRefused.reason, transient: false, counters: c });
+  }
   if (intent.kind === 'effectful') {
     // Before authority, before binding, before dispatch: the governed path
     // owns every write and send, confirmation and effect safety untouched.
-    return { outcome: 'exits_to_governed_path', counters: c };
+    return withElapsed({ outcome: 'exits_to_governed_path', counters: c });
   }
-  if (intent.kind === 'unresolved') return { outcome: 'declined', counters: c };
+  if (intent.kind === 'unresolved') return withElapsed({ outcome: 'declined', counters: c });
 
   // 2. Exact scoped procedure resolution (the warm hit or the honest miss).
   const resolved = resolveWithLiveFingerprint(run, intent, c);
   if (resolved.outcome === 'unavailable') {
     c.procedure_resolution = 'unavailable';
-    return { outcome: 'failed', reason: resolved.reason, transient: true, counters: c };
+    return withElapsed({ outcome: 'failed', reason: resolved.reason, transient: true, counters: c });
   }
   if (resolved.outcome === 'needs_slots') {
     c.procedure_resolution = 'hit';
-    return {
+    return withElapsed({
       outcome: 'needs_slots',
       missingSlots: resolved.missingSlots,
       question: `To run this I need: ${resolved.missingSlots.join(', ')}.`,
       counters: c,
-    };
+    });
   }
 
   if (resolved.outcome === 'bound') {
     // ── WARM ─────────────────────────────────────────────────────────────────
     c.procedure_resolution = 'hit';
     if (!laneAdmitsDispatch(run.lane, resolved.artifact.identifier)) {
-      return { outcome: 'requires_readmission', outside: [resolved.artifact.identifier], counters: c };
+      return withElapsed({ outcome: 'requires_readmission', outside: [resolved.artifact.identifier], counters: c });
     }
     const args = bindSlots(resolved.artifact.template.args, intent.slotValues);
-    return dispatchOnce(run, c, {
+    return withElapsed(await dispatchOnce(run, c, {
       identifier: resolved.artifact.identifier,
       args,
       warm: true,
       artifactId: resolved.artifact.artifactId,
-    });
+    }));
   }
 
   // ── COLD ───────────────────────────────────────────────────────────────────
   c.procedure_resolution = resolved.outcome === 'stale' ? 'stale'
     : 'quarantined' in resolved && resolved.quarantined ? 'quarantined' : 'miss';
   const discoveryBudget = budget.debit('discoveryCalls', 1);
-  if (!discoveryBudget.ok) return { outcome: 'failed', reason: discoveryBudget.reason, transient: false, counters: c };
+  if (!discoveryBudget.ok) return withElapsed({ outcome: 'failed', reason: discoveryBudget.reason, transient: false, counters: c });
   spans.mark('discovery');
   c.schema_discovery_calls += 1;
   c.tool_discovery_calls += 1;
   const acquired = await ports.discover(intent.provider, intent.operation);
   spans.finish('discovery');
   if (!acquired) {
-    return { outcome: 'failed', reason: 'discovery found no dispatchable capability for the resolved operation', transient: false, counters: c };
+    return withElapsed({ outcome: 'failed', reason: 'discovery found no dispatchable capability for the resolved operation', transient: false, counters: c });
   }
   if (!laneAdmitsDispatch(run.lane, acquired.identifier)) {
-    return { outcome: 'requires_readmission', outside: [acquired.identifier], counters: c };
+    return withElapsed({ outcome: 'requires_readmission', outside: [acquired.identifier], counters: c });
   }
   spans.mark('slot_binding');
   const coldArgs = bindSlots(acquired.templateArgs, intent.slotValues);
   const missingSlots = unboundSlots(coldArgs);
   spans.finish('slot_binding');
   if (missingSlots.length > 0) {
-    return {
+    return withElapsed({
       outcome: 'needs_slots',
       missingSlots,
       question: `To run this I need: ${missingSlots.join(', ')}.`,
       counters: c,
-    };
+    });
   }
-  return dispatchOnce(run, c, {
+  return withElapsed(await dispatchOnce(run, c, {
     identifier: acquired.identifier,
     args: coldArgs,
     warm: false,
     promote: { intent, acquired },
-  });
+  }));
 }
 
 function resolveWithLiveFingerprint(

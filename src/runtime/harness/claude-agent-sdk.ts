@@ -1649,6 +1649,11 @@ function recordClaudeAgentSdkUsage(
       // This adapter pre-folds cache_read/cache_creation into inputTokens, so
       // its DECLARED convention is inclusive (cached ⊆ input).
       cacheDialect: 'inclusive',
+      trace: {
+        acceptedSource: options.sessionId?.trim() || 'unknown',
+        brain: 'claude',
+        ...(typeof responseId === 'string' && responseId ? { modelCallId: responseId } : {}),
+      },
       inputTokens: totals.inputTokens,
       cachedInputTokens: totals.cachedInputTokens,
       outputTokens: totals.outputTokens,

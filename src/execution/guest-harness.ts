@@ -298,6 +298,27 @@ function parseCodexLine(raw: string): ParsedLine | null {
     const label = typeof item?.command === 'string' ? item.command : type;
     return { event: { kind: 'tool', text: String(label).slice(0, 200) } };
   }
+  // Codex usage: `codex exec --json` reports token usage on its final
+  // events (token_count / turn.completed shapes across versions). OpenAI
+  // wire convention: input_tokens ⊇ cached tokens (inclusive dialect).
+  const usageSource = (evt?.usage ?? item?.usage ?? evt?.info?.total_token_usage ?? evt?.msg?.info?.total_token_usage) as
+    Record<string, unknown> | undefined;
+  if (/token_count|turn.completed|token_usage/.test(type) || (usageSource && typeof usageSource === 'object')) {
+    if (usageSource && typeof usageSource === 'object') {
+      const n = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+      const inputTokens = n(usageSource.input_tokens ?? usageSource.inputTokens);
+      const outputTokens = n(usageSource.output_tokens ?? usageSource.outputTokens);
+      if (inputTokens + outputTokens > 0) {
+        return {
+          usage: {
+            inputTokens,
+            cachedInputTokens: n(usageSource.cached_input_tokens ?? usageSource.cache_read_input_tokens ?? usageSource.cachedInputTokens),
+            outputTokens,
+          },
+        };
+      }
+    }
+  }
   return null;
 }
 
@@ -412,9 +433,10 @@ export async function runGuestHarness(opts: GuestRunOptions): Promise<GuestRunRe
       sessionId: opts.sessionId || 'guest-harness',
       channel: 'guest-harness',
       model: usage.model || `${opts.harness}-guest`,
-      // Parsed from raw Anthropic result JSON: input_tokens EXCLUDES cache
-      // reads. This is the lane the 07-30 audit found accruing zero.
-      cacheDialect: 'exclusive',
+      // Claude guests emit raw Anthropic result JSON (input EXCLUDES cache
+      // reads — the lane the 07-30 audit found accruing zero); Codex guests
+      // emit OpenAI-wire counts (input ⊇ cached).
+      cacheDialect: opts.harness === 'claude' ? 'exclusive' : 'inclusive',
       inputTokens: usage.inputTokens,
       cachedInputTokens: usage.cachedInputTokens,
       outputTokens: usage.outputTokens,

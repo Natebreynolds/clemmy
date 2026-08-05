@@ -3,6 +3,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { recordOperationalEvent } from './operational-telemetry.js';
 import { accrueSessionTokens, getSession, type SessionKind } from './harness/eventlog.js';
+import { sealTraceEnvelope } from './trace-envelope.js';
 import type { TraceEnvelope } from './trace-envelope.js';
 
 /**
@@ -303,10 +304,20 @@ export function canonicalCacheAccounting(event: {
   const output = event.outputTokens ?? 0;
   const reasoning = event.reasoningTokens ?? 0;
   const total = event.totalTokens ?? 0;
+  // A sample that cannot be certified must still never be FREE: charge a
+  // conservative finite floor from whichever fields are trustworthy. Zero
+  // debit for exactly the least-trustworthy samples is free budget (F12).
+  const finite = (value: number): number => (Number.isFinite(value) && value >= 0 ? value : 0);
+  const conservativeFloor = Math.max(
+    finite(total),
+    finite(input) + finite(output),
+    finite(cached),
+    finite(output),
+  );
   const invalid = (base: Partial<CanonicalUsage> = {}): CanonicalUsage => ({
     dialect, certified: false, invalid: true,
     promptTokens: 0, cachedReadTokens: 0, uncachedInputTokens: 0,
-    uncachedWorkTokens: 0, hitRate: 0, ...base,
+    uncachedWorkTokens: conservativeFloor, hitRate: 0, ...base,
   });
   for (const value of [input, cached, output, reasoning, total]) {
     if (!Number.isFinite(value) || value < 0) return invalid();
@@ -413,7 +424,13 @@ export function recordModelUsage(args: {
     kindReason: resolution.reason,
     model: args.model,
     cacheDialect: args.cacheDialect ?? 'unknown' as const,
-    ...(args.trace ? { trace: args.trace } : {}),
+    // Sealed at persistence: an unsealable (content-shaped) envelope is
+    // dropped, never appended raw.
+    ...((): { trace?: TraceEnvelope } => {
+      if (!args.trace) return {};
+      const sealed = sealTraceEnvelope(args.trace);
+      return sealed.ok ? { trace: sealed.envelope } : {};
+    })(),
     canonical: {
       certified: canonical.certified,
       promptTokens: canonical.promptTokens,

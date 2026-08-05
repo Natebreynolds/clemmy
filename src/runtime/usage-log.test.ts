@@ -169,20 +169,30 @@ test('C1: every model adapter DECLARES its cache dialect at its recordModelUsage
   const { fileURLToPath } = await import('node:url');
   const path = await import('node:path');
   const here = path.dirname(fileURLToPath(import.meta.url));
+  // EVERY production recorder, including the raw wrapper (usageRecorder) and
+  // the guest lane (E2.1: the whitelist covers raw wrappers and guests).
   const producers = [
     ['../runtime/codex-native-runtime.ts', 'codex-native-runtime.ts'],
     ['../runtime/harness/codex-model.ts', 'harness/codex-model.ts'],
     ['../runtime/harness/claude-agent-sdk.ts', 'harness/claude-agent-sdk.ts'],
     ['../runtime/harness/claude-headless-model.ts', 'harness/claude-headless-model.ts'],
+    ['../runtime/harness/claude-model.ts', 'harness/claude-model.ts'],
     ['../runtime/harness/byo-model.ts', 'harness/byo-model.ts'],
     ['../execution/guest-harness.ts', 'execution/guest-harness.ts'],
   ];
   for (const [rel] of producers) {
     const source = readFileSync(path.join(here, '..', rel.replace('../', '')), 'utf-8');
-    for (const call of source.split('recordModelUsage({').slice(1)) {
-      const head = call.slice(0, 600);
-      assert.ok(/cacheDialect:\s*'(inclusive|exclusive|none)'/.test(head),
-        `${rel}: a recordModelUsage call does not declare its cache dialect — no consumer may guess it`);
+    const calls = [
+      ...source.split('recordModelUsage({').slice(1),
+      ...source.split('usageRecorder({').slice(1),
+    ];
+    assert.ok(calls.length > 0, `${rel}: expected at least one usage recording call`);
+    for (const call of calls) {
+      const head = call.slice(0, 1_000);
+      // A literal or a ternary of LITERALS both count as declarations; what
+      // never counts is absence or a computed value from magnitudes.
+      assert.ok(/cacheDialect:\s*[^,\n]*'(inclusive|exclusive|none)'/.test(head),
+        `${rel}: a usage recording call does not declare its cache dialect — no consumer may guess it`);
     }
   }
   // And the magnitude guess itself is gone: the old guessed-dialect type

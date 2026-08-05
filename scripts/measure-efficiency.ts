@@ -4,7 +4,9 @@
  * Reads the usage log (~/.clementine-next/state/token-usage/*.ndjson) and prints
  * the numbers every "measure-first" efficiency decision needs but that nothing
  * surfaced before:
- *   - prompt cache-hit-rate (cachedInputTokens / inputTokens), SEGMENTED by kind
+ *   - prompt cache-hit-rate over CANONICAL prompt tokens (cachedInputTokens /
+ *     promptTokens — dialect-normalized, so an exclusive sample reads 90%,
+ *     never 900%), SEGMENTED by kind
  *     so the INTERACTIVE-chat rate is isolated from boot `warmup` traffic (which
  *     otherwise dominates volume and skews the headline number),
  *   - token spend + avg latency by kind / model / top sources,
@@ -94,12 +96,12 @@ console.log(`OVERALL cache-hit-rate: ${pct(r.totalCachedInputTokens, r.totalInpu
 console.log(`\nBY KIND            calls    inputTok   cachedTok    hit%     avgLatency`);
 for (const [kind, v] of Object.entries(r.byKind).sort((a, b) => b[1].inputTokens - a[1].inputTokens)) {
   const star = kind === 'chat' ? ' ←interactive' : '';
-  console.log(`${lpad(kind, 16)} ${pad(v.calls, 6)} ${pad(k(v.inputTokens), 11)} ${pad(k(v.cachedInputTokens), 11)} ${pad(pct(v.cachedInputTokens, v.inputTokens), 8)} ${pad(avgMs(kind), 12)}${star}`);
+  console.log(`${lpad(kind, 16)} ${pad(v.calls, 6)} ${pad(k(v.inputTokens), 11)} ${pad(k(v.cachedInputTokens), 11)} ${pad(pct(v.cachedInputTokens, v.promptTokens), 8)} ${pad(avgMs(kind), 12)}${star}`);
 }
 
 console.log(`\nBY MODEL           calls    inputTok   cachedTok    hit%`);
 for (const [model, v] of Object.entries(r.byModel).sort((a, b) => b[1].inputTokens - a[1].inputTokens)) {
-  console.log(`${lpad(model, 16)} ${pad(v.calls, 6)} ${pad(k(v.inputTokens), 11)} ${pad(k(v.cachedInputTokens), 11)} ${pad(pct(v.cachedInputTokens, v.inputTokens), 8)}`);
+  console.log(`${lpad(model, 16)} ${pad(v.calls, 6)} ${pad(k(v.inputTokens), 11)} ${pad(k(v.cachedInputTokens), 11)} ${pad(pct(v.cachedInputTokens, v.promptTokens), 8)}`);
 }
 
 console.log(`\nTOP SOURCES        calls      tokens   kind`);

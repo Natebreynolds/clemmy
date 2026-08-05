@@ -1570,6 +1570,11 @@ export function recordCodexHarnessUsage(
     recordModelUsage({
       sessionId: harnessRunContextStorage.getStore()?.sessionId ?? 'unknown',
       model: modelId,
+      trace: {
+        acceptedSource: harnessRunContextStorage.getStore()?.sessionId ?? 'unknown',
+        brain: 'codex',
+        ...(responseId ? { modelCallId: responseId } : {}),
+      },
       cacheDialect: 'inclusive', // OpenAI wire: input_tokens ⊇ cached_tokens
       inputTokens,
       cachedInputTokens: typeof cached === 'number' ? cached : undefined,
