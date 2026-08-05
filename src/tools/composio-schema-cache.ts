@@ -103,3 +103,9 @@ export function liveComposioSchemaFingerprint(toolSlug: string): string | undefi
     return undefined;
   }
 }
+
+/** Test hook: empty the process cache — the daemon-restart / TTL-expiry
+ *  shape, under which schema-bound retrieval must decline (fail closed). */
+export function _clearToolSchemaCacheForTest(): void {
+  cache.clear();
+}

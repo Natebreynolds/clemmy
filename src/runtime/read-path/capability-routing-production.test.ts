@@ -39,6 +39,7 @@ const schemaCache = await import('../../tools/composio-schema-cache.js');
 const jit = await import('../../agents/tool-jit.js');
 const mcpScope = await import('../mcp-tool-scope.js');
 const candidates = await import('./capability-candidates.js');
+const worker = await import('../../memory/learning-worker.js');
 
 const CALENDAR_SLUG = 'SCHEDULERCO_LIST_EVENTS';
 const COLD_PHRASE = "What's on my calendar tomorrow?";
@@ -67,6 +68,7 @@ async function teachOneVerifiedRead(): Promise<void> {
   await composio.runComposioExecuteForTestInSession(
     CALENDAR_SLUG, { timeMin: '2026-08-06', timeMax: '2026-08-07' }, exec, sessionId,
   );
+  await worker.drainPendingLearning();
 }
 
 /** What the brain build receives FROM INSIDE the turn. */

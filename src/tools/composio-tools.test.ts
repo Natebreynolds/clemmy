@@ -718,7 +718,7 @@ test('composioThrownErrorOutput: a plain error with no .cause is unchanged (no e
 const { noteComposioSearchIntent, maybeAutoRememberComposioChoice } = await import('./composio-tools.js');
 const { recallToolChoice } = await import('../memory/tool-choice-store.js');
 
-test('auto-remember: a successful execute after a search memorizes intent→slug', async () => {
+test('auto-remember writes NO memory: procedures come from the settlement pipeline only', async () => {
   const intent = 'get google serp organic rankings';
   noteComposioSearchIntent('sess-auto-1', intent);
   await maybeAutoRememberComposioChoice(
@@ -727,11 +727,10 @@ test('auto-remember: a successful execute after a search memorizes intent→slug
     { successful: true, data: { items: [] } },
     'sess-auto-1',
   );
-  const rec = recallToolChoice(intent);
-  assert.equal(rec?.choice?.identifier, 'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED');
-  assert.equal(rec?.choice?.kind, 'composio');
-  // connection ids must never be baked into the memo
-  assert.ok(!(rec?.choice?.invocationTemplate ?? '').includes('connected_account_id'));
+  // There is exactly ONE learning path. A search followed by a success is
+  // outcome ACCOUNTING here — it may not create a procedure, an alias, or an
+  // invocation template (the retired path persisted historical arguments).
+  assert.equal(recallToolChoice(intent)?.choice, undefined);
 });
 
 test('auto-remember: a QUEUED RECEIPT (task_post) memorizes nothing — the job has no result yet', async () => {
@@ -768,15 +767,13 @@ test('auto-remember: an execute with NO prior search learns nothing (slug was al
   assert.equal(recallToolChoice(intent), null);
 });
 
-test('auto-remember: a search query is single-use (a later unrelated execute is not mis-keyed)', async () => {
-  const intent = 'one-shot search intent';
-  noteComposioSearchIntent('sess-auto-4', intent);
-  // First execute consumes the pending search.
-  await maybeAutoRememberComposioChoice('FIRST_SLUG', {}, { successful: true }, 'sess-auto-4');
-  // Second execute in the same session has no pending search → must not re-key.
-  await maybeAutoRememberComposioChoice('SECOND_SLUG', {}, { successful: true }, 'sess-auto-4');
-  const rec = recallToolChoice(intent);
-  assert.equal(rec?.choice?.identifier, 'FIRST_SLUG', 'only the first execute after the search is keyed');
+test('the consumed search intent is single-use accounting, never a later memo', async () => {
+  noteComposioSearchIntent('sess-auto-2', 'first search intent probe');
+  await maybeAutoRememberComposioChoice('TOOLKITX_FIRST_READ', {}, { successful: true, data: { ok: 1 } }, 'sess-auto-2');
+  // The entry is consumed; a later unrelated execute has nothing to key from
+  // and, like every auto-remember call now, writes nothing.
+  await maybeAutoRememberComposioChoice('TOOLKITX_SECOND_READ', {}, { successful: true, data: { ok: 1 } }, 'sess-auto-2');
+  assert.equal(recallToolChoice('first search intent probe')?.choice, undefined);
 });
 
 test('auto-remember is ADDITIVE: it does not overwrite an existing active choice', async () => {
@@ -790,15 +787,12 @@ test('auto-remember is ADDITIVE: it does not overwrite an existing active choice
   assert.equal(recallToolChoice(intent)?.choice?.identifier, 'CURATED_SLUG');
 });
 
-test('auto-remember RE-LEARNS after a choice was invalidated (choice cleared → fill again)', async () => {
-  const { rememberToolChoice, invalidateToolChoice, peekToolChoice } = await import('../memory/tool-choice-store.js');
-  const intent = 're-learn after invalidate intent';
-  rememberToolChoice({ intent, choice: { kind: 'composio', identifier: 'OLD_SLUG' } });
-  invalidateToolChoice(intent, 'failed', { automatic: true });
-  assert.equal(peekToolChoice(intent)?.choice, null, 'precondition: choice invalidated');
-  noteComposioSearchIntent('sess-relearn', intent);
-  await maybeAutoRememberComposioChoice('NEW_WORKING_SLUG', {}, { successful: true }, 'sess-relearn');
-  assert.equal(peekToolChoice(intent)?.choice?.identifier, 'NEW_WORKING_SLUG', 'auto-commit re-fills an invalidated intent');
+test('an invalidated choice is NOT refilled by auto-remember — rediscovery goes through settlement', async () => {
+  const intent = 'refill probe intent unique 77';
+  noteComposioSearchIntent('sess-auto-3', intent);
+  await maybeAutoRememberComposioChoice('TOOLKITY_LIST_ROWS', {}, { successful: true, data: { rows: [1] } }, 'sess-auto-3');
+  assert.equal(recallToolChoice(intent)?.choice, undefined,
+    'the retired path wrote a memo — two learning paths exist again');
 });
 
 test('auto-remember (v0.5.64 membership gate): a slug the search did NOT surface is NOT cached', async () => {
@@ -810,11 +804,11 @@ test('auto-remember (v0.5.64 membership gate): a slug the search did NOT surface
   assert.equal(recallToolChoice(intent), null, 'a slug not in the search candidates must not poison the intent');
 });
 
-test('auto-remember (v0.5.64 membership gate): a slug the search DID surface is cached normally', async () => {
-  const intent = 'get dataforseo ranked keywords for site';
-  noteComposioSearchIntent('sess-gate-2', intent, ['DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', 'DATAFORSEO_SERP']);
-  await maybeAutoRememberComposioChoice('DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', {}, { successful: true }, 'sess-gate-2');
-  assert.equal(recallToolChoice(intent)?.choice?.identifier, 'DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', 'a surfaced slug is learned');
+test('a slug the search surfaced still writes nothing — membership gates accounting, not memory', async () => {
+  const intent = 'membership probe intent unique 88';
+  noteComposioSearchIntent('sess-auto-4', intent, ['TOOLKITZ_GET_ITEMS']);
+  await maybeAutoRememberComposioChoice('TOOLKITZ_GET_ITEMS', {}, { successful: true, data: { items: [1] } }, 'sess-auto-4');
+  assert.equal(recallToolChoice(intent)?.choice, undefined);
 });
 
 // ── Cross-service mis-binding guard (2026-06-22) — the pure decision ──────────
@@ -1136,13 +1130,11 @@ test('composio_search_tools: a query with NO confident memory falls through to n
   assert.match(text, /not configured/i, 'a miss runs the normal (non-memory) path');
 });
 
-test('auto-remember fires for a BACKGROUND-lane success (lane-agnostic, just a sessionId)', async () => {
-  const intent = 'brightdata scrape a public company profile page';
-  const bgSession = 'background:bg-attribution-fixture';
-  noteComposioSearchIntent(bgSession, intent);
-  await maybeAutoRememberComposioChoice('BRIGHTDATA_SCRAPE_AS_MARKDOWN', { url: 'https://site-alt.example' }, { successful: true, data: { markdown: 'hi' } }, bgSession);
-  const rec = recallToolChoice(intent);
-  assert.equal(rec?.choice?.identifier, 'BRIGHTDATA_SCRAPE_AS_MARKDOWN', 'a background-lane success is remembered too');
+test('background-lane successes also write nothing through auto-remember', async () => {
+  const intent = 'background lane probe intent unique 99';
+  noteComposioSearchIntent('background:bg-123', intent);
+  await maybeAutoRememberComposioChoice('TOOLKITW_FETCH_DATA', {}, { successful: true, data: { data: [1] } }, 'background:bg-123');
+  assert.equal(recallToolChoice(intent)?.choice, undefined);
 });
 
 const { executionIntentForSession } = await import('./composio-tools.js');

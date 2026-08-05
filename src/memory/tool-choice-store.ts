@@ -1866,6 +1866,9 @@ export interface StepToolChoiceMatch {
   family: string[];
   /** The concrete command/tool to bake into the bound step prompt. */
   command: string;
+  /** The stable account this capability was PROVEN against, when bound.
+   *  Retrieval preserves every distinct provenance; it never picks one. */
+  accountIdentity?: string;
 }
 
 export interface MatchToolChoicesOptions {
@@ -1956,15 +1959,16 @@ export function matchToolChoicesForStep(
     if (!rec.choice) continue; // inactive (invalidated, not yet rediscovered)
     if (placeholderChoiceString(rec.choice.identifier)) continue;
     if (rec.choice.kind === 'mcp' && !validCallableMcpIdentifier(rec.choice.identifier)) continue;
-    // A capability bound to a provider contract stops serving when the LIVE
-    // contract for its identifier has moved — a stale procedure is a wrong
-    // answer waiting to be argued for. No live contract known ⇒ nothing is
-    // proven either way and the record serves normally.
+    // A capability bound to a provider contract serves only under LIVE
+    // catalog authority that matches it. A moved contract is a wrong answer
+    // waiting to be argued for; NO live authority (empty or expired process
+    // cache) is absence of proof, and absence of proof declines — validation
+    // that cannot run must never read as validation that passed.
     const storedFingerprint = (rec.choice.schemaFingerprint
       ?? (rec as { schemaFingerprint?: string }).schemaFingerprint)?.trim();
     if (storedFingerprint && rec.choice.kind === 'composio') {
       const live = liveFingerprintFor(rec.choice.identifier);
-      if (live && live !== storedFingerprint) continue;
+      if (!live || live !== storedFingerprint) continue;
     }
     const identity = identityChoiceTokens(rec);
     if (identity.size === 0) continue;
@@ -2026,6 +2030,7 @@ export function matchToolChoicesForStep(
       autoBindable: rec.choice.kind === 'cli' || rec.choice.kind === 'mcp',
       family: toolFamilyForChoice(rec.choice),
       command: boundCommandForChoice(rec.choice),
+      ...(rec.choice.accountIdentity ? { accountIdentity: rec.choice.accountIdentity } : {}),
     });
   }
 
@@ -2042,7 +2047,11 @@ export function matchToolChoicesForStep(
     liveSchemaFingerprintFor: opts.liveSchemaFingerprintFor ?? liveComposioSchemaFingerprint,
   });
   for (const aliasHit of aliasHits) {
-    if (out.some((m) => m.identifier === aliasHit.identifier)) continue;
+    // One match per (identifier, account) — a phrase proven against two
+    // accounts yields two provenances, and choosing between them is the
+    // brain's decision, never retrieval's.
+    if (out.some((m) => m.identifier === aliasHit.identifier
+      && (m.accountIdentity ?? '') === aliasHit.accountIdentity)) continue;
     const rec = records.find((r) => r.intent === aliasHit.intent
       && r.choice?.identifier === aliasHit.identifier);
     if (!rec?.choice) continue;
@@ -2059,6 +2068,7 @@ export function matchToolChoicesForStep(
       autoBindable: false,
       family: toolFamilyForChoice(rec.choice),
       command: boundCommandForChoice(rec.choice),
+      ...(aliasHit.accountIdentity ? { accountIdentity: aliasHit.accountIdentity } : {}),
     });
   }
 

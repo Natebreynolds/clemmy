@@ -40,6 +40,7 @@ const mcpScope = await import('../mcp-tool-scope.js');
 const toolChoice = await import('../../memory/tool-choice-store.js');
 const eventlog = await import('../harness/eventlog.js');
 const candidates = await import('./capability-candidates.js');
+const worker = await import('../../memory/learning-worker.js');
 
 const CALENDAR_SLUG = 'SCHEDULERCO_LIST_EVENTS';
 const COLD_PHRASE = "What's on my calendar tomorrow?";
@@ -69,6 +70,7 @@ async function governedRead(sessionId: string, args: Record<string, unknown>): P
   let dispatches = 0;
   const exec = (async () => { dispatches += 1; return calendarPayload(); }) as never;
   const output = await composio.runComposioExecuteForTestInSession(CALENDAR_SLUG, args, exec, sessionId);
+  await worker.drainPendingLearning();
   return { output, dispatches };
 }
 
@@ -169,6 +171,7 @@ test('A4: failure, ambiguity, and unverified payloads never learn', async () => 
     acceptSource(sessionId, phrase);
     const exec = (async () => payload) as never;
     await composio.runComposioExecuteForTestInSession('SCHEDULERCO_UNVERIFIED', { q: label }, exec, sessionId);
+    await worker.drainPendingLearning();
     const learned = toolChoice.matchToolChoicesForStep(phrase, { limit: 5 });
     assert.equal(learned.some((match) => match.identifier === 'SCHEDULERCO_UNVERIFIED'), false,
       `${label} was learned as a proven capability — only verified success may teach`);

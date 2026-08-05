@@ -1,36 +1,35 @@
 /**
- * Verified READ settlement for governed Composio dispatches (A-series).
+ * Verified READ settlement for governed Composio dispatches (A-series, R2).
  *
- * Learning is a SETTLEMENT act. This module runs only after the execute
- * wrapper has finished everything that decides what actually happened:
- * canonical failure detection, async job-receipt resolution, retries. It is
- * handed the FINAL settled payload — never the raw wire result — and it will
- * not teach memory anything it cannot back with a durable receipt:
+ * Settlement is SYNCHRONOUS and cheap; materialization is not allowed here.
+ * This module runs after the execute wrapper has finished everything that
+ * decides what actually happened — canonical failure classification, async
+ * job-receipt resolution — and does exactly three things with what is
+ * already in hand:
  *
- *   1. the sealed slug taxonomy must prove a READ;
- *   2. the settled payload must carry real returned data;
- *   3. a LIVE schema contract for the identifier must exist to bind to —
- *      no contract, no capability (a capability without a contract cannot
- *      be validated when it is later retrieved);
- *   4. a typed `read_receipt` event is appended to the session log, and the
- *      learner re-resolves it BY ID through the same resolver production
- *      retrieval uses — the durable record is the authority, not the
- *      in-memory object that happened to be at hand.
+ *   1. verify the FINAL payload through the one settled-read verifier
+ *      (nested error envelopes decline);
+ *   2. capture the accepted source, attempt, account, and evidence digest
+ *      while they are still live;
+ *   3. append ONE durable pending-learning row and arm the bounded worker.
+ *
+ * Catalog fetches, receipt creation, procedure/alias writes, and embedding
+ * all belong to `src/memory/learning-worker.ts` — the user-visible tool
+ * return never waits on any of them, and a crash at any point leaves a
+ * pending row that restart retries.
  */
 import { createHash } from 'node:crypto';
-import { BASE_DIR } from '../config.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
-import { getMachineId } from '../runtime/machine-id.js';
-import { appendEvent } from '../runtime/harness/eventlog.js';
-import { eventLogReceiptResolver } from '../runtime/read-path/read-lane-adapters.js';
-import type { DurableReceiptRecord } from '../memory/procedure-receipts.js';
+import { getActiveRunAttempt } from '../runtime/harness/eventlog.js';
 import {
-  learnVerifiedReadSettlement,
+  enqueuePendingLearning,
+  type PendingLearningRecord,
+} from '../memory/capability-alias-index.js';
+import {
+  acceptedIntentPhraseForSettlement,
   settlementCarriesVerifiedData,
-  type LearningVerdict,
 } from '../memory/verified-read-learning.js';
-import { liveComposioSchemaFingerprint, rememberToolSchema } from './composio-schema-cache.js';
-import { getComposioToolBySlug } from '../integrations/composio/client.js';
+import { scheduleLearningDrain } from '../memory/learning-worker.js';
 
 function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -47,80 +46,47 @@ export interface VerifiedComposioSettlementInput {
   accountIdentity?: string;
 }
 
-/**
- * A brain that already knows a slug can dispatch it without ever fetching its
- * schema, so an empty cache at settlement is the COMMON verified-read case,
- * not an edge (observed live: a direct calendar read with zero discovery
- * calls). Fetch the live contract once, post-settlement and off the hot path
- * — the fail-closed rule stays (no contract obtainable, no capability), it
- * just gets its one honest chance to obtain one.
- */
-async function ensureLiveSchemaContract(toolSlug: string): Promise<string | undefined> {
-  const cached = liveComposioSchemaFingerprint(toolSlug);
-  if (cached) return cached;
-  try {
-    const match = await getComposioToolBySlug(toolSlug);
-    if (match?.inputParameters) rememberToolSchema(toolSlug, match.inputParameters);
-  } catch { /* fail closed below */ }
-  return liveComposioSchemaFingerprint(toolSlug);
-}
+export type SettlementVerdict =
+  | { queued: true; pending: PendingLearningRecord }
+  | { queued: false; reason: string };
 
 /**
- * Create the durable receipt and learn from it. Fail-closed at every step;
- * a decline is a normal outcome, never an error surfaced to the tool call.
+ * Queue the learning intent for one verified read. Fail-closed at every
+ * step; a decline is a normal outcome, never an error surfaced to the tool
+ * call.
  */
-export async function settleVerifiedComposioRead(input: VerifiedComposioSettlementInput): Promise<LearningVerdict> {
+export function settleVerifiedComposioRead(input: VerifiedComposioSettlementInput): SettlementVerdict {
   const toolSlug = input.toolSlug?.trim();
-  if (!toolSlug || !input.sessionId) return { learned: false, reason: 'no identifier or session' };
+  if (!toolSlug || !input.sessionId) return { queued: false, reason: 'no identifier or session' };
   if (classifyComposioSlugEffect(toolSlug) !== 'read') {
-    return { learned: false, reason: 'the sealed taxonomy does not prove a read' };
+    return { queued: false, reason: 'the sealed taxonomy does not prove a read' };
   }
   if (!settlementCarriesVerifiedData(input.result)) {
-    return { learned: false, reason: 'settlement carries no verified returned data' };
+    return { queued: false, reason: 'settlement carries no verified returned data' };
   }
-  const schemaFingerprint = await ensureLiveSchemaContract(toolSlug);
-  if (!schemaFingerprint) {
-    return { learned: false, reason: 'no live schema contract to bind the capability to' };
-  }
-
-  const accountIdentity = input.accountIdentity?.trim() ?? '';
-  let payloadDigest = '';
+  let evidenceDigest = '';
   try {
-    payloadDigest = sha256(JSON.stringify(input.result)).slice(0, 24);
+    evidenceDigest = sha256(JSON.stringify(input.result)).slice(0, 24);
   } catch {
-    return { learned: false, reason: 'settled payload is not serializable evidence' };
+    return { queued: false, reason: 'settled payload is not serializable evidence' };
   }
-  const record: DurableReceiptRecord = {
-    receiptId: `rr_${sha256(`${input.sessionId}:${toolSlug}:${payloadDigest}`).slice(0, 24)}`,
-    at: new Date().toISOString(),
-    provider: (toolSlug.split('_')[0] ?? '').toLowerCase(),
-    operation: toolSlug.split('_').slice(1).join('_').toLowerCase() || 'operation',
-    effectClass: 'read',
-    identifier: toolSlug,
-    schemaFingerprint,
-    scope: { tenant: getMachineId(), workspace: BASE_DIR, accountIdentity },
-    dispatchOutcome: 'succeeded',
-    readEvidenceRef: `evt:${payloadDigest}`,
-  };
-  try {
-    appendEvent({
-      sessionId: input.sessionId,
-      turn: 0,
-      role: 'system',
-      type: 'read_receipt',
-      data: { record },
-    });
-  } catch {
-    // No durable receipt, no learning: an unrecorded settlement is a
-    // settlement that never provably happened.
-    return { learned: false, reason: 'the durable receipt could not be recorded' };
-  }
+  // The accepted source and live attempt exist NOW and are gone by the time
+  // the worker runs — capture the intent phrase and identity here.
+  const captured = acceptedIntentPhraseForSettlement(input.sessionId, input.sourceUserSeq);
+  if (!captured) return { queued: false, reason: 'no exact accepted source phrase' };
+  const attemptId = getActiveRunAttempt(input.sessionId)?.attemptId;
 
-  return learnVerifiedReadSettlement({
-    receiptId: record.receiptId,
-    receipts: eventLogReceiptResolver(input.sessionId),
-    kind: 'composio',
+  const pending = enqueuePendingLearning({
     sessionId: input.sessionId,
-    ...(typeof input.sourceUserSeq === 'number' ? { sourceUserSeq: input.sourceUserSeq } : {}),
+    ...(typeof captured.sourceUserSeq === 'number' ? { sourceUserSeq: captured.sourceUserSeq } : {}),
+    ...(attemptId ? { attemptId } : {}),
+    identifier: toolSlug,
+    kind: 'composio',
+    accountIdentity: input.accountIdentity?.trim() ?? '',
+    phrase: captured.phrase,
+    evidenceDigest,
   });
+  if (!pending) return { queued: false, reason: 'the durable pending-learning record could not be written' };
+  scheduleLearningDrain();
+  return { queued: true, pending };
 }

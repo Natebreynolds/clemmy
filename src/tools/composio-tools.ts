@@ -855,42 +855,12 @@ export async function maybeAutoRememberComposioChoice(
     }
     const intent = pending.query.trim();
     if (!intent) return;
-    // Additive only (north star: "propose before update"). Never silently
-    // overwrite an ACTIVE choice — a curated or already-proven one. We fill an
-    // empty intent (first discovery) or a just-invalidated one (choice===null,
-    // post-failure re-learn). A genuinely BETTER option for an already-active
-    // intent is the model's call: it proposes the swap and only the user's
-    // approval triggers a manual tool_choice_remember. Non-emitting peek so
-    // this existence check doesn't skew recall-hit-rate telemetry.
-    const existingChoice = peekToolChoice(intent);
-    if (existingChoice?.choice) return;
-    // Compact, connection-free args example as the invocation hint. NEVER bake a
-    // connected_account_id into the memo (stale-connection class bug, v0.5.47).
-    let template: string | undefined;
-    try {
-      const compact = JSON.stringify(args ?? {});
-      template = compact && compact.length <= 600 ? stripBakedConnectionId(compact) : undefined;
-    } catch {
-      template = undefined;
-    }
-    // C4 — learn the MAILBOX (stable email, never the ca_ id): only when a
-    // specific connection was used AND the toolkit has >1 connection (so the
-    // binding actually disambiguates). Single-account toolkits stay byte-
-    // identical; a genuinely-ambiguous execute never reaches here with a pinned
-    // connectionId. Zero network (SWR cache in hand).
-    const accountIdentity = await stableComposioAccountIdentity(toolSlug, connectionId);
-    rememberToolChoice({
-      intent,
-      description: 'Auto-remembered: this Composio slug satisfied the searched intent.',
-      aliasSource: 'composio_search',
-      choice: {
-        kind: 'composio',
-        identifier: toolSlug,
-        invocationTemplate: template,
-        accountIdentity,
-        testEvidence: 'auto-remembered after a successful composio_execute_tool call',
-      },
-    });
+    // R2/A: this path no longer WRITES memory. Outcome accounting above
+    // (procedure-use attribution) is preserved; procedures, schemas, aliases
+    // and invocation templates are created by exactly one path — the
+    // settlement → pending-learning → worker pipeline — which never persists
+    // a historical argument. A discovery-followed-by-success turn teaches
+    // through that same pipeline or not at all.
   } catch {
     // North star: learning is ADDITIVE — a memory-write failure must never
     // break the tool call. Silent here is correct (the call already succeeded).
@@ -2160,7 +2130,7 @@ async function runComposioExecute(
         if (sid && settledForLearning !== null && settledForLearning !== undefined
           && !detectJobReceipt(toolSlug, settledForLearning)) {
           const runContext = harnessRunContextStorage.getStore();
-          await settleVerifiedComposioRead({
+          settleVerifiedComposioRead({
             toolSlug,
             sessionId: sid,
             result: settledForLearning,

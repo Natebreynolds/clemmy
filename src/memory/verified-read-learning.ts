@@ -63,6 +63,14 @@ export function settlementCarriesVerifiedData(result: unknown): boolean {
   if (record.successful === false || record.error) return false;
   const data = record.data ?? record.result ?? record.items;
   if (data === null || data === undefined) return false;
+  // Nested error envelopes: providers routinely wrap a failure inside a
+  // 200-shaped body (data.error, result.error, data.errors[]). Data that
+  // arrives NEXT TO an error object is not verified evidence of anything.
+  if (typeof data === 'object' && !Array.isArray(data)) {
+    const envelope = data as Record<string, unknown>;
+    if (envelope.error) return false;
+    if (Array.isArray(envelope.errors) && envelope.errors.length > 0) return false;
+  }
   if (typeof data === 'object') {
     const inner = data as Record<string, unknown>;
     // A queued receipt names a job, not an answer.
@@ -149,6 +157,21 @@ export function acceptedPhraseFor(sessionId: string, sourceUserSeq: number | und
 
 export { acceptedPhraseDigest, boundedAliasTerms, normalizeAcceptedPhrase } from './capability-alias-index.js';
 
+/**
+ * Settlement-time capture: the exact accepted source and its INTENT-carrying
+ * phrase (the clarification-continuity rule applies now, while the session's
+ * awaiting state is still current — not later in the worker, when a newer
+ * turn may have changed it).
+ */
+export function acceptedIntentPhraseForSettlement(
+  sessionId: string,
+  sourceUserSeq?: number,
+): AcceptedSource | undefined {
+  const source = resolveAcceptedSource(sessionId, sourceUserSeq);
+  if (!source) return undefined;
+  return { sourceUserSeq: source.sourceUserSeq, phrase: intentPhraseFor(sessionId, source) };
+}
+
 export interface VerifiedReadLearningInput {
   /** The durable receipt this learning cites — resolved BY ID, never trusted
    *  as a caller-constructed object. */
@@ -158,7 +181,23 @@ export interface VerifiedReadLearningInput {
   sessionId: string;
   /** The EXACT accepted user event this dispatch belongs to. */
   sourceUserSeq?: number;
+  /** Every binding the caller expects the durable record to prove. A receipt
+   *  that resolves but disagrees on ANY of these is a different settlement
+   *  and must not teach under this identity. */
+  expect: {
+    identifier: string;
+    accountIdentity: string;
+    evidenceDigest: string;
+  };
+  /** The intent-carrying accepted phrase, captured AT settlement (the live
+   *  attempt is gone by the time the worker runs). */
+  phrase: string;
 }
+
+/** Verification failures that a retry cannot fix (a binding mismatch) are
+ *  distinct from transient write failures (which the worker retries). */
+export class LearningBindingError extends Error {}
+export class LearningWriteError extends Error {}
 
 export type LearningVerdict =
   | { learned: true; intent: string; aliasDigest: string; klass: 'capability_only' }
@@ -195,10 +234,25 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
   }
   const identifier = receipt.identifier?.trim();
   if (!identifier) return { learned: false, reason: 'the receipt names no identifier' };
+  // EVERY binding validates — a resolver that returned the first record with
+  // a matching id is not authority; the record must agree with what the
+  // caller settled: identifier, account, and the exact evidence digest.
+  if (identifier !== input.expect.identifier) {
+    return { learned: false, reason: `the receipt proves ${identifier}, not ${input.expect.identifier}` };
+  }
+  if ((receipt.scope?.accountIdentity ?? '') !== input.expect.accountIdentity) {
+    return { learned: false, reason: 'the receipt is bound to a different account' };
+  }
+  if (receipt.readEvidenceRef !== `evt:${input.expect.evidenceDigest}`) {
+    return { learned: false, reason: 'the receipt cites different evidence than this settlement produced' };
+  }
 
-  const source = resolveAcceptedSource(input.sessionId, input.sourceUserSeq);
-  if (!source) return { learned: false, reason: 'no exact accepted source phrase' };
-  const phrase = intentPhraseFor(input.sessionId, source);
+  const phrase = input.phrase.trim();
+  if (!phrase) return { learned: false, reason: 'no accepted source phrase was captured at settlement' };
+  const source = typeof input.sourceUserSeq === 'number'
+    ? { sourceUserSeq: input.sourceUserSeq, phrase }
+    : resolveAcceptedSource(input.sessionId, input.sourceUserSeq);
+  if (!source) return { learned: false, reason: 'no exact accepted source' };
 
   const intent = canonicalIntentSlug(identifier);
   if (!intent) return { learned: false, reason: 'identifier has no canonical slug' };
@@ -206,18 +260,18 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
   if (terms.length === 0) return { learned: false, reason: 'accepted phrase has no distinctive terms' };
   const aliasDigest = acceptedPhraseDigest(phrase);
 
-  // Exactly-once: the first settlement to claim this accepted source learns; a
-  // retry or a replayed frame is told it lost rather than re-teaching. The
-  // account is part of the claim: reading two mailboxes is two settlements.
-  const claimAccount = receipt.scope?.accountIdentity?.trim() ?? '';
-  if (!claimAcceptedSourceForLearning({
-    sessionId: input.sessionId, sourceUserSeq: source.sourceUserSeq, identifier,
-    accountIdentity: claimAccount,
-  })) {
-    return { learned: false, reason: 'accepted source already owned by an earlier settlement' };
-  }
 
   const accountIdentity = receipt.scope?.accountIdentity?.trim() || undefined;
+  const claimAccount = accountIdentity ?? '';
+  // A retry or replayed frame that already lost the claim stops here — but
+  // the claim itself is only CONSUMED after every write below commits.
+  const alreadyClaimed = !claimAcceptedSourceForLearning({
+    sessionId: input.sessionId, sourceUserSeq: source.sourceUserSeq, identifier,
+    accountIdentity: claimAccount, probe: true,
+  });
+  if (alreadyClaimed) {
+    return { learned: false, reason: 'accepted source already owned by an earlier settlement' };
+  }
   try {
     rememberToolChoice({
       intent,
@@ -234,10 +288,10 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
       aliasSource: 'verified_read',
       schemaFingerprint: receipt.schemaFingerprint,
     });
-    // The separate, scoped, class-locked retrieval index. Its write is not
-    // allowed to undo the capability memo above, so a refusal here (a class
-    // conflict, a locked file) degrades retrieval, never learning.
-    recordCapabilityAlias({
+    // The separate, scoped, class-locked retrieval index. A refused write is
+    // a MATERIALIZATION FAILURE the worker must retry — swallowing it here
+    // would commit the learning state with half its writes missing.
+    const aliasWrite = recordCapabilityAlias({
       aliasDigest,
       scope: daemonAliasScope(),
       intent,
@@ -248,11 +302,22 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
       terms,
       schemaFingerprint: receipt.schemaFingerprint,
     });
+    if (!aliasWrite.stored && !/immutable/.test((aliasWrite as { reason?: string }).reason ?? '')) {
+      throw new LearningWriteError((aliasWrite as { reason?: string }).reason ?? 'alias write refused');
+    }
+    // COMMIT: only now is the exactly-once claim consumed. Everything above
+    // is idempotent, so a crash between the writes and this line retries
+    // cleanly on the next drain.
+    claimAcceptedSourceForLearning({
+      sessionId: input.sessionId, sourceUserSeq: source.sourceUserSeq, identifier,
+      accountIdentity: claimAccount,
+    });
     // A paraphrase learned NOW must retrieve on the NEXT turn: the missing
     // embedding rows are the durable queue, this arms the drain.
     scheduleCapabilityAliasEmbedBackfill();
     return { learned: true, intent, aliasDigest, klass: 'capability_only' };
   } catch (error) {
-    return { learned: false, reason: error instanceof Error ? error.message : 'remember refused' };
+    if (error instanceof LearningWriteError) throw error;
+    throw new LearningWriteError(error instanceof Error ? error.message : 'remember refused');
   }
 }

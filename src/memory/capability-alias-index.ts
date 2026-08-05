@@ -199,6 +199,22 @@ function db(): Database.Database {
       PRIMARY KEY (alias_digest, scope_digest, identifier, account_identity)
     );
     CREATE INDEX IF NOT EXISTS aliases_by_scope ON aliases (scope_digest);
+    CREATE TABLE IF NOT EXISTS pending_learning (
+      pending_id       TEXT PRIMARY KEY,
+      session_id       TEXT NOT NULL,
+      source_user_seq  INTEGER,
+      attempt_id       TEXT,
+      identifier       TEXT NOT NULL,
+      kind             TEXT NOT NULL,
+      account_identity TEXT NOT NULL DEFAULT '',
+      phrase           TEXT NOT NULL,
+      evidence_digest  TEXT NOT NULL,
+      status           TEXT NOT NULL CHECK (status IN ('pending','done','dead')),
+      attempts         INTEGER NOT NULL DEFAULT 0,
+      last_error       TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS alias_claims (
       session_id       TEXT NOT NULL,
       source_user_seq  INTEGER NOT NULL,
@@ -325,6 +341,7 @@ export function recordCapabilityAlias(input: {
     embeddingSpace: null, createdAt: now, updatedAt: now,
   };
 
+  if (failAliasWritesForTest) return { stored: false, reason: 'alias store unavailable (test fault)' };
   try {
     const database = db();
     const write = database.transaction((): CapabilityAliasWrite => {
@@ -364,9 +381,24 @@ export function recordCapabilityAlias(input: {
   }
 }
 
+/**
+ * A schema-BOUND capability may only serve under LIVE catalog authority that
+ * matches its recorded contract. No live authority (an empty or expired
+ * process cache, a daemon that has not reloaded its catalog) is absence of
+ * proof, and absence of proof DECLINES — validation that cannot run must
+ * never read as validation that passed. Rows recorded without a contract
+ * (manual/legacy memos) are outside this rule.
+ */
 function schemaIsCurrent(row: CapabilityAliasRow, live: string | null | undefined): boolean {
-  if (!live || !row.schemaFingerprint) return true;
-  return row.schemaFingerprint === live;
+  if (!row.schemaFingerprint) return true;
+  return Boolean(live) && row.schemaFingerprint === live;
+}
+
+let failAliasWritesForTest = false;
+/** Test hook: simulate a transiently unwritable store (locked file, full
+ *  disk) so restart-retry behavior is provable without real fault injection. */
+export function _failAliasWritesForTest(fail: boolean): void {
+  failAliasWritesForTest = fail;
 }
 
 /**
@@ -540,16 +572,24 @@ export function claimAcceptedSourceForLearning(input: {
   /** A settlement against a DIFFERENT account is a different settlement — a
    *  brief that read two mailboxes teaches both, exactly once each. */
   accountIdentity?: string;
+  /** probe: report whether the claim is still available WITHOUT consuming it.
+   *  The claim is only spent at the learning COMMIT, after every memory write
+   *  has succeeded — a crash between them must leave the claim winnable. */
+  probe?: boolean;
   now?: string;
 }): boolean {
   if (!input.sessionId || !Number.isInteger(input.sourceUserSeq) || !input.identifier) return false;
+  const account = input.accountIdentity?.trim() ?? '';
   try {
+    if (input.probe) {
+      const existing = db().prepare(
+        'SELECT COUNT(*) AS n FROM alias_claims WHERE session_id = ? AND source_user_seq = ? AND identifier = ? AND account_identity = ?',
+      ).get(input.sessionId, input.sourceUserSeq, input.identifier, account) as { n: number };
+      return existing.n === 0;
+    }
     const result = db().prepare(
       'INSERT OR IGNORE INTO alias_claims (session_id, source_user_seq, identifier, account_identity, claimed_at) VALUES (?, ?, ?, ?, ?)',
-    ).run(
-      input.sessionId, input.sourceUserSeq, input.identifier,
-      input.accountIdentity?.trim() ?? '', input.now ?? new Date().toISOString(),
-    );
+    ).run(input.sessionId, input.sourceUserSeq, input.identifier, account, input.now ?? new Date().toISOString());
     return result.changes > 0;
   } catch {
     return false;
@@ -615,4 +655,119 @@ export function scheduleCapabilityAliasEmbedBackfill(delayMs = 50): void {
       });
   }, delayMs);
   backfillTimer.unref?.();
+}
+
+// ── the durable pending-learning queue ───────────────────────────────────────
+//
+// Settlement is synchronous and user-visible; materialization (catalog fetch,
+// receipt, procedure/alias writes, embedding) is not allowed on that path. A
+// settled verified read leaves ONE durable row here; the bounded worker
+// drains it, and only a fully committed materialization marks it done. A
+// crash at any point leaves the row pending — restart retries it.
+
+export interface PendingLearningRecord {
+  pendingId: string;
+  sessionId: string;
+  sourceUserSeq: number | null;
+  attemptId: string | null;
+  identifier: string;
+  kind: string;
+  accountIdentity: string;
+  phrase: string;
+  evidenceDigest: string;
+  status: 'pending' | 'done' | 'dead';
+  attempts: number;
+  lastError: string | null;
+}
+
+const PENDING_LEARNING_MAX_ATTEMPTS = 5;
+
+export function enqueuePendingLearning(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  attemptId?: string;
+  identifier: string;
+  kind: string;
+  accountIdentity?: string;
+  phrase: string;
+  evidenceDigest: string;
+}): PendingLearningRecord | null {
+  const pendingId = sha256(JSON.stringify([
+    input.sessionId, input.sourceUserSeq ?? null, input.identifier,
+    input.accountIdentity ?? '', input.evidenceDigest,
+  ])).slice(0, 32);
+  const now = new Date().toISOString();
+  try {
+    db().prepare(`
+      INSERT OR IGNORE INTO pending_learning (
+        pending_id, session_id, source_user_seq, attempt_id, identifier, kind,
+        account_identity, phrase, evidence_digest, status, attempts, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+    `).run(
+      pendingId, input.sessionId, input.sourceUserSeq ?? null, input.attemptId ?? null,
+      input.identifier, input.kind, input.accountIdentity?.trim() ?? '',
+      input.phrase, input.evidenceDigest, now, now,
+    );
+    return loadPendingLearning(pendingId);
+  } catch {
+    return null;
+  }
+}
+
+function hydratePending(raw: Record<string, unknown>): PendingLearningRecord {
+  return {
+    pendingId: String(raw.pending_id),
+    sessionId: String(raw.session_id),
+    sourceUserSeq: (raw.source_user_seq as number | null) ?? null,
+    attemptId: (raw.attempt_id as string | null) ?? null,
+    identifier: String(raw.identifier),
+    kind: String(raw.kind),
+    accountIdentity: String(raw.account_identity ?? ''),
+    phrase: String(raw.phrase),
+    evidenceDigest: String(raw.evidence_digest),
+    status: raw.status as PendingLearningRecord['status'],
+    attempts: Number(raw.attempts ?? 0),
+    lastError: (raw.last_error as string | null) ?? null,
+  };
+}
+
+export function loadPendingLearning(pendingId: string): PendingLearningRecord | null {
+  try {
+    const raw = db().prepare('SELECT * FROM pending_learning WHERE pending_id = ?').get(pendingId) as
+      Record<string, unknown> | undefined;
+    return raw ? hydratePending(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function listPendingLearning(limit = 32): PendingLearningRecord[] {
+  try {
+    return (db().prepare(
+      "SELECT * FROM pending_learning WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+    ).all(Math.max(1, Math.min(limit, 256))) as Array<Record<string, unknown>>).map(hydratePending);
+  } catch {
+    return [];
+  }
+}
+
+export function completePendingLearning(pendingId: string): void {
+  try {
+    db().prepare("UPDATE pending_learning SET status = 'done', updated_at = ? WHERE pending_id = ?")
+      .run(new Date().toISOString(), pendingId);
+  } catch { /* the worker retries a row it could not complete */ }
+}
+
+/** A failed attempt stays retryable until the bounded attempt budget is
+ *  spent; then the row is DEAD and visible, never silently gone. */
+export function recordPendingLearningFailure(pendingId: string, error: string): void {
+  try {
+    db().prepare(`
+      UPDATE pending_learning
+         SET attempts = attempts + 1, last_error = ?,
+             status = CASE WHEN attempts + 1 >= ${PENDING_LEARNING_MAX_ATTEMPTS} THEN 'dead' ELSE 'pending' END,
+             updated_at = ?
+       WHERE pending_id = ?
+    `).run(error.slice(0, 400), new Date().toISOString(), pendingId);
+  } catch { /* leave the row pending */ }
 }

@@ -40,7 +40,7 @@
  */
 import { runConversation, verifiedWorkflowRunDispatchReceipts } from './loop.js';
 import { resolveAcceptedTurnRead, type AcceptedTurnReadPorts, type AcceptedTurnReadResult } from '../read-path/read-lane-chat.js';
-import { resolveTurnCapabilityCandidates } from '../read-path/capability-candidates.js';
+import { resolveTurnCapabilityCandidates, type TurnCapabilityCandidates } from '../read-path/capability-candidates.js';
 import {
   PendingWorkflowChatDispatchOwnershipError,
   readPendingWorkflowChatDispatchOwnership,
@@ -981,6 +981,7 @@ export async function respondViaHarness(
           allowedToolNames: request.allowedToolNames,
           excludeToolNames: request.excludeToolNames,
           allowToolJit: true,
+          ...(request.turnCandidates ? { turnCandidates: request.turnCandidates } : {}),
           buildAgent: buildAgentImpl,
         })
       : {};
@@ -1734,7 +1735,11 @@ export function buildChatFalloverWiring(opts: {
   allowedToolNames?: string[];
   excludeToolNames?: string[];
   allowToolJit?: boolean;
-  buildAgent: (o: { userInput?: string; sessionId: string; allowedToolNames?: string[]; excludeToolNames?: string[]; model?: string; allowToolJit?: boolean }) => Promise<BuiltAgent>;
+  /** The turn's resolved candidates. A fallover rebuild serves the SAME
+   *  accepted turn — the second brain must not pay rediscovery for state the
+   *  first brain already had. */
+  turnCandidates?: TurnCapabilityCandidates;
+  buildAgent: (o: { userInput?: string; sessionId: string; allowedToolNames?: string[]; excludeToolNames?: string[]; model?: string; allowToolJit?: boolean; turnCandidates?: TurnCapabilityCandidates }) => Promise<BuiltAgent>;
 }): { falloverModelIds?: string[]; rebuildAgentForBrain?: (modelId: string) => Promise<BuiltAgent> } {
   if (!chatBrainFalloverEnabled()) return {};
   try {
@@ -1747,6 +1752,7 @@ export function buildChatFalloverWiring(opts: {
       rebuildAgentForBrain: (modelId: string) => opts.buildAgent({
         userInput: opts.userInput,
         sessionId: opts.sessionId,
+        ...(opts.turnCandidates ? { turnCandidates: opts.turnCandidates } : {}),
         allowedToolNames: opts.allowedToolNames,
         excludeToolNames: opts.excludeToolNames,
         model: modelId,

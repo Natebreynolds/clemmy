@@ -34,6 +34,7 @@ const schemaCache = await import('../../tools/composio-schema-cache.js');
 const toolChoice = await import('../../memory/tool-choice-store.js');
 const eventlog = await import('../harness/eventlog.js');
 const candidates = await import('./capability-candidates.js');
+const worker = await import('../../memory/learning-worker.js');
 
 const CAL_SLUG = 'SCHEDULERCO_LIST_EVENTS';
 const CAL_SCHEMA_V1 = { type: 'object', properties: { timeMin: { type: 'string' }, timeMax: { type: 'string' } } };
@@ -66,7 +67,11 @@ async function governedRead(
 ): Promise<string> {
   if (options.schema !== null) schemaCache.rememberToolSchema(slug, options.schema ?? CAL_SCHEMA_V1);
   const exec = (async () => payload) as never;
-  return composio.runComposioExecuteForTestInSession(slug, { timeMin: '2026-08-06' }, exec, sessionId);
+  const output = await composio.runComposioExecuteForTestInSession(slug, { timeMin: '2026-08-06' }, exec, sessionId);
+  // Materialization is the durable worker's job now; tests drive its entry
+  // the way the daemon timer does.
+  await worker.drainPendingLearning();
+  return output;
 }
 
 function retrievedIdentifiers(phrase: string): string[] {
@@ -198,6 +203,7 @@ test('the same phrase proven against two accounts keeps both, each with its own 
     result: { successful: true, data: { items: [{ id: 'i-9' }] } },
     accountIdentity: 'billing@southco.example',
   });
+  await worker.drainPendingLearning();
 
   const aliasIndex = await import('../../memory/capability-alias-index.js');
   const rows = aliasIndex.listCapabilityAliases({ scope: aliasIndex.daemonAliasScope() })

@@ -34,7 +34,11 @@ const {
 const SCOPE = { tenant: 'tenant-1', workspace: 'ws-1' };
 
 function firstExact(aliasDigest: string, options: Record<string, unknown> = {}) {
-  return lookupExactCapabilityAliases(aliasDigest, { scope: SCOPE, ...options })[0] ?? null;
+  // Rows in this suite bind contract fp-1; schema-bound retrieval requires
+  // LIVE authority, so the default lookup presents it.
+  return lookupExactCapabilityAliases(aliasDigest, {
+    scope: SCOPE, liveSchemaFingerprintFor: () => 'fp-1', ...options,
+  })[0] ?? null;
 }
 const DB_FILE = path.join(TMP_HOME, 'memory', 'capability-aliases', 'machine-A', 'aliases.db');
 
@@ -172,7 +176,9 @@ test('one phrase may prove many capabilities and many accounts, each its own row
   assert.equal(record({
     aliasDigest: 'alias-many', identifier: 'PROVIDERX_LIST_ITEMS', accountIdentity: 'b@example.com',
   }).stored, true);
-  const rows = lookupExactCapabilityAliases('alias-many', { scope: SCOPE });
+  const rows = lookupExactCapabilityAliases('alias-many', {
+    scope: SCOPE, liveSchemaFingerprintFor: () => 'fp-1',
+  });
   assert.equal(rows.length, 3, 'rows for one phrase displaced each other');
   const identities = new Set(rows.map((r) => `${r.identifier}::${r.accountIdentity}`));
   assert.equal(identities.size, 3);
@@ -231,14 +237,23 @@ test('semantic retrieval is bounded by scope, space, and floor', () => {
   const row = (written as Extract<typeof written, { stored: true }>).row;
   assert.equal(attachCapabilityAliasEmbedding(row, stored, 'space-A'), true);
 
-  const near = semanticCapabilityAliases(unit([1, 0.9, 0, 0]), { scope: SCOPE, embeddingSpace: 'space-A' });
+  const near = semanticCapabilityAliases(unit([1, 0.9, 0, 0]), {
+    scope: SCOPE, embeddingSpace: 'space-A', liveSchemaFingerprintFor: () => 'fp-1',
+  });
   assert.equal(near[0]?.row.aliasDigest, 'alias-vec');
   assert.ok(near[0]!.score >= DEFAULT_SEMANTIC_FLOOR);
 
-  assert.equal(semanticCapabilityAliases(unit([0, 0, 1, 0]), { scope: SCOPE, embeddingSpace: 'space-A' }).length, 0,
-    'an unrelated vector cleared the retrieval floor');
-  assert.equal(semanticCapabilityAliases(stored, { scope: SCOPE, embeddingSpace: 'space-B' }).length, 0,
-    'a vector from a different embedding space was compared anyway');
-  assert.equal(semanticCapabilityAliases(stored, { scope: { tenant: 'tenant-2' }, embeddingSpace: 'space-A' }).length, 0,
-    'semantic retrieval crossed a privacy boundary');
+  assert.equal(semanticCapabilityAliases(unit([0, 0, 1, 0]), {
+    scope: SCOPE, embeddingSpace: 'space-A', liveSchemaFingerprintFor: () => 'fp-1',
+  }).length, 0, 'an unrelated vector cleared the retrieval floor');
+  assert.equal(semanticCapabilityAliases(stored, {
+    scope: SCOPE, embeddingSpace: 'space-B', liveSchemaFingerprintFor: () => 'fp-1',
+  }).length, 0, 'a vector from a different embedding space was compared anyway');
+  assert.equal(semanticCapabilityAliases(stored, {
+    scope: { tenant: 'tenant-2' }, embeddingSpace: 'space-A', liveSchemaFingerprintFor: () => 'fp-1',
+  }).length, 0, 'semantic retrieval crossed a privacy boundary');
+  // And the fail-closed rule itself: no live authority, no schema-bound hit.
+  assert.equal(semanticCapabilityAliases(unit([1, 0.9, 0, 0]), {
+    scope: SCOPE, embeddingSpace: 'space-A',
+  }).length, 0, 'a schema-bound row served without live catalog authority');
 });

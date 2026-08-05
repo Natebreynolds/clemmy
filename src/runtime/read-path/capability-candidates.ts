@@ -76,9 +76,16 @@ function candidateFromMatch(match: StepToolChoiceMatch): CapabilityCandidate {
     kind: match.kind,
     intent: match.intent,
     klass: 'capability_only',
+    ...(match.accountIdentity ? { accountIdentity: match.accountIdentity } : {}),
     via: 'exact',
     score: match.score,
   };
+}
+
+/** Candidate identity: procedure scope + identifier + ACCOUNT. Two accounts
+ *  that proved one identifier are two candidates end to end. */
+function candidateKey(c: { identifier: string; accountIdentity?: string }): string {
+  return `${c.identifier}::${c.accountIdentity ?? ''}`;
 }
 
 function candidateFromAlias(row: CapabilityAliasRow, score: number): CapabilityCandidate {
@@ -142,7 +149,10 @@ export async function resolveTurnCapabilityCandidates(options: {
   } catch { /* retrieval never fails a turn */ }
 
   const byIdentifier = new Map<string, CapabilityCandidate>();
-  for (const match of matches) byIdentifier.set(match.identifier, candidateFromMatch(match));
+  for (const match of matches) {
+    const candidate = candidateFromMatch(match);
+    byIdentifier.set(candidateKey(candidate), candidate);
+  }
 
   // Semantic tier: only against an ALREADY WARM local model, inside the
   // request deadline. A cold model warms in the background for later turns.
@@ -165,8 +175,9 @@ export async function resolveTurnCapabilityCandidates(options: {
         liveSchemaFingerprintFor: options.liveSchemaFingerprintFor ?? liveComposioSchemaFingerprint,
       });
       for (const hit of hits) {
-        if (byIdentifier.has(hit.row.identifier)) continue;
-        byIdentifier.set(hit.row.identifier, candidateFromAlias(hit.row, hit.score));
+        const candidate = candidateFromAlias(hit.row, hit.score);
+        if (byIdentifier.has(candidateKey(candidate))) continue;
+        byIdentifier.set(candidateKey(candidate), candidate);
       }
     }
   } else {
