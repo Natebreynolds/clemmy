@@ -2384,3 +2384,14 @@ export const __test__ = {
     invalidateConnectedAccountSnapshot();
   },
 };
+
+/**
+ * Synchronous snapshot of the connection registry — the cached (or last-good)
+ * listing, never a probe. For sync preflight seams (typed capability
+ * resolution) that must not block a turn on a network call. Empty means "no
+ * registry available", which callers must treat as UNKNOWN, never as
+ * disconnected — absence of the registry is not absence of the connection.
+ */
+export function peekConnectedToolkits(): ConnectedToolkit[] {
+  return connectionsCache?.data ?? lastGoodConnections ?? [];
+}

@@ -385,6 +385,12 @@ export const EVENT_TYPES = [
   // the promotion/verification authority the resolver reads back by id.
   // Internal evidence: the public-presentation allowlist does not carry it.
   'read_receipt',
+  // Typed capability resolution: what this turn's ask can already rely on
+  // (proven procedures), what has failed before (invalidated memos), and the
+  // connection state of each — resolved by the runtime at preflight. The UI's
+  // live "what Clem knows going in" frame and the graph's future admission
+  // input. Carries {entries, registryAvailable, sourceUserSeq?}.
+  'capability_resolution',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

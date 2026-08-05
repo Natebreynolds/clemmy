@@ -504,6 +504,31 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       };
     case 'codemode_program_summary':
       return selected(data, ['ok', 'rpcCalls', 'durationMs', 'completed', 'failed']);
+    case 'capability_resolution': {
+      // Typed "what Clem knows going in" frame. Bounded and sanitized: the
+      // identifier must be a well-formed tool identifier; internal failure
+      // prose stays private (the UI speaks plain voice from status + date).
+      const rawEntries = Array.isArray(data.entries) ? data.entries.slice(0, 8) : [];
+      const entries = rawEntries.flatMap((raw) => {
+        if (!raw || typeof raw !== 'object') return [];
+        const e = raw as Record<string, unknown>;
+        const identifier = firstString(e.identifier);
+        const status = firstString(e.status);
+        if (!identifier || !PUBLIC_TOOL_IDENTIFIER_RE.test(identifier)) return [];
+        if (status !== 'proven' && status !== 'previously_failed') return [];
+        return [{
+          identifier,
+          status,
+          ...(firstString(e.intent) ? { intent: firstString(e.intent) } : {}),
+          ...(firstString(e.kind) ? { kind: firstString(e.kind) } : {}),
+          ...(firstString(e.connection) ? { connection: firstString(e.connection) } : {}),
+          ...(firstString(e.accountIdentity) ? { accountIdentity: firstString(e.accountIdentity) } : {}),
+          ...(firstString(e.failedAt) ? { failedAt: firstString(e.failedAt) } : {}),
+        }];
+      });
+      if (entries.length === 0) return null;
+      return { entries };
+    }
     case 'verdict_recorded':
       return selected(data, ['door', 'pass', 'failedOpen', 'selfJudge', 'criteriaMet', 'criteriaTotal']);
     case 'heartbeat':

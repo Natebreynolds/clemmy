@@ -60,6 +60,11 @@ import {
   standardAwareBeatText,
 } from './turn-control.js';
 import {
+  recordCapabilityResolution,
+  renderCapabilityResolutionForContext,
+  resolveTurnCapabilities,
+} from './capability-resolution.js';
+import {
   pullRecentTurnsForSession,
   renderRecentActionsForHarnessHistory,
   renderCrossSessionPrefixesForModel,
@@ -1157,6 +1162,20 @@ async function buildClaudeAgentBrainTurnContext(
     fanoutDirective = '';
     confirmBeat = '';
   }
+  // Typed capability resolution (parity with the context packet — this lane
+  // doesn't consume the packet): what THIS ask can already rely on, what has
+  // failed before, what has no active connection. Runtime facts as DATA; the
+  // model never has to rediscover — or silently trust — its own history.
+  let capabilityResolution = '';
+  try {
+    const resolved = resolveTurnCapabilities(request.message ?? '');
+    capabilityResolution = renderCapabilityResolutionForContext(resolved);
+    if (preflightSessionKind === 'chat') {
+      recordCapabilityResolution(request.sessionId, resolved, opts?.sourceUserSeq);
+    }
+  } catch {
+    capabilityResolution = '';
+  }
   // Pre-flight error library (parity with the context packet's Known-pitfalls
   // line — this lane doesn't consume the packet): the freshest distilled
   // lessons for the skills this turn will likely use, so a known failure mode
@@ -1191,6 +1210,7 @@ async function buildClaudeAgentBrainTurnContext(
       sessionActions,
       fanoutDirective,
       confirmBeat,
+      capabilityResolution,
       pitfalls,
       projectRoutes,
     ].filter(Boolean).join('\n\n'),

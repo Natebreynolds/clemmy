@@ -533,3 +533,26 @@ test('public replay drops corrupt typed claims without suppressing a later valid
   assert.deepEqual(projected.map((row) => row.seq), [9]);
   assert.equal(projected[0].data.reply, 'Validated answer.');
 });
+
+test('capability_resolution projects bounded typed entries and drops junk', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const row = {
+    sessionId: 's', seq: 1, turn: 0, role: 'system', type: 'capability_resolution',
+    data: {
+      registryAvailable: true,
+      entries: [
+        { intent: 'outlook.calendar.view_day', kind: 'composio', identifier: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW', status: 'proven', connection: 'active', accountIdentity: 'user@example.com', failureReason: 'internal prose that must not ship' },
+        { identifier: 'bad identifier with spaces', status: 'proven' },
+        { identifier: 'APIFY_RUN_ACTOR', status: 'made_up_status' },
+      ],
+    },
+  } as never;
+  const projected = projectHarnessEventForPublic(row);
+  const data = projected?.data as { entries: Array<Record<string, unknown>> };
+  assert.equal(data.entries.length, 1, 'malformed identifiers and unknown statuses are dropped');
+  assert.equal(data.entries[0].identifier, 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW');
+  assert.equal(data.entries[0].failureReason, undefined, 'internal failure prose stays private');
+
+  const empty = projectHarnessEventForPublic({ ...row, data: { entries: [] } } as never);
+  assert.equal(empty, null, 'an empty resolution never reaches the public bus');
+});

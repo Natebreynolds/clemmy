@@ -2881,3 +2881,76 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   if (lines.length === 0) return '';
   return [header, ...lines].join('\n');
 }
+
+// ── invalidated-capability matching (typed capability resolution) ────────────
+
+export interface InvalidatedChoiceMatch {
+  intent: string;
+  kind: ToolChoiceKind;
+  identifier: string;
+  /** Newest fallback's failure timestamp. */
+  failedAt?: string;
+  /** Newest fallback's failure reason (e.g. the 3-loss auto-invalidate). */
+  reason?: string;
+  score: number;
+}
+
+/**
+ * Match the turn's ask against memos whose choice was INVALIDATED (choice:
+ * null, failure recorded in fallbacks). These records are invisible to every
+ * active-choice matcher by design — but "this exact play failed last time" is
+ * a runtime FACT the turn must be able to know, or the model re-asks the user
+ * to approve a path its own memory has already watched die (live 2026-08-05:
+ * the apify firm-research procedure, auto-invalidated in July, was silently
+ * absent while the model asked for a go-ahead that assumed it). Matching uses
+ * the same generic token machinery as the advertise tier — the newest
+ * fallback's identifier supplies identity — so nothing here names a provider.
+ */
+export function matchInvalidatedToolChoices(
+  promptText: string,
+  opts: { limit?: number; choices?: ToolChoiceRecord[] } = {},
+): InvalidatedChoiceMatch[] {
+  const limit = opts.limit ?? 3;
+  const prompt = wordTokens(promptText);
+  if (prompt.size === 0) return [];
+  let records: ToolChoiceRecord[];
+  try {
+    records = (opts.choices ?? listToolChoices()).filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
+  } catch {
+    return [];
+  }
+  const out: InvalidatedChoiceMatch[] = [];
+  for (const rec of records) {
+    if (rec.choice) continue; // active memos belong to the ordinary matchers
+    const newest = [...(rec.fallbacks ?? [])]
+      .filter((f) => f.identifier && !placeholderChoiceString(f.identifier))
+      .sort((a, b) => (b.failedAt ?? '').localeCompare(a.failedAt ?? ''))[0];
+    if (!newest) continue;
+    const identity = new Set<string>();
+    for (const t of wordTokens(newest.identifier)) {
+      if (t.length < 2 || STEP_MATCH_STOPWORDS.has(t)) continue;
+      if (t.length >= 3 || SHORT_TOOL_ALIASES[t]) addExpandedToken(identity, t);
+    }
+    const core = new Set<string>([...intentChoiceTokens(rec), ...identity]);
+    if (identity.size === 0 || core.size === 0) continue;
+    const matchedIdentity = [...identity].filter((t) => prompt.has(t));
+    const hasStrongIdentity = matchedIdentity.some((t) => !STEP_MATCH_WEAK_IDENTITY_TOKENS.has(t));
+    const matchedCore = [...core].filter((t) => prompt.has(t));
+    // Advertise-tier gates: the service is clearly named and at least one
+    // substantive token matches. Nothing is bound from this path — it only
+    // reports a failure fact.
+    if (matchedIdentity.length === 0 || !hasStrongIdentity) continue;
+    if (matchedCore.length < 1 || !matchedCore.some((t) => t.length >= 4)) continue;
+    const distinctive = new Set<string>([...core, ...contextChoiceTokens(rec)]);
+    const matchedDistinctive = [...distinctive].filter((t) => prompt.has(t));
+    out.push({
+      intent: rec.intent,
+      kind: newest.kind,
+      identifier: newest.identifier,
+      failedAt: newest.failedAt,
+      reason: newest.reason,
+      score: matchedDistinctive.length / distinctive.size,
+    });
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, limit);
+}

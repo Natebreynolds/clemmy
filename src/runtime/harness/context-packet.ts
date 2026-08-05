@@ -27,6 +27,12 @@ import {
   recordTurnPreflightDecision,
 } from './turn-control.js';
 import {
+  recordCapabilityResolution,
+  renderCapabilityResolutionForContext,
+  resolveTurnCapabilities,
+  type CapabilityResolution,
+} from './capability-resolution.js';
+import {
   buildProspectiveIntentionContext,
   prospectiveCaptureDirective,
 } from '../prospective-intentions.js';
@@ -105,6 +111,8 @@ export interface AgentContextPacket {
   confirmBeatOffered: boolean;
   /** The typed preflight phase this turn classified into. */
   preflightPhase: 'read' | 'align' | 'execute';
+  /** Typed capability facts resolved for this ask (empty = no history). */
+  capabilityResolution: CapabilityResolution;
   text: string;
 }
 
@@ -713,6 +721,28 @@ export function buildAgentContextPacket(
       })
     : null;
 
+  // Typed capability resolution: what THIS ask can already rely on, what has
+  // failed before, what has no active connection — runtime facts as DATA.
+  // Same chat-only persistence condition as the preflight decision.
+  let capabilityResolution: CapabilityResolution = { entries: [], registryAvailable: false };
+  let capabilityBlock = '';
+  if (!constrainedWorkflowNode) {
+    try {
+      capabilityResolution = resolveTurnCapabilities(input);
+      capabilityBlock = renderCapabilityResolutionForContext(capabilityResolution);
+      if (
+        opts?.sessionKind === 'chat'
+        && Number.isSafeInteger(opts?.sourceUserSeq)
+        && (opts?.sourceUserSeq ?? 0) > 0
+        && opts.sessionId
+      ) {
+        recordCapabilityResolution(opts.sessionId, capabilityResolution, opts.sourceUserSeq);
+      }
+    } catch {
+      capabilityBlock = '';
+    }
+  }
+
   const lines = [
     '[AGENT CONTEXT PACKET]',
     'This deterministic preflight ran before the model call. Use it to choose memory, skills, workflows, and tools instead of guessing.',
@@ -735,6 +765,7 @@ export function buildAgentContextPacket(
     agentSystem.text,
     parallelismLine,
     confirmBeat,
+    capabilityBlock,
     'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
   ].filter((line): line is string => Boolean(line));
 
@@ -771,6 +802,7 @@ export function buildAgentContextPacket(
     },
     confirmBeatOffered: Boolean(confirmBeat),
     preflightPhase: preflightDecision.phase,
+    capabilityResolution,
     text: lines.join('\n'),
   };
 }
