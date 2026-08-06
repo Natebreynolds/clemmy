@@ -1,4 +1,4 @@
-import { Fragment, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
 import { DogMark } from '@/components/DogMark';
@@ -397,9 +397,28 @@ function DelegatedWorkCard({ message, delegated }: {
   delegated: NonNullable<ChatMessage['delegated']>;
 }) {
   const now = useNowTick(true);
-  const elapsedMin = Math.max(0, Math.floor((now - delegated.startedAt) / 60_000));
-  const elapsedSec = Math.max(0, Math.floor((now - delegated.startedAt) / 1000) % 60);
+  // Anchor the clock to the SERVER's task start when the task is known — the
+  // client-open anchor lied after a reattach (a 20-minute run read as
+  // seconds). One lazy fetch; until it lands, the client anchor stands with
+  // an honest tooltip.
+  const [serverStartedAt, setServerStartedAt] = useState<number | null>(null);
+  useEffect(() => {
+    if (!delegated.taskId) return;
+    let cancelled = false;
+    void import('@/lib/board').then(({ getBackgroundTaskDetail }) =>
+      getBackgroundTaskDetail(delegated.taskId as string).then((detail) => {
+        const raw = detail?.task?.startedAt ?? detail?.task?.createdAt;
+        const parsed = raw ? Date.parse(raw) : Number.NaN;
+        if (!cancelled && Number.isFinite(parsed)) setServerStartedAt(parsed);
+      }),
+    ).catch(() => { /* the client anchor remains the honest fallback */ });
+    return () => { cancelled = true; };
+  }, [delegated.taskId]);
+  const anchor = serverStartedAt ?? delegated.startedAt;
+  const elapsedMin = Math.max(0, Math.floor((now - anchor) / 60_000));
+  const elapsedSec = Math.max(0, Math.floor((now - anchor) / 1000) % 60);
   const elapsed = elapsedMin > 0 ? `${elapsedMin}m ${elapsedSec}s` : `${elapsedSec}s`;
+  const elapsedTitle = serverStartedAt ? 'time since the task started' : 'time since this live view opened';
   const traceHref = delegated.taskId ? `/tasks?select=${encodeURIComponent(delegated.taskId)}` : '/tasks';
   return (
     <div className="flex gap-3">
@@ -409,7 +428,7 @@ function DelegatedWorkCard({ message, delegated }: {
           <div className="flex items-center gap-2">
             <span className="h-2 w-2 shrink-0 animate-breathe rounded-full bg-success" aria-hidden />
             <span className="min-w-0 truncate text-small font-semibold text-fg">Working on this in the background</span>
-            <span className="ml-auto shrink-0 text-caption tabular-nums text-faint" title="time since this live view opened">{elapsed}</span>
+            <span className="ml-auto shrink-0 text-caption tabular-nums text-faint" title={elapsedTitle}>{elapsed}</span>
           </div>
           {message.progress && (
             <p className="mt-1.5 text-body text-muted">{message.progress}</p>

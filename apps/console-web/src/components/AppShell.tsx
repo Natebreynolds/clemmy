@@ -38,7 +38,14 @@ export function AppShell() {
   // kicked-off background work updates the badge without moving the user's UI.
   const board = usePoll(['board'], listBoard, liveAgentsOpen ? 4000 : 12_000);
   const boardCards = board.data?.cards ?? [];
-  const liveRunCount = liveAgentBadgeCount(boardCards);
+  // The badge never counts the conversation the user is currently watching —
+  // its bubble already narrates itself; other live work (background AND
+  // foreground turns in other chats) counts.
+  const currentChatMatch = /^\/chat\/([^/]+)/.exec(location.pathname);
+  const liveRunCount = liveAgentBadgeCount(
+    boardCards,
+    currentChatMatch ? decodeURIComponent(currentChatMatch[1]) : null,
+  );
 
   const toggleLiveAgents = () => {
     setLiveAgentsOpen((current) => {

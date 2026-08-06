@@ -13,7 +13,7 @@
  * chat); below xl it is a scrimmed dialog with a focus trap.
  */
 import { useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { ArrowRight, Bot, CircleStop, X } from 'lucide-react';
 import { Button } from './ui/Button';
@@ -21,7 +21,7 @@ import { cn } from '@/lib/cn';
 import { runBoardAction, type BoardCard } from '@/lib/board';
 import { liveAgentRows, liveAgentTarget, sourceKindLabel, type LiveAgentRow } from '@/lib/live-agents';
 
-function AgentRow({ row, onOpen }: { row: LiveAgentRow; onOpen: () => void }) {
+function AgentRow({ row, onOpen, isCurrentChat }: { row: LiveAgentRow; onOpen: () => void; isCurrentChat: boolean }) {
   const qc = useQueryClient();
   const [stopping, setStopping] = useState(false);
   const [stopError, setStopError] = useState('');
@@ -55,7 +55,9 @@ function AgentRow({ row, onOpen }: { row: LiveAgentRow; onOpen: () => void }) {
             <span className="shrink-0 text-caption text-faint">{row.updatedLabel}</span>
           </span>
           <span className="mt-1 flex min-w-0 items-start gap-2 pl-4">
-            <span className="shrink-0 rounded border border-border px-1.5 py-px text-caption text-muted">{sourceKindLabel(row.sourceKind)}</span>
+            <span className="shrink-0 rounded border border-border px-1.5 py-px text-caption text-muted">
+              {isCurrentChat ? 'this chat' : sourceKindLabel(row.sourceKind)}
+            </span>
             {/* line-clamp-2, NOT truncate: the status line carries the progress
                 counts, and a single-line ellipsis in a 320px panel cut them off —
                 the board card already clamps this same field to two lines. */}
@@ -100,6 +102,11 @@ export function LiveAgentsPanel({
 }) {
   const panelRef = useRef<HTMLElement | null>(null);
   const navigate = useNavigate();
+  const location = useLocation();
+  // The conversation currently on screen — its foreground row reads "this
+  // chat" and clicking it just closes the panel (you are already there).
+  const currentChatMatch = /^\/chat\/([^/]+)/.exec(location.pathname);
+  const currentChatSessionId = currentChatMatch ? decodeURIComponent(currentChatMatch[1]) : null;
   const [mobileDialog, setMobileDialog] = useState(() => (
     typeof window !== 'undefined' ? window.matchMedia('(max-width: 1279px)').matches : false
   ));
@@ -173,7 +180,7 @@ export function LiveAgentsPanel({
       >
         <div className="app-drag flex min-h-14 min-w-0 shrink-0 items-center gap-3 border-b border-border px-4 py-2">
           <Bot className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-          <h2 id="live-agents-title" className="min-w-0 flex-1 truncate text-body font-semibold text-fg">Background work</h2>
+          <h2 id="live-agents-title" className="min-w-0 flex-1 truncate text-body font-semibold text-fg">Working now</h2>
           <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close live agents" title="Close" className="app-no-drag">
             <X className="h-4 w-4" aria-hidden />
           </Button>
@@ -187,17 +194,24 @@ export function LiveAgentsPanel({
             </div>
           ) : rows.length === 0 ? (
             <div className="px-1 py-6 text-center text-small text-muted">
-              {loading ? 'Checking…' : 'Nothing running in the background.'}
+              {loading ? 'Checking…' : 'Nothing running right now.'}
             </div>
           ) : (
             <ul className="flex flex-col gap-2">
-              {rows.map((row) => (
-                <AgentRow
-                  key={row.id}
-                  row={row}
-                  onOpen={() => { onClose(); navigate(liveAgentTarget(row)); }}
-                />
-              ))}
+              {rows.map((row) => {
+                const isCurrentChat = row.foreground && Boolean(currentChatSessionId) && row.sessionId === currentChatSessionId;
+                return (
+                  <AgentRow
+                    key={row.id}
+                    row={row}
+                    isCurrentChat={isCurrentChat}
+                    onOpen={() => {
+                      onClose();
+                      if (!isCurrentChat) navigate(liveAgentTarget(row));
+                    }}
+                  />
+                );
+              })}
             </ul>
           )}
         </div>

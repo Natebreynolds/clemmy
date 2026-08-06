@@ -27,6 +27,9 @@ export interface LiveAgentRow {
   updatedLabel: string;
   canStop: boolean;
   sessionId: string | null;
+  /** A live FOREGROUND chat turn (canonical harness attempt). Rendered with a
+   *  "chat" chip and deep-links to its conversation instead of the board. */
+  foreground: boolean;
   card: BoardCard;
 }
 
@@ -56,18 +59,25 @@ export function sourceKindLabel(kind: BoardSourceKind): string {
     case 'execution': return 'execution';
     case 'approval': return 'approval';
     case 'schedule': return 'scheduled';
-    case 'run': return 'run';
+    case 'run': return 'chat';
     default: return 'work';
   }
 }
 
 /**
- * The panel's rows: genuinely RUNNING work only, newest first. Queued work
- * has not started, finished work reports back into the chat + Delivered, and
- * waiting-on-you items live on the Needs-you strip / Inbox / Tasks — none of
- * them belong here. A `parked` workflow run mis-columns as running upstream
- * (the column derives from inFlightStepId alone) but is actually blocking on
- * the user, so it is excluded too.
+ * The panel's rows: genuinely RUNNING work only — foreground AND background —
+ * newest first. Queued work has not started, finished work reports back into
+ * the chat + Delivered, and waiting-on-you items live on the Needs-you strip /
+ * Inbox / Tasks — none of them belong here (the 2026-07-30 declutter stands).
+ * A `parked` workflow run mis-columns as running upstream (the column derives
+ * from inFlightStepId alone) but is actually blocking on the user, excluded.
+ *
+ * FOREGROUND turns are rows now (owner ask, 2026-08-05): "what is Clem doing
+ * right now" must include a chat turn running in ANOTHER conversation — it
+ * was invisible on every surface. They render with a "chat" chip and
+ * deep-link to their conversation. The panel still never auto-opens, and the
+ * BADGE still excludes the conversation the user is currently watching (its
+ * progress is already on screen in the bubble — counting it read as noise).
  */
 export function liveAgentRows(cards: BoardCard[]): LiveAgentRow[] {
   return cards
@@ -75,7 +85,6 @@ export function liveAgentRows(cards: BoardCard[]): LiveAgentRow[] {
       card.column === 'running'
       && !card.archived
       && card.status !== 'parked'
-      && !isForegroundConversationCard(card)
     ))
     .sort((a, b) => a.ageMs - b.ageMs)
     .map((card) => ({
@@ -86,19 +95,29 @@ export function liveAgentRows(cards: BoardCard[]): LiveAgentRow[] {
       updatedLabel: updatedLabel(card.ageMs),
       canStop: card.actions.includes('cancel'),
       sessionId: card.sessionId,
+      foreground: isForegroundConversationCard(card),
       card,
     }));
 }
 
-/** Badge on the toggle button: how many agents are live right now. */
-export function liveAgentBadgeCount(cards: BoardCard[]): number {
-  return liveAgentRows(cards).length;
+/** Badge on the toggle button: live work that is NOT the conversation the
+ *  user is currently looking at — its bubble already narrates itself. */
+export function liveAgentBadgeCount(cards: BoardCard[], currentSessionId?: string | null): number {
+  return liveAgentRows(cards)
+    .filter((row) => !(row.foreground && currentSessionId && row.sessionId === currentSessionId))
+    .length;
 }
 
 /** Exact Tasks target for a row. The board-card id is unique while session ids
  * are intentionally reusable across attempts, so every in-page row selects its
  * own card and carries lineage only as an additional fail-closed constraint. */
 export function liveAgentTarget(row: LiveAgentRow): string {
+  // A live foreground turn's natural home is its conversation — the bubble
+  // there is the expanded live view. The board remains the fallback when the
+  // session id is unknown.
+  if (row.foreground && row.sessionId) {
+    return `/chat/${encodeURIComponent(row.sessionId)}`;
+  }
   const select = row.card.id || row.sessionId || row.id;
   const params = new URLSearchParams({ select });
   if (row.card.attemptId) params.set('attemptId', row.card.attemptId);

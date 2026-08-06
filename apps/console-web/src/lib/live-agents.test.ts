@@ -53,13 +53,29 @@ test('liveAgentRows: RUNNING only — needs_you, queued, done, archived, and par
     // waiting on the user — it is NOT live work.
     card({ id: 'parked', column: 'running', status: 'parked', sourceKind: 'workflow', title: 'Parked on approval' }),
   ]);
-  assert.deepEqual(rows.map((r) => r.title), ['Fresh run', 'Old run']);
+  // Foreground turns are rows now (2026-08-05): a chat running in another
+  // conversation was invisible on every surface. Waiting/queued/done/archived/
+  // parked exclusions are unchanged — the declutter stands.
+  assert.deepEqual(rows.map((r) => r.title), ['Fresh run', 'The chat I am already watching', 'Old run']);
   assert.equal(rows[0].canStop, true, 'a running card with a cancel action gets the stop affordance');
-  assert.equal(liveAgentBadgeCount([
+  assert.equal(rows.find((r) => r.sourceKind === 'run')?.foreground, true, 'a chat turn is marked foreground');
+  // The badge counts other-chat foreground turns, but never the conversation
+  // the user is currently watching — its bubble already narrates itself.
+  const badgeCards = [
     card({ id: 'a', column: 'running' }),
-    card({ id: 'chat', sourceKind: 'run', attemptId: 'attempt:discord:1', column: 'running' }),
+    card({ id: 'chat', sourceKind: 'run', attemptId: 'attempt:discord:1', column: 'running', sessionId: 'sess-elsewhere' }),
     card({ id: 'b', column: 'needs_you', sourceKind: 'approval' }),
-  ]), 1, 'the badge counts live agents, never waiting items');
+  ];
+  assert.equal(liveAgentBadgeCount(badgeCards), 2, 'a foreground turn in another chat counts');
+  assert.equal(liveAgentBadgeCount(badgeCards, 'sess-elsewhere'), 1, 'the currently watched chat never counts');
+});
+
+test('a foreground row deep-links to its conversation, not the board', async () => {
+  const { liveAgentTarget } = await import('./live-agents');
+  const rows = liveAgentRows([
+    card({ id: 'fg', sourceKind: 'run', attemptId: 'attempt:desktop:9', column: 'running', sessionId: 'sess-desktop-abc' }),
+  ]);
+  assert.equal(liveAgentTarget(rows[0]), '/chat/sess-desktop-abc');
 });
 
 test('rows deep-link to the exact trace identity when one exists', () => {
