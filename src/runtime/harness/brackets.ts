@@ -1000,6 +1000,10 @@ export interface HarnessRunContext {
   /** Per-turn budget for recall_tool_result calls. Optional — when
    *  absent (e.g. tests, non-harness call paths), recall is unmetered. */
   recallBudget?: RecallBudget;
+  /** The model this run is routed on. Lets in-context consumers (fan-out
+   *  envelopes, recall budgets) scale their tuned-for-200K defaults to the
+   *  window actually available — absent ⇒ consumers keep the tuned default. */
+  routedModelId?: string;
   /** Warn-advisory dedupe: (action:rule:tool) tuples already logged as
    *  guardrail_tripped events this run context (2026-07-24 feed-spam fix). */
   guardrailAdvisoryLogged?: Set<string>;

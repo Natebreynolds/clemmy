@@ -76,3 +76,13 @@ test('acceptance at or below current belief writes nothing (steady-state cost is
   recordWindowAcceptance('gpt-5.4', 100_000); // below the 272K registry row
   assert.equal(effectiveContextWindow('gpt-5.4'), 272_000, 'registry belief unchanged');
 });
+
+test('windowScaleForModel: tuned-for-200K defaults scale with the real window, clamped [1, 4]', async () => {
+  _resetModelWindowObservationCacheForTests();
+  const { windowScaleForModel } = await import('./model-window-observations.js');
+  assert.equal(windowScaleForModel('gpt-5.4'), 272_000 / 200_000, 'codex 272K scales 1.36x');
+  assert.equal(windowScaleForModel('kimi-k3'), 4, '1M window clamps at 4x, never unbounded');
+  assert.equal(windowScaleForModel('claude-opus-4-8'), 4);
+  assert.equal(windowScaleForModel('totally-unknown-model'), 1, 'unknown window never scales below the tuned default');
+  assert.equal(windowScaleForModel(undefined), 1);
+});

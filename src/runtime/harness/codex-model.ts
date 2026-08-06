@@ -708,6 +708,22 @@ export class CodexResponsesModel implements Model {
       // #streamCodex. Stored in a separate folder so 4xx traces and
       // SSE-truncation traces don't blur together.
       await writeSseTruncationTrace(this.modelId, diagContext, body);
+      // Oversized-prefill learning: the Codex-OAuTH transport is known to
+      // SSE-truncate ~1.4MB request bodies WITHOUT a clean 4xx, so the
+      // context-overflow ratchet never fires for it. When the request body
+      // was large enough to plausibly be the cause, ratchet this model's
+      // effective window down the same way an overflow does — window-aware
+      // budgets then converge below the transport's real ceiling instead of
+      // truncating every subsequent turn (2026-08-05 all-lane review; the
+      // direct Responses API accepted 4.4MB probe bodies, so this only ever
+      // fires where the cliff actually exists).
+      const truncRequestBytes = typeof lastDiag?.requestBytes === 'number' ? lastDiag.requestBytes : 0;
+      if (truncRequestBytes > 1_000_000) {
+        try {
+          const { recordWindowRejection } = await import('./model-window-observations.js');
+          recordWindowRejection(this.modelId);
+        } catch { /* learning is additive */ }
+      }
       // Emit a structured log line BEFORE the throw so the failure is
       // visible even if a downstream consumer swallows BoundaryError's
       // .context. Pino warn level — surfaces in the supervisor log

@@ -138,6 +138,24 @@ export function effectiveContextWindow(modelId: string | undefined | null): numb
   return window;
 }
 
+/**
+ * How much roomier this model is than the 200K-era baseline every fixed
+ * harness threshold was tuned against. Consumers multiply their tuned default
+ * by this — never divide below 1 (small windows are protected by the
+ * compaction budget, not by shrinking result surfaces), and capped so a 1M
+ * window loosens generously without becoming unbounded. Env overrides at each
+ * consumer still win untouched.
+ */
+export function windowScaleForModel(modelId: string | undefined | null, maxScale = 4): number {
+  try {
+    const scale = effectiveContextWindow(modelId) / 200_000;
+    if (!Number.isFinite(scale)) return 1;
+    return Math.min(maxScale, Math.max(1, scale));
+  } catch {
+    return 1;
+  }
+}
+
 /** Test-only: reset the read cache (the state file is under a temp HOME in tests). */
 export function _resetModelWindowObservationCacheForTests(): void {
   cache = null;

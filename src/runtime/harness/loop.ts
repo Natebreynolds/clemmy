@@ -49,6 +49,7 @@ import {
   compactionBudgetForModel,
   checkpointGoalStage,
 } from './compaction.js';
+import { windowScaleForModel } from './model-window-observations.js';
 import {
   pullRecentTurnsForHarnessHistory,
   renderRecentActionsForHarnessHistory,
@@ -2123,6 +2124,7 @@ function strictStructuredNoToolResultText(value: unknown): string | null {
 }
 
 export const _testOnly_strictStructuredNoToolResultText = strictStructuredNoToolResultText;
+export const _testOnly_recallBudgetDefaults = { recallBudgetMaxCalls, recallBudgetMaxBytes };
 
 function positiveIntEnv(key: string, fallback: number): number {
   const parsed = Number.parseInt(getRuntimeEnv(key, String(fallback)), 10);
@@ -7473,9 +7475,12 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         // accounts:[] and the contract checker (rightly) halted the run. Data
         // grows daily; a fixed 60KB budget is a cliff every long-lived source
         // eventually walks off. Still bounded per turn to protect compaction.
+        // Defaults scale with the routed model's window (5/150KB were tuned
+        // for a 200K window; a 1M-window brain paging a large parked payload
+        // hit the cliff at 3 slices). Env overrides stay absolute.
         const recallBudget = new RecallBudget(
-          recallBudgetMaxCalls(),
-          recallBudgetMaxBytes(),
+          recallBudgetMaxCalls(windowScaleForModel(routedModelIdForBudget)),
+          recallBudgetMaxBytes(windowScaleForModel(routedModelIdForBudget)),
         );
         harnessCtx = {
           sessionId: options.sessionId,
@@ -7484,6 +7489,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
           behaviorScopeId: `${options.sessionId}::turn:${turn}`,
           recallBudget,
+          ...(routedModelIdForBudget ? { routedModelId: routedModelIdForBudget } : {}),
           mcpToolScope: options.mcpToolScope !== undefined
             ? options.mcpToolScope
             : (() => {
@@ -10481,11 +10487,13 @@ function truncate(s: string, n: number): string {
 /** Per-turn recall_tool_result budget — env-tunable so grown data sources
  *  (a daily-append tracker sheet) don't hit a hard cliff. Defaults sized to
  *  page a ~150KB payload in one turn while still bounding re-inflation. */
-function recallBudgetMaxCalls(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_MAX_CALLS', '5') ?? '5', 10);
-  return Number.isFinite(raw) && raw >= 1 ? raw : 5;
+function recallBudgetMaxCalls(windowScale = 1): number {
+  const fallback = Math.round(5 * windowScale);
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_MAX_CALLS', String(fallback)) ?? String(fallback), 10);
+  return Number.isFinite(raw) && raw >= 1 ? raw : fallback;
 }
-function recallBudgetMaxBytes(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_MAX_BYTES', '150000') ?? '150000', 10);
-  return Number.isFinite(raw) && raw >= 10_000 ? raw : 150_000;
+function recallBudgetMaxBytes(windowScale = 1): number {
+  const fallback = Math.round(150_000 * windowScale);
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_MAX_BYTES', String(fallback)) ?? String(fallback), 10);
+  return Number.isFinite(raw) && raw >= 10_000 ? raw : fallback;
 }

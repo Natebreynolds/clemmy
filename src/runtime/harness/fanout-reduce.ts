@@ -42,6 +42,8 @@ import { BASE_DIR, MODELS, getRuntimeEnv } from '../../config.js';
 import { listEvents, writeToolOutput } from './eventlog.js';
 import { summarizeFanoutCoverage } from './fanout-ledger.js';
 import { toolCallHint } from './tool-call-hint.js';
+import { windowScaleForModel } from './model-window-observations.js';
+import { harnessRunContextStorage } from './brackets.js';
 
 // ---------------------------------------------------------------------------
 // Switches + tunables
@@ -57,10 +59,25 @@ export function chatFanoutDigestEnabled(): boolean {
   return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
 }
 
-/** Verbatim exemplars before digest mode engages. N ≤ this ⇒ byte-identical. */
+/** The PARENT's window scale — fan-out envelopes return into the parent's
+ *  context, and every size here was tuned against the 200K-era assumption.
+ *  A 700-char digest that was thrift on a 200K parent is starvation on an
+ *  880K/1M one: each exact figure costs a tool_output_query round-trip on the
+ *  run's fattest context (2026-08-05 deep-look). Absent context ⇒ scale 1. */
+function parentWindowScale(): number {
+  try {
+    return windowScaleForModel(harnessRunContextStorage.getStore()?.routedModelId);
+  } catch {
+    return 1;
+  }
+}
+
+/** Verbatim exemplars before digest mode engages. N ≤ this ⇒ byte-identical.
+ *  Default scales with the parent's window (8 → up to 32); env stays absolute. */
 export function fanoutDigestThreshold(): number {
-  const n = Number.parseInt(getRuntimeEnv('CLEMMY_REDUCE_FANOUT_THRESHOLD', '8') ?? '8', 10);
-  return Number.isFinite(n) && n >= 1 ? n : 8;
+  const fallback = Math.round(8 * parentWindowScale());
+  const n = Number.parseInt(getRuntimeEnv('CLEMMY_REDUCE_FANOUT_THRESHOLD', String(fallback)) ?? String(fallback), 10);
+  return Number.isFinite(n) && n >= 1 ? n : fallback;
 }
 
 export function reduceShardSize(): number {
@@ -69,6 +86,12 @@ export function reduceShardSize(): number {
 }
 
 const ENVELOPE_DIGEST_MAX = 700;
+/** Per-item envelope digest budget, scaled to the parent's window (700 → up
+ *  to 2,800 chars) so results visibly ARRIVE instead of every figure hiding
+ *  behind a drill-in round-trip. */
+export function envelopeDigestMax(): number {
+  return Math.round(ENVELOPE_DIGEST_MAX * parentWindowScale());
+}
 const REDUCER_PER_ITEM_INPUT_MAX = 4_000; // compaction's per-result cap
 const WINDOW_IDLE_RESET_MS = 10 * 60 * 1_000;
 /** How long a filling envelope waits for its own shard's summary in-band. */
@@ -515,7 +538,7 @@ export async function buildWorkerReturn(input: WorkerReturnInput): Promise<strin
 
     const envelope = [
       `✓ DONE: ${JSON.stringify(input.item)}`,
-      `digest: ${zeroLlmDigest(input.text)}`,
+      `digest: ${zeroLlmDigest(input.text, envelopeDigestMax())}`,
       `full output parked: ${toolCallHint('tool_output_query', { call_id: input.callId })} for records, ${toolCallHint('recall_tool_result', { call_id: input.callId })} for raw text.`,
       `${coverage} shard summaries: ${fanoutReduceDir(input.parentRunId)} (workspace_artifact_query when you synthesize).`,
       'RULE: report only figures visible above or fetched via the readers — never reconstruct a number from memory of this digest.',

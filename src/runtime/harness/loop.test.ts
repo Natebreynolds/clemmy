@@ -10191,3 +10191,21 @@ test('a failing synthetic-directive turn on a chat session never surfaces the in
   assert.equal(asks.length, 0, 'no retry/switch/stop ask for a turn the user never sent');
   assert.notEqual(result.status, 'awaiting_user_input', 'the relay fails quiet, not interactive');
 });
+
+test('recall budget defaults scale with the routed window; env overrides stay absolute', async () => {
+  // 5 calls / 150KB were tuned for a 200K window — a 1M-window brain paging a
+  // large parked payload hit the cliff at 3 slices (2026-08-05 deep-look).
+  const { _testOnly_recallBudgetDefaults } = await import('./loop.js');
+  const { recallBudgetMaxCalls, recallBudgetMaxBytes } = _testOnly_recallBudgetDefaults;
+  assert.equal(recallBudgetMaxCalls(1), 5, 'tuned default at scale 1');
+  assert.equal(recallBudgetMaxCalls(4), 20, '1M window quadruples the call budget');
+  assert.equal(recallBudgetMaxBytes(4), 600_000, '1M window quadruples the byte budget');
+  const prev = process.env.CLEMMY_RECALL_MAX_CALLS;
+  process.env.CLEMMY_RECALL_MAX_CALLS = '7';
+  try {
+    assert.equal(recallBudgetMaxCalls(4), 7, 'an explicit env override is absolute, never scaled');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_RECALL_MAX_CALLS;
+    else process.env.CLEMMY_RECALL_MAX_CALLS = prev;
+  }
+});

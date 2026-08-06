@@ -349,3 +349,29 @@ test('recordReduceDigest / readReduceDigest round-trip in the run workspace', as
   assert.doesNotThrow(() => JSON.parse(readFileSync(abs, 'utf-8')), 'artifact is JSON (workspace_artifact_query-readable)');
   assert.equal(readReduceDigest('wf-test', 'run-1', 'missing-step'), null);
 });
+
+test('fan-out envelope sizes scale with the PARENT window (2026-08-05 deep-look)', async () => {
+  // 200K-era thrift (8 verbatim, 700-char digests) is starvation on an
+  // 880K/1M parent: every exact figure costs a drill-in round-trip on the
+  // run's fattest context. Defaults scale via the run context's routedModelId;
+  // absent context keeps the tuned defaults; env overrides stay absolute.
+  const { fanoutDigestThreshold, envelopeDigestMax } = await import('./fanout-reduce.js');
+  const { withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
+
+  assert.equal(fanoutDigestThreshold(), 8, 'no run context → tuned default');
+  assert.equal(envelopeDigestMax(), 700, 'no run context → tuned default');
+
+  await withHarnessRunContext(
+    { sessionId: 'sess-scale', counter: new ToolCallsCounter(10), routedModelId: 'claude-opus-4-8' },
+    async () => {
+      assert.equal(fanoutDigestThreshold(), 32, '1M parent sees 4x verbatim exemplars');
+      assert.equal(envelopeDigestMax(), 2800, '1M parent gets 4x digest budget');
+    },
+  );
+  await withHarnessRunContext(
+    { sessionId: 'sess-scale2', counter: new ToolCallsCounter(10), routedModelId: 'gpt-5.4' },
+    async () => {
+      assert.equal(fanoutDigestThreshold(), Math.round(8 * 1.36), '272K parent scales proportionally');
+    },
+  );
+});
