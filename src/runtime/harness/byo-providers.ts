@@ -453,13 +453,45 @@ export async function discoverProviderModels(
 
   const json = (await resp.json().catch(() => null)) as unknown;
   const models = normalizeModelsList(json);
-  // Provider-published windows become durable observations — the evidence
-  // that keeps budgeting honest as models change without a code release.
-  try {
-    const { recordCatalogWindow } = await import('./model-window-observations.js');
-    for (const m of models) {
-      if (m.contextLength !== undefined) recordCatalogWindow(m.id, m.contextLength, baseURL);
-    }
-  } catch { /* discovery result is unaffected */ }
+  recordCatalogWindowsFromModels(models, baseURL);
   return { status: 200, body: { models } };
 }
+
+/** Best-effort: persist provider-published windows as observations. */
+function recordCatalogWindowsFromModels(models: DiscoveredModel[], source: string): void {
+  try {
+    // Lazy import keeps this module's load graph unchanged for tests that stub
+    // the discovery path.
+    void import('./model-window-observations.js').then(({ recordCatalogWindow }) => {
+      for (const m of models) {
+        if (m.contextLength !== undefined) recordCatalogWindow(m.id, m.contextLength, source);
+      }
+    }).catch(() => { /* discovery result is unaffected */ });
+  } catch { /* discovery result is unaffected */ }
+}
+
+/**
+ * Daemon-start catalog warm: list every CONFIGURED BYO provider's models once
+ * so their published context windows become durable observations WITHOUT
+ * anyone opening the models UI (the observation layer shipped 2026-08-05 was
+ * only fed by the console route — a daemon that never opened that page ran on
+ * registry seeds forever). Fire-and-forget, short timeout, never throws — a
+ * provider being down must not slow daemon start.
+ */
+export async function warmByoProviderCatalogs(timeoutMs = 8_000): Promise<number> {
+  let recorded = 0;
+  try {
+    const providers = getByoProviders().filter((p) => providerToBackendConfig(p).configured);
+    await Promise.all(providers.map(async (p) => {
+      try {
+        const apiKey = getByoProviderApiKey(p.id) ?? '';
+        const result = await discoverProviderModels({ baseURL: p.baseURL, apiKey }, fetch, timeoutMs);
+        if (result.status === 200 && 'models' in result.body) {
+          recorded += result.body.models.filter((m) => m.contextLength !== undefined).length;
+        }
+      } catch { /* per-provider best-effort */ }
+    }));
+  } catch { /* warm is additive — never breaks startup */ }
+  return recorded;
+}
+

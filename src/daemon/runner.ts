@@ -1754,6 +1754,14 @@ export async function startDaemon(
     },
     'Model catalog discovery initialized',
   );
+  // BYO catalog warm (fire-and-forget): providers that publish context_length
+  // on /v1/models (Together, Moonshot) get their windows recorded as durable
+  // observations at startup, so window budgeting runs on provider evidence
+  // instead of registry seeds even if the models UI is never opened.
+  void import('../runtime/harness/byo-providers.js')
+    .then(({ warmByoProviderCatalogs }) => warmByoProviderCatalogs())
+    .then((n) => { if (n > 0) logger.info({ windows: n }, 'BYO provider catalog windows recorded'); })
+    .catch(() => { /* warm is additive — never blocks startup */ });
   ensureDir(CRON_PROGRESS_DIR);
   // Warm capability retrieval OFF the request path. The local model takes a few
   // seconds the first time and milliseconds afterwards; doing it here means the

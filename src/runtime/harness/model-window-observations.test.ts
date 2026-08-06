@@ -86,3 +86,28 @@ test('windowScaleForModel: tuned-for-200K defaults scale with the real window, c
   assert.equal(windowScaleForModel('totally-unknown-model'), 1, 'unknown window never scales below the tuned default');
   assert.equal(windowScaleForModel(undefined), 1);
 });
+
+test('warmByoProviderCatalogs: daemon start records provider windows without the models UI (fire-and-forget, dead-provider safe)', async () => {
+  // REGRESSION PIN (2026-08-06 live-run review): the observation layer shipped
+  // with the console route as its only catalog feed — a daemon whose models UI
+  // was never opened ran on registry seeds forever. The startup warm lists
+  // every CONFIGURED provider and records published windows; a dead provider
+  // must cost only its own timeout, never a throw.
+  _resetModelWindowObservationCacheForTests();
+  const { warmByoProviderCatalogs, discoverProviderModels } = await import('./byo-providers.js');
+
+  // Direct path: a provider response with context_length reaches the store.
+  const fakeFetch = (async () => new Response(JSON.stringify({
+    data: [{ id: 'warm-test/model-a', context_length: 300_000 }, { id: 'warm-test/model-b' }],
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as unknown as typeof fetch;
+  const result = await discoverProviderModels({ baseURL: 'https://warm.example.test/v1', apiKey: 'k' }, fakeFetch);
+  assert.equal(result.status, 200);
+  // recording is fire-and-forget — give the microtask queue one beat.
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(effectiveContextWindow('warm-test/model-a'), 300_000, 'published window became an observation');
+  assert.equal(effectiveContextWindow('warm-test/model-b'), 128_000, 'no published window → registry fallback untouched');
+
+  // The startup wrapper never throws even with unreachable configured providers.
+  const recorded = await warmByoProviderCatalogs(500);
+  assert.equal(typeof recorded, 'number');
+});
