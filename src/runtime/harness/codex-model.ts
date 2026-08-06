@@ -601,6 +601,13 @@ export class CodexResponsesModel implements Model {
         // shape: snake_case detail spreads, camelCase token counts.
         const u = completedEvent?.response?.usage ?? {};
         recordCodexHarnessUsage(u, this.modelId, responseId ?? completedEvent?.response?.id);
+        // Proven-acceptance learning: a request the provider ACCEPTED at more
+        // input than we believed raises the window floor (writes only when it
+        // beats the current belief — steady-state cost is zero).
+        try {
+          const { recordWindowAcceptance } = await import('./model-window-observations.js');
+          recordWindowAcceptance(this.modelId, u.input_tokens);
+        } catch { /* learning is additive */ }
         yield {
           type: 'response_done',
           response: {
@@ -828,6 +835,19 @@ export class CodexResponsesModel implements Model {
           }
           // Transient refresh failure (network / 5xx): fall through to throw a
           // non-terminal 401 the loop can retry, rather than bricking auth.
+        }
+        // Context-overflow learning: the provider just PROVED our window
+        // belief is too big for this model. Ratchet the effective window down
+        // (model-window-observations) so the next turn's compaction budget
+        // self-corrects — a stale registry row costs ONE failed call, not a
+        // failing run. Detection mirrors the provider error codes/texts
+        // (OpenAI: context_length_exceeded / "exceeds the context window").
+        if (res.status >= 400 && res.status < 500
+          && /context_length_exceeded|exceeds the context window|maximum context length/i.test(detail ?? '')) {
+          try {
+            const { recordWindowRejection } = await import('./model-window-observations.js');
+            recordWindowRejection(this.modelId);
+          } catch { /* learning is additive */ }
         }
         // Persist a 4xx trace so operators can inspect the exact request
         // that Codex rejected. The codex-native-runtime path has the same

@@ -9,7 +9,7 @@ import {
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
 import { estimateInputTokens } from './token-estimator.js';
-import { resolveModelCapability } from './model-wire-registry.js';
+import { effectiveContextWindow } from './model-window-observations.js';
 import { toolCallHint } from './tool-call-hint.js';
 
 /**
@@ -82,7 +82,10 @@ const DEFAULT_INPUT_BUDGET_TOKENS = 200_000;
  */
 export function compactionBudgetForModel(modelId: string | undefined | null): number {
   try {
-    const window = resolveModelCapability(modelId).contextWindow;
+    // Evidence-first: provider catalog listings / live acceptances / overflow
+    // rejections override the static registry seed, so budgets track model
+    // changes without a code release (see model-window-observations.ts).
+    const window = effectiveContextWindow(modelId);
     return Number.isFinite(window) && window > 0 ? window : DEFAULT_INPUT_BUDGET_TOKENS;
   } catch {
     return DEFAULT_INPUT_BUDGET_TOKENS;
@@ -655,10 +658,35 @@ function serializeForSummarizer(items: AgentInputItem[]): string {
  * for the outer compaction loop — Layer 2 is best-effort, and Layer 3
  * can still take over if needed.
  */
-async function runSummarizerTurn(serializedOlder: string): Promise<SummarizerTurnResult> {
-  if (summarizerTurnForTests) return summarizerTurnForTests(serializedOlder);
+/**
+ * Cap the summarizer's INPUT to a safe fraction of the summarizer model's OWN
+ * window. Latent until window-aware budgets (2026-08-05): on a 200K-budget
+ * session Layer 2 fired at ~110K tokens of history and the per-item caps kept
+ * the serialized blob far under the fast model's 272K window — but on an
+ * 880K/1M-budget session the 55% trigger can serialize MORE history than the
+ * summarizer itself can read, and the overflowing call would fail Layer 2
+ * every turn until the Layer 3 fork. Truncate from the HEAD (oldest lines):
+ * Layer 2 is lossy by design, parked tool outputs stay recallable by call_id,
+ * and the omission is stated so the summary never silently claims coverage.
+ * 60% of the window (×4 chars/token) leaves room for the prompt + output.
+ */
+export function capSummarizerInput(serializedOlder: string, summarizerModelId: string): string {
+  const maxChars = Math.floor(effectiveContextWindow(summarizerModelId) * 4 * 0.6);
+  if (serializedOlder.length <= maxChars) return serializedOlder;
+  const kept = serializedOlder.slice(-maxChars);
+  // Start at a line boundary so the first kept line isn't a severed fragment.
+  const firstNewline = kept.indexOf('\n');
+  const clean = firstNewline > 0 && firstNewline < 2_000 ? kept.slice(firstNewline + 1) : kept;
+  const droppedChars = serializedOlder.length - clean.length;
+  return `[NOTE: the ${droppedChars.toLocaleString()} oldest chars of this history were omitted from summarization — their exact tool outputs remain recallable by call_id.]\n${clean}`;
+}
 
+async function runSummarizerTurn(serializedOlder: string): Promise<SummarizerTurnResult> {
   const model = getSummarizerModel();
+  // Cap BEFORE the test hook so the pin can observe exactly what a live
+  // summarizer would receive.
+  serializedOlder = capSummarizerInput(serializedOlder, model);
+  if (summarizerTurnForTests) return summarizerTurnForTests(serializedOlder);
   try {
     const agent = new Agent({
       name: 'Compaction Summarizer',

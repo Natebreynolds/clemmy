@@ -574,20 +574,53 @@ test('compactionBudgetForModel: budget tracks the ROUTED model window, never a f
   const { compactionBudgetForModel } = await import('./compaction.js');
   const { resolveModelCapability } = await import('./model-wire-registry.js');
 
-  // BYO small-window model: budget = its real 128K window, so Layer 3 (90% =
-  // ~115K) now forks BEFORE provider overflow.
-  assert.equal(compactionBudgetForModel('glm-4.7'), 128_000);
-  assert.ok(compactionBudgetForModel('glm-4.7') * 0.9 < 128_000, 'fork fires inside the real window');
-
-  // Codex: real window is 272K — the old constant was silently TIGHTER than
-  // the model's capacity.
+  // LIVE-VERIFIED windows (2026-08-05): Together/Moonshot /v1/models report
+  // context_length; gpt-5.6 was probed against the Responses API (accept at
+  // 880,007 input tokens, reject at 882,007); gpt-5.4 live-rejected 280K,
+  // confirming the documented 272K input cap; Claude Opus 4.8 / Sonnet 5 are
+  // 1M per the platform docs. Budget = the real window, so Layer 3 always
+  // forks INSIDE it and large-window models stop compacting at a fraction of
+  // their capacity.
+  assert.equal(compactionBudgetForModel('glm-4.7'), 202_752);
+  assert.ok(compactionBudgetForModel('glm-4.7') * 0.9 < 202_752, 'fork fires inside the real window');
+  assert.equal(compactionBudgetForModel('zai-org/GLM-5.2'), 512_000);
+  // Bare `glm-5.2` is a DIFFERENT id owned by a different backend (exact-id
+  // provider ownership) — it seeds from the conservative GLM family row until
+  // its own provider's catalog/live evidence teaches its real window.
+  assert.equal(compactionBudgetForModel('glm-5.2'), 202_752);
+  assert.equal(compactionBudgetForModel('kimi-k3'), 1_048_576);
+  assert.equal(compactionBudgetForModel('kimi-k2.6'), 262_144);
+  assert.equal(compactionBudgetForModel('gpt-5.6-sol'), 880_000);
   assert.equal(compactionBudgetForModel('gpt-5.4'), 272_000);
-
-  // Claude models: 200K — byte-identical behavior to the old constant.
-  assert.equal(compactionBudgetForModel('claude-opus-4-8'), 200_000);
+  assert.equal(compactionBudgetForModel('claude-opus-4-8'), 1_000_000);
+  assert.equal(compactionBudgetForModel('claude-sonnet-5'), 1_000_000);
+  // Fable 5: not yet documented at 1M — held at 200K (over-stating overflows
+  // the provider; under-stating only compacts early).
+  assert.equal(compactionBudgetForModel('claude-fable-5'), 200_000);
 
   // Unknown wire: the registry's conservative default, never the old 200K
   // (which would overflow an unknown 128K-class backend).
   assert.equal(compactionBudgetForModel('totally-unknown-model'), resolveModelCapability('totally-unknown-model').contextWindow);
   assert.equal(compactionBudgetForModel(undefined), resolveModelCapability(undefined).contextWindow);
+});
+
+test('capSummarizerInput: the Layer-2 summarizer can never be fed more than its own window', async () => {
+  // REGRESSION PIN (2026-08-05 deep-look): window-aware budgets let an
+  // 880K/1M-budget session serialize MORE older history than the fast
+  // summarizer model can read — the overflowing call would fail Layer 2 every
+  // turn until the Layer 3 fork. The cap truncates from the HEAD (oldest),
+  // keeps line boundaries, and STATES the omission.
+  const { capSummarizerInput } = await import('./compaction.js');
+  const { effectiveContextWindow } = await import('./model-window-observations.js');
+
+  const line = `[TOOL_RESULT call_id=call_x] ${'r'.repeat(400)}`;
+  const huge = Array.from({ length: 20_000 }, () => line).join('\n'); // ~8MB ≈ 2M tokens
+  const capped = capSummarizerInput(huge, 'gpt-5.4');
+  const budgetChars = Math.floor(effectiveContextWindow('gpt-5.4') * 4 * 0.6);
+  assert.ok(capped.length <= budgetChars + 300, 'capped within the summarizer window budget (+note)');
+  assert.match(capped, /oldest chars of this history were omitted/, 'omission is stated, never silent');
+  assert.match(capped.split('\n')[1] ?? '', /^\[TOOL_RESULT/, 'kept text starts on a line boundary');
+
+  const small = 'short history';
+  assert.equal(capSummarizerInput(small, 'gpt-5.4'), small, 'under-budget input passes through byte-identical');
 });

@@ -175,7 +175,11 @@ const REGISTRY: RegistryRow[] = [
     idMatch: /claude-opus-4-(7|8)|claude-opus-4\.(7|8)/i,
     cap: {
       family: 'claude-opus-4.7/4.8', apiShape: 'anthropic_messages',
-      contextWindow: 200_000, maxOutput: 64_000, supportsEffort: true,
+      // 1M on the Claude API (platform docs, verified 2026-08-05; Opus 4.6+ and
+      // Sonnet 4.6+ carry the 1M window; Sonnet 4.5 and older stay 200K). Note
+      // long-context requests above 200K input bill at Anthropic's premium
+      // long-context tier — this field is a budgeting ceiling, not a spend plan.
+      contextWindow: 1_000_000, maxOutput: 64_000, supportsEffort: true,
       effortMap: ANTHROPIC_EFFORT_MAP, thinkingMode: 'effort',
       supportsPromptCache: true, cacheMinTokens: 4096, retryClass: 'anthropic',
     },
@@ -203,13 +207,27 @@ const REGISTRY: RegistryRow[] = [
     },
   },
   {
+    // Fable 5 split out: not yet documented at 1M — stays 200K until confirmed
+    // (an over-stated window overflows the provider; an under-stated one only
+    // compacts early).
+    idMatch: /claude-fable-5/i,
+    cap: {
+      family: 'fable-5', apiShape: 'anthropic_messages',
+      contextWindow: 200_000, maxOutput: 64_000, supportsEffort: true,
+      effortMap: ANTHROPIC_EFFORT_MAP, thinkingMode: 'effort',
+      supportsPromptCache: true, cacheMinTokens: 2048, retryClass: 'anthropic',
+    },
+  },
+  {
     // Sonnet 5 is a 4.6+ generation Sonnet (effort + adaptive thinking, NOT the
     // legacy budget_tokens path) — it MUST match here and not fall through to the
     // claude-sonnet-legacy row below, which would 400 on effort/budget_tokens.
-    idMatch: /claude-fable-5|claude-sonnet-5|claude-sonnet-4-6|claude-sonnet-4\.6/i,
+    idMatch: /claude-sonnet-5|claude-sonnet-4-6|claude-sonnet-4\.6/i,
     cap: {
-      family: 'fable-5/sonnet-5/sonnet-4.6', apiShape: 'anthropic_messages',
-      contextWindow: 200_000, maxOutput: 64_000, supportsEffort: true,
+      family: 'sonnet-5/sonnet-4.6', apiShape: 'anthropic_messages',
+      // 1M on the Claude API (platform docs, verified 2026-08-05) — same
+      // long-context pricing caveat as the Opus 4.7/4.8 row above.
+      contextWindow: 1_000_000, maxOutput: 64_000, supportsEffort: true,
       effortMap: ANTHROPIC_EFFORT_MAP, thinkingMode: 'effort',
       supportsPromptCache: true, cacheMinTokens: 2048, retryClass: 'anthropic',
     },
@@ -227,6 +245,20 @@ const REGISTRY: RegistryRow[] = [
   },
   // ---- Codex (codex_responses) ----------------------------------------------
   {
+    // gpt-5.6 family: LIVE-PROBED 2026-08-05 against the Responses API —
+    // oversized requests accepted at 880,007 input tokens, rejected at 882,007
+    // (a 1M-total-class window). 880K is the highest PROVEN-accept value; the
+    // generic gpt row below keeps the documented 272K input cap of the
+    // 400K-total gpt-5.x family (gpt-5.4 live-REJECTED 280K same probe).
+    idMatch: /^gpt-5[.-]6/i,
+    cap: {
+      family: 'gpt-5.6', apiShape: 'codex_responses',
+      contextWindow: 880_000, maxOutput: 128_000, supportsEffort: true,
+      effortMap: CODEX_EFFORT_MAP, thinkingMode: 'effort',
+      supportsPromptCache: false, cacheMinTokens: 0, retryClass: 'codex',
+    },
+  },
+  {
     // ^gpt-[0-9] (not gpt-5) so a FUTURE gpt-6/gpt-7 routes to Codex instead of
     // silently falling through to the BYO backend; ^codex covers codex-* ids.
     idMatch: /^gpt-[0-9]|^o[0-9]|^codex/i,
@@ -238,8 +270,60 @@ const REGISTRY: RegistryRow[] = [
     },
   },
   // ---- BYO OpenAI-compatible (openai_completions) ---------------------------
+  // Windows below are LIVE-VERIFIED 2026-08-05 from the serving providers'
+  // /v1/models endpoints (Together publishes context_length; Moonshot too).
+  // Specific families first; the conservative 128K generic row stays last.
   {
-    idMatch: /deepseek|minimax|qwen|kimi|moonshot|glm|llama|mistral|gemini/i,
+    // Moonshot kimi-k3: context_length 1,048,576 (Moonshot platform API).
+    idMatch: /kimi-k3/i,
+    cap: {
+      family: 'kimi-k3', apiShape: 'openai_completions',
+      contextWindow: 1_048_576, maxOutput: 16_000, supportsEffort: false,
+      effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      thinkingMode: 'none',
+      supportsPromptCache: false, cacheMinTokens: 1024, retryClass: 'openai_compat',
+    },
+  },
+  {
+    // kimi-k2.x family: 262,144 (Moonshot + Together both report it).
+    idMatch: /kimi|moonshot/i,
+    cap: {
+      family: 'kimi-k2', apiShape: 'openai_completions',
+      contextWindow: 262_144, maxOutput: 16_000, supportsEffort: false,
+      effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      thinkingMode: 'none',
+      supportsPromptCache: false, cacheMinTokens: 1024, retryClass: 'openai_compat',
+    },
+  },
+  {
+    // GLM-5.2 as served by TOGETHER under its catalog id (zai-org/GLM-5.2):
+    // context_length 512,000, live-listed 2026-08-05. EXACT-ID seed on
+    // purpose: the bare `glm-5.2` id routes to a DIFFERENT default backend
+    // (provider ownership is exact-id — byo-providers.ts) whose serving
+    // window is unverified, so it falls to the conservative GLM family row
+    // below; its provider catalog/live evidence can raise it per-id.
+    idMatch: /zai-org\/glm[-_]?5[._]2/i,
+    cap: {
+      family: 'glm-5.2', apiShape: 'openai_completions',
+      contextWindow: 512_000, maxOutput: 16_000, supportsEffort: false,
+      effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      thinkingMode: 'none',
+      supportsPromptCache: false, cacheMinTokens: 1024, retryClass: 'openai_compat',
+    },
+  },
+  {
+    // GLM 4.6 / 4.7 / 5 / 5.1: Together reports 202,752 for all of them.
+    idMatch: /glm[-_]?(4[._][67]|5([._]1)?)\b|glm/i,
+    cap: {
+      family: 'glm', apiShape: 'openai_completions',
+      contextWindow: 202_752, maxOutput: 16_000, supportsEffort: false,
+      effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      thinkingMode: 'none',
+      supportsPromptCache: false, cacheMinTokens: 1024, retryClass: 'openai_compat',
+    },
+  },
+  {
+    idMatch: /deepseek|minimax|qwen|llama|mistral|gemini/i,
     cap: {
       family: 'byo-openai-compat', apiShape: 'openai_completions',
       contextWindow: 128_000, maxOutput: 16_000, supportsEffort: false,

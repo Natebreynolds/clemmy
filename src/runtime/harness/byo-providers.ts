@@ -356,6 +356,9 @@ export interface DiscoveredModel {
   id: string;
   /** Optional human label (provider `display_name`), falls back to id in the UI. */
   label?: string;
+  /** Provider-published context window for this exact id, when the catalog
+   * carries one — recorded as a window observation at discovery time. */
+  contextLength?: number;
 }
 
 /**
@@ -377,7 +380,19 @@ export function normalizeModelsList(raw: unknown): DiscoveredModel[] {
     if (!id || seen.has(id)) continue;
     seen.add(id);
     const dn = item && typeof item === 'object' ? (item as { display_name?: unknown }).display_name : undefined;
-    out.push({ id, label: typeof dn === 'string' && dn.trim() ? dn.trim() : undefined });
+    // The provider's published window for this exact id (Together/Moonshot:
+    // `context_length`) — the authoritative fact static registry rows rot away
+    // from. Carried so discovery can record it as a window observation.
+    const cl = item && typeof item === 'object'
+      ? (item as { context_length?: unknown; max_context_length?: unknown })
+      : undefined;
+    const contextLength = typeof cl?.context_length === 'number' ? cl.context_length
+      : typeof cl?.max_context_length === 'number' ? cl.max_context_length : undefined;
+    out.push({
+      id,
+      label: typeof dn === 'string' && dn.trim() ? dn.trim() : undefined,
+      ...(contextLength !== undefined ? { contextLength } : {}),
+    });
   }
   out.sort((a, b) => a.id.localeCompare(b.id));
   return out;
@@ -437,5 +452,14 @@ export async function discoverProviderModels(
   if (!resp.ok) return { status: 502, body: { error: `The provider returned ${resp.status} listing models.` } };
 
   const json = (await resp.json().catch(() => null)) as unknown;
-  return { status: 200, body: { models: normalizeModelsList(json) } };
+  const models = normalizeModelsList(json);
+  // Provider-published windows become durable observations — the evidence
+  // that keeps budgeting honest as models change without a code release.
+  try {
+    const { recordCatalogWindow } = await import('./model-window-observations.js');
+    for (const m of models) {
+      if (m.contextLength !== undefined) recordCatalogWindow(m.id, m.contextLength, baseURL);
+    }
+  } catch { /* discovery result is unaffected */ }
+  return { status: 200, body: { models } };
 }

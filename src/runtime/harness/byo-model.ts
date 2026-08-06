@@ -35,6 +35,7 @@ import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } fro
 import { withResilience } from './resilient-model.js';
 import { resolveModelCapability, modelParityEnabled, restoreLegacyInstructionOrder } from './model-wire-registry.js';
 import { recordModelUsage } from '../usage-log.js';
+import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
 import pino from 'pino';
 
@@ -449,8 +450,40 @@ async function* synthFaithfulStream(completion: CompatCompletion): AsyncGenerato
  *  NON-streaming internally — more reliable for M3 (avoids its stream bugs) and
  *  lets us lift reasoning + repair — then re-emits one SDK-legal chunk.
  *  Exported for unit tests with an injected `original`. */
+// Context-overflow learning (provider phrasings vary: OpenAI-compat
+// `context_length_exceeded`, GLM "context length exceeded", Moonshot "input
+// token length too long"). On a match, ratchet the model's effective window
+// down so the next turn's compaction budget self-corrects — a stale window
+// belief costs ONE failed call, not a failing run.
+const CONTEXT_OVERFLOW_RE = /context_length_exceeded|exceeds the context|maximum context length|context length|input token length too long/i;
+function noteContextOverflow(err: unknown, model: unknown): void {
+  try {
+    const text = err instanceof Error
+      ? `${err.message} ${(err as { code?: unknown }).code ?? ''}`
+      : String(err ?? '');
+    if (CONTEXT_OVERFLOW_RE.test(text) && typeof model === 'string' && model) {
+      recordWindowRejection(model);
+    }
+  } catch { /* learning is additive */ }
+}
+
 export function wrapCompletionsCreate(original: CreateFn): CreateFn {
   return async (params: Record<string, unknown>, options?: unknown) => {
+    try {
+      return await wrappedCompletionsCreate(original, params, options);
+    } catch (err) {
+      noteContextOverflow(err, (params as { model?: unknown }).model);
+      throw err;
+    }
+  };
+}
+
+async function wrappedCompletionsCreate(
+  original: CreateFn,
+  params: Record<string, unknown>,
+  options?: unknown,
+): Promise<unknown> {
+  {
     const relaxed = relaxRequestForCompatBackend(params) as Record<string, unknown>;
     const structured = downgradedBodies.has(relaxed as object);
 
@@ -482,7 +515,7 @@ export function wrapCompletionsCreate(original: CreateFn): CreateFn {
       await repairStructuredContent(original, relaxed, options, completion, downgradedSchemas.get(relaxed as object));
     }
     return completion;
-  };
+  }
 }
 
 /**
@@ -520,6 +553,13 @@ function recordByoUsage(completion: CompatCompletion, fallbackModel?: unknown): 
       totalTokens: n(u.total_tokens) || inputTokens + outputTokens,
       promptComponents: harnessContext?.promptComponents,
     });
+    // Proven-acceptance learning: an accepted request above our believed
+    // window raises the budgeting floor (writes only when it beats the
+    // current belief — see model-window-observations.ts).
+    try {
+      const modelId = (completion as { model?: string })?.model || (typeof fallbackModel === 'string' ? fallbackModel : '');
+      if (modelId) recordWindowAcceptance(modelId, inputTokens);
+    } catch { /* learning is additive */ }
   } catch { /* never break the call path */ }
 }
 
