@@ -13,7 +13,7 @@ import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
  * call when auto-compact (Layer 1) has clipped it from the conversation.
  *
  * Lossless fetch from the `tool_outputs` table (populated at write-time
- * in hooks.ts with up to TOOL_OUTPUT_MAX_BYTES (2MB) of original output,
+ * in hooks.ts with up to TOOL_OUTPUT_MAX_BYTES of original output,
  * before the event-log copy is clipped to 8KB). Pass `offset` to page
  * through a payload larger than a single 30KB slice.
  *

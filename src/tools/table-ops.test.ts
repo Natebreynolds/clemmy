@@ -111,7 +111,9 @@ test('tool: a >2MB exact read fails closed instead of aggregating the parked CSV
     type: 'tool_called',
     data: { callId, tool: 'provider_list_rows', effect: 'read', arguments: {} },
   });
-  const trueRowCount = 600_000;
+  // Sized FROM the cap so the fixture keeps crossing it at any ceiling
+  // ('a,1\n' = 4 bytes/row).
+  const trueRowCount = Math.ceil(TOOL_OUTPUT_MAX_BYTES / 4) + 50_000;
   const csv = `group,value\n${'a,1\n'.repeat(trueRowCount)}`;
   assert.ok(Buffer.byteLength(csv) > TOOL_OUTPUT_MAX_BYTES, 'fixture must cross the durable output cap');
   writeToolOutput({

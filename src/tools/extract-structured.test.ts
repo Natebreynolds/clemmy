@@ -78,7 +78,9 @@ test('a >2MB exact source fails closed before extraction can validate an incompl
     return '{"name":"Amy Chen","email":"amy@firm.example"}';
   });
   const sess = createSession({ kind: 'chat' });
-  const source = `Name: Amy Chen\n${'ordinary filler words\n'.repeat(110_000)}Email: amy@firm.example\n`;
+  // Sized FROM the cap so the trailing email stays beyond the durable
+  // ceiling at any cap value.
+  const source = `Name: Amy Chen\n${'ordinary filler words\n'.repeat(Math.ceil(TOOL_OUTPUT_MAX_BYTES / 22) + 10_000)}Email: amy@firm.example\n`;
   assert.ok(Buffer.byteLength(source) > TOOL_OUTPUT_MAX_BYTES, 'fixture must cross the durable output cap');
   writeToolOutput({
     sessionId: sess.id,

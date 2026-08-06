@@ -3531,11 +3531,19 @@ export function clearKill(
 // Raised 200KB → 2MB (2026-06-25): a 200KB ceiling tail-dropped the back of
 // large-but-legitimate results (Apify dataset items, DataForSEO reports), and
 // since tool_output_query pages from THIS store, dropped rows became
-// unqueryable — not just unshown. 2MB covers realistic single-call results
-// (~thousands of records); the 14-day retention sweep below bounds aggregate
-// disk. The tail-truncate + truncated_at_write marker stays as a backstop for
-// the pathological >2MB case.
-export const TOOL_OUTPUT_MAX_BYTES = 2_000_000;
+// unqueryable — not just unshown.
+// Raised 2MB → 16MB (2026-08-05, owner ask): 2MB was the hard wall on the
+// large-dataset class ("reconcile two 10MB exports") — the tail of a big pull
+// became unqueryable and the loss was unrecoverable by ANY reader. The win is
+// NOT reading 16MB into context (the event-log clip, digest, and recall
+// budget still gate that): it is that tool_output_query filters/projects/
+// paginates IN CODE against this store, so a 10MB record set stays fully
+// queryable and only matching rows ever reach the model. Costs disk + an
+// occasional ~100-300ms JSON.parse on query — the 14-day retention sweep
+// below bounds aggregate disk. The tail-truncate + truncated_at_write marker
+// (surfaced to the model by recall_tool_result) stays as the backstop for the
+// pathological >16MB case.
+export const TOOL_OUTPUT_MAX_BYTES = 16_000_000;
 
 export interface ToolOutputRecord {
   output: string;

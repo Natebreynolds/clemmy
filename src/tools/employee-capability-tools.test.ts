@@ -110,7 +110,9 @@ test('file_query refuses a >2MB parked prefix instead of falsely missing a tail 
   const handler = capture(registerFileQueryTools as never);
   const sess = createSession({ kind: 'chat' });
   const marker = 'TAIL_SECRET_NEEDLE_9Q8Z';
-  const source = `${'ordinary filler words\n'.repeat(110_000)}${marker}\n`;
+  // Sized FROM the cap ('ordinary filler words\n' = 22 bytes) so the tail
+  // marker sits beyond the durable ceiling at any cap value.
+  const source = `${'ordinary filler words\n'.repeat(Math.ceil(TOOL_OUTPUT_MAX_BYTES / 22) + 10_000)}${marker}\n`;
   assert.ok(Buffer.byteLength(source) > TOOL_OUTPUT_MAX_BYTES, 'fixture must cross the durable output cap');
   writeToolOutput({
     sessionId: sess.id,

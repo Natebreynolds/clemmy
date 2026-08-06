@@ -291,10 +291,12 @@ test('normalizeCodeModeToolResult: Composio warning-prefixed FAILED banners beco
   assert.match(out.error ?? '', /exceeds grid limits/);
 });
 
-test('normalizeCodeModeToolResult: a >2MB parked exact result fails closed instead of exposing its prefix', async () => {
+test('normalizeCodeModeToolResult: an over-cap parked exact result fails closed instead of exposing its prefix', async () => {
   const { createSession, writeToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('../runtime/harness/eventlog.js');
   const sess = createSession({ kind: 'chat' });
-  const full = `group,value\n${'a,1\n'.repeat(600_000)}`;
+  // Sized FROM the cap ('a,1\n' = 4 bytes/row) so the fixture keeps crossing
+  // the durable ceiling at any cap value.
+  const full = `group,value\n${'a,1\n'.repeat(Math.ceil(TOOL_OUTPUT_MAX_BYTES / 4) + 50_000)}`;
   assert.ok(Buffer.byteLength(full) > TOOL_OUTPUT_MAX_BYTES, 'fixture must cross the durable output cap');
   writeToolOutput({
     sessionId: sess.id,
