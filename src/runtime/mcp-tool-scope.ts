@@ -533,7 +533,11 @@ function recallScopeEnabled(): boolean {
 function learnedMcpServerSlugs(matches: StepToolChoiceMatch[]): string[] {
   const slugs: string[] = [];
   for (const m of matches) {
-    if (m.kind !== 'mcp' || m.tier !== 'high') continue;
+    // Any advertise-tier match may PROPOSE its server: a conversational ask
+    // names the service without the operation token 'high' demands, and the
+    // caller's own guards decide admission (fail-open turns take proposals;
+    // an already-precise scope still requires the input to name the server).
+    if (m.kind !== 'mcp') continue;
     const slug = (m.identifier.split('__')[0] ?? '').trim().toLowerCase();
     if (slug) slugs.push(slug);
   }
@@ -605,7 +609,14 @@ export function resolveMcpToolScopeWithRecall(
     matches = options.learnedMatches;
   } else if (input) {
     try {
-      matches = matchToolChoicesForStep(input);
+      // 'advertise': exposing a learned SERVER is scoping, not binding — the
+      // same distinction the Claude lane's JIT pin uses. The bind-tier
+      // matcher demanded an operation token a conversational ask never
+      // carries and consulted a fingerprint cache that is empty at turn
+      // start, so the Codex/BYO lane re-discovered servers its own memory
+      // had proven (lane-parity fix, 2026-08-05). The widening guards below
+      // (explicitlyNamesLearnedServer on precise scopes) are unchanged.
+      matches = matchToolChoicesForStep(input, { purpose: 'advertise' });
     } catch {
       matches = [];
     }

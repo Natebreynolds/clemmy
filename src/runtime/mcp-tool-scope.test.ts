@@ -366,12 +366,23 @@ test('resolveMcpToolScopeWithRecall: a DELIBERATE no-tool turn is NOT widened by
   assert.deepEqual(scope.allowedServerSlugs, []);
 });
 
-test('resolveMcpToolScopeWithRecall: medium-tier or non-mcp matches are ignored', () => {
-  const scope = resolveMcpToolScopeWithRecall({
+test('resolveMcpToolScopeWithRecall: a medium-tier mcp match proposes its server; non-mcp kinds never do', () => {
+  // Lane parity (2026-08-05): scoping is advertising, so the tier latch that
+  // silenced conversational matches is gone — a medium (advertise-tier) mcp
+  // match now proposes its proven server, and the fail-open/explicit-naming
+  // guards decide admission. Non-mcp kinds still cannot name an MCP server.
+  const medium = resolveMcpToolScopeWithRecall({
     userInput: 'create a page in my Notion workspace',
     learnedMatches: [mcpMatch('notion__create_page', 'medium')],
   });
-  assert.equal(scope.failOpenCandidate, true, 'only HIGH-tier mcp matches widen');
+  assert.ok((medium.allowedServerSlugs ?? []).includes('notion'), 'a medium-tier proven server surfaces');
+  assert.ok(!medium.failOpenCandidate);
+
+  const composioOnly = resolveMcpToolScopeWithRecall({
+    userInput: 'create a page in my Notion workspace',
+    learnedMatches: [{ ...mcpMatch('notion__create_page', 'medium'), kind: 'composio' as const }],
+  });
+  assert.equal(composioOnly.failOpenCandidate, true, 'a non-mcp kind never names an MCP server');
 });
 
 test('resolveMcpToolScopeWithRecall: the kill-switch returns the base scope untouched', () => {
@@ -659,4 +670,22 @@ test('awaitingAnswer never over-inherits: a fresh topic still wins', () => {
   });
   assert.ok((scope.allowedServerSlugs ?? []).includes('dataforseo'));
   assert.ok(!(scope.allowedServerSlugs ?? []).some((slug) => /outlook/.test(slug)));
+});
+
+test('resolveMcpToolScopeWithRecall: a conversational ask reaches its proven server through the REAL matcher (lane parity)', async () => {
+  // The Claude lane's JIT pin got the advertise-tier fix; this lane still ran
+  // the bind-tier matcher, so "can you put this in my notion" — no operation
+  // token — matched nothing and the turn re-discovered a proven server
+  // (2026-08-05). Exercises the real store path, not injected matches.
+  const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
+  rememberToolChoice({
+    intent: 'notion.page.create',
+    description: 'Create a page in the Notion workspace',
+    choice: { kind: 'mcp', identifier: 'notion__create_page' },
+  });
+  const scope = resolveMcpToolScopeWithRecall({
+    userInput: 'can you put this in my notion for me',
+  });
+  assert.ok((scope.allowedServerSlugs ?? []).includes('notion'), 'the proven server surfaces for a conversational ask');
+  assert.ok(!scope.failOpenCandidate, 'precise recall replaces the broad fail-open surface');
 });
