@@ -1390,6 +1390,49 @@ function revalidateStaleSuppressionsOnce(): void {
  * mailbox) → constraint validation of the owner → suppression policy →
  * arg validation. Pure resolution: NO dispatch happens here.
  */
+// ── Run-scoped account stickiness ─────────────────────────────────────────
+// The account question is answered AT MOST ONCE per run. Once an account is
+// positively resolved for a toolkit — explicit pin/alias, or an identity the
+// selector resolved — later calls in the same run reuse it instead of
+// re-interrogating. Two DISTINCT accounts used in one run disables reuse for
+// that toolkit (never guess between proven alternatives for irreversible
+// sends). Stored on the existing HarnessRunContext: no new persistence, and
+// the memo dies with the run.
+function recordRunToolkitAccountUse(
+  toolkit: string,
+  connectionId: string | undefined,
+  identity: string | undefined,
+  explicit: boolean,
+): void {
+  if (!connectionId) return;
+  const ctx = harnessRunContextStorage.getStore();
+  if (!ctx) return;
+  ctx.resolvedToolkitAccounts ??= new Map();
+  let uses = ctx.resolvedToolkitAccounts.get(toolkit);
+  if (!uses) {
+    uses = new Map();
+    ctx.resolvedToolkitAccounts.set(toolkit, uses);
+  }
+  const prev = uses.get(connectionId);
+  uses.set(connectionId, {
+    identity: identity ?? prev?.identity,
+    explicit: explicit || Boolean(prev?.explicit),
+  });
+}
+
+function stickyRunAccount(
+  toolkit: string,
+  usable: ConnectedToolkit[],
+): { connectionId: string; identity?: string } | undefined {
+  const uses = harnessRunContextStorage.getStore()?.resolvedToolkitAccounts?.get(toolkit);
+  if (!uses || uses.size !== 1) return undefined;
+  const [connectionId, use] = [...uses.entries()][0]!;
+  // The remembered connection must still be live in the CURRENT snapshot —
+  // a disconnect mid-run falls back to the normal ask, never a stale route.
+  if (!usable.some((c) => c.connectionId === connectionId)) return undefined;
+  return { connectionId, identity: use.identity };
+}
+
 export async function resolveComposioDispatch(
   toolSlug: string,
   rawArgs: Record<string, unknown>,
@@ -1655,6 +1698,17 @@ export async function resolveComposioDispatch(
         notes.push(`[account-route] Routed to your ${label ? `"${label}" (${hint})` : `remembered ${hint}`} ${toolkit} account.`);
       }
     } else if (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent') {
+      // Ask-at-most-once: an account already chosen for this toolkit IN THIS
+      // RUN answers the question — the user should never be re-interrogated
+      // per call for a choice they already made.
+      const sticky = stickyRunAccount(toolkit, usable);
+      if (sticky) {
+        owner = sticky.connectionId;
+        identity = sticky.identity ?? identity;
+        notes.push(
+          `[account-route] Reusing the ${sticky.identity ?? 'account'} already chosen for ${toolkit} in this run.`,
+        );
+      } else {
       // Ambiguity → typed block for ALL operations (reads included: reading the
       // wrong mailbox produces confidently-wrong answers). Zero dispatch.
       const message = composioMultiAccountAskMessage(toolSlug, outcome);
@@ -1668,6 +1722,7 @@ export async function resolveComposioDispatch(
         toolkit,
         candidates: outcome.candidates.map((c) => ({ email: c.email, connectionId: c.connectionId })),
       };
+      }
     }
     // 'defer' → owner stays undefined (composio default entity).
   }
@@ -1719,8 +1774,17 @@ export async function resolveComposioDispatch(
   // defer; a wrong-account SEND is not.
   if (!owner && isIrreversibleSendSlug(toolSlug) && usable.length > 1) {
     const outcome = selectToolkitConnection(toolSlug, conns);
+    const sticky = outcome.kind === 'resolved' ? undefined : stickyRunAccount(toolkit, usable);
     if (outcome.kind === 'resolved') {
       owner = outcome.connectionId; // one distinct mailbox (e.g. duplicate re-auths) — safe
+    } else if (sticky) {
+      // Ask-at-most-once, send edition: exactly ONE account was chosen for
+      // this toolkit in this run — a proven choice, not a guess.
+      owner = sticky.connectionId;
+      identity = sticky.identity ?? identity;
+      notes.push(
+        `[account-route] Reusing the ${sticky.identity ?? 'account'} already chosen for ${toolkit} in this run.`,
+      );
     } else {
       const candidates = outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent'
         ? outcome.candidates
@@ -1791,6 +1855,13 @@ export async function resolveComposioDispatch(
       validationReason: validation.error.reason,
     });
     return { ok: false, reason: 'invalid-args', message, toolkit };
+  }
+
+  // A positively resolved account is this run's answer to the account
+  // question — remember it so the question is asked at most once per run.
+  // CLI-only lanes are excluded (no targetable connectionId exists there).
+  if (owner && !cliOnlyLane) {
+    recordRunToolkitAccountUse(toolkit, owner, identity, Boolean(pinned) || Boolean(aliasArg));
   }
 
   return { ok: true, args, connectionId: owner, identity, senderVerified, notes };

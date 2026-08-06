@@ -895,3 +895,106 @@ test('CLI/SDK selection boundary: a pinned owner is NEVER dispatched via the CLI
     else process.env.COMPOSIO_BACKEND = prev;
   }
 });
+
+// ─── Run-scoped account stickiness (ask AT MOST ONCE per run) ───
+// Live 2026-08-06: with two Outlook accounts connected, EVERY call of a
+// 10-draft run re-asked "which account?" — 81 tool calls, 43% harness
+// refusals, 0 drafts created. One answered choice must hold for the run.
+const { harnessRunContextStorage, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+const stickyCtx = () => ({ sessionId: `sess-sticky-${Math.random().toString(36).slice(2)}`, counter: new ToolCallsCounter(50) });
+
+test('ask-once: an explicit account pin answers the question for the REST of the run', async () => {
+  setAccounts([
+    account('ca_work', 'outlook', 'work@site.example'),
+    account('ca_home', 'outlook', 'home@personal.example'),
+  ]);
+  await harnessRunContextStorage.run(stickyCtx(), async () => {
+    // First call without a pin: ambiguous → asks (unchanged behavior).
+    const asked = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'a' }, undefined, {});
+    assert.equal(asked.ok, false);
+    if (!asked.ok) assert.equal(asked.reason, 'ambiguous-account');
+    // The user answers; the model retries with the pin.
+    const pinnedCall = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'a' }, 'ca_work', {});
+    assert.equal(pinnedCall.ok, true);
+    // Every LATER unpinned call in the run reuses that answer — zero re-asks.
+    for (const subject of ['b', 'c', 'd']) {
+      const reused = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject }, undefined, {});
+      assert.equal(reused.ok, true, `draft "${subject}" must not re-ask`);
+      if (reused.ok) {
+        assert.equal(reused.connectionId, 'ca_work');
+        assert.ok(
+          reused.notes.some((n) => /already chosen for outlook in this run/i.test(n)),
+          'route note says the run choice was reused',
+        );
+      }
+    }
+    // A DIFFERENT toolkit in the same run still resolves on its own terms.
+    setAccounts([
+      account('ca_g1', 'gmail', 'one@g.example'),
+      account('ca_g2', 'gmail', 'two@g.example'),
+    ]);
+    const otherToolkit = await resolveComposioDispatch('GMAIL_SEND_EMAIL', {}, undefined, {});
+    assert.equal(otherToolkit.ok, false, 'outlook stickiness never leaks into gmail');
+  });
+});
+
+test('never guess between proven alternatives: two accounts used in ONE run re-arms the ask', async () => {
+  setAccounts([
+    account('ca_work', 'outlook', 'work@site.example'),
+    account('ca_home', 'outlook', 'home@personal.example'),
+  ]);
+  await harnessRunContextStorage.run(stickyCtx(), async () => {
+    const first = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'a' }, 'ca_work', {});
+    assert.equal(first.ok, true);
+    // Explicit user choice ALWAYS wins — a later pin to the other account is honored.
+    const second = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'b' }, 'ca_home', {});
+    assert.equal(second.ok, true);
+    if (second.ok) assert.equal(second.connectionId, 'ca_home');
+    // Now BOTH accounts are proven in this run: an unpinned call must ASK, not guess.
+    const ambiguous = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'c' }, undefined, {});
+    assert.equal(ambiguous.ok, false, 'two used accounts → the gateway refuses to pick one');
+    if (!ambiguous.ok) assert.equal(ambiguous.reason, 'ambiguous-account');
+  });
+});
+
+test('stickiness is RUN-scoped: a new run context starts with the question open', async () => {
+  setAccounts([
+    account('ca_work', 'outlook', 'work@site.example'),
+    account('ca_home', 'outlook', 'home@personal.example'),
+  ]);
+  await harnessRunContextStorage.run(stickyCtx(), async () => {
+    const pinnedCall = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'a' }, 'ca_work', {});
+    assert.equal(pinnedCall.ok, true);
+  });
+  // Fresh run → the memo died with the old run; no context at all → also asks.
+  await harnessRunContextStorage.run(stickyCtx(), async () => {
+    const asked = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'b' }, undefined, {});
+    assert.equal(asked.ok, false);
+    if (!asked.ok) assert.equal(asked.reason, 'ambiguous-account');
+  });
+  const noCtx = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'c' }, undefined, {});
+  assert.equal(noCtx.ok, false, 'outside any run context the gateway behaves exactly as before');
+});
+
+test('a disconnected sticky account falls back to the ask — never a stale route', async () => {
+  setAccounts([
+    account('ca_work', 'outlook', 'work@site.example'),
+    account('ca_home', 'outlook', 'home@personal.example'),
+  ]);
+  await harnessRunContextStorage.run(stickyCtx(), async () => {
+    const pinnedCall = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'a' }, 'ca_work', {});
+    assert.equal(pinnedCall.ok, true);
+    // The chosen connection disappears mid-run (revoked/disconnected)…
+    setAccounts([
+      account('ca_home', 'outlook', 'home@personal.example'),
+      account('ca_new', 'outlook', 'new@site.example'),
+    ]);
+    // …so reuse must NOT route to the dead id; normal resolution runs instead.
+    const out = await resolveComposioDispatch('OUTLOOK_CREATE_DRAFT', { subject: 'b' }, undefined, {});
+    if (out.ok) {
+      assert.notEqual(out.connectionId, 'ca_work', 'a dead connection is never reused');
+    } else {
+      assert.equal(out.reason, 'ambiguous-account');
+    }
+  });
+});

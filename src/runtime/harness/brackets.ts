@@ -1047,6 +1047,13 @@ export interface HarnessRunContext {
    * adapters attach this to usage events so prompt cost is attributable instead
    * of appearing as one opaque input-token number. Refreshed before every call. */
   promptComponents?: Record<string, number>;
+  /** Run-scoped account stickiness: toolkit → connectionId → use. One answered
+   * account choice (explicit pin/alias or a positively resolved identity) holds
+   * for the rest of the run; two DISTINCT accounts used in one run means later
+   * ambiguous calls ask again instead of guessing between proven alternatives
+   * (live 2026-08-06: with two Outlook accounts connected, EVERY call of a
+   * 10-draft run re-asked "which account?" — 81 calls, 43% refusals, 0 drafts). */
+  resolvedToolkitAccounts?: Map<string, Map<string, { identity?: string; explicit: boolean }>>;
 }
 
 /** The tracker scope a call registers under. EXEMPT lanes (code-mode programs,
