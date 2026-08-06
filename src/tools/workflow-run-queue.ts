@@ -1302,6 +1302,10 @@ export interface QueueWorkflowRunOptions {
   recoveryIntent?: QueueWorkflowRunRecoveryIntentInput;
   /** Optional run-id prefix for system-triggered runs such as schedules. */
   idPrefix?: string;
+  /** Auto-retest lineage (creation tests only): depth of the chained
+   * fresh-version retest this run is. Set ONLY by the runner's stale-version
+   * self-heal; bounds the loop when edits outpace tests. */
+  autoRetestDepth?: number;
   /** Disable duplicate suppression for sources that intentionally enqueue fresh runs. */
   dedupe?: boolean;
   /** Internal authority used only by the runner after the source execution has
@@ -2549,6 +2553,9 @@ export function queueWorkflowCreationTest(
     status: 'creation_test',
     mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
     ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
+    ...(typeof opts?.autoRetestDepth === 'number' && opts.autoRetestDepth > 0
+      ? { autoRetestDepth: Math.trunc(opts.autoRetestDepth) }
+      : {}),
     createdAt,
     ...(source ? { source } : {}),
     ...(origin ? { originSessionId: origin } : {}),

@@ -798,6 +798,10 @@ export interface QueuedRunRecord {
    * snapshot is content-hashed and immutable; legacy runs omit it and retain
    * the pre-v2 behavior of resolving the current workflow definition. */
   workflowDefinitionSnapshot?: unknown;
+  /** Auto-retest lineage: how many chained creation tests were auto-queued
+   * because the definition drifted mid-test. Bounds the self-heal loop when
+   * the author is editing faster than tests complete. */
+  autoRetestDepth?: number;
   /**
    * Failed-item retry lineage. A retry run inherits completed upstream step
    * outputs and completed forEach items from the source run, then leaves only
@@ -976,6 +980,28 @@ function sameTerminalReport(envelope: WorkflowRunReportBackEnvelope, report: Ter
     && envelope.workflowName === report.workflowName
     && envelope.outcome === report.outcome
     && envelope.detail === report.detail;
+}
+
+/**
+ * Stale-version creation-test SELF-HEAL decision (live 2026-08-06, Discord
+ * authoring session): rapid iteration routinely drifts the definition while
+ * its test runs. The activation guard is right to refuse enabling an untested
+ * version — but handing the author "run a fresh creation test" is our race,
+ * not their chore. Retest automatically when the ONLY blocker is drift (never
+ * deletion — nothing to test), depth-bounded so an author editing faster than
+ * tests complete still terminates with the honest manual message.
+ */
+export const AUTO_RETEST_MAX_DEPTH = 2;
+export function shouldAutoRetestStaleCreationTest(input: {
+  pass: boolean;
+  activationCompatible: boolean;
+  blockedReason: string;
+  depth: number;
+}): boolean {
+  return input.pass
+    && !input.activationCompatible
+    && input.blockedReason !== 'the workflow was deleted while its creation test was running'
+    && input.depth < AUTO_RETEST_MAX_DEPTH;
 }
 
 interface WorkflowRunRecordWriteResult {
@@ -9512,7 +9538,9 @@ async function processOneRunFile(
     // CREATION TEST (Part B): really run the read-only steps + preview mutating,
     // confirm they return data, then AUTO-ENABLE on a clean pass (or leave the
     // draft disabled + report what to fix). Works on a disabled draft, so it
-    // sits before the enabled gate.
+    // sits before the enabled gate. On a pass blocked ONLY by mid-test
+    // definition drift, the runner self-heals by queueing a fresh test against
+    // the latest version (see shouldAutoRetestStaleCreationTest).
     if (run.status === 'creation_test') {
       const ctInputs = normalizeWorkflowRunInputs({
         ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
@@ -9544,6 +9572,23 @@ async function processOneRunFile(
         }
       }
       const creationReady = result.pass && activationCompatible;
+      let autoRetestRunId: string | null = null;
+      if (shouldAutoRetestStaleCreationTest({
+        pass: result.pass,
+        activationCompatible,
+        blockedReason: activationBlockedReason,
+        depth: run.autoRetestDepth ?? 0,
+      })) {
+        try {
+          const { queueWorkflowCreationTest } = await import('../tools/workflow-run-queue.js');
+          const requeued = queueWorkflowCreationTest(workflow.name, run.inputs ?? {}, {
+            ...(run.originSessionId ? { originSessionId: run.originSessionId } : {}),
+            ...(typeof run.source === 'string' && run.source ? { source: run.source } : {}),
+            autoRetestDepth: (run.autoRetestDepth ?? 0) + 1,
+          });
+          if (requeued.status === 'queued' && requeued.id) autoRetestRunId = requeued.id;
+        } catch { /* self-heal is additive — fall back to the manual message */ }
+      }
       const lines = result.steps.map((s) => {
         if (s.status === 'ok') return `- ${s.stepId}: ✅ returned data`;
         if (s.status === 'previewed') return `- ${s.stepId}: ⏭️ previewed (mutating step — not run)`;
@@ -9555,7 +9600,9 @@ async function processOneRunFile(
       const body = creationReady
         ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
         : result.pass
-          ? `⚠️ Creation test passed for the admitted version of "${workflow.data.name}", but I left the current workflow unchanged because ${activationBlockedReason}. Run a fresh creation test for the newer version before enabling it.\n\n${lines.join('\n')}`
+          ? autoRetestRunId
+            ? `🔁 Creation test passed, but ${activationBlockedReason} — so that pass no longer covers what's saved. Re-testing the newer version now (run ${autoRetestRunId}); it'll auto-enable here on pass.\n\n${lines.join('\n')}`
+            : `⚠️ Creation test passed for the admitted version of "${workflow.data.name}", but I left the current workflow unchanged because ${activationBlockedReason}. Run a fresh creation test for the newer version before enabling it.\n\n${lines.join('\n')}`
         : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nFix the flagged step(s) with workflow_update (e.g. bind the right tool), then re-test. To run it as-is anyway: workflow_set_enabled.`;
       const report = {
         workflowName: workflow.data.name,

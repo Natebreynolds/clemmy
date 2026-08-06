@@ -2867,3 +2867,29 @@ test('queueWorkflowCreationTest: does NOT dedupe (each authoring test is fresh)'
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
+
+test('stale-version self-heal: auto-retest depth persists through the queue and the decision is bounded', async () => {
+  // REGRESSION PIN (2026-08-06, live Discord authoring): a creation test that
+  // passes for a version the author already replaced must RE-TEST the newer
+  // version automatically — but only while drift is the sole blocker, never
+  // for deletion, and never past the depth bound (an author editing faster
+  // than tests complete gets the honest manual message, not a queue storm).
+  writeAuditWorkflow(false);
+  const requeued = queueWorkflowCreationTest('audit-brief', { url: 'https://retest.example' }, { autoRetestDepth: 1 });
+  assert.equal(requeued.status, 'queued');
+  const record = runFiles()
+    .map((file) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as { id?: string; autoRetestDepth?: number })
+    .find((r) => r.id === requeued.id);
+  assert.equal(record?.autoRetestDepth, 1, 'depth rides the durable run record');
+
+  const { shouldAutoRetestStaleCreationTest, AUTO_RETEST_MAX_DEPTH } = await import('../execution/workflow-runner.js');
+  const drift = 'the workflow definition changed while its creation test was running';
+  const codeDrift = 'the workflow code changed while its creation test was running';
+  const deleted = 'the workflow was deleted while its creation test was running';
+  assert.equal(shouldAutoRetestStaleCreationTest({ pass: true, activationCompatible: false, blockedReason: drift, depth: 0 }), true);
+  assert.equal(shouldAutoRetestStaleCreationTest({ pass: true, activationCompatible: false, blockedReason: codeDrift, depth: 1 }), true);
+  assert.equal(shouldAutoRetestStaleCreationTest({ pass: true, activationCompatible: false, blockedReason: drift, depth: AUTO_RETEST_MAX_DEPTH }), false, 'depth bound terminates the chain');
+  assert.equal(shouldAutoRetestStaleCreationTest({ pass: true, activationCompatible: false, blockedReason: deleted, depth: 0 }), false, 'deletion never retests');
+  assert.equal(shouldAutoRetestStaleCreationTest({ pass: false, activationCompatible: false, blockedReason: drift, depth: 0 }), false, 'a failed test is a real failure, not a race');
+  assert.equal(shouldAutoRetestStaleCreationTest({ pass: true, activationCompatible: true, blockedReason: '', depth: 0 }), false, 'a clean pass enables, never retests');
+});
