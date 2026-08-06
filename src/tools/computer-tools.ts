@@ -754,6 +754,30 @@ function tokenResolvesToSkillArtifact(token: string, cwd: string): boolean {
   return Boolean(resolved && isInstalledSkillArtifactPath(resolved));
 }
 
+/**
+ * Deliverable LEADS for a completed shell command: per redirect target, the
+ * candidate absolute paths it may have written, in resolution-priority order.
+ * A relative redirect after an in-command `cd` resolves against the cd'ed
+ * directory, not the spawn cwd (live 2026-08-05: `cd DIR && cat > profile.md`
+ * wrote seven files the feed never saw). Pure — the caller's existence +
+ * fresh-mtime check is what turns a lead into a deliverable, so a wrong base
+ * simply finds nothing.
+ */
+export function shellWriteLeadPaths(command: string, cwd: string): string[][] {
+  const cdBases = [...command.matchAll(/(?:^|&&|;|\|)\s*cd\s+(['"]?)(\/[^'"\s;&|]+)\1/g)]
+    .map((m) => m[2])
+    .slice(0, 4);
+  const bases = [cwd, ...cdBases];
+  return outputRedirectionTargets(command).slice(0, 10).map((token) => {
+    const candidates: string[] = [];
+    for (const base of bases) {
+      const resolved = resolveShellPathToken(token, base);
+      if (resolved && !candidates.includes(resolved)) candidates.push(resolved);
+    }
+    return candidates;
+  });
+}
+
 function shellWriteApiTargets(command: string, cwd: string): boolean {
   const apiWrite = /\b(?:writeFileSync|appendFileSync|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|mkdirSync)\s*\(/.test(command);
   if (!apiWrite) return false;
@@ -1030,16 +1054,18 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
       if ((code ?? 0) === 0) {
         try {
           const seen = new Set<string>();
-          for (const token of outputRedirectionTargets(command).slice(0, 10)) {
-            const resolved = resolveShellPathToken(token, cwd);
-            if (!resolved || seen.has(resolved)) continue;
-            seen.add(resolved);
-            try {
-              const stat = statSync(resolved);
-              if (stat.isFile() && stat.mtimeMs >= commandStartedAtMs - 2_000) {
-                teeFileDeliverable(resolved);
-              }
-            } catch { /* a lead that never landed is not a deliverable */ }
+          for (const candidates of shellWriteLeadPaths(command, cwd)) {
+            for (const resolved of candidates) {
+              if (seen.has(resolved)) continue;
+              try {
+                const stat = statSync(resolved);
+                if (stat.isFile() && stat.mtimeMs >= commandStartedAtMs - 2_000) {
+                  seen.add(resolved);
+                  teeFileDeliverable(resolved);
+                  break;
+                }
+              } catch { /* a lead that never landed is not a deliverable */ }
+            }
           }
         } catch { /* visibility must never affect the command result */ }
       }

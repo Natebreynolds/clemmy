@@ -483,3 +483,19 @@ test('write_file guard: resolved paths into state/audit/secrets are refused; vau
   assert.equal(writeTargetsProtectedOwnStore(path.join(BASE_DIR, 'files', 'documents', 'letter.pdf')), false, 'file pipeline stays writable');
   assert.equal(writeTargetsProtectedOwnStore('/tmp/report.md'), false);
 });
+
+test('shellWriteLeadPaths: a relative redirect after an in-command cd resolves against the cd target', async () => {
+  const { shellWriteLeadPaths } = await import('./computer-tools.js');
+  // The live 2026-08-05 shape: seven files written via `cd DIR && cat > x.md`
+  // were invisible because the lead resolved only against the spawn cwd.
+  const leads = shellWriteLeadPaths(
+    "mkdir -p /tmp/deliver-test && cd /tmp/deliver-test && cat > profile.md <<'EOF'\ncontent\nEOF",
+    '/spawn/cwd',
+  );
+  assert.equal(leads.length, 1, 'one redirect target');
+  assert.deepEqual(leads[0], ['/spawn/cwd/profile.md', '/tmp/deliver-test/profile.md'],
+    'both bases are candidates, spawn cwd first, cd target second');
+  // Absolute targets need no base juggling.
+  const absolute = shellWriteLeadPaths('echo hi > /tmp/out.md', '/spawn/cwd');
+  assert.deepEqual(absolute[0], ['/tmp/out.md']);
+});
