@@ -501,21 +501,12 @@ export function canonicalExternalWriteActionKey(
   return `shape:${fallback || 'unknown'}`;
 }
 
-/**
- * Returned/thrown error prose is not proof that an irreversible write had no
- * effect. These phrases explicitly indicate that dispatch may have begun or
- * that only the response channel failed; callers must preserve the write as
- * ambiguous even when the same text also says "invalid" or "validation".
- */
-export function externalWriteFailureMayHaveLanded(text: string): boolean {
-  return /\b(?:accepted|committed|dispatched|executed|succeeded|successful(?:ly)?)\b|\bexecution\s+(?:was\s+)?completed\b|after\s+(?:the\s+)?(?:provider\s+)?(?:dispatch|send|commit|accept|execut(?:e|ion))|outcome\s+(?:is\s+)?(?:unknown|uncertain)|(?:may|might|could)\s+have\s+(?:landed|sent|committed)|\b(?:timeout|timed out|gateway timeout|dropped response|lost response|response envelope|malformed response|invalid response)\b/i.test(
-    text,
-  );
-}
-
-export function externalWriteFailureProvesNoDispatch(text: string): boolean {
-  return /\[provider-dispatch:not-started:[a-z0-9_-]+\]/i.test(text);
-}
+// (Deleted 2026-08-06) The prose marker parsers that used to live here —
+// externalWriteFailureMayHaveLanded / externalWriteFailureProvesNoDispatch —
+// were never called by settlement. Doctrine: `[provider-dispatch:not-started:*]`
+// PROSE must never authorize replay (providers can echo it after a real
+// commit); only a local ExternalWritePreDispatchResult/Error INSTANCE proves
+// no-dispatch, and settlement honors the instance directly.
 
 interface WriteEvidenceEvent {
   seq: number;

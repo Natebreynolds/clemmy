@@ -17,7 +17,7 @@ import {
   type DispatchLeaseRef,
 } from '../runtime/harness/dispatch-lease.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
-import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
+import { toolOutputLooksSuccessful } from '../runtime/harness/tool-evidence.js';
 import { toolCallCorrelationFingerprint } from '../runtime/harness/tool-correlation.js';
 import { textResult } from './shared.js';
 
@@ -222,15 +222,16 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
           );
           const text = typeof out === 'string' ? out : out == null ? '' : JSON.stringify(out);
           try {
-            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...(sourceUserSeq ? { sourceUserSeq } : {}), tool: name, callId, ok: true, preview: text.slice(0, 400), accounting: 'transport_mirror' } });
+            // The mirror row reports what the OUTPUT says, not "the call
+            // returned" — a resolved harness refusal must never read ok:true.
+            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...(sourceUserSeq ? { sourceUserSeq } : {}), tool: name, callId, ok: toolOutputLooksSuccessful(text), preview: text.slice(0, 400), accounting: 'transport_mirror' } });
           } catch { /* best-effort */ }
-          // Token efficiency (parity with the Codex lane, computer-tools.ts): digest a
-          // large result + park the full payload in tool_outputs keyed by this
-          // sessionId/callId, so Claude gets a structure-aware summary + a recall
-          // pointer (recall_tool_result / tool_output_query) instead of a 76KB body
-          // flooding its context. Without sessionId/callId this falls back to plain
-          // truncation — both are present here, so the digest path fires.
-          return textResult(formatRecallableToolText(text, { toolName: name, sessionId, callId }));
+          // ONE park, inside the bracket: wrapped.invoke already formatted and
+          // parked the exact payload (digest + recall pointer + exact-output
+          // receipt) inside the harness's tool-output context. Re-formatting
+          // here ran OUTSIDE that scope, so the second writeToolOutput lost the
+          // invocation nonce and clobbered the receipt-bearing row.
+          return textResult(text);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           try {

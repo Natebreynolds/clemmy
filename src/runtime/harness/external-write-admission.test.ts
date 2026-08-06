@@ -22,8 +22,6 @@ const {
   consumeExternalWriteRetryAuthorization,
   externalWriteAdmissionKey,
   externalWriteSemanticFingerprint,
-  externalWriteFailureMayHaveLanded,
-  externalWriteFailureProvesNoDispatch,
   uncompensatedExternalWriteEvents,
   withExternalWriteAdmissionLock,
 } = await import('./external-write-admission.js');
@@ -565,36 +563,6 @@ test('retry authorization and one-shot consumption survive event-log close and r
       (event) => event.data.retryAuthorizationSeq === authorization.seq,
     ).length,
     1,
-  );
-});
-
-test('post-dispatch and broken-response wording is never treated as proven no-effect', () => {
-  for (const message of [
-    'Invalid response envelope after provider accepted and committed the request',
-    'HTTP 504 Gateway Timeout; the final outcome is unknown',
-    'The response was dropped after dispatch',
-    'The request may have landed even though validation of the response failed',
-    'Provider executed the send successfully, but tool result validation failed',
-    'Response schema validation failed after execution completed',
-  ]) {
-    assert.equal(externalWriteFailureMayHaveLanded(message), true, message);
-  }
-  for (const message of [
-    'HTTP 400 validation failed: recipient is required',
-    'HTTP 401 unauthorized before dispatch',
-    'DNS lookup failed with ENOTFOUND',
-  ]) {
-    assert.equal(externalWriteFailureMayHaveLanded(message), false, message);
-  }
-  assert.equal(
-    externalWriteFailureProvesNoDispatch(
-      '[provider-dispatch:not-started:invalid-args] HTTP 400 validation failed',
-    ),
-    true,
-  );
-  assert.equal(
-    externalWriteFailureProvesNoDispatch('HTTP 400 validation failed'),
-    false,
   );
 });
 

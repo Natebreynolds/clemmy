@@ -769,13 +769,14 @@ function findOrphanedWriteMatch(
   sessionId: string,
   shapeKey: string | undefined,
   targets: string[],
-): { target: string } | null {
+): { target: string; recordedReason?: string } | null {
   if (!shapeKey || targets.length === 0) return null;
   let orphans: Array<{
     seq: number;
     shapeKey?: string | null;
     slug?: string | null;
     targets?: string[];
+    reason?: string | null;
   }>;
   try {
     orphans = listEvents(sessionId, { types: ['external_write_orphaned'] })
@@ -785,6 +786,7 @@ function findOrphanedWriteMatch(
           shapeKey?: string | null;
           slug?: string | null;
           targets?: string[];
+          reason?: string | null;
         }),
       }));
   } catch {
@@ -818,23 +820,34 @@ function findOrphanedWriteMatch(
     try {
       if (hasSuccessfulReadBackAfter(sessionId, latestOrphanSeq, t)) return null;
     } catch { /* can't tell — keep the speed bump */ }
-    return { target: t };
+    const recordedReason = hit.find((o) => o.seq === latestOrphanSeq)?.reason ?? undefined;
+    return { target: t, recordedReason };
   }
   return null;
 }
 
 /** Thrown when a mutating write is retried against a shape/target whose prior
- *  attempt TIMED OUT and may have landed. Surfaced to the model as a SOFT tool
- *  error (same disposition as DuplicateExternalWriteError) so it verifies via a
- *  read-back and then re-issues — it never hard-aborts the run. */
+ *  attempt settled AMBIGUOUS and may have landed. Surfaced to the model as a
+ *  SOFT tool error (same disposition as DuplicateExternalWriteError) so it
+ *  verifies via a read-back and then re-issues — it never hard-aborts the run.
+ *  The message states the RECORDED settlement reason: claiming "TIMED OUT" for
+ *  every orphan class taught the model (and the user) a false story about what
+ *  happened (live 2026-08-06: most orphans were unrecognized SUCCESS bodies,
+ *  not timeouts). */
 export class OrphanedWriteRetryError extends Error {
   public readonly toolName: string;
   public readonly shapeKey: string | undefined;
   public readonly target: string;
-  constructor(opts: { toolName: string; shapeKey: string | undefined; target: string }) {
+  constructor(opts: { toolName: string; shapeKey: string | undefined; target: string; recordedReason?: string }) {
+    const recorded = opts.recordedReason?.trim();
+    const whatHappened = recorded && /\b(?:timed? ?out|timeout)\b/i.test(recorded)
+      ? 'TIMED OUT'
+      : recorded
+        ? `settled AMBIGUOUS (recorded reason: "${recorded.slice(0, 160)}")`
+        : 'settled AMBIGUOUS (no clean provider acknowledgement was recorded)';
     super(
-      `ORPHANED_WRITE_RETRY: an earlier ${opts.shapeKey ?? opts.toolName} to ${opts.target} in this session TIMED OUT — ` +
-        'the harness stopped waiting but the write MAY HAVE LANDED server-side, so retrying blindly could create a DUPLICATE. ' +
+      `ORPHANED_WRITE_RETRY: an earlier ${opts.shapeKey ?? opts.toolName} to ${opts.target} in this session ${whatHappened} — ` +
+        'the write MAY HAVE LANDED server-side, so retrying blindly could create a DUPLICATE. ' +
         'This hold is CLEMENTINE\'S OWN duplicate-safety ledger — the provider is not refusing anything; never tell the user the provider is blocking you. ' +
         'FIRST verify whether it landed: READ THE TARGET BACK with any read-only action (a get, a list, a search) for this same record/object. ' +
         'If the read shows it LANDED, report it done — do not re-send. If it is confirmed ABSENT, retry once (prefer an UPSERT or idempotency key if the toolkit supports one). ' +
@@ -2354,7 +2367,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               });
             } catch { /* telemetry write must never block */ }
           }
-          throw new OrphanedWriteRetryError({ toolName: tool.name, shapeKey: shape.shapeKey, target: match.target });
+          throw new OrphanedWriteRetryError({ toolName: tool.name, shapeKey: shape.shapeKey, target: match.target, recordedReason: match.recordedReason });
         }
       }
     } catch (err) {
