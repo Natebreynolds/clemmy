@@ -3655,3 +3655,131 @@ test('Layer 1: an unresolvable reference fails closed — the tool never runs', 
   assert.equal(ran, false, 'the send must NOT execute with an unresolved reference');
   assert.match(String(result), /reference_resolution_failed/);
 });
+
+test('a RESOLVED typed refusal (SDK-built tool path) settles failed — the 2026-08-06 draft-batch class', async () => {
+  // REGRESSION PIN — the live incident: composio's gateway refusal
+  // ("which Outlook account?") crossed the SDK's error_as_result as prose,
+  // settled `external_write_orphaned`, and the orphan-retry gate then blocked
+  // the account-corrected retry. With the return-pattern fix the refusal
+  // arrives as a RESOLVED ExternalWritePreDispatchResult and must settle
+  // `external_write_failed` (not_started, preDispatch) — leaving the
+  // corrected retry completely unblocked.
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Create the outreach drafts in my name.' },
+  });
+  const { ExternalWritePreDispatchResult } = await import('./external-write-admission.js');
+  let accountPinned = false;
+  let dispatches = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      if (!accountPinned) {
+        // What runComposioExecute now RETURNS for an ambiguous-account block —
+        // the exact live shape, marker included.
+        return new ExternalWritePreDispatchResult(
+          '[provider-dispatch:not-started:ambiguous-account] ⚠️ NEEDS-YOUR-CHOICE (outlook): You have 2 outlook accounts connected, so I need to know WHICH account to use for this action.',
+          'provider-dispatch:not-started:ambiguous-account',
+        ) as unknown as string;
+      }
+      dispatches += 1;
+      return JSON.stringify({ successful: true, data: { id: 'draft-1', webLink: 'https://outlook.example/draft-1' } });
+    },
+  });
+  const input = JSON.stringify({
+    tool_slug: 'OUTLOOK_CREATE_DRAFT',
+    arguments: { to_recipients: ['spencer@calahanlaw.com'], subject: 'Quick idea', body: 'Hi Spencer' },
+  });
+  const invoke = (callId: string) => (wrapped as unknown as {
+    invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+  }).invoke(null, input, { toolCall: { callId } });
+
+  const counter = new ToolCallsCounter(20);
+  await withHarnessRunContext({
+    sessionId: session.id, sourceUserSeq: source.seq,
+    behaviorScopeId: 'resolved-typed-refusal', counter,
+  }, async () => {
+    const refused = String(await invoke('draft-refused'));
+    assert.match(refused, /NEEDS-YOUR-CHOICE/, 'model-facing refusal text is preserved');
+    assert.equal(dispatches, 0);
+    const failed = listEvents(session.id, { types: ['external_write_failed'] });
+    assert.equal(failed.length, 1, 'never-started refusal settles FAILED');
+    assert.equal(failed[0]?.data.preDispatch, true);
+    assert.equal(failed[0]?.data.dispatch, 'not_started');
+    assert.match(String(failed[0]?.data.reason ?? ''), /ambiguous-account/, 'machine class survives to the ledger');
+    assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0,
+      'ZERO orphans — the ambiguity factory is closed');
+
+    // The corrected retry (account pinned) is NOT orphan-blocked and dispatches.
+    accountPinned = true;
+    const ok = String(await invoke('draft-corrected'));
+    assert.match(ok, /draft-1/);
+    assert.equal(dispatches, 1, 'the corrected retry reached the provider exactly once');
+  });
+});
+
+test('the SDK PROSE shape of a swallowed typed error still settles orphaned — doctrine pin, never string-match it to failed', async () => {
+  // The doctrine (integrations/composio/client.ts): prose containing the
+  // not-started marker can be echoed by a provider AFTER a real commit, so a
+  // STRING can never prove no-dispatch. Only the resolved class instance may.
+  // This pins the boundary so nobody "fixes" residual orphans by parsing text.
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'send it' },
+  });
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async () =>
+      'An error occurred while running the tool. Please try again. Error: ExternalWritePreDispatchError: [provider-dispatch:not-started:ambiguous-account] ⚠️ NEEDS-YOUR-CHOICE (outlook)…',
+  });
+  const input = JSON.stringify({ tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { to_recipients: ['x@y.z'], subject: 's', body: 'b' } });
+  const counter = new ToolCallsCounter(20);
+  await withHarnessRunContext({
+    sessionId: session.id, sourceUserSeq: source.seq,
+    behaviorScopeId: 'prose-stays-ambiguous', counter,
+  }, async () => {
+    await (wrapped as unknown as {
+      invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+    }).invoke(null, input, { toolCall: { callId: 'prose-shape' } });
+    assert.equal(listEvents(session.id, { types: ['external_write_failed'] }).length, 0);
+    assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 1,
+      'prose is never proof — the string shape stays an orphan by doctrine');
+  });
+});
+
+test('inside a certified batch a RESOLVED typed refusal re-surfaces as a typed per-item failure', async () => {
+  // Mirror of the rejection-arm certifiedBatch rule: a returned refusal must
+  // never read as batch-item success. Settlement records failed first; the
+  // batch runner then sees the typed throw.
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'run the approved batch' },
+  });
+  const { ExternalWritePreDispatchResult, ExternalWritePreDispatchError } = await import('./external-write-admission.js');
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async () => new ExternalWritePreDispatchResult(
+      '[provider-dispatch:not-started:ambiguous-account] ⚠️ NEEDS-YOUR-CHOICE (outlook)…',
+      'provider-dispatch:not-started:ambiguous-account',
+    ) as unknown as string,
+  });
+  const input = JSON.stringify({ tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { to_recipients: ['a@b.c'], subject: 's', body: 'b' } });
+  const counter = new ToolCallsCounter(20);
+  await withHarnessRunContext({
+    sessionId: session.id, sourceUserSeq: source.seq,
+    behaviorScopeId: 'certified-batch-refusal', counter,
+    certifiedBatch: { payloadHash: 'test-hash' } as never,
+  }, async () => {
+    await assert.rejects(
+      (wrapped as unknown as {
+        invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+      }).invoke(null, input, { toolCall: { callId: 'batch-item-refused' } }),
+      (err: unknown) => err instanceof ExternalWritePreDispatchError,
+    );
+    assert.equal(listEvents(session.id, { types: ['external_write_failed'] }).length, 1,
+      'settlement recorded the honest failed before the typed re-throw');
+  });
+});

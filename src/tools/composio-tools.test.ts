@@ -109,26 +109,31 @@ test('ambiguous Composio mutation errors never replay the provider dispatch', as
   assert.doesNotMatch(output, /Retry this EXACT call/i);
 });
 
-test('a nominal local pre-dispatch error is rethrown once for both mutations and reads', async () => {
+test('a nominal local pre-dispatch error RESOLVES as the typed refusal once for both mutations and reads', async () => {
+  // CONTRACT CHANGE (2026-08-06): typed pre-dispatch errors are now RETURNED
+  // as ExternalWritePreDispatchResult so they survive the SDK's
+  // error_as_result to settlement (a rethrow was flattened into prose and
+  // settled `orphaned` — the live draft-batch gauntlet). Still exactly one
+  // attempt, never retried, message preserved.
   const { ComposioPreDispatchError } = await import('../integrations/composio/client.js');
+  const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
   for (const toolSlug of ['GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', 'OUTLOOK_LIST_MESSAGES']) {
     let dispatchAttempts = 0;
-    await assert.rejects(
-      runComposioExecuteForTest(
-        toolSlug,
-        { title: 'One document', markdown_text: '# Snapshot' },
-        async () => {
-          dispatchAttempts += 1;
-          throw new ComposioPreDispatchError('sdk-unavailable', 'SDK client was not constructed');
-        },
-      ),
-      (error: unknown) => {
-        assert.ok(error instanceof ComposioPreDispatchError);
-        assert.match((error as Error).message, /SDK client was not constructed/);
-        return true;
+    const out = await runComposioExecuteForTest(
+      toolSlug,
+      { title: 'One document', markdown_text: '# Snapshot' },
+      async () => {
+        dispatchAttempts += 1;
+        throw new ComposioPreDispatchError('sdk-unavailable', 'SDK client was not constructed');
       },
     );
-    assert.equal(dispatchAttempts, 1, `${toolSlug}: typed preflight is rethrown immediately and never retried`);
+    assert.ok((out as unknown) instanceof ExternalWritePreDispatchResult,
+      `${toolSlug}: the typed preflight survives as the nominal class`);
+    assert.match(
+      (out as unknown as InstanceType<typeof ExternalWritePreDispatchResult>).output,
+      /SDK client was not constructed/,
+    );
+    assert.equal(dispatchAttempts, 1, `${toolSlug}: typed preflight resolves immediately and is never retried`);
   }
 });
 
@@ -1209,17 +1214,19 @@ test('data-quality checkpoint: an autonomous run with hollow reads is confronted
       await runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q }, emptyExec, sid);
     }
 
-    // First WRITE attempt: deferred with the evidence + the real-assistant fork.
-    await rejects(
-      runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid),
-      (error: unknown) => {
-        assert.ok(error instanceof ExternalWritePreDispatchError);
-        match((error as Error).message, /DATA-QUALITY CHECKPOINT/);
-        match((error as Error).message, /APIFY_GET_DATASET_ITEMS: 3\/3 reads returned empty/);
-        match((error as Error).message, /ask_user_question/);
-        return true;
-      },
-    );
+    // First WRITE attempt: deferred with the evidence + the real-assistant
+    // fork. CONTRACT CHANGE (2026-08-06): the checkpoint now RESOLVES as the
+    // typed refusal (survives the SDK error wrapper to settlement) instead of
+    // throwing — same one-shot semantics, same message.
+    void rejects; void ExternalWritePreDispatchError;
+    const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
+    const checkpointOut = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid);
+    assert.ok((checkpointOut as unknown) instanceof ExternalWritePreDispatchResult,
+      'the checkpoint refusal is the nominal typed class');
+    const checkpointText = (checkpointOut as unknown as InstanceType<typeof ExternalWritePreDispatchResult>).output;
+    match(checkpointText, /DATA-QUALITY CHECKPOINT/);
+    match(checkpointText, /APIFY_GET_DATASET_ITEMS: 3\/3 reads returned empty/);
+    match(checkpointText, /ask_user_question/);
 
     // Deliberate second attempt proceeds (autonomy redirected, never dead-ended).
     const second = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid);
@@ -1238,32 +1245,39 @@ test('data-quality checkpoint: an autonomous run with hollow reads is confronted
   }
 });
 
-test('a gateway refusal is a nominal pre-dispatch throw and performs zero provider calls', async () => {
+test('a gateway refusal is a nominal pre-dispatch RETURN and performs zero provider calls', async () => {
+  // CONTRACT CHANGE (2026-08-06 draft-batch incident): the refusal used to be
+  // THROWN, and the SDK's error_as_result flattened the typed error into
+  // prose before settlement could classify it — a provably never-started
+  // write settled `external_write_orphaned` and the orphan-retry gate then
+  // blocked the corrected retry (5/5 drafts, 43% of the turn's tool budget
+  // burned on harness refusals, 0 drafts created). Refusals are now RETURNED
+  // as ExternalWritePreDispatchResult (the call_tool pattern), which survives
+  // to settlement typed. The model-facing text (the marker + message) and the
+  // zero-provider-calls guarantee are unchanged.
   const {
     runComposioExecuteWithGatewayForTest,
     __gatewayTest__,
   } = await import('./composio-tools.js');
-  const { ExternalWritePreDispatchError } = await import('../runtime/harness/external-write-admission.js');
+  const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
   const sid = 'sess-gateway-nominal-preflight';
   const slug = 'AIRTABLE_CREATE_RECORD';
   __gatewayTest__.recordReconnectBreaker(sid, slug);
   let dispatches = 0;
-  await assert.rejects(
-    runComposioExecuteWithGatewayForTest(
-      slug,
-      { base_id: 'app1', table_id: 'tbl1', fields: { Name: 'Ada' } },
-      (async () => {
-        dispatches += 1;
-        return { successful: true, data: { id: 'rec1' } };
-      }) as never,
-      sid,
-    ),
-    (error: unknown) => {
-      assert.ok(error instanceof ExternalWritePreDispatchError);
-      assert.match((error as Error).message, /provider-dispatch:not-started:not-connected/i);
-      return true;
-    },
+  const out = await runComposioExecuteWithGatewayForTest(
+    slug,
+    { base_id: 'app1', table_id: 'tbl1', fields: { Name: 'Ada' } },
+    (async () => {
+      dispatches += 1;
+      return { successful: true, data: { id: 'rec1' } };
+    }) as never,
+    sid,
   );
+  assert.ok((out as unknown) instanceof ExternalWritePreDispatchResult,
+    'the refusal reaches the harness as the nominal typed class, never SDK error prose');
+  const refusal = out as unknown as InstanceType<typeof ExternalWritePreDispatchResult>;
+  assert.match(refusal.output, /provider-dispatch:not-started:not-connected/i);
+  assert.match(refusal.reason, /provider-dispatch:not-started/);
   assert.equal(dispatches, 0);
 });
 

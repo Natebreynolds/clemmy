@@ -60,7 +60,7 @@ const {
   runComposioExecuteForTestInSession,
   resetDataQualityForTest,
 } = await import('../tools/composio-tools.js');
-const { ExternalWritePreDispatchError } = await import('../runtime/harness/external-write-admission.js');
+const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
 const { listNotifications } = await import('../runtime/notifications.js');
 const { setProactiveReportFireForTest } = await import('../runtime/outcome.js');
 
@@ -223,16 +223,18 @@ test('J3: dead data source → empty-result advisory → data-quality checkpoint
     }
     assert.match(advisorySeen, /empty-result advisory/, 'the model was steered before the write');
 
-    await assert.rejects(
-      runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid),
-      (error: unknown) => {
-        assert.ok(error instanceof ExternalWritePreDispatchError);
-        assert.match(error.message, /DATA-QUALITY CHECKPOINT/);
-        assert.match(error.message, /4\/4 reads returned empty/);
-        assert.match(error.message, /ask_user_question/, 'the check-in fork is offered');
-        return true;
-      },
+    // The checkpoint RESOLVES as a typed refusal (never throws): a thrown
+    // refusal was flattened to prose by the SDK's error wrapper and settled
+    // ORPHANED ("may have landed") instead of failed-retryable.
+    const checkpoint = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid);
+    assert.ok(
+      (checkpoint as unknown) instanceof ExternalWritePreDispatchResult,
+      'the checkpoint survives as the typed no-dispatch class',
     );
+    const checkpointText = String(checkpoint);
+    assert.match(checkpointText, /DATA-QUALITY CHECKPOINT/);
+    assert.match(checkpointText, /4\/4 reads returned empty/);
+    assert.match(checkpointText, /ask_user_question/, 'the check-in fork is offered');
     assert.equal(writeDispatches, 0, 'the typed checkpoint proves no provider write started');
 
     // A deliberate second attempt proceeds — autonomy redirected, never dead-ended.

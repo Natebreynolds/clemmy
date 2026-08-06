@@ -3449,6 +3449,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
           settlementNonce,
           bracketOutcome?.reservation,
         );
+        // Certified-batch mirror of the rejection-arm rule below: a RETURNED
+        // typed refusal must still surface to the batch runner as a typed
+        // per-item failure — otherwise a refusal string would read as item
+        // success. Settlement above has already recorded the honest `failed`.
+        if (ctx?.certifiedBatch && result instanceof ExternalWritePreDispatchResult) {
+          throw new ExternalWritePreDispatchError(result.output);
+        }
         const outwardResult = unwrapExternalWritePreDispatchResult(result);
         recordPublishIfSucceeded(tool.name, parsedInput, outwardResult, shellOutcome);
         creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, outwardResult, shellOutcome);

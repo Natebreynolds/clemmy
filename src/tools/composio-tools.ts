@@ -77,7 +77,7 @@ import {
   type ComposioConnectionSuppressionState,
 } from '../agents/composio-connection-suppression.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
-import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
+import { ExternalWritePreDispatchError, ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 import { getComposioCliDefaultAccountAuthority } from '../integrations/composio/cli-default-account-authority.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 
@@ -1973,9 +1973,19 @@ async function runComposioExecute(
       userInput: latestUserInputForContext(options.context),
     });
   if (!resolved.ok) {
-    throw new ExternalWritePreDispatchError(
+    // RETURN the typed refusal instead of throwing (call-tool.ts precedent):
+    // a throw inside execute is swallowed by the SDK's error_as_result into
+    // prose BEFORE the harness bracket can classify it, so a provably
+    // never-started refusal settled `external_write_orphaned` ("may have
+    // landed") and the orphan-retry gate then blocked the corrected retry —
+    // the live 2026-08-06 draft-batch gauntlet (5/5 refusals orphaned, 43% of
+    // the turn's tool budget burned on harness refusals, 0 drafts). A
+    // resolved instance survives to settlement, `trustedNotStarted` fires,
+    // and the ledger records the honest `external_write_failed` (retryable).
+    return new ExternalWritePreDispatchResult(
       `[provider-dispatch:not-started:${resolved.reason}] ${resolved.message}`,
-    );
+      `provider-dispatch:not-started:${resolved.reason}`,
+    ) as unknown as string;
   }
   args = resolved.args;
   const effectiveConnectionId = resolved.connectionId;
@@ -1987,7 +1997,14 @@ async function runComposioExecute(
   // of shipping false negatives (2026-07-22 Phoenix Airtable audit). Fires
   // once; a deliberate second attempt proceeds.
   const checkpoint = dataQualityWriteCheckpoint(runSid, toolSlug);
-  if (checkpoint) throw new ExternalWritePreDispatchError(checkpoint);
+  // Same typed-return rule as the gateway refusal above: never started ⇒
+  // settle `failed`, never `orphaned`.
+  if (checkpoint) {
+    return new ExternalWritePreDispatchResult(
+      checkpoint,
+      'provider-dispatch:not-started:data-quality-checkpoint',
+    ) as unknown as string;
+  }
 
   // Tool-bound standing rules ride with EVERY call's output — the model
   // re-reads them at the moment it acts on this toolkit, independent of
@@ -2213,11 +2230,17 @@ async function runComposioExecute(
       const errorMsg = err instanceof Error ? err.message : String(err ?? '');
       recentErrors.push(errorMsg);
 
-      // Preserve nominal pre-dispatch provenance for the shared write boundary.
-      // Formatting this as a returned string would erase the only trustworthy
-      // proof that no provider call started and strand the durable reservation
-      // as ambiguous. The bracket soft-surfaces this exact typed error.
-      if (err instanceof ExternalWritePreDispatchError) throw err;
+      // Preserve nominal pre-dispatch provenance for the shared write boundary
+      // as a RETURNED typed result — a rethrow here is swallowed into prose by
+      // the SDK's error_as_result BEFORE the bracket can see it (the exact
+      // mechanism that orphaned the 2026-08-06 draft batch), while a resolved
+      // instance survives to settlement and records the honest `failed`.
+      if (err instanceof ExternalWritePreDispatchError) {
+        return new ExternalWritePreDispatchResult(
+          err.message,
+          'local_pre_dispatch_refusal',
+        ) as unknown as string;
+      }
 
       // Entity/user mismatches and NoActiveConnection are deterministic. In
       // particular, do not spend the generic retry budget repeating a call
@@ -2455,6 +2478,12 @@ export async function getDynamicComposioRuntimeTools(options: {
         // (read for GET/LIST/etc., send for everything else), then
         // consults the scope policy (yolo → auto, strict → ask, etc.).
         needsApproval: needsApprovalFromTaxonomy(name),
+        // Same typed-refusal safety net as composio_execute_tool.
+        errorFunction: (_context, error) => {
+          if (error instanceof ExternalWritePreDispatchError) throw error;
+          const details = error instanceof Error ? error.toString() : String(error);
+          return `An error occurred while running the tool. Please try again. Error: ${details}`;
+        },
         execute: async (input, context, details) => runComposioExecute(
           toolSlug,
           normalizeToolInput(input),
@@ -2762,6 +2791,15 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     // GOOGLESHEETS_BATCH_GET autos through while GMAIL_SEND_EMAIL pauses
     // (or autos in YOLO).
     needsApproval: needsApprovalFromTaxonomy('composio_execute_tool'),
+    // Safety net (call-tool.ts precedent): any FUTURE code path that still
+    // throws the typed pre-dispatch refusal from inside execute must escape
+    // the SDK's error_as_result so the bracket settles it `failed`, never
+    // `orphaned`. Ordinary errors keep the SDK's exact default prose.
+    errorFunction: (_context, error) => {
+      if (error instanceof ExternalWritePreDispatchError) throw error;
+      const details = error instanceof Error ? error.toString() : String(error);
+      return `An error occurred while running the tool. Please try again. Error: ${details}`;
+    },
     execute: async ({ tool_slug, arguments: args, connected_account_id }, context, details) => {
       let parsedArgs: Record<string, unknown>;
       try {
