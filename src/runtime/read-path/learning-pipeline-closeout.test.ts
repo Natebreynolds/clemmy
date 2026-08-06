@@ -74,11 +74,22 @@ test('a fresh search followed by success cannot write a procedure with historica
   await drainLearning();
 
   const procedure = toolChoice.resolveToolProcedureForIdentifier('SCHEDULERCO_LIST_OFFSITE');
-  const serialized = JSON.stringify(procedure ?? {});
-  assert.equal(/2026-08-06/.test(serialized), false,
+  // Scan ONLY argument surfaces. A whole-record date scan was a time bomb:
+  // after 17:00 Pacific the record's own testedAt/createdAt timestamps carry
+  // tomorrow's UTC date and matched the forbidden fixture date (live
+  // 2026-08-05 — the suite went red at sunset with no code change).
+  const argumentSurface = JSON.stringify({
+    template: (procedure as { choice?: { invocationTemplate?: string } } | null)?.choice?.invocationTemplate ?? '',
+    fallbacks: ((procedure as { fallbacks?: Array<{ invocationTemplate?: string }> } | null)?.fallbacks ?? [])
+      .map((f) => f.invocationTemplate ?? ''),
+  });
+  assert.equal(/2026-08-06|timeMin/.test(argumentSurface), false,
     'the search-then-success path persisted a historical invocation argument');
-  assert.equal(/invocationTemplate/.test(serialized) && /timeMin/.test(serialized), false,
-    'the search-then-success path persisted an invocation template for a read');
+  assert.equal(
+    (procedure as { choice?: { invocationTemplate?: string } } | null)?.choice?.invocationTemplate,
+    undefined,
+    'the search-then-success path persisted an invocation template for a read',
+  );
 });
 
 // ─── A.4: receipts are unique and fully bound ────────────────────────────────
