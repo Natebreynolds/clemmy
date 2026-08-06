@@ -65,3 +65,24 @@ test('the runtime publicSlug names the tool row when args are private', async ()
   assert.equal(humanToolLabel('composio_execute_tool', undefined, 'OUTLOOK_SEND_EMAIL'), 'outlook send email');
   assert.equal(humanToolLabel('composio_execute_tool', undefined, undefined), 'composio execute tool');
 });
+
+test('the visibility window: excerpts ride the deliverables row; glimpses land on tool rows', () => {
+  let rows = reduceActivity(EMPTY, {
+    type: 'deliverable_saved',
+    data: { name: 'acme.md', dir: 'drafts', excerpt: 'Subject: Quick intro\n\nHi —' },
+  } as never);
+  assert.equal(rows[0].excerpt, 'Subject: Quick intro\n\nHi —');
+  // A later save WITHOUT an excerpt keeps the last good peek.
+  rows = reduceActivity(rows, { type: 'deliverable_saved', data: { name: 'baker.md', dir: 'drafts' } } as never);
+  assert.equal(rows[0].count, 2);
+  assert.ok(rows[0].excerpt?.startsWith('Subject:'));
+
+  let tools = reduceActivity(EMPTY, { type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'c1', publicSlug: 'APIFY_RUN_ACTOR' } } as never);
+  tools = reduceActivity(tools, {
+    type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', callId: 'c1', ok: true, glimpse: { count: 12, key: 'records', fields: ['name', 'website'], sample: 'Acme Roofing' } },
+  } as never);
+  assert.equal(tools[0].label, 'apify run actor');
+  assert.equal(tools[0].status, 'done');
+  assert.match(tools[0].detail ?? '', /12 records · name, website · “Acme Roofing”/);
+});

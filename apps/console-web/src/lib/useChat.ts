@@ -48,6 +48,10 @@ export interface ActivityItem {
   /** kind 'event' rolling rows only: how many occurrences this row aggregates
    *  (e.g. files saved this turn). */
   count?: number;
+  /** Bounded runtime-verified content peek (the opening of a file just
+   *  written). Rendered as an expandable pane under the row — the
+   *  visibility window into what's actually being produced. */
+  excerpt?: string;
 }
 
 export interface ChatMessage {
@@ -415,6 +419,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       const label = count === 1
         ? `Saved ${name}${dir ? ` in ${dir}` : ''}`
         : `Saved ${count} files · latest ${name}`;
+      const excerpt = typeof d.excerpt === 'string' && d.excerpt.trim() ? d.excerpt : undefined;
       const row: ActivityItem = {
         id: 'deliverables',
         kind: 'event',
@@ -424,6 +429,9 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
         ...(dir && count > 1 ? { detail: `in ${dir}` } : {}),
         status: 'done',
         count,
+        // The latest file's opening rides along, so the peek pane always
+        // shows what was JUST produced.
+        ...(excerpt ? { excerpt } : (existing?.excerpt ? { excerpt: existing.excerpt } : {})),
       };
       return existing
         ? prev.map((a) => (a.id === 'deliverables' ? row : a))
@@ -471,15 +479,31 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       if (d.batchMode === true) return prev; // counted via batch_progress
       // The backend now carries data.ok — a returned tool can have failed.
       const status: ActivityItem['status'] = d.ok === false ? 'failed' : 'done';
+      // The read-result glimpse: "12 records · name, website, phone — Acme
+      // Roofing". Runtime-derived structure, so scraped data visibly ARRIVES
+      // instead of disappearing into a digest.
+      const g = d.glimpse as { count?: number; key?: string; fields?: string[]; sample?: string } | undefined;
+      const glimpseDetail = g && typeof g.count === 'number'
+        ? [
+            `${g.count} ${typeof g.key === 'string' && g.key ? g.key : 'items'}`,
+            Array.isArray(g.fields) && g.fields.length ? g.fields.join(', ') : '',
+            typeof g.sample === 'string' && g.sample ? `“${g.sample}”` : '',
+          ].filter(Boolean).join(' · ')
+        : '';
+      const settle = (a: ActivityItem): ActivityItem => ({
+        ...a,
+        status,
+        ...(glimpseDetail ? { detail: glimpseDetail } : {}),
+      });
       if (callId) {
         const id = `t-${callId}`;
         if (prev.some((a) => a.kind === 'tool' && a.id === id)) {
-          return prev.map((a) => (a.kind === 'tool' && a.id === id ? { ...a, status } : a));
+          return prev.map((a) => (a.kind === 'tool' && a.id === id ? settle(a) : a));
         }
       }
       for (let i = prev.length - 1; i >= 0; i--) {
         if (prev[i].kind === 'tool' && prev[i].status === 'running' && prev[i].label === toolLabel) {
-          return prev.map((a, j) => (j === i ? { ...a, status } : a));
+          return prev.map((a, j) => (j === i ? settle(a) : a));
         }
       }
       return prev;

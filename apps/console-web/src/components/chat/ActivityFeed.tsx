@@ -119,26 +119,48 @@ export function ActivityRow({ a, now, live, showDetails = false }: {
   const elapsed = running ? elapsedLabel(a.startedAt, now) : '';
   const isEvent = a.kind === 'event';
   const detailVisible = a.detail && (a.kind === 'tool' || a.kind === 'check' || isEvent || (a.kind === 'agent' && showDetails));
+  // The peek pane: auto-open while the run is live (the whole point is seeing
+  // work as it happens); the user's toggle wins once touched.
+  const [peekTouched, setPeekTouched] = useState(false);
+  const [peekOpen, setPeekOpen] = useState(live);
+  const showExcerpt = Boolean(a.excerpt) && (peekTouched ? peekOpen : live);
   return (
-    <li className="flex items-center gap-2 text-caption">
-      {a.kind === 'agent' ? (
-        <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
-      ) : a.kind === 'check' ? (
-        a.status === 'interrupted'
-          ? <AlertCircle className="h-3 w-3 shrink-0 text-warning" aria-hidden />
-          : <Check className={cn('h-3 w-3 shrink-0', a.status === 'failed' ? 'text-warning' : 'text-success')} aria-hidden />
-      ) : isEvent ? (
-        <EventIcon a={a} />
-      ) : (
-        <Wrench className="h-3 w-3 shrink-0 text-faint" aria-hidden />
+    <li className="flex flex-col gap-1 text-caption">
+      <div className="flex items-center gap-2">
+        {a.kind === 'agent' ? (
+          <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
+        ) : a.kind === 'check' ? (
+          a.status === 'interrupted'
+            ? <AlertCircle className="h-3 w-3 shrink-0 text-warning" aria-hidden />
+            : <Check className={cn('h-3 w-3 shrink-0', a.status === 'failed' ? 'text-warning' : 'text-success')} aria-hidden />
+        ) : isEvent ? (
+          <EventIcon a={a} />
+        ) : (
+          <Wrench className="h-3 w-3 shrink-0 text-faint" aria-hidden />
+        )}
+        <span className={cn('min-w-0 truncate', running || (isEvent && a.tone && a.tone !== 'muted') ? 'text-fg' : 'text-muted')}>{a.label}</span>
+        {detailVisible && (
+          <span className="min-w-0 flex-1 truncate text-faint">→ {a.detail}</span>
+        )}
+        {!detailVisible && <span className="flex-1" />}
+        {a.excerpt && (
+          <button
+            type="button"
+            onClick={() => { setPeekTouched(true); setPeekOpen(!showExcerpt); }}
+            aria-expanded={showExcerpt}
+            className="shrink-0 text-caption text-faint transition-colors hover:text-muted"
+          >
+            {showExcerpt ? 'hide' : 'peek'}
+          </button>
+        )}
+        {elapsed && <span className="shrink-0 tabular-nums text-faint">{elapsed}</span>}
+        {!isEvent && <StatusIcon status={a.status} />}
+      </div>
+      {showExcerpt && (
+        <pre className="ml-5 max-h-36 overflow-y-auto whitespace-pre-wrap rounded-md border border-border/60 bg-subtle px-2.5 py-2 font-sans text-caption leading-relaxed text-muted">
+          {a.excerpt}
+        </pre>
       )}
-      <span className={cn('min-w-0 truncate', running || (isEvent && a.tone && a.tone !== 'muted') ? 'text-fg' : 'text-muted')}>{a.label}</span>
-      {detailVisible && (
-        <span className="min-w-0 flex-1 truncate text-faint">→ {a.detail}</span>
-      )}
-      {!detailVisible && <span className="flex-1" />}
-      {elapsed && <span className="shrink-0 tabular-nums text-faint">{elapsed}</span>}
-      {!isEvent && <StatusIcon status={a.status} />}
     </li>
   );
 }
