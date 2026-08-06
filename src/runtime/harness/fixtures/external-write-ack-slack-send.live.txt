@@ -1,0 +1,843 @@
+{
+  "data": {
+    "channel": "C0BHT7WHZDL",
+    "message": {
+      "app_id": "A09DP8VR3DF",
+      "blocks": [
+        {
+          "block_id": "ocS9ZC",
+          "elements": [
+            {
+              "elements": [
+                {
+                  "name": "bar_chart",
+                  "style": {
+                    "bold": true
+                  },
+                  "type": "emoji",
+                  "unicode": "1f4ca"
+                },
+                {
+                  "style": {
+                    "bold": true
+                  },
+                  "text": " Team Activity Update — Morning, Thu Aug 6, 2026",
+                  "type": "text"
+                },
+                {
+                  "text": "\n\n",
+                  "type": "text"
+                },
+                {
+                  "style": {
+                    "bold": true
+                  },
+                  "text": "PER-REP (today, sorted by total)",
+                  "type": "text"
+                },
+                {
+                  "text": " — calls / emails / other, Δ vs yesterday, WTD total",
+                  "type": "text"
+                }
+              ],
+              "type": "rich_text_section"
+            },
+            {
+              "elements": [
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Tim Demik",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 71 total: 4 calls (-9), 11 emails (-6), 56 other (+25) · WTD 225",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Kim Hillman",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 33 total: 4 calls (-21), 20 emails (-18), 9 other (+9) · WTD 233",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Jake Wright",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 21 total: 13 calls (-27), 8 emails (-40), 0 other (-1) · WTD 223",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Bobby Romano",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 20 total: 3 calls (-24), 17 emails (-21), 0 other · WTD 184",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Tyler Jorgensen",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 20 total: 19 calls (-3), 1 email (+1), 0 other (-1) · WTD 142",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Brett Lorenzini",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 17 total: 0 calls, 17 emails (-19), 0 other · WTD 161",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Jarrett Tyus",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 13 total: 13 calls (-29), 0 emails (-4), 0 other · WTD 175",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Taylor Saunders",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 7 total: 0 calls (-51), 7 emails (-159), 0 other · WTD 492",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                }
+              ],
+              "indent": 0,
+              "style": "ordered",
+              "type": "rich_text_list"
+            },
+            {
+              "elements": [
+                {
+                  "text": "\n",
+                  "type": "text"
+                },
+                {
+                  "name": "triangular_flag_on_post",
+                  "style": {
+                    "bold": true
+                  },
+                  "type": "emoji",
+                  "unicode": "1f6a9"
+                },
+                {
+                  "style": {
+                    "bold": true
+                  },
+                  "text": " ZERO-ACTIVITY FLAGS:",
+                  "type": "text"
+                },
+                {
+                  "text": " none — every rep logged activity today (low: Taylor Saunders, 7).",
+                  "type": "text"
+                },
+                {
+                  "text": "\n\n",
+                  "type": "text"
+                },
+                {
+                  "name": "date",
+                  "style": {
+                    "bold": true
+                  },
+                  "type": "emoji",
+                  "unicode": "1f4c5"
+                },
+                {
+                  "style": {
+                    "bold": true
+                  },
+                  "text": " MEETINGS BOOKED TODAY (3 total)",
+                  "type": "text"
+                }
+              ],
+              "type": "rich_text_section"
+            },
+            {
+              "elements": [
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Brett Lorenzini",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 1: Oxendine & Associates PLLC (Beth Lapierre), meets 8/11. Booked off a warm recap email sent 7/23 after their initial in-person meeting, confirming the Wed 9am strategy review (no more-recent SF touch found).",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Jake Wright",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 1: Jon Miller Law, PLLC (Jon Miller), meets 8/12. Booked off a same-day email (8/5) sent right after their proposal-review call, following an earlier voicemail (8/5) and confirmation emails (8/3-8/4).",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Tyler Jorgensen",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — 1: Get Me Brittany™ Law (Brittany Hale), meets 8/14 — inbound lead. SDR Paden Adams emailed availability that morning (8/6), then a rep placed 2 calls (voicemail, no-answer) same day before the meeting landed; last touch = voicemail.",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                }
+              ],
+              "indent": 0,
+              "style": "bullet",
+              "type": "rich_text_list"
+            },
+            {
+              "elements": [
+                {
+                  "text": "\n",
+                  "type": "text"
+                },
+                {
+                  "name": "moneybag",
+                  "style": {
+                    "bold": true
+                  },
+                  "type": "emoji",
+                  "unicode": "1f4b0"
+                },
+                {
+                  "style": {
+                    "bold": true
+                  },
+                  "text": " PIPELINE (today)",
+                  "type": "text"
+                }
+              ],
+              "type": "rich_text_section"
+            },
+            {
+              "elements": [
+                {
+                  "elements": [
+                    {
+                      "text": "Opportunities created: 0 (all reps)",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "text": "Stage-advanced: 0 (OpportunityFieldHistory queried successfully — no stage changes logged today)",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "text": "Closed-won: 0 (all reps), $0",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "text": "Team totals: 0 created / 0 advanced / 0 closed-won / $0",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                }
+              ],
+              "indent": 0,
+              "style": "bullet",
+              "type": "rich_text_list"
+            },
+            {
+              "elements": [
+                {
+                  "text": "\n",
+                  "type": "text"
+                },
+                {
+                  "name": "warning",
+                  "style": {
+                    "bold": true
+                  },
+                  "type": "emoji",
+                  "unicode": "26a0-fe0f"
+                },
+                {
+                  "style": {
+                    "bold": true
+                  },
+                  "text": " STALE OPPORTUNITIES (5+ DAYS COLD): 13 open opps, $117,849.08 total stale pipeline (4 opps have no $ amount on file)",
+                  "type": "text"
+                },
+                {
+                  "text": "\n",
+                  "type": "text"
+                },
+                {
+                  "style": {
+                    "italic": true
+                  },
+                  "text": "Bobby Romano",
+                  "type": "text"
+                },
+                {
+                  "text": " (3):",
+                  "type": "text"
+                }
+              ],
+              "type": "rich_text_section"
+            },
+            {
+              "elements": [
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Gautier & Hasty, P.L. I Global Support Upsell",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Discovery · $6,998.99 · last touch 2026-07-07 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "30d cold",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "G Best Husband Law, PLLC | Gabrielle Best Husband",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Proposal · $8,999.01 · last touch 2026-07-27 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "10d cold",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Kennedy, Kennedy, Robbins & Yarbro | Chris L. Yarbro",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Proposal · $41,349.98 · last touch 2026-07-30 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "7d cold",
+                      "type": "text"
+                    },
+                    {
+                      "text": "\n",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Taylor Saunders",
+                      "type": "text"
+                    },
+                    {
+                      "text": " (4):",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Terc Law Office P.C | Maximiliano Karehnke",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Discovery · no amt · last touch 2026-07-23 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "14d cold",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "The Gillespie Law Firm | Tristan Gillespie",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Proposal · $9,998.99 · last touch 2026-07-24 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "13d cold",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Kaiman & Crahan | Kyle D. Kaiman",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Proposal · $8,001.99 · last touch 2026-07-24 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "13d cold",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Beckerman & Granados | Brandon Granados",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Proposal · $13,500.03 · last touch 2026-07-27 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "10d cold",
+                      "type": "text"
+                    },
+                    {
+                      "text": "\n",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Tim Demik",
+                      "type": "text"
+                    },
+                    {
+                      "text": " (1):",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Hallam Law Group | Josephine Hallam",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Discovery · $16,900.04 · last touch 2026-07-23 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "14d cold",
+                      "type": "text"
+                    },
+                    {
+                      "text": "\n",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Brett Lorenzini",
+                      "type": "text"
+                    },
+                    {
+                      "text": " (2):",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Morris James | Dawn Sheiker",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Discovery · no amt · last touch 2026-07-17 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "20d cold",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Cal Mundell Law Firm | Stehpanie Mundell",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Discovery · no amt · last touch 2026-07-28 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "9d cold",
+                      "type": "text"
+                    },
+                    {
+                      "text": "\n",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Kim Hillman",
+                      "type": "text"
+                    },
+                    {
+                      "text": " (3):",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Walker Disability Law | Jared Walker",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Proposal · $10,400.02 · last touch 2026-07-29 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "8d cold",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "R.P. Jones Law | Ryan Jones",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Proposal · $1,700.03 · last touch 2026-07-30 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "7d cold",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "Myatt & Bell | Dana Holway",
+                      "type": "text"
+                    },
+                    {
+                      "text": " — Discovery · no amt · last touch 2026-07-31 · ",
+                      "type": "text"
+                    },
+                    {
+                      "style": {
+                        "italic": true
+                      },
+                      "text": "6d cold",
+                      "type": "text"
+                    },
+                    {
+                      "text": "\n",
+                      "type": "text"
+                    },
+                    {
+                      "text": "Clean (0 stale): Jake Wright, Jarrett Tyus, Tyler Jorgensen",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                }
+              ],
+              "indent": 0,
+              "style": "bullet",
+              "type": "rich_text_list"
+            },
+            {
+              "elements": [
+                {
+                  "text": "\n",
+                  "type": "text"
+                },
+                {
+                  "name": "trophy",
+                  "style": {
+                    "bold": true
+                  },
+                  "type": "emoji",
+                  "unicode": "1f3c6"
+                },
+                {
+                  "style": {
+                    "bold": true
+                  },
+                  "text": " LEADERBOARD",
+                  "type": "text"
+                },
+                {
+                  "text": "\n",
+                  "type": "text"
+                },
+                {
+                  "text": "Top rep today: ",
+                  "type": "text"
+                },
+                {
+                  "style": {
+                    "italic": true
+                  },
+                  "text": "Tim Demik",
+                  "type": "text"
+                },
+                {
+                  "text": " — 71 total activities",
+                  "type": "text"
+                },
+                {
+                  "text": "\n",
+                  "type": "text"
+                },
+                {
+                  "text": "Team totals today: 56 calls · 81 emails · 65 other · 3 meetings booked",
+                  "type": "text"
+                }
+              ],
+              "type": "rich_text_section"
+            }
+          ],
+          "type": "rich_text"
+        }
+      ],
+      "bot_id": "B0BJTTS9Z50",
+      "bot_profile": {
+        "app_id": "A09DP8VR3DF",
+        "deleted": false,
+        "icons": {
+          "image_36": "https://avatars.slack-edge.com/2025-09-03/9465308667617_bcceb0ff7c6702aa2df9_36.png",
+          "image_48": "https://avatars.slack-edge.com/2025-09-03/9465308667617_bcceb0ff7c6702aa2df9_48.png",
+          "image_72": "https://avatars.slack-edge.com/2025-09-03/9465308667617_bcceb0ff7c6702aa2df9_72.png"
+        },
+        "id": "B0BJTTS9Z50",
+        "name": "Composio",
+        "team_id": "T07M64F2S",
+        "updated": 1784651934
+      },
+      "team": "T07M64F2S",
+      "text": ":bar_chart: *Team Activity Update — Morning, Thu Aug 6, 2026*\n\n*PER-REP (today, sorted by total)* — calls / emails / other, Δ vs yesterday, WTD total\n1. _Tim Demik_ — 71 total: 4 calls (-9), 11 emails (-6), 56 other (+25) · WTD 225\n2. _Kim Hillman_ — 33 total: 4 calls (-21), 20 emails (-18), 9 other (+9) · WTD 233\n3. _Jake Wright_ — 21 total: 13 calls (-27), 8 emails (-40), 0 other (-1) · WTD 223\n4. _Bobby Romano_ — 20 total: 3 calls (-24), 17 emails (-21), 0 other · WTD 184\n5. _Tyler Jorgensen_ — 20 total: 19 calls (-3), 1 email (+1), 0 other (-1) · WTD 142\n6. _Brett Lorenzini_ — 17 total: 0 calls, 17 emails (-19), 0 other · WTD 161\n7. _Jarrett Tyus_ — 13 total: 13 calls (-29), 0 emails (-4), 0 other · WTD 175\n8. _Taylor Saunders_ — 7 total: 0 calls (-51), 7 emails (-159), 0 other · WTD 492\n:triangular_flag_on_post: *ZERO-ACTIVITY FLAGS:* none — every rep logged activity today (low: Taylor Saunders, 7).\n\n:date: *MEETINGS BOOKED TODAY (3 total)*\n• _Brett Lorenzini_ — 1: Oxendine &amp; Associates PLLC (Beth Lapierre), meets 8/11. Booked off a warm recap email sent 7/23 after their initial in-person meeting, confirming the Wed 9am strategy review (no more-recent SF touch found).\n• _Jake Wright_ — 1: Jon Miller Law, PLLC (Jon Miller), meets 8/12. Booked off a same-day email (8/5) sent right after their proposal-review call, following an earlier voicemail (8/5) and confirmation emails (8/3-8/4).\n• _Tyler Jorgensen_ — 1: Get Me Brittany™ Law (Brittany Hale), meets 8/14 — inbound lead. SDR Paden Adams emailed availability that morning (8/6), then a rep placed 2 calls (voicemail, no-answer) same day before the meeting landed; last touch = voicemail.\n:moneybag: *PIPELINE (today)*\n• Opportunities created: 0 (all reps)\n• Stage-advanced: 0 (OpportunityFieldHistory queried successfully — no stage changes logged today)\n• Closed-won: 0 (all reps), $0\n• Team totals: 0 created / 0 advanced / 0 closed-won / $0\n:warning: *STALE OPPORTUNITIES (5+ DAYS COLD): 13 open opps, $117,849.08 total stale pipeline (4 opps have no $ amount on file)*\n_Bobby Romano_ (3):\n• _Gautier &amp; Hasty, P.L. I Global Support Upsell_ — Discovery · $6,998.99 · last touch 2026-07-07 · _30d cold_\n• _G Best Husband Law, PLLC | Gabrielle Best Husband_ — Proposal · $8,999.01 · last touch 2026-07-27 · _10d cold_\n• _Kennedy, Kennedy, Robbins &amp; Yarbro | Chris L. Yarbro_ — Proposal · $41,349.98 · last touch 2026-07-30 · _7d cold_\n_Taylor Saunders_ (4):\n• _Terc Law Office P.C | Maximiliano Karehnke_ — Discovery · no amt · last touch 2026-07-23 · _14d cold_\n• _The Gillespie Law Firm | Tristan Gillespie_ — Proposal · $9,998.99 · last touch 2026-07-24 · _13d cold_\n• _Kaiman &amp; Crahan | Kyle D. Kaiman_ — Proposal · $8,001.99 · last touch 2026-07-24 · _13d cold_\n• _Beckerman &amp; Granados | Brandon Granados_ — Proposal · $13,500.03 · last touch 2026-07-27 · _10d cold_\n_Tim Demik_ (1):\n• _Hallam Law Group | Josephine Hallam_ — Discovery · $16,900.04 · last touch 2026-07-23 · _14d cold_\n_Brett Lorenzini_ (2):\n• _Morris James | Dawn Sheiker_ — Discovery · no amt · last touch 2026-07-17 · _20d cold_\n• _Cal Mundell Law Firm | Stehpanie Mundell_ — Discovery · no amt · last touch 2026-07-28 · _9d cold_\n_Kim Hillman_ (3):\n• _Walker Disability Law | Jared Walker_ — Proposal · $10,400.02 · last touch 2026-07-29 · _8d cold_\n• _R.P. Jones Law | Ryan Jones_ — Proposal · $1,700.03 · last touch 2026-07-30 · _7d cold_\n• _Myatt &amp; Bell | Dana Holway_ — Discovery · no amt · last touch 2026-07-31 · _6d cold_\nClean (0 stale): Jake Wright, Jarrett Tyus, Tyler Jorgensen\n:trophy: *LEADERBOARD*\nTop rep today: _Tim Demik_ — 71 total activities\nTeam totals today: 56 calls · 81 emails · 65 other · 3 meetings booked",
+      "ts": "1786033455.584879",
+      "type": "message",
+      "user": "U0B7DK363"
+    },
+    "ok": true,
+    "ts": "1786033455.584879"
+  },
+  "error": null,
+  "successful": true,
+  "logId": "log_vO31EGEl-Or1"
+}

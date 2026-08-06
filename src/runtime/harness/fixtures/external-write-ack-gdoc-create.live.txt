@@ -1,0 +1,2263 @@
+{
+  "data": {
+    "default_tab_id": "t.0",
+    "display_url": "https://docs.google.com/document/d/1udZzs8_9FXWMBGIK3C0eDY_xkWG84-h25YPwlpcfbuk/edit",
+    "documentId": "1udZzs8_9FXWMBGIK3C0eDY_xkWG84-h25YPwlpcfbuk",
+    "request_data": [
+      {
+        "insertText": {
+          "location": {
+            "index": 1
+          },
+          "text": "SEO Intelligence: 10 Brett-Owned Market Leader Accounts\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_1"
+          },
+          "range": {
+            "endIndex": 56,
+            "startIndex": 1
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 56,
+            "startIndex": 1
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 57
+          },
+          "text": "Prepared: August 2, 2026\nScope: Live homepage review plus DataForSEO U.S. Google organic visibility estimates through July 2026.\nImportant: Estimated organic traffic (ETV) is a directional third-party estimate, not analytics data. Twelve-month change compares July 2026 with the oldest month in the returned 12-month series.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 66,
+            "startIndex": 57
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 88,
+            "startIndex": 82
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 196,
+            "startIndex": 186
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 382
+          },
+          "text": "Executive summary\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_2"
+          },
+          "range": {
+            "endIndex": 399,
+            "startIndex": 382
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 399,
+            "startIndex": 382
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 400
+          },
+          "text": "Best immediate recovery prospects: Lebowitz & Mzhen, Petrillo & Goldberg, WRSH, and The Richardson Firm. Each still has meaningful keyword coverage but has lost 67%–87% of estimated organic traffic.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 434,
+            "startIndex": 400
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 599
+          },
+          "text": "Largest existing SEO asset: Albertson & Davidson leads the group with 4,926 ranking keywords and approximately 14,904 estimated monthly organic visits, despite a 35% year-over-year decline.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 626,
+            "startIndex": 599
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 789
+          },
+          "text": "Strongest positive momentum: Stotts Law is up 71% with roughly 6,342 estimated monthly visits. Carluzzo Rochkind & Smith is up 232%, but from a low base.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 817,
+            "startIndex": 789
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 943
+          },
+          "text": "Greenfield opportunities: Goodrich and Associates and Burnett Law Office have minimal current visibility, making them suitable for foundational local SEO, service-page, and authority-building programs.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 968,
+            "startIndex": 943
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1145
+          },
+          "text": "Comparative benchmark\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_2"
+          },
+          "range": {
+            "endIndex": 1166,
+            "startIndex": 1145
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 1166,
+            "startIndex": 1145
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1167
+          },
+          "text": "\n"
+        }
+      },
+      {
+        "insertTable": {
+          "columns": 7,
+          "location": {
+            "index": 1168
+          },
+          "rows": 11
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1334
+          },
+          "text": "Rebuild visibility"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1332
+          },
+          "text": "-55%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1330
+          },
+          "text": "23"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1328
+          },
+          "text": "36"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1326
+          },
+          "text": "goodrichpc.com"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1324
+          },
+          "text": "Goodrich and Associates"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1322
+          },
+          "text": "10"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1319
+          },
+          "text": "Foundational growth"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1317
+          },
+          "text": "-10%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1315
+          },
+          "text": "155"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1313
+          },
+          "text": "93"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1311
+          },
+          "text": "burnettlawaz.com"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1309
+          },
+          "text": "Burnett Law Office"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1307
+          },
+          "text": "9"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1304
+          },
+          "text": "Build from momentum"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1302
+          },
+          "text": "+232%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1300
+          },
+          "text": "210"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1298
+          },
+          "text": "151"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1296
+          },
+          "text": "novatriallawyers.com"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1294
+          },
+          "text": "Carluzzo Rochkind & Smith"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1292
+          },
+          "text": "8"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1289
+          },
+          "text": "Urgent recovery"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1287
+          },
+          "text": "-78%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1285
+          },
+          "text": "1,417"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1283
+          },
+          "text": "816"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1281
+          },
+          "text": "petrilloandgoldberg.com"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1279
+          },
+          "text": "Petrillo & Goldberg Law"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1277
+          },
+          "text": "7"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1274
+          },
+          "text": "Urgent recovery"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1272
+          },
+          "text": "-67%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1270
+          },
+          "text": "3,980"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1268
+          },
+          "text": "602"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1266
+          },
+          "text": "therichardsonfirm.com"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1264
+          },
+          "text": "The Richardson Firm"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1262
+          },
+          "text": "6"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1259
+          },
+          "text": "Urgent recovery"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1257
+          },
+          "text": "-87%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1255
+          },
+          "text": "5,520"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1253
+          },
+          "text": "756"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1251
+          },
+          "text": "marylandinjurylawyer.net"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1249
+          },
+          "text": "Lebowitz & Mzhen"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1247
+          },
+          "text": "5"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1244
+          },
+          "text": "Scale momentum"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1242
+          },
+          "text": "+71%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1240
+          },
+          "text": "6,342"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1238
+          },
+          "text": "1,456"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1236
+          },
+          "text": "adamstotts.com"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1234
+          },
+          "text": "Stotts Law"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1232
+          },
+          "text": "4"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1229
+          },
+          "text": "Recovery"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1227
+          },
+          "text": "-53%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1225
+          },
+          "text": "7,590"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1223
+          },
+          "text": "1,460"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1221
+          },
+          "text": "fusonlaw.com"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1219
+          },
+          "text": "Freeman & Fuson"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1217
+          },
+          "text": "3"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1214
+          },
+          "text": "Urgent recovery"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1212
+          },
+          "text": "-73%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1210
+          },
+          "text": "9,630"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1208
+          },
+          "text": "2,433"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1206
+          },
+          "text": "wrshlaw.com"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1204
+          },
+          "text": "WRSH"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1202
+          },
+          "text": "2"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1199
+          },
+          "text": "Protect and recover"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1197
+          },
+          "text": "-35%"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1195
+          },
+          "text": "14,904"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1193
+          },
+          "text": "4,926"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1191
+          },
+          "text": "aldavlaw.com"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1189
+          },
+          "text": "Albertson & Davidson"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1187
+          },
+          "text": "1"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1184
+          },
+          "text": "Priority"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 1192,
+            "startIndex": 1184
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1182
+          },
+          "text": "12-month change"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 1197,
+            "startIndex": 1182
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1180
+          },
+          "text": "Est. monthly organic traffic"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 1208,
+            "startIndex": 1180
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1178
+          },
+          "text": "Organic keywords"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 1194,
+            "startIndex": 1178
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1176
+          },
+          "text": "Domain"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 1182,
+            "startIndex": 1176
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1174
+          },
+          "text": "Firm"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 1178,
+            "startIndex": 1174
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 1172
+          },
+          "text": "Rank"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 1176,
+            "startIndex": 1172
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTableCellStyle": {
+          "fields": "backgroundColor",
+          "tableCellStyle": {
+            "backgroundColor": {
+              "color": {
+                "rgbColor": {
+                  "blue": 0.95,
+                  "green": 0.95,
+                  "red": 0.95
+                }
+              }
+            }
+          },
+          "tableRange": {
+            "columnSpan": 7,
+            "rowSpan": 1,
+            "tableCellLocation": {
+              "columnIndex": 0,
+              "rowIndex": 0,
+              "tableStartLocation": {
+                "index": 1169
+              }
+            }
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 2046
+          },
+          "text": "\n"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 2047
+          },
+          "text": "Firm-by-firm findings\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_2"
+          },
+          "range": {
+            "endIndex": 2068,
+            "startIndex": 2047
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 2068,
+            "startIndex": 2047
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 2069
+          },
+          "text": "1. Albertson & Davidson — aldavlaw.com\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 2107,
+            "startIndex": 2069
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 2107,
+            "startIndex": 2069
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 2108
+          },
+          "text": "Snapshot: 4,926 ranking keywords; ~14,904 estimated monthly organic visits; down 35% over 12 months.\nWhat matters: This is the group’s largest organic asset. A broad keyword footprint means losses may be recoverable through content consolidation, internal-link repair, technical cleanup, and refreshing high-value probate and trust-litigation pages.\nSales angle: Protect a valuable existing channel before further erosion; lead with a page-level loss analysis and recovery roadmap rather than a basic SEO build.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 2117,
+            "startIndex": 2108
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 2222,
+            "startIndex": 2209
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 2470,
+            "startIndex": 2458
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 2620
+          },
+          "text": "2. Wingate, Russotti, Shapiro & Halperin — wrshlaw.com\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 2674,
+            "startIndex": 2620
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 2674,
+            "startIndex": 2620
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 2675
+          },
+          "text": "Snapshot: 2,433 keywords; ~9,630 visits; down 73%.\nWhat matters: The firm retains substantial visibility despite a severe decline, indicating strong recovery upside. Focus on pages and query clusters with the largest historical losses, cannibalization, and link-equity decay.\nSales angle: A high-value recovery engagement could restore traffic faster than building a new footprint from scratch.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 2684,
+            "startIndex": 2675
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 2739,
+            "startIndex": 2726
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 2963,
+            "startIndex": 2951
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 3070
+          },
+          "text": "3. Freeman & Fuson — fusonlaw.com\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 3103,
+            "startIndex": 3070
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3103,
+            "startIndex": 3070
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 3104
+          },
+          "text": "Snapshot: 1,460 keywords; ~7,590 visits; down 53%.\nWhat matters: The domain still converts a moderate keyword footprint into meaningful traffic. Prioritize rankings that slipped from positions 1–10 into positions 11–20, along with local-intent service pages.\nSales angle: Position the opportunity around recovering page-one rankings and strengthening Nashville-area local authority.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3113,
+            "startIndex": 3104
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3168,
+            "startIndex": 3155
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3375,
+            "startIndex": 3363
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 3487
+          },
+          "text": "4. Stotts Law — adamstotts.com\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 3517,
+            "startIndex": 3487
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3517,
+            "startIndex": 3487
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 3518
+          },
+          "text": "Snapshot: 1,456 keywords; ~6,342 visits; up 71%.\nWhat matters: This is the strongest growth story in the set. Identify the pages and topics driving gains, then expand adjacent practice-area and geographic coverage without diluting winning content.\nSales angle: Scale what is already working; offer competitive-gap expansion and conversion optimization rather than a turnaround pitch.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3527,
+            "startIndex": 3518
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3580,
+            "startIndex": 3567
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3778,
+            "startIndex": 3766
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 3902
+          },
+          "text": "5. Lebowitz & Mzhen — marylandinjurylawyer.net\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 3948,
+            "startIndex": 3902
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3948,
+            "startIndex": 3902
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 3949
+          },
+          "text": "Snapshot: 756 keywords; ~5,520 visits; down 87%.\nWhat matters: The largest percentage loss among firms with meaningful traffic. The site still has enough residual visibility to support recovery, but the decline warrants immediate page-level, technical, indexing, and backlink-loss investigation.\nSales angle: Lead with the scale of lost demand and a 90-day recovery plan focused on formerly productive personal-injury topics.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 3958,
+            "startIndex": 3949
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 4011,
+            "startIndex": 3998
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 4257,
+            "startIndex": 4245
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 4375
+          },
+          "text": "6. The Richardson Firm — therichardsonfirm.com\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 4421,
+            "startIndex": 4375
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 4421,
+            "startIndex": 4375
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 4422
+          },
+          "text": "Snapshot: 602 keywords; ~3,980 visits; down 67%.\nWhat matters: Traffic remains material relative to the keyword footprint, suggesting several pages may still carry outsized value. Find and defend those pages while rebuilding lost local and practice-area coverage.\nSales angle: Emphasize revenue risk from declining high-intent rankings and a focused recovery plan rather than a broad content-volume proposal.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 4431,
+            "startIndex": 4422
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 4484,
+            "startIndex": 4471
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 4698,
+            "startIndex": 4686
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 4831
+          },
+          "text": "7. Petrillo & Goldberg Law — petrilloandgoldberg.com\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 4883,
+            "startIndex": 4831
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 4883,
+            "startIndex": 4831
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 4884
+          },
+          "text": "Snapshot: 816 keywords; ~1,417 visits; down 78%.\nWhat matters: Keyword breadth remains, but traffic yield is weak and falling sharply. This often points to ranking-position deterioration, low-value query mix, or pages losing relevance and authority.\nSales angle: Offer a keyword-to-page remediation plan that moves existing visibility back toward page one.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 4893,
+            "startIndex": 4884
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 4946,
+            "startIndex": 4933
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 5146,
+            "startIndex": 5134
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 5241
+          },
+          "text": "8. Carluzzo Rochkind & Smith — novatriallawyers.com\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 5292,
+            "startIndex": 5241
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 5292,
+            "startIndex": 5241
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 5293
+          },
+          "text": "Snapshot: 151 keywords; ~210 visits; up 232%.\nWhat matters: Momentum is positive but the base is small. Preserve winning pages, then expand carefully into high-intent Northern Virginia litigation and personal-injury topic clusters.\nSales angle: Early-stage growth is working; accelerate it with structured content, local authority, and internal linking.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 5302,
+            "startIndex": 5293
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 5352,
+            "startIndex": 5339
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 5537,
+            "startIndex": 5525
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 5647
+          },
+          "text": "9. Burnett Law Office — burnettlawaz.com\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 5687,
+            "startIndex": 5647
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 5687,
+            "startIndex": 5647
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 5688
+          },
+          "text": "Snapshot: 93 keywords; ~155 visits; down 10%.\nWhat matters: Visibility is limited but relatively stable. The core opportunity is foundational: stronger service/location architecture, local signals, helpful content, and authoritative links.\nSales angle: Build a predictable local organic acquisition channel from a low base.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 5697,
+            "startIndex": 5688
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 5747,
+            "startIndex": 5734
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 5940,
+            "startIndex": 5928
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6012
+          },
+          "text": "10. Goodrich and Associates — goodrichpc.com\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_3"
+          },
+          "range": {
+            "endIndex": 6056,
+            "startIndex": 6012
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6056,
+            "startIndex": 6012
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6057
+          },
+          "text": "Snapshot: 36 keywords; ~23 visits; down 55%.\nWhat matters: Organic visibility is nearly absent. Start with indexing and technical validation, keyword-to-page mapping, local presence, core practice pages, and authority acquisition.\nSales angle: This is a clean-slate growth opportunity with straightforward baseline KPIs and visible early wins.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6066,
+            "startIndex": 6057
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6115,
+            "startIndex": 6102
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6300,
+            "startIndex": 6288
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6401
+          },
+          "text": "Recommended outreach order\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_2"
+          },
+          "range": {
+            "endIndex": 6427,
+            "startIndex": 6401
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6427,
+            "startIndex": 6401
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6428
+          },
+          "text": "Lebowitz & Mzhen — extreme decline with substantial remaining traffic.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6444,
+            "startIndex": 6428
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6499
+          },
+          "text": "WRSH — highest absolute recovery upside after Albertson & Davidson.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6503,
+            "startIndex": 6499
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6567
+          },
+          "text": "Petrillo & Goldberg — broad footprint, poor current traffic yield, severe decline.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6586,
+            "startIndex": 6567
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6650
+          },
+          "text": "The Richardson Firm — meaningful traffic at risk and a focused recovery case.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6669,
+            "startIndex": 6650
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6728
+          },
+          "text": "Albertson & Davidson — largest asset; strong protect-and-recover pitch.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6748,
+            "startIndex": 6728
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6800
+          },
+          "text": "Freeman & Fuson — meaningful recoverable traffic and page-one opportunity.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6815,
+            "startIndex": 6800
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6875
+          },
+          "text": "Goodrich and Associates — near-zero visibility and clear foundational need.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6898,
+            "startIndex": 6875
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 6951
+          },
+          "text": "Burnett Law Office — stable but underdeveloped local SEO footprint.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 6969,
+            "startIndex": 6951
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 7019
+          },
+          "text": "Carluzzo Rochkind & Smith — positive early momentum to accelerate.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 7044,
+            "startIndex": 7019
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 7086
+          },
+          "text": "Stotts Law — healthy growth; best approached with a scale-and-convert message.\n"
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 7096,
+            "startIndex": 7086
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 7165
+          },
+          "text": "Recommended next diagnostic for interested firms\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_2"
+          },
+          "range": {
+            "endIndex": 7213,
+            "startIndex": 7165
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 7213,
+            "startIndex": 7165
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 7214
+          },
+          "text": "For the top six recovery prospects, pull: lost keyword/page pairs, position distribution, top landing pages, referring-domain losses, technical indexability, local-pack coverage, and competitor content gaps. Those details will turn this benchmark into a firm-specific 90-day SEO action plan.\n"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 7506
+          },
+          "text": "Data sources\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "fields": "namedStyleType",
+          "paragraphStyle": {
+            "namedStyleType": "HEADING_2"
+          },
+          "range": {
+            "endIndex": 7518,
+            "startIndex": 7506
+          }
+        }
+      },
+      {
+        "updateTextStyle": {
+          "fields": "bold",
+          "range": {
+            "endIndex": 7518,
+            "startIndex": 7506
+          },
+          "textStyle": {
+            "bold": true
+          }
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 7519
+          },
+          "text": "DataForSEO Labs, Google U.S. historical bulk traffic estimation, pulled August 2, 2026.\n"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 7607
+          },
+          "text": "Live homepage fetch and content review for all ten supplied domains, August 2, 2026.\n"
+        }
+      },
+      {
+        "insertText": {
+          "location": {
+            "index": 7692
+          },
+          "text": "Salesforce account list supplied from the verified Brett-owned Market Leader workflow.\n"
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+          "range": {
+            "endIndex": 7779,
+            "startIndex": 7692
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+          "range": {
+            "endIndex": 7692,
+            "startIndex": 7607
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+          "range": {
+            "endIndex": 7607,
+            "startIndex": 7519
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 7165,
+            "startIndex": 7086
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 7086,
+            "startIndex": 7019
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 7019,
+            "startIndex": 6951
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 6951,
+            "startIndex": 6875
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 6875,
+            "startIndex": 6800
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 6800,
+            "startIndex": 6728
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 6728,
+            "startIndex": 6650
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 6650,
+            "startIndex": 6567
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 6567,
+            "startIndex": 6499
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+          "range": {
+            "endIndex": 6499,
+            "startIndex": 6428
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+          "range": {
+            "endIndex": 1145,
+            "startIndex": 943
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+          "range": {
+            "endIndex": 943,
+            "startIndex": 789
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+          "range": {
+            "endIndex": 789,
+            "startIndex": 599
+          }
+        }
+      },
+      {
+        "createParagraphBullets": {
+          "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+          "range": {
+            "endIndex": 599,
+            "startIndex": 400
+          }
+        }
+      }
+    ],
+    "revisionId": "AIroW36ur7F0p2krOJ2mJszkp1NH7q3YtqXz7gzIBzvGzKeh5IdfVwuyuc2C0pxVW6yHqNyHh0wKeIkF7HwANWVHPhXK71t6TSli4IgNsw",
+    "suggestionsViewMode": "SUGGESTIONS_INLINE",
+    "tab_ids": [
+      "t.0"
+    ],
+    "title": "SEO Intelligence — 10 Brett Market Leader Accounts (August 2026)"
+  },
+  "error": null,
+  "successful": true,
+  "logId": "log_4aXxxxV3sSMs"
+}

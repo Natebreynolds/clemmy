@@ -3,6 +3,7 @@ import {
   MUTATION_ACTION_CUES,
 } from '../../assistant/message-intent.js';
 import { classifyExternalEffectRequest } from '../../assistant/external-effect-taxonomy.js';
+import { extractJsonCandidate } from './json-repair.js';
 
 const TOOL_SURFACE_PROBE_TOOLS = new Set([
   'check_capability',
@@ -703,7 +704,7 @@ function structuredFalse(value: unknown): boolean {
     || (typeof value === 'string' && /^(?:0|false|no)$/i.test(value.trim()));
 }
 
-function recordLooksFailed(record: Record<string, unknown>): boolean {
+function recordLooksFailed(record: Record<string, unknown>, inEchoedEntity = false): boolean {
   const explicitSuccess =
     structuredTrue(record.successful)
     || structuredTrue(record.success)
@@ -717,7 +718,10 @@ function recordLooksFailed(record: Record<string, unknown>): boolean {
 
   const status = typeof record.status === 'string' ? record.status.trim().toLowerCase() : '';
   if (
-    /^(?:aborted|cancelled|canceled|declined|denied|error|failed|failure|no[_ -]?op|noop|not[_ -]?connected|rejected|refused|reverted|rolled[_ -]?back|skipped|unchanged)$/.test(
+    // Inside an echoed entity, `status` describes the ENTITY (a cancelled
+    // calendar event mirrored back by the provider), not the operation.
+    !inEchoedEntity
+    && /^(?:aborted|cancelled|canceled|declined|denied|error|failed|failure|no[_ -]?op|noop|not[_ -]?connected|rejected|refused|reverted|rolled[_ -]?back|skipped|unchanged)$/.test(
       status,
     )
   ) return true;
@@ -914,17 +918,28 @@ function parseWrappedExternalWriteJson(text: string): unknown | undefined {
   if (fenced) candidate = fenced[1]?.trim() ?? '';
   const labelled = candidate.match(/^(?:output|response|result)\s*:\s*([\s\S]+)$/i);
   if (labelled) candidate = labelled[1]?.trim() ?? '';
+  if (!(candidate.startsWith('{') || candidate.startsWith('['))) return undefined;
   if (
-    !(
-      (candidate.startsWith('{') && candidate.endsWith('}'))
-      || (candidate.startsWith('[') && candidate.endsWith(']'))
-    )
-  ) return undefined;
-  try {
-    return JSON.parse(candidate) as unknown;
-  } catch {
-    return undefined;
+    (candidate.startsWith('{') && candidate.endsWith('}'))
+    || (candidate.startsWith('[') && candidate.endsWith(']'))
+  ) {
+    try {
+      return JSON.parse(candidate) as unknown;
+    } catch { /* fall through to the balanced-prefix extractor */ }
   }
+  // Wrapper prose AFTER the payload (live 2026-08-06: the standing-rules
+  // banner composio appends to every result made `{"successful":true,…}` +
+  // banner unparseable, so a landed Outlook send could never acknowledge and
+  // settled orphaned — messaging writes were 0% successful ALL-TIME). Extract
+  // the leading balanced JSON value; the negative prose gates have already
+  // run against the FULL text before this parse, so trailing text still vetoes.
+  const balanced = extractJsonCandidate(candidate);
+  if (balanced) {
+    try {
+      return JSON.parse(balanced) as unknown;
+    } catch { /* not JSON after all */ }
+  }
+  return undefined;
 }
 
 function acknowledgementReceiptValue(key: string, value: unknown): boolean {
@@ -959,10 +974,18 @@ function acknowledgementReceiptValue(key: string, value: unknown): boolean {
   return text.length >= 3;
 }
 
+const EXTERNAL_WRITE_ENVELOPE_KEYS = new Set(['data', 'result', 'results', 'response', 'output']);
+
+// Below any object key OUTSIDE the envelope set we are inside an ECHOED
+// ENTITY (the message/event/record the provider mirrors back) whose
+// attributes must never be read as the operation's outcome — live 2026-08-06:
+// Slack's `bot_profile.deleted:false` was read as "the delete failed", which
+// is why every Slack send in 14.85 days of ledger settled orphaned.
 function externalWriteValueContainsFailure(
   value: unknown,
   depth = 0,
   keyHint = '',
+  inEchoedEntity = false,
 ): boolean {
   if (depth > 6 || value === null || value === undefined) return false;
   if (typeof value === 'string') {
@@ -984,7 +1007,7 @@ function externalWriteValueContainsFailure(
     ) return true;
     const parsed = parseWrappedExternalWriteJson(text);
     if (parsed !== undefined) {
-      return externalWriteValueContainsFailure(parsed, depth + 1, keyHint);
+      return externalWriteValueContainsFailure(parsed, depth + 1, keyHint, inEchoedEntity);
     }
     return false;
   }
@@ -999,12 +1022,12 @@ function externalWriteValueContainsFailure(
     return depth === 0 && (!Number.isFinite(value) || value <= 0);
   }
   if (Array.isArray(value)) {
-    return value.some((item) => externalWriteValueContainsFailure(item, depth + 1, keyHint));
+    return value.some((item) => externalWriteValueContainsFailure(item, depth + 1, keyHint, inEchoedEntity));
   }
   if (typeof value !== 'object') return false;
 
   const record = value as Record<string, unknown>;
-  if (recordLooksFailed(record) || structuredTrue(record.isError)) return true;
+  if (recordLooksFailed(record, inEchoedEntity) || structuredTrue(record.isError)) return true;
   const recordExplicitSuccess =
     structuredTrue(record.successful)
     || structuredTrue(record.success)
@@ -1028,11 +1051,13 @@ function externalWriteValueContainsFailure(
       && structuredTrue(child)
     ) return true;
     if (
-      EXTERNAL_WRITE_MUTATION_BOOLEAN_KEY_RE.test(key)
+      !inEchoedEntity
+      && EXTERNAL_WRITE_MUTATION_BOOLEAN_KEY_RE.test(key)
       && structuredFalse(child)
     ) return true;
     if (
-      EXTERNAL_WRITE_MUTATION_COUNT_KEY_RE.test(key)
+      !inEchoedEntity
+      && EXTERNAL_WRITE_MUTATION_COUNT_KEY_RE.test(key)
       && (
         (
           typeof child === 'number'
@@ -1068,7 +1093,8 @@ function externalWriteValueContainsFailure(
       )
     ) return true;
     if (
-      /^(?:phase|ready_state|state|status)$/.test(key)
+      !inEchoedEntity
+      && /^(?:phase|ready_state|state|status)$/.test(key)
       && typeof child === 'string'
       && (
         EXTERNAL_WRITE_AMBIGUOUS_STATUS_RE.test(child.trim().toLowerCase())
@@ -1111,7 +1137,8 @@ function externalWriteValueContainsFailure(
             : undefined
         );
     if (
-      (key === 'status' || key === 'status_code' || key === 'statuscode')
+      !inEchoedEntity
+      && (key === 'status' || key === 'status_code' || key === 'statuscode')
       && numericStatus !== undefined
       && (
         (
@@ -1122,7 +1149,10 @@ function externalWriteValueContainsFailure(
         || (numericStatus >= 40_000 && numericStatus < 60_000)
       )
     ) return true;
-    if (externalWriteValueContainsFailure(child, depth + 1, key)) return true;
+    const childIsContainer = child !== null && typeof child === 'object';
+    const childInEntity = inEchoedEntity
+      || (childIsContainer && !EXTERNAL_WRITE_ENVELOPE_KEYS.has(key));
+    if (externalWriteValueContainsFailure(child, depth + 1, key, childInEntity)) return true;
   }
   return false;
 }

@@ -1,0 +1,12 @@
+{
+  "data": {
+    "message": "Email sent successfully."
+  },
+  "error": null,
+  "successful": true,
+  "logId": "log_FO_wDAP0slTt"
+}
+
+⚖️ STANDING RULES bound to the outlook toolkit — they apply to EVERY call, no exceptions:
+- Email sending constraint: ALWAYS send email via the Scorpion Outlook mailbox nathan.reynolds@scorpion.co. Multiple Outlook accounts are connected on purpose (read/scrape all of them) — but sends go ONLY from the Scorpion mailbox unless Nate explicitly directs otherwise in the current conversation. The dispatch gate verifies the actual connected mailbox and routes to the compliant connection automatically.
+- For Scorpion calendar lookups, use Outlook connection ca_T9pDCuTalAI3 as the Scorpion calendar connection; the other active Outlook connection returned no Scorpion calendar events for 2026-06-18.

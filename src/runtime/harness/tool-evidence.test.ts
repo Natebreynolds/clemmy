@@ -994,3 +994,64 @@ test('a write bound to an explicit LOCAL destination never requires an external 
     true,
   );
 });
+
+test('live messaging success payloads acknowledge verbatim (0%-success incident class)', async () => {
+  // Live 2026-08-06 ledger forensics: messaging-class writes had a 0% recorded
+  // success rate ALL-TIME (Slack sends 0/13, emails 0/5, Outlook drafts 0/5)
+  // because these EXACT provider responses — carried verbatim in orphan-row
+  // reasons — failed acknowledgement detection. Each fixture is the untouched
+  // live payload; each must acknowledge forever.
+  const { readFile } = await import('node:fs/promises');
+  const dir = new URL('./fixtures/', import.meta.url);
+  for (const name of [
+    // Slack chat.postMessage echo: `data.message.bot_profile.deleted: false`
+    // is an ENTITY attribute of the echoed message, not the operation outcome.
+    'external-write-ack-slack-send.live.txt',
+    // Outlook send via composio: valid JSON followed by an appended
+    // "⚖️ STANDING RULES" advisory banner that broke strict JSON.parse.
+    'external-write-ack-outlook-email-send.live.txt',
+    // Google Doc create: acknowledged even before the fix; pinned so the
+    // envelope-tolerant parse never regresses the already-working shape.
+    'external-write-ack-gdoc-create.live.txt',
+  ]) {
+    const payload = await readFile(new URL(name, dir), 'utf8');
+    assert.equal(
+      toolOutputProvesExternalWriteAcknowledgement(payload),
+      true,
+      `${name} must prove acknowledgement`,
+    );
+  }
+});
+
+test('entity-scope guard: echoed-entity attributes are not operation outcomes, envelope outcomes still are', () => {
+  const ack = (value: unknown) =>
+    toolOutputProvesExternalWriteAcknowledgement(
+      typeof value === 'string' ? value : JSON.stringify(value),
+    );
+  // Entity attributes below a non-envelope key never veto an explicit success.
+  assert.equal(ack({ successful: true, data: { message: { bot_profile: { deleted: false } } } }), true);
+  assert.equal(ack({ successful: true, data: { event: { status: 'cancelled', id: 'e1' } } }), true);
+  // Envelope-level outcome fields keep their full authority.
+  assert.equal(ack({ successful: false, data: { deleted: false } }), false);
+  assert.equal(ack({ status: 500, data: { id: 'x' } }), false);
+  assert.equal(ack({ data: { id: 'x' }, deleted: false }), false);
+  // Explicit failure keys stay live at EVERY depth, entity or not.
+  assert.equal(ack({ successful: true, data: { message: { failed: true } } }), false);
+  assert.equal(ack({ successful: true, data: { message: { error: 'boom' } } }), false);
+  assert.equal(ack({ successful: true, error: 'rate limited', data: {} }), false);
+});
+
+test('a trailing advisory banner after valid JSON does not hide the acknowledgement', () => {
+  // Minimal twin of the live Outlook fixture: the JSON body is authoritative;
+  // appended non-JSON advisory text must not break parsing into blindness.
+  const payload = `${JSON.stringify({
+    data: { message: 'Email sent successfully.' },
+    error: null,
+    successful: true,
+    logId: 'log_TEST',
+  })}\n\n⚖️ STANDING RULES (supplementary; the task prompt rules)`;
+  assert.equal(toolOutputProvesExternalWriteAcknowledgement(payload), true);
+  // A banner can never RESCUE a failure body.
+  const failed = `${JSON.stringify({ successful: false, error: 'send failed' })}\n\n⚖️ STANDING RULES`;
+  assert.equal(toolOutputProvesExternalWriteAcknowledgement(failed), false);
+});
