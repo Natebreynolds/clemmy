@@ -589,7 +589,7 @@ test('deliverable_saved projects basename-only truth and rejects path leakage', 
 
   const leak = projectHarnessEventForPublic({
     sessionId: 's', seq: 5, turn: 0, role: 'system', type: 'deliverable_saved',
-    data: { name: '/Users/someone/secret/file.md' },
+    data: { name: '/tmp/leaked/full/path/file.md' },
   } as never);
   assert.equal(leak, null, 'a path-shaped name never ships');
 });
