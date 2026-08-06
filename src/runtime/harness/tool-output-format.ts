@@ -5,10 +5,14 @@ import { digestToolOutput } from './tool-output-digest.js';
 
 // Raised 4000 → 12000 (2026-05-29): 4000 clipped normal "show me N" results
 // (e.g. 10 Salesforce accounts ≈ 5.5KB) into head+tail, which read as
-// "aggressive" clipping. 12000 (~3K tokens) lets typical results through
-// whole while genuinely huge outputs (100KB+ Composio dumps) still digest +
-// stay recoverable. Compaction handles long sessions.
-export const DEFAULT_TOOL_RESULT_MAX_CHARS = 12000;
+// "aggressive" clipping. Raised 12000 → 20000 (2026-08-05): a 39KB calendar
+// day (6 Graph events) digested at 12K, forcing a follow-up tool_output_query
+// round-trip for data the model was about to need anyway; 20K (~5K tokens)
+// passes typical single-screen results whole while genuinely huge outputs
+// (100KB+ Composio dumps) still digest + stay recoverable. Context pressure is
+// owned by compaction, which is now budgeted from the routed model's REAL
+// window (compactionBudgetForModel) instead of a fixed 200K.
+export const DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000;
 
 export interface RecallableToolTextOptions {
   maxChars?: number;

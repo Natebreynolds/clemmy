@@ -564,3 +564,30 @@ test('compactSessionIfNeeded — Layer 1 STILL clips under genuine token pressur
   assert.ok(result.beforeTokens > 1_000 * 0.3, 'precondition: past the token-pressure trigger');
   assert.equal(result.layer1.applied, true, 'real token pressure still triggers Layer-1');
 });
+
+test('compactionBudgetForModel: budget tracks the ROUTED model window, never a fixed 200K', async () => {
+  // REGRESSION PIN (2026-08-05): with a hard-coded 200K budget, Layer 3's fork
+  // threshold (90% → 180K tokens) sat ABOVE a 128K-window BYO model's real
+  // capacity — the provider overflowed before the safety net fired — while
+  // large-window models clipped verbatim history at a fraction of their real
+  // headroom. The budget must come from the wire registry's contextWindow.
+  const { compactionBudgetForModel } = await import('./compaction.js');
+  const { resolveModelCapability } = await import('./model-wire-registry.js');
+
+  // BYO small-window model: budget = its real 128K window, so Layer 3 (90% =
+  // ~115K) now forks BEFORE provider overflow.
+  assert.equal(compactionBudgetForModel('glm-4.7'), 128_000);
+  assert.ok(compactionBudgetForModel('glm-4.7') * 0.9 < 128_000, 'fork fires inside the real window');
+
+  // Codex: real window is 272K — the old constant was silently TIGHTER than
+  // the model's capacity.
+  assert.equal(compactionBudgetForModel('gpt-5.4'), 272_000);
+
+  // Claude models: 200K — byte-identical behavior to the old constant.
+  assert.equal(compactionBudgetForModel('claude-opus-4-8'), 200_000);
+
+  // Unknown wire: the registry's conservative default, never the old 200K
+  // (which would overflow an unknown 128K-class backend).
+  assert.equal(compactionBudgetForModel('totally-unknown-model'), resolveModelCapability('totally-unknown-model').contextWindow);
+  assert.equal(compactionBudgetForModel(undefined), resolveModelCapability(undefined).contextWindow);
+});

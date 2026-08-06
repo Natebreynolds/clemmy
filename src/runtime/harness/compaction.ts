@@ -42,11 +42,17 @@ import { toolCallHint } from './tool-call-hint.js';
 //   - Layer 1 trigger 0.5 → 0.3  (clip older tool outputs at 30% of
 //     budget instead of waiting for 50%)
 //   - Layer 1 retain turns 8 → 4  (keep less raw history; agent can
-//     `recall_tool_result(callId)` to re-fetch any clipped output)
+//     use recall_tool_result to re-fetch any clipped output)
+//     [re-loosened 4 → 6 on 2026-08-05 — see DEFAULT_LAYER1_RETAIN_TURNS]
 //   - Layer 1 item threshold 30 → 15  (kick in earlier on chatty turns)
 //   - Layer 2 trigger 0.7 → 0.55 (summarize older messages sooner)
 const DEFAULT_LAYER1_ITEM_THRESHOLD = 15;
-const DEFAULT_LAYER1_RETAIN_TURNS = 4;
+// Retain turns 4 → 6 (2026-08-05): 4 was tuned alongside a FIXED 200K budget;
+// now that the budget tracks the routed model's real context window (see
+// compactionBudgetForModel) the fractions fire at honest pressure, and keeping
+// 6 turns of verbatim recent history trades a little headroom for fewer
+// recall round-trips (a live scrape run went back via recall_tool_result 44×).
+const DEFAULT_LAYER1_RETAIN_TURNS = 6;
 const DEFAULT_LAYER1_RETAIN_TOOL_PAIRS = 12;
 const DEFAULT_LAYER2_RETAIN_MESSAGES = 6;
 const DEFAULT_LAYER1_TOKEN_FRACTION = 0.3;
@@ -63,6 +69,25 @@ const DEFAULT_LAYER3_TOKEN_FRACTION = 0.9;
 // the real signal.
 const DEFAULT_LAYER1_ITEM_TRIGGER_MIN_FRACTION = 0.5;
 const DEFAULT_INPUT_BUDGET_TOKENS = 200_000;
+
+/**
+ * Input budget derived from the ROUTED model's context window, not a constant.
+ * The fixed 200K assumption was wrong in both directions (2026-08-05 audit):
+ * a 128K-window BYO model hit provider overflow BEFORE the Layer 3 fork
+ * (90% of 200K = 180K > the real window), while a 1M-window model clipped
+ * verbatim history at 60K tokens with ~940K of headroom. The registry is the
+ * single owner of window facts (resolveModelCapability; unknown wires resolve
+ * to its conservative 128K default). Fractions are unchanged — they now just
+ * apply to an honest denominator.
+ */
+export function compactionBudgetForModel(modelId: string | undefined | null): number {
+  try {
+    const window = resolveModelCapability(modelId).contextWindow;
+    return Number.isFinite(window) && window > 0 ? window : DEFAULT_INPUT_BUDGET_TOKENS;
+  } catch {
+    return DEFAULT_INPUT_BUDGET_TOKENS;
+  }
+}
 const COLLAPSED_TOOL_SUMMARY_MAX_CHARS = 12_000;
 const DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS = 32_000;
 const DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS = 20_000;

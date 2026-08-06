@@ -46,6 +46,7 @@ import {
 import {
   compactInFlightToolContext,
   compactSessionIfNeeded,
+  compactionBudgetForModel,
   checkpointGoalStage,
 } from './compaction.js';
 import {
@@ -6817,6 +6818,14 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const sessionItems = session.toInputItems();
   let compactedItems = sessionItems;
   let layer3WarningInjected = false;
+  // Compaction budget from the ROUTED model's real context window (the fixed
+  // 200K assumption overflowed small-window BYO models before Layer 3 could
+  // fork, and clipped 1M-window models at 60K with huge headroom — see
+  // compactionBudgetForModel). Same value scales the in-flight thresholds below.
+  const routedModelIdForBudget = typeof (options.agent as { model?: unknown })?.model === 'string'
+    ? (options.agent as { model: string }).model
+    : undefined;
+  const turnInputBudgetTokens = compactionBudgetForModel(routedModelIdForBudget);
   // Idle gap since the last turn (read BEFORE this turn writes back, so it's the
   // previous turn's completion → now). Feeds age/idle-aware compaction so a stale
   // thread summarizes its old turns instead of dragging the full transcript in.
@@ -6826,7 +6835,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     if (Number.isFinite(last)) idleMs = Math.max(0, Date.now() - last);
   } catch { /* no idle signal → no idle trigger (byte-identical to before) */ }
   try {
-    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, sessionItems, { idleMs });
+    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, sessionItems, { idleMs, inputBudgetTokens: turnInputBudgetTokens });
     compactedItems = nextItems;
     if (result.modified) {
       session.updateConversationSnapshot(compactedItems);
@@ -7237,9 +7246,15 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // model-facing old pairs with a recall ledger and retain a recent working
       // set. Every full output was durably parked by the tool-end hook first.
       if (inFlightCompactionEnabled()) {
+        // Defaults scale with the routed model's window (32K/20K were tuned for
+        // a 200K window; a 1M-window model was in-flight-compacting at 3% of its
+        // real capacity). Never scaled DOWN below the tuned defaults — small
+        // windows are protected by the between-turn budget above. Env overrides
+        // still win untouched.
+        const inFlightScale = Math.max(1, turnInputBudgetTokens / 200_000);
         const compacted = compactInFlightToolContext(modelData.input, options.sessionId, {
-          resultTriggerTokens: positiveIntEnv('CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS', 32_000),
-          retainedResultBudgetTokens: positiveIntEnv('CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS', 20_000),
+          resultTriggerTokens: positiveIntEnv('CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS', Math.round(32_000 * inFlightScale)),
+          retainedResultBudgetTokens: positiveIntEnv('CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS', Math.round(20_000 * inFlightScale)),
           minRetainPairs: positiveIntEnv('CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS', 3),
           maxRetainPairs: positiveIntEnv('CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS', 8),
         });
