@@ -66,6 +66,12 @@ const NEGATED_NO_MUTATION_SEGMENT_RE =
   /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b[^,.!?\n;]*/gi;
 const INHERENT_EXTERNAL_WRITE_RE =
   /\b(?:deploy|invite|publish|send|submit|unsubscribe|upload)\b/i;
+
+/** A write whose stated destination is the LOCAL filesystem: a named local/
+ *  markdown/text file, a local folder ("in my drafts folder"), or an explicit
+ *  local-only qualifier. */
+const LOCAL_FILE_DESTINATION_RE =
+  /\b(?:in(?:to)?|as|to)\s+(?:a\s+|an\s+|my\s+|the\s+)?(?:local\s+)?(?:markdown|md|text|txt|csv|json)\s+files?\b|\bin\s+(?:my|a|the)\s+[\w-]*\s*(?:folder|directory)\b|\blocal\s+files?\s+only\b|\.(?:md|txt|csv|json)\b/i;
 const CONTEXTUAL_EXTERNAL_WRITE_VERB_RE =
   /\b(?:host|post|schedule|reschedule)\s+(?:a|an|the|this|that|it|them|to|on|for)\b/i;
 const LOCAL_SCHEDULE_TARGET_RE =
@@ -267,6 +273,13 @@ export function objectiveRequiresFreshExternalWrite(objectiveText: string): bool
       if (stagedMetadataOnly) return false;
       if (classifyMessageIntent(clause).intent !== 'action') return false;
       if (externalDestinationIsOnlyArtifactContext(clause, immediateExecution)) return false;
+      // An explicitly LOCAL destination outranks the artifact's vocabulary.
+      // "Write an outreach email draft into a markdown file in my drafts
+      // folder" names email — and lands on disk. Only an inherently external
+      // verb (send/publish/…) in the same clause keeps the requirement (live
+      // 2026-08-05: a local-only draft turn was rewritten to "no receipt of
+      // it landing" after every deliverable had verifiably landed on disk).
+      if (LOCAL_FILE_DESTINATION_RE.test(clause) && !INHERENT_EXTERNAL_WRITE_RE.test(clause)) return false;
       if (EXPLICIT_EXTERNAL_WRITE_RE.test(clause) || URL_TARGETED_WRITE_RE.test(clause)) return true;
       if (INHERENT_EXTERNAL_WRITE_RE.test(clause)) return true;
       if (classifyExternalEffectRequest(clause).requested) return true;

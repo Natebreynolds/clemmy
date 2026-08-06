@@ -974,3 +974,23 @@ test('accepted execution completion can fill missing evidence but never override
     'an accepted controller summary cannot erase a maybe-landed write',
   );
 });
+
+test('a write bound to an explicit LOCAL destination never requires an external receipt', async () => {
+  const { objectiveRequiresFreshExternalWrite } = await import('./tool-evidence.js');
+  // Live 2026-08-05: this exact turn drafted a real file (deliverable_saved,
+  // verified on disk) and the gate rewrote the reply to "no receipt of it
+  // landing". Email is the artifact's vocabulary; the disk is the destination.
+  assert.equal(
+    objectiveRequiresFreshExternalWrite(
+      'quick favor: look up 5 plumbing companies in austin with apify, then write one short '
+      + 'outreach email draft for the best-looking one into a markdown file in my drafts folder. '
+      + 'local file only, nothing sent',
+    ),
+    false,
+  );
+  // An inherently external verb in the same clause keeps the requirement.
+  assert.equal(
+    objectiveRequiresFreshExternalWrite('draft it in a markdown file and then send it to the client'),
+    true,
+  );
+});
