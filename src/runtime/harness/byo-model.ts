@@ -260,6 +260,34 @@ type CompatMessage = NonNullable<NonNullable<CompatCompletion['choices']>[number
 
 /** A message we must NOT JSON-repair: missing, a tool-call turn, or empty
  *  content (mirrors the SDK's own hasContent gate). */
+/**
+ * Kimi final-in-reasoning promotion (live 2026-08-06, kimi-k3 on v3.9.1): the
+ * model can finish a turn with finish_reason=stop, EMPTY content, and its
+ * entire user-facing answer in the reasoning channel. Downstream, the SDK's
+ * finalOutput is assembled from message CONTENT — so an honest, correct reply
+ * became an empty final, fired the D_decision_unparsed → A_zero_tools retry
+ * ladder, and the harness DISCARDED the model's own words for the "reliable
+ * written summary was not available" fallback (two users, same signature).
+ *
+ * A stop-final with no tool calls and no content IS the reply — there is no
+ * separate answer coming. Promote the reasoning text to content (and clear
+ * reasoning so it isn't doubled). Tool-call finals never promote: their
+ * reasoning is genuinely private thinking alongside real calls.
+ */
+function promoteReasoningFinal(completion: CompatCompletion): void {
+  const choice = completion?.choices?.[0];
+  const msg = choice?.message;
+  if (!msg) return;
+  if (choice.finish_reason !== 'stop') return;
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return;
+  if (typeof msg.content === 'string' && msg.content.trim()) return;
+  if (msg.content !== null && msg.content !== undefined && typeof msg.content !== 'string') return;
+  const reasoning = typeof msg.reasoning === 'string' ? msg.reasoning.trim() : '';
+  if (!reasoning) return;
+  msg.content = reasoning;
+  delete msg.reasoning;
+}
+
 function isToolOrEmpty(msg: CompatMessage | undefined): boolean {
   return !msg
     || (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0)
@@ -495,6 +523,7 @@ async function wrappedCompletionsCreate(
         return original(relaxed, options); // backend rejects stream:false → real (unmodified) stream
       }
       liftReasoning(completion);
+      promoteReasoningFinal(completion);
       recordByoUsage(completion, relaxed.model);
       const msg = completion?.choices?.[0]?.message;
       if (isToolOrEmpty(msg)) {
@@ -507,6 +536,7 @@ async function wrappedCompletionsCreate(
 
     const completion = (await original(relaxed, options)) as CompatCompletion;
     liftReasoning(completion);
+    promoteReasoningFinal(completion);
     recordByoUsage(completion, relaxed.model);
     const msg = completion?.choices?.[0]?.message;
     if (Array.isArray(msg?.tool_calls) && msg!.tool_calls!.length > 0) {

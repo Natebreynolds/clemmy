@@ -623,3 +623,64 @@ test('conformance(stream): parallel tool calls are each protocol-legal', async (
   assert.equal(items.filter((i) => (i as AnyObj).type === 'function_call').length, 2);
   assertItemsConform('stream parallel tool calls', items);
 });
+
+test('kimi final-in-reasoning: a stop-final whose prose rode the reasoning channel becomes the CONTENT — never an empty reply', async () => {
+  // REGRESSION PIN (2026-08-06 live, kimi-k3 on v3.9.1): the model finished a
+  // turn with finish_reason=stop, empty content, and its entire user-facing
+  // answer in the reasoning channel ("Test is running now (run `…`) — it
+  // auto-enables on pass; I'll report back."). The wrapper classified it
+  // tool-or-empty, emitted a chunk with NO delta.content, the SDK's
+  // finalOutput came back empty, and the harness's D_decision_unparsed →
+  // A_zero_tools ladder DISCARDED two honest correct replies, shipping the
+  // "reliable written summary was not available" fallback (turn blocked).
+  // Same signature as the other user's two red draft turns.
+  const kimiFinal = {
+    id: 'k1', created: 1, model: 'kimi-k3',
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: '',
+        reasoning: 'Test is running now (run `1786032911758-56d61d`) — it re-checks the Salesforce pull and previews the Slack post. It auto-enables on pass.',
+      },
+    }],
+  };
+  const fake = makeFake([() => kimiFinal]);
+  const stream = await wrapCompletionsCreate(fake.fn)({
+    model: 'kimi-k3',
+    messages: [{ role: 'user', content: 'rerun the creation test' }],
+    stream: true,
+  });
+  const chunks = await collect(stream);
+  const delta = (chunks[0].choices as AnyObj[])[0].delta as AnyObj;
+  assert.ok(typeof delta.content === 'string' && (delta.content as string).includes('auto-enables on pass'),
+    'the final answer must reach delta.content — an empty-content stop-final with prose reasoning IS the reply');
+  assert.equal((chunks[0].choices as AnyObj[])[0].finish_reason, 'stop');
+
+  // Non-stream path: same promotion.
+  const fake2 = makeFake([() => JSON.parse(JSON.stringify(kimiFinal))]);
+  const res = (await wrapCompletionsCreate(fake2.fn)({
+    model: 'kimi-k3',
+    messages: [{ role: 'user', content: 'rerun the creation test' }],
+  })) as AnyObj;
+  const msg = (res.choices as AnyObj[])[0].message as AnyObj;
+  assert.ok(typeof msg.content === 'string' && (msg.content as string).includes('auto-enables on pass'));
+
+  // Guard rails: a TOOL-CALL final must NOT promote (reasoning stays private
+  // alongside real tool calls), and a final that HAS content is untouched.
+  const toolFinal = {
+    id: 'k2', created: 1, model: 'kimi-k3',
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    choices: [{
+      index: 0, finish_reason: 'tool_calls',
+      message: { role: 'assistant', content: '', reasoning: 'private thinking', tool_calls: [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+    }],
+  };
+  const fake3 = makeFake([() => toolFinal]);
+  const stream3 = await wrapCompletionsCreate(fake3.fn)({ model: 'kimi-k3', messages: [], stream: true });
+  const chunks3 = await collect(stream3);
+  const delta3 = (chunks3[0].choices as AnyObj[])[0].delta as AnyObj;
+  assert.equal(delta3.content, undefined, 'tool-call finals never promote reasoning into content');
+});
