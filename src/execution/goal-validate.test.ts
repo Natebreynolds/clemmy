@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { validateGoal, extractLocalPathFromCriterion, toGoalEvidence, scoreGoalVerdicts } = await import('./goal-validate.js');
+const { validateGoal, extractLocalPathFromCriterion, extractRequiredKeysFromCriterion, toGoalEvidence, scoreGoalVerdicts } = await import('./goal-validate.js');
 
 function passingJudge(calls: { objective: string; evidence: string }[] = []) {
   return async (objective: string, evidence: string) => {
@@ -286,4 +286,56 @@ test('validateGoal: only legacy judge injected → whole-checklist path still us
   assert.match(checklistSeen, /1\. c1/);
   assert.equal(result.pass, true);
   assert.equal(result.perCriterion.length, 2);
+});
+
+test('required-keys criteria are checked in CODE against real step outputs — the judge is never consulted (2026-08-06 false alarm)', async () => {
+  // REGRESSION PIN — live scorpion-facebook-trends run: notify_nate's output
+  // carried ALL four required keys, the LLM judge marked the criterion unmet
+  // anyway (its own note admitted "required keys present"), producing an 86%
+  // verdict + an escalate advisory + self-contradicting "re-run could double
+  // the notify" advice on a run that was actually 7/7. Mechanically
+  // verifiable criteria must be deterministic-authoritative BOTH directions.
+  const liveCriterion = 'Step "notify_nate" output includes required keys: notified, source_page_url, posts_reviewed_count, summary';
+  const hostileJudge = async (): Promise<never> => {
+    throw new Error('judge must not be consulted for a mechanically verifiable criterion');
+  };
+
+  // All keys present (the live shape) → deterministic PASS, judge untouched.
+  const passResult = await validateGoal({
+    objective: 'Post the Facebook trends brief',
+    successCriteria: [liveCriterion],
+    evidenceText: '(irrelevant — the structured output is the authority)',
+    stepOutputs: {
+      notify_nate: { notified: true, source_page_url: 'https://www.facebook.com/Scorpion.co/', posts_reviewed_count: 25, summary: 'brief…' },
+    },
+  }, { judge: hostileJudge, judgeCriteria: hostileJudge as never });
+  assert.equal(passResult.pass, true);
+  assert.equal(passResult.perCriterion[0].method, 'deterministic');
+  assert.equal(passResult.criteriaMet, 1);
+
+  // A genuinely missing key → deterministic FAIL naming the key, judge untouched.
+  const failResult = await validateGoal({
+    objective: 'Post the Facebook trends brief',
+    successCriteria: [liveCriterion],
+    evidenceText: '(irrelevant)',
+    stepOutputs: { notify_nate: { notified: true, source_page_url: 'x', posts_reviewed_count: 25 } },
+  }, { judge: hostileJudge, judgeCriteria: hostileJudge as never });
+  assert.equal(failResult.pass, false);
+  assert.equal(failResult.perCriterion[0].method, 'deterministic');
+  assert.match(failResult.perCriterion[0].detail ?? '', /missing key: summary/);
+
+  // No step outputs supplied → the criterion honestly stays a judge question.
+  const judged = await validateGoal({
+    objective: 'Post the brief',
+    successCriteria: [liveCriterion],
+    evidenceText: 'evidence',
+  }, { judge: async () => ({ done: true, awaitingUser: false, reason: 'ok' }) });
+  assert.equal(judged.perCriterion[0].method, 'judge', 'without outputs the deterministic tier claims nothing');
+
+  // Parser coverage: quoting/`and` variants and the non-match fallback.
+  assert.deepEqual(
+    extractRequiredKeysFromCriterion('step notify_nate output includes the required keys a, b and c'),
+    { stepId: 'notify_nate', keys: ['a', 'b', 'c'] },
+  );
+  assert.equal(extractRequiredKeysFromCriterion('the report reads well'), null);
 });

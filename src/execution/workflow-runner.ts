@@ -10205,6 +10205,10 @@ async function processOneRunFile(
           objective: runGoal.objective,
           successCriteria: runGoal.successCriteria,
           evidenceText: buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }),
+          // Structured outputs unlock the required-keys deterministic class —
+          // key-presence criteria are checked in code, never by the judge
+          // (live 2026-08-06 false alarm on scorpion-facebook-trends).
+          stepOutputs: publicRawStepOutputs,
         });
         // Verdict door (T3-B4): one canonical audit row per judge decision.
         appendWorkflowEvent(workflow.name, run.id, {

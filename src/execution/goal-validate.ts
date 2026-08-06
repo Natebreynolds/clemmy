@@ -110,6 +110,14 @@ export interface ValidateGoalInput {
   /** The assistant's completion evidence — typically the final reply text
    *  plus any harness-collected artifact notes. */
   evidenceText: string;
+  /** Structured step outputs by step id, when the caller has them (workflow
+   *  runs do). Enables the required-keys deterministic class — a criterion
+   *  like `Step "x" output includes required keys: a, b` is checked in CODE
+   *  against the real output instead of asking an LLM to eyeball key names
+   *  (live 2026-08-06: the judge marked all-four-keys-present as unmet while
+   *  its own note admitted they were present — 86% false alarm + a scary
+   *  "re-run could double the notify" escalation on a 7/7 run). */
+  stepOutputs?: Record<string, unknown>;
 }
 
 export interface ValidateGoalDeps {
@@ -132,6 +140,24 @@ export interface ValidateGoalDeps {
  * remote state offline) — it goes to the judge with everything else.
  */
 const LOCAL_PATH_RE = /(?:^|[\s"'`(])((?:~|\.{1,2})?\/(?:[\w .@-]+\/)*[\w .@-]+\.[A-Za-z0-9]{1,8})(?:[\s"'`).,]|$)/;
+
+/**
+ * A criterion asserting a step's output carries named keys — 100%
+ * mechanically checkable when the caller supplied stepOutputs. Shapes:
+ *   Step "notify_nate" output includes required keys: notified, source_page_url
+ *   step notify_nate output includes the required keys a, b and c
+ */
+const REQUIRED_KEYS_RE = /step\s+["'`]?([\w.-]+)["'`]?(?:'s)?\s+output\s+includes\s+(?:the\s+)?required\s+keys?:?\s+(.+?)\.?$/i;
+
+export function extractRequiredKeysFromCriterion(criterion: string): { stepId: string; keys: string[] } | null {
+  const m = REQUIRED_KEYS_RE.exec(criterion.trim());
+  if (!m) return null;
+  const keys = m[2]
+    .split(/,|\band\b/i)
+    .map((k) => k.trim().replace(/^["'`]|["'`]$/g, ''))
+    .filter((k) => /^[\w.-]+$/.test(k));
+  return keys.length > 0 ? { stepId: m[1], keys } : null;
+}
 
 export function extractLocalPathFromCriterion(criterion: string): string | null {
   const m = LOCAL_PATH_RE.exec(criterion);
@@ -224,9 +250,27 @@ export async function validateGoal(
         method: 'deterministic',
         detail: exists ? `file exists: ${localPath}` : `file missing: ${localPath}`,
       });
-    } else {
-      fuzzy.push(criterion);
+      continue;
     }
+    // Required-keys class: authoritative in BOTH directions when the caller
+    // supplied the step's real output — an LLM must never re-litigate key
+    // presence. Absent the output (or a non-object output), it stays a judge
+    // criterion; the deterministic tier only ever claims what it can prove.
+    const req = extractRequiredKeysFromCriterion(criterion);
+    const stepOutput = req ? input.stepOutputs?.[req.stepId] : undefined;
+    if (req && stepOutput && typeof stepOutput === 'object' && !Array.isArray(stepOutput)) {
+      const missing = req.keys.filter((k) => !(k in (stepOutput as Record<string, unknown>)));
+      perCriterion.push({
+        criterion,
+        pass: missing.length === 0,
+        method: 'deterministic',
+        detail: missing.length === 0
+          ? `step "${req.stepId}" output carries all required keys (${req.keys.join(', ')})`
+          : `step "${req.stepId}" output missing key${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}`,
+      });
+      continue;
+    }
+    fuzzy.push(criterion);
   }
 
   let judgeFailedOpen = false;
