@@ -657,7 +657,7 @@ const MIGRATIONS: EventLogMigration[] = [
     // (see hooks.ts:202) for readability; that loss broke the
     // recall_tool_result promise. This table stores the full output
     // (up to 200KB) so an agent that sees `[clipped: ... call
-    // recall_tool_result("call_xxx")]` can retrieve the verbatim
+    // recall_tool_result …]` stub can retrieve the verbatim
     // original. Append-only; cascade-deleted with the session.
     version: 3,
     sql: `

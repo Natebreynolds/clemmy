@@ -11,6 +11,7 @@ import {
   type RuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
 import { harnessRunContextStorage } from './brackets.js';
+import { toolCallHint } from './tool-call-hint.js';
 
 /**
  * RunHooks → event log writer.
@@ -92,7 +93,7 @@ function clip(text: string | undefined | null, max: number): string | null {
 /**
  * Tool-return-specific clip. When the original is over the budget AND
  * we have a callId, emit a marker the model can actually act on —
- * `recall_tool_result("<call_id>")` retrieves the full payload from
+ * `recall_tool_result` with the call_id retrieves the full payload from
  * the `tool_outputs` side store (already written upstream of this
  * call by writeToolOutput). Falls back to the bare `…[+N chars]`
  * marker when callId is missing, since recall isn't possible without
@@ -112,7 +113,7 @@ function clipToolResult(
   const head = text.slice(0, max);
   if (callId) {
     const iso = new Date().toISOString();
-    return `${head}\n[clipped: ${toolName ?? 'tool'} returned ${text.length} chars at ${iso} — call recall_tool_result("${callId}") for full output]`;
+    return `${head}\n[clipped: ${toolName ?? 'tool'} returned ${text.length} chars at ${iso} — ${toolCallHint('recall_tool_result', { call_id: callId })} returns the full output]`;
   }
   return `${head}…[+${text.length - max} chars]`;
 }

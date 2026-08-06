@@ -924,7 +924,7 @@ export const DEFAULT_TOKEN_BUDGET: Readonly<TokenBudgetCounts> = Object.freeze({
 /**
  * Per-turn budget for recall_tool_result. After Layer 1 of auto-compact
  * clips old tool outputs with stubs that name a call_id, the agent can
- * call `recall_tool_result(call_id)` to retrieve the verbatim original.
+ * call `recall_tool_result` with that call_id to retrieve the verbatim original.
  * Without a budget the agent could pull 200KB × 3 calls back into the
  * input prompt that we just compacted. Resets per-turn (the loop builds
  * a new HarnessRunContext per `Runner.run`).

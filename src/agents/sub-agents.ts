@@ -23,6 +23,7 @@ import { getGoalPinForDelegation } from './plan-proposals.js';
 import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, type WorkerToolInput } from './worker-job-packet.js';
 import { normalizeWorkerOutput } from './worker-output.js';
+import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import {
   externalMcpScopeFromExactToolNames,
   externalMcpScopeFromResolvedTools,
@@ -196,7 +197,7 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope | 
       '  - If the parent named a specific skill or the item clearly needs installed skill rules, call `skill_read` for that skill. Otherwise do not spend worker context on skill discovery.',
       '  - Return a TIGHT, structured result on the last line: a single sentence, a JSON object, or a bullet list. The parent will aggregate hundreds of these — keep yours compact.',
       '  - If a tool call fails or returns a result missing the data you need, fix and retry that call ONCE: re-run discovery to get the exact slug/id, narrow the query, or adjust arguments from the error. A failing tool result is information, not a stop sign. Do NOT re-issue the SAME call with identical arguments — that is a loop and will be cut off; change something or move on.',
-      '  - If a tool result shows a `[clipped: …]` or `[digest: …]` footer with a call_id, the full payload is stored and retrievable RIGHT NOW: call `tool_output_query("call_id", …)` for specific records or `recall_tool_result("call_id")` for the raw output. Never report that the data is unavailable, that a reader "isn\'t exposed", or that a completed call is still pending — pull it.',
+      `  - If a tool result shows a \`[clipped: …]\` or \`[digest: …]\` footer with a call_id, the full payload is stored and retrievable RIGHT NOW: ${toolCallHint('tool_output_query', { call_id: '<call id>', fields: ['<field>'] })} for specific records or ${toolCallHint('recall_tool_result', { call_id: '<call id>' })} for the raw output. Never report that the data is unavailable, that a reader "isn't exposed", or that a completed call is still pending — pull it.`,
       '  - Only after one genuine retry fails should you give up. Return a single line starting with "ERROR:" and the specific reason, including which tool failed and what data was missing. Never return a normal-looking result when the item did not actually complete.',
       '  - Fill per-item artifacts (email/Outlook draft, record, message) with the REAL identity values from your data. If your item is "draft an email to account X", the draft carries X\'s actual recipient address and a real first-name greeting from the data you were given or fetched — never a blank or "Hi there". If a required identity field (recipient email, contact first name) is genuinely missing for your item and one retry to fetch it fails, do NOT produce a hollow draft — return "ERROR: missing <field> for <item>" so the parent can decide.',
       '  - Do NOT call notify_user, ask_user_question, or write to shared tasks/executions — those mutate state your sibling workers also touch and create race conditions.',

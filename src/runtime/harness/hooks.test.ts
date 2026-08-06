@@ -380,7 +380,7 @@ test('large tool_returned result uses recall_tool_result marker when callId pres
   // Head preserved
   assert.ok(result.startsWith('A'.repeat(50)), 'head preserved');
   // Marker references the callId in the recall_tool_result form
-  assert.match(result, /recall_tool_result\("call_recall_test"\)/);
+  assert.match(result, /recall_tool_result \{"call_id":"call_recall_test"\}/);
   // Original length surfaced in the marker
   assert.match(result, /returned 500 chars/);
   // Tool name surfaced

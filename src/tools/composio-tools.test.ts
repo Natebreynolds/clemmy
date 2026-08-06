@@ -70,7 +70,7 @@ test('formatComposioToolOutput stores full oversized JSON before returning a rec
   });
 
   assert.ok(output.length < full.length, 'model-facing output should be clipped');
-  assert.match(output, /recall_tool_result\("call_composio_full"\)/);
+  assert.match(output, /recall_tool_result \{"call_id":"call_composio_full"\}/);
   // List payload → the footer now reports the TRUE item count + that recall
   // returns ALL of them (the acme 44→4 fix), not a bare char count.
   assert.match(output, /20 record\(s\) at data\.value\[\*\]/);

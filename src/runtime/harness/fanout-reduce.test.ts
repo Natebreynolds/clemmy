@@ -78,7 +78,7 @@ test('the first 8 results return byte-identical verbatim; the 9th compresses to 
   const ninth = await workerReturn(sess, 9);
   assert.match(ninth, /✓ DONE: "item-9"/);
   assert.match(ninth, /digest: /);
-  assert.match(ninth, /tool_output_query\("call_w_test_9"\)/);
+  assert.match(ninth, /tool_output_query \{"call_id":"call_w_test_9"\}/);
   assert.match(ninth, /RULE: report only figures/);
 });
 

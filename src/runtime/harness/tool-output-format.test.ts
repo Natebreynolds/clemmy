@@ -54,7 +54,7 @@ test('formatRecallableToolText stores full output and returns canonical recall s
   });
 
   assert.ok(visible.length < full.length);
-  assert.match(visible, /recall_tool_result\("call_global_clip"\)/);
+  assert.match(visible, /recall_tool_result \{"call_id":"call_global_clip"\}/);
 
   const row = getToolOutput(sess.id, 'call_global_clip');
   assert.ok(row);
@@ -136,7 +136,7 @@ test('clip footer reports the TRUE record count + that recall returns ALL (acme 
   assert.match(visible, /[Cc]ontains 59 record\(s\) at data\.records\[\*\]/);
   assert.match(visible, /returns ALL 59/);
   assert.match(visible, /no pagination/i);
-  assert.match(visible, /recall_tool_result\("call_air"\)/);
+  assert.match(visible, /recall_tool_result \{"call_id":"call_air"\}/);
   assert.equal(getToolOutput(sess.id, 'call_air')!.output, full); // full payload preserved
 });
 
@@ -155,7 +155,7 @@ test('textResult uses active tool-output context for MCP-style local tools', asy
   );
 
   const visible = result.content[0].text;
-  assert.match(visible, /recall_tool_result\("call_text_result_full"\)/);
+  assert.match(visible, /recall_tool_result \{"call_id":"call_text_result_full"\}/);
 
   const row = getToolOutput(sess.id, 'call_text_result_full');
   assert.ok(row);

@@ -41,6 +41,7 @@ import { Agent, Runner } from '@openai/agents';
 import { BASE_DIR, MODELS, getRuntimeEnv } from '../../config.js';
 import { listEvents, writeToolOutput } from './eventlog.js';
 import { summarizeFanoutCoverage } from './fanout-ledger.js';
+import { toolCallHint } from './tool-call-hint.js';
 
 // ---------------------------------------------------------------------------
 // Switches + tunables
@@ -416,7 +417,7 @@ export async function runShardReduce(
 function shardBlock(artifact: ShardArtifact, dir: string): string {
   const label = artifact.degraded ? 'deterministic digest — reducer unavailable' : 'machine-generated summary';
   return [
-    `=== FAN-OUT SHARD ${artifact.shardIndex} (${artifact.items.length} results; ${label}; per-item truth: tool_output_query("<call_id>")) ===`,
+    `=== FAN-OUT SHARD ${artifact.shardIndex} (${artifact.items.length} results; ${label}; per-item truth: ${toolCallHint('tool_output_query', { call_id: '<call id>' })}) ===`,
     artifact.summary,
     `(shard artifacts: ${dir} — workspace_artifact_query for exact rows)`,
   ].join('\n');
@@ -515,7 +516,7 @@ export async function buildWorkerReturn(input: WorkerReturnInput): Promise<strin
     const envelope = [
       `✓ DONE: ${JSON.stringify(input.item)}`,
       `digest: ${zeroLlmDigest(input.text)}`,
-      `full output parked: tool_output_query("${input.callId}") for records, recall_tool_result("${input.callId}") for raw text.`,
+      `full output parked: ${toolCallHint('tool_output_query', { call_id: input.callId })} for records, ${toolCallHint('recall_tool_result', { call_id: input.callId })} for raw text.`,
       `${coverage} shard summaries: ${fanoutReduceDir(input.parentRunId)} (workspace_artifact_query when you synthesize).`,
       'RULE: report only figures visible above or fetched via the readers — never reconstruct a number from memory of this digest.',
     ].join('\n');

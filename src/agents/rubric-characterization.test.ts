@@ -118,13 +118,18 @@ const GOLDEN = {
   // tool_choice_remember on success) — the write side of the learning loop
   // was never requested, so long runs re-discovered per item. Compact shared
   // line added; the legacy head keeps its verbose original.
-  instructions: { len: 35242, sha16: 'fa01ba7c201ee349' },
-  native: { len: 34345, sha16: '1bbccddf98984ebd' },
+  // 2026-08-05 hints-are-schema: the two reader-tool examples (Recently
+  // Learned call_xxx hint; COMPACTED CONTEXT stub example) now render as
+  // literal valid-JSON inputs — recall_tool_result {"call_id":"call_abc123"} —
+  // instead of paren/kwargs pseudo-signatures the model copied verbatim into
+  // unparseable tool calls (live InputValidationError class, 4/4 occurrences).
+  instructions: { len: 35266, sha16: '241c132876912f4c' },
+  native: { len: 34369, sha16: 'd5ce61448272d292' },
   claudeBrain: { len: 8174, sha16: '837d5fe4608c35ce' },
   // 2026-07-27 live efficiency proof: execution_create already guards against
   // a duplicate active lane, so the lean rubric no longer makes the model dump
   // every user's old executions before opening/reusing the current one.
-  lean: { len: 11719, sha16: '5b461b5ea9184f0a' },
+  lean: { len: 11734, sha16: 'd99facc1b69b0cc3' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

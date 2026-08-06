@@ -358,3 +358,42 @@ test('a projection that matches nothing returns the MAP, never "{}"', async () =
   assert.match(t3, /0 records matched filter_field="subject"/);
   assert.match(t3, /record fields: subject/, 'zero matches still teach the shape');
 });
+
+test('fields accepts the comma-separated STRING spelling — the live 2026-08-05 near-miss', async () => {
+  // REGRESSION PIN: the model sent `"fields": "subject,start"` (valid JSON,
+  // string type) after being taught prose field lists. The widened schema
+  // accepts it and normalizeFieldsInput canonicalizes to the array form, so
+  // both spellings produce byte-identical projections.
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const payload = JSON.stringify({
+    data: {
+      value: Array.from({ length: 4 }, (_, i) => ({
+        subject: `Event ${i}`, start: { dateTime: `2026-08-06T0${i}:00:00` }, isAllDay: false, organizer: 'nate',
+      })),
+    },
+  });
+  writeToolOutput({ sessionId: sess.id, callId: 'call_widen', tool: 'composio_execute_tool', output: payload });
+
+  const query = captureToolOutputQueryHandler();
+  const run = (fields: unknown) => withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_widen', fields }),
+  );
+  const viaString = (await run(' subject, start ')).content[0].text;
+  const viaArray = (await run(['subject', 'start'])).content[0].text;
+  assert.equal(viaString, viaArray, 'string and array spellings are the SAME query (one canonical form past the boundary)');
+  assert.ok(viaString.includes('Event 3'), 'projection actually returned records');
+  assert.doesNotMatch(viaString, /isAllDay/, 'projection excluded unrequested fields');
+});
+
+test('normalizeFieldsInput: one canonical spelling, junk-tolerant, never a phantom empty projection', async () => {
+  const { normalizeFieldsInput } = await import('./recall-tools.js');
+  assert.deepEqual(normalizeFieldsInput('a,b , c'), ['a', 'b', 'c']);
+  assert.deepEqual(normalizeFieldsInput(['a', ' b ']), ['a', 'b']);
+  assert.equal(normalizeFieldsInput(''), undefined);
+  assert.equal(normalizeFieldsInput('  ,  '), undefined);
+  assert.equal(normalizeFieldsInput([]), undefined);
+  assert.equal(normalizeFieldsInput(undefined), undefined);
+  assert.equal(normalizeFieldsInput(null), undefined);
+});

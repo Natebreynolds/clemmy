@@ -32,8 +32,8 @@ test('JSON array digest reports the true total, field list, and recovery path', 
   const digest = digestToolOutput(JSON.stringify(accounts), { maxChars: 2000, toolName: 'sf', callId: 'call_x1' });
   assert.match(digest, /array of 37 records/);
   assert.match(digest, /Fields: .*Website/);
-  assert.match(digest, /tool_output_query\("call_x1"/);
-  assert.match(digest, /recall_tool_result\("call_x1"/);
+  assert.match(digest, /tool_output_query \{"call_id":"call_x1"/);
+  assert.match(digest, /recall_tool_result \{"call_id":"call_x1"\}/);
 });
 
 test('JSON object: shows real CONTENT of nested arrays, not just array(N) shape', () => {
@@ -45,7 +45,7 @@ test('JSON object: shows real CONTENT of nested arrays, not just array(N) shape'
   assert.match(digest, /"Website":"http/); // actual record content is visible
   assert.match(digest, /more of 37/);
   assert.doesNotMatch(digest, /rows: array\(37\)/);
-  assert.match(digest, /tool_output_query\("call_o1"/);
+  assert.match(digest, /tool_output_query \{"call_id":"call_o1"/);
 });
 
 test('Composio envelope: digest surfaces the data payload (tables/ids), not data: object(1 keys)', () => {
@@ -97,7 +97,7 @@ test('plain text: head+tail + line/char count, points to recall', () => {
   const digest = digestToolOutput(text, { maxChars: 1200, toolName: 'run_shell_command', callId: 'call_t1' });
   assert.match(digest, /chars \/ 500 lines/);
   assert.match(digest, /middle omitted/);
-  assert.match(digest, /recall_tool_result\("call_t1"/);
+  assert.match(digest, /recall_tool_result \{"call_id":"call_t1"\}/);
 });
 
 test('no callId: still a digest, but recovery hint is the re-run advice', () => {
@@ -157,7 +157,7 @@ test('Composio search catalog digest preserves exact slugs and compact input fie
   assert.match(digest, /DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED/);
   assert.match(digest, /target:string/);
   assert.match(digest, /location_name/);
-  assert.match(digest, /tool_output_query\("call_catalog"/);
+  assert.match(digest, /tool_output_query \{"call_id":"call_catalog"/);
 });
 
 test('Composio list catalog digest keeps slug index instead of only top-level shape', () => {
@@ -224,7 +224,7 @@ test('object digest names WHERE the records live and that the query engine reach
   });
   const digest = digestToolOutput('x'.repeat(0) + graphish, { maxChars: 900, toolName: 'composio_execute_tool', callId: 'call_g' });
   assert.match(digest, /9 record\(s\) at data\.value\[\*\]/, 'the digest is a map, not just a count');
-  assert.match(digest, /fields: subject, start, organizer/);
+  assert.match(digest, /fields: \["subject","start","organizer"\]/);
   assert.match(digest, /tool_output_query filters\/projects\/paginates THESE records directly/);
 });
 

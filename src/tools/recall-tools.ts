@@ -6,6 +6,7 @@ import { textResult } from './shared.js';
 import { parseShellToolOutput } from './code-mode-tool.js';
 import { extractCompleteJsonObjects, extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
+import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -40,6 +41,67 @@ const clipQueryBody = (text: string): string =>
     ? text
     : `${text.slice(0, QUERY_MAX_CHARS)}\n…[clipped to ${QUERY_MAX_CHARS} chars — narrow with fields:[...], a filter, or a smaller limit]`;
 
+/** Zod shapes exported so the tool-call-hint pin can validate every emitted
+ * hint example against the REAL registered contract (single source of truth —
+ * a hand-written example can never drift from the schema unnoticed). */
+export const RECALL_TOOL_RESULT_SHAPE = {
+  call_id: z
+    .string()
+    .min(1)
+    .describe('The call_id from the [clipped: ...] stub. Looks like "call_abc123".'),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe('Start character to read from (default 0). Use the "more remains — offset: N" hint from a prior call to page through a large payload.'),
+  max_chars: z
+    .number()
+    .int()
+    .min(100)
+    .max(DEFAULT_RECALL_MAX_CHARS)
+    .optional()
+    .describe('Optional cap on the returned slice. Defaults to 30000.'),
+};
+
+export const TOOL_OUTPUT_QUERY_SHAPE = {
+  call_id: z.string().min(1).describe('The call_id from the digest/clip footer, e.g. "call_abc123".'),
+  // Accepts BOTH an array and a comma-separated string. The array is the
+  // documented form; the string form is deliberate boundary tolerance — a
+  // near-miss models actually produce (`"fields": "subject,start"`), and a
+  // comma-separated projection list has exactly one meaning, so accepting it
+  // converts a wasted error round-trip into the intended query. Both branches
+  // are TYPED (strict-schema compatible — see the nullish-anyOf constraint).
+  fields: z
+    .union([
+      z.array(z.string()),
+      z.string().describe('Comma-separated field names — equivalent to the array form.'),
+    ])
+    .optional()
+    .describe('Only include these keys from each record/object (projection), e.g. ["subject","start"]. Omit for all fields.'),
+  filter_field: z.string().optional().describe('Keep only records where this field matches filter_contains/filter_equals.'),
+  filter_contains: z.string().optional().describe('Substring match (case-insensitive) for filter_field.'),
+  filter_equals: z.string().optional().describe('Exact match for filter_field.'),
+  offset: z.number().int().min(0).optional().describe('Skip this many matching records (default 0).'),
+  limit: z.number().int().min(1).max(200).optional().describe('Return at most this many records (default 50).'),
+};
+
+/** Normalize the widened `fields` input to a clean array (or undefined). One
+ * canonical spelling past this boundary — so downstream projection logic and
+ * any future input-bound reuse/replay identity never see two encodings of the
+ * same query. */
+export function normalizeFieldsInput(raw: unknown): string[] | undefined {
+  if (Array.isArray(raw)) {
+    const arr = raw.filter((f): f is string => typeof f === 'string' && f.trim().length > 0).map((f) => f.trim());
+    return arr.length > 0 ? arr : undefined;
+  }
+  if (typeof raw === 'string' && raw.trim()) {
+    const arr = raw.split(',').map((s) => s.trim()).filter(Boolean);
+    return arr.length > 0 ? arr : undefined;
+  }
+  return undefined;
+}
+
 export function registerRecallTools(server: McpServer): void {
   server.tool(
     'recall_tool_result',
@@ -47,27 +109,10 @@ export function registerRecallTools(server: McpServer): void {
       'Retrieve the full verbatim output of a prior tool call by its call_id.',
       'Use this whenever the conversation shows a `[clipped: …]` stub OR a `[digest: …]` footer carrying a call_id and you need a detail the shortened view dropped (URLs, IDs, exact figures, ranking positions, full records, etc.).',
       'This reader is ALWAYS available to you inside a turn — the full payload is stored losslessly. Never tell the user the data is unavailable, that the reader "isn\'t exposed", or that a completed call is still pending: call this instead.',
-      'Returns up to 30KB of original output per call, starting at `offset` (default 0). When the result is bigger, the header says how much remains and the exact `offset` to pass next to continue paging. Counts against a per-turn budget of 3 calls / 60KB total — use sparingly; for a JSON list prefer tool_output_query (it pages records, not raw chars).',
+      'Returns up to 30KB of original output per call, starting at `offset` (default 0). When the result is bigger, the header says how much remains and the exact `offset` to pass next to continue paging. Counts against a per-turn budget of 3 calls / 60KB total — use sparingly; for a JSON list prefer tool_output_query, which pages records rather than raw chars.',
+      `Input is ONE JSON object, e.g. ${toolCallHint('recall_tool_result', { call_id: 'call_abc123' })}.`,
     ].join(' '),
-    {
-      call_id: z
-        .string()
-        .min(1)
-        .describe('The call_id from the [clipped: ...] stub. Looks like "call_abc123".'),
-      offset: z
-        .number()
-        .int()
-        .min(0)
-        .optional()
-        .describe('Start character to read from (default 0). Use the "more remains — offset: N" hint from a prior call to page through a large payload.'),
-      max_chars: z
-        .number()
-        .int()
-        .min(100)
-        .max(DEFAULT_RECALL_MAX_CHARS)
-        .optional()
-        .describe('Optional cap on the returned slice. Defaults to 30000.'),
-    },
+    RECALL_TOOL_RESULT_SHAPE,
     async (input: Record<string, unknown>) => {
       const callId = String(input.call_id ?? '');
       const maxChars = Number.isFinite(input.max_chars as number)
@@ -135,19 +180,12 @@ export function registerRecallTools(server: McpServer): void {
     'tool_output_query',
     [
       'Query a slice of a large prior tool output by its call_id, without loading the whole payload.',
-      'Use after you see a `[digest: … tool_output_query("call_xxx", …)]` footer (or a `[clipped: …]` stub) and you need specific records the digest did not show.',
+      'Use after you see a `[digest: …]` footer (or a `[clipped: …]` stub) naming a call_id and you need specific records the digest did not show.',
       'This reader is ALWAYS available inside a turn — the full result is parked losslessly. Never claim the data is unavailable, the reader "isn\'t exposed", or that the call is still pending; call this to pull exactly the rows/fields you need.',
       'For a JSON array result: filter rows, project fields, and paginate. For a JSON object: project top-level keys. Returns compact JSON plus a "showing X of N" header.',
+      `Input is ONE JSON object, e.g. ${toolCallHint('tool_output_query', { call_id: 'call_abc123', fields: ['name', 'id'], limit: 50 })}.`,
     ].join(' '),
-    {
-      call_id: z.string().min(1).describe('The call_id from the digest/clip footer, e.g. "call_abc123".'),
-      fields: z.array(z.string()).optional().describe('Only include these keys from each record/object (projection). Omit for all fields.'),
-      filter_field: z.string().optional().describe('Keep only records where this field matches filter_contains/filter_equals.'),
-      filter_contains: z.string().optional().describe('Substring match (case-insensitive) for filter_field.'),
-      filter_equals: z.string().optional().describe('Exact match for filter_field.'),
-      offset: z.number().int().min(0).optional().describe('Skip this many matching records (default 0).'),
-      limit: z.number().int().min(1).max(200).optional().describe('Return at most this many records (default 50).'),
-    },
+    TOOL_OUTPUT_QUERY_SHAPE,
     async (input: Record<string, unknown>) => {
       const callId = String(input.call_id ?? '');
       const ctx = harnessRunContextStorage.getStore();
@@ -192,7 +230,9 @@ export function registerRecallTools(server: McpServer): void {
         }
       }
 
-      const fields = Array.isArray(input.fields) ? (input.fields as string[]) : undefined;
+      // One canonical spelling past this line: the widened string form
+      // ("subject,start") becomes the same array the documented form produces.
+      const fields = normalizeFieldsInput(input.fields);
       const project = (rec: unknown): unknown => {
         if (!fields || !rec || typeof rec !== 'object' || Array.isArray(rec)) return rec;
         const out: Record<string, unknown> = {};
@@ -210,16 +250,16 @@ export function registerRecallTools(server: McpServer): void {
       if (!Array.isArray(parsed) && parsed && typeof parsed === 'object') {
         const wantsRecordQuery = Boolean(
           input.filter_field !== undefined || input.offset !== undefined || input.limit !== undefined
-          || input.fields !== undefined,
+          || fields !== undefined,
         );
         const dom = resolveDominantArray(parsed);
         if (dom && dom.path && wantsRecordQuery) {
           // Only when the requested fields aren't literal top-level keys — an
           // explicit top-level projection still means the top-level object.
           const topLevel = new Set(Object.keys(parsed as Record<string, unknown>));
-          const fieldsAreTopLevel = Array.isArray(input.fields)
-            && (input.fields as string[]).length > 0
-            && (input.fields as string[]).every((f) => topLevel.has(f));
+          const fieldsAreTopLevel = fields !== undefined
+            && fields.length > 0
+            && fields.every((f) => topLevel.has(f));
           if (!fieldsAreTopLevel) {
             parsed = dom.rows;
             unwrappedPath = dom.path;

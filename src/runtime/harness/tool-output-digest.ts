@@ -18,6 +18,8 @@
  * Pure: callId is passed in, no I/O.
  */
 
+import { toolCallHint } from './tool-call-hint.js';
+
 export interface DigestOptions {
   maxChars?: number;
   toolName?: string | null;
@@ -125,15 +127,22 @@ function collectFields(arr: unknown[], sample = 12): string[] {
   return [...keys];
 }
 
-function recoveryHint(callId: string | null | undefined): string {
+function recoveryHint(callId: string | null | undefined, sampleFields?: string[]): string {
   if (!callId) return 'Re-run the call with a narrower scope (filter / fewer fields / a smaller range) to get the rest.';
   // The full result is parked losslessly under this call_id — these two
   // readers are available to you RIGHT NOW. Spell that out so the model
   // pulls the data instead of declaring it unavailable / still pending /
-  // "the reader isn't exposed" (observed live, 2026-06-01).
+  // "the reader isn't exposed" (observed live, 2026-06-01). The examples are
+  // literal valid-JSON inputs (toolCallHint) — the model copies hint syntax
+  // verbatim, so a pseudo-signature here becomes an unparseable tool call
+  // (observed live, 2026-08-05).
+  const queryArgs: Record<string, unknown> = { call_id: callId };
+  if (sampleFields && sampleFields.length > 0) queryArgs.fields = sampleFields.slice(0, 3);
+  queryArgs.limit = 50;
   return (
-    `The full result is stored — call tool_output_query("${callId}", {offset, limit, fields, filter}) ` +
-    `to pull specific records, or recall_tool_result("${callId}") for the raw payload. ` +
+    `The full result is stored — pull records with ${toolCallHint('tool_output_query', queryArgs)} ` +
+    `(offset / filter_field / filter_contains also accepted), or the raw payload with ` +
+    `${toolCallHint('recall_tool_result', { call_id: callId })}. ` +
     `These readers are available now; do NOT say the data is unavailable or that the call is still pending.`
   );
 }
@@ -153,11 +162,14 @@ function digestArray(arr: unknown[], totalChars: number, maxChars: number, toolN
   }
   const more = total - shown.length;
   const body = JSON.stringify(shown, null, 1);
-  const fieldList = fields.length ? ` Fields: ${fields.slice(0, 24).join(', ')}${fields.length > 24 ? ', …' : ''}.` : '';
+  // Field list rendered as a JSON array — the model lifts this list verbatim
+  // into `fields:`, so it must already be the exact syntax the tool accepts
+  // (a bare comma list here became `"fields": subject,start,…` live 2026-08-05).
+  const fieldList = fields.length ? ` Fields: ${JSON.stringify(fields.slice(0, 24))}${fields.length > 24 ? ' (+more)' : ''}.` : '';
   const footer =
     `\n[digest: ${toolName} returned a JSON array of ${total} record${total === 1 ? '' : 's'} (~${totalChars.toLocaleString()} chars). ` +
     `Showing the first ${shown.length} COMPLETE record${shown.length === 1 ? '' : 's'}${more > 0 ? `; ${more} more not shown` : ''}.${fieldList} ` +
-    `${recoveryHint(callId)}]`;
+    `${recoveryHint(callId, fields)}]`;
   return body + footer;
 }
 
@@ -254,14 +266,17 @@ function digestObject(obj: Record<string, unknown>, totalChars: number, maxChars
   // operates on them directly — so the first tool_output_query is written
   // against known shape instead of a guessed top-level projection (the
   // 2026-07-31 calendar run paid 3 extra calls + a 26KB replay for that guess).
+  // Field list as a JSON array — the model lifts it verbatim into `fields:`,
+  // so it must already be the exact accepted syntax (same fix as digestArray;
+  // a bare comma list here became `"fields": subject,start,…` live 2026-08-05).
   const domNote = resolved
     ? ` Contains ${resolved.rows.length} record(s) at ${resolved.path ? `${resolved.path}[*]` : '[*]'}` +
-      `${domFields.length ? ` with fields: ${domFields.slice(0, 16).join(', ')}${domFields.length > 16 ? ', …' : ''}` : ''}` +
+      `${domFields.length ? ` with fields: ${JSON.stringify(domFields.slice(0, 16))}${domFields.length > 16 ? ' (+more)' : ''}` : ''}` +
       ` — tool_output_query filters/projects/paginates THESE records directly; recall_tool_result returns ALL ${resolved.rows.length} (no pagination needed).`
     : '';
   const footer =
     `\n[digest: ${toolName} returned a JSON object with ${entries.length} top-level key${entries.length === 1 ? '' : 's'} (~${totalChars.toLocaleString()} chars)${moreKeys > 0 ? `; ${moreKeys} key(s) not shown` : ''}.${domNote} ` +
-    `${recoveryHint(callId)}]`;
+    `${recoveryHint(callId, domFields)}]`;
   return `{\n${lines.join('\n')}\n}${footer}`;
 }
 

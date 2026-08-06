@@ -106,7 +106,7 @@ test('clipOldToolResults — leaves last N turns untouched', () => {
   assert.ok(first);
   const stub = (first!.output as { text: string }).text;
   assert.match(stub, /^\[clipped:/);
-  assert.match(stub, /recall_tool_result\("call_0"\)/);
+  assert.match(stub, /recall_tool_result \{"call_id":"call_0"\}/);
   assert.equal(first!.__clipped, true);
 });
 
@@ -178,7 +178,7 @@ test('collapseOldCompletedToolPairs — removes old recallable pairs and keeps t
     return any.role === 'system' && typeof any.content === 'string' && any.content.startsWith('[summary of older completed tool activity]');
   }) as Record<string, unknown> | undefined;
   assert.ok(summary, 'collapsed history should include a summary message');
-  assert.match(String(summary.content), /recall_tool_result\("call_0"\)/);
+  assert.match(String(summary.content), /recall_tool_result \{"call_id":"call_0"\}/);
   assert.match(String(summary.content), /https:\/\/example-0\.com/);
 
   const remainingCallIds = new Set<string>();
@@ -255,7 +255,7 @@ test('compactInFlightToolContext — bounds same-turn results without mutating d
     (item as { role?: unknown }).role === 'system'
     && typeof (item as { content?: unknown }).content === 'string',
   ) as { content: string } | undefined;
-  assert.match(summary?.content ?? '', /recall_tool_result\("flight_0"\)/);
+  assert.match(summary?.content ?? '', /recall_tool_result \{"call_id":"flight_0"\}/);
   assert.doesNotMatch(filteredJson, /"callId":"flight_0"/);
   assert.match(filteredJson, /"callId":"flight_8"/);
   assert.match(filteredJson, /"callId":"flight_9"/);
@@ -341,7 +341,7 @@ test('summarizeOlderMessages — preserves compaction summaries instead of re-su
     assert.equal(result.modelUsed, 'test-summarizer');
     assert.match(serializedOlder, /draft still needs final review/);
     assert.doesNotMatch(serializedOlder, /summary of older completed tool activity/);
-    assert.doesNotMatch(serializedOlder, /recall_tool_result\("call_old"\)/);
+    assert.doesNotMatch(serializedOlder, /recall_tool_result.*call_old/);
     assert.doesNotMatch(serializedOlder, /summary of earlier conversation/);
 
     const contents = (result.mutatedItems ?? [])

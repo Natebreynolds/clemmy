@@ -64,7 +64,7 @@ export const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
  * The truncation marker tells the model the response was cut and how
  * much was dropped, so it can choose to re-call with a narrower scope
  * (offset/limit, filter, more specific query) or call
- * `recall_tool_result(callId)` to pull the original full output from
+ * `recall_tool_result` with the callId to pull the original full output from
  * disk without re-invoking the upstream tool.
  */
 export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS): string {

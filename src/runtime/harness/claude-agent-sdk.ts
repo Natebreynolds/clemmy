@@ -1368,7 +1368,7 @@ export interface ClaudeAgentSdkRunResult {
   stoppedReason?: RunStoppedReason;
   /** A3 recall ledger: every tool call this run with its callId, so an
    *  auto-continue (fresh context — tool RESULTS are lost) can pull earlier
-   *  results via tool_output_query(callId) instead of re-fetching. */
+   *  results via tool_output_query by call id instead of re-fetching. */
   toolCallLedger?: Array<{ callId: string; name: string; argsPreview: string }>;
 }
 

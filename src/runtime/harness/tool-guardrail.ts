@@ -11,7 +11,7 @@
  *
  *   B. Tool-return size enforcement. When a tool returns >8KB AND the
  *      tool is in HIGH_VOLUME_TOOLS, truncate the return to a head +
- *      tail summary with a `[full output via recall_tool_result("…")]`
+ *      tail summary with a `[full output via recall_tool_result …]`
  *      marker. The full payload still lives in tool_outputs via the
  *      eventlog hook; the model just doesn't get the bloat in context.
  *
@@ -493,7 +493,7 @@ export interface GuardrailDecision {
   /** Within-task fetch memory (FIX 2). Set when THIS call is a byte-identical
    *  repeat of a CACHE_SAFE read whose source hasn't mutated in-session — the
    *  call_id of the PRIOR identical call, which the harness turns into a
-   *  "recall_tool_result(this id) instead of re-fetching" nudge. Advisory,
+   *  "recall_tool_result with this id instead of re-fetching" nudge. Advisory,
    *  never blocks, never serves a payload (so it can never serve stale data —
    *  the model decides whether to recall or re-fetch). Only set when
    *  CLEMMY_WITHIN_TASK_RECALL_NUDGE=on. */

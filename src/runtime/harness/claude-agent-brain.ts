@@ -118,6 +118,7 @@ import {
   type FreshExternalWriteEvidenceStatus,
 } from './tool-evidence.js';
 import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
+import { toolCallHint } from './tool-call-hint.js';
 import {
   resolveMcpToolScopeWithRecall,
   type McpToolScope,
@@ -752,7 +753,7 @@ function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
       '- Every tool call runs through Clementine\'s safety gates (grounding, goal-fidelity, execution-wrap, destination, duplicate-write, loop-guard). Irreversible/external actions (sends, batch external writes) PAUSE for the user\'s approval BEFORE they run. Do the work — the gates + approval protect it; you do not need to ask permission in prose first.',
       '- SURFACE NOTE: the intent-matched native vendor MCP servers for THIS turn (e.g. a native dataforseo/firecrawl/supabase MCP) ARE attached on this lane — their tool schemas load on demand via tool search (surfaced by name, fetched when you call them). When a skill or instruction says "use the <X> MCP", use that native server/tool directly. Fall back to composio_search_tools → composio_execute_tool (e.g. a DATAFORSEO_* slug) or run_shell_command (the vendor CLI) only when no native server is attached for the need. Use ONE surface per capability — do not pull the same data from two surfaces in the same run.',
       '- Before a MUTATING external write (a composio send/create, a batch), call execution_create FIRST (title, objective, successCriteria), then proceed — the harness requires an active execution lane for those.',
-      '- A large tool result may be clipped with a `[digest: … tool_output_query("call_…")]` footer — call tool_output_query or recall_tool_result to pull the records. Never report stored data as unavailable.',
+      `- A large tool result may be clipped with a \`[digest: …]\` footer naming a call id — pull the stored records with ${toolCallHint('tool_output_query', { call_id: '<call id>', fields: ['<field>'] })} or the raw payload with ${toolCallHint('recall_tool_result', { call_id: '<call id>' })}. Never report stored data as unavailable.`,
       '- Do NOT claim you ran a command, sent a message, or wrote a file unless a tool result in THIS run proves it. If a tool result begins with `ERROR:`, treat that item as failed and say so.',
       '- If an installed skill applies (design/report/audit), call skill_read for it before producing the artifact.',
     ].join('\n');
@@ -2379,7 +2380,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       })();
       // A3 recall ledger: continuations run in FRESH context (tool RESULTS from
       // earlier segments are lost) — hand the model each earlier call's id so it
-      // can tool_output_query(callId) the stored result instead of re-fetching.
+      // can tool_output_query the stored result instead of re-fetching.
       // Lossless-recall parity with the Codex lane's clip stubs.
       let continuationLedger = [...(result.toolCallLedger ?? [])];
       const renderLedger = (): string => {
@@ -2392,7 +2393,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           if (bytes > 4000) { lines.push(`- …(+${continuationLedger.length - lines.length} more calls)`); break; }
           lines.push(line);
         }
-        return `\n\nTool calls you already made this run (their FULL results are stored — pull any of them with tool_output_query("<call id>") instead of re-running the tool):\n${lines.join('\n')}\n`;
+        return `\n\nTool calls you already made this run (their FULL results are stored — pull any of them with ${toolCallHint('tool_output_query', { call_id: '<call id>' })} instead of re-running the tool):\n${lines.join('\n')}\n`;
       };
       while (
         result.limitHit

@@ -9,6 +9,8 @@ import {
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
 import { estimateInputTokens } from './token-estimator.js';
+import { resolveModelCapability } from './model-wire-registry.js';
+import { toolCallHint } from './tool-call-hint.js';
 
 /**
  * Auto-compact for the harness loop. See plan v0.5.10.
@@ -87,7 +89,7 @@ const CLIP_PLACEHOLDER = (
   callId: string,
   iso: string,
 ): string =>
-  `[clipped: ${toolName ?? 'tool'} returned ${chars} chars at ${iso} — call recall_tool_result("${callId}") for full output]`;
+  `[clipped: ${toolName ?? 'tool'} returned ${chars} chars at ${iso} — ${toolCallHint('recall_tool_result', { call_id: callId })} returns the full output]`;
 
 // Cheap, fast model for summarization. The fast tier is gpt-5.4-mini (or
 // equivalent) — summarization is straightforward and doesn't need the
@@ -301,15 +303,19 @@ interface CompletedToolPair {
 
 function collapsedPairLine(pair: CompletedToolPair): string {
   const args = pair.args ? oneLine(pair.args, 180) : '{}';
-  const clippedMarker = pair.resultText.match(/\[clipped:[^\]]*recall_tool_result\("[^"]+"\)[^\]]*\]/)?.[0];
+  // Match BOTH clip-marker generations: the current valid-JSON hint form and
+  // the legacy paren form (persisted snapshots from older versions replay
+  // through here — detection must stay lenient even though we only EMIT the
+  // JSON form).
+  const clippedMarker = pair.resultText.match(/\[clipped:[^\]]*recall_tool_result[^\]]*\]/)?.[0];
   const result = clippedMarker ?? oneLine(pair.resultText, 220);
-  return `- ${pair.name} [${pair.callId}] args: ${args}; result: ${result || '(empty)'} [clipped: ${pair.name} collapsed from active context - call recall_tool_result("${pair.callId}") for full output]`;
+  return `- ${pair.name} [${pair.callId}] args: ${args}; result: ${result || '(empty)'} [clipped: ${pair.name} collapsed from active context - ${toolCallHint('recall_tool_result', { call_id: pair.callId })} returns the full output]`;
 }
 
 function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[]): AgentInputItem {
   const lines: string[] = [
     '[summary of older completed tool activity]',
-    `${pairs.length} older completed tool call/result pairs were collapsed to keep the active model context small. Recent tool calls remain verbatim. Exact older outputs remain available with recall_tool_result("call_id").`,
+    `${pairs.length} older completed tool call/result pairs were collapsed to keep the active model context small. Recent tool calls remain verbatim. Exact older outputs remain available with ${toolCallHint('recall_tool_result', { call_id: '<call id>' })}.`,
   ];
 
   let chars = lines.join('\n').length;

@@ -516,7 +516,7 @@ test('reflection digests oversized results before extraction and preserves a raw
       `extractor input stays bounded (got ${extractorInput.length})`,
     );
     assert.match(extractorInput, /Clementine Release Validation/);
-    assert.match(extractorInput, /recall_tool_result\(\"call-large-sheet\"\)/);
+    assert.match(extractorInput, /recall_tool_result \{\"call_id\":\"call-large-sheet\"\}/);
   } finally {
     if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
     if (prevThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = prevThreshold;

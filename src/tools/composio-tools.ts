@@ -422,7 +422,7 @@ function composioFailureCorrective(
  *
  * The model-facing copy stays capped so long runs do not accumulate
  * megabytes of app data in Codex request bodies. The full JSON is
- * written before clipping, so `recall_tool_result("call_xxx")` can
+ * written before clipping, so recall_tool_result by call_id can
  * recover details without re-running a side-effecting upstream tool.
  */
 export function formatComposioToolOutput(
