@@ -76,6 +76,7 @@ import {
 import { reengageSpace } from '../spaces/reengage.js';
 import { buildPublishSnapshot } from '../spaces/publish.js';
 import { injectWorkspaceBootstrap } from '../spaces/view-html.js';
+import { appendWiringHealthBanner, spaceWiringHealth } from '../spaces/wiring-health.js';
 import { availableStarterRecipes } from '../spaces/starter-recipes.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
 
@@ -387,7 +388,12 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       // the surface renders empty on first load. That ordering bug forced
       // hand-rolled `waitForClem` polls in authored views.) The bridge touches
       // no DOM, so <head> is safe.
-      res.send(injectWorkspaceBootstrap(html, CLEM_VIEW_BRIDGE(slug)));
+      // Wiring-health banner LAST (end of body): the surface tells the user
+      // when its own plumbing can't deliver what the UI promises (e.g. a
+      // refresh action with no data source attached) and names the one-line
+      // ask that has Clem repair it. Advisory: dismissible, never blocks.
+      const wiring = spaceWiringHealth(spaceStore.get(slug) ?? { title: slug, dataSources: [], actions: [] });
+      res.send(appendWiringHealthBanner(injectWorkspaceBootstrap(html, CLEM_VIEW_BRIDGE(slug)), wiring));
       return;
     }
     res.send(readFileSync(target));
