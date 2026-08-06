@@ -46,6 +46,7 @@ import {
   composeKillAwareShouldCancel,
 } from './turn-control.js';
 import { classifyRuntimeToolEffect, runtimeToolAccountingMetadata } from './tool-effect.js';
+import { countDominantArray } from './tool-output-digest.js';
 import { toolCallCorrelationFingerprint } from './tool-correlation.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import {
@@ -826,6 +827,57 @@ function sdkToolResultPreview(output: unknown): string {
   try { return JSON.stringify(output ?? '').slice(0, 400); } catch { return String(output ?? '').slice(0, 400); }
 }
 
+/**
+ * The visibility-window glimpse of a READ result: how many records landed and
+ * what they look like ("12 records · name, website, phone · Acme Roofing").
+ * Runtime-derived from the settled payload's structure — the counts/fields
+ * machinery the digest already trusts — never free-text from the model. Null
+ * for non-list results; the feed stays quiet rather than guessing.
+ */
+function sdkToolResultGlimpse(output: unknown): { count: number; key: string; fields: string[]; sample?: string } | null {
+  try {
+    let value: unknown = output;
+    if (typeof value === 'string') {
+      const t = value.trim();
+      if (!t || (t[0] !== '{' && t[0] !== '[')) return null;
+      value = JSON.parse(t);
+    }
+    // MCP-style envelopes carry the real payload as text content.
+    const content = (value as { content?: Array<{ type?: string; text?: string }> })?.content;
+    if (Array.isArray(content)) {
+      const text = content.find((c) => c?.type === 'text' && typeof c.text === 'string')?.text;
+      if (text) {
+        const t = text.trim();
+        if (t && (t[0] === '{' || t[0] === '[')) {
+          try { value = JSON.parse(t); } catch { /* keep envelope */ }
+        }
+      }
+    }
+    const dominant = countDominantArray(value);
+    if (!dominant || dominant.count === 0) return null;
+    const rows = Array.isArray(value)
+      ? value
+      : (() => {
+          const obj = value as Record<string, unknown>;
+          const direct = obj[dominant.key];
+          if (Array.isArray(direct)) return direct;
+          const data = obj.data;
+          const nested = data && typeof data === 'object' ? (data as Record<string, unknown>)[dominant.key] : undefined;
+          return Array.isArray(nested) ? nested : [];
+        })();
+    const first = rows.find((r) => r && typeof r === 'object' && !Array.isArray(r)) as Record<string, unknown> | undefined;
+    const fields = first
+      ? Object.keys(first).filter((k) => k.length <= 40).slice(0, 6)
+      : [];
+    const sample = first
+      ? Object.values(first).find((v): v is string => typeof v === 'string' && v.trim().length > 0)?.trim().slice(0, 80)
+      : typeof rows[0] === 'string' ? (rows[0] as string).slice(0, 80) : undefined;
+    return { count: dominant.count, key: dominant.key, fields, ...(sample ? { sample } : {}) };
+  } catch {
+    return null;
+  }
+}
+
 function appendSdkTopLevelToolEvent(
   sessionId: string | undefined,
   type: 'tool_called' | 'tool_returned',
@@ -863,6 +915,9 @@ function appendSdkTopLevelToolEvent(
           // The full payload still lives in tool_outputs; this matches the
           // existing bounded transport preview without duplicating the body.
           ...(result?.output !== undefined ? { preview: sdkToolResultPreview(result.output) } : {}),
+          ...(!result?.isError && result?.output !== undefined
+            ? (() => { const g = sdkToolResultGlimpse(result.output); return g ? { glimpse: g } : {}; })()
+            : {}),
         } : {}),
       },
     });

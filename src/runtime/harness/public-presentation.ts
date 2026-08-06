@@ -436,6 +436,23 @@ function publicDispatchSlug(data: Record<string, unknown>): string {
   return PUBLIC_DISPATCH_SLUG_RE.test(candidate) ? candidate : '';
 }
 
+/** The read-result glimpse ("12 records · name, website, phone · sample").
+ *  Structure-derived by the runtime; every field re-validated and bounded
+ *  here so a malformed producer cannot widen the window. */
+function publicResultGlimpse(data: Record<string, unknown>): Record<string, unknown> | null {
+  const raw = data.glimpse;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const g = raw as Record<string, unknown>;
+  const count = typeof g.count === 'number' && Number.isFinite(g.count) && g.count > 0 ? Math.floor(g.count) : 0;
+  if (!count) return null;
+  const key = firstString(g.key).slice(0, 40);
+  const fields = Array.isArray(g.fields)
+    ? g.fields.filter((f): f is string => typeof f === 'string' && f.length > 0 && f.length <= 40).slice(0, 6)
+    : [];
+  const sample = firstString(g.sample).slice(0, 80);
+  return { count, ...(key ? { key } : {}), ...(fields.length ? { fields } : {}), ...(sample ? { sample } : {}) };
+}
+
 /** Runtime-owned effect classification (a closed enum, never model text). */
 function publicToolEffect(data: Record<string, unknown>): string {
   const effect = firstString(data.effect);
@@ -506,10 +523,12 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     }
     case 'tool_returned': {
       const publicSlug = publicDispatchSlug(data);
+      const glimpse = publicResultGlimpse(data);
       return {
         ...selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'ok', 'success', 'batchMode', 'accounting']),
         ...(publicSlug ? { publicSlug } : {}),
         ...(publicToolEffect(data) ? { effect: publicToolEffect(data) } : {}),
+        ...(glimpse ? { glimpse } : {}),
       };
     }
     case 'deliverable_saved': {
@@ -520,10 +539,14 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       const name = firstString(data.name);
       if (!name || name.includes('/') || name.includes('\\') || name.length > 120) return null;
       const dir = firstString(data.dir);
+      const excerpt = firstString(data.excerpt);
       return {
         name,
         ...(dir && !dir.includes('/') && !dir.includes('\\') && dir.length <= 80 ? { dir } : {}),
         ...(typeof data.bytes === 'number' && Number.isFinite(data.bytes) ? { bytes: data.bytes } : {}),
+        // The runtime read this back from the file it just wrote — the
+        // session owner's own deliverable, bounded for the peek pane.
+        ...(excerpt ? { excerpt: excerpt.slice(0, 700) } : {}),
       };
     }
     case 'handoff':

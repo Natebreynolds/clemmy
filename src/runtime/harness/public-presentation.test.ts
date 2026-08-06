@@ -593,3 +593,30 @@ test('deliverable_saved projects basename-only truth and rejects path leakage', 
   } as never);
   assert.equal(leak, null, 'a path-shaped name never ships');
 });
+
+test('the visibility window ships bounded excerpts and glimpses, re-validated', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const saved = projectHarnessEventForPublic({
+    sessionId: 's', seq: 6, turn: 0, role: 'system', type: 'deliverable_saved',
+    data: { name: 'acme.md', dir: 'drafts', bytes: 900, excerpt: 'Subject: Quick intro\n\nHi there — '.padEnd(900, 'x') },
+  } as never);
+  const savedData = saved?.data as { excerpt?: string };
+  assert.ok(savedData.excerpt?.startsWith('Subject: Quick intro'));
+  assert.ok((savedData.excerpt?.length ?? 0) <= 700, 'excerpt is bounded');
+
+  const returned = projectHarnessEventForPublic({
+    sessionId: 's', seq: 7, turn: 0, role: 'tool', type: 'tool_returned',
+    data: {
+      tool: 'composio_execute_tool', callId: 'c9', accounting: 'top_level', ok: true,
+      glimpse: { count: 12, key: 'records', fields: ['name', 'website', 'phone'], sample: 'Acme Roofing' },
+    },
+  } as never);
+  const g = (returned?.data as { glimpse?: Record<string, unknown> }).glimpse;
+  assert.deepEqual(g, { count: 12, key: 'records', fields: ['name', 'website', 'phone'], sample: 'Acme Roofing' });
+
+  const junk = projectHarnessEventForPublic({
+    sessionId: 's', seq: 8, turn: 0, role: 'tool', type: 'tool_returned',
+    data: { tool: 'x', callId: 'c10', accounting: 'top_level', ok: true, glimpse: { count: 0, fields: [{ evil: true }] } },
+  } as never);
+  assert.equal((junk?.data as { glimpse?: unknown }).glimpse, undefined, 'a zero-count or malformed glimpse never ships');
+});

@@ -245,6 +245,16 @@ function teeFileDeliverable(filePath: string): void {
         .then(({ appendEvent }) => {
           let bytes = 0;
           try { bytes = statSync(filePath).size; } catch { /* size is enrichment */ }
+          // The visibility window: the OPENING of what was just written, read
+          // back from disk (runtime truth), so a drafted email is glanceable
+          // in the chat the moment it lands — not after a folder hunt.
+          let excerpt = '';
+          try {
+            excerpt = readFileSync(filePath, 'utf-8')
+              .slice(0, 700)
+              // eslint-disable-next-line no-control-regex
+              .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '');
+          } catch { /* excerpt is enrichment */ }
           appendEvent({
             sessionId: ctx.sessionId as string,
             turn: 0,
@@ -254,6 +264,7 @@ function teeFileDeliverable(filePath: string): void {
               name: path.basename(filePath),
               dir: path.basename(path.dirname(filePath)),
               bytes,
+              ...(excerpt ? { excerpt } : {}),
             },
           });
         })
