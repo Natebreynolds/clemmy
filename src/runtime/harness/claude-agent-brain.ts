@@ -1195,8 +1195,18 @@ async function buildClaudeAgentBrainTurnContext(
   if (
     preflightSessionKind === 'chat'
     && turnOpennessEnabled()
-    && capabilityResolution
-    && turnOpennessWarranted(resolvedCapabilityEntries)
+    // EITHER signal is enough, and the first one matters most (live 2026-08-07,
+    // an hour after this shipped): gating on resolved capabilities ALONE made
+    // the pass silent on exactly the requests that need it. Capability
+    // resolution only produces entries when a PROVEN memo matches, so a novel
+    // ask resolves to nothing — and a novel ask is the most ambiguous kind
+    // there is. The live miss: "pull 5 stale accounts in salesforce and help me
+    // draft some emails" resolved zero capabilities, so the pass never ran,
+    // while the preflight had already typed the turn as consequential with an
+    // unstated destination. The signal was sitting right there. Same shape as
+    // the vocabulary bug this pass was built to replace: gate on something
+    // frequently empty and you ship silence.
+    && (Boolean(confirmBeat) || turnOpennessWarranted(resolvedCapabilityEntries))
   ) {
     try {
       openness = renderTurnOpennessForContext(await resolveTurnOpenness({

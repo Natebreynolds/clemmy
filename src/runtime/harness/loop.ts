@@ -7159,7 +7159,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   if (
     session.sessionRow.kind === 'chat'
     && turnOpennessEnabled()
-    && turnOpennessWarranted(contextPacket.capabilityResolution.entries)
+    // Either signal suffices — see the Claude lane for the live miss this
+    // fixes. A consequential turn with no proven capability history is the
+    // MOST ambiguous case, not the least.
+    && (contextPacket.preflightPhase === 'align'
+      || turnOpennessWarranted(contextPacket.capabilityResolution.entries))
   ) {
     try {
       opennessBlock = renderTurnOpennessForContext(await resolveTurnOpenness({

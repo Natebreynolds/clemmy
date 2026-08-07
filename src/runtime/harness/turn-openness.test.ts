@@ -131,6 +131,28 @@ test('the real classifier agrees: a list carrier reads, a create carrier writes'
   assert.equal(turnOpennessWarranted([{ kind: 'composio', identifier: 'AIRTABLE_CREATE_MULTIPLE_RECORDS' }]), true);
 });
 
+test('a CONSEQUENTIAL turn with zero proven capabilities still runs the pass', async () => {
+  // Live miss, one hour after this shipped: "pull 5 stale accounts in
+  // salesforce and help me draft some emails" resolved ZERO capability entries
+  // (no proven memo matched), so a gate keyed only on resolved capabilities
+  // stayed silent — on a turn the preflight had already typed align /
+  // consequential / destination-instance-unstated. A novel request is the most
+  // ambiguous kind, not the least. Both lanes must accept EITHER signal.
+  const { readFileSync } = await import('node:fs');
+  for (const [name, url] of [
+    ['claude-agent-brain.ts', new URL('./claude-agent-brain.ts', import.meta.url)],
+    ['loop.ts', new URL('./loop.ts', import.meta.url)],
+  ] as const) {
+    const source = readFileSync(url, 'utf8');
+    const gate = source.slice(
+      Math.max(0, source.indexOf('turnOpennessEnabled()') - 400),
+      source.indexOf('turnOpennessWarranted(') + 300,
+    );
+    assert.match(gate, /confirmBeat|preflightPhase === 'align'/,
+      `${name} must also run the pass on a consequential turn with no capability history`);
+  }
+});
+
 test('BOTH brain lanes run the pass — lane asymmetry is the bug that caused this', async () => {
   // The root cause of the whole wave: the Codex lane assembled the ask tool
   // unconditionally, the Claude lane deferred it, and nothing noticed for
