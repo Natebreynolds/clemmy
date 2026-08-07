@@ -78,7 +78,12 @@ export function Composer({
 
   const uploading = attachments.some((a) => a.status === 'uploading');
   const readyIds = attachments.filter((a) => a.status === 'ready' && a.id).map((a) => a.id!);
-  const canSend = !busy && !uploading && (value.trim().length > 0 || readyIds.length > 0);
+  // Mid-run steering: TEXT can be sent while Clem is working — it reaches her
+  // at the next step without stopping the run. Attachments still wait for the
+  // turn to finish (a file mid-run would have to start a new turn).
+  const canSend = !uploading
+    && (value.trim().length > 0 || readyIds.length > 0)
+    && !(busy && readyIds.length > 0);
 
   const submit = () => {
     if (!canSend) return;
@@ -171,6 +176,16 @@ export function Composer({
                 <SendToBack className="h-4 w-4" aria-hidden />
               </Button>
             )}
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={submit}
+              disabled={!canSend}
+              aria-label="Send while she works"
+              title="Send while she works — reaches Clem at her next step without stopping the run"
+            >
+              <ArrowUp className="h-5 w-5" aria-hidden />
+            </Button>
             <Button variant="secondary" size="icon" onClick={onStop} aria-label="Stop" title="Stop">
               <Square className="h-4 w-4" aria-hidden />
             </Button>

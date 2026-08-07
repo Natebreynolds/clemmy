@@ -208,6 +208,13 @@ export function ChatBubble({
           {message.attachmentNames && message.attachmentNames.length > 0 && (
             <p className="mt-1 text-caption text-muted">📎 {message.attachmentNames.join(', ')}</p>
           )}
+          {message.steer && (
+            <p className="mt-1 text-caption text-muted">
+              {message.steer === 'pending' && 'Reaching her mid-run…'}
+              {message.steer === 'delivered' && '✓ Reaches her at the next step — the run keeps going'}
+              {message.steer === 'failed' && 'The run just ended before this landed — send it again'}
+            </p>
+          )}
         </div>
       </div>
     );

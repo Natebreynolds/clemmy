@@ -13,7 +13,7 @@ import {
   type StreamHandle,
 } from './chat';
 import { rememberLastChatSession, unifiedChatSessionId } from './last-session';
-import { apiGet, type ApiError } from './api';
+import { apiGet, apiPost, type ApiError } from './api';
 import { getPendingActionStatus } from './pendingActions';
 import { humanToolLabel, salientArgDetail, describeExternalWrite } from './toolLabels';
 import type { ChatPostResult, HarnessEvent, PendingActionApprovalView } from './types';
@@ -68,6 +68,9 @@ export interface ChatMessage {
    *  frame needs — a ticking elapsed anchor and the task id for the
    *  watch-the-full-run deep link. */
   delegated?: { startedAt: number; taskId?: string };
+  /** Mid-run steering: this user message was sent while a run was active and
+   *  rides to the model at its next step instead of starting a new turn. */
+  steer?: 'pending' | 'delivered' | 'failed';
   approval?: {
     subject: string;
     reason?: string;
@@ -1072,7 +1075,29 @@ export function useChat(options?: UseChatOptions) {
     const text = input.text.trim();
     const attachmentIds = input.attachmentIds ?? [];
     if (!text && attachmentIds.length === 0) return;
-    if (busy) return;
+    if (busy) {
+      // MID-RUN STEERING: the message reaches the RUNNING turn at its next
+      // tool-result boundary — it must not claim a new attempt (that would
+      // supersede and kill the active run). steerOnly makes the server
+      // steer-or-409, never silently accept a competing turn. Attachments
+      // wait for the turn to finish.
+      if (attachmentIds.length > 0) return;
+      const steerId = nextId();
+      setMessages((prev) => [...prev, { id: steerId, role: 'user', text, steer: 'pending' }]);
+      try {
+        const res = await apiPost<{ steered?: boolean }>('/api/harness/chat', {
+          input: text,
+          sessionId: sessionIdRef.current || undefined,
+          attachments: [],
+          clientRequestId: createChatClientRequestId(),
+          steerOnly: true,
+        });
+        patch(steerId, { steer: res?.steered ? 'delivered' : 'failed' } as Partial<ChatMessage>);
+      } catch {
+        patch(steerId, { steer: 'failed' } as Partial<ChatMessage>);
+      }
+      return;
+    }
 
     const userId = nextId();
     const assistantId = nextId();
