@@ -13,6 +13,8 @@ import assert from 'node:assert/strict';
 // Keep the store in-memory (no disk write to the operator's live state file).
 process.env.NODE_ENV = 'test';
 const {
+  codexQuotaExhausted,
+  recordCodexUsageExhausted,
   recordCodexRateLimit,
   getRateLimitSnapshot,
   classifyCodexQuota,
@@ -102,4 +104,55 @@ test('classifyCodexQuota assigns slots by duration — the weekly-as-primary liv
   assert.equal(legacy.weekly?.usedPercent, 5);
 
   assert.deepEqual(classifyCodexQuota(undefined), { capturedAt: undefined });
+});
+
+// ── Codex quota-aware availability (2026-08-07, the all-day 429 alert class) ──
+test('codexQuotaExhausted: header truth, the 429 latch, and self-healing', () => {
+  __resetRateLimitStoreForTests();
+  assert.equal(codexQuotaExhausted(), false, 'no data → available (fail-open)');
+
+  // Captured headers say a live window is at 100% with a future reset → exhausted.
+  recordCodexRateLimit({
+    get: (name: string) => ({
+      'x-codex-primary-used-percent': '100',
+      'x-codex-primary-reset-after-seconds': '1800',
+      'x-codex-primary-window-minutes': '300',
+    })[name.toLowerCase()] ?? null,
+  });
+  assert.equal(codexQuotaExhausted(), true, 'a full window with a future reset blocks the lane');
+  assert.equal(codexQuotaExhausted(Date.now() + 2000 * 1000), false, 'past the reset the lane self-heals');
+
+  // A later capture with head-room clears the block.
+  recordCodexRateLimit({
+    get: (name: string) => ({
+      'x-codex-primary-used-percent': '42',
+      'x-codex-primary-reset-after-seconds': '1800',
+      'x-codex-primary-window-minutes': '300',
+    })[name.toLowerCase()] ?? null,
+  });
+  assert.equal(codexQuotaExhausted(), false);
+
+  // The 429 latch works with NO headers at all (the streaming-drop case)…
+  __resetRateLimitStoreForTests();
+  recordCodexUsageExhausted();
+  assert.equal(codexQuotaExhausted(), true, 'a bare 429 latches exhaustion');
+  assert.equal(codexQuotaExhausted(Date.now() + 31 * 60 * 1000), false, 'the default latch expires in 30 min');
+
+  // …and a provider retry-after is honored but bounded to 6 hours.
+  __resetRateLimitStoreForTests();
+  recordCodexUsageExhausted(24 * 60 * 60 * 1000);
+  assert.equal(codexQuotaExhausted(Date.now() + 5 * 60 * 60 * 1000), true);
+  assert.equal(codexQuotaExhausted(Date.now() + 7 * 60 * 60 * 1000), false, 'latch never exceeds 6h');
+
+  // A zero-duration placeholder window is never read as a real limit.
+  __resetRateLimitStoreForTests();
+  recordCodexRateLimit({
+    get: (name: string) => ({
+      'x-codex-primary-used-percent': '100',
+      'x-codex-primary-reset-after-seconds': '1800',
+      'x-codex-primary-window-minutes': '0',
+    })[name.toLowerCase()] ?? null,
+  });
+  assert.equal(codexQuotaExhausted(), false);
+  __resetRateLimitStoreForTests();
 });

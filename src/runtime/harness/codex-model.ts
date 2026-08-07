@@ -56,7 +56,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { estimateInputTokens } from './token-estimator.js';
 import { stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
-import { recordCodexRateLimit } from './rate-limit-store.js';
+import { recordCodexRateLimit, recordCodexUsageExhausted } from './rate-limit-store.js';
 import { recordModelUsage } from '../usage-log.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import pino from 'pino';
@@ -907,6 +907,15 @@ export class CodexResponsesModel implements Model {
           } catch {
             // best-effort; never block the error path on a trace write
           }
+        }
+        // A 429 is exhaustion truth even when the quota headers were dropped:
+        // latch it so codexAvailable() stops offering this lane to judges and
+        // routing until the provider's stated retry (default 30 min). The
+        // live 2026-08-07 class: hourly scheduled-workflow judges dialed an
+        // out-of-tokens Codex all day and alerted on every dial.
+        if (res.status === 429) {
+          const retryAfterSec = Number.parseInt(res.headers.get('retry-after') ?? '', 10);
+          recordCodexUsageExhausted(Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec * 1000 : undefined);
         }
         throw new CodexModelError(
           `Codex /responses returned ${res.status} ${res.statusText}${detail ? ': ' + detail : ''}`,

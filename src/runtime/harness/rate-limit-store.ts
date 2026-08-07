@@ -22,7 +22,15 @@ import { BASE_DIR } from '../../config.js';
 import { atomicJsonMutate } from '../atomic-json.js';
 
 export interface CodexWindow { usedPercent: number; resetAt?: number; windowMinutes?: number }
-export interface CodexRateLimit { primary?: CodexWindow; secondary?: CodexWindow; capturedAt: number }
+export interface CodexRateLimit {
+  primary?: CodexWindow;
+  secondary?: CodexWindow;
+  capturedAt: number;
+  /** Explicit exhaustion latch: set when /responses answers 429 (usage limit)
+   *  WITHOUT quota headers — the belt for the header-drop case. Cleared by
+   *  time or by any later capture showing head-room. */
+  exhaustedUntil?: number;
+}
 export interface RateLimitSnapshot { codex?: CodexRateLimit }
 
 const STORE_PATH = path.join(BASE_DIR, 'state', 'model-rate-limits.json');
@@ -128,10 +136,56 @@ export function recordCodexRateLimit(headers: HeaderLike): void {
           resetAt: resetToEpochMs(headers, ['x-codex-secondary-reset-at'], ['x-codex-secondary-reset-after-seconds'], now),
           windowMinutes: numFrom(headers, 'x-codex-secondary-window-minutes'),
         };
-    snapshot.codex = { primary, secondary, capturedAt: now };
+    const headroom = [primary, secondary].some(
+      (window) => window && window.windowMinutes !== 0 && window.usedPercent < 100,
+    );
+    snapshot.codex = {
+      primary,
+      secondary,
+      capturedAt: now,
+      ...(headroom ? {} : snapshot.codex?.exhaustedUntil ? { exhaustedUntil: snapshot.codex.exhaustedUntil } : {}),
+    };
     persist();
   } catch {
     /* never break the model path */
+  }
+}
+
+/** A 429 from /responses proves exhaustion even when quota headers were
+ *  dropped. Latch for `retryAfterMs` (default 30 min) so availability checks
+ *  stop dialing a lane the provider just refused — the live 2026-08-07 class:
+ *  every scheduled workflow's judge dialed an out-of-tokens Codex hourly and
+ *  minted an alert each time. */
+export function recordCodexUsageExhausted(retryAfterMs?: number): void {
+  try {
+    loadOnce();
+    const now = Date.now();
+    const until = now + Math.min(6 * 60 * 60 * 1000, Math.max(5 * 60 * 1000, retryAfterMs ?? 30 * 60 * 1000));
+    snapshot.codex = { ...(snapshot.codex ?? { capturedAt: now }), exhaustedUntil: until };
+    persist();
+  } catch { /* never break the model path */ }
+}
+
+/**
+ * Is the Codex lane PROVABLY out of quota right now? True when the explicit
+ * 429 latch is live, or when a captured window reads >=100% used with its
+ * reset still in the future. Missing/stale/expired data → false (fail-open:
+ * availability must never be denied on guesswork).
+ */
+export function codexQuotaExhausted(now: number = Date.now()): boolean {
+  try {
+    loadOnce();
+    const codex = snapshot.codex;
+    if (!codex) return false;
+    if (typeof codex.exhaustedUntil === 'number' && codex.exhaustedUntil > now) return true;
+    for (const window of [codex.primary, codex.secondary]) {
+      if (!window) continue;
+      if (window.windowMinutes === 0) continue; // placeholder, not a real limit
+      if (window.usedPercent >= 100 && typeof window.resetAt === 'number' && window.resetAt > now) return true;
+    }
+    return false;
+  } catch {
+    return false;
   }
 }
 

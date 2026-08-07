@@ -1063,6 +1063,12 @@ export class CodexNativeRuntime implements AgentRuntime {
         // traces per minute. The original exception still throws so
         // the caller's existing handling fires.
         if (error instanceof CodexRuntimeError && typeof error.status === 'number') {
+          if (error.status === 429) {
+            try {
+              const { recordCodexUsageExhausted } = await import('./harness/rate-limit-store.js');
+              recordCodexUsageExhausted();
+            } catch { /* latch is best-effort */ }
+          }
           try {
             const { rateLimitedAlert } = await import('./rate-limited-alert.js');
             const bucket =

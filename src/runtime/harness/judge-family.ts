@@ -13,6 +13,7 @@
  * provider-heavy `buildJudgeForRole` / `resolveBoundaryJudge` that turn the
  * decision into a live Model.
  */
+import { codexQuotaExhausted } from './rate-limit-store.js';
 import { getRuntimeEnv } from '../../config.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
@@ -35,10 +36,16 @@ export function claudeAvailable(): boolean {
   }
 }
 
-/** Is the Codex (OpenAI) OAuth brain logged in? */
+/** Is the Codex (OpenAI) OAuth brain logged in AND not provably out of quota?
+ *  Auth alone was the whole check, so every consumer (judge chains, routing,
+ *  fallbacks) kept dialing a lane whose plan was exhausted — hourly scheduled
+ *  workflows turned that into an all-day 429 alert stream (live 2026-08-07).
+ *  Quota truth comes from the provider's own captured headers plus the 429
+ *  latch; both self-heal at the stated reset. */
 export function codexAvailable(): boolean {
   try {
-    return Boolean(getStoredCodexOAuthTokens()?.accessToken);
+    if (!getStoredCodexOAuthTokens()?.accessToken) return false;
+    return !codexQuotaExhausted();
   } catch {
     return false;
   }
