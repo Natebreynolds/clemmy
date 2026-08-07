@@ -1,15 +1,15 @@
 {
   "data": {
     "default_tab_id": "t.0",
-    "display_url": "https://docs.google.com/document/d/1udZzs8_9FXWMBGIK3C0eDY_xkWG84-h25YPwlpcfbuk/edit",
-    "documentId": "1udZzs8_9FXWMBGIK3C0eDY_xkWG84-h25YPwlpcfbuk",
+    "display_url": "https://docs.google.com/document/d/1_fixture_doc_id_AAAAAAAAAAAAAAAAAAAAAAAAAA/edit",
+    "documentId": "1_fixture_doc_id_AAAAAAAAAAAAAAAAAAAAAAAAAA",
     "request_data": [
       {
         "insertText": {
           "location": {
             "index": 1
           },
-          "text": "SEO Intelligence: 10 Brett-Owned Market Leader Accounts\n"
+          "text": "fixture content"
         }
       },
       {
@@ -41,7 +41,7 @@
           "location": {
             "index": 57
           },
-          "text": "Prepared: August 2, 2026\nScope: Live homepage review plus DataForSEO U.S. Google organic visibility estimates through July 2026.\nImportant: Estimated organic traffic (ETV) is a directional third-party estimate, not analytics data. Twelve-month change compares July 2026 with the oldest month in the returned 12-month series.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -85,7 +85,7 @@
           "location": {
             "index": 382
           },
-          "text": "Executive summary\n"
+          "text": "fixture content"
         }
       },
       {
@@ -117,7 +117,7 @@
           "location": {
             "index": 400
           },
-          "text": "Best immediate recovery prospects: Lebowitz & Mzhen, Petrillo & Goldberg, WRSH, and The Richardson Firm. Each still has meaningful keyword coverage but has lost 67%–87% of estimated organic traffic.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -137,7 +137,7 @@
           "location": {
             "index": 599
           },
-          "text": "Largest existing SEO asset: Albertson & Davidson leads the group with 4,926 ranking keywords and approximately 14,904 estimated monthly organic visits, despite a 35% year-over-year decline.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -157,7 +157,7 @@
           "location": {
             "index": 789
           },
-          "text": "Strongest positive momentum: Stotts Law is up 71% with roughly 6,342 estimated monthly visits. Carluzzo Rochkind & Smith is up 232%, but from a low base.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -177,7 +177,7 @@
           "location": {
             "index": 943
           },
-          "text": "Greenfield opportunities: Goodrich and Associates and Burnett Law Office have minimal current visibility, making them suitable for foundational local SEO, service-page, and authority-building programs.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -197,7 +197,7 @@
           "location": {
             "index": 1145
           },
-          "text": "Comparative benchmark\n"
+          "text": "fixture content"
         }
       },
       {
@@ -229,7 +229,7 @@
           "location": {
             "index": 1167
           },
-          "text": "\n"
+          "text": "fixture content"
         }
       },
       {
@@ -246,7 +246,7 @@
           "location": {
             "index": 1334
           },
-          "text": "Rebuild visibility"
+          "text": "fixture content"
         }
       },
       {
@@ -254,7 +254,7 @@
           "location": {
             "index": 1332
           },
-          "text": "-55%"
+          "text": "fixture content"
         }
       },
       {
@@ -262,7 +262,7 @@
           "location": {
             "index": 1330
           },
-          "text": "23"
+          "text": "fixture content"
         }
       },
       {
@@ -270,7 +270,7 @@
           "location": {
             "index": 1328
           },
-          "text": "36"
+          "text": "fixture content"
         }
       },
       {
@@ -278,7 +278,7 @@
           "location": {
             "index": 1326
           },
-          "text": "goodrichpc.com"
+          "text": "fixture content"
         }
       },
       {
@@ -286,7 +286,7 @@
           "location": {
             "index": 1324
           },
-          "text": "Goodrich and Associates"
+          "text": "fixture content"
         }
       },
       {
@@ -294,7 +294,7 @@
           "location": {
             "index": 1322
           },
-          "text": "10"
+          "text": "fixture content"
         }
       },
       {
@@ -302,7 +302,7 @@
           "location": {
             "index": 1319
           },
-          "text": "Foundational growth"
+          "text": "fixture content"
         }
       },
       {
@@ -310,7 +310,7 @@
           "location": {
             "index": 1317
           },
-          "text": "-10%"
+          "text": "fixture content"
         }
       },
       {
@@ -318,7 +318,7 @@
           "location": {
             "index": 1315
           },
-          "text": "155"
+          "text": "fixture content"
         }
       },
       {
@@ -326,7 +326,7 @@
           "location": {
             "index": 1313
           },
-          "text": "93"
+          "text": "fixture content"
         }
       },
       {
@@ -334,7 +334,7 @@
           "location": {
             "index": 1311
           },
-          "text": "burnettlawaz.com"
+          "text": "fixture content"
         }
       },
       {
@@ -342,7 +342,7 @@
           "location": {
             "index": 1309
           },
-          "text": "Burnett Law Office"
+          "text": "fixture content"
         }
       },
       {
@@ -350,7 +350,7 @@
           "location": {
             "index": 1307
           },
-          "text": "9"
+          "text": "fixture content"
         }
       },
       {
@@ -358,7 +358,7 @@
           "location": {
             "index": 1304
           },
-          "text": "Build from momentum"
+          "text": "fixture content"
         }
       },
       {
@@ -366,7 +366,7 @@
           "location": {
             "index": 1302
           },
-          "text": "+232%"
+          "text": "fixture content"
         }
       },
       {
@@ -374,7 +374,7 @@
           "location": {
             "index": 1300
           },
-          "text": "210"
+          "text": "fixture content"
         }
       },
       {
@@ -382,7 +382,7 @@
           "location": {
             "index": 1298
           },
-          "text": "151"
+          "text": "fixture content"
         }
       },
       {
@@ -390,7 +390,7 @@
           "location": {
             "index": 1296
           },
-          "text": "novatriallawyers.com"
+          "text": "fixture content"
         }
       },
       {
@@ -398,7 +398,7 @@
           "location": {
             "index": 1294
           },
-          "text": "Carluzzo Rochkind & Smith"
+          "text": "fixture content"
         }
       },
       {
@@ -406,7 +406,7 @@
           "location": {
             "index": 1292
           },
-          "text": "8"
+          "text": "fixture content"
         }
       },
       {
@@ -414,7 +414,7 @@
           "location": {
             "index": 1289
           },
-          "text": "Urgent recovery"
+          "text": "fixture content"
         }
       },
       {
@@ -422,7 +422,7 @@
           "location": {
             "index": 1287
           },
-          "text": "-78%"
+          "text": "fixture content"
         }
       },
       {
@@ -430,7 +430,7 @@
           "location": {
             "index": 1285
           },
-          "text": "1,417"
+          "text": "fixture content"
         }
       },
       {
@@ -438,7 +438,7 @@
           "location": {
             "index": 1283
           },
-          "text": "816"
+          "text": "fixture content"
         }
       },
       {
@@ -446,7 +446,7 @@
           "location": {
             "index": 1281
           },
-          "text": "petrilloandgoldberg.com"
+          "text": "fixture content"
         }
       },
       {
@@ -454,7 +454,7 @@
           "location": {
             "index": 1279
           },
-          "text": "Petrillo & Goldberg Law"
+          "text": "fixture content"
         }
       },
       {
@@ -462,7 +462,7 @@
           "location": {
             "index": 1277
           },
-          "text": "7"
+          "text": "fixture content"
         }
       },
       {
@@ -470,7 +470,7 @@
           "location": {
             "index": 1274
           },
-          "text": "Urgent recovery"
+          "text": "fixture content"
         }
       },
       {
@@ -478,7 +478,7 @@
           "location": {
             "index": 1272
           },
-          "text": "-67%"
+          "text": "fixture content"
         }
       },
       {
@@ -486,7 +486,7 @@
           "location": {
             "index": 1270
           },
-          "text": "3,980"
+          "text": "fixture content"
         }
       },
       {
@@ -494,7 +494,7 @@
           "location": {
             "index": 1268
           },
-          "text": "602"
+          "text": "fixture content"
         }
       },
       {
@@ -502,7 +502,7 @@
           "location": {
             "index": 1266
           },
-          "text": "therichardsonfirm.com"
+          "text": "fixture content"
         }
       },
       {
@@ -510,7 +510,7 @@
           "location": {
             "index": 1264
           },
-          "text": "The Richardson Firm"
+          "text": "fixture content"
         }
       },
       {
@@ -518,7 +518,7 @@
           "location": {
             "index": 1262
           },
-          "text": "6"
+          "text": "fixture content"
         }
       },
       {
@@ -526,7 +526,7 @@
           "location": {
             "index": 1259
           },
-          "text": "Urgent recovery"
+          "text": "fixture content"
         }
       },
       {
@@ -534,7 +534,7 @@
           "location": {
             "index": 1257
           },
-          "text": "-87%"
+          "text": "fixture content"
         }
       },
       {
@@ -542,7 +542,7 @@
           "location": {
             "index": 1255
           },
-          "text": "5,520"
+          "text": "fixture content"
         }
       },
       {
@@ -550,7 +550,7 @@
           "location": {
             "index": 1253
           },
-          "text": "756"
+          "text": "fixture content"
         }
       },
       {
@@ -558,7 +558,7 @@
           "location": {
             "index": 1251
           },
-          "text": "marylandinjurylawyer.net"
+          "text": "fixture content"
         }
       },
       {
@@ -566,7 +566,7 @@
           "location": {
             "index": 1249
           },
-          "text": "Lebowitz & Mzhen"
+          "text": "fixture content"
         }
       },
       {
@@ -574,7 +574,7 @@
           "location": {
             "index": 1247
           },
-          "text": "5"
+          "text": "fixture content"
         }
       },
       {
@@ -582,7 +582,7 @@
           "location": {
             "index": 1244
           },
-          "text": "Scale momentum"
+          "text": "fixture content"
         }
       },
       {
@@ -590,7 +590,7 @@
           "location": {
             "index": 1242
           },
-          "text": "+71%"
+          "text": "fixture content"
         }
       },
       {
@@ -598,7 +598,7 @@
           "location": {
             "index": 1240
           },
-          "text": "6,342"
+          "text": "fixture content"
         }
       },
       {
@@ -606,7 +606,7 @@
           "location": {
             "index": 1238
           },
-          "text": "1,456"
+          "text": "fixture content"
         }
       },
       {
@@ -614,7 +614,7 @@
           "location": {
             "index": 1236
           },
-          "text": "adamstotts.com"
+          "text": "fixture content"
         }
       },
       {
@@ -622,7 +622,7 @@
           "location": {
             "index": 1234
           },
-          "text": "Stotts Law"
+          "text": "fixture content"
         }
       },
       {
@@ -630,7 +630,7 @@
           "location": {
             "index": 1232
           },
-          "text": "4"
+          "text": "fixture content"
         }
       },
       {
@@ -638,7 +638,7 @@
           "location": {
             "index": 1229
           },
-          "text": "Recovery"
+          "text": "fixture content"
         }
       },
       {
@@ -646,7 +646,7 @@
           "location": {
             "index": 1227
           },
-          "text": "-53%"
+          "text": "fixture content"
         }
       },
       {
@@ -654,7 +654,7 @@
           "location": {
             "index": 1225
           },
-          "text": "7,590"
+          "text": "fixture content"
         }
       },
       {
@@ -662,7 +662,7 @@
           "location": {
             "index": 1223
           },
-          "text": "1,460"
+          "text": "fixture content"
         }
       },
       {
@@ -670,7 +670,7 @@
           "location": {
             "index": 1221
           },
-          "text": "fusonlaw.com"
+          "text": "fixture content"
         }
       },
       {
@@ -678,7 +678,7 @@
           "location": {
             "index": 1219
           },
-          "text": "Freeman & Fuson"
+          "text": "fixture content"
         }
       },
       {
@@ -686,7 +686,7 @@
           "location": {
             "index": 1217
           },
-          "text": "3"
+          "text": "fixture content"
         }
       },
       {
@@ -694,7 +694,7 @@
           "location": {
             "index": 1214
           },
-          "text": "Urgent recovery"
+          "text": "fixture content"
         }
       },
       {
@@ -702,7 +702,7 @@
           "location": {
             "index": 1212
           },
-          "text": "-73%"
+          "text": "fixture content"
         }
       },
       {
@@ -710,7 +710,7 @@
           "location": {
             "index": 1210
           },
-          "text": "9,630"
+          "text": "fixture content"
         }
       },
       {
@@ -718,7 +718,7 @@
           "location": {
             "index": 1208
           },
-          "text": "2,433"
+          "text": "fixture content"
         }
       },
       {
@@ -726,7 +726,7 @@
           "location": {
             "index": 1206
           },
-          "text": "wrshlaw.com"
+          "text": "fixture content"
         }
       },
       {
@@ -734,7 +734,7 @@
           "location": {
             "index": 1204
           },
-          "text": "WRSH"
+          "text": "fixture content"
         }
       },
       {
@@ -742,7 +742,7 @@
           "location": {
             "index": 1202
           },
-          "text": "2"
+          "text": "fixture content"
         }
       },
       {
@@ -750,7 +750,7 @@
           "location": {
             "index": 1199
           },
-          "text": "Protect and recover"
+          "text": "fixture content"
         }
       },
       {
@@ -758,7 +758,7 @@
           "location": {
             "index": 1197
           },
-          "text": "-35%"
+          "text": "fixture content"
         }
       },
       {
@@ -766,7 +766,7 @@
           "location": {
             "index": 1195
           },
-          "text": "14,904"
+          "text": "fixture content"
         }
       },
       {
@@ -774,7 +774,7 @@
           "location": {
             "index": 1193
           },
-          "text": "4,926"
+          "text": "fixture content"
         }
       },
       {
@@ -782,7 +782,7 @@
           "location": {
             "index": 1191
           },
-          "text": "aldavlaw.com"
+          "text": "fixture content"
         }
       },
       {
@@ -790,7 +790,7 @@
           "location": {
             "index": 1189
           },
-          "text": "Albertson & Davidson"
+          "text": "fixture content"
         }
       },
       {
@@ -798,7 +798,7 @@
           "location": {
             "index": 1187
           },
-          "text": "1"
+          "text": "fixture content"
         }
       },
       {
@@ -806,7 +806,7 @@
           "location": {
             "index": 1184
           },
-          "text": "Priority"
+          "text": "fixture content"
         }
       },
       {
@@ -826,7 +826,7 @@
           "location": {
             "index": 1182
           },
-          "text": "12-month change"
+          "text": "fixture content"
         }
       },
       {
@@ -846,7 +846,7 @@
           "location": {
             "index": 1180
           },
-          "text": "Est. monthly organic traffic"
+          "text": "fixture content"
         }
       },
       {
@@ -866,7 +866,7 @@
           "location": {
             "index": 1178
           },
-          "text": "Organic keywords"
+          "text": "fixture content"
         }
       },
       {
@@ -886,7 +886,7 @@
           "location": {
             "index": 1176
           },
-          "text": "Domain"
+          "text": "fixture content"
         }
       },
       {
@@ -906,7 +906,7 @@
           "location": {
             "index": 1174
           },
-          "text": "Firm"
+          "text": "fixture content"
         }
       },
       {
@@ -926,7 +926,7 @@
           "location": {
             "index": 1172
           },
-          "text": "Rank"
+          "text": "fixture content"
         }
       },
       {
@@ -973,7 +973,7 @@
           "location": {
             "index": 2046
           },
-          "text": "\n"
+          "text": "fixture content"
         }
       },
       {
@@ -981,7 +981,7 @@
           "location": {
             "index": 2047
           },
-          "text": "Firm-by-firm findings\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1013,7 +1013,7 @@
           "location": {
             "index": 2069
           },
-          "text": "1. Albertson & Davidson — aldavlaw.com\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1045,7 +1045,7 @@
           "location": {
             "index": 2108
           },
-          "text": "Snapshot: 4,926 ranking keywords; ~14,904 estimated monthly organic visits; down 35% over 12 months.\nWhat matters: This is the group’s largest organic asset. A broad keyword footprint means losses may be recoverable through content consolidation, internal-link repair, technical cleanup, and refreshing high-value probate and trust-litigation pages.\nSales angle: Protect a valuable existing channel before further erosion; lead with a page-level loss analysis and recovery roadmap rather than a basic SEO build.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1089,7 +1089,7 @@
           "location": {
             "index": 2620
           },
-          "text": "2. Wingate, Russotti, Shapiro & Halperin — wrshlaw.com\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1121,7 +1121,7 @@
           "location": {
             "index": 2675
           },
-          "text": "Snapshot: 2,433 keywords; ~9,630 visits; down 73%.\nWhat matters: The firm retains substantial visibility despite a severe decline, indicating strong recovery upside. Focus on pages and query clusters with the largest historical losses, cannibalization, and link-equity decay.\nSales angle: A high-value recovery engagement could restore traffic faster than building a new footprint from scratch.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1165,7 +1165,7 @@
           "location": {
             "index": 3070
           },
-          "text": "3. Freeman & Fuson — fusonlaw.com\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1197,7 +1197,7 @@
           "location": {
             "index": 3104
           },
-          "text": "Snapshot: 1,460 keywords; ~7,590 visits; down 53%.\nWhat matters: The domain still converts a moderate keyword footprint into meaningful traffic. Prioritize rankings that slipped from positions 1–10 into positions 11–20, along with local-intent service pages.\nSales angle: Position the opportunity around recovering page-one rankings and strengthening Nashville-area local authority.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1241,7 +1241,7 @@
           "location": {
             "index": 3487
           },
-          "text": "4. Stotts Law — adamstotts.com\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1273,7 +1273,7 @@
           "location": {
             "index": 3518
           },
-          "text": "Snapshot: 1,456 keywords; ~6,342 visits; up 71%.\nWhat matters: This is the strongest growth story in the set. Identify the pages and topics driving gains, then expand adjacent practice-area and geographic coverage without diluting winning content.\nSales angle: Scale what is already working; offer competitive-gap expansion and conversion optimization rather than a turnaround pitch.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1317,7 +1317,7 @@
           "location": {
             "index": 3902
           },
-          "text": "5. Lebowitz & Mzhen — marylandinjurylawyer.net\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1349,7 +1349,7 @@
           "location": {
             "index": 3949
           },
-          "text": "Snapshot: 756 keywords; ~5,520 visits; down 87%.\nWhat matters: The largest percentage loss among firms with meaningful traffic. The site still has enough residual visibility to support recovery, but the decline warrants immediate page-level, technical, indexing, and backlink-loss investigation.\nSales angle: Lead with the scale of lost demand and a 90-day recovery plan focused on formerly productive personal-injury topics.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1393,7 +1393,7 @@
           "location": {
             "index": 4375
           },
-          "text": "6. The Richardson Firm — therichardsonfirm.com\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1425,7 +1425,7 @@
           "location": {
             "index": 4422
           },
-          "text": "Snapshot: 602 keywords; ~3,980 visits; down 67%.\nWhat matters: Traffic remains material relative to the keyword footprint, suggesting several pages may still carry outsized value. Find and defend those pages while rebuilding lost local and practice-area coverage.\nSales angle: Emphasize revenue risk from declining high-intent rankings and a focused recovery plan rather than a broad content-volume proposal.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1469,7 +1469,7 @@
           "location": {
             "index": 4831
           },
-          "text": "7. Petrillo & Goldberg Law — petrilloandgoldberg.com\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1501,7 +1501,7 @@
           "location": {
             "index": 4884
           },
-          "text": "Snapshot: 816 keywords; ~1,417 visits; down 78%.\nWhat matters: Keyword breadth remains, but traffic yield is weak and falling sharply. This often points to ranking-position deterioration, low-value query mix, or pages losing relevance and authority.\nSales angle: Offer a keyword-to-page remediation plan that moves existing visibility back toward page one.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1545,7 +1545,7 @@
           "location": {
             "index": 5241
           },
-          "text": "8. Carluzzo Rochkind & Smith — novatriallawyers.com\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1577,7 +1577,7 @@
           "location": {
             "index": 5293
           },
-          "text": "Snapshot: 151 keywords; ~210 visits; up 232%.\nWhat matters: Momentum is positive but the base is small. Preserve winning pages, then expand carefully into high-intent Northern Virginia litigation and personal-injury topic clusters.\nSales angle: Early-stage growth is working; accelerate it with structured content, local authority, and internal linking.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1621,7 +1621,7 @@
           "location": {
             "index": 5647
           },
-          "text": "9. Burnett Law Office — burnettlawaz.com\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1653,7 +1653,7 @@
           "location": {
             "index": 5688
           },
-          "text": "Snapshot: 93 keywords; ~155 visits; down 10%.\nWhat matters: Visibility is limited but relatively stable. The core opportunity is foundational: stronger service/location architecture, local signals, helpful content, and authoritative links.\nSales angle: Build a predictable local organic acquisition channel from a low base.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1697,7 +1697,7 @@
           "location": {
             "index": 6012
           },
-          "text": "10. Goodrich and Associates — goodrichpc.com\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1729,7 +1729,7 @@
           "location": {
             "index": 6057
           },
-          "text": "Snapshot: 36 keywords; ~23 visits; down 55%.\nWhat matters: Organic visibility is nearly absent. Start with indexing and technical validation, keyword-to-page mapping, local presence, core practice pages, and authority acquisition.\nSales angle: This is a clean-slate growth opportunity with straightforward baseline KPIs and visible early wins.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1773,7 +1773,7 @@
           "location": {
             "index": 6401
           },
-          "text": "Recommended outreach order\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1805,7 +1805,7 @@
           "location": {
             "index": 6428
           },
-          "text": "Lebowitz & Mzhen — extreme decline with substantial remaining traffic.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1825,7 +1825,7 @@
           "location": {
             "index": 6499
           },
-          "text": "WRSH — highest absolute recovery upside after Albertson & Davidson.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1845,7 +1845,7 @@
           "location": {
             "index": 6567
           },
-          "text": "Petrillo & Goldberg — broad footprint, poor current traffic yield, severe decline.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1865,7 +1865,7 @@
           "location": {
             "index": 6650
           },
-          "text": "The Richardson Firm — meaningful traffic at risk and a focused recovery case.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1885,7 +1885,7 @@
           "location": {
             "index": 6728
           },
-          "text": "Albertson & Davidson — largest asset; strong protect-and-recover pitch.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1905,7 +1905,7 @@
           "location": {
             "index": 6800
           },
-          "text": "Freeman & Fuson — meaningful recoverable traffic and page-one opportunity.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1925,7 +1925,7 @@
           "location": {
             "index": 6875
           },
-          "text": "Goodrich and Associates — near-zero visibility and clear foundational need.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1945,7 +1945,7 @@
           "location": {
             "index": 6951
           },
-          "text": "Burnett Law Office — stable but underdeveloped local SEO footprint.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1965,7 +1965,7 @@
           "location": {
             "index": 7019
           },
-          "text": "Carluzzo Rochkind & Smith — positive early momentum to accelerate.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -1985,7 +1985,7 @@
           "location": {
             "index": 7086
           },
-          "text": "Stotts Law — healthy growth; best approached with a scale-and-convert message.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -2005,7 +2005,7 @@
           "location": {
             "index": 7165
           },
-          "text": "Recommended next diagnostic for interested firms\n"
+          "text": "fixture content"
         }
       },
       {
@@ -2037,7 +2037,7 @@
           "location": {
             "index": 7214
           },
-          "text": "For the top six recovery prospects, pull: lost keyword/page pairs, position distribution, top landing pages, referring-domain losses, technical indexability, local-pack coverage, and competitor content gaps. Those details will turn this benchmark into a firm-specific 90-day SEO action plan.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -2045,7 +2045,7 @@
           "location": {
             "index": 7506
           },
-          "text": "Data sources\n"
+          "text": "fixture content"
         }
       },
       {
@@ -2077,7 +2077,7 @@
           "location": {
             "index": 7519
           },
-          "text": "DataForSEO Labs, Google U.S. historical bulk traffic estimation, pulled August 2, 2026.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -2085,7 +2085,7 @@
           "location": {
             "index": 7607
           },
-          "text": "Live homepage fetch and content review for all ten supplied domains, August 2, 2026.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -2093,7 +2093,7 @@
           "location": {
             "index": 7692
           },
-          "text": "Salesforce account list supplied from the verified Brett-owned Market Leader workflow.\n"
+          "text": "fixture content"
         }
       },
       {
@@ -2250,12 +2250,12 @@
         }
       }
     ],
-    "revisionId": "AIroW36ur7F0p2krOJ2mJszkp1NH7q3YtqXz7gzIBzvGzKeh5IdfVwuyuc2C0pxVW6yHqNyHh0wKeIkF7HwANWVHPhXK71t6TSli4IgNsw",
+    "revisionId": "AIroW36ur7F0p2krOJ2mJszkp1_fixture_tab_id_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAeIkF7HwANWVHPhXK71t6TSli4IgNsw",
     "suggestionsViewMode": "SUGGESTIONS_INLINE",
     "tab_ids": [
       "t.0"
     ],
-    "title": "SEO Intelligence — 10 Brett Market Leader Accounts (August 2026)"
+    "title": "fixture content"
   },
   "error": null,
   "successful": true,
