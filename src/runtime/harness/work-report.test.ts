@@ -283,3 +283,41 @@ test('synthesizeTurnReport: a failed first attempt does not hide a later exactly
   assert.ok(report);
   assert.equal((report!.match(/Created a record/g) ?? []).length, 1);
 });
+
+// ── Billable provider jobs are visible (2026-08-07 Arizona scrape) ──
+test('the run report names provider jobs it started, and flags the ones with no confirmed result', async () => {
+  const { synthesizeWorkReport, summarizeProviderJobs } = await import('./work-report.js');
+  const row = (seq: number, type: string, data: Record<string, unknown>) =>
+    ({ seq, type, sessionId: 's', turn: 0, role: 'system', data } as never);
+
+  // Live shape: four actor starts, one confirmed, the rest never fetched —
+  // the user found the spend only by opening the provider's dashboard.
+  const evidence = [
+    row(1, 'external_write', { shapeKey: 'APIFY_RUN_ACTOR', callId: 'c1', preDispatch: true }),
+    row(2, 'external_write_orphaned', { shapeKey: 'APIFY_RUN_ACTOR', callId: 'c1' }),
+    row(3, 'external_write', { shapeKey: 'APIFY_RUN_ACTOR', callId: 'c2', preDispatch: true }),
+    row(4, 'external_write_succeeded', { shapeKey: 'APIFY_RUN_ACTOR', callId: 'c2' }),
+    row(5, 'external_write', { shapeKey: 'APIFY_RUN_ACTOR', callId: 'c3', preDispatch: true }),
+    row(6, 'external_write_orphaned', { shapeKey: 'APIFY_RUN_ACTOR', callId: 'c3' }),
+  ];
+
+  const jobs = summarizeProviderJobs(evidence);
+  assert.equal(jobs?.started, 3);
+  assert.equal(jobs?.unresolved, 2, 'two paid jobs have no confirmed result');
+  assert.deepEqual(jobs?.families, ['apify']);
+
+  const report = synthesizeWorkReport(evidence);
+  assert.match(String(report), /Started 3 provider jobs on apify/);
+  assert.match(String(report), /2 of them have no confirmed result yet/);
+  assert.match(String(report), /billable/);
+
+  // Ordinary writes report exactly as before — no job line invented.
+  const plain = synthesizeWorkReport([
+    row(1, 'external_write', { shapeKey: 'OUTLOOK_CREATE_DRAFT', callId: 'd1', preDispatch: true }),
+    row(2, 'external_write_succeeded', { shapeKey: 'OUTLOOK_CREATE_DRAFT', callId: 'd1', targets: ['a@x.example'] }),
+  ]);
+  assert.doesNotMatch(String(plain), /provider job/);
+  assert.equal(summarizeProviderJobs([
+    row(1, 'external_write', { shapeKey: 'AIRTABLE_CREATE_MULTIPLE_RECORDS', callId: 'r1', preDispatch: true }),
+  ]), null, 'a plain record write is not a provider job');
+});

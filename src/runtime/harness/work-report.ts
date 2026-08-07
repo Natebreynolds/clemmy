@@ -156,6 +156,62 @@ export function describeExternalWrite(shapeKey: string | undefined, toolName: st
 }
 
 /**
+ * Provider JOBS this window started — actor runs, crawls, exports. They are
+ * billable the moment they start, whatever their settlement says, so a run has
+ * to be able to tell the user it launched them.
+ *
+ * Live 2026-08-07: a 50-firm scrape started four Apify runs; the user only
+ * discovered the spend by opening the provider's own dashboard, because
+ * nothing in the run ever mentioned a paid job existed.
+ */
+export interface ProviderJobSummary {
+  started: number;
+  /** Started but never settled with a confirmed result — the ones whose paid
+   *  output may still be unfetched. */
+  unresolved: number;
+  families: string[];
+}
+
+const JOB_START_VERB_RE =
+  /(?:^|_)(?:RUN|RUNS|ACTOR|ACTORS|TASK|TASKS|START|TRIGGER|LAUNCH|CRAWL|SCRAPE|EXPORT|IMPORT|JOB)(?:_|$)/;
+
+function jobSlugOf(event: EventRow): string {
+  return eventText(event.data as Record<string, unknown>, 'shapeKey', 'slug', 'toolName', 'tool').toUpperCase();
+}
+
+export function summarizeProviderJobs(evidence: readonly EventRow[]): ProviderJobSummary | null {
+  const started = new Map<string, EventRow>();
+  const settledOk = new Set<string>();
+  for (const event of evidence) {
+    const slug = jobSlugOf(event);
+    if (!slug || !JOB_START_VERB_RE.test(slug)) continue;
+    const callId = writeCallId(event);
+    if (event.type === 'external_write') {
+      started.set(callId || `${slug}:${event.seq}`, event);
+    } else if (event.type === 'external_write_succeeded' && callId) {
+      settledOk.add(callId);
+    }
+  }
+  if (started.size === 0) return null;
+  const families = [...new Set(
+    [...started.values()].map((event) => (jobSlugOf(event).split('_')[0] ?? '').toLowerCase()).filter(Boolean),
+  )].sort();
+  const unresolved = [...started.keys()].filter((key) => !settledOk.has(key)).length;
+  return { started: started.size, unresolved, families };
+}
+
+function providerJobLine(evidence: readonly EventRow[]): string | null {
+  const jobs = summarizeProviderJobs(evidence);
+  if (!jobs) return null;
+  const where = jobs.families.length ? ` on ${jobs.families.join(', ')}` : '';
+  const plural = jobs.started === 1 ? 'job' : 'jobs';
+  const tail = jobs.unresolved > 0
+    ? ` — ${jobs.unresolved} of them ${jobs.unresolved === 1 ? 'has' : 'have'} no confirmed result yet, so check the provider before starting more.`
+    : '.';
+  return `• Started ${jobs.started} provider ${plural}${where}${tail} These are billable whether or not I fetched their output`;
+}
+
+/**
  * Build a report from the COMPLETE external-write evidence window for one
  * turn/run: `external_write`, `external_write_succeeded`,
  * `external_write_failed`, and `external_write_orphaned`. A pre-dispatch row
@@ -182,20 +238,27 @@ export function synthesizeWorkReport(evidence: readonly EventRow[]): string | nu
     seen.add(line);
     uncertainLines.push(line);
   }
-  if (lines.length === 0 && uncertainLines.length === 0) return null;
+  const jobLine = providerJobLine(evidence);
+  if (lines.length === 0 && uncertainLines.length === 0 && !jobLine) return null;
   if (uncertainLines.length === 0) {
-    return `I finished — here's what I did this turn:\n${lines.join('\n')}`;
+    return [
+      `I finished — here's what I did this turn:`,
+      ...lines,
+      ...(jobLine ? [jobLine] : []),
+    ].join('\n');
   }
   if (lines.length === 0) {
     return [
       'I could not confirm whether this external action completed. Verify the destination before retrying:',
       ...uncertainLines,
+      ...(jobLine ? [jobLine] : []),
     ].join('\n');
   }
   return [
     'The action ledger confirmed some work, but at least one external action is still uncertain:',
     ...lines,
     ...uncertainLines,
+    ...(jobLine ? [jobLine] : []),
     'Verify the uncertain destination before retrying it.',
   ].join('\n');
 }
