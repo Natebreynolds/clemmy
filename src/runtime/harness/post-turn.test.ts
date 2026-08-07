@@ -24,7 +24,11 @@ beforeEach(() => { resetMemoryDb(); });
 
 test('a run recorded in another process is swept and credited when the turn provably used it', () => {
   const fact = rememberFact({ kind: 'project', content: 'The Harbor renewal owner is the northeast ops lead.' });
-  const turnStartedAt = '2026-07-31T12:00:00.000Z';
+  // TIME-RELATIVE fixtures (2026-08-07): these were hardcoded to 2026-07-31 and
+  // the suite went red the day those runs' `expires_at` elapsed — the sweep
+  // requires a LIVE run (`expires_at > now`), so a frozen fixture date is a
+  // time bomb that fails long after the code it guards last changed.
+  const turnStartedAt = new Date(Date.now() - 60_000).toISOString();
   // Simulates the MCP tool process: session-stamped in the shared DB, but its
   // id is NOT handed to the lane (recallIds below stays empty).
   recordRecallRun({
@@ -33,7 +37,7 @@ test('a run recorded in another process is swept and credited when the turn prov
     answerability: 'partial',
     candidateRefs: [{ type: 'fact', id: String(fact.id), snippet: fact.content }],
     sessionId: 'sess-sweep',
-    nowIso: '2026-07-31T12:00:05.000Z',
+    nowIso: new Date(Date.now() - 55_000).toISOString(),
   });
 
   runPostTurnHooks({
@@ -50,15 +54,19 @@ test('a run recorded in another process is swept and credited when the turn prov
 
 test('the sweep never reaches runs from before the turn or other sessions', () => {
   const fact = rememberFact({ kind: 'project', content: 'The Harbor renewal owner is the northeast ops lead.' });
+  // Both fixtures stay LIVE (unexpired) so this test proves the sweep's real
+  // boundaries — before-the-turn and other-session — instead of passing
+  // vacuously because the rows aged out (which is what the frozen 2026-07-31
+  // dates had started doing).
   recordRecallRun({
     objective: 'stale run', surface: 'memory_search_facts', answerability: 'partial',
     candidateRefs: [{ type: 'fact', id: String(fact.id), snippet: fact.content }],
-    sessionId: 'sess-sweep', nowIso: '2026-07-31T11:00:00.000Z',
+    sessionId: 'sess-sweep', nowIso: new Date(Date.now() - 3 * 60_000).toISOString(),
   });
   recordRecallRun({
     objective: 'other session', surface: 'memory_search_facts', answerability: 'partial',
     candidateRefs: [{ type: 'fact', id: String(fact.id), snippet: fact.content }],
-    sessionId: 'sess-other', nowIso: '2026-07-31T12:00:05.000Z',
+    sessionId: 'sess-other', nowIso: new Date(Date.now() - 55_000).toISOString(),
   });
 
   runPostTurnHooks({
@@ -68,7 +76,7 @@ test('the sweep never reaches runs from before the turn or other sessions', () =
     detectCorrection: false,
     recallIds: [],
     replyText: `Per [fact:${fact.id}], the northeast ops lead owns it.`,
-    turnStartedAt: '2026-07-31T12:00:00.000Z',
+    turnStartedAt: new Date(Date.now() - 2 * 60_000).toISOString(),
   });
   assert.equal(getFact(fact.id)?.utilityCount, 0, 'pre-turn and cross-session runs stay out of this turn\'s credit');
 });
