@@ -196,9 +196,15 @@ test('run_batch propose: a reversible Sheets write still emits an automatic form
     ),
   ) as ToolResult;
 
-  assert.match(res.content[0].text, /exactly one approval card/);
+  // CONTRACT CHANGE (2026-08-07, the babysitting fix): in autonomous mode a
+  // certified reversible write batch auto-approves — the formal approval EDGE
+  // is still durably recorded (audit + retry identity), but no card parks and
+  // the record is approved by policy.
+  assert.match(res.content[0].text, /Covered by your autonomy policy/);
   const [record] = listPendingActions({ sessionId, status: 'all' });
   assert.equal(record.kind, 'external_write');
+  assert.equal(record.status, 'approved');
+  assert.equal(record.approvedBy, 'policy');
   const [edge] = listEvents(sessionId, { types: ['autonomy_note'] }).filter(
     (event) => event.data.kind === 'pending_action_queued',
   );
@@ -561,4 +567,67 @@ test('run_batch execute refuses a foreign session without claiming or dispatchin
   assert.deepEqual(dispatchedSessionIds, [ownerSessionId], 'the ledger and dispatch retain the owner session');
   assert.equal(getPendingAction(pending.id)?.status, 'executed');
   _setBatchPlanRunnerForTests(null);
+});
+
+// ── Consent-scope wave (2026-08-07): the beat's approval carries into the batch lane ──
+test('run_batch propose: in autonomous mode a certified write plan auto-approves — zero extra cards', async () => {
+  _setCertifyJudgeForTests(async () => ({
+    allow: true,
+    reason: 'payloads are exact',
+    concerns: [],
+    judgeUnavailable: false,
+  }));
+  const sessionId = 'sess-batch-scope-covered';
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'go' },
+  });
+  const handler = batchHandler();
+  const propose = (plan: Record<string, unknown>) => withToolOutputContext(
+    { sessionId, runScopeId: 'batch-scope-run' },
+    () => withHarnessRunContext(
+      { sessionId, behaviorScopeId: 'batch-scope-run', sourceUserSeq: source.seq, counter: new ToolCallsCounter(100) },
+      () => handler({ action: 'propose', plan }),
+    ),
+  ) as Promise<ToolResult>;
+
+  const res = await propose({
+    tool: 'composio_execute_tool',
+    composioSlug: 'OUTLOOK_CREATE_DRAFT',
+    sideEffect: 'write',
+    objective: 'draft intro emails to the remaining contacts',
+    items: [
+      { id: 'c-1', args: JSON.stringify({ subject: 'Hi A', body: 'a', to_email: 'a@x.example' }) },
+      { id: 'c-2', args: JSON.stringify({ subject: 'Hi B', body: 'b', to_email: 'b@x.example' }) },
+      { id: 'c-3', args: JSON.stringify({ subject: 'Hi C', body: 'c', to_email: 'c@x.example' }) },
+    ],
+  });
+  const text = res.content[0].text;
+  assert.match(text, /Covered by your autonomy policy/, 'writes flow in autonomous mode');
+  assert.match(text, /run_batch action=execute/, 'model is told to execute now');
+  assert.doesNotMatch(text, /exactly one approval card/, 'no card language');
+  const record = listPendingActions({ sessionId, status: 'all' })[0];
+  assert.equal(record.status, 'approved', 'record approved before materialization → no card minted');
+  assert.equal(record.approvedBy, 'policy');
+
+  // The SAME scope does not cover a delete-slug plan — that still cards.
+  const delRes = await propose({
+    tool: 'composio_execute_tool',
+    composioSlug: 'OUTLOOK_BATCH_DELETE_MESSAGES',
+    sideEffect: 'write',
+    objective: 'delete the old duplicates',
+    items: [{ id: 'd-1', args: JSON.stringify({ message_ids: ['m1'] }) }],
+  });
+  assert.match(delRes.content[0].text, /exactly one approval card/, 'out-of-contract delete keeps its card');
+
+  // And a SEND plan never rides the scope (kind=external_send is excluded).
+  const sendRes = await propose({
+    tool: 'composio_execute_tool',
+    composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    sideEffect: 'send',
+    objective: 'send the drafts',
+    items: [{ id: 's-1', args: JSON.stringify({ subject: 'Hi', body: 'x', to_email: 'a@x.example' }) }],
+  });
+  assert.match(sendRes.content[0].text, /exactly one approval card/, 'sends always card');
 });

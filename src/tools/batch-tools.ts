@@ -22,10 +22,13 @@ import {
   cancelPendingActionIfQueuedUnlinked,
   claimPendingActionExecution,
   getPendingAction,
+  markPendingActionApprovalResolved,
   pendingActionPayloadHash,
   queuePendingAction,
   recordPendingActionResult,
 } from '../runtime/harness/pending-actions.js';
+import { evaluateAutoApprove } from '../agents/plan-scope.js';
+import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -375,6 +378,50 @@ export function registerBatchTools(server: McpServer): void {
                 + 'Nothing is authorized or executable; retry the proposal once.',
               );
             }
+          }
+          // CONSENT ALREADY GIVEN (2026-08-07, the babysitting fix): in
+          // autonomous mode, writes flow. A certified, non-send write plan
+          // asks the SAME layered approval authority every single tool call
+          // already asks (plan scope, then the user's autonomy policy) —
+          // the batch lane used to card unconditionally, which is why an
+          // approved 10-draft run stopped for a second approval. Approving
+          // the queued record here (before end-of-turn materialization, which
+          // only mints cards for records still 'queued') runs the batch with
+          // zero extra cards. Sends never take this path (the "check in
+          // before you send" default); destructive slugs never take it
+          // (decideToolApproval's destructive gate governs them); an
+          // unverified plan (judge unavailable) always goes to the human.
+          const { isDestructiveExternalToolCall } = await import('../agents/tool-taxonomy.js');
+          const batchArgs = {
+            tool_slug: planForExecution.composioSlug,
+            arguments: JSON.stringify(planForExecution.items[0]?.args ?? {}),
+          };
+          const policyCovered = !unverified
+            && !reused
+            && kind === 'external_write'
+            && record.status === 'queued'
+            && planForExecution.tool === 'composio_execute_tool'
+            && typeof planForExecution.composioSlug === 'string'
+            && !isDestructiveExternalToolCall('composio_execute_tool', batchArgs)
+            && evaluateAutoApprove({
+              sessionId,
+              toolName: 'composio_execute_tool',
+              args: batchArgs,
+              scope: loadProactivityPolicy().autoApproveScope,
+              insideWorkspace: false,
+              kindHint: 'other',
+            }).autoApproved;
+          if (policyCovered) {
+            markPendingActionApprovalResolved(record.id, 'approved', null, {
+              by: 'policy',
+              evidence: { kind: 'policy', scope: 'plan-scope' },
+            });
+            return textResult(
+              `Certified (${cert.reason || 'allowed'}).${repairNote} `
+              + `Covered by your autonomy policy — no extra card. `
+              + `Pending action ${record.id} is APPROVED (${planForExecution.items.length} ${planForExecution.sideEffect} item(s)). `
+              + `Call run_batch action=execute pending_action_id=${record.id} now; it dispatches the byte-identical stored payload. Do not execute items yourself.`,
+            );
           }
           return textResult(
             (unverified
