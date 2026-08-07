@@ -823,11 +823,13 @@ export function bindProvenStandardLine(fn: (request: string) => string): void {
  * the model.
  */
 export const CONFIRM_BEAT_TEXT =
-  '[confirm-first] Before doing the work, take ONE short conversational beat in your own words — a sentence or two, the way a colleague checks they understood before starting. '
-  + 'Say how you are reading the request and which source or tool you would use, and invite a correction. '
-  + 'Do NOT produce a plan summary, a checklist, or a bulleted proposal — that is a plan card, not a conversation. '
-  + 'If the work may run for several minutes, say you will pick it up in the background and report back here. '
-  + 'Do not call tools yet: wait for the go-ahead, then do the whole thing without asking again. Skip the beat entirely if the request is actually read-only.';
+  '[confirm-first] This request is consequential. Open it the way a smart colleague would — informed, and honest about what is still open. Everything below describes WHAT the beat must accomplish; the words are yours, in your own voice — never a template.\n'
+  + 'Your context above already contains what you know: the capability resolution (which connections, tools, and proven procedures THIS ask can rely on) and your recalled memory. Use them — do not fetch more first.\n'
+  + 'Ground your opening in what you actually found: the specific real connections, tools, or remembered work you would use for this. Specific and true — no invented capabilities, no generic filler.\n'
+  + 'Then reason about what is genuinely OPEN — the load-bearing unknowns that change the result: exact scope (which people, accounts, rows), the time window, the format or destination, anything named but unbound. The assumptions you would otherwise silently make are exactly what to surface.\n'
+  + '- If one or two of those are truly open: ask about them, conversationally, as yourself. Do not call tools yet; wait for the answer, then do the whole thing without asking again.\n'
+  + '- If the request genuinely specifies everything load-bearing: state your reading briefly and PROCEED in this same turn — a fully-specified ask has earned execution, and a question you already know the answer to is noise.\n'
+  + 'Never produce a plan summary, a checklist, or a bulleted proposal — that is a plan card, not a conversation. If the work may run for several minutes, say you will pick it up in the background and report back here. Skip the beat entirely if the request is actually read-only.';
 
 /** Directive for a fresh execution-shaped chat turn, or null. Pure over its
  *  inputs plus one point read (prior completed turns); never throws. */

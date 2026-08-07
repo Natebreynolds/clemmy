@@ -617,12 +617,24 @@ test('the beat asks for a conversation, never a plan card', () => {
   // the first response to an action request; the owner's ideal is one natural
   // line that states the reading and invites a correction. A beat that produces
   // a briefing document re-creates the thing that was rolled back.
-  assert.match(CONFIRM_BEAT_TEXT, /conversational beat/i);
-  assert.match(CONFIRM_BEAT_TEXT, /invite a correction/i, 'the beat must open a door, not announce a plan');
-  assert.match(CONFIRM_BEAT_TEXT, /do not call tools yet/i, 'the pause is the point');
+  // UPGRADED (2026-08-07, live dashboard run): the model bulldozed the generic
+  // beat on a detailed prompt. The beat is now INFORMED (opens with what the
+  // capability resolution + memory already found) and INTELLIGENT about gaps
+  // (asks only about load-bearing unknowns; a fully-specified ask proceeds).
+  assert.match(CONFIRM_BEAT_TEXT, /capability resolution/i, 'the beat is grounded in what the turn already knows');
+  assert.match(CONFIRM_BEAT_TEXT, /Ground your opening in what you actually found/i, 'informed, not generic');
+  assert.match(CONFIRM_BEAT_TEXT, /load-bearing unknowns/i, 'gaps are reasoned about, not recited');
+  assert.match(CONFIRM_BEAT_TEXT, /Do not call tools yet; wait for the answer/i, 'a real question earns the pause');
+  assert.match(CONFIRM_BEAT_TEXT, /genuinely specifies everything load-bearing.*PROCEED/is, 'a fully-specified ask just goes');
   assert.match(CONFIRM_BEAT_TEXT, /without asking again/i, 'approve once, then run — never per-step approvals');
   assert.doesNotMatch(CONFIRM_BEAT_TEXT, /2–3 lines|bulleted proposal is fine|checklist of steps/i);
-  assert.match(CONFIRM_BEAT_TEXT, /Do NOT produce a plan summary/i, 'the plan-card shape is explicitly refused');
+  assert.match(CONFIRM_BEAT_TEXT, /Never produce a plan summary/i, 'the plan-card shape is explicitly refused');
+  assert.match(CONFIRM_BEAT_TEXT, /no invented capabilities/i, 'grounding stays honest');
+  // VOICE-COSPLAY GUARD (owner rule, re-affirmed 2026-08-07): the directive
+  // describes what the beat must ACCOMPLISH — it never scripts sentences for
+  // the model to parrot. No quoted sample utterances, ever.
+  assert.match(CONFIRM_BEAT_TEXT, /the words are yours, in your own voice — never a template/i);
+  assert.doesNotMatch(CONFIRM_BEAT_TEXT, /"(?:ok |your |I have |the Apify)/i, 'no scripted example sentences');
 });
 
 test('an unstated destination is settled in the beat, not discovered mid-run', () => {
