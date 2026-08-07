@@ -66,7 +66,19 @@ test('shadow recorder persists one source-owned private graph and dedupes retrie
   assert.equal(events[0].data.sourceUserSeq, source.seq);
   assert.equal(events[0].data.shadow, true);
   assert.equal(events[0].data.route, 'retrieve');
-  assert.equal(projectHarnessEventForPublic(events[0]), null);
+  // CONTRACT CHANGE (2026-08-07, "see the graph"): the compiled plan projects
+  // publicly as SHAPE ONLY — route/fastPath/nodeCount. Hashes, the graph body,
+  // and source internals stay private.
+  const projected = projectHarnessEventForPublic(events[0]);
+  assert.ok(projected, 'the plan shape reaches the public stream');
+  const projectedData = (projected as { data: Record<string, unknown> }).data;
+  assert.equal(projectedData.route, 'retrieve');
+  assert.equal(typeof projectedData.nodeCount, 'number');
+  assert.doesNotMatch(
+    JSON.stringify(projected),
+    /graphHash|policyHash|"graph"|surface/,
+    'internals never leak into the projection',
+  );
   assert.equal((events[0].data.graph as { source?: { surface?: unknown } }).source?.surface, 'home');
 });
 
@@ -105,12 +117,12 @@ test('missing accepted text cannot be replaced by a private runtime fallback', (
   assert.equal(JSON.stringify(event.data).includes('private-fallback-secret-882'), false);
 });
 
-test('shadow graph emits no public action-bus row', () => {
+test('shadow graph emits ONE public plan row, shape-only — internals stay off the bus', () => {
   const source = acceptedTurn({ sessionId: 'shadow-public-bus', text: 'Look up Acme.' });
-  const publicTypes: string[] = [];
+  const publicRows: Array<Record<string, unknown>> = [];
   const detach = actionBus.subscribe((message) => {
     if (message.kind === 'harness.public_event' && message.sessionId === source.sessionId) {
-      publicTypes.push(message.event.type);
+      publicRows.push(message.event as unknown as Record<string, unknown>);
     }
   });
   try {
@@ -121,7 +133,16 @@ test('shadow graph emits no public action-bus row', () => {
   } finally {
     detach();
   }
-  assert.deepEqual(publicTypes, []);
+  // CONTRACT CHANGE (2026-08-07, "see the graph"): the chat strip renders
+  // "Planned: … · N steps" from exactly this row. Shape only — never the
+  // graph body, hashes, or surface internals.
+  assert.equal(publicRows.length, 1);
+  assert.equal(publicRows[0].type, 'turn_graph_compiled');
+  assert.doesNotMatch(
+    JSON.stringify(publicRows[0]),
+    /graphHash|policyHash|"graph"|surface/,
+    'the bus row is the bounded shape summary',
+  );
 });
 
 test('operational mirror receives only the bounded graph summary', () => {
