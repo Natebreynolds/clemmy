@@ -380,7 +380,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
   const model = typeof d.model === 'string' ? d.model : '';
   // Server names can contain underscores (mcp__some_server__tool) — a non-greedy
   // `.+?` strips the whole `mcp__…__` prefix; `[^_]+` stopped at the first `_`.
-  const toolLabel = humanToolLabel(tool, d.args, d.publicSlug);
+  const toolLabel = humanToolLabel(tool, d.args, d.publicSlug, d.innerTool);
   switch (ev.type) {
     // The compiled turn plan — the graph making itself legible ("see the
     // team's plan, not just its motion"). One row at turn start; replaced,

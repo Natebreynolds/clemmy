@@ -435,6 +435,22 @@ function publicDispatchSlug(data: Record<string, unknown>): string {
   return PUBLIC_DISPATCH_SLUG_RE.test(candidate) ? candidate : '';
 }
 
+/** call_tool / code-mode wrap an inner tool; the WRAPPER name ("call tool") is
+ *  all the strip could show, so a page of anonymous "call tool" rows hid what
+ *  was actually happening (live 2026-08-07: write_file + sf data query rendered
+ *  as identical blank rows, so the user could not see progress or steer). The
+ *  runtime attaches the real inner tool as `effectiveTool` — runtime-owned
+ *  metadata (accounting layer), NOT a model-supplied argument — so it is safe
+ *  to surface as the row's identity. Lowercase built-in tool names only; a
+ *  provider SLUG rides `publicDispatchSlug` already. */
+const PUBLIC_INNER_TOOL_RE = /^[a-z][a-z0-9_]{1,48}$/;
+function publicInnerTool(data: Record<string, unknown>): string {
+  const wrapper = firstString(data.tool, data.toolName, data.name);
+  if (wrapper !== 'call_tool' && wrapper !== 'run_tool_program') return '';
+  const inner = firstString(data.effectiveTool);
+  return inner && PUBLIC_INNER_TOOL_RE.test(inner) ? inner : '';
+}
+
 /** The read-result glimpse ("12 records · name, website, phone · sample").
  *  Structure-derived by the runtime; every field re-validated and bounded
  *  here so a malformed producer cannot widen the window. */
@@ -527,21 +543,25 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       // replay because transcripts intentionally consume only completions.
       return null;
     case 'tool_called': {
-      const tool = firstString(data.tool, data.toolName, data.name) || 'tool';
-      const progress = publicToolProgressLabel(tool);
+      const innerTool = publicInnerTool(data);
+      const labelName = innerTool || firstString(data.tool, data.toolName, data.name) || 'tool';
+      const progress = publicToolProgressLabel(labelName);
       const publicSlug = publicDispatchSlug(data);
       return {
         ...selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'batchMode', 'accounting']),
+        ...(innerTool ? { innerTool } : {}),
         ...(progress ? { progress } : {}),
         ...(publicSlug ? { publicSlug } : {}),
         ...(publicToolEffect(data) ? { effect: publicToolEffect(data) } : {}),
       };
     }
     case 'tool_returned': {
+      const innerTool = publicInnerTool(data);
       const publicSlug = publicDispatchSlug(data);
       const glimpse = publicResultGlimpse(data);
       return {
         ...selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'ok', 'success', 'batchMode', 'accounting']),
+        ...(innerTool ? { innerTool } : {}),
         ...(publicSlug ? { publicSlug } : {}),
         ...(publicToolEffect(data) ? { effect: publicToolEffect(data) } : {}),
         ...(glimpse ? { glimpse } : {}),

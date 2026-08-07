@@ -214,6 +214,11 @@ test('transport mirrors remain in the audit ledger but never enter the public ev
 });
 
 test('public tool progress never derives identity from model-supplied carrier arguments', () => {
+  // CONTRACT (2026-08-07): the runtime-owned effectiveTool IS surfaced as the
+  // inner action when it is a valid tool NAME (see the dashboard-run test), but
+  // NEVER the model-supplied `arguments`/`name`. This fixture's effectiveTool is
+  // not a valid tool-name shape (hyphens), so it is refused too — proving the
+  // grammar gate, not a blanket suppression.
   const shellCarrier = projectHarnessEventForPublic(event('tool_called', {
     tool: 'call_tool',
     accounting: 'top_level',
@@ -226,7 +231,7 @@ test('public tool progress never derives identity from model-supplied carrier ar
   assert.ok(shellCarrier);
   assert.equal(shellCarrier.data.progress, 'using call_tool');
   assert.equal('arguments' in shellCarrier.data, false);
-  assert.equal('effectiveTool' in shellCarrier.data, false);
+  assert.equal(shellCarrier.data.innerTool, undefined, 'a non-tool-name effectiveTool is refused');
   assert.doesNotMatch(
     JSON.stringify(shellCarrier.data),
     /customer-secret-123|customer-secret-effective-tool|bearer-secret-123|deploy --token/,
@@ -653,4 +658,36 @@ test('the compiled turn plan projects as SHAPE only — hashes and graph body st
     data: { noteSeqs: [10] },
   } as never);
   assert.equal(marker, null, 'delivery markers stay internal');
+});
+
+test('call_tool progress rows show the REAL inner action, never an anonymous wrapper (2026-08-07 dashboard run)', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  // Live: a page of "call tool" rows hid write_file + sf-query; the user could
+  // not see progress or steer. effectiveTool is runtime-owned, so surface it.
+  const wrote = projectHarnessEventForPublic({
+    sessionId: 's', seq: 9, turn: 0, role: 'Clem', type: 'tool_called',
+    data: { tool: 'call_tool', callId: 'c1', effect: 'local_write', effectiveTool: 'write_file',
+      arguments: JSON.stringify({ name: 'write_file', args_json: '{"path":"/Users/x/secret/index.html"}' }) },
+  } as never);
+  const wd = (wrote as { data: Record<string, unknown> }).data;
+  assert.equal(wd.innerTool, 'write_file', 'the inner tool is named');
+  assert.match(String(wd.progress), /write_file/);
+  // The model-supplied arguments (the absolute path) never leak.
+  assert.doesNotMatch(JSON.stringify(wrote), /\/Users\/x\/secret/);
+
+  // A bare provider call (no wrapper) is unchanged — no phantom innerTool.
+  const plain = projectHarnessEventForPublic({
+    sessionId: 's', seq: 10, turn: 0, role: 'Clem', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'c2', toolSlug: 'GOOGLESHEETS_BATCH_GET' },
+  } as never);
+  const pd = (plain as { data: Record<string, unknown> }).data;
+  assert.equal(pd.innerTool, undefined);
+  assert.equal(pd.publicSlug, 'GOOGLESHEETS_BATCH_GET');
+
+  // A malformed/uppercase-junk effectiveTool is refused (name shape only).
+  const junk = projectHarnessEventForPublic({
+    sessionId: 's', seq: 11, turn: 0, role: 'Clem', type: 'tool_called',
+    data: { tool: 'call_tool', callId: 'c3', effectiveTool: '/etc/passwd; rm -rf' },
+  } as never);
+  assert.equal((junk as { data: Record<string, unknown> }).data.innerTool, undefined);
 });

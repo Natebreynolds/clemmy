@@ -64,9 +64,14 @@ export function describeExternalWrite(shapeKey: string | undefined, toolName: st
  *  `publicSlug` is the runtime-validated dispatch identity the public event
  *  plane attaches (raw args are private there) — it wins when present, so the
  *  live strip says "outlook send email" instead of "composio execute tool". */
-export function humanToolLabel(tool: string, argsRaw?: unknown, publicSlug?: unknown): string {
+export function humanToolLabel(tool: string, argsRaw?: unknown, publicSlug?: unknown, innerTool?: unknown): string {
   if (typeof publicSlug === 'string' && publicSlug) {
     return publicSlug.replace(/_/g, ' ').toLowerCase();
+  }
+  // call_tool / run_tool_program wrap an inner tool; show the real inner name
+  // (runtime-validated `effectiveTool`) instead of the anonymous wrapper.
+  if (typeof innerTool === 'string' && innerTool) {
+    return innerTool.replace(/_/g, ' ').toLowerCase();
   }
   if (tool === 'composio_execute_tool' && typeof argsRaw === 'string') {
     try {
