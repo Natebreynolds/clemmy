@@ -70,4 +70,51 @@ import { rememberToolSchema, rememberToolSchemas, getCachedToolSchema, resetTool
 }
 
 resetToolSchemaCache();
+// ── Schema-FIRST dispatch (live 2026-08-07 scrape) ──
+// APIFY_RUN_ACTOR had no cached schema, so a call with no `actorId` fell to
+// heuristic validation, reached the provider, and came back as a paid 400 —
+// twice. ensureToolSchema loads the real contract once per session so the
+// same mistake is refused locally, naming the missing field.
+{
+  const {
+    ensureToolSchema, _setToolSchemaLoaderForTests,
+  } = await import('./composio-schema-cache.js');
+  const { validateComposioArgs } = await import('./composio-batch-validator.js');
+
+  resetToolSchemaCache();
+  let loads = 0;
+  _setToolSchemaLoaderForTests(async (slug: string) => {
+    loads += 1;
+    return slug === 'APIFY_RUN_ACTOR'
+      ? { inputParameters: { type: 'object', required: ['actorId'], properties: { actorId: { type: 'string' } } } }
+      : null;
+  });
+
+  const contract = await ensureToolSchema('APIFY_RUN_ACTOR');
+  if (!contract || String(contract.required) !== 'actorId') throw new Error('should load the real contract on first use');
+  if (loads !== 1) throw new Error('first use loads exactly once');
+
+  await ensureToolSchema('APIFY_RUN_ACTOR');
+  if (loads !== 1) throw new Error('a cached contract must never refetch');
+  if (!getCachedToolSchema('APIFY_RUN_ACTOR')) throw new Error('the sync reader sees the loaded contract');
+
+  // An undescribable slug is attempted once, not per dispatch.
+  if (await ensureToolSchema('UNKNOWABLE_SLUG') !== null) throw new Error('unknown slug yields null');
+  if (await ensureToolSchema('UNKNOWABLE_SLUG') !== null) throw new Error('unknown slug still null');
+  if (loads !== 2) throw new Error('no repeated fetches for an undescribable slug');
+
+  // The live failure is now a LOCAL refusal naming the field.
+  const missing = validateComposioArgs('APIFY_RUN_ACTOR', { input: { q: 'x' } }, contract);
+  if (missing.mode !== 'schema') throw new Error('validated against the real contract');
+  if (!missing.error || !/actorId/.test(String(missing.error.field))) throw new Error('missing actorId must be caught pre-dispatch');
+  const complete = validateComposioArgs('APIFY_RUN_ACTOR', { actorId: 'a~b', input: {} }, contract);
+  if (complete.error) throw new Error('a complete payload still passes');
+
+  // Loader failure is fail-open: no throw, previous behavior preserved.
+  _setToolSchemaLoaderForTests(async () => { throw new Error('composio down'); });
+  if (await ensureToolSchema('SOME_OTHER_SLUG') !== null) throw new Error('loader failure yields null, never a throw');
+  _setToolSchemaLoaderForTests(null);
+  resetToolSchemaCache();
+}
+
 console.log('composio-schema-cache tests passed');

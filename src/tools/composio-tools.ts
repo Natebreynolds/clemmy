@@ -65,7 +65,7 @@ import { resolveCompliantSenderConnection, extractMailboxEmails } from '../runti
 import { rememberAccountAlias, resolveAccountAlias, aliasLabelFor } from '../memory/account-alias-store.js';
 import { cachedIdentityEmail, identityProbeAttempted, recordIdentityProbe } from '../integrations/composio/identity-cache.js';
 import { validateComposioArgs, formatBatchValidationError, applyEmailRecipientAliases } from './composio-batch-validator.js';
-import { rememberToolSchema, getCachedToolSchema } from './composio-schema-cache.js';
+import { rememberToolSchema, getCachedToolSchema, ensureToolSchema } from './composio-schema-cache.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import { composioSlugIsReadOnly } from '../integrations/composio/slug-effect.js';
@@ -1846,7 +1846,12 @@ export async function resolveComposioDispatch(
   }
 
   // Arg validation — provably-incomplete args never dispatch (any path).
-  const validation = validateComposioArgs(toolSlug, args, getCachedToolSchema(toolSlug));
+  // Schema-FIRST: load this action's real contract once per session when it is
+  // not cached yet, so a first-use slug is validated against the provider's own
+  // required fields instead of a heuristic (live 2026-08-07: two paid 400s for
+  // an APIFY_RUN_ACTOR with no actorId). Fail-open — an unavailable schema
+  // simply keeps the previous heuristic behavior.
+  const validation = validateComposioArgs(toolSlug, args, await ensureToolSchema(toolSlug));
   if (validation.error) {
     const message = formatBatchValidationError(validation.error, toolSlug, validation.mode);
     emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {

@@ -577,6 +577,11 @@ test('AUTO with an SDK key keeps normal account-addressable routing unchanged', 
     else process.env.COMPOSIO_API_KEY = previousApiKey;
     if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
     else process.env.COMPOSIO_BACKEND = previousBackend;
+    // Restoring the ENV is not enough: the SDK client is a module singleton, so
+    // anything that touched getComposio() while this key was set would keep a
+    // live client for every LATER keyless test (which then takes the SDK path
+    // instead of proving "not configured"). Drop it with the key.
+    resetComposioClient();
   }
 });
 

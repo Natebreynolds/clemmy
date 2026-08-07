@@ -72,9 +72,56 @@ export function getCachedToolSchema(toolSlug: string): Record<string, unknown> |
   return hit.schema;
 }
 
+/**
+ * Slugs whose live schema we already tried to load this session. Prevents a
+ * slug the provider cannot describe from paying a fetch on every dispatch.
+ */
+const schemaLoadAttempted = new Set<string>();
+
+type SchemaLoader = (slug: string) => Promise<{ inputParameters?: unknown } | null>;
+let schemaLoader: SchemaLoader | null = null;
+
+/** Test seam: inject the live loader without importing the composio client. */
+export function _setToolSchemaLoaderForTests(loader: SchemaLoader | null): void {
+  schemaLoader = loader;
+  schemaLoadAttempted.clear();
+}
+
+/**
+ * Schema-FIRST dispatch: return this action's real input contract, fetching it
+ * ONCE per session when it isn't cached yet.
+ *
+ * Without this, validation for a first-use slug falls back to heuristics, so a
+ * missing REQUIRED field reaches the provider and returns as a paid 400 plus a
+ * full model turn to recover (live 2026-08-07: APIFY_RUN_ACTOR dispatched twice
+ * with no `actorId`). One bounded lookup converts that into a local refusal
+ * that names the exact missing field. Fail-open and non-throwing: any loader
+ * failure leaves validation exactly as it was.
+ */
+export async function ensureToolSchema(toolSlug: string): Promise<Record<string, unknown> | null> {
+  const cached = getCachedToolSchema(toolSlug);
+  if (cached) return cached;
+  if (!toolSlug || schemaLoadAttempted.has(toolSlug)) return null;
+  schemaLoadAttempted.add(toolSlug);
+  try {
+    const load = schemaLoader ?? (async (slug: string) => {
+      const client = await import('../integrations/composio/client.js');
+      // Ask ONLY when an SDK client already exists. Without one, the slug
+      // lookup falls back to listing the whole toolkit — a side effect no
+      // validation step should cause on a keyless/CLI-only install.
+      if (!client.getComposio()) return null;
+      return client.getComposioToolBySlug(slug);
+    });
+    const tool = await load(toolSlug);
+    if (tool?.inputParameters) rememberToolSchema(toolSlug, tool.inputParameters);
+  } catch { /* fail-open: heuristic validation still applies */ }
+  return getCachedToolSchema(toolSlug);
+}
+
 /** Test hook. */
 export function resetToolSchemaCache(): void {
   cache.clear();
+  schemaLoadAttempted.clear();
 }
 
 /**
