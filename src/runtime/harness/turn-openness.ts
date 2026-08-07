@@ -140,6 +140,21 @@ export interface TurnOpennessInput {
   capabilityBlock?: string;
   /** What the session already knows, so a settled question is never re-opened. */
   memoryBlock?: string;
+  /**
+   * Unknowns the runtime is CERTAIN about without asking a model — today, a
+   * named destination kind whose specific instance was never stated.
+   *
+   * These are listed first and survive a judge failure, because they are not
+   * inferences. The live case this exists for (2026-08-07): "pull 5 stale
+   * accounts in salesforce and help me draft some emails" with two Outlook
+   * accounts connected. The preflight typed the destination instance as
+   * unstated before a single tool ran; the run then spent its entire length
+   * reading a playbook, querying Salesforce and enriching accounts, and every
+   * draft failed at the last step with "you have 2 outlook accounts connected,
+   * so I need to know WHICH account to use". The question that ended the run
+   * was knowable at its first instant, and no model call was needed to know it.
+   */
+  deterministicOpen?: readonly string[];
 }
 
 function buildOpennessPrompt(input: TurnOpennessInput): string {
@@ -209,11 +224,27 @@ async function runOpennessJudge(input: TurnOpennessInput): Promise<TurnOpenness 
 export async function resolveTurnOpenness(input: TurnOpennessInput): Promise<TurnOpenness | null> {
   if (!turnOpennessEnabled()) return null;
   if (!input.message?.trim()) return null;
+  const certain = (input.deterministicOpen ?? [])
+    .map((dimension) => dimension.trim())
+    .filter((dimension) => dimension.length >= 3);
+  let judged: TurnOpenness | null = null;
   try {
-    return await (judgeOverride ?? runOpennessJudge)(input);
+    judged = await (judgeOverride ?? runOpennessJudge)(input);
   } catch {
-    return null;
+    judged = null;
   }
+  // Certain unknowns lead and survive a dead judge: they were never inferences,
+  // so a model outage must not be able to swallow them.
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const dimension of [...certain, ...(judged?.open ?? [])]) {
+    const key = dimension.toLowerCase().replace(/\s+/g, ' ');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(dimension);
+    if (merged.length >= MAX_OPEN_DIMENSIONS) break;
+  }
+  return merged.length > 0 ? { open: merged } : null;
 }
 
 /**

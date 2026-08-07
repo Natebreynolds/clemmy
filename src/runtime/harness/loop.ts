@@ -7170,6 +7170,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         message: classifierInput,
         capabilityBlock: renderCapabilityResolutionForContext(contextPacket.capabilityResolution),
         memoryBlock: turnMemoryPrimer.text ?? '',
+        deterministicOpen: contextPacket.preflightDestinationInstanceUnstated && contextPacket.preflightDestination
+          ? [`which ${contextPacket.preflightDestination} account/instance to use — you have more than one and none was named`]
+          : [],
       }));
     } catch { opennessBlock = ''; }
   }

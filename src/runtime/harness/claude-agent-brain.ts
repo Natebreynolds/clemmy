@@ -1132,6 +1132,7 @@ async function buildClaudeAgentBrainTurnContext(
   // alignment beat before autonomous execution. Continuations, questions,
   // pre-authorized hand-offs, and non-chat kinds stay silent.
   let confirmBeat = '';
+  let certainOpen: string[] = [];
   const sourceBoundTurn = Number.isSafeInteger(opts?.sourceUserSeq)
     && Number(opts?.sourceUserSeq) > 0;
   let preflightSessionKind: NonNullable<ReturnType<typeof getSession>>['kind'] | undefined;
@@ -1162,6 +1163,12 @@ async function buildClaudeAgentBrainTurnContext(
     // Standard-aware on BOTH lanes — a beat that names the governing standard
     // on one brain and not the other is the two-lane trap in miniature.
     confirmBeat = preflight.phase === 'align' ? standardAwareBeatText(request.message) : '';
+    // A named destination whose INSTANCE was never stated is a certain unknown,
+    // not an inference — carried to the openness pass so it is settled before
+    // the work rather than discovered by a failed write at the end.
+    if (preflight.destinationInstanceUnstated && preflight.destination) {
+      certainOpen = [`which ${preflight.destination} account/instance to use — you have more than one and none was named`];
+    }
   } catch {
     // Preflight state is directive/telemetry, not execution authority — a
     // classify/persist failure degrades to no beat, never a failed turn.
@@ -1213,6 +1220,7 @@ async function buildClaudeAgentBrainTurnContext(
         message: request.message ?? '',
         capabilityBlock: capabilityResolution,
         memoryBlock: recall,
+        deterministicOpen: certainOpen,
       }));
     } catch { openness = ''; }
   }

@@ -131,6 +131,33 @@ test('the real classifier agrees: a list carrier reads, a create carrier writes'
   assert.equal(turnOpennessWarranted([{ kind: 'composio', identifier: 'AIRTABLE_CREATE_MULTIPLE_RECORDS' }]), true);
 });
 
+test('THE LIVE FAILURE: an unstated account is surfaced up front, and survives a dead judge', async () => {
+  // "pull 5 stale accounts in salesforce and help me draft some emails", two
+  // Outlook accounts connected. The run read the playbook, queried Salesforce,
+  // enriched every account — and every draft failed at the last step with "you
+  // have 2 outlook accounts connected, so I need to know WHICH account to use".
+  // The preflight had typed destinationInstanceUnstated before a single tool
+  // ran. No model call was ever needed to know this.
+  _setOpennessJudgeForTests(async () => { throw new Error('judge unavailable'); });
+  const openness = await resolveTurnOpenness({
+    message: 'can you pull 5 stale accounts for me in salesfroce and help me draft some emails',
+    deterministicOpen: ['which emails account/instance to use — you have more than one and none was named'],
+  });
+  assert.ok(openness, 'a certain unknown must not depend on a judge being alive');
+  assert.match(openness!.open[0]!, /which emails account/i);
+  assert.match(renderTurnOpennessForContext(openness), /BEFORE you commit/i);
+});
+
+test('certain unknowns lead, and duplicates across the two sources collapse', async () => {
+  _setOpennessJudgeForTests(async () => ({ open: ['Which Emails Account/Instance To Use — you have more than one and none was named', 'the tone'] }));
+  const openness = await resolveTurnOpenness({
+    message: 'draft some emails',
+    deterministicOpen: ['which emails account/instance to use — you have more than one and none was named'],
+  });
+  assert.equal(openness?.open.length, 2, 'the same dimension from both sources is one dimension');
+  assert.match(openness!.open[0]!, /^which emails account/, 'the certain one leads');
+});
+
 test('a CONSEQUENTIAL turn with zero proven capabilities still runs the pass', async () => {
   // Live miss, one hour after this shipped: "pull 5 stale accounts in
   // salesforce and help me draft some emails" resolved ZERO capability entries

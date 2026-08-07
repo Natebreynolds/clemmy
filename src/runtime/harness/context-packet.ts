@@ -111,6 +111,10 @@ export interface AgentContextPacket {
   confirmBeatOffered: boolean;
   /** The typed preflight phase this turn classified into. */
   preflightPhase: 'read' | 'align' | 'execute';
+  /** A named destination whose specific instance was never stated — a certain
+   *  unknown the openness pass surfaces without needing a model call. */
+  preflightDestination?: string;
+  preflightDestinationInstanceUnstated: boolean;
   /** Typed capability facts resolved for this ask (empty = no history). */
   capabilityResolution: CapabilityResolution;
   text: string;
@@ -805,6 +809,10 @@ export function buildAgentContextPacket(
     },
     confirmBeatOffered: Boolean(confirmBeat),
     preflightPhase: preflightDecision.phase,
+    preflightDestination: 'destination' in preflightDecision ? preflightDecision.destination : undefined,
+    preflightDestinationInstanceUnstated: 'destinationInstanceUnstated' in preflightDecision
+      ? Boolean(preflightDecision.destinationInstanceUnstated)
+      : false,
     capabilityResolution,
     text: lines.join('\n'),
   };
