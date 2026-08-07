@@ -4199,6 +4199,30 @@ export async function handleDiscordHarnessMessage(
       logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'status command failed; falling through to brain');
     }
   }
+  // MID-RUN STEERING (desktop↔Discord parity, 2026-08-07): a message for a
+  // channel whose bound session has a LIVE run becomes a steer note delivered
+  // at the model's next tool-result boundary — starting a new conversation
+  // here would supersede the attempt and kill the running work. Approval
+  // replies and commands were already intercepted upstream; attachments keep
+  // the normal path so files are never silently folded into a note.
+  if (message.attachments.size === 0 && prompt.trim()) {
+    try {
+      const boundSessionId = getBoundDiscordHarnessSessionId(message.channelId);
+      const latest = boundSessionId ? getLatestRunAttempt(boundSessionId) : null;
+      const leaseLive = Boolean(
+        latest
+        && !latest.finishedAt
+        && latest.leaseExpiresAt
+        && Date.parse(latest.leaseExpiresAt) > Date.now(),
+      );
+      if (boundSessionId && leaseLive) {
+        const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
+        appendSteerNote(boundSessionId, prompt);
+        await message.reply('📝 Noted — she’s mid-run, and your message reaches her at the next step without restarting anything.');
+        return;
+      }
+    } catch { /* fall through to the normal conversation path */ }
+  }
   const transport: DiscordHarnessTransport = {
     async sendInitial(content) {
       const reply = (await message.reply(content)) as unknown as {

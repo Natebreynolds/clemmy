@@ -14593,6 +14593,53 @@ export function registerConsoleRoutes(
       proposedEarlyRoute = { kind: 'new' };
     }
 
+    // MID-RUN STEERING (2026-08-07): a message for a session whose attempt is
+    // STILL RUNNING becomes a durable steer note delivered to the model at its
+    // next tool-result boundary — it must NOT claim a new attempt, because
+    // claimRunAttemptLease retires the prior row and the running work dies
+    // (the old behavior: nudging Clem mid-run killed the run). Control edges
+    // (cancel/new, parked-task answers) keep their existing priority above;
+    // attachments keep the normal turn path so files are never silently
+    // dropped into a note. A dead-leased attempt is NOT running — the normal
+    // supersede path is the correct recovery there.
+    if (!proposedEarlyRoute && input && requestedSessionId && attachmentIds.length === 0 && !command) {
+      try {
+        const latestAttempt = getLatestHarnessRunAttempt(sessionId);
+        const leaseLive = Boolean(
+          latestAttempt
+          && !latestAttempt.finishedAt
+          && latestAttempt.leaseExpiresAt
+          && Date.parse(latestAttempt.leaseExpiresAt) > Date.now(),
+        );
+        if (leaseLive) {
+          const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
+          const note = appendSteerNote(sessionId, input);
+          res.json({
+            ok: true,
+            steered: true,
+            sessionId,
+            noteSeq: note.seq,
+            streamUrl,
+            clientRequestId: requestIdentity.requestId,
+          });
+          return;
+        }
+        // steerOnly is the client's promise that this message must NEVER
+        // become a competing turn. If the run is no longer live, refuse
+        // instead of accepting — the client re-sends as a normal turn.
+        if ((body as Record<string, unknown>).steerOnly === true) {
+          res.status(409).json({ error: 'the run just finished — send again as a normal message', code: 'RUN_NOT_ACTIVE', sessionId });
+          return;
+        }
+      } catch (steerErr) {
+        if ((body as Record<string, unknown>).steerOnly === true) {
+          res.status(409).json({ error: 'steering unavailable — send again as a normal message', code: 'RUN_NOT_ACTIVE', sessionId });
+          return;
+        }
+        void steerErr; /* any failure falls through to the normal turn path */
+      }
+    }
+
     // Route-owned control edges do not need a model runtime. Normal turns still
     // fail before acceptance when no brain is available, preserving the prior
     // retry contract without blocking /cancel or a parked-task answer on auth.
