@@ -100,10 +100,10 @@ test('ingestAttachment: plain-text file with unknown ext is read directly', asyn
 test('an ingested image carries its stored path and the fold points the model at view_image', async () => {
   const { foldAttachmentsIntoMessage } = await import('./attachments.js');
   const folded = foldAttachmentsIntoMessage('what is in this screenshot?', [
-    { name: 'pasted-image-1.png', markdown: 'A machine description of the image.', imagePath: '/home/state/attachments-files/abc__pasted-image-1.png' },
+    { name: 'pasted-image-1.png', markdown: 'A machine description of the image.', imagePath: '/opt/clem/state/attachments-files/abc__pasted-image-1.png' },
   ]);
   assert.match(folded, /This is an IMAGE — call view_image/);
-  assert.match(folded, /\/home\/state\/attachments-files\/abc__pasted-image-1\.png/);
+  assert.match(folded, /\/opt\/clem\/state\/attachments-files\/abc__pasted-image-1\.png/);
   // Non-image attachments keep the exact prior format.
   const plain = foldAttachmentsIntoMessage('summarize', [{ name: 'doc.pdf', markdown: 'pdf text' }]);
   assert.doesNotMatch(plain, /view_image/);
