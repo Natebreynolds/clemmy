@@ -251,6 +251,33 @@ test('JIT monotonic floor: the per-session advertised tool set only GROWS (cache
   assert.deepEqual([...bumpSessionToolFloor('other-session', ['x'])].sort(), ['x']);
 });
 
+test('the schema-on-demand path applies the monotonic floor too — a stable tools block is the cache', async () => {
+  // The floor existed and was wired to only ONE of the two JIT branches. The
+  // branch the desktop actually runs recomputed its hot set per turn, so the
+  // advertised set moved (live: 4 → 5 → 8 → 10, and one 8 → 7). A changed tool
+  // DEFINITION invalidates tools + system + the whole message history, so those
+  // turns rebuilt the entire prompt cache — measured hit ratio ~0.88 with dips
+  // to 0.74 exactly at those boundaries. Same class of bug as every other one
+  // tonight: the capability existed, on one path, and nothing noticed the other
+  // path lacked it.
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./claude-agent-brain.ts', import.meta.url), 'utf8');
+  const schemaOnDemandBranch = source.slice(
+    source.indexOf('if (schemaOnDemandAcquisition)'),
+    source.indexOf("jitReason = 'schema-on-demand-dispatch'"),
+  );
+  assert.ok(schemaOnDemandBranch.length > 0, 'the schema-on-demand branch must still exist');
+  assert.match(schemaOnDemandBranch, /bumpSessionToolFloor\(/,
+    'schema-on-demand must stabilise its advertised set or it busts the prompt cache every turn');
+  assert.match(schemaOnDemandBranch, /jitMonotonicEnabled\(\)/,
+    'and must honour the same kill-switch as the sibling branch');
+  // Order determinism is the OTHER documented way to break this cache: the
+  // advertised list must be built by filtering the stable universe array, never
+  // by iterating a Set.
+  assert.match(schemaOnDemandBranch, /advertisedUniverse\.filter\(/,
+    'advertised order must come from the stable array, not from set iteration');
+});
+
 test('Claude brain receives the same relevance-gated future commitments without a permanent context tax', async () => {
   upsertProspectiveIntention({
     id: 'background:orchid-research',

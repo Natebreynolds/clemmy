@@ -1733,10 +1733,31 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           if (advertisedUniverse.includes(toolName)) hot.add(toolName);
         }
       }
+      // MONOTONIC FLOOR — the cache lever, which this branch was missing.
+      //
+      // The hot set is recomputed per turn from the tools the user happened to
+      // name plus a recent-use tail, so the advertised set moved turn to turn:
+      // live sessions show 4 → 5 → 8 → 10, and one that went 8 → 7. Changing a
+      // tool DEFINITION invalidates the tools block AND the system prompt AND
+      // the entire message history — tools sit first in the cache hierarchy, so
+      // touching them resets everything behind them. That meant most turns of
+      // most conversations rebuilt the whole prompt cache and re-paid the
+      // persona, the tools, and all prior messages at ten times the cached rate,
+      // with the latency to match. Measured hit ratio sat around 0.88 with dips
+      // to 0.74 at exactly those turn boundaries.
+      //
+      // The floor only ever GROWS, so the tools block converges to byte-identical
+      // and then holds for the rest of the session. Filtering the stable
+      // advertised array (rather than iterating the set) keeps the ORDER
+      // deterministic too — non-deterministic tool ordering is a documented way
+      // to break the same cache. Same kill-switch and starvation-safety argument
+      // as the sibling branch: the floor never drops below the per-turn
+      // selection, so nothing becomes unreachable.
+      const hotFloor = (jitMonotonicEnabled() && sessionId) ? bumpSessionToolFloor(sessionId, hot) : hot;
       // A local-runtime-only tool cannot become a first-class MCP schema. Leave
       // it deferred even when explicitly named; tool_search → call_tool remains
       // the truthful, gated route.
-      jitAdvertised = advertisedUniverse.filter((name) => hot.has(name) && firstClassCapable.has(name));
+      jitAdvertised = advertisedUniverse.filter((name) => hotFloor.has(name) && firstClassCapable.has(name));
       // Permissions remain fullAllowed. mcpToolAllowlist is the tiny first-class
       // schema set; the SDK omits every other schema and keeps it reachable via
       // tool_search → call_tool.
