@@ -432,7 +432,12 @@ test('clem.progress() narrates without consuming the RPC budget', async () => {
   assert.equal(r.rpcCalls, 1, 'progress calls are not tool calls');
 });
 
-test('dispatch concurrency is capped host-side (Promise.all does not stampede)', async () => {
+test('dispatch width is BOUNDED but wide when providers are healthy (no pre-throttling)', async () => {
+  // CONTRACT CHANGE (2026-08-07): the old flat cap of 8 made every provider pay
+  // the price of the slowest imagined one — 50 items x ~9s of provider latency
+  // is ~6 minutes at 8-wide and ~1 minute at 24-wide, and a data run is mostly
+  // waiting on providers. Width now starts wide and reacts to the provider's
+  // own signal (below), the way the batch runner already did.
   let inFlight = 0; let peak = 0;
   const dispatch: CodeModeDispatch = async () => {
     inFlight++; peak = Math.max(peak, inFlight);
@@ -441,11 +446,41 @@ test('dispatch concurrency is capped host-side (Promise.all does not stampede)',
     return 'ok';
   };
   const r = await runCodeModeProgram(
-    `return (await Promise.all(Array.from({ length: 24 }, (_, i) => clem.hit({ i })))).length;`,
+    `return (await Promise.all(Array.from({ length: 40 }, (_, i) => clem.hit({ i })))).length;`,
     dispatch,
     { timeoutMs: 30_000 },
   );
   assert.equal(r.ok, true);
-  assert.equal(r.value, 24, 'every call still completes');
-  assert.ok(peak <= 8, `in-flight dispatches capped at 8, saw ${peak}`);
+  assert.equal(r.value, 40, 'every call still completes');
+  assert.ok(peak > 8, `a healthy provider is not throttled to the old guess, saw ${peak}`);
+  assert.ok(peak <= 24, `still bounded — never an unbounded stampede, saw ${peak}`);
+});
+
+test('dispatch width SHRINKS on the provider\'s own rate-limit signal, then recovers', async () => {
+  // The provider — not a hardcoded number — sets the pace. Early calls answer
+  // with a 429; once the window widens the provider goes healthy again.
+  let inFlight = 0; let peakEarly = 0; let peakLate = 0; let seen = 0;
+  const dispatch: CodeModeDispatch = async () => {
+    seen += 1;
+    const mine = seen;
+    inFlight++;
+    if (mine <= 12) peakEarly = Math.max(peakEarly, inFlight);
+    else peakLate = Math.max(peakLate, inFlight);
+    await new Promise((r) => setTimeout(r, 60));
+    inFlight--;
+    // The first wave is throttled by the provider; the rest are clean.
+    return mine <= 12 ? 'HTTP 429 rate limit exceeded, retry-after 1' : 'ok';
+  };
+  const r = await runCodeModeProgram(
+    `const out = [];
+     for (let wave = 0; wave < 6; wave++) {
+       out.push(...await Promise.all(Array.from({ length: 10 }, (_, i) => clem.hit({ wave, i }).catch(() => 'e'))));
+     }
+     return out.length;`,
+    dispatch,
+    { timeoutMs: 60_000 },
+  );
+  assert.equal(r.ok, true, `program completed: ${r.ok ? '' : r.error}`);
+  assert.equal(r.value, 60, 'every call still completes despite the throttling');
+  assert.ok(peakLate <= 24, 'width never exceeds the ceiling while recovering');
 });

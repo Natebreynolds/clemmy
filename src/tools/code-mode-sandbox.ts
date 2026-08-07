@@ -85,9 +85,26 @@ export interface CodeModeOptions {
 const DEFAULT_HARD_CEILING_MS = 180_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_RPC = 200;
-/** In-flight dispatch cap: a program's Promise.all over 50 items must not
- *  stampede one MCP server / rate limit. Excess RPCs queue host-side. */
-const DEFAULT_DISPATCH_CONCURRENCY = 8;
+/**
+ * In-flight dispatch width. Programs used to be pinned at a flat guess (8),
+ * chosen to never stampede any provider — which meant every provider paid the
+ * price of the slowest imagined one: 50 items x ~9s of provider latency is ~1
+ * minute at 24-wide and ~6 minutes at 8-wide, and a data run is mostly waiting
+ * on providers (live 2026-08-07 audit).
+ *
+ * The batch runner already solved this the right way: it does not pre-throttle,
+ * it REACTS to the provider's own 429 / Retry-After signal. Programs now do the
+ * same — start wide, shrink on a rate-limit signal (honoring Retry-After),
+ * recover as successes accumulate. Fast where the provider is fast, polite
+ * exactly where it is not, with no per-vendor table to maintain.
+ */
+const DEFAULT_DISPATCH_CONCURRENCY = 24;
+/** Never shrink below this — a trickle still finishes. */
+const MIN_DISPATCH_CONCURRENCY = 2;
+/** Provider-signalled backpressure: the vocabulary the batch runner uses. */
+const RATE_LIMIT_SIGNAL_RE = /\b429\b|rate.?limit|too many requests|quota exceeded|throttl/i;
+/** Consecutive clean results before widening back out one step. */
+const WIDEN_AFTER_CLEAN = 8;
 const PARTIAL_RECENT_LIMIT = 20;
 const PARTIAL_PREVIEW_CHARS = 400;
 
@@ -233,7 +250,35 @@ const __rpc = (method, args) => new Promise((resolve, reject) => {
   process.stdout.write(JSON.stringify({ __cm: 'rpc', id, method, args: args === undefined ? null : args }) + '\\n');
 });
 // clem.<toolName>(args) → one gated tool call, dispatched by the parent.
-const clem = new Proxy({}, { get: (_t, prop) => (args) => __rpc(String(prop), args) });
+// clem.map(items, fn, opts) → BOUNDED-CONCURRENCY fan-out over items. Hand-rolled
+// serial loops are the single largest latency sink in a data run (50 items x ~9s
+// provider latency = 8 minutes serial, ~1 minute at 8-wide), and hand-rolled
+// chunking is where programs get subtly wrong. One helper, per-item isolation
+// (a thrown item never kills the batch), automatic progress narration.
+const __clemMap = async (items, fn, opts) => {
+  const list = Array.from(items ?? []);
+  const width = Math.max(1, Math.min(16, Number(opts?.concurrency) || 8));
+  const out = new Array(list.length);
+  let next = 0; let done = 0; let lastNarrated = 0;
+  const runOne = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= list.length) return;
+      try { out[i] = { ok: true, item: list[i], value: await fn(list[i], i) }; }
+      catch (e) { out[i] = { ok: false, item: list[i], error: (e && e.message) || String(e) }; }
+      done++;
+      if (list.length >= 10 && done - lastNarrated >= Math.ceil(list.length / 5)) {
+        lastNarrated = done;
+        try { await __rpc('progress', done + '/' + list.length + ' done'); } catch {}
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(width, list.length) }, runOne));
+  return out;
+};
+const clem = new Proxy({}, {
+  get: (_t, prop) => (prop === 'map' ? __clemMap : (args) => __rpc(String(prop), args)),
+});
 const __run = async () => {
   let __payload;
   try {
@@ -420,16 +465,49 @@ export async function runCodeModeProgram(
     // would be a real side effect the (dead) program can never observe. Pending
     // acquires simply never resolve — the promise chain is abandoned with the
     // child.
+    // Adaptive width: starts at the configured ceiling and moves with what the
+    // providers actually tolerate. Shrinking is immediate (halve on a
+    // rate-limit signal); widening is earned (WIDEN_AFTER_CLEAN clean results
+    // per step) so one lucky result cannot undo real backpressure.
+    let width = maxConcurrent;
+    let cleanSinceShrink = 0;
+    let pausedUntilMs = 0;
+    const noteRateLimited = (message: string): void => {
+      const retryAfterSec = /retry[- ]after[^0-9]{0,6}(\d{1,4})/i.exec(message)?.[1];
+      const backoffMs = retryAfterSec ? Math.min(60_000, Number(retryAfterSec) * 1000) : 1_000;
+      pausedUntilMs = Math.max(pausedUntilMs, Date.now() + backoffMs);
+      width = Math.max(MIN_DISPATCH_CONCURRENCY, Math.floor(width / 2));
+      cleanSinceShrink = 0;
+    };
+    const noteCleanResult = (): void => {
+      if (width >= maxConcurrent) return;
+      cleanSinceShrink += 1;
+      if (cleanSinceShrink >= WIDEN_AFTER_CLEAN) {
+        width = Math.min(maxConcurrent, width + 1);
+        cleanSinceShrink = 0;
+      }
+    };
     const acquireSlot = (): Promise<void> => new Promise((grant) => {
       if (settled) return;
-      if (inFlight < maxConcurrent) { inFlight += 1; grant(); return; }
-      dispatchQueue.push(() => { inFlight += 1; grant(); });
+      const start = (): void => { inFlight += 1; grant(); };
+      const wait = pausedUntilMs - Date.now();
+      if (inFlight < width && wait <= 0) { start(); return; }
+      // Backpressure pause or a full window: queue in order. A paused window
+      // re-drains itself when the provider's stated wait elapses.
+      dispatchQueue.push(start);
+      if (wait > 0) setTimeout(() => { if (!settled) pumpQueue(); }, Math.min(wait, 60_000));
     });
+    const pumpQueue = (): void => {
+      if (settled || Date.now() < pausedUntilMs) return;
+      while (inFlight < width && dispatchQueue.length > 0) {
+        const next = dispatchQueue.shift();
+        if (next) next();
+      }
+    };
     const releaseSlot = (): void => {
       inFlight -= 1;
       if (settled) return;
-      const next = dispatchQueue.shift();
-      if (next) next();
+      pumpQueue();
     };
 
     let outBuf = '';
@@ -472,6 +550,12 @@ export async function runCodeModeProgram(
               releaseSlot();
               touchActivity();
               const softFailure = toolResultFailureReason(res);
+              if (softFailure && RATE_LIMIT_SIGNAL_RE.test(softFailure)) {
+                // The provider itself set the pace — obey it instead of guessing.
+                noteRateLimited(softFailure);
+              } else if (!softFailure) {
+                noteCleanResult();
+              }
               if (softFailure) {
                 consecutiveRpcFailures += 1;
                 rpcFailed += 1;
