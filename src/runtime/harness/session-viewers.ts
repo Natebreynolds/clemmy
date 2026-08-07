@@ -98,6 +98,20 @@ export function sessionViewerSeenSince(sessionId: string, sinceMs: number): bool
   return state.lastSeenMs >= sinceMs;
 }
 
+/**
+ * Was a viewer present on ANY session at or after `sinceMs`? The
+ * approval-mirror deferral asks this: a user actively watching some session
+ * stream is IN the app, where the approval card is already on screen — a
+ * Discord/push mirror at that moment is noise, not signal.
+ */
+export function anySessionViewerSeenSince(sinceMs: number): boolean {
+  for (const state of viewers.values()) {
+    if (state.count > 0) return true;
+    if (state.lastSeenMs >= sinceMs) return true;
+  }
+  return false;
+}
+
 /** Observe viewer arrivals without coupling the SSE routes to report-back.
  * Used to make "the user saw it" survive a daemon restart during the terminal
  * grace window. */

@@ -15,6 +15,9 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.DISCORD_ENABLED = 'false';
 process.env.SLACK_ENABLED = 'false';
 process.env.WEBHOOK_ENABLED = 'false';
+// Presence window shrunk so the mirror-deferral pin can exercise both sides
+// (present → defer, away → send) with a ~1.2s wait instead of 2 minutes.
+process.env.NOTIFICATION_APPROVAL_PRESENCE_WINDOW_SECONDS = '1';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const {
@@ -889,4 +892,65 @@ test('a corrupt notification carrier cannot CAS-delete its healthy queued delive
   // Leave the shared fixture healthy for any later tests in this file.
   writeFileSync(path.join(TMP_HOME, 'state', 'notifications.json'), '[]');
   replaceQueuedNotificationDeliveries([]);
+});
+
+// ── Consent-scope wave (2026-08-07): approval mirrors wait while the user is in the app ──
+test('an approval mirror DEFERS to non-desktop destinations while a session viewer is live, and sends once they leave', async () => {
+  const { createSession } = await import('../runtime/harness/eventlog.js');
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const { attachSessionViewer, resetSessionViewersForTest } =
+    await import('../runtime/harness/session-viewers.js');
+
+  const session = createSession({ id: 'sess-approval-presence', kind: 'chat' });
+  const row = approvalRegistry.register({
+    sessionId: session.id,
+    channel: 'desktop',
+    subject: 'Batch write: create 3 drafts',
+    tool: 'request_approval',
+  });
+  upsertNotificationDestination({
+    id: 'dest-discord-nate',
+    name: 'Nate Discord DM',
+    type: 'discord_user',
+    userId: 'discord-user-1',
+    enabled: true,
+    createdAt: new Date().toISOString(),
+  } as never);
+
+  const delivered: string[] = [];
+  _setNotificationDeliveryForTests(async (_notification, destination) => {
+    delivered.push((destination as { type: string }).type);
+  });
+  try {
+    resetSessionViewersForTest();
+    const detach = attachSessionViewer(session.id); // the user is in the room
+    addNotification({
+      id: `approval-${row.approvalId}`,
+      kind: 'approval',
+      title: 'Approval pending',
+      body: 'Batch write: create 3 drafts',
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { approvalId: row.approvalId, sessionId: session.id },
+    });
+
+    await processNotificationDeliveries(assistantStub);
+    assert.ok(!delivered.includes('discord_user'), 'no Discord DM while the user watches in-app');
+
+    const job = listQueuedNotificationDeliveries().find(
+      (queued) => queued.notificationId === `approval-${row.approvalId}`,
+    );
+    assert.ok(job, 'job still queued (deferred, not failed)');
+
+    // The user steps away: past the presence window, the mirror sends.
+    detach();
+    resetSessionViewersForTest();
+    await new Promise((resolve) => setTimeout(resolve, 1_300));
+    await processNotificationDeliveries(assistantStub);
+    assert.ok(delivered.includes('discord_user'), 'mirror delivers once the user is away');
+  } finally {
+    _setNotificationDeliveryForTests(null);
+    resetSessionViewersForTest();
+    removeNotificationDestination('dest-discord-nate');
+  }
 });

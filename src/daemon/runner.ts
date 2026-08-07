@@ -11,6 +11,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { anySessionViewerSeenSince } from '../runtime/harness/session-viewers.js';
 import matter from 'gray-matter';
 import pino from 'pino';
 import { ClementineAssistant } from '../assistant/core.js';
@@ -227,6 +228,16 @@ const NO_DESTINATION_RETRY_KEY = '__no_destinations__';
 const NO_DESTINATION_RETRY_MS = (() => {
   const minutes = parseInt(getRuntimeEnv('NOTIFICATION_NO_DESTINATION_RETRY_MINUTES') ?? '', 10);
   return (Number.isFinite(minutes) && minutes > 0 ? minutes : 15) * 60_000;
+})();
+
+// Approval mirrors defer while the user is visibly IN the app (a live session
+// viewer within this window): the card is already on their screen — a
+// Discord/push copy at that moment is the "babysitting" noise (live
+// 2026-08-07: desktop-origin approval DM'd the user mid-run while they
+// watched the run in the desktop app). When they step away, the mirror sends.
+const APPROVAL_MIRROR_PRESENCE_WINDOW_MS = (() => {
+  const seconds = parseInt(getRuntimeEnv('NOTIFICATION_APPROVAL_PRESENCE_WINDOW_SECONDS') ?? '', 10);
+  return (Number.isFinite(seconds) && seconds >= 0 ? seconds : 120) * 1_000;
 })();
 
 interface BootModelWarmupGate {
@@ -1584,6 +1595,24 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
 
       const nextAttemptAt = nextAttemptAtByDestination[destination.id];
       if (nextAttemptAt && new Date(nextAttemptAt).getTime() > now.getTime()) {
+        continue;
+      }
+
+      // Presence-aware approval mirrors: while the user is in the app, the
+      // in-app card is the delivery — every non-desktop copy waits. Deferral
+      // does NOT consume an attempt; a resolved card is dropped upstream by
+      // the stale-approval skip, so a promptly-answered approval never
+      // reaches Discord/push at all. Fail-open: no presence signal (fresh
+      // restart, headless daemon) sends the mirror as before.
+      if (
+        notification.kind === 'approval'
+        && destination.type !== 'desktop'
+        && APPROVAL_MIRROR_PRESENCE_WINDOW_MS > 0
+        && anySessionViewerSeenSince(now.getTime() - APPROVAL_MIRROR_PRESENCE_WINDOW_MS)
+      ) {
+        nextAttemptAtByDestination[destination.id] = new Date(
+          now.getTime() + APPROVAL_MIRROR_PRESENCE_WINDOW_MS,
+        ).toISOString();
         continue;
       }
 
