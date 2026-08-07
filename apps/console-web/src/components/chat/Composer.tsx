@@ -156,6 +156,21 @@ export function Composer({
           ref={textarea}
           value={value}
           onChange={(e) => { setValue(e.target.value); autoGrow(); }}
+          onPaste={(e) => {
+            // Paste an image (screenshot, copied picture) straight into the
+            // chat — it rides the same upload pipeline as drag-drop, and Clem
+            // can look at it natively via view_image.
+            const images = Array.from(e.clipboardData?.items ?? [])
+              .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+              .map((item) => item.getAsFile())
+              .filter((file): file is File => file !== null)
+              .map((file, index) => (file.name && !/^image\.\w+$/.test(file.name)
+                ? file
+                : new File([file], `pasted-image-${Date.now()}-${index + 1}.${(file.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}`, { type: file.type })));
+            if (images.length === 0) return;
+            e.preventDefault();
+            addFiles(images);
+          }}
           onKeyDown={onKeyDown}
           rows={1}
           placeholder={placeholder}

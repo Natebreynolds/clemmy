@@ -95,3 +95,63 @@ test('ingestAttachment: plain-text file with unknown ext is read directly', asyn
   assert.equal(r.error, undefined);
   assert.match(r.markdown || '', /INFO ready/);
 });
+
+// ── Paste-to-see images (2026-08-07): the pixels, not a description ──
+test('an ingested image carries its stored path and the fold points the model at view_image', async () => {
+  const { foldAttachmentsIntoMessage } = await import('./attachments.js');
+  const folded = foldAttachmentsIntoMessage('what is in this screenshot?', [
+    { name: 'pasted-image-1.png', markdown: 'A machine description of the image.', imagePath: '/home/state/attachments-files/abc__pasted-image-1.png' },
+  ]);
+  assert.match(folded, /This is an IMAGE — call view_image/);
+  assert.match(folded, /\/home\/state\/attachments-files\/abc__pasted-image-1\.png/);
+  // Non-image attachments keep the exact prior format.
+  const plain = foldAttachmentsIntoMessage('summarize', [{ name: 'doc.pdf', markdown: 'pdf text' }]);
+  assert.doesNotMatch(plain, /view_image/);
+});
+
+test('readImageForViewing: store-confined, typed, capped — and honest about every refusal', async () => {
+  const { readImageForViewing } = await import('./attachments.js');
+  const { BASE_DIR } = await import('../config.js');
+  const { mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const path = await import('node:path');
+  const store = path.join(BASE_DIR, 'state', 'attachments-files');
+  mkdirSync(store, { recursive: true });
+  const cleanup: string[] = [];
+  try {
+
+  // Traversal / outside-store reads are refused (a model-supplied path must
+  // never become an arbitrary filesystem read).
+  const outside = readImageForViewing('/etc/hosts');
+  assert.equal(outside.ok, false);
+  const traversal = readImageForViewing(path.join(store, '..', '..', 'auth.json'));
+  assert.equal(traversal.ok, false);
+
+  // A real stored PNG round-trips with its mime + trimmed name.
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+  const stored = path.join(store, '11111111-1111-1111-1111-111111111111__shot.png');
+  cleanup.push(stored);
+  writeFileSync(stored, png);
+  const ok = readImageForViewing(stored);
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.mimeType, 'image/png');
+    assert.equal(ok.name, 'shot.png');
+    assert.equal(Buffer.from(ok.base64, 'base64').length, png.length);
+  }
+
+  // Unsupported type and over-cap files refuse with a usable message.
+  const svg = path.join(store, '22222222-2222-2222-2222-222222222222__vec.svg');
+  cleanup.push(svg);
+  writeFileSync(svg, '<svg/>');
+  const badType = readImageForViewing(svg);
+  assert.equal(badType.ok, false);
+  const big = path.join(store, '33333333-3333-3333-3333-333333333333__big.png');
+  cleanup.push(big);
+  writeFileSync(big, Buffer.alloc(3_800_001));
+  const overCap = readImageForViewing(big);
+  assert.equal(overCap.ok, false);
+  if (!overCap.ok) assert.match(overCap.error, /viewing cap/);
+  } finally {
+    for (const file of cleanup) rmSync(file, { force: true });
+  }
+});

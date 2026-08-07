@@ -364,6 +364,27 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
 
   server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));
 
+  // view_image (2026-08-07): the model LOOKS at a stored attachment image —
+  // real pixels as an MCP image block, not the OCR/description text. Read-only
+  // ('view' classifies read; never gated); the path guard inside
+  // readImageForViewing confines reads to state/attachments-files.
+  server.tool(
+    'view_image',
+    'Look at an attached image directly (the actual pixels, not a description). Pass the stored path given in the attachment block.',
+    { path: z.string().min(1).describe('The stored image path from the attachment block (state/attachments-files/…).') },
+    async (input: { path: string }) => {
+      const { readImageForViewing } = await import('../runtime/attachments.js');
+      const image = readImageForViewing(input.path);
+      if (!image.ok) return textResult(`Could not view image: ${image.error}`);
+      return {
+        content: [
+          { type: 'image' as const, data: image.base64, mimeType: image.mimeType },
+          { type: 'text' as const, text: `Image ${image.name} (${image.mimeType}, ${(image.bytes / 1024).toFixed(0)}KB) shown above.` },
+        ],
+      };
+    },
+  );
+
   // Register discovery LAST. A normal allowlisted server searches only what it
   // actually registered. A schema-on-demand server additionally searches the
   // explicitly deferred authority set; every such result is callable through

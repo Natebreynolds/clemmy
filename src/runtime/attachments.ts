@@ -71,6 +71,10 @@ export interface IngestedAttachment {
   name: string;
   markdown?: string;
   error?: string;
+  /** For images: the persisted raw file under state/attachments-files, so a
+   *  vision-capable brain can LOOK at the actual pixels via view_image
+   *  instead of settling for the OCR/description text. */
+  imagePath?: string;
 }
 
 function clip(text: string): string {
@@ -183,21 +187,27 @@ export async function ingestAttachment(input: IngestInput): Promise<IngestedAtta
     // and SAY SO, so a no-key user (e.g. codex_oauth, which carries no OpenAI
     // key) isn't silently given metadata-only or a misleading "reinstall" error.
     if (isImageExtension(target)) {
+      // The raw pixels are the primary artifact: when the file lives in OUR
+      // store (bytes were persisted above), carry its path so a vision brain
+      // can view_image it natively — description text becomes supplementary.
+      const imagePath = target.startsWith(path.join(BASE_DIR, 'state', 'attachments-files') + path.sep)
+        ? target
+        : undefined;
       const keyed = hasOpenAiKey();
       if (keyed) {
         const res = await describeImage(target);
-        if (res.ok) return { name, markdown: clip(res.text) };
+        if (res.ok) return { name, markdown: clip(res.text), imagePath };
         // vision failed — fall through to markitdown metadata rather than error
       }
       const res = await convertToMarkdown(target);
       if (res.ok) {
-        const note = keyed
+        const note = keyed || imagePath
           ? ''
           : '\n\n> ⚠️ Image metadata only. Full image analysis (text/OCR + description) needs an OpenAI API key — set OPENAI_API_KEY to enable vision.';
-        return { name, markdown: clip(res.markdown + note) };
+        return { name, markdown: clip(res.markdown + note), imagePath };
       }
-      // Metadata path also failed. If there's no key, the honest primary fix is
-      // the key (not "reinstall Clementine", which is what res.error would say).
+      // Metadata failed too — with a stored image the native view still works.
+      if (imagePath) return { name, markdown: '_(no extractable text)_', imagePath };
       return {
         name,
         error: keyed
@@ -231,7 +241,10 @@ export function foldAttachmentsIntoMessage(message: string, attachments: Ingeste
   if (usable.length === 0) return message;
   const blocks = usable.map((a) => {
     if (a.error) return `### Attachment: ${a.name}\n\n_Could not read this file: ${a.error}_`;
-    return `### Attachment: ${a.name}\n\n${a.markdown || '_(no extractable content)_'}`;
+    const nativeView = a.imagePath
+      ? `\n\n> 🖼 This is an IMAGE — call view_image with path "${a.imagePath}" to look at it directly. The text above is only a machine description.`
+      : '';
+    return `### Attachment: ${a.name}\n\n${a.markdown || '_(no extractable content)_'}${nativeView}`;
   });
   const head = message.trim() || 'The user attached the following file(s) — use their content to answer.';
   return `${head}\n\n---\n\n${blocks.join('\n\n---\n\n')}`;
@@ -273,5 +286,53 @@ function pruneInbox(): void {
     }
   } catch {
     /* inbox may not exist yet */
+  }
+}
+
+// ── Native image viewing (2026-08-07): the pixels, not a description ─────────
+
+const VIEWABLE_IMAGE_MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+};
+
+/** Anthropic's per-image API cap is 5MB; stay under it with base64 overhead. */
+const MAX_VIEWABLE_IMAGE_BYTES = 3_750_000;
+
+export type ViewableImage =
+  | { ok: true; base64: string; mimeType: string; bytes: number; name: string }
+  | { ok: false; error: string };
+
+/**
+ * Load a stored attachment image for native viewing. Fail-closed guards:
+ * the path must resolve INSIDE state/attachments-files (no traversal, no
+ * arbitrary filesystem reads through a model-supplied path), must be a
+ * supported image type, and must fit the provider's image cap.
+ */
+export function readImageForViewing(requestedPath: string): ViewableImage {
+  try {
+    const store = path.join(BASE_DIR, 'state', 'attachments-files');
+    const resolved = path.resolve(String(requestedPath ?? ''));
+    if (resolved !== store && !resolved.startsWith(store + path.sep)) {
+      return { ok: false, error: 'view_image only reads stored attachment images (state/attachments-files).' };
+    }
+    if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+      return { ok: false, error: 'No stored image at that path — it may have been pruned. Ask the user to re-attach it.' };
+    }
+    const mimeType = VIEWABLE_IMAGE_MIME[path.extname(resolved).toLowerCase()];
+    if (!mimeType) {
+      return { ok: false, error: 'Not a viewable image type (png/jpg/gif/webp).' };
+    }
+    const bytes = statSync(resolved).size;
+    if (bytes > MAX_VIEWABLE_IMAGE_BYTES) {
+      return { ok: false, error: `Image is ${(bytes / 1_000_000).toFixed(1)}MB — over the ${(MAX_VIEWABLE_IMAGE_BYTES / 1_000_000).toFixed(1)}MB viewing cap. Use the description text instead.` };
+    }
+    const name = path.basename(resolved).replace(/^[0-9a-f-]{36}__/, '');
+    return { ok: true, base64: readFileSync(resolved).toString('base64'), mimeType, bytes, name };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
