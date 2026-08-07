@@ -499,3 +499,36 @@ test('shellWriteLeadPaths: a relative redirect after an in-command cd resolves a
   const absolute = shellWriteLeadPaths('echo hi > /tmp/out.md', '/spawn/cwd');
   assert.deepEqual(absolute[0], ['/tmp/out.md']);
 });
+
+// ── Credential reads are refused, never carded (owner rule 2026-08-07) ──
+test('a credential-touching command is refused outright — an autonomous run is never stopped to be asked', async () => {
+  const { assertCommandAllowed, needsApprovalForShellSmart } = await import('./computer-tools.js');
+
+  // Live 2026-08-07: mid-scrape, Clem tried to read ~/.apify/auth.json. The
+  // run parked for six silent minutes on an approval whose answer is always
+  // no. Refusing costs nothing, keeps the secret out of context entirely, and
+  // steers to the connection that already works.
+  const credentialCommands = [
+    'cat ~/.apify/auth.json',
+    'env | grep -i OPENAI_API_KEY',
+    'cat .env',
+    'security find-generic-password -s composio',
+  ];
+  for (const command of credentialCommands) {
+    assert.throws(
+      () => assertCommandAllowed(command),
+      /Refused: this reads credential material|safety policy/,
+      command,
+    );
+    // …and it is NOT converted into an approval interrupt.
+    assert.equal(
+      await needsApprovalForShellSmart()({}, { command }),
+      false,
+      `${command} must never become an approval`,
+    );
+  }
+
+  // Ordinary work is untouched: no refusal, no new nagging.
+  assert.doesNotThrow(() => assertCommandAllowed('ls ~/Documents'));
+  assert.doesNotThrow(() => assertCommandAllowed('git status'));
+});

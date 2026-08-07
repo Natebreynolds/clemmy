@@ -193,7 +193,9 @@ export function needsApprovalForShellSmart() {
   // truly catastrophic shapes (rm -rf /, sudo, shutdown).
   return async (runContext: unknown, input: unknown): Promise<boolean> => {
     const command = (input && typeof input === 'object' ? (input as Record<string, unknown>).command : undefined);
-    if (typeof command === 'string' && shellCommandTouchesSensitiveData(command)) return true;
+    // Credential-touching commands are REFUSED at execution (assertCommandAllowed),
+    // never turned into an approval — an autonomous run must not be stopped to be
+    // asked a question whose answer is always no.
     if (!shellCommandNeedsApproval(command)) return false;
     // Destructive pattern matched — still honor plan-scope so an
     // approved plan can pre-cover the whole thing.
@@ -207,7 +209,9 @@ function inputTargetsSensitivePath(toolName: string, input: unknown): boolean {
 }
 
 function needsApprovalForReadFile() {
-  return async (_runContext: unknown, input: unknown): Promise<boolean> => inputTargetsSensitivePath('read_file', input);
+  // Reading a secrets file is refused inside the tool (same rule as shell), so
+  // it never becomes an approval either.
+  return async (): Promise<boolean> => false;
 }
 
 export function needsApprovalForWriteFile() {
@@ -565,7 +569,7 @@ function assertOwnStoresProtected(command: string, cwd: string): void {
   }
 }
 
-function assertCommandAllowed(command: string): void {
+export function assertCommandAllowed(command: string): void {
   const normalized = command.toLowerCase().replace(/\s+/g, ' ').trim();
   const denied = [
     /\brm\s+-[^\n;|&]*r[^\n;|&]*f\s+(\/|\$home|~)(\s|$)/,
@@ -582,6 +586,22 @@ function assertCommandAllowed(command: string): void {
   ];
   if (denied.some((pattern) => pattern.test(normalized))) {
     throw new Error('Command denied by Clementine safety policy.');
+  }
+  // CREDENTIAL READS ARE REFUSED, NOT ASKED (owner rule, 2026-08-07: "in
+  // autonomous mode I shouldn't have to approve anything"). Interrupting an
+  // autonomous run to ask "may I read your API token?" is the wrong question:
+  // the answer is always no, and no legitimate flow needs it — every provider
+  // is already brokered through an authenticated connection. Refusing costs
+  // the user nothing, keeps the secret out of the model's context entirely,
+  // and steers to the path that actually works.
+  if (shellCommandTouchesSensitiveData(command)) {
+    throw new Error(
+      'Refused: this reads credential material (API tokens, .env, auth/vault files). '
+      + 'Nothing was executed and no approval is needed — Clementine never needs raw secrets to do work: '
+      + 'the provider connections are already authenticated, so call the toolkit/connection directly '
+      + '(composio_status or the toolkit action itself). For configuration questions use the vault/status '
+      + 'tools, which report what is configured without exposing values.',
+    );
   }
 }
 
@@ -1246,6 +1266,14 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     needsApproval: needsApprovalForReadFile(),
     execute: async (input, runContext, details) => {
       const filePath = resolveAllowedPath(input.path);
+      // Credential material is refused, never asked about (owner rule
+      // 2026-08-07). The secret stays out of the model's context and the
+      // autonomous run is not interrupted for a question with one answer.
+      if (isSensitivePath(filePath)) {
+        return 'Refused: that file holds credential material, and Clementine never needs raw secrets to do work. '
+          + 'Nothing was read and no approval is needed — the provider connections are already authenticated, so use '
+          + 'the connection/toolkit directly (composio_status for configuration state).';
+      }
       if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
       if (!statSync(filePath).isFile()) return `Not a file: ${filePath}`;
       // HTML/HTM are TEXT — read the raw source. A Workspace view is edited AS
@@ -1289,6 +1317,11 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     needsApproval: needsApprovalForReadFile(),
     execute: async (input, runContext, details) => {
       const filePath = resolveAllowedPath(input.path);
+      // Same refusal as read_file — conversion is still a read.
+      if (isSensitivePath(filePath)) {
+        return 'Refused: that file holds credential material, and Clementine never needs raw secrets to do work. '
+          + 'Nothing was read and no approval is needed — use the already-authenticated connection instead.';
+      }
       if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
       if (!statSync(filePath).isFile()) return `Not a file: ${filePath}`;
       const ingested = await ingestAttachment({ name: path.basename(filePath), sourcePath: filePath });
