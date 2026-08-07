@@ -67,7 +67,15 @@ export interface ChatMessage {
    *  window onto a background task, not a turn reply. Carries what the premium
    *  frame needs — a ticking elapsed anchor and the task id for the
    *  watch-the-full-run deep link. */
-  delegated?: { startedAt: number; taskId?: string };
+  delegated?: {
+    startedAt: number;
+    taskId?: string;
+    /** Set while the delegated run is PARKED waiting on an approval. Without
+     *  it the card renders "Working on this…" forever and a run that is
+     *  actually blocked on the user looks identical to one that is busy
+     *  (live 2026-08-07: six silent minutes inside a watched scrape). */
+    awaitingApproval?: { approvalId?: string; subject?: string };
+  };
   /** Mid-run steering: this user message was sent while a run was active and
    *  rides to the model at its next step instead of starting a new turn. */
   steer?: 'pending' | 'delivered' | 'failed';
@@ -967,6 +975,7 @@ export function useChat(options?: UseChatOptions) {
     if (!sid) return;
     return subscribeDelegatedActivity(sid, (ev) => {
       const label = progressLabel(ev);
+      const evData = (ev.data ?? {}) as Record<string, unknown>;
       const taskId = ev.sessionId?.startsWith('background:')
         ? ev.sessionId.slice('background:'.length)
         : undefined;
@@ -988,15 +997,32 @@ export function useChat(options?: UseChatOptions) {
         const cur = prev[idx];
         const before = cur.activity ?? EMPTY_ACTIVITY;
         const activity = reduceActivity(before, ev);
-        if (activity === before && !label) return prev;
+        // A delegated run that parks for approval is BLOCKED ON THE USER, not
+        // working — say so, and clear it the moment the decision lands.
+        const parked = ev.type === 'approval_requested'
+          ? {
+              approvalId: typeof evData.approvalId === 'string' ? evData.approvalId : undefined,
+              subject: typeof evData.subject === 'string' ? evData.subject : undefined,
+            }
+          : undefined;
+        const unparked = ev.type === 'approval_resolved' || ev.type === 'conversation_completed';
+        const delegatedNext = cur.delegated
+          ? {
+              ...cur.delegated,
+              ...(taskId && !cur.delegated.taskId ? { taskId } : {}),
+              ...(parked ? { awaitingApproval: parked } : {}),
+              ...(unparked ? { awaitingApproval: undefined } : {}),
+            }
+          : cur.delegated;
+        const delegatedChanged = delegatedNext !== cur.delegated
+          && JSON.stringify(delegatedNext) !== JSON.stringify(cur.delegated);
+        if (activity === before && !label && !delegatedChanged) return prev;
         const next = [...prev];
         next[idx] = {
           ...cur,
           ...(activity !== before ? { activity } : {}),
           ...(label ? { progress: label } : {}),
-          ...(cur.delegated && !cur.delegated.taskId && taskId
-            ? { delegated: { ...cur.delegated, taskId } }
-            : {}),
+          ...(delegatedChanged ? { delegated: delegatedNext } : {}),
         };
         return next;
       });

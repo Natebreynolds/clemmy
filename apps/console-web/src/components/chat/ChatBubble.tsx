@@ -427,24 +427,48 @@ function DelegatedWorkCard({ message, delegated }: {
   const elapsed = elapsedMin > 0 ? `${elapsedMin}m ${elapsedSec}s` : `${elapsedSec}s`;
   const elapsedTitle = serverStartedAt ? 'time since the task started' : 'time since this live view opened';
   const traceHref = delegated.taskId ? `/tasks?select=${encodeURIComponent(delegated.taskId)}` : '/tasks';
+  // A parked run is blocked on the USER — the elapsed clock keeps ticking, so
+  // saying "working" is the one thing the card must never do here.
+  const parked = Boolean(delegated.awaitingApproval);
   return (
     <div className="flex gap-3">
       <DogMark size={28} className="mt-0.5 self-start" />
       <div className="min-w-0 max-w-[80%] flex-1">
         <div className="rounded-lg rounded-tl-sm border border-primary/30 bg-surface px-4 py-3 shadow-xs">
           <div className="flex items-center gap-2">
-            <span className="h-2 w-2 shrink-0 animate-breathe rounded-full bg-success" aria-hidden />
-            <span className="min-w-0 truncate text-small font-semibold text-fg">Working on this in the background</span>
+            <span
+              className={parked
+                ? 'h-2 w-2 shrink-0 rounded-full bg-warning'
+                : 'h-2 w-2 shrink-0 animate-breathe rounded-full bg-success'}
+              aria-hidden
+            />
+            <span className="min-w-0 truncate text-small font-semibold text-fg">
+              {parked ? 'Paused — waiting on your approval' : 'Working on this in the background'}
+            </span>
             <span className="ml-auto shrink-0 text-caption tabular-nums text-faint" title={elapsedTitle}>{elapsed}</span>
           </div>
-          {message.progress && (
+          {parked ? (
+            <p className="mt-1.5 text-body text-muted">
+              {delegated.awaitingApproval?.subject
+                ? `Nothing is moving until you decide: ${delegated.awaitingApproval.subject}`
+                : 'Nothing is moving until you approve or reject the pending action.'}
+              {' '}
+              <Link to="/inbox" className="font-medium text-primary transition-colors hover:text-primary/80">
+                Review it
+              </Link>
+            </p>
+          ) : message.progress ? (
             <p className="mt-1.5 text-body text-muted">{message.progress}</p>
-          )}
+          ) : null}
           {message.activity && message.activity.length > 0 && (
             <TurnActivity items={message.activity} live />
           )}
           <div className="mt-2.5 flex items-center justify-between gap-3 border-t border-border/60 pt-2">
-            <span className="min-w-0 truncate text-caption text-faint">Reply anytime to steer or adjust — the work picks up your change.</span>
+            <span className="min-w-0 truncate text-caption text-faint">
+              {parked
+                ? 'Approve or reject to let it continue.'
+                : 'Reply anytime to steer or adjust — the work picks up your change.'}
+            </span>
             <Link
               to={traceHref}
               className="inline-flex shrink-0 items-center gap-1 text-caption font-medium text-primary transition-colors hover:text-primary/80"
