@@ -1882,57 +1882,6 @@ export function pendingNestedToolApprovalRequiredError(
   );
 }
 
-// ── Pace awareness (2026-08-07) ──────────────────────────────────────────────
-// A 40-minute run drifted 30 minutes past what the work needed and NOTHING in
-// the system noticed — the user did. Heartbeats prove liveness to the UI but
-// never reach the model, so a run that is dripping items one at a time has no
-// moment of "this is taking too long, change approach or deliver what I have".
-// Fires at most twice per run scope, at coarse thresholds, with the concrete
-// alternatives — informing, never blocking.
-const PACE_THRESHOLDS_MS = [10 * 60_000, 25 * 60_000] as const;
-const paceState = new Map<string, { startedAt: number; emitted: Set<number> }>();
-
-function paceAdvisory(scopeKey: string | undefined, toolCallsSoFar: number): string | null {
-  if (!scopeKey) return null;
-  const now = Date.now();
-  let state = paceState.get(scopeKey);
-  if (!state) {
-    state = { startedAt: now, emitted: new Set() };
-    paceState.set(scopeKey, state);
-    // Bound the map: this is per-run bookkeeping, not a durable ledger.
-    if (paceState.size > 200) {
-      const oldest = paceState.keys().next().value;
-      if (oldest !== undefined && oldest !== scopeKey) paceState.delete(oldest);
-    }
-    return null;
-  }
-  const elapsed = now - state.startedAt;
-  const crossed = [...PACE_THRESHOLDS_MS].reverse().find((t) => elapsed >= t && !state!.emitted.has(t));
-  if (crossed === undefined) return null;
-  // Crossing a HIGHER threshold subsumes every lower one — otherwise a run that
-  // is already 30 minutes deep would emit the 25-minute note, then the
-  // 10-minute note on its next call, and read as nagging.
-  for (const threshold of PACE_THRESHOLDS_MS) {
-    if (threshold <= crossed) state.emitted.add(threshold);
-  }
-  const minutes = Math.round(elapsed / 60_000);
-  return `\n\n[pace] This run has been going ${minutes} minutes (${toolCallsSoFar} tool calls in this scope). `
-    + 'If you are working items ONE AT A TIME, stop and cover the rest in a single pass — one run_tool_program for '
-    + 'same-shape reads, run_batch for same-shape writes, run_worker only where each item needs its own reasoning. '
-    + 'If the remaining work genuinely cannot finish soon, deliver what you already have with the concrete numbers '
-    + 'and say exactly what is left — a partial result now beats a perfect one the user stopped waiting for.';
-}
-
-/** Test seam: pace state is per-process run bookkeeping. */
-export function _resetPaceStateForTests(): void {
-  paceState.clear();
-}
-
-/** Test seam: inspect/age the pace clock without waiting real minutes. */
-export function _paceStateForTests(): Map<string, { startedAt: number; emitted: Set<number> }> {
-  return paceState;
-}
-
 /**
  * Did THIS RUN already create this exact thing?
  *
@@ -3658,9 +3607,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
             classifyExternalWrite(tool.name, parsedInput).shapeKey,
             invokeCallId,
           );
-          const pace = ctx ? paceAdvisory(guardrailScopeKey(ctx), ctx.counter?.calls ?? 0) : null;
           const steer = steerBlockForToolBoundary(ctx?.sessionId);
-          if (repeated || steer || pace) return `${outwardResult}${repeated ?? ''}${pace ?? ''}${steer}`;
+          if (repeated || steer) return `${outwardResult}${repeated ?? ''}${steer}`;
         }
         return outwardResult;
       }, (err) => {
@@ -3932,11 +3880,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
           executeCallId,
         ) ?? '')
       : '';
-    const pace = (typeof outwardResult === 'string' && ctx)
-      ? (paceAdvisory(guardrailScopeKey(ctx), ctx.counter?.calls ?? 0) ?? '')
-      : '';
-    if (fanoutNudge && typeof outwardResult === 'string') return `${outwardResult}\n\n${fanoutNudge}${repeatedCreate}${pace}${steer}`;
-    if ((steer || repeatedCreate || pace) && typeof outwardResult === 'string') return `${outwardResult}${repeatedCreate}${pace}${steer}`;
+    if (fanoutNudge && typeof outwardResult === 'string') return `${outwardResult}\n\n${fanoutNudge}${repeatedCreate}${steer}`;
+    if ((steer || repeatedCreate) && typeof outwardResult === 'string') return `${outwardResult}${repeatedCreate}${steer}`;
     return outwardResult;
     // NOTE: A tool-return truncator used to live here as part of
     // Primitive 6 (v0.5.18 plan). Removed 2026-05-24 because hooks.ts

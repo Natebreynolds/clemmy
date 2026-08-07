@@ -3907,34 +3907,3 @@ test('a repeated CREATE is told it already exists — informed, never blocked', 
   const other = await create('AZ Family Law Firms');
   assert.doesNotMatch(other, /already-created/);
 });
-
-// ── Pace awareness: a long run notices before the user does (2026-08-07) ──
-test('a run that drifts long is told once per threshold, with the concrete alternatives', async () => {
-  const { _resetPaceStateForTests } = await import('./brackets.js');
-  _resetPaceStateForTests();
-  const session = createSession({ id: 'sess-pace', kind: 'chat' });
-  const wrapped = wrapToolForHarness({ name: 'memory_search_facts', execute: async () => 'rows' });
-  const call = () => withHarnessRunContext(
-    { sessionId: session.id, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(50) },
-    () => wrapped.execute!({ query: 'x' }),
-  ) as Promise<string>;
-
-  // The first call establishes the run's clock and says nothing.
-  assert.doesNotMatch(await call(), /\[pace\]/, 'no nagging at the start of a run');
-  assert.doesNotMatch(await call(), /\[pace\]/);
-
-  // Simulate the run having been going 30 minutes (the live shape was 40).
-  const { _paceStateForTests } = await import('./brackets.js') as unknown as {
-    _paceStateForTests?: () => Map<string, { startedAt: number; emitted: Set<number> }>;
-  };
-  if (_paceStateForTests) {
-    for (const state of _paceStateForTests().values()) state.startedAt = Date.now() - 30 * 60_000;
-    const drifted = await call();
-    assert.match(drifted, /\[pace\] This run has been going 30 minutes/);
-    assert.match(drifted, /run_tool_program/, 'names the concrete faster lane');
-    assert.match(drifted, /partial result now beats a perfect one/, 'and the honest fallback');
-    // Said once per threshold — never on every call.
-    assert.doesNotMatch(await call(), /\[pace\]/, 'the advisory does not repeat');
-  }
-  _resetPaceStateForTests();
-});
