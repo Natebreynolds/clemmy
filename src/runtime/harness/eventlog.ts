@@ -396,6 +396,14 @@ export const EVENT_TYPES = [
   // live "what Clem knows going in" frame and the graph's future admission
   // input. Carries {entries, registryAvailable, sourceUserSeq?}.
   'capability_resolution',
+  // What occupied this turn's prompt, split by whether it can be cached.
+  // Per-step prompt cost is paid once per step and therefore ~100x per task,
+  // so the lever on latency is keeping the LARGE part invariant and the
+  // VARIABLE part small — which is only auditable if the split is recorded.
+  // Observation only; it never changes a byte of any prompt. Carries
+  // {lane, totalTokens, stableTokens, variableTokens, stableShare, toolCount,
+  // buckets[], sourceUserSeq?}.
+  'prompt_composition',
   // A file the runtime ACTUALLY wrote (local deliverable). Emitted by the
   // write path after the filesystem write succeeds — runtime truth, not model
   // prose — so drafted emails / reports appear in the live feed as they land

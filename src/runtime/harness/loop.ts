@@ -58,6 +58,7 @@ import {
 import { selectReasoningEffort, dynamicReasoningEnabled, continuationClassifyEnabled } from './reasoning-effort.js';
 import { buildCanonicalContextPack } from './canonical-context.js';
 import { renderCapabilityResolutionForContext } from './capability-resolution.js';
+import { recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
 import {
   renderTurnOpennessForContext,
   resolveTurnOpenness,
@@ -7264,6 +7265,15 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
               ...toolPromptComponents,
             };
       }
+      // Composition as CACHEABILITY (parity with the Claude lane): per-step
+      // prompt cost is paid once per step and ~100x per task, and the lever is
+      // keeping the large part invariant rather than making everything small.
+      // Observation only — this reads what is already being sent.
+      recordPromptComposition(options.sessionId, 'codex', summarizePromptComposition({
+        instructions: value.instructions ?? '',
+        contextPacket: contextPacket.text,
+        currentMessage: typeof options.input === 'string' ? options.input : '',
+      }), sourceUserSeq);
       return value;
     };
     try {

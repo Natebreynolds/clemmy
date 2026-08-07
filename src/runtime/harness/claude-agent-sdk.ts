@@ -33,6 +33,7 @@ import {
 } from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
 import { estimateTokens } from './budget.js';
+import { recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, listEvents, writeToolOutput } from './eventlog.js';
@@ -1698,6 +1699,18 @@ function recordClaudeAgentSdkUsage(
         ? { outputSchema: estimateTokens(JSON.stringify(options.outputSchema)) }
         : {}),
     };
+    // Composition as CACHEABILITY, not just size. Per-step latency is prompt
+    // assembly paid once per step and therefore ~100x per task; the lever is
+    // keeping the large part invariant and the variable part small, which is
+    // only auditable if the split is recorded. Observation only.
+    recordPromptComposition(options.sessionId, 'claude_sdk', summarizePromptComposition({
+      instructions: options.systemAppend,
+      history: priorTranscript,
+      contextPacket: options.turnContext,
+      currentMessage: options.prompt,
+      outputSchema: options.outputSchema ? JSON.stringify(options.outputSchema) : '',
+      toolNames: options.mcpToolAllowlist ?? [],
+    }), options.sourceUserSeq);
     recordModelUsage({
       sessionId: options.sessionId?.trim() || result?.session_id || init?.session_id || 'unknown',
       model: init?.model || options.modelId || 'claude-agent-sdk',
