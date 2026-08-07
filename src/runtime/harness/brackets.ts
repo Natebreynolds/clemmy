@@ -4,6 +4,7 @@ import { isKillRequested, appendEvent, getSession, listEvents, resolveToolOutput
 import { effectiveTurnObjective } from './turn-control.js';
 import { runWithToolAbortSignal } from '../tool-abort-context.js';
 import { withToolOutputContext } from './tool-output-context.js';
+import { steerBlockForToolBoundary } from './steer-notes.js';
 import { exactToolOutputForInvocation } from './tool-output-format.js';
 import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
 import {
@@ -3483,6 +3484,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // exact-args guardrail can tell a progressing status poll from a
         // genuine loop (live 2026-07-23).
         if (ctx) { try { noteGuardrailToolResult(guardrailScopeKey(ctx), tool.name, parsedInput, outwardResult); } catch { /* advisory */ } }
+        // MID-RUN STEERING: deliver any user message that arrived while this
+        // run was working, riding the next tool result (the one channel every
+        // lane's model reads every few seconds). Appended AFTER settlement,
+        // publish detection, and recall credit consumed the clean value, so
+        // steering text can never masquerade as provider output to a gate; the
+        // parked exact-output bytes above are untouched.
+        if (typeof outwardResult === 'string') {
+          const steer = steerBlockForToolBoundary(ctx?.sessionId);
+          if (steer) return `${outwardResult}${steer}`;
+        }
         return outwardResult;
       }, (err) => {
         const shellOutcome = tool.name === 'run_shell_command'
@@ -3741,7 +3752,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
     const outwardResult = unwrapExternalWritePreDispatchResult(result);
     recordPublishIfSucceeded(tool.name, input, outwardResult, shellOutcome);
     creditRecallFromToolResult(ctx?.sessionId, tool.name, input, outwardResult, shellOutcome);
-    if (fanoutNudge && typeof outwardResult === 'string') return `${outwardResult}\n\n${fanoutNudge}`;
+    // MID-RUN STEERING (mirror of the invoke path): deliver any user message
+    // that arrived while this run was working, appended AFTER settlement and
+    // credit consumed the clean value.
+    const steer = typeof outwardResult === 'string' ? steerBlockForToolBoundary(ctx?.sessionId) : '';
+    if (fanoutNudge && typeof outwardResult === 'string') return `${outwardResult}\n\n${fanoutNudge}${steer}`;
+    if (steer && typeof outwardResult === 'string') return `${outwardResult}${steer}`;
     return outwardResult;
     // NOTE: A tool-return truncator used to live here as part of
     // Primitive 6 (v0.5.18 plan). Removed 2026-05-24 because hooks.ts

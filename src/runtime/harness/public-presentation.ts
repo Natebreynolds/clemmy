@@ -480,6 +480,12 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       const input = publicUserInputText(data);
       return input ? { text: input } : null;
     }
+    // Mid-run steering: the user's own words, shown in their own transcript —
+    // same trust class as user_input_received. Delivery markers stay internal.
+    case 'user_steer_note': {
+      const text = typeof data.text === 'string' ? data.text : '';
+      return text ? { text } : null;
+    }
     case 'conversation_completed':
       return terminalData(data, event.sessionId);
     case 'async_work_dispatched':

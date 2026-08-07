@@ -3783,3 +3783,34 @@ test('inside a certified batch a RESOLVED typed refusal re-surfaces as a typed p
       'settlement recorded the honest failed before the typed re-throw');
   });
 });
+
+// ── Mid-run steering (2026-08-07): a user note rides the next tool result ──
+test('a steer note is appended to the next tool result exactly once — settlement and parked bytes stay clean', async () => {
+  const { appendSteerNote } = await import('./steer-notes.js');
+  const session = createSession({ id: 'sess-steer-bracket', kind: 'chat' });
+  const wrapped = wrapToolForHarness({
+    name: 'memory_search_facts',
+    execute: async () => 'fact-a; fact-b',
+  });
+  const run = (label: string) => withHarnessRunContext(
+    {
+      sessionId: session.id,
+      behaviorScopeId: `${session.id}::${label}`,
+      counter: new ToolCallsCounter(10),
+    },
+    () => wrapped.execute!({ query: label }),
+  ) as Promise<string>;
+
+  // Quiet session: byte-identical result.
+  assert.equal(await run('baseline'), 'fact-a; fact-b');
+
+  // The user speaks mid-run → the NEXT result carries their words verbatim.
+  appendSteerNote(session.id, 'only firms in Phoenix and Tucson please');
+  const steered = await run('with-note');
+  assert.match(steered, /^fact-a; fact-b/, 'the tool result itself is untouched at the front');
+  assert.match(steered, /MID-RUN MESSAGE FROM THE USER/);
+  assert.match(steered, /"only firms in Phoenix and Tucson please"/);
+
+  // Exactly once — the following result is clean again.
+  assert.equal(await run('after'), 'fact-a; fact-b');
+});

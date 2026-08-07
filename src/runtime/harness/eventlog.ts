@@ -62,6 +62,11 @@ export const EVENT_TYPES = [
   'handoff',
   'awaiting_user_input',
   'user_input_received',
+  // Mid-run steering (2026-08-07): a user message that arrived while the
+  // session had an active attempt — delivered to the model at the next
+  // tool-result boundary instead of superseding the running work.
+  'user_steer_note',
+  'user_steer_note_delivered',
   // One-release read compatibility for align rows persisted by Clementine 3.5.
   // New turns do not append this event; remove after the upgrade window.
   'turn_preflight_decision',
