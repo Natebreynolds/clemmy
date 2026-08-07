@@ -532,3 +532,26 @@ test('a credential-touching command is refused outright — an autonomous run is
   assert.doesNotThrow(() => assertCommandAllowed('ls ~/Documents'));
   assert.doesNotThrow(() => assertCommandAllowed('git status'));
 });
+
+// ── Blocking sleep is refused (live 2026-08-07: ~5 min of a 40-min run) ──
+test('a command whose only job is waiting is refused; real work that happens to pause is not', async () => {
+  const { assertCommandAllowed, longBlockingSleepSeconds } = await import('./computer-tools.js');
+
+  // The exact live commands.
+  for (const command of ['sleep 75 && echo waited', 'sleep 90 && echo waited', 'sleep 115 && echo waited']) {
+    assert.throws(() => assertCommandAllowed(command), /Refused: this command just waits/, command);
+  }
+  // Poll loops built around sleep are the same waste in a bow.
+  assert.throws(
+    () => assertCommandAllowed('while true; do sleep 30; curl -s https://api.example.test/status; done'),
+    /Refused: this command just waits/,
+  );
+
+  // Real work is untouched, including a short courtesy pause between calls.
+  assert.equal(longBlockingSleepSeconds('sleep 2 && curl -s https://api.example.test/x'), null);
+  assert.doesNotThrow(() => assertCommandAllowed('sleep 2 && curl -s https://api.example.test/x'));
+  assert.doesNotThrow(() => assertCommandAllowed('npm test'));
+  assert.equal(longBlockingSleepSeconds('python3 analyze.py --window 90'), null, 'a number is not a sleep');
+  // Aggregate waits count: three chained sleeps are still just waiting.
+  assert.equal(longBlockingSleepSeconds('sleep 5; sleep 5; sleep 5; echo done'), 15);
+});

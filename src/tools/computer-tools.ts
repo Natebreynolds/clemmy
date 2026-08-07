@@ -569,6 +569,33 @@ function assertOwnStoresProtected(command: string, cwd: string): void {
   }
 }
 
+/**
+ * Seconds a command spends purely waiting, when waiting is ALL it does — a bare
+ * `sleep N` (optionally chained to a trivial echo/true), or a `sleep` inside a
+ * polling loop. Returns null when the command does real work, so a legitimate
+ * short pause between calls is untouched.
+ */
+export function longBlockingSleepSeconds(rawCommand: unknown): number | null {
+  if (typeof rawCommand !== 'string') return null;
+  const command = rawCommand.trim();
+  if (!/\bsleep\s+\d/.test(command)) return null;
+  const total = [...command.matchAll(/\bsleep\s+(\d+(?:\.\d+)?)/g)]
+    .reduce((sum, match) => sum + Number(match[1] ?? 0), 0);
+  if (!Number.isFinite(total) || total < LONG_BLOCKING_SLEEP_SECONDS) return null;
+  // Only refuse when waiting is the POINT: the command is sleep plus nothing
+  // of substance (echo/true/date/printf), or a loop built around sleep.
+  const withoutSleep = command
+    .replace(/\bsleep\s+\d+(?:\.\d+)?/g, ' ')
+    .replace(/\b(?:echo|true|date|printf)\b[^;&|]*/g, ' ')
+    .replace(/[;&|]+/g, ' ')
+    .replace(/["'`]/g, ' ')
+    .trim();
+  const isLoopAroundSleep = /\b(?:while|until|for)\b/.test(command);
+  return withoutSleep.length === 0 || isLoopAroundSleep ? total : null;
+}
+
+const LONG_BLOCKING_SLEEP_SECONDS = 10;
+
 export function assertCommandAllowed(command: string): void {
   const normalized = command.toLowerCase().replace(/\s+/g, ' ').trim();
   const denied = [
@@ -594,6 +621,23 @@ export function assertCommandAllowed(command: string): void {
   // is already brokered through an authenticated connection. Refusing costs
   // the user nothing, keeps the secret out of the model's context entirely,
   // and steers to the path that actually works.
+  // BLOCKING SLEEP IS NEVER THE ANSWER (live 2026-08-07: `sleep 75`, `sleep 90`,
+  // `sleep 115` — ~5 minutes of a 40-minute run spent deliberately doing
+  // nothing while waiting on provider jobs). The harness already watches async
+  // jobs and delivers their real results, and long work belongs in a
+  // background task; blocking the turn burns wall-clock and the tool budget
+  // while producing zero information. Short waits (rate-limit courtesy) still
+  // pass. General: any shell command whose whole job is to wait.
+  const sleepSeconds = longBlockingSleepSeconds(command);
+  if (sleepSeconds !== null) {
+    throw new Error(
+      `Refused: this command just waits ${sleepSeconds}s. Nothing was executed. `
+      + 'Do NOT block on sleep — you cannot learn anything while sleeping, and the wait costs the run real time. '
+      + 'A provider job you started is already being watched: its finished result is delivered to this conversation '
+      + 'automatically, so continue with other work now. If there is nothing else to do until it lands, end the turn '
+      + 'and let the result arrive; if the whole task is long-running, move it to a background task instead.',
+    );
+  }
   if (shellCommandTouchesSensitiveData(command)) {
     throw new Error(
       'Refused: this reads credential material (API tokens, .env, auth/vault files). '
