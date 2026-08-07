@@ -65,6 +65,12 @@ import {
   resolveTurnCapabilities,
 } from './capability-resolution.js';
 import {
+  renderTurnOpennessForContext,
+  resolveTurnOpenness,
+  turnOpennessEnabled,
+  turnOpennessWarranted,
+} from './turn-openness.js';
+import {
   pullRecentTurnsForSession,
   renderRecentActionsForHarnessHistory,
   renderCrossSessionPrefixesForModel,
@@ -1168,14 +1174,37 @@ async function buildClaudeAgentBrainTurnContext(
   // failed before, what has no active connection. Runtime facts as DATA; the
   // model never has to rediscover — or silently trust — its own history.
   let capabilityResolution = '';
+  let resolvedCapabilityEntries: ReadonlyArray<{ kind: string; identifier: string }> = [];
   try {
     const resolved = resolveTurnCapabilities(request.message ?? '');
+    resolvedCapabilityEntries = resolved.entries;
     capabilityResolution = renderCapabilityResolutionForContext(resolved);
     if (preflightSessionKind === 'chat') {
       recordCapabilityResolution(request.sessionId, resolved, opts?.sourceUserSeq);
     }
   } catch {
     capabilityResolution = '';
+  }
+  // WHAT IS STILL OPEN. A separate, cross-family pass over the readings of this
+  // request — the decision to ask cannot be made by the model that is trying to
+  // finish the work, and it cannot be made from the request text alone. Gated
+  // on the runtime's OWN facts rather than on grammar: a turn that resolved real
+  // capabilities is a turn that is about to do something. Fail-open and
+  // time-boxed, so it can inform a turn but never delay or break one.
+  let openness = '';
+  if (
+    preflightSessionKind === 'chat'
+    && turnOpennessEnabled()
+    && capabilityResolution
+    && turnOpennessWarranted(resolvedCapabilityEntries)
+  ) {
+    try {
+      openness = renderTurnOpennessForContext(await resolveTurnOpenness({
+        message: request.message ?? '',
+        capabilityBlock: capabilityResolution,
+        memoryBlock: recall,
+      }));
+    } catch { openness = ''; }
   }
   // Pre-flight error library (parity with the context packet's Known-pitfalls
   // line — this lane doesn't consume the packet): the freshest distilled
@@ -1212,6 +1241,7 @@ async function buildClaudeAgentBrainTurnContext(
       fanoutDirective,
       confirmBeat,
       capabilityResolution,
+      openness,
       pitfalls,
       projectRoutes,
     ].filter(Boolean).join('\n\n'),

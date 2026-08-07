@@ -57,6 +57,13 @@ import {
 } from './session-transcript.js';
 import { selectReasoningEffort, dynamicReasoningEnabled, continuationClassifyEnabled } from './reasoning-effort.js';
 import { buildCanonicalContextPack } from './canonical-context.js';
+import { renderCapabilityResolutionForContext } from './capability-resolution.js';
+import {
+  renderTurnOpennessForContext,
+  resolveTurnOpenness,
+  turnOpennessEnabled,
+  turnOpennessWarranted,
+} from './turn-openness.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import { boundAgentMcpToolScope } from '../mcp-tool-authority.js';
 import { getHarnessBudgetSettings, getElevatedBudget } from './budget-settings.js';
@@ -7142,6 +7149,25 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     },
   });
   const contextPacket = canonicalContext.turn;
+  // WHAT IS STILL OPEN (parity with the Claude lane — one surface, both
+  // brains). A separate cross-family pass over the readings of this request,
+  // gated on the runtime's own resolved capabilities rather than on the
+  // grammar of the sentence. Fail-open and time-boxed: it may inform this turn,
+  // never delay or break it.
+  let opennessBlock = '';
+  if (
+    session.sessionRow.kind === 'chat'
+    && turnOpennessEnabled()
+    && turnOpennessWarranted(contextPacket.capabilityResolution.entries)
+  ) {
+    try {
+      opennessBlock = renderTurnOpennessForContext(await resolveTurnOpenness({
+        message: classifierInput,
+        capabilityBlock: renderCapabilityResolutionForContext(contextPacket.capabilityResolution),
+        memoryBlock: turnMemoryPrimer.text ?? '',
+      }));
+    } catch { opennessBlock = ''; }
+  }
   safeAppend({
     sessionId: options.sessionId,
     turn,
@@ -7298,12 +7324,13 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         ...toolPromptComponents,
       };
 
-      if (contextPacket.text) {
-        promptComponents.contextPacket = estimateTokens(contextPacket.text);
+      const contextPacketText = [contextPacket.text, opennessBlock].filter(Boolean).join('\n\n');
+      if (contextPacketText) {
+        promptComponents.contextPacket = estimateTokens(contextPacketText);
         modelData = {
           input: [
             ...modelData.input,
-            { role: 'system', content: contextPacket.text } as AgentInputItem,
+            { role: 'system', content: contextPacketText } as AgentInputItem,
           ],
           instructions: modelData.instructions,
         };
