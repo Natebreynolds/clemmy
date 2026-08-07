@@ -756,7 +756,15 @@ test('packet makes small-N fan-out imperative when the user explicitly asks for 
   assert.equal(packet.multiItem.itemCount, 5);
   assert.match(packet.text, /Fan-out directive: this turn names 5 independent same-shape/);
   assert.match(packet.text, /Do NOT serialize/);
-  assert.match(packet.text, /do not collapse this into one aggregate program or one inline batch/);
+  // CONTRACT CHANGE (2026-08-07, live 50-firm scrape): the directive used to
+  // forbid "one aggregate program" — the exact recovery the read-fanout rail
+  // REFUSES calls to demand. The model obeyed the directive, called run_worker,
+  // then got blocked mid-run for its own direct reads. The directive now names
+  // the same lane discriminator the rails enforce, so pre-turn guidance and
+  // mid-turn enforcement can never prescribe different tools again.
+  assert.match(packet.text, /run_tool_program covering all 5/, 'same-shape reads → ONE program');
+  assert.match(packet.text, /run_worker with the full 5-item/, 'per-item multi-step → workers');
+  assert.doesNotMatch(packet.text, /do not collapse this into one aggregate program/);
   assert.ok(!/save it as a forEach workflow/.test(packet.text), 'explicit small-N fan-out does not imply workflow offer');
 });
 

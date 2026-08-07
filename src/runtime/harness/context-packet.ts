@@ -202,16 +202,19 @@ export function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8): stri
     return (
       `Fan-out directive: this turn names ${n} independent same-shape${kind} to process. `
       + 'Do NOT serialize them in this context — that balloons tokens and forces the harness to clip your freshly-fetched data mid-run. '
-      + `Resolve any shared tool/connection ONCE, then call run_worker with the full ${n}-item \`items\` array and a workManifest declaring that canonical universe; the harness will execute it in parallel waves of up to ${cappedWaveSize}. `
+      + 'Resolve any shared tool/connection ONCE, then pick the lane by what each item needs: '
+      + `if every item is the SAME shape of read/lookup, write ONE run_tool_program covering all ${n} and return only the distilled rows; `
+      + `if each item needs its own multi-step work or large payloads, call run_worker with the full ${n}-item \`items\` array and a workManifest declaring that canonical universe (parallel waves of up to ${cappedWaveSize}); `
+      + 'if you can bake every item\'s exact arguments now and they are writes, use run_batch. '
       + (n >= 8
         ? 'This is a large/recurring shape: after you finish, offer in ONE line to save it as a forEach workflow — do not create or run a workflow unless the user says yes.'
-        : 'The user explicitly asked for parallel/same-shape execution, so do not collapse this into one aggregate program or one inline batch.')
+        : 'The user explicitly asked for parallel/same-shape execution, so do not drip these one at a time.')
     );
   }
   return (
     `Fan-out hint: this turn names ${n} independent same-shape${kind}. `
     + `If each item needs its own multi-step work or large payloads, fan out with run_worker (one per item, parallel waves of up to ${cappedWaveSize}) to keep this context lean. `
-    + 'If they are quick lookups, just batch the calls in parallel here. Use your judgment.'
+    + 'If they are same-shape lookups, cover them in ONE run_tool_program rather than calling the tool once per item.'
   );
 }
 

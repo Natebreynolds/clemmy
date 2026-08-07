@@ -195,3 +195,39 @@ test('SMOKE: an EXECUTION (background) multi-item turn gets the count-aware dire
   assert.match(modelInputText, /Do NOT serialize/);
   assert.ok(!/Parallelism reminder:/.test(modelInputText), 'the static line is replaced by the directive');
 });
+
+// ── Pre-turn guidance and mid-turn enforcement must never disagree (2026-08-07) ──
+test('the fan-out directive names the SAME recovery lane the read-fanout rail refuses toward', async () => {
+  const { fanoutDirectiveLine } = await import('./context-packet.js');
+  const { buildFanoutRecoveryMessage } = await import('./tool-guardrail.js');
+
+  // Live 2026-08-07 (50-firm Arizona scrape): the directive said "call
+  // run_worker … do not collapse this into one aggregate program"; the rail
+  // then refused her reads demanding ONE run_tool_program. Two subsystems,
+  // opposite instructions, three wasted refusal rounds mid-run.
+  const directive = fanoutDirectiveLine(
+    { isMultiItem: true, itemCount: 50, itemKind: 'firms' } as never,
+  );
+  const refusal = buildFanoutRecoveryMessage({
+    toolName: 'composio_execute_tool',
+    slug: 'APIFY_GET_DATASET_ITEMS',
+    distinct: 6,
+    blockAt: 6,
+  } as never);
+
+  // Whatever tool the refusal prescribes must already be offered by the directive.
+  for (const lane of ['run_tool_program', 'run_worker']) {
+    if (refusal.includes(lane)) {
+      assert.ok(
+        directive.includes(lane),
+        `the rail refuses toward ${lane}, so the pre-turn directive must offer it`,
+      );
+    }
+  }
+  // And the directive must never forbid the rail's own recovery.
+  assert.doesNotMatch(directive, /do not collapse this into one aggregate program/i);
+  // The discriminator itself is what makes the two agree: same-shape reads →
+  // one program; per-item multi-step work → workers.
+  assert.match(directive, /SAME shape of read\/lookup/i);
+  assert.match(directive, /multi-step work/i);
+});
