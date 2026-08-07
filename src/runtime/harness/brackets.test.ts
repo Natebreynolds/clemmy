@@ -3814,3 +3814,61 @@ test('a steer note is appended to the next tool result exactly once — settleme
   // Exactly once — the following result is clean again.
   assert.equal(await run('after'), 'fact-a; fact-b');
 });
+
+// ── Timed-out job starts keep their provider work (2026-08-07 live scrape) ──
+test('a timed-out job-starting call is NOT cancelled, so its late result can self-park', async () => {
+  const { toolCallMayStartProviderJob } = await import('./brackets.js');
+
+  // The predicate is verb-shaped and vendor-agnostic — it must cover job
+  // starters across families, and must NOT cover ordinary reads/writes.
+  for (const [slug, expected] of [
+    ['APIFY_RUN_ACTOR', true],
+    ['APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET', true],
+    ['FIRECRAWL_CRAWL_URLS', true],
+    ['DATAFORSEO_SERP_TASK_POST', true],
+    ['SOMEVENDOR_START_EXPORT', true],
+    ['APIFY_GET_DATASET_ITEMS', false],
+    ['OUTLOOK_CREATE_DRAFT', false],
+    ['GOOGLESHEETS_BATCH_GET', true],
+    ['AIRTABLE_LIST_RECORDS', false],
+  ] as Array<[string, boolean]>) {
+    assert.equal(
+      toolCallMayStartProviderJob('composio_execute_tool', { tool_slug: slug }),
+      expected,
+      slug,
+    );
+  }
+  // Non-external tools never qualify, whatever their name looks like.
+  assert.equal(toolCallMayStartProviderJob('run_shell_command', { command: 'run export' }), false);
+  assert.equal(toolCallMayStartProviderJob('run_worker', { items: [] }), false);
+
+  // The live behavior: a job-starting call that blows its budget still runs to
+  // completion in the background (where its own receipt detection parks it),
+  // while the model gets the corrective immediately.
+  let settledLate = false;
+  let aborted = false;
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    execute: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 260));
+      settledLate = true;                     // the provider answered after the budget
+      return JSON.stringify({ data: { id: 'run_1', status: 'RUNNING' } });
+    },
+  }, { timeoutMs: 60 });                      // budget expires long before the call
+  const session = createSession({ id: 'sess-job-timeout', kind: 'chat' });
+  const out = await withHarnessRunContext(
+    {
+      sessionId: session.id,
+      behaviorScopeId: `${session.id}::turn`,
+      counter: new ToolCallsCounter(10),
+    },
+    () => wrapped.execute!({ tool_slug: 'APIFY_RUN_ACTOR', arguments: '{"actorId":"a~b"}' }),
+  ) as string;
+
+  assert.match(out, /TIMED OUT/, 'the model is told immediately, not left hanging');
+  assert.match(out, /STILL RUNNING and already billed/, 'and told not to pay twice');
+  assert.match(out, /Do NOT start a fresh run/);
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(settledLate, true, 'the provider call was never cancelled — its result can still park');
+  assert.equal(aborted, false);
+});

@@ -584,7 +584,6 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
   | 'behaviorScopeId'
   | 'guardrailScopeId'
   | 'recallBudget'
-  | 'defaultTimeoutMs'
   | 'turnRecallRunIds'
   | 'mcpToolScope'
   | 'dispatchLease'
@@ -609,7 +608,6 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
     // error, the program JSON.parsed it, and 60 accounts of good banked data
     // were declared "malformed" — triggering a full wasteful re-scrape. Program
     // recalls stay bounded by the tool-call counter and program timeout.
-    ...(parent.defaultTimeoutMs ? { defaultTimeoutMs: parent.defaultTimeoutMs } : {}),
     ...(parent.turnRecallRunIds ? { turnRecallRunIds: parent.turnRecallRunIds } : {}),
   };
 }

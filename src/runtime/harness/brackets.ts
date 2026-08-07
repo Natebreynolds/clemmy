@@ -544,6 +544,37 @@ export function isTimeoutSelfCorrectTool(toolName: string): boolean {
   return false;
 }
 
+/**
+ * Slug verbs that START work the provider keeps doing after our HTTP read gives
+ * up — an actor/agent run, a crawl, a scrape, an export, a bulk import.
+ * Deliberately narrow and vendor-agnostic: verbs, never a slug list.
+ */
+const PROVIDER_JOB_START_VERB_RE =
+  /(?:^|_)(?:RUN|RUNS|ACTOR|ACTORS|TASK|TASKS|START|TRIGGER|LAUNCH|CRAWL|SCRAPE|EXPORT|IMPORT|BATCH|JOB|EXECUTE)(?:_|$)/;
+
+/**
+ * Could this call have STARTED provider-side work that outlives our timeout?
+ *
+ * Live 2026-08-07 (50-firm scrape): two Apify runs timed out client-side, kept
+ * running, produced full datasets — and the harness had aborted its own read,
+ * throwing away the response that carried the run id. The work was paid for
+ * twice and fetched zero times. Aborting never stopped the provider; it only
+ * blinded us to what we had already bought.
+ */
+export function toolCallMayStartProviderJob(toolName: string, parsedInput: unknown): boolean {
+  if (!isTimeoutSelfCorrectTool(toolName)) return false;
+  const slug = composioSlugFromToolInput(toolName, parsedInput);
+  if (!slug) return false;
+  return PROVIDER_JOB_START_VERB_RE.test(slug.toUpperCase());
+}
+
+function composioSlugFromToolInput(toolName: string, parsedInput: unknown): string | undefined {
+  if (toolName.startsWith('cx_')) return toolName.slice(3);
+  if (!parsedInput || typeof parsedInput !== 'object') return undefined;
+  const slug = (parsedInput as { tool_slug?: unknown }).tool_slug;
+  return typeof slug === 'string' && slug ? slug : undefined;
+}
+
 /** Pick the self-correcting corrective for a timed-out long-job tool. Reads vs
  *  writes get OPPOSITE advice: a read switches to async START+POLL; a write must
  *  verify-before-retry (it may have landed server-side — re-issuing risks a
@@ -554,9 +585,21 @@ function timeoutCorrectiveFor(toolName: string, parsedInput: unknown, timeoutMs:
   const summary = `exceeded its ${Math.round(timeoutMs / 1000)}s time budget`;
   const where = ` (${toolName})`;
   const { mutating } = classifyExternalWrite(toolName, parsedInput);
-  return mutating
+  const base = mutating
     ? writeJobTimeoutCorrective(toolName, summary, where)
     : asyncJobTimeoutCorrective(toolName, summary, where);
+  // A call that may have STARTED provider-side work is no longer cancelled on
+  // timeout — it keeps running so it can park its own job with the watcher.
+  // Say so, or the model pays for the same work twice (live 2026-08-07).
+  if (!toolCallMayStartProviderJob(toolName, parsedInput)) return base;
+  return [
+    base,
+    'IMPORTANT: this call may have STARTED work on the provider that is STILL RUNNING and already billed. '
+    + 'The harness did NOT cancel it — it is still being watched, and if it produced a job the finished result '
+    + 'will arrive here automatically as a background-task completion. Do NOT start a fresh run of the same work: '
+    + 'that pays for it twice and races two jobs. Continue with other work, or check the provider\'s recent runs '
+    + 'for this job and adopt the one that is already running.',
+  ].join('\n\n');
 }
 
 // ─── S3 orphan ledger + orphaned-write retry corrective ─────────────────────
@@ -1021,10 +1064,6 @@ export interface HarnessRunContext {
   /** Warn-advisory dedupe: (action:rule:tool) tuples already logged as
    *  guardrail_tripped events this run context (2026-07-24 feed-spam fix). */
   guardrailAdvisoryLogged?: Set<string>;
-  /** Cap each tool's wall-clock execution to this. Overrides
-   *  timeoutForTool(name) when set; otherwise the default per-name
-   *  policy applies. */
-  defaultTimeoutMs?: number;
   /** Loop-guard tracker key. When set (only for run_worker sub-agent
    *  runs, behind CLEMMY_WORKER_THRASH_GUARD), each worker's loop
    *  detection counts against its OWN window instead of the shared
@@ -3414,6 +3453,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // ALS into the tool's fetch layer (Composio merges it via AbortSignal.any).
         // onTimeout → ac.abort() so a timed-out call is CANCELLED at the network
         // layer instead of running on and burning provider credits.
+        //
+        // EXCEPT for a call that STARTS provider-side work (an actor run, a
+        // crawl/export): aborting cannot stop the provider — it only discards
+        // the response carrying the job id, so the running job becomes
+        // invisible and its finished output is never fetched. Letting the call
+        // finish in the background costs nothing extra (the work is already
+        // paid for) and lets the tool's OWN receipt detection park the job with
+        // the watcher, which then delivers the real result to this session.
+        const mayStartProviderJob = toolCallMayStartProviderJob(tool.name, parsedInput);
         const ac = new AbortController();
         const start = () => Promise.resolve(withToolOutputContext({
           sessionId: ctx?.sessionId,
@@ -3424,13 +3472,22 @@ export function wrapToolForHarness<T extends WrappableTool>(
           settlementNonce,
         }, () => originalInvoke.call(tt, runContext, input, details)));
         const work = runWithToolAbortSignal(ac.signal, start);
+        if (mayStartProviderJob) {
+          // The harness stops WAITING on it; the promise keeps living so its
+          // late completion can self-park. Swallow its settlement so a late
+          // failure never surfaces as an unhandled rejection.
+          work.catch(() => { /* the model already received the timeout corrective */ });
+        }
         return withTimeout(
           work,
           timeoutMs,
           tool.name,
           {
             isPaused: isPausedFactory(ctx?.sessionId),
-            onTimeout: () => ac.abort(new ToolTimeout(tool.name, timeoutMs)),
+            onTimeout: () => {
+              if (mayStartProviderJob) return;
+              ac.abort(new ToolTimeout(tool.name, timeoutMs));
+            },
           },
         );
       };
