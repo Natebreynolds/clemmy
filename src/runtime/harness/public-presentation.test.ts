@@ -620,3 +620,37 @@ test('the visibility window ships bounded excerpts and glimpses, re-validated', 
   } as never);
   assert.equal((junk?.data as { glimpse?: unknown }).glimpse, undefined, 'a zero-count or malformed glimpse never ships');
 });
+
+test('the compiled turn plan projects as SHAPE only — hashes and graph body stay private', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const row = projectHarnessEventForPublic({
+    sessionId: 's', seq: 9, turn: 0, role: 'system', type: 'turn_graph_compiled',
+    data: {
+      shadow: true, graphId: 'turn-graph:v1:42', graphHash: 'deadbeef', policyHash: 'cafef00d',
+      route: 'act', fastPath: 'fanout_action', nodeCount: 11, edgeCount: 11, compileMs: 3.7,
+      graph: { version: 1, nodes: [{ secret: 'internals' }] },
+    },
+  } as never);
+  assert.ok(row, 'plan shape reaches the public stream');
+  const data = (row as unknown as { data: Record<string, unknown> }).data;
+  assert.equal(data.route, 'act');
+  assert.equal(data.fastPath, 'fanout_action');
+  assert.equal(data.nodeCount, 11);
+  const text = JSON.stringify(row);
+  assert.doesNotMatch(text, /deadbeef|cafef00d|internals|graphHash|policyHash/, 'internals never leak');
+
+  const steer = projectHarnessEventForPublic({
+    sessionId: 's', seq: 10, turn: 0, role: 'user', type: 'user_steer_note',
+    data: { text: 'prioritize Phoenix' },
+  } as never);
+  assert.equal(
+    (steer as unknown as { data?: { text?: string } })?.data?.text,
+    'prioritize Phoenix',
+    'steer notes are the user\'s own words',
+  );
+  const marker = projectHarnessEventForPublic({
+    sessionId: 's', seq: 11, turn: 0, role: 'system', type: 'user_steer_note_delivered',
+    data: { noteSeqs: [10] },
+  } as never);
+  assert.equal(marker, null, 'delivery markers stay internal');
+});

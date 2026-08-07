@@ -374,6 +374,21 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
   // `.+?` strips the whole `mcp__…__` prefix; `[^_]+` stopped at the first `_`.
   const toolLabel = humanToolLabel(tool, d.args, d.publicSlug);
   switch (ev.type) {
+    // The compiled turn plan — the graph making itself legible ("see the
+    // team's plan, not just its motion"). One row at turn start; replaced,
+    // never duplicated, if a retry recompiles.
+    case 'turn_graph_compiled': {
+      const nodeCount = typeof d.nodeCount === 'number' ? d.nodeCount : 0;
+      const fastPath = typeof d.fastPath === 'string' ? d.fastPath : '';
+      if (nodeCount <= 0) return prev;
+      const shape = fastPath === 'fanout_action' ? 'fan-out plan'
+        : fastPath === 'single_action' ? 'action plan'
+        : d.route === 'reply' ? 'reply plan'
+        : 'plan';
+      const label = `Planned: ${shape} · ${nodeCount} steps`;
+      const withoutOld = prev.filter((a) => a.id !== 'turn-plan');
+      return [...withoutOld, { id: 'turn-plan', kind: 'event', label, status: 'done', variant: 'lifecycle', tone: 'muted' }];
+    }
     case 'batch_started': {
       const batchId = typeof d.batchId === 'string' ? d.batchId : `${prev.length}`;
       const total = typeof d.items === 'number' ? d.items : 0;

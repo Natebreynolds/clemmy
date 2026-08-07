@@ -36,7 +36,6 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'conversation_recovery_candidate',
   'cross_session_prefix',
   'agent_context_packet',
-  'turn_graph_compiled',
   'async_work_dispatch_prepared',
   'async_work_dispatch_batch_closed',
   'turn_memory_primer',
@@ -485,6 +484,17 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'user_steer_note': {
       const text = typeof data.text === 'string' ? data.text : '';
       return text ? { text } : null;
+    }
+    // The compiled turn plan, as a SHAPE summary only (2026-08-07, "see the
+    // graph"): route + fast-path + node count let the chat strip show "Plan:
+    // fan-out action · 11 steps" at turn start. Hashes, policy internals, and
+    // the graph body stay private.
+    case 'turn_graph_compiled': {
+      const fastPath = typeof data.fastPath === 'string' ? data.fastPath : '';
+      const route = typeof data.route === 'string' ? data.route : '';
+      const nodeCount = typeof data.nodeCount === 'number' ? data.nodeCount : 0;
+      if (!route || nodeCount <= 0) return null;
+      return { route, fastPath, nodeCount };
     }
     case 'conversation_completed':
       return terminalData(data, event.sessionId);
