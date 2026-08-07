@@ -749,10 +749,30 @@ export function buildAskUserQuestionTool() {
   return tool({
     name: 'ask_user_question',
     description:
-      'Ask the user a question and (normally) pause for the reply. Set `purpose`: "clarification" if you truly '
-      + 'cannot proceed without a fact only the user has, or "approval" if you are seeking sign-off for work already '
-      + 'requested. In YOLO mode an "approval" question does NOT pause — it auto-resolves to "proceed with your best '
-      + 'default" — so use this for genuine clarifications, not to seek permission for work you were already asked to do.',
+      'Ask the user a question and (normally) pause for the reply. This is how you reach the one source of '
+      + 'information nothing else can give you — their intent. Use it as a normal step in doing the work, not as a '
+      + 'last resort.\n'
+      + 'ASK WHEN the ambiguity would materially change what you do: which specific account/base/list/records, the '
+      + 'time window, the destination, the format — anything named but unbound, where two readings of the request '
+      + 'would produce different results. Ask BEFORE committing to that direction, not after; a question that arrives '
+      + 'once the work is done is a report, not a question.\n'
+      + 'ASK ALSO when you have hit a boundary the user has to decide about — the connected tool cannot produce '
+      + 'exactly what they asked for, or a step genuinely requires them (an account, a permission, a credential). '
+      + 'Name the gap and the closest thing you CAN do.\n'
+      + 'DO NOT ASK when you can find out yourself: read the file, list the records, check the connection, consult '
+      + 'your recalled memory. Anything retrievable is not a question. Do not ask about details that would not change '
+      + 'the outcome, and do not re-ask what this session already settled.\n'
+      + 'HOW: if part of the work is unblocked, do that part first, then ask ONE targeted question covering what is '
+      + 'genuinely open. Give 2-5 concrete options when they exist; if you have a recommendation, put it first and '
+      + 'say it is your recommendation. The user can always answer in their own words, so never add an "other" '
+      + 'option. Batch independent questions into one turn; only serialize when a later question truly depends on the '
+      + 'answer to an earlier one.\n'
+      + 'Set `purpose`: "clarification" if you cannot proceed without a fact only the user has, or "approval" if you '
+      + 'are seeking sign-off for work already requested. In autonomous mode an "approval" question does NOT pause — '
+      + 'it auto-resolves to "proceed with your best default" — because permission for work they already asked for is '
+      + 'not a question. A genuine clarification still reaches them.\n'
+      + 'This tool is for direction, not safety: dangerous or irreversible actions are gated separately and never '
+      + 'need a question here.',
     parameters: askUserQuestionParams,
     execute: async (args, runContext) => {
       const sessionId = extractSessionId(runContext);

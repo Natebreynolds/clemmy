@@ -82,6 +82,36 @@ test('resolveHotSet does not inherit the broad legacy JIT core', () => {
   }
 });
 
+// THE ASKING AFFORDANCE (live 2026-08-07). On the schema-on-demand lane the
+// tool for asking the user a question had no schema at turn start, so the model
+// would have had to search for the ability to ask while every tool needed to
+// just start working was already loaded. It never asked. These pins fail if
+// asking is ever pushed back behind discovery on any lane, for any wording.
+test('the ask tool is first-class on a bare turn — asking is never behind a search', () => {
+  _resetHotSetForTest();
+  const hot = resolveHotSet('sess-ask-affordance', 'hello there');
+  assert.ok(hot.has('ask_user_question'), 'ask_user_question must be schema-loaded with no prompting');
+});
+
+test('the ask tool stays first-class for a request that never names a tool', () => {
+  _resetHotSetForTest();
+  // The owner's real message that produced zero questions and went straight to work.
+  const hot = resolveHotSet(
+    'sess-ask-live-fixture',
+    'we started pulling the data for arizona criminal defense firms but still havnt gotten them into a new airtable base can we finalize that',
+  );
+  assert.ok(hot.has('ask_user_question'), 'a consequential ask must not have to earn the right to ask back');
+});
+
+test('the ask tool description teaches WHEN to ask, not just the mechanics', async () => {
+  const { TOOL_REGISTRY: registry } = await import('../tools/tool-registry.js');
+  const entry = registry.find((d) => d.name === 'ask_user_question');
+  assert.ok(entry, 'ask_user_question must stay in the registry');
+  // A one-liner about pausing taught the model nothing about judgment; the
+  // description has to name the trigger, or the affordance goes unused again.
+  assert.match(entry!.description ?? '', /would change what you do|materially/i);
+});
+
 test('resolveHotSet drops LRU names that are not real registry tools', () => {
   _resetHotSetForTest();
   const sid = 'sess-hotset-2';

@@ -32,12 +32,28 @@ export interface CatalogEntry {
  * This is deliberately NOT TOOL_JIT_MANDATED. That older set protects lanes
  * which can only use schemas present at turn start, and has accumulated dozens
  * of incident-specific tools. Reusing it here kept 60+ schemas in every chat
- * prompt even though every deferred tool remained callable. These four tools
- * are the actual acquisition/recovery primitives; structural tools such as
- * ask_user_question, request_approval, and run_worker are assembled separately
- * by the orchestrator.
+ * prompt even though every deferred tool remained callable. These are the
+ * actual acquisition primitives: the ways an agent gets something it does not
+ * already have.
+ *
+ * ASKING THE USER IS ONE OF THEM (live 2026-08-07). The Codex lane assembles
+ * `ask_user_question` unconditionally as a structural tool, so it is always
+ * callable there. The schema-on-demand lane had no such carve-out: the hot set
+ * is the acquisition kernel plus tools the user literally named plus a short
+ * recall/LRU tail, and asking matched none of those — so on the lane the
+ * desktop actually runs, the tool for asking a question had NO SCHEMA at turn
+ * start. To ask, the model would first have had to go SEARCHING for the ability
+ * to ask, while every tool needed to just start working was already loaded. It
+ * chose the loaded path every time, and the ledger shows it: the tool went
+ * unused for days on that lane while the owner watched runs begin with no
+ * conversation. A missing affordance reads as a personality flaw.
+ *
+ * The user is a source of information the repository does not contain, so the
+ * tool that reaches them belongs beside the tools that reach memory and prior
+ * results — first-class on every lane, every turn, never behind a search.
  */
 export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
+  'ask_user_question',
   'memory_recall_all',
   'recall_tool_result',
   'tool_output_query',
