@@ -29,7 +29,7 @@
  *   the scope policy take care of the rest.
  */
 
-import { evaluateAutoApprove, recordAutoApproval, summarizeToolArgs } from './plan-scope.js';
+import { evaluateAutoApprove, isAutoApprovedByScope, recordAutoApproval, summarizeToolArgs } from './plan-scope.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import type { AutoApproveScope } from './proactivity-policy.js';
@@ -557,6 +557,34 @@ export interface ApprovalDecision {
   kind: ToolKind;
 }
 
+/** Verbs whose provider effect is destroying user data. Deliberately NARROW —
+ *  REMOVE/CLEAR/CANCEL are commonly reversible bookkeeping (remove a label,
+ *  clear a filter, respond to an invite) and gating them would re-create the
+ *  over-prompting this wave removes. */
+const DESTRUCTIVE_SLUG_VERBS = new Set(['DELETE', 'TRASH', 'PURGE', 'DESTROY', 'WIPE', 'ERASE', 'DROP']);
+
+function destructiveSlugFromArgs(args: unknown): string | undefined {
+  if (typeof args === 'string') {
+    try { return destructiveSlugFromArgs(JSON.parse(args) as unknown); } catch { return undefined; }
+  }
+  if (!args || typeof args !== 'object') return undefined;
+  const slug = (args as Record<string, unknown>).tool_slug;
+  return typeof slug === 'string' && slug ? slug : undefined;
+}
+
+export function isDestructiveExternalToolCall(toolName: string, args?: unknown): boolean {
+  const slug = destructiveSlugFromArgs(args)
+    ?? (toolName.startsWith('cx_') ? toolName.slice(3).toUpperCase() : undefined);
+  if (slug) {
+    return slug.toUpperCase().split('_').some((token) => DESTRUCTIVE_SLUG_VERBS.has(token));
+  }
+  // Native MCP tool names (mcp__server__sharepoint_delete_item and friends).
+  if (toolName.startsWith('mcp__')) {
+    return toolName.toUpperCase().split('_').some((token) => DESTRUCTIVE_SLUG_VERBS.has(token));
+  }
+  return false;
+}
+
 export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecision {
   const kind = classifyTool(input.toolName, {
     kindHint: input.kindHint,
@@ -587,7 +615,26 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
   if (kind === 'admin') {
     return { needsApproval: true, reason: 'admin', kind };
   }
-  if (input.isDestructiveHint) {
+  // DESTRUCTIVE writes require consent that names them (2026-08-07: a live
+  // draft run deleted a mailbox item with zero gate — deletes classified as
+  // ordinary mutations and YOLO waved them through, while the system prompt
+  // promised users the opposite). A destructive call auto-approves ONLY via
+  // plan-scope: a wildcard/enumerated scope (cron, workflow, card-approved
+  // slug) or an alignment-beat contract whose action families include
+  // 'delete'. Blanket policies (YOLO/workspace) never cover it.
+  const destructiveCall = input.isDestructiveHint === true
+    || isDestructiveExternalToolCall(input.toolName, input.args);
+  if (destructiveCall) {
+    if (isAutoApprovedByScope(input.sessionId, input.toolName, input.args)) {
+      if (input.sessionId) {
+        recordAutoApproval(
+          input.sessionId,
+          input.toolName,
+          `[plan-scope:destructive] kind=${kind} ${summarizeToolArgs(input.toolName, input.args)}`,
+        );
+      }
+      return { needsApproval: false, reason: 'plan-scope', kind };
+    }
     return { needsApproval: true, reason: 'destructive-hint', kind };
   }
   if (kind === 'read') {

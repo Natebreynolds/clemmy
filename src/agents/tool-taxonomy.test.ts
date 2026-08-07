@@ -535,3 +535,70 @@ test('write-validation guard: tonight\'s new tools never open an ungated externa
   assert.equal(classifyTool('produce_document'), 'write');
   assert.equal(classifyTool('workflow_state'), 'write');
 });
+
+// ── Consent-scope wave (2026-08-07): destructive writes need consent that names them ──
+test('a destructive external call never rides YOLO — only a scope that covers it', async () => {
+  const { decideToolApproval, isDestructiveExternalToolCall } = await import('./tool-taxonomy.js');
+  const { openPlanScope, closePlanScope } = await import('./plan-scope.js');
+  setScope('yolo');
+
+  // Live 2026-08-07: OUTLOOK_DELETE_MESSAGE executed with zero gate mid-run.
+  const del = decideToolApproval({
+    sessionId: 'sess-destructive-unscoped',
+    toolName: 'composio_execute_tool',
+    args: { tool_slug: 'OUTLOOK_DELETE_MESSAGE', arguments: '{"message_id":"m1"}' },
+  });
+  assert.equal(del.needsApproval, true, 'an unscoped delete now asks');
+  assert.equal(del.reason, 'destructive-hint');
+
+  // A card-approved scope that ENUMERATES the delete slug is the consent
+  // (the orchestrator opens exactly this scope when the user approves the
+  // card, so answering once covers the run's repeats).
+  const sid = 'sess-destructive-scoped';
+  openPlanScope({
+    sessionId: sid,
+    planProposalId: 'card:cleanup',
+    approvedPlanObjective: 'delete the duplicate outlook drafts',
+    allowedTools: ['composio_execute_tool'],
+    allowedComposioSlugs: ['OUTLOOK_DELETE_MESSAGE'],
+  });
+  const covered = decideToolApproval({
+    sessionId: sid,
+    toolName: 'composio_execute_tool',
+    args: { tool_slug: 'OUTLOOK_DELETE_MESSAGE', arguments: '{"message_id":"m1"}' },
+  });
+  assert.equal(covered.needsApproval, false, 'an enumerated card scope covers the delete');
+  assert.equal(covered.reason, 'plan-scope');
+  closePlanScope(sid, 'test-done');
+
+  // A wildcard scope (launched cron/background/workflow grant) keeps covering
+  // deletes — those lanes were launched as autonomous on purpose.
+  const wild = 'sess-destructive-wildcard';
+  openPlanScope({
+    sessionId: wild,
+    planProposalId: 'cron:cycle',
+    approvedPlanObjective: 'scheduled cycle',
+    allowedTools: ['*'],
+  });
+  const cron = decideToolApproval({
+    sessionId: wild,
+    toolName: 'composio_execute_tool',
+    args: { tool_slug: 'AIRTABLE_DELETE_RECORDS_FOR_TABLE', arguments: '{}' },
+  });
+  assert.equal(cron.needsApproval, false, 'wildcard lanes keep their autonomy');
+  closePlanScope(wild, 'test-done');
+
+  // Non-destructive writes keep today's exact behavior (no new nags).
+  const create = decideToolApproval({
+    sessionId: 'sess-nondestructive',
+    toolName: 'composio_execute_tool',
+    args: { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: '{}' },
+  });
+  assert.equal(create.needsApproval, false, 'creates unchanged');
+
+  // Classifier stays NARROW: reversible bookkeeping verbs are not destructive.
+  assert.equal(isDestructiveExternalToolCall('composio_execute_tool', { tool_slug: 'GMAIL_REMOVE_LABEL' }), false);
+  assert.equal(isDestructiveExternalToolCall('composio_execute_tool', { tool_slug: 'OUTLOOK_DELETE_EVENT' }), true);
+  assert.equal(isDestructiveExternalToolCall('mcp__m365__sharepoint_delete_item', undefined), true);
+  assert.equal(isDestructiveExternalToolCall('cx_outlook_trash_thread', undefined), true);
+});
