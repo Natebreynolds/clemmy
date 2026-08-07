@@ -2250,6 +2250,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // when set (a worker run isolates its own window) else sessionId.
     let fanoutNudge: string | undefined;
     let cacheNudge: string | undefined;
+    let managerNudge: string | undefined;
     try {
       const rawDecision = evaluateToolCall(
         guardrailScopeKey(ctx),
@@ -2692,10 +2693,22 @@ export function wrapToolForHarness<T extends WrappableTool>(
             // legit self-send live 2026-06-22). The send PROCEEDS; record the
             // verdict (fulfills:false, advisory) + a warn-level guardrail so it
             // surfaces for review without breaking the send.
+            //
+            // THE MANAGER SPEAKS (owner ask, 2026-08-07): this verdict used to go
+            // to telemetry only — the judge noticed the drift and the MODEL never
+            // heard it, so a run that wandered off the pinned task just kept
+            // wandering (live: personalized drafts the user never asked for). The
+            // manager's nudge now rides the advisory rail into the tool result:
+            // the work proceeds, and the model is told a colleague-shaped truth —
+            // this may not be what the user asked; consider checking with them.
+            managerNudge = `[manager] A check against the pinned task flagged this step: ${verdict.reason.slice(0, 240)} `
+              + 'The action went through, but it may not be what the user actually asked for. Before going further down '
+              + 'this path, re-read the pinned task; if this direction is not clearly theirs, ask the user in one short '
+              + 'sentence whether it is wanted — do not silently continue a direction they never chose.';
             try {
               appendEvent({
                 sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged',
-                data: { toolName: tool.name, fulfills: false, advisory: true, targets: verdict.targets.slice(0, 5), reason: verdict.reason },
+                data: { toolName: tool.name, fulfills: false, advisory: true, managerNudged: true, targets: verdict.targets.slice(0, 5), reason: verdict.reason },
               });
             } catch { /* telemetry write must never block */ }
             try {
@@ -3237,7 +3250,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if (ctx.codeMode) return reservation ? { reservation } : undefined;
     // All nudges ride the same advisory rail (appended to the tool result by the
     // caller). Combine so a turn that trips several still delivers each.
-    const nudges = [fanoutNudge, cacheNudge, workerFinishNudge].filter(Boolean);
+    const nudges = [fanoutNudge, cacheNudge, workerFinishNudge, managerNudge].filter(Boolean);
     const advisory = nudges.length > 0 ? nudges.join('\n\n') : undefined;
     return advisory || reservation ? { advisory, reservation } : undefined;
   };

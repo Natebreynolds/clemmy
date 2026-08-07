@@ -3907,3 +3907,52 @@ test('a repeated CREATE is told it already exists — informed, never blocked', 
   const other = await create('AZ Family Law Firms');
   assert.doesNotMatch(other, /already-created/);
 });
+
+// ── The manager speaks on advisory drift (owner ask, 2026-08-07) ──
+test('an advisory goal-alignment miss reaches the MODEL as a manager nudge, and the work still proceeds', async () => {
+  const { _setGoalFidelityJudgeForTests, _resetGoalFidelityStateForTests } =
+    await import('./goal-fidelity-gate.js');
+  resetEventLog();
+  _resetGoalFidelityStateForTests();
+  const session = createSession({ kind: 'chat' });
+  // The pinned task the user actually stated (the judge reads it from events).
+  appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Find verified contact emails for each firm and put them in the sheet. Do not draft outreach.' },
+  });
+  // The judge sees the drift (live shape: she started producing outreach the
+  // user never asked for). Zero skills loaded → advisory mode: inform, allow.
+  _setGoalFidelityJudgeForTests(async () => ({
+    fulfills: false,
+    gap: 'the pinned task asks for verified emails in the sheet; this action drafts outreach instead',
+  }));
+  let invoked = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    execute: async () => { invoked += 1; return JSON.stringify({ successful: true, data: { id: 'd1' } }); },
+  });
+  try {
+    const out = await withHarnessRunContext(
+      { sessionId: session.id, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(10) },
+      () => wrapped.execute!(
+        {
+          tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+          arguments: JSON.stringify({ to_email: 'lead@firm.example', subject: 'intro', body: 'outreach draft' }),
+        },
+        { context: { sessionId: session.id } },
+        { toolCall: { callId: 'call-drift-1' } },
+      ),
+    ) as string;
+
+    assert.equal(invoked, 1, 'advisory means the action PROCEEDS — inform, never block');
+    assert.match(out, /\[manager\]/, 'the judge\'s observation reaches the model, not just telemetry');
+    assert.match(out, /drafts outreach instead/, 'with the SPECIFIC drift named');
+    assert.match(out, /ask the user in one short sentence/, 'and the colleague-shaped recovery');
+    const judged = listEvents(session.id, { types: ['goal_alignment_judged'] });
+    assert.equal(judged.length >= 1, true);
+    assert.equal(judged[judged.length - 1].data.managerNudged, true, 'telemetry records that the nudge was delivered');
+  } finally {
+    _setGoalFidelityJudgeForTests(null);
+    _resetGoalFidelityStateForTests();
+  }
+});
