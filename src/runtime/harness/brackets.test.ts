@@ -3872,3 +3872,38 @@ test('a timed-out job-starting call is NOT cancelled, so its late result can sel
   assert.equal(settledLate, true, 'the provider call was never cancelled — its result can still park');
   assert.equal(aborted, false);
 });
+
+// ── Knowing what it already built this run (2026-08-07 double table) ──
+test('a repeated CREATE is told it already exists — informed, never blocked', async () => {
+  const session = createSession({ id: 'sess-repeat-create', kind: 'chat' });
+  let dispatches = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    execute: async () => {
+      dispatches += 1;
+      return JSON.stringify({ successful: true, data: { id: `tbl_${dispatches}` } });
+    },
+  });
+  let callSeq = 0;
+  const create = (name: string) => withHarnessRunContext(
+    { sessionId: session.id, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(20) },
+    () => wrapped.execute!(
+      { tool_slug: 'AIRTABLE_CREATE_TABLE', arguments: JSON.stringify({ baseId: 'appX', name }) },
+      { context: { sessionId: session.id } },
+      { toolCall: { callId: `call-${++callSeq}` } },
+    ),
+  ) as Promise<string>;
+
+  const first = await create('AZ Criminal Defense Attorneys');
+  assert.doesNotMatch(first, /already-created/, 'the first creation is clean');
+
+  // The live shape: same table, created again a few steps later.
+  const second = await create('AZ Criminal Defense Attorneys');
+  assert.match(second, /\[already-created\]/, 'the repeat is named immediately');
+  assert.match(second, /reuse the object you already created/);
+  assert.equal(dispatches, 2, 'advisory only — a create is never blocked');
+
+  // A DIFFERENT table is ordinary new work, never flagged.
+  const other = await create('AZ Family Law Firms');
+  assert.doesNotMatch(other, /already-created/);
+});

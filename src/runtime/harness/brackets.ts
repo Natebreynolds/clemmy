@@ -1882,6 +1882,58 @@ export function pendingNestedToolApprovalRequiredError(
   );
 }
 
+/**
+ * Did THIS RUN already create this exact thing?
+ *
+ * Duplicate detection is a hard gate for irreversible SENDS only — a create is
+ * mutating but reversible, so nothing ever told the model it was repeating
+ * itself. Live 2026-08-07: mid-scrape she created the Airtable table, lost
+ * track of it, and tried to create the same table again; only Airtable's own
+ * rejection stopped it, and the user could not find the table that DID exist.
+ *
+ * Advisory by construction (guardrails inform, they don't override): 50
+ * legitimate record-creates must still flow, so this never blocks — it hands
+ * back the fact plus the prior call id so the model can reuse what it built.
+ */
+function repeatedCreationAdvisory(
+  sessionId: string | undefined,
+  toolName: string,
+  parsedInput: unknown,
+  shapeKey: string | undefined,
+  /** THIS call's id — its own settlement is already in the ledger by the time
+   *  this runs, and a call is never a repeat of itself. */
+  currentCallId: string | undefined,
+): string | null {
+  if (!sessionId || !shapeKey) return null;
+  const actionKey = canonicalExternalWriteActionKey(toolName, shapeKey);
+  if (!/(?:^|[:_])(?:CREATE|ADD|INSERT|NEW)(?:[:_]|$)/i.test(actionKey)) return null;
+  const identityKeys = externalWriteDuplicateIdentityKeys(
+    extractDuplicateIdentityKeys(parsedInput),
+    externalWriteSemanticFingerprint(actionKey, parsedInput),
+  );
+  if (identityKeys.length === 0) return null;
+  try {
+    const priorSuccess = listEvents(sessionId, { types: ['external_write_succeeded'] }).find((event) => {
+      const data = event.data as {
+        actionKey?: string; shapeKey?: string; toolName?: string;
+        duplicateIdentityKeys?: string[]; callId?: string; canonicalCallId?: string;
+      };
+      if (currentCallId && (data.callId === currentCallId || data.canonicalCallId === currentCallId)) return false;
+      const priorAction = data.actionKey
+        ?? canonicalExternalWriteActionKey(data.toolName, data.shapeKey);
+      if (priorAction !== actionKey) return false;
+      return (data.duplicateIdentityKeys ?? []).some((key) => identityKeys.includes(key));
+    });
+    if (!priorSuccess) return null;
+    const at = priorSuccess.createdAt ? ` (at ${String(priorSuccess.createdAt).slice(11, 19)})` : '';
+    return `\n\n[already-created] You already completed this exact ${actionKey} earlier in THIS run${at} — it exists. `
+      + 'Do not treat this as new work: reuse the object you already created (its id is in that earlier result) '
+      + 'and tell the user where it lives rather than creating another.';
+  } catch {
+    return null;
+  }
+}
+
 function assertNoDuplicateExternalWrite(input: {
   sessionId: string;
   toolName: string;
@@ -3548,8 +3600,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // steering text can never masquerade as provider output to a gate; the
         // parked exact-output bytes above are untouched.
         if (typeof outwardResult === 'string') {
+          const repeated = repeatedCreationAdvisory(
+            ctx?.sessionId,
+            tool.name,
+            parsedInput,
+            classifyExternalWrite(tool.name, parsedInput).shapeKey,
+            invokeCallId,
+          );
           const steer = steerBlockForToolBoundary(ctx?.sessionId);
-          if (steer) return `${outwardResult}${steer}`;
+          if (repeated || steer) return `${outwardResult}${repeated ?? ''}${steer}`;
         }
         return outwardResult;
       }, (err) => {
@@ -3809,12 +3868,20 @@ export function wrapToolForHarness<T extends WrappableTool>(
     const outwardResult = unwrapExternalWritePreDispatchResult(result);
     recordPublishIfSucceeded(tool.name, input, outwardResult, shellOutcome);
     creditRecallFromToolResult(ctx?.sessionId, tool.name, input, outwardResult, shellOutcome);
-    // MID-RUN STEERING (mirror of the invoke path): deliver any user message
-    // that arrived while this run was working, appended AFTER settlement and
-    // credit consumed the clean value.
+    // MID-RUN STEERING + already-created advisory (mirror of the invoke path):
+    // both are appended AFTER settlement and credit consumed the clean value.
     const steer = typeof outwardResult === 'string' ? steerBlockForToolBoundary(ctx?.sessionId) : '';
-    if (fanoutNudge && typeof outwardResult === 'string') return `${outwardResult}\n\n${fanoutNudge}${steer}`;
-    if (steer && typeof outwardResult === 'string') return `${outwardResult}${steer}`;
+    const repeatedCreate = typeof outwardResult === 'string'
+      ? (repeatedCreationAdvisory(
+          ctx?.sessionId,
+          tool.name,
+          input,
+          classifyExternalWrite(tool.name, input).shapeKey,
+          executeCallId,
+        ) ?? '')
+      : '';
+    if (fanoutNudge && typeof outwardResult === 'string') return `${outwardResult}\n\n${fanoutNudge}${repeatedCreate}${steer}`;
+    if ((steer || repeatedCreate) && typeof outwardResult === 'string') return `${outwardResult}${repeatedCreate}${steer}`;
     return outwardResult;
     // NOTE: A tool-return truncator used to live here as part of
     // Primitive 6 (v0.5.18 plan). Removed 2026-05-24 because hooks.ts
