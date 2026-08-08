@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { loadToolContract, saveToolContract } from './tool-contract-store.js';
 /**
  * In-memory cache of Composio action input schemas, keyed by tool slug.
  *
@@ -45,6 +46,9 @@ export function rememberToolSchema(toolSlug: string, inputParameters: unknown): 
   // Refresh insertion order so hot slugs survive the size cap.
   cache.delete(toolSlug);
   cache.set(toolSlug, { schema: inputParameters, cachedAt: Date.now() });
+  // Learn it once, keep it forever: the same deposit that warms this session
+  // also survives the restart, so discovery is paid a single time per tool.
+  saveToolContract({ identifier: toolSlug, schema: inputParameters });
   while (cache.size > MAX_ENTRIES) {
     const oldest = cache.keys().next().value;
     if (oldest === undefined) break;
@@ -61,15 +65,23 @@ export function rememberToolSchemas(
   }
 }
 
-/** Fetch a live (non-expired) schema, or null. */
+/** Fetch a live (non-expired) schema, or null.
+ *
+ * Falls through to the DURABLE contract store on a miss. Before that, this map
+ * died with the process, so a restart re-paid discovery for tools used a
+ * hundred times before — and discovery is not a cheap HTTP call at that point,
+ * it is a full model round trip mid-run. Measured live: fifteen discovery calls
+ * inside a forty-eight-call run that needed about four. Disk is the difference
+ * between learning a tool once and learning it every session. */
 export function getCachedToolSchema(toolSlug: string): Record<string, unknown> | null {
   const hit = cache.get(toolSlug);
-  if (!hit) return null;
-  if (Date.now() - hit.cachedAt > SCHEMA_TTL_MS) {
-    cache.delete(toolSlug);
-    return null;
-  }
-  return hit.schema;
+  if (hit && Date.now() - hit.cachedAt <= SCHEMA_TTL_MS) return hit.schema;
+  if (hit) cache.delete(toolSlug);
+  const durable = loadToolContract(toolSlug);
+  if (!durable) return null;
+  // Promote back into the hot map so the rest of the session pays nothing.
+  cache.set(toolSlug, { schema: durable.schema, cachedAt: Date.now() });
+  return durable.schema;
 }
 
 /**
@@ -118,6 +130,13 @@ export async function ensureToolSchema(toolSlug: string): Promise<Record<string,
   return getCachedToolSchema(toolSlug);
 }
 
+/** Test hook: how many entries the PROCESS cache currently holds — the size
+ *  cap is a memory bound, and asserting it through the public getter no longer
+ *  works now that a durable contract can answer for an evicted entry. */
+export function inMemorySchemaCount(): number {
+  return cache.size;
+}
+
 /** Test hook. */
 export function resetToolSchemaCache(): void {
   cache.clear();
@@ -132,7 +151,15 @@ export function resetToolSchemaCache(): void {
  * (learning fails closed; retrieval cannot prove a mismatch and serves).
  */
 export function liveComposioSchemaFingerprint(toolSlug: string): string | undefined {
-  const schema = getCachedToolSchema(toolSlug);
+  // Deliberately reads the PROCESS cache only, never the durable store. This
+  // digest is what lets a proven procedure be learned, and learning must fail
+  // CLOSED on a restart: a contract recovered from disk proves we once saw the
+  // schema, not that the provider still serves it. Validation may lean on the
+  // durable copy (it can only ever make a local check more precise); learning
+  // may not. Conflating the two would let a stale on-disk contract mint a
+  // proven procedure nobody re-verified.
+  const hit = cache.get(toolSlug);
+  const schema = hit && Date.now() - hit.cachedAt <= SCHEMA_TTL_MS ? hit.schema : null;
   if (!schema) return undefined;
   const canonical = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(canonical);

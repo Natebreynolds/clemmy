@@ -1,4 +1,5 @@
-import { rememberToolSchema, rememberToolSchemas, getCachedToolSchema, resetToolSchemaCache } from './composio-schema-cache.js';
+import { rememberToolSchema, rememberToolSchemas, getCachedToolSchema, resetToolSchemaCache, inMemorySchemaCount } from './composio-schema-cache.js';
+import { _clearToolContractsForTests } from './tool-contract-store.js';
 
 // remember → get round-trip
 {
@@ -55,17 +56,34 @@ import { rememberToolSchema, rememberToolSchemas, getCachedToolSchema, resetTool
   }
 }
 
-// size cap holds (oldest evicted, hot entries survive via re-insertion)
+// size cap holds (oldest evicted from MEMORY, hot entries survive re-insertion)
+//
+// The cap bounds MEMORY in a long-lived daemon; forgetting how to call a tool
+// was never the goal, it was a side effect. Now that a contract also lands on
+// disk, an entry pushed out of the map is still recallable — which is the
+// point: discovery is paid once per tool, not once per session. So this asserts
+// the memory bound directly, and the durable store is cleared first so the
+// assertion cannot be satisfied by a leftover contract from another test run.
 {
   resetToolSchemaCache();
+  _clearToolContractsForTests();
   for (let i = 0; i < 520; i++) {
     rememberToolSchema(`SLUG_${i}`, { type: 'object', idx: i });
   }
-  if (getCachedToolSchema('SLUG_0') !== null) {
-    throw new Error('Oldest entry should have been evicted past the cap');
+  if (inMemorySchemaCount() > 500) {
+    throw new Error('In-memory cache must stay within its size cap');
   }
   if (!getCachedToolSchema('SLUG_519')) {
     throw new Error('Newest entry must survive the cap');
+  }
+  // Evicted from memory, still known: the durable contract answers for it.
+  if (!getCachedToolSchema('SLUG_0')) {
+    throw new Error('An entry evicted from memory must still be recallable from the durable store');
+  }
+  _clearToolContractsForTests();
+  resetToolSchemaCache();
+  if (getCachedToolSchema('SLUG_0') !== null) {
+    throw new Error('With the durable store cleared, an evicted entry must be genuinely gone');
   }
 }
 
