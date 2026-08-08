@@ -951,6 +951,36 @@ interface ConstraintGateResult {
   routeConnectedAccountId?: string;
 }
 
+/**
+ * The ROUTE half of the standing-constraint gate: pure, no I/O, no resolved
+ * account. It answers "is this tool allowed to be reached at all", which is a
+ * question about the RULE, not about the provider's health.
+ *
+ * Separated so it can run before any connection or identity probe. Live
+ * 2026-08-08: a pinned dispatch constraint forbids Composio Salesforce and names
+ * the local sf CLI as the only route — and the user's rule says in terms never
+ * to ask for a Composio reconnect. The gate never got to speak: the connection
+ * probe found the (deliberately) dead connector first and emitted exactly the
+ * forbidden sentence. A rule that forbids a route makes that route's health and
+ * its account ambiguity irrelevant, so the rule must be asked first.
+ *
+ * Sender resolution stays behind in enforceStandingConstraints — it needs live
+ * connections and a profile probe, so it cannot move and does not need to.
+ */
+function routeConstraintBlock(
+  toolSlug: string,
+  args: Record<string, unknown>,
+): string | null {
+  // `emailHandledExternally` stays true: the mailbox rule is resolved by
+  // findEmailSendConstraint during sender resolution, exactly as before. This
+  // call is only the pattern-based ROUTE prohibition.
+  const violation = checkConstraintViolation('composio_execute_tool', {
+    ...args,
+    action: toolSlug,
+  }, { emailHandledExternally: true });
+  return violation ? formatConstraintEscalation(violation) : null;
+}
+
 async function enforceStandingConstraints(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -988,11 +1018,11 @@ async function enforceStandingConstraints(
     }
   }
 
-  const violation = checkConstraintViolation('composio_execute_tool', {
-    ...args,
-    action: toolSlug,
-  }, { emailHandledExternally: true });
-  if (violation) return { block: formatConstraintEscalation(violation) };
+  // The route prohibition already ran at the top of resolveComposioDispatch,
+  // before any connection probe. Re-checking here is harmless but redundant —
+  // and leaving it as the ONLY check is what let a dead connector answer first.
+  const routeBlock = routeConstraintBlock(toolSlug, args);
+  if (routeBlock) return { block: routeBlock };
 
   return { block: null, routeConnectedAccountId };
 }
@@ -1476,6 +1506,23 @@ export async function resolveComposioDispatch(
     ? String((args as Record<string, unknown>).account_alias).trim()
     : undefined;
   delete (args as Record<string, unknown>).account_alias;
+
+  // ROUTE PROHIBITION FIRST — before connection health, before identity.
+  //
+  // Every gateway answer below this line describes the state of a PROVIDER:
+  // not connected, ambiguous account, unauthorized CLI default. None of those
+  // are true answers when a standing rule says this provider is not the route
+  // at all. Asked in the wrong order, a deliberately-dead connector reports
+  // itself as the blocker and asks the user to revive it — which is the one
+  // thing the rule that would have redirected the call explicitly forbids.
+  //
+  // Pure and I/O-free, so it costs nothing to ask first, and it covers the
+  // nested call_tool path because every dispatch funnels through here.
+  const routeBlock = routeConstraintBlock(toolSlug, args as Record<string, unknown>);
+  if (routeBlock) {
+    emitComposioGatewayBlock(sid, toolSlug, 'constraint');
+    return { ok: false, reason: 'constraint', message: routeBlock, toolkit };
+  }
 
   // The published CLI has no connected-account selector on execute. Its
   // `whoami` response proves only that a CLI session exists; it proves neither

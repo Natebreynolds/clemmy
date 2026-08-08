@@ -48,6 +48,7 @@ const { deleteToolChoice, rememberToolChoice } = await import('../memory/tool-ch
 const { createSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const { rememberAccountAlias, resolveAccountAlias } = await import('../memory/account-alias-store.js');
 const { recordIdentityProbe } = await import('../integrations/composio/identity-cache.js');
+const { rememberFact, forgetFact } = await import('../memory/facts.js');
 const {
   grantComposioCliDefaultAccountAuthority,
   revokeComposioCliDefaultAccountAuthority,
@@ -1002,4 +1003,97 @@ test('a disconnected sticky account falls back to the ask — never a stale rout
       assert.equal(out.reason, 'ambiguous-account');
     }
   });
+});
+
+// ── ROUTE PROHIBITION OUTRANKS PROVIDER HEALTH ────────────────────────────────
+//
+// Live 2026-08-08: a pinned dispatch constraint forbade Composio Salesforce and
+// named the local sf CLI as the only route. The gateway answered
+// "not-connected — reconnect salesforce in Connect" instead, which is the exact
+// sentence that same rule forbids, because connection health was probed before
+// the rule was consulted. The guard itself was correct and simply never ran.
+//
+// These pin the ORDER, not the guard: a rule that forbids a route must be asked
+// before any question about that route's health or account ambiguity, since
+// neither is a true answer once the route itself is off-limits.
+
+/** The shape checkSingleConstraint compiles into a deterministic dispatch rule. */
+const SF_CLI_ONLY_RULE =
+  'ALWAYS call Salesforce via the local sf CLI (run_shell_command with `sf data query --json`), '
+  + 'NEVER via the Composio Salesforce toolkit. The Composio Salesforce connection is expired/dead.';
+
+test('a dispatch constraint outranks not-connected: a deliberately dead connector never asks for a reconnect', async () => {
+  const rule = rememberFact({ kind: 'constraint', content: SF_CLI_ONLY_RULE });
+  const sid = createSession({ kind: 'chat' }).id;
+  // Zero usable Salesforce connections — precisely the live condition. Before
+  // the hoist this returned 'not-connected' and told the user to reconnect.
+  setAccounts([]);
+  try {
+    const out = await resolveComposioDispatch(
+      'SALESFORCE_RUN_SOQL_QUERY',
+      { query: 'SELECT Id, Name FROM Account LIMIT 5' },
+      undefined,
+      { sessionId: sid },
+    );
+    assert.equal(out.ok, false);
+    if (!out.ok) {
+      assert.equal(out.reason, 'constraint', 'the RULE answers, not the dead connection');
+      assert.match(out.message, /sf CLI/i, 'the block names the route that does work');
+      assert.doesNotMatch(
+        out.message,
+        /reconnect/i,
+        'never ask to revive a connector the user intentionally abandoned',
+      );
+    }
+    const gw = listEvents(sid, { types: ['guardrail_tripped'] }).filter((e) => {
+      const d = (e as { data?: unknown }).data as Record<string, unknown> | undefined
+        ?? JSON.parse((e as unknown as { data_json?: string }).data_json ?? '{}');
+      return d?.guardrail === 'composio_gateway';
+    });
+    assert.equal(gw.length, 1, 'exactly one ledgered gateway block');
+    const reason = ((gw[0] as { data?: Record<string, unknown> }).data
+      ?? JSON.parse((gw[0] as unknown as { data_json?: string }).data_json ?? '{}')).reason;
+    assert.equal(reason, 'constraint', 'the ledger records the rule, not a connection fault');
+  } finally {
+    forgetFact(rule.id, { hard: true });
+  }
+});
+
+test('a dispatch constraint outranks ambiguous-account: a forbidden route is never a choice to offer', async () => {
+  const rule = rememberFact({ kind: 'constraint', content: SF_CLI_ONLY_RULE });
+  const sid = createSession({ kind: 'chat' }).id;
+  // Two live Salesforce connections would normally raise NEEDS-YOUR-CHOICE.
+  // Asking which forbidden account to use is still the wrong question.
+  setAccounts([
+    account('ca_sf_prod', 'salesforce', 'nate@corp.example'),
+    account('ca_sf_alt', 'salesforce', 'alt@corp.example'),
+  ]);
+  try {
+    const out = await resolveComposioDispatch(
+      'SALESFORCE_RUN_SOQL_QUERY',
+      { query: 'SELECT Id FROM Account' },
+      undefined,
+      { sessionId: sid },
+    );
+    assert.equal(out.ok, false);
+    if (!out.ok) {
+      assert.equal(out.reason, 'constraint');
+      assert.doesNotMatch(
+        out.message,
+        /NEEDS-YOUR-CHOICE/,
+        'the user is not asked to pick between accounts on a route they forbade',
+      );
+    }
+  } finally {
+    forgetFact(rule.id, { hard: true });
+  }
+});
+
+test('with no dispatch constraint the gateway still reports provider health honestly', async () => {
+  // The hoist must not swallow real connection faults — without a matching rule
+  // the not-connected answer is the TRUE one and must survive unchanged.
+  setAccounts([]);
+  const out = await resolveComposioDispatch('SALESFORCE_RUN_SOQL_QUERY', {}, undefined, {});
+  assert.equal(out.ok, false);
+  if (!out.ok) assert.equal(out.reason, 'not-connected');
 });
