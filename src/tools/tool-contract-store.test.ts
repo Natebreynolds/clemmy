@@ -87,6 +87,35 @@ test('a working example survives a schema refresh — losing it re-opens the fai
   assert.equal(loaded!.exampleArgs!.isDraft, true);
 });
 
+test('a SUCCESSFUL call teaches the shape; a failed one teaches nothing', async () => {
+  // The learning guards elsewhere decide whether a slug becomes the proven
+  // answer for an INTENT — a much stricter question than "what does a valid
+  // payload look like". Shape capture must not inherit those guards, or the
+  // example is missing exactly when it would have helped.
+  const { maybeAutoRememberComposioChoice } = await import('./composio-tools.js');
+  await maybeAutoRememberComposioChoice(
+    'OUTLOOK_CREATE_DRAFT',
+    { to: 'christian@inmanandstadler.com', subject: 'Q3 traffic', isDraft: true },
+    { successful: true, data: { id: 'draft-1' } },
+    undefined,
+  );
+  const learned = loadToolContract('OUTLOOK_CREATE_DRAFT');
+  assert.ok(learned?.exampleArgs, 'a success must leave a known-good call shape behind');
+  assert.ok('to' in learned!.exampleArgs!, 'the keys are the recipe');
+  assert.doesNotMatch(JSON.stringify(learned!.exampleArgs), /christian|Q3 traffic/i,
+    'and still no content, on the path that runs against real mail');
+
+  _clearToolContractsForTests();
+  await maybeAutoRememberComposioChoice(
+    'OUTLOOK_UPDATE_EMAIL',
+    { message_id: 'x' },
+    { successful: false, error: 'invalid arguments' },
+    undefined,
+  );
+  assert.equal(loadToolContract('OUTLOOK_UPDATE_EMAIL'), null,
+    'a failed call must never be recorded as the way to call something');
+});
+
 test('a corrupt or missing contract reads as no opinion, never as a throw', () => {
   assert.equal(loadToolContract('NEVER_SAVED'), null);
   assert.equal(loadToolContract(''), null);

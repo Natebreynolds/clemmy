@@ -66,6 +66,7 @@ import { rememberAccountAlias, resolveAccountAlias, aliasLabelFor } from '../mem
 import { cachedIdentityEmail, identityProbeAttempted, recordIdentityProbe } from '../integrations/composio/identity-cache.js';
 import { validateComposioArgs, formatBatchValidationError, applyEmailRecipientAliases } from './composio-batch-validator.js';
 import { rememberToolSchema, getCachedToolSchema, ensureToolSchema } from './composio-schema-cache.js';
+import { saveToolContract } from './tool-contract-store.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import { composioSlugIsReadOnly } from '../integrations/composio/slug-effect.js';
@@ -841,6 +842,23 @@ export async function maybeAutoRememberComposioChoice(
     // (that would teach "task_post = the answer" when it only QUEUES). The real
     // outcome is decided when the result is fetched. Guarded by the same kill-switch.
     if (!failed && composioAsyncResolveEnabled() && detectJobReceipt(toolSlug, result)) return;
+    // A call that WORKED is the only honest example of how to call this tool.
+    // Recorded before every learning guard below, and independent of them: those
+    // guards decide whether this slug becomes the proven answer for an INTENT,
+    // which is a different and much stricter question than "what does a valid
+    // payload for this slug look like". Live 2026-08-07: an OUTLOOK update failed
+    // with invalid arguments on a tool already used successfully in the same run —
+    // the schema said what was legal, and nothing said what had worked. Shape
+    // only; the store redacts every value that could carry content.
+    if (!failed) {
+      try {
+        saveToolContract({
+          identifier: toolSlug,
+          schema: getCachedToolSchema(toolSlug) ?? { type: 'object' },
+          exampleArgs: args,
+        });
+      } catch { /* learning an example must never affect the call that succeeded */ }
+    }
     const sid = sessionId;
     const pending = sid ? lastComposioSearchBySession.get(sid) : undefined;
     const pendingFresh = Boolean(pending && Date.now() - pending.at <= AUTO_REMEMBER_WINDOW_MS);
