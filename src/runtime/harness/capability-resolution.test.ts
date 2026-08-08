@@ -11,6 +11,35 @@
  * silently vanishing while the model asks the user to approve a plan that
  * assumes it.
  */
+import { test as _warmTest } from 'node:test';
+import _warmAssert from 'node:assert/strict';
+
+// WARMING. The resolution names the proven tools before the model moves, and
+// the model then spent 15 of 48 calls searching for those very tools (live
+// 2026-08-07) — because a name arrives as prose while the argument schema does
+// not. Fetching a schema is I/O, not a decision, so it belongs here, off the
+// critical path. These hold the two properties that make that safe: it never
+// delays the turn, and it never spends a fetch on a path the runtime already
+// disbelieves.
+_warmTest('warming never delays or fails the resolution it is helping', async () => {
+  const mod = await import('./capability-resolution.js');
+  const started = Date.now();
+  // A resolution runs synchronously even though warming is async underneath.
+  const resolved = mod.resolveTurnCapabilities('draft an outlook email');
+  _warmAssert.ok(Date.now() - started < 1_000, 'resolution must stay synchronous and immediate');
+  _warmAssert.ok(Array.isArray(resolved.entries), 'and must still return its normal shape');
+});
+
+_warmTest('warming is off when the kill-switch says so', async () => {
+  process.env.CLEMMY_WARM_TOOL_CONTRACTS = 'off';
+  try {
+    const mod = await import('./capability-resolution.js');
+    _warmAssert.ok(mod.resolveTurnCapabilities('draft an outlook email'), 'resolution is unaffected either way');
+  } finally {
+    delete process.env.CLEMMY_WARM_TOOL_CONTRACTS;
+  }
+});
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';

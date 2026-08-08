@@ -33,6 +33,7 @@ import {
 } from '../../memory/tool-choice-store.js';
 import { peekConnectedToolkits } from '../../integrations/composio/client.js';
 import { appendEvent } from './eventlog.js';
+import { getRuntimeEnv } from '../../config.js';
 
 export type CapabilityStatus = 'proven' | 'previously_failed';
 export type ConnectionState = 'active' | 'missing' | 'unknown' | 'not_applicable';
@@ -125,7 +126,57 @@ export function resolveTurnCapabilities(message: string): CapabilityResolution {
       });
     }
   } catch { /* resolution is additive context, never turn authority */ }
+  warmResolvedContracts(entries);
   return { entries, registryAvailable };
+}
+
+/**
+ * WARM the contracts for capabilities this ask already resolved.
+ *
+ * The resolution names the proven tools before the model takes its first step —
+ * and then, live 2026-08-07, the model spent fifteen of forty-eight calls
+ * searching for those very tools. Naming is not enough: the name arrives as
+ * prose while the ARGUMENT SCHEMA does not, so "I know which tool" still costs
+ * a discovery round trip to learn how to call it.
+ *
+ * Fetching a schema is I/O, not a decision. Doing it here — at preflight, off
+ * the model's critical path, while it is still reading — converts that round
+ * trip into a background request, and after the first time into nothing at all
+ * because the contract is durable.
+ *
+ * Deliberately fire-and-forget: a warm that is slow, rate-limited, or failing
+ * must never delay or fail the turn it was only trying to help. Every consumer
+ * of a contract already fails open, so the worst case is exactly today's
+ * behaviour.
+ */
+function warmResolvedContracts(entries: readonly CapabilityResolutionEntry[]): void {
+  if (!contractWarmingEnabled() || entries.length === 0) return;
+  // Only paths the runtime believes in: a previously-FAILED capability is not
+  // worth a fetch, and a toolkit with no live connection cannot answer one.
+  const warmable = entries
+    .filter((e) => e.kind === 'composio' && e.status === 'proven' && e.connection !== 'missing')
+    .map((e) => e.identifier)
+    .filter(Boolean)
+    .slice(0, MAX_WARMED_CONTRACTS);
+  if (warmable.length === 0) return;
+  void (async () => {
+    try {
+      const { ensureToolSchema } = await import('../../tools/composio-schema-cache.js');
+      // ensureToolSchema is already once-per-session and negative-cached, so a
+      // slug the provider cannot describe costs one attempt, ever.
+      await Promise.allSettled(warmable.map((slug) => ensureToolSchema(slug)));
+    } catch { /* warming is an optimisation; it has no failure mode that matters */ }
+  })();
+}
+
+/** Bounded so a turn that resolves many capabilities cannot fan out into a
+ *  burst of provider requests — the point is to remove round trips, not to
+ *  trade model latency for provider rate limits. */
+const MAX_WARMED_CONTRACTS = 6;
+
+function contractWarmingEnabled(): boolean {
+  const v = (getRuntimeEnv('CLEMMY_WARM_TOOL_CONTRACTS', 'on') ?? 'on').trim().toLowerCase();
+  return v !== 'off' && v !== '0' && v !== 'false' && v !== 'no';
 }
 
 /**
