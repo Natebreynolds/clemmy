@@ -44,6 +44,8 @@ export interface ActivityItem {
    *  beat). `variant` picks the icon; `tone` its color. `status` is left set for
    *  the shared spinner/✓/✗ but the event icon is driven by `tone`. */
   variant?: 'write' | 'program' | 'lifecycle';
+  /** Narration: how many identical rows folded into this one. Absent means one. */
+  repeats?: number;
   tone?: 'success' | 'danger' | 'warning' | 'live' | 'muted';
   /** kind 'event' rolling rows only: how many occurrences this row aggregates
    *  (e.g. files saved this turn). */

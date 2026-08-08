@@ -15,6 +15,7 @@ import { Users, ArrowUpRight } from 'lucide-react';
 import { ActivityRow, BatchRow, PROVIDER_DOT, useNowTick } from '@/components/chat/ActivityFeed';
 import type { ActivityItem } from '@/lib/useChat';
 import {
+  narrateActivity,
   settleTerminalActivity,
   type ActivityTerminalOutcome,
 } from '@/lib/activity-presentation';
@@ -49,7 +50,12 @@ export function TurnActivity({ items, live, traceHref, terminalOutcome }: {
 
   if (items.length === 0) return null;
 
-  const view = settleTerminalActivity(items, live ? undefined : (terminalOutcome ?? 'interrupted'));
+  // Narrate BEFORE settling, so folded rows carry one honest terminal state
+  // rather than a settled attempt sitting beside its own outcome.
+  const view = settleTerminalActivity(
+    narrateActivity(items),
+    live ? undefined : (terminalOutcome ?? 'interrupted'),
+  );
   const agents = view.filter((a) => a.kind === 'agent');
   const tools = view.filter((a) => a.kind === 'tool');
   const batches = view.filter((a) => a.kind === 'batch');

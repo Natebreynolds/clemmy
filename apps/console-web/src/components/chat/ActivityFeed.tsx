@@ -10,6 +10,7 @@ import { Wrench, Users, Check, X, Zap, Send, AlertCircle, CheckCircle2, Radio, D
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
 import {
+  narrateActivity,
   settleTerminalActivity,
   type ActivityTerminalOutcome,
 } from '@/lib/activity-presentation';
@@ -182,7 +183,9 @@ export function LiveFeed({ items, live, showDetails, terminalOutcome }: {
   if (items.length === 0) {
     return <p className="text-body text-faint">No activity yet — it streams in as the agent works.</p>;
   }
-  const view = settleTerminalActivity(items, live ? undefined : (terminalOutcome ?? 'interrupted'));
+  // Same narration as the inline strip — one visual language means one
+  // filter, or the two surfaces disagree about what happened.
+  const view = settleTerminalActivity(narrateActivity(items), live ? undefined : (terminalOutcome ?? 'interrupted'));
   const agents = view.filter((a) => a.kind === 'agent');
   const doneAgents = agents.filter((a) => a.status !== 'running').length;
   return (
