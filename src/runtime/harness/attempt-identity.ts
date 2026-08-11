@@ -35,6 +35,7 @@ import {
   type RefinedLogicalCall,
 } from './dispatch-ledger.js';
 import { assertExpectedWorkLogicalAdmission } from './expected-work-admission.js';
+import { durableLogicalCallContract } from './logical-call-contract.js';
 
 export interface LogicalCallIdentity {
   acceptedTaskId: string;
@@ -95,6 +96,10 @@ export function acceptedTaskIdFor(sessionId: string, sourceUserSeq: number): str
 interface LogicalFrame extends LogicalCallIdentity {
   /** Crossings so far, so each physical dispatch gets a truthful ordinal. */
   crossings: number;
+  /** The exact contract this frame was opened for. A nested call whose own
+   *  contract differs is DIFFERENT WORK and may not adopt this identity. */
+  toolName: string;
+  argumentDigest: string;
 }
 
 const logicalStorage = new AsyncLocalStorage<LogicalFrame>();
@@ -123,7 +128,7 @@ export function authorizeResolvedLogicalCallContract(input: {
   tool: string;
   effectiveArgs?: unknown;
   turn?: number;
-}): RefinedLogicalCall {
+}): RefinedLogicalCall | null {
   const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
   const frame = logicalStorage.getStore();
   if (!frame || frame.acceptedTaskId !== acceptedTaskId) {
@@ -132,6 +137,20 @@ export function authorizeResolvedLogicalCallContract(input: {
       'trusted resolver has no logical call owned by this accepted task',
     );
   }
+  // A resolver may only refine the frame ITS OWN call opened. When a local
+  // tool executes a provider action, the ambient frame belongs to the caller,
+  // and refining it to the inner tool is not a rewrite the ledger can accept —
+  // it POISONS the caller's logical row and takes the whole step down. That is
+  // the live platform-49 failure: a nested Composio dispatch inside a local
+  // orchestrator tool refined its caller's frame and killed the run six times
+  // a day. Nothing to refine is not a failure; the nested call opens its own
+  // logical identity moments later.
+  const resolvedContract = durableLogicalCallContract(
+    acceptedTaskId,
+    input.tool,
+    input.effectiveArgs,
+  );
+  if (!resolvedContract || resolvedContract.toolName !== frame.toolName) return null;
   const refinement = refineLogicalCallContract({
     identity: {
       sessionId: input.sessionId,
@@ -181,10 +200,22 @@ export function withLogicalToolCall<T>(
     && input.logicalToolCallId.length <= 512
     ? input.logicalToolCallId.trim()
     : undefined;
+  // A nested wrapper re-entering the SAME call inherits; genuinely different
+  // work does not. Adopting a parent's identity re-admits and later SETTLES the
+  // parent's logical row under the child's contract, which poisons the parent
+  // and takes the whole turn down with it — a live scheduled workflow failed
+  // this way six times a day (platform-49, 2026-08-11: a local orchestrator
+  // tool whose inner provider action wore its caller's identity).
+  const ownContract = durableLogicalCallContract(acceptedTaskId, input.tool, input.args);
+  const sameWorkAsInherited = inherited !== undefined
+    && ownContract !== null
+    && inherited.toolName === ownContract.toolName
+    && inherited.argumentDigest === ownContract.argumentDigest;
   if (
     inherited
     && inherited.acceptedTaskId === acceptedTaskId
-    && (requested === undefined || requested === inherited.logicalToolCallId)
+    && (requested === inherited.logicalToolCallId
+      || (requested === undefined && sameWorkAsInherited))
   ) {
     const identity = {
       acceptedTaskId: inherited.acceptedTaskId,
@@ -211,11 +242,21 @@ export function withLogicalToolCall<T>(
     acceptedTaskId,
     logicalToolCallId: requested ?? `call:${randomUUID()}`,
     crossings: 0,
+    toolName: ownContract?.toolName ?? input.tool,
+    argumentDigest: ownContract?.argumentDigest ?? '',
   };
+  // A child of an admitted parent is work that parent is already authorized to
+  // do, so the WALL still asks about the authorizing identity. Only the LEDGER
+  // changes: the child records its own contract instead of overwriting its
+  // parent's. Splitting the identity without splitting the question keeps every
+  // existing admission verdict exactly as it was.
+  const admissionIdentity = inherited && inherited.acceptedTaskId === acceptedTaskId
+    ? inherited.logicalToolCallId
+    : frame.logicalToolCallId;
   assertExpectedWorkLogicalAdmission({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
-    logicalToolCallId: frame.logicalToolCallId,
+    logicalToolCallId: admissionIdentity,
     tool: input.tool,
     args: input.args,
   });
