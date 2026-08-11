@@ -93,6 +93,62 @@ const {
   looksLikeHealthyDurableMemoryAcknowledgement,
 } = await import('./durable-memory-receipt.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
+const fixtureDispatchLedger = await import('./dispatch-ledger.js');
+const fixtureOutcomes = await import('./attempt-outcome.js');
+const fixtureSettlements = await import('./logical-call-settlement-store.js');
+const fixtureIdentities = await import('./attempt-identity.js');
+
+let fixtureReadSerial = 0;
+const fixtureReadSettled = new Set<string>();
+/** Settle one COMPLETE read for the latest accepted source. The retrieve
+ *  contract demands settled source evidence before done may publish
+ *  (retrieval-is-not-authority); a stub that claims "I searched" without a
+ *  settled read is the fabrication class that gate exists to block, so these
+ *  fixtures settle the read the way a live turn does. */
+function settleFixtureRead(sessionId: string): void {
+  const source = listEvents(sessionId, { types: ['user_input_received'] }).at(-1);
+  if (!source) return;
+  const settledKey = `${sessionId}:${source.seq}`;
+  if (fixtureReadSettled.has(settledKey)) return;
+  fixtureReadSettled.add(settledKey);
+  fixtureReadSerial += 1;
+  const identity = {
+    sessionId,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    acceptedTaskId: fixtureIdentities.acceptedTaskIdFor(sessionId, source.seq),
+    logicalToolCallId: `logical:loop-fixture-read:${fixtureReadSerial}`,
+    physicalDispatchId: `dispatch:loop-fixture-read:${fixtureReadSerial}`,
+    ordinal: 0,
+  };
+  const begun = fixtureDispatchLedger.beginPhysicalDispatch({
+    identity,
+    tool: 'fixture_mailbox_search',
+    args: { query: 'fixture' },
+  });
+  if (begun.status !== 'inserted') return;
+  fixtureDispatchLedger.settlePhysicalDispatch({
+    identity: begun.identity,
+    tool: 'fixture_mailbox_search',
+    outcome: 'returned',
+  });
+  fixtureSettlements.commitLogicalCallSettlement({
+    identity: {
+      sessionId,
+      sourceUserSeq: source.seq,
+      turn: 1,
+      acceptedTaskId: identity.acceptedTaskId,
+      logicalToolCallId: identity.logicalToolCallId,
+    },
+    contract: { toolName: 'fixture_mailbox_search', args: { query: 'fixture' } },
+    execution: { kind: 'provider_execution' },
+    result: { payload: { successful: true, data: { records: [] }, meta: { complete: true } } },
+    outcome: fixtureOutcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: false },
+    observer: { lane: 'composio', turn: 1 },
+  });
+}
+
 const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded, harnessRunContextStorage, wrapToolForHarness } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
@@ -3327,6 +3383,7 @@ test('a local call_tool carrier rejection cannot manufacture ambiguity or replac
   };
   const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
     modelSteps += 1;
+    settleFixtureRead(session.id);
     if (modelSteps === 1) {
       const refusal = await wrappedCallTool.invoke(
         { context: { sessionId: session.id } },
@@ -9072,14 +9129,17 @@ test('runConversation: done:true completion reporting PRIOR tool work is NOT a z
     sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
     data: { tool: 'outlook_email_search', callId: 'call-mailbox-fixture', arguments: '{"query":"Casey"}' },
   });
-  const runRunner: RunRunnerFn = async (_r, _a, items) => ({
-    history: items, lastResponseId: undefined,
-    finalOutput: {
-      summary: 'Searched the fixture inbox and mailbox for Casey; no results.',
-      reply: "I searched the fixture mailbox and didn't find any email from Casey — the only result was a sample notification at noon.",
-      done: true, nextAction: 'completed', reason: null,
-    },
-  });
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    settleFixtureRead(sess.id);
+    return {
+      history: items, lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Searched the fixture inbox and mailbox for Casey; no results.',
+        reply: "I searched the fixture mailbox and didn't find any email from Casey — the only result was a sample notification at noon.",
+        done: true, nextAction: 'completed', reason: null,
+      },
+    };
+  };
   const result = await runConversation({
     agent: makeAgentStub(), sessionId: sess.id, input: 'find the fixture email from Casey',
     makeRunner: makeRunnerStub, runRunner,
@@ -9108,7 +9168,10 @@ test('runConversation: a coherent reply that failed strict parse is salvaged + d
     reply: "There's no email from Casey in the fixture mailbox — the only item is a sample notification.",
     done: true, nextAction: 'completed', reason: null,
   });
-  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: jsonString });
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    settleFixtureRead(sess.id);
+    return { history: items, lastResponseId: undefined, finalOutput: jsonString };
+  };
   const result = await runConversation({
     agent: makeAgentStub(), sessionId: sess.id, input: 'find the fixture email from Casey',
     makeRunner: makeRunnerStub, runRunner,
@@ -9260,7 +9323,10 @@ test('runConversation: a substantive answer repeated identically across stall re
   // call) is used, so the plain-text-contract exemption never applies and the
   // retries genuinely exhaust. The model confidently repeats the same
   // substantive text — the prose IS the deliverable.
-  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: STALL_DRAFT });
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    settleFixtureRead(sess.id);
+    return { history: items, lastResponseId: undefined, finalOutput: STALL_DRAFT };
+  };
   const result = await runConversation({
     agent: makeAgentStub(), sessionId: sess.id, input: 'can I see the full draft please',
     makeRunner: makeRunnerStub, runRunner,
@@ -9378,6 +9444,7 @@ test('runConversation: an EMPTY zero-tool turn is RETRIED, then recovers (not dr
     { summary: 'Located the fixture message.', reply: 'Found it — the email from Casey arrived at 10:00am.', done: true, nextAction: 'completed', reason: null },
   ];
   const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    settleFixtureRead(sess.id);
     const output = scripted[i] ?? scripted[scripted.length - 1];
     i += 1;
     return { history: items, lastResponseId: undefined, finalOutput: output };
@@ -11309,6 +11376,7 @@ test('runConversation: exhausted stall retries trigger ONE recovery-summary turn
   let calls = 0;
   const runRunner: RunRunnerFn = async (_r, _a, items) => {
     calls += 1;
+    settleFixtureRead(sess.id);
     const input = JSON.stringify(items);
     // The recovery directive is recognizable by its contract phrasing.
     const isRecoveryTurn = /do not call another tool/i.test(input) && /where you are/i.test(input);

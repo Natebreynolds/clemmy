@@ -66,14 +66,44 @@ function makeAgentStub(): import('@openai/agents').Agent<any, any> {
   return {} as import('@openai/agents').Agent<any, any>;
 }
 
+/** Settle a tiny work manifest bound to the CURRENT accepted source. The
+ *  fail-closed action terminal refuses done-claims with zero settled work
+ *  (that is the H4 guarantee, validated live 2026-08-11); a stub that says
+ *  "Done — saved to /tmp/x" without durable work is exactly the false-done
+ *  class it exists to block, so these fixtures settle real manifest truth
+ *  the way a live turn does. */
+function settleSourceManifest(sessionId: string, manifestId: string): void {
+  const source = listEvents(sessionId, { types: ['user_input_received'] }).at(-1);
+  if (!source) return;
+  declareWorkManifest({
+    sessionId,
+    sourceUserSeq: source.seq,
+    manifestId,
+    contractVersion: '1',
+    phases: [{ id: 'work' }],
+    items: [{ id: 'item-1' }],
+  });
+  checkpointWorkItem({
+    sessionId,
+    manifestId,
+    contractVersion: '1',
+    phase: 'work',
+    itemId: 'item-1',
+    status: 'succeeded',
+    evidence: [{ kind: 'artifact', ref: `artifact:${manifestId}` }],
+  });
+}
+
 /** A runner whose every turn simulates ONE tool call (so the zero-tool stall
  *  detector stays quiet and totalToolCalls opens the goal-validation gate)
  *  then declares done. Replies vary per pass so the identical-decision stall
- *  guard never trips. */
-function doneRunner(replyBase: string): RunRunnerFn {
+ *  guard never trips. Each pass settles manifest truth for the latest
+ *  accepted source so the action terminal can honestly publish done. */
+function doneRunner(replyBase: string, settleForSession?: string): RunRunnerFn {
   let n = 0;
   return async (runner, _agent, items, opts) => {
     n += 1;
+    if (settleForSession) settleSourceManifest(settleForSession, `settled-${n}`);
     const ee = runner as unknown as EventEmitter;
     const runContext = { context: (opts as { context?: unknown }).context };
     ee.emit('agent_start', runContext, { name: 'Orchestrator' });
@@ -120,7 +150,7 @@ test('goal validation: fail → evidence continuation → pass → goal satisfie
     sessionId: sess.id,
     input: 'get going on the brief',
     makeRunner: makeRunnerStub,
-    runRunner: doneRunner('Done — Q2 brief saved to /tmp/q2-brief.md.'),
+    runRunner: doneRunner('Done — Q2 brief saved to /tmp/q2-brief.md.', sess.id),
     goalValidator: async (input) => {
       validatorCalls.push(input.objective);
       return validatorCalls.length === 1 ? failResult('no artifact produced yet') : PASS_RESULT;
@@ -176,7 +206,7 @@ test('goal validation receives durable manifest coverage instead of requiring th
     sessionId: sess.id,
     input: 'process the accounts',
     makeRunner: makeRunnerStub,
-    runRunner: doneRunner('All accounts are complete.'),
+    runRunner: doneRunner('All accounts are complete.', sess.id),
     goalValidator: async (input) => {
       validatorEvidence = input.evidenceText;
       return PASS_RESULT;
@@ -205,7 +235,7 @@ test('staged goal: validates one stage at a time, advances, then satisfies on th
     sessionId: sess.id,
     input: 'go',
     makeRunner: makeRunnerStub,
-    runRunner: doneRunner('Stage work done'),
+    runRunner: doneRunner('Stage work done', sess.id),
     goalValidator: async (input) => {
       validatedCriteria.push(input.successCriteria);
       return PASS_RESULT;
@@ -240,7 +270,7 @@ test('staged goal: a stage that fails retries WITHIN the stage and does not adva
     sessionId: sess.id,
     input: 'go',
     makeRunner: makeRunnerStub,
-    runRunner: doneRunner('working stage 1'),
+    runRunner: doneRunner('working stage 1', sess.id),
     goalValidator: async () => {
       calls += 1;
       // Fail stage 1 once, then pass everything (stage1, stage2, final).
@@ -266,7 +296,7 @@ test('goal validation: attempt budget exhausted → honest unmet note, goal stay
     sessionId: sess.id,
     input: 'go',
     makeRunner: makeRunnerStub,
-    runRunner: doneRunner('Done — migration report saved to /tmp/migration-report.md.'),
+    runRunner: doneRunner('Done — migration report saved to /tmp/migration-report.md.', sess.id),
     goalValidator: async () => failResult('no migration evidence'),
   });
 
@@ -291,7 +321,7 @@ test('goal validation: dead judge (judgeFailedOpen) never spins and never satisf
     sessionId: sess.id,
     input: 'go',
     makeRunner: makeRunnerStub,
-    runRunner: doneRunner('Done — report draft saved to /tmp/report-draft.md.'),
+    runRunner: doneRunner('Done — report draft saved to /tmp/report-draft.md.', sess.id),
     goalValidator: async () => {
       calls += 1;
       return { pass: false, judgeFailedOpen: true, perCriterion: [], advice: 'judge unavailable' };
@@ -347,7 +377,7 @@ test('kill-switch: CLEMMY_GOAL_CONTRACT=off makes the goal loop inert', async ()
       sessionId: sess.id,
       input: 'go',
       makeRunner: makeRunnerStub,
-      runRunner: doneRunner('Done — feature release notes saved to /tmp/release-notes.md.'),
+      runRunner: doneRunner('Done — feature release notes saved to /tmp/release-notes.md.', sess.id),
       goalValidator: async () => { calls += 1; return PASS_RESULT; },
     });
     assert.equal(result.status, 'completed');
