@@ -322,9 +322,10 @@ test('normalizeCodeModeToolResult: an over-cap parked exact result fails closed 
 });
 
 test('code-mode wrapper never appends harness advisories to structured Composio results', async () => {
-  const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
   const { _resetAllTrackersForTests } = await import('../runtime/harness/tool-guardrail.js');
-  const { createSession } = await import('../runtime/harness/eventlog.js');
+  const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
+  const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
   const prevWrites = process.env.CLEMMY_CODE_MODE_WRITES;
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.CLEMMY_CODE_MODE_WRITES = 'on';
@@ -342,16 +343,31 @@ test('code-mode wrapper never appends harness advisories to structured Composio 
   ]) as never);
   try {
     const sid = createSession({ kind: 'chat' }).id;
+    // Durable settlement requires the accepted-source identity plus a
+    // persisted turn graph for the accepted task (authority spine).
+    const source = appendEvent({
+      sessionId: sid,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'read the sheet ranges' },
+    });
+    assert.ok(recordTurnGraphShadow({
+      identity: { sessionId: sid, sourceUserSeq: source.seq, turn: source.turn },
+    }), 'fixture persisted the turn graph for the accepted task');
     const counter = new ToolCallsCounter(100);
     for (let i = 1; i <= 4; i += 1) {
-      const result = await dispatchCodeModeTool(
-        'composio_execute_tool',
-        {
-          tool_slug: 'GOOGLESHEETS_BATCH_GET',
-          arguments: JSON.stringify({ spreadsheet_id: 'sheet-1', range: `Sheet1!A${i}:D${i}` }),
-        },
-        sid,
-        counter,
+      const result = await withHarnessRunContext(
+        { sessionId: sid, sourceUserSeq: source.seq, turn: source.turn, counter },
+        () => dispatchCodeModeTool(
+          'composio_execute_tool',
+          {
+            tool_slug: 'GOOGLESHEETS_BATCH_GET',
+            arguments: JSON.stringify({ spreadsheet_id: 'sheet-1', range: `Sheet1!A${i}:D${i}` }),
+          },
+          sid,
+          counter,
+        ),
       ) as { successful?: boolean; data?: { range?: string } };
       assert.equal(result.successful, true, `call ${i}: JSON stayed structured`);
       assert.equal(result.data?.range, `Sheet1!A${i}:D${i}`);
@@ -666,6 +682,8 @@ test('dispatchBatchItemTool establishes tool-output context for the inner tool (
   const { dispatchBatchItemTool, _setCodeModeToolsForTests } = await import('./code-mode-tool.js');
   const { getToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
   const { ToolCallsCounter, withHarnessRunContext, harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+  const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
+  const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
   _setCodeModeToolsForTests(new Map([
     ['ctx_probe', {
       name: 'ctx_probe',
@@ -676,12 +694,35 @@ test('dispatchBatchItemTool establishes tool-output context for the inner tool (
     }],
   ]) as never);
   try {
+    // Durable settlement requires the accepted-source identity plus a
+    // persisted turn graph for the accepted task (authority spine).
+    const sid = createSession({ kind: 'chat' }).id;
+    const source = appendEvent({
+      sessionId: sid,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'hand off the background task' },
+    });
+    assert.ok(recordTurnGraphShadow({
+      identity: { sessionId: sid, sourceUserSeq: source.seq, turn: source.turn },
+    }), 'fixture persisted the turn graph for the accepted task');
+    // A LATER ambient user input: the inner tool must keep the exact accepted
+    // source seq, not this newest event.
+    const decoy = appendEvent({
+      sessionId: sid,
+      turn: 2,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'unrelated newer input' },
+    });
+    assert.notEqual(decoy.seq, source.seq);
     const out = await withHarnessRunContext(
-      { sessionId: 'sess-ctx-regression', sourceUserSeq: 42, counter: new ToolCallsCounter(10) },
-      () => dispatchBatchItemTool('ctx_probe', {}, 'sess-ctx-regression', new ToolCallsCounter(10)),
+      { sessionId: sid, sourceUserSeq: source.seq, turn: source.turn, counter: new ToolCallsCounter(10) },
+      () => dispatchBatchItemTool('ctx_probe', {}, sid, new ToolCallsCounter(10)),
     ) as { seenSessionId?: string | null; seenSourceUserSeq?: number | null };
-    assert.equal(out?.seenSessionId, 'sess-ctx-regression', 'inner tool must see the session via getToolOutputContext');
-    assert.equal(out?.seenSourceUserSeq, 42, 'inner tool must retain the exact source turn instead of consulting the latest ambient user input');
+    assert.equal(out?.seenSessionId, sid, 'inner tool must see the session via getToolOutputContext');
+    assert.equal(out?.seenSourceUserSeq, source.seq, 'inner tool must retain the exact source turn instead of consulting the latest ambient user input');
   } finally {
     _setCodeModeToolsForTests(null);
   }

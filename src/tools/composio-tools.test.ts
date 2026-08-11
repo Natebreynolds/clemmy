@@ -43,6 +43,46 @@ const {
   appendEvent,
   getToolOutput,
 } = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+
+/**
+ * Durable settlement requires the accepted-source identity plus a persisted
+ * turn graph for the accepted task (authority spine) before a wrapped/gateway
+ * dispatch can settle. Anchor legacy fixtures exactly the way the real turn
+ * spine does: accepted user input -> persisted turn graph -> run context.
+ */
+function anchorAcceptedTask(text: string, sessionId?: string): {
+  sessionId: string; sourceUserSeq: number; turn: number;
+} {
+  const sid = createSession(sessionId ? { id: sessionId, kind: 'chat' } : { kind: 'chat' }).id;
+  const source = appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: sid, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
+  return { sessionId: sid, sourceUserSeq: source.seq, turn: source.turn };
+}
+
+function withAnchoredRunContext<T>(
+  anchor: { sessionId: string; sourceUserSeq: number; turn: number },
+  work: () => Promise<T>,
+): Promise<T> {
+  return withHarnessRunContext(
+    {
+      sessionId: anchor.sessionId,
+      sourceUserSeq: anchor.sourceUserSeq,
+      turn: anchor.turn,
+      counter: new ToolCallsCounter(1000),
+    },
+    work,
+  ) as Promise<T>;
+}
 
 test.after(() => {
   try {
@@ -166,15 +206,18 @@ test('CLI search normalization rejects toolkit rows and deduplicates action slug
 });
 
 test('ambiguous Composio mutation errors never replay the provider dispatch', async () => {
+  const { runComposioExecuteForTestInSession } = await import('./composio-tools.js');
+  const anchor = anchorAcceptedTask('create the snapshot document');
   let dispatches = 0;
-  const output = await runComposioExecuteForTest(
+  const output = await withAnchoredRunContext(anchor, () => runComposioExecuteForTestInSession(
     'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
     { title: 'One document', markdown_text: '# Snapshot' },
-    async () => {
+    (async () => {
       dispatches += 1;
       throw new Error('Socket timeout after provider accepted the request');
-    },
-  );
+    }) as never,
+    anchor.sessionId,
+  ));
   assert.equal(dispatches, 1, 'a create crosses the provider boundary at most once');
   assert.match(output, /provider-dispatch:uncertain/);
   assert.match(output, /Do NOT repeat this mutation/);
@@ -189,16 +232,19 @@ test('a nominal local pre-dispatch error RESOLVES as the typed refusal once for 
   // attempt, never retried, message preserved.
   const { ComposioPreDispatchError } = await import('../integrations/composio/client.js');
   const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
+  const { runComposioExecuteForTestInSession } = await import('./composio-tools.js');
   for (const toolSlug of ['GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', 'OUTLOOK_LIST_MESSAGES']) {
+    const anchor = anchorAcceptedTask(`drive the ${toolSlug} preflight`);
     let dispatchAttempts = 0;
-    const out = await runComposioExecuteForTest(
+    const out = await withAnchoredRunContext(anchor, () => runComposioExecuteForTestInSession(
       toolSlug,
       { title: 'One document', markdown_text: '# Snapshot' },
-      async () => {
+      (async () => {
         dispatchAttempts += 1;
         throw new ComposioPreDispatchError('sdk-unavailable', 'SDK client was not constructed');
-      },
-    );
+      }) as never,
+      anchor.sessionId,
+    ));
     assert.ok((out as unknown) instanceof ExternalWritePreDispatchResult,
       `${toolSlug}: the typed preflight survives as the nominal class`);
     assert.match(
@@ -323,14 +369,15 @@ test('strict preferred identity selects only its exact active account and carrie
     });
 
     let boundaryContext: { connectionId?: string; identity?: string } | undefined;
-    const dispatched = await dispatchComposioTool(slug, {}, {
+    const anchor = anchorAcceptedTask('list the work mailbox messages');
+    const dispatched = await withAnchoredRunContext(anchor, () => dispatchComposioTool(slug, {}, {
       preferredIdentity: 'work@example.com',
       strictPreferredIdentity: true,
       dispatchBoundary: async (context) => {
         boundaryContext = context;
         return { successful: true, data: { items: [] } };
       },
-    });
+    }));
     assert.equal(dispatched.ok, true);
     assert.deepEqual(boundaryContext, {
       toolSlug: slug,
@@ -722,11 +769,12 @@ test('grind guard (returned shape): first auth-config miss trips the breaker →
   const { runComposioExecuteForTestInSession, resolveComposioDispatch, __gatewayTest__ } = await import('./composio-tools.js');
   const sid = 'sess-grind-returned';
   const slug = 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS';
+  const anchor = anchorAcceptedTask('pull the apify dataset items', sid);
   __gatewayTest__.clearReconnectBreaker(sid, slug);
 
   let dispatches = 0;
   const authMissExec = (async () => { dispatches += 1; return AUTH_MISS_RESULT; }) as never;
-  const out = await runComposioExecuteForTestInSession(slug, { q: 'firm-a' }, authMissExec, sid);
+  const out = await withAnchoredRunContext(anchor, () => runComposioExecuteForTestInSession(slug, { q: 'firm-a' }, authMissExec, sid));
   assert.match(out, /reconnect APIFY/i, 'the miss returns reconnect guidance, not a grindable error');
   assert.equal(__gatewayTest__.reconnectBreakerTripped(sid, slug), true, 'one failure trips the session/toolkit breaker');
 
@@ -741,10 +789,11 @@ test('grind guard (thrown shape): a thrown auth error trips the same breaker', a
   const { runComposioExecuteForTestInSession, resolveComposioDispatch, __gatewayTest__ } = await import('./composio-tools.js');
   const sid = 'sess-grind-thrown';
   const slug = 'FIRECRAWL_SEARCH';
+  const anchor = anchorAcceptedTask('search firecrawl for the firm', sid);
   __gatewayTest__.clearReconnectBreaker(sid, slug);
 
   const authThrowExec = (async () => { throw new Error('unsupported OAuth2 authentication'); }) as never;
-  const out = await runComposioExecuteForTestInSession(slug, { query: 'firm-a' }, authThrowExec, sid);
+  const out = await withAnchoredRunContext(anchor, () => runComposioExecuteForTestInSession(slug, { query: 'firm-a' }, authThrowExec, sid));
   assert.match(out, /reconnect FIRECRAWL/i);
   assert.equal(__gatewayTest__.reconnectBreakerTripped(sid, slug), true);
 
@@ -1081,15 +1130,21 @@ test('fan-out advisory inside a WORKFLOW step recommends forEach, NOT run_worker
 
 test('code-mode Composio batches keep every successful payload parseable and free of in-band advisories', async () => {
   const { runComposioExecuteForTestInSession } = await import('./composio-tools.js');
-  const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
-  const sid = 'workflow:run-code-mode:tracker';
+  const anchor = anchorAcceptedTask('read the sheet ranges in one program');
+  const sid = anchor.sessionId;
   const execute = (async (_slug: string, args: Record<string, unknown>) => ({
     successful: true,
     data: { range: args.range, values: [['ok']] },
   })) as never;
 
   await withHarnessRunContext(
-    { sessionId: sid, counter: new ToolCallsCounter(100), codeMode: true },
+    {
+      sessionId: sid,
+      sourceUserSeq: anchor.sourceUserSeq,
+      turn: anchor.turn,
+      counter: new ToolCallsCounter(100),
+      codeMode: true,
+    },
     async () => {
       for (let i = 1; i <= 4; i += 1) {
         const output = await runComposioExecuteForTestInSession(
@@ -1339,7 +1394,7 @@ test('executionIntentForSession: no session / no search falls back to the slug s
 });
 
 test('uniform-empty streak: 3 same-slug empty reads append the query-shape advisory; a real result resets it', async () => {
-  const { runComposioExecuteForTest, composioResultLooksEmpty } = await import('./composio-tools.js');
+  const { runComposioExecuteForTestInSession, composioResultLooksEmpty } = await import('./composio-tools.js');
   const { equal, ok, doesNotMatch, match } = await import('node:assert/strict');
 
   equal(composioResultLooksEmpty({ data: { items: [] } }), true);
@@ -1350,18 +1405,24 @@ test('uniform-empty streak: 3 same-slug empty reads append the query-shape advis
   const emptyExec = (async () => ({ data: { items: [] }, error: null, successful: true })) as never;
   const fullExec = (async () => ({ data: { items: [{ ad: 'PI attorneys near you' }] }, error: null, successful: true })) as never;
 
-  const first = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-a' }, emptyExec);
+  const anchor = anchorAcceptedTask('pull the ad datasets for each firm');
+  const run = (q: string, exec: never) => withAnchoredRunContext(
+    anchor,
+    () => runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q }, exec, anchor.sessionId),
+  );
+
+  const first = await run('firm-a', emptyExec);
   doesNotMatch(first, /empty-result advisory/);
-  const second = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-b' }, emptyExec);
+  const second = await run('firm-b', emptyExec);
   doesNotMatch(second, /empty-result advisory/);
-  const third = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-c' }, emptyExec);
+  const third = await run('firm-c', emptyExec);
   match(third, /empty-result advisory/);
   match(third, /unverified \(tool returned empty\)/);
 
   // A genuinely non-empty result resets the streak.
-  const real = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-d' }, fullExec);
+  const real = await run('firm-d', fullExec);
   doesNotMatch(real, /empty-result advisory/);
-  const afterReset = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-e' }, emptyExec);
+  const afterReset = await run('firm-e', emptyExec);
   doesNotMatch(afterReset, /empty-result advisory/);
   ok(true);
 });
@@ -1375,10 +1436,14 @@ test('data-quality checkpoint: an autonomous run with hollow reads is confronted
     const emptyExec = (async () => ({ data: { items: [] }, error: null, successful: true })) as never;
     const writeExec = (async () => ({ data: { id: 'appNEW123' }, error: null, successful: true })) as never;
     const sid = 'background:bg-checkpoint-test';
+    // The checkpoint keys on the background: session-id prefix; the authority
+    // spine keys on a chat session with a persisted turn graph. The fixture
+    // needs both, so the anchored session carries the background-prefixed id.
+    const anchor = anchorAcceptedTask('build the intel base from the datasets', sid);
 
     // Three hollow reads build the ledger (read slug — retried internally is fine).
     for (const q of ['a', 'b', 'c']) {
-      await runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q }, emptyExec, sid);
+      await withAnchoredRunContext(anchor, () => runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q }, emptyExec, sid));
     }
 
     // First WRITE attempt: deferred with the evidence + the real-assistant
@@ -1387,7 +1452,7 @@ test('data-quality checkpoint: an autonomous run with hollow reads is confronted
     // throwing — same one-shot semantics, same message.
     void rejects; void ExternalWritePreDispatchError;
     const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
-    const checkpointOut = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid);
+    const checkpointOut = await withAnchoredRunContext(anchor, () => runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid));
     assert.ok((checkpointOut as unknown) instanceof ExternalWritePreDispatchResult,
       'the checkpoint refusal is the nominal typed class');
     const checkpointText = (checkpointOut as unknown as InstanceType<typeof ExternalWritePreDispatchResult>).output;
@@ -1396,16 +1461,17 @@ test('data-quality checkpoint: an autonomous run with hollow reads is confronted
     match(checkpointText, /ask_user_question/);
 
     // Deliberate second attempt proceeds (autonomy redirected, never dead-ended).
-    const second = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid);
+    const second = await withAnchoredRunContext(anchor, () => runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid));
     doesNotMatch(second, /DATA-QUALITY CHECKPOINT/);
     match(second, /appNEW123/);
 
     // Foreground chat sessions are untouched.
     resetDataQualityForTest();
+    const fgAnchor = anchorAcceptedTask('build the intel base from the desktop', 'sess-desktop-foreground');
     for (const q of ['a', 'b', 'c']) {
-      await runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q }, emptyExec, 'sess-desktop-foreground');
+      await withAnchoredRunContext(fgAnchor, () => runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q }, emptyExec, 'sess-desktop-foreground'));
     }
-    const fg = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, 'sess-desktop-foreground');
+    const fg = await withAnchoredRunContext(fgAnchor, () => runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, 'sess-desktop-foreground'));
     doesNotMatch(fg, /DATA-QUALITY CHECKPOINT/);
   } finally {
     resetDataQualityForTest();
@@ -1429,9 +1495,10 @@ test('a gateway refusal is a nominal pre-dispatch RETURN and performs zero provi
   const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
   const sid = 'sess-gateway-nominal-preflight';
   const slug = 'AIRTABLE_CREATE_RECORD';
+  const anchor = anchorAcceptedTask('add ada to the airtable', sid);
   __gatewayTest__.recordReconnectBreaker(sid, slug);
   let dispatches = 0;
-  const out = await runComposioExecuteWithGatewayForTest(
+  const out = await withAnchoredRunContext(anchor, () => runComposioExecuteWithGatewayForTest(
     slug,
     { base_id: 'app1', table_id: 'tbl1', fields: { Name: 'Ada' } },
     (async () => {
@@ -1439,7 +1506,7 @@ test('a gateway refusal is a nominal pre-dispatch RETURN and performs zero provi
       return { successful: true, data: { id: 'rec1' } };
     }) as never,
     sid,
-  );
+  ));
   assert.ok((out as unknown) instanceof ExternalWritePreDispatchResult,
     'the refusal reaches the harness as the nominal typed class, never SDK error prose');
   const refusal = out as unknown as InstanceType<typeof ExternalWritePreDispatchResult>;
@@ -1469,7 +1536,8 @@ test('a current closed no-arg read repairs invented inner args once and dispatch
   let dispatches = 0;
   let dispatchedArgs: Record<string, unknown> | undefined;
   try {
-    const out = await runComposioExecuteWithGatewayForTest(
+    const repairAnchor = anchorAcceptedTask('list the proof tasks', 'sess-closed-no-arg-read-repair');
+    const out = await withAnchoredRunContext(repairAnchor, () => runComposioExecuteWithGatewayForTest(
       slug,
       { force_refresh: true },
       (async (_toolSlug: string, args: Record<string, unknown>) => {
@@ -1481,7 +1549,7 @@ test('a current closed no-arg read repairs invented inner args once and dispatch
         };
       }) as never,
       'sess-closed-no-arg-read-repair',
-    );
+    ));
     assert.equal(dispatches, 1, 'the local projection must not add a retry or second provider call');
     assert.deepEqual(dispatchedArgs, {}, 'the executor receives the schema\'s sole legal payload');
     assert.match(out, /\[argument-repair\].*force_refresh/s);
@@ -1500,12 +1568,13 @@ test('a current closed no-arg read repairs invented inner args once and dispatch
       properties: { status: { type: 'string' } },
       additionalProperties: false,
     }, Date.now());
-    const filtered = await runComposioExecuteWithGatewayForTest(
+    const filteredAnchor = anchorAcceptedTask('list the filtered proof tasks', 'sess-nonempty-schema-no-repair');
+    const filtered = await withAnchoredRunContext(filteredAnchor, () => runComposioExecuteWithGatewayForTest(
       filteredSlug,
       { force_refresh: true },
       shouldNotDispatch,
       'sess-nonempty-schema-no-repair',
-    );
+    ));
     assert.ok((filtered as unknown) instanceof ExternalWritePreDispatchResult,
       'a nonempty schema stays a typed invalid-args refusal');
 
@@ -1515,12 +1584,13 @@ test('a current closed no-arg read repairs invented inner args once and dispatch
       properties: {},
       additionalProperties: false,
     }, Date.now());
-    const write = await runComposioExecuteWithGatewayForTest(
+    const writeAnchor = anchorAcceptedTask('update the proof task', 'sess-write-no-repair');
+    const write = await withAnchoredRunContext(writeAnchor, () => runComposioExecuteWithGatewayForTest(
       writeSlug,
       { force_refresh: true },
       shouldNotDispatch,
       'sess-write-no-repair',
-    );
+    ));
     assert.ok((write as unknown) instanceof ExternalWritePreDispatchResult,
       'a write stays a typed invalid-args refusal even with a closed empty schema');
     assert.equal(outOfScopeDispatches, 0, 'the repair never broadens to nonempty schemas or writes');

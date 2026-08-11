@@ -27,6 +27,27 @@ const {
   workerThrashGuardEnabled,
   ToolCallsCounter,
 } = await import('./brackets.js');
+const { appendEvent, createSession } = await import('./eventlog.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+
+/** The settlement spine refuses wrapped dispatch without an accepted source
+ *  AND a persisted turn graph — anchor both for every fixture session that
+ *  drives a wrapped tool. */
+function anchorAcceptedTask(sessionId: string, text: string): { sourceUserSeq: number; turn: number } {
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { sourceUserSeq: source.seq, turn: source.turn };
+}
 
 test.after(() => {
   try {
@@ -90,10 +111,11 @@ test('runBrackets keys the guard by guardrailScopeId when set (plumbing)', async
       execute: async (_input: unknown) => 'ok',
     });
 
+    const anchorP = anchorAcceptedTask('p', 'write the shared file');
     // Two per-worker scopes, 4 identical calls each → neither trips (isolated).
     for (const scope of ['p::w:A', 'p::w:B']) {
       await withHarnessRunContext(
-        { sessionId: 'p', counter, guardrailScopeId: scope },
+        { sessionId: 'p', sourceUserSeq: anchorP.sourceUserSeq, counter, guardrailScopeId: scope },
         async () => {
           for (let i = 0; i < 4; i++) {
             assert.equal(await wrapped.execute!({ path: 'a', content: 'same' }), 'ok',
@@ -105,8 +127,9 @@ test('runBrackets keys the guard by guardrailScopeId when set (plumbing)', async
 
     // Contrast: NO scope id (all share sessionId) → the 5th identical call trips.
     _resetAllTrackersForTests();
+    const anchorP2 = anchorAcceptedTask('p2', 'write the shared file');
     await withHarnessRunContext(
-      { sessionId: 'p2', counter },
+      { sessionId: 'p2', sourceUserSeq: anchorP2.sourceUserSeq, counter },
       async () => {
         for (let i = 0; i < 4; i++) await wrapped.execute!({ path: 'a', content: 'same' });
         const blocked = await wrapped.execute!({ path: 'a', content: 'same' });
@@ -137,8 +160,16 @@ test('run_worker bracket preserves a truthful partial-batch result with an embed
     } as never) as unknown as {
       invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
     };
+    const anchor = anchorAcceptedTask('run-worker-batch', 'run the 24-account batch');
     assert.equal(
-      await wrapped.invoke(undefined, {}),
+      await withHarnessRunContext(
+        {
+          sessionId: 'run-worker-batch',
+          sourceUserSeq: anchor.sourceUserSeq,
+          counter: new ToolCallsCounter(1000),
+        },
+        () => wrapped.invoke(undefined, {}),
+      ),
       batch,
       'the outer bracket must not replace the batch ledger with a generic one-item error',
     );

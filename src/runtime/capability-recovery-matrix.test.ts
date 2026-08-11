@@ -23,6 +23,9 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-recovery-matrix\n', 'utf-8');
 
 const eventlog = await import('./harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
+const { acceptedTaskIdFor } = await import('./harness/attempt-identity.js');
+const { admitLogicalCall } = await import('./harness/dispatch-ledger.js');
 const { DiscoveryGovernor } = await import('./harness/discovery-governor.js');
 const {
   settleToolAttempt,
@@ -42,7 +45,35 @@ function acceptedTask(label: string): { sessionId: string; sourceUserSeq: number
     sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: `${label} task` },
   });
+  // Durable settlement authority: the accepted source above plus a persisted
+  // turn graph for the accepted task (authority spine).
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
   return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+
+/** Every lane admits its logical call before dispatch; the fixture does too. */
+function admitFixtureCall(
+  key: { sessionId: string; sourceUserSeq: number },
+  callId: string,
+  tool: string,
+  args?: unknown,
+): void {
+  const admitted = admitLogicalCall({
+    identity: {
+      sessionId: key.sessionId,
+      sourceUserSeq: key.sourceUserSeq,
+      acceptedTaskId: acceptedTaskIdFor(key.sessionId, key.sourceUserSeq),
+      logicalToolCallId: callId,
+    },
+    tool,
+    args,
+  });
+  assert.ok(
+    admitted.status === 'inserted' || admitted.status === 'replayed',
+    `fixture admitted the logical call (${admitted.status}${'reason' in admitted ? `: ${admitted.reason}` : ''})`,
+  );
 }
 
 function settlementsFor(sessionId: string): Array<Record<string, unknown>> {
@@ -147,6 +178,7 @@ for (const testCase of MATRIX) {
     governor.admit({ ...key, category: 'broad_discovery', callId: 'matrix-search' });
 
     const callId = `matrix-call-${testCase.label.replace(/\s+/g, '-')}`;
+    admitFixtureCall(key, callId, testCase.tool);
     const settled = settleToolAttempt({
       ...key,
       lane: 'native_mcp',
@@ -219,6 +251,7 @@ test('LIVE REGRESSION: repeating one step is not progress and mints no budget', 
   const sameArgs = { start: '2026-08-10', end: '2026-08-17' };
   const credits: boolean[] = [];
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    admitFixtureCall(key, `repeat-${attempt}`, 'ALPHA_LIST_CALENDAR', sameArgs);
     credits.push(settleToolAttempt({
       ...key,
       lane: 'composio',
@@ -239,6 +272,7 @@ test('LIVE REGRESSION: repeating one step is not progress and mints no budget', 
   );
 
   // A genuinely different step earns the next one.
+  admitFixtureCall(key, 'next-step', 'ALPHA_CREATE_SHEET', { title: 'Week' });
   const nextStep = settleToolAttempt({
     ...key,
     lane: 'composio',
@@ -252,6 +286,7 @@ test('LIVE REGRESSION: repeating one step is not progress and mints no budget', 
   assert.equal(governor.getTaskState(key)?.policy.epoch, 2);
 
   // ...and repeating THAT step earns nothing either.
+  admitFixtureCall(key, 'next-step-again', 'ALPHA_CREATE_SHEET', { title: 'Week' });
   assert.equal(
     settleToolAttempt({
       ...key,
@@ -275,6 +310,7 @@ test('LIVE REGRESSION: a pre-dispatch invalid-args refusal repairs instead of el
   governor.initializeTask({ ...key, knownCapability: false });
   governor.admit({ ...key, category: 'broad_discovery', callId: 'repair-search' });
 
+  admitFixtureCall(key, 'repair-1', 'ALPHA_SHEET_FROM_JSON');
   const settled = settleToolAttempt({
     ...key,
     lane: 'composio',
@@ -347,6 +383,7 @@ test('elimination is task-local and never leaks to another task', () => {
     governor.initializeTask({ ...key, knownCapability: false });
   }
 
+  admitFixtureCall(first, 'c1', 'alpha__dead');
   settleToolAttempt({
     ...first, lane: 'native_mcp', toolName: 'alpha__dead', callId: 'c1', businessCall: true,
     result: { content: [], isError: true },
@@ -367,6 +404,7 @@ test('an auth failure asks for a reconnect and does NOT spend a search on a brok
   governor.initializeTask({ ...key, knownCapability: false });
   governor.admit({ ...key, category: 'broad_discovery', callId: 'auth-search' });
 
+  admitFixtureCall(key, 'auth-1', 'alpha__read');
   const settled = settleToolAttempt({
     ...key, lane: 'composio', toolName: 'alpha__read', callId: 'auth-1', businessCall: true,
     thrown: new Error('reconnect required'), signals: { connectionMissing: true },

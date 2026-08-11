@@ -21,8 +21,27 @@ import type { MCPServer } from '@openai/agents';
 
 const { createMcpNamespaceShim, namespaceToolName, slugifyServerName } = await import('./mcp-namespace-shim.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
-const { getToolOutput, createSession } = await import('./harness/eventlog.js');
+const { appendEvent, getToolOutput, createSession } = await import('./harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
 const { saveProactivityPolicy } = await import('../agents/proactivity-policy.js');
+
+/** The settlement spine refuses dispatch without an accepted source AND a
+ *  persisted turn graph for the accepted task — every fixture that drives the
+ *  shim anchors both (turn-graph persistence requires a `chat` session). */
+function anchorAcceptedTask(sessionId: string, text: string): { seq: number; turn: number } {
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { seq: source.seq, turn: source.turn };
+}
 
 // The clip path is what's under test, not approval — auto-approve so the fresh
 // test home's strict default doesn't gate the (write-classified) MCP call.
@@ -52,8 +71,9 @@ test('MCP shim clips + parks a LARGE native result for recall (context-blowup fi
   const shim = createMcpNamespaceShim({ servers: [makeServer(slug, tool, big)] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'pull the full SERP dump');
 
-  await withHarnessRunContext({ sessionId: sess.id, counter: new ToolCallsCounter(100) }, async () => {
+  await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter: new ToolCallsCounter(100) }, async () => {
     await shim.listTools();
     const res = await shim.callTool(namespaced, {});
     const text = (res as Array<{ text?: string }>).map((b) => b.text || '').join('\n');
@@ -72,8 +92,9 @@ test('MCP shim leaves a SMALL native result byte-identical (no recall overhead)'
   const shim = createMcpNamespaceShim({ servers: [makeServer(slug, tool, small)] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'check the serp rank');
 
-  await withHarnessRunContext({ sessionId: sess.id, counter: new ToolCallsCounter(100) }, async () => {
+  await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter: new ToolCallsCounter(100) }, async () => {
     await shim.listTools();
     const res = await shim.callTool(namespaced, {});
     const text = (res as Array<{ text?: string }>).map((b) => b.text || '').join('\n');

@@ -54,6 +54,42 @@ const {
   markByoModelNotServed,
   clearByoNotServedForTest,
 } = await import('../runtime/harness/byo-providers.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+
+/**
+ * Production no longer lets a bracketed tool mint settlement authority from a
+ * session id alone: every wrapped dispatch needs the ACCEPTED SOURCE
+ * (user_input_received) plus a PERSISTED TURN GRAPH for that accepted task.
+ * Anchor the same exact identity the real turn spine establishes before
+ * dispatch. Chat-session fixtures persist the graph shadow; the harness run
+ * context then carries the identity into settlement.
+ */
+function anchorAcceptedTask(sessionId: string, text: string): { sourceUserSeq: number; turn: number } {
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  if (!shadow) throw new Error('fixture could not persist a turn graph');
+  return { sourceUserSeq: source.seq, turn: source.turn };
+}
+
+function withAnchoredDispatch<T>(
+  sessionId: string,
+  anchor: { sourceUserSeq: number; turn: number },
+  work: () => Promise<T>,
+): Promise<T> {
+  return withHarnessRunContext(
+    { sessionId, sourceUserSeq: anchor.sourceUserSeq, turn: anchor.turn, counter: new ToolCallsCounter(1_000) },
+    work,
+  ) as Promise<T>;
+}
 
 async function renderAgentInstructions(agent: { instructions?: unknown }): Promise<string> {
   const instr = agent.instructions;
@@ -230,11 +266,12 @@ test('production call_tool admits a deferred built-in against the orchestrator s
       invoke: (context: unknown, input: string, details: unknown) => Promise<unknown>;
     } | undefined;
     assert.ok(callTool, 'schema-on-demand production surface omitted call_tool');
-    const output = await callTool!.invoke(
-      { context: { sessionId: session.id } },
+    const anchor = anchorAcceptedTask(session.id, 'prove the sealed capability boundary');
+    const output = await withAnchoredDispatch(session.id, anchor, () => callTool!.invoke(
+      { context: { sessionId: session.id, sourceUserSeq: anchor.sourceUserSeq, turn: anchor.turn } },
       JSON.stringify({ name: 'desktop_status', args_json: '{}' }),
       { toolCall: { callId: 'orchestrator-capability-admission' } },
-    );
+    ));
     assert.equal(String(output), 'desktop-ok');
     assert.equal(dispatches, 1, 'admitted production call dispatched more or less than once');
     const after = boundAgentCapabilityRevision(agent)!;
@@ -506,7 +543,12 @@ test('run_worker requires a structured parent-planned job packet', async () => {
 
 test('orchestrator run_worker refuses a quantified successful subset before dispatch', async () => {
   resetEventLog();
-  const session = createSession({ kind: 'execution', title: 'quantified subset' });
+  // The quantified-subset refusal keys on user_input_received +
+  // fanout_policy_decision rows, never on session kind. The BRACKETED invoke
+  // driven here additionally demands the chat-turn authority spine (accepted
+  // source + persisted turn graph), which TurnGraph v1 contracts for chat
+  // sessions only — so this fixture anchors a chat session.
+  const session = createSession({ kind: 'chat', title: 'quantified subset' });
   const inputEvent = appendEvent({
     sessionId: session.id,
     turn: 1,
@@ -514,6 +556,9 @@ test('orchestrator run_worker refuses a quantified successful subset before disp
     type: 'user_input_received',
     data: { text: 'Research these 10 prospects and summarize each one.' },
   });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: inputEvent.seq, turn: inputEvent.turn },
+  }), 'fixture could not persist a turn graph for the accepted task');
   appendEvent({
     sessionId: session.id,
     turn: 1,
@@ -553,16 +598,20 @@ test('orchestrator run_worker refuses a quantified successful subset before disp
     },
   };
   const encoded = JSON.stringify(packet);
-  const result = await runWorker.invoke(
-    new RunContext({ sessionId: session.id, sourceUserSeq: inputEvent.seq }),
-    encoded,
-    {
-      toolCall: {
-        name: 'run_worker',
-        callId: 'call_quantified_subset',
-        arguments: encoded,
+  const result = await withAnchoredDispatch(
+    session.id,
+    { sourceUserSeq: inputEvent.seq, turn: inputEvent.turn },
+    () => runWorker.invoke(
+      new RunContext({ sessionId: session.id, sourceUserSeq: inputEvent.seq }),
+      encoded,
+      {
+        toolCall: {
+          name: 'run_worker',
+          callId: 'call_quantified_subset',
+          arguments: encoded,
+        },
       },
-    },
+    ),
   );
 
   assert.match(String(result), /^ERROR:/);
@@ -695,14 +744,15 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       },
     };
     const input = JSON.stringify(packet);
-    const result = await runWorker.invoke(
+    const anchor = anchorAcceptedTask(session.id, 'Generate one design variation for the landing page hero.');
+    const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
       new RunContext({ sessionId: session.id }),
       input,
       {
         parentRunConfig: { modelProvider: stubProvider },
         toolCall: { name: 'run_worker', callId: 'call_worker_design', arguments: input },
       },
-    );
+    ));
 
     assert.equal(result, 'worker finished on routed model');
     assert.ok(requestedModels.includes('minimax-01'), `expected nested Worker to request minimax-01, got ${requestedModels.join(', ')}`);
@@ -732,14 +782,14 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       },
     };
     const resumedInput = JSON.stringify(resumedPacket);
-    const resumed = await runWorker.invoke(
+    const resumed = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
       new RunContext({ sessionId: session.id }),
       resumedInput,
       {
         parentRunConfig: { modelProvider: stubProvider },
         toolCall: { name: 'run_worker', callId: 'call_worker_design_after_restart', arguments: resumedInput },
       },
-    );
+    ));
     assert.match(String(resumed), /Durable receipt: this item was already complete/);
     assert.match(String(resumed), /No worker ran and no action was repeated/);
     assert.match(String(resumed), /worker finished on routed model/, 'the original persisted work-product is reused');
@@ -777,14 +827,14 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       },
     };
     const batchInput = JSON.stringify(batchPacket);
-    const firstBatch = await runWorker.invoke(
+    const firstBatch = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
       new RunContext({ sessionId: session.id }),
       batchInput,
       {
         parentRunConfig: { modelProvider: stubProvider },
         toolCall: { name: 'run_worker', callId: 'call_worker_design_batch', arguments: batchInput },
       },
-    );
+    ));
     assert.match(String(firstBatch), /Batch complete: 2\/2 items succeeded/);
     const requestsAfterFirstBatch = requestedModels.length;
 
@@ -797,14 +847,14 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       },
     };
     const resumedBatchInput = JSON.stringify(resumedBatchPacket);
-    const resumedBatch = await runWorker.invoke(
+    const resumedBatch = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
       new RunContext({ sessionId: session.id }),
       resumedBatchInput,
       {
         parentRunConfig: { modelProvider: stubProvider },
         toolCall: { name: 'run_worker', callId: 'call_worker_design_batch_after_restart', arguments: resumedBatchInput },
       },
-    );
+    ));
     assert.match(String(resumedBatch), /Durable receipt: all 2\/2 requested items were already complete/);
     assert.match(String(resumedBatch), /No worker ran and no action was repeated/);
     assert.match(String(resumedBatch), /complete "design" phase is already proven/);
@@ -905,14 +955,15 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
       },
     };
     const input = JSON.stringify(packet);
-    const result = await runWorker.invoke(
+    const anchor = anchorAcceptedTask(session.id, 'Produce one fictional SEO note.');
+    const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
       new RunContext({ sessionId: session.id }),
       input,
       {
         parentRunConfig: { modelProvider: stubProvider },
         toolCall: { name: 'run_worker', callId: 'call_worker_repaired', arguments: input },
       },
-    );
+    ));
 
     assert.equal(result, 'worker finished after route repair');
     assert.deepEqual(requestedModels, ['glm-5.2']);
@@ -980,11 +1031,12 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
       intent: 'design',
     };
     const input = JSON.stringify(packet);
-    const result = await runWorker.invoke(
+    const anchor = anchorAcceptedTask(session.id, 'Design one report section using the taste skill.');
+    const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
       new RunContext({ sessionId: session.id }),
       input,
       { toolCall: { name: 'run_worker', callId: 'call_worker_claude_design', arguments: input } },
-    );
+    ));
 
     assert.equal(result, 'sdk worker used skill');
     assert.equal(captured.modelId.startsWith('claude-'), true);
@@ -1036,11 +1088,12 @@ test('run_worker emits worker_result ok=false when an already-capped item is ref
     intent: 'research',
   };
   const input = JSON.stringify(packet);
-  const result = await runWorker.invoke(
+  const anchor = anchorAcceptedTask(session.id, 'Research one firm.');
+  const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
     new RunContext({ sessionId: session.id }),
     input,
     { toolCall: { name: 'run_worker', callId: 'call_worker_capped', arguments: input } },
-  );
+  ));
 
   assert.match(String(result), /^ERROR:/);
   const results = listEvents(session.id, { types: ['worker_result'] });

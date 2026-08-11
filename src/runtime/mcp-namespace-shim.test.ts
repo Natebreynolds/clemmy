@@ -32,6 +32,45 @@ const {
   listMcpServerHealth,
   classifyMcpIntegrityScope,
 } = await import('./mcp-namespace-shim.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
+const { appendEvent, createSession, getSession } = await import('./harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
+
+/** The settlement spine refuses native-MCP dispatch without durable identity:
+ *  an accepted source (user_input_received event) plus a persisted turn graph
+ *  for the accepted task. Anchor both on a `chat` session — the same shape the
+ *  real turn spine establishes before dispatch. */
+function anchorAcceptedTask(sessionId?: string): { sessionId: string; sourceUserSeq: number; turn: number } {
+  const id = sessionId && getSession(sessionId)
+    ? sessionId
+    : createSession(sessionId ? { id: sessionId, kind: 'chat' } : { kind: 'chat' }).id;
+  const source = appendEvent({
+    sessionId: id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'drive the native MCP tool' },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId: id, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { sessionId: id, sourceUserSeq: source.seq, turn: source.turn };
+}
+
+/** Drive shim.callTool inside a harness run context carrying the anchored
+ *  accepted-task identity the settlement spine requires. */
+function callWithAcceptedTask(
+  shim: Pick<MCPServer, 'callTool'>,
+  toolName: string,
+  args: Record<string, unknown> | null,
+): Promise<unknown> {
+  const anchor = anchorAcceptedTask();
+  return withHarnessRunContext(
+    { sessionId: anchor.sessionId, sourceUserSeq: anchor.sourceUserSeq, turn: anchor.turn, counter: new ToolCallsCounter(100) },
+    () => shim.callTool(toolName, args),
+  );
+}
 
 test('MCP integrity classification separates reversible network writes from irreversible sends', () => {
   assert.deepEqual(
@@ -193,7 +232,7 @@ test('shim: callTool routes to the right server with the original tool name', as
   const b = makeFakeServer({ name: 'beta', tools: [{ name: 'get_thing' }] });
   const shim = createMcpNamespaceShim({ servers: [a, b], cacheToolsList: false });
   await shim.listTools(); // populate routing map
-  await shim.callTool('beta__get_thing', { q: 'pinecone' });
+  await callWithAcceptedTask(shim, 'beta__get_thing', { q: 'pinecone' });
   assert.deepEqual(a._calls, []);
   assert.deepEqual(b._calls, [{ tool: 'get_thing', args: { q: 'pinecone' } }]);
 });
@@ -207,7 +246,7 @@ test('shim: normalizes malformed MCP text blocks into model-readable failure res
   const shim = createMcpNamespaceShim({ servers: [dfs], cacheToolsList: false });
   await shim.listTools();
 
-  const result = await shim.callTool('dataforseo__get_page_content', { url: 'https://example.com' });
+  const result = await callWithAcceptedTask(shim, 'dataforseo__get_page_content', { url: 'https://example.com' });
 
   assert.equal(Array.isArray(result), true);
   assert.equal((result as any).isError, true);
@@ -228,7 +267,7 @@ test('shim: SDK invalid tools/call result validation errors become tool results 
   const shim = createMcpNamespaceShim({ servers: [dfs], cacheToolsList: false });
   await shim.listTools();
 
-  const result = await shim.callTool('dataforseo__get_page_content', { url: 'https://example.com' });
+  const result = await callWithAcceptedTask(shim, 'dataforseo__get_page_content', { url: 'https://example.com' });
 
   assert.equal(Array.isArray(result), true);
   assert.equal((result as any).isError, true);
@@ -251,7 +290,7 @@ test('shim: MCP isError metadata gets self-correcting failure guidance', async (
     const shim = createMcpNamespaceShim({ servers: [server], cacheToolsList: false });
     await shim.listTools();
 
-    const result = await shim.callTool('plainerr__get_failure_probe', {});
+    const result = await callWithAcceptedTask(shim, 'plainerr__get_failure_probe', {});
     const text = (result as any[])
       .map((block) => (typeof block?.text === 'string' ? block.text : ''))
       .join('\n');
@@ -270,8 +309,9 @@ test('shim: native MCP lifecycle telemetry is scoped to the harness session', as
   const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
   await shim.listTools();
 
+  const anchor = anchorAcceptedTask('mcp-observability-sess');
   await withHarnessRunContext(
-    { sessionId: 'mcp-observability-sess', counter: new ToolCallsCounter() },
+    { sessionId: anchor.sessionId, sourceUserSeq: anchor.sourceUserSeq, turn: anchor.turn, counter: new ToolCallsCounter() },
     () => shim.callTool('obs__get_observability_probe', { q: 'session-scope' }),
   );
 
@@ -292,7 +332,7 @@ test('shim: callTool throws a clear error for an unknown tool name', async () =>
   const shim = createMcpNamespaceShim({ servers: [a], cacheToolsList: false });
   await shim.listTools();
   await assert.rejects(
-    () => shim.callTool('nope__whatever', null),
+    () => callWithAcceptedTask(shim, 'nope__whatever', null),
     /Unknown MCP tool/,
   );
 });
@@ -500,7 +540,7 @@ test('T2.3: callTool on the stub throws BoundaryError(mcp.server_unavailable)', 
   const shim = createMcpNamespaceShim({ servers: [bad], cacheToolsList: false });
   await shim.listTools(); // populates routing + marks server unavailable
   await assert.rejects(
-    () => shim.callTool('bad-server__unavailable', null),
+    () => callWithAcceptedTask(shim, 'bad-server__unavailable', null),
     (err: Error) => {
       const isBoundary = (err as { kind?: unknown }).kind === 'mcp.server_unavailable';
       const hasUserMessage = typeof (err as { userMessage?: unknown }).userMessage === 'string';
@@ -597,8 +637,9 @@ test('shim: a native MCP call credits its proven-path memo (closes the 0% MCP co
   const b = makeFakeServer({ name: 'mcpcredit', tools: [{ name: 'get_rank_probe' }] });
   const shim = createMcpNamespaceShim({ servers: [b], cacheToolsList: false });
   await shim.listTools();
+  const anchor = anchorAcceptedTask('mcp-credit-sess');
   await harnessRunContextStorage.run(
-    { sessionId: 'mcp-credit-sess', counter: new ToolCallsCounter() },
+    { sessionId: anchor.sessionId, sourceUserSeq: anchor.sourceUserSeq, turn: anchor.turn, counter: new ToolCallsCounter() },
     () => shim.callTool('mcpcredit__get_rank_probe', { q: 'x' }),
   );
   assert.equal(peekToolChoice(INTENT)!.choice!.successCount ?? 0, before + 1, 'the native MCP call scored the memo (was bypassing the credit boundary entirely)');

@@ -38,6 +38,7 @@ const {
 } = await import('../agents/external-mcp-scope-lock.js');
 const { mcpServersTestHooks, enabledExternalServerNames } = await import('./mcp-servers.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -243,6 +244,11 @@ function acceptedTask(label: string): { sessionId: string; sourceUserSeq: number
     sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: `${label} task` },
   });
+  // Durable settlement authority: the accepted source above plus a persisted
+  // turn graph for the accepted task (authority spine).
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
   return { sessionId: session.id, sourceUserSeq: source.seq };
 }
 
@@ -254,10 +260,16 @@ test('a returned 400 repairs the call and does NOT spend a discovery epoch', asy
   governor.initializeTask({ ...key, knownCapability: false });
   governor.admit({ ...key, category: 'broad_discovery', callId: 'search-1' });
 
-  const settled = settleToolAttempt({
-    ...key, lane: 'native_mcp', toolName: 'alpha__create', businessCall: true,
-    result: { status: 400, error: 'missing required field' },
-  });
+  // Every lane opens a logical tool call before settling; an uncorrelated
+  // settlement is refused, so modelling the lane means opening one here too.
+  const { withLogicalToolCall } = await import('./harness/attempt-identity.js');
+  const settled = withLogicalToolCall(
+    { ...key, tool: 'alpha__create' },
+    () => settleToolAttempt({
+      ...key, lane: 'native_mcp', toolName: 'alpha__create', businessCall: true,
+      result: { status: 400, error: 'missing required field' },
+    }),
+  );
   assert.equal(settled.outcome.kind, 'invalid_arguments');
   assert.equal(settled.outcome.evidence, 'structured');
   assert.equal(settled.outcome.directive.retrySameCandidate, true, 'the call is repairable');
@@ -277,7 +289,7 @@ test('a THROWN unsupported error eliminates the candidate and reopens discovery'
   // Every lane opens a logical tool call before settling; an uncorrelated
   // settlement is refused, so modelling the lane means opening one here too.
   const { withLogicalToolCall } = await import('./harness/attempt-identity.js');
-  const settled = withLogicalToolCall(key, () => settleToolAttempt({
+  const settled = withLogicalToolCall({ ...key, tool: 'alpha__unsupported' }, () => settleToolAttempt({
     ...key, lane: 'native_mcp', toolName: 'alpha__unsupported', businessCall: true, thrown,
   }));
   assert.equal(settled.outcome.kind, 'unsupported_capability');
@@ -294,10 +306,16 @@ test('an uncertain mutation reconciles and is never replayed', async () => {
   governor.initializeTask({ ...key, knownCapability: false });
   governor.admit({ ...key, category: 'broad_discovery', callId: 'search-1' });
 
-  const settled = settleToolAttempt({
-    ...key, lane: 'native_mcp', toolName: 'alpha__send', mutating: true, businessCall: true,
-    thrown: new Error('socket hang up'),
-  });
+  // Every lane opens a logical tool call before settling; an uncorrelated
+  // settlement is refused, so modelling the lane means opening one here too.
+  const { withLogicalToolCall } = await import('./harness/attempt-identity.js');
+  const settled = withLogicalToolCall(
+    { ...key, tool: 'alpha__send' },
+    () => settleToolAttempt({
+      ...key, lane: 'native_mcp', toolName: 'alpha__send', mutating: true, businessCall: true,
+      thrown: new Error('socket hang up'),
+    }),
+  );
   assert.equal(settled.outcome.kind, 'uncertain_write');
   assert.equal(settled.outcome.directive.requiresReconciliation, true);
   assert.equal(settled.outcome.directive.retrySameCandidate, false, 'never replay an unacknowledged write');
@@ -320,21 +338,21 @@ test('capability_satisfied comes from a successful BUSINESS call, not from looki
   const { withLogicalToolCall } = await import('./harness/attempt-identity.js');
 
   // Succeeding at discovery is not progress.
-  withLogicalToolCall(key, () => settleToolAttempt({
+  withLogicalToolCall({ ...key, tool: 'alpha__list' }, () => settleToolAttempt({
     ...key, lane: 'native_mcp', toolName: 'alpha__list', businessCall: false,
     result: { successful: true, data: [{ id: 1 }] },
   }));
   assert.equal(governor.getTaskState(key)?.policy.epoch, 0, 'a search is not a finished step');
 
   // Neither is an empty answer.
-  withLogicalToolCall(key, () => settleToolAttempt({
+  withLogicalToolCall({ ...key, tool: 'alpha__read' }, () => settleToolAttempt({
     ...key, lane: 'native_mcp', toolName: 'alpha__read', businessCall: true,
     result: { successful: true, data: [] },
   }));
   assert.equal(governor.getTaskState(key)?.policy.epoch, 0, 'nothing found is not progress');
 
   // Real work is.
-  const done = withLogicalToolCall(key, () => settleToolAttempt({
+  const done = withLogicalToolCall({ ...key, tool: 'alpha__read' }, () => settleToolAttempt({
     ...key, lane: 'native_mcp', toolName: 'alpha__read', businessCall: true,
     result: { successful: true, data: [{ id: 1 }] },
   }));

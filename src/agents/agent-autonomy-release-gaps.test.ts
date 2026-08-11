@@ -79,6 +79,27 @@ function decisionFor(delegationId: string): string {
   });
 }
 
+/** Contract mirror of the spine's capability_resolve node: the builder is
+ * handed the exact accepted identity during the turn (execution-kind sessions
+ * route as direct_reply). Stubs must call it the same way production does. */
+type BuildAgentSeam = (identity: {
+  sessionId: string;
+  sourceUserSeq: number;
+  route: 'direct_reply' | 'retrieve' | 'act';
+}) => Promise<unknown>;
+
+function resolveStubCapability(options: {
+  sessionId: string;
+  sourceUserSeq: number;
+  buildAgent?: BuildAgentSeam;
+}): Promise<unknown> | undefined {
+  return options.buildAgent?.({
+    sessionId: options.sessionId,
+    sourceUserSeq: options.sourceUserSeq,
+    route: 'direct_reply',
+  });
+}
+
 function fakeAssistantReturning(text: string, onCall?: () => void): unknown {
   return {
     async respond(request: { sessionId?: string }) {
@@ -130,10 +151,11 @@ test('delegation wake fires even when cadence proactivity is disabled', async ()
     buildAgent: (async () => ({})) as never,
     runConversation: (async (options: {
       sessionId: string;
+      sourceUserSeq: number;
       acceptStructuredNoToolResult?: boolean;
-      buildAgent?: () => Promise<unknown>;
+      buildAgent?: BuildAgentSeam;
     }) => {
-      await options.buildAgent?.();
+      await resolveStubCapability(options);
       assistantCalls += 1;
       structuredNoToolOptIn = options.acceptStructuredNoToolResult;
       return {
@@ -306,7 +328,11 @@ test('OAuth autonomy uses an explicit empty tool allowlist instead of generic cr
       builtWith = options;
       return {};
     }) as never,
-    runConversation: (async (options: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await options.buildAgent?.(), {
+    runConversation: (async (options: {
+      sessionId: string;
+      sourceUserSeq: number;
+      buildAgent?: BuildAgentSeam;
+    }) => (await resolveStubCapability(options), {
       sessionId: options.sessionId,
       status: 'completed',
       steps: 1,
@@ -452,7 +478,11 @@ test('a denied runtime action fails the cycle and leaves delegated input availab
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
-    runConversation: (async (options: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await options.buildAgent?.(), {
+    runConversation: (async (options: {
+      sessionId: string;
+      sourceUserSeq: number;
+      buildAgent?: BuildAgentSeam;
+    }) => (await resolveStubCapability(options), {
       sessionId: options.sessionId,
       status: 'completed',
       steps: 1,
@@ -503,7 +533,11 @@ test('a delegation wake cannot succeed as an empty no-op cycle', async () => {
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
-    runConversation: (async (options: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await options.buildAgent?.(), {
+    runConversation: (async (options: {
+      sessionId: string;
+      sourceUserSeq: number;
+      buildAgent?: BuildAgentSeam;
+    }) => (await resolveStubCapability(options), {
       sessionId: options.sessionId,
       status: 'completed',
       steps: 1,
@@ -546,7 +580,11 @@ test('an ordinary cadence wake may still succeed as a truthful no-op', async () 
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
-    runConversation: (async (options: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await options.buildAgent?.(), {
+    runConversation: (async (options: {
+      sessionId: string;
+      sourceUserSeq: number;
+      buildAgent?: BuildAgentSeam;
+    }) => (await resolveStubCapability(options), {
       sessionId: options.sessionId,
       status: 'completed',
       steps: 1,

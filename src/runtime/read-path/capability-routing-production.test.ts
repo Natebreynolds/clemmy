@@ -40,6 +40,8 @@ const jit = await import('../../agents/tool-jit.js');
 const mcpScope = await import('../mcp-tool-scope.js');
 const candidates = await import('./capability-candidates.js');
 const worker = await import('../../memory/learning-worker.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../harness/brackets.js');
 
 const CALENDAR_SLUG = 'SCHEDULERCO_LIST_EVENTS';
 const COLD_PHRASE = "What's on my calendar tomorrow?";
@@ -55,9 +57,15 @@ async function teachOneVerifiedRead(): Promise<void> {
   const sessionId = `sess-teach-${(teachSeq += 1)}`;
   eventlog.createSession({ id: sessionId, kind: 'chat', channel: 'home', title: 'teach' });
   const attempt = eventlog.beginRunAttempt(sessionId, {});
-  eventlog.recordRunAttemptUserInput(attempt, {
+  const source = eventlog.recordRunAttemptUserInput(attempt, {
     turn: 1, role: 'user', data: { text: COLD_PHRASE, attemptId: attempt.attemptId, source: 'home' },
   }, { armRunInFlight: true });
+  // Durable settlement requires the accepted-source identity plus a persisted
+  // turn graph for the accepted task (authority spine).
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  if (!shadow) throw new Error('fixture could not persist a turn graph');
   schemaCache.rememberToolSchema(CALENDAR_SLUG, {
     type: 'object', properties: { timeMin: { type: 'string' }, timeMax: { type: 'string' } },
   }, Date.now());
@@ -65,8 +73,11 @@ async function teachOneVerifiedRead(): Promise<void> {
     successful: true,
     data: { items: [{ id: 'evt-1', summary: 'Standup', start: '2026-08-06T09:00:00-07:00' }] },
   })) as never;
-  await composio.runComposioExecuteForTestInSession(
-    CALENDAR_SLUG, { timeMin: '2026-08-06', timeMax: '2026-08-07' }, exec, sessionId,
+  await withHarnessRunContext(
+    { sessionId, sourceUserSeq: source.seq, turn: source.turn, counter: new ToolCallsCounter(1_000) },
+    () => composio.runComposioExecuteForTestInSession(
+      CALENDAR_SLUG, { timeMin: '2026-08-06', timeMax: '2026-08-07' }, exec, sessionId,
+    ),
   );
   await worker.drainPendingLearning();
 }
@@ -76,8 +87,14 @@ type SurfaceProbe = { pinned: string[]; matchCount: number; card: string };
 
 function probeBridgeTurn(): { probes: SurfaceProbe[]; run: never; buildAgent: never } {
   const probes: SurfaceProbe[] = [];
-  const run = (async (opts: { sessionId: string; buildAgent?: () => Promise<unknown> }) => {
-    await opts.buildAgent?.();
+  const run = (async (opts: {
+    sessionId: string;
+    sourceUserSeq: number;
+    buildAgent?: (identity: { sessionId: string; sourceUserSeq: number; route: string }) => Promise<unknown>;
+  }) => {
+    // The spine builds the agent AT the capability_resolve node with the
+    // accepted identity; the stub honors that contract.
+    await opts.buildAgent?.({ sessionId: opts.sessionId, sourceUserSeq: opts.sourceUserSeq, route: 'act' });
     return { sessionId: opts.sessionId, steps: 1, lastTurn: 1, status: 'completed', text: 'ok' };
   }) as never;
   const buildAgent = (async (opts: {
@@ -153,8 +170,12 @@ test('an ESTABLISHED session still receives its candidates — delivery is bound
   }
 
   const probes: Array<{ pinned: string[] }> = [];
-  const run = (async (opts: { sessionId: string; buildAgent?: () => Promise<unknown> }) => {
-    await opts.buildAgent?.();
+  const run = (async (opts: {
+    sessionId: string;
+    sourceUserSeq: number;
+    buildAgent?: (identity: { sessionId: string; sourceUserSeq: number; route: string }) => Promise<unknown>;
+  }) => {
+    await opts.buildAgent?.({ sessionId: opts.sessionId, sourceUserSeq: opts.sourceUserSeq, route: 'act' });
     return { sessionId: opts.sessionId, steps: 1, lastTurn: 1, status: 'completed', text: 'ok' };
   }) as never;
   _setBridgeImplsForTests({

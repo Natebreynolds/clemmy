@@ -41,10 +41,59 @@ process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 
 const { buildWorkflowStepAgent } = await import('./workflow-step-agent.js');
 const { runWorkspaceDir } = await import('../execution/workflow-run-workspace.js');
+const { appendEvent, createSession } = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
+
+/**
+ * Production no longer lets a bracketed tool settle from thin air: every
+ * wrapped dispatch needs an ACCEPTED SOURCE (user_input_received) plus a
+ * PERSISTED TURN GRAPH for that accepted task. Anchor one fixture identity
+ * per invocation and run the invoke inside the same harness run context the
+ * real turn spine establishes before dispatch. The assertions below are
+ * untouched — only the dispatch anchoring changed.
+ */
+let fixtureTaskSerial = 0;
+function acceptedTaskAnchor(): { sessionId: string; sourceUserSeq: number; turn: number } {
+  fixtureTaskSerial += 1;
+  const session = createSession({
+    id: `graph-context-query-fixture-${fixtureTaskSerial}`,
+    kind: 'chat',
+  });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'query the offloaded artifact' },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  if (!shadow) throw new Error('fixture could not persist a turn graph');
+  return { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+}
+
+let fixtureCallSerial = 0;
+function invokeAnchored(
+  tool: { invoke: (ctx: unknown, input: string, details?: unknown) => Promise<unknown> },
+  input: string,
+): Promise<unknown> {
+  const anchor = acceptedTaskAnchor();
+  fixtureCallSerial += 1;
+  return withHarnessRunContext(
+    { ...anchor, counter: new ToolCallsCounter(1_000) },
+    () => tool.invoke(
+      { context: anchor },
+      input,
+      { toolCall: { callId: `graph-context-query-call-${fixtureCallSerial}` } },
+    ),
+  ) as Promise<unknown>;
+}
 
 const WORKFLOW = 'graph-context-query-pin';
 const RUN_ID = 'graph-context-query-pin-run';
@@ -121,9 +170,9 @@ test('compiled-project exact authority replaces the generic artifact reader and 
   assert.equal(tools.some((tool) => tool.name === 'notify_user'), false);
   const query = tools.find((tool) => tool.name === 'workspace_artifact_query');
   assert.ok(query?.invoke);
-  assert.match(String(await query.invoke({}, JSON.stringify({ path: allowed }))), /Artifact /);
+  assert.match(String(await invokeAnchored(query as { invoke: (ctx: unknown, input: string, details?: unknown) => Promise<unknown> }, JSON.stringify({ path: allowed }))), /Artifact /);
   assert.match(
-    String(await query.invoke({}, JSON.stringify({ path: unowned }))),
+    String(await invokeAnchored(query as { invoke: (ctx: unknown, input: string, details?: unknown) => Promise<unknown> }, JSON.stringify({ path: unowned }))),
     /not rendered into the active workflow step context/,
     'same-run files that are not bound to a completed event remain unreadable',
   );
@@ -151,7 +200,7 @@ test('the specialist read tool admits the exact strict-mode payload the live can
     max_chars: 500_000,
   });
 
-  const out = String(await tool.invoke({}, liveArgs));
+  const out = String(await invokeAnchored(tool, liveArgs));
   assert.ok(!isSchemaRejection(out), `the tool must not reject its own strict-mode call shape: ${out}`);
   assert.ok(!/Refused:/.test(out), `the seeded artifact is event-owned and must be readable: ${out}`);
   assert.match(out, /of 514 matching/, 'the query must reach the offloaded rows');
@@ -161,7 +210,7 @@ test('an over-large page request is clamped and told exactly how to continue', a
   const absolute = seedArtifact();
   const tool = await graphQueryTool();
 
-  const out = String(await tool.invoke({}, JSON.stringify({
+  const out = String(await invokeAnchored(tool, JSON.stringify({
     path: absolute, json_path: '$.transactions', offset: 0, limit: 514, max_chars: 500_000,
   })));
 
@@ -176,7 +225,7 @@ test('null-valued optionals are treated as absent, not as bad input', async () =
   const absolute = seedArtifact();
   const tool = await graphQueryTool();
 
-  const out = String(await tool.invoke({}, JSON.stringify({
+  const out = String(await invokeAnchored(tool, JSON.stringify({
     path: absolute,
     json_path: '$.transactions',
     fields: null,
@@ -198,7 +247,7 @@ test('filters still work when supplied, and the run-workspace boundary still hol
   const absolute = seedArtifact();
   const tool = await graphQueryTool();
 
-  const filtered = String(await tool.invoke({}, JSON.stringify({
+  const filtered = String(await invokeAnchored(tool, JSON.stringify({
     path: absolute,
     json_path: '$.transactions',
     fields: ['id', 'stage'],
@@ -214,7 +263,7 @@ test('filters still work when supplied, and the run-workspace boundary still hol
   assert.ok(!/Closed Lost/.test(filtered), 'filter_equals must still exclude non-matching rows');
 
   // Relaxing the schema must NOT relax the containment guarantees.
-  const escape = String(await tool.invoke({}, JSON.stringify({
+  const escape = String(await invokeAnchored(tool, JSON.stringify({
     path: path.join(os.tmpdir(), 'definitely-not-in-this-run.json'),
     json_path: null, fields: null, filter_field: null, filter_contains: null,
     filter_equals: null, offset: null, limit: null, max_chars: null,
@@ -242,7 +291,10 @@ test('an allowed path whose bytes change after binding fails closed', async () =
   assert.ok(query?.invoke);
 
   writeFileSync(absolute, JSON.stringify({ transactions: [{ secret: 'replacement' }] }), 'utf8');
-  const out = String(await query.invoke({}, JSON.stringify({ path: absolute })));
+  const out = String(await invokeAnchored(
+    query as { invoke: (ctx: unknown, input: string, details?: unknown) => Promise<unknown> },
+    JSON.stringify({ path: absolute }),
+  ));
   assert.match(out, /byte length mismatch|SHA-256 mismatch/i);
   assert.doesNotMatch(out, /replacement/, 'tampered bytes are never parsed or returned');
 });

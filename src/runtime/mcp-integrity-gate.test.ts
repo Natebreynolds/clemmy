@@ -30,9 +30,28 @@ import type { MCPServer } from '@openai/agents';
 const { createMcpNamespaceShim } = await import('./mcp-namespace-shim.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
 const { appendEvent, createSession, writeToolOutput, listEvents, resetEventLog } = await import('./harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
 const { openPlanScope } = await import('../agents/plan-scope.js');
 const grounding = await import('./harness/grounding-gate.js');
 const outputGrounding = await import('./harness/output-grounding-gate.js');
+
+/** The settlement spine refuses dispatch without an accepted source AND a
+ *  persisted turn graph for the accepted task — every fixture that drives the
+ *  shim anchors both (turn-graph persistence requires a `chat` session). */
+function anchorAcceptedTask(sessionId: string, text: string): { seq: number; turn: number } {
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { seq: source.seq, turn: source.turn };
+}
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -86,6 +105,7 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
   grounding._resetGroundingStateForTests();
   grounding._resetDuplicateStateForTests();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'send the reviewed emails');
 
   // Authorize the send with an enumerated plan scope so the INTEGRITY gates —
   // grounding + duplicate — are the ONLY thing between a corrupted/duplicate
@@ -113,7 +133,7 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
   await shim.listTools();
   const counter = new ToolCallsCounter(100);
   const send = (subject: string) =>
-    withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+    withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter }, () =>
       shim.callTool('gmail__send_email', { to_email: 'casey@oakridge-law.example', subject, body: `${subject} body` }));
 
   try {
@@ -154,6 +174,7 @@ test('MCP EXEC tool with a network-mutation command gets grounding too (audit #6
   grounding._resetGroundingStateForTests();
   grounding._resetDuplicateStateForTests();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'run the reviewed network mutation');
   writeTrustedReadOutput(
     sess.id,
     'c_extract',
@@ -169,7 +190,7 @@ test('MCP EXEC tool with a network-mutation command gets grounding too (audit #6
   await shim.listTools();
   const counter = new ToolCallsCounter(100);
   const exec = (city: string) =>
-    withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+    withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter }, () =>
       shim.callTool('kernel__exec_command', {
         session_id: 's1',
         command: 'curl',
@@ -197,6 +218,7 @@ test('MCP send gets the OUTPUT-GROUNDING gate too — a fabricated figure bounce
   grounding._resetDuplicateStateForTests();
   outputGrounding._resetOutputGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'send the reviewed emails');
   openPlanScope({ sessionId: sess.id, planProposalId: 'p-integ2', approvedPlanObjective: 'send the reviewed emails', allowedTools: ['gmail__send_email'] });
   // Source: campaign spend sums to $11,000 (labels include "spend"/"campaign").
   writeTrustedReadOutput(
@@ -217,7 +239,7 @@ test('MCP send gets the OUTPUT-GROUNDING gate too — a fabricated figure bounce
   await shim.listTools();
   const counter = new ToolCallsCounter(100);
   const send = (body: string) =>
-    withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+    withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter }, () =>
       shim.callTool('gmail__send_email', { to_email: 'casey@oakridge-law.example', subject: 'Q report', body }));
   try {
     // Fabricated figure → output-grounding soft-blocks BEFORE dispatch.
@@ -239,6 +261,7 @@ test('MCP READ tool is untouched by the integrity gate (no false gating)', async
   resetEventLog();
   grounding._resetGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'list the airtable records');
   const calls: Array<{ tool: string }> = [];
   const server: MCPServer = {
     name: 'airtable', cacheToolsList: false, toolFilter: undefined,
@@ -249,7 +272,7 @@ test('MCP READ tool is untouched by the integrity gate (no false gating)', async
   const shim = createMcpNamespaceShim({ servers: [server], cacheToolsList: false });
   await shim.listTools();
   const counter = new ToolCallsCounter(100);
-  await withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+  await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter }, () =>
     shim.callTool('airtable__list_records', { baseId: 'b1' }));
   assert.equal(calls.length, 1, 'read dispatched with no gate interference');
   assert.equal(listEvents(sess.id, { types: ['external_write'] }).length, 0, 'no external_write for a read');

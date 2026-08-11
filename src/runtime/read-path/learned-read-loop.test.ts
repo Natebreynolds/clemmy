@@ -41,6 +41,8 @@ const toolChoice = await import('../../memory/tool-choice-store.js');
 const eventlog = await import('../harness/eventlog.js');
 const candidates = await import('./capability-candidates.js');
 const worker = await import('../../memory/learning-worker.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../harness/brackets.js');
 
 const CALENDAR_SLUG = 'SCHEDULERCO_LIST_EVENTS';
 const COLD_PHRASE = "What's on my calendar tomorrow?";
@@ -59,6 +61,20 @@ function calendarPayload() {
   };
 }
 
+/** The accepted-task identity each fixture session dispatches under. */
+const acceptedBySession = new Map<string, { sourceUserSeq: number; turn: number }>();
+
+/** Run wrapped-tool work under the session's accepted-task authority, the way
+ *  the production loop does (settlement reads it from the run context). */
+function withAcceptedTask<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+  const accepted = acceptedBySession.get(sessionId);
+  if (!accepted) throw new Error(`fixture has no accepted source for ${sessionId}`);
+  return withHarnessRunContext(
+    { sessionId, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn, counter: new ToolCallsCounter(1_000) },
+    work,
+  ) as Promise<T>;
+}
+
 /** Drive ONE governed read through the production gateway for a session. */
 async function governedRead(sessionId: string, args: Record<string, unknown>): Promise<{ output: string; dispatches: number }> {
   // The live contract the capability binds to — production deposits this at
@@ -69,13 +85,16 @@ async function governedRead(sessionId: string, args: Record<string, unknown>): P
   }, Date.now());
   let dispatches = 0;
   const exec = (async () => { dispatches += 1; return calendarPayload(); }) as never;
-  const output = await composio.runComposioExecuteForTestInSession(CALENDAR_SLUG, args, exec, sessionId);
+  const output = await withAcceptedTask(sessionId, () =>
+    composio.runComposioExecuteForTestInSession(CALENDAR_SLUG, args, exec, sessionId));
   await worker.drainPendingLearning();
   return { output, dispatches };
 }
 
 /** Record an accepted user turn the way production does, so learning has an
- *  exact {sessionId, sourceUserSeq} to bind to. */
+ *  exact {sessionId, sourceUserSeq} to bind to. Durable settlement requires
+ *  the accepted-source identity plus a persisted turn graph for the accepted
+ *  task (authority spine), so the fixture persists both. */
 function acceptSource(sessionId: string, text: string): { sourceUserSeq: number } {
   if (!eventlog.getSession(sessionId)) {
     eventlog.createSession({ id: sessionId, kind: 'chat', channel: 'home', title: text.slice(0, 60) });
@@ -84,6 +103,11 @@ function acceptSource(sessionId: string, text: string): { sourceUserSeq: number 
   const event = eventlog.recordRunAttemptUserInput(attempt, {
     turn: 1, role: 'user', data: { text, attemptId: attempt.attemptId, source: 'home' },
   }, { armRunInFlight: true });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: event.seq, turn: event.turn },
+  });
+  if (!shadow) throw new Error('fixture could not persist a turn graph');
+  acceptedBySession.set(sessionId, { sourceUserSeq: event.seq, turn: event.turn });
   return { sourceUserSeq: event.seq };
 }
 
@@ -181,7 +205,8 @@ test('A4: failure, ambiguity, and unverified payloads never learn', async () => 
     const phrase = `check the ${label} calendar situation`;
     acceptSource(sessionId, phrase);
     const exec = (async () => payload) as never;
-    await composio.runComposioExecuteForTestInSession('SCHEDULERCO_UNVERIFIED', { q: label }, exec, sessionId);
+    await withAcceptedTask(sessionId, () =>
+      composio.runComposioExecuteForTestInSession('SCHEDULERCO_UNVERIFIED', { q: label }, exec, sessionId));
     await worker.drainPendingLearning();
     const learned = toolChoice.matchToolChoicesForStep(phrase, { limit: 5 });
     assert.equal(learned.some((match) => match.identifier === 'SCHEDULERCO_UNVERIFIED'), false,

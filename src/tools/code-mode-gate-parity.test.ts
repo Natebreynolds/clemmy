@@ -18,8 +18,30 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'clemmy-codemode-parity-'));
 process.env.CLEMENTINE_HOME = TMP;
 mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
-const { resetEventLog, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const { resetEventLog, createSession, listEvents, appendEvent } = await import('../runtime/harness/eventlog.js');
 const { dispatchCodeModeTool, _setCodeModeToolsForTests } = await import('./code-mode-tool.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+
+/**
+ * Durable settlement requires the accepted-source identity plus a persisted
+ * turn graph for the accepted task (authority spine) before a wrapped dispatch
+ * can settle. Mirrors the real turn spine's anchors.
+ */
+function anchorAcceptedTask(sessionId: string, text: string): { seq: number; turn: number } {
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { seq: source.seq, turn: source.turn };
+}
 
 function setBaselineEnv(): void {
   process.env.HARNESS_TOOL_BRACKETS = 'on';
@@ -86,13 +108,18 @@ test('GATE-PARITY: an in-program reversible-write loop is refused at the 3rd mut
   resetEventLog();
   injectFakes();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'update these airtable records');
   const counter = (await import('../runtime/harness/brackets.js')).ToolCallsCounter;
   const shared = new counter(1000);
   const update = (n: number) => ({ tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: JSON.stringify({ record: n }) });
-  await dispatchCodeModeTool('composio_execute_tool', update(1), sess.id, shared);
-  await dispatchCodeModeTool('composio_execute_tool', update(2), sess.id, shared);
+  const run = (n: number) => withHarnessRunContext(
+    { sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter: shared },
+    () => dispatchCodeModeTool('composio_execute_tool', update(n), sess.id, shared),
+  );
+  await run(1);
+  await run(2);
   await assert.rejects(
-    () => dispatchCodeModeTool('composio_execute_tool', update(3), sess.id, shared),
+    () => run(3),
     /run_batch/,
     'the 3rd mutating call in one program run must be refused toward run_batch',
   );
@@ -119,9 +146,13 @@ test('TELEMETRY: each in-program call emits codeMode-tagged tool_called/tool_ret
   resetEventLog();
   injectFakes();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'update the airtable record');
   // A reversible UPDATE, not a send — sends are refused in code mode by design
   // (606a2245), so telemetry visibility is proven on a call that executes.
-  await dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: JSON.stringify({ record: 1 }) }, sess.id);
+  await withHarnessRunContext(
+    { sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter: new ToolCallsCounter(1000) },
+    () => dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: JSON.stringify({ record: 1 }) }, sess.id),
+  );
   const called = listEvents(sess.id, { types: ['tool_called'] }).filter((e) => (e.data as { codeMode?: boolean }).codeMode);
   const returned = listEvents(sess.id, { types: ['tool_returned'] }).filter((e) => (e.data as { codeMode?: boolean }).codeMode);
   assert.ok(called.length >= 1, 'an in-program clem call emits a codeMode-tagged tool_called');
@@ -175,7 +206,11 @@ test('BYPASS-FIX: a hook that AUTO-APPROVES still runs (gate-parity, not a blank
   let ran = false;
   injectShellFake(async () => false, () => { ran = true; });
   const sess = createSession({ kind: 'chat' });
-  const out = await dispatchCodeModeTool('run_shell_command', { command: 'ls -la' }, sess.id);
+  const anchor = anchorAcceptedTask(sess.id, 'list the files in this directory');
+  const out = await withHarnessRunContext(
+    { sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter: new ToolCallsCounter(1000) },
+    () => dispatchCodeModeTool('run_shell_command', { command: 'ls -la' }, sess.id),
+  );
   assert.equal(ran, true, 'an auto-approved command must still execute');
   assert.equal(out, 'RAN');
   _setCodeModeToolsForTests(null);

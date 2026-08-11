@@ -40,6 +40,35 @@ const {
   sealAgentCapabilityUniverse,
 } = await import('./capability-envelope.js');
 const { _resetHotSetForTest } = await import('./tool-hotset.js');
+const { appendEvent, createSession, getSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+
+/**
+ * Production no longer lets a bracketed tool mint settlement authority from a
+ * session id alone: every wrapped dispatch needs an ACCEPTED SOURCE
+ * (user_input_received) plus a PERSISTED TURN GRAPH for that accepted task.
+ * Anchor the same exact identity the real turn spine establishes before
+ * dispatch, and reuse it for later calls in the same fixture session.
+ */
+function anchorAcceptedTask(sessionId: string, text: string): { sourceUserSeq: number; turn: number } {
+  if (!getSession(sessionId)) createSession({ id: sessionId, kind: 'chat' });
+  const existing = listEvents(sessionId, { types: ['user_input_received'] })
+    .find((event) => event.data.workflowStepAuthorityFixture === true);
+  if (existing) return { sourceUserSeq: existing.seq, turn: existing.turn };
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text, workflowStepAuthorityFixture: true },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  if (!shadow) throw new Error('fixture could not persist a turn graph');
+  return { sourceUserSeq: source.seq, turn: source.turn };
+}
 
 after(() => {
   _resetHotSetForTest();
@@ -339,11 +368,27 @@ test('unbound workflow call_tool advances its sealed revision once and refuses o
 
     const callTool = agent.tools.find((toolRef) => toolRef.name === 'call_tool') as InvokableAgentTool | undefined;
     assert.ok(callTool?.invoke, 'unbound schema-on-demand step omitted call_tool');
-    const invoke = () => callTool!.invoke!(
-      { context: { sessionId: 'workflow-capability-revision-test' } },
-      JSON.stringify({ name: 'desktop_status', args_json: '{}' }),
-      { toolCall: { callId: `workflow-capability-${dispatches}` } },
+    const accepted = anchorAcceptedTask(
+      'workflow-capability-revision-test',
+      'Synthesize the supplied evidence into a compact neutral summary.',
     );
+    let fixtureCallSerial = 0;
+    const invoke = () => {
+      fixtureCallSerial += 1;
+      return withHarnessRunContext(
+        {
+          sessionId: 'workflow-capability-revision-test',
+          sourceUserSeq: accepted.sourceUserSeq,
+          turn: accepted.turn,
+          counter: new ToolCallsCounter(1_000),
+        },
+        () => callTool!.invoke!(
+          { context: { sessionId: 'workflow-capability-revision-test', sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn } },
+          JSON.stringify({ name: 'desktop_status', args_json: '{}' }),
+          { toolCall: { callId: `workflow-capability-${fixtureCallSerial}` } },
+        ),
+      ) as Promise<unknown>;
+    };
 
     assert.equal(String(await invoke()), 'desktop-ok');
     const afterFirst = boundAgentCapabilityRevision(agent)!;

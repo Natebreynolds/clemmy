@@ -341,9 +341,24 @@ function fakeHarnessAssistant(responses: HarnessStubReply[]): {
       authority.push(options.allowedToolNames);
       return {};
     }) as never,
-    runConversation: (async (options: { sessionId: string; input: string; buildAgent?: () => Promise<unknown> }) => {
-      // Contract mirror: capability resolves during the turn.
-      await options.buildAgent?.();
+    runConversation: (async (options: {
+      sessionId: string;
+      input: string;
+      sourceUserSeq: number;
+      buildAgent?: (identity: {
+        sessionId: string;
+        sourceUserSeq: number;
+        route: 'direct_reply' | 'retrieve' | 'act';
+      }) => Promise<unknown>;
+    }) => {
+      // Contract mirror: capability resolves during the turn, at the spine's
+      // capability_resolve node, which hands the builder the exact accepted
+      // identity (execution-kind sessions route as direct_reply).
+      await options.buildAgent?.({
+        sessionId: options.sessionId,
+        sourceUserSeq: options.sourceUserSeq,
+        route: 'direct_reply',
+      });
       prompts.push(options.input);
       const response = responses.shift();
       if (!response) throw new Error('unexpected harness conversation call');

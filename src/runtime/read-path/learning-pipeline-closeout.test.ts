@@ -29,6 +29,8 @@ const toolChoice = await import('../../memory/tool-choice-store.js');
 const eventlog = await import('../harness/eventlog.js');
 const candidates = await import('./capability-candidates.js');
 const { productionScope } = await import('./read-lane-chat.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../harness/brackets.js');
 const { closeMemoryDb } = await import('../../memory/db.js');
 const { closeProcedureStoreForTests } = await import('../../memory/procedure-store.js');
 const { closeOperationalTelemetryDb } = await import('../operational-telemetry.js');
@@ -57,6 +59,9 @@ function freshSession(prefix: string): string {
   return `${prefix}-${(seq += 1)}`;
 }
 
+/** The accepted-task identity each fixture session dispatches under. */
+const acceptedBySession = new Map<string, { sourceUserSeq: number; turn: number }>();
+
 function acceptSource(sessionId: string, text: string): { sourceUserSeq: number } {
   if (!eventlog.getSession(sessionId)) {
     eventlog.createSession({ id: sessionId, kind: 'chat', channel: 'home', title: text.slice(0, 60) });
@@ -65,13 +70,32 @@ function acceptSource(sessionId: string, text: string): { sourceUserSeq: number 
   const event = eventlog.recordRunAttemptUserInput(attempt, {
     turn: 1, role: 'user', data: { text, attemptId: attempt.attemptId, source: 'home' },
   }, { armRunInFlight: true });
+  // Durable settlement requires the accepted-source identity plus a persisted
+  // turn graph for the accepted task (authority spine).
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: event.seq, turn: event.turn },
+  });
+  if (!shadow) throw new Error('fixture could not persist a turn graph');
+  acceptedBySession.set(sessionId, { sourceUserSeq: event.seq, turn: event.turn });
   return { sourceUserSeq: event.seq };
+}
+
+/** Run wrapped-tool work under the session's accepted-task authority, the way
+ *  the production loop does (settlement reads it from the run context). */
+function withAcceptedTask<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+  const accepted = acceptedBySession.get(sessionId);
+  if (!accepted) throw new Error(`fixture has no accepted source for ${sessionId}`);
+  return withHarnessRunContext(
+    { sessionId, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn, counter: new ToolCallsCounter(1_000) },
+    work,
+  ) as Promise<T>;
 }
 
 async function governedRead(sessionId: string, slug: string, payload: unknown): Promise<string> {
   schemaCache.rememberToolSchema(slug, CAL_SCHEMA, Date.now());
   const exec = (async () => payload) as never;
-  return composio.runComposioExecuteForTestInSession(slug, { timeMin: '2026-08-06' }, exec, sessionId);
+  return withAcceptedTask(sessionId, () =>
+    composio.runComposioExecuteForTestInSession(slug, { timeMin: '2026-08-06' }, exec, sessionId));
 }
 
 /** Drain the durable post-settlement learning worker (the daemon's timer
@@ -409,13 +433,21 @@ test('a warm paraphrase turn: zero discovery, one dispatch, one committed termin
     configure: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({}) as never) as never,
     runConversation: (async (opts: {
-      sessionId: string; buildAgent?: (o?: unknown) => Promise<unknown>;
+      sessionId: string; sourceUserSeq: number; buildAgent?: (o?: unknown) => Promise<unknown>;
     }) => {
-      await opts.buildAgent?.();
-      // The brain honors the card: ONE dispatch with CURRENT arguments.
+      // The spine builds the agent AT the capability_resolve node with the
+      // accepted identity; the stub honors that contract.
+      await opts.buildAgent?.({ sessionId: opts.sessionId, sourceUserSeq: opts.sourceUserSeq, route: 'act' });
+      // The brain honors the card: ONE dispatch with CURRENT arguments — made
+      // under the bridge-accepted task authority, as the production loop does.
       schemaCache.rememberToolSchema(CAL_SLUG, CAL_SCHEMA, Date.now());
       const exec = (async () => { dispatches += 1; return { successful: true, data: { items: [{ id: 'e2' }] } }; }) as never;
-      await composio.runComposioExecuteForTestInSession(CAL_SLUG, { timeMin: '2026-08-07' }, exec, opts.sessionId);
+      const sourceTurn = eventlog.listEvents(opts.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === opts.sourceUserSeq)?.turn ?? 1;
+      await withHarnessRunContext(
+        { sessionId: opts.sessionId, sourceUserSeq: opts.sourceUserSeq, turn: sourceTurn, counter: new ToolCallsCounter(1_000) },
+        () => composio.runComposioExecuteForTestInSession(CAL_SLUG, { timeMin: '2026-08-07' }, exec, opts.sessionId),
+      );
       return { sessionId: opts.sessionId, steps: 1, lastTurn: 1, status: 'completed', text: 'done' };
     }) as never,
   });

@@ -25,6 +25,9 @@ const fixtures = await import('./harness/alpha-fixtures.js');
 const contract = await import('./harness/callable-contract.js');
 const { toResultHandle } = await import('./harness/result-handle.js');
 const { adjudicateTerminal } = await import('./harness/terminal-truth.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
+const { acceptedTaskIdFor } = await import('./harness/attempt-identity.js');
+const { admitLogicalCall } = await import('./harness/dispatch-ledger.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -37,7 +40,35 @@ function acceptedTask(label: string): { sessionId: string; sourceUserSeq: number
     sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: `${label} task` },
   });
+  // Durable settlement authority: the accepted source above plus a persisted
+  // turn graph for the accepted task (authority spine).
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
   return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+
+/** Every lane admits its logical call before dispatch; the fixture does too. */
+function admitFixtureCall(
+  key: { sessionId: string; sourceUserSeq: number },
+  logicalToolCallId: string,
+  tool: string,
+  args?: unknown,
+): void {
+  const admitted = admitLogicalCall({
+    identity: {
+      sessionId: key.sessionId,
+      sourceUserSeq: key.sourceUserSeq,
+      acceptedTaskId: acceptedTaskIdFor(key.sessionId, key.sourceUserSeq),
+      logicalToolCallId,
+    },
+    tool,
+    args,
+  });
+  assert.ok(
+    admitted.status === 'inserted' || admitted.status === 'replayed',
+    `fixture admitted the logical call (${admitted.status}${'reason' in admitted ? `: ${admitted.reason}` : ''})`,
+  );
 }
 
 // ── 1. Trusted tool identity ─────────────────────────────────────────────────
@@ -281,7 +312,8 @@ test('P5a: settlement identity is accepted task + physical attempt, not session+
   const settle = kernel.settleToolAttempt as (i: Record<string, unknown>) => { duplicate: boolean };
   const key = acceptedTask('settlement-identity');
 
-  const attempt = { acceptedTaskId: `${key.sessionId}#${key.sourceUserSeq}`, physicalAttemptId: 'phys-1' };
+  const attempt = { acceptedTaskId: acceptedTaskIdFor(key.sessionId, key.sourceUserSeq), physicalAttemptId: 'phys-1' };
+  admitFixtureCall(key, attempt.physicalAttemptId, 'alphasource__list_records');
   const first = settle({ ...key, ...attempt, lane: 'native_mcp', toolName: 'alphasource__list_records', businessCall: true, result: { successful: true, data: { records: [{ id: 1 }] } } });
   const mirror = settle({ ...key, ...attempt, lane: 'agents_runner', toolName: 'alphasource__list_records', businessCall: true, result: { successful: true, data: { records: [{ id: 1 }] } } });
   assert.equal(first.duplicate, false);
@@ -295,8 +327,9 @@ test('P5b: settlement dedupe survives a restart', async () => {
   const kernel = await import('./harness/attempt-settlement.js') as Record<string, unknown>;
   const settle = kernel.settleToolAttempt as (i: Record<string, unknown>) => { duplicate: boolean };
   const key = acceptedTask('settlement-durable');
-  const attempt = { acceptedTaskId: `${key.sessionId}#${key.sourceUserSeq}`, physicalAttemptId: 'phys-restart' };
+  const attempt = { acceptedTaskId: acceptedTaskIdFor(key.sessionId, key.sourceUserSeq), physicalAttemptId: 'phys-restart' };
 
+  admitFixtureCall(key, attempt.physicalAttemptId, 'alphasource__list_records');
   settle({ ...key, ...attempt, lane: 'native_mcp', toolName: 'alphasource__list_records', businessCall: true, result: { successful: true, data: { records: [] } } });
   (kernel._resetAttemptSettlementStateForTests as () => void)(); // models a process restart
   const afterRestart = settle({ ...key, ...attempt, lane: 'native_mcp', toolName: 'alphasource__list_records', businessCall: true, result: { successful: true, data: { records: [] } } });

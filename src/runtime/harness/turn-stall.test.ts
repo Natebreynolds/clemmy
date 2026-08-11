@@ -514,8 +514,21 @@ test('an authoritative normal attempt can mutate exactly once through the dispat
     withHarnessRunContext,
     wrapToolForHarness,
   } = await import('./brackets.js');
-  const { createSession } = await import('./eventlog.js');
+  const { appendEvent, createSession } = await import('./eventlog.js');
+  const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
   const session = createSession({ kind: 'chat' });
+  // The settlement spine refuses wrapped dispatch without an accepted source
+  // AND a persisted turn graph — anchor both before driving the wrapped tool.
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'save the workspace' },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
   const writes: string[] = [];
   const wrapped = wrapToolForHarness({
     name: 'space_save',
@@ -536,6 +549,7 @@ test('an authoritative normal attempt can mutate exactly once through the dispat
   const out = await withHarnessRunContext(
     {
       sessionId: session.id,
+      sourceUserSeq: source.seq,
       behaviorScopeId: `${session.id}::turn:normal`,
       counter: new ToolCallsCounter(10),
     },
@@ -558,8 +572,21 @@ test('a superseded pre-content attempt cannot mutate after the recovery attempt 
     withHarnessRunContext,
     wrapToolForHarness,
   } = await import('./brackets.js');
-  const { createSession } = await import('./eventlog.js');
+  const { appendEvent, createSession } = await import('./eventlog.js');
+  const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
   const session = createSession({ kind: 'chat' });
+  // The settlement spine refuses wrapped dispatch without an accepted source
+  // AND a persisted turn graph — anchor both before driving the wrapped tool.
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'save the workspace' },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
   const writes: string[] = [];
   let cancelCalls = 0;
   let releaseRetry!: () => void;
@@ -613,6 +640,7 @@ test('a superseded pre-content attempt cannot mutate after the recovery attempt 
   const out = await withHarnessRunContext(
     {
       sessionId: session.id,
+      sourceUserSeq: source.seq,
       behaviorScopeId: `${session.id}::turn:1`,
       counter: new ToolCallsCounter(10),
     },

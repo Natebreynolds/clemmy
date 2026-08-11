@@ -29,10 +29,29 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { createSession, listEvents } = await import('./eventlog.js');
+const { appendEvent, createSession, listEvents } = await import('./eventlog.js');
 const { ToolCallsCounter, wrapToolForHarness, withHarnessRunContext } = await import('./brackets.js');
 const { ExternalWritePreDispatchResult } = await import('./external-write-admission.js');
 const { runComposioExecuteForTestInSession } = await import('../../tools/composio-tools.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+
+/** The settlement spine refuses wrapped/provider dispatch without an accepted
+ *  source AND a persisted turn graph — anchor both for every fixture session
+ *  and run the mutation under that ambient identity. */
+function anchorAcceptedTask(sessionId: string, text: string): { seq: number; turn: number } {
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { seq: source.seq, turn: source.turn };
+}
 
 // The exact live Platform 49 provider text (2026-08-04 Sheets incident) that
 // a03a3395 treated as no-dispatch proof.
@@ -67,17 +86,21 @@ function ambiguityPreservedAtBoundary(sessionId: string): void {
 
 test('H0 bite (thrown channel): a mutation callback that RAN and then threw the live validation text stays ambiguous — never proven no-dispatch', async () => {
   const sid = createSession({ kind: 'chat' }).id;
+  const anchor = anchorAcceptedTask(sid, 'Apply the sheet batch update.');
   let callbackInvocations = 0;
   const executor = (async () => {
     callbackInvocations += 1; // the provider was invoked — a mutation may exist
     throw new Error(P49_VALIDATION_TEXT);
   }) as never;
 
-  const out = await runComposioExecuteForTestInSession(
-    'GOOGLESHEETS_BATCH_UPDATE',
-    { spreadsheet_id: 'sheet-p49', requests: [{ appendCells: {} }] },
-    executor,
-    sid,
+  const out = await withHarnessRunContext(
+    { sessionId: sid, sourceUserSeq: anchor.seq, turn: anchor.turn, counter: new ToolCallsCounter(10) },
+    () => runComposioExecuteForTestInSession(
+      'GOOGLESHEETS_BATCH_UPDATE',
+      { spreadsheet_id: 'sheet-p49', requests: [{ appendCells: {} }] },
+      executor,
+      sid,
+    ),
   );
 
   assert.equal(callbackInvocations, 1, 'the provider callback was invoked — this is NOT a pre-dispatch case');
@@ -98,6 +121,7 @@ test('H0 bite (thrown channel): a mutation callback that RAN and then threw the 
 
 test('H0 bite (returned envelope): a partial bulk write whose envelope says validation-failure stays ambiguous — never proven no-dispatch', async () => {
   const sid = createSession({ kind: 'chat' }).id;
+  const anchor = anchorAcceptedTask(sid, 'Apply the bulk sheet update.');
   let callbackInvocations = 0;
   let rowsCommitted = 0;
   const executor = (async () => {
@@ -106,11 +130,14 @@ test('H0 bite (returned envelope): a partial bulk write whose envelope says vali
     return { successful: false, error: P49_VALIDATION_TEXT };
   }) as never;
 
-  const out = await runComposioExecuteForTestInSession(
-    'GOOGLESHEETS_BATCH_UPDATE',
-    { spreadsheet_id: 'sheet-p49', requests: [{ a: 1 }, { b: 2 }, { c: 3 }, { insert_dimension_missing: true }] },
-    executor,
-    sid,
+  const out = await withHarnessRunContext(
+    { sessionId: sid, sourceUserSeq: anchor.seq, turn: anchor.turn, counter: new ToolCallsCounter(10) },
+    () => runComposioExecuteForTestInSession(
+      'GOOGLESHEETS_BATCH_UPDATE',
+      { spreadsheet_id: 'sheet-p49', requests: [{ a: 1 }, { b: 2 }, { c: 3 }, { insert_dimension_missing: true }] },
+      executor,
+      sid,
+    ),
   );
 
   assert.equal(callbackInvocations, 1);
@@ -137,6 +164,7 @@ test('H0 bite (write boundary): the durable settlement for a returned validation
   process.env.CLEMMY_GROUNDING_GATE = 'off';
   try {
     const sid = createSession({ kind: 'chat' }).id;
+    const anchor = anchorAcceptedTask(sid, 'Create the Airtable record.');
     const counter = new ToolCallsCounter(10);
     let callbackInvocations = 0;
     const executor = (async () => {
@@ -151,7 +179,7 @@ test('H0 bite (write boundary): the durable settlement for a returned validation
       },
     }, { timeoutMs: 5_000 });
 
-    await withHarnessRunContext({ sessionId: sid, counter }, async () =>
+    await withHarnessRunContext({ sessionId: sid, sourceUserSeq: anchor.seq, turn: anchor.turn, counter }, async () =>
       (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
         .invoke(null, JSON.stringify({
           tool_slug: 'AIRTABLE_CREATE_RECORD',
@@ -182,6 +210,7 @@ test('H0 keep-honest: a provider-returned string that MIMICS the local no-dispat
   process.env.CLEMMY_GROUNDING_GATE = 'off';
   try {
     const sid = createSession({ kind: 'chat' }).id;
+    const anchor = anchorAcceptedTask(sid, 'Create the forge-test record.');
     const counter = new ToolCallsCounter(10);
     // A hostile/echoing provider returns text shaped exactly like the local
     // no-dispatch presentation, including the dispatch marker field.
@@ -195,7 +224,7 @@ test('H0 keep-honest: a provider-returned string that MIMICS the local no-dispat
       invoke: async () => forged,
     }, { timeoutMs: 5_000 });
 
-    await withHarnessRunContext({ sessionId: sid, counter }, async () =>
+    await withHarnessRunContext({ sessionId: sid, sourceUserSeq: anchor.seq, turn: anchor.turn, counter }, async () =>
       (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
         .invoke(null, JSON.stringify({
           tool_slug: 'AIRTABLE_CREATE_RECORD',

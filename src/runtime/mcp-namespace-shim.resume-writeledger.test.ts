@@ -28,7 +28,26 @@ const { withHarnessRunContext, ToolCallsCounter, wrapToolForHarness } = await im
 const { appendEvent, createSession, listEvents } = await import('./harness/eventlog.js');
 const { grantSendTrust, openPlanScope, revokeSendTrust } = await import('../agents/plan-scope.js');
 const { saveProactivityPolicy } = await import('../agents/proactivity-policy.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
 type HarnessRunContext = import('./harness/brackets.js').HarnessRunContext;
+
+/** The settlement spine refuses dispatch without an accepted source AND a
+ *  persisted turn graph for the accepted task — every fixture that drives the
+ *  shim anchors both (turn-graph persistence requires a `chat` session). */
+function anchorAcceptedTask(sessionId: string, text: string): { seq: number; turn: number } {
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { seq: source.seq, turn: source.turn };
+}
 
 after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -135,14 +154,8 @@ test('ordinary native MCP writes reserve before dispatch and settle only a clean
     servers: [successfulServer(slug, tool, () => { dispatches += 1; })],
   });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Create the approved Airtable record.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Create the approved Airtable record.');
   openPlanScope({
     sessionId: sid,
     planProposalId: 'p-airtable-write',
@@ -185,14 +198,8 @@ test('valid-shaped native MCP failure prose and empty envelopes never certify a 
     };
     const shim = createMcpNamespaceShim({ servers: [server] });
     const namespaced = namespaceToolName(slugifyServerName(entry.slug), 'create_record');
-    const sid = createSession({ kind: 'execution' }).id;
-    const source = appendEvent({
-      sessionId: sid,
-      turn: 1,
-      role: 'user',
-      type: 'user_input_received',
-      data: { text: `Create provider-failure fixture ${index}.` },
-    });
+    const sid = createSession({ kind: 'chat' }).id;
+    const source = anchorAcceptedTask(sid, `Create provider-failure fixture ${index}.`);
     openPlanScope({
       sessionId: sid,
       planProposalId: `p-native-failure-${index}`,
@@ -222,14 +229,8 @@ test('G: an AMBIGUOUS send throw (timeout / dropped response) records external_w
   assert.equal(classifyMcpIntegrityScope(tool, 'read').isIrreversibleSend, true, 'test tool must be a send');
   const shim = createMcpNamespaceShim({ servers: [throwingServer(slug, tool, 'ETIMEDOUT: request timed out; response dropped after send')] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Send the approved email.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Send the approved email.');
   authorizeSend(sid, namespaced, tool);
 
   await withHarnessRunContext(ctx(sid, source.seq), async () => {
@@ -266,14 +267,8 @@ test('G: provider auth/DNS/bad-params throws remain ambiguous after invocation s
   const tool = 'send_email';
   const shim = createMcpNamespaceShim({ servers: [throwingServer(slug, tool, 'Request failed: 401 Unauthorized — permission denied')] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Send the approved email.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Send the approved email.');
   authorizeSend(sid, namespaced, tool);
 
   await withHarnessRunContext(ctx(sid, source.seq), async () => {
@@ -320,14 +315,8 @@ test('returned native MCP failure envelopes never become successful write receip
       )],
     });
     const namespaced = namespaceToolName(slugifyServerName(entry.slug), entry.tool);
-    const sid = createSession({ kind: 'execution' }).id;
-    const source = appendEvent({
-      sessionId: sid,
-      turn: 1,
-      role: 'user',
-      type: 'user_input_received',
-      data: { text: `Run returned-failure write ${index + 1}.` },
-    });
+    const sid = createSession({ kind: 'chat' }).id;
+    const source = anchorAcceptedTask(sid, `Run returned-failure write ${index + 1}.`);
     openPlanScope({
       sessionId: sid,
       planProposalId: `p-returned-${index}`,
@@ -365,14 +354,8 @@ test('concurrent identical native sends admit exactly one provider dispatch', as
     })],
   });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Send the approved email exactly once.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Send the approved email exactly once.');
   authorizeSend(sid, namespaced, tool);
 
   const settled = await withHarnessRunContext(ctx(sid, source.seq), async () => {
@@ -407,14 +390,8 @@ test('concurrent distinct native sends cannot race past the batch-consent thresh
       })],
     });
     const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-    const sid = createSession({ kind: 'execution' }).id;
-    const source = appendEvent({
-      sessionId: sid,
-      turn: 1,
-      role: 'user',
-      type: 'user_input_received',
-      data: { text: 'Send distinct messages, but stop at the batch approval floor.' },
-    });
+    const sid = createSession({ kind: 'chat' }).id;
+    const source = anchorAcceptedTask(sid, 'Send distinct messages, but stop at the batch approval floor.');
     const recipients = Array.from({ length: 5 }, (_, index) =>
       `distinct-${index + 1}@example.com`
     );
@@ -462,14 +439,8 @@ test('native duplicate safety preserves recipients beyond the eighth identity', 
     servers: [successfulServer(slug, tool, () => { dispatches += 1; })],
   });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Send this approved message to the ten listed recipients exactly once.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Send this approved message to the ten listed recipients exactly once.');
   authorizeSend(sid, namespaced, tool);
   const recipients = Array.from({ length: 10 }, (_, index) => `person-${index + 1}@example.com`);
 
@@ -497,14 +468,8 @@ test('fresh resend approval is previewed without consumption and authorizes exac
     servers: [successfulServer(slug, tool, () => { dispatches += 1; })],
   });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Send the approved email, then honor one separately approved follow-up.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Send the approved email, then honor one separately approved follow-up.');
   authorizeSend(sid, namespaced, tool);
   const args = {
     to: 'approved-resend@example.com',
@@ -547,14 +512,8 @@ test('native MCP refuses a same-recipient email already reserved through Composi
     servers: [successfulServer(slug, tool, () => { dispatches += 1; })],
   });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Send the approved email exactly once.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Send the approved email exactly once.');
   appendEvent({
     sessionId: sid,
     turn: 1,
@@ -595,14 +554,8 @@ test('targetless social duplicate identity matches across Composio and native MC
     servers: [successfulServer(slug, tool, () => { nativeDispatches += 1; })],
   });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Publish this exact LinkedIn launch note once.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Publish this exact LinkedIn launch note once.');
   const payload = { text: 'Clementine 3.0 launches today.', visibility: 'PUBLIC' };
   authorizeSend(sid, namespaced, tool);
   const composio = wrapToolForHarness({
@@ -647,14 +600,8 @@ test('a malformed post-dispatch MCP response remains ambiguous, never retry-safe
   };
   const shim = createMcpNamespaceShim({ servers: [malformed] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Send the approved email.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Send the approved email.');
   authorizeSend(sid, namespaced, tool);
 
   await withHarnessRunContext(ctx(sid, source.seq), async () => {
@@ -679,14 +626,8 @@ test('a missing-text MCP result after dispatch remains ambiguous despite invalid
   };
   const shim = createMcpNamespaceShim({ servers: [malformed] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
-  const source = appendEvent({
-    sessionId: sid,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Send the approved email.' },
-  });
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Send the approved email.');
   authorizeSend(sid, namespaced, tool);
 
   await withHarnessRunContext(ctx(sid, source.seq), async () => {
@@ -706,7 +647,7 @@ test('G negative: a READ tool whose dispatch throws records NO external_write (o
   assert.equal(classifyMcpIntegrityScope(tool, 'read').isIrreversibleSend, false, 'test tool must be a read');
   const shim = createMcpNamespaceShim({ servers: [throwingServer(slug, tool, 'ETIMEDOUT')] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-  const sid = createSession({ kind: 'execution' }).id;
+  const sid = createSession({ kind: 'chat' }).id;
 
   await withHarnessRunContext(ctx(sid), async () => {
     await shim.listTools();

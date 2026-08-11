@@ -18,6 +18,16 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 // errors deterministically instead of making a real model call.
 delete process.env.OPENAI_API_KEY;
 delete process.env.ANTHROPIC_API_KEY;
+// These fixtures exercise the batch runner's OWN semantics (ledger honesty,
+// retry/halt, idempotency, polite-failure classification) — not the chat-lane
+// per-call gates. The authority spine requires chat-kind accepted sources, so
+// with the fixture sessions now 'chat' the unrelated gates must be off exactly
+// as the migrated sibling fixtures do.
+process.env.CLEMMY_EXECUTION_GATE = 'off';
+process.env.CLEMMY_TOOL_GUARDRAIL = 'off';
+process.env.CLEMMY_GROUNDING_GATE = 'off';
+process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+process.env.CLEMMY_CONFIRM_FIRST = 'off';
 
 // eslint-disable-next-line import/first
 const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
@@ -28,10 +38,50 @@ const { getJudgeChainFallovers, resetJudgeChainFalloversForTests } = await impor
 // eslint-disable-next-line import/first
 const { rememberToolSchema, resetToolSchemaCache } = await import('../tools/composio-schema-cache.js');
 // eslint-disable-next-line import/first
-const { createSession } = await import('../runtime/harness/eventlog.js');
+const { createSession, appendEvent, getSession, listEvents } = await import('../runtime/harness/eventlog.js');
+// eslint-disable-next-line import/first
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+// eslint-disable-next-line import/first
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
 
 type FakeCall = { name: string; input: unknown };
 const calls: FakeCall[] = [];
+
+/** The settlement spine refuses wrapped-tool dispatch without an accepted
+ *  source (user_input_received) AND a persisted turn graph for that accepted
+ *  task. Anchor each fixture session once and reuse the same accepted source
+ *  for later batches in that session. */
+function anchorAcceptedTask(sessionId: string): { sourceUserSeq: number; turn: number } {
+  if (!getSession(sessionId)) createSession({ id: sessionId, kind: 'chat' });
+  const existing = listEvents(sessionId, { types: ['user_input_received'] })
+    .find((event) => event.data.batchAuthorityFixture === true);
+  if (existing) return { sourceUserSeq: existing.seq, turn: existing.turn };
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'run the batch plan', batchAuthorityFixture: true },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
+  return { sourceUserSeq: source.seq, turn: source.turn };
+}
+
+/** Run a batch plan under the same accepted-task ambient identity the
+ *  production executor always carries into dispatch. */
+function runBatchPlanAnchored(
+  plan: Parameters<typeof runBatchPlan>[0],
+  sessionId: string,
+  certified?: Parameters<typeof runBatchPlan>[2],
+): ReturnType<typeof runBatchPlan> {
+  const anchor = anchorAcceptedTask(sessionId);
+  return withHarnessRunContext(
+    { sessionId, sourceUserSeq: anchor.sourceUserSeq, counter: new ToolCallsCounter(1_000) },
+    () => runBatchPlan(plan, sessionId, certified),
+  ) as ReturnType<typeof runBatchPlan>;
+}
 
 function fakeTool(name: string, impl: (input: Record<string, unknown>) => unknown | Promise<unknown>) {
   return {
@@ -48,9 +98,11 @@ before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
   // Write admission is deliberately fail-closed and events are FK-bound to a
   // real durable session. These fixtures dispatch provider writes directly, so
-  // give them the same session parent the production batch executor always has.
-  createSession({ id: 'sess-batch-test', kind: 'execution' });
-  createSession({ id: 'sess-batch-structured-failure', kind: 'execution' });
+  // give them the same session parent the production batch executor always
+  // has — chat kind, because the authority spine persists a turn graph only
+  // for a chat session's accepted source.
+  createSession({ id: 'sess-batch-test', kind: 'chat' });
+  createSession({ id: 'sess-batch-structured-failure', kind: 'chat' });
 });
 
 test('validateBatchPlan: catches the shapes that must never execute', () => {
@@ -94,7 +146,7 @@ test('validateBatchPlan: catches the shapes that must never execute', () => {
 test('runBatchPlan: read batch executes every item, ledger honest, zero model involvement', async () => {
   calls.length = 0;
   _setCodeModeToolsForTests(new Map([['read_file', fakeTool('read_file', (input) => `contents of ${String(input.path)}`)]]) as never);
-  const ledger = await runBatchPlan({
+  const ledger = await runBatchPlanAnchored({
     tool: 'read_file',
     sideEffect: 'read',
     objective: 'read three fixture files for the test',
@@ -136,7 +188,7 @@ test('runBatchPlan: bounded http_fetch aliases validate and execute through the 
       return 'exit_code: 0\n\nstdout:\n{"ok":true}';
     })],
   ]) as never);
-  const ledger = await runBatchPlan(plan, 'sess-http-alias-batch');
+  const ledger = await runBatchPlanAnchored(plan, 'sess-http-alias-batch');
   assert.equal(ledger.succeeded, 3);
   assert.equal(ledger.failed, 0);
   assert.equal(calls.length, 3);
@@ -155,7 +207,7 @@ test('runBatchPlan: transient failures retry once; hard failures do not; consecu
       return 'ok';
     })],
   ]) as never);
-  const ledger = await runBatchPlan({
+  const ledger = await runBatchPlanAnchored({
     tool: 'read_file',
     sideEffect: 'read',
     objective: 'exercise retry + halt semantics deterministically',
@@ -187,7 +239,7 @@ test('runBatchPlan: a composio polite-failure result counts as a FAILED item, no
   _setCodeModeToolsForTests(new Map([
     ['composio_execute_tool', fakeTool('composio_execute_tool', () => '⚠️ composio_execute_tool FAILED (slug=X): boom')],
   ]) as never);
-  const ledger = await runBatchPlan({
+  const ledger = await runBatchPlanAnchored({
     tool: 'composio_execute_tool',
     composioSlug: 'X_SLUG',
     sideEffect: 'write',
@@ -206,7 +258,7 @@ test('runBatchPlan: a structured provider failure counts as FAILED and never ear
       error: { message: 'upstream rejected the write' },
     }))],
   ]) as never);
-  const ledger = await runBatchPlan({
+  const ledger = await runBatchPlanAnchored({
     tool: 'composio_execute_tool',
     composioSlug: 'X_STRUCTURED_FAILURE',
     sideEffect: 'write',
@@ -340,7 +392,7 @@ test('runBatchPlan: a rate-limit pauses the whole batch, does NOT consume the it
     ['read_file', fakeTool('read_file', () => { n += 1; if (n <= 2) throw new Error('HTTP 429 Too Many Requests'); return 'ok'; })],
   ]) as never);
   try {
-    const ledger = await runBatchPlan({
+    const ledger = await runBatchPlanAnchored({
       tool: 'read_file', sideEffect: 'read',
       objective: 'rate-limit back-off should not halt or burn the retry',
       items: [{ id: 'rl-1', args: { path: '/tmp/rl-1' } }],
@@ -367,7 +419,7 @@ test('runBatchPlan: persistent rate-limiting halts after 5 back-offs with the th
     ['read_file', fakeTool('read_file', () => { throw new Error('429 rate limit exceeded'); })],
   ]) as never);
   try {
-    const ledger = await runBatchPlan({
+    const ledger = await runBatchPlanAnchored({
       tool: 'read_file', sideEffect: 'read',
       objective: 'a provider that never stops throttling must halt honestly',
       items: [{ id: 'rl-forever', args: { path: '/tmp/rl-forever' } }],
@@ -401,14 +453,14 @@ test('runBatchPlan: a re-run skips an already-succeeded item but re-executes a f
     { id: 'dedup-ok', args: { path: '/tmp/dedup-ok' } },
     { id: 'dedup-fail', args: { path: '/tmp/dedup-fail' } },
   ];
-  const ledgerA = await runBatchPlan({ tool: 'read_file', sideEffect: 'read', objective: 'first pass — one succeeds one fails', items, concurrency: 1 }, 'sess-dedup');
+  const ledgerA = await runBatchPlanAnchored({ tool: 'read_file', sideEffect: 'read', objective: 'first pass — one succeeds one fails', items, concurrency: 1 }, 'sess-dedup');
   assert.equal(ledgerA.outcomes.find((o) => o.id === 'dedup-ok')!.ok, true);
   assert.equal(ledgerA.outcomes.find((o) => o.id === 'dedup-fail')!.ok, false);
   assert.ok(ledgerA.outcomes.every((o) => typeof o.idempotencyKey === 'string' && o.idempotencyKey.length > 0), 'every outcome carries an idempotency key');
 
   // Run B: SAME plan. dedup-ok must be skipped (deduped); dedup-fail re-dispatched.
   calls.length = 0;
-  const ledgerB = await runBatchPlan({ tool: 'read_file', sideEffect: 'read', objective: 'retry the partially-failed batch', items, concurrency: 1 }, 'sess-dedup');
+  const ledgerB = await runBatchPlanAnchored({ tool: 'read_file', sideEffect: 'read', objective: 'retry the partially-failed batch', items, concurrency: 1 }, 'sess-dedup');
   const okB = ledgerB.outcomes.find((o) => o.id === 'dedup-ok')!;
   const failB = ledgerB.outcomes.find((o) => o.id === 'dedup-fail')!;
   assert.equal(okB.deduped, true, 'the already-succeeded item is deduped, not re-run');
@@ -438,7 +490,7 @@ test('composio items: connected_account_id is ALWAYS present (strict nullable-re
       return JSON.stringify({ data: { ok: true } });
     })],
   ]) as never);
-  const ledger = await runBatchPlan({
+  const ledger = await runBatchPlanAnchored({
     tool: 'composio_execute_tool',
     composioSlug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
     sideEffect: 'write',
@@ -455,7 +507,7 @@ test('composio items: connected_account_id is ALWAYS present (strict nullable-re
     ['composio_execute_tool', fakeTool('composio_execute_tool', () =>
       'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool')],
   ]) as never);
-  const bad = await runBatchPlan({
+  const bad = await runBatchPlanAnchored({
     tool: 'composio_execute_tool',
     composioSlug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
     sideEffect: 'write',
@@ -555,7 +607,7 @@ test('a harness gate REFUSAL banner is a FAILED item — never a fake success (2
   // runs). This reaches the inner tool so we can assert its refusal banner is
   // an honest failure; an UNCERTIFIED send would be refused earlier by the
   // send floor (which is also correct, just a different message).
-  const ledger = await runBatchPlan({
+  const ledger = await runBatchPlanAnchored({
     tool: 'composio_execute_tool', composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', sideEffect: 'send',
     objective: 'verify gate refusals are honest failures',
     items: [{ id: 'a@beta.example', args: { to: 'a@beta.example' } }],

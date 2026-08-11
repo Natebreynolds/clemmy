@@ -35,6 +35,8 @@ const toolChoice = await import('../../memory/tool-choice-store.js');
 const eventlog = await import('../harness/eventlog.js');
 const candidates = await import('./capability-candidates.js');
 const worker = await import('../../memory/learning-worker.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../harness/brackets.js');
 
 const CAL_SLUG = 'SCHEDULERCO_LIST_EVENTS';
 const CAL_SCHEMA_V1 = { type: 'object', properties: { timeMin: { type: 'string' }, timeMax: { type: 'string' } } };
@@ -44,6 +46,9 @@ function freshSession(prefix: string): string {
   return `${prefix}-${(seq += 1)}`;
 }
 
+/** The accepted-task identity each fixture session dispatches under. */
+const acceptedBySession = new Map<string, { sourceUserSeq: number; turn: number }>();
+
 function acceptSource(sessionId: string, text: string): { sourceUserSeq: number } {
   if (!eventlog.getSession(sessionId)) {
     eventlog.createSession({ id: sessionId, kind: 'chat', channel: 'home', title: text.slice(0, 60) });
@@ -52,7 +57,25 @@ function acceptSource(sessionId: string, text: string): { sourceUserSeq: number 
   const event = eventlog.recordRunAttemptUserInput(attempt, {
     turn: 1, role: 'user', data: { text, attemptId: attempt.attemptId, source: 'home' },
   }, { armRunInFlight: true });
+  // Durable settlement requires the accepted-source identity plus a persisted
+  // turn graph for the accepted task (authority spine).
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: event.seq, turn: event.turn },
+  });
+  if (!shadow) throw new Error('fixture could not persist a turn graph');
+  acceptedBySession.set(sessionId, { sourceUserSeq: event.seq, turn: event.turn });
   return { sourceUserSeq: event.seq };
+}
+
+/** Run wrapped-tool work under the session's accepted-task authority, the way
+ *  the production loop does (settlement reads it from the run context). */
+function withAcceptedTask<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+  const accepted = acceptedBySession.get(sessionId);
+  if (!accepted) throw new Error(`fixture has no accepted source for ${sessionId}`);
+  return withHarnessRunContext(
+    { sessionId, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn, counter: new ToolCallsCounter(1_000) },
+    work,
+  ) as Promise<T>;
 }
 
 function payloadWithItems() {
@@ -67,7 +90,8 @@ async function governedRead(
 ): Promise<string> {
   if (options.schema !== null) schemaCache.rememberToolSchema(slug, options.schema ?? CAL_SCHEMA_V1, Date.now());
   const exec = (async () => payload) as never;
-  const output = await composio.runComposioExecuteForTestInSession(slug, { timeMin: '2026-08-06' }, exec, sessionId);
+  const output = await withAcceptedTask(sessionId, () =>
+    composio.runComposioExecuteForTestInSession(slug, { timeMin: '2026-08-06' }, exec, sessionId));
   // Materialization is the durable worker's job now; tests drive its entry
   // the way the daemon timer does.
   await worker.drainPendingLearning();
@@ -99,7 +123,8 @@ test('a thrown provider error never learns', async () => {
   acceptSource(sessionId, phrase);
   const exec = (async () => { throw new Error('upstream unreachable'); }) as never;
   schemaCache.rememberToolSchema('SCHEDULERCO_FETCH_NUMBERS', CAL_SCHEMA_V1, Date.now());
-  await composio.runComposioExecuteForTestInSession('SCHEDULERCO_FETCH_NUMBERS', {}, exec, sessionId).catch(() => '');
+  await withAcceptedTask(sessionId, () =>
+    composio.runComposioExecuteForTestInSession('SCHEDULERCO_FETCH_NUMBERS', {}, exec, sessionId)).catch(() => '');
   assert.equal(retrievedIdentifiers(phrase).includes('SCHEDULERCO_FETCH_NUMBERS'), false,
     'a thrown dispatch was learned as a proven capability');
 });

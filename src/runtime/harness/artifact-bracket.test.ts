@@ -11,6 +11,7 @@ const eventlog = await import('./eventlog.js');
 const ledger = await import('./artifact-ledger.js');
 const brackets = await import('./brackets.js');
 const { ExternalWritePreDispatchError } = await import('./external-write-admission.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 
 beforeEach(() => {
   eventlog.resetEventLog();
@@ -19,9 +20,34 @@ beforeEach(() => {
 
 after(() => rmSync(home, { recursive: true, force: true }));
 
-function runContext(sessionId: string, runScopeId: string) {
-  return {
+/** The settlement spine refuses wrapped-tool dispatch without an accepted
+ *  source AND a persisted turn graph — anchor both on a chat session and
+ *  carry the identity in every harness run context. */
+function anchorTask(sessionId: string, turn: number, text: string): { sessionId: string; seq: number; turn: number } {
+  const source = eventlog.appendEvent({
     sessionId,
+    turn,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { sessionId, seq: source.seq, turn: source.turn };
+}
+
+function anchoredChatSession(text: string): { sessionId: string; seq: number; turn: number } {
+  const sessionId = eventlog.createSession({ kind: 'chat' }).id;
+  return anchorTask(sessionId, 1, text);
+}
+
+function runContext(anchor: { sessionId: string; seq: number; turn: number }, runScopeId: string) {
+  return {
+    sessionId: anchor.sessionId,
+    sourceUserSeq: anchor.seq,
+    turn: anchor.turn,
     behaviorScopeId: runScopeId,
     counter: new brackets.ToolCallsCounter(100),
   };
@@ -53,7 +79,8 @@ function seedArtifactVerification(sessionId: string, callId: string, output: unk
 }
 
 test('the tool bracket binds one create and reuses it across renamed retries in the same run', async () => {
-  const sessionId = eventlog.createSession({ kind: 'chat' }).id;
+  const anchor = anchoredChatSession('Create the document.');
+  const sessionId = anchor.sessionId;
   let dispatches = 0;
   const tool = brackets.wrapToolForHarness({
     name: 'googledocs__create_document',
@@ -66,8 +93,8 @@ test('the tool bracket binds one create and reuses it across renamed retries in 
     },
   });
 
-  const invoke = (title: string, runScopeId = 'run:first') => brackets.withHarnessRunContext(
-    runContext(sessionId, runScopeId),
+  const invoke = (title: string, runScopeId = 'run:first', taskAnchor = anchor) => brackets.withHarnessRunContext(
+    runContext(taskAnchor, runScopeId),
     () => tool.execute!({ title }),
   );
 
@@ -77,12 +104,16 @@ test('the tool bracket binds one create and reuses it across renamed retries in 
   assert.match(String(duplicate), /already bound/i);
   assert.equal(ledger.listRunArtifacts(sessionId, 'run:first')[0]?.status, 'bound');
 
-  await invoke('A later user request', 'run:second');
+  // A later logical run is a later ACCEPTED USER REQUEST — the artifact run
+  // scope roots at the accepted source, so the fixture anchors a second one.
+  const laterTask = anchorTask(sessionId, 2, 'Create the follow-up document.');
+  await invoke('A later user request', 'run:second', laterTask);
   assert.equal(dispatches, 2, 'a later logical run in the same chat keeps the feature available');
 });
 
 test('a proven pre-dispatch block releases the slot, while an ambiguous failure stays fail-closed', async () => {
-  const sessionId = eventlog.createSession({ kind: 'chat' }).id;
+  const anchor = anchoredChatSession('Create the retryable document.');
+  const sessionId = anchor.sessionId;
   let mode: 'blocked' | 'ambiguous' | 'success' = 'blocked';
   let dispatches = 0;
   const tool = brackets.wrapToolForHarness({
@@ -96,8 +127,8 @@ test('a proven pre-dispatch block releases the slot, while an ambiguous failure 
       return { documentId: 'doc_retry_123456789' };
     },
   });
-  const invoke = (scope: string) => brackets.withHarnessRunContext(
-    runContext(sessionId, scope),
+  const invoke = (scope: string, taskAnchor = anchor) => brackets.withHarnessRunContext(
+    runContext(taskAnchor, scope),
     () => tool.execute!({ title: 'Retryable' }),
   );
 
@@ -108,11 +139,14 @@ test('a proven pre-dispatch block releases the slot, while an ambiguous failure 
   assert.equal(dispatches, 2);
   assert.equal(ledger.listRunArtifacts(sessionId, 'run:blocked')[0]?.status, 'bound');
 
+  // The ambiguous phase is a separate logical run — and the artifact run
+  // scope roots at the accepted source, so it gets its own accepted task.
+  const ambiguousTask = anchorTask(sessionId, 2, 'Create the second retryable document.');
   mode = 'ambiguous';
-  await invoke('run:ambiguous');
+  await invoke('run:ambiguous', ambiguousTask);
   assert.equal(ledger.listRunArtifacts(sessionId, 'run:ambiguous')[0]?.status, 'uncertain');
   mode = 'success';
-  const denied = await invoke('run:ambiguous');
+  const denied = await invoke('run:ambiguous', ambiguousTask);
   assert.match(String(denied), /Verify that attempt before retrying/i);
   assert.match(String(denied), new RegExp(`artifactId ${ledger.listRunArtifacts(sessionId, 'run:ambiguous')[0]!.id}`));
   assert.match(String(denied), /artifact_claim_resolve/);
@@ -120,7 +154,8 @@ test('a proven pre-dispatch block releases the slot, while an ambiguous failure 
 });
 
 test('Netlify API create shares the site slot and cannot bypass an uncertain sites:create claim', async () => {
-  const sessionId = eventlog.createSession({ kind: 'chat' }).id;
+  const anchor = anchoredChatSession('Create the rc-proof site.');
+  const sessionId = anchor.sessionId;
   const runScope = 'run:netlify-api-create';
   let dispatches = 0;
   let first = true;
@@ -139,7 +174,7 @@ test('Netlify API create shares the site slot and cannot bypass an uncertain sit
     },
   });
   const invoke = (command: string) => brackets.withHarnessRunContext(
-    runContext(sessionId, runScope),
+    runContext(anchor, runScope),
     () => tool.execute!({ command }),
   );
 
@@ -176,7 +211,8 @@ test('Netlify API create shares the site slot and cannot bypass an uncertain sit
 });
 
 test('execute wrapper records an exact Google Docs provider read-back but ignores mismatches', async () => {
-  const sessionId = eventlog.createSession({ kind: 'chat' }).id;
+  const anchor = anchoredChatSession('Verify the firm brief document.');
+  const sessionId = anchor.sessionId;
   const runScope = 'run:verify-doc';
   const intent = {
     kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary',
@@ -196,7 +232,7 @@ test('execute wrapper records an exact Google Docs provider read-back but ignore
     },
   });
   const invoke = () => brackets.withHarnessRunContext(
-    runContext(sessionId, runScope),
+    runContext(anchor, runScope),
     () => getter.execute!({ document_id: 'doc_bracket_123456789' }),
   );
 
@@ -210,7 +246,8 @@ test('execute wrapper records an exact Google Docs provider read-back but ignore
 });
 
 test('invoke wrapper records a Netlify getSite shell envelope and never treats status as proof', async () => {
-  const sessionId = eventlog.createSession({ kind: 'chat' }).id;
+  const anchor = anchoredChatSession('Verify the asset site.');
+  const sessionId = anchor.sessionId;
   const runScope = 'run:verify-site';
   const siteId = '00000000-0000-4000-8000-000000000001';
   const intent = {
@@ -233,7 +270,7 @@ test('invoke wrapper records a Netlify getSite shell envelope and never treats s
     },
   });
   const invoke = (command: string, callId: string) => brackets.withHarnessRunContext(
-    runContext(sessionId, runScope),
+    runContext(anchor, runScope),
     () => shell.invoke!({}, { command }, { toolCall: { callId } }),
   );
 
