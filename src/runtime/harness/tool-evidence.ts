@@ -1450,10 +1450,12 @@ export function freshExternalWriteRequirement(input: {
         if (event.type !== 'tool_called') continue;
         if (!isCanonicalTopLevelToolEvent(event)) continue;
         const effect = typeof event.data.effect === 'string' ? event.data.effect : null;
-        // Unknown effects prove nothing either way — they neither count as a
-        // touched destination nor as external. Only classified activity moves
-        // the decision off the text fallback.
-        if (effect === 'read' || effect === 'compute' || effect === 'local_write') {
+        // A touched DESTINATION is a write target. Reads/compute prove
+        // nothing about where output landed — counting them excused a
+        // reads-only turn from an objective that demanded a fresh write
+        // (the stale-receipt lie would have completed). Unknown effects
+        // prove nothing either way.
+        if (effect === 'local_write') {
           touchedTotal += 1;
         } else if (effect === 'external_write') {
           touchedTotal += 1;

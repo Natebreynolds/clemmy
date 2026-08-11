@@ -231,7 +231,7 @@ import {
   hasMeaningfulSuccessfulToolNames,
   isAcceptedExecutionCompletionOutput,
   objectiveMayRequireMultipleResults,
-  objectiveRequiresFreshExternalWrite,
+  freshExternalWriteRequirement,
   type FreshExternalWriteEvidenceStatus,
   toolOutputLooksSuccessful,
 } from './tool-evidence.js';
@@ -5417,8 +5417,17 @@ async function runConversationCore(
       // This floor belongs to the opted-in interactive completion contract.
       // Non-judged workflow/reporting lanes preserve their existing terminal
       // semantics; their execution controllers own request-bound validation.
+      // Ledger-observed local-only activity beats the text regexes: a turn
+      // whose every touched destination resolved local owes no external
+      // receipt (live 2026-08-09: all 8 Slack IDs on disk, terminal replaced
+      // the real report with 'I cannot honestly confirm' — this exact class
+      // was point-fixed 08-05 and recurred because text stayed authoritative).
       const freshExternalWriteRequired = objectiveJudgeOptIn
-        && objectiveRequiresFreshExternalWrite(objective);
+        && freshExternalWriteRequirement({
+          objectiveText: objective,
+          sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+        }).required;
       const currentExternalWriteStatus = freshExternalWriteRequired
         ? requestFreshExternalWriteStatus(options.sessionId, activeSourceUserSeq)
         : 'confirmed';
@@ -6023,7 +6032,11 @@ async function runConversationCore(
             objective,
             artifactRequirements: selfResolve.artifactRequirements,
             ambiguousExternalWrite: selfResolve.ambiguousExternalWrite,
-            externalWriteRequiredByObjective: objectiveRequiresFreshExternalWrite(objective),
+            externalWriteRequiredByObjective: freshExternalWriteRequirement({
+              objectiveText: objective,
+              sessionId: options.sessionId,
+              sourceUserSeq: activeSourceUserSeq,
+            }).required,
             completionVerdict: objectiveJudgeVerdictThisTurn,
             skipDeliveryGate: goalSatisfiedThisTurn,
           };
@@ -6117,7 +6130,11 @@ async function runConversationCore(
       const completionNotes = [goalUnmetNote, outputGroundingNote].filter((n) => n && n.trim());
       let userVisibleSummary = completionNotes.length ? `${baseSummary}\n\n${completionNotes.join('\n\n')}` : baseSummary;
       const terminalExternalWriteRequired = objectiveJudgeOptIn
-        && objectiveRequiresFreshExternalWrite(objective);
+        && freshExternalWriteRequirement({
+          objectiveText: objective,
+          sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+        }).required;
       const terminalExternalWriteStatus = terminalExternalWriteRequired
         ? requestFreshExternalWriteStatus(options.sessionId, activeSourceUserSeq)
         : 'confirmed';
