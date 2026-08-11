@@ -239,11 +239,11 @@ export function clusteredPairedAnalysis(input: {
   seed?: number;
 }): ClusteredPairedResult {
   const byKey = new Map<string, FirstRunCellRollup>();
-  for (const cell of input.baseline) byKey.set(`${cell.scenario} ${cell.brain}`, cell);
+  for (const cell of input.baseline) byKey.set(`${cell.scenario}\u0000${cell.brain}`, cell);
 
   const cells: PairedCellDifference[] = [];
   for (const cand of input.candidate) {
-    const base = byKey.get(`${cand.scenario} ${cand.brain}`);
+    const base = byKey.get(`${cand.scenario}\u0000${cand.brain}`);
     if (!base) continue;
     cells.push({
       scenario: cand.scenario,
