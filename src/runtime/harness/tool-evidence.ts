@@ -1394,3 +1394,85 @@ export function hasMeaningfulSuccessfulToolNames(
     return !mutationRequired || !isReadOnlyCompletionEvidence(name);
   });
 }
+
+/**
+ * B3 — destination truth from what the turn actually TOUCHED.
+ *
+ * `objectiveRequiresFreshExternalWrite` classifies REQUEST TEXT through ~45
+ * regexes, and the class has already produced two live false-incompletions
+ * ("save them in the workflow" matched nothing local → the finished turn was
+ * rewritten to "no receipt of it landing"; the 2026-08-05 fix was one regex
+ * wider and the class recurred in four days). The settlement-aware form asks
+ * the ledger first: when the turn demonstrably touched destinations and every
+ * one of them resolved LOCAL (read / compute / local_write — no external_write
+ * event, no external-effect dispatch), no external receipt is required, and
+ * no phrasing can change that fact.
+ *
+ * PRECISION THAT KEEPS THE HOLE CLOSED: the inversion fires ONLY on observed
+ * local-only activity. A turn that was supposed to send and did NOTHING
+ * touched no destination, so it falls through to the text classifier and
+ * behaves exactly as today.
+ *
+ * Callsites (loop/claude-agent-brain/controller) flip to this at integration
+ * time; the text regexes the settlement path subsumes get DELETED in that same
+ * change (subtraction pin), never before — deleting them while live callsites
+ * still pass only text would widen the gate blind.
+ */
+import { listEvents as listEventsForEvidence } from './eventlog.js';
+import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
+
+export interface FreshExternalWriteRequirement {
+  required: boolean;
+  basis: 'observed_local_only' | 'objective_text';
+  touchedTotal: number;
+  touchedExternal: number;
+}
+
+export function freshExternalWriteRequirement(input: {
+  objectiveText: string;
+  sessionId?: string;
+  sourceUserSeq?: number;
+}): FreshExternalWriteRequirement {
+  let touchedTotal = 0;
+  let touchedExternal = 0;
+  if (input.sessionId && typeof input.sourceUserSeq === 'number') {
+    try {
+      const events = listEventsForEvidence(input.sessionId);
+      for (const event of events) {
+        if (event.seq <= input.sourceUserSeq) continue;
+        if (event.type === 'external_write'
+          || event.type === 'external_write_succeeded'
+          || event.type === 'external_write_orphaned') {
+          touchedTotal += 1;
+          touchedExternal += 1;
+          continue;
+        }
+        if (event.type !== 'tool_called') continue;
+        if (!isCanonicalTopLevelToolEvent(event)) continue;
+        const effect = typeof event.data.effect === 'string' ? event.data.effect : null;
+        // Unknown effects prove nothing either way — they neither count as a
+        // touched destination nor as external. Only classified activity moves
+        // the decision off the text fallback.
+        if (effect === 'read' || effect === 'compute' || effect === 'local_write') {
+          touchedTotal += 1;
+        } else if (effect === 'external_write') {
+          touchedTotal += 1;
+          touchedExternal += 1;
+        }
+      }
+    } catch {
+      // Ledger unavailable → text fallback. A transient read error must never
+      // decide the requirement (the sibling gate once deleted a finished
+      // turn's answer on a DB hiccup).
+    }
+  }
+  if (touchedTotal > 0 && touchedExternal === 0) {
+    return { required: false, basis: 'observed_local_only', touchedTotal, touchedExternal };
+  }
+  return {
+    required: objectiveRequiresFreshExternalWrite(input.objectiveText),
+    basis: 'objective_text',
+    touchedTotal,
+    touchedExternal,
+  };
+}
