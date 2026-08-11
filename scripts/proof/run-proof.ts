@@ -72,6 +72,7 @@ import { teamDelegationRoundtrip } from './scenarios/team-delegation-roundtrip.j
 import { pendingActionGate } from './scenarios/pending-action-gate.js';
 import { completeSetRecall } from './scenarios/complete-set-recall.js';
 import { longHorizonManifest } from './scenarios/long-horizon-manifest.js';
+import { countOnlyDrafts } from './scenarios/count-only-drafts.js';
 import { backgroundSteerInFlight } from './scenarios/background-steer-in-flight.js';
 import { restartResume } from './scenarios/restart-resume.js';
 import { blockedAuthTruth } from './scenarios/blocked-auth-truth.js';
@@ -105,6 +106,7 @@ const DEFAULT_SCENARIOS: ScenarioDef[] = [
   teamDelegationRoundtrip,
   pendingActionGate,
   longHorizonManifest,
+  countOnlyDrafts,
   backgroundSteerInFlight,
   restartResume,
   blockedAuthTruth,
