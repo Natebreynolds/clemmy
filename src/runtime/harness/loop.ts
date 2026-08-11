@@ -3675,7 +3675,14 @@ export async function runConversation(
       sessionId: options.sessionId,
       sourceUserSeq,
     });
-    if (acceptedCapabilityRoute === 'act') {
+    // Workflow-controller sessions never activate act expected-work: the
+    // step's authority is the workflow controller (admission, validation,
+    // report-back), and its agent surface mounts no work_call carrier — so
+    // activation raised a wall with no door and 500'd plain step dispatch
+    // (live 2026-08-11 sweep: capability-reconnect 'prepare' and a cron step
+    // both died ExpectedWorkBindingRequiredError on write_file).
+    const workflowControllerOwned = getSession(options.sessionId)?.kind === 'workflow';
+    if (acceptedCapabilityRoute === 'act' && !workflowControllerOwned) {
       if (expectedWork.status !== 'action_deferred') {
         throw new BoundaryError({
           kind: 'state.read_corrupted',

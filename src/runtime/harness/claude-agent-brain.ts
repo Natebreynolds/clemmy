@@ -58,7 +58,6 @@ import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { enabledExternalServerNames } from '../mcp-servers.js';
 import { appendEvent } from './eventlog.js';
-import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 // Lane wiring: the callable-surface oracle serves exact local schemas on this
 // lane (guardrail mandates are constructible only from proof).
 import '../../tools/callable-surface-registration.js';
@@ -3142,16 +3141,19 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // and fail closed. Record the business tool uses durably BEFORE either
   // consults the stores; control/discovery uses are not work.
   try {
-    const businessToolUses = result.toolUses
-      .map((name) => name.split('__').pop() ?? name)
-      .filter((name) => actionTopologyRoleFor(name) !== 'control');
-    if (businessToolUses.length > 0) {
+    // ALL tool uses count: the marker answers "did this turn do anything?",
+    // and control-plane work (authoring a workflow, staging an approval) is
+    // exactly as real as provider dispatch for that question. Filtering by
+    // topology role false-blocked authoring turns when the coordination class
+    // moved to control (live 2026-08-11).
+    const recordedToolUses = result.toolUses.map((name) => name.split('__').pop() ?? name);
+    if (recordedToolUses.length > 0) {
       appendEvent({
         sessionId,
         turn: userInputEvent.turn,
         role: 'system',
         type: 'sdk_tool_use_recorded',
-        data: { sourceUserSeq: userInputEvent.seq, tools: businessToolUses.slice(0, 40) },
+        data: { sourceUserSeq: userInputEvent.seq, tools: recordedToolUses.slice(0, 40) },
       });
     }
   } catch { /* evidence recording must never break the terminal */ }

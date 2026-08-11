@@ -21,7 +21,7 @@ import {
   type ExpectedWorkProposalV1,
   type ExpectedWorkUniverseV1,
 } from './expected-work-contract.js';
-import { openEventLog } from './eventlog.js';
+import { getSession, openEventLog } from './eventlog.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import { detectMultiItemIntent } from './multi-item-intent.js';
 import {
@@ -230,6 +230,19 @@ function authorityActivationRow(
 /** Durable marker used by dispatch and terminal boundaries. Historical/test
  * callers default to inactive; the production graph spine activates exact act
  * turns immediately before constructing the carrier-enabled agent. */
+/** Workflow-controller sessions never enter act expected-work: the step's
+ *  authority is the workflow controller (admission, validation, report-back)
+ *  and its agent surface mounts no work_call carrier — activation raised a
+ *  wall with no door and 500'd plain step dispatch (live 2026-08-11 sweep).
+ *  An unreadable session store keeps the act protocol (fail closed). */
+function workflowControllerOwned(sessionId: string): boolean {
+  try {
+    return getSession(sessionId)?.kind === 'workflow';
+  } catch {
+    return false;
+  }
+}
+
 export function activateActionExpectedWork(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -243,6 +256,9 @@ export function activateActionExpectedWork(input: {
   }
   if (expected.graph.classification.route !== 'act') {
     return { status: 'not_action', reason: 'the exact persisted graph is not an action turn' };
+  }
+  if (workflowControllerOwned(input.sessionId)) {
+    return { status: 'not_action', reason: 'workflow-controller sessions own their own step authority' };
   }
   const armed = armAcceptedTaskAuthority(input);
   if (armed.status !== 'armed' && armed.status !== 'existing') {
@@ -297,6 +313,7 @@ export function actionExpectedWorkState(input: {
     };
   }
   if (expected.graph.classification.route !== 'act') return { status: 'not_action' };
+  if (workflowControllerOwned(input.sessionId)) return { status: 'not_action' };
   try {
     const row = authorityActivationRow(openEventLog(), input.sessionId, input.sourceUserSeq);
     if (!row) return { status: 'missing', reason: 'accepted action authority row is missing' };
