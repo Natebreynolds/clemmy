@@ -161,42 +161,23 @@ function boundedReason(error: unknown): string {
 
 // ── Strict raw encoding ─────────────────────────────────────────────────────
 
-function validateJsonValue(value: unknown, stack = new Set<object>(), depth = 0): boolean {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
-  if (typeof value === 'number') return Number.isFinite(value);
-  if (typeof value !== 'object' || depth > 256) return false;
-  const object = value as object;
-  if (stack.has(object)) return false;
-  const prototype = Object.getPrototypeOf(object);
-  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return false;
-  if (Reflect.ownKeys(object).some((key) => typeof key === 'symbol')) return false;
-  stack.add(object);
-  try {
-    if (Array.isArray(value)) {
-      for (let index = 0; index < value.length; index += 1) {
-        if (!(index in value) || !validateJsonValue(value[index], stack, depth + 1)) return false;
-      }
-    } else {
-      for (const key of Object.keys(value as Record<string, unknown>)) {
-        if (!validateJsonValue((value as Record<string, unknown>)[key], stack, depth + 1)) return false;
-      }
-    }
-    return true;
-  } catch {
-    return false;
-  } finally {
-    stack.delete(object);
-  }
-}
-
 function encodeRaw(result: unknown, skipRawStore: boolean): PersistableResult {
   if (skipRawStore) {
     return { rawJson: null, rawDigest: null, rawBytes: 0, rejection: 'raw_store_skipped' };
   }
   try {
-    if (!validateJsonValue(result)) {
-      return { rawJson: null, rawDigest: null, rawBytes: 0, rejection: 'unserializable' };
-    }
+    // Canonicalize by stringify, never by shape-policing. The strict
+    // validator rejected any payload containing an `undefined` property or a
+    // non-plain-prototype object — exactly what provider SDK responses carry
+    // — and ONE such value anywhere discarded the whole result: a healthy
+    // 194KB Apify payload was rejected 'unserializable', the model was told
+    // its paid calls could not be stored, and a scheduled workflow died with
+    // no notification (live 2026-08-11, scorpion-facebook-trends).
+    // JSON.stringify drops undefined/symbols/functions, flattens class
+    // instances through their enumerable data, and throws only on circular
+    // references and BigInt — the honest 'unserializable' set. The stored
+    // string IS the canonical value, so digest and redemption determinism
+    // are unchanged.
     const rawJson = JSON.stringify(result);
     if (rawJson === undefined) {
       return { rawJson: null, rawDigest: null, rawBytes: 0, rejection: 'unserializable' };

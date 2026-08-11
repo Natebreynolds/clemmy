@@ -478,3 +478,37 @@ test('a returned business entity may truthfully have a failed domain status', ()
   assert.equal(facts.success, true);
   assert.equal(facts.statusCode, null);
 });
+
+// Provider SDK payloads carry undefined properties and non-plain-prototype
+// objects; shape-policing rejected the WHOLE result as 'unserializable' —
+// a healthy 194KB Apify payload was discarded, the model was told its paid
+// calls could not be stored, and a scheduled workflow died silently (live
+// 2026-08-11, scorpion-facebook-trends). Canonicalization is stringify's job.
+test('SDK-shaped payloads (undefined props, class instances) persist and redeem', () => {
+  class SdkEnvelope { constructor(readonly page: string, readonly likes: number) {} }
+  const task = accept('sdk shapes');
+  const authority = returnedCall({
+    task,
+    logicalToolCallId: 'logical-sdk-shape',
+    physicalDispatchId: 'physical-sdk-shape',
+    args: { query: 'scorpion facebook' },
+  });
+  const payload = {
+    successful: true,
+    data: {
+      items: [
+        { id: 'post-1', text: 'trend', missing: undefined, envelope: new SdkEnvelope('scorpion.co', 42) },
+      ],
+    },
+    meta: { complete: true },
+  };
+  const handle = results.toResultHandle(payload, { authority });
+  assert.ok(handle.rawLocation, 'the payload is stored, not rejected');
+  const row = eventlog.openEventLog().prepare(
+    'SELECT rejection_reason, raw_payload_json FROM durable_result_handles WHERE handle_id = ?',
+  ).get(handle.handle) as { rejection_reason: string | null; raw_payload_json: string | null };
+  assert.equal(row.rejection_reason, null);
+  const stored = JSON.parse(row.raw_payload_json!);
+  assert.equal(stored.data.items[0].envelope.page, 'scorpion.co', 'class instances flatten to their data');
+  assert.ok(!('missing' in stored.data.items[0]), 'undefined properties drop, never poison');
+});
