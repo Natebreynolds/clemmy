@@ -1714,6 +1714,35 @@ test('sweepStaleBlockedExecutions: active execution is NOT swept by the blocked 
   assert.equal(swept, 0);
 });
 
+test('sweepStaleExecutions publishes a stopped notification for user-facing work (swallowed-state pin)', async () => {
+  // The stale sweep used to rewrite a wedged execution to 'completed' with the
+  // reason visible only inside the record — recorded SUCCESS, zero user signal.
+  // It must route through the same publisher as the crash/blocked sweeps.
+  seedExecutions([
+    baseExecution({
+      id: 'stale-user-facing',
+      title: 'Draft the weekly summary',
+      objective: 'Draft the weekly summary',
+      status: 'active',
+      updatedAt: nowMinusMinutes(120),
+      lastActivityAt: nowMinusMinutes(120),
+    }),
+  ]);
+  const { loadNotifications } = await import('../runtime/notifications.js');
+  const before = loadNotifications().length;
+  assert.equal(sweepStaleExecutions(), 1);
+  const after = readExecutions();
+  assert.equal(after[0].status, 'completed');
+  assert.match(String(after[0].blocker), /Auto-closed: no activity/);
+  const fresh = loadNotifications().slice(before);
+  const stopped = fresh.find(
+    (n) => n.kind === 'execution' && n.metadata?.executionId === 'stale-user-facing',
+  );
+  assert.ok(stopped, 'stale sweep must notify — auto-closing silently is the swallowed-state bug');
+  assert.match(stopped.title, /Execution stopped: Draft the weekly summary/);
+  assert.match(stopped.body, /Auto-closed: no activity/);
+});
+
 test('legacy controller sweepers never manufacture terminal truth for durable project graphs', () => {
   seedExecutions([
     baseExecution({

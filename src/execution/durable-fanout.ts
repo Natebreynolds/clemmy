@@ -48,6 +48,7 @@ import {
   type BackgroundTaskRecord,
 } from './background-tasks.js';
 import { checkpointCapsuleForSession } from './continuation-capsule.js';
+import type { AttentionSource, AttentionState } from './attention-watchdog.js';
 
 export type FanoutPlanStatus = 'active' | 'reduced' | 'failed' | 'superseded';
 export type FanoutActivationStatus = 'pending' | 'running' | 'done' | 'failed';
@@ -878,3 +879,28 @@ export function reconcileDurableFanout(input: {
   }
   return { rescheduled, reduced, failedPlans };
 }
+
+/**
+ * Attention reader (swallowed-state class closure, 2026-08-11): a plan that
+ * flips to status='failed' here was previously surfaced only as a focus-board
+ * patch plus a discarded daemon log array — a fanned-out job could die
+ * overnight with zero user signal. The attention watchdog sweeps this reader
+ * on its own timer and guarantees one non-silent notification per failed plan.
+ */
+export const durableFanoutAttentionSource: AttentionSource = {
+  name: 'fanout-plan-failed',
+  listAttentionStates(): AttentionState[] {
+    return listFanoutPlans('failed').map((plan) => {
+      const objective = plan.objective.trim() || 'a fanned-out job';
+      return {
+        id: plan.planId,
+        title: 'A fanned-out job stopped and needs attention',
+        body:
+          `"${objective}" stopped after repeated worker failures — it will not finish on its own. `
+          + 'Completed items are saved, so re-running resumes from them; or ask me to investigate what kept failing.',
+        recordedAt: plan.updatedAt,
+        metadata: { planId: plan.planId, objective: plan.objective },
+      };
+    });
+  },
+};

@@ -47,6 +47,7 @@ import {
   registerWorkflowRunDrainKick,
 } from '../execution/workflow-origin-group.js';
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
+import { runAttentionWatchdog } from '../execution/attention-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { processComposioJobWatchTick } from '../integrations/composio/job-watcher.js';
 import { runRoutePolicyJob } from '../runtime/harness/route-policy.js';
@@ -2344,6 +2345,17 @@ export async function startDaemon(
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
           'Background-task watchdog tick failed',
+        );
+      }
+      // Generalized net for every other durable store that can record a bad
+      // terminal state (failed fan-out plans, dead-ended trigger deliveries):
+      // one registry sweep instead of a bespoke watchdog per store.
+      try {
+        runAttentionWatchdog();
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Attention watchdog tick failed',
         );
       }
     });

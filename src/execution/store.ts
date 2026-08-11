@@ -1859,11 +1859,16 @@ export class ExecutionStore {
  * dashboard reports phantom in-flight work. Returns the number swept.
  */
 export function sweepStaleExecutions(staleAfterMs = 60 * 60 * 1000): number {
-  return executionsFileLock(() => {
+  // Route through the SAME failed-transition publisher as the crash and
+  // stale-blocked sweeps. This sweep silently rewrote wedged work to
+  // 'completed' with the reason visible only inside the record — dropped
+  // work that read as success unless someone opened the row (sweep-confirmed
+  // 2026-08-11, the swallowed-state class).
+  const notices: FailedExecutionTransitionNotice[] = [];
+  const swept = executionsFileLock(() => {
     const cutoff = Date.now() - staleAfterMs;
     const executions = loadExecutionsUnlocked();
-    const now = new Date().toISOString();
-    let swept = 0;
+    let count = 0;
     for (const execution of executions) {
       // Durable project graphs are owned by their exact root workflow run.
       // Their model nodes may legitimately run for hours (or park on an
@@ -1874,28 +1879,18 @@ export function sweepStaleExecutions(staleAfterMs = 60 * 60 * 1000): number {
       if (execution.status !== 'active' && execution.status !== 'blocked' && execution.status !== 'paused') continue;
       const updated = Date.parse(execution.lastActivityAt || execution.updatedAt || execution.createdAt);
       if (Number.isFinite(updated) && updated > cutoff) continue;
-      const note = `Auto-closed: no activity for ${Math.round(staleAfterMs / 60000)}m (stale-execution sweep).`;
-      execution.status = 'completed';
-      execution.updatedAt = now;
-      execution.lastActivityAt = now;
-      execution.blocker = note;
-      execution.lastAssistantSummary = execution.lastAssistantSummary
-        ? `${execution.lastAssistantSummary} | ${note}`
-        : note;
-      execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
-      execution.activity.push({
-        id: randomUUID(),
-        key: `sweep-${Date.now()}`,
-        type: 'status',
-        message: note,
-        createdAt: now,
-      });
-      execution.activity = execution.activity.slice(-60);
-      swept += 1;
+      notices.push(transitionToFailed(
+        execution,
+        `Auto-closed: no activity for ${Math.round(staleAfterMs / 60000)}m (stale-execution sweep).`,
+        `sweep-${Date.now()}-${count}`,
+      ));
+      count += 1;
     }
-    if (swept > 0) saveExecutionsUnlocked(executions);
-    return swept;
+    if (count > 0) saveExecutionsUnlocked(executions);
+    return count;
   });
+  for (const notice of notices) publishFailedExecutionTransition(notice);
+  return swept;
 }
 
 export function renderExecutionSummary(execution: ExecutionRecord): string {

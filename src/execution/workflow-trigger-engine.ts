@@ -37,6 +37,7 @@ import {
   type WorkflowTriggerKind,
   type WorkflowTriggerEventState,
 } from './workflow-trigger-registry.js';
+import type { AttentionSource, AttentionState } from './attention-watchdog.js';
 import {
   prospectiveIntentionId,
   recordProspectiveCue,
@@ -988,3 +989,70 @@ export function fireWorkflowWebhook(hookPath: string, payload: unknown): Workflo
     }];
   }
 }
+
+/**
+ * Attention reader (swallowed-state class closure, 2026-08-11). Two states in
+ * this store previously died with no user signal on exactly the background
+ * surface where nobody watches logs:
+ *  - needs_verification: a durable delivery that requires operator review
+ *    before any retry — it will never fire on its own.
+ *  - perpetually-pending: a receipt retrying forever on capped backoff, with
+ *    last_error recorded durably but no escalation. Past the attempt
+ *    threshold the workflow is effectively not running and the user must
+ *    hear it.
+ */
+const STUCK_PENDING_ATTEMPTS = 10;
+
+export const workflowTriggerAttentionSource: AttentionSource = {
+  name: 'workflow-trigger',
+  listAttentionStates(): AttentionState[] {
+    const database = openTriggerDb();
+    const rows = database.prepare(`
+      SELECT e.id AS event_id, e.state, e.attempt_count, e.last_error,
+             e.fired_at, e.last_attempt_at, e.updated_at, t.workflow_name
+      FROM workflow_trigger_events e
+      JOIN workflow_triggers t ON t.id = e.trigger_id
+      WHERE e.state = 'needs_verification'
+         OR (e.state = 'pending' AND e.attempt_count >= ?)
+    `).all(STUCK_PENDING_ATTEMPTS) as Array<{
+      event_id: string;
+      state: string;
+      attempt_count: number;
+      last_error: string | null;
+      fired_at: string;
+      last_attempt_at: string | null;
+      updated_at: string | null;
+      workflow_name: string;
+    }>;
+    return rows.map((row) => {
+      if (row.state === 'needs_verification') {
+        return {
+          id: row.event_id,
+          title: `Workflow trigger needs review: ${row.workflow_name}`,
+          body:
+            `A delivery for "${row.workflow_name}" needs a manual review before it can run — I won't retry it on my own. `
+            + 'Open Console → Activity to review it; until then that trigger firing is on hold.',
+          recordedAt: row.updated_at ?? row.fired_at,
+          metadata: { workflow: row.workflow_name, triggerEventId: row.event_id, state: row.state },
+        };
+      }
+      const error = (row.last_error ?? '').trim();
+      return {
+        id: row.event_id,
+        title: `Workflow trigger keeps failing to start: ${row.workflow_name}`,
+        body:
+          `A trigger for "${row.workflow_name}" has failed to start ${row.attempt_count} times and keeps retrying`
+          + `${error ? ` — latest error: ${error}` : ''}. The workflow isn't running until this clears; `
+          + 'ask me to investigate or check Console → Activity.',
+        recordedAt: row.last_attempt_at ?? row.fired_at,
+        metadata: {
+          workflow: row.workflow_name,
+          triggerEventId: row.event_id,
+          state: row.state,
+          attemptCount: row.attempt_count,
+          ...(error ? { lastError: error } : {}),
+        },
+      };
+    });
+  },
+};
