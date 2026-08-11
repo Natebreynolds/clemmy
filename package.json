@@ -118,7 +118,8 @@
     "proof:endurance:codex": "CLEMMY_PROOF_LONG_HORIZON_ITEMS=120 tsx scripts/proof/run-proof.ts --brain codex --scenario long-horizon-manifest",
     "proof:fusion:codex": "tsx scripts/proof/run-proof.ts --brain codex --fusion all --scenario fusion-bounded-verifier",
     "proof:selftest": "tsx --test 'scripts/proof/*.test.ts'",
-    "journeys": "tsx --test src/journeys/*.test.ts"
+    "journeys": "tsx --test src/journeys/*.test.ts",
+    "test:measurement": "tsx --test scripts/session-comparison.test.ts scripts/proof/first-run.test.ts scripts/proof/leg-totals.test.ts scripts/proof/version-comparison.test.ts scripts/proof/conversation-facts.test.ts scripts/proof/runtime-under-test.test.ts scripts/proof/benchmark-comparison.test.ts scripts/proof/report-output.test.ts scripts/proof/required-brains.test.ts scripts/proof/route-expectation.test.ts scripts/proof/source-guard.test.ts scripts/proof/score.test.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.82",

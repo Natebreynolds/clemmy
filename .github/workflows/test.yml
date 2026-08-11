@@ -85,6 +85,12 @@ jobs:
       - name: Run tests
         run: npm test
 
+      # Measurement/benchmark layer (scripts/**) sits outside the npm-test
+      # globs; explicit hermetic file list so a future daemon-spawning
+      # selftest can never silently enter CI.
+      - name: Run measurement-layer tests
+        run: npm run test:measurement
+
       - name: Run release asset tests
         run: npm run test:release-assets
 

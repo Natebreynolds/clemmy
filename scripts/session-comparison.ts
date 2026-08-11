@@ -102,6 +102,14 @@ export interface AcceptedTurnMeasurement extends SessionMeasurement {
   governorKnownCapability: boolean | null;
   discoveryClaimsByCategory: Record<string, number>;
   discoveryClaimsByOutcome: Record<string, number>;
+  /** First-run-correctness facts (scripts/proof/first-run.ts consumes these).
+   *  run_attempts was already read for usage bounding; these expose the
+   *  counts it used to discard. */
+  attemptCount: number;
+  unfinishedAttempts: number;
+  awaitingUserInputEvents: number;
+  supersededEvents: number;
+  restartRecoveryEvents: number;
 }
 
 export interface AcceptedTurnComparison {
@@ -740,6 +748,11 @@ export function measureAcceptedTurn(
     governorKnownCapability: discovery.knownCapability,
     discoveryClaimsByCategory: discovery.byCategory,
     discoveryClaimsByOutcome: discovery.byOutcome,
+    attemptCount: attempts.ids.size,
+    unfinishedAttempts: attempts.unfinished,
+    awaitingUserInputEvents: events.filter((event) => event.type === 'awaiting_user_input').length,
+    supersededEvents: events.filter((event) => event.type === 'conversation_superseded').length,
+    restartRecoveryEvents: events.filter((event) => event.type === 'restart_recovery_decision').length,
   };
 }
 

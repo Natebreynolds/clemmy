@@ -16,6 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { planBrain, provisionDaemon } from './provision.js';
+import { executeRuntimePlan, planRuntimeUnderTest } from './runtime-under-test.js';
 import {
   parseProofBenchmarkFlags,
   proofBenchmarkMetadata,
@@ -139,6 +140,7 @@ function parseArgs(argv: string[]): {
   allowDirtyDev: boolean;
   requiredBrains: BrainKind[];
   benchmarkRequest: ReturnType<typeof parseProofBenchmarkFlags>;
+  runtimeRef?: string;
 } {
   const benchmarkRequest = parseProofBenchmarkFlags(argv);
   const brains: BrainKind[] = [];
@@ -147,6 +149,7 @@ function parseArgs(argv: string[]): {
   let keep = false;
   let fusionMode: FusionProofMode = 'off';
   let allowDirtyDev = false;
+  let runtimeRef: string | undefined;
   const requiredBrains: BrainKind[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -156,6 +159,10 @@ function parseArgs(argv: string[]): {
     else if (a === '--keep') keep = true;
     else if (a === '--allow-dirty-dev') allowDirtyDev = true;
     else if (a === '--require-brains') requiredBrains.push(...parseRequiredBrains(argv[++i]));
+    else if (a === '--runtime') {
+      runtimeRef = (argv[++i] ?? '').trim();
+      if (!runtimeRef) throw new Error('--runtime requires a git ref (e.g. v3.14.0)');
+    }
     else if (a === '--benchmark-cohort' || a === '--benchmark-sample') i += 1;
     else if (a === '--fusion') {
       const raw = (argv[++i] ?? '').trim().toLowerCase();
@@ -180,6 +187,7 @@ function parseArgs(argv: string[]): {
     allowDirtyDev,
     requiredBrains: uniqueRequiredBrains,
     benchmarkRequest,
+    ...(runtimeRef ? { runtimeRef } : {}),
   };
 }
 
@@ -211,6 +219,7 @@ async function main(): Promise<void> {
     allowDirtyDev,
     requiredBrains,
     benchmarkRequest,
+    runtimeRef,
   } = parseArgs(process.argv.slice(2));
 
   if (scoreOnly) {
@@ -258,10 +267,24 @@ async function main(): Promise<void> {
   console.log(sourceClean
     ? `\n→ building candidate ${gitHead.slice(0, 12)} …`
     : `\n→ building dirty working tree at ${gitHead.slice(0, 12)} …`);
-  try {
-    execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'inherit' });
-  } catch (error) {
-    throw new Error(`Candidate build failed before live proof: ${error instanceof Error ? error.message : String(error)}`);
+  let pinnedDaemonEntry: string | undefined;
+  if (runtimeRef) {
+    // Pinned baseline leg: the DAEMON under test comes from a worktree built
+    // at its own ref; the measurement stack (scenarios, scoring, shim) always
+    // runs from the current tree so ONE stack drives both versions. The
+    // current-tree build is skipped — its dist is not what runs.
+    console.log(`\n→ provisioning pinned runtime ${runtimeRef} …`);
+    const plan = planRuntimeUnderTest({ repoRoot: REPO_ROOT, ref: runtimeRef });
+    const runtime = executeRuntimePlan(plan, { log: (line) => console.log(line) });
+    if (!runtime.built) throw new Error(`pinned runtime ${runtimeRef} did not produce ${runtime.daemonEntry}`);
+    console.log(`→ pinned runtime ready: ${runtime.gitSha.slice(0, 12)} (${runtime.nodeModulesProvenance}) at ${runtime.daemonEntry}`);
+    pinnedDaemonEntry = runtime.daemonEntry;
+  } else {
+    try {
+      execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'inherit' });
+    } catch (error) {
+      throw new Error(`Candidate build failed before live proof: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   const outcomes: ScenarioOutcome[] = [];
@@ -292,6 +315,7 @@ async function main(): Promise<void> {
         keepHome: keep,
         fusionMode,
         requireWorkerProvider: scenarios.some((scenario) => scenario.workerRouteExpectation),
+        ...(pinnedDaemonEntry ? { daemonEntry: pinnedDaemonEntry } : {}),
       });
     } catch (err) {
       for (const s of scenarios) {

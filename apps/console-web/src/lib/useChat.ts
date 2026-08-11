@@ -625,7 +625,12 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       const shapeKey = typeof d.shapeKey === 'string' ? d.shapeKey : '';
       const writeTool = typeof d.toolName === 'string' ? d.toolName : tool;
       const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
-      const base = describeExternalWrite(shapeKey, writeTool, targets);
+      // The recorded irreversibility bit rides through so a reversible write
+      // (draft/update) can never render as delivery in the live feed either.
+      const base = describeExternalWrite(shapeKey, writeTool, targets, {
+        ...(typeof d.irreversible === 'boolean' ? { irreversible: d.irreversible } : {}),
+        ...(typeof d.actionKey === 'string' ? { actionKey: d.actionKey } : {}),
+      });
       const failed = ev.type === 'external_write_failed';
       const orphaned = ev.type === 'external_write_orphaned';
       const key = callId || shapeKey || writeTool || `${prev.length}`;

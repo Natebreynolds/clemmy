@@ -440,6 +440,11 @@ export interface ProvisionOptions {
   /** Test-only preflight injection. Production compiles and executes the
    * mutation-free native safety selftest before creating a proof home. */
   runtimeSafetyPreflight?: () => void;
+  /** Absolute dist/index.js of the runtime under test. Default: this repo's
+   * dist — byte-for-byte today's behavior. A pinned baseline leg (git
+   * worktree built at its own tag, scripts/proof/runtime-under-test.ts)
+   * passes its own entry so ONE measurement stack drives TWO runtimes. */
+  daemonEntry?: string;
 }
 
 export interface ProofProviderRequirements {
@@ -987,8 +992,9 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
   // provider-capable spawn. Unsupported platforms/helper execution fail with
   // zero disposable credential footprint.
   (opts.runtimeSafetyPreflight ?? preflightProofRuntimeSafety)();
-  if (!existsSync(DAEMON_ENTRY)) {
-    throw new Error(`dist/index.js missing — run \`npm run build\` first (${DAEMON_ENTRY})`);
+  const daemonEntry = opts.daemonEntry ?? DAEMON_ENTRY;
+  if (!existsSync(daemonEntry)) {
+    throw new Error(`dist/index.js missing — run \`npm run build\` first (${daemonEntry})`);
   }
   const tempRoot = os.tmpdir();
   let providerLifecycle: 'never-spawned' | 'active' | 'terminated' = 'never-spawned';
@@ -1127,7 +1133,7 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     providerLifecycle = 'active';
     let child: ChildProcess;
     try {
-      child = spawn(process.execPath, [DAEMON_ENTRY, 'service'], {
+      child = spawn(process.execPath, [daemonEntry, 'service'], {
         cwd: home,
         env: daemonEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
