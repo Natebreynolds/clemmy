@@ -8808,6 +8808,30 @@ export async function runConversationFromResume(opts: {
     surface: 'approval_resume',
   });
   const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
+  // Arm the RESUME source exactly like a fresh turn (loop.ts fresh-turn twin).
+  // The parked source's armed authority is keyed to ITS seq and does not
+  // transfer; without this, every approval resume (Discord/Slack button,
+  // mobile approve, console, drain — seven callers) ran its tool dispatches
+  // with the expected-work wall silently open: assertExpectedWorkLogicalAdmission
+  // returns when no authority row exists (sweep-confirmed 2026-08-11).
+  {
+    requireAcceptedTaskAuthority({
+      sessionId: opts.sessionId,
+      sourceUserSeq,
+    });
+    const resumeExpectedWork = requireKnownExpectedWorkContract({
+      sessionId: opts.sessionId,
+      sourceUserSeq,
+    });
+    const resumeRoute = acceptedTurnGraph?.classification.route ?? 'direct_reply';
+    if (
+      resumeRoute === 'act'
+      && resumeExpectedWork.status === 'action_deferred'
+      && getSession(opts.sessionId)?.kind !== 'workflow'
+    ) {
+      requireActionExpectedWorkActivation({ sessionId: opts.sessionId, sourceUserSeq });
+    }
+  }
   let foregroundReleased = false;
   return withModelUsageAttribution(
     {

@@ -2567,6 +2567,14 @@ test('runConversationFromResume publishes the exact new approval requested by th
   assert.equal(result.publicPresentation?.identity.turn, accepted.turn);
   assert.equal(Object.hasOwn(result.publicPresentation?.identity ?? {}, 'runId'), false);
   assert.equal(listEventsForConv(sess.id, { types: ['conversation_completed'] }).length, 1);
+  // Sweep-confirmed 2026-08-11: the resume source was shadowed but never
+  // ARMED, so every approval resume ran its tool dispatches with the
+  // expected-work wall silently open. The resume source must own an
+  // accepted-task authority row exactly like a fresh turn's.
+  const authorityRow = openEventLog().prepare(
+    'SELECT state FROM accepted_task_authority WHERE session_id = ? AND source_user_seq = ?',
+  ).get(sess.id, accepted.seq) as { state: string } | undefined;
+  assert.ok(authorityRow, 'the resume source is armed');
 });
 
 test('runConversationFromResume continuation publishes its exact SDK approval instead of the resolved prior card', async () => {
