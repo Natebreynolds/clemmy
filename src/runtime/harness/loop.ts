@@ -3657,15 +3657,16 @@ export async function runConversation(
   // Arm its exact accepted source before capability construction, context
   // warming, model invocation, or any tool can run. A bridge/fallover may enter
   // this seam again with the same source; exact re-admission is idempotent.
-  // Arm wherever a graph exists. Every lane now persists the shadow graph
-  // (the dispatch ledger demands it), and the model-facing carrier surface
-  // (actionExpectedWorkCarrierSelection in orchestrator/SDK) is lane-neutral —
-  // an act-routed background/workflow source with a graph but no activation
-  // row had its batched run_worker refused live (2026-08-11:
-  // long-horizon-manifest, 12/12 items failed 'activation row is missing').
-  // Contract compilation and terminal adjudication keep their own
-  // route/kind scoping unchanged.
-  if (graphEvent !== null) {
+  // Arm UNCONDITIONALLY. Every lane persists the shadow graph now (the
+  // dispatch ledger demands it, and the model-facing carrier surface is
+  // lane-neutral — an act-routed background source with a graph but no
+  // activation row had its batched run_worker refused live 2026-08-11,
+  // long-horizon-manifest, 12/12 items). A null graphEvent therefore means
+  // PERSISTENCE FAILED, and requireAcceptedTaskAuthority fails the turn
+  // closed before any model call — gating on the event turned a storage
+  // failure into a silent unarmed model run. Contract compilation and
+  // terminal adjudication keep their own route/kind scoping unchanged.
+  {
     requireAcceptedTaskAuthority({
       sessionId: options.sessionId,
       sourceUserSeq,

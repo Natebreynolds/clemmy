@@ -181,8 +181,7 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
         graph,
       },
     }).event;
-  } catch (error) {
-    if (process.env.CLEM_DEBUG_SHADOW === '1') console.error('[shadow-debug]', error);
+  } catch {
     return null;
   }
 }

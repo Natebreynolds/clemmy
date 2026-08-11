@@ -1787,7 +1787,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       ...(request.runId ? { runId: request.runId } : {}),
     },
   }, { existingEventSeq: preRecordedUserInput?.seq, armRunInFlight: true });
-  const brainGraphEvent = recordTurnGraphShadow({
+  recordTurnGraphShadow({
     identity: {
       sessionId,
       turn: userInputEvent.turn,
@@ -1806,7 +1806,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // dispatch ledger and the lane-neutral carrier surface both require it;
   // see the loop.ts twin for the live incident this closes). Contract and
   // terminal scoping stay route-owned downstream.
-  if (brainGraphEvent !== null) {
+  // Unconditional (see the loop.ts twin): every lane persists the shadow, so
+  // a null graph event means persistence FAILED and the authority requirement
+  // fails the turn closed before any model call.
+  {
     requireAcceptedTaskAuthority({
       sessionId,
       sourceUserSeq: userInputEvent.seq,

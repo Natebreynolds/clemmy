@@ -209,7 +209,7 @@ test('operational mirror receives only the bounded graph summary', () => {
   assert.equal(JSON.stringify(events[0].payload).includes('private-first-turn-title-774'), false);
 });
 
-test('invalid or non-chat observations fail open without writing an event', () => {
+test('invalid observations fail open; non-chat sessions persist their graph', () => {
   const chatSource = acceptedTurn({ sessionId: 'shadow-invalid' });
   assert.doesNotThrow(() => {
     const event = recordTurnGraphShadow({
@@ -220,8 +220,12 @@ test('invalid or non-chat observations fail open without writing an event', () =
   });
   assert.equal(listEvents('shadow-invalid', { types: ['turn_graph_compiled'] }).length, 0);
 
+  // Every lane persists the shadow now — the dispatch ledger and the
+  // lane-neutral carrier surface both require it (live 2026-08-11: the
+  // chat-only gate left act-routed background sources unable to arm, killing
+  // 12/12 fan-out workers).
   const executionSource = acceptedTurn({ sessionId: 'shadow-execution', kind: 'execution' });
-  const skipped = recordTurnGraphShadow({
+  const persisted = recordTurnGraphShadow({
     identity: {
       sessionId: 'shadow-execution',
       turn: executionSource.turn,
@@ -229,8 +233,8 @@ test('invalid or non-chat observations fail open without writing an event', () =
     },
     surface: 'background',
   });
-  assert.equal(skipped, null);
-  assert.equal(listEvents('shadow-execution', { types: ['turn_graph_compiled'] }).length, 0);
+  assert.ok(persisted, 'a non-chat observation persists its graph');
+  assert.equal(listEvents('shadow-execution', { types: ['turn_graph_compiled'] }).length, 1);
 
   const wrongTurn = recordTurnGraphShadow({
     identity: {
