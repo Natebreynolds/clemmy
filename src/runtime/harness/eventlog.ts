@@ -3593,6 +3593,65 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     },
   },
+  {
+    /**
+     * Re-assert v35's complete end state.
+     *
+     * A migration is gated on its version number, so EDITING an already-shipped
+     * version is a permanent no-op on every store that recorded it. v35 grew a
+     * column after a live daemon had already applied and recorded it, leaving
+     * that store with three of v35's four changes and no way to ever receive
+     * the fourth — while the code shipping alongside it writes to that column on
+     * every poisoned call (found on the live store 2026-08-11, which applied v35
+     * at 19:52Z without conflict_reason).
+     *
+     * Every step is guarded, so this is a no-op on a store that received all of
+     * v35 and a repair on one that received part of it. The rule it encodes: a
+     * shipped migration is immutable, and a correction ships as its own version.
+     */
+    version: 36,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      const columnsOf = (table: string): Set<string> => new Set(
+        (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (tables.has('physical_dispatches') && !columnsOf('physical_dispatches').has('execution_site')) {
+        db.exec('ALTER TABLE physical_dispatches ADD COLUMN execution_site TEXT');
+      }
+      if (tables.has('logical_call_settlements')) {
+        if (!columnsOf('logical_call_settlements').has('host_crossing_count')) {
+          db.exec('ALTER TABLE logical_call_settlements ADD COLUMN host_crossing_count INTEGER');
+        }
+        db.exec(`
+          DROP TRIGGER IF EXISTS trg_logical_settlement_result_required;
+          CREATE TRIGGER trg_logical_settlement_result_required
+          BEFORE INSERT ON logical_call_settlements
+          WHEN (
+            NEW.execution_kind = 'provider_execution'
+            AND NEW.outcome_kind IN ('succeeded','empty_result')
+            AND NEW.result_handle_id IS NULL
+          ) OR (
+            NEW.result_handle_id IS NOT NULL
+            AND NOT (
+              NEW.execution_kind IN ('provider_execution','local_execution')
+              AND NEW.outcome_kind IN ('succeeded','empty_result')
+            )
+          )
+          BEGIN
+            SELECT RAISE(ABORT, 'logical settlement result-handle binding is inconsistent');
+          END;
+        `);
+      }
+      if (tables.has('logical_tool_calls') && !columnsOf('logical_tool_calls').has('conflict_reason')) {
+        db.exec('ALTER TABLE logical_tool_calls ADD COLUMN conflict_reason TEXT');
+      }
+    },
+  },
 ];
 
 function runMigrations(db: Database.Database): void {

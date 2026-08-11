@@ -502,7 +502,9 @@ test('the execution-site migration is idempotent and preserves existing dispatch
   // again exactly as it would on a live store that has never seen it.
   const live = eventlog.openEventLog();
   live.exec('ALTER TABLE physical_dispatches DROP COLUMN execution_site');
-  live.prepare('DELETE FROM schema_version WHERE version = 35').run();
+  // The runner resumes from MAX(version), so a store rolled back to its
+  // pre-v35 shape must lose every version at or above it.
+  live.prepare('DELETE FROM schema_version WHERE version >= 35').run();
   assert.equal(
     (live.prepare('PRAGMA table_info(physical_dispatches)').all() as Array<{ name: string }>)
       .some((column) => column.name === 'execution_site'),
@@ -532,5 +534,37 @@ test('the execution-site migration is idempotent and preserves existing dispatch
       .get() as { n: number }).n,
     1,
     'the migration is recorded exactly once',
+  );
+});
+
+test('a store that recorded a PARTIAL earlier version is repaired, not stranded', () => {
+  // The live store applied v35 from a build whose v35 did not yet add
+  // conflict_reason, recorded version 35, and could therefore never receive
+  // that column again — while the code shipping beside it wrote to it on every
+  // poisoned call. Editing a shipped migration is a permanent no-op; the
+  // correction has to be its own version.
+  const live = eventlog.openEventLog();
+  const rows = (live.prepare('SELECT COUNT(*) AS n FROM logical_tool_calls').get() as { n: number }).n;
+  assert.ok(rows > 0, 'the fixture already wrote logical calls');
+  live.exec('ALTER TABLE logical_tool_calls DROP COLUMN conflict_reason');
+  live.exec('ALTER TABLE physical_dispatches DROP COLUMN execution_site');
+  live.prepare('DELETE FROM schema_version WHERE version = 36').run();
+  eventlog.closeEventLog();
+
+  const repaired = eventlog.openEventLog();
+  const columns = (table: string): string[] =>
+    (repaired.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+      .map((column) => column.name);
+  assert.ok(columns('logical_tool_calls').includes('conflict_reason'), 'the missed column arrived');
+  assert.ok(columns('physical_dispatches').includes('execution_site'), 'a partially applied version is completed');
+  assert.equal(
+    (repaired.prepare('SELECT COUNT(*) AS n FROM logical_tool_calls').get() as { n: number }).n,
+    rows,
+    'the repair preserved every row',
+  );
+  assert.equal(
+    (repaired.prepare('SELECT COUNT(*) AS n FROM schema_version WHERE version = 36')
+      .get() as { n: number }).n,
+    1,
   );
 });
