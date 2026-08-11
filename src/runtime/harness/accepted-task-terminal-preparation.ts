@@ -25,7 +25,7 @@ import {
 } from './obligation-store.js';
 import { adjudicateTerminalForTaskSync, type TerminalVerdict } from './terminal-truth.js';
 import { prepareDurableMemoryIntakeHostCompletion } from './durable-memory-intake-receipt.js';
-import { listEvents } from './eventlog.js';
+import { listEvents, openEventLog } from './eventlog.js';
 import { summarizeWorkManifest, type WorkManifestSummary } from './work-manifest.js';
 
 export type AcceptedTaskTerminalPreparation =
@@ -134,6 +134,33 @@ function settledWorkManifestAuthority(input: {
   return { status: 'complete', manifestIds, itemPhases };
 }
 
+/**
+ * Whether any settled call for this accepted source mutated anything. The
+ * route classifier sends many plain conversational asks ("what time is it?")
+ * down the act route; an activated action whose turn settled zero mutating
+ * calls and owns no manifest was answered conversationally — blocking it
+ * replaced ordinary replies with a canned verification refusal (the
+ * false-block class flagged when the fail-closed gate landed). Mutation
+ * without a frozen topology or manifest still fails closed, and text-level
+ * effect claims stay guarded by the settlement-derived claim lanes.
+ */
+function sourceHasMutatingSettlement(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  try {
+    const row = openEventLog().prepare(`
+      SELECT 1 FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ? AND mutating = 1
+       LIMIT 1
+    `).get(input.sessionId, input.sourceUserSeq);
+    return row !== undefined;
+  } catch {
+    // An unreadable settlement store must never loosen the gate.
+    return true;
+  }
+}
+
 function verdictResult(
   manifestId: string,
   verdict: TerminalVerdict,
@@ -218,8 +245,6 @@ export function prepareAcceptedTaskTerminal(input: {
       if (host.status === 'conflict') {
         return { status: 'conflict', reason: host.reason };
       }
-    }
-    if (action.status === 'required' && !action.contractId) {
       const workAuthority = settledWorkManifestAuthority(input);
       if (workAuthority.status === 'complete') {
         return {
@@ -241,6 +266,22 @@ export function prepareAcceptedTaskTerminal(input: {
           status: 'needs_verification',
           reason: workAuthority.reason,
           missing: ['cardinality_item_missing'],
+        };
+      }
+      // Scoped to 'ineligible' (not a memory-instruction turn): a memory
+      // instruction that failed to record must keep its gap, never publish
+      // a conversational done over the missing receipt.
+      if (host.status === 'ineligible' && !sourceHasMutatingSettlement(input)) {
+        return {
+          status: 'ready',
+          manifestId: `conversational:${input.sessionId}:${input.sourceUserSeq}`,
+          verdict: {
+            status: 'done',
+            missing: [],
+            facts: [
+              'no mutating call settled for this accepted source; the conversational reply is the terminal',
+            ],
+          },
         };
       }
     }

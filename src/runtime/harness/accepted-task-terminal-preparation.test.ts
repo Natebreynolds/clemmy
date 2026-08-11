@@ -238,13 +238,85 @@ test('a half-settled work manifest keeps the verification gap and names the open
   );
 });
 
-test('an activated action with no work manifest still requires a frozen contract', () => {
-  const task = acceptActivatedAction('Email alex@example.com the update for every record.');
+test('an activated action whose turn mutated without manifest or contract keeps the gap', () => {
+  // The mutating dispatch lands in the pre-activation window (restart/bridge
+  // race) — post-activation, the dispatch-ledger backstop refuses unbound
+  // dispatch outright, so this is the exact seam the terminal branch guards.
+  const session = eventlog.createSession({ id: `terminal-preparation-${++serial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Email alex@example.com the update for every record.' },
+  });
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
+  const task = { sessionId: session.id, sourceUserSeq: source.seq };
+  const identity = {
+    ...task,
+    turn: 1,
+    acceptedTaskId: identities.acceptedTaskIdFor(task.sessionId, task.sourceUserSeq),
+    logicalToolCallId: `logical:terminal-preparation:mutating:${serial}`,
+    physicalDispatchId: `dispatch:terminal-preparation:mutating:${serial}`,
+    ordinal: 0,
+  };
+  // A provider business dispatch is refused pre-dispatch without a binding
+  // (work_binding_required backstop) — the mutation lane this branch guards is
+  // the LOCAL one, where a mutating local execution settles without any
+  // provider crossing.
+  const begun = dispatch.beginPhysicalDispatch({
+    identity,
+    tool: 'write_file',
+    args: { path: '/tmp/pin.txt', content: 'x' },
+  });
+  assert.equal(begun.status, 'inserted', JSON.stringify(begun));
+  if (begun.status !== 'inserted') throw new Error(begun.reason);
+  assert.equal(dispatch.settlePhysicalDispatch({
+    identity: begun.identity,
+    tool: 'write_file',
+    outcome: 'returned',
+  }).status, 'inserted');
+  const settled = settlements.commitLogicalCallSettlement({
+    identity: {
+      ...task,
+      turn: 1,
+      acceptedTaskId: identity.acceptedTaskId,
+      logicalToolCallId: identity.logicalToolCallId,
+    },
+    contract: { toolName: 'write_file', args: { path: '/tmp/pin.txt', content: 'x' } },
+    execution: { kind: 'provider_execution' },
+    result: { payload: { successful: true } },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: true },
+    observer: { lane: 'composio', turn: 1 },
+  });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  const activated = admission.activateActionExpectedWork(task);
+  assert.ok(
+    activated.status === 'activated' || activated.status === 'replayed',
+    JSON.stringify(activated),
+  );
   const prepared = preparation.prepareAcceptedTaskTerminal(task);
   assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
   assert.deepEqual(
     prepared.status === 'needs_verification' ? prepared.missing : [],
     ['work_contract_missing'],
+  );
+});
+
+// The route classifier sends plain conversational asks down the act route
+// ("what time is it?" classifies act). An activated action that settled zero
+// mutating calls and owns no manifest was answered in conversation — blocking
+// it replaced ordinary replies with a canned verification refusal.
+test('an activated action with zero mutating settlements publishes the conversational terminal', () => {
+  const task = acceptActivatedAction('Email alex@example.com the update for every record.');
+  const prepared = preparation.prepareAcceptedTaskTerminal(task);
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  assert.match(
+    prepared.status === 'ready' ? prepared.verdict.facts.join('; ') : '',
+    /no mutating call settled/,
   );
 });
 
