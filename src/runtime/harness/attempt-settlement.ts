@@ -23,6 +23,7 @@ import {
 import { callableContractIdentity, normalizeCallableArguments } from './callable-contract.js';
 import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
 import { toResultHandle } from './result-handle.js';
+import { deriveResultHandleFactsFromRaw } from './result-facts.js';
 import {
   commitLogicalCallSettlement,
   type LogicalCallSettlementResult,
@@ -362,7 +363,23 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     if (input.thrown !== undefined || returnedFailure) extracted.acknowledged = false;
   }
 
-  const outcome = classifyAttemptOutcome(extracted);
+  let outcome = classifyAttemptOutcome(extracted);
+  if (outcome.kind === 'succeeded' && !deriveResultHandleFactsFromRaw(input.result).success) {
+    // TWO CLASSIFIERS, ONE SEAM. The dispatch failure detector deliberately
+    // lets an authoritative `successful:true` win over nested error fields
+    // (the DataForSEO 5-digit-status history), while the redeemability
+    // inspector deliberately refuses to mint proof from a contradicted
+    // envelope. Both are right; a success that cannot be redeemed is the
+    // taxonomy's own `ignored_requirement` — looks like success, dropped
+    // something — and must SETTLE as that, never crash the dispatch path
+    // ("successful provider result did not produce redeemable result
+    // authority" threw here live, 2026-08-11).
+    outcome = classifyAttemptOutcome({
+      ...extracted,
+      envelopeSuccessful: undefined,
+      droppedRequiredParameter: true,
+    });
+  }
   if (!hasTaskIdentity(input)) {
     throw new ToolAttemptSettlementAuthorityError(
       'uncorrelated',
