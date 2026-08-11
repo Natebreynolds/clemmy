@@ -22,9 +22,12 @@ import {
   type AcceptedTaskWorkContractV1,
   type ExpectedWorkUniverseV1,
 } from './expected-work-contract.js';
-import { providerEnvelopeHasContradiction } from './provider-read-evidence.js';
-import { recordsAtRecordPath } from './result-facts.js';
-import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import { deriveResultHandleFactsFromRaw, recordsAtRecordPath } from './result-facts.js';
+import {
+  redeemedReadIsExhausted,
+  redeemSuccessfulSettlementResultForHost,
+  type SuccessfulSettlementResultEvidence,
+} from './result-handle.js';
 
 export type SourceDerivedUniverseV1 = Extract<
   ExpectedWorkUniverseV1,
@@ -64,6 +67,16 @@ interface SettledProducerRow {
   continues_requirement: number;
 }
 
+/** The record's own top-level keys, as DATA in the refusal. A frozen pointer
+ *  cannot be verified until the read settles, so when it misses, the one thing
+ *  that lets the model correct itself next turn is what the records actually
+ *  carry — '/id' against records keyed "Id" is otherwise a silent dead end. */
+function availableKeys(record: unknown): string {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return '';
+  const keys = Object.keys(record as Record<string, unknown>).slice(0, 8);
+  return keys.length > 0 ? ` (record keys: ${keys.map((key) => `/${key}`).join(', ')})` : '';
+}
+
 function memberIdOf(
   record: unknown,
   pointer: string,
@@ -73,18 +86,60 @@ function memberIdOf(
   if (!resolved.ok) {
     return {
       ok: false,
-      reason: `source record ${index} has no value at member id pointer '${pointer}'`,
+      reason: `source record ${index} has no value at member id pointer '${pointer}'${availableKeys(record)}`,
     };
   }
   const value = resolved.value;
   if (typeof value !== 'string' || value.length < 1 || value.length > MEMBER_ID_MAX_LENGTH) {
     return {
       ok: false,
-      reason: `source record ${index} has no bounded string member id at pointer '${pointer}'`,
+      reason: `source record ${index} has no bounded string member id at pointer '${pointer}'${availableKeys(record)}`,
     };
   }
   return { ok: true, id: value };
 }
+
+/**
+ * The records a settled source read actually produced.
+ *
+ * A host read hands back exactly what the tool returned, and a local file of
+ * JSON arrives as TEXT — the bytes ARE the records, but the handle's own facts
+ * see a string and find no collection. Refusing there would fail the model for
+ * a representation detail after it did precisely the right read (live
+ * 2026-08-11: leads.json read whole, 671 bytes, record_path NULL).
+ *
+ * Strictly guarded: host executions only, only a string that strictly parses,
+ * and the parsed value goes through the SAME derivation an object payload
+ * takes — no second shape-extraction path, no lenient parsing, no repair. A
+ * provider string is untouched: a provider that returns text is making a
+ * claim about its own shape, and we do not reinterpret it.
+ */
+function sourceRecordsFor(
+  value: SuccessfulSettlementResultEvidence,
+): { ok: true; records: unknown[] } | { ok: false; reason: 'no_collection' | 'count_mismatch' } {
+  const direct = recordsAtRecordPath(value.rawPayload, value.handle.recordPath);
+  if (direct) {
+    return direct.length === value.handle.recordCount
+      ? { ok: true, records: direct }
+      : { ok: false, reason: 'count_mismatch' };
+  }
+  if (value.executionSite !== 'host' || typeof value.rawPayload !== 'string') {
+    return { ok: false, reason: 'no_collection' };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value.rawPayload) as unknown;
+  } catch {
+    return { ok: false, reason: 'no_collection' };
+  }
+  const facts = deriveResultHandleFactsFromRaw(parsed);
+  const records = recordsAtRecordPath(parsed, facts.recordPath);
+  if (!records) return { ok: false, reason: 'no_collection' };
+  return records.length === facts.recordCount
+    ? { ok: true, records }
+    : { ok: false, reason: 'count_mismatch' };
+}
+
 
 function deriveSeal(
   db: Database.Database,
@@ -153,31 +208,24 @@ function deriveSeal(
       reason: `the settled source read ${universe.producedBy} result is ${redeemed.status}: ${redeemed.reason}`,
     };
   }
-  if (
-    redeemed.value.handle.completeness !== 'complete'
-    || redeemed.value.handle.continuationRef !== null
-    || redeemed.value.handle.continuationRepeated !== false
-    || providerEnvelopeHasContradiction(redeemed.value.rawPayload)
-  ) {
+  // One authority decides exhaustion for every reader.
+  if (!redeemedReadIsExhausted(redeemed.value)) {
     return {
       status: 'unsealed',
       reason: `the settled source read ${universe.producedBy} does not prove it exhausted its collection`,
     };
   }
 
-  const records = recordsAtRecordPath(redeemed.value.rawPayload, redeemed.value.handle.recordPath);
-  if (!records) {
+  const source = sourceRecordsFor(redeemed.value);
+  if (!source.ok) {
     return {
       status: 'unsealed',
-      reason: `the settled source read ${universe.producedBy} exposes no record collection to seal`,
+      reason: source.reason === 'count_mismatch'
+        ? `the settled source read ${universe.producedBy} disagrees with its durable record count`
+        : `the settled source read ${universe.producedBy} exposes no record collection to seal`,
     };
   }
-  if (records.length !== redeemed.value.handle.recordCount) {
-    return {
-      status: 'unsealed',
-      reason: `the settled source read ${universe.producedBy} disagrees with its durable record count`,
-    };
-  }
+  const records = source.records;
   if (records.length > EXPECTED_WORK_MAX_UNIVERSE_MEMBERS) {
     return {
       status: 'unsealed',

@@ -194,6 +194,34 @@ function frozenContract(task: LocalTask): contracts.AcceptedTaskWorkContractV1 {
   return loaded.contract;
 }
 
+/** Open one logical call for a per-item write without binding it yet. */
+function openAndBindable(task: LocalTask, suffix: string): string {
+  const logicalToolCallId = `logical:${task.label}:${suffix}`;
+  const opened = dispatch.admitLogicalCall({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId,
+    },
+    tool: DRAFT_TOOL,
+    args: { path: 'drafts/lead-001.md', content: 'x', lead_id: 'lead-001' },
+  });
+  assert.equal(opened.status, 'inserted', JSON.stringify(opened));
+  return logicalToolCallId;
+}
+
+/** Seal this task's `leads` universe from whatever its producer read settled. */
+function sealFor(task: LocalTask): seals.ExpectedWorkUniverseSealResult {
+  const contract = frozenContract(task);
+  const universe = contract.universes.find((entry) => entry.id === 'leads');
+  assert.ok(universe && universe.seal === 'complete_source_receipt');
+  if (!universe || universe.seal !== 'complete_source_receipt') throw new Error('universe missing');
+  return seals.sealSourceDerivedUniverse({ db: eventlog.openEventLog(), contract, universe });
+}
+
+
 test('the host classifies its own returned execution, and never overrides a real verdict', () => {
   const host = outcomes.classifyAttemptOutcome({ hostExecuted: true });
   assert.equal(host.kind, 'succeeded');
@@ -567,4 +595,193 @@ test('a store that recorded a PARTIAL earlier version is repaired, not stranded'
       .get() as { n: number }).n,
     1,
   );
+});
+
+test('a host read with no completeness signal is exhausted by construction and seals', () => {
+  // THE h7NEP8 WALL. A local source read settled succeeded with a durable
+  // handle, but its payload carried no completeness signal — nothing says
+  // "complete" when a file is simply handed back whole — so the collection
+  // gate read 'unknown' and held the entire per-item lane closed while the
+  // plan card said the same read was satisfied. A provider can withhold a
+  // page; an in-process call cannot.
+  const task = acceptLocalAction('exhausted');
+  const args = { path: 'leads.json' };
+  const call = openAndBind({
+    task, suffix: 'source', tool: SOURCE_TOOL, args,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task, logicalToolCallId: call, tool: SOURCE_TOOL, args,
+    // No `complete`, no cursor, no envelope — exactly what a whole-file read
+    // looks like once its records are in hand.
+    result: { records: [{ id: 'lead-001' }, { id: 'lead-002' }] },
+    requirementId: 'read_leads',
+  });
+  const handle = eventlog.openEventLog().prepare(`
+    SELECT completeness FROM durable_result_handles
+     WHERE logical_tool_call_id = ?
+  `).get(call) as { completeness: string };
+  assert.equal(handle.completeness, 'unknown', 'the stored handle stays byte-faithful');
+
+  const contract = frozenContract(task);
+  const universe = contract.universes.find((entry) => entry.id === 'leads');
+  assert.ok(universe && universe.seal === 'complete_source_receipt');
+  if (!universe || universe.seal !== 'complete_source_receipt') throw new Error('universe missing');
+  const sealed = seals.sealSourceDerivedUniverse({
+    db: eventlog.openEventLog(), contract, universe,
+  });
+  assert.equal(sealed.status, 'sealed', JSON.stringify(sealed));
+  if (sealed.status !== 'sealed') throw new Error('a whole-file host read did not seal');
+  assert.deepEqual(sealed.seal.members, ['lead-001', 'lead-002']);
+
+  // And the per-item lane actually opens: the dependency now discharges.
+  const admitted = admissionModule.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId: openAndBindable(task, 'draft-lead-001'),
+    proposal: null,
+    requirementId: 'write_draft',
+    universeItemId: 'lead-001',
+    universeSelector: { argumentPointer: '/lead_id', memberIdPointer: null },
+    tool: DRAFT_TOOL,
+    args: { path: 'drafts/lead-001.md', content: 'x', lead_id: 'lead-001' },
+  });
+  assert.equal(admitted.status, 'bound', JSON.stringify(admitted));
+});
+
+test('a host read that hands back a continuation is still partial', () => {
+  const task = acceptLocalAction('hostcursor');
+  const args = { path: 'leads.json' };
+  const call = openAndBind({
+    task, suffix: 'source', tool: SOURCE_TOOL, args,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task, logicalToolCallId: call, tool: SOURCE_TOOL, args,
+    // A local tool that says it has more is believed, exactly like a provider.
+    result: { records: [{ id: 'lead-001' }], next_cursor: 'page-2' },
+    requirementId: 'read_leads',
+  });
+  const contract = frozenContract(task);
+  const universe = contract.universes.find((entry) => entry.id === 'leads');
+  if (!universe || universe.seal !== 'complete_source_receipt') throw new Error('universe missing');
+  const sealed = seals.sealSourceDerivedUniverse({
+    db: eventlog.openEventLog(), contract, universe,
+  });
+  assert.equal(sealed.status, 'unsealed');
+  assert.match(
+    sealed.status === 'unsealed' ? sealed.reason : '',
+    /does not prove it exhausted its collection/,
+  );
+});
+
+test('a host read of a JSON text file seals from the bytes it actually returned', () => {
+  // WALL C from h7NEP8: read_file hands back the file as TEXT, so the handle's
+  // own facts see a string and find no collection. The bytes ARE the records;
+  // refusing there fails the model for a representation detail after it did
+  // exactly the right read.
+  const task = acceptLocalAction('jsontext');
+  const args = { path: 'leads.json' };
+  const call = openAndBind({
+    task, suffix: 'source', tool: SOURCE_TOOL, args,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task, logicalToolCallId: call, tool: SOURCE_TOOL, args,
+    result: JSON.stringify([{ id: 'lead-001' }, { id: 'lead-002' }], null, 2),
+    requirementId: 'read_leads',
+  });
+  const handle = eventlog.openEventLog().prepare(`
+    SELECT record_path, record_count FROM durable_result_handles WHERE logical_tool_call_id = ?
+  `).get(call) as { record_path: string | null; record_count: number };
+  assert.equal(handle.record_path, null, 'the stored handle still sees a string');
+  assert.equal(handle.record_count, 0);
+
+  const sealed = sealFor(task);
+  assert.equal(sealed.status, 'sealed', JSON.stringify(sealed));
+  if (sealed.status !== 'sealed') throw new Error('a JSON text file did not seal');
+  assert.deepEqual(sealed.seal.members, ['lead-001', 'lead-002']);
+});
+
+test('a host text read that is not JSON still refuses, and names the keys when a pointer misses', () => {
+  const plain = acceptLocalAction('plaintext');
+  const plainArgs = { path: 'notes.txt' };
+  const plainCall = openAndBind({
+    task: plain, suffix: 'source', tool: SOURCE_TOOL, args: plainArgs,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task: plain, logicalToolCallId: plainCall, tool: SOURCE_TOOL, args: plainArgs,
+    result: 'just some notes, not a record collection',
+    requirementId: 'read_leads',
+  });
+  const plainSeal = sealFor(plain);
+  assert.equal(plainSeal.status, 'unsealed');
+  assert.match(
+    plainSeal.status === 'unsealed' ? plainSeal.reason : '',
+    /exposes no record collection to seal/,
+    'a non-JSON string refuses exactly as before — no lenient parsing',
+  );
+
+  // A frozen pointer that misses now names what the records actually carry,
+  // which is the only thing that lets the model re-propose correctly.
+  const cased = acceptLocalAction('casing');
+  const casedArgs = { path: 'leads.json' };
+  const casedCall = openAndBind({
+    task: cased, suffix: 'source', tool: SOURCE_TOOL, args: casedArgs,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task: cased, logicalToolCallId: casedCall, tool: SOURCE_TOOL, args: casedArgs,
+    result: JSON.stringify([{ Id: 'lead-001', company: 'Harbor & Vale LLP' }]),
+    requirementId: 'read_leads',
+  });
+  const casedSeal = sealFor(cased);
+  assert.equal(casedSeal.status, 'unsealed');
+  const reason = casedSeal.status === 'unsealed' ? casedSeal.reason : '';
+  assert.match(reason, /no value at member id pointer '\/id'/);
+  assert.match(reason, /record keys: \/Id, \/company/, 'the refusal carries the fix as data');
+});
+
+test('the plan card cannot claim a requirement the dependency gate refuses', () => {
+  // The h7NEP8 defect itself: one refusal payload carried
+  // work_dependency_pending for write_draft AND a plan card saying read_leads
+  // was 'satisfied'. Two readers of one question. They now derive from the
+  // same discharge test, so the card can only ever agree with the gate or be
+  // more conservative — never the reverse.
+  const task = acceptLocalAction('agreement');
+  const args = { path: 'leads.json' };
+  const call = openAndBind({
+    task, suffix: 'source', tool: SOURCE_TOOL, args,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  // Settles succeeded — the CARD's old test — but hands back a continuation,
+  // so the GATE's test refuses it.
+  settleLocal({
+    task, logicalToolCallId: call, tool: SOURCE_TOOL, args,
+    result: { records: [{ id: 'lead-001' }], next_cursor: 'page-2' },
+    requirementId: 'read_leads',
+  });
+
+  const refused = admissionModule.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId: openAndBindable(task, 'draft-blocked'),
+    proposal: null,
+    requirementId: 'write_draft',
+    universeItemId: 'lead-001',
+    universeSelector: { argumentPointer: '/lead_id', memberIdPointer: null },
+    tool: DRAFT_TOOL,
+    args: { path: 'drafts/lead-001.md', content: 'x', lead_id: 'lead-001' },
+  });
+  assert.equal(refused.status, 'refused');
+  if (refused.status !== 'refused') throw new Error('an unexhausted producer admitted work');
+  const producerLine = refused.plan?.find((line) => line.requirementId === 'read_leads');
+  assert.ok(producerLine, 'the refusal carries the plan card');
+  assert.notEqual(
+    producerLine?.state,
+    'satisfied',
+    'the card must never call a requirement satisfied while the gate refuses work waiting on it',
+  );
+  assert.equal(producerLine?.settledInstances, 0, 'a settled-but-undischarged read counts for nothing');
 });

@@ -20,7 +20,10 @@ import {
 } from './expected-work-universe-seal.js';
 import { openEventLog } from './eventlog.js';
 import { operationEvidenceContract } from '../graph/operation-evidence-contract.js';
-import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import {
+  redeemedReadIsExhausted,
+  redeemSuccessfulSettlementResultForHost,
+} from './result-handle.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { proveFiniteReadResultCoverage } from './read-evidence-refinement.js';
 import { providerEnvelopeHasContradiction } from './provider-read-evidence.js';
@@ -188,10 +191,7 @@ export function projectObservedExpectedWorkHistory(input: {
             coverage = 'observed';
           } else if (
             evidenceMode === 'collection_read'
-            && redeemed.value.handle.completeness === 'complete'
-            && redeemed.value.handle.continuationRef === null
-            && redeemed.value.handle.continuationRepeated === false
-            && !providerEnvelopeHasContradiction(redeemed.value.rawPayload)
+            && redeemedReadIsExhausted(redeemed.value)
           ) {
             coverage = 'complete';
           } else if (

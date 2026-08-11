@@ -8,6 +8,7 @@
  * canonical base-call arguments. Knowing a reference is not authority to use
  * it from another task or call.
  */
+import { providerEnvelopeHasContradiction } from './provider-read-evidence.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
@@ -93,6 +94,8 @@ export interface SuccessfulSettlementResultEvidence {
   toolName: string;
   outcomeKind: 'succeeded' | 'empty_result';
   handle: ResultHandle;
+  /** 'host' when the call never left the process; 'provider' when it crossed. */
+  executionSite: 'host' | 'provider';
   rawPayload: unknown;
   rawPayloadJson: string;
   rawPayloadSha256: string;
@@ -555,6 +558,7 @@ interface SettledResultRow extends DurableResultRow {
   logical_tool_name: string;
   logical_argument_digest: string;
   logical_state: string;
+  dispatch_execution_site: string | null;
   dispatch_state: string;
   dispatch_tool_name: string;
   dispatch_argument_digest: string;
@@ -759,6 +763,7 @@ export function redeemSuccessfulSettlementResultForHost(input: {
              l.argument_digest AS logical_argument_digest,
              l.state AS logical_state,
              p.state AS dispatch_state,
+             p.execution_site AS dispatch_execution_site,
              p.tool_name AS dispatch_tool_name,
              p.argument_digest AS dispatch_argument_digest,
              p.ordinal AS dispatch_ordinal,
@@ -869,6 +874,7 @@ export function redeemSuccessfulSettlementResultForHost(input: {
         toolName: row.tool_name,
         outcomeKind: row.settlement_outcome_kind as 'succeeded' | 'empty_result',
         handle: rowToHandle(row),
+        executionSite: row.dispatch_execution_site === 'host' ? 'host' : 'provider',
         rawPayload,
         rawPayloadJson: row.raw_payload_json,
         rawPayloadSha256: row.raw_payload_sha256,
@@ -878,6 +884,27 @@ export function redeemSuccessfulSettlementResultForHost(input: {
   } catch (error) {
     return { status: 'storage_error', reason: boundedReason(error) };
   }
+}
+
+/**
+ * Is this redeemed READ exhausted — is there provably nothing more to fetch?
+ *
+ * The one authority on that question, so no consumer can answer it privately.
+ * A provider result must SAY it is complete, because a page is exactly what a
+ * provider withholds. A host execution cannot withhold one: the host called
+ * the function and holds everything it returned, so an absent completeness
+ * signal means there was never a page 2 rather than that we failed to look
+ * (live 2026-08-11: a local source read settled succeeded with a durable
+ * handle, and 'unknown' completeness held the whole per-item lane closed).
+ *
+ * An EXPLICIT partial signal still wins for both — a tool that says it has
+ * more, or that hands back a continuation, is believed.
+ */
+export function redeemedReadIsExhausted(value: SuccessfulSettlementResultEvidence): boolean {
+  if (providerEnvelopeHasContradiction(value.rawPayload)) return false;
+  if (value.handle.continuationRef !== null || value.handle.continuationRepeated) return false;
+  return value.handle.completeness === 'complete'
+    || (value.executionSite === 'host' && value.handle.completeness === 'unknown');
 }
 
 export function redeemRawResult(

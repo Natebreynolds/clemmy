@@ -37,7 +37,10 @@ import {
   type FiniteReadStructuralProof,
 } from './read-evidence-refinement.js';
 import { providerEnvelopeHasContradiction } from './provider-read-evidence.js';
-import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import {
+  redeemedReadIsExhausted,
+  redeemSuccessfulSettlementResultForHost,
+} from './result-handle.js';
 import { expectedTaskFor } from './resolution-ledger.js';
 import {
   isClementineLocalToolNamespace,
@@ -443,13 +446,23 @@ function sourceWitness(
   };
 }
 
-function dependencySatisfied(
+/**
+ * The requirement instances that are DURABLY DISCHARGED — the one reader of
+ * that question.
+ *
+ * The dependency gate and the plan card used to answer it separately: the gate
+ * demanded redeemable, exhausted evidence while the card counted any settled
+ * binding. They disagreed in the same refusal payload — the card told the model
+ * its producer read was satisfied while the gate refused the work waiting on it
+ * (live 2026-08-11, count-only-drafts: every worker, twice each). A card that
+ * can contradict the gate is its own truth defect, so both now derive from here
+ * and the card can only ever be equal to the gate or more conservative.
+ */
+function dischargedRequirementSettlements(
   db: Database.Database,
   contract: AcceptedTaskWorkContractV1,
-  dependency: ExpectedWorkOperationV1,
-  current: ExpectedWorkOperationV1,
-  currentItemId: string | undefined,
-): boolean {
+  requirementId: string,
+): Array<{ logical_tool_call_id: string; universe_item_id: string | null }> {
   const rows = db.prepare(`
     SELECT b.logical_tool_call_id, b.effect_kind, b.cardinality_kind,
            b.universe_id, b.universe_item_id, b.universe_selector_json,
@@ -469,7 +482,7 @@ function dependencySatisfied(
     contract.identity.sessionId,
     contract.identity.sourceUserSeq,
     contract.contractId,
-    dependency.id,
+    requirementId,
   ) as Array<{
     logical_tool_call_id: string;
     effect_kind: RuntimeToolEffect;
@@ -508,11 +521,8 @@ function dependencySatisfied(
       return false;
     }
     if (row.evidence_mode === 'point_read') return true;
-    if (row.evidence_mode === 'collection_read') {
-      return redeemed.value.handle.completeness === 'complete'
-        && redeemed.value.handle.continuationRef === null
-        && redeemed.value.handle.continuationRepeated === false;
-    }
+    // Exhaustion has ONE authority, shared with the seal and the projector.
+    if (row.evidence_mode === 'collection_read') return redeemedReadIsExhausted(redeemed.value);
     if (
       row.evidence_mode !== 'finite_read'
       || !row.universe_id
@@ -546,6 +556,20 @@ function dependencySatisfied(
       rawResult: redeemed.value.rawPayload,
     }).status === 'proved';
   });
+  return discharged.map((row) => ({
+    logical_tool_call_id: row.logical_tool_call_id,
+    universe_item_id: row.universe_item_id,
+  }));
+}
+
+function dependencySatisfied(
+  db: Database.Database,
+  contract: AcceptedTaskWorkContractV1,
+  dependency: ExpectedWorkOperationV1,
+  current: ExpectedWorkOperationV1,
+  currentItemId: string | undefined,
+): boolean {
+  const discharged = dischargedRequirementSettlements(db, contract, dependency.id);
   if (dependency.cardinality.kind === 'once' || dependency.cardinality.kind === 'set') {
     return discharged.length === 1;
   }
@@ -706,25 +730,17 @@ function planLinesFor(
   contract: AcceptedTaskWorkContractV1,
   sealCache?: ExpectedWorkUniverseSealCache,
 ): ExpectedWorkPlanLine[] {
-  const settledRows = db.prepare(`
-    SELECT b.requirement_id, b.universe_item_id
-      FROM expected_work_call_bindings b
-      JOIN logical_call_settlements s
-        ON s.session_id = b.session_id
-       AND s.source_user_seq = b.source_user_seq
-       AND s.logical_tool_call_id = b.logical_tool_call_id
-     WHERE b.session_id = ? AND b.source_user_seq = ? AND b.contract_id = ?
-       AND s.outcome_kind IN ('succeeded', 'empty_result')
-  `).all(
-    contract.identity.sessionId,
-    contract.identity.sourceUserSeq,
-    contract.contractId,
-  ) as Array<{ requirement_id: string; universe_item_id: string | null }>;
+  // DERIVED FROM THE GATE, never counted separately. A settled binding is not
+  // a discharged one: the card used to count anything that settled and so told
+  // the model a requirement was satisfied while the gate refused the work
+  // waiting on it.
   const settledByRequirement = new Map<string, Set<string>>();
-  for (const row of settledRows) {
-    const set = settledByRequirement.get(row.requirement_id) ?? new Set<string>();
-    set.add(row.universe_item_id ?? '');
-    settledByRequirement.set(row.requirement_id, set);
+  for (const operation of contract.operations) {
+    const set = new Set<string>();
+    for (const row of dischargedRequirementSettlements(db, contract, operation.id)) {
+      set.add(row.universe_item_id ?? '');
+    }
+    settledByRequirement.set(operation.id, set);
   }
   const satisfied = new Set<string>();
   const lines: ExpectedWorkPlanLine[] = [];
