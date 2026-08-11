@@ -244,7 +244,11 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
   assert.ok(registered.tool_search);
   assert.ok(registered.mcp_list_tools, 'control/discovery remains first-class');
   assert.equal(registered.call_tool, undefined, 'generic call_tool cannot compete with the bound carrier');
-  assert.equal(registered.memory_search, undefined, 'business reads are inner calls, not an unbound bypass');
+  // memory_search is a harness-STATE read (control role since 320b5947):
+  // local recall must never burn work_call carrier attempts, so control
+  // reads are first-class on act. World compute/writes remain business and
+  // stay inner calls behind the bound carrier.
+  assert.ok(registered.memory_search, 'control-role harness-state reads are first-class on act');
   assert.equal(registered.run_shell_command, undefined, 'business compute/writes are inner calls, not an unbound bypass');
 
   const searched = await registered.tool_search.handler({ query: 'run_shell_command', limit: 1 });
