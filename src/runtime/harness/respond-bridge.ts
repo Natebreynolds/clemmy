@@ -2201,15 +2201,18 @@ function blockedWholeTurnRecoveryResponse(
   turn: AcceptedRecoveryTurn,
   check: Exclude<RecoveryLedgerCheck, { safeToRerun: true }>,
 ): AssistantResponse {
+  // Deterministic FLOOR text (no model is available on this path — the brain
+  // crashed mid-turn). Floors state facts in the harness's own voice and
+  // never name a provider.
   const recorded = check.reason === 'external_write'
     ? synthesizeWorkReport(check.evidence)?.replace(
         /^I finished — here's what I did this turn:/,
-        'Before Claude stopped, the action ledger recorded:',
+        'Before that turn stopped, the action ledger recorded:',
       )
     : null;
   const text = check.reason === 'external_write'
-    ? `${recorded ?? 'The action ledger recorded an external write attempt but did not confirm a completed change.'}\n\nClaude stopped before it finished the turn. I did not rerun the task on another model because that could repeat or conflict with the external action.`
-    : 'Claude stopped before it finished the turn. I could not verify the external-write ledger for this attempt, so I did not rerun the task on another model. The recovery path made no additional changes.';
+    ? `${recorded ?? 'The action ledger recorded an external write attempt but did not confirm a completed change.'}\n\nThat turn stopped before it finished. I did not rerun it because that could repeat or conflict with the external action already recorded. Tell me how you'd like to proceed.`
+    : 'That turn stopped before it finished. I could not verify the external-write ledger for the attempt, so I did not rerun it, and nothing further was changed. Tell me how you\'d like to proceed.';
   const terminal = commitBridgeBlockedTerminal({
     request,
     turn,

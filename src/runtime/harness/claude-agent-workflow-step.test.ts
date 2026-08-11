@@ -657,7 +657,7 @@ test('runClaudeAgentSdkWorkflowStep converts SDK turn limits into a blocked work
 
     assert.deepEqual(result.output, {
       blocked: true,
-      reason: 'Claude reached the workflow-step turn budget before finishing this step.',
+      reason: 'This step reached its turn budget before finishing.',
     });
     assert.equal(result.structured, true);
     assert.equal(result.sdkSessionId, 'sdk-workflow-session');

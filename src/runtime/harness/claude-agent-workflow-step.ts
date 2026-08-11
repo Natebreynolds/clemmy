@@ -507,8 +507,8 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     // Honest reason: an anti-thrash loop-stop is NOT a plain budget exhaustion —
     // say so, so the runner's self-heal sees the real cause (was hardcoded generic).
     const reason = result.selfStopped
-      ? 'Claude stopped this step early: it began repeating actions that looked like a loop (anti-thrash safeguard) before finishing.'
-      : 'Claude reached the workflow-step turn budget before finishing this step.';
+      ? 'This step stopped early: it began repeating actions that looked like a loop (anti-thrash safeguard) before finishing.'
+      : 'This step reached its turn budget before finishing.';
     recordStepAgent(reason, 'capped', result.model);
     return {
       output: { blocked: true, reason },
