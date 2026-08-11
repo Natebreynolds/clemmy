@@ -38,6 +38,11 @@ import {
 import { isAutoApprovedByScope } from '../../agents/plan-scope.js';
 import { getRuntimeEnv } from '../../config.js';
 import { classifyRuntimeToolEffect, type RuntimeToolEffect } from './tool-effect.js';
+import {
+  isMandatable,
+  localSchemaProviderRegistered,
+  resolveCallable,
+} from './callable-surface.js';
 
 const logger = pino({ name: 'clementine.harness.tool-guardrail' });
 
@@ -322,14 +327,72 @@ function batchApiHintFor(slug: string): string | undefined {
  *  is not a code-mode method (the 2026-07-11 bug that made every recovery
  *  UNRUNNABLE → "tool not available" → fallback to raw serial reads). Pure +
  *  exported for the regression test that pins the dispatch shapes. */
+/**
+ * A tool name a guardrail is allowed to prescribe. Constructible ONLY from
+ * proof (the callable-surface oracle: reachable, un-eliminated, schema in
+ * hand) or, during the wiring transition, from the exact legacy heuristic the
+ * consumer used before — never from assumption. The live failure this ends:
+ * the fan-out refusal mandated run_tool_program while the discovery governor
+ * refused its schema (2.62M-token deadlock), and the nudge recommended
+ * run_worker in an environment where it returned "unknown tool".
+ */
+export interface MandatedAlternative {
+  name: string;
+  schema: Record<string, unknown> | null;
+  requiredFields: string[];
+  exampleArgs?: Record<string, unknown>;
+  source: 'oracle' | 'legacy_env';
+}
+
+export function mandateFor(
+  name: string,
+  ctx?: { sessionId?: string; sourceUserSeq?: number },
+): MandatedAlternative | null {
+  const entry = resolveCallable(name, ctx);
+  if (isMandatable(entry)) {
+    const mandate: MandatedAlternative = {
+      name,
+      schema: entry.schema,
+      requiredFields: entry.requiredFields,
+      source: 'oracle',
+    };
+    if (entry.exampleArgs) mandate.exampleArgs = entry.exampleArgs;
+    return mandate;
+  }
+  if (entry.eliminatedForTask) return null;
+  // TRANSITION (until every lane registers its local schema projection): an
+  // unwired oracle must not WEAKEN the proven block/nudge, so the two names
+  // the fan-out ladder historically prescribed keep their exact legacy
+  // availability semantics — run_tool_program gated on the code-mode env
+  // (the old codeModeRecoveryAvailable), run_worker unchecked. Once a lane
+  // registers, truth replaces both. The per-lane wiring pin retires this arm.
+  if (!localSchemaProviderRegistered()) {
+    if (name === 'run_tool_program') {
+      const codeMode = (getRuntimeEnv('CLEMMY_CODE_MODE', 'on') || 'on').trim().toLowerCase() !== 'off';
+      return codeMode ? { name, schema: null, requiredFields: [], source: 'legacy_env' } : null;
+    }
+    if (name === 'run_worker') {
+      return { name, schema: null, requiredFields: [], source: 'legacy_env' };
+    }
+  }
+  return null;
+}
+
 export function buildFanoutRecoveryMessage(opts: {
   toolName: string;
   slug?: string;
   args: unknown;
   distinct: number;
   fanoutBlockAt: number;
+  /** The prescribable batching route, if one is PROVEN available. Omitted =
+   *  legacy callers; null = the refusal keeps the behavioral constraint and
+   *  names NO tool (an un-followable instruction is worse than none). */
+  mandate?: MandatedAlternative | null;
 }): string {
   const { toolName, slug, args, distinct, fanoutBlockAt } = opts;
+  const mandate = opts.mandate === undefined
+    ? { name: 'run_tool_program', schema: null, requiredFields: [], source: 'legacy_env' as const }
+    : opts.mandate;
   const label = slug ?? toolName;
   const innerArgs = slug ? (args as { arguments?: unknown })?.arguments : args;
   let exampleArgs: string;
@@ -565,15 +628,12 @@ function fanoutBlockEnabled(): boolean {
   return (process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK ?? 'on').toLowerCase() !== 'off';
 }
 
-/** The read-fanout refusal steers the model to run_tool_program — which is ONLY
- *  registered when code mode is enabled (mirrors codeModeEnabled() in
- *  code-mode-tool.ts; inlined to avoid a tools→guardrail import cycle). If an
- *  operator disabled code mode, refusing a read while prescribing a tool that
- *  does not exist would STRAND the turn, so we fall back to the advisory nudge
- *  (never a hard refusal) in that case (2026-07-12 strand-hunt finding). */
-function codeModeRecoveryAvailable(): boolean {
-  return (getRuntimeEnv('CLEMMY_CODE_MODE', 'on') || 'on').trim().toLowerCase() !== 'off';
-}
+// codeModeRecoveryAvailable() lived here — an env flag standing in for "can
+// this turn actually call run_tool_program". Replaced by mandateFor(), which
+// answers from the callable-surface oracle (and carries the flag's exact
+// semantics as the transition arm until every lane registers its schemas).
+// The 2026-07-12 strand-hunt property is preserved: no mandate → advisory
+// nudge, never a refusal prescribing a tool that does not exist.
 
 // ─────────────────────────────────────────────────────────────────
 // Per-session tracker
@@ -970,11 +1030,19 @@ export function evaluateToolCall(
     const callLabel = slug ?? toolName;
     if (nudgeCount >= at && (nudgeCount - at) % 5 === 0) {
       const batchHint = slug ? batchApiHintFor(slug) : undefined;
+      // The nudge historically prescribed run_worker with NO availability
+      // check — live 2026-08-09 it steered the model to a tool that returned
+      // "unknown tool" in the environment the block had pushed it into. Every
+      // prescribed name now rides a mandate.
+      const workerMandate = mandateFor('run_worker');
+      const fanRoute = workerMandate
+        ? `fan the REMAINING items out with one ${workerMandate.name} call carrying the complete stable-id items array, or `
+        : '';
       fanoutNudge =
         `[harness fan-out check] You have now made ${nudgeCount} DISTINCT ${callLabel} calls in this conversation's recent window — `
         + `you are serializing per-item batch work through your own context. STOP looping serially: `
-        + `fan the REMAINING items out with one run_worker call carrying the complete stable-id items array, `
-        + `or use the service's real batch API if it accepts an array of items in one call. `
+        + fanRoute
+        + `use the service's real batch API if it accepts an array of items in one call. `
         + `For very large batches (>50), author a workflow with forEach instead. `
         + `Serial looping piles every item's payload into your context and is dramatically slower.`
         + (batchHint ? ` ${batchHint}` : '');
@@ -1020,14 +1088,51 @@ export function evaluateToolCall(
     // meaning: the gap is derived from the configured pair, not hardcoded.
     const nudgeToBlockGap = Math.max(1, thresholds.fanoutBlockAt - thresholds.fanoutNudgeAt);
     const effectiveBlockAt = Math.max(thresholds.fanoutBlockAt, at + nudgeToBlockGap);
+    // THREE OBSERVED CONDITIONS, all from the 2026-08-09 Slack-id run.
+    const signals = trackerScopeId ? signalsFor(trackerScopeId) : null;
+
+    // (1) COST, not count. Serialization is only worth refusing when it is
+    // actually expensive. Six one-second lookups returning a few hundred bytes
+    // each is a job; forcing it into a program traded a working path for a
+    // failing one. Block only once the observed payloads are large enough that
+    // piling them into context is the real cost this ladder exists to prevent.
+    const samples = signals?.serialResultBytes ?? [];
+    const observedMeanBytes = samples.length
+      ? samples.reduce((sum, n) => sum + n, 0) / samples.length
+      : Number.POSITIVE_INFINITY; // unmeasured ⇒ behave exactly as before
+    const serialIsExpensive = observedMeanBytes >= FANOUT_EXPENSIVE_RESULT_BYTES;
+
+    // (2) A BLOCK MAY NOT OUTLIVE ITS OWN ALTERNATIVE. The ladder prescribes a
+    // code-mode program; that program has independent failure modes (its own
+    // discovery budget, JSON validation). Once the prescribed path has failed
+    // twice, refusing the path that WAS working strands the turn.
+    const redirectIsWorking = (signals?.redirectFailures ?? 0) < 2;
+
+    // A MANDATE IS CONSTRUCTED FROM PROOF, never assumed: the block fires only
+    // when its prescribed alternative is provably available this turn (oracle
+    // truth once the lane registers its schemas; the exact legacy env
+    // heuristic meanwhile). No mandate → the advisory nudge remains, a refusal
+    // prescribing a phantom does not (the 2.62M-token deadlock class).
+    const fanoutMandate = mandateFor('run_tool_program');
     if (
       fanoutBlockEnabled()
-      && codeModeRecoveryAvailable()
+      && fanoutMandate !== null
       && !dangerousWrite
       && distinct >= effectiveBlockAt
       && distinctEntities >= effectiveBlockAt
+      && serialIsExpensive
+      && redirectIsWorking
     ) {
-      fanoutBlock = buildFanoutRecoveryMessage({ toolName, slug, args, distinct, fanoutBlockAt: effectiveBlockAt });
+      fanoutBlock = buildFanoutRecoveryMessage({
+        toolName, slug, args, distinct, fanoutBlockAt: effectiveBlockAt, mandate: fanoutMandate,
+      });
+      // (3) The deadlock is broken by RELEASE, not by a turn-kill: once the
+      // prescribed program has failed twice, condition (2) lifts this block and
+      // the path that was working resumes. A fanout-refused READ must never
+      // escalate to ending the turn — that invariant is pinned, and it exists
+      // because killing turns stranded real work. Counting refusals is still
+      // useful evidence for the release above.
+      if (signals) signals.fanoutRefusals += 1;
     }
   }
 

@@ -24,7 +24,7 @@
  */
 import { createHash } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, type KillRequestTarget } from './eventlog.js';
-import { evaluateToolCall, applyMode } from './tool-guardrail.js';
+import { evaluateToolCall, applyMode, mandateFor } from './tool-guardrail.js';
 import { checkRunTokenWindow, type RunTokenWindow, type RunTokenStatus } from './run-token-budget.js';
 import type { RuntimeToolEffect } from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
@@ -123,10 +123,20 @@ export function grindGateVerdict(
     }
     if (decision.action === 'block' || decision.action === 'halt') {
       emit('tool_call_guardrail', decision.reason);
+      // Alternatives are named only when PROVEN available (mandateFor) — this
+      // deny used to hardcode both tool names, which on the Claude native-MCP
+      // lane prescribed routes the turn could not always take.
+      const routes = [
+        mandateFor('run_worker') ? 'fan out with run_worker' : null,
+        mandateFor('run_tool_program') ? 'batch the reads with run_tool_program' : null,
+      ].filter((route): route is string => route !== null);
+      const changeApproach = routes.length
+        ? `change approach (${routes.join(', or ')}) instead of retrying one at a time.`
+        : 'change approach — batch the remaining work in one call by a route available to you, or report the blocker — instead of retrying one at a time.';
       return {
         behavior: 'deny',
         interrupt: false,
-        message: `Guardrail ${decision.action} (${decision.reason}): ${strippedToolName} has repeated too many times this turn — change approach (fan out with run_worker, or batch the reads with run_tool_program) instead of retrying one at a time.`,
+        message: `Guardrail ${decision.action} (${decision.reason}): ${strippedToolName} has repeated too many times this turn — ${changeApproach}`,
       };
     }
   } catch { /* the guardrail must never itself break a tool call */ }
