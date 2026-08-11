@@ -848,10 +848,20 @@ test('respondPreferHarness: Claude auth + SDK brain opt-in routes chat through C
   assert.equal(runConversationCalled, 0, 'Claude SDK brain is a distinct route from the OpenAI SDK runner');
 });
 
-test('respondPreferHarness: exact compound decline reaches Claude with full text while graphing the fresh task', async () => {
+test('respondPreferHarness: exact compound decline reaches Claude with full text while graphing the fresh task', async (t) => {
   const sessionId = 'claude-bridge-compound-decline';
   const fullMessage = 'No—leave that note alone. Instead, what is 15 × 9? Answer that naturally without tools.';
   const activeTaskInput = 'what is 15 × 9? Answer that naturally without tools.';
+  // A connected capability must exist for the conversational-lookup freeze
+  // downgrade to prove the ask references none of it (an EMPTY registry keeps
+  // the read requirement fail-closed) — this mirrors a real home, where the
+  // knowledge ask publishes naturally.
+  const composioClient = await import('../../integrations/composio/client.js');
+  composioClient.__test__.setConnectedAccountsLoader(async () => [
+    { id: 'ca_bridge_outlook', toolkit: { slug: 'outlook' }, status: 'ACTIVE' },
+  ]);
+  await composioClient.listUsableConnectedToolkits({ requireFresh: true });
+  t.after(() => composioClient.__test__.setConnectedAccountsLoader(null));
   createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
   const parent = appendEvent({
     sessionId,
@@ -938,16 +948,10 @@ test('respondPreferHarness: exact compound decline reaches Claude with full text
       assert.fail('the exact Claude turn cannot fall through to legacy');
     });
 
-    // KNOWN GAP, not a desired terminal. The fresh clause routes `retrieve`,
-    // which freezes a deterministic expected-work contract requiring one
-    // observed read. Only a settled dispatch-ledger read discharges it, and
-    // this lane's inner SDK tools never cross that ledger — so a retrieve turn
-    // on the Claude lane cannot publish `done` whether or not it used a tool.
-    // The committer therefore holds the model's answer behind the verification
-    // presentation. When the lane grows a read-evidence issuer (or a
-    // conversation-shaped lookup stops contracting a read), this assertion
-    // goes back to the provider's '135'.
-    assert.match(response.text, /still need to verify the result/);
+    // The retrieve bridge publishes this zero-ledger conversational answer
+    // (a zero-tool lookup naming no connected capability); the frozen read
+    // requirement is discharged for lanes that actually cross the ledger.
+    assert.match(response.text, /135/);
     assert.equal(claudeRequest?.message, fullMessage, 'Claude receives the complete conversational correction');
     assert.equal(claudeRequest?.sourceUserSeq, accepted.seq);
     assert.equal(claudeRequest?.taskContinuation?.answer, fullMessage);

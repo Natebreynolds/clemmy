@@ -19,6 +19,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { armAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { openEventLog } from './eventlog.js';
 import { expectedTaskFor } from './resolution-ledger.js';
+import { peekConnectedToolkits } from '../../integrations/composio/client.js';
 
 export const EXPECTED_WORK_CONTRACT_VERSION = 1 as const;
 export const EXPECTED_WORK_MAX_OPERATIONS = 32 as const;
@@ -804,15 +805,73 @@ function exactExpectedTask(input: {
 }
 
 /** Freeze conversation/retrieve without invoking any provider. */
+/**
+ * A retrieve-routed ask with NO capability anchor is a conversational lookup:
+ * the answer comes from knowledge, not from a read anyone can observe
+ * ("what is 15 × 9?" classifies lookup → retrieve). Contracting a read for it
+ * made done unpublishable on any lane whose reply used no settled read (live
+ * 2026-08-11 canary: the committer replaced the correct answer with the
+ * verification hold). The anchor test is runtime-derived — token overlap with
+ * a CONNECTED toolkit slug/alias, never a name catalog — so "list my outlook
+ * messages" with outlook connected still contracts its read and an unbacked
+ * mailbox answer still cannot publish. Applied at FREEZE so the recorded
+ * contract is the durable decision; discharge stays untouched.
+ */
+function conversationalLookupWithoutCapabilityAnchor(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  graph: TurnGraphIR;
+}): boolean {
+  const classification = input.graph.classification as {
+    messageIntent?: unknown;
+    externalEffectRequested?: unknown;
+  };
+  if (classification.messageIntent === 'action' || classification.externalEffectRequested === true) {
+    return false;
+  }
+  try {
+    const source = openEventLog().prepare(`
+      SELECT data_json FROM events
+       WHERE session_id = ? AND seq = ? AND type = 'user_input_received'
+    `).get(input.sessionId, input.sourceUserSeq) as { data_json: string } | undefined;
+    if (!source) return false;
+    const text = String((JSON.parse(source.data_json) as { text?: unknown })?.text ?? '');
+    if (!text.trim()) return false;
+    const askTokens = new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 3));
+    const toolkits = peekConnectedToolkits();
+    // An EMPTY registry proves nothing about the ask — without a single
+    // connected capability to test against, the read requirement stays.
+    if (toolkits.length === 0) return false;
+    for (const toolkit of toolkits) {
+      const toolkitTokens = [
+        ...String(toolkit.slug ?? '').toLowerCase().split(/[^a-z0-9]+/),
+        ...String(toolkit.alias ?? '').toLowerCase().split(/[^a-z0-9]+/),
+      ].filter((token) => token.length >= 3);
+      if (toolkitTokens.some((token) => askTokens.has(token))) return false;
+    }
+    return true;
+  } catch {
+    // An unreadable source or registry keeps the read requirement.
+    return false;
+  }
+}
+
 export function freezeDeterministicExpectedWorkContract(input: {
   sessionId: string;
   sourceUserSeq: number;
 }): FreezeExpectedWorkContractResult {
   const expected = exactExpectedTask(input);
   if ('status' in expected && expected.status !== 'ok') return expected;
-  const proposal = compileDeterministicExpectedWorkProposal(expected.graph);
+  let proposal = compileDeterministicExpectedWorkProposal(expected.graph);
   if (!proposal) {
     return { status: 'planning_required', reason: 'action topology requires one explicit bounded proposal' };
+  }
+  if (
+    proposal.operations.length > 0
+    && expected.graph.classification.route === 'retrieve'
+    && conversationalLookupWithoutCapabilityAnchor({ ...input, graph: expected.graph })
+  ) {
+    proposal = { ...proposal, operations: [], universes: [] };
   }
   const validated = validateExpectedWorkProposal(proposal);
   if (!validated.ok) return { status: 'invalid', reason: validated.errors.join('; ') };

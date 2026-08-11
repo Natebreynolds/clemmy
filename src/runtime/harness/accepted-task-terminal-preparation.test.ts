@@ -148,6 +148,7 @@ test('an incomplete collection remains repairable and cannot freeze a manifest',
   assert.equal(eventlog.listEvents(task.sessionId, { types: ['obligation_manifest'] }).length, 0);
 });
 
+
 function acceptActivatedAction(text: string) {
   const session = eventlog.createSession({ id: `terminal-preparation-${++serial}`, kind: 'chat' });
   const source = eventlog.appendEvent({
