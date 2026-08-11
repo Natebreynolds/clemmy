@@ -69,6 +69,15 @@ export type ExpectedWorkUniverseV1 =
       id: string;
       seal: 'complete_source_receipt';
       producedBy: string;
+      /**
+       * Where one member's id lives inside ONE producer record. The host seals
+       * this universe from the producer read's settled complete result, so it
+       * must know which field carries member identity before that result
+       * exists; declaring it per consumer call would let whichever consumer
+       * dispatched first decide the universe. Empty pointer means the record
+       * itself is the id.
+       */
+      memberIdPointer: string;
     };
 
 export interface ExpectedWorkProposalV1 {
@@ -128,6 +137,40 @@ const MEMBER_PATTERN = /^\S(?:[\s\S]{0,254}\S)?$/;
 
 function plainRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+/** One bounded RFC 6901 pointer. The empty pointer addresses the whole value. */
+export function isBoundedJsonPointer(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length <= 512
+    && (value === '' || value.startsWith('/'))
+    && !/(?:~(?![01]))/.test(value);
+}
+
+function pointerSegment(segment: string): string {
+  return segment.replace(/~1/g, '/').replace(/~0/g, '~');
+}
+
+/** Resolve a bounded pointer against untrusted data. Absence is never a value. */
+export function resolveJsonPointer(
+  value: unknown,
+  pointer: string,
+): { ok: true; value: unknown } | { ok: false } {
+  if (pointer === '') return { ok: true, value };
+  let current = value;
+  for (const rawSegment of pointer.slice(1).split('/')) {
+    const segment = pointerSegment(rawSegment);
+    if (Array.isArray(current)) {
+      if (!/^(?:0|[1-9][0-9]*)$/.test(segment)) return { ok: false };
+      const index = Number(segment);
+      if (!Number.isSafeInteger(index) || index >= current.length) return { ok: false };
+      current = current[index];
+      continue;
+    }
+    if (!current || typeof current !== 'object' || !(segment in current)) return { ok: false };
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return { ok: true, value: current };
 }
 
 function exactKeys(
@@ -318,17 +361,21 @@ export function validateExpectedWorkProposal(value: unknown): ExpectedWorkPropos
         universes.push({ id: String(raw.id), seal: 'accepted_input', members: [...members].sort() });
       }
     } else if (raw.seal === 'complete_source_receipt') {
-      exactKeys(raw, ['id', 'seal', 'producedBy'], label, errors);
+      exactKeys(raw, ['id', 'seal', 'producedBy', 'memberIdPointer'], label, errors);
       const producerOk = validId(raw.producedBy, `${label}.producedBy`, errors);
-      if (idOk && producerOk) {
+      const memberIdPointer = raw.memberIdPointer;
+      if (!isBoundedJsonPointer(memberIdPointer)) {
+        errors.push(`${label}.memberIdPointer must be a bounded RFC 6901 pointer into one source record`);
+      } else if (idOk && producerOk) {
         universes.push({
           id: String(raw.id),
           seal: 'complete_source_receipt',
           producedBy: String(raw.producedBy),
+          memberIdPointer,
         });
       }
     } else {
-      exactKeys(raw, ['id', 'seal', 'members', 'producedBy'], label, errors);
+      exactKeys(raw, ['id', 'seal', 'members', 'producedBy', 'memberIdPointer'], label, errors);
       errors.push(`${label}.seal is invalid`);
     }
   }

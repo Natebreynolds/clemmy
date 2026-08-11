@@ -387,6 +387,22 @@ function boundedProjection(records: unknown[]): unknown[] {
   return projected;
 }
 
+/**
+ * Re-resolve the record collection a stored handle named, from the exact raw
+ * bytes. `recordPath` is host-derived, so this reads the same array the handle
+ * counted rather than trusting the byte-bounded projection beside it.
+ */
+export function recordsAtRecordPath(payload: unknown, recordPath: string | null): unknown[] | null {
+  if (recordPath === null) return null;
+  const value = recordPath === ''
+    ? payload
+    : recordPath.split('.').reduce<unknown>((current, key) => {
+      const record = asRecord(current);
+      return record ? record[key] : undefined;
+    }, payload);
+  return Array.isArray(value) ? value : null;
+}
+
 /** Pure host interpretation of raw provider result bytes. */
 export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandleFacts {
   try {

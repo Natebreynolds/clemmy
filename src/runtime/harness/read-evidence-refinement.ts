@@ -51,6 +51,13 @@ export interface PreDispatchReadEvidenceInput {
   universes: readonly ExpectedWorkUniverseV1[];
   /** Exact member bound by action admission for `single + each`. */
   universeItemId?: string;
+  /**
+   * Host-sealed members of the operation's universe, supplied only when the
+   * contract could not enumerate them at accept time (a source-derived
+   * universe). This module still proves nothing from them by itself: the seal
+   * is derived by the host from the producer read's settled complete result.
+   */
+  universeMembers?: readonly string[];
   /** Exact provider-ready input schema observed before dispatch. */
   inputSchema: unknown;
   /** Exact provider-ready arguments. Values are consumed only in this pure call. */
@@ -81,7 +88,7 @@ export type PreDispatchReadEvidenceDecision =
       status: 'authoritative';
       mode: 'point_read';
       requiresExhaustion: false;
-      basis: 'accepted_input_member';
+      basis: 'accepted_input_member' | 'sealed_source_member';
       proof: FiniteReadStructuralProof;
     }
   | {
@@ -420,10 +427,15 @@ export function refinePreDispatchReadEvidence(
     const universeId = cardinality.universeId;
     const universe = input.universes.find((entry) => entry.id === universeId);
     if (!universe) return unknown('finite_universe_is_missing');
-    if (universe.seal !== 'accepted_input') {
-      return unknown('finite_universe_is_not_accepted_input');
-    }
-    const members = [...universe.members].sort();
+    // A per-item read may also range over a source-derived universe, but only
+    // against the member list the host already sealed from the producer read.
+    const sealedMembers = universe.seal === 'accepted_input'
+      ? universe.members
+      : operation.coverage === 'single' && input.universeMembers
+        ? input.universeMembers
+        : null;
+    if (!sealedMembers) return unknown('finite_universe_is_not_accepted_input');
+    const members = [...sealedMembers].sort();
     if (
       members.length === 0
       || members.length > EXPECTED_WORK_MAX_UNIVERSE_MEMBERS
@@ -447,7 +459,10 @@ export function refinePreDispatchReadEvidence(
       return proof
         ? {
             status: 'authoritative', mode: 'point_read', requiresExhaustion: false,
-            basis: 'accepted_input_member', proof,
+            basis: universe.seal === 'accepted_input'
+              ? 'accepted_input_member'
+              : 'sealed_source_member',
+            proof,
           }
         : unknown('finite_selector_not_proven');
     }

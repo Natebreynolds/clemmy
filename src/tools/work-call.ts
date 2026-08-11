@@ -54,6 +54,9 @@ const UniverseSchema = z.discriminatedUnion('seal', [
     id: IdSchema,
     seal: z.literal('complete_source_receipt'),
     producedBy: IdSchema,
+    memberIdPointer: z.string().max(512).describe(
+      'RFC 6901 pointer to one member id inside ONE record returned by the producing read; empty string when the record is itself the id.',
+    ),
   }).strict(),
 ]);
 

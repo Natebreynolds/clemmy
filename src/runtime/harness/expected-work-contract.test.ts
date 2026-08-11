@@ -213,6 +213,7 @@ test('strict validation rejects unknown fields, dangling/cyclic lineage, and inv
       id: 'source_items',
       seal: 'complete_source_receipt',
       producedBy: 'source_snapshot',
+      memberIdPointer: '/id',
     }],
   }).ok, true, 'a sealed read-to-per-item-write fanout is a first-class structural contract');
   const cases: unknown[] = [
@@ -233,7 +234,36 @@ test('strict validation rejects unknown fields, dangling/cyclic lineage, and inv
     {
       version: 1,
       operations: [{ ...base.operations[0], cardinality: { kind: 'each', universeId: 'items' } }],
-      universes: [{ id: 'items', seal: 'complete_source_receipt', producedBy: 'source_snapshot' }],
+      universes: [{
+        id: 'items',
+        seal: 'complete_source_receipt',
+        producedBy: 'source_snapshot',
+        memberIdPointer: '/id',
+      }],
+    },
+    // A source-derived universe the host cannot identify members in is
+    // unsealable, so it may never freeze: the per-item lane would be
+    // structurally unreachable for the whole turn.
+    {
+      version: 1,
+      operations: [
+        base.operations[0],
+        { ...base.operations[1], cardinality: { kind: 'each', universeId: 'source_items' } },
+      ],
+      universes: [{ id: 'source_items', seal: 'complete_source_receipt', producedBy: 'source_snapshot' }],
+    },
+    {
+      version: 1,
+      operations: [
+        base.operations[0],
+        { ...base.operations[1], cardinality: { kind: 'each', universeId: 'source_items' } },
+      ],
+      universes: [{
+        id: 'source_items',
+        seal: 'complete_source_receipt',
+        producedBy: 'source_snapshot',
+        memberIdPointer: 'id',
+      }],
     },
   ];
   for (const candidate of cases) {

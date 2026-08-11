@@ -7,11 +7,17 @@
  * derived only from the settlement-bound raw result handle. The later
  * manifest receipt redeems the same handle for terminal proof.
  */
+import type Database from 'better-sqlite3';
 import type { AcceptedTaskWorkContractV1 } from './expected-work-contract.js';
 import {
   type ObservedExpectedWorkHistoryV1,
   type ObservedExpectedWorkOperationV1,
+  type ObservedExpectedWorkUniverseV1,
 } from './expected-work-matcher.js';
+import {
+  createExpectedWorkUniverseSealCache,
+  sealSourceDerivedUniverse,
+} from './expected-work-universe-seal.js';
 import { openEventLog } from './eventlog.js';
 import { operationEvidenceContract } from '../graph/operation-evidence-contract.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
@@ -43,6 +49,53 @@ interface AcceptedOperationProjectionRow {
 export type ExpectedWorkObservedProjection =
   | { status: 'ok'; history: ObservedExpectedWorkHistoryV1 }
   | { status: 'storage_error'; reason: string };
+
+/**
+ * Re-derive each source-derived universe from its producer's settled result,
+ * then require every consumer binding that already recorded a seal to agree
+ * with what was just derived. A universe that cannot be re-derived, or whose
+ * durable digest disagrees, is simply not projected: the matcher then reports
+ * it unsealed rather than matching against a member list nobody can prove.
+ */
+function sealedUniversesFor(
+  db: Database.Database,
+  contract: AcceptedTaskWorkContractV1,
+): ObservedExpectedWorkUniverseV1[] {
+  const cache = createExpectedWorkUniverseSealCache();
+  const projected: ObservedExpectedWorkUniverseV1[] = [];
+  for (const universe of contract.universes) {
+    if (universe.seal !== 'complete_source_receipt') continue;
+    const sealed = sealSourceDerivedUniverse({ db, contract, universe, cache });
+    if (sealed.status !== 'sealed') continue;
+    const recorded = db.prepare(`
+      SELECT DISTINCT input_source_kind, input_source_ref, input_source_digest
+        FROM expected_work_call_bindings
+       WHERE session_id = ? AND source_user_seq = ?
+         AND contract_id = ? AND universe_id = ?
+    `).all(
+      contract.identity.sessionId,
+      contract.identity.sourceUserSeq,
+      contract.contractId,
+      universe.id,
+    ) as Array<{
+      input_source_kind: string | null;
+      input_source_ref: string | null;
+      input_source_digest: string | null;
+    }>;
+    if (recorded.some((row) =>
+      row.input_source_kind !== 'complete_source_receipt'
+      || row.input_source_ref !== sealed.seal.producerLogicalToolCallId
+      || row.input_source_digest !== sealed.seal.digest)) continue;
+    projected.push({
+      universeId: universe.id,
+      seal: 'complete_source_receipt',
+      producerRequirementId: sealed.seal.producerRequirementId,
+      complete: true,
+      members: sealed.seal.members,
+    });
+  }
+  return projected;
+}
 
 function boundedReason(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 240);
@@ -195,10 +248,10 @@ export function projectObservedExpectedWorkHistory(input: {
       history: {
         finalized: input.finalized,
         operations,
-        // Dynamic universes remain staged until a scheduler-owned item/seal
-        // projection exists. An action contract therefore fails closed here;
-        // no caller may fabricate a complete-source seal.
-        universes: [],
+        // Source-derived universes are sealed from the producer read's own
+        // settled complete result and cross-checked against the digest every
+        // consumer binding froze. No caller may hand in a seal.
+        universes: sealedUniversesFor(db, input.contract),
       },
     };
   } catch (error) {

@@ -14,13 +14,20 @@ import {
   canonicalExpectedWorkJson,
   expectedWorkDigest,
   freezePreparedExpectedWorkContractInTransaction,
+  isBoundedJsonPointer,
   loadExpectedWorkContract,
   prepareActionExpectedWorkContract,
+  resolveJsonPointer,
   type AcceptedTaskWorkContractV1,
   type ExpectedWorkOperationV1,
   type ExpectedWorkProposalV1,
   type ExpectedWorkUniverseV1,
 } from './expected-work-contract.js';
+import {
+  createExpectedWorkUniverseSealCache,
+  resolveExpectedWorkUniverseMembers,
+  type ExpectedWorkUniverseSealCache,
+} from './expected-work-universe-seal.js';
 import { getSession, openEventLog } from './eventlog.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import { detectMultiItemIntent } from './multi-item-intent.js';
@@ -152,13 +159,6 @@ function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): 
   return Object.keys(value).every((key) => allow.has(key));
 }
 
-function safePointer(value: unknown): value is string {
-  return typeof value === 'string'
-    && value.length <= 512
-    && (value === '' || value.startsWith('/'))
-    && !/(?:~(?![01]))/.test(value);
-}
-
 export function validateExpectedWorkUniverseSelector(
   value: unknown,
 ): { ok: true; selector: ExpectedWorkUniverseSelectorV1 } | { ok: false; reason: string } {
@@ -169,10 +169,10 @@ export function validateExpectedWorkUniverseSelector(
   if (!exactKeys(record, ['argumentPointer', 'memberIdPointer'])) {
     return { ok: false, reason: 'universe_selector contains an unknown field' };
   }
-  if (!safePointer(record.argumentPointer)) {
+  if (!isBoundedJsonPointer(record.argumentPointer)) {
     return { ok: false, reason: 'universe_selector.argumentPointer must be a bounded RFC 6901 pointer' };
   }
-  if (record.memberIdPointer !== null && !safePointer(record.memberIdPointer)) {
+  if (record.memberIdPointer !== null && !isBoundedJsonPointer(record.memberIdPointer)) {
     return { ok: false, reason: 'universe_selector.memberIdPointer must be null or a bounded RFC 6901 pointer' };
   }
   return {
@@ -184,34 +184,12 @@ export function validateExpectedWorkUniverseSelector(
   };
 }
 
-function pointerSegment(segment: string): string {
-  return segment.replace(/~1/g, '/').replace(/~0/g, '~');
-}
-
-function resolvePointer(value: unknown, pointer: string): { ok: true; value: unknown } | { ok: false } {
-  if (pointer === '') return { ok: true, value };
-  let current = value;
-  for (const rawSegment of pointer.slice(1).split('/')) {
-    const segment = pointerSegment(rawSegment);
-    if (Array.isArray(current)) {
-      if (!/^(?:0|[1-9][0-9]*)$/.test(segment)) return { ok: false };
-      const index = Number(segment);
-      if (!Number.isSafeInteger(index) || index >= current.length) return { ok: false };
-      current = current[index];
-      continue;
-    }
-    if (!current || typeof current !== 'object' || !(segment in current)) return { ok: false };
-    current = (current as Record<string, unknown>)[segment];
-  }
-  return { ok: true, value: current };
-}
-
 function selectedMemberIds(
   args: unknown,
   selector: ExpectedWorkUniverseSelectorV1,
   cardinality: 'each' | 'set',
 ): { ok: true; ids: string[] } | { ok: false; reason: string } {
-  const selected = resolvePointer(args, selector.argumentPointer);
+  const selected = resolveJsonPointer(args, selector.argumentPointer);
   if (!selected.ok) return { ok: false, reason: 'universe selector does not resolve in normalized arguments' };
   const values = cardinality === 'set'
     ? Array.isArray(selected.value) ? selected.value : null
@@ -224,7 +202,7 @@ function selectedMemberIds(
   for (const value of values) {
     const extracted = selector.memberIdPointer === null
       ? { ok: true as const, value }
-      : resolvePointer(value, selector.memberIdPointer);
+      : resolveJsonPointer(value, selector.memberIdPointer);
     if (!extracted.ok || typeof extracted.value !== 'string' || extracted.value.length < 1 || extracted.value.length > 256) {
       return { ok: false, reason: 'every selected member must resolve to one bounded string id' };
     }
@@ -726,6 +704,7 @@ function refusal(
 function planLinesFor(
   db: Database.Database,
   contract: AcceptedTaskWorkContractV1,
+  sealCache?: ExpectedWorkUniverseSealCache,
 ): ExpectedWorkPlanLine[] {
   const settledRows = db.prepare(`
     SELECT b.requirement_id, b.universe_item_id
@@ -755,8 +734,18 @@ function planLinesFor(
     if (operation.cardinality.kind !== 'once') {
       const universe = contract.universes.find((entry) =>
         entry.id === (operation.cardinality as { universeId: string }).universeId);
-      required = universe && universe.seal === 'accepted_input'
-        ? (operation.cardinality.kind === 'each' ? universe.members.length : 1)
+      // A sealed source universe knows its own size once its producer read has
+      // settled; before that the count is honestly unknown, not zero.
+      const resolved = universe
+        ? resolveExpectedWorkUniverseMembers({
+            db,
+            contract,
+            universe,
+            ...(sealCache ? { cache: sealCache } : {}),
+          })
+        : { status: 'unsealed' as const, reason: 'operation universe is missing' };
+      required = resolved.status === 'resolved'
+        ? (operation.cardinality.kind === 'each' ? resolved.members.length : 1)
         : 'unknown';
     }
     const done = typeof required === 'number' && settled >= required;
@@ -842,12 +831,13 @@ export function admitExpectedWorkInvocation(input: {
   // them sent the model into blind proposal-retry cycles (live 2026-08-11:
   // 84 refusals on one count-only ask).
   const db = openEventLog();
+  const sealCache = createExpectedWorkUniverseSealCache();
   const refusedWithPlan = (
     kind: ExpectedWorkAdmissionFailureKind,
     reason: string,
   ): ExpectedWorkInvocationAdmission => {
     try {
-      return { status: 'refused', kind, reason, plan: planLinesFor(db, contract) };
+      return { status: 'refused', kind, reason, plan: planLinesFor(db, contract, sealCache) };
     } catch {
       return refusal(kind, reason);
     }
@@ -950,7 +940,7 @@ export function admitExpectedWorkInvocation(input: {
             status: 'satisfied',
             priorLogicalToolCallId: prior.satisfiedByLogicalToolCallId,
             contract,
-            plan: planLinesFor(db, contract),
+            plan: planLinesFor(db, contract, sealCache),
           };
         }
         return refusedWithPlan('work_already_satisfied', prior.reason);
@@ -974,6 +964,7 @@ export function admitExpectedWorkInvocation(input: {
       let inputSourceKind: string | null = null;
       let inputSourceRef: string | null = null;
       let inputSourceDigest: string | null = null;
+      let universeMembers: string[] | null = null;
       if (operation.cardinality.kind === 'once') {
         if (input.universeItemId != null || input.universeSelector != null) {
           return refusedWithPlan('work_cardinality_mismatch', 'once cardinality accepts neither an item nor universe selector');
@@ -991,10 +982,18 @@ export function admitExpectedWorkInvocation(input: {
         }
         const selected = selectedMemberIds(evidenceArgs, input.universeSelector, operation.cardinality.kind);
         if (!selected.ok) return refusedWithPlan('work_cardinality_mismatch', selected.reason);
-        const expectedMembers = universe.seal === 'accepted_input'
-          ? [...universe.members].sort()
-          : null;
-        if (!expectedMembers) return refusedWithPlan('work_universe_unsealed', 'dynamic source universe has no redeemed host seal');
+        // Accepted input is exact at freeze; a source-derived universe is
+        // sealed here from its producer read's own settled complete result.
+        const resolvedUniverse = resolveExpectedWorkUniverseMembers({
+          db,
+          contract,
+          universe,
+          cache: sealCache,
+        });
+        if (resolvedUniverse.status !== 'resolved') {
+          return refusedWithPlan('work_universe_unsealed', resolvedUniverse.reason);
+        }
+        const expectedMembers = resolvedUniverse.members;
         const requiredMembers = operation.cardinality.kind === 'each'
           ? [input.universeItemId as string]
           : expectedMembers;
@@ -1003,14 +1002,24 @@ export function admitExpectedWorkInvocation(input: {
           || requiredMembers.some((member, index) => member !== selected.ids[index])
           || requiredMembers.some((member) => !expectedMembers.includes(member))
         ) return refusedWithPlan('work_cardinality_mismatch', 'selected argument members do not match the accepted universe instance');
-        const witness = sourceWitness(db, contract, universe, selected.ids);
-        if (!witness.ok) return refusedWithPlan('work_source_witness_missing', witness.reason);
+        universeMembers = expectedMembers;
+        if (resolvedUniverse.seal) {
+          // The consumer binding carries the seal durably: which producer call
+          // sealed the universe, and the digest of the exact member list every
+          // later reader must recompute.
+          inputSourceKind = 'complete_source_receipt';
+          inputSourceRef = resolvedUniverse.seal.producerLogicalToolCallId;
+          inputSourceDigest = resolvedUniverse.seal.digest;
+        } else {
+          const witness = sourceWitness(db, contract, universe, selected.ids);
+          if (!witness.ok) return refusedWithPlan('work_source_witness_missing', witness.reason);
+          inputSourceKind = witness.kind;
+          inputSourceRef = witness.ref;
+          inputSourceDigest = witness.digest;
+        }
         selectorJson = canonicalExpectedWorkJson(input.universeSelector);
         memberDigest = expectedWorkDigest(canonicalExpectedWorkJson(selected.ids));
         memberCount = selected.ids.length;
-        inputSourceKind = witness.kind;
-        inputSourceRef = witness.ref;
-        inputSourceDigest = witness.digest;
       }
 
       let evidenceMode: 'point_read' | 'collection_read' | 'finite_read' | null = null;
@@ -1022,6 +1031,10 @@ export function admitExpectedWorkInvocation(input: {
           operation,
           universes: contract.universes,
           ...(input.universeItemId ? { universeItemId: input.universeItemId } : {}),
+          // A per-item read over a sealed source universe is proven against the
+          // members the host just sealed, not against a member list the
+          // contract could not have known at accept time.
+          ...(universeMembers ? { universeMembers } : {}),
           inputSchema: evidenceInputSchema,
           args: evidenceArgs,
         });
