@@ -10489,7 +10489,7 @@ export function registerConsoleRoutes(
   app.get('/api/console/approvals/list', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { listPending } = await import('../runtime/harness/approval-registry.js');
+      const { listPending, isApprovalStaleForHeader } = await import('../runtime/harness/approval-registry.js');
       const harnessRows = listPending({ status: 'pending' });
       const runtimeRows = assistant.getRuntime().listPendingApprovals();
       const backgroundTaskByApprovalId = new Map(
@@ -10509,6 +10509,9 @@ export function registerConsoleRoutes(
         const preview = normalizeApprovalPreview(r.args?.preview);
         return {
           kind: 'harness' as const,
+          // Aged out of the urgent header (unanswered 48h+, nothing parked on
+          // it). Still pending and approvable — presentation only.
+          stale: isApprovalStaleForHeader(r, { boundToActiveWork: backgroundTaskByApprovalId.has(r.approvalId) }),
           approvalId: r.approvalId,
           sessionId: r.sessionId,
           channel: r.channel,
@@ -10544,6 +10547,10 @@ export function registerConsoleRoutes(
         const task = backgroundTaskByApprovalId.get(approval.id);
         return {
           kind: 'runtime' as const,
+          stale: isApprovalStaleForHeader(
+            { requestedAt: approval.createdAt },
+            { boundToActiveWork: Boolean(task) },
+          ),
           approvalId: approval.id,
           sessionId: approval.sessionId,
           channel: approval.channel,
@@ -10562,10 +10569,12 @@ export function registerConsoleRoutes(
         };
       });
 
-      // Newest first across both registries.
+      // Urgent first, then newest, so aged cards sink below live decisions.
       const approvals = [...harnessApprovals, ...runtimeApprovals]
-        .sort((a, b) => (b.requestedAt || '').localeCompare(a.requestedAt || ''));
-      res.json({ approvals, count: approvals.length });
+        .sort((a, b) => Number(a.stale) - Number(b.stale)
+          || (b.requestedAt || '').localeCompare(a.requestedAt || ''));
+      const urgentCount = approvals.filter((approval) => !approval.stale).length;
+      res.json({ approvals, count: approvals.length, urgentCount });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

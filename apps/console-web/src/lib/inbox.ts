@@ -14,6 +14,9 @@ export interface ApprovalRow {
   expiresAt?: string;
   kind?: string;
   pendingAction?: PendingActionApprovalView;
+  /** Unanswered 48h+ with nothing parked on it — sinks out of the urgent
+   * header but stays fully approvable. */
+  stale?: boolean;
 }
 
 export interface ApprovalDecisionResponse {
@@ -97,7 +100,7 @@ export function collapseAttentionRows(rows: NotificationRow[]): CollapsedAttenti
 }
 
 export const listApprovals = () =>
-  apiGet<{ approvals: ApprovalRow[]; count: number }>('/api/console/approvals/list');
+  apiGet<{ approvals: ApprovalRow[]; count: number; urgentCount?: number }>('/api/console/approvals/list');
 
 // Runtime approvals (chat/Discord/CLI loop) resolve via /api/approvals/:id/:decision;
 // harness approvals via /api/console/harness-approvals/:id/:decision. The list

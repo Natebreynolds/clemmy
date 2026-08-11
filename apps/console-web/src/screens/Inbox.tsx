@@ -74,6 +74,10 @@ export function Inbox() {
   const trustProposals = usePoll(['trust-proposals'], listTrustProposals, 8000);
 
   const approvalRows = approvals.data?.approvals ?? [];
+  // Server sorts urgent-first; aged cards (48h+ unanswered, nothing parked on
+  // them) render below a divider and stop counting toward "needs you".
+  const urgentApprovalRows = approvalRows.filter((a) => !a.stale);
+  const agedApprovalRows = approvalRows.filter((a) => a.stale);
   const notifRows = notifications.data?.notifications ?? [];
   const trustRows = trustProposals.data?.proposals ?? [];
   // Unread needs-attention notifications are DECISIONS → they live on "Needs you"
@@ -84,7 +88,8 @@ export function Inbox() {
   // A burst of blocked runs from one workflow is ONE decision, not ten rows —
   // collapse duplicates to the newest and badge the earlier ones.
   const collapsedAttention = collapseAttentionRows(attentionRows);
-  const needsCount = approvalRows.length + collapsedAttention.length + trustRows.length;
+  const needsCount = urgentApprovalRows.length + collapsedAttention.length + trustRows.length;
+  const anyDecisionRows = approvalRows.length + collapsedAttention.length + trustRows.length;
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
@@ -315,7 +320,7 @@ export function Inbox() {
             />
           )}
 
-          {!loading && !queryUnavailable && tab === 'needs' && (needsCount === 0
+          {!loading && !queryUnavailable && tab === 'needs' && (anyDecisionRows === 0
             ? <EmptyState title="You're all caught up" description="Nothing needs a decision from you right now." />
             : (
               <>
@@ -343,7 +348,24 @@ export function Inbox() {
                     )}
                   </div>
                 )}
-                {approvalRows.map((a) => (
+                {urgentApprovalRows.map((a) => (
+                  <ApprovalCard key={a.approvalId} row={a} selected={selected === a.approvalId}
+                    checked={checked.has(a.approvalId)}
+                    decisionState={decisionStates[a.approvalId]}
+                    disabled={bulkBusy}
+                    onToggleCheck={() => toggleChecked(a.approvalId)}
+                    onSelect={() => setSelected(a.approvalId)}
+                    onApprove={() => onDecide(a.approvalId, 'approve')}
+                    onReject={() => onDecide(a.approvalId, 'reject')} />
+                ))}
+                {agedApprovalRows.length > 0 && (
+                  <div className="flex items-center gap-2 pt-2 text-caption text-muted">
+                    <span className="h-px flex-1 bg-border" aria-hidden />
+                    Older approvals — waiting 2+ days, still approvable
+                    <span className="h-px flex-1 bg-border" aria-hidden />
+                  </div>
+                )}
+                {agedApprovalRows.map((a) => (
                   <ApprovalCard key={a.approvalId} row={a} selected={selected === a.approvalId}
                     checked={checked.has(a.approvalId)}
                     decisionState={decisionStates[a.approvalId]}

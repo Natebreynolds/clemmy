@@ -432,3 +432,26 @@ test('provider-neutral resend consent is an explicit contract across an external
     'provider-neutral resend consent remains one-shot',
   );
 });
+
+test('isApprovalStaleForHeader: 48h+ unanswered ages out; bound-to-work and fresh rows never do', () => {
+  // Live 2026-08-09: two 90-day standing-grant asks rode the urgent header
+  // for days. Aging is presentation-only — the row stays pending.
+  const now = new Date('2026-08-11T12:00:00.000Z');
+  const hoursAgo = (h: number) => new Date(now.getTime() - h * 60 * 60_000).toISOString();
+  assert.equal(reg.isApprovalStaleForHeader({ requestedAt: hoursAgo(1) }, { now }), false, 'fresh ask is urgent');
+  assert.equal(reg.isApprovalStaleForHeader({ requestedAt: hoursAgo(47) }, { now }), false, 'inside the window stays urgent');
+  assert.equal(reg.isApprovalStaleForHeader({ requestedAt: hoursAgo(49) }, { now }), true, 'unanswered 48h+ ages out');
+  assert.equal(
+    reg.isApprovalStaleForHeader({ requestedAt: hoursAgo(200) }, { now, boundToActiveWork: true }),
+    false,
+    'an approval something is actively parked on NEVER ages out of the header',
+  );
+  assert.equal(reg.isApprovalStaleForHeader({ requestedAt: 'garbage' }, { now }), false, 'unparseable timestamps stay urgent (fail-loud, not fail-hidden)');
+});
+
+test('the dashboard approvals endpoint consumes the header-staleness rule (who-calls-this pin)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const routes = readFileSync(path.join(process.cwd(), 'src/dashboard/console-routes.ts'), 'utf-8');
+  assert.match(routes, /isApprovalStaleForHeader/, 'staleness helper exists but the approvals endpoint never consults it');
+  assert.match(routes, /urgentCount/, 'the endpoint must expose urgentCount so badges stop counting aged cards');
+});

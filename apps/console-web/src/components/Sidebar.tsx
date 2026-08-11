@@ -48,10 +48,15 @@ export function Sidebar({ collapsed }: { collapsed: boolean }) {
   // Live Inbox badge: pending approvals (best-effort).
   const approvals = usePoll(
     ['approvals-count'],
-    () => apiGet<{ count?: number; approvals?: unknown[] }>('/api/console/approvals/list'),
+    () => apiGet<{ count?: number; urgentCount?: number; approvals?: unknown[] }>('/api/console/approvals/list'),
     8000,
   );
-  const pending = approvals.data?.count ?? approvals.data?.approvals?.length ?? 0;
+  // Aged-out approvals (48h+ unanswered, nothing parked on them) stay
+  // approvable in the Inbox but stop inflating the badge.
+  const pending = approvals.data?.urgentCount
+    ?? approvals.data?.count
+    ?? approvals.data?.approvals?.length
+    ?? 0;
 
   // Developer panel is opt-in (Settings → Developer mode); only then does the
   // "Developer" item appear under Advanced.

@@ -95,6 +95,24 @@ export function isExpired(row: Pick<PendingApprovalRow, 'expiresAt'>, now: Date 
   return Number.isFinite(expiresAt) && expiresAt < now.getTime();
 }
 
+/** How long an unanswered approval stays in the urgent "needs you" surfaces.
+ * Long-TTL standing-grant asks (e.g. a 90-day CLI trust freeze) otherwise ride
+ * the header until they expire — live 2026-08-09: two space-trust cards from
+ * one afternoon haunted the header for days. Aging is presentation-only: the
+ * row stays pending, approvable, and listed — it just stops counting as
+ * urgent. An approval something is actively parked on never ages out. */
+export const APPROVAL_HEADER_URGENT_WINDOW_MS = 48 * 60 * 60_000;
+
+export function isApprovalStaleForHeader(
+  row: Pick<PendingApprovalRow, 'requestedAt'>,
+  opts: { boundToActiveWork?: boolean; now?: Date } = {},
+): boolean {
+  if (opts.boundToActiveWork) return false;
+  const requested = Date.parse(row.requestedAt);
+  if (!Number.isFinite(requested)) return false;
+  return (opts.now ?? new Date()).getTime() - requested > APPROVAL_HEADER_URGENT_WINDOW_MS;
+}
+
 export function isActionable(row: PendingApprovalRow, now: Date = new Date()): boolean {
   return row.status === 'pending' && !isExpired(row, now);
 }
