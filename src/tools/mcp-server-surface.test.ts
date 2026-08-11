@@ -15,7 +15,8 @@ const {
 } = await import('./mcp-server.js');
 const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
 const { getToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-const { createSession } = await import('../runtime/harness/eventlog.js');
+const { appendEvent, createSession } = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
 const {
   activateDispatchLease,
   revokeDispatchLease,
@@ -25,6 +26,29 @@ const {
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
+
+/**
+ * A dispatch that reaches the settlement spine needs the whole accepted-source
+ * anchor: a real session, the accepted user input, and the persisted turn graph
+ * for it. Half of it settles as `uncorrelated`, which the MCP surface renders
+ * as tool-error TEXT — so a test that only inspects returned text can look
+ * green while nothing dispatched.
+ */
+function anchoredSession(ask: string): { sessionId: string; sourceUserSeq: number } {
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: ask },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId: session.id, turn: source.turn, sourceUserSeq: source.seq },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { sessionId: session.id, sourceUserSeq: source.seq };
+}
 
 test('MCP tool_search is scoped to tools the active server actually registered', async () => {
   const server = createClementineMcpServer({
@@ -63,9 +87,10 @@ test('MCP always-load metadata is additive and leaves unselected tools deferred'
 });
 
 test('MCP schema-on-demand omits deferred schemas but search → call_tool still dispatches them', async () => {
-  const session = createSession({ kind: 'chat' });
+  const anchor = anchoredSession('list the workspace roots for this install');
   const server = createClementineMcpServer({
-    sessionId: session.id,
+    sessionId: anchor.sessionId,
+    sourceUserSeq: anchor.sourceUserSeq,
     allowedTools: ['memory_recall_all', 'tool_search', 'call_tool'],
     deferredTools: ['workspace_roots'],
   });
@@ -135,9 +160,10 @@ test('MCP schema-on-demand fails closed when its exact universe cannot seal', as
 
 test('two physical MCP servers keep capability revisions isolated', async () => {
   const make = () => {
-    const session = createSession({ kind: 'chat' });
+    const anchor = anchoredSession('list the workspace roots for this install');
     return createClementineMcpServer({
-      sessionId: session.id,
+      sessionId: anchor.sessionId,
+      sourceUserSeq: anchor.sourceUserSeq,
       allowedTools: ['tool_search', 'call_tool'],
       deferredTools: ['workspace_roots'],
     });
@@ -169,9 +195,10 @@ test('the real default Claude full universe seals and admits a deferred built-in
   assert.ok(deferred.includes('view_image'), 'fixture stopped matching the production MCP surface');
   assert.ok(deferred.includes('workspace_roots'), 'fixture needs a safe deferred dispatch probe');
 
-  const session = createSession({ kind: 'chat' });
+  const anchor = anchoredSession('list the workspace roots for this install');
   const server = createClementineMcpServer({
-    sessionId: session.id,
+    sessionId: anchor.sessionId,
+    sourceUserSeq: anchor.sourceUserSeq,
     gatedMutations: true,
     allowedTools: firstClass,
     deferredTools: deferred,
@@ -189,6 +216,10 @@ test('the real default Claude full universe seals and admits a deferred built-in
   }>;
   const called = await registered.call_tool.handler({ name: 'workspace_roots', args_json: '{}' });
   assert.doesNotMatch(called.content[0].text, /requires_readmission|not_reachable/i);
+  // The acquired capability must have actually RUN, not merely been admitted:
+  // a settlement refusal comes back as ordinary tool text and would otherwise
+  // satisfy every assertion above.
+  assert.match(called.content[0].text, /clementine-next|clemmy-mcp-surface/i);
   const acquired = await boundClementineMcpCapabilityRevision(server);
   assert.equal(acquired?.revision, (before?.revision ?? 0) + 1);
   assert.equal(acquired?.bound.includes('workspace_roots'), true);

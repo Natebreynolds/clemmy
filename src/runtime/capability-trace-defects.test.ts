@@ -29,6 +29,9 @@ const {
 } = await import('./harness/attempt-settlement.js');
 const { classifyAttemptOutcome } = await import('./harness/attempt-outcome.js');
 const { DiscoveryGovernor } = await import('./harness/discovery-governor.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
+const { acceptedTaskIdFor } = await import('./harness/attempt-identity.js');
+const { admitLogicalCall } = await import('./harness/dispatch-ledger.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -41,7 +44,35 @@ function acceptedTask(label: string): { sessionId: string; sourceUserSeq: number
     sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: `${label} task` },
   });
+  // Durable settlement authority: the accepted source above plus a persisted
+  // turn graph for the accepted task (authority spine).
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
   return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+
+/** Every lane admits its logical call before dispatch; the fixture does too. */
+function admitFixtureCall(
+  key: { sessionId: string; sourceUserSeq: number },
+  callId: string,
+  tool: string,
+  args?: unknown,
+): void {
+  const admitted = admitLogicalCall({
+    identity: {
+      sessionId: key.sessionId,
+      sourceUserSeq: key.sourceUserSeq,
+      acceptedTaskId: acceptedTaskIdFor(key.sessionId, key.sourceUserSeq),
+      logicalToolCallId: callId,
+    },
+    tool,
+    args,
+  });
+  assert.ok(
+    admitted.status === 'inserted' || admitted.status === 'replayed',
+    `fixture admitted the logical call (${admitted.status}${'reason' in admitted ? `: ${admitted.reason}` : ''})`,
+  );
 }
 
 // ── D1. One logical call, four carrier encodings, one identity ───────────────
@@ -81,6 +112,7 @@ test('D1b (progress): re-encoding a call must not manufacture a completed step',
     // OBSERVABLE. Without this the "epoch already fresh" guard masks the defect
     // and the test passes while the identity is still wrong.
     governor.admit({ ...key, category: 'broad_discovery', callId: `spend-${index}` });
+    admitFixtureCall(key, `encoding-${index}`, fixtures.ALPHA_SOURCE, carrier);
     return settleToolAttempt({
       ...key,
       lane: 'composio',
@@ -114,6 +146,7 @@ test('D2 (pagination): following a cursor stays on one requirement and mints no 
   const credits: boolean[] = [];
   do {
     const envelope = fixtures.alphaSourceRead({ cursor }, 'pagination');
+    admitFixtureCall(key, `page-${pages}`, fixtures.ALPHA_SOURCE, { cursor });
     credits.push(settleToolAttempt({
       ...key,
       lane: 'composio',
@@ -200,6 +233,7 @@ test('D4 (settlement coverage): a pre-dispatch refusal produces exactly one type
 
   // The Claude trace made 25 provider calls and produced 8 settlements: 17
   // guardrail refusals vanished without a typed outcome.
+  admitFixtureCall(key, 'refused-1', fixtures.ALPHA_SINK_WRITE);
   const settled = settleToolAttempt({
     ...key,
     lane: 'agents_runner',

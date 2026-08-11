@@ -34,6 +34,7 @@ const { invalidateComposioCliStatusCache } = await import('../integrations/compo
 const { getCachedToolSchema } = await import('./composio-schema-cache.js');
 const { getComposioRuntimeTools } = await import('./composio-tools.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
 const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
 
 test.after(() => {
@@ -41,6 +42,39 @@ test.after(() => {
   eventlog.closeEventLog();
   rmSync(HOME, { recursive: true, force: true });
 });
+
+/**
+ * Every dispatch settles against its accepted source, so each invocation needs
+ * the whole anchor — session, run attempt, accepted user input and the
+ * persisted turn graph. Discovery and execution each get their own accepted
+ * task here, exactly as separate user turns would.
+ */
+function anchoredCtx(sessionId: string, ask: string): {
+  sessionId: string;
+  turn: number;
+  sourceUserSeq: number;
+  runAttemptId: string;
+  counter: InstanceType<typeof ToolCallsCounter>;
+} {
+  const session = eventlog.createSession({ id: sessionId, kind: 'chat' });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: `${sessionId}-attempt` });
+  const source = eventlog.recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: ask },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId: session.id, turn: source.turn, sourceUserSeq: source.seq },
+  });
+  assert.ok(shadow, `fixture persisted the turn graph for ${sessionId}`);
+  return {
+    sessionId: session.id,
+    turn: source.turn,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    counter: new ToolCallsCounter(10),
+  };
+}
 
 test('CLI-only composio_search_tools returns the live slug and deposits its schema', async () => {
   invalidateComposioCliStatusCache();
@@ -56,21 +90,9 @@ test('CLI-only composio_search_tools returns the live slug and deposits its sche
     invoke(context: unknown, input: string, details: unknown): Promise<unknown>;
   };
 
-  const session = eventlog.createSession({ id: 'proof-cli-search-session', kind: 'chat' });
-  const attempt = eventlog.beginRunAttempt(session.id, { runId: 'proof-cli-search-attribution' });
-  const source = eventlog.recordRunAttemptUserInput(attempt, {
-    turn: 1,
-    role: 'user',
-    data: { text: 'proof release queue current items' },
-  });
-  const result = await withHarnessRunContext({
-    sessionId: session.id,
-    turn: source.turn,
-    sourceUserSeq: source.seq,
-    runAttemptId: attempt.attemptId,
-    counter: new ToolCallsCounter(10),
-  }, () => search.invoke(
-    { context: { sessionId: session.id } },
+  const anchor = anchoredCtx('proof-cli-search-session', 'proof release queue current items');
+  const result = await withHarnessRunContext(anchor, () => search.invoke(
+    { context: { sessionId: anchor.sessionId } },
     JSON.stringify({ query: 'proof release queue current items', toolkit_slug: null, limit: 5 }),
     { toolCall: { callId: 'proof-cli-search-call' } },
   ));
@@ -83,21 +105,25 @@ test('CLI-only composio_search_tools returns the live slug and deposits its sche
   assert.deepEqual(getCachedToolSchema('PROOF_LIST_TASKS'), {
     type: 'object', properties: {}, additionalProperties: false,
   });
-  const discovered = eventlog.listEvents(session.id, { types: ['capability_discovered'] }).at(-1);
-  assert.equal(discovered?.turn, source.turn);
-  assert.equal(discovered?.data.sourceUserSeq, source.seq);
-  assert.equal(discovered?.data.attemptId, attempt.attemptId);
+  const discovered = eventlog.listEvents(anchor.sessionId, { types: ['capability_discovered'] }).at(-1);
+  assert.equal(discovered?.turn, anchor.turn);
+  assert.equal(discovered?.data.sourceUserSeq, anchor.sourceUserSeq);
+  assert.equal(discovered?.data.attemptId, anchor.runAttemptId);
   const searches = readFileSync(path.join(HOME, 'proof-composio-searches.log'), 'utf8')
     .trim()
     .split('\n')
     .map((line) => JSON.parse(line) as { query?: string });
   assert.deepEqual(searches.map((row) => row.query), ['proof release queue current items']);
 
-  const stringNullResult = await search.invoke(
-    { context: { sessionId: 'proof-cli-search-string-null-session' } },
+  const stringNullAnchor = anchoredCtx(
+    'proof-cli-search-string-null-session',
+    'proof release queue current items',
+  );
+  const stringNullResult = await withHarnessRunContext(stringNullAnchor, () => search.invoke(
+    { context: { sessionId: stringNullAnchor.sessionId } },
     JSON.stringify({ query: 'proof release queue current items', toolkit_slug: 'null', limit: 10 }),
     { toolCall: { callId: 'proof-cli-search-string-null-call' } },
-  );
+  ));
   const stringNullText = typeof stringNullResult === 'string'
     ? stringNullResult
     : (stringNullResult as { content?: Array<{ text?: string }> } | null)?.content?.[0]?.text ?? JSON.stringify(stringNullResult);
@@ -110,11 +136,15 @@ test('CLI-only composio_search_tools returns the live slug and deposits its sche
   assert.equal(stringNullSearch?.toolkitSlug, null,
     'a provider stringified null is absence, never a literal --toolkits null constraint');
 
-  const emptyToolkitResult = await search.invoke(
-    { context: { sessionId: 'proof-cli-search-empty-toolkit-session' } },
+  const emptyToolkitAnchor = anchoredCtx(
+    'proof-cli-search-empty-toolkit-session',
+    'proof release queue current items',
+  );
+  const emptyToolkitResult = await withHarnessRunContext(emptyToolkitAnchor, () => search.invoke(
+    { context: { sessionId: emptyToolkitAnchor.sessionId } },
     JSON.stringify({ query: 'proof release queue current items', toolkit_slug: '', limit: 10 }),
     { toolCall: { callId: 'proof-cli-search-empty-toolkit-call' } },
-  );
+  ));
   const emptyToolkitText = typeof emptyToolkitResult === 'string'
     ? emptyToolkitResult
     : (emptyToolkitResult as { content?: Array<{ text?: string }> } | null)?.content?.[0]?.text ?? JSON.stringify(emptyToolkitResult);
@@ -127,15 +157,19 @@ test('CLI-only composio_search_tools returns the live slug and deposits its sche
   assert.equal(emptyToolkitSearch?.toolkitSlug, null,
     'an empty optional toolkit from an OpenAI-compatible provider remains a broad search');
 
-  const executed = await execute.invoke(
-    { context: { sessionId: 'proof-cli-execute-string-null-session' } },
+  const executeAnchor = anchoredCtx(
+    'proof-cli-execute-string-null-session',
+    'read the current proof release queue items',
+  );
+  const executed = await withHarnessRunContext(executeAnchor, () => execute.invoke(
+    { context: { sessionId: executeAnchor.sessionId } },
     JSON.stringify({
       tool_slug: 'PROOF_LIST_TASKS',
       arguments: '{}',
       connected_account_id: 'null',
     }),
     { toolCall: { callId: 'proof-cli-execute-string-null-call' } },
-  );
+  ));
   const executedText = typeof executed === 'string'
     ? executed
     : (executed as { content?: Array<{ text?: string }> } | null)?.content?.[0]?.text ?? JSON.stringify(executed);
@@ -160,11 +194,12 @@ test('CLI-only composio_search_tools returns the live slug and deposits its sche
     '',
   ].join('\n'), { encoding: 'utf8', mode: 0o755 });
   invalidateComposioCliStatusCache();
-  const withRelated = await search.invoke(
-    { context: { sessionId: 'proof-cli-related-session' } },
+  const relatedAnchor = anchoredCtx('proof-cli-related-session', 'proof release queue current items');
+  const withRelated = await withHarnessRunContext(relatedAnchor, () => search.invoke(
+    { context: { sessionId: relatedAnchor.sessionId } },
     JSON.stringify({ query: 'proof release queue current items', toolkit_slug: null, limit: 5 }),
     { toolCall: { callId: 'proof-cli-related-call' } },
-  );
+  ));
   const withRelatedText = typeof withRelated === 'string'
     ? withRelated
     : (withRelated as { content?: Array<{ text?: string }> } | null)?.content?.[0]?.text ?? JSON.stringify(withRelated);

@@ -27,7 +27,31 @@ process.env.CLEMMY_GUARDRAIL_PERSIST = 'off';
 const { createMcpNamespaceShim, namespaceToolName, slugifyServerName } = await import('./mcp-namespace-shim.js');
 const { _resetAllTrackersForTests } = await import('./harness/tool-guardrail.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
+const { appendEvent, createSession, getSession } = await import('./harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
+const { ToolAttemptSettlementAuthorityError } = await import('./harness/attempt-settlement.js');
 type HarnessRunContext = import('./harness/brackets.js').HarnessRunContext;
+
+/** The settlement spine refuses wrapped dispatch without an accepted source AND
+ *  a persisted turn graph for the accepted task. Create the fixture session
+ *  under its EXACT id (the forEach-vs-run_worker choice keys on the `workflow:`
+ *  id PREFIX, not the session kind) as kind `chat` — the only kind the
+ *  turn-graph shadow persists — then anchor both authorities. */
+function anchorAcceptedTask(sessionId: string, text: string): number {
+  if (!getSession(sessionId)) createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return source.seq;
+}
 
 // Fake underlying server that returns the REAL CallToolResultContent shape
 // (a content-block ARRAY), so appendMcpFanoutAdvisory's Array.isArray gate and
@@ -51,8 +75,12 @@ function makeFakeServer(name: string, toolName: string): MCPServer {
   } as unknown as MCPServer;
 }
 
-function ctx(sessionId: string): HarnessRunContext {
-  return { sessionId, counter: new ToolCallsCounter(100) };
+function ctx(sessionId: string, sourceUserSeq?: number): HarnessRunContext {
+  return {
+    sessionId,
+    counter: new ToolCallsCounter(100),
+    ...(sourceUserSeq ? { sourceUserSeq } : {}),
+  };
 }
 
 test('MCP shim appends the run_worker advisory on the 3rd serial same-shape native call', async () => {
@@ -61,7 +89,8 @@ test('MCP shim appends the run_worker advisory on the 3rd serial same-shape nati
   const shim = createMcpNamespaceShim({ servers: [makeFakeServer(slug, tool)] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
 
-  await withHarnessRunContext(ctx('sess-mcp-int-1'), async () => {
+  const seq = anchorAcceptedTask('sess-mcp-int-1', 'Run the serp research.');
+  await withHarnessRunContext(ctx('sess-mcp-int-1', seq), async () => {
     await shim.listTools(); // populate the routing map
     const r1 = JSON.stringify(await shim.callTool(namespaced, { target: 'alpha-firm-one.example' }));
     const r2 = JSON.stringify(await shim.callTool(namespaced, { target: 'beta-firm-two.example' }));
@@ -84,7 +113,8 @@ test('MCP shim emits the forEach variant (not run_worker) when the session is a 
   const shim = createMcpNamespaceShim({ servers: [makeFakeServer(slug, tool)] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
 
-  await withHarnessRunContext(ctx('workflow:run-9:step-enrich'), async () => {
+  const seq = anchorAcceptedTask('workflow:run-9:step-enrich', 'Enrich the firm records.');
+  await withHarnessRunContext(ctx('workflow:run-9:step-enrich', seq), async () => {
     await shim.listTools();
     await shim.callTool(namespaced, { url: 'one-firm-a.example' });
     await shim.callTool(namespaced, { url: 'two-firm.example' });
@@ -94,19 +124,34 @@ test('MCP shim emits the forEach variant (not run_worker) when the session is a 
   });
 });
 
-test('MCP shim leaves results untouched when there is no harness session context', async () => {
+test('MCP shim never appends fan-out prose without a keyed accepted task', async () => {
   const slug = 'dataforseo';
   const tool = 'serp_organic_live_advanced';
   const shim = createMcpNamespaceShim({ servers: [makeFakeServer(slug, tool)] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
-
-  // No withHarnessRunContext wrapper => getStore() is undefined => no-op.
   await shim.listTools();
+
+  // Without a run context there is no accepted source to correlate the attempt
+  // to, and the settlement spine refuses it rather than returning an
+  // unaccounted-for result. The advisory is downstream of that seam, so an
+  // unkeyed native call can never carry one.
+  await assert.rejects(
+    () => shim.callTool(namespaced, { target: 'firm-uncorrelated.example' }),
+    (error: unknown) => error instanceof ToolAttemptSettlementAuthorityError
+      && /uncorrelated/.test(error.message),
+  );
+
+  // The bucket is keyed by the accepted task, not by the tool: five same-shape
+  // reads accepted as five separate tasks never accumulate into an advisory.
   let last = '';
   for (let i = 0; i < 5; i++) {
-    last = JSON.stringify(await shim.callTool(namespaced, { target: `firm-${i}-batch.example` }));
+    const sessionId = `sess-mcp-unkeyed-${i}`;
+    const seq = anchorAcceptedTask(sessionId, 'Read one firm ranking.');
+    last = await withHarnessRunContext(ctx(sessionId, seq), async () => JSON.stringify(
+      await shim.callTool(namespaced, { target: `firm-${i}-batch.example` }),
+    ));
   }
-  assert.ok(!/FAN-OUT NOW/.test(last), 'no advisory without a session context (cannot key the bucket)');
+  assert.ok(!/FAN-OUT NOW/.test(last), 'one call per accepted task never keys a fan-out bucket');
 });
 
 test('MCP shim leaves structured results untouched inside a code-mode batch', async () => {
@@ -115,7 +160,8 @@ test('MCP shim leaves structured results untouched inside a code-mode batch', as
   const shim = createMcpNamespaceShim({ servers: [makeFakeServer(slug, tool)] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
 
-  await withHarnessRunContext({ ...ctx('workflow:run-code-mode:seo'), codeMode: true }, async () => {
+  const seq = anchorAcceptedTask('workflow:run-code-mode:seo', 'Run the seo research program.');
+  await withHarnessRunContext({ ...ctx('workflow:run-code-mode:seo', seq), codeMode: true }, async () => {
     await shim.listTools();
     for (let i = 1; i <= 6; i += 1) {
       const result = await shim.callTool(namespaced, { target: `firm-${i}.example` });
@@ -162,7 +208,8 @@ test('shim block: 6 distinct-entity serial reads → 6th REFUSED pre-dispatch wi
     const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
     const shim = createMcpNamespaceShim({ servers: [server] });
     const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
-    await withHarnessRunContext(ctx('sess-shimblock-batch'), async () => {
+    const seq = anchorAcceptedTask('sess-shimblock-batch', 'Scan the prospect group.');
+    await withHarnessRunContext(ctx('sess-shimblock-batch', seq), async () => {
       await shim.listTools();
       for (let i = 1; i <= 5; i += 1) {
         const r = JSON.stringify(await shim.callTool(namespaced, { target: `firm-${i}-group-a.example` }));
@@ -186,7 +233,8 @@ test('shim block entity gate: re-reading ONE entity 8 ways (pagination/refinemen
     const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
     const shim = createMcpNamespaceShim({ servers: [server] });
     const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
-    await withHarnessRunContext(ctx('sess-shimblock-refine'), async () => {
+    const seq = anchorAcceptedTask('sess-shimblock-refine', 'Refine the report for one firm.');
+    await withHarnessRunContext(ctx('sess-shimblock-refine', seq), async () => {
       await shim.listTools();
       for (let i = 1; i <= 8; i += 1) {
         const r = JSON.stringify(await shim.callTool(namespaced, { target: 'same-firm.example', depth: i * 10 }));
@@ -210,7 +258,8 @@ test('shim block exemptions: code-mode program reads and certified-batch items a
       const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
       const shim = createMcpNamespaceShim({ servers: [server] });
       const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
-      await withHarnessRunContext({ ...ctx(`sess-shimblock-${label}`), ...extra }, async () => {
+      const seq = anchorAcceptedTask(`sess-shimblock-${label}`, `Run the ${label} reads.`);
+      await withHarnessRunContext({ ...ctx(`sess-shimblock-${label}`, seq), ...extra }, async () => {
         await shim.listTools();
         for (let i = 1; i <= 8; i += 1) {
           const r = JSON.stringify(await shim.callTool(namespaced, { target: `firm-${i}-${label}.com` }));
@@ -233,7 +282,8 @@ test('shim block A: exempt program reads do NOT poison the orchestrator scope �
     const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
     // Phase 1: a code-mode PROGRAM reads 6 distinct entities (exempt — the sanctioned
     // batched execution). Under the fix these register in the program's OWN window.
-    await withHarnessRunContext({ ...ctx('sess-poison'), codeMode: true }, async () => {
+    const seq = anchorAcceptedTask('sess-poison', 'Run the program reads then one follow-up.');
+    await withHarnessRunContext({ ...ctx('sess-poison', seq), codeMode: true }, async () => {
       await shim.listTools();
       for (let i = 1; i <= 6; i += 1)
         await shim.callTool(namespaced, { target: `firm-${i}-group-a.example` });
@@ -242,7 +292,7 @@ test('shim block A: exempt program reads do NOT poison the orchestrator scope �
     // Phase 2: the ORCHESTRATOR makes ONE direct read of the SAME tool. Before the
     // fix this was refused (the 6 exempt reads inflated the shared session ceiling).
     let directResult = '';
-    await withHarnessRunContext(ctx('sess-poison'), async () => {
+    await withHarnessRunContext(ctx('sess-poison', seq), async () => {
       directResult = JSON.stringify(await shim.callTool(namespaced, { target: 'single-followup.example' }));
     });
     assert.ok(!/REFUSED/.test(directResult), 'the first DIRECT read must NOT be refused — exempt reads live in their own window');
@@ -257,7 +307,8 @@ test('shim block kill-switch: OFF → 10 distinct-entity serial reads all dispat
     const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
     const shim = createMcpNamespaceShim({ servers: [server] });
     const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
-    await withHarnessRunContext(ctx('sess-shimblock-off'), async () => {
+    const seq = anchorAcceptedTask('sess-shimblock-off', 'Run the serial reads.');
+    await withHarnessRunContext(ctx('sess-shimblock-off', seq), async () => {
       await shim.listTools();
       for (let i = 1; i <= 10; i += 1) {
         const r = JSON.stringify(await shim.callTool(namespaced, { target: `firm-${i}-off.example` }));

@@ -55,6 +55,32 @@ const {
   executeWorkflowCallMutation,
   inspectWorkflowCallMutation,
 } = await import('./workflow-call-receipts.js');
+const { appendEvent, createSession, getSession } = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+
+/**
+ * A wrapped tool settles its logical call against the accepted source that
+ * authorized it. The production loop is stubbed out here, so the stub owes the
+ * same spine the loop would have established for each specialist branch:
+ * accepted input -> persisted turn graph -> run context.
+ */
+function anchorSpecialistTurn(sessionId: string, text: string): {
+  sessionId: string; sourceUserSeq: number; turn: number;
+} {
+  const session = getSession(sessionId) ?? createSession({ id: sessionId, kind: 'workflow' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the specialist branch');
+  return { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+}
 
 test.after(() => {
   _setWorkflowCallNodeForTests();
@@ -314,16 +340,23 @@ console.log(JSON.stringify({
         await allSpecialistsStarted;
 
         const offset = role === 'trend' ? 0 : role === 'rep' ? 500 : 1_180;
-        const page = String(await queryTool.invoke(
-          { context: { sessionId } },
-          JSON.stringify({
-            path: sourceArtifactPath,
-            json_path: 'transactions',
-            fields: ['id', 'rep', 'region', 'stage', 'revenue'],
-            offset,
-            limit: 20,
-          }),
-          { toolCall: { callId: `sales-portal-${role}-${offset}` } },
+        const anchor = anchorSpecialistTurn(
+          sessionId,
+          `what do the July sales transactions show for ${role}?`,
+        );
+        const page = String(await withHarnessRunContext(
+          { ...anchor, counter: new ToolCallsCounter(50) },
+          () => queryTool.invoke(
+            { context: { sessionId } },
+            JSON.stringify({
+              path: sourceArtifactPath,
+              json_path: 'transactions',
+              fields: ['id', 'rep', 'region', 'stage', 'revenue'],
+              offset,
+              limit: 20,
+            }),
+            { toolCall: { callId: `sales-portal-${role}-${offset}` } },
+          ),
         ));
         queriedOffsets.push(offset);
         assert.match(page, /showing 20 record\(s\)/);

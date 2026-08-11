@@ -63,6 +63,31 @@ const {
 const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
 const { listNotifications } = await import('../runtime/notifications.js');
 const { setProactiveReportFireForTest } = await import('../runtime/outcome.js');
+const { appendEvent, getSession } = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+
+/**
+ * A dispatch settles durably against the accepted source that authorized it,
+ * so a journey that drives real tool calls has to stand up the same spine the
+ * lane does: accepted user input -> persisted turn graph -> run context.
+ */
+function anchorAcceptedTask(sessionId: string, text: string): {
+  sessionId: string; sourceUserSeq: number; turn: number;
+} {
+  const session = getSession(sessionId) ?? createSession({ id: sessionId, kind: 'execution' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
+  return { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+}
 
 setProactiveReportFireForTest(async () => { /* passive outcome turns are asserted directly */ });
 
@@ -209,7 +234,15 @@ test('J2: an approved workflow payload replays VERBATIM on re-admission; racing 
 test('J3: dead data source → empty-result advisory → data-quality checkpoint intercepts the first write', async () => {
   resetDataQualityForTest();
   try {
-    const sid = 'background:bg-journey-j3';
+    const anchor = anchorAcceptedTask(
+      'background:bg-journey-j3',
+      'compile the intel base for the four firms',
+    );
+    const sid = anchor.sessionId;
+    const inTurn = <T>(work: () => Promise<T>): Promise<T> => withHarnessRunContext(
+      { ...anchor, counter: new ToolCallsCounter(50) },
+      work,
+    ) as Promise<T>;
     const deadSource = (async () => ({ data: { items: [] }, error: null, successful: true })) as never;
     let writeDispatches = 0;
     const writeExec = (async () => {
@@ -219,14 +252,16 @@ test('J3: dead data source → empty-result advisory → data-quality checkpoint
 
     let advisorySeen = '';
     for (const firm of ['firm-1', 'firm-2', 'firm-3', 'firm-4']) {
-      advisorySeen = await runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q: firm }, deadSource, sid);
+      advisorySeen = await inTurn(() =>
+        runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q: firm }, deadSource, sid));
     }
     assert.match(advisorySeen, /empty-result advisory/, 'the model was steered before the write');
 
     // The checkpoint RESOLVES as a typed refusal (never throws): a thrown
     // refusal was flattened to prose by the SDK's error wrapper and settled
     // ORPHANED ("may have landed") instead of failed-retryable.
-    const checkpoint = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid);
+    const checkpoint = await inTurn(() =>
+      runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid));
     assert.ok(
       (checkpoint as unknown) instanceof ExternalWritePreDispatchResult,
       'the checkpoint survives as the typed no-dispatch class',
@@ -238,7 +273,8 @@ test('J3: dead data source → empty-result advisory → data-quality checkpoint
     assert.equal(writeDispatches, 0, 'the typed checkpoint proves no provider write started');
 
     // A deliberate second attempt proceeds — autonomy redirected, never dead-ended.
-    const proceeded = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid);
+    const proceeded = await inTurn(() =>
+      runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid));
     assert.equal(writeDispatches, 1, 'the repaired retry crosses the provider boundary exactly once');
     assert.doesNotMatch(proceeded, /DATA-QUALITY CHECKPOINT/);
     assert.match(proceeded, /appJ3/);

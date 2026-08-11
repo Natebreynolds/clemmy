@@ -12,6 +12,7 @@ const { DiscoveryGovernor, MAX_DISCOVERY_EPOCHS } = await import('./harness/disc
 const { mcpToolAllowedByScope } = await import('./mcp-tool-authority.js');
 const { filterMcpToolsForScope } = await import('./mcp-tool-filter.js');
 const { mcpServersTestHooks } = await import('./mcp-servers.js');
+const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -42,7 +43,7 @@ function largeAuthorizedCatalog(): Array<{ name: string; description: string }> 
     .map((entry) => entry.tool);
 }
 
-function acceptedTask(label: string): { sessionId: string; sourceUserSeq: number } {
+function acceptedTask(label: string): { sessionId: string; sourceUserSeq: number; turn: number } {
   const session = eventlog.createSession({ id: `capability-recovery-${label}`, kind: 'chat' });
   const source = eventlog.appendEvent({
     sessionId: session.id,
@@ -51,7 +52,12 @@ function acceptedTask(label: string): { sessionId: string; sourceUserSeq: number
     type: 'user_input_received',
     data: { text: `do the ${label} task` },
   });
-  return { sessionId: session.id, sourceUserSeq: source.seq };
+  // A dispatch settles against the accepted source that authorized it, and the
+  // persisted graph is what makes that source an authority the ledger accepts.
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
+  return { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
 }
 
 function fakeBase(tools: Array<{ name: string; description: string }>) {
@@ -267,7 +273,7 @@ test('scenario 10: a user prohibition denies every tool, however exactly it is n
 // ── The wiring, not just the mechanism ───────────────────────────────────────
 
 test('a real failed dispatch reopens the epoch — the recovery path is CONNECTED', async () => {
-  const { maybeAutoRememberComposioChoice } = await import('../tools/composio-tools.js');
+  const { runComposioExecuteForTestInSession } = await import('../tools/composio-tools.js');
   const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
 
   const key = acceptedTask('wired');
@@ -279,16 +285,17 @@ test('a real failed dispatch reopens the epoch — the recovery path is CONNECTE
     false,
   );
 
-  // Drive the ACTUAL production settlement seam with a failed provider result.
-  // If this pin only called recordEvidence directly it would prove the function
-  // works while the runtime never reaches it — which is how the escape hatch
-  // came to exist unwired in the first place.
+  // Drive the ACTUAL dispatch entry point with a failed provider result, so the
+  // evidence has to travel the whole way — execute -> attempt settlement ->
+  // governor. If this pin called the governor (or a learning helper beside it)
+  // directly it would prove the function works while the runtime never reaches
+  // it, which is how the escape hatch came to exist unwired in the first place.
   await withHarnessRunContext(
     { ...key, counter: new ToolCallsCounter(10) },
-    () => maybeAutoRememberComposioChoice(
+    () => runComposioExecuteForTestInSession(
       'SOME_LIST_RECORDS',
       {},
-      { successful: false, error: 'unsupported operation' },
+      (async () => ({ successful: false, error: 'unsupported operation', data: {} })) as never,
       key.sessionId,
     ),
   );
@@ -305,7 +312,7 @@ test('a real failed dispatch reopens the epoch — the recovery path is CONNECTE
 });
 
 test('a failed WRITE reconciles instead of hunting for a sibling', async () => {
-  const { maybeAutoRememberComposioChoice } = await import('../tools/composio-tools.js');
+  const { runComposioExecuteForTestInSession } = await import('../tools/composio-tools.js');
   const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
 
   const key = acceptedTask('write-no-hunt');
@@ -313,12 +320,14 @@ test('a failed WRITE reconciles instead of hunting for a sibling', async () => {
   governor.initializeTask({ ...key, knownCapability: false });
   governor.admit({ ...key, category: 'broad_discovery', callId: 'write-search-1' });
 
+  // The same live dispatch path as its READ sibling above — the difference the
+  // pin is proving belongs to the effect class, not to how the test called in.
   await withHarnessRunContext(
     { ...key, counter: new ToolCallsCounter(10) },
-    () => maybeAutoRememberComposioChoice(
+    () => runComposioExecuteForTestInSession(
       'SOME_SEND_MESSAGE',
       {},
-      { successful: false, error: 'gateway timeout' },
+      (async () => ({ successful: false, error: 'gateway timeout', data: {} })) as never,
       key.sessionId,
     ),
   );

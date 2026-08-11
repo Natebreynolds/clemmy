@@ -44,6 +44,7 @@ const {
   createSession,
   listEvents,
 } = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
 const {
   getPendingAction,
   listPendingActions,
@@ -193,6 +194,27 @@ function canonicalDrafts(value: StoredDraft[]): StoredDraft[] {
   return [...value].sort((left, right) => left.id.localeCompare(right.id));
 }
 
+/**
+ * Accept one user turn the way the runtime does: the input event plus the
+ * persisted turn graph for it. Dispatch admission refuses a logical call whose
+ * accepted task has no graph, so an anchor missing either half turns the first
+ * worker attempt into a pre-dispatch authority error.
+ */
+function acceptUserTurn(sessionId: string, turn: number, text: string): { seq: number; turn: number } {
+  const source = appendEvent({
+    sessionId,
+    turn,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
+  });
+  assert.ok(shadow, `fixture persisted the turn graph for turn ${turn}`);
+  return { seq: source.seq, turn: source.turn };
+}
+
 after(() => {
   _setCertifyJudgeForTests(null);
   _setCodeModeToolsForTests(null);
@@ -204,13 +226,11 @@ after(() => {
 
 test('five workers compose, one parent batch commits, and stable mailbox routing survives ca_* rotation', async () => {
   const session = createSession({ kind: 'chat', title: 'compose parent commit acceptance' });
-  const executionSource = appendEvent({
-    sessionId: session.id,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Prepare the reviewed Outlook drafts through the worker-compose parent-commit lane.' },
-  });
+  const executionSource = acceptUserTurn(
+    session.id,
+    1,
+    'Prepare the reviewed Outlook drafts through the worker-compose parent-commit lane.',
+  );
   new ExecutionStore().create({
     sessionId: session.id,
     sourceUserSeq: executionSource.seq,
@@ -323,13 +343,11 @@ test('five workers compose, one parent batch commits, and stable mailbox routing
     expectedReadback: StoredDraft[],
   ): Promise<BatchRunLedger> => {
     const expected = fixtures(phase);
-    const source = appendEvent({
-      sessionId: session.id,
-      turn: phase === 'before' ? 2 : 3,
-      role: 'user',
-      type: 'user_input_received',
-      data: { text: `Create the five ${phase} reviewed Outlook drafts.` },
-    });
+    const source = acceptUserTurn(
+      session.id,
+      phase === 'before' ? 2 : 3,
+      `Create the five ${phase} reviewed Outlook drafts.`,
+    );
     const workerServer = createClementineMcpServer({
       sessionId: session.id,
       sourceUserSeq: source.seq,
@@ -478,10 +496,18 @@ test('five workers compose, one parent batch commits, and stable mailbox routing
     }
     assert.equal(getPendingAction(pending.id)?.status, 'executed');
 
-    const read = await dispatchComposioTool(
-      LIST_DRAFTS,
-      { account_alias: ACCOUNT_ALIAS },
-      { sessionId: session.id },
+    const read = await withHarnessRunContext(
+      {
+        sessionId: session.id,
+        behaviorScopeId: `${session.id}:${phase}:readback`,
+        sourceUserSeq: source.seq,
+        counter: new ToolCallsCounter(100),
+      },
+      () => dispatchComposioTool(
+        LIST_DRAFTS,
+        { account_alias: ACCOUNT_ALIAS },
+        { sessionId: session.id },
+      ),
     );
     assert.equal(read.ok, true, `${phase}: exact mailbox readback succeeded`);
     if (!read.ok) throw new Error(read.message);

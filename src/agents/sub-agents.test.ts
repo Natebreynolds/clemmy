@@ -34,6 +34,33 @@ const {
   sealAgentCapabilityUniverse,
 } = await import('./capability-envelope.js');
 const { _resetHotSetForTest } = await import('./tool-hotset.js');
+const { appendEvent, createSession } = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+
+/**
+ * A wrapped tool settles its logical call durably, and durable settlement needs
+ * the accepted-source identity plus the persisted turn graph that authorizes
+ * it. Anchor the fixture the way the real turn spine does — accepted user input
+ * -> persisted turn graph -> run context — rather than invoking a tool from
+ * outside any turn.
+ */
+function anchorAcceptedTask(sessionId: string, text: string): {
+  sessionId: string; sourceUserSeq: number; turn: number;
+} {
+  const session = createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
+  return { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+}
 
 after(() => {
   _resetHotSetForTest();
@@ -231,7 +258,11 @@ test('worker call_tool advances its sealed revision once and refuses outside reb
     },
   }]]));
   try {
-    const worker = await buildWorkerAgent({ sessionId: 'worker-capability-revision-test' });
+    const anchor = anchorAcceptedTask(
+      'worker-capability-revision-test',
+      'what does the desktop status say right now?',
+    );
+    const worker = await buildWorkerAgent({ sessionId: anchor.sessionId });
     const envelope = boundAgentCapabilityEnvelope(worker);
     const before = boundAgentCapabilityRevision(worker);
     assert.ok(envelope, 'worker did not bind its filtered capability universe');
@@ -241,10 +272,13 @@ test('worker call_tool advances its sealed revision once and refuses outside reb
 
     const callTool = worker.tools.find((toolRef) => toolRef.name === 'call_tool') as InvokableAgentTool | undefined;
     assert.ok(callTool?.invoke, 'worker slim surface omitted call_tool');
-    const invoke = () => callTool!.invoke!(
-      { context: { sessionId: 'worker-capability-revision-test' } },
-      JSON.stringify({ name: 'desktop_status', args_json: '{}' }),
-      { toolCall: { callId: `worker-capability-${dispatches}` } },
+    const invoke = () => withHarnessRunContext(
+      { ...anchor, counter: new ToolCallsCounter(50) },
+      () => callTool!.invoke!(
+        { context: { sessionId: anchor.sessionId } },
+        JSON.stringify({ name: 'desktop_status', args_json: '{}' }),
+        { toolCall: { callId: `worker-capability-${dispatches}` } },
+      ),
     );
 
     assert.equal(String(await invoke()), 'desktop-ok');
