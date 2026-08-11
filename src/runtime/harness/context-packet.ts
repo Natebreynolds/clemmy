@@ -761,7 +761,7 @@ export function buildAgentContextPacket(
   if (!constrainedWorkflowNode && !suppressSemanticEnrichment) {
     try {
       capabilityResolution = resolveTurnCapabilities(input, { sessionId: opts?.sessionId });
-      capabilityBlock = renderCapabilityResolutionForContext(capabilityResolution);
+      capabilityBlock = renderCapabilityResolutionForContext(capabilityResolution, { focusInput: input });
       if (
         opts?.sessionKind === 'chat'
         && Number.isSafeInteger(opts?.sourceUserSeq)

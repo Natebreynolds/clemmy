@@ -1288,7 +1288,7 @@ async function buildClaudeAgentBrainTurnContext(
     try {
       const resolved = resolveTurnCapabilities(taskInput, { sessionId: request.sessionId });
       resolvedCapabilityEntries = resolved.entries;
-      capabilityResolution = renderCapabilityResolutionForContext(resolved);
+      capabilityResolution = renderCapabilityResolutionForContext(resolved, { focusInput: taskInput });
       if (preflightSessionKind === 'chat') {
         recordCapabilityResolution(request.sessionId, resolved, opts?.sourceUserSeq);
       }

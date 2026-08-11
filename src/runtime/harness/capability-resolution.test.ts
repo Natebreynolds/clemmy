@@ -381,3 +381,35 @@ test('caller-constructed resolution data cannot manufacture known-capability aut
   assert.equal(state?.policy.knownCapability, false);
   assert.equal(state?.policy.broadDiscoveryAllowance, 1);
 });
+
+// A1 (learned-contract render): call shapes that already worked on this
+// machine reach the model through the SAME volatile capability block — even
+// when the resolution itself is empty, because a contract learned in another
+// session must reach a fresh one (live 2026-08-08: OUTLOOK_CREATE_DRAFT
+// succeeded twice, then the next session re-derived the whole discovery path).
+test('a learned contract renders through the capability block on token overlap', async () => {
+  const store = await import('../../tools/tool-contract-store.js');
+  store.saveToolContractExample({
+    identifier: 'OUTLOOK_CREATE_DRAFT_RENDER_PIN',
+    exampleArgs: { body_content: 'hello', subject: 'update' },
+  });
+  const empty = { entries: [], registryAvailable: false };
+  const block = renderCapabilityResolutionForContext(empty, {
+    focusInput: 'draft the outlook render pin email create',
+  });
+  assert.match(block, /LEARNED TOOL CONTRACTS/);
+  assert.match(block, /OUTLOOK_CREATE_DRAFT_RENDER_PIN/);
+  assert.match(block, /body_content/);
+});
+
+test('no focusInput → the render is byte-identical to the pre-A1 shape', () => {
+  const empty = { entries: [], registryAvailable: false };
+  assert.equal(renderCapabilityResolutionForContext(empty), '');
+});
+
+test('an unrelated focusInput renders no contract text', () => {
+  const empty = { entries: [], registryAvailable: false };
+  assert.equal(renderCapabilityResolutionForContext(empty, {
+    focusInput: 'tell me a story about clementines',
+  }), '');
+});

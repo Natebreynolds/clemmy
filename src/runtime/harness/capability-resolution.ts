@@ -37,6 +37,7 @@ import { appendEvent, listEvents } from './eventlog.js';
 import { getRuntimeEnv } from '../../config.js';
 import { discoveryGovernor } from './discovery-governor.js';
 import { resolveActiveTaskContext } from './active-task-context.js';
+import { recallLearnedContracts, renderLearnedContracts } from '../../tools/tool-contract-recall.js';
 
 export type CapabilityStatus = 'proven' | 'previously_failed';
 export type ConnectionState = 'active' | 'missing' | 'unknown' | 'not_applicable';
@@ -367,8 +368,22 @@ export function recordCapabilityResolution(
  * deterministic floor. Empty resolution renders nothing — no prompt tax on
  * turns with no capability history.
  */
-export function renderCapabilityResolutionForContext(resolution: CapabilityResolution): string {
-  if (resolution.entries.length === 0) return '';
+export function renderCapabilityResolutionForContext(
+  resolution: CapabilityResolution,
+  opts?: {
+    /**
+     * The turn's ask text. When present, learned tool contracts (call shapes
+     * that already succeeded on this machine) are recalled by token overlap
+     * and appended as DATA. Contracts render even with zero capability
+     * entries — a shape learned in another session must reach a fresh one.
+     * This whole render rides the volatile turn tail on every lane; it must
+     * never enter the cached system prefix.
+     */
+    focusInput?: string;
+  },
+): string {
+  const contractBlock = opts?.focusInput ? renderContractRecall(opts.focusInput) : null;
+  if (resolution.entries.length === 0) return contractBlock ?? '';
   const lines: string[] = ['[capability resolution — runtime-resolved facts about THIS request]'];
   for (const e of resolution.entries) {
     const conn = e.connection === 'active' ? 'connection active'
@@ -392,5 +407,15 @@ export function renderCapabilityResolutionForContext(resolution: CapabilityResol
     + 'or ask for a go-ahead that assumes it — and say so. A toolkit with no active connection must be '
     + 'surfaced to the user, never worked around silently. Capabilities not listed are ordinary discovery.',
   );
+  if (contractBlock) lines.push(contractBlock);
   return lines.join('\n');
+}
+
+/** Pure read over the on-disk contract store; a failure renders nothing. */
+function renderContractRecall(focusInput: string): string | null {
+  try {
+    return renderLearnedContracts(recallLearnedContracts(focusInput));
+  } catch {
+    return null;
+  }
 }
