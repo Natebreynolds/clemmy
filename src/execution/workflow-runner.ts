@@ -1729,6 +1729,51 @@ export function _setWorkflowCallNodeForTests(
   workflowCallNodeOverrideForTests = override;
 }
 
+/**
+ * The zero-LLM structured-call lane still crosses the settlement spine, and
+ * the spine refuses dispatch without an accepted source + persisted turn
+ * graph + ambient run context. Mint the step-session identity once per call
+ * node (idempotent per step/item): session row → accepted user_input_received
+ * (the rendered call IS the step's input) → turn-graph shadow. Without this,
+ * every workflow exact-call threw ToolAttemptSettlementAuthorityError
+ * post-spine (live class: scheduled workflows dying on their first dispatch).
+ */
+async function ensureWorkflowCallIdentity(
+  sessionId: string,
+  step: WorkflowStepInput,
+  toolSlug: string,
+  mutationItemKey?: string,
+): Promise<{ sourceUserSeq: number; turn: number } | null> {
+  try {
+    const { createSession, getSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
+    const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+    if (!getSession(sessionId)) createSession({ id: sessionId, kind: 'workflow' });
+    const marker = `${step.id}::${mutationItemKey ?? ''}`;
+    const existing = listEvents(sessionId, { types: ['user_input_received'] })
+      .find((event) => event.data.workflowCallNode === marker);
+    const source = existing ?? appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: {
+        text: `Workflow step ${step.id}: execute ${toolSlug}`,
+        workflowCallNode: marker,
+      },
+    });
+    recordTurnGraphShadow({
+      identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+      surface: 'workflow',
+    });
+    return { sourceUserSeq: source.seq, turn: source.turn };
+  } catch {
+    // Identity minting is dispatch ENABLEMENT — a bookkeeping failure here
+    // must surface as the settlement spine's own typed refusal downstream,
+    // never as a silent skip of the call.
+    return null;
+  }
+}
+
 async function executeWorkflowCallNode(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
@@ -1756,8 +1801,22 @@ async function executeWorkflowCallNode(
   // The slug is an independent safety signal: an author-supplied `read` label
   // must not disable receipts for an obviously create/update/delete call.
   const mutatesExternally = structuredCallNeedsMutationReceipt(step);
-  const outcome = await dispatchComposioTool(call.tool, args, {
-    sessionId: `workflow:${ctx.runId}:${step.id}`,
+  const callSessionId = `workflow:${ctx.runId}:${step.id}`;
+  const callIdentity = await ensureWorkflowCallIdentity(callSessionId, step, call.tool, mutationItemKey);
+  const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  const dispatchWithIdentity = <T>(work: () => Promise<T>): Promise<T> => (
+    callIdentity
+      ? Promise.resolve(withHarnessRunContext({
+        sessionId: callSessionId,
+        sourceUserSeq: callIdentity.sourceUserSeq,
+        turn: callIdentity.turn,
+        counter: new ToolCallsCounter(1_000),
+        behaviorScopeId: `${callSessionId}::call-node`,
+      }, work))
+      : work()
+  );
+  const outcome = await dispatchWithIdentity(() => dispatchComposioTool(call.tool, args, {
+    sessionId: callSessionId,
     ...(mutatesExternally
       ? {
         dispatchBoundary: (resolved, dispatch) => {
@@ -1799,7 +1858,7 @@ async function executeWorkflowCallNode(
         },
       }
       : {}),
-  });
+  }));
   if (!outcome.ok) {
     // Typed gateway block → fail the step VISIBLY with the deterministic
     // corrective (which account / reconnect / fix args) instead of dispatching.

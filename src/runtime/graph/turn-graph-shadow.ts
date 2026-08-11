@@ -105,7 +105,16 @@ function isGraphPolicy(value: RecordTurnGraphShadowInput['policy']): value is Tu
 export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventRow | null {
   try {
     const session = getSession(input.identity.sessionId);
-    if (!session || session.kind !== 'chat') return null;
+    // Every lane that dispatches through the settlement spine needs a
+    // persisted graph — the dispatch ledger refuses logical calls without one.
+    // The old chat-only gate predated that requirement and turned the FIRST
+    // tool call of every background/workflow/execution run into
+    // LogicalCallPreDispatchAuthorityError (live 2026-08-11:
+    // long-horizon-manifest died in 8.9s on `background:bg-*`). Authority,
+    // contracts, and terminal adjudication remain chat-scoped at their own
+    // seams (loop.ts / claude-agent-brain / delivery-committer kind checks);
+    // the graph itself is lane-neutral dispatch admission.
+    if (!session) return null;
     const source = acceptedSource(input.identity);
     if (!source || source.turn !== input.identity.turn) return null;
     const graphId = `turn-graph:v1:${input.identity.sourceUserSeq}`;
@@ -172,7 +181,8 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
         graph,
       },
     }).event;
-  } catch {
+  } catch (error) {
+    if (process.env.CLEM_DEBUG_SHADOW === '1') console.error('[shadow-debug]', error);
     return null;
   }
 }

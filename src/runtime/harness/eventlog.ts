@@ -5158,13 +5158,18 @@ export function appendTurnGraphEventOnce(input: {
           AND events.type = 'user_input_received'
         LIMIT 1`,
     ).get(input.sessionId, input.sourceUserSeq) as (RawEventRow & { session_kind: SessionKind }) | undefined;
+    // Every dispatching lane needs a persisted graph (the dispatch ledger
+    // refuses logical calls without one), so the writer validates the exact
+    // accepted USER event — not the session kind. The former chat-only guard
+    // here plus the shadow recorder's own made background/workflow/execution
+    // dispatch impossible (live 2026-08-11: first tool call of every
+    // background run failed LogicalCallPreDispatchAuthorityError).
     if (
       !source
-      || source.session_kind !== 'chat'
       || source.role !== 'user'
       || source.turn !== input.turn
     ) {
-      throw new Error('turn graph source is not the exact accepted chat user turn');
+      throw new Error('turn graph source is not the exact accepted user turn');
     }
 
     const prior = rawTurnGraphEventForSource(db, input.sessionId, input.sourceUserSeq);
