@@ -33,12 +33,62 @@ const WRITE_ACTIONS: ReadonlySet<string> = new Set([
   'INVITE', 'CANCEL', 'ENABLE', 'DISABLE',
 ]);
 
-function actionTokens(value: string): string[] {
+/**
+ * The CONSEQUENCE class an action's own declared verb implies.
+ *
+ * `classifyComposioSlugEffect` answers read-or-write, which is the right
+ * question for gating but too coarse for a choice: creating a new record and
+ * updating an existing one are both "write", and they are not interchangeable
+ * outcomes. A caller that asked to change something and is offered only a way
+ * to make something new is being offered a materially different result, and
+ * that difference should be visible as DATA rather than discovered afterwards.
+ *
+ * Derived from the action's own tokens against the same verb evidence the
+ * effect classifier uses — no provider names, no slug lists, no per-tool rules.
+ * Unknown verbs stay unknown rather than being guessed into a class.
+ */
+export type ComposioActionConsequence = 'read' | 'create' | 'update' | 'delete' | 'send' | 'other';
+
+const CREATE_VERBS: ReadonlySet<string> = new Set(['CREATE', 'INSERT', 'ADD', 'NEW', 'DUPLICATE', 'COPY', 'UPLOAD', 'REGISTER']);
+const UPDATE_VERBS: ReadonlySet<string> = new Set(['UPDATE', 'EDIT', 'PATCH', 'MODIFY', 'REPLACE', 'SET', 'RENAME', 'MOVE', 'APPEND', 'SAVE']);
+const DELETE_VERBS: ReadonlySet<string> = new Set(['DELETE', 'REMOVE', 'TRASH', 'DESTROY', 'ARCHIVE', 'UNREGISTER']);
+const SEND_VERBS: ReadonlySet<string> = new Set(['SEND', 'DISPATCH', 'POST', 'PUBLISH', 'BROADCAST', 'FORWARD', 'REPLY', 'DM', 'TWEET', 'CALL', 'DIAL', 'INVITE']);
+
+export function classifyComposioActionConsequence(
+  slug: string | null | undefined,
+): ComposioActionConsequence {
+  if (!slug) return 'other';
+  const tokens = actionTokens(slug);
+  // Most specific consequence wins; a slug naming several verbs is judged by
+  // the most consequential one it declares.
+  if (tokens.some((t) => DELETE_VERBS.has(t))) return 'delete';
+  if (tokens.some((t) => SEND_VERBS.has(t))) return 'send';
+  if (tokens.some((t) => UPDATE_VERBS.has(t))) return 'update';
+  if (tokens.some((t) => CREATE_VERBS.has(t))) return 'create';
+  if (tokens.some((t) => READ_ACTIONS.has(t))) return 'read';
+  return 'other';
+}
+
+export function actionTokens(value: string): string[] {
   return value
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
     .toUpperCase()
     .split(/[^A-Z0-9]+/)
     .filter(Boolean);
+}
+
+/**
+ * An action whose object is a DRAFT that stays unsent: CREATE_DRAFT /
+ * UPDATE_DRAFT compose, SEND_DRAFT / PUBLISH_DRAFT dispatch the composed
+ * draft. Token rule mirrors the irreversible-send chokepoint
+ * (execution-gate.ts isIrreversibleSendSlug) so the two classifiers can never
+ * disagree about which side of the send boundary a draft action sits on.
+ */
+export function actionTargetsUnsentDraft(slug: string | null | undefined): boolean {
+  if (!slug) return false;
+  const tokens = actionTokens(slug);
+  if (!tokens.includes('DRAFT') && !tokens.includes('DRAFTS')) return false;
+  return !tokens.includes('SEND') && !tokens.includes('PUBLISH');
 }
 
 const DATAFORSEO_RESEARCH_NAMESPACES: ReadonlySet<string> = new Set([

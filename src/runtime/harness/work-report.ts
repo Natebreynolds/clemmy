@@ -16,6 +16,11 @@ import {
   toolOutputLooksSuccessful,
 } from './tool-evidence.js';
 import { projectCanonicalTopLevelToolEvents } from './tool-effect.js';
+import {
+  actionTargetsUnsentDraft,
+  actionTokens,
+  classifyComposioActionConsequence,
+} from '../../integrations/composio/slug-effect.js';
 
 export interface ResolvedWriteEvidence {
   confirmed: EventRow[];
@@ -139,20 +144,56 @@ function describeUncertainWrite(event: EventRow): string {
   return `Could not confirm whether ${shape.toLowerCase().replace(/_/g, ' ')}${to} completed`;
 }
 
-/** Humanize ONE recorded external write into a report line. */
-export function describeExternalWrite(shapeKey: string | undefined, toolName: string, targets: string[]): string {
-  const key = (shapeKey || toolName || 'action').toUpperCase();
+/**
+ * Humanize ONE recorded external write into a report line.
+ *
+ * The phrase derives from the action's CONSEQUENCE class (the same verb
+ * evidence the effect classifier uses) plus the write's own recorded
+ * `irreversible` bit — never from an ordered slug-regex chain. The chain shipped
+ * two live lies in one weekend: OUTLOOK_UPDATE_EMAIL fell through /EMAIL/ to
+ * "Sent a message" on a draft-only task, and SLACK_DELETE_MESSAGE matched
+ * /MESSAGE/ before /DELETE/. Invariant enforced here, not by pattern order:
+ * a write recorded as reversible (`irreversible === false`) may NEVER render
+ * as delivery ("Sent…", "Published…") — reversible actions did not deliver
+ * anything. Legacy rows without the bit keep their historical reading.
+ */
+export function describeExternalWrite(
+  shapeKey: string | undefined,
+  toolName: string,
+  targets: string[],
+  write?: { irreversible?: boolean; actionKey?: string },
+): string {
+  const key = shapeKey || write?.actionKey || toolName || 'action';
   const to = targets.length
     ? ` to ${targets.slice(0, 5).join(', ')}${targets.length > 5 ? ` (+${targets.length - 5} more)` : ''}`
     : '';
-  if (/DRAFT/.test(key) && !/SEND|PUBLISH/.test(key)) return `Created a draft${to}`;
-  if (/SEND|EMAIL|DELIVER|DISPATCH|DM\b|MESSAGE|SMS|TEXT/.test(key)) return `Sent a message${to}`;
-  if (/PUBLISH|POST|TWEET/.test(key)) return `Published a post${to}`;
-  if (/CREATE|ADD|INSERT|UPSERT/.test(key)) return `Created a record${to}`;
-  if (/UPDATE|PATCH|EDIT|MODIFY|SET_/.test(key)) return `Updated a record${to}`;
-  if (/DELETE|REMOVE|ARCHIVE|TRASH/.test(key)) return `Deleted a record${to}`;
-  if (/UPLOAD|SAVE|WRITE/.test(key)) return `Saved a file${to}`;
-  return `Ran ${key.toLowerCase().replace(/_/g, ' ')}${to}`;
+  const tokens = actionTokens(key);
+  const deliveryAllowed = write?.irreversible !== false;
+  const fileShaped = tokens.includes('UPLOAD') || tokens.includes('SAVE') || tokens.includes('WRITE') || tokens.includes('FILE');
+  const fallback = `Ran ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
+
+  if (actionTargetsUnsentDraft(key)) {
+    return classifyComposioActionConsequence(key) === 'update'
+      ? `Updated a draft${to}`
+      : `Created a draft${to}`;
+  }
+  switch (classifyComposioActionConsequence(key)) {
+    case 'delete':
+      return `Deleted a record${to}`;
+    case 'send': {
+      if (!deliveryAllowed) return fallback;
+      const postShaped = tokens.includes('PUBLISH') || tokens.includes('POST') || tokens.includes('TWEET');
+      return postShaped ? `Published a post${to}` : `Sent a message${to}`;
+    }
+    case 'update':
+      return fileShaped ? `Saved a file${to}` : `Updated a record${to}`;
+    case 'create':
+      return fileShaped ? `Saved a file${to}` : `Created a record${to}`;
+    case 'read':
+      return fallback;
+    default:
+      return fileShaped ? `Saved a file${to}` : fallback;
+  }
 }
 
 /**
@@ -224,9 +265,15 @@ export function synthesizeWorkReport(evidence: readonly EventRow[]): string | nu
   const lines: string[] = [];
   const seen = new Set<string>();
   for (const w of writes) {
-    const d = (w.data ?? {}) as { shapeKey?: string; toolName?: string; targets?: unknown };
+    const d = (w.data ?? {}) as {
+      shapeKey?: string; toolName?: string; targets?: unknown;
+      irreversible?: unknown; actionKey?: unknown;
+    };
     const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
-    const line = `• ${describeExternalWrite(d.shapeKey, d.toolName ?? '', targets)}`;
+    const line = `• ${describeExternalWrite(d.shapeKey, d.toolName ?? '', targets, {
+      irreversible: typeof d.irreversible === 'boolean' ? d.irreversible : undefined,
+      actionKey: typeof d.actionKey === 'string' ? d.actionKey : undefined,
+    })}`;
     if (seen.has(line)) continue;
     seen.add(line);
     lines.push(line);

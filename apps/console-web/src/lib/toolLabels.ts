@@ -39,24 +39,65 @@ export function salientArgDetail(argsRaw: unknown): string {
 }
 
 /** Humanize ONE recorded external write into a plain, short feed line —
- *  "Sent a message to paul@…", "Created a record", "Saved a file". Keyed off the
- *  write's shapeKey/slug (SEND / CREATE / UPDATE / …), never a specific tool name,
- *  so it covers email, chat, SMS, CRM, files. Mirrors the server's
- *  describeExternalWrite (src/runtime/harness/work-report.ts) so the live feed and
- *  the report-back message read identically. */
-export function describeExternalWrite(shapeKey: string | undefined, toolName: string, targets: string[]): string {
-  const key = (shapeKey || toolName || 'action').toUpperCase();
+ *  "Sent a message to paul@…", "Created a record", "Saved a file". Derived from
+ *  the action's verb CONSEQUENCE plus the write's recorded `irreversible` bit,
+ *  never an ordered slug-regex chain (the chain rendered OUTLOOK_UPDATE_EMAIL
+ *  and SLACK_DELETE_MESSAGE as "Sent a message" — live 2026-08). Mirrors the
+ *  server's describeExternalWrite (src/runtime/harness/work-report.ts) so the
+ *  live feed and the report-back message read identically; console-web cannot
+ *  import server code, so the parity test in
+ *  src/runtime/harness/work-report-effect-truth.test.ts pins the two copies
+ *  phrase-identical. A write recorded reversible may never render as delivery. */
+const CW_DELETE_VERBS = new Set(['DELETE', 'REMOVE', 'TRASH', 'DESTROY', 'ARCHIVE', 'UNREGISTER']);
+const CW_SEND_VERBS = new Set(['SEND', 'DISPATCH', 'POST', 'PUBLISH', 'BROADCAST', 'FORWARD', 'REPLY', 'DM', 'TWEET', 'CALL', 'DIAL', 'INVITE']);
+const CW_UPDATE_VERBS = new Set(['UPDATE', 'EDIT', 'PATCH', 'MODIFY', 'REPLACE', 'SET', 'RENAME', 'MOVE', 'APPEND', 'SAVE']);
+const CW_CREATE_VERBS = new Set(['CREATE', 'INSERT', 'ADD', 'NEW', 'DUPLICATE', 'COPY', 'UPLOAD', 'REGISTER']);
+
+function cwActionTokens(value: string): string[] {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toUpperCase()
+    .split(/[^A-Z0-9]+/)
+    .filter(Boolean);
+}
+
+export function describeExternalWrite(
+  shapeKey: string | undefined,
+  toolName: string,
+  targets: string[],
+  write?: { irreversible?: boolean; actionKey?: string },
+): string {
+  const key = shapeKey || write?.actionKey || toolName || 'action';
   const to = targets.length
     ? ` to ${targets.slice(0, 3).join(', ')}${targets.length > 3 ? ` (+${targets.length - 3} more)` : ''}`
     : '';
-  if (/DRAFT/.test(key) && !/SEND|PUBLISH/.test(key)) return `Created a draft${to}`;
-  if (/SEND|EMAIL|DELIVER|DISPATCH|DM\b|MESSAGE|SMS|TEXT/.test(key)) return `Sent a message${to}`;
-  if (/PUBLISH|POST|TWEET/.test(key)) return `Published a post${to}`;
-  if (/CREATE|ADD|INSERT|UPSERT/.test(key)) return `Created a record${to}`;
-  if (/UPDATE|PATCH|EDIT|MODIFY|SET_/.test(key)) return `Updated a record${to}`;
-  if (/DELETE|REMOVE|ARCHIVE|TRASH/.test(key)) return `Deleted a record${to}`;
-  if (/UPLOAD|SAVE|WRITE/.test(key)) return `Saved a file${to}`;
-  return `Ran ${key.toLowerCase().replace(/_/g, ' ')}${to}`;
+  const tokens = cwActionTokens(key);
+  const has = (token: string): boolean => tokens.includes(token);
+  const deliveryAllowed = write?.irreversible !== false;
+  const fileShaped = has('UPLOAD') || has('SAVE') || has('WRITE') || has('FILE');
+  const fallback = `Ran ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
+  const consequence = tokens.some((t) => CW_DELETE_VERBS.has(t)) ? 'delete'
+    : tokens.some((t) => CW_SEND_VERBS.has(t)) ? 'send'
+      : tokens.some((t) => CW_UPDATE_VERBS.has(t)) ? 'update'
+        : tokens.some((t) => CW_CREATE_VERBS.has(t)) ? 'create'
+          : 'other';
+
+  if ((has('DRAFT') || has('DRAFTS')) && !has('SEND') && !has('PUBLISH')) {
+    return consequence === 'update' ? `Updated a draft${to}` : `Created a draft${to}`;
+  }
+  switch (consequence) {
+    case 'delete':
+      return `Deleted a record${to}`;
+    case 'send':
+      if (!deliveryAllowed) return fallback;
+      return has('PUBLISH') || has('POST') || has('TWEET') ? `Published a post${to}` : `Sent a message${to}`;
+    case 'update':
+      return fileShaped ? `Saved a file${to}` : `Updated a record${to}`;
+    case 'create':
+      return fileShaped ? `Saved a file${to}` : `Created a record${to}`;
+    default:
+      return fileShaped ? `Saved a file${to}` : fallback;
+  }
 }
 
 /** Human label for a tool call: composio calls read as their inner slug
