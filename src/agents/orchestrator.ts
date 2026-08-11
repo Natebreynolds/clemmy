@@ -1415,7 +1415,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const key = `${model}\0${scopeKey}`;
     let pending = workerAgentCache.get(key);
     if (!pending) {
-      pending = buildWorkerAgent({ model, workerInput: input, mcpToolScope: scope });
+      // A worker dispatches under the PARENT's accepted source, so it must be
+      // built with that identity or it cannot know it is under contract and
+      // will assemble a surface the admission wall refuses.
+      pending = buildWorkerAgent({
+        model,
+        workerInput: input,
+        mcpToolScope: scope,
+        ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+        ...(Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+          ? { sourceUserSeq: options.sourceUserSeq }
+          : {}),
+      });
       workerAgentCache.set(key, pending);
     }
     try {

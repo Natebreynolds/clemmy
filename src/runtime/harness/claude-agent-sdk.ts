@@ -55,8 +55,7 @@ import {
   isClaudeLocalComposioSdkTool,
   recordClaudeLocalPermissionAdmission,
 } from './claude-local-tool-correlation.js';
-import { expectedTaskFor } from './resolution-ledger.js';
-import { actionExpectedWorkCarrierSelection } from './action-expected-work-boundary.js';
+import { actionExpectedWorkCarrierRequired } from './action-expected-work-boundary.js';
 import {
   SETTLED_READ_REPEAT_REPLAY_KIND,
   settledReadRepeatReplayDisposition,
@@ -281,16 +280,13 @@ export class ClaudeAgentSdkToolSurfaceError extends Error {
 export function claudeActionExpectedWorkRequired(
   options: Pick<ClaudeAgentSdkRunOptions, 'sessionId' | 'sourceUserSeq'>,
 ): boolean {
-  const sessionId = options.sessionId?.trim();
-  const sourceUserSeq = options.sourceUserSeq;
-  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return false;
-  const expected = expectedTaskFor(sessionId, sourceUserSeq as number);
   // Direct SDK worker/test routes without a persisted chat graph retain their
-  // historical surface. A known direct/retrieve graph is explicitly non-action.
-  if (expected.status !== 'ok' || expected.graph.classification.route !== 'act') return false;
-  return actionExpectedWorkCarrierSelection({
-    sessionId,
-    sourceUserSeq: sourceUserSeq as number,
+  // historical surface; a known direct/retrieve graph is explicitly non-action.
+  // The route guard lives in the shared boundary so no lane can answer this
+  // question differently from the lane beside it.
+  return actionExpectedWorkCarrierRequired({
+    sessionId: options.sessionId,
+    sourceUserSeq: options.sourceUserSeq,
   }) !== false;
 }
 

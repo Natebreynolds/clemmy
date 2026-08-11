@@ -4,6 +4,9 @@ import { createHash } from 'node:crypto';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { buildCallTool, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
+import { buildWorkCall } from '../tools/work-call.js';
+import { actionExpectedWorkCarrierRequired } from '../runtime/harness/action-expected-work-boundary.js';
+import { actionTopologyRoleFor } from '../tools/tool-registry.js';
 import { buildCompactToolCatalog } from './tool-catalog.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
@@ -176,10 +179,22 @@ export async function buildWorkerAgent(options: {
   model?: string;
   workerInput?: WorkerToolInput;
   sessionId?: string | null;
+  /** Parent accepted-source identity. A worker dispatches under it verbatim. */
+  sourceUserSeq?: number | null;
 } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const capabilityUniverseTools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
   let tools = [...capabilityUniverseTools];
+  // A worker inherits the parent's accepted task verbatim, so an activated
+  // action contract binds ITS business calls too. Delegation is control; the
+  // delegated work is not. Without asking, this lane handed the worker
+  // first-class business tools the admission wall then refused — a wall with
+  // no door (live 2026-08-11, count-only-drafts: five workers, five identical
+  // ExpectedWorkBindingRequiredError deaths, zero drafts).
+  const actionWork = actionExpectedWorkCarrierRequired({
+    sessionId: options.sessionId,
+    sourceUserSeq: options.sourceUserSeq,
+  }) !== false;
   const externalMcpScope = options.mcpToolScope !== undefined
     ? options.mcpToolScope
     : (options.workerInput
@@ -197,7 +212,36 @@ export async function buildWorkerAgent(options: {
     reason: 'the worker capability universe or binding revision is not sealed',
   });
   let workerCatalogBlock = '';
-  if (workerSlimToolsEnabled()) {
+  if (actionWork) {
+    // Exactly one generic business carrier, identical to the brain lanes:
+    // control/discovery stays first-class, every business capability is
+    // reachable only as an inner work_call target bound to the parent's frozen
+    // contract. Roles come from the registry, never from a name list here.
+    const universeNames = tools
+      .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+      .filter(Boolean);
+    const controlNames = new Set(
+      universeNames.filter((name) => actionTopologyRoleFor(name) === 'control'),
+    );
+    const businessNames = new Set(universeNames.filter((name) => !controlNames.has(name)));
+    tools = tools.filter((toolRef) =>
+      controlNames.has((toolRef as { name?: string }).name ?? ''));
+    tools.push(buildWorkCall({
+      reachableBuiltinNames: businessNames,
+      firstClassNames: controlNames,
+      mcpToolScope: externalMcpScope,
+      admitBuiltinAcquisition: (targetName) => admitBuiltinAcquisition(targetName),
+    }) as Tool<RuntimeContextValue>);
+    workerCatalogBlock = [
+      '',
+      '## Your item is part of an accepted action already under contract',
+      'The work you were delegated is one instance of the parent\'s frozen work contract, so it dispatches through `work_call` — direct business tools are deliberately absent, and `call_tool` is not a second carrier.',
+      'Bind the requirement and item the parent named in your job packet: work_call(requirement_id, universe_item_id, universe_selector, name, args_json), with proposal:null — the contract is already frozen, and re-proposing one is refused.',
+      'If the packet did not name your requirement/item, do NOT guess: a refusal returns the frozen plan, and its `plan` array lists the exact requirement ids, cardinality and remaining instances to bind against.',
+      'Call `tool_search(query)` when the inner tool name or schema is unknown.',
+      buildCompactToolCatalog({ allowedNames: businessNames }),
+    ].join('\n');
+  } else if (workerSlimToolsEnabled()) {
     const names = tools.map((t) => (t as { name?: string }).name ?? '').filter(Boolean);
     const surface = resolveToolSurface({
       surface: 'worker',
@@ -381,6 +425,7 @@ export async function runCrossProviderWorker(
     workerInput: input,
     mcpToolScope: effectiveMcpToolScope,
     sessionId,
+    ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
   });
   const guard = workerThrashGuardEnabled();
   // Base per-item turn budget — mirrors the orchestrator nested lane

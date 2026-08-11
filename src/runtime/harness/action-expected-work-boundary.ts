@@ -11,6 +11,7 @@ import {
   actionExpectedWorkState,
   activateActionExpectedWork,
 } from './expected-work-admission.js';
+import { expectedTaskFor } from './resolution-ledger.js';
 
 export interface ActionExpectedWorkIdentity {
   sessionId: string;
@@ -72,4 +73,32 @@ export function actionExpectedWorkCarrierSelection(
     };
   }
   throw activationBoundaryError(input, state.status, state.reason);
+}
+
+/**
+ * The one question every lane that can dispatch business work must ask.
+ *
+ * Identity may be absent (direct SDK, unit and test routes) and the persisted
+ * graph may be non-action; both keep a lane's historical surface. Only an exact
+ * accepted action turn binds the lane to its carrier.
+ *
+ * This exists because asking is not optional and the answer must not be
+ * re-derived per lane. The fan-out worker lane never asked, so it built a
+ * surface of first-class business tools that the admission wall then refused —
+ * five workers died on one item set with no door to walk through (live
+ * 2026-08-11, count-only-drafts).
+ */
+export function actionExpectedWorkCarrierRequired(input: {
+  sessionId?: string | null;
+  sourceUserSeq?: number | null;
+}): false | RequiredActionExpectedWork {
+  const sessionId = input.sessionId?.trim();
+  const sourceUserSeq = input.sourceUserSeq;
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return false;
+  const expected = expectedTaskFor(sessionId, sourceUserSeq as number);
+  if (expected.status !== 'ok' || expected.graph.classification.route !== 'act') return false;
+  return actionExpectedWorkCarrierSelection({
+    sessionId,
+    sourceUserSeq: sourceUserSeq as number,
+  });
 }
