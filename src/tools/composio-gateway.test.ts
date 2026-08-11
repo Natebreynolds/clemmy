@@ -72,6 +72,33 @@ function setAccounts(items: LoaderItem[]): void {
   __test__.setConnectedAccountsLoader(async () => items);
 }
 
+// Full accepted-source anchor: session + user input + persisted turn graph +
+// run attempt. Settlement engages whenever a REAL session is in scope and
+// then requires the complete identity (a half-anchored context throws
+// ToolAttemptSettlementAuthorityError instead of settling the refusal).
+const shadowMod = await import('../runtime/graph/turn-graph-shadow.js');
+const bracketsMod = await import('../runtime/harness/brackets.js');
+const eventlogMod = await import('../runtime/harness/eventlog.js');
+let anchorSerial = 0;
+function anchoredCtx(text: string) {
+  const session = eventlogMod.createSession({ id: `gateway-anchor-${++anchorSerial}`, kind: 'chat' });
+  const attempt = eventlogMod.beginRunAttempt(session.id, { runId: `gateway-anchor-run-${anchorSerial}` });
+  const source = eventlogMod.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text } });
+  shadowMod.recordTurnGraphShadow({
+    identity: { sessionId: session.id, turn: source.turn, sourceUserSeq: source.seq },
+  });
+  return {
+    sessionId: session.id,
+    turn: source.turn,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    counter: new bracketsMod.ToolCallsCounter(50),
+  };
+}
+async function withAnchoredTurn<T>(text: string, work: () => Promise<T>): Promise<T> {
+  return await bracketsMod.harnessRunContextStorage.run(anchoredCtx(text), work);
+}
+
 test('ambiguity → typed block with candidates, ZERO dispatch (reads included)', async () => {
   setAccounts([
     account('ca_work', 'outlook', 'work@site.example'),
@@ -80,7 +107,8 @@ test('ambiguity → typed block with candidates, ZERO dispatch (reads included)'
   // A READ (not a send): the gateway still blocks — reading the wrong mailbox
   // produces confidently-wrong answers. Returning (not throwing) proves the
   // client was never reached (no API key would have thrown).
-  const out = await resolveComposioDispatch('OUTLOOK_LIST_MESSAGES', {}, undefined, {});
+  const out = await withAnchoredTurn('list my outlook messages', () =>
+    resolveComposioDispatch('OUTLOOK_LIST_MESSAGES', {}, undefined, {}));
   assert.equal(out.ok, false);
   if (!out.ok) {
     assert.equal(out.reason, 'ambiguous-account');
@@ -89,7 +117,8 @@ test('ambiguity → typed block with candidates, ZERO dispatch (reads included)'
     assert.match(out.message, /connected_account_id/, 'ASK teaches the pin-and-retry path');
   }
   // Same through the one-shot wrapper (the Space/workflow path) — typed block, no throw.
-  const wrapped = await dispatchComposioTool('OUTLOOK_LIST_MESSAGES', {}, {});
+  const wrapped = await withAnchoredTurn('list my outlook messages', () =>
+    dispatchComposioTool('OUTLOOK_LIST_MESSAGES', {}, {}));
   assert.equal(wrapped.ok, false);
   if (!wrapped.ok) assert.equal(wrapped.reason, 'ambiguous-account');
 });
@@ -521,11 +550,11 @@ test('operator-authorized CLI default dispatches end-to-end with no false connec
   resetComposioClient();
   bustComposioDashboardCaches();
   try {
-    const out = await dispatchComposioTool(
+    const out = await withAnchoredTurn('create the proof record', () => dispatchComposioTool(
       'PROOF_CREATE_RECORD',
       { fields: { Name: 'End-to-end CLI proof' } },
       {},
-    );
+    ));
     assert.equal(out.ok, true, 'the gateway must reach the real CLI client path, not stop at resolver-only ok:true');
     if (out.ok) {
       assert.equal(out.connectionId, undefined, 'CLI execute has no account selector; never claim a routed SDK owner');
@@ -917,7 +946,8 @@ const stickyCtx = () => ({ sessionId: `sess-sticky-${Math.random().toString(36).
 test('worker compose-only boundary: mutations dispatch zero, reads work, and the parent certified context still commits', async () => {
   const previousApiKey = process.env.COMPOSIO_API_KEY;
   process.env.COMPOSIO_API_KEY = 'worker-compose-boundary-test-key';
-  const sessionId = createSession({ kind: 'chat' }).id;
+  const workerAnchor = anchoredCtx('compose the outlook draft for the worker boundary');
+  const sessionId = workerAnchor.sessionId;
   setAccounts([account('ca_worker_outlook', 'outlook', 'worker-owner@example.test')]);
   let providerDispatches = 0;
   __test__.setComposioClient({
@@ -932,8 +962,7 @@ test('worker compose-only boundary: mutations dispatch zero, reads work, and the
   });
   try {
     await harnessRunContextStorage.run({
-      sessionId,
-      counter: new ToolCallsCounter(50),
+      ...workerAnchor,
       workerScope: true,
     }, async () => {
       const blocked = await dispatchComposioTool('OUTLOOK_CREATE_DRAFT', {
@@ -959,7 +988,7 @@ test('worker compose-only boundary: mutations dispatch zero, reads work, and the
     });
 
     const parent = await harnessRunContextStorage.run({
-      sessionId,
+      ...workerAnchor,
       counter: new ToolCallsCounter(50),
       certifiedBatch: { batchId: 'parent-certified-batch', payloadHash: 'payload-hash' },
     }, () => dispatchComposioTool('OUTLOOK_CREATE_DRAFT', {
