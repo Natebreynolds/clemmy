@@ -99,6 +99,7 @@ import {
 } from './dispatch-lease.js';
 import {
   isTerminalToolName,
+  renderTerminalToolReply,
   terminalToolShouldHalt,
 } from './terminal-tool.js';
 import {
@@ -1541,30 +1542,6 @@ function isTerminalAfterTool(rawName: string | null | undefined): boolean {
   return isTerminalToolName(rawName);
 }
 
-function renderTerminalToolReply(rawName: string, input: unknown, output: string): string {
-  const bare = bareMcpToolName(rawName);
-  if (bare === 'dispatch_background_task') {
-    // Voice-first (owner feedback, 2026-07-24): the model authors its own
-    // handoff confirmation in the dispatch call (handoff_note rubric) — the
-    // generated line below is only the floor when it omitted one.
-    const note = (input as { handoff_note?: unknown } | null | undefined)?.handoff_note;
-    if (typeof note === 'string' && note.trim().length >= 12) return note.trim();
-    const match = output.match(/Dispatched "([^"]+)" to the background \(task ([^)]+)\)/i);
-    const inputObjective = (input as { objective?: unknown } | null | undefined)?.objective;
-    const title = match?.[1] || (typeof inputObjective === 'string' && inputObjective.trim() ? inputObjective.trim() : 'the task');
-    const taskId = match?.[2];
-    return `Started "${title}" in the background${taskId ? ` (${taskId})` : ''} — it reports back here when it finishes or gets stuck.`;
-  }
-  if (bare === 'ask_user_question') {
-    // Surface the QUESTION inline (from the tool input) so the turn ends on a clean
-    // clarifying question the user answers in their next message — the conversational
-    // beat. Render from the input, not the tool output (which is a check-in receipt),
-    // so the question shows even if the check-in record write hiccuped.
-    const q = (input as { question?: unknown } | null | undefined)?.question;
-    return typeof q === 'string' && q.trim() ? q.trim() : (output.trim() || 'I have a quick question before I proceed.');
-  }
-  return output.trim() || `${bare} completed.`;
-}
 
 function claudeSdkToolOutputLooksSuccessful(rawName: string | undefined, output: unknown): boolean {
   if (!toolOutputLooksSuccessful(output)) return false;

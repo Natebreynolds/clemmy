@@ -17,6 +17,7 @@ import { listEvents, type EventRow } from './eventlog.js';
 import { isToolSurfaceProbeTool } from './tool-evidence.js';
 import { isCanonicalTopLevelToolEvent, projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 import { scrubInternalNarration } from './scrub-internal-narration.js';
+import { parseControlReceiptFinalOutput } from './terminal-tool.js';
 import { looksLikeToolUnavailableSelfReport } from './tool-unavailable-text.js';
 // Type-only import — erased at compile time, so there is no runtime cycle
 // with loop.ts (which imports this module's values).
@@ -466,6 +467,20 @@ function parseDecisionText(text: string): OrchestratorDecisionShape | null {
 }
 
 export function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | null {
+  // A halting control receipt carries its machine-readable prefix so it can
+  // never re-enter prose parsing ("reports back when it finishes" reads as
+  // an announcement stall — live 2026-08-10, the 58-status-call loop). The
+  // receipt text IS the delivered answer; the turn is complete.
+  const controlReceipt = parseControlReceiptFinalOutput(value);
+  if (controlReceipt) {
+    return {
+      summary: controlReceipt,
+      reply: controlReceipt,
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    };
+  }
   const decision = typeof value === 'string'
     ? parseDecisionText(value)
     : value && typeof value === 'object'

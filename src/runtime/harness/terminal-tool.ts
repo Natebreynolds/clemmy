@@ -73,3 +73,54 @@ function controlReceiptFailed(output: string): boolean {
   if (/^\s*(?:\{\s*")?(?:Tool call refused by harness|\[provider-dispatch:not-started:)/i.test(head)) return true;
   return /"(?:ok|successful)"\s*:\s*false/i.test(head) || /"error"\s*:\s*"/i.test(head);
 }
+
+/**
+ * One user-facing reply per control receipt, shared by both lanes so a
+ * receipt reads identically wherever it settles. `input` may be null on
+ * lanes whose tool-result callback carries no input (Codex); every branch
+ * degrades to output-derived text.
+ */
+export function renderTerminalToolReply(rawName: string, input: unknown, output: string): string {
+  const bare = bareTerminalToolName(rawName);
+  if (bare === 'dispatch_background_task') {
+    // Voice-first (owner feedback, 2026-07-24): the model authors its own
+    // handoff confirmation in the dispatch call (handoff_note rubric) — the
+    // generated line below is only the floor when it omitted one.
+    const note = (input as { handoff_note?: unknown } | null | undefined)?.handoff_note;
+    if (typeof note === 'string' && note.trim().length >= 12) return note.trim();
+    const match = output.match(/Dispatched "([^"]+)" to the background \(task ([^)]+)\)/i);
+    const inputObjective = (input as { objective?: unknown } | null | undefined)?.objective;
+    const title = match?.[1] || (typeof inputObjective === 'string' && inputObjective.trim() ? inputObjective.trim() : 'the task');
+    const taskId = match?.[2];
+    return `Started "${title}" in the background${taskId ? ` (${taskId})` : ''} — it reports back here when it finishes or gets stuck.`;
+  }
+  if (bare === 'ask_user_question') {
+    // Surface the QUESTION inline (from the tool input) so the turn ends on a clean
+    // clarifying question the user answers in their next message — the conversational
+    // beat. Render from the input, not the tool output (which is a check-in receipt),
+    // so the question shows even if the check-in record write hiccuped.
+    const q = (input as { question?: unknown } | null | undefined)?.question;
+    return typeof q === 'string' && q.trim() ? q.trim() : (output.trim() || 'I have a quick question before I proceed.');
+  }
+  return output.trim() || `${bare} completed.`;
+}
+
+/**
+ * Machine-readable finalOutput contract for a HALTING control receipt on the
+ * loop lane. The single decision parser converts it deterministically into a
+ * completed decision — the receipt text must never re-enter prose parsing,
+ * where "reports back when it finishes" reads as an announcement stall (live
+ * 2026-08-10: 58 status calls / 3.36M tokens answering "How's it going?").
+ */
+export const CONTROL_RECEIPT_FINAL_OUTPUT_PREFIX = '[clementine:control-receipt:final]';
+
+export function formatControlReceiptFinalOutput(text: string): string {
+  return `${CONTROL_RECEIPT_FINAL_OUTPUT_PREFIX}\n${text}`;
+}
+
+export function parseControlReceiptFinalOutput(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  if (!value.startsWith(`${CONTROL_RECEIPT_FINAL_OUTPUT_PREFIX}\n`)) return null;
+  const text = value.slice(CONTROL_RECEIPT_FINAL_OUTPUT_PREFIX.length + 1).trim();
+  return text || null;
+}

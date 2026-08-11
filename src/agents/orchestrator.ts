@@ -87,6 +87,9 @@ import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import {
   bareTerminalToolName,
   formatAutoResolvedAskUserQuestionOutput,
+  formatControlReceiptFinalOutput,
+  isTerminalToolName,
+  renderTerminalToolReply,
   terminalToolShouldHalt,
 } from '../runtime/harness/terminal-tool.js';
 import { HarnessSession } from '../runtime/harness/session.js';
@@ -554,6 +557,26 @@ export function userChoiceToolUseBehavior(
     const output = stringifyToolOutput(result.output);
     if (!terminalToolShouldHalt(rawName, output)) continue;
     return { isFinalOutput: true as const, isInterrupted: undefined, finalOutput: output };
+  }
+  // A successful background-control receipt is itself the answer to the
+  // request that invoked it — end the provider turn here on this lane too
+  // (the Claude lane already does). The incident this closes ran on Codex:
+  // "How's it going?" produced a good status answer, then the harness kept
+  // re-invoking — 58 status calls, 95 model calls, 3.36M tokens, nothing
+  // delivered (live 2026-08-10). The machine-readable prefix keeps the
+  // receipt out of prose decision parsing.
+  for (const result of toolResults) {
+    if (result.type !== 'function_output') continue;
+    const rawName = result.tool.name ?? '';
+    if (!isTerminalToolName(rawName)) continue;
+    if (bareTerminalToolName(rawName) === 'ask_user_question') continue;
+    const output = stringifyToolOutput(result.output);
+    if (!terminalToolShouldHalt(rawName, output)) continue;
+    return {
+      isFinalOutput: true as const,
+      isInterrupted: undefined,
+      finalOutput: formatControlReceiptFinalOutput(renderTerminalToolReply(rawName, null, output)),
+    };
   }
   return { isFinalOutput: false as const, isInterrupted: undefined };
 }

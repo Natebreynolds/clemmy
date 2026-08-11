@@ -69,3 +69,41 @@ test('a successful durable control receipt settles the foreground request on eve
     'a pre-dispatch refusal must not settle the request',
   );
 });
+
+// Stage 8 (status fast path): the Codex lane consumes the same control
+// receipts the Claude lane already does — the 58-status-call incident WAS on
+// Codex (live 2026-08-10: "How's it going?" → good answer produced → harness
+// re-invoked 39 more model steps, 3.36M tokens, nothing delivered).
+test('a successful control receipt formats a machine-readable final output that parses to a completed decision', async () => {
+  const { formatControlReceiptFinalOutput, parseControlReceiptFinalOutput, renderTerminalToolReply } = await import('./terminal-tool.js');
+  const { toOrchestratorDecision } = await import('./loop.js');
+  const statusText = 'Task bg-123 is running: 7 of 12 records analyzed, none failed.';
+  const finalOutput = formatControlReceiptFinalOutput(renderTerminalToolReply('background_task_status', null, statusText));
+  assert.equal(parseControlReceiptFinalOutput(finalOutput), statusText);
+  const decision = toOrchestratorDecision(finalOutput);
+  assert.ok(decision, 'the receipt parses as a decision, never prose/stall parsing');
+  assert.equal(decision!.done, true);
+  assert.equal(decision!.nextAction, 'completed');
+  assert.equal(decision!.reply, statusText);
+});
+
+test('the orchestrator halt hook ends the turn on a successful background control receipt', async () => {
+  const { userChoiceToolUseBehavior } = await import('../../agents/orchestrator.js');
+  const halted = await userChoiceToolUseBehavior({}, [
+    {
+      type: 'function_output',
+      tool: { name: 'background_task_status' },
+      output: 'Task bg-123 is running: 7 of 12 records analyzed.',
+    },
+  ] as never);
+  assert.equal(halted.isFinalOutput, true, 'a successful status read settles the request');
+  assert.match(String((halted as { finalOutput?: unknown }).finalOutput ?? ''), /^\[clementine:control-receipt:final\]\n/);
+  const notHalted = await userChoiceToolUseBehavior({}, [
+    {
+      type: 'function_output',
+      tool: { name: 'background_task_status' },
+      output: '{"ok":false,"error":"task not found"}',
+    },
+  ] as never);
+  assert.equal(notHalted.isFinalOutput, false, 'a failed control read returns to the model loop');
+});
