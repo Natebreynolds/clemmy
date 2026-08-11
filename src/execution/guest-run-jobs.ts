@@ -46,6 +46,9 @@ export interface GuestRunJob {
    *  through the canonical outcome pipeline (same spine as background tasks),
    *  so the origin turn can END instead of babysitting a 20-minute run. */
   originSessionId?: string;
+  /** Exact accepted origin and physical attempt for cost attribution. */
+  originSourceUserSeq?: number;
+  originAttemptId?: string;
   /** Last narration event, for liveness (a run's health is whether it is
    *  still emitting events, not how long it has been running). */
   lastEventAt?: string;
@@ -189,6 +192,8 @@ export interface StartGuestRunInput {
   model?: string;
   timeoutMs?: number;
   sessionId?: string;
+  sourceUserSeq?: number;
+  attemptId?: string;
 }
 
 export function startGuestRun(input: StartGuestRunInput): GuestRunJob {
@@ -214,6 +219,8 @@ export function startGuestRun(input: StartGuestRunInput): GuestRunJob {
     changedFiles: [],
     startedAt: new Date().toISOString(),
     ...(input.sessionId ? { originSessionId: input.sessionId } : {}),
+    ...(input.sourceUserSeq !== undefined ? { originSourceUserSeq: input.sourceUserSeq } : {}),
+    ...(input.attemptId ? { originAttemptId: input.attemptId } : {}),
   };
   const abort = new AbortController();
   jobs.set(id, { job, abort });
@@ -227,6 +234,8 @@ export function startGuestRun(input: StartGuestRunInput): GuestRunJob {
     model: input.model,
     timeoutMs: input.timeoutMs,
     sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    attemptId: input.attemptId,
     signal: abort.signal,
     onEvent: (event) => {
       job.events.push(`${event.kind}: ${event.text.slice(0, 300)}`);

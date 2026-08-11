@@ -232,6 +232,87 @@ test('wrap(n): stream + internal stream:false rejection falls back to a real str
   assert.equal(((chunks[0].choices as AnyObj[])[0].message as AnyObj).content, 'streamed');
 });
 
+test('wrap: buffered non-streaming request exposes bounded transport ownership to the outer watchdog', async () => {
+  const { ToolCallsCounter, withHarnessRunContext } = await import('./brackets.js');
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const fake = makeFake([async () => {
+    await held;
+    return completionWith('finished');
+  }]);
+  const context = {
+    sessionId: 'byo-buffered-ownership',
+    counter: new ToolCallsCounter(4),
+  };
+
+  const pending = withHarnessRunContext(
+    context,
+    () => wrapCompletionsCreate(fake.fn)(structuredParams({ stream: true })),
+  );
+  await Promise.resolve();
+  const ownership = [...(context.bufferedProviderRequests ?? [])][0];
+  assert.equal(ownership?.kind, 'byo_non_streaming_completion');
+  assert.equal(ownership?.active, true, 'ownership is visible while the paid request is buffered');
+
+  release();
+  await pending;
+  assert.equal(ownership?.active, false, 'ownership ends when the provider request settles');
+  assert.equal(context.bufferedProviderRequests?.size, 0, 'settled ownership is removed from the active set');
+  assert.equal(typeof context.privateModelActivityAt, 'number', 'settlement bridges the synthetic-chunk scheduling gap');
+});
+
+test('wrap: concurrent buffered requests retain every active owner until each settles', async () => {
+  const { ToolCallsCounter, withHarnessRunContext } = await import('./brackets.js');
+  let releaseFirst!: () => void;
+  let releaseSecond!: () => void;
+  const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const secondHeld = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  let call = 0;
+  const original = async (): Promise<unknown> => {
+    const mine = call++;
+    await (mine === 0 ? firstHeld : secondHeld);
+    return completionWith(`finished-${mine}`);
+  };
+  const context = {
+    sessionId: 'byo-buffered-concurrent-ownership',
+    counter: new ToolCallsCounter(4),
+  };
+  const create = wrapCompletionsCreate(original);
+  const first = withHarnessRunContext(context, () => create(structuredParams({ stream: true })));
+  const second = withHarnessRunContext(context, () => create(structuredParams({ stream: true })));
+  await Promise.resolve();
+  assert.equal(context.bufferedProviderRequests?.size, 2, 'parallel branches cannot overwrite one another');
+
+  releaseSecond();
+  await second;
+  assert.equal(context.bufferedProviderRequests?.size, 1, 'the earlier paid request remains owned after its sibling settles');
+  assert.equal([...context.bufferedProviderRequests!][0]?.active, true);
+
+  releaseFirst();
+  await first;
+  assert.equal(context.bufferedProviderRequests?.size, 0);
+});
+
+test('wrap: cancellation never probes a second streaming request while the paid non-streaming request settles', async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  const original = async (_params: AnyObj, options?: unknown): Promise<unknown> => {
+    calls += 1;
+    const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+    await new Promise<never>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+  };
+  const pending = wrapCompletionsCreate(original)(
+    structuredParams({ stream: true }),
+    { signal: controller.signal },
+  );
+  await Promise.resolve();
+  controller.abort();
+  await assert.rejects(pending, /aborted/);
+  assert.equal(calls, 1, 'abort does not fall back into a second paid wire request');
+});
+
 test('wrap(o): re-ask fires exactly once — junk then clean JSON succeeds', async () => {
   const fake = makeFake([() => completionWith('garbage, no json'), () => completionWith('{"ok": 1}')]);
   const create = wrapCompletionsCreate(fake.fn);
@@ -387,6 +468,108 @@ test('repairToolCallArguments: valid or empty args are left byte-identical', () 
   const empty = completionWith('', [{ id: 't1', type: 'function', function: { name: 'f', arguments: '' } }]);
   assert.equal(repairToolCallArguments(empty), false, 'empty (no-arg call) untouched');
   assert.equal(firstToolArgs(empty), '');
+});
+
+const strictComposioCarrierTool = [{
+  type: 'function',
+  function: {
+    name: 'composio_execute_tool',
+    parameters: {
+      type: 'object',
+      properties: {
+        tool_slug: { type: 'string' },
+        arguments: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+        connected_account_id: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+      },
+      required: ['tool_slug', 'arguments', 'connected_account_id'],
+    },
+  },
+}];
+
+test('repairToolCallArguments: omitted strict-nullable carrier fields become JSON null before SDK validation', () => {
+  const c = completionWith('', [{
+    id: 't1',
+    type: 'function',
+    function: {
+      name: 'composio_execute_tool',
+      arguments: '{"tool_slug":"PROOF_LIST_TASKS","arguments":"{}"}',
+    },
+  }]);
+  assert.equal(repairToolCallArguments(c, strictComposioCarrierTool), true);
+  assert.deepEqual(JSON.parse(firstToolArgs(c) as string), {
+    tool_slug: 'PROOF_LIST_TASKS',
+    arguments: '{}',
+    connected_account_id: null,
+  });
+});
+
+test('repairToolCallArguments: explicit selectors and real missing required values are never rewritten', () => {
+  const explicit = completionWith('', [{
+    id: 't1',
+    type: 'function',
+    function: {
+      name: 'composio_execute_tool',
+      arguments: '{"tool_slug":"PROOF_LIST_TASKS","arguments":"{}","connected_account_id":"ca_exact"}',
+    },
+  }]);
+  assert.equal(repairToolCallArguments(explicit, strictComposioCarrierTool), false);
+  assert.equal(
+    firstToolArgs(explicit),
+    '{"tool_slug":"PROOF_LIST_TASKS","arguments":"{}","connected_account_id":"ca_exact"}',
+  );
+
+  const missingSlug = completionWith('', [{
+    id: 't2',
+    type: 'function',
+    function: { name: 'composio_execute_tool', arguments: '{"arguments":"{}"}' },
+  }]);
+  assert.equal(repairToolCallArguments(missingSlug, strictComposioCarrierTool), true);
+  assert.deepEqual(JSON.parse(firstToolArgs(missingSlug) as string), {
+    arguments: '{}',
+    connected_account_id: null,
+  }, 'nullable transport omission is repaired, but the required slug is not invented');
+});
+
+test('wrap: compatible-provider tool calls materialize strict nullable omissions', async () => {
+  const fake = makeFake([() => completionWith('', [{
+    id: 't1',
+    type: 'function',
+    function: {
+      name: 'composio_execute_tool',
+      arguments: '{"tool_slug":"PROOF_LIST_TASKS","arguments":"{}"}',
+    },
+  }])]);
+  const res = (await wrapCompletionsCreate(fake.fn)(structuredParams({
+    tools: strictComposioCarrierTool,
+  }))) as AnyObj;
+  assert.deepEqual(JSON.parse(firstToolArgs(res) as string), {
+    tool_slug: 'PROOF_LIST_TASKS',
+    arguments: '{}',
+    connected_account_id: null,
+  });
+});
+
+test('wrap(stream): compatible-provider tool calls materialize strict nullable omissions', async () => {
+  const fake = makeFake([() => completionWith('', [{
+    id: 't1',
+    type: 'function',
+    function: {
+      name: 'composio_execute_tool',
+      arguments: '{"tool_slug":"PROOF_LIST_TASKS","arguments":"{}"}',
+    },
+  }])]);
+  const stream = await wrapCompletionsCreate(fake.fn)(structuredParams({
+    stream: true,
+    tools: strictComposioCarrierTool,
+  }));
+  const chunks = await collect(stream);
+  const delta = (chunks[0].choices as AnyObj[])[0].delta as AnyObj;
+  const toolCalls = delta.tool_calls as AnyObj[];
+  assert.deepEqual(JSON.parse(((toolCalls[0].function as AnyObj).arguments as string)), {
+    tool_slug: 'PROOF_LIST_TASKS',
+    arguments: '{}',
+    connected_account_id: null,
+  });
 });
 
 test('wrap: a tool-call turn with malformed args is repaired (non-stream)', async () => {

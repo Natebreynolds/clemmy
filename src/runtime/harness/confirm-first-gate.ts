@@ -100,8 +100,10 @@ export function decideInstructionReview(opts: {
 }
 
 export function isConfirmFirstEnabled(): boolean {
-  const raw = (getRuntimeEnv('CLEMMY_CONFIRM_FIRST', 'on') ?? 'on').toLowerCase();
-  return raw === 'on' || raw === 'strict' || raw === 'true' || raw === '1';
+  const raw = (getRuntimeEnv('CLEMMY_CONFIRM_FIRST', 'on') ?? 'on').trim().toLowerCase();
+  // Safety flags fail closed: only an explicit false spelling is an escape
+  // hatch. Unknown/typo values retain confirm-first protection.
+  return !['off', 'false', '0', 'no'].includes(raw);
 }
 
 /**

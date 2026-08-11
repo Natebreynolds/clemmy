@@ -35,14 +35,20 @@ const {
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
-function writeAuthoritativeOutput(input: Parameters<typeof writeToolOutput>[0]): void {
+function writeAuthoritativeOutput(
+  input: Parameters<typeof writeToolOutput>[0],
+  sourceUserSeq?: number,
+): void {
   const effect = 'read';
   const called = appendEvent({
     sessionId: input.sessionId,
     turn: 1,
     role: 'tool',
     type: 'tool_called',
-    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect },
+    data: {
+      tool: input.tool ?? 'unknown_tool', callId: input.callId, effect,
+      ...(sourceUserSeq ? { sourceUserSeq } : {}),
+    },
   });
   writeToolOutput({ ...input, invocationNonce: input.invocationNonce ?? `nonce-${input.callId}` });
   appendEvent({
@@ -51,7 +57,11 @@ function writeAuthoritativeOutput(input: Parameters<typeof writeToolOutput>[0]):
     role: 'tool',
     type: 'tool_returned',
     parentEventId: called.id,
-    data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect, result: 'stored separately' },
+    data: {
+      tool: input.tool ?? 'unknown_tool', callId: input.callId, effect,
+      result: 'stored separately',
+      ...(sourceUserSeq ? { sourceUserSeq } : {}),
+    },
   });
 }
 
@@ -71,6 +81,14 @@ test('extractNumericClaims: ignores years, versions, ordinals, bare small ints, 
     + 'Site ID 81b831b3-e109-420e-97e5-822a85e87fed.',
   );
   assert.equal(claims.length, 0, 'no load-bearing figures — all are noise');
+});
+
+test('extractNumericClaims: ignores numbers embedded in hyphenated identifiers', () => {
+  const claims = extractNumericClaims(
+    'Cedar-17 is current; Cedar-12 is retired. Ticket INC-420 replaced 421-beta, while 17 customers remain.',
+  );
+  assert.deepEqual(claims.map((claim) => claim.raw), ['17']);
+  assert.equal(claims[0]?.context.includes('customers'), true);
 });
 
 test('extractNumericClaims: dedups identical (value,unit) and caps', () => {
@@ -163,6 +181,96 @@ test('evaluateOutputGrounding: contradiction BOUNCES, escalates on repeat; no ju
     const allowed = await evaluateOutputGrounding(sess.id, 'Total ad spend across campaigns was $11,000.', { kind: 'chat' });
     assert.equal(allowed.action, 'allow');
     assert.equal(judged, false, 'all figures verified deterministically → judge never consulted');
+  } finally {
+    _setOutputGroundingJudgeForTests(null);
+  }
+});
+
+test('evaluateOutputGrounding: exact accepted input and arithmetic ground a natural chat reply without old-session evidence', async () => {
+  resetEventLog();
+  _resetOutputGroundingStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  const oldSource = appendEvent({
+    sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Pull the old spend report.' },
+  });
+  writeAuthoritativeOutput({
+    sessionId: sess.id,
+    callId: 'old-spend',
+    tool: 'dataforseo',
+    output: 'Current spend was $11,000.',
+  }, oldSource.seq);
+  const source = appendEvent({
+    sessionId: sess.id, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'No—leave that report alone. Instead, what is 15 × 9?' },
+  });
+  let judgeCalls = 0;
+  _setOutputGroundingJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { verdict: 'contradicted', offending: [], reason: 'should not run' };
+  });
+  try {
+    const result = await evaluateOutputGrounding(
+      sess.id,
+      '15 × 9 is 135.',
+      {
+        kind: 'chat',
+        sourceUserSeq: source.seq,
+        acceptedUserInput: 'No—leave that report alone. Instead, what is 15 × 9?',
+      },
+    );
+    assert.equal(result.action, 'allow');
+    assert.equal(judgeCalls, 0, 'exact arithmetic clears before a judge');
+    assert.ok(result.sourceCallIds.includes(`user:source:${source.seq}`));
+    assert.equal(result.sourceCallIds.includes('old-spend'), false, 'prior source cannot enter evidence');
+  } finally {
+    _setOutputGroundingJudgeForTests(null);
+  }
+});
+
+test('evaluateOutputGrounding: source-scoped current read can contradict while unrelated prior reads cannot', async () => {
+  resetEventLog();
+  _resetOutputGroundingStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  const oldSource = appendEvent({
+    sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Old audit.' },
+  });
+  writeAuthoritativeOutput({
+    sessionId: sess.id, callId: 'old-figure', tool: 'dataforseo', output: 'Spend $24.5K.',
+  }, oldSource.seq);
+  const currentSource = appendEvent({
+    sessionId: sess.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Is current campaign spend $24.5K?' },
+  });
+  writeAuthoritativeOutput({
+    sessionId: sess.id, callId: 'current-figure', tool: 'dataforseo', output: 'Campaign spend total $11,000.',
+  }, currentSource.seq);
+  _setOutputGroundingJudgeForTests(async (_claims, sources) => {
+    assert.ok(sources.some((sourceRow) => sourceRow.callId === 'current-figure'));
+    assert.equal(sources.some((sourceRow) => sourceRow.callId === 'old-figure'), false);
+    assert.equal(
+      sources.some((sourceRow) => sourceRow.callId === `user:source:${currentSource.seq}`),
+      false,
+      'a numeric user premise is conversational context, not factual authority',
+    );
+    return {
+      verdict: 'contradicted',
+      offending: [{ figure: '$24.5K', kind: 'contradicted', note: 'current source says $11,000' }],
+      reason: 'Current campaign source says $11,000.',
+    };
+  });
+  try {
+    const result = await evaluateOutputGrounding(
+      sess.id,
+      'Current campaign spend is $24.5K.',
+      {
+        kind: 'chat',
+        sourceUserSeq: currentSource.seq,
+        acceptedUserInput: 'Is current campaign spend $24.5K?',
+      },
+    );
+    assert.equal(result.action, 'bounce');
+    assert.ok(result.sourceCallIds.includes('current-figure'));
+    assert.equal(result.sourceCallIds.includes('old-figure'), false);
   } finally {
     _setOutputGroundingJudgeForTests(null);
   }

@@ -2158,6 +2158,66 @@ export interface RestoreResult {
 }
 
 /**
+ * Hard deletes are the one memory operation that cannot tolerate SQLite's
+ * per-connection foreign-key default. A caller (or an interrupted table-rebuild
+ * migration) can leave a cached handle with enforcement disabled; a plain
+ * DELETE would then strand evidence, validity, policy, and graph rows.
+ *
+ * PRAGMA foreign_keys is a no-op while a transaction is active, so fail before
+ * making any change when enforcement cannot be restored. Callers that already
+ * own a transaction are supported as long as they entered it with FKs enabled.
+ */
+export function ensureMemoryForeignKeysEnabled(db: Database.Database): void {
+  const enabled = () => Number(db.pragma('foreign_keys', { simple: true }) ?? 0) === 1;
+  if (!enabled()) db.pragma('foreign_keys = ON');
+  if (!enabled()) {
+    throw new Error(
+      'Memory hard delete refused: SQLite foreign-key enforcement is disabled. '
+      + 'Enable PRAGMA foreign_keys before opening the transaction.',
+    );
+  }
+}
+
+/**
+ * Physically remove facts without leaving graph dependents behind.
+ *
+ * All child-table cleanup is delegated to the schema's declared CASCADE / SET
+ * NULL actions. The sole NO ACTION reference is the fact-to-fact supersession
+ * pointer, which is detached explicitly in the same transaction. Keeping this
+ * primitive in db.ts lets manual forget, retention purge, and Workspace privacy
+ * purge share exactly the same deletion contract.
+ */
+export function hardDeleteConsolidatedFacts(
+  db: Database.Database,
+  factIds: readonly number[],
+): number {
+  const ids = [...new Set(factIds.filter((id) => Number.isSafeInteger(id) && id > 0))];
+  if (ids.length === 0) return 0;
+  ensureMemoryForeignKeysEnabled(db);
+
+  const remove = (): number => {
+    let deleted = 0;
+    // Stay well below SQLite's host-parameter limit while preserving one outer
+    // transaction for arbitrarily large retention purges.
+    for (let offset = 0; offset < ids.length; offset += 400) {
+      const chunk = ids.slice(offset, offset + 400);
+      const placeholders = chunk.map(() => '?').join(',');
+      db.prepare(`
+        UPDATE consolidated_facts
+        SET superseded_by_fact_id = NULL
+        WHERE superseded_by_fact_id IN (${placeholders})
+      `).run(...chunk);
+      deleted += Number(db.prepare(
+        `DELETE FROM consolidated_facts WHERE id IN (${placeholders})`,
+      ).run(...chunk).changes ?? 0);
+    }
+    return deleted;
+  };
+
+  return db.inTransaction ? remove() : db.transaction(remove)();
+}
+
+/**
  * WS6 — restore the memory DB from a {@link backupMemoryDb} snapshot. The
  * nightly backup wrote snapshots but NOTHING read them — recovery was a manual,
  * undocumented file copy. This closes that DR gap.
@@ -2216,11 +2276,14 @@ export function purgeSoftDeletedFacts(opts: { minAgeDays?: number } = {}): numbe
   const minAgeDays = Math.max(30, opts.minAgeDays ?? 180);
   try {
     const db = openMemoryDb();
+    ensureMemoryForeignKeysEnabled(db);
     const cutoff = new Date(Date.now() - minAgeDays * 24 * 60 * 60 * 1000).toISOString();
-    const info = db.prepare(
-      'DELETE FROM consolidated_facts WHERE active = 0 AND pinned = 0 AND updated_at < ?',
-    ).run(cutoff);
-    return Number(info.changes ?? 0);
+    return db.transaction(() => {
+      const ids = db.prepare(
+        'SELECT id FROM consolidated_facts WHERE active = 0 AND pinned = 0 AND updated_at < ?',
+      ).all(cutoff) as Array<{ id: number }>;
+      return hardDeleteConsolidatedFacts(db, ids.map((row) => row.id));
+    })();
   } catch {
     return 0;
   }

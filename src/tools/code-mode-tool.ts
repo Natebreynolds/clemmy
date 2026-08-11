@@ -35,6 +35,11 @@ import { deriveCodeModeSets } from './tool-registry.js';
 import { runCodeModeProgram, cleanCodeModeStderr, type CodeModeResult } from './code-mode-sandbox.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope, stripMcpToolCarrier } from '../runtime/mcp-tool-authority.js';
+import {
+  admitDiscoveryBoundary,
+  settleDiscoveryBoundary,
+} from '../runtime/harness/discovery-boundary.js';
+import { toolOutputLooksSuccessful } from '../runtime/harness/tool-evidence.js';
 // NB: getCoreTools is reached via DYNAMIC import in realToolsByName() — a static
 // import would form a registry ↔ code-mode-tool cycle (registry exposes
 // buildCodeModeTool). The dynamic import resolves at first dispatch, by when the
@@ -471,6 +476,46 @@ async function dispatchCodeModeWorker(args: unknown, sessionId: string, counter?
   }
 }
 
+/**
+ * The callable schema for an authorized tool the advertised list left out.
+ *
+ * `externalMcpToolList()` is the CAPPED surface — asking it about a tool the
+ * budget dropped returns "not in the connected set", which is a statement about
+ * this turn's prompt, not about the user's account. Describing a tool the model
+ * has already named is the cheapest possible recovery from a wrong cap, so it
+ * resolves against the tool's own server instead. Ambient authority still
+ * narrows the lookup, so this cannot reach outside the turn's boundary.
+ */
+async function authorizedMcpToolSchema(
+  toolName: string,
+): Promise<{ name: string; description?: unknown; inputSchema?: unknown } | undefined> {
+  const serverSlug = toolName.replace(/^mcp__/i, '').split('__')[0]?.trim();
+  if (!serverSlug) return undefined;
+  if (externalMcpToolListForTest) {
+    // The injected catalog is the UNCAPPED authorized set; the cap is applied
+    // by the advertised-list path, which is precisely what this lookup skips.
+    return (await externalMcpToolListForTest()).find((tool) => tool.name === toolName) as never;
+  }
+  try {
+    const { getOrCreateExternalMcpServers } = await import('../runtime/mcp-servers.js');
+    const scope = harnessRunContextStorage.getStore()?.mcpToolScope;
+    // An exact lease for the one tool being described. The old arbitrary
+    // 1,000-tool cap was both a truncation that could hide the answer and a
+    // wider surface than the question needed: describing one tool is an exact
+    // request, so it asks exactly.
+    const shim = getOrCreateExternalMcpServers({
+      reason: `code-mode schema lookup for ${toolName}`,
+      authority: 'exact',
+      allowedServerSlugs: [serverSlug],
+      allowedToolNames: [toolName],
+    });
+    const tools = await shim.listTools() as Array<{ name: string }>;
+    return tools.find((tool) => tool.name === toolName) as never;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function describeCodeModeTool(name: unknown): Promise<unknown> {
   const toolName = typeof name === 'string' ? name : String((name as { tool?: unknown; name?: unknown })?.tool ?? (name as { name?: unknown })?.name ?? '');
   if (!toolName) return { error: 'describe: pass a tool name string, e.g. clem.describe("list_files")' };
@@ -481,7 +526,8 @@ export async function describeCodeModeTool(name: unknown): Promise<unknown> {
     // Return the REAL schema from the shim's listTools so the model stops
     // guessing MCP arg shapes (the {directory}-vs-{path} bug class code mode is
     // meant to batch through). Falls back to the generic note if unavailable.
-    const t = (await externalMcpToolList()).find((x) => x.name === toolName);
+    const t = (await externalMcpToolList()).find((x) => x.name === toolName)
+      ?? (allowed ? await authorizedMcpToolSchema(toolName) : undefined);
     if (t) {
       return {
         name: toolName,
@@ -508,9 +554,40 @@ export async function describeCodeModeTool(name: unknown): Promise<unknown> {
 }
 
 export async function dispatchCodeModeTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter): Promise<unknown> {
-  // Host-answered helpers — never tool dispatches, never gated, never counted.
-  if (method === 'describe') return describeCodeModeTool(args);
-  if (method === 'listTools') return listCodeModeTools();
+  // Host-answered helpers remain free of the ordinary tool counter, but they
+  // are still physical discovery/schema reads and therefore share the exact
+  // accepted task's durable discovery budget. One call id is minted per helper
+  // invocation and reused for admission + settlement.
+  if (method === 'describe' || method === 'listTools') {
+    // `describe` rejects a missing/non-string name entirely in local code. Do
+    // that zero-I/O validation before minting the one-shot schema-refresh
+    // claim; a corrected call must still receive the task's real allowance.
+    if (method === 'describe' && (typeof args !== 'string' || !args.trim())) {
+      return describeCodeModeTool(args);
+    }
+    const callId = `codemode-discovery-${randomUUID()}`;
+    const parent = harnessRunContextStorage.getStore();
+    const sourceUserSeq = parent?.sessionId === sessionId ? parent.sourceUserSeq : undefined;
+    const lease = admitDiscoveryBoundary({
+      sessionId,
+      sourceUserSeq,
+      turn: parent?.turn,
+      attemptId: parent?.runAttemptId,
+      toolName: method === 'describe' ? 'clem.describe' : 'clem.listTools',
+      input: args,
+      callId,
+    });
+    try {
+      const result = method === 'describe'
+        ? await describeCodeModeTool(args)
+        : await listCodeModeTools();
+      settleDiscoveryBoundary(lease, 'succeeded');
+      return result;
+    } catch (error) {
+      settleDiscoveryBoundary(lease, 'failed', 'code_mode_helper_error');
+      throw error;
+    }
+  }
   if (method === 'run_worker') return dispatchCodeModeWorker(args, sessionId, counter);
   if (!isCodeModeToolAllowed(method)) {
     const why = WRITE_TOOLS.has(method) ? 'writes are disabled (set CLEMMY_CODE_MODE_WRITES=on)' : 'not in the code-mode allowlist';
@@ -568,7 +645,8 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
       ? await dispatchCodeModeMcpTool(method, args, sessionId, counter)
       : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter);
     const normalized = normalizeCodeModeToolResult(method, out, { sessionId, callId });
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...currentEventAttribution(), tool: method, callId, ok: true, codeMode: true, preview: (typeof normalized === 'string' ? normalized : JSON.stringify(normalized ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
+    const ok = toolOutputLooksSuccessful(normalized);
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...currentEventAttribution(), tool: method, callId, ok, codeMode: true, preview: (typeof normalized === 'string' ? normalized : JSON.stringify(normalized ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     return normalized;
   } catch (err) {
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...currentEventAttribution(), tool: method, callId, ok: false, codeMode: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
@@ -583,6 +661,7 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
   | 'sourceUserSeq'
   | 'behaviorScopeId'
   | 'guardrailScopeId'
+  | 'workerScope'
   | 'recallBudget'
   | 'turnRecallRunIds'
   | 'mcpToolScope'
@@ -598,6 +677,7 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
     ...(parent.sourceUserSeq ? { sourceUserSeq: parent.sourceUserSeq } : {}),
     ...(parent.behaviorScopeId ? { behaviorScopeId: parent.behaviorScopeId } : {}),
     ...(parent.guardrailScopeId ? { guardrailScopeId: parent.guardrailScopeId } : {}),
+    ...(parent.workerScope === true ? { workerScope: true } : {}),
     ...(parent.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
     ...(parent.dispatchLease ? { dispatchLease: parent.dispatchLease } : {}),
     ...(parent.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
@@ -737,6 +817,7 @@ async function dispatchCodeModeMcpTool(
       ? getOrCreateExternalMcpServerForTool(executableMethod)
       : getOrCreateExternalMcpServers(scope ?? {
           reason: 'explicit no-external-tools scope',
+          authority: 'none',
           allowedServerSlugs: [],
           maxTools: 0,
         })) as unknown as ExternalMcpShim;
@@ -781,7 +862,14 @@ export async function dispatchBatchItemTool(
   telemetry?: { accounting?: 'transport_mirror'; canonicalCallId?: string },
   mcpToolScopeOverride?: McpToolScope | null,
 ): Promise<unknown> {
-  const callId = `batch-${randomUUID()}`;
+  // `call_tool` is a transport mirror of the model's existing invocation, so
+  // its inner bracket must carry the same logical id.  A real batch item has no
+  // canonical parent id and therefore receives a fresh child call as before.
+  const callId = telemetry?.accounting === 'transport_mirror'
+    && typeof telemetry.canonicalCallId === 'string'
+    && telemetry.canonicalCallId.trim().length > 0
+    ? telemetry.canonicalCallId
+    : `batch-${randomUUID()}`;
   const telemetryData = {
     ...currentEventAttribution(),
     ...(telemetry?.accounting ? { accounting: telemetry.accounting } : {}),
@@ -792,7 +880,8 @@ export async function dispatchBatchItemTool(
     const out = isMcpNamespacedTool(method)
       ? await dispatchCodeModeMcpTool(method, args, sessionId, counter, certifiedBatch, true, mcpToolScopeOverride)
       : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter, certifiedBatch, true);
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, batchMode: true, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
+    const ok = toolOutputLooksSuccessful(out);
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok, batchMode: true, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;
     try { return JSON.parse(out); } catch { return out; }
   } catch (err) {
@@ -867,7 +956,7 @@ export function codeModeDescription(): string {
       ? 'Writes ARE allowed and pass the SAME approval/grounding/destination gates as a normal tool call — a blocked write throws inside your program (catch it or let it surface).'
       : 'Local writes are off, but MCP reads work; a destructive MCP tool is still blocked by its approval gate.',
     'Example: `const [a,b] = await Promise.all([clem["dataforseo__serp_organic_live_advanced"]({...}), clem["dataforseo__serp_organic_live_advanced"]({...})]); return { aTop: a.items?.[0], bTop: b.items?.[0] };`',
-    'Helpers (free — host-answered, not tool calls): `await clem.listTools()` lists the connected external MCP tools (names + descriptions) so you know what is callable; `await clem.describe("tool_name")` returns a tool\'s REAL arg schema — including external MCP tools — so check it before guessing arg shapes; `await clem.progress("34/60 fetched")` narrates status to the user.',
+    'Helpers (host-answered and not ordinary tool-counter calls): `await clem.listTools()` spends this accepted task\'s one broad-discovery slot to list connected external MCP tools; `await clem.describe("tool_name")` spends its one exact-schema-refresh slot and returns the REAL arg schema — including external MCP tools. Reuse those results instead of calling either helper again. `await clem.progress("34/60 fetched")` narrates status to the user.',
     'FAN-OUT: `await clem.run_worker({ objective, item, resolvedTools, context, instructions, expectedOutput, intent })` runs ONE isolated reasoning sub-agent and returns `{ ok, text }` — use it to fetch/aggregate, then fan reasoning out over the interesting subset (Promise.all a few for parallelism). Bounded: at most 4 per program, and a worker cannot itself call run_worker (no worker-of-worker). For a large uniform per-item batch, prefer run_batch.',
     'Sandboxed: no network, no filesystem, no other modules — only `clem` calls reach Clementine. Tool-call budget applies; a program is killed after ~20s with NO tool activity (an actively-fetching program can run to a ~3-minute ceiling). If it is killed mid-run you receive the completed calls\' results as PARTIAL RESULTS — salvage them, only redo what is missing.',
     'HARD LIMIT: this is for READ-ONLY aggregation. NEVER loop irreversible external SENDS/writes (email send, publish) inside it — a batch of gated sends cannot finish inside the program ceiling, so it dies mid-batch and loses track of what was sent. For ANY batch of sends/writes use `run_batch` instead (it certifies once, then runs a deterministic per-item loop with its own budget and an honest ledger). An irreversible send attempted here is refused.',

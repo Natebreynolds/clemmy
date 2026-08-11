@@ -79,8 +79,17 @@ async function startAction(
     );
   }
   const { startGuestRun } = await import('../execution/guest-run-jobs.js');
-  const sessionId = harnessRunContextStorage.getStore()?.sessionId;
-  const job = startGuestRun({ harness: chosen, project, prompt, model, sessionId });
+  const context = harnessRunContextStorage.getStore();
+  const sessionId = context?.sessionId;
+  const job = startGuestRun({
+    harness: chosen,
+    project,
+    prompt,
+    model,
+    sessionId,
+    sourceUserSeq: context?.sourceUserSeq,
+    attemptId: context?.runAttemptId,
+  });
   return textResult(
     `Started ${job.harness} in ${job.projectName} (${job.projectPath}) — runId ${job.id}, running in the background.\n`
     + `Prompt: ${job.prompt}\n`

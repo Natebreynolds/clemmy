@@ -346,14 +346,47 @@ export function buildFanoutRecoveryMessage(opts: {
   // Refusal-count escalation (derived from the tracked set — zero new state):
   // after 2+ ignored refusals, a harder stop for families that ride through one.
   const refusals = distinct - fanoutBlockAt;
+  // ESCALATION OVER BLOCKING. A refusal repeated identically is not a stronger
+  // refusal, it is a deadlock — live 2026-08-09 issued the same one for six
+  // minutes while the model kept trying and the user watched nothing happen.
+  // The second time round, stop instructing and hand the decision back to the
+  // person: they can say "try another way" or "just keep going" in one line,
+  // and either answer unblocks work that no amount of restating can.
+  //
+  // A RUBRIC, not a script (the voiceMessage contract): what must be true —
+  // name what already succeeded, name what is blocked, offer the alternative,
+  // ask. The words are hers.
   const escalate = refusals >= 2
-    ? `You have ALREADY been refused ${refusals}× for this — discrete ${label} reads will NOT resume this turn. Write the run_tool_program NOW or tell the user you are blocked. `
+    ? `You have already been refused ${refusals}× for this, so STOP retrying and CHECK IN WITH THE USER instead. `
+      + `In your own words: say which items you already completed, say plainly that the remaining ones are blocked this way, `
+      + `offer to try a different route (a batch program, a list-and-match, or whatever fits), and ask whether to continue. `
+      + `Do not restate this instruction and do not mention harnesses or guardrails — just ask them. `
+    : '';
+  const header =
+    `[harness fan-out check — REFUSED] ${escalate}`
+    + `You have read ${label} one-at-a-time ${distinct} times. STOP — every further one-at-a-time ${label} call is refused for the rest of this turn; this is NOT this item failing, the next one is refused identically. `;
+  // NO PHANTOM MANDATES: when no batching route is proven available this turn,
+  // the refusal keeps the behavioral constraint and prescribes nothing — the
+  // model batches by whatever route it actually has, or checks in. Naming a
+  // tool the turn cannot learn or call produced schema brute-forcing live.
+  if (mandate === null) {
+    return (
+      header
+      + `Cover EVERY remaining item in ONE batched call by a route available to you (a provider batch endpoint that takes an array, or one aggregated request) — do not continue item-by-item. `
+      + `If no batched route exists, stop and tell the user what is done and what remains.`
+    );
+  }
+  // The refusal carries the answer: when the mandate arrived with a real
+  // schema, render what the tool requires and (when banked) a payload that
+  // already worked, so following the instruction needs zero discovery.
+  const contractLine = mandate.schema
+    ? `\n${mandate.name} contract — required: ${mandate.requiredFields.length ? mandate.requiredFields.join(', ') : '(none)'}`
+      + (mandate.exampleArgs ? `; worked before with: ${JSON.stringify(mandate.exampleArgs).slice(0, 200)}` : '')
     : '';
   return (
-    `[harness fan-out check — REFUSED] ${escalate}`
-    + `You have read ${label} one-at-a-time ${distinct} times. STOP — every further one-at-a-time ${label} call is refused for the rest of this turn; this is NOT this item failing, the next one is refused identically. `
-    + `Write ONE run_tool_program that covers EVERY remaining item in a single array — do NOT write several small programs (that just re-fragments the work into more turns). Build the array from the items you already have (same arg shape as the call just refused: ${exampleArgs}):\n`
-    + `${skeleton}\n`
+    header
+    + `Write ONE ${mandate.name} that covers EVERY remaining item in a single array — do NOT write several small programs (that just re-fragments the work into more turns). Build the array from the items you already have (same arg shape as the call just refused: ${exampleArgs}):\n`
+    + `${skeleton}${contractLine}\n`
     + `Return ONLY that small distilled value (the answering field per item) — returning the raw payloads wastes the exact tokens this redirect exists to save.`
   );
 }
@@ -448,7 +481,7 @@ export interface GuardrailDecision {
   /** Human-readable reason — surfaced in events + error messages. */
   reason: string;
   /** Bucket the decision came from (exact-args / same-mut-tool / etc). */
-  rule: 'exact_args_repeat' | 'same_mut_tool_repeat' | 'allowed';
+  rule: 'exact_args_repeat' | 'same_mut_tool_repeat' | 'fanout_refusal_deadlock' | 'allowed';
   /** Current count for the matched signature/tool. */
   count: number;
   /** What to CALL the repeated call in the memo — the gateway slug when there
@@ -670,6 +703,94 @@ function fingerprintToolResult(result: unknown): string {
 
 /** Record a successful tool result for loop-vs-poll discrimination. Called
  *  from the brackets invoke tap; best-effort by contract. */
+/**
+ * OBSERVED SIGNALS PER SCOPE — what actually happened, not what was assumed.
+ *
+ * Live 2026-08-09, a Slack-id lookup for eight reps: six resolved in about five
+ * seconds, one per call, and the fan-out block then refused the remaining two
+ * for being "serialized". The model complied and wrote the prescribed
+ * run_tool_program twenty-eight times; those programs hit their OWN failures
+ * (code_mode_describe discovery budget exhausted, invalid JSON input). Nine
+ * minutes, thirty-three guardrails, and a turn that ended "I cannot honestly
+ * confirm the work went out" — on a job that had been 75% done and finishing at
+ * one item per second.
+ *
+ * Three facts that ladder never had: how expensive the serial calls actually
+ * were, whether the alternative it prescribed was working, and how many times
+ * it had already refused without progress.
+ */
+interface ScopeSignals {
+  /** Result sizes for the fanned tool, newest last. Serial work that returns
+   *  small payloads quickly is a JOB, not a thrash. */
+  serialResultBytes: number[];
+  /** The prescribed redirect (code-mode program) failed this many times. A
+   *  block may not outlive the alternative it demands. */
+  redirectFailures: number;
+  /** Fan-out refusals issued in this scope with no successful fan-out since. */
+  fanoutRefusals: number;
+}
+const scopeSignals = new Map<string, ScopeSignals>();
+const MAX_SCOPE_SIGNALS = 200;
+
+function signalsFor(scopeId: string): ScopeSignals {
+  let entry = scopeSignals.get(scopeId);
+  if (!entry) {
+    entry = { serialResultBytes: [], redirectFailures: 0, fanoutRefusals: 0 };
+    scopeSignals.set(scopeId, entry);
+    while (scopeSignals.size > MAX_SCOPE_SIGNALS) {
+      const oldest = scopeSignals.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      scopeSignals.delete(oldest);
+    }
+  }
+  return entry;
+}
+
+/** Redirect tools the fan-out ladder prescribes. When these fail, the ladder's
+ *  own advice is failing — not the model's compliance. */
+/** Serial reads returning less than this on average are cheap enough that
+ *  forcing a batch program costs more than it saves (live: ~300-byte Slack
+ *  user records refused as if they were page-sized payloads). */
+const FANOUT_EXPENSIVE_RESULT_BYTES = 4_000;
+/** Identical fan-out refusals before the turn ends instead of refusing again. */
+const FANOUT_REFUSAL_TERMINAL_AT = 3;
+
+const FANOUT_REDIRECT_TOOLS = /^(?:run_tool_program|code_mode|run_code|run_worker)$/i;
+
+function resultLooksFailed(result: unknown): boolean {
+  const text = typeof result === 'string' ? result : (() => {
+    try { return JSON.stringify(result ?? ''); } catch { return ''; }
+  })();
+  return /(?:program failed|budget denied|budget_exhausted|InvalidToolInput|An error occurred while running the tool)/i.test(text);
+}
+
+/** Record what a completed call cost and whether a prescribed redirect worked. */
+export function noteGuardrailObservedCost(
+  scopeId: string | undefined,
+  toolName: string,
+  result: unknown,
+): void {
+  if (!scopeId) return;
+  try {
+    const entry = signalsFor(scopeId);
+    if (FANOUT_REDIRECT_TOOLS.test(toolName)) {
+      if (resultLooksFailed(result)) entry.redirectFailures += 1;
+      else entry.fanoutRefusals = 0; // the redirect worked; the ladder is satisfied
+      return;
+    }
+    const size = typeof result === 'string'
+      ? result.length
+      : (() => { try { return JSON.stringify(result ?? '').length; } catch { return 0; } })();
+    entry.serialResultBytes.push(size);
+    while (entry.serialResultBytes.length > 8) entry.serialResultBytes.shift();
+  } catch { /* observation is advisory-only */ }
+}
+
+/** Test seam: scope signals are process-local and must not leak between tests. */
+export function _resetGuardrailScopeSignals(): void {
+  scopeSignals.clear();
+}
+
 export function noteGuardrailToolResult(
   scopeId: string | undefined,
   toolName: string,
@@ -1322,4 +1443,29 @@ export function _peekTracker(sessionId: string): Readonly<{
 /** Test-only: clear all trackers + classification cache. */
 export function _resetAllTrackersForTests(): void {
   trackers.clear();
+}
+
+/**
+ * Is a repeated call fan-out, or is it one requirement being paged?
+ *
+ * The fan-out check exists to stop a model calling one tool across many
+ * independent items serially instead of delegating. Following a cursor looks
+ * identical from the outside — same tool, repeatedly — but it is the opposite
+ * situation: one obligation, and each call DEPENDS on the last one's cursor, so
+ * it cannot be parallelised and must not be refused. A live run was blocked
+ * mid-snapshot for exactly this reason and reported done with a page missing.
+ */
+export type RepeatedCallShape = 'dependent_pagination' | 'independent_fanout' | 'repeat';
+
+export function classifyRepeatedCallShape(input: {
+  toolName: string;
+  /** The obligation this call serves, when the harness issued one. */
+  requirementId?: string;
+  /** True when this call consumes a continuation from the previous one. */
+  dependent?: boolean;
+}): RepeatedCallShape {
+  if (input.dependent === true || (input.requirementId && input.dependent !== false)) {
+    return 'dependent_pagination';
+  }
+  return input.requirementId ? 'repeat' : 'independent_fanout';
 }

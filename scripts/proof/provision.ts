@@ -4,17 +4,16 @@
  *
  * Isolation contract (BINDING): the spawned daemon's BASE_DIR and HOME are the
  * same mkdtemp — memory.db / harness.db / state and every CLI config lookup live
- * there. Clementine's own model grants are copied into its isolated state
- * vault; no real-home CLI config (Railway, Composio, etc.) is visible.
+ * there. Only provider credentials positively required by the selected proof
+ * leg are reduced to non-refreshable snapshots in isolated state; no real-home
+ * CLI config (Railway, Composio, etc.) is visible.
  */
 import {
   chmodSync,
-  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -22,11 +21,13 @@ import { createConnection } from 'node:net';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
+import Database from 'better-sqlite3';
 
 import type {
   BrainKind,
   BrainPlan,
   DaemonHandle,
+  DaemonStopResult,
   FusionProofMode,
   ProofModelExpectation,
   ProofModelProvider,
@@ -34,11 +35,138 @@ import type {
 } from './types.js';
 import { PROOF_CLIENT_COMPLETION_TIMEOUT_MS } from './timeouts.js';
 import { seedIsolatedClaudeAccess } from '../lib/isolated-claude-auth.js';
+import {
+  inspectIsolatedCodexAccess,
+  PROOF_CODEX_MIN_VALIDITY_MS,
+  seedIsolatedCodexAccess,
+  type IsolatedCodexSeed,
+} from '../lib/isolated-codex-auth.js';
+import { presentationEventFromCompletionData } from '../../src/runtime/harness/turn-outcome.js';
+import {
+  assertProofHomeIdentity,
+  assertProofTempCapacity,
+  awaitProofChildOutputDrain,
+  BoundedProofLogCapture,
+  captureProofHomeIdentity,
+  captureProofStateIdentity,
+  createProofForensicReserve,
+  persistProofDaemonLogForForensics,
+  PROOF_CHILD_OUTPUT_DRAIN_TIMEOUT_MS,
+  PROOF_FORENSIC_RESERVE_BYTES,
+  PROOF_MIN_TEMP_FREE_BYTES,
+  proofCleanupFailure,
+  proofCredentialFileRedactions,
+  preflightProofRuntimeSafety,
+  redactProofDaemonLog,
+  sanitizeAndRemoveProofHome,
+  sanitizeProofHomeForForensics,
+  trackProofChildOutput,
+  type ProofHomeCleanupResult,
+  type ProofHomeIdentity,
+  type ProofChildOutputTracker,
+} from './runtime-safety.js';
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
 const DAEMON_ENTRY = path.join(REPO_ROOT, 'dist', 'index.js');
 const REAL_HOME = os.homedir();
 const REAL_CLEM_HOME = process.env.CLEMENTINE_HOME || path.join(REAL_HOME, '.clementine-next');
+const DEFAULT_PROOF_BOOT_TIMEOUT_MS = 90_000;
+const CODEX_PROOF_CALL_BUDGET_MS = 10 * 60_000;
+const CODEX_PROOF_EXPIRY_SKEW_MS = 60_000;
+const CODEX_PROOF_PROVISION_MARGIN_MS = 2 * 60_000;
+
+function errorWithCleanup(
+  primary: unknown,
+  stage: string,
+  cleanup: ProofHomeCleanupResult,
+  additional?: unknown,
+): Error {
+  const parts = [primary instanceof Error ? primary.message : String(primary)];
+  if (additional) parts.push(additional instanceof Error ? additional.message : String(additional));
+  const cleanupError = proofCleanupFailure(stage, cleanup);
+  if (cleanupError) parts.push(cleanupError);
+  return new Error(parts.join('; '));
+}
+
+/** Terminate one provider-capable daemon and separate two independent facts:
+ * the process is terminal (so native sanitation is safe) and its output pipes
+ * drained cleanly (so the retained transcript is complete). A drain failure
+ * remains a proof failure, but it must not strand credentials after the child
+ * is already proven dead. */
+export async function terminateProofProviderProcess(input: {
+  child: ChildProcess;
+  output: ProofChildOutputTracker;
+  markProviderTerminated(): void;
+  outputDrainTimeoutMs?: number;
+}): Promise<void> {
+  const child = input.child;
+  const exited = new Promise<void>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve();
+    else child.once('exit', () => resolve());
+  });
+  if (child.exitCode === null && child.signalCode === null) {
+    try { child.kill('SIGTERM'); } catch { /* already dead */ }
+  }
+  await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 1_500))]);
+  if (child.exitCode === null && child.signalCode === null) {
+    try { child.kill('SIGKILL'); } catch { /* already dead */ }
+    await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 750))]);
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    throw new Error('provider process termination remains unproven after SIGKILL');
+  }
+
+  // Mark this before waiting for EOF/close. `exit` proves the provider cannot
+  // mutate a freshly-built cleanup helper; pipe integrity is separate evidence.
+  input.markProviderTerminated();
+  await awaitProofChildOutputDrain(
+    input.output,
+    input.outputDrainTimeoutMs ?? PROOF_CHILD_OUTPUT_DRAIN_TIMEOUT_MS,
+  );
+}
+
+/** Restart orchestration kept outside provisionDaemon so the teardown-failure
+ * branch can be exercised without a live provider. Any failure—including the
+ * first daemon's output drain—runs sanitation before control returns. */
+export async function restartProofDaemonWithSanitation(input: {
+  terminate(): Promise<void>;
+  start(): Promise<void>;
+  sanitize(): ProofHomeCleanupResult;
+}): Promise<void> {
+  let restartError: unknown;
+  try {
+    await input.terminate();
+    await input.start();
+    return;
+  } catch (error) {
+    restartError = error;
+  }
+  let drainError: unknown;
+  try {
+    await input.terminate();
+  } catch (caught) {
+    drainError = caught;
+  }
+  const cleanup = input.sanitize();
+  throw errorWithCleanup(
+    restartError,
+    'restart-failure proof-home',
+    cleanup,
+    drainError
+      ? `daemon output also failed to close during restart recovery: ${drainError instanceof Error ? drainError.message : String(drainError)}`
+      : undefined,
+  );
+}
+
+/** Overflow is evidence loss, not a benign truncation. Retain the bounded tail
+ * and sanitize credentials even when every scenario otherwise appeared green. */
+export function proofStopMustRetainHome(input: {
+  requested: boolean;
+  shutdownError?: string;
+  logCaptureError?: string;
+}): boolean {
+  return input.requested || Boolean(input.shutdownError) || Boolean(input.logCaptureError);
+}
 
 /** Parse a dotenv-ish file without importing any src/ module (BASE_DIR pinning). */
 function readEnvFile(file: string): Record<string, string> {
@@ -144,24 +272,18 @@ function roleExpectations(kind: BrainKind, env: Record<string, string>): {
         : '';
   const brain = expectation(env, brainSlot, 'provider-slot');
   const workerBinding = roleModel(env, 'worker');
-  // The GLM matrix deliberately runs in all-in mode. A saved Codex/Claude
-  // worker binding is inactive under that product contract, so expecting it
-  // here makes the proof impossible by construction and can also leave a stale
-  // OPENAI_MODEL_WORKER id probing the BYO endpoint. Preserve active BYO
-  // bindings (including named-provider workers); otherwise follow the selected
-  // BYO brain exactly.
+  // The isolated matrix preserves explicit worker/judge role bindings. Current
+  // all-in semantics collapse role DEFAULTS to BYO, but still honor an explicit
+  // binding to a connected provider. Keep the proof expectation aligned with
+  // the binding copied into the daemon instead of expecting the BYO default
+  // while the runtime correctly dispatches the bound worker elsewhere.
   const allInWorkerSlot = kind === 'glm'
     ? env.BYO_MODEL_ID || brainSlot
     : brainSlot;
-  const activeWorkerBinding = kind === 'glm'
-    && workerBinding
-    && providerFor(workerBinding, env) !== 'byo'
-    ? undefined
-    : workerBinding;
   const worker = expectation(
     env,
-    activeWorkerBinding || allInWorkerSlot,
-    activeWorkerBinding ? 'role-binding' : 'provider-slot',
+    workerBinding || allInWorkerSlot,
+    workerBinding ? 'role-binding' : 'provider-slot',
   );
   const judgeBinding = roleModel(env, 'judge');
   const judgeSlot = kind === 'glm'
@@ -215,7 +337,9 @@ export function planBrain(kind: BrainKind): BrainPlan {
     };
   }
   if (kind === 'codex') {
-    const hasCodex = existsSync(path.join(REAL_HOME, '.codex'));
+    const hasCodex = Boolean(inspectIsolatedCodexAccess({
+      sourceClementineHome: REAL_CLEM_HOME,
+    }));
     const apiKey = realEnvValue('OPENAI_API_KEY');
     if (hasCodex) {
       return {
@@ -241,7 +365,7 @@ export function planBrain(kind: BrainKind): BrainPlan {
       expectedBrain: expected.brain,
       expectedWorker: expected.worker,
       expectedFusionChecker: expected.judge,
-      skipReason: 'no ~/.codex and no OPENAI_API_KEY',
+      skipReason: `no Clementine Codex access token with at least ${Math.ceil(PROOF_CODEX_MIN_VALIDITY_MS / 60_000)} minutes remaining and no OPENAI_API_KEY`,
     };
   }
   // glm — BYO all-in brain. Copy only the BYO/GLM material the real install
@@ -305,6 +429,124 @@ export interface ProvisionOptions {
   bootTimeoutMs?: number;
   /** Default off. Dedicated live Fusion canaries opt into the mode under test. */
   fusionMode?: FusionProofMode;
+  /** True only when at least one selected scenario proves an exact worker
+   * route. Cross-family worker auth is not copied for brain-only scenarios. */
+  requireWorkerProvider?: boolean;
+  /** Test/diagnostic override. Production uses the conservative derived floor. */
+  codexAccessMinValidityMs?: number;
+  /** Provider-neutral test/diagnostic override for access-only subscription
+   * snapshots. The legacy Codex-specific override remains supported. */
+  subscriptionAccessMinValidityMs?: number;
+  /** Test-only preflight injection. Production compiles and executes the
+   * mutation-free native safety selftest before creating a proof home. */
+  runtimeSafetyPreflight?: () => void;
+}
+
+export interface ProofProviderRequirements {
+  codex: boolean;
+  claude: boolean;
+}
+
+/** Exact credential families the selected leg can dispatch. The brain is
+ * always live; worker and checker routes count only when the matrix explicitly
+ * selected those behaviors. API-key Codex plans do not need an OAuth snapshot. */
+export function proofProviderRequirements(
+  plan: BrainPlan,
+  opts: Pick<ProvisionOptions, 'fusionMode' | 'requireWorkerProvider'> = {},
+): ProofProviderRequirements {
+  const providers = new Set<ProofModelProvider>([plan.expectedBrain.provider]);
+  if (opts.requireWorkerProvider) providers.add(plan.expectedWorker.provider);
+  if (opts.fusionMode && opts.fusionMode !== 'off') {
+    providers.add(plan.expectedFusionChecker.provider);
+  }
+  return {
+    codex: providers.has('codex') && plan.env.AUTH_MODE !== 'api_key',
+    claude: providers.has('claude'),
+  };
+}
+
+export interface ProofModelAccessSeeds {
+  requirements: ProofProviderRequirements;
+  codex: IsolatedCodexSeed | null;
+  claude: ReturnType<typeof seedIsolatedClaudeAccess>;
+}
+
+export function proofModelAccessValidityError(
+  access: ProofModelAccessSeeds,
+  options: { nowMs?: number; requiredValidityMs: number },
+): string | null {
+  const nowMs = options.nowMs ?? Date.now();
+  const requiredValidityMs = Math.max(0, options.requiredValidityMs);
+  const requiredUntil = nowMs + requiredValidityMs;
+  const checks: Array<{
+    required: boolean;
+    provider: 'Codex' | 'Claude';
+    seed: IsolatedCodexSeed | ReturnType<typeof seedIsolatedClaudeAccess>;
+  }> = [
+    { required: access.requirements.codex, provider: 'Codex', seed: access.codex },
+    { required: access.requirements.claude, provider: 'Claude', seed: access.claude },
+  ];
+  for (const check of checks) {
+    if (!check.required) continue;
+    if (!check.seed?.expiresAt) {
+      return `${check.provider} proof access has no verifiable expiration and cannot authorize another paid call`;
+    }
+    const expiresAt = Date.parse(check.seed.expiresAt);
+    if (!Number.isFinite(expiresAt)) {
+      return `${check.provider} proof access carries an invalid expiration and cannot authorize another paid call`;
+    }
+    if (expiresAt <= requiredUntil) {
+      return `${check.provider} proof access expires at ${check.seed.expiresAt}, before the next call's ${Math.ceil(requiredValidityMs / 60_000)} minute safety window`;
+    }
+  }
+  return null;
+}
+
+export function assertProofModelAccessValidity(
+  access: ProofModelAccessSeeds,
+  requiredValidityMs: number,
+  nowMs = Date.now(),
+): void {
+  const error = proofModelAccessValidityError(access, { nowMs, requiredValidityMs });
+  if (error) throw new Error(`Live proof refused to start or continue: ${error}`);
+}
+
+/** Seed only the subscription families that this exact proof leg can call. */
+export function seedProofModelAccess(
+  home: string,
+  plan: BrainPlan,
+  opts: ProvisionOptions = {},
+): ProofModelAccessSeeds {
+  const requirements = proofProviderRequirements(plan, opts);
+  // Default 20m already covers a 90s boot + the runtime's 10m per-call budget
+  // + expiry skew. Preserve that floor, and grow it for a custom long boot.
+  const accessMinValidityMs = opts.subscriptionAccessMinValidityMs
+    ?? opts.codexAccessMinValidityMs
+    ?? Math.max(
+      PROOF_CODEX_MIN_VALIDITY_MS,
+      (opts.bootTimeoutMs ?? DEFAULT_PROOF_BOOT_TIMEOUT_MS)
+        + CODEX_PROOF_CALL_BUDGET_MS
+        + CODEX_PROOF_EXPIRY_SKEW_MS
+        + CODEX_PROOF_PROVISION_MARGIN_MS,
+    );
+  return {
+    requirements,
+    codex: requirements.codex
+      ? seedIsolatedCodexAccess({
+          targetHome: home,
+          sourceClementineHome: REAL_CLEM_HOME,
+          minValidityMs: accessMinValidityMs,
+        })
+      : null,
+    claude: requirements.claude
+      ? seedIsolatedClaudeAccess({
+          targetHome: home,
+          sourceClementineHome: REAL_CLEM_HOME,
+          userHome: REAL_HOME,
+          minValidityMs: accessMinValidityMs,
+        })
+      : null,
+  };
 }
 
 /** Runtime policy pins that make every live proof leg comparable. Exported so
@@ -337,6 +579,12 @@ export function proofProcessIsolationEnv(
   const base = {
     HOME: home,
     ZDOTDIR: home,
+    // HOME/ZDOTDIR isolate filesystem credentials, but macOS Keychain remains
+    // global to the logged-in user. Reuse the runtime's existing hard stop so
+    // a BYO-only proof cannot probe—or block on—the real Claude Code keychain.
+    // Claude proof legs use the short-lived credential explicitly seeded into
+    // this disposable home, so they retain exactly the access they requested.
+    CLEMMY_TEST_ISOLATED_HOME: '1',
   };
   if (platform !== 'win32') return base;
   const parsed = path.win32.parse(home);
@@ -416,8 +664,10 @@ export function createProofComposioShim(home: string): string {
     "const path = require('node:path');",
     "const home = process.env.HOME || process.env.USERPROFILE;",
     "if (!home) { console.error('proof home missing'); process.exit(1); }",
-    "const [command, slug, flag, payload = ''] = process.argv.slice(2);",
+    "const argv = process.argv.slice(2);",
+    "const [command, slug, flag, payload = ''] = argv;",
     "const state = path.join(home, 'proof-composio-connected');",
+    "const taskFeedStatePath = path.join(home, 'proof-task-feed-state.json');",
     "const sheetsStatePath = path.join(home, 'proof-googlesheets-state.json');",
     "const sheetsReceiptLog = path.join(home, 'proof-googlesheets-receipts.log');",
     "const sheetsOperationLog = path.join(home, 'proof-googlesheets-operations.log');",
@@ -436,6 +686,22 @@ export function createProofComposioShim(home: string): string {
     "  if (fs.existsSync(state)) { console.log('proof-user'); process.exit(0); }",
     "  console.error('Not authenticated.'); process.exit(1);",
     "}",
+    "if (command === 'search') {",
+    "  if (!fs.existsSync(state)) { console.error('401 Unauthorized.'); process.exit(1); }",
+    "  const query = String(slug || '').trim();",
+    "  const toolkitIndex = argv.indexOf('--toolkits');",
+    "  const limitIndex = argv.indexOf('--limit');",
+    "  const toolkitSlug = toolkitIndex >= 0 ? String(argv[toolkitIndex + 1] || '').toLowerCase() : '';",
+    "  const requestedLimit = limitIndex >= 0 ? Number(argv[limitIndex + 1]) : 25;",
+    "  fs.appendFileSync(path.join(home, 'proof-composio-searches.log'), JSON.stringify({ query, toolkitSlug: toolkitSlug || null, limit: Number.isFinite(requestedLimit) ? requestedLimit : null }) + '\\n', 'utf8');",
+    "  const eligible = (!toolkitSlug || toolkitSlug === 'proof') && /proof|release|queue|task|item/i.test(query);",
+    "  const schemaDir = path.join(home, '.composio', 'tool_definitions');",
+    "  const schemaPath = path.join(schemaDir, 'PROOF_LIST_TASKS.json');",
+    "  const primary = eligible && requestedLimit !== 0 ? ['PROOF_LIST_TASKS'] : [];",
+    "  if (primary.length) { fs.mkdirSync(schemaDir, { recursive: true }); writeJsonAtomic(schemaPath, { version: 'proof-v1', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }); }",
+    "  console.log(JSON.stringify({ results: [{ use_case: query, toolkits: ['proof'], primary_tool_slugs: primary, related_tool_slugs: [] }], tool_schemas: { primary: primary.length ? { PROOF_LIST_TASKS: '~/.composio/tool_definitions/PROOF_LIST_TASKS.json' } : {}, related_tools_path_format: '~/.composio/tool_definitions/<TOOL_SLUG>.json' }, connected_toolkits: ['proof'], next_steps: { guidance: primary.length ? 'Execute the selected action with its schema.' : 'Refine the search query.', steps: primary.length ? [{ tool_slug: 'PROOF_LIST_TASKS', arguments: {} }] : [] } }));",
+    "  process.exit(0);",
+    "}",
     "if (command === 'execute') {",
     "  if (!fs.existsSync(state)) { console.error('401 Unauthorized.'); process.exit(1); }",
     "  if (!slug || flag !== '-d') { console.error('invalid proof execute arguments'); process.exit(1); }",
@@ -448,6 +714,17 @@ export function createProofComposioShim(home: string): string {
     "      process.exit(2);",
     "    }",
     "    console.log(JSON.stringify({ successful: true, data: { tasks: [{ id: 'proof-task-1', title: 'Review the Clementine release proof', status: 'open' }], count: 1, generated_at: '2026-07-29T00:00:00.000Z' } }));",
+    "    process.exit(0);",
+    "  }",
+    "  if (slug === 'PROOF_LIST_TASKS') {",
+    "    const args = parsePayload();",
+    "    if (!exactKeys(args, [])) {",
+    "      console.error('invalid proof release task-list payload: use exactly {}');",
+    "      process.exit(2);",
+    "    }",
+    "    const feed = readJson(taskFeedStatePath, { revision: 1, id: 'proof-release-1', title: 'Review the Clementine 4 release proof', status: 'open' });",
+    "    fs.appendFileSync(path.join(home, 'proof-composio-successes.log'), JSON.stringify({ slug, payload }) + '\\n', 'utf8');",
+    "    console.log(JSON.stringify({ successful: true, data: { sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY', revision: Number(feed.revision) || 1, items: [{ id: String(feed.id || 'proof-release-1'), title: String(feed.title || 'Review the Clementine 4 release proof'), status: String(feed.status || 'open') }], total: 1 } }));",
     "    process.exit(0);",
     "  }",
     "  if (slug === 'PROOF_SOCIAL_GET_CONTENT_PLAN') {",
@@ -503,56 +780,287 @@ export function createProofComposioShim(home: string): string {
   return shim;
 }
 
-/** Keep event/task state for a failed proof without retaining copied model
- * credentials or a generated webhook bearer. */
-function sanitizeProofHomeForForensics(home: string): void {
-  for (const relative of [
-    path.join('state', 'auth.json'),
-    path.join('state', 'claude-auth.json'),
-    path.join('state', 'secrets-vault.json'),
-    '.env',
-  ]) {
-    try { rmSync(path.join(home, relative), { force: true }); } catch { /* best effort */ }
+interface AcceptedChatSourceRow {
+  seq: number;
+  turn: number;
+  data_json: string;
+}
+
+interface AcceptedChatTerminalRow {
+  seq: number;
+  data_json: string;
+}
+
+function parsedEventData(raw: string): Record<string, unknown> | null {
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
   }
 }
 
+function exactAcceptedChatSource(
+  db: Database.Database,
+  sessionId: string,
+  clientRequestId: string,
+  runId: string,
+): AcceptedChatSourceRow | null {
+  const matches = (db.prepare(`
+    SELECT seq, turn, data_json
+    FROM events
+    WHERE session_id = ?
+      AND type = 'user_input_received'
+      AND role = 'user'
+    ORDER BY seq ASC
+  `).all(sessionId) as AcceptedChatSourceRow[]).filter((row) => {
+    const data = parsedEventData(row.data_json);
+    return data?.synthetic !== true
+      && data?.clientRequestId === clientRequestId
+      && data?.requestId === clientRequestId
+      && data?.runId === runId;
+  });
+  if (matches.length > 1) {
+    throw new Error(
+      `accepted chat request ${clientRequestId} owns multiple user sources in ${sessionId}: ${matches.map((row) => row.seq).join(',')}`,
+    );
+  }
+  return matches[0] ?? null;
+}
+
+function exactAcceptedChatTerminal(
+  db: Database.Database,
+  sessionId: string,
+  source: AcceptedChatSourceRow,
+): { text: string; pendingApprovalId?: string } | null {
+  const rows = db.prepare(`
+    SELECT seq, data_json
+    FROM events
+    WHERE session_id = ?
+      AND type = 'conversation_completed'
+      AND seq > ?
+    ORDER BY seq ASC
+  `).all(sessionId, source.seq) as AcceptedChatTerminalRow[];
+  const exact: Array<{ seq: number; text: string; pendingApprovalId?: string }> = [];
+  for (const row of rows) {
+    const data = parsedEventData(row.data_json);
+    if (!data) continue;
+    const presentationData = data.presentation && typeof data.presentation === 'object' && !Array.isArray(data.presentation)
+      ? data.presentation as Record<string, unknown>
+      : null;
+    const identityData = presentationData?.identity && typeof presentationData.identity === 'object' && !Array.isArray(presentationData.identity)
+      ? presentationData.identity as Record<string, unknown>
+      : null;
+    const claimsSource = data.sourceUserSeq === source.seq
+      || data.terminalKey === `turn:${source.seq}`
+      || identityData?.sourceUserSeq === source.seq;
+    if (!claimsSource) continue;
+
+    const presentation = presentationEventFromCompletionData(data);
+    if (!presentation) {
+      throw new Error(`accepted chat terminal ${sessionId}:${row.seq} is not a typed conversation completion`);
+    }
+    if (
+      presentation.identity.sessionId !== sessionId
+      || presentation.identity.sourceUserSeq !== source.seq
+      || presentation.identity.turn !== source.turn
+    ) {
+      throw new Error(`accepted chat terminal ${sessionId}:${row.seq} contradicts source ${source.seq}`);
+    }
+    exact.push({
+      seq: row.seq,
+      text: presentation.text,
+      ...(presentation.approvalId ? { pendingApprovalId: presentation.approvalId } : {}),
+    });
+  }
+  if (exact.length > 1) {
+    throw new Error(
+      `accepted chat source ${sessionId}:${source.seq} has ambiguous typed terminals: ${exact.map((row) => row.seq).join(',')}`,
+    );
+  }
+  return exact[0] ?? null;
+}
+
+export interface AcceptedHarnessChatRequestOptions {
+  home: string;
+  baseUrl: string;
+  headers: Record<string, string>;
+  message: string;
+  sessionId: string;
+  timeoutMs?: number;
+}
+
+/**
+ * Drive the durable desktop ingress used by the real UI. Its HTTP response is
+ * only an acceptance receipt, so completion comes exclusively from the typed
+ * terminal owned by the request's exact durable user edge. No latest-message,
+ * model-route, tool-result, or text-shape inference is allowed here.
+ */
+export async function requestAcceptedHarnessChat(
+  options: AcceptedHarnessChatRequestOptions,
+): Promise<TurnResult> {
+  assertProofTempCapacity(options.home);
+  const timeoutMs = options.timeoutMs ?? PROOF_CLIENT_COMPLETION_TIMEOUT_MS;
+  const started = Date.now();
+  const deadline = started + timeoutMs;
+  const clientRequestId = `proof-${randomBytes(16).toString('hex')}`;
+  const remainingMs = (): number => Math.max(1, deadline - Date.now());
+  const { Agent } = await import('undici');
+  const dispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+  let status: number;
+  let responseBody: Record<string, unknown>;
+  try {
+    const response = await fetch(`${options.baseUrl}/api/harness/chat`, {
+      method: 'POST',
+      headers: options.headers,
+      body: JSON.stringify({
+        input: options.message,
+        sessionId: options.sessionId,
+        clientRequestId,
+      }),
+      signal: AbortSignal.timeout(remainingMs()),
+      // @ts-expect-error dispatcher is a Node-fetch (undici) extension
+      dispatcher,
+    });
+    status = response.status;
+    const decoded = await response.json().catch(() => ({})) as unknown;
+    responseBody = decoded && typeof decoded === 'object' && !Array.isArray(decoded)
+      ? decoded as Record<string, unknown>
+      : {};
+  } finally {
+    await dispatcher.close();
+  }
+
+  if (status !== 202) {
+    throw new Error(
+      `durable harness chat was not accepted (HTTP ${status}): ${JSON.stringify(responseBody).slice(0, 500)}`,
+    );
+  }
+  const responseSessionId = typeof responseBody.sessionId === 'string' ? responseBody.sessionId : '';
+  const responseRequestId = typeof responseBody.clientRequestId === 'string' ? responseBody.clientRequestId : '';
+  const responseRunId = typeof responseBody.runId === 'string' ? responseBody.runId : '';
+  if (responseSessionId !== options.sessionId) {
+    throw new Error(`durable harness chat accepted unexpected session ${responseSessionId || '(missing)'}`);
+  }
+  if (responseRequestId !== clientRequestId || !responseRunId) {
+    throw new Error('durable harness chat acceptance receipt is missing its exact request/run identity');
+  }
+
+  const dbPath = path.join(options.home, 'state', 'harness.db');
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  try {
+    let source: AcceptedChatSourceRow | null = null;
+    while (Date.now() < deadline) {
+      source ??= exactAcceptedChatSource(
+        db,
+        responseSessionId,
+        clientRequestId,
+        responseRunId,
+      );
+      if (source) {
+        const terminal = exactAcceptedChatTerminal(db, responseSessionId, source);
+        if (terminal) {
+          return {
+            text: terminal.text,
+            sessionId: responseSessionId,
+            sourceUserSeq: source.seq,
+            pendingApprovalId: terminal.pendingApprovalId,
+            wallMs: Date.now() - started,
+            httpStatus: status,
+          };
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(50, remainingMs())));
+    }
+  } finally {
+    db.close();
+  }
+  throw new Error(
+    `durable harness chat timed out after ${timeoutMs}ms waiting for the exact typed terminal (${responseSessionId}, request ${clientRequestId})`,
+  );
+}
+
 export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = {}): Promise<DaemonHandle> {
+  // This must precede dist inspection, mkdtemp, credential snapshots, and every
+  // provider-capable spawn. Unsupported platforms/helper execution fail with
+  // zero disposable credential footprint.
+  (opts.runtimeSafetyPreflight ?? preflightProofRuntimeSafety)();
   if (!existsSync(DAEMON_ENTRY)) {
     throw new Error(`dist/index.js missing — run \`npm run build\` first (${DAEMON_ENTRY})`);
   }
-  const home = mkdtempSync(path.join(os.tmpdir(), `clemmy-proof-${plan.kind}-`));
+  const tempRoot = os.tmpdir();
+  let providerLifecycle: 'never-spawned' | 'active' | 'terminated' = 'never-spawned';
+  const nativeCleanupOperations = {
+    assertProviderTerminated: (): void => {
+      if (providerLifecycle === 'active') {
+        throw new Error(
+          'live-proof native filesystem mutation refused because provider termination is unproven',
+        );
+      }
+    },
+  };
+  // Admit enough free space to allocate the forensic reserve and still leave
+  // the full runtime safety floor available at the first action boundary.
+  assertProofTempCapacity(tempRoot, {
+    requiredBytes: PROOF_MIN_TEMP_FREE_BYTES + PROOF_FORENSIC_RESERVE_BYTES,
+  });
+  const home = mkdtempSync(path.join(tempRoot, `clemmy-proof-${plan.kind}-`));
+  let proofHomeIdentity: ProofHomeIdentity;
+  try {
+    proofHomeIdentity = captureProofHomeIdentity(home);
+  } catch (error) {
+    const cleanup = sanitizeAndRemoveProofHome(home, { operations: nativeCleanupOperations });
+    throw errorWithCleanup(error, 'proof-home identity capture', cleanup);
+  }
+
+  let proofBin: string;
+  let proofComposioShim: string;
+  let modelAccess: ProofModelAccessSeeds;
+  let daemonLog: BoundedProofLogCapture;
+  try {
+    // Allocate fixed output rings before copying credentials or spawning. An
+    // allocation failure therefore flows through the same pre-spawn cleanup.
+    daemonLog = new BoundedProofLogCapture();
+    // Isolation assertion: the temp home starts with NO state.
+    if (existsSync(path.join(home, 'state'))) throw new Error('temp home unexpectedly pre-populated');
+
+    // Allocate and fsync recoverable log headroom before any access material
+    // is copied or any provider-capable process is spawned.
+    createProofForensicReserve(home);
+
+    // Seed ONLY the provider access snapshots this exact leg can dispatch.
+    // Deliberately NOT the secrets vault: it carries Composio/API keys, and the
+    // sandbox must stay physically unable to reach external services. Databases,
+    // memory and every other state file start EMPTY: that's the isolation contract.
+    mkdirSync(path.join(home, 'state'), { recursive: true });
+    seedProofComposioDefaultAccountAuthorities(home);
+    modelAccess = seedProofModelAccess(home, plan, opts);
+    if (modelAccess.requirements.codex && !modelAccess.codex) {
+      throw new Error(
+        'no Codex access token with enough remaining lifetime is available for the isolated proof; refresh the real daemon sign-in, then reprovision',
+      );
+    }
+    if (modelAccess.requirements.claude && !modelAccess.claude) {
+      throw new Error('no currently-valid Claude subscription access token is available for the isolated proof');
+    }
+    proofBin = createProofRailwayShim(home);
+    proofComposioShim = createProofComposioShim(home);
+    proofHomeIdentity = captureProofStateIdentity(proofHomeIdentity);
+  } catch (error) {
+    // Any pre-spawn failure (including a partial credential/shim write) must
+    // not orphan access material in a disposable directory the runner never
+    // receives a handle for and therefore cannot stop later.
+    const cleanup = sanitizeAndRemoveProofHome(home, {
+      identity: proofHomeIdentity,
+      operations: nativeCleanupOperations,
+    });
+    throw errorWithCleanup(error, 'pre-spawn proof-home', cleanup);
+  }
   const port = 9600 + Math.floor(Math.random() * 300);
   const secret = randomBytes(16).toString('hex');
 
-  // Isolation assertion: the temp home starts with NO state.
-  if (existsSync(path.join(home, 'state'))) throw new Error('temp home unexpectedly pre-populated');
-
-  // Seed ONLY Clementine's own model sign-in files (the runtime factory refuses
-  // to boot without one — "Run clementine auth login-device"). Deliberately NOT
-  // the secrets vault: it carries Composio/API keys, and the sandbox must stay
-  // physically unable to reach external services. Databases, memory and every
-  // other state file start EMPTY: that's the isolation contract.
-  mkdirSync(path.join(home, 'state'), { recursive: true });
-  seedProofComposioDefaultAccountAuthorities(home);
-  const codexAuth = path.join(REAL_CLEM_HOME, 'state', 'auth.json');
-  if (existsSync(codexAuth)) copyFileSync(codexAuth, path.join(home, 'state', 'auth.json'));
-  // Never copy a rotating Claude refresh token into a disposable home. A
-  // refresh there would invalidate the real grant and strand the replacement
-  // token in a directory we delete. Seed a currently-valid access token only.
-  const claudeSeed = seedIsolatedClaudeAccess({
-    targetHome: home,
-    sourceClementineHome: REAL_CLEM_HOME,
-    userHome: REAL_HOME,
-  });
-  if ((plan.kind === 'claude' || opts.fusionMode !== undefined && opts.fusionMode !== 'off') && !claudeSeed) {
-    sanitizeProofHomeForForensics(home);
-    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
-    throw new Error('no currently-valid Claude subscription access token is available for the isolated proof');
-  }
-  const proofBin = createProofRailwayShim(home);
-  const proofComposioShim = createProofComposioShim(home);
-
-  const logChunks: string[] = [];
   const daemonEnv: NodeJS.ProcessEnv = {
     PATH: `${proofBin}${path.delimiter}${process.env.PATH ?? ''}`,
     LANG: process.env.LANG ?? 'en_US.UTF-8',
@@ -572,34 +1080,83 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     ...plan.env,
     ...proofRuntimeOverrides(opts.fusionMode),
   };
-
-  let proc: ChildProcess;
-  const spawnDaemon = (): ChildProcess => {
-    logChunks.push(`\n[proof] spawning daemon at ${new Date().toISOString()}\n`);
-    const child = spawn(process.execPath, [DAEMON_ENTRY, 'service'], {
-      cwd: home,
-      env: daemonEnv,
-      stdio: ['ignore', 'pipe', 'pipe'],
+  const proofLogSecrets = [
+    secret,
+    // Capture access-only file credentials before the first spawn. A failed
+    // restart sanitizes those files immediately, while stop() persists the log
+    // later from this immutable in-memory redaction set.
+    ...proofCredentialFileRedactions(home),
+    ...Object.entries(daemonEnv)
+      .filter(([key, value]) => value && /(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION)/i.test(key))
+      .map(([, value]) => String(value)),
+  ];
+  try {
+    // Prove the fixed overlap covers every exact credential before the first
+    // provider-capable spawn. A later snapshot may never discover this only
+    // after it has already retained a boundary fragment.
+    daemonLog.assertForensicRedactionCoverage(proofLogSecrets);
+  } catch (error) {
+    const cleanup = sanitizeAndRemoveProofHome(home, {
+      identity: proofHomeIdentity,
+      operations: nativeCleanupOperations,
     });
-    child.stdout?.on('data', (b) => logChunks.push(String(b)));
-    child.stderr?.on('data', (b) => logChunks.push(String(b)));
-    return child;
+    throw errorWithCleanup(error, 'proof log redaction coverage', cleanup);
+  }
+  const safeRecentLog = (): string => redactProofDaemonLog(
+    daemonLog.forensicLog(proofLogSecrets),
+    proofLogSecrets,
+  ).slice(-2000);
+  const assertProviderBoundary = (timeoutMs: number): void => {
+    assertProofHomeIdentity(proofHomeIdentity);
+    assertProofTempCapacity(home);
+    assertProofModelAccessValidity(
+      modelAccess,
+      Math.max(CODEX_PROOF_CALL_BUDGET_MS, timeoutMs) + CODEX_PROOF_EXPIRY_SKEW_MS,
+    );
+  };
+
+  interface SpawnedProofDaemon {
+    child: ChildProcess;
+    output: ProofChildOutputTracker;
+  }
+  let proc: SpawnedProofDaemon;
+  const spawnDaemon = (): SpawnedProofDaemon => {
+    assertProofHomeIdentity(proofHomeIdentity);
+    nativeCleanupOperations.assertProviderTerminated();
+    daemonLog.append(`\n[proof] spawning daemon at ${new Date().toISOString()}\n`);
+    providerLifecycle = 'active';
+    let child: ChildProcess;
+    try {
+      child = spawn(process.execPath, [DAEMON_ENTRY, 'service'], {
+        cwd: home,
+        env: daemonEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      providerLifecycle = 'terminated';
+      throw error;
+    }
+    const output = trackProofChildOutput(child, (chunk) => daemonLog.append(chunk));
+    return { child, output };
   };
   const terminateDaemon = async (): Promise<void> => {
-    if (!proc || proc.exitCode !== null) return;
-    const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
-    try { proc.kill('SIGTERM'); } catch { /* already dead */ }
-    await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 1_500))]);
-    if (proc.exitCode === null) {
-      try { proc.kill('SIGKILL'); } catch { /* already dead */ }
-      await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 750))]);
-    }
+    if (!proc) return;
+    const current = proc;
+    await terminateProofProviderProcess({
+      child: current.child,
+      output: current.output,
+      markProviderTerminated: () => { providerLifecycle = 'terminated'; },
+    });
   };
   const waitForReady = async (): Promise<void> => {
-    const deadline = Date.now() + (opts.bootTimeoutMs ?? 90_000);
+    const deadline = Date.now() + (opts.bootTimeoutMs ?? DEFAULT_PROOF_BOOT_TIMEOUT_MS);
     while (Date.now() < deadline) {
-      if (proc.exitCode !== null) {
-        throw new Error(`daemon exited during boot (code ${proc.exitCode})\n${logChunks.join('').slice(-2000)}`);
+      assertProofHomeIdentity(proofHomeIdentity);
+      if (proc.child.exitCode !== null || proc.child.signalCode !== null) {
+        const reason = proc.child.exitCode !== null
+          ? `code ${proc.child.exitCode}`
+          : `signal ${proc.child.signalCode}`;
+        throw new Error(`daemon exited during boot (${reason})\n${safeRecentLog()}`);
       }
       if (await tcpProbe(port)) {
         try {
@@ -609,17 +1166,33 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
       }
       await new Promise((r) => setTimeout(r, 300));
     }
-    throw new Error(`daemon not ready within boot timeout\n${logChunks.join('').slice(-2000)}`);
+    throw new Error(`daemon not ready within boot timeout\n${safeRecentLog()}`);
   };
 
-  proc = spawnDaemon();
   try {
+    proc = spawnDaemon();
     await waitForReady();
   } catch (error) {
-    await terminateDaemon();
-    sanitizeProofHomeForForensics(home);
-    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
-    throw error;
+    let drainError: unknown;
+    try {
+      await terminateDaemon();
+    } catch (caught) {
+      drainError = caught;
+    }
+    const cleanup = sanitizeAndRemoveProofHome(home, {
+      identity: proofHomeIdentity,
+      operations: nativeCleanupOperations,
+    });
+    const failure = errorWithCleanup(
+      error,
+      'boot-failure proof-home',
+      cleanup,
+      drainError
+        ? `daemon teardown also failed: ${drainError instanceof Error ? drainError.message : String(drainError)}`
+        : undefined,
+    );
+    daemonLog.clear();
+    throw failure;
   }
 
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -630,6 +1203,7 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     sessionId: string,
     timeoutMs = PROOF_CLIENT_COMPLETION_TIMEOUT_MS,
   ): Promise<TurnResult> => {
+    assertProviderBoundary(timeoutMs);
     const started = Date.now();
     // Node fetch (undici) kills any response whose HEADERS take >300s by
     // default — a real workspace-build/long-agent turn legitimately runs past
@@ -656,7 +1230,24 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     };
   };
 
+  const acceptedChat = async (
+    message: string,
+    sessionId: string,
+    timeoutMs = PROOF_CLIENT_COMPLETION_TIMEOUT_MS,
+  ): Promise<TurnResult> => {
+    assertProviderBoundary(timeoutMs);
+    return requestAcceptedHarnessChat({
+      home,
+      baseUrl,
+      headers,
+      message,
+      sessionId,
+      timeoutMs,
+    });
+  };
+
   const approve = async (approvalId: string, decision: 'approve' | 'reject'): Promise<number> => {
+    assertProviderBoundary(PROOF_CLIENT_COMPLETION_TIMEOUT_MS);
     const res = await fetch(`${baseUrl}/api/console/harness-approvals/${encodeURIComponent(approvalId)}/${decision}`, {
       method: 'POST',
       headers,
@@ -667,6 +1258,7 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
   };
 
   const request = async (method: string, apiPath: string, body?: unknown): Promise<{ status: number; json: unknown }> => {
+    assertProviderBoundary(60_000);
     const res = await fetch(`${baseUrl}${apiPath}`, {
       method,
       headers,
@@ -677,26 +1269,92 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
   };
 
   const restart = async (): Promise<void> => {
-    await terminateDaemon();
-    proc = spawnDaemon();
-    await waitForReady();
+    // Do not terminate a healthy isolated daemon and begin another paid model
+    // turn when the volume can no longer safely persist its evidence.
+    assertProviderBoundary(PROOF_CLIENT_COMPLETION_TIMEOUT_MS);
+    await restartProofDaemonWithSanitation({
+      terminate: terminateDaemon,
+      start: async () => {
+        proc = spawnDaemon();
+        await waitForReady();
+      },
+      // This also covers failure while draining the *old* daemon. The runner
+      // may never regain a usable handle, so sanitize before returning.
+      sanitize: () => sanitizeProofHomeForForensics(home, {
+        identity: proofHomeIdentity,
+        operations: nativeCleanupOperations,
+      }),
+    });
   };
 
-  const stop = async (stopOpts?: { keepHome?: boolean }): Promise<void> => {
-    await terminateDaemon();
-    const keepHome = Boolean(opts.keepHome || stopOpts?.keepHome);
-    if (keepHome) {
-      sanitizeProofHomeForForensics(home);
-    } else {
-      try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+  const stop = async (stopOpts?: { keepHome?: boolean }): Promise<DaemonStopResult> => {
+    try {
+      let shutdownError: string | undefined;
+      try {
+        await terminateDaemon();
+      } catch (error) {
+        shutdownError = error instanceof Error ? error.message : String(error);
+      }
+      const logCapture = daemonLog.stats();
+      const logCaptureError = daemonLog.overflowError();
+      // Teardown uncertainty or semantic log loss is itself a failed run and
+      // therefore forces sanitized retention even after green scenarios.
+      const keepHome = proofStopMustRetainHome({
+        requested: Boolean(opts.keepHome || stopOpts?.keepHome),
+        shutdownError,
+        logCaptureError,
+      });
+      if (keepHome) {
+        let logPath: string | undefined;
+        let logPersistenceError: string | undefined;
+        try {
+          logPath = persistProofDaemonLogForForensics({
+            home,
+            log: daemonLog.forensicLog(proofLogSecrets),
+            exactSecrets: proofLogSecrets,
+            identity: proofHomeIdentity,
+            operations: nativeCleanupOperations,
+          });
+        } catch (error) {
+          logPersistenceError = error instanceof Error ? error.message : String(error);
+        }
+        const cleanup = sanitizeProofHomeForForensics(home, {
+          identity: proofHomeIdentity,
+          operations: nativeCleanupOperations,
+        });
+        if (logPersistenceError) {
+          console.warn(`[proof] could not persist retained daemon log for ${home}: ${logPersistenceError}`);
+        }
+        return {
+          retainedHome: true,
+          forensicLog: logPersistenceError
+            ? { status: 'failed', error: logPersistenceError }
+            : { status: 'persisted', path: logPath },
+          cleanup,
+          logCapture,
+          ...(shutdownError ? { shutdownError } : {}),
+          ...(logCaptureError ? { logCaptureError } : {}),
+        };
+      }
+
+      const cleanup = sanitizeAndRemoveProofHome(home, {
+        identity: proofHomeIdentity,
+        operations: nativeCleanupOperations,
+      });
+      return {
+        retainedHome: false,
+        forensicLog: { status: 'not-requested' },
+        cleanup,
+        logCapture,
+      };
+    } finally {
+      daemonLog.clear();
     }
   };
 
-  // log() is scoped to the CURRENT scenario: markLog() (called by the runner
-  // between scenarios) advances the window so one early provider-back-pressure
-  // burst can't fail the storm check of every scenario after it.
-  let logMark = 0;
-  const log = (): string => logChunks.join('').slice(logMark);
-  const markLog = (): void => { logMark = logChunks.join('').length; };
-  return { home, port, secret, baseUrl, chat, approve, request, log, markLog, restart, stop };
+  // log() is scoped to the CURRENT bounded scenario window. markLog() drops the
+  // prior semantic window while the smaller forensic tail spans all restarts.
+  const log = (): string => daemonLog.scenarioLog();
+  const markLog = (): void => { daemonLog.markScenario(); };
+  return { home, port, secret, baseUrl, chat, acceptedChat, approve, request, log, markLog, restart, stop };
 }

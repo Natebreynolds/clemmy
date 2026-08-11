@@ -33,6 +33,7 @@ import {
   type OperationalEventType,
 } from '../operational-telemetry.js';
 import type { EventRow, EventType, SessionRow } from './eventlog.js';
+import { isSettledReadReplayMarkerData } from './settled-read-replay-semantics.js';
 
 /** Kill-switch: CLEMMY_EVENTLOG_OPERATIONAL_MIRROR default ON. */
 function mirrorEnabled(): boolean {
@@ -48,9 +49,12 @@ function mirrorEnabled(): boolean {
 const EXCLUDED_EVENT_TYPES: ReadonlySet<string> = new Set<string>([
   'tool_called',
   'tool_returned',
+  'claude_local_permission_admitted',
+  'claude_local_permission_claimed',
   'stream_token',
   'heartbeat',
   'memory_signals_captured',
+  'durable_memory_intake_receipt',
 ]);
 
 interface MirrorMapping {
@@ -83,6 +87,11 @@ const STATIC_MIRROR_MAP: Readonly<Partial<Record<EventType, MirrorMapping>>> = {
 
 /** Resolve the operational mapping for an event, or null when it isn't mirrored. */
 function resolveMapping(event: EventRow): MirrorMapping | null {
+  if (event.type === 'guardrail_tripped' && isSettledReadReplayMarkerData(event.data)) {
+    // The event shape is reused for durable accounting, but nothing was
+    // blocked or degraded: a prior verified result satisfied this attempt.
+    return { type: 'gate_verdict', source: 'safety', severity: 'info' };
+  }
   if (event.type === 'worker_result') {
     const ok = (event.data as { ok?: unknown } | undefined)?.ok;
     // Treat an explicit ok:false as a failure; anything else (ok:true / missing)

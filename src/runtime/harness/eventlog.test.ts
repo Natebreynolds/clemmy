@@ -119,7 +119,7 @@ test('latest schema upgrades an existing v4 approval table without losing rows',
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    20, // v20: indexed exact-authority lifecycle lookup
+    34, // v34: normalized durable-memory host receipt authority
   );
   resetEventLog();
 });
@@ -163,7 +163,7 @@ test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => 
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    20, // v20: indexed exact-authority lifecycle lookup
+    34, // v34: normalized durable-memory host receipt authority
   );
   resetEventLog();
 });
@@ -243,7 +243,7 @@ test('schema v11 preserves a legacy targeted stop without widening its compatibi
   resetEventLog();
 });
 
-test('fresh schema v12 creates artifact truth and pre-ack cancellation tables eagerly', () => {
+test('fresh schema creates artifact truth, discovery, and accepted-task authority tables eagerly', () => {
   resetEventLog();
   const db = openEventLog();
   const tables = new Set(
@@ -256,6 +256,21 @@ test('fresh schema v12 creates artifact truth and pre-ack cancellation tables ea
     'artifact_source_roots',
     'harness_chat_request_cancellations',
     'tool_output_invocations',
+    'discovery_governor_tasks',
+    'discovery_governor_claims',
+    'accepted_task_resolutions',
+    'accepted_task_operations',
+    'obligation_transitions',
+    'settlement_claims',
+    'logical_tool_calls',
+    'physical_dispatches',
+    'logical_call_settlements',
+    'logical_call_settlement_crossings',
+    'logical_call_progress_claims',
+    'accepted_task_authority',
+    'durable_result_handles',
+    'accepted_task_work_contracts',
+    'evidence_receipts',
   ]) assert.ok(tables.has(name), `${name} exists before the first turn`);
   const columns = new Set(
     (db.prepare('PRAGMA table_info(run_artifacts)').all() as Array<{ name: string }>).map((row) => row.name),
@@ -277,9 +292,13 @@ test('fresh schema v12 creates artifact truth and pre-ack cancellation tables ea
     indexes.has('idx_events_external_write_settlement_key'),
     'fresh schema enforces one successful settlement per exact reservation',
   );
+  assert.ok(
+    indexes.has('idx_discovery_governor_claims_call'),
+    'fresh schema indexes discovery claims by their stable physical call id',
+  );
   assert.equal(
     (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    20, // v20: indexed exact-authority lifecycle lookup
+    34, // v34: normalized durable-memory host receipt authority
   );
   resetEventLog();
 });
@@ -346,7 +365,7 @@ test('schema v12 upgrades a lazy artifact ledger in place and preserves its earl
   assert.equal(root.root_scope_id, 'root-first');
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    20, // v20: indexed exact-authority lifecycle lookup
+    34, // v34: normalized durable-memory host receipt authority
   );
   resetEventLog();
 });
@@ -382,7 +401,7 @@ test('schema v19 upgrades a live-like v18 database with invocation-scoped output
   assert.ok(tables.has('tool_output_invocations'));
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    20,
+    34,
   );
   writeToolOutput({
     sessionId: 'sess-live-v18',
@@ -396,6 +415,520 @@ test('schema v19 upgrades a live-like v18 database with invocation-scoped output
     'exact live output',
   );
   resetEventLog();
+});
+
+test('schema v21 upgrades a v20 database with durable discovery claims and cascading ownership', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (20, '2026-08-08T00:00:00.000Z');
+    CREATE TABLE sessions (id TEXT PRIMARY KEY);
+    INSERT INTO sessions (id) VALUES ('sess-v20-discovery');
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    34,
+  );
+  migrated.prepare(`
+    INSERT INTO discovery_governor_tasks
+      (session_id, source_user_seq, known_capability, initialized_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(
+    'sess-v20-discovery',
+    7,
+    0,
+    '2026-08-08T00:00:01.000Z',
+    '2026-08-08T00:00:01.000Z',
+  );
+  migrated.prepare(`
+    INSERT INTO discovery_governor_claims
+      (session_id, source_user_seq, category, call_id, admitted_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(
+    'sess-v20-discovery',
+    7,
+    'broad_discovery',
+    'call-v20-discovery',
+    '2026-08-08T00:00:02.000Z',
+  );
+  assert.throws(
+    () => migrated.prepare(`
+      INSERT INTO discovery_governor_claims
+        (session_id, source_user_seq, category, call_id, admitted_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      'sess-v20-discovery',
+      7,
+      'unbounded_discovery',
+      'call-invalid-category',
+      '2026-08-08T00:00:03.000Z',
+    ),
+    /CHECK constraint failed/,
+  );
+
+  migrated.prepare('DELETE FROM sessions WHERE id = ?').run('sess-v20-discovery');
+  assert.equal(
+    (migrated.prepare('SELECT COUNT(*) AS n FROM discovery_governor_tasks').get() as { n: number }).n,
+    0,
+  );
+  assert.equal(
+    (migrated.prepare('SELECT COUNT(*) AS n FROM discovery_governor_claims').get() as { n: number }).n,
+    0,
+  );
+  resetEventLog();
+});
+
+test('schema v22 preserves complete legacy obligation evidence without inventing dispatch identity', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (21, '2026-08-09T00:00:00.000Z');
+    CREATE TABLE obligation_transitions (
+      obligation_key      TEXT PRIMARY KEY,
+      session_id          TEXT NOT NULL,
+      source_user_seq     INTEGER NOT NULL,
+      manifest_id         TEXT NOT NULL,
+      node_id             TEXT NOT NULL,
+      obligation          TEXT NOT NULL,
+      receipt_id          TEXT NOT NULL,
+      physical_attempt_id TEXT NOT NULL,
+      claimed_at          TEXT NOT NULL
+    );
+    INSERT INTO obligation_transitions
+      (obligation_key, session_id, source_user_seq, manifest_id, node_id,
+       obligation, receipt_id, physical_attempt_id, claimed_at)
+    VALUES
+      ('legacy-proof', 'legacy-session', 7, 'manifest:v1:legacy', 'node/read',
+       'source_completeness', 'receipt:legacy', 'logical-call-in-old-column',
+       '2026-08-09T00:00:01.000Z');
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  const row = migrated.prepare(`
+    SELECT obligation_key, session_id, source_user_seq, manifest_id, node_id,
+           obligation, receipt_id, physical_attempt_id,
+           logical_tool_call_id, physical_dispatch_id, claimed_at
+      FROM obligation_transitions WHERE obligation_key = 'legacy-proof'
+  `).get() as {
+    obligation_key: string;
+    session_id: string;
+    source_user_seq: number;
+    manifest_id: string;
+    node_id: string;
+    obligation: string;
+    receipt_id: string;
+    physical_attempt_id: string;
+    logical_tool_call_id: string | null;
+    physical_dispatch_id: string | null;
+    claimed_at: string;
+  };
+  assert.deepEqual(row, {
+    obligation_key: 'legacy-proof',
+    session_id: 'legacy-session',
+    source_user_seq: 7,
+    manifest_id: 'manifest:v1:legacy',
+    node_id: 'node/read',
+    obligation: 'source_completeness',
+    receipt_id: 'receipt:legacy',
+    physical_attempt_id: 'logical-call-in-old-column',
+    logical_tool_call_id: null,
+    physical_dispatch_id: null,
+    claimed_at: '2026-08-09T00:00:01.000Z',
+  });
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    34,
+  );
+  migrated.close();
+  resetEventLog();
+});
+
+test('schema v22 quarantines an incomplete obligation table instead of promoting claims as evidence', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (21, '2026-08-09T00:00:00.000Z');
+    CREATE TABLE obligation_transitions (
+      obligation_key TEXT PRIMARY KEY,
+      session_id     TEXT NOT NULL
+    );
+    INSERT INTO obligation_transitions (obligation_key, session_id)
+    VALUES ('unredeemable-claim', 'legacy-session');
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  const tables = new Set(
+    (migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  );
+  assert.ok(tables.has('obligation_transitions_legacy_v21'));
+  assert.equal(
+    (migrated.prepare(
+      "SELECT COUNT(*) AS n FROM obligation_transitions_legacy_v21 WHERE obligation_key = 'unredeemable-claim'",
+    ).get() as { n: number }).n,
+    1,
+    'the incompatible claim remains available for forensic inspection',
+  );
+  assert.equal(
+    (migrated.prepare('SELECT COUNT(*) AS n FROM obligation_transitions').get() as { n: number }).n,
+    0,
+    'an ownerless two-column claim is never upgraded into terminal authority',
+  );
+  const columns = new Set(
+    (migrated.prepare('PRAGMA table_info(obligation_transitions)').all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  );
+  for (const name of ['manifest_id', 'receipt_id', 'logical_tool_call_id', 'physical_dispatch_id']) {
+    assert.ok(columns.has(name), `${name} exists on the fresh authoritative table`);
+  }
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    34,
+  );
+  resetEventLog();
+});
+
+test('schema v22 keeps sparse migration rehearsals sparse while installing standalone ledgers', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (21, '2026-08-09T00:00:00.000Z');
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  const rows = migrated.prepare(`
+    SELECT name FROM sqlite_master
+     WHERE type = 'table'
+       AND name IN (
+         'accepted_task_operations', 'accepted_task_resolutions',
+         'obligation_transitions', 'settlement_claims'
+       )
+     ORDER BY name
+  `).all() as Array<{ name: string }>;
+  assert.deepEqual(rows, [
+    { name: 'obligation_transitions' },
+    { name: 'settlement_claims' },
+  ]);
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    34,
+  );
+  resetEventLog();
+});
+
+test('schema v24 refuses to stamp a real event spine whose v23 authority is incomplete', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (23, '2026-08-10T00:00:00.000Z');
+    CREATE TABLE sessions (id TEXT PRIMARY KEY);
+    CREATE TABLE events (id TEXT PRIMARY KEY);
+  `);
+  raw.close();
+
+  assert.throws(() => openEventLog(), /schema v24 prerequisite missing: accepted_task_resolutions/);
+  const inspected = new Database(HARNESS_DB_PATH, { readonly: true });
+  assert.equal(
+    (inspected.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    23,
+    'the failed migration is never marked applied',
+  );
+  inspected.close();
+  resetEventLog();
+});
+
+test('schema v28 preserves the raw logical digest and installs one-way effective-contract authority', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (27, '2026-08-10T00:00:00.000Z');
+    CREATE TABLE sessions (id TEXT PRIMARY KEY);
+    CREATE TABLE events (id TEXT PRIMARY KEY);
+    CREATE TABLE accepted_task_resolutions (
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL,
+      accepted_task_id TEXT NOT NULL,
+      state TEXT NOT NULL,
+      PRIMARY KEY (session_id, source_user_seq)
+    );
+    CREATE TABLE logical_tool_calls (
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL,
+      accepted_task_id TEXT NOT NULL,
+      logical_tool_call_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      argument_digest TEXT NOT NULL,
+      state TEXT NOT NULL,
+      opened_at TEXT NOT NULL,
+      settled_at TEXT,
+      settlement_event_id TEXT,
+      outcome_kind TEXT,
+      PRIMARY KEY (session_id, source_user_seq, logical_tool_call_id)
+    );
+    CREATE TABLE physical_dispatches (
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL,
+      logical_tool_call_id TEXT NOT NULL
+    );
+    CREATE TABLE logical_call_settlements (
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL,
+      logical_tool_call_id TEXT NOT NULL
+    );
+    CREATE TABLE accepted_task_authority (
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL,
+      accepted_task_id TEXT NOT NULL UNIQUE,
+      graph_event_id TEXT NOT NULL,
+      graph_id TEXT NOT NULL,
+      graph_hash TEXT NOT NULL,
+      state TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (session_id, source_user_seq)
+    );
+    INSERT INTO sessions (id) VALUES ('sess-v27-contract');
+    INSERT INTO accepted_task_resolutions
+      (session_id, source_user_seq, accepted_task_id, state)
+    VALUES ('sess-v27-contract', 7, 'task:sess-v27-contract#7', 'open');
+    INSERT INTO logical_tool_calls
+      (session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
+       tool_name, argument_digest, state, opened_at)
+    VALUES
+      ('sess-v27-contract', 7, 'task:sess-v27-contract#7', 'logical:v27',
+       'alpha__records_search', '${'a'.repeat(64)}', 'open', '2026-08-10T00:00:01.000Z');
+  `);
+  raw.close();
+
+  assert.throws(
+    () => openEventLog(),
+    /schema v30 prerequisite missing: logical_call_settlement_crossings/,
+    'v30 refuses a falsely stamped v27 spine with no settlement-crossing authority',
+  );
+  const migrated = new Database(HARNESS_DB_PATH);
+  assert.deepEqual(migrated.prepare(`
+    SELECT argument_digest, raw_argument_digest, effective_argument_digest,
+           refined_at, refinement_event_id
+      FROM logical_tool_calls
+     WHERE logical_tool_call_id = 'logical:v27'
+  `).get(), {
+    argument_digest: 'a'.repeat(64),
+    raw_argument_digest: 'a'.repeat(64),
+    effective_argument_digest: null,
+    refined_at: null,
+    refinement_event_id: null,
+  });
+  assert.throws(() => migrated.prepare(`
+    UPDATE logical_tool_calls SET argument_digest = ?
+     WHERE logical_tool_call_id = 'logical:v27'
+  `).run('b'.repeat(64)), /logical call contract refinement is not monotonic/);
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    29,
+  );
+  migrated.close();
+  resetEventLog();
+});
+
+test('schema v29 preserves armed authority and adds an unbound immutable work-contract slot', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (28, '2026-08-10T00:00:00.000Z');
+    CREATE TABLE sessions (id TEXT PRIMARY KEY);
+    CREATE TABLE events (id TEXT PRIMARY KEY);
+    CREATE TABLE accepted_task_authority (
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL,
+      accepted_task_id TEXT NOT NULL UNIQUE,
+      graph_event_id TEXT NOT NULL,
+      graph_id TEXT NOT NULL,
+      graph_hash TEXT NOT NULL,
+      state TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (session_id, source_user_seq)
+    );
+    INSERT INTO sessions (id) VALUES ('sess-v28-expected-work');
+    INSERT INTO events (id) VALUES ('graph-event-v28');
+    INSERT INTO accepted_task_authority
+      (session_id, source_user_seq, accepted_task_id, graph_event_id,
+       graph_id, graph_hash, state, revision, updated_at)
+    VALUES
+      ('sess-v28-expected-work', 7, 'task:sess-v28-expected-work#7',
+       'graph-event-v28', 'turn-graph:v1:7', '${'a'.repeat(64)}',
+       'armed', 3, '2026-08-10T00:00:01.000Z');
+  `);
+  raw.close();
+
+  assert.throws(
+    () => openEventLog(),
+    /schema v30 prerequisite missing: logical_tool_calls/,
+    'v30 refuses to stamp a partial event spine that cannot bind exact settlement evidence',
+  );
+  const migrated = new Database(HARNESS_DB_PATH, { readonly: true });
+  assert.deepEqual(migrated.prepare(`
+    SELECT state, revision, work_contract_id
+      FROM accepted_task_authority
+     WHERE session_id = 'sess-v28-expected-work' AND source_user_seq = 7
+  `).get(), { state: 'armed', revision: 3, work_contract_id: null });
+  assert.ok(migrated.prepare(`
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'table' AND name = 'accepted_task_work_contracts'
+  `).get());
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    29,
+  );
+  migrated.close();
+  resetEventLog();
+});
+
+test('schema v32 installs immutable action bindings and removes only rows whose parent session is absent', () => {
+  resetEventLog();
+  const live = createSession({ id: 'v32-live-session', kind: 'chat' });
+  closeEventLog();
+
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.pragma('foreign_keys = OFF');
+  raw.exec(`
+    DELETE FROM schema_version WHERE version IN (32, 33, 34);
+    INSERT INTO run_attempts
+      (attempt_id, session_id, run_id, started_at, finished_at, status,
+       lease_owner, lease_expires_at, source_user_seq)
+    VALUES
+      ('attempt-v32-live', '${live.id}', 'run-v32-live', '2026-08-10T00:00:00.000Z', NULL,
+       'active', NULL, NULL, 999999),
+      ('attempt-v32-orphan', 'v32-missing-session', 'run-v32-orphan',
+       '2026-08-10T00:00:00.000Z', NULL, 'active', NULL, NULL, 777777);
+    INSERT INTO run_dispatch_leases
+      (scope_id, session_id, lease_id, run_attempt_id, activated_at, revoked_at,
+       parent_scope_id, parent_lease_id)
+    VALUES
+      ('scope-v32-live', '${live.id}', 'lease-v32-live', 'attempt-v32-live',
+       '2026-08-10T00:00:00.000Z', NULL, NULL, NULL),
+      ('scope-v32-orphan', 'v32-missing-session', 'lease-v32-orphan', 'attempt-v32-orphan',
+       '2026-08-10T00:00:00.000Z', NULL, NULL, NULL);
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    34,
+  );
+  assert.deepEqual(
+    migrated.prepare('SELECT attempt_id, source_user_seq FROM run_attempts ORDER BY attempt_id').all(),
+    [{ attempt_id: 'attempt-v32-live', source_user_seq: 999999 }],
+    'a live-session attempt survives even when its historical source event is absent',
+  );
+  assert.deepEqual(
+    migrated.prepare('SELECT scope_id FROM run_dispatch_leases ORDER BY scope_id').all(),
+    [{ scope_id: 'scope-v32-live' }],
+  );
+  const tables = new Set(
+    (migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  );
+  assert.ok(tables.has('expected_work_call_bindings'));
+  const authorityColumns = new Set(
+    (migrated.prepare('PRAGMA table_info(accepted_task_authority)').all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  );
+  assert.ok(authorityColumns.has('expected_work_required'));
+  resetEventLog();
+});
+
+test('schema v33 installs normalized pre-dispatch write bindings and proof authority', () => {
+  resetEventLog();
+  const db = openEventLog();
+  assert.equal(
+    (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    34,
+  );
+  const tables = new Set(
+    (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  );
+  for (const table of [
+    'write_evidence_bindings',
+    'write_evidence_dispatch_reservations',
+    'write_evidence_dispatch_outcomes',
+    'write_evidence_readback_bindings',
+    'write_evidence_derivations',
+    'write_evidence_derivation_sources',
+    'write_evidence_execution_snapshots',
+    'write_evidence_proofs',
+  ]) assert.ok(tables.has(table), `v33 installs ${table}`);
+  resetEventLog();
+});
+
+test('accepts discovery-governor decision and outcome telemetry events', () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat', channel: 'cli', title: 'discovery telemetry' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Find the right tool once.' },
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'orchestrator',
+    type: 'discovery_governor_decision',
+    data: {
+      sourceUserSeq: source.seq,
+      category: 'broad_discovery',
+      decision: 'admitted',
+      consumedBudget: true,
+    },
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'orchestrator',
+    type: 'discovery_governor_outcome',
+    data: {
+      sourceUserSeq: source.seq,
+      category: 'broad_discovery',
+      outcome: 'succeeded',
+    },
+  });
+
+  const telemetry = listEvents(session.id).filter((event) =>
+    event.type === 'discovery_governor_decision' || event.type === 'discovery_governor_outcome'
+  );
+  assert.deepEqual(
+    telemetry.map((event) => ({ type: event.type, sourceUserSeq: event.data.sourceUserSeq })),
+    [
+      { type: 'discovery_governor_decision', sourceUserSeq: source.seq },
+      { type: 'discovery_governor_outcome', sourceUserSeq: source.seq },
+    ],
+  );
 });
 
 test('creates a session and appends events with monotonic seq', () => {
@@ -1773,6 +2306,56 @@ test('authority fallback rejects reused zero-v19 call ids instead of selecting s
   assert.equal(resolution.invocationCount, 2);
 });
 
+test('a no-dispatch replay occurrence cannot poison fresh authority when an SDK call id is reused', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const callId = 'replay-then-fresh';
+  const replayCalled = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'executor',
+    type: 'tool_called',
+    data: { callId, tool: 'provider_search', effect: 'read' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'executor',
+    type: 'tool_returned',
+    parentEventId: replayCalled.id,
+    data: {
+      callId,
+      tool: 'provider_search',
+      effect: 'read',
+      providerDispatched: false,
+      replayedFromCallId: 'physical-source',
+      replayKind: 'same_source_settled_read_replay',
+    },
+  });
+
+  const freshCalled = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'executor',
+    type: 'tool_called',
+    data: { callId, tool: 'provider_search', effect: 'read' },
+  });
+  const fresh = JSON.stringify({ successful: true, data: { rows: [{ id: 'fresh' }] } });
+  writeToolOutput({ sessionId: sess.id, callId, tool: 'provider_search', output: fresh });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'executor',
+    type: 'tool_returned',
+    parentEventId: freshCalled.id,
+    data: { callId, tool: 'provider_search', effect: 'read', ok: true },
+  });
+
+  const resolution = resolveToolOutputForAuthority(sess.id, callId);
+  assert.equal(resolution.status, 'ok');
+  if (resolution.status === 'ok') assert.equal(resolution.record.output, fresh);
+});
+
 test('authority resolution rejects a lone nonce row when durable events prove later id reuse', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -1928,11 +2511,25 @@ test('reapStaleToolOutputs bounds exact rows while preserving an uncompensated w
 
 test('schema v20 installs the indexed tool-lifecycle lookup used on long sessions', () => {
   resetEventLog();
+  const db = openEventLog();
   const indexes = new Set(
-    (openEventLog().prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all() as Array<{ name: string }>)
+    (db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all() as Array<{ name: string }>)
       .map((row) => row.name),
   );
   assert.ok(indexes.has('idx_events_tool_lifecycle_call'));
+  const plan = db.prepare(`
+    EXPLAIN QUERY PLAN
+    SELECT seq, id, session_id, turn, role, type, parent_event_id, data_json, created_at
+      FROM events
+     WHERE session_id = ?
+       AND type IN ('tool_called', 'tool_returned')
+       AND json_extract(data_json, '$.callId') = ?
+  `).all('planner-session', 'planner-call') as Array<{ detail?: string }>;
+  assert.ok(
+    plan.some((row) => row.detail?.includes('idx_events_tool_lifecycle_call')
+      && row.detail.includes('<expr>=?')),
+    `lifecycle lookup must use its call-id index: ${plan.map((row) => row.detail).join(' | ')}`,
+  );
 });
 
 // Destructive-store guard (2026-07-23): the live home's harness.db was found

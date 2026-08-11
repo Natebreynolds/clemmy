@@ -8,10 +8,11 @@
  * and account-plural. Every test crosses the real governed gateway or the
  * real bridge; nothing injects the feature under test.
  */
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+const PRIOR_CLEMENTINE_HOME = process.env.CLEMENTINE_HOME;
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-learning-pipeline-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT = 'off';
@@ -27,6 +28,26 @@ const schemaCache = await import('../../tools/composio-schema-cache.js');
 const toolChoice = await import('../../memory/tool-choice-store.js');
 const eventlog = await import('../harness/eventlog.js');
 const candidates = await import('./capability-candidates.js');
+const { productionScope } = await import('./read-lane-chat.js');
+const { closeMemoryDb } = await import('../../memory/db.js');
+const { closeProcedureStoreForTests } = await import('../../memory/procedure-store.js');
+const { closeOperationalTelemetryDb } = await import('../operational-telemetry.js');
+
+test.after(async () => {
+  // Settlements debounce a fire-and-forget learning drain by 100 ms. Let that
+  // timer observe the already-drained queue before removing its durable home,
+  // otherwise it can recreate harness.db after teardown.
+  await new Promise<void>((resolve) => setTimeout(resolve, 150));
+  const worker = await import('../../memory/learning-worker.js');
+  await worker.drainPendingLearning();
+  eventlog.closeEventLog();
+  closeMemoryDb();
+  closeProcedureStoreForTests();
+  closeOperationalTelemetryDb();
+  rmSync(TMP_HOME, { recursive: true, force: true });
+  if (PRIOR_CLEMENTINE_HOME === undefined) delete process.env.CLEMENTINE_HOME;
+  else process.env.CLEMENTINE_HOME = PRIOR_CLEMENTINE_HOME;
+});
 
 const CAL_SLUG = 'SCHEDULERCO_LIST_EVENTS';
 const CAL_SCHEMA = { type: 'object', properties: { timeMin: { type: 'string' } } };
@@ -48,7 +69,7 @@ function acceptSource(sessionId: string, text: string): { sourceUserSeq: number 
 }
 
 async function governedRead(sessionId: string, slug: string, payload: unknown): Promise<string> {
-  schemaCache.rememberToolSchema(slug, CAL_SCHEMA);
+  schemaCache.rememberToolSchema(slug, CAL_SCHEMA, Date.now());
   const exec = (async () => payload) as never;
   return composio.runComposioExecuteForTestInSession(slug, { timeMin: '2026-08-06' }, exec, sessionId);
 }
@@ -98,7 +119,7 @@ test('identical data from two accounts yields two unique receipts and two candid
   const sessionId = freshSession('sess-twoacct');
   const phrase = 'any new invoices this morning?';
   acceptSource(sessionId, phrase);
-  schemaCache.rememberToolSchema('MAILCO_FETCH_INVOICES', CAL_SCHEMA);
+  schemaCache.rememberToolSchema('MAILCO_FETCH_INVOICES', CAL_SCHEMA, Date.now());
   const identicalPayload = { successful: true, data: { items: [{ id: 'inv-1', total: 100 }] } };
   await composio._settleVerifiedComposioReadForTest({
     toolSlug: 'MAILCO_FETCH_INVOICES', sessionId, result: identicalPayload,
@@ -111,12 +132,16 @@ test('identical data from two accounts yields two unique receipts and two candid
   await drainLearning();
 
   const receipts = eventlog.listEvents(sessionId).filter((e) => e.type === 'read_receipt')
-    .map((e) => (e.data as { record: { receiptId: string; scope?: { accountIdentity?: string } } }).record);
+    .map((e) => (e.data as { record: { receiptId: string; scope?: { tenant?: string; workspace?: string; accountIdentity?: string } } }).record);
   assert.equal(receipts.length, 2, 'two settlements produced a shared or missing receipt');
   assert.notEqual(receipts[0]!.receiptId, receipts[1]!.receiptId,
     'identical payloads from two accounts collided into one receipt identity');
   const accounts = new Set(receipts.map((r) => r.scope?.accountIdentity));
   assert.equal(accounts.size, 2, 'the receipts do not carry distinct account bindings');
+  for (const receipt of receipts) {
+    assert.deepEqual(receipt.scope, productionScope(receipt.scope?.accountIdentity ?? ''),
+      'learning and production serving derived different procedure scope identities');
+  }
 
   const resolved = await candidates.resolveTurnCapabilityCandidates({ userInput: phrase });
   const provenances = resolved.candidates
@@ -128,7 +153,7 @@ test('identical data from two accounts yields two unique receipts and two candid
 
 // ─── A.6: catalog authority is required, never fail-open ─────────────────────
 
-test('an empty or expired schema cache declines schema-bound candidates until authority reloads', async () => {
+test('clearing process-local catalog authority declines schema-bound capability binding', async () => {
   const sessionId = freshSession('sess-authority');
   const phrase = 'check the loading dock booking sheet';
   acceptSource(sessionId, phrase);
@@ -141,20 +166,13 @@ test('an empty or expired schema cache declines schema-bound candidates until au
     true, 'the capability did not learn while authority was live',
   );
 
-  // The daemon restarts: the process schema cache is empty. Absent live
-  // authority, a schema-bound capability must DECLINE — validation cannot
-  // run against a contract nobody currently holds.
+  // General capability binding does not hydrate executable authority from the
+  // validation store. The governed warm factory owns the narrower exact-slug
+  // restart-continuity path.
   schemaCache._clearToolSchemaCacheForTest();
   assert.equal(
     toolChoice.matchToolChoicesForStep(phrase, { limit: 8 }).some((m) => m.identifier === 'SCHEDULERCO_LIST_DOCKS'),
-    false, 'a schema-bound capability served with NO live catalog authority — validation went fail-open',
-  );
-
-  // Authority reloads (catalog fetch re-deposits the same contract) → serves.
-  schemaCache.rememberToolSchema('SCHEDULERCO_LIST_DOCKS', CAL_SCHEMA);
-  assert.equal(
-    toolChoice.matchToolChoicesForStep(phrase, { limit: 8 }).some((m) => m.identifier === 'SCHEDULERCO_LIST_DOCKS'),
-    true, 'the capability did not come back when catalog authority reloaded',
+    false, 'a schema-bound capability served without process-local executable authority',
   );
 });
 
@@ -204,13 +222,48 @@ test('a transient materialization failure retries after restart instead of spend
   );
 });
 
+test('a privacy-bounded pending identity survives restart-before-drain and still learns', async () => {
+  const sessionId = freshSession('sess-private-restart');
+  const phrase = 'list renewal invoices PRIVATE_RESTART_SENTINEL_67e9c0b31a user@example.com https://private.example/case/12345';
+  acceptSource(sessionId, phrase);
+  const aliasIndex = await import('../../memory/capability-alias-index.js');
+  // Hold materialization at its existing deterministic write seam. Under a
+  // busy parallel test run the 100ms background timer can otherwise drain the
+  // row before this restart-boundary assertion gets CPU time.
+  aliasIndex._failAliasWritesForTest(true);
+  try {
+    await governedRead(sessionId, 'BILLINGCO_LIST_RENEWAL_INVOICES', {
+      successful: true, data: { items: [{ id: 'renewal-1' }] },
+    });
+
+    const queued = aliasIndex.listPendingLearning().find((row) => row.sessionId === sessionId);
+    assert.ok(queued, 'settlement left no durable restart boundary');
+    assert.equal('phrase' in queued!, false, 'the in-memory queue contract still exposes raw accepted text');
+    assert.deepEqual(queued!.aliasTerms, ['list', 'renewal', 'invoices']);
+    assert.equal(queued!.aliasDigest, aliasIndex.acceptedPhraseDigest(phrase));
+
+    // Simulate process restart before a materialization can commit. The next
+    // process has only digest + bounded terms, yet exact recall still learns.
+    aliasIndex.closeCapabilityAliasIndexForTests();
+  } finally {
+    aliasIndex._failAliasWritesForTest(false);
+  }
+  await drainLearning();
+  assert.equal(
+    toolChoice.matchToolChoicesForStep(phrase, { limit: 8 })
+      .some((match) => match.identifier === 'BILLINGCO_LIST_RENEWAL_INVOICES'),
+    true,
+    'the privacy-bounded queue could not materialize after restart',
+  );
+});
+
 // ─── A.7: both brains receive every provenance ───────────────────────────────
 
 test('the candidate card names every distinct account provenance for one identifier', async () => {
   const sessionId = freshSession('sess-card');
   const phrase = 'scan both inboxes for contracts';
   acceptSource(sessionId, phrase);
-  schemaCache.rememberToolSchema('MAILCO_SCAN_CONTRACTS', CAL_SCHEMA);
+  schemaCache.rememberToolSchema('MAILCO_SCAN_CONTRACTS', CAL_SCHEMA, Date.now());
   for (const account of ['legal@northco.example', 'deals@southco.example']) {
     await composio._settleVerifiedComposioReadForTest({
       toolSlug: 'MAILCO_SCAN_CONTRACTS', sessionId,
@@ -223,6 +276,10 @@ test('the candidate card names every distinct account provenance for one identif
   const card = candidates.renderCapabilityCandidateCard(resolved);
   assert.match(card, /legal@northco\.example/, 'the first account provenance is missing from the card');
   assert.match(card, /deals@southco\.example/, 'the second account provenance is missing from the card');
+  assert.match(card, /composio_execute_tool.*tool_slug.*MAILCO_SCAN_CONTRACTS/s,
+    'the card must distinguish the executable carrier/slug from learned intent metadata');
+  assert.match(card, /intent label.*NEVER a tool name/s,
+    'the card must explicitly prevent semantic intent labels from being invoked');
 });
 
 // ─── A.9: candidates survive brain fallover ──────────────────────────────────
@@ -259,6 +316,83 @@ test('a fallover rebuild receives the same turn candidates as the first brain', 
   assert.ok(seen[0], 'the fallover rebuild dropped the turn candidates — the second brain pays full discovery');
 });
 
+test('empty-args executable promotion refuses schema drift between dispatch settlement and worker drain', async () => {
+  const slug = 'HEALTHCO_LIST_STATUS';
+  const sessionId = freshSession('sess-schema-drift');
+  const source = acceptSource(sessionId, 'healthco list status');
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object', properties: {}, additionalProperties: false,
+  }, Date.now());
+  const dispatchFingerprint = schemaCache.liveComposioSchemaFingerprint(slug);
+  assert.ok(dispatchFingerprint);
+  const verdict = composio._settleVerifiedComposioReadForTest({
+    toolSlug: slug,
+    sessionId,
+    sourceUserSeq: source.sourceUserSeq,
+    result: { successful: true, data: { items: [{ status: 'healthy' }] } },
+    accountIdentity: 'ops@example.com',
+    schemaFingerprint: dispatchFingerprint,
+    normalizedArgs: {},
+  });
+  assert.equal(verdict.queued, true);
+  if (!verdict.queued) assert.fail(verdict.reason);
+  assert.equal(verdict.pending.executableEmptyArgs, true);
+
+  // Contract moves before the asynchronous materializer runs. The worker may
+  // not rewrite history and claim the old dispatch proved this new schema.
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object', properties: { region: { type: 'string' } }, required: ['region'],
+  }, Date.now());
+  const movedFingerprint = schemaCache.liveComposioSchemaFingerprint(slug);
+  assert.ok(movedFingerprint);
+  assert.notEqual(movedFingerprint, dispatchFingerprint);
+  for (let attempt = 0; attempt < 5; attempt += 1) await drainLearning();
+
+  const procedureStore = await import('../../memory/procedure-store.js');
+  const procedureReceipts = await import('../../memory/procedure-receipts.js');
+  const artifactExists = procedureStore.listActiveArtifactRows()
+    .map((document) => procedureReceipts.parseProcedureArtifactDocument(document))
+    .some((parsed) => parsed.ok && parsed.artifact.identifier === slug);
+  assert.equal(artifactExists, false,
+    'worker promoted an executable artifact under a schema the dispatch never proved');
+  assert.equal(eventlog.listEvents(sessionId).some((event) => event.type === 'read_receipt'), false,
+    'worker minted a receipt that rewrote the dispatch-time schema');
+});
+
+test('empty-args settlement from a superseded source remains capability-only', async () => {
+  const slug = 'HEALTHCO_LIST_STALE_STATUS';
+  const sessionId = freshSession('sess-stale-source');
+  const stale = acceptSource(sessionId, 'healthco list stale status');
+  acceptSource(sessionId, 'a newer accepted turn owns this session now');
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object', properties: {}, additionalProperties: false,
+  }, Date.now());
+  const fingerprint = schemaCache.liveComposioSchemaFingerprint(slug);
+  assert.ok(fingerprint);
+  const verdict = composio._settleVerifiedComposioReadForTest({
+    toolSlug: slug,
+    sessionId,
+    sourceUserSeq: stale.sourceUserSeq,
+    result: { successful: true, data: { items: [{ status: 'healthy' }] } },
+    accountIdentity: 'ops@example.com',
+    schemaFingerprint: fingerprint,
+    normalizedArgs: {},
+  });
+  assert.equal(verdict.queued, true);
+  if (!verdict.queued) assert.fail(verdict.reason);
+  assert.equal(verdict.pending.executableEmptyArgs, false);
+  assert.equal(verdict.pending.attemptId, null,
+    'a superseded attempt was captured as current executable authority');
+  await drainLearning();
+
+  const procedureStore = await import('../../memory/procedure-store.js');
+  const procedureReceipts = await import('../../memory/procedure-receipts.js');
+  assert.equal(procedureStore.listActiveArtifactRows()
+    .map((document) => procedureReceipts.parseProcedureArtifactDocument(document))
+    .some((parsed) => parsed.ok && parsed.artifact.identifier === slug), false,
+  'superseded source minted an executable procedure artifact');
+});
+
 // ─── warm turn shape (guard) ─────────────────────────────────────────────────
 
 test('a warm paraphrase turn: zero discovery, one dispatch, one committed terminal', async () => {
@@ -279,7 +413,7 @@ test('a warm paraphrase turn: zero discovery, one dispatch, one committed termin
     }) => {
       await opts.buildAgent?.();
       // The brain honors the card: ONE dispatch with CURRENT arguments.
-      schemaCache.rememberToolSchema(CAL_SLUG, CAL_SCHEMA);
+      schemaCache.rememberToolSchema(CAL_SLUG, CAL_SCHEMA, Date.now());
       const exec = (async () => { dispatches += 1; return { successful: true, data: { items: [{ id: 'e2' }] } }; }) as never;
       await composio.runComposioExecuteForTestInSession(CAL_SLUG, { timeMin: '2026-08-07' }, exec, opts.sessionId);
       return { sessionId: opts.sessionId, steps: 1, lastTurn: 1, status: 'completed', text: 'done' };

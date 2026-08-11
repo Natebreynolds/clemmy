@@ -279,6 +279,33 @@ test('resumable approval registration dedupes and an approved grant is claimed e
   assert.equal(replay.state, 'consumed', 'the exact approved payload cannot reuse the grant twice');
 });
 
+test('resumable approval expected-id claim consumes the awaited row, not a newer same-key row', () => {
+  const session = createSession({ kind: 'workflow' });
+  const input = {
+    sessionId: session.id,
+    subject: 'Run exact action?',
+    tool: 'm365__delete_item',
+    args: { item_id: 'same-item' },
+    resumeKey: 'resume-same-payload-race',
+  };
+  const awaited = reg.registerResumable(input).row;
+  reg.resolve(awaited.approvalId, 'approved', 'unit-test-human');
+
+  // Once the first card resolves, another identical attempt can create a newer
+  // card with the same key before the original WAIT loop wakes up.
+  const newer = reg.registerResumable(input).row;
+  reg.resolve(newer.approvalId, 'approved', 'unit-test-human');
+
+  const exact = reg.claimResumableApproval(input.resumeKey, awaited.approvalId);
+  assert.equal(exact.state, 'approved');
+  assert.equal(exact.state === 'approved' && exact.row.approvalId, awaited.approvalId);
+  assert.ok(reg.get(awaited.approvalId)?.consumedAt);
+  assert.equal(reg.get(newer.approvalId)?.consumedAt, null, 'the newer grant was not consumed by mistake');
+
+  const newerClaim = reg.claimResumableApproval(input.resumeKey, newer.approvalId);
+  assert.equal(newerClaim.state, 'approved');
+});
+
 test('resumable approval refuses a same-key row whose nested payload authority differs', () => {
   const session = createSession({ kind: 'workflow' });
   const first = reg.registerResumable({
@@ -371,4 +398,37 @@ test('approvedSendSlugsForSessions returns approved slugs only — rejections ne
   assert.deepEqual(slugs, ['SLACK_SEND_MESSAGE'], 'approved run graduates');
   assert.deepEqual(reg.approvedSendSlugsForSessions([sessB]), [], 'a rejection alone graduates nothing');
   assert.deepEqual(reg.approvedSendSlugsForSessions([]), []);
+});
+
+test('provider-neutral resend consent is an explicit contract across an external broker transport', () => {
+  const session = createSession({ kind: 'chat' });
+  const target = 'provider-neutral@example.com';
+  const row = reg.register({
+    sessionId: session.id,
+    subject: `Send a second email to ${target}`,
+    tool: 'm365__callTool',
+    args: {
+      name: 'sendEmail',
+      args_json: JSON.stringify({ to: target, subject: 'Approved follow-up' }),
+    },
+  });
+  reg.resolve(row.approvalId, 'approved', 'provider-neutral-contract-test');
+
+  const beforeApproval = '2020-01-01T00:00:00.000Z';
+  assert.equal(
+    reg.hasApprovedResendConsent(session.id, target, beforeApproval, 'email:reply'),
+    false,
+    'provider-neutral does not mean action-family neutral',
+  );
+  assert.equal(
+    reg.hasApprovedResendConsent(session.id, target, beforeApproval, 'email:send'),
+    true,
+    'the semantic email-send approval is independent of its provider wrapper',
+  );
+  assert.equal(reg.claimApprovedResendConsent(session.id, target, beforeApproval, 'email:send'), true);
+  assert.equal(
+    reg.claimApprovedResendConsent(session.id, target, beforeApproval, 'email:send'),
+    false,
+    'provider-neutral resend consent remains one-shot',
+  );
 });

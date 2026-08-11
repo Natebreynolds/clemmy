@@ -28,8 +28,13 @@ import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { recordRecallRun } from '../../memory/recall-usage.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
+import {
+  EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
+  explicitlyOptsOutOfAutomaticMemoryRecall,
+} from '../../memory/automatic-recall-opt-out.js';
 import { runPostTurnHooks } from './post-turn.js';
 import { recordRunTokenWindow, resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from './run-token-budget.js';
+import { withModelUsageAttribution } from '../usage-log.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import {
   beginRunAttempt,
@@ -51,8 +56,15 @@ import {
 } from './eventlog.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
+import { enabledExternalServerNames } from '../mcp-servers.js';
 import { appendEvent } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
+import { enrichAcceptedRequestWithTaskContinuity } from './task-continuity-runtime.js';
+import {
+  durableMemoryReceiptAllowsConversationOnly,
+  isSafeDurableMemoryReceiptPresentation,
+} from './durable-memory-receipt.js';
+import { prepareDurableMemoryIntakeHostCompletion } from './durable-memory-intake-receipt.js';
 import {
   classifyTurnPreflight,
   effectiveTurnObjective,
@@ -84,6 +96,13 @@ import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { publicReplyText } from './public-presentation.js';
 import { finalizePreparedWorkflowDispatchForSource } from './loop.js';
 import { commitTurnOutcome } from './delivery-committer.js';
+import {
+  repairActionTerminalBeforeCommit,
+  type PrecommitTerminalPresentationResult,
+  type TerminalPresentationRepairPort,
+} from './terminal-presentation-repair.js';
+import { createAgentsTerminalPresentationRepairPort } from './terminal-presentation-repair-port.js';
+import { getClaudeHeadlessModel } from './claude-headless-model.js';
 import {
   PendingWorkflowChatDispatchOwnershipError,
   readPendingWorkflowChatDispatchOwnership,
@@ -121,6 +140,7 @@ import {
   isAcceptedExecutionCompletionOutput,
   objectiveMayRequireMultipleResults,
   objectiveRequiresFreshExternalWrite,
+  singleSuccessfulCollectionReadCompletesObjective,
   type FreshExternalWriteEvidenceStatus,
 } from './tool-evidence.js';
 import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
@@ -161,13 +181,23 @@ import {
   type DispatchRecoveryLedgerCheck,
 } from './dispatch-lease.js';
 import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
+import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
+import { requireKnownExpectedWorkContract } from './expected-work-contract.js';
+import { requireActionExpectedWorkActivation } from './action-expected-work-boundary.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
 let runPostTurnHooksImpl: typeof runPostTurnHooks = runPostTurnHooks;
+let terminalPresentationRepairPortForTest: TerminalPresentationRepairPort | null = null;
 
 export function setClaudeAgentSdkBrainRunForTest(fn: ClaudeAgentSdkRunFn | null): void {
   runClaudeAgentSdkImpl = fn ?? runClaudeAgentSdk;
+}
+
+export function setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest(
+  port: TerminalPresentationRepairPort | null,
+): void {
+  terminalPresentationRepairPortForTest = port;
 }
 
 export function setClaudeAgentSdkBrainPostTurnHooksForTest(
@@ -212,9 +242,44 @@ function contextSplitEnabled(): boolean {
   // switch CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT=off → old single-append behavior.
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
+/** Private query used by retrieval/routing for a verified continuation. The
+ * provider prompt still receives request.message verbatim. */
+function semanticTaskInput(request: AssistantRequest): string {
+  return request.semanticTaskInput?.trim() || request.message;
+}
+
+function isDeclinedTaskContinuation(request: AssistantRequest): boolean {
+  return request.taskContinuation?.disposition === 'declined';
+}
+
+function isDeclinedParentWithNewTask(request: AssistantRequest): boolean {
+  return request.taskContinuation?.disposition === 'declined_with_new_task';
+}
+
+function taskContinuationDeclinesParent(request: AssistantRequest): boolean {
+  return isDeclinedTaskContinuation(request) || isDeclinedParentWithNewTask(request);
+}
+
+/** Retrieval may use the private A/Q/B task for a positive continuation, but a
+ * typed decline deliberately collapses back to literal B. The continuation
+ * object and durable transcript still carry the conversation for the model. */
+function retrievalTaskInput(request: AssistantRequest): string {
+  if (isDeclinedParentWithNewTask(request)) {
+    return request.taskContinuation?.activeTaskInput?.trim() || semanticTaskInput(request);
+  }
+  if (!isDeclinedTaskContinuation(request)) return semanticTaskInput(request);
+  // `answer` is the bridge-validated text from the exact accepted B event. It
+  // remains the retrieval/telemetry authority even if a caller supplied a
+  // private model directive in `message`; the provider prompt itself is left
+  // untouched and still receives request.message verbatim.
+  return request.taskContinuation?.answer.trim() || request.message;
+}
 function queryRecallTimeoutMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS', '1500') ?? '1500', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 1500;
+}
+function queryRecallEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BRAIN_QUERY_RECALL', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 async function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -460,6 +525,8 @@ export function claudeAgentSdkBrainEnabled(surface: string): surface is ClaudeAg
   }
 }
 
+export { durableMemoryReceiptAllowsConversationOnly };
+
 export function resolveClaudeAgentBrainMaxTurns(
   objective: string,
   recentUserInputs: readonly string[] = [],
@@ -583,9 +650,13 @@ export function shouldJudgeClaudeCompletion(
   replyText: string,
   successfulToolUses: string[],
 ): boolean {
+  const concreteSingleCollectionRead = singleSuccessfulCollectionReadCompletesObjective(
+    requestText,
+    successfulToolUses,
+  );
   return isPromiseShapedReply(replyText)
     || ((!hasMeaningfulSuccessfulToolNames(successfulToolUses, requestText)
-      || objectiveMayRequireMultipleResults(requestText))
+      || (objectiveMayRequireMultipleResults(requestText) && !concreteSingleCollectionRead))
       && looksLikeActionCompletionClaim(requestText, replyText));
 }
 
@@ -830,7 +901,7 @@ function renderStableMemoryFrozen(request: AssistantRequest): string {
     // back to the machine-wide focus — for an unattended background run that
     // is whatever the user last touched in chat, so the proven memo for the
     // task at hand rarely made the 12-entry recency fold (2026-08-04 audit).
-    focusInput: request.message,
+    focusInput: retrievalTaskInput(request),
     partition: 'stable',
     includeSessionActions: false,
   });
@@ -868,7 +939,7 @@ export function renderClaudeAgentBrainSystemAppend(
     ? renderStableMemoryFrozen(request)
     : renderCanonicalMemoryContext({
         sessionId: request.sessionId,
-        query: request.message,
+        query: retrievalTaskInput(request),
         partition: 'all',
         includeSessionActions: false,
       });
@@ -964,10 +1035,17 @@ async function buildClaudeAgentBrainTurnContext(
   text: string;
   memoryPrimer: ClaudeTurnMemoryPrimerTelemetry;
 }> {
-  const q = (request.message ?? '').replace(/\s+/g, ' ').trim();
+  const declinedContinuation = isDeclinedTaskContinuation(request);
+  const declinedParentWithNewTask = isDeclinedParentWithNewTask(request);
+  const taskInput = retrievalTaskInput(request);
+  // The provider still receives request.message byte-for-byte. This narrower
+  // value governs only deterministic preflight and semantic acquisition after
+  // an exact typed parent decline introduced separate new work.
+  const authorityInput = declinedParentWithNewTask ? taskInput : request.message;
+  const q = taskInput.replace(/\s+/g, ' ').trim();
   const splitContext = contextSplitEnabled();
   let relevantSkills = '';
-  if (splitContext && q) {
+  if (splitContext && q && !declinedContinuation) {
     try {
       // Proven standard first — same contract as the Codex lane (parity is a
       // hard requirement; a standard that binds on one brain and not the other
@@ -982,27 +1060,36 @@ async function buildClaudeAgentBrainTurnContext(
   const volatile = splitContext
     ? renderCanonicalMemoryContext({
         sessionId: request.sessionId,
-        focusInput: request.message,
+        focusInput: taskInput,
         partition: 'volatile',
         includeSessionActions: false,
       })
     : '';
   let recall = '';
   let unifiedPrimerStatus: 'ok' | 'empty' | 'timeout' | 'error' | 'disabled' | null = null;
-  const recallOn = (getRuntimeEnv('CLEMMY_BRAIN_QUERY_RECALL', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+  const recallOn = queryRecallEnabled();
+  const recallOptedOut = explicitlyOptsOutOfAutomaticMemoryRecall(q);
   let memoryPrimer: ClaudeTurnMemoryPrimerTelemetry = {
     enabled: recallOn,
     hitCount: 0,
     omittedCount: 0,
     candidateCount: 0,
-    source: recallOn ? 'unified' : null,
+    source: recallOn && !recallOptedOut && !declinedContinuation ? 'unified' : null,
     recallId: null,
     answerability: null,
     stores: [],
     recallElapsedMs: null,
-    skippedReason: !recallOn ? 'disabled' : !q ? 'empty_input' : 'no_hits',
+    skippedReason: declinedContinuation
+      ? 'declined_continuation'
+      : !recallOn
+      ? 'disabled'
+      : !q
+        ? 'empty_input'
+        : recallOptedOut
+          ? EXPLICIT_MEMORY_RECALL_OPTOUT_REASON
+          : 'no_hits',
   };
-  if (q && recallOn) {
+  if (q && recallOn && !recallOptedOut && !declinedContinuation) {
     scheduleRecallShadow({ query: q, surface: 'claude_primer', limit: 6 });
     try {
       const timeoutMs = queryRecallTimeoutMs();
@@ -1090,14 +1177,16 @@ async function buildClaudeAgentBrainTurnContext(
   }
   let prospectiveContext = '';
   let prospectiveCapture = '';
-  try {
-    prospectiveContext = buildProspectiveIntentionContext({
-      query: request.message ?? '',
-      sessionId: request.sessionId,
-    }).text;
-    prospectiveCapture = prospectiveCaptureDirective(request.message ?? '') ?? '';
-  } catch {
-    // Future-intention projection is advisory context, never turn authority.
+  if (!declinedContinuation) {
+    try {
+      prospectiveContext = buildProspectiveIntentionContext({
+        query: taskInput,
+        sessionId: request.sessionId,
+      }).text;
+      prospectiveCapture = prospectiveCaptureDirective(authorityInput) ?? '';
+    } catch {
+      // Future-intention projection is advisory context, never turn authority.
+    }
   }
   if (!splitContext) {
     return {
@@ -1109,7 +1198,13 @@ async function buildClaudeAgentBrainTurnContext(
   // explicitly disabled or unavailable. The primary result already contains
   // entities, resources, episodes, policies, notes, facts, and procedures.
   let breadcrumbs = '';
-  if (q && unifiedPrimerStatus !== 'ok' && unifiedPrimerStatus !== 'empty') {
+  if (
+    q
+    && !declinedContinuation
+    && !recallOptedOut
+    && unifiedPrimerStatus !== 'ok'
+    && unifiedPrimerStatus !== 'empty'
+  ) {
     try { breadcrumbs = await crossStoreBreadcrumbs(q); } catch { breadcrumbs = ''; }
   }
   let sessionActions = '';
@@ -1144,10 +1239,14 @@ async function buildClaudeAgentBrainTurnContext(
     if (sourceBoundTurn) throw error;
   }
   try {
-    const multi = detectMultiItemIntent(request.message ?? '');
+    // Private semantic continuation text is useful for recall and capability
+    // ranking, but it is not the user's current authority. A reply such as
+    // "No" must never inherit the parent request's action classification or
+    // fan-out directive merely because A/Q/B are present in taskInput.
+    const multi = detectMultiItemIntent(authorityInput);
     if (multi.isMultiItem) fanoutDirective = fanoutDirectiveLine(multi);
     const preflight = classifyTurnPreflight({
-      message: request.message ?? '',
+      message: authorityInput,
       sessionId: request.sessionId,
       sessionKind: preflightSessionKind,
       isMultiItem: multi.isMultiItem,
@@ -1162,7 +1261,10 @@ async function buildClaudeAgentBrainTurnContext(
     }
     // Standard-aware on BOTH lanes — a beat that names the governing standard
     // on one brain and not the other is the two-lane trap in miniature.
-    confirmBeat = preflight.phase === 'align' ? standardAwareBeatText(request.message) : '';
+    confirmBeat = (!request.semanticTaskInput || declinedParentWithNewTask)
+      && preflight.phase === 'align'
+      ? standardAwareBeatText(authorityInput)
+      : '';
     // A named destination whose INSTANCE was never stated is a certain unknown,
     // not an inference — carried to the openness pass so it is settled before
     // the work rather than discovered by a failed write at the end.
@@ -1182,15 +1284,17 @@ async function buildClaudeAgentBrainTurnContext(
   // model never has to rediscover — or silently trust — its own history.
   let capabilityResolution = '';
   let resolvedCapabilityEntries: ReadonlyArray<{ kind: string; identifier: string }> = [];
-  try {
-    const resolved = resolveTurnCapabilities(request.message ?? '');
-    resolvedCapabilityEntries = resolved.entries;
-    capabilityResolution = renderCapabilityResolutionForContext(resolved);
-    if (preflightSessionKind === 'chat') {
-      recordCapabilityResolution(request.sessionId, resolved, opts?.sourceUserSeq);
+  if (!declinedContinuation) {
+    try {
+      const resolved = resolveTurnCapabilities(taskInput, { sessionId: request.sessionId });
+      resolvedCapabilityEntries = resolved.entries;
+      capabilityResolution = renderCapabilityResolutionForContext(resolved);
+      if (preflightSessionKind === 'chat') {
+        recordCapabilityResolution(request.sessionId, resolved, opts?.sourceUserSeq);
+      }
+    } catch {
+      capabilityResolution = '';
     }
-  } catch {
-    capabilityResolution = '';
   }
   // WHAT IS STILL OPEN. A separate, cross-family pass over the readings of this
   // request — the decision to ask cannot be made by the model that is trying to
@@ -1201,6 +1305,7 @@ async function buildClaudeAgentBrainTurnContext(
   let openness = '';
   if (
     preflightSessionKind === 'chat'
+    && request.taskContinuation?.disposition !== 'declined'
     && turnOpennessEnabled()
     // EITHER signal is enough, and the first one matters most (live 2026-08-07,
     // an hour after this shipped): gating on resolved capabilities ALONE made
@@ -1217,7 +1322,7 @@ async function buildClaudeAgentBrainTurnContext(
   ) {
     try {
       openness = renderTurnOpennessForContext(await resolveTurnOpenness({
-        message: request.message ?? '',
+        message: taskInput,
         capabilityBlock: capabilityResolution,
         memoryBlock: recall,
         deterministicOpen: certainOpen,
@@ -1229,24 +1334,38 @@ async function buildClaudeAgentBrainTurnContext(
   // lessons for the skills this turn will likely use, so a known failure mode
   // isn't repeated. Bounded to a couple of lines; empty for most turns.
   let pitfalls = '';
-  try { pitfalls = knownPitfallLineForInput(request.message ?? '') ?? ''; } catch { pitfalls = ''; }
+  if (!declinedContinuation) {
+    try { pitfalls = knownPitfallLineForInput(taskInput) ?? ''; } catch { pitfalls = ''; }
+  }
   // Project-command deliverable routes (parity with the context packet — this
   // lane doesn't consume the packet): when the ask matches a local project's
   // own slash command, steer to project_run instead of an in-loop rebuild.
   let projectRoutes = '';
-  try { projectRoutes = projectCommandsLineForInput(request.message ?? '') ?? ''; } catch { projectRoutes = ''; }
+  if (!declinedContinuation) {
+    try { projectRoutes = projectCommandsLineForInput(taskInput) ?? ''; } catch { projectRoutes = ''; }
+  }
   let harnessHealth = '';
   try { harnessHealth = renderHarnessCapabilityHealthForContext({ limit: 3 }); } catch { harnessHealth = ''; }
   // CONVERGENCE: carry the user's answer forward and forbid re-asking the
   // resolved point, without turning every exploratory reply into permission to
   // execute. Kill-switch CLEMMY_BRAIN_CONVERGE=off.
   let convergenceSteer = '';
-  if (convergenceSteerEnabled() && priorTurnEndedAwaitingClarification(request.sessionId)) {
+  if (
+    convergenceSteerEnabled()
+    && (Boolean(request.taskContinuation)
+      || (!request.taskContinuationResolved
+        && !opts?.sourceUserSeq
+        && priorTurnEndedAwaitingClarification(request.sessionId)))
+  ) {
     convergenceSteer = CONVERGENCE_STEER;
   }
+  const declinedParentPolicy = declinedParentWithNewTask
+    ? 'Typed continuation result: the user declined the prior proposal and supplied separate new work. Keep the full reply conversationally intact, but treat only the fresh clause as active authority; do not revive, retrieve for, or prepare tools from the declined parent.'
+    : '';
   return {
     text: [
       convergenceSteer,
+      declinedParentPolicy,
       volatile,
       relevantSkills,
       continuationContext,
@@ -1280,7 +1399,13 @@ function emitClaudeAgentSdkBrainContextTelemetry(
   turnContext: string,
   primer?: ClaudeTurnMemoryPrimerTelemetry,
 ): void {
-  const query = (request.message ?? '').replace(/\s+/g, ' ').trim();
+  const declinedContinuation = isDeclinedTaskContinuation(request);
+  const semanticEnrichmentSkippedReason = primer?.skippedReason === 'durable_memory_receipt_conversation_only'
+    ? primer.skippedReason
+    : declinedContinuation
+      ? 'declined_continuation'
+      : null;
+  const query = retrievalTaskInput(request).replace(/\s+/g, ' ').trim();
   const recallBlocks = turnContext.split('\n\n').filter((block) =>
     block.startsWith('[MEMORY PRIMER]')
     || block.startsWith('## Relevant To Your Request')
@@ -1334,11 +1459,12 @@ function emitClaudeAgentSdkBrainContextTelemetry(
       type: 'agent_context_packet',
       data: {
         inputPreview: query.slice(0, 160),
+        semanticEnrichmentSkippedReason,
         complexity: 'provider_managed',
         memory: {
-          enabled: true,
+          enabled: primer?.enabled ?? true,
           injected,
-          source: unified ? 'unified' : injected ? 'legacy_fallback' : null,
+          source: primer?.source ?? (unified ? 'unified' : injected ? 'legacy_fallback' : null),
         },
         prospective: {
           injected: prospectiveCount > 0,
@@ -1352,7 +1478,11 @@ function emitClaudeAgentSdkBrainContextTelemetry(
         mcp: { lane: 'claude_agent_sdk_brain' },
         healthWarnings: [],
         agentSystem: { lane: 'claude_agent_sdk_brain' },
-        multiItem: { detected: (() => { try { return detectMultiItemIntent(request.message ?? '').isMultiItem; } catch { return false; } })() },
+        multiItem: {
+          detected: semanticEnrichmentSkippedReason
+            ? false
+            : (() => { try { return detectMultiItemIntent(retrievalTaskInput(request)).isMultiItem; } catch { return false; } })(),
+        },
         injectedBytes,
       },
     });
@@ -1475,13 +1605,14 @@ export async function respondViaClaudeAgentSdkBrain(
       ? findUserInputEventForRun(sessionId, request.runId, displayMessage)
       : null
   );
+  let acceptedSource;
   if (routeAcceptedSource) {
     const bound = getRunAttemptSourceUserEvent(attempt);
     if (bound && bound.seq !== routeAcceptedSource.seq) {
       try { finishRunAttempt(attempt, 'superseded'); } catch { /* best effort */ }
       attempt = beginRunAttempt(sessionId);
     }
-    recordRunAttemptUserInput(attempt, {
+    acceptedSource = recordRunAttemptUserInput(attempt, {
       turn: routeAcceptedSource.turn,
       role: 'user',
       data: {
@@ -1489,8 +1620,25 @@ export async function respondViaClaudeAgentSdkBrain(
         ...(request.runId ? { runId: request.runId } : {}),
       },
     }, { existingEventSeq: routeAcceptedSource.seq, armRunInFlight: true });
+  } else {
+    // Bind the physical attempt before any model work, including context
+    // helpers and the post-response completion judge. The inner attempt reuses
+    // this exact event, so direct SDK callers and pre-accepted desktop turns
+    // share one source identity without appending a duplicate user row.
+    acceptedSource = recordRunAttemptUserInput(attempt, {
+      turn: 1,
+      role: 'user',
+      data: {
+        text: displayMessage,
+        ...(displayMessage !== request.message ? { modelDirectiveApplied: true } : {}),
+        ...(request.runId ? { runId: request.runId } : {}),
+      },
+    }, { armRunInFlight: true });
   }
   preserveCurrentKillAndClearStale(sessionId, attempt);
+  // Re-derive private continuation state from the exact accepted source. An
+  // outer caller cannot widen retrieval/MCP scope by supplying semantic text.
+  request = await enrichAcceptedRequestWithTaskContinuity(request, acceptedSource.seq);
   const callerShouldCancel = request.shouldCancel;
   const scopedRequest: AssistantRequest = {
     ...request,
@@ -1504,7 +1652,11 @@ export async function respondViaClaudeAgentSdkBrain(
   let status: 'completed' | 'cancelled' | 'failed' = 'failed';
   let preserveAttemptOwnership = false;
   try {
-    const response = await respondViaClaudeAgentSdkBrainAttempt(surface, scopedRequest, attempt);
+    const response = await withModelUsageAttribution({
+      sessionId,
+      sourceUserSeq: acceptedSource.seq,
+      attemptId: attempt.attemptId,
+    }, () => respondViaClaudeAgentSdkBrainAttempt(surface, scopedRequest, attempt));
     status = response.stoppedReason === 'cancelled' ? 'cancelled' : 'completed';
     return response;
   } catch (err) {
@@ -1547,6 +1699,13 @@ async function respondViaClaudeAgentSdkBrainAttempt(
 ): Promise<AssistantResponse> {
   const sessionId = request.sessionId;
   const displayMessage = request.displayMessage ?? request.message;
+  // A declined continuation keeps A/Q/B available to the conversational
+  // context builder, but tool acquisition ranks only the literal decline. This
+  // avoids paying for—or tempting the model with—the parent action surface.
+  const declinedContinuation = isDeclinedTaskContinuation(request);
+  const declinedParentWithNewTask = isDeclinedParentWithNewTask(request);
+  const parentAuthorityDeclined = taskContinuationDeclinesParent(request);
+  const taskInput = retrievalTaskInput(request);
   // Anchor for the post-turn recall-run sweep: this lane's memory tools run in
   // a separate MCP process, so their recall-run ids are recoverable only by
   // (session_id, created_at >= turn start) from the shared DB.
@@ -1633,7 +1792,31 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     surface,
     allowedToolNames: request.allowedToolNames,
     excludedToolNames: request.excludeToolNames,
+    verifiedTaskContinuation: request.taskContinuation,
   });
+  // Match the standard harness seam: no provider/model/tool work begins until
+  // this exact source's hash-validated graph has durable cutover authority.
+  // Re-entry from the bridge or a brain fallover observes the existing marker;
+  // it never arms an independent task.
+  // TurnGraph v1 is a chat contract. Background/cron execution sessions keep
+  // their existing durable execution authority until an execution graph is
+  // introduced; they must not be forced through a fabricated chat graph.
+  if (getSession(sessionId)?.kind === 'chat') {
+    requireAcceptedTaskAuthority({
+      sessionId,
+      sourceUserSeq: userInputEvent.seq,
+    });
+    const expectedWork = requireKnownExpectedWorkContract({
+      sessionId,
+      sourceUserSeq: userInputEvent.seq,
+    });
+    if (expectedWork.status === 'action_deferred') {
+      requireActionExpectedWorkActivation({
+        sessionId,
+        sourceUserSeq: userInputEvent.seq,
+      });
+    }
+  }
   // Source binding and restart ownership committed atomically above. Any crash
   // during context, memory, tool-surface, or provider setup is recoverable.
   try {
@@ -1648,18 +1831,43 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // memory_remember, so run the same deterministic auto-capture fallback here
   // for real chat turns. Errors are swallowed: memory capture must not block the
   // model turn, but the trace records candidate signals when it does engage.
+  let durableMemoryConversationOnly = false;
   try {
     const session = getSession(sessionId);
-    // A reused source was already captured on original acceptance. The private
-    // restart/continuation directive must never become user memory.
-    const shouldCapture = session?.kind === 'chat' && request.sourceUserSeq === undefined;
+    // Capture the exact accepted user source on every delivery. Durable intake
+    // de-duplicates by this stable source identity, so a daemon restart can
+    // safely retry without losing or duplicating the user's memory. For a
+    // compound decline, only the independent fresh clause is active memory
+    // authority; the parent cancellation remains conversational transcript.
+    const acceptedDisplayText = typeof userInputEvent.data.displayText === 'string'
+      ? userInputEvent.data.displayText
+      : typeof userInputEvent.data.text === 'string'
+        ? userInputEvent.data.text
+        : displayMessage;
+    const captureMessage = declinedParentWithNewTask ? taskInput : acceptedDisplayText;
+    const shouldCapture = session?.kind === 'chat';
     const captured = shouldCapture
       ? captureInteractionSignals({
-          message: displayMessage,
+          message: captureMessage,
           sessionId,
-          sourceEventId: request.runId ? `run:${request.runId}` : undefined,
+          sourceEventId: `user-source:${userInputEvent.seq}`,
+          occurredAt: userInputEvent.createdAt,
         })
-      : { candidates: [], facts: [], profilePatch: undefined, profile: undefined };
+      : { candidates: [], facts: [], queuedCandidateIds: [], profilePatch: undefined, profile: undefined };
+    const queuedCandidateCount = captured.queuedCandidateIds?.length ?? 0;
+    // The caller tuple and conversationOnly telemetry are never completion
+    // authority. Re-read the accepted source plus the exact memory episode and
+    // candidate rows, then bind one content-addressed host receipt. The explicit
+    // caller allowlist still keeps the ordinary model/tool presentation path,
+    // but it cannot mint or weaken the receipt itself.
+    const hostCompletion = shouldCapture
+      ? prepareDurableMemoryIntakeHostCompletion({
+          sessionId,
+          sourceUserSeq: userInputEvent.seq,
+        })
+      : { status: 'missing' as const, reason: 'not a chat source' };
+    durableMemoryConversationOnly = (request.allowedToolNames === undefined || request.allowedToolNames.length === 0)
+      && hostCompletion.status === 'redeemed';
     if (captured.candidates.length > 0 || captured.profilePatch) {
       appendEvent({
         sessionId,
@@ -1668,8 +1876,15 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         type: 'memory_signals_captured',
         data: {
           factCount: captured.candidates.length,
+          queuedCandidateCount,
+          episodeId: captured.episodeId ?? null,
           profilePatch: captured.profilePatch ?? null,
           reasons: captured.candidates.map((candidate) => candidate.reason),
+          sourceUserSeq: userInputEvent.seq,
+          conversationOnly: durableMemoryConversationOnly,
+          hostReceiptId: hostCompletion.status === 'redeemed'
+            ? hostCompletion.receiptId
+            : null,
         },
       });
     }
@@ -1698,8 +1913,16 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // definitions never enter provider accounting. This is an acquisition
   // mechanism, not permission pruning. If disabled, fall back to the legacy
   // semantic JIT behavior byte-for-byte.
-  const explicitToolAuthority = request.allowedToolNames !== undefined;
-  const fullToolPolicy = toolPolicyForRequest(request, mode);
+  // A pure, runtime-typed decline needs conversation, not an agent surface.
+  // Give the provider no local schemas and do no acquisition/ranking work. A
+  // compound correction is not classified as `declined`, so it keeps the
+  // normal tool path.
+  const conversationOnlyToolBoundary = declinedContinuation || durableMemoryConversationOnly;
+  const explicitToolAuthority = request.allowedToolNames !== undefined || conversationOnlyToolBoundary;
+  const fullToolPolicy = toolPolicyForRequest(
+    conversationOnlyToolBoundary ? { ...request, allowedToolNames: [] } : request,
+    mode,
+  );
   const fullAllowed = fullToolPolicy.names;
   const advertisedUniverse = claudeAgentSdkAdvertisedToolUniverse(
     mode,
@@ -1713,7 +1936,20 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       turn: 0,
       role: 'system',
       type: 'tool_policy_resolved',
-      data: { ...fullToolPolicy.diagnostics },
+      data: {
+        ...fullToolPolicy.diagnostics,
+        ...(conversationOnlyToolBoundary
+          ? {
+              shortCircuitReason: declinedContinuation
+                ? 'declined_continuation'
+                : 'durable_memory_receipt_conversation_only',
+              semanticAcquisitionSkipped: true,
+              schemaWarmSkipped: true,
+              advertisedSchemaCount: 0,
+              catalogCount: 0,
+            }
+          : {}),
+      },
     });
   } catch { /* tool policy telemetry must never block the turn */ }
   const jitDecision = resolveToolJitDecision({ allowLane: true, sessionId });
@@ -1730,9 +1966,17 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // allowlists therefore remain first-class and never gain tool_search or
   // call_tool implicitly.
   const schemaOnDemandAcquisition =
-    mode === 'full' && !explicitToolAuthority && claudeToolSearchEnabled();
-  const priorBrainInputs = recentPriorBrainInputs(sessionId, request.message);
-  const jitQuery = [request.message, ...priorBrainInputs]
+    !conversationOnlyToolBoundary
+    && mode === 'full'
+    && !explicitToolAuthority
+    && claudeToolSearchEnabled();
+  const priorBrainInputs = parentAuthorityDeclined
+    ? []
+    : [
+        request.taskContinuation?.parentInput ?? '',
+        ...recentPriorBrainInputs(sessionId, request.message),
+      ].filter((value, index, all) => value.trim() && all.indexOf(value) === index);
+  const jitQuery = [taskInput, ...priorBrainInputs]
     .filter((s) => s.trim().length > 0)
     .join('\n');
   if (schemaOnDemandAcquisition) {
@@ -1790,7 +2034,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       jitDropped = 0;
       jitReason = 'schema-on-demand-selection-fellback';
     }
-  } else if (jitDecision.active && request.message.trim()) {
+  } else if (!conversationOnlyToolBoundary && jitDecision.active && taskInput.trim()) {
     try {
       const descByName = await coreToolDescriptions();
       // Fold recent prior-turn messages into the ranking query so bare follow-ups
@@ -1855,35 +2099,89 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // Provider text remains private until the graph reduces the run to a typed
   // TurnOutcome. Long-running feedback comes from typed tool/progress events,
   // not speculative prose that a retry or completion judge may invalidate.
-  const renderedTurnContext = await buildClaudeAgentBrainTurnContext(request, { sourceUserSeq: userInputEvent.seq });
-  const turnContext = renderedTurnContext.text;
+  const renderedTurnContext = durableMemoryConversationOnly
+    ? {
+        text: '',
+        memoryPrimer: {
+          enabled: queryRecallEnabled(),
+          hitCount: 0,
+          omittedCount: 0,
+          candidateCount: 0,
+          source: null,
+          recallId: null,
+          answerability: null,
+          stores: [],
+          recallElapsedMs: null,
+          skippedReason: 'durable_memory_receipt_conversation_only',
+        } satisfies ClaudeTurnMemoryPrimerTelemetry,
+      }
+    : await buildClaudeAgentBrainTurnContext(request, { sourceUserSeq: userInputEvent.seq });
+  const durableMemoryReceiptDirective = durableMemoryConversationOnly
+    ? [
+        '[durable-memory-receipt]',
+        'This exact memory instruction is already durably queued. The user requested acknowledgement only.',
+        'The literal latest user message is authoritative and supersedes any older conflicting value in persistent context.',
+        'Do not mention internal machinery. Acknowledge it naturally in your own voice without searching for or calling tools.',
+      ].join('\n')
+    : '';
+  const turnContext = durableMemoryReceiptDirective
+    ? [renderedTurnContext.text, durableMemoryReceiptDirective].filter(Boolean).join('\n\n')
+    : renderedTurnContext.text;
   emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer);
   const attemptTrackerScopeId = `${sessionId}::brain:${attempt.runId ?? attempt.attemptId}`;
-  const turnObjective = effectiveTurnObjective(sessionId, request.message, userInputEvent.seq);
+  // POLICY AUTHORITY is intentionally separate from retrieval context. The
+  // private semantic task is A + Clem's question + B; using it here made a
+  // literal correction such as "No" still look like A's requested write to
+  // completion gates and corrective prompts. Only the exact accepted B (or an
+  // exact typed preflight acknowledgement recovered from durable state) may
+  // authorize effects and define completion.
+  const turnObjective = declinedParentWithNewTask
+    ? taskInput
+    : effectiveTurnObjective(
+        sessionId,
+        request.message,
+        userInputEvent.seq,
+      );
   // Keep the Claude-native external MCP surface observable with the same event
   // contract as the Codex lane. This is also the auditable proof that an
   // explicit local-only boundary resolved to zero external authority.
   const nativeMcpScope: McpToolScope = explicitToolAuthority
     ? {
         reason: 'Explicit local tool allowlist; native external MCP authority denied',
+        authority: 'none',
         allowedServerSlugs: [],
         maxTools: 0,
       }
     : mode === 'full'
     ? resolveMcpToolScopeWithRecall({
-        userInput: turnObjective,
+        userInput: declinedParentWithNewTask ? taskInput : request.message,
         priorUserInputs: priorBrainInputs,
         pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+        configuredServerNames: enabledExternalServerNames(),
         ...(request.turnCandidates?.matches.length
           ? { learnedMatches: request.turnCandidates.matches }
           : {}),
         // An answer to Clem's own question keeps the scope the request earned,
         // however the user phrases the go-ahead. Same predicate the CONVERGE
         // steer already uses — the fact was known, just never consulted here.
-        awaitingAnswer: priorTurnEndedAwaitingClarification(sessionId),
+        awaitingAnswer: Boolean(
+          request.taskContinuation
+          && request.taskContinuation.disposition !== 'declined'
+          && request.taskContinuation.disposition !== 'declined_with_new_task'
+        )
+          || (!request.taskContinuationResolved
+            && !request.sourceUserSeq
+            && priorTurnEndedAwaitingClarification(sessionId)),
+        ...(request.taskContinuation
+          && request.taskContinuation.disposition !== 'declined_with_new_task'
+          ? { answerDisposition: request.taskContinuation.disposition }
+          : {}),
       })
     : {
         reason: `Claude SDK ${mode} mode does not attach native external MCP servers`,
+        // A locked worker/workflow-step lane holds no external authority of its
+        // own; its parent already bound whatever it is allowed to touch.
+        authority: 'none',
         allowedServerSlugs: [],
         maxTools: 0,
       };
@@ -1917,7 +2215,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     } catch { /* text-shape limits remain the fallback */ }
     return createToolEconomyState(interactiveToolEconomyPolicy({
       message: turnObjective,
-      priorMessages: priorTurns.filter((turn) => turn.who === 'user').map((turn) => turn.text),
+      priorMessages: parentAuthorityDeclined
+        ? []
+        : priorTurns.filter((turn) => turn.who === 'user').map((turn) => turn.text),
       multiItem,
       budget: economyBudget,
     }));
@@ -1949,6 +2249,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // is the ONE lane with run_tool_program (the recovery), so serial native-MCP
     // reads here get refused + steered to a program; workers/steps opt out.
     readFanoutGuard: mode === 'full',
+    directOrchestrator: mode === 'full',
     // TOOL-STARVATION GUARD (live 2026-07-01: the local MCP server's ~13s cold
     // boot intermittently missed the CLI's startup window under load — the brain
     // then ran with ONLY external MCP tools and narrated/refused local actions,
@@ -1963,7 +2264,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // Scope the native external MCP servers to THIS turn's intent (the user's message)
     // so the Claude brain reaches native capabilities (dataforseo, browsermcp, …) like
     // the Codex lane, without attaching all of them.
-    nativeMcpScopeInput: turnObjective,
+    nativeMcpScopeInput: declinedParentWithNewTask
+      ? taskInput
+      : request.taskContinuation
+        ? request.message
+        : turnObjective,
     nativeMcpToolScope: nativeMcpScope,
     maxTurns: sdkMaxTurns,
     maxWallClockMs: request.maxWallClockMs,
@@ -2194,6 +2499,61 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     let continuationsUsed = 0;
     const continuationBudget = maxTurnContinuations();
 
+    const receiptAcknowledgementNeedsRepair = (): boolean => durableMemoryConversationOnly
+      && (
+        result.toolUses.length > 0
+        || !isSafeDurableMemoryReceiptPresentation(result.text)
+      );
+
+    // A receipt-only turn is presentation work: the durable intake already
+    // completed and tool authority is exactly zero. If the provider emits
+    // machinery, internal deliberation, emptiness, or a new question, give it
+    // one text-only chance in the same sealed surface. Never route this through
+    // generic "invoke the tool" recovery, which would contradict the receipt.
+    if (
+      receiptAcknowledgementNeedsRepair()
+      && continuationsUsed < continuationBudget
+    ) {
+      const repaired = await runContinuation({
+        prompt: [
+          'The durable memory intake for the user\'s request is already complete. No tool or additional work is needed.',
+          `Original user message: ${JSON.stringify(request.message)}`,
+          'Reply once with a brief, natural acknowledgement in your own voice. Do not mention internal machinery or tools, and do not ask a follow-up question.',
+        ].join('\n'),
+        ...runOptions,
+      });
+      continuationsUsed += 1;
+      if (repaired) result = mergeClaudeRunEvidence(result, repaired);
+    }
+    if (receiptAcknowledgementNeedsRepair()) {
+      try {
+        appendEvent({
+          sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: { kind: 'durable_memory_receipt_presentation_fallback' },
+        });
+      } catch { /* the durable receipt remains authoritative */ }
+      result = {
+        ...result,
+        text: 'Got it — I\'ll remember that.',
+        limitHit: false,
+        selfStopped: false,
+        stoppedReason: 'success',
+      };
+    } else if (durableMemoryConversationOnly && result.limitHit) {
+      // A valid acknowledgement is the complete presentation for this already
+      // satisfied objective; a provider bookkeeping flag cannot turn it into a
+      // false "say continue" horizon.
+      result = {
+        ...result,
+        limitHit: false,
+        selfStopped: false,
+        stoppedReason: 'success',
+      };
+    }
+
     // Queue + an explicit execution question is already a complete graph
     // state. Reconcile after every result merge so a narration/judge/max-turn
     // continuation cannot strand or duplicate the queued action.
@@ -2248,7 +2608,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // most of it). If the brain made NO real tool calls but its text reproduces the
     // tool-call protocol, it described a call instead of making one — retry ONCE
     // with a hard nudge to actually invoke the tool.
-    if (continuationsUsed < continuationBudget && !resultIsAwaitingInput() && !result.limitHit && modeCanAuthorOrExecute(mode) && looksLikeToolNarration(result.text, result.toolUses)) {
+    if (continuationsUsed < continuationBudget && !durableMemoryConversationOnly && !resultIsAwaitingInput() && !result.limitHit && modeCanAuthorOrExecute(mode) && looksLikeToolNarration(result.text, result.toolUses)) {
       const retry = await runContinuation({
         prompt:
           `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
@@ -2270,7 +2630,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // memory-context cousin of narrate-instead-of-call — it second-guessed its
     // memory instead of doing the task. Retry ONCE, telling it the context is
     // trusted and to just do the work. Any mode (a read turn can spiral too).
-    if (continuationsUsed < continuationBudget && !resultIsAwaitingInput() && !result.limitHit && looksLikeReasoningLeak(result.text, result.toolUses)) {
+    if (continuationsUsed < continuationBudget && !durableMemoryConversationOnly && !resultIsAwaitingInput() && !result.limitHit && looksLikeReasoningLeak(result.text, result.toolUses)) {
       const retry = await runContinuation({
         prompt:
           `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +
@@ -2299,6 +2659,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // judge scolding the question into autonomous execution.
     if (
       modeCanAuthorOrExecute(mode) &&
+      !durableMemoryConversationOnly &&
       !resultIsAwaitingInput() &&
       !result.limitHit &&
       isDirectionSeekingQuestion(result.text)
@@ -2307,6 +2668,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     }
     if (
       completionJudgeForSurface &&
+      !durableMemoryConversationOnly &&
       modeCanAuthorOrExecute(mode) &&
       !resultIsAwaitingInput() &&
       !result.limitHit &&
@@ -2321,7 +2683,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     ) {
       const objective = composeJudgedObjective(
         turnObjective,
-        recentPriorBrainInputs(sessionId, request.message),
+        parentAuthorityDeclined ? [] : recentPriorBrainInputs(sessionId, request.message),
       );
       const maxCont = judgeMaxContinuations();
       for (let i = 0; i < maxCont; i += 1) {
@@ -2501,7 +2863,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // material — and a single-model user has no judge to catch it either. One
     // continuation, conservative zero-ran threshold, kill-switch and fail-open
     // identical to the loop lane.
-    if (!result.limitHit && !resultIsAwaitingInput()
+    if (!durableMemoryConversationOnly && !result.limitHit && !resultIsAwaitingInput()
       && (getRuntimeEnv('HARNESS_SKILL_EXEC_GATE', 'on') ?? 'on').toLowerCase() !== 'off') {
       const skillGap = skillExecutionShortfall(sessionId);
       if (skillGap) {
@@ -2547,7 +2909,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // Give bound-but-unverified pointers ONE deterministic exact-ID read-back
     // query after all ordinary continuations. This query cannot create or list;
     // the durable ledger prevents a retry from duplicating the resource.
-    if (!result.limitHit && !resultIsAwaitingInput()) {
+    if (!durableMemoryConversationOnly && !result.limitHit && !resultIsAwaitingInput()) {
       let unresolved = logicalRunScopeId
         ? listUnverifiedRunArtifacts(sessionId, logicalRunScopeId)
         : [];
@@ -2696,7 +3058,35 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         turnsUsed: 1,
       };
     }
-    throw err;
+    if (err instanceof PendingWorkflowChatDispatchOwnershipError) throw err;
+    if (!durableMemoryConversationOnly) throw err;
+    // The user's objective was completed at the synchronous durable intake
+    // boundary. Replaying the original turn on another brain would add latency
+    // and restore broad tool authority merely because presentation failed.
+    // Publish a truthful acknowledgement while preserving the provider failure
+    // in telemetry; cancellation and workflow ownership still propagate above.
+    try {
+      appendEvent({
+        sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'durable_memory_receipt_provider_failure_fallback',
+          errorName: err instanceof Error ? err.name : typeof err,
+          reason: (err instanceof Error ? err.message : String(err)).slice(0, 300),
+        },
+      });
+    } catch { /* the durable receipt remains authoritative */ }
+    result = {
+      text: 'Got it — I\'ll remember that.',
+      sessionId,
+      model: modelId,
+      toolUses: [],
+      limitHit: false,
+      selfStopped: false,
+      stoppedReason: 'success',
+    };
   }
 
   let text = result.limitHit
@@ -2738,6 +3128,30 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     text = 'Some of the work ran, but a later tool call was printed instead of executed, so I cannot claim the task is finished. I did not replay the turn because that could duplicate an action. Should I continue from the recorded state?';
     result = { ...result, stoppedReason: 'awaiting-input' };
   }
+  let terminalPresentationRepair: Exclude<
+    PrecommitTerminalPresentationResult,
+    { status: 'unchanged' }
+  > | null = null;
+  if (
+    !result.limitHit
+    && result.stoppedReason !== 'awaiting-input'
+    && result.stoppedReason !== 'pending-approval'
+    && result.stoppedReason !== 'cancelled'
+  ) {
+    const repaired = await repairActionTerminalBeforeCommit({
+      sessionId,
+      sourceUserSeq: userInputEvent.seq,
+      proposedReply: text,
+      port: terminalPresentationRepairPortForTest
+        ?? createAgentsTerminalPresentationRepairPort({ model: getClaudeHeadlessModel(modelId) }),
+    });
+    if (repaired.status !== 'unchanged') {
+      terminalPresentationRepair = repaired;
+      text = repaired.text;
+      result = { ...result, stoppedReason: 'awaiting-input' };
+    }
+  }
+
   // Long-running parity: a turn-budget stop surfaces as a graceful
   // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
   const stoppedReason: AssistantResponse['stoppedReason'] =
@@ -2781,10 +3195,15 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       if (!latestAsk || (latestUser && latestAsk.seq < latestUser.seq)) {
         appendEvent({
           sessionId,
-          turn: 0,
+          turn: userInputEvent.turn,
           role: 'Clem',
           type: 'awaiting_user_input',
-          data: { question: text, source: 'decision_awaiting' },
+          data: {
+            question: text,
+            purpose: 'clarification',
+            source: 'decision_awaiting',
+            sourceUserSeq: userInputEvent.seq,
+          },
         });
       }
     } catch { /* pause telemetry is best-effort; completion below remains authoritative */ }
@@ -2810,7 +3229,16 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     sourceUserSeq: userInputEvent.seq,
   };
   let outcome: TurnOutcome;
-  if (result.limitHit) {
+  if (terminalPresentationRepair) {
+    outcome = {
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'blocked',
+      resumable: true,
+      presentation: { kind: 'blocked', text: publicText },
+    };
+  } else if (result.limitHit) {
     outcome = {
       version: 2,
       id: turnOutcomeId(identity),
@@ -2851,7 +3279,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     };
   }
   const terminal = commitTurnOutcome(outcome, {
-    legacyReason: result.limitHit
+    legacyReason: terminalPresentationRepair
+      ? 'verification_required'
+      : result.limitHit
       ? 'awaiting_continue'
       : awaitingInput
         ? 'awaiting_user_input'
@@ -2876,6 +3306,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           }
         : {}),
       ...(completionVerification ? { verification: completionVerification } : {}),
+      ...(terminalPresentationRepair
+        ? { blockedReason: 'authoritative_terminal_verification_incomplete' }
+        : {}),
       ...(result.limitHit ? { transport: 'claude_agent_sdk_brain', maxTurns: sdkMaxTurns } : {}),
     },
   });
@@ -2909,7 +3342,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     runPostTurnHooksImpl({
       sessionId,
       turn: 0,
-      userInput: request.message,
+      userInput: declinedParentWithNewTask ? taskInput : request.message,
       recallIds: [renderedTurnContext.memoryPrimer.recallId],
       replyText: text,
       toolArgTexts: result.toolUses,

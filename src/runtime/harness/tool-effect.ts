@@ -37,6 +37,12 @@ export interface RuntimeToolEventLike {
   data?: unknown;
 }
 
+function eventToolData(event: RuntimeToolEventLike): Record<string, unknown> {
+  return event.data && typeof event.data === 'object' && !Array.isArray(event.data)
+    ? event.data as Record<string, unknown>
+    : {};
+}
+
 export type RuntimeToolEventType = 'tool_called' | 'tool_returned';
 
 function runtimeToolEventAccounting(event: RuntimeToolEventLike): unknown {
@@ -67,12 +73,6 @@ export function projectCanonicalTopLevelToolEvents<T extends RuntimeToolEventLik
 export interface TransportMirrorToolCallPairs {
   canonicalToMirrorCallId: Map<string, string>;
   mirrorToCanonicalCallId: Map<string, string>;
-}
-
-function eventToolData(event: RuntimeToolEventLike): Record<string, unknown> {
-  return event.data && typeof event.data === 'object' && !Array.isArray(event.data)
-    ? event.data as Record<string, unknown>
-    : {};
 }
 
 function normalizedToolInput(value: unknown): unknown {
@@ -222,16 +222,28 @@ export function unwrapRuntimeEffectiveToolIdentity(
   const args = decodedToolArgs(rawArgs);
   const tail = localToolTail(toolName);
 
-  if (tail === 'call_tool' && isPlainOrClementineLocalTool(toolName, 'call_tool')) {
+  if (
+    (tail === 'call_tool' && isPlainOrClementineLocalTool(toolName, 'call_tool'))
+    || (tail === 'work_call' && isPlainOrClementineLocalTool(toolName, 'work_call'))
+  ) {
     if (!args || typeof args !== 'object' || Array.isArray(args)) {
       return { toolName: tail, args };
     }
     const record = args as Record<string, unknown>;
     const target = typeof record.name === 'string' ? record.name.trim() : '';
     if (!target) return { toolName: tail, args };
+    const targetArgs = decodedToolArgs(record.args_json ?? record.args ?? {});
+    const alias = resolveCallToolAlias(target, targetArgs);
+    if (alias?.ok) {
+      return unwrapRuntimeEffectiveToolIdentity(
+        alias.targetName,
+        alias.targetArgs,
+        depth + 1,
+      );
+    }
     return unwrapRuntimeEffectiveToolIdentity(
       target,
-      record.args_json ?? record.args ?? {},
+      targetArgs,
       depth + 1,
     );
   }
@@ -261,7 +273,7 @@ export function unwrapRuntimeEffectiveToolIdentity(
  * the local controller. Model-supplied carrier names are bounded and limited
  * to provider-safe tool-name characters before entering durable telemetry.
  */
-function canonicalRuntimeEffectiveToolName(toolName: string | null): string | undefined {
+export function canonicalRuntimeEffectiveToolName(toolName: string | null): string | undefined {
   if (!toolName) return undefined;
   const trimmed = toolName.trim();
   if (!trimmed || trimmed.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9_.:/-]*$/.test(trimmed)) {
@@ -344,14 +356,17 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
   const normalized = normalizedToolName(toolName);
   const tail = localToolTail(normalized);
 
-  if (tail === 'call_tool' && isPlainOrClementineLocalTool(toolName, 'call_tool')) {
+  if (
+    (tail === 'call_tool' && isPlainOrClementineLocalTool(toolName, 'call_tool'))
+    || (tail === 'work_call' && isPlainOrClementineLocalTool(toolName, 'work_call'))
+  ) {
     const outer = decodedToolArgs(args);
     if (!outer || typeof outer !== 'object' || Array.isArray(outer)) {
       return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
     }
     const input = outer as Record<string, unknown>;
     const target = typeof input.name === 'string' ? input.name.trim() : '';
-    if (!target || target === 'call_tool') {
+    if (!target || target === 'call_tool' || target === 'work_call') {
       return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
     }
     const innerArgs = decodedToolArgs(input.args_json ?? {});

@@ -17,6 +17,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { isDeepStrictEqual } from 'node:util';
 import pino from 'pino';
 import { extractDeliverablePointers } from '../runtime/harness/claim-grounding.js';
 import {
@@ -29,9 +30,16 @@ import {
   SLACK_BOT_TOKEN,
   SLACK_ENABLED,
 } from '../config.js';
-import { addNotification, markNotificationsReadByQuestionId } from '../runtime/notifications.js';
+import {
+  addNotification,
+  getNotification,
+  markNotificationsReadByQuestionId,
+  type NotificationRecord,
+} from '../runtime/notifications.js';
 import {
   deliverOutcome,
+  deliverOutcomeWithAcknowledgement,
+  type DeliverContext,
   type Outcome,
   type OutcomeEvidence,
 } from '../runtime/outcome.js';
@@ -112,6 +120,22 @@ export function _setBackgroundCompletionVerificationPauseForTests(fn: (() => Pro
   backgroundCompletionVerificationPauseForTests = fn;
 }
 
+export type BackgroundTaskTerminalReportBackFaultPhase =
+  | 'after_persist'
+  | 'after_notification_delivery'
+  | 'after_origin_delivery';
+
+let backgroundTaskTerminalReportBackFaultForTests:
+  ((phase: BackgroundTaskTerminalReportBackFaultPhase) => void) | null = null;
+
+/** Test-only process-death seam. Throwing at one of these boundaries models a
+ * hard stop before the following acknowledgement can be merged. */
+export function _setBackgroundTaskTerminalReportBackFaultForTests(
+  fn: ((phase: BackgroundTaskTerminalReportBackFaultPhase) => void) | null,
+): void {
+  backgroundTaskTerminalReportBackFaultForTests = fn;
+}
+
 export type BackgroundTaskStatus =
   | 'pending'
   | 'running'
@@ -150,6 +174,28 @@ export interface BackgroundTaskOutcomeSnapshot {
   blocker?: string;
   nextAction?: string;
   resumable?: boolean;
+}
+
+type BackgroundTaskOutcome = 'done' | 'failed' | 'blocked' | 'needs_input';
+
+/**
+ * The exact completion envelope is persisted in the same atomic task-file
+ * replacement that changes the task to `done`. Delivery acknowledgements are
+ * merged afterwards. A daemon crash can therefore leave a pending envelope,
+ * but it can no longer leave a terminal task with no recoverable report.
+ */
+export interface BackgroundTaskTerminalReportBack {
+  version: 1;
+  outboxId: string;
+  outcome: BackgroundTaskOutcome;
+  detail: string;
+  outcomePayload: Outcome;
+  deliveryContext: DeliverContext;
+  notification: NotificationRecord;
+  createdAt: string;
+  notificationAcknowledgedAt?: string;
+  originAcknowledgedAt?: string;
+  acknowledgedAt?: string;
 }
 
 export interface BackgroundTaskRecord {
@@ -230,6 +276,10 @@ export interface BackgroundTaskRecord {
    * This is runtime-owned execution truth, not a second model verdict. It
    * survives replay, daemon restart, and weak final prose. */
   outcomeSnapshot?: BackgroundTaskOutcomeSnapshot;
+  /** Durable completion-delivery outbox. The first terminal envelope is
+   * immutable; acknowledgement fields advance monotonically after each sink
+   * proves the exact snapshot is present. */
+  terminalReportBack?: BackgroundTaskTerminalReportBack;
   pendingApprovalId?: string;
   /** One-shot guard: set when the settle auto-queued a continuation because a
    *  completion lacked deliverable evidence (2026-07-23). A second artifact-less
@@ -249,6 +299,10 @@ export interface BackgroundTaskRecord {
    * auth-recovery sweep resumes ONLY tagged tasks. */
   blockedOnCli?: string;
   pendingQuestion?: string;
+  /** Exact choices attached to the parked question, when the question tool
+   * supplied them. Kept separate from rendered/numbered question text so a
+   * reply such as `Production` or `2` can be bound deterministically. */
+  pendingQuestionOptions?: string[];
   inputResolution?: {
     questionId: string;
     answer: string;
@@ -1923,6 +1977,7 @@ function clearParkedBackgroundState(): Partial<Omit<BackgroundTaskRecord, 'id' |
     approvalResolution: undefined,
     pendingQuestionId: undefined,
     pendingQuestion: undefined,
+    pendingQuestionOptions: undefined,
     inputResolution: undefined,
     continueResolution: undefined,
     outcomeSnapshot: undefined,
@@ -2021,6 +2076,7 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     // approvalResolution survives markBackgroundTaskRunning).
     pendingQuestionId: undefined,
     pendingQuestion: undefined,
+    pendingQuestionOptions: undefined,
   });
   // The worker has the run. Recorded as a durable fact rather than a ladder
   // rung because it races the foreground's own terminal and neither order is
@@ -2083,8 +2139,6 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
  * Tasks with no `originSessionId` (cron / autonomous spawns with no session to
  * wake) are a no-op, by design.
  */
-type BackgroundTaskOutcome = 'done' | 'failed' | 'blocked' | 'needs_input';
-
 function enqueueBackgroundTaskOutcomeTurn(
   task: BackgroundTaskRecord,
   outcome: BackgroundTaskOutcome,
@@ -2099,26 +2153,34 @@ function enqueueBackgroundTaskOutcomeTurn(
       ? 'Completed and reported back.'
       : detail.replace(/\s+/g, ' ').trim().slice(0, 240),
   });
-  // Unified report-back (Move 4): one mechanism for every lane. Preserves the
-  // `[background task <id> …]` prefix (idempotency + UI detect); the body is the
-  // shared Outcome card. See src/runtime/outcome.ts.
+  const envelope = buildBackgroundTaskOutcomeEnvelope(task, outcome, detail);
+  return deliverOutcome(envelope.payload, envelope.context);
+}
+
+/** Build once, then persist for terminal delivery. Keeping this pure is what
+ * prevents a restart from re-humanizing, re-truncating, or re-routing the same
+ * completed task under newer configuration. */
+function buildBackgroundTaskOutcomeEnvelope(
+  task: BackgroundTaskRecord,
+  outcome: BackgroundTaskOutcome,
+  detail: string,
+): { payload: Outcome; context: DeliverContext } {
   const snapshot = task.outcomeSnapshot
     ?? buildBackgroundTaskOutcomeSnapshot(task, outcome, {
       blocker: task.error,
       nextAction: outcome === 'needs_input' ? task.pendingQuestion : undefined,
       resumable: outcome === 'needs_input',
     });
-  const payload: Outcome = {
-    status: outcome,
-    detail,
-    evidence: snapshot.evidence,
-    blocker: snapshot.blocker,
-    nextAction: snapshot.nextAction,
-    resumable: snapshot.resumable,
-  };
-  return deliverOutcome(
-    payload,
-    {
+  return {
+    payload: {
+      status: outcome,
+      detail,
+      evidence: snapshot.evidence,
+      blocker: snapshot.blocker,
+      nextAction: snapshot.nextAction,
+      resumable: snapshot.resumable,
+    },
+    context: {
       originSessionId: task.originSessionId,
       sourceLabel: 'background task',
       sourceId: task.id,
@@ -2133,7 +2195,219 @@ function enqueueBackgroundTaskOutcomeTurn(
       // keep this from colliding with a mid-conversation turn.
       proactiveTurn: true,
     },
+  };
+}
+
+function terminalDoneReportBackId(taskId: string): string {
+  return `background-task-terminal-report:${taskId}:done:v1`;
+}
+
+function terminalDoneNotificationId(taskId: string): string {
+  return `background-${taskId}-done-terminal-v1`;
+}
+
+function boundedTerminalOutcomeDetail(task: BackgroundTaskRecord, result: string): string {
+  if (result.length <= RESULT_TRUNCATE_CHARS) return result;
+  const retrieval = task.resultPath
+    ? `[Full result saved to ${task.resultPath}; retrieve it with background_task_status('${task.id}').]`
+    : `[Retrieve the full result with background_task_status('${task.id}').]`;
+  // truncateResultBody can append two characters (` …`) after its budget.
+  // Reserve those plus the paragraph break so the complete immutable outcome
+  // carrier remains within the task record's normal 4k preview ceiling.
+  const previewBudget = Math.max(256, RESULT_TRUNCATE_CHARS - retrieval.length - 4);
+  return `${truncateResultBody(result, previewBudget)}\n\n${retrieval}`;
+}
+
+function buildBackgroundTaskDoneReportBack(
+  task: BackgroundTaskRecord,
+  result: string,
+  notificationBody: string,
+  createdAt: string,
+): BackgroundTaskTerminalReportBack {
+  const detail = boundedTerminalOutcomeDetail(task, result);
+  const envelope = buildBackgroundTaskOutcomeEnvelope(task, 'done', detail);
+  return {
+    version: 1,
+    outboxId: terminalDoneReportBackId(task.id),
+    outcome: 'done',
+    detail,
+    outcomePayload: envelope.payload,
+    deliveryContext: envelope.context,
+    notification: {
+      id: terminalDoneNotificationId(task.id),
+      kind: 'execution',
+      title: `Background task completed: ${task.title}`,
+      body: truncateResultBody(notificationBody),
+      createdAt,
+      read: false,
+      metadata: taskNotificationMetadata(task, {
+        status: 'done',
+        terminalReportBack: true,
+        terminalReportBackOutboxId: terminalDoneReportBackId(task.id),
+      }),
+    },
+    createdAt,
+  };
+}
+
+function notificationMatchesTerminalEnvelope(
+  actual: NotificationRecord | undefined,
+  expected: NotificationRecord,
+): boolean {
+  if (!actual) return false;
+  // Read/delivery state is allowed to advance inside the notification store.
+  // The carrier identity, presentation, route metadata, and admission time are
+  // immutable and must still match the task-owned envelope byte-for-byte in
+  // value (object key order is immaterial).
+  return actual.id === expected.id
+    && actual.kind === expected.kind
+    && actual.title === expected.title
+    && actual.body === expected.body
+    && actual.createdAt === expected.createdAt
+    && isDeepStrictEqual(actual.metadata ?? {}, expected.metadata ?? {});
+}
+
+function acknowledgeBackgroundTaskTerminalReportBack(
+  taskId: string,
+  outboxId: string,
+  sink: 'notification' | 'origin',
+  acknowledgedAt: string,
+): BackgroundTaskRecord | null {
+  return updateBackgroundTaskWhere(
+    taskId,
+    (task) => task.terminalReportBack?.outboxId === outboxId,
+    (task) => {
+      const current = task.terminalReportBack!;
+      const next: BackgroundTaskTerminalReportBack = {
+        ...current,
+        ...(sink === 'notification' && !current.notificationAcknowledgedAt
+          ? { notificationAcknowledgedAt: acknowledgedAt }
+          : {}),
+        ...(sink === 'origin' && !current.originAcknowledgedAt
+          ? { originAcknowledgedAt: acknowledgedAt }
+          : {}),
+      };
+      const notificationAcknowledged = next.notificationAcknowledgedAt !== undefined;
+      const originAcknowledged = next.originAcknowledgedAt !== undefined;
+      if (notificationAcknowledged && originAcknowledged && !next.acknowledgedAt) {
+        next.acknowledgedAt = acknowledgedAt;
+      }
+      return { terminalReportBack: next };
+    },
   );
+}
+
+export interface BackgroundTaskTerminalReportBackDrainResult {
+  scanned: number;
+  notificationsAcknowledged: number;
+  originsAcknowledged: number;
+  acknowledged: number;
+  pending: number;
+}
+
+/**
+ * Recover a bounded set of terminal report envelopes. Each sink is retried
+ * independently and acknowledged only after its durable store proves the
+ * exact immutable carrier exists. Stable notification/source ids make a crash
+ * between delivery and acknowledgement an idempotent verification pass.
+ */
+export function drainBackgroundTaskTerminalReportBacks(
+  opts: { limit?: number; taskId?: string } = {},
+): BackgroundTaskTerminalReportBackDrainResult {
+  const limit = Math.max(1, Math.min(200, Math.trunc(opts.limit ?? 50)));
+  const candidates = listBackgroundTasks({ includeArchived: true })
+    .filter((task) => !opts.taskId || task.id === opts.taskId)
+    .filter((task) => task.terminalReportBack && !task.terminalReportBack.acknowledgedAt)
+    .slice(0, limit);
+  const result: BackgroundTaskTerminalReportBackDrainResult = {
+    scanned: 0,
+    notificationsAcknowledged: 0,
+    originsAcknowledged: 0,
+    acknowledged: 0,
+    pending: 0,
+  };
+
+  for (const candidate of candidates) {
+    result.scanned += 1;
+    // Different daemon processes can run boot/tick drains at the same time.
+    // Serialize the check-deliver-ack sequence on a DEDICATED report lease so
+    // the outcome sink's read-before-append idempotency check cannot race. The
+    // ordinary task-transition lease remains free for each acknowledgement;
+    // notification/outcome callbacks therefore never execute while canonical
+    // task state is locked.
+    const drained = withTaskTransitionLock(
+      `${candidate.id}-terminal-report-back-drain`,
+      () => {
+        let task = getBackgroundTask(candidate.id) ?? candidate;
+        let report = task.terminalReportBack;
+        if (!report || report.acknowledgedAt) return true;
+
+        if (!report.notificationAcknowledgedAt) {
+          let notificationVerified = false;
+          try {
+            let existing = getNotification(report.notification.id);
+            if (!existing) {
+              // addNotification may annotate its argument with delivery state,
+              // so keep the task-owned immutable carrier isolated from that
+              // mutation.
+              addNotification({
+                ...report.notification,
+                metadata: report.notification.metadata
+                  ? { ...report.notification.metadata }
+                  : undefined,
+              });
+              existing = getNotification(report.notification.id);
+            }
+            notificationVerified = notificationMatchesTerminalEnvelope(existing, report.notification);
+          } catch (error) {
+            logger.warn(
+              { taskId: task.id, outboxId: report.outboxId, error: error instanceof Error ? error.message : String(error) },
+              'Background terminal notification delivery remains pending',
+            );
+          }
+          if (notificationVerified) {
+            backgroundTaskTerminalReportBackFaultForTests?.('after_notification_delivery');
+            task = acknowledgeBackgroundTaskTerminalReportBack(
+              task.id,
+              report.outboxId,
+              'notification',
+              nowIso(),
+            ) ?? task;
+            result.notificationsAcknowledged += 1;
+            report = task.terminalReportBack;
+          }
+        }
+
+        if (report && !report.originAcknowledgedAt) {
+          const acknowledgement = deliverOutcomeWithAcknowledgement(
+            report.outcomePayload,
+            report.deliveryContext,
+          );
+          if (acknowledgement.acknowledged) {
+            backgroundTaskTerminalReportBackFaultForTests?.('after_origin_delivery');
+            updateLinkedFocusAction(task.id, {
+              status: 'done',
+              note: 'Completed and reported back.',
+            });
+            task = acknowledgeBackgroundTaskTerminalReportBack(
+              task.id,
+              report.outboxId,
+              'origin',
+              nowIso(),
+            ) ?? task;
+            result.originsAcknowledged += 1;
+            report = task.terminalReportBack;
+          }
+        }
+
+        if (report?.acknowledgedAt) result.acknowledged += 1;
+        else result.pending += 1;
+        return true;
+      },
+    );
+    if (!drained) result.pending += 1;
+  }
+  return result;
 }
 
 function backgroundTaskOutcomeForStatus(status: BackgroundTaskStatus): BackgroundTaskOutcome | null {
@@ -2397,44 +2671,54 @@ export function markBackgroundTaskDone(
     );
   }
   if (!prepareWorkerSettlementForCas(id)) return null;
+  let terminalEnvelopePersisted = false;
   // Cancellation is a terminal authority boundary. The result file and task
   // completion are created only after the latest record is checked while the
   // task transition lease is held, so a stale worker cannot complete after a
   // cross-process stop committed.
   const updated = updateBackgroundTaskWhere(id, workerDoneMayProceed, (task) => {
     const resultPath = writeFullResultFile(task, result);
-    return {
+    const completedAt = nowIso();
+    const outcomeSnapshot = buildBackgroundTaskOutcomeSnapshot(task, 'done');
+    const completedTask: BackgroundTaskRecord = {
+      ...task,
       ...clearParkedBackgroundState(),
       status: 'done',
-      completedAt: nowIso(),
+      completedAt,
       result: resultPath ? `${result.slice(0, RESULT_TRUNCATE_CHARS)}\n...[full result saved to ${resultPath}]` : result,
       resultPath,
       error: undefined,
-      outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'done'),
+      outcomeSnapshot,
     };
+    if (!task.internal && !task.terminalReportBack) {
+      const notificationBody = opts?.notificationBody ?? humanizeReportBody(result);
+      completedTask.terminalReportBack = buildBackgroundTaskDoneReportBack(
+        completedTask,
+        result,
+        notificationBody,
+        completedAt,
+      );
+      terminalEnvelopePersisted = true;
+    } else if (task.terminalReportBack) {
+      // The first terminal envelope is immutable. A repeated physical settle
+      // may refresh diagnostic task fields, but can neither change what the
+      // user is told nor redirect where that already-admitted report goes.
+      completedTask.terminalReportBack = task.terminalReportBack;
+    }
+    return completedTask;
   });
   if (updated) {
+    if (terminalEnvelopePersisted) {
+      backgroundTaskTerminalReportBackFaultForTests?.('after_persist');
+    }
     // User-facing deliveries only for user-facing tasks: an INTERNAL plan
     // unit reports through its plan (aggregate progress, one reducer
     // terminal). Operational telemetry and strategy capture stay on.
     if (!updated.internal) {
-      // The HUMAN sees a conversational body: a caller-supplied one when the raw
-      // result is machine-shaped (e.g. the job-watcher's JSON), otherwise the
-      // worker's text with its audit ledger stripped. The MODEL still gets the
-      // full `result` (result file + `enqueueBackgroundTaskOutcomeTurn` below).
-      const notificationBody = opts?.notificationBody ?? humanizeReportBody(result);
-      addNotification({
-        id: `${Date.now()}-background-${updated.id}-done`,
-        kind: 'execution',
-        title: `Background task completed: ${updated.title}`,
-        body: truncateResultBody(notificationBody),
-        createdAt: nowIso(),
-        read: false,
-        metadata: taskNotificationMetadata(updated, { terminalReportBack: true }),
-      });
-      // Async report-back: also feed the result into the origin session's
-      // context so Clementine resumes from it, not just a notification.
-      enqueueBackgroundTaskOutcomeTurn(updated, 'done', result);
+      // Both presentations were frozen in the terminal task generation above.
+      // This immediate bounded drain preserves the historical synchronous
+      // behavior; boot/tick drains recover any crash between its writes.
+      drainBackgroundTaskTerminalReportBacks({ limit: 1, taskId: updated.id });
     }
     emitBackgroundTaskOperational('background_task_finished', updated, { status: 'done' });
     // Learning loop (DREAM): distill this run's SHAPE — real tools used,
@@ -2448,7 +2732,7 @@ export function markBackgroundTaskDone(
       captureRunStrategyFromTrace(updated);
     } catch { /* strategy capture is best-effort */ }
   }
-  return updated;
+  return updated ? (getBackgroundTask(updated.id) ?? updated) : null;
 }
 
 /**
@@ -2466,6 +2750,62 @@ interface BackgroundInputPauseOptions {
   /** Structured harness fact appended after the report, not substituted for it. */
   blockerReason?: string;
   blockerType?: BlockerType;
+  /** Exact options when the caller already owns the structured question. When
+   * omitted, markBackgroundTaskAwaitingInput recovers them from the latest
+   * matching awaiting_user_input event in this task's run session. */
+  options?: string[];
+}
+
+function cleanBackgroundQuestionOptions(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const options: string[] = [];
+  for (const candidate of value) {
+    if (typeof candidate !== 'string') continue;
+    const option = clean(candidate, 240);
+    const key = option.toLowerCase();
+    if (!option || seen.has(key)) continue;
+    seen.add(key);
+    options.push(option);
+    if (options.length >= 8) break;
+  }
+  return options;
+}
+
+function matchingBackgroundQuestionOptions(
+  task: BackgroundTaskRecord | null,
+  questionId: string,
+  renderedQuestion: string,
+): string[] {
+  if (!task) return [];
+  try {
+    const renderedKey = renderedQuestion.replace(/\s+/g, ' ').trim().toLowerCase();
+    const events = listHarnessEventsForRefute(task.runSessionId, {
+      types: ['awaiting_user_input'],
+      desc: true,
+      limit: 12,
+    });
+    // listEvents(desc:true) bounds from the newest tail but restores
+    // chronological order. Prefer the exact durable question id, then scan
+    // newest-first only as a compatibility fallback for legacy callers whose
+    // stored question id was not the event id.
+    const ordered = [
+      ...events.filter((event) => event.id === questionId),
+      ...[...events].reverse().filter((event) => event.id !== questionId),
+    ];
+    for (const event of ordered) {
+      const question = typeof event.data.question === 'string'
+        ? event.data.question.replace(/\s+/g, ' ').trim()
+        : '';
+      const questionKey = question.toLowerCase();
+      if (
+        !questionKey
+        || !(renderedKey.includes(questionKey) || questionKey.includes(renderedKey))
+      ) continue;
+      return cleanBackgroundQuestionOptions(event.data.options);
+    }
+  } catch { /* legacy/non-harness tasks simply have no structured options */ }
+  return [];
 }
 
 /**
@@ -2546,6 +2886,10 @@ export function markBackgroundTaskAwaitingInput(
   opts: BackgroundInputPauseOptions = {},
 ): BackgroundTaskRecord | null {
   if (!prepareWorkerSettlementForCas(id)) return null;
+  const taskAtPause = getBackgroundTask(id);
+  const pendingQuestionOptions = opts.options !== undefined
+    ? cleanBackgroundQuestionOptions(opts.options)
+    : matchingBackgroundQuestionOptions(taskAtPause, questionId, question);
   const reportDetail = progressPreservingPauseDetail(question, opts);
   const notificationBody = progressPreservingPauseDetail(question, opts, 2000);
   const blockedOnCli = detectBlockedOnCli(opts.blockerType, opts.blockerReason, rosterCliCommands());
@@ -2557,6 +2901,7 @@ export function markBackgroundTaskAwaitingInput(
     pendingQuestionId: questionId,
     ...(blockedOnCli ? { blockedOnCli } : {}),
     pendingQuestion: question.slice(0, RESULT_TRUNCATE_CHARS),
+    ...(pendingQuestionOptions.length > 0 ? { pendingQuestionOptions } : {}),
     result: (opts.resultText ?? question).slice(0, RESULT_TRUNCATE_CHARS),
     outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'needs_input', {
       blocker: opts.blockerReason,
@@ -3959,6 +4304,17 @@ function resolveLatestBackgroundResumeOwner(
  * tasks whose `resumeCount` has reached `cap`. Returns the number resumed.
  */
 export function resumeInterruptedBackgroundTasks(opts: { cap?: number } = {}): number {
+  // Boot recovery begins with already-finished work. A task that reached its
+  // atomic terminal generation before the prior process died must report back
+  // before we spend capacity resuming unrelated interrupted workers.
+  try {
+    drainBackgroundTaskTerminalReportBacks({ limit: 50 });
+  } catch (error) {
+    logger.warn(
+      { error: error instanceof Error ? error.message : String(error) },
+      'Background terminal report-back boot drain failed; the ordinary tick will retry',
+    );
+  }
   const cap = Math.max(1, opts.cap ?? 2);
   let resumedCount = 0;
   for (const task of listBackgroundTasks({ status: 'interrupted' })) {
@@ -4482,6 +4838,16 @@ async function finishWorkerRun(
 export async function processBackgroundTasks(assistant: ClementineAssistant, limit?: number): Promise<number> {
   try {
     backgroundDrainsInFlight += 1;
+    // The report outbox is independent of worker capacity. Drain it before the
+    // running-count early return so a busy daemon cannot strand a completion.
+    try {
+      drainBackgroundTaskTerminalReportBacks({ limit: 50 });
+    } catch (error) {
+      logger.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        'Background terminal report-back tick drain failed; a later tick will retry',
+      );
+    }
     const policy = loadProactivityPolicy();
     const requestedLimit = typeof limit === 'number' ? limit : policy.maxConcurrentBackgroundTasks;
     const effectiveLimit = Math.max(1, Math.min(requestedLimit, policy.maxConcurrentBackgroundTasks));

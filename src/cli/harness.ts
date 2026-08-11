@@ -65,13 +65,14 @@ async function harnessRun(opts: HarnessRunOptions): Promise<number> {
 
   let result;
   try {
-    const agent = await buildOrchestratorAgent({
-      userInput: opts.prompt,
-      sessionId: session.id,
-      allowToolJit: true,
-    });
     result = await runConversation({
-      agent,
+      buildAgent: (identity) => buildOrchestratorAgent({
+        userInput: opts.prompt,
+        sessionId: session.id,
+        sourceUserSeq: identity.sourceUserSeq,
+        acceptedRoute: identity.route,
+        allowToolJit: true,
+      }),
       sessionId: session.id,
       input: opts.prompt,
       maxSteps: opts.maxSteps,

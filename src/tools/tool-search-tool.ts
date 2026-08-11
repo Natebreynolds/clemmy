@@ -94,6 +94,9 @@ export function registerToolSearchTool(
     /** Deferred results are intentionally absent from the advertised schema
      * surface and must be invoked through the generic same-turn dispatcher. */
     dispatchViaCallTool?: boolean;
+    /** Action turns use the semantic carrier instead of advertising a second,
+     * unbound business dispatcher. Omitted preserves the legacy call_tool hint. */
+    dispatchCarrier?: 'call_tool' | 'work_call';
   } = {},
 ): void {
   server.tool(
@@ -137,7 +140,7 @@ export function registerToolSearchTool(
       for (const name of schemaNames) {
         const metadata = metadataMap.get(name);
         if (metadata?.schema !== undefined) {
-          schemas[name] = opts.dispatchViaCallTool
+          schemas[name] = (opts.dispatchViaCallTool || opts.dispatchCarrier)
             ? relaxJsonSchemaForDeferred(metadata.schema)
             : metadata.schema;
         }
@@ -169,8 +172,10 @@ export function registerToolSearchTool(
         results: topN.map((r) => ({ name: r.name, summary: r.oneLiner })),
         schemas,
         ...(Object.keys(guidance).length > 0 ? { guidance } : {}),
-        hint: opts.dispatchViaCallTool
-          ? 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.'
+        hint: (opts.dispatchCarrier ?? (opts.dispatchViaCallTool ? 'call_tool' : null)) === 'work_call'
+          ? 'Invoke the selected result as the inner name/args_json of work_call. On the first work_call, include the complete provider-neutral semantic proposal and dispatch this first requirement in that same call; later calls use proposal:null.'
+          : opts.dispatchViaCallTool
+            ? 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.'
           : opts.allowedNames
             ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
             : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',

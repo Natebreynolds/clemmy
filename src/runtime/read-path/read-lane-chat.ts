@@ -20,8 +20,6 @@
  * flow; matching is over the artifact index's own identifiers and recorded
  * intents, which are data.
  */
-import { createHash } from 'node:crypto';
-import { hostname, userInfo } from 'node:os';
 import {
   parseProcedureArtifactDocument,
   resolveActiveProcedure,
@@ -35,12 +33,26 @@ import { sealBudgetContract, createBudgetMeter, type RuntimeBudgetContract } fro
 import { createSpanRecorder } from '../trace-envelope.js';
 import { sealReadLaneEnvelope, type ReadLaneEnvelope } from './read-envelope.js';
 import { runColdToWarmRead, type ReadLaneCounters, type ReadLanePorts } from './read-lane.js';
+import { canonicalProcedureScope } from './procedure-scope.js';
+
+export interface AcceptedTurnReadArtifactAuthority {
+  artifactId: string;
+  kind: ProcedureArtifact['kind'];
+  identifier: string;
+  provider: string;
+  operation: string;
+  schemaFingerprint: string;
+  scope: ProcedureScope;
+}
 
 export interface AcceptedTurnReadPorts {
   /** The scoped stable identity this daemon runs as. REAL identities: the
    *  install/user identity, the workspace, and the connected account's
    *  stable logical identity — never a rotating connection id. */
   scope(): ProcedureScope | undefined;
+  /** Production factories bind the exact artifact they admitted. Generic
+   * injected resolver ports may omit this for provider-neutral tests. */
+  authorizedArtifact?(): AcceptedTurnReadArtifactAuthority;
   /** Live schema fingerprint for a bound identifier, from the loaded
    *  catalog (never a discovery call). */
   liveSchemaFingerprint(identifier: string): string | undefined;
@@ -64,7 +76,11 @@ export type AcceptedTurnReadResult =
       counters: ReadLaneCounters;
       laneDigest: string;
     }
-  | { kind: 'declined'; reason: string };
+  | { kind: 'declined'; reason: string }
+  /** The governed boundary crossed and a paid read happened, but no verified
+   * presentation could be formed. The bridge must stop here, never run a
+   * second brain/provider path. */
+  | { kind: 'spent'; reason: string; counters: ReadLaneCounters; laneDigest: string };
 
 /** The v1 production budget for one warm read turn. */
 function warmReadContract(): RuntimeBudgetContract {
@@ -81,6 +97,45 @@ const WORD = /[a-z0-9]+/g;
 
 function tokens(text: string): Set<string> {
   return new Set((text.toLowerCase().match(WORD) ?? []).filter((token) => token.length > 2));
+}
+
+const PRESENTATION_INDEPENDENT_SHELL_TOKENS = new Set([
+  'a', 'an', 'at', 'can', 'could', 'do', 'fetch', 'for', 'from', 'get', 'in',
+  'me', 'my', 'now', 'of', 'on', 'our', 'please', 'pull', 'retrieve', 'run',
+  'show', 'the', 'to', 'us', 'view', 'will', 'with', 'would', 'you',
+]);
+
+/**
+ * A warm read may bypass Clem's conversational brain only when the user's
+ * whole turn is the retrieval itself. Provider/operation words embedded in
+ * commentary, advice, comparison, explanation, a compound request, or an
+ * extra constraint are not sufficient authority for a fixed presentation.
+ *
+ * This deliberately small deterministic grammar is fail-open to the normal
+ * brain: unfamiliar wording costs the optimization, never the conversation.
+ */
+export function isPresentationIndependentRetrieval(
+  message: string,
+  artifact: Pick<ProcedureArtifact, 'provider' | 'operation'>,
+): boolean {
+  const operationTokens = new Set(
+    (`${artifact.operation.replace(/_/g, ' ')} ${artifact.provider}`.toLowerCase().match(WORD) ?? []),
+  );
+  if (operationTokens.size === 0) return false;
+  const messageTokens = message.toLowerCase().match(WORD) ?? [];
+  if (messageTokens.length === 0) return false;
+  return messageTokens.every((token) => (
+    operationTokens.has(token) || PRESENTATION_INDEPENDENT_SHELL_TOKENS.has(token)
+  ));
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && Object.values(value as Record<string, unknown>).every((item) => typeof item === 'string'),
+  );
 }
 
 /**
@@ -110,12 +165,7 @@ export function matchWarmCandidate(
 
 /** Stable single-install identity — real, derived, never blank. */
 export function productionScope(accountIdentity: string): ProcedureScope {
-  const user = (() => { try { return userInfo().username; } catch { return 'user'; } })();
-  return {
-    tenant: `install:${createHash('sha256').update(`${hostname()}:${user}`).digest('hex').slice(0, 16)}`,
-    workspace: 'default',
-    accountIdentity,
-  };
+  return canonicalProcedureScope(accountIdentity);
 }
 
 function laneFor(scope: ProcedureScope, artifact: ProcedureArtifact, request: { sessionId: string; seq: string }): ReadLaneEnvelope | undefined {
@@ -161,17 +211,53 @@ export async function resolveAcceptedTurnRead(
       && artifact.scope.tenant === scope.tenant
       && artifact.scope.workspace === scope.workspace
       && artifact.scope.accountIdentity === scope.accountIdentity);
-  if (artifacts.length === 0) return { kind: 'declined', reason: 'no proven procedures in scope' };
+  const authorized = ports.authorizedArtifact?.();
+  const authorizedArtifacts = authorized
+    ? artifacts.filter((artifact) => artifact.artifactId === authorized.artifactId
+      && artifact.kind === authorized.kind
+      && artifact.identifier === authorized.identifier
+      && artifact.provider === authorized.provider
+      && artifact.operation === authorized.operation
+      && artifact.schemaFingerprint === authorized.schemaFingerprint
+      && artifact.scope.tenant === authorized.scope.tenant
+      && artifact.scope.workspace === authorized.scope.workspace
+      && artifact.scope.accountIdentity === authorized.scope.accountIdentity)
+    : artifacts;
+  if (authorizedArtifacts.length === 0) return { kind: 'declined', reason: 'no proven procedures in scope' };
 
-  const candidate = matchWarmCandidate(request.message, artifacts);
+  const candidate = matchWarmCandidate(request.message, authorizedArtifacts);
   if (!candidate) return { kind: 'declined', reason: 'no deterministic warm candidate' };
+  if (!isPresentationIndependentRetrieval(request.message, candidate)) {
+    return { kind: 'declined', reason: 'retrieval requires conversational presentation' };
+  }
 
-  // Slots: template constants, a durable pending answer, nothing else. A
-  // procedure needing un-derivable slots declines to the ordinary brain.
+  // Slots: template constants plus values extracted under THIS exact accepted
+  // source, nothing else. A pending acquisition is keyed durably by logical
+  // operation, so it may outlive the turn that created it. Reusing its values
+  // for a later request would silently run the active procedure with stale
+  // task context. Preserve same-source physical retries, but an unrelated
+  // accepted source must resolve its own slots through the ordinary brain.
+  const acceptedSource = `${request.sessionId}:${request.seq}`;
   const pending = loadPendingCapabilityTurn({
     scope, provider: candidate.provider, operation: candidate.operation,
   });
-  const slotValues: Record<string, string> = { ...(pending?.knownSlotValues ?? {}) };
+  const pendingBelongsToAcceptedSource = Boolean(
+    pending
+    && pending.scope
+    && pending.acceptedSource === acceptedSource
+    && pending.scope.tenant === scope.tenant
+    && pending.scope.workspace === scope.workspace
+    && pending.scope.accountIdentity === scope.accountIdentity
+    && pending.provider === candidate.provider
+    && pending.operation === candidate.operation
+    && pending.identifier === candidate.identifier
+    && pending.schemaFingerprint === candidate.schemaFingerprint,
+  );
+  const slotValues: Record<string, string> = pendingBelongsToAcceptedSource
+    && pending
+    && isStringRecord(pending.knownSlotValues)
+    ? { ...pending.knownSlotValues }
+    : {};
   const resolved = resolveActiveProcedure({
     scope,
     provider: candidate.provider,
@@ -182,6 +268,14 @@ export async function resolveAcceptedTurnRead(
   });
   if (resolved.outcome !== 'bound') {
     return { kind: 'declined', reason: `procedure resolution: ${resolved.outcome}` };
+  }
+  if (authorized && (resolved.artifact.artifactId !== authorized.artifactId
+    || resolved.artifact.kind !== authorized.kind
+    || resolved.artifact.identifier !== authorized.identifier
+    || resolved.artifact.provider !== authorized.provider
+    || resolved.artifact.operation !== authorized.operation
+    || resolved.artifact.schemaFingerprint !== authorized.schemaFingerprint)) {
+    return { kind: 'declined', reason: 'authorized artifact changed during resolution' };
   }
 
   const lane = laneFor(scope, resolved.artifact, request);
@@ -212,6 +306,14 @@ export async function resolveAcceptedTurnRead(
     ports: lanePorts,
     clock: ports.clock,
   });
+  if (outcome.outcome === 'failed' && outcome.providerDispatched) {
+    return {
+      kind: 'spent',
+      reason: outcome.reason,
+      counters: outcome.counters,
+      laneDigest: lane.laneDigest,
+    };
+  }
   if (outcome.outcome !== 'terminal' || !outcome.warm) {
     return { kind: 'declined', reason: `lane outcome: ${outcome.outcome}` };
   }

@@ -302,6 +302,10 @@ let lastGoodConnections: ConnectedToolkit[] | null = null;
 // error propagates (retry contract) rather than degrading to last-good.
 const SNAPSHOT_SUPERSEDED_MESSAGE = 'Composio account state changed during refresh; retry the operation.';
 let connectedAccountsLoaderForTest: (() => Promise<Array<Record<string, unknown>>>) | null = null;
+// Test-only override: null follows the real vault/env chain, while an empty
+// string proves the genuinely keyless AUTO lane without touching a developer's
+// local credential files.
+let composioApiKeyOverrideForTest: string | null = null;
 let catalogCache: { at: number; data: CatalogToolkit[] } | null = null;
 
 // Per-toolkit tool-list cache (D3): composio_search_tools fans out to
@@ -313,6 +317,14 @@ let catalogCache: { at: number; data: CatalogToolkit[] } | null = null;
 // first time).
 const TOOLKIT_TOOLS_TTL_MS = 15 * 60 * 1000;
 const toolkitToolsCache = new Map<string, { at: number; data: ComposioToolkitTool[] }>();
+// Kept out-of-band so provider provenance never leaks into tool catalog output
+// or schema payloads. Cached objects retain their ORIGINAL observation time;
+// replaying the 15-minute list cache cannot mint a fresh execution lease.
+const toolSchemaObservedAt = new WeakMap<object, number>();
+
+export function composioToolSchemaObservedAt(tool: ComposioToolkitTool): number | undefined {
+  return tool && typeof tool === 'object' ? toolSchemaObservedAt.get(tool) : undefined;
+}
 /** Clear the per-toolkit tool-list cache. Exported for tests + connection busts. */
 export function bustToolkitToolsCache(): void {
   toolkitToolsCache.clear();
@@ -342,6 +354,9 @@ function readSecretFromFileVaultSync(name: string): string | undefined {
 }
 
 function readComposioEnv(key: 'COMPOSIO_API_KEY' | 'COMPOSIO_USER_ID'): string {
+  if (key === 'COMPOSIO_API_KEY' && composioApiKeyOverrideForTest !== null) {
+    return composioApiKeyOverrideForTest;
+  }
   // Precedence matches CompositeSecretStore: vault → env. Previously
   // process.env won, which let a stale/bad value in .env silently mask
   // a freshly-saved vault value. (Observed 2026-05-23: user had two
@@ -1716,18 +1731,27 @@ export async function getComposioToolBySlug(slug: string): Promise<ComposioToolk
   if (!composio || !slug) return null;
   const wanted = slug.toUpperCase();
   try {
+    // Order observations by request start, not response completion. Two
+    // overlapping lookups can finish out of order; a slower older request must
+    // never look newer and roll schema authority back.
+    const observedAt = Date.now();
     const raw = await composio.tools.getRawComposioTools({ tools: [wanted] });
     const list = Array.isArray(raw) ? raw : (raw?.items ?? []);
     for (const item of list) {
       if (String(item?.slug ?? '').toUpperCase() === wanted) {
-        return { slug: item.slug, name: item.name ?? item.slug, description: item.description ?? '', inputParameters: item.inputParameters ?? item.input_parameters } as ComposioToolkitTool;
+        const tool = { slug: item.slug, name: item.name ?? item.slug, description: item.description ?? '', inputParameters: item.inputParameters ?? item.input_parameters } as ComposioToolkitTool;
+        toolSchemaObservedAt.set(tool, observedAt);
+        return tool;
       }
     }
   } catch { /* fall through to the toolkit listing */ }
   const toolkit = (slug.split('_')[0] ?? '').toLowerCase();
   if (!toolkit) return null;
   try {
-    const tools = await listComposioToolkitTools(toolkit, 500);
+    // An exact authority refresh must not fall back to the process's 15-minute
+    // toolkit cache. Supplying the current client as an override forces a live
+    // listing while preserving the existing SDK-version compatibility path.
+    const tools = await listComposioToolkitTools(toolkit, 500, composio);
     return tools.find((tool) => String(tool.slug ?? '').toUpperCase() === wanted) ?? null;
   } catch {
     return null;
@@ -1751,6 +1775,8 @@ export async function listComposioToolkitTools(
     if (hit && Date.now() - hit.at < TOOLKIT_TOOLS_TTL_MS) return hit.data;
   }
 
+  const observedAt = Date.now();
+
   const seen = new Set<string>();
   const tools: ComposioToolkitTool[] = [];
   const ingest = (raw: unknown): void => {
@@ -1760,13 +1786,15 @@ export async function listComposioToolkitTools(
       const toolSlug = str(item.slug) ?? str(item.name);
       if (!toolSlug || seen.has(toolSlug)) continue;
       seen.add(toolSlug);
-      tools.push({
+      const tool: ComposioToolkitTool = {
         slug: toolSlug,
         name: str(item.name) ?? toolSlug,
         description: str(item.description),
         toolkitSlug: str(toolkit.slug) ?? slug,
         inputParameters: item.inputParameters ?? item.input_parameters ?? item.parameters,
-      });
+      };
+      toolSchemaObservedAt.set(tool, observedAt);
+      tools.push(tool);
     }
   };
 
@@ -1873,6 +1901,8 @@ export async function executeComposioTool(
   preferredIdentity?: string,
 ): Promise<unknown> {
   const backend = getComposioExecutionBackend();
+  let cliReadFailureAwaitingSdkFallback: unknown;
+  let hasCliReadFailureAwaitingSdkFallback = false;
   const cliOnlyLane = composioExecutionUsesCliOnlyLane({
     executionBackend: backend,
     apiKeyPresent: Boolean(readComposioEnv('COMPOSIO_API_KEY')),
@@ -1916,6 +1946,14 @@ export async function executeComposioTool(
           // response. Never use a post-failure probe to authorize SDK replay.
           throw new ComposioDispatchUncertainError(toolSlug, error);
         }
+        // AUTO may still recover a failed read through an available SDK client.
+        // Retain the actual CLI failure until that client is proven available;
+        // otherwise the nominal "missing API key" condition would erase the
+        // provider/CLI rejection that explains why this call failed.
+        if (composioSlugIsReadOnly(toolSlug)) {
+          cliReadFailureAwaitingSdkFallback = error;
+          hasCliReadFailureAwaitingSdkFallback = true;
+        }
       }
     } else if (backend === 'cli') {
       // This status check completed before executeComposioCliTool was invoked,
@@ -1933,6 +1971,9 @@ export async function executeComposioTool(
   // No SDK client was constructed, so this nominal local error is strictly
   // pre-dispatch. The same API-key prose inside a provider error is not proof.
   if (!composio) {
+    if (hasCliReadFailureAwaitingSdkFallback) {
+      throw cliReadFailureAwaitingSdkFallback;
+    }
     throw new ComposioPreDispatchError(
       'sdk-unavailable',
       'COMPOSIO_API_KEY is not configured.',
@@ -2376,6 +2417,9 @@ export const __test__ = {
   derivedComposioUserId,
   setComposioClient(client: unknown): void {
     singleton = client as Composio;
+  },
+  setComposioApiKeyOverride(value: string | null): void {
+    composioApiKeyOverrideForTest = value;
   },
   setConnectedAccountsLoader(
     loader: (() => Promise<Array<Record<string, unknown>>>) | null,

@@ -18,6 +18,8 @@ const toolEconomy = await import('./tool-economy.js');
 const capabilityHealth = await import('./capability-health.js');
 const dispatchLease = await import('./dispatch-lease.js');
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
+const claudeLocalCorrelation = await import('./claude-local-tool-correlation.js');
+const settledReadRepeat = await import('./settled-read-repeat.js');
 const { formatAutoResolvedAskUserQuestionOutput } = await import('./terminal-tool.js');
 const {
   CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
@@ -27,6 +29,7 @@ const {
   buildAllowOnlyToolsPermission,
   buildClaudeAgentSdkLocalMcpServers,
   buildScopedNativeMcpServers,
+  claudeAgentSdkUsageLane,
   defaultClaudeAgentSdkAllowedLocalTools,
   runClaudeAgentSdk,
   resolveClaudeAgentSdkTrackerScope,
@@ -43,6 +46,18 @@ const { isAuthRecoverableError } = await import('../../execution/transient-error
 // Irreversible sends are held regardless of posture.
 const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
 saveProactivityPolicy({ autoApproveScope: 'strict' });
+
+test('Claude SDK usage lane uses only explicit caller-owned role identity', () => {
+  assert.equal(claudeAgentSdkUsageLane({ workerScope: true, directOrchestrator: true }), 'worker');
+  assert.equal(claudeAgentSdkUsageLane({ directOrchestrator: true }), 'brain');
+  assert.equal(claudeAgentSdkUsageLane({ workflowRunId: 'run-1', stepId: 'write' }), 'workflow_step');
+  assert.equal(claudeAgentSdkUsageLane({ sessionId: 'workflow:run-2:review' }), 'workflow_step');
+  assert.equal(
+    claudeAgentSdkUsageLane({ sessionId: 'background:bg-1' }),
+    'unattributed',
+    'session/model shape never invents a role',
+  );
+});
 
 const STATE_DIR = path.join(TMP_HOME, 'state');
 const CLAUDE_AUTH_FILE = path.join(STATE_DIR, 'claude-auth.json');
@@ -1223,7 +1238,11 @@ test('same-run Claude-native call-id reuse keeps differing results and inputs as
     const invocations = eventlog.listToolOutputInvocations(session.id, callId);
     assert.equal(invocations.length, 3, 'exact frame replay coalesces while differing result bytes or inputs remain physical occurrences');
     assert.equal(new Set(invocations.map((row: any) => row.invocationNonce)).size, 3);
-    assert.deepEqual(invocations.map((row: any) => row.output), [firstOutput, secondOutput, thirdOutput]);
+    assert.deepEqual(
+      new Set(invocations.map((row: any) => row.output)),
+      new Set([firstOutput, secondOutput, thirdOutput]),
+      'the invocation store preserves every physical result; equal-millisecond writes need not sort by stream order',
+    );
     assert.equal(result.toolCallLedger?.length, 3);
     assert.deepEqual(result.toolUses, [toolName, toolName, toolName]);
     const called = eventlog.listEvents(session.id, { types: ['tool_called'] });
@@ -1464,6 +1483,7 @@ test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine M
       undefined,
       {
         sourceUserSeq: 123,
+        directOrchestrator: true,
         dispatchLease: {
           sessionId: 'brain-session-1',
           scopeId: 'brain-session-1::sdk',
@@ -1478,6 +1498,7 @@ test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine M
     assert.equal(local.env.CLEMENTINE_HOME, TMP_HOME);
     assert.equal(local.env.CLEMENTINE_MCP_SESSION_ID, 'brain-session-1');
     assert.equal(local.env.CLEMENTINE_MCP_SOURCE_USER_SEQ, '123');
+    assert.equal(local.env.CLEMENTINE_MCP_DIRECT_ORCHESTRATOR, 'on');
     assert.deepEqual(
       JSON.parse(local.env.CLEMENTINE_MCP_DISPATCH_LEASE_JSON),
       {
@@ -1488,6 +1509,16 @@ test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine M
     );
     assert.ok(Array.isArray(local.args));
     assert.ok(local.args.some((arg: string) => arg.includes('mcp-server')));
+
+    const workerServers = buildClaudeAgentSdkLocalMcpServers(
+      'worker-session-stdio',
+      true,
+      undefined,
+      { directOrchestrator: false, workerScope: true },
+    );
+    const workerLocal = workerServers['clementine-local'] as any;
+    assert.equal(workerLocal.env.CLEMENTINE_MCP_DIRECT_ORCHESTRATOR, 'off');
+    assert.equal(workerLocal.env.CLEMENTINE_MCP_WORKER_SCOPE, 'on', 'stdio workers preserve compose-only authority');
 
     const deferred = buildClaudeAgentSdkLocalMcpServers(
       'brain-session-deferred-stdio',
@@ -1757,6 +1788,125 @@ test('agentic schema-on-demand keeps local-runtime-only tools deferred even when
   });
   const body = JSON.parse(searched.content[0].text) as { results: Array<{ name: string }> };
   assert.ok(body.results.some((result) => result.name === 'workspace_roots'));
+
+  const {
+    boundClementineMcpCapabilityEnvelope,
+    boundClementineMcpCapabilityRevision,
+  } = await import('../../tools/mcp-server.js');
+  const envelope = await boundClementineMcpCapabilityEnvelope(local.instance);
+  const initial = await boundClementineMcpCapabilityRevision(local.instance);
+  assert.ok(envelope?.capabilities.some((capability) => capability.name === 'workspace_roots'),
+    'Claude deferred authority was not in the sealed per-query universe');
+  assert.equal(initial?.revision, 1);
+  assert.equal(initial?.bound.includes('workspace_roots'), false);
+
+  const called = await (registered.call_tool as any).handler({
+    name: 'workspace_roots',
+    args_json: '{}',
+  });
+  assert.doesNotMatch(called.content[0].text, /requires_readmission|not_reachable/i);
+  const acquired = await boundClementineMcpCapabilityRevision(local.instance);
+  assert.equal(acquired?.revision, 2);
+  assert.equal(acquired?.bound.includes('workspace_roots'), true);
+});
+
+test('Claude direct discovery spends one task slot, settles the exact result, and refuses a second broad search', async () => {
+  const { discoveryGovernor } = await import('./discovery-governor.js');
+  const session = eventlog.createSession({ kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Find the right built-in workspace inspection capability.' },
+  });
+  const verdicts: Array<{ id: string; behavior: string; message?: string }> = [];
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    const firstId = 'toolu_discovery_first';
+    const secondId = 'toolu_discovery_second';
+    const firstInput = { query: 'find a tool that can inspect configured workspace roots' };
+    const secondInput = { query: 'find another tool that can inspect repository roots' };
+    const gen = (async function* () {
+      yield {
+        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6',
+        session_id: 'sdk-discovery-budget', uuid: 'discovery-init', apiKeySource: 'none',
+        claude_code_version: '2.1.181', cwd: process.cwd(),
+        tools: ['mcp__clementine-local__tool_search'],
+        mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+      } as any;
+      const first = await params.options.canUseTool(
+        'mcp__clementine-local__tool_search',
+        firstInput,
+        { signal: new AbortController().signal, toolUseID: firstId },
+      );
+      verdicts.push({ id: firstId, behavior: first.behavior, message: first.message });
+      if (first.behavior === 'allow') {
+        yield {
+          type: 'assistant', session_id: 'sdk-discovery-budget', uuid: 'discovery-use',
+          parent_tool_use_id: null,
+          message: { content: [{
+            type: 'tool_use', id: firstId,
+            name: 'mcp__clementine-local__tool_search', input: firstInput,
+          }] },
+        } as any;
+        yield {
+          type: 'user', session_id: 'sdk-discovery-budget', uuid: 'discovery-result',
+          parent_tool_use_id: null,
+          message: { content: [{
+            type: 'tool_result', tool_use_id: firstId,
+            content: '{"results":[{"name":"workspace_roots"}]}',
+          }] },
+        } as any;
+      }
+      const second = await params.options.canUseTool(
+        'mcp__clementine-local__tool_search',
+        secondInput,
+        { signal: new AbortController().signal, toolUseID: secondId },
+      );
+      verdicts.push({ id: secondId, behavior: second.behavior, message: second.message });
+      yield {
+        type: 'result', subtype: 'success', session_id: 'sdk-discovery-budget',
+        uuid: 'discovery-done', result: 'Found the workspace tool.',
+        duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
+        stop_reason: 'end_turn', total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+      } as any;
+    })();
+    return Object.assign(gen, {
+      close() {}, interrupt: async () => {}, setPermissionMode: async () => {}, setModel: async () => {},
+      setMcpServers: async () => ({ added: [], removed: [], errors: {} }), streamInput: async () => {},
+      stopTask: async () => false, backgroundTasks: async () => false,
+    }) as Query;
+  }) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Find the correct workspace inspection capability.',
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    modelId: 'claude-sonnet-4-6',
+    agentic: true,
+    allowedLocalMcpTools: ['tool_search'],
+    mcpToolAllowlist: ['tool_search'],
+    localMcpToolUniverse: ['tool_search', 'workspace_roots'],
+  });
+
+  assert.deepEqual(verdicts.map((verdict) => verdict.behavior), ['allow', 'deny']);
+  assert.match(verdicts[1]?.message ?? '', /discovery budget denied.*category_budget_exhausted/i);
+  const state = discoveryGovernor.getTaskState({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(state?.claims.broad_discovery?.callId, 'toolu_discovery_first');
+  assert.equal(state?.claims.broad_discovery?.outcome, 'succeeded');
+  assert.equal(
+    eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] }).length,
+    2,
+  );
+  assert.equal(
+    eventlog.listEvents(session.id, { types: ['discovery_governor_outcome'] }).length,
+    1,
+  );
 });
 
 test('runClaudeAgentSdk fails before model work when required local MCP tools are absent from SDK init', async () => {
@@ -2055,7 +2205,7 @@ test('runClaudeAgentSdk retries a required local MCP startup that never emits in
   }
 });
 
-test('runClaudeAgentSdk records usage for the shared usage dashboard and workflow cost joins', async () => {
+test('runClaudeAgentSdk records raw cache creation and explicit role for usage diagnostics', async () => {
   const sessionId = `sdk-usage-recording-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages([
     {
@@ -2076,6 +2226,24 @@ test('runClaudeAgentSdk records usage for the shared usage dashboard and workflo
       plugins: [],
     } as any,
     {
+      type: 'assistant',
+      session_id: 'sdk-session-usage',
+      uuid: 'usage-assistant-1',
+      parent_tool_use_id: null,
+      message: {
+        id: 'usage-assistant-message-1',
+        model: 'claude-opus-4-8',
+        role: 'assistant',
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        content: [{ type: 'text', text: 'ok' }],
+        // Deliberately different from the aggregate result below: healthy
+        // turns must keep the result frame authoritative, not double-count the
+        // assistant-frame fallback.
+        usage: { input_tokens: 100, cache_read_input_tokens: 20, output_tokens: 50 },
+      },
+    } as any,
+    {
       type: 'result',
       subtype: 'success',
       session_id: 'sdk-session-usage',
@@ -2093,7 +2261,12 @@ test('runClaudeAgentSdk records usage for the shared usage dashboard and workflo
     } as any,
   ], {})) as any);
 
-  await runClaudeAgentSdk({ prompt: 'hi', sessionId, modelId: 'claude-opus-4-8' });
+  await runClaudeAgentSdk({
+    prompt: 'hi',
+    sessionId,
+    modelId: 'claude-opus-4-8',
+    workerScope: true,
+  });
 
   const events = usageLog.readUsageEventsForDate().filter((e) => e.source === sessionId);
   assert.equal(events.length, 1);
@@ -2101,11 +2274,13 @@ test('runClaudeAgentSdk records usage for the shared usage dashboard and workflo
   assert.equal(events[0].model, 'claude-opus-4-8');
   assert.equal(events[0].inputTokens, 20);
   assert.equal(events[0].cachedInputTokens, 7);
+  assert.equal(events[0].cacheCreationInputTokens, 3);
   assert.equal(events[0].outputTokens, 5);
   assert.equal(events[0].totalTokens, 25);
   assert.equal(events[0].durationMs, 17);
   assert.equal(events[0].providerApiDurationMs, 12);
   assert.equal(events[0].responseId, 'usage-result-1');
+  assert.equal(events[0].trace?.lane, 'worker');
   assert.equal(events[0].promptComponents?.currentMessage, 1);
   assert.equal(events[0].promptComponents?.providerAndToolOverhead, 19);
 
@@ -2294,6 +2469,190 @@ test('runClaudeAgentSdk reflects each tool return into the learning pipeline (br
   assert.equal(returned[0].data.toolSlug, 'SALESFORCE_QUERY');
   assert.equal(returned[0].data.effect, 'read');
   assert.match(String(returned[0].data.preview ?? ''), /Acme Corp has 3 open opportunities/);
+});
+
+test('Claude local settled-read replay reuses the handler-authored outer occurrence without minting authority or learning', async () => {
+  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+  const previousGuardrail = process.env.CLEMMY_TOOL_GUARDRAIL;
+  const previousSettled = process.env.CLEMMY_SETTLED_READ_REPEAT;
+  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'on';
+  process.env.CLEMMY_TOOL_GUARDRAIL = 'warn';
+  process.env.CLEMMY_SETTLED_READ_REPEAT = 'on';
+  const session = eventlog.createSession({ kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Read the proof queue once and summarize it.' },
+  });
+  const trackerScopeId = `${session.id}::brain:settled-read`;
+  const sdkToolName = 'mcp__clementine-local__composio_execute_tool';
+  const input = { tool_slug: 'PROOF_LIST_TASKS', arguments: '{}' };
+  const providerOutput = JSON.stringify({
+    successful: true,
+    data: {
+      sourceMarker: 'CLAUDE_SDK_SETTLED_LOCAL_ONLY',
+      items: [{ id: 'proof-1', status: 'done' }],
+    },
+  });
+  const firstModelFacing = `${providerOutput}\n\n[harness settled-read] Fresh PROOF_LIST_TASKS data for this accepted request is above. Use it for the next step or answer naturally; do not issue this exact call again unless a write changes the source or the user starts a new request.`;
+  const firstCallId = 'toolu_claude_read_first';
+  const replayCallId = 'toolu_claude_read_replay';
+  let simulatedProviderDispatches = 0;
+  const reflected: Array<{ callId: string; tool: string | null; output: string }> = [];
+  setClaudeAgentSdkReflectionForTest(((record: any) => { reflected.push(record); }) as any);
+
+  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
+    yield initOnlyMessage();
+    const canUse = params.options.canUseTool as (
+      name: string,
+      args: Record<string, unknown>,
+      opts: { signal: AbortSignal; toolUseID: string; requestId: string },
+    ) => Promise<{ behavior: string }>;
+
+    const firstVerdict = await canUse(sdkToolName, input, {
+      signal: new AbortController().signal,
+      toolUseID: firstCallId,
+      requestId: 'permission-first-read',
+    });
+    assert.equal(firstVerdict.behavior, 'allow');
+    // Exercise the real stream-first race: the SDK consumer authors the outer
+    // lifecycle from tool_use before the local handler enters and claims it.
+    yield {
+      type: 'assistant', session_id: 'sdk-settled', uuid: 'use-first', parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_use', id: firstCallId, name: sdkToolName, input }] },
+    } as any;
+    const firstClaim = claudeLocalCorrelation.claimClaudeLocalPermissionAdmission({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      runScopeId: trackerScopeId,
+      toolName: 'composio_execute_tool',
+      rawInput: input,
+      directOrchestrator: true,
+    });
+    assert.equal(firstClaim?.providerCallId, firstCallId);
+    simulatedProviderDispatches += 1;
+    eventlog.writeToolOutput({
+      sessionId: session.id,
+      callId: firstCallId,
+      tool: 'composio_execute_tool',
+      output: providerOutput,
+      invocationNonce: 'claude-local-inner-first-invocation',
+    });
+    yield {
+      type: 'user', session_id: 'sdk-settled', uuid: 'result-first', parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_result', tool_use_id: firstCallId, content: firstModelFacing }] },
+    } as any;
+
+    const replayVerdict = await canUse(sdkToolName, input, {
+      signal: new AbortController().signal,
+      toolUseID: replayCallId,
+      requestId: 'permission-replay-read',
+    });
+    assert.equal(replayVerdict.behavior, 'allow');
+    yield {
+      type: 'assistant', session_id: 'sdk-settled', uuid: 'use-replay', parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_use', id: replayCallId, name: sdkToolName, input }] },
+    } as any;
+    const replayClaim = claudeLocalCorrelation.claimClaudeLocalPermissionAdmission({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      runScopeId: trackerScopeId,
+      toolName: 'composio_execute_tool',
+      rawInput: input,
+      directOrchestrator: true,
+    });
+    assert.equal(replayClaim?.providerCallId, replayCallId);
+    const replay = settledReadRepeat.resolveSettledReadRepeat({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      currentCallId: replayCallId,
+      toolName: 'composio_execute_tool',
+      args: input,
+      currentBehaviorScopeId: trackerScopeId,
+    });
+    assert.ok(replay);
+    eventlog.appendEvent({
+      sessionId: session.id,
+      turn: 0,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: settledReadRepeat.settledReadRepeatReplayMarker({
+        replayCallId,
+        replayCalledEventId: replay!.currentCalledEventId,
+        sourceCallId: replay!.sourceCallId,
+        sourceUserSeq: source.seq,
+        toolSlug: replay!.toolSlug,
+        sourceBehaviorScopeId: replay!.sourceBehaviorScopeId,
+        replayBehaviorScopeId: trackerScopeId,
+      }),
+    });
+    const replayModelFacing = `${replay!.output}\n\n${settledReadRepeat.formatSettledReadRepeatAdvisory({
+      toolSlug: replay!.toolSlug,
+      sourceCallId: replay!.sourceCallId,
+      recoveredAcrossBehaviorScope: replay!.recoveredAcrossBehaviorScope,
+    })}`;
+    yield {
+      type: 'user', session_id: 'sdk-settled', uuid: 'result-replay', parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_result', tool_use_id: replayCallId, content: replayModelFacing }] },
+    } as any;
+    yield successResultMessage('Summarized the proof queue.');
+  })())) as any);
+
+  try {
+    await runClaudeAgentSdk({
+      prompt: 'Read the proof queue once and summarize it.',
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      trackerScopeId,
+      modelId: 'claude-sonnet-4-6',
+      agentic: true,
+      directOrchestrator: true,
+      allowedLocalMcpTools: ['composio_execute_tool'],
+      mcpToolAllowlist: ['composio_execute_tool'],
+    });
+
+    assert.equal(simulatedProviderDispatches, 1, 'only the first read crosses the simulated provider boundary');
+    const topLevelCalled = eventlog.listEvents(session.id, { types: ['tool_called'] })
+      .filter((event) => event.data.accounting === 'top_level');
+    assert.deepEqual(topLevelCalled.map((event) => event.data.callId), [firstCallId, replayCallId]);
+    assert.equal(
+      eventlog.listEvents(session.id, { types: ['claude_local_permission_claimed'] }).length,
+      2,
+      'each stream-first SDK canonical is consumed once by its later local handler',
+    );
+    assert.ok(topLevelCalled.every((event) => event.data.tool === 'composio_execute_tool'),
+      'the exact SDK hook name is namespaced, but canonical lifecycle identity is normalized to the local tool tail');
+    const topLevelReturned = eventlog.listEvents(session.id, { types: ['tool_returned'] })
+      .filter((event) => event.data.accounting === 'top_level');
+    assert.equal(topLevelReturned.length, 2);
+    assert.equal(topLevelReturned[0]?.parentEventId, topLevelCalled[0]?.id);
+    assert.equal(topLevelReturned[1]?.parentEventId, topLevelCalled[1]?.id);
+    assert.equal(topLevelReturned[1]?.data.providerDispatched, false);
+    assert.equal(topLevelReturned[1]?.data.replayedFromCallId, firstCallId);
+
+    const firstAuthority = eventlog.getToolOutput(session.id, firstCallId);
+    assert.equal(firstAuthority?.output, providerOutput, 'first-success steering is stripped before authority parking');
+    const firstInvocations = eventlog.listToolOutputInvocations(session.id, firstCallId);
+    assert.equal(firstInvocations.length, 1, 'the SDK stream reuses the local bracket invocation instead of parking it twice');
+    assert.equal(firstInvocations[0]?.invocationNonce, 'claude-local-inner-first-invocation');
+    assert.equal(eventlog.getToolOutput(session.id, replayCallId), null, 'recovered bytes never mint replay authority');
+    assert.deepEqual(reflected, [{
+      sessionId: session.id,
+      callId: firstCallId,
+      tool: 'PROOF_LIST_TASKS',
+      output: providerOutput,
+      scopeId: trackerScopeId,
+    }], 'only physical provider output is reflected, with all harness prose removed');
+  } finally {
+    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
+    if (previousGuardrail === undefined) delete process.env.CLEMMY_TOOL_GUARDRAIL;
+    else process.env.CLEMMY_TOOL_GUARDRAIL = previousGuardrail;
+    if (previousSettled === undefined) delete process.env.CLEMMY_SETTLED_READ_REPEAT;
+    else process.env.CLEMMY_SETTLED_READ_REPEAT = previousSettled;
+  }
 });
 
 test('Claude reflection unwraps deferred call_tool to the real inner capability', async () => {
@@ -3024,6 +3383,271 @@ test('ask_user_question is terminal in the SDK lane — the question surfaces in
   assert.match(r.text, /New topic, or resume the Salesforce work\?/);
   assert.doesNotMatch(r.text, /Check-in created/);
   assert.doesNotMatch(r.text, /should not run the task/);
+});
+
+test('parallel ask_user_question results become one natural bundled question without dropping returns or usage', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const firstQuestion = 'Which environment should I use: staging or production?';
+  const secondQuestion = 'Should the report go to Slack or stay in the project folder?';
+  let interruptCalls = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    const query = stubsFor((async function* () {
+      yield { ...initOnlyMessage(), model: 'claude-sonnet-5' } as any;
+      yield {
+        type: 'assistant',
+        session_id: 'sdk-parallel-asks-provider-session',
+        uuid: 'assistant-parallel-asks',
+        parent_tool_use_id: null,
+        message: {
+          id: 'msg-parallel-asks',
+          model: 'claude-sonnet-5',
+          role: 'assistant',
+          stop_reason: 'tool_use',
+          stop_sequence: null,
+          content: [
+            {
+              type: 'tool_use',
+              id: 'toolu_ask_environment',
+              name: 'mcp__clementine-local__ask_user_question',
+              input: { question: firstQuestion },
+            },
+            {
+              type: 'tool_use',
+              id: 'toolu_ask_destination',
+              name: 'mcp__clementine-local__ask_user_question',
+              input: { question: secondQuestion },
+            },
+          ],
+          usage: {
+            input_tokens: 12,
+            cache_creation_input_tokens: 2,
+            cache_read_input_tokens: 3,
+            output_tokens: 6,
+          },
+        },
+      } as any;
+      yield {
+        type: 'user',
+        session_id: 'sdk-parallel-asks-provider-session',
+        uuid: 'user-parallel-asks',
+        parent_tool_use_id: null,
+        message: {
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_ask_destination',
+              content: 'Check-in created: ci-destination. The user has been notified.',
+            },
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_ask_environment',
+              content: 'Check-in created: ci-environment. The user has been notified.',
+            },
+          ],
+        },
+      } as any;
+      yield successResultMessage('must not continue after the questions');
+    })());
+    return Object.assign(query, {
+      interrupt: async () => { interruptCalls += 1; },
+    });
+  }) as any);
+
+  const result = await runClaudeAgentSdk({
+    prompt: 'Prepare the release report once the two blocking details are known.',
+    sessionId: session.id,
+    modelId: 'claude-sonnet-5',
+    allowedLocalMcpTools: ['ask_user_question'],
+  });
+
+  assert.equal(interruptCalls, 1, 'the completed result frame interrupts exactly once');
+  assert.equal(result.stoppedReason, 'awaiting-input');
+  assert.equal(
+    result.text,
+    `Before I continue, could you answer these together?\n\n1. ${firstQuestion}\n2. ${secondQuestion}`,
+  );
+  assert.deepEqual(result.toolUses, [
+    'mcp__clementine-local__ask_user_question',
+    'mcp__clementine-local__ask_user_question',
+  ]);
+  assert.deepEqual(result.successfulToolUses, ['ask_user_question', 'ask_user_question']);
+  assert.doesNotMatch(result.text, /Check-in created|must not continue/);
+
+  assert.equal(eventlog.listEvents(session.id, { types: ['tool_called'] }).length, 2);
+  assert.equal(eventlog.listEvents(session.id, { types: ['tool_returned'] }).length, 2);
+  const usage = usageLog.readUsageEventsForDate().filter((event) => event.source === session.id);
+  assert.equal(usage.length, 1, 'one assistant frame produces one terminal usage row');
+  assert.equal(usage[0]?.inputTokens, 17);
+  assert.equal(usage[0]?.cachedInputTokens, 3);
+  assert.equal(usage[0]?.outputTokens, 6);
+  assert.equal(usage[0]?.totalTokens, 23);
+  assert.equal(usage[0]?.responseId, 'assistant-parallel-asks');
+});
+
+test('parallel ask_user_question never reports a question whose tool result failed', async () => {
+  const postedQuestion = 'Which environment should I use?';
+  const failedQuestion = 'Which destination should receive the report?';
+  let interrupted = false;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    const query = stubsFor((async function* () {
+      yield initOnlyMessage();
+      yield {
+        type: 'assistant', session_id: 's', uuid: 'parallel-ask-failure-use', parent_tool_use_id: null,
+        message: { content: [
+          {
+            type: 'tool_use', id: 'toolu_ask_posted',
+            name: 'mcp__clementine-local__ask_user_question', input: { question: postedQuestion },
+          },
+          {
+            type: 'tool_use', id: 'toolu_ask_failed',
+            name: 'mcp__clementine-local__ask_user_question', input: { question: failedQuestion },
+          },
+        ] },
+      } as any;
+      yield {
+        type: 'user', session_id: 's', uuid: 'parallel-ask-failure-results', parent_tool_use_id: null,
+        message: { content: [
+          {
+            type: 'tool_result', tool_use_id: 'toolu_ask_posted',
+            content: 'Check-in created: ci-posted. The user has been notified.',
+          },
+          {
+            // The local MCP tool reports a rejected question as an ordinary
+            // text result, so truth cannot rely on the SDK envelope's is_error
+            // bit alone.
+            type: 'tool_result', tool_use_id: 'toolu_ask_failed',
+            content: 'Question rejected: ask one concrete question tied to the task.',
+          },
+        ] },
+      } as any;
+      yield successResultMessage('must not continue after the posted question');
+    })());
+    return Object.assign(query, { interrupt: async () => { interrupted = true; } });
+  }) as any);
+
+  const result = await runClaudeAgentSdk({
+    prompt: 'Ask for the blocking details.',
+    sessionId: 'sdk-parallel-ask-failure',
+    modelId: 'claude-sonnet-5',
+    allowedLocalMcpTools: ['ask_user_question'],
+  });
+
+  assert.equal(interrupted, true);
+  assert.equal(result.stoppedReason, 'awaiting-input');
+  assert.equal(result.text, postedQuestion, 'one durable ask preserves the exact single-question behavior');
+  assert.doesNotMatch(result.text, new RegExp(failedQuestion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.deepEqual(result.successfulToolUses, ['ask_user_question']);
+});
+
+test('result-less terminal tool records assistant-frame usage with exact turn attribution', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const runAttempt = eventlog.beginRunAttempt(session.id, { runId: 'sdk-terminal-usage' });
+  const source = eventlog.recordRunAttemptUserInput(runAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Ask the exact blocking question.' },
+  });
+  const parentLease = dispatchLease.activateDispatchLease({
+    sessionId: session.id,
+    scopeId: `${session.id}::terminal-usage`,
+    runAttemptId: runAttempt.attemptId,
+  });
+  let interrupted = false;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    const query = stubsFor((async function* () {
+      yield { ...initOnlyMessage(), model: 'claude-sonnet-5' } as any;
+      yield {
+        type: 'assistant',
+        session_id: 'sdk-terminal-usage-provider-session',
+        uuid: 'assistant-terminal-usage',
+        parent_tool_use_id: null,
+        message: {
+          id: 'msg-terminal-usage',
+          model: 'claude-sonnet-5',
+          role: 'assistant',
+          stop_reason: 'tool_use',
+          stop_sequence: null,
+          content: [{
+            type: 'tool_use',
+            id: 'toolu_ask_usage',
+            name: 'mcp__clementine-local__ask_user_question',
+            input: { question: 'Please reconnect Railway, then reply continue.' },
+          }],
+          usage: {
+            input_tokens: 10,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 7,
+            output_tokens: 5,
+          },
+        },
+      } as any;
+      yield {
+        type: 'user',
+        session_id: 'sdk-terminal-usage-provider-session',
+        uuid: 'user-terminal-usage',
+        parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'toolu_ask_usage',
+            content: 'Check-in created: ci-terminal-usage. The user has been notified.',
+          }],
+        },
+      } as any;
+      // The terminal-tool boundary interrupts before this aggregate result can
+      // be observed, matching the live blocked-auth run.
+      yield successResultMessage('must not continue after the question');
+    })());
+    return Object.assign(query, {
+      interrupt: async () => { interrupted = true; },
+    });
+  }) as any);
+
+  try {
+    const result = await runClaudeAgentSdk({
+      prompt: 'Ask the exact blocking question.',
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      modelId: 'claude-sonnet-5',
+      allowedLocalMcpTools: ['ask_user_question'],
+      dispatchLease: parentLease,
+    });
+
+    assert.equal(interrupted, true);
+    assert.equal(result.stoppedReason, 'awaiting-input');
+    const usage = usageLog.readUsageEventsForDate().filter((event) => event.source === session.id);
+    assert.equal(usage.length, 1);
+    assert.equal(usage[0]?.model, 'claude-sonnet-5');
+    assert.equal(usage[0]?.inputTokens, 20);
+    assert.equal(usage[0]?.cachedInputTokens, 7);
+    assert.equal(usage[0]?.cacheCreationInputTokens, 3);
+    assert.equal(usage[0]?.outputTokens, 5);
+    assert.equal(usage[0]?.totalTokens, 25);
+    assert.equal(usage[0]?.responseId, 'assistant-terminal-usage');
+    assert.equal(usage[0]?.durationMs, undefined, 'missing provider duration is not fabricated as zero latency');
+    assert.equal(usage[0]?.trace?.acceptedSource, `${session.id}:${source.seq}`);
+    assert.equal(usage[0]?.trace?.logicalTurnId, `turn:${source.seq}`);
+    assert.equal(usage[0]?.trace?.attemptId, runAttempt.attemptId);
+    assert.equal(usage[0]?.trace?.modelCallId, 'assistant-terminal-usage');
+    assert.equal(usage[0]?.trace?.lane, 'unattributed');
+
+    const cache = eventlog.listEvents(session.id, { types: ['sdk_cache'] });
+    assert.equal(cache.length, 1);
+    assert.equal(cache[0]?.data.inputTokens, 20);
+    assert.equal(cache[0]?.data.cachedInputTokens, 7);
+    assert.equal(cache[0]?.data.cacheHitRatio, 0.35);
+    assert.equal(cache[0]?.data.sourceUserSeq, source.seq);
+    assert.equal(cache[0]?.data.attemptId, runAttempt.attemptId);
+    const composition = eventlog.listEvents(session.id, { types: ['prompt_composition'] });
+    assert.equal(composition.length, 1);
+    assert.equal(composition[0]?.data.sourceUserSeq, source.seq);
+    const lifecycle = eventlog.listEvents(session.id, { types: ['tool_called', 'tool_returned'] });
+    assert.equal(lifecycle.length, 2);
+    assert.ok(lifecycle.every((event) => event.data.attemptId === runAttempt.attemptId));
+  } finally {
+    dispatchLease.revokeDispatchLease(parentLease);
+    eventlog.finishRunAttempt(runAttempt, 'completed');
+  }
 });
 
 test('ask_user_question approval auto-resolve is non-terminal in the SDK lane', async () => {

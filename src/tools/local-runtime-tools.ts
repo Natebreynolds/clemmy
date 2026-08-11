@@ -384,7 +384,10 @@ export function getLocalToolCatalog(): Array<{ name: string; description: string
  * this turn. The static runtime tool remains available for non-schema-on-demand
  * lanes; this scoped instance prevents discovery from promising a tool that the
  * active call_tool dispatcher cannot reach. */
-export function buildScopedLocalToolSearch(allowedNames: ReadonlySet<string>): Tool<RuntimeContextValue> {
+export function buildScopedLocalToolSearch(
+  allowedNames: ReadonlySet<string>,
+  dispatchCarrier: 'call_tool' | 'work_call' = 'call_tool',
+): Tool<RuntimeContextValue> {
   const captured: CapturedLocalTool[] = [];
   const fakeServer = {
     tool(
@@ -398,7 +401,8 @@ export function buildScopedLocalToolSearch(allowedNames: ReadonlySet<string>): T
   };
   registerToolSearchTool(fakeServer as unknown as McpServer, {
     allowedNames,
-    dispatchViaCallTool: true,
+    dispatchViaCallTool: dispatchCarrier === 'call_tool',
+    dispatchCarrier,
   });
   const localTool = captured[0];
   if (!localTool) throw new Error('tool_search did not register');

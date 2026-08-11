@@ -44,6 +44,9 @@ import {
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import {
+  settledReadReplayCallId,
+} from '../runtime/harness/settled-read-replay-semantics.js';
+import {
   claimDurableRequest,
   durablePayloadHash,
   durableRequestIdentity,
@@ -435,6 +438,7 @@ function firstEventText(...values: unknown[]): string {
 
 interface ToolProjectionEvent {
   id?: string;
+  parentEventId?: string | null;
   type?: string;
   createdAt?: string;
   data?: Record<string, unknown>;
@@ -456,20 +460,63 @@ function projectedToolName(event: ToolProjectionEvent): string {
   ) || 'tool';
 }
 
+function projectedToolCallId(event: ToolProjectionEvent): string {
+  const data = eventRecord(event.data);
+  return firstEventText(data.canonicalCallId, data.callId, data.call_id);
+}
+
+/** Derive the only public reuse bit from the exact canonical return marker.
+ * Every tool_called row remains present, so attempt/storm accounting stays
+ * honest even though the user-facing narration no longer implies provider I/O. */
+function annotateSettledReadReuses<T extends ToolProjectionEvent>(events: T[]): T[] {
+  const reusedCallIds = new Set<string>();
+  const reusedParentEventIds = new Set<string>();
+  const canonicalCallIdCounts = new Map<string, number>();
+  for (const event of events) {
+    if (event.type === 'tool_called' && eventRecord(event.data).accounting !== 'transport_mirror') {
+      const callId = projectedToolCallId(event);
+      if (callId) canonicalCallIdCounts.set(callId, (canonicalCallIdCounts.get(callId) ?? 0) + 1);
+    }
+    if (event.type !== 'tool_returned') continue;
+    if (eventRecord(event.data).accounting === 'transport_mirror') continue;
+    const callId = settledReadReplayCallId(event.data);
+    if (callId) {
+      reusedCallIds.add(callId);
+      if (event.parentEventId) reusedParentEventIds.add(event.parentEventId);
+    }
+  }
+  if (reusedCallIds.size === 0) return events;
+  return events.map((event) => {
+    if (event.type !== 'tool_called') return event;
+    if (eventRecord(event.data).accounting === 'transport_mirror') return event;
+    const callId = projectedToolCallId(event);
+    const reused = Boolean(event.id && reusedParentEventIds.has(event.id))
+      || Boolean(callId && canonicalCallIdCounts.get(callId) === 1 && reusedCallIds.has(callId));
+    if (!reused) return event;
+    return {
+      ...event,
+      data: { ...eventRecord(event.data), reused: true },
+    } as T;
+  });
+}
+
 /** Select one bounded, canonical tool milestone for live-state projection.
  * Transport mirrors are audit evidence, not another action. The sanitized
  * clone keeps only the display name so a 4s UI poll never returns a second
  * copy of potentially large tool arguments just to say "Working". */
 function latestCanonicalToolMilestone<T extends ToolProjectionEvent>(events: T[]): T | undefined {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
+  const projected = annotateSettledReadReuses(events);
+  for (let index = projected.length - 1; index >= 0; index -= 1) {
+    const event = projected[index];
     if (event.type !== 'tool_called') continue;
     if (eventRecord(event.data).accounting === 'transport_mirror') continue;
+    const reused = eventRecord(event.data).reused === true;
     return {
       ...event,
       data: {
         tool: projectedToolName(event),
         accounting: 'top_level',
+        ...(reused ? { reused: true } : {}),
       },
     } as T;
   }
@@ -620,10 +667,10 @@ function computeHarnessSessionActivityRun(session: HarnessSessionRow, latestSeq:
   // One latest tool milestone is enough for Planning vs Working/liveLine. Do
   // not load up to 40 argument-heavy tool events for every row in a 4s poll.
   const latestTool = latestCanonicalToolMilestone(scopedHarnessEvents(session.id, scope, {
-    types: ['tool_called'],
+    types: ['tool_called', 'tool_returned'],
     // A production call can be followed by its MCP transport mirror. Keep the
-    // lookup bounded while looking past that mirror to the actual action.
-    limit: 16,
+    // lookup bounded while looking past that mirror and the canonical return.
+    limit: 32,
     desc: true,
   }));
   const events = [...activityEvents, ...(latestTool ? [latestTool] : [])]
@@ -2715,8 +2762,8 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
         : scopedHarnessEvents(id, scope, { limit: 500, desc: true });
       const latestStateTool = environmentView
         ? latestCanonicalToolMilestone(scopedHarnessEvents(id, scope, {
-          types: ['tool_called'],
-          limit: 16,
+          types: ['tool_called', 'tool_returned'],
+          limit: 32,
           desc: true,
         }))
         : undefined;
@@ -2754,7 +2801,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
         data: event.data,
         message: harnessEventMessage(event),
       });
-      const projectedEvents = events.map(asActivityEvent);
+      const projectedEvents = annotateSettledReadReuses(events).map(asActivityEvent);
       const stateEvents = latestStateTool
         ? [...events, latestStateTool]
           .sort((left, right) => left.seq - right.seq)

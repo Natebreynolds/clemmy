@@ -45,7 +45,6 @@ import {
 import type { ProcedureScope } from '../../memory/procedure-artifact.js';
 import type { ProcedureKind } from '../../memory/procedure-validity.js';
 import { boundDispatchFor, laneAdmitsDispatch, type BoundReadDispatch, type ReadLaneEnvelope } from './read-envelope.js';
-import { recordWarmProcedureUse } from '../../memory/procedure-receipts.js';
 import {
   consumePendingCapabilityTurn,
   persistPendingCapabilityTurn,
@@ -84,7 +83,10 @@ export interface ReadLanePorts {
   discover(provider: string, operation: string): Promise<DiscoveryAcquisition | undefined>;
   /** Dispatch the selected read exactly once, under the FULL bound-dispatch
    *  identity (F26); returns the durable receipt id. */
-  dispatch(bound: BoundReadDispatch): Promise<{ receiptId: string } | { error: string; transient: boolean }>;
+  dispatch(bound: BoundReadDispatch): Promise<
+    | { receiptId: string }
+    | { error: string; transient: boolean; providerDispatched?: boolean }
+  >;
   receipts: ReceiptResolver;
   /**
    * Produce the evidence-grounded PRESENTATION INPUT (a draft, never a
@@ -118,7 +120,15 @@ export type ReadLaneOutcome =
    *  re-admit — logging-and-continuing is forbidden. */
   | { outcome: 'requires_readmission'; outside: string[]; counters: ReadLaneCounters }
   /** Typed failure: budget ceiling, provider trouble, unverifiable receipt. */
-  | { outcome: 'failed'; reason: string; transient: boolean; counters: ReadLaneCounters };
+  | {
+      outcome: 'failed';
+      reason: string;
+      transient: boolean;
+      /** Once true, callers must not fall through to a brain that can issue
+       * the same paid read again. */
+      providerDispatched?: boolean;
+      counters: ReadLaneCounters;
+    };
 
 export interface ReadLaneRun {
   lane: ReadLaneEnvelope;
@@ -360,7 +370,6 @@ async function dispatchOnce(
   }
 
   spans.mark('tool_provider');
-  c.provider_dispatches += 1;
   let dispatched: Awaited<ReturnType<ReadLanePorts['dispatch']>>;
   try {
     dispatched = await ports.dispatch(bound.dispatch);
@@ -370,9 +379,17 @@ async function dispatchOnce(
   }
   spans.finish('tool_provider');
   if ('error' in dispatched) {
+    if (dispatched.providerDispatched) c.provider_dispatches += 1;
     // Transient provider trouble never poisons a structurally valid artifact.
-    return { outcome: 'failed', reason: dispatched.error, transient: dispatched.transient, counters: c };
+    return {
+      outcome: 'failed',
+      reason: dispatched.error,
+      transient: dispatched.transient,
+      ...(dispatched.providerDispatched ? { providerDispatched: true } : {}),
+      counters: c,
+    };
   }
+  c.provider_dispatches += 1;
 
   // ONE receipt verifier for cold and warm (F20): the durable record must
   // prove THIS provider, operation, identifier, schema, scope, and the read
@@ -389,7 +406,9 @@ async function dispatchOnce(
     scope: run.scope,
   });
   if (verifyFailure) {
-    return { outcome: 'failed', reason: verifyFailure, transient: false, counters: c };
+    return {
+      outcome: 'failed', reason: verifyFailure, transient: false, providerDispatched: true, counters: c,
+    };
   }
 
   if (!input.warm && input.promote) {
@@ -411,6 +430,7 @@ async function dispatchOnce(
         outcome: 'failed',
         reason: `verified dispatch could not promote its procedure: ${promoted.errors.join('; ')}`,
         transient: false,
+        providerDispatched: true,
         counters: c,
       };
     }
@@ -418,21 +438,21 @@ async function dispatchOnce(
       scope: run.scope, provider: input.promote.intent.provider, operation: input.promote.intent.operation,
     });
   }
-  if (input.warm && input.artifactId) {
-    // E3.5: credit the EXACT artifact that carried the warm hit.
-    recordWarmProcedureUse(input.artifactId);
-  }
-
   spans.mark('terminal_commit');
   let presentation: { draft: string };
   try {
     presentation = await ports.present(record!);
   } catch (error) {
     spans.finish('terminal_commit');
-    return { outcome: 'failed', reason: `presentation port threw: ${error instanceof Error ? error.message : String(error)}`, transient: false, counters: c };
+    return {
+      outcome: 'failed',
+      reason: `presentation port threw: ${error instanceof Error ? error.message : String(error)}`,
+      transient: false,
+      providerDispatched: true,
+      counters: c,
+    };
   }
   spans.finish('terminal_commit');
-  c.public_terminals += 1;
   return { outcome: 'terminal', text: presentation.draft, counters: c, warm: input.warm };
 }
 

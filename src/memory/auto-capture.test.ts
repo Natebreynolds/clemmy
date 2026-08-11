@@ -4,6 +4,7 @@ import {
   assessAutoMemoryAdmission,
   extractAutoMemoryCandidates,
   extractProfilePatchFromMessage,
+  parseExplicitMemoryInstruction,
 } from './auto-capture.js';
 
 test('extractAutoMemoryCandidates captures Clementine product requirements', () => {
@@ -133,6 +134,256 @@ test('explicit remember honors short user-authored facts down to the memory sche
   }]);
 });
 
+test('explicit memory isolates unrelated live work while preserving the complete user turn for callers', () => {
+  const cases = [
+    {
+      message: 'Remember this: Cedar is Cedar-17. Also give me three launch ideas. Just confirm.',
+      content: 'Cedar is Cedar-17.',
+    },
+    {
+      message: 'Remember that my preferred reviewer is Taylor. Can you draft an email to them?',
+      content: 'my preferred reviewer is Taylor.',
+    },
+    {
+      message: 'Remember this: Cedar is Cedar-17, and then review the release checklist. Just confirm.',
+      content: 'Cedar is Cedar-17',
+    },
+    {
+      message: 'Summarize the plan, and remember that Cedar is Cedar-17.',
+      content: 'Cedar is Cedar-17.',
+    },
+  ];
+
+  for (const { message, content } of cases) {
+    assert.deepEqual(extractAutoMemoryCandidates(message), [{
+      kind: 'user',
+      content,
+      reason: 'explicit remember request',
+    }], message);
+    assert.deepEqual(parseExplicitMemoryInstruction(message), {
+      kind: 'remember',
+      memoryContent: content,
+      hasSecondaryWork: true,
+    }, message);
+  }
+});
+
+test('explicit memory clause isolation does not trim additional declarative facts or reminder substance', () => {
+  for (const { message, content } of [
+    {
+      message: 'Remember this: Cedar is Cedar-17. Cedar-12 is retired. Just confirm.',
+      content: 'Cedar is Cedar-17. Cedar-12 is retired.',
+    },
+    {
+      message: 'Remember this: Cedar is Cedar-17. Also, Cedar-12 is retired. Just confirm.',
+      content: 'Cedar is Cedar-17. Also, Cedar-12 is retired.',
+    },
+    {
+      message: 'Remember that I need to confirm.',
+      content: 'I need to confirm.',
+    },
+    {
+      message: 'Remember to call the vendor on Friday about the renewal.',
+      content: 'Remember to call the vendor on Friday about the renewal.',
+    },
+  ]) {
+    const parsed = parseExplicitMemoryInstruction(message);
+    assert.equal(parsed?.kind, 'remember', message);
+    assert.equal(parsed?.memoryContent, content, message);
+    assert.equal(parsed?.hasSecondaryWork, false, message);
+    assert.equal(extractAutoMemoryCandidates(message)[0]?.content, content, message);
+  }
+});
+
+test('explicit memory parser rejects questions and declarative recollections', () => {
+  for (const message of [
+    'Do you remember Cedar?',
+    'I also remember that Cedar is Cedar-17.',
+    'Explain what "remember" means.',
+  ]) {
+    assert.equal(parseExplicitMemoryInstruction(message), null, message);
+  }
+});
+
+test('request-shaped comma-and and conditional linkers are isolated from durable memory', () => {
+  for (const { message, content } of [
+    {
+      message: 'Remember this: my compound marker is MIXED-MEMORY-9013, and create a local note afterward.',
+      content: 'my compound marker is MIXED-MEMORY-9013',
+    },
+    {
+      message: 'Remember this: Cedar is Cedar-17 while you review the release checklist.',
+      content: 'Cedar is Cedar-17',
+    },
+    {
+      message: 'Remember this: Cedar is Cedar-17, if you can, create a local note.',
+      content: 'Cedar is Cedar-17',
+    },
+    {
+      message: "Remember this: Cedar is Cedar-17, since we're here, summarize the rollout.",
+      content: 'Cedar is Cedar-17',
+    },
+  ]) {
+    assert.deepEqual(parseExplicitMemoryInstruction(message), {
+      kind: 'remember',
+      memoryContent: content,
+      hasSecondaryWork: true,
+    }, message);
+    assert.equal(extractAutoMemoryCandidates(message)[0]?.content, content, message);
+  }
+});
+
+test('indirect question, intent, passive, and memory-tool tails cannot enter a durable candidate', () => {
+  for (const tail of [
+    'and I have a question: what is 8 x 7.',
+    'and I wonder what else you remember.',
+    'and I need a summary of the launch.',
+    'and the old memory should be deleted.',
+    'and memory_forget should be called for fact 1.',
+    'and I want the report sent to alice@example.com.',
+  ]) {
+    const message = `Remember this: my compound marker is MIXED-MEMORY-9013, ${tail} Just confirm.`;
+    assert.deepEqual(parseExplicitMemoryInstruction(message), {
+      kind: 'remember',
+      memoryContent: 'my compound marker is MIXED-MEMORY-9013',
+      hasSecondaryWork: true,
+    }, message);
+    assert.equal(
+      extractAutoMemoryCandidates(message)[0]?.content,
+      'my compound marker is MIXED-MEMORY-9013',
+      message,
+    );
+  }
+});
+
+test('question-shaped conjunction tails without a question mark remain live work', () => {
+  for (const tail of [
+    'and I would like to know what 8 x 7 is.',
+    "and I'd like to know what 8 x 7 is.",
+    'and I’d like to know what 8 x 7 is.',
+    'and I am curious what else you remember.',
+    'and I have something to ask about the launch.',
+    'and I was wondering what else you remember.',
+    'and I am wondering what else you remember.',
+    'and I need to know what 8 x 7 is.',
+    'and I want to know what 8 x 7 is.',
+    'and one more question is what 8 x 7 equals.',
+    'and there is one more question about the launch.',
+  ]) {
+    const message = `Remember this: my compound marker is MIXED-MEMORY-9013, ${tail} Just confirm.`;
+    assert.deepEqual(parseExplicitMemoryInstruction(message), {
+      kind: 'remember',
+      memoryContent: 'my compound marker is MIXED-MEMORY-9013',
+      hasSecondaryWork: true,
+    }, message);
+    assert.equal(
+      extractAutoMemoryCandidates(message)[0]?.content,
+      'my compound marker is MIXED-MEMORY-9013',
+      message,
+    );
+  }
+});
+
+test('passive mutation and explicit memory-tool tails remain live work', () => {
+  for (const tail of [
+    'and the memory_forget tool should be called.',
+    'and the report should be sent to alice@example.com.',
+    'and the document must be published.',
+    'and the spreadsheet needs to be updated.',
+    'and the deployment must be run.',
+    'and the payment needs to be refunded.',
+    'and the database needs to be migrated.',
+    'and the row needs to be inserted.',
+    'and the spreadsheet needs updated.',
+    'and the payment needs refunded.',
+    'and the database needs migrated.',
+    'and the row needs inserted.',
+    'and let memory_forget run for fact 1.',
+    'and memory_forget is the tool to run for fact 1.',
+    'and I need memory_forget run for fact 1.',
+  ]) {
+    const message = `Remember this: my compound marker is MIXED-MEMORY-9013, ${tail} Just confirm.`;
+    assert.deepEqual(parseExplicitMemoryInstruction(message), {
+      kind: 'remember',
+      memoryContent: 'my compound marker is MIXED-MEMORY-9013',
+      hasSecondaryWork: true,
+    }, message);
+    assert.equal(
+      extractAutoMemoryCandidates(message)[0]?.content,
+      'my compound marker is MIXED-MEMORY-9013',
+      message,
+    );
+  }
+});
+
+test('deliverable expectations are isolated as live work', () => {
+  for (const tail of [
+    'and I expect a launch summary.',
+    'and I anticipate the launch report.',
+    'and we expect a concise launch brief.',
+  ]) {
+    const message = `Remember this: Cedar is Cedar-17, ${tail} Just confirm.`;
+    assert.deepEqual(parseExplicitMemoryInstruction(message), {
+      kind: 'remember',
+      memoryContent: 'Cedar is Cedar-17',
+      hasSecondaryWork: true,
+    }, message);
+    assert.equal(extractAutoMemoryCandidates(message)[0]?.content, 'Cedar is Cedar-17', message);
+  }
+});
+
+test('collaborative, suggestive, gerund, and shorthand request tails remain live work', () => {
+  for (const tail of [
+    'and I was hoping you could summarize the rollout.',
+    "and let's review the launch.",
+    'and let’s review the launch.',
+    'and let us review the launch.',
+    'and we should review the launch.',
+    'and maybe review the launch.',
+    'and I have another ask: summarize the launch.',
+    'and I want you reviewing the launch.',
+    'and I could use a summary of the launch.',
+    'and the plan needs summarizing.',
+    'and I need you summarizing the launch.',
+    'and memory_forget needs running for fact 1.',
+  ]) {
+    const message = `Remember this: Cedar is Cedar-17, ${tail} Just confirm.`;
+    assert.deepEqual(parseExplicitMemoryInstruction(message), {
+      kind: 'remember',
+      memoryContent: 'Cedar is Cedar-17',
+      hasSecondaryWork: true,
+    }, message);
+    assert.equal(extractAutoMemoryCandidates(message)[0]?.content, 'Cedar is Cedar-17', message);
+  }
+});
+
+test('comma-and preserves an additional declarative memory fact', () => {
+  const message = 'Remember this: my compound marker is MIXED-MEMORY-9013, and Cedar-12 is retired.';
+  const content = 'my compound marker is MIXED-MEMORY-9013, and Cedar-12 is retired.';
+
+  assert.deepEqual(parseExplicitMemoryInstruction(message), {
+    kind: 'remember',
+    memoryContent: content,
+    hasSecondaryWork: false,
+  });
+  assert.equal(extractAutoMemoryCandidates(message)[0]?.content, content);
+});
+
+test('tool facts and declarative deliverable preferences are not overtrimmed', () => {
+  for (const message of [
+    'Remember this: my compound marker is MIXED-MEMORY-9013, and memory_forget is deprecated.',
+    'Remember this: my launch-summary format is concise, and Cedar-12 is retired.',
+  ]) {
+    const content = message.replace(/^Remember this:\s*/, '');
+    assert.deepEqual(parseExplicitMemoryInstruction(message), {
+      kind: 'remember',
+      memoryContent: content,
+      hasSecondaryWork: false,
+    }, message);
+    assert.equal(extractAutoMemoryCandidates(message)[0]?.content, content, message);
+  }
+});
+
 test('extractProfilePatchFromMessage captures explicit communication preferences', () => {
   const patch = extractProfilePatchFromMessage('Call me Alex. Keep it concise and no preamble.');
 
@@ -157,6 +408,81 @@ test('captures "remember to ..." (was dropped by the narrow regex)', () => {
 test('captures "note that ..." / "don\'t forget ..." store requests', () => {
   assert.equal(extractAutoMemoryCandidates('Note that the board meeting moved to the 14th.').length, 1);
   assert.equal(extractAutoMemoryCandidates("Don't forget the renewal is due end of month.").length, 1);
+});
+
+test('captures a factual future-reference correction and preserves its complete correction claim', () => {
+  const message = "Small correction for later: Cedar's current release number is Cedar-17. Cedar-12 is retired and must not be used as current. A natural acknowledgement is enough.";
+  const correction = "Small correction for later: Cedar's current release number is Cedar-17. Cedar-12 is retired and must not be used as current.";
+
+  assert.deepEqual(extractAutoMemoryCandidates(message), [{
+    kind: 'user',
+    content: correction,
+    reason: 'explicit durable correction',
+  }]);
+  assert.deepEqual(parseExplicitMemoryInstruction(message), {
+    kind: 'future_reference_correction',
+    memoryContent: correction,
+    hasSecondaryWork: false,
+  });
+  assert.deepEqual(assessAutoMemoryAdmission(message), {
+    scope: 'durable',
+    reasons: ['explicit durable correction'],
+  });
+});
+
+test('captures the future-reference-first correction form without stripping the old value', () => {
+  const message = 'For future reference, correction: the renewal date is May 4, not May 1.';
+  const candidates = extractAutoMemoryCandidates(message);
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.content, message);
+  assert.equal(candidates[0]?.reason, 'explicit durable correction');
+});
+
+test('future-reference correction isolates a following live request but keeps both correction values', () => {
+  const message = 'Small correction for later: Cedar is Cedar-17. Cedar-12 is retired. Also summarize the rollout. A natural acknowledgement is enough.';
+  const correction = 'Small correction for later: Cedar is Cedar-17. Cedar-12 is retired.';
+
+  assert.deepEqual(parseExplicitMemoryInstruction(message), {
+    kind: 'future_reference_correction',
+    memoryContent: correction,
+    hasSecondaryWork: true,
+  });
+  assert.deepEqual(extractAutoMemoryCandidates(message), [{
+    kind: 'user',
+    content: correction,
+    reason: 'explicit durable correction',
+  }]);
+});
+
+test('ordinary response and artifact corrections remain ephemeral', () => {
+  for (const message of [
+    'Small correction: make this response shorter and use bullets.',
+    'Small correction for later: make this response shorter and use bullets.',
+    'Small correction for future reference: update the note title to Cedar-17.',
+    'For this task, correction: the heading should be Cedar-17.',
+  ]) {
+    assert.deepEqual(extractAutoMemoryCandidates(message), [], message);
+    assert.equal(assessAutoMemoryAdmission(message).scope, 'ephemeral', message);
+  }
+});
+
+test('the noun note does not grant explicit memory-write authority', () => {
+  for (const message of [
+    'I may want a tiny local note at proof/example.md. Ask before creating anything.',
+    'No—leave that note alone. Instead, what is 15 × 9?',
+  ]) {
+    assert.deepEqual(extractAutoMemoryCandidates(message), [], message);
+  }
+
+  const nounDeclarative = extractAutoMemoryCandidates('The note is only an artifact for this response.');
+  assert.ok(
+    nounDeclarative.every((candidate) => candidate.reason !== 'explicit remember request'),
+    'an independently declarative sentence may be admitted, but the noun itself grants no explicit-store authority',
+  );
+
+  assert.equal(extractAutoMemoryCandidates('Please note: the board meeting moved to the 14th.').length, 1);
+  assert.equal(extractAutoMemoryCandidates('Make a note that the renewal is due Friday.').length, 1);
 });
 
 test('declarative fallback captures an un-cued durable fact', () => {

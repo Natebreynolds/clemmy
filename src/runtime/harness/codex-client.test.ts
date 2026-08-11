@@ -27,18 +27,24 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CODEX_AUTH_SOURCE_FILE = path.join(TMP_HOME, 'codex-cli-auth.json');
 const AUTH_STATE_DIR = path.join(TMP_HOME, 'state');
 const AUTH_STATE_FILE = path.join(AUTH_STATE_DIR, 'auth.json');
+const ACCESS_ONLY_FILE = path.join(AUTH_STATE_DIR, 'codex-access-only.json');
 mkdirSync(AUTH_STATE_DIR, { recursive: true });
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { configureHarnessRuntime, resetHarnessRuntimeConfig, __test__ } = await import(
+const { configureHarnessRuntime, loadFreshCodexAccessToken, resetHarnessRuntimeConfig, __test__ } = await import(
   './codex-client.js'
 );
 
 function clearAuth(): void {
   try {
     rmSync(AUTH_STATE_FILE);
+  } catch {
+    /* not present */
+  }
+  try {
+    rmSync(ACCESS_ONLY_FILE);
   } catch {
     /* not present */
   }
@@ -110,6 +116,21 @@ test('configureHarnessRuntime is idempotent within a process', async () => {
   clearAuth();
   const second = await configureHarnessRuntime();
   assert.equal(second.ok, true);
+});
+
+test('access-only proof token fails before a model call that could cross its expiry', async () => {
+  const expiresAt = (Math.floor(Date.now() / 1000) + 5 * 60) * 1000;
+  writeFileSync(ACCESS_ONLY_FILE, JSON.stringify({
+    version: 1,
+    accessToken: jwtWithExp(expiresAt / 1000),
+    expiresAt,
+    accountId: 'proof-account',
+  }), 'utf-8');
+
+  await assert.rejects(
+    loadFreshCodexAccessToken(),
+    /cannot cover this model call/i,
+  );
 });
 
 // --- claude_oauth brain registration (either-flagship coverage) --------------

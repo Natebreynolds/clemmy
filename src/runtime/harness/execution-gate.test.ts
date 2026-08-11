@@ -514,11 +514,11 @@ test('isGateEnabled: explicit on enables', () => {
   }
 });
 
-test('isGateEnabled: unrecognized value treated as OFF (permissive — don\'t block on typo)', () => {
+test('isGateEnabled: unrecognized value stays ON (a typo cannot disable safety)', () => {
   const prev = process.env.CLEMMY_EXECUTION_GATE;
   process.env.CLEMMY_EXECUTION_GATE = 'enabled';
   try {
-    assert.equal(isGateEnabled(), false);
+    assert.equal(isGateEnabled(), true);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
     else process.env.CLEMMY_EXECUTION_GATE = prev;

@@ -18,6 +18,8 @@ interface ConsequentialCase {
 }
 
 const CONSEQUENTIAL_CASES: readonly ConsequentialCase[] = [
+  { text: 'Send every alpha record to the beta recipients.', kind: 'communication' },
+  { text: 'Send the finished report to Alice.', kind: 'communication' },
   { text: 'RSVP yes to the invitation.', kind: 'invitation_response' },
   { text: 'Decline the calendar invitation.', kind: 'invitation_response' },
   { text: 'Like this post.', kind: 'social_reaction' },
@@ -223,4 +225,40 @@ test('shared external-effect taxonomy: advice, deferral, artifacts, and local co
       `${expected.text}: turn intent`,
     );
   }
+});
+
+test('calling an explicit tool identifier is technical execution, not a phone call', () => {
+  const prompt = [
+    'Retrieve the current item feed from the connected local provider.',
+    'Call composio_search_tools exactly once, then call composio_execute_tool exactly once.',
+    'Return the source marker, revision, item id, title, and status.',
+  ].join('\n');
+
+  assert.deepEqual(classifyExternalEffectRequest(prompt), { requested: false, kinds: [] });
+  assert.deepEqual(
+    classifyExternalEffectRequest('Send the payload to the callback function.'),
+    { requested: false, kinds: [] },
+    'programming data flow is not person-directed communication',
+  );
+  assert.equal(objectiveRequiresFreshExternalWrite(prompt), false);
+  for (const callable of ['mcp__calendar__list_events', 'calendar.listEvents', 'listEvents()', '`list_events`']) {
+    assert.equal(classifyExternalEffectRequest(`Call ${callable} once.`).requested, false, callable);
+  }
+  for (const phoneCall of [
+    'Call Alice about the release.',
+    'Please call my doctor.',
+    'Call +1-415-555-0100.',
+    'Call Dr. Smith about the release.',
+    'Call alice.smith about the release.',
+  ]) {
+    assert.deepEqual(classifyExternalEffectRequest(phoneCall), {
+      requested: true,
+      kinds: ['communication'],
+    }, phoneCall);
+  }
+  assert.deepEqual(
+    classifyExternalEffectRequest('Call calendar.listEvents once, then call Alice.'),
+    { requested: true, kinds: ['communication'] },
+    'a later person-directed call remains consequential',
+  );
 });

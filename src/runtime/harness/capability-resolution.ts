@@ -31,9 +31,12 @@ import {
   matchInvalidatedToolChoices,
   type ToolChoiceKind,
 } from '../../memory/tool-choice-store.js';
+import type { VerifiedReadCapabilityOrigin } from '../../memory/verified-read-origin.js';
 import { peekConnectedToolkits } from '../../integrations/composio/client.js';
-import { appendEvent } from './eventlog.js';
+import { appendEvent, listEvents } from './eventlog.js';
 import { getRuntimeEnv } from '../../config.js';
+import { discoveryGovernor } from './discovery-governor.js';
+import { resolveActiveTaskContext } from './active-task-context.js';
 
 export type CapabilityStatus = 'proven' | 'previously_failed';
 export type ConnectionState = 'active' | 'missing' | 'unknown' | 'not_applicable';
@@ -49,12 +52,119 @@ export interface CapabilityResolutionEntry {
   /** previously_failed only. */
   failedAt?: string;
   failureReason?: string;
+  /** Effect evidence used to keep read/write memory from crossing asks. */
+  effectClass?: 'read' | 'write' | 'unknown';
+  /** Private continuity pointer. Persisted for the runtime resolver but never
+   * rendered to the model or projected onto the public event plane. */
+  verifiedReadOrigin?: VerifiedReadCapabilityOrigin;
 }
 
 export interface CapabilityResolution {
   entries: CapabilityResolutionEntry[];
   /** True when the registry snapshot was available for connection joins. */
   registryAvailable: boolean;
+}
+
+export interface ResolveTurnCapabilitiesOptions {
+  /** Exact durable chat session. Enables continuation-only task enrichment. */
+  sessionId?: string;
+}
+
+// A capability result can tighten discovery only when it was resolved from
+// the exact accepted input that owns the budget. Keep that provenance out of
+// the public/persisted result shape: context packets serialize resolutions,
+// and the raw accepted input already has one durable home in the event log.
+const resolutionInputByResult = new WeakMap<CapabilityResolution, string>();
+
+function bindResolutionInput(
+  resolution: CapabilityResolution,
+  input: string,
+): CapabilityResolution {
+  resolutionInputByResult.set(resolution, input);
+  return resolution;
+}
+
+function normalizeAuthorityInput(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return normalized || null;
+}
+
+function resolutionBelongsToAcceptedTask(
+  sessionId: string,
+  sourceUserSeq: number,
+  resolution: CapabilityResolution,
+): boolean {
+  const resolutionInput = normalizeAuthorityInput(resolutionInputByResult.get(resolution));
+  if (!resolutionInput) return false;
+  const [accepted] = listEvents(sessionId, {
+    types: ['user_input_received'],
+    sinceSeq: sourceUserSeq - 1,
+    limit: 1,
+  });
+  if (accepted?.seq !== sourceUserSeq) return false;
+  const acceptedInput = normalizeAuthorityInput(accepted?.data.text);
+  return acceptedInput !== null && acceptedInput === resolutionInput;
+}
+
+/**
+ * Only turns whose whole payload is a low-information continuation may borrow
+ * task vocabulary. A substantive turn must stand entirely on its own words:
+ * seeing "continue" somewhere inside a new request is not permission to blend
+ * the prior task into capability resolution.
+ */
+const CLEAR_CONTINUATION_RE = /^(?:(?:please\s+)?(?:continue|proceed|resume|go\s+on|carry\s+on|keep\s+going|keep\s+working|keep\s+pushing(?:\s+forward)?|press\s+on|move\s+forward|go\s+ahead|next|next\s+step|do\s+the\s+next\s+step|what(?:['’]s|\s+is)\s+next|pick\s+(?:it|this|that)\s+up|pick\s+up\s+where\s+(?:we|you)\s+left\s+off)|let(?:['’]s|\s+us)\s+(?:continue|proceed|resume|keep\s+going|keep\s+pushing(?:\s+forward)?|press\s+on|move\s+forward))(?:\s+(?:please|thanks?|now))?[.!?]*$/i;
+
+const CONTINUATION_QUERY_MAX_CHARS = 1_600;
+
+function continuationCapabilityQuery(
+  message: string,
+  opts: ResolveTurnCapabilitiesOptions,
+): string {
+  const text = (message ?? '').trim();
+  const sessionId = opts.sessionId?.trim();
+  if (!text || !sessionId || !CLEAR_CONTINUATION_RE.test(text)) return text;
+
+  try {
+    const task = resolveActiveTaskContext({ sessionId, input: text });
+    const parts: string[] = [text];
+    const focus = task.focus;
+    // The canonical projection may intentionally expose a cross-session focus
+    // for a review/resume prompt. Capability carry-over is stricter: only an
+    // explicitly same-session, fresh focus can explain a bare continuation.
+    if (
+      focus?.disposition === 'active'
+      && focus.relatedSessionId === sessionId
+    ) {
+      parts.push(
+        focus.workstate?.objective ?? '',
+        focus.title,
+        focus.summary ?? '',
+      );
+    }
+    // resolveActiveTaskContext already proves exact-session goal ownership and
+    // active status; no related_goal_id or global goal-list text is consulted.
+    if (task.goal?.sessionId === sessionId) parts.push(task.goal.objective);
+
+    const seen = new Set<string>();
+    const enriched = parts
+      .map((part) => part.replace(/\s+/g, ' ').trim())
+      .filter((part) => {
+        if (!part) return false;
+        const key = part.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .join(' ')
+      .slice(0, CONTINUATION_QUERY_MAX_CHARS)
+      .trim();
+    return enriched || text;
+  } catch {
+    // Task projection is additive. A malformed focus/goal never makes basic
+    // capability matching fail, nor does it authorize a broader fallback.
+    return text;
+  }
 }
 
 /** Toolkit slug implied by a composio identifier (`GOOGLESHEETS_BATCH_GET` →
@@ -83,9 +193,15 @@ function connectionStateFor(
  * and cheap (store reads are mtime-cached; the registry is a peek) so both
  * brain lanes can run it at preflight without a network round trip.
  */
-export function resolveTurnCapabilities(message: string): CapabilityResolution {
-  const text = (message ?? '').trim();
-  if (!text) return { entries: [], registryAvailable: false };
+export function resolveTurnCapabilities(
+  message: string,
+  opts: ResolveTurnCapabilitiesOptions = {},
+): CapabilityResolution {
+  const resolutionInput = (message ?? '').trim();
+  const text = continuationCapabilityQuery(resolutionInput, opts);
+  if (!text) {
+    return bindResolutionInput({ entries: [], registryAvailable: false }, resolutionInput);
+  }
   let registry: ReturnType<typeof peekConnectedToolkits> = [];
   try {
     registry = peekConnectedToolkits();
@@ -107,6 +223,8 @@ export function resolveTurnCapabilities(message: string): CapabilityResolution {
         status: 'proven',
         connection: connectionStateFor(m.kind, m.identifier, registry, registryAvailable),
         ...(m.accountIdentity ? { accountIdentity: m.accountIdentity } : {}),
+        ...(m.effectClass ? { effectClass: m.effectClass } : {}),
+        ...(m.verifiedReadOrigin ? { verifiedReadOrigin: m.verifiedReadOrigin } : {}),
       });
     }
   } catch { /* resolution is additive context, never turn authority */ }
@@ -123,11 +241,12 @@ export function resolveTurnCapabilities(message: string): CapabilityResolution {
         connection: connectionStateFor(m.kind, m.identifier, registry, registryAvailable),
         ...(m.failedAt ? { failedAt: m.failedAt } : {}),
         ...(m.reason ? { failureReason: m.reason } : {}),
+        ...(m.effectClass ? { effectClass: m.effectClass } : {}),
       });
     }
   } catch { /* resolution is additive context, never turn authority */ }
   warmResolvedContracts(entries);
-  return { entries, registryAvailable };
+  return bindResolutionInput({ entries, registryAvailable }, resolutionInput);
 }
 
 /**
@@ -153,11 +272,7 @@ function warmResolvedContracts(entries: readonly CapabilityResolutionEntry[]): v
   if (!contractWarmingEnabled() || entries.length === 0) return;
   // Only paths the runtime believes in: a previously-FAILED capability is not
   // worth a fetch, and a toolkit with no live connection cannot answer one.
-  const warmable = entries
-    .filter((e) => e.kind === 'composio' && e.status === 'proven' && e.connection !== 'missing')
-    .map((e) => e.identifier)
-    .filter(Boolean)
-    .slice(0, MAX_WARMED_CONTRACTS);
+  const warmable = selectWarmableContractIdentifiers(entries);
   if (warmable.length === 0) return;
   void (async () => {
     try {
@@ -169,10 +284,25 @@ function warmResolvedContracts(entries: readonly CapabilityResolutionEntry[]): v
   })();
 }
 
-/** Bounded so a turn that resolves many capabilities cannot fan out into a
- *  burst of provider requests — the point is to remove round trips, not to
- *  trade model latency for provider rate limits. */
-const MAX_WARMED_CONTRACTS = 6;
+export function selectWarmableContractIdentifiers(
+  entries: readonly CapabilityResolutionEntry[],
+): string[] {
+  return entries
+    .filter((e) => e.kind === 'composio' && e.status === 'proven' && e.connection !== 'missing')
+    .map((e) => e.identifier)
+    .filter(Boolean)
+    .slice(0, MAX_WARMED_CONTRACTS);
+}
+
+/**
+ * Preflight warming is speculative: the resolver can surface several plausible
+ * procedures, but the turn normally dispatches only one of them. Warm only the
+ * highest-ranked proven contract. The old ceiling of six let one accepted turn
+ * issue six provider metadata requests before the model selected a capability,
+ * which moved discovery cost off the model trace without actually removing it.
+ * Any additional schema is still available through the exact on-demand path.
+ */
+const MAX_WARMED_CONTRACTS = 1;
 
 function contractWarmingEnabled(): boolean {
   const v = (getRuntimeEnv('CLEMMY_WARM_TOOL_CONTRACTS', 'on') ?? 'on').trim().toLowerCase();
@@ -189,6 +319,32 @@ export function recordCapabilityResolution(
   resolution: CapabilityResolution,
   sourceUserSeq?: number,
 ): void {
+  let authoritativeForTask = false;
+  // Discovery policy belongs to the accepted task, including the important
+  // empty-resolution case (novel task => one broad lookup). Initialize at the
+  // same pre-model seam on every brain. The governor independently verifies
+  // that sourceUserSeq is this session's accepted user event.
+  if (Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0) {
+    try {
+      // A retry/correction may reuse the accepted task identity while replacing
+      // its model input with an internal verification prompt. Capabilities
+      // matched from that prompt are useful context, but they are not evidence
+      // that the accepted task's capability is known. Exact input provenance
+      // still permits a later same-task continuation resolution to tighten the
+      // initially novel policy monotonically.
+      authoritativeForTask = resolutionBelongsToAcceptedTask(
+        sessionId,
+        sourceUserSeq as number,
+        resolution,
+      );
+      discoveryGovernor.initializeTask({
+        sessionId,
+        sourceUserSeq: sourceUserSeq as number,
+        knownCapability: authoritativeForTask
+          && resolution.entries.some((entry) => entry.status === 'proven'),
+      });
+    } catch { /* render-only probes and legacy fixtures do not own task authority */ }
+  }
   if (resolution.entries.length === 0) return;
   try {
     appendEvent({
@@ -199,6 +355,7 @@ export function recordCapabilityResolution(
       data: {
         entries: resolution.entries,
         registryAvailable: resolution.registryAvailable,
+        authoritativeForTask,
         ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
       },
     });
@@ -219,7 +376,8 @@ export function renderCapabilityResolutionForContext(resolution: CapabilityResol
         : e.connection === 'unknown' ? 'connection unverified'
           : null;
     if (e.status === 'proven') {
-      lines.push(`✓ proven: ${e.intent} — ${e.kind}:${e.identifier}`
+      lines.push(`✓ proven execution path: ${e.kind}:${e.identifier}`
+        + `; learned intent label (metadata only, NOT callable): ${JSON.stringify(e.intent)}`
         + `${e.accountIdentity ? ` (${e.accountIdentity})` : ''}${conn ? ` [${conn}]` : ''}`);
     } else {
       lines.push(`✕ previously failed: ${e.intent} — ${e.kind}:${e.identifier}`
@@ -228,6 +386,8 @@ export function renderCapabilityResolutionForContext(resolution: CapabilityResol
     }
   }
   lines.push(
+    'Execution rule: for a proven composio path, call composio_execute_tool with the exact identifier as tool_slug. '
+    + 'Never pass the learned intent label to call_tool, and never rediscover the same proven capability. ',
     'Floor: a previously-failed path must be re-verified with a cheap probe before you rely on it '
     + 'or ask for a go-ahead that assumes it — and say so. A toolkit with no active connection must be '
     + 'surfaced to the user, never worked around silently. Capabilities not listed are ordinary discovery.',

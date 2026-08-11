@@ -4,6 +4,7 @@ import {
 } from '../../assistant/message-intent.js';
 import { classifyExternalEffectRequest } from '../../assistant/external-effect-taxonomy.js';
 import { extractJsonCandidate } from './json-repair.js';
+import { detectMultiItemIntent } from './multi-item-intent.js';
 
 const TOOL_SURFACE_PROBE_TOOLS = new Set([
   'check_capability',
@@ -54,17 +55,17 @@ const MUTATION_NOUN_REFERENCE_RE = new RegExp(
 );
 
 const NEGATED_ACTION_CLAUSE_RE =
-  /\b(?:do\s+not|don't|dont|never|without)\b(?:(?!,\s*(?:but|however|instead|then|yet)\b)[^.!?\n;])*/gi;
+  /\b(?:do\s+not|don't|dont|never|without)\b(?:(?!\b(?:but|however|instead|then|yet)\b)[^.!?\n;:—–])*/gi;
 const NEGATED_NO_ACTION_CLAUSE_RE =
-  /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b(?:(?!,\s*(?:but|however|instead|then|yet)\b)[^.!?\n;])*/gi;
-// Mutation evidence uses a tighter, comma-bounded form. A prohibition such as
+  /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b(?:(?!\b(?:but|however|instead|then|yet)\b)[^.!?\n;:—–])*/gi;
+// Mutation evidence uses a tighter, punctuation-bounded form. A prohibition such as
 // "do not run shell commands" must not turn a lookup into a mutation, while a
 // positive clause after it ("do not send email, but write the local report")
 // must remain visible to the classifier.
 const NEGATED_MUTATION_SEGMENT_RE =
-  /\b(?:do\s+not|don't|dont|never|without)\b[^,.!?\n;]*/gi;
+  /\b(?:do\s+not|don't|dont|never|without)\b(?:(?!\b(?:but|however|instead|then|yet)\b)[^,.!?\n;:—–])*/gi;
 const NEGATED_NO_MUTATION_SEGMENT_RE =
-  /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b[^,.!?\n;]*/gi;
+  /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b(?:(?!\b(?:but|however|instead|then|yet)\b)[^,.!?\n;:—–])*/gi;
 const INHERENT_EXTERNAL_WRITE_RE =
   /\b(?:deploy|invite|publish|send|submit|unsubscribe|upload)\b/i;
 
@@ -196,12 +197,17 @@ export function objectiveRequiresMutatingEvidence(objectiveText: string): boolea
   const nonNegated = objectiveText
     .replace(NEGATED_MUTATION_SEGMENT_RE, ' ')
     .replace(NEGATED_NO_MUTATION_SEGMENT_RE, ' ');
-  const directExternalEffect = classifyExternalEffectRequest(nonNegated).requested;
-  const positive = nonNegated
-    .replace(MUTATION_NOUN_REFERENCE_RE, ' referenced item ');
-  return directExternalEffect
-    || classifyMessageIntent(positive).intent === 'action'
-    && MUTATING_OBJECTIVE_RE.test(positive);
+  return nonNegated
+    .split(/[.!?\n;:—–]+/)
+    .some((clause) => {
+      // Direct-effect objects carry semantic evidence (for example, `post` in
+      // `Like this post`). Preserve them for the canonical effect classifier;
+      // noun projection is only for the generic mutation-cue fallback.
+      if (classifyExternalEffectRequest(clause).requested) return true;
+      const positiveClause = clause.replace(MUTATION_NOUN_REFERENCE_RE, ' referenced item ');
+      return classifyMessageIntent(positiveClause).intent === 'action'
+        && MUTATING_OBJECTIVE_RE.test(positiveClause);
+    });
 }
 
 function positiveObjectiveActionText(objectiveText: string): string {
@@ -256,7 +262,7 @@ function externalDestinationIsBoundMutationTarget(
 export function objectiveRequiresFreshExternalWrite(objectiveText: string): boolean {
   const positive = positiveObjectiveActionText(objectiveText);
   return positive
-    .split(/[.!?\n;]+/)
+    .split(/[.!?\n;:—–]+/)
     .some((clause) => {
       if (!clause.trim()) return false;
       const immediateExecution = STAGED_CLAUSE_IMMEDIATE_EXECUTION_RE.test(clause);
@@ -690,6 +696,64 @@ export function objectiveMayRequireMultipleResults(objectiveText: string): boole
     || MULTI_RESULT_QUANTIFIER_RE.test(required)
     || ACTION_SEQUENCE_RE.test(required)
     || /(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/.test(required);
+}
+
+const COLLECTION_READ_TOOL_RE = /(?:^|_)(?:list|search|query)(?:_|$)/i;
+const HARD_COLLECTION_MULTIPLICITY_RE =
+  /\b(?:all|both|couple|dozens?|each|every|few|handful|hundreds?|multiple|pair|quartet|score|several|many|remaining|these|those|thousands?|trio|[2-9]\d*|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|hundred)\b/i;
+const HARD_COLLECTION_LOWER_BOUND_RE =
+  /\b(?:more\s+than\s+(?:one|1|a\s+single)|half\s+(?:a\s+)?dozen|(?:a\s+)?(?:pair|couple|trio|quartet|dozen|score|few|handful)\s+of|(?:one|1|a\s+single)\s+(?:[\w-]+\s+){0,4}(?:per|for\s+each)\b|(?:one|1)\b[^.!?\n;]{0,80}\band\s+(?:another\s+)?(?:one|1)\b)/i;
+const HARD_COLLECTION_REPEAT_RE =
+  /\b(?:keep\s+(?:checking|polling|watching)|monitor|once\s+per\s+(?:second|minute|hour|day|week)|poll|repeat(?:ed|edly)?|repeatedly|thrice|twice|watch)\b/i;
+
+/**
+ * A plural collection noun ("items", "records") does not by itself turn one
+ * successful list/search/query into a batch whose completion needs a second
+ * model. This is deliberately narrower than ordinary read evidence: explicit
+ * multiplicity, compound/bulleted work, probes, multiple calls, and anything
+ * mutating remain outside the certificate.
+ */
+export function singleSuccessfulCollectionReadHasNoHardMultiplicity(
+  objectiveText: string,
+  successfulToolNames: readonly string[],
+): boolean {
+  const successfulWork = successfulToolNames.filter((name) => (
+    Boolean(name)
+    && !isControlOnlyTool(name)
+    && !isToolSurfaceProbeTool(name)
+  ));
+  if (successfulWork.length !== 1) return false;
+  const toolName = successfulWork[0]!;
+  if (!isReadOnlyCompletionEvidence(toolName)
+    || !COLLECTION_READ_TOOL_RE.test(normalizedToolName(toolName))) return false;
+
+  const positiveObjective = positiveObjectiveActionText(objectiveText);
+  if (HARD_COLLECTION_MULTIPLICITY_RE.test(positiveObjective)
+    || HARD_COLLECTION_LOWER_BOUND_RE.test(positiveObjective)
+    || HARD_COLLECTION_REPEAT_RE.test(positiveObjective)
+    || ACTION_SEQUENCE_RE.test(positiveObjective)
+    || /(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/.test(positiveObjective)
+    || detectMultiItemIntent(positiveObjective).isMultiItem) return false;
+  return true;
+}
+
+/**
+ * Completion-authority wrapper around the structural collection-read shape.
+ * The structural helper above deliberately does not decide whether an
+ * objective is mutating: an exact runtime receipt may prove that literal
+ * transport instructions such as "call the read action" were read-only. Most
+ * callers do not hold that receipt, so this public convenience keeps the
+ * conservative objective-text mutation floor.
+ */
+export function singleSuccessfulCollectionReadCompletesObjective(
+  objectiveText: string,
+  successfulToolNames: readonly string[],
+): boolean {
+  return !objectiveRequiresMutatingEvidence(objectiveText)
+    && singleSuccessfulCollectionReadHasNoHardMultiplicity(
+      objectiveText,
+      successfulToolNames,
+    );
 }
 
 function structuredTrue(value: unknown): boolean {

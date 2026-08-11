@@ -240,7 +240,9 @@ const WARM_GATE = {
   tool_discovery_calls: 0,
   provider_dispatches: 1,
   validation_repairs: 0,
-  public_terminals: 1,
+  // The lane produces a verified presentation draft. Only the delivery
+  // committer that durably wins publication may count a public terminal.
+  public_terminals: 0,
   external_write_or_send_dispatches: 0,
 } as const;
 
@@ -256,7 +258,7 @@ test('D4: three unrelated operations run cold (one discovery, one dispatch, one 
     assert.equal(coldResult.warm, false);
     assert.equal(coldResult.counters.schema_discovery_calls, 1, `${operation.label}: cold must make AT MOST one acquisition — and needs exactly one here`);
     assert.equal(coldResult.counters.provider_dispatches, 1);
-    assert.equal(coldResult.counters.public_terminals, 1);
+    assert.equal(coldResult.counters.public_terminals, 0);
     assert.equal(coldResult.counters.external_write_or_send_dispatches, 0);
     assert.equal(coldResult.text, operation.evidenceText);
 

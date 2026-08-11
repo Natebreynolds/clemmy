@@ -31,7 +31,14 @@ const {
 // eslint-disable-next-line import/first
 const { rememberFact, listConstraints } = await import('../../memory/facts.js');
 // eslint-disable-next-line import/first
-const { findEmailSendConstraint, findOutlookCalendarReadConstraint, checkConstraintViolation, constraintsForToolkit, renderToolkitConstraintBanner } = await import('./constraint-guard.js');
+const {
+  findEmailDraftAuthoringPreference,
+  findEmailSendConstraint,
+  findOutlookCalendarReadConstraint,
+  checkConstraintViolation,
+  constraintsForToolkit,
+  renderToolkitConstraintBanner,
+} = await import('./constraint-guard.js');
 // eslint-disable-next-line import/first
 const { verifyOutlookSender, extractMailboxEmails, clearSenderVerificationCache, resolveCompliantSenderConnection } = await import('./sender-verify.js');
 
@@ -228,6 +235,24 @@ test('rememberFact(kind=constraint) → listConstraints → gate applies to the 
   // Reads and profile lookups are NOT gated (no recursion, no read friction).
   assert.equal(findEmailSendConstraint('OUTLOOK_GET_PROFILE', { user_id: 'me' }), null);
   assert.equal(findEmailSendConstraint('OUTLOOK_OUTLOOK_LIST_MESSAGES', {}), null);
+
+  // Reversible draft authoring can reuse the stable mailbox as a preference,
+  // while ordinary reads and the irreversible SEND_DRAFT stay on their own
+  // (stricter) rails.
+  assert.equal(
+    findEmailDraftAuthoringPreference('OUTLOOK_CREATE_DRAFT')?.preferredAccount,
+    'alex.chen@legacy.example',
+  );
+  assert.equal(
+    findEmailDraftAuthoringPreference('OUTLOOK_CREATE_REPLY_ALL_DRAFT')?.preferredAccount,
+    'alex.chen@legacy.example',
+  );
+  assert.equal(findEmailDraftAuthoringPreference('OUTLOOK_LIST_DRAFTS'), null);
+  assert.equal(findEmailDraftAuthoringPreference('OUTLOOK_SEND_DRAFT'), null);
+  assert.ok(
+    findEmailSendConstraint('OUTLOOK_SEND_DRAFT', {}),
+    'sending an existing draft still requires the sender constraint',
+  );
 });
 
 test('compiled Salesforce CLI-only policy blocks the forbidden Composio route', () => {

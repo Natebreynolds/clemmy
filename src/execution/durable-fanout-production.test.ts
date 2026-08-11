@@ -185,7 +185,15 @@ for (const count of [40, 120, 514]) {
       'the reducer is not instructed to page the full journal');
 
     // The reducer task completes on the scheduler → the plan closes.
-    recordFanoutReducerOutcome(planId, { taskId: plan.reducerTaskId!, outcome: 'completed' });
+    assert.equal(
+      tasks.markBackgroundTaskDone(plan.reducerTaskId!, 'Combined durable fan-out result delivered.')?.status,
+      'done',
+      'the reducer fixture did not commit its real durable task terminal',
+    );
+    assert.equal(
+      recordFanoutReducerOutcome(planId, { taskId: plan.reducerTaskId!, outcome: 'completed' }),
+      true,
+    );
     plan = loadFanoutPlan(planId)!;
     assert.equal(plan.status, 'reduced');
     assert.equal(plan.reducerState, 'completed');
@@ -288,6 +296,13 @@ test('a child process settles part of a window, dies, and this process completes
   const finalReconcile = reconcileDurableFanout({ taskState: () => 'missing' });
   assert.equal(finalReconcile.reduced.includes(planId), true, 'the completed journal admitted no reducer');
   const plan = loadFanoutPlan(planId)!;
-  recordFanoutReducerOutcome(planId, { taskId: plan.reducerTaskId!, outcome: 'completed' });
+  assert.equal(
+    tasks.markBackgroundTaskDone(plan.reducerTaskId!, 'Combined child-restart result delivered.')?.status,
+    'done',
+  );
+  assert.equal(
+    recordFanoutReducerOutcome(planId, { taskId: plan.reducerTaskId!, outcome: 'completed' }),
+    true,
+  );
   assert.equal(loadFanoutPlan(planId)!.status, 'reduced');
 });

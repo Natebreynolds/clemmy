@@ -22,6 +22,7 @@ import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } fr
 import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix, revertWorkflowFix } from '../execution/workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { withModelUsageAttribution } from '../runtime/usage-log.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import {
@@ -178,7 +179,7 @@ function parseCommand(message: string): GatewayCommand | null {
 
 function isBareContinue(message: string): boolean {
   const t = message.trim().toLowerCase();
-  return t === '/continue' || t === 'continue' || t === 'keep going';
+  return /^\/?(?:continue|keep going)[.!?]*$/.test(t);
 }
 
 function isContinueCompletionReason(reason: unknown): boolean {
@@ -613,7 +614,7 @@ function routeParkedBackgroundReply(request: GatewayRequest): ParkedBackgroundRo
     };
   }
 
-  if (/^\/?(continue|resume|keep going)$/i.test(answer)) {
+  if (/^\/?(continue|resume|keep going)[.!?]*$/i.test(answer)) {
     const continueTask = findSoleAwaitingContinueTaskForOrigin(request.sessionId);
     if (continueTask) {
       const queued = queueBackgroundTaskContinue(continueTask.id);
@@ -1125,7 +1126,14 @@ export class ClementineGateway {
       // with the reason. The returned text is left as the agent wrote it.
       const verdict = response.pendingApprovalId || runCancelled
         ? null
-        : await verifyDelivered(request.message, response.text, { stoppedReason: response.stoppedReason });
+        : await withModelUsageAttribution(
+            {
+              sessionId: request.sessionId,
+              sourceUserSeq: accepted.source.seq,
+              attemptId: activeAttempt.attemptId,
+            },
+            () => verifyDelivered(request.message, response.text, { stoppedReason: response.stoppedReason }),
+          );
       const runFailedNotDelivered = verdict ? !verdict.delivered : false;
       finishRun(run.id, {
         status: runCancelled

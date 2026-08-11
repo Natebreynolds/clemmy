@@ -14,6 +14,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 import { listEvents, type EventRow } from '../harness/eventlog.js';
 import { projectCanonicalTopLevelToolEvents } from '../harness/tool-effect.js';
+import { isSettledReadReplayMarkerData } from '../harness/settled-read-replay-semantics.js';
 import { toGenAiSpans, type GenAiSpan } from './otel-spans.js';
 
 export interface PendingEvalCase {
@@ -45,12 +46,13 @@ function safeName(sessionId: string): string {
 export function buildFailureCase(sessionId: string, events: EventRow[]): PendingEvalCase | null {
   const failures = events.filter((e) => FAILURE_EVENT_TYPES.has(e.type));
   if (failures.length === 0) return null;
-  // guardrail_tripped is noisy (fanout_nudge is advisory, not a failure) — drop it.
+  // guardrail_tripped also carries a few durable advisories. They are useful
+  // audit/accounting rows, but must not grow the production-failure corpus.
   const kinds = new Set<string>();
   for (const f of failures) {
     if (f.type === 'guardrail_tripped') {
       const k = typeof f.data.kind === 'string' ? f.data.kind : 'guardrail';
-      if (k === 'fanout_nudge') continue; // advisory, not a failure
+      if (k === 'fanout_nudge' || isSettledReadReplayMarkerData(f.data)) continue;
       kinds.add(`guardrail:${k}`);
     } else {
       kinds.add(f.type);

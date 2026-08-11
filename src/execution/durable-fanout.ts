@@ -43,6 +43,7 @@ import {
 } from './work-disposition.js';
 import {
   createBackgroundTask,
+  getBackgroundTask,
   requestBackgroundDrain,
   type BackgroundTaskRecord,
 } from './background-tasks.js';
@@ -555,7 +556,11 @@ export function fanoutReducerReady(planId: string): { ready: boolean; missing: L
     .filter((a) => a.status === 'done')
     .map((a) => ({ itemId: a.itemId, phaseId: a.phaseId }));
   const verdict = reducerReady({ plan: plan.durable, completed });
-  return { ready: verdict.ready, missing: verdict.missing };
+  const windows = listFanoutWindows(planId);
+  const expectedWindowIndexes = new Set(plan.durable.windows.map((window) => window.index));
+  const everyWindowClosed = windows.length === expectedWindowIndexes.size
+    && windows.every((window) => expectedWindowIndexes.has(window.windowIndex) && window.status === 'done');
+  return { ready: verdict.ready && everyWindowClosed, missing: verdict.missing };
 }
 
 /**
@@ -565,20 +570,36 @@ export function fanoutReducerReady(planId: string): { ready: boolean; missing: L
  * TTL — or whose reduction FAILED — is recoverable for a bounded retry.
  */
 export function acquireFanoutReducerLease(planId: string, owner: string): boolean {
-  if (!fanoutReducerReady(planId).ready) return false;
   const staleBefore = new Date(Date.now() - REDUCER_LEASE_TTL_MS).toISOString();
+  const database = db();
   try {
-    const result = db().prepare(`
-      UPDATE plans SET reducer_lease_owner = ?, reducer_leased_at = ?, reducer_state = 'leased', updated_at = ?
-      WHERE plan_id = ? AND status = 'active'
-        AND reducer_attempts < ${REDUCER_RETRY_CAP}
-        AND (
-          reducer_lease_owner IS NULL
-          OR reducer_state = 'failed'
-          OR (reducer_state IN ('leased','admitted','running') AND reducer_leased_at < ?)
-        )
-    `).run(owner, now(), now(), planId, staleBefore);
-    return result.changes > 0;
+    // The readiness observation and lease CAS share one IMMEDIATE transaction.
+    // Otherwise a scheduler could observe the journal complete while a worker
+    // still owns its window and admit the reducer before that worker exits.
+    const acquire = database.transaction((): boolean => {
+      if (!fanoutReducerReady(planId).ready) return false;
+      const at = now();
+      const result = database.prepare(`
+        UPDATE plans SET reducer_lease_owner = ?, reducer_leased_at = ?, reducer_state = 'leased', updated_at = ?
+        WHERE plan_id = ? AND status = 'active'
+          AND reducer_attempts < ${REDUCER_RETRY_CAP}
+          AND NOT EXISTS (
+            SELECT 1 FROM activations
+            WHERE activations.plan_id = plans.plan_id AND activations.status != 'done'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM windows
+            WHERE windows.plan_id = plans.plan_id AND windows.status != 'done'
+          )
+          AND (
+            reducer_lease_owner IS NULL
+            OR reducer_state = 'failed'
+            OR (reducer_state IN ('leased','admitted','running') AND reducer_leased_at < ?)
+          )
+      `).run(owner, at, at, planId, staleBefore);
+      return result.changes > 0;
+    });
+    return acquire.immediate();
   } catch {
     return false;
   }
@@ -638,8 +659,14 @@ export function scheduleDurableFanout(planId: string): ScheduledFanout | null {
   for (const window of listFanoutWindows(planId)) {
     const open = window.itemIds.filter((itemId) => (doneByItem.get(itemId) ?? 0) < phaseCount);
     if (open.length === 0) {
-      database.prepare("UPDATE windows SET status = 'done', updated_at = ? WHERE plan_id = ? AND window_index = ?")
-        .run(now(), planId, window.windowIndex);
+      // A claimed window remains claimed until reconciliation observes its
+      // real worker task terminal. Journal settlement can happen before the
+      // worker has stopped executing, so closing here would merely rename a
+      // still-live window "done" and reopen the reducer race.
+      if (window.status !== 'claimed') {
+        database.prepare("UPDATE windows SET status = 'done', updated_at = ? WHERE plan_id = ? AND window_index = ?")
+          .run(now(), planId, window.windowIndex);
+      }
       skippedWindows.push(window.windowIndex);
       continue;
     }
@@ -733,6 +760,11 @@ export function recordFanoutReducerOutcome(
       `).run(now(), planId, input.taskId).changes > 0;
     }
     if (input.outcome === 'completed') {
+      // The plan cannot become reduced on a caller's assertion alone. The
+      // named reducer must be a real durable background task whose own store
+      // has already committed its successful terminal.
+      const reducerTask = getBackgroundTask(input.taskId);
+      if (!reducerTask || reducerTask.status !== 'done') return false;
       const changed = database.prepare(`
         UPDATE plans SET reducer_state = 'completed', status = 'reduced', updated_at = ?
         WHERE plan_id = ? AND reducer_task_id = ? AND status = 'active'

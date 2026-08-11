@@ -207,7 +207,7 @@ export function normalizeShapeForDeferredJson(shape: z.ZodRawShape): z.ZodRawSha
   );
 }
 
-function jsonSchemaAllowsNull(schemaValue: unknown): boolean {
+export function jsonSchemaAllowsNull(schemaValue: unknown): boolean {
   if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return false;
   const schema = schemaValue as {
     type?: unknown;
@@ -221,6 +221,84 @@ function jsonSchemaAllowsNull(schemaValue: unknown): boolean {
     if (Array.isArray(branch) && branch.some(jsonSchemaAllowsNull)) return true;
   }
   return false;
+}
+
+function jsonSchemaTypeMatches(value: unknown, schemaValue: unknown): boolean {
+  if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return false;
+  const wrapper = schemaValue as { type?: unknown; anyOf?: unknown; oneOf?: unknown };
+  if (wrapper.type === undefined) {
+    for (const alternatives of [wrapper.anyOf, wrapper.oneOf]) {
+      if (Array.isArray(alternatives)) {
+        return alternatives.some((candidate) => jsonSchemaTypeMatches(value, candidate));
+      }
+    }
+  }
+  const types = Array.isArray(wrapper.type) ? wrapper.type : [wrapper.type];
+  if (value === null) return types.includes('null');
+  if (Array.isArray(value)) return types.includes('array');
+  if (typeof value === 'object') {
+    return types.includes('object') || Boolean((schemaValue as { properties?: unknown }).properties);
+  }
+  if (typeof value === 'string') return types.includes('string');
+  if (typeof value === 'boolean') return types.includes('boolean');
+  if (typeof value === 'number') {
+    return types.includes('number') || (Number.isInteger(value) && types.includes('integer'));
+  }
+  return false;
+}
+
+function schemaBranchForValue(schemaValue: unknown, value: unknown): unknown {
+  if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return schemaValue;
+  const schema = schemaValue as { anyOf?: unknown; oneOf?: unknown };
+  for (const alternatives of [schema.anyOf, schema.oneOf]) {
+    if (!Array.isArray(alternatives)) continue;
+    const exact = alternatives.find((candidate) => jsonSchemaTypeMatches(value, candidate));
+    if (exact) return schemaBranchForValue(exact, value);
+    const nonNull = alternatives.find((candidate) => !jsonSchemaAllowsNull(candidate));
+    if (nonNull) return schemaBranchForValue(nonNull, value);
+  }
+  return schemaValue;
+}
+
+/**
+ * Materialize only fields that an exact JSON Schema marks both required and
+ * nullable. OpenAI strict schemas use that shape to represent an optional
+ * value, while several compatible providers naturally omit the value. Adding
+ * JSON null is a transport repair, not a semantic default: real required
+ * non-null values remain missing and fail normal validation.
+ */
+export function materializeStrictNullableFields(value: unknown, schemaValue: unknown): unknown {
+  const schema = schemaBranchForValue(schemaValue, value);
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return value;
+  const record = schema as {
+    properties?: unknown;
+    required?: unknown;
+    items?: unknown;
+  };
+
+  if (Array.isArray(value)) {
+    return value.map((item) => materializeStrictNullableFields(item, record.items));
+  }
+  if (!value || typeof value !== 'object') return value;
+
+  const out: Record<string, unknown> = { ...(value as Record<string, unknown>) };
+  const properties = record.properties && typeof record.properties === 'object'
+    ? record.properties as Record<string, unknown>
+    : {};
+  const required = new Set(
+    Array.isArray(record.required)
+      ? record.required.filter((key): key is string => typeof key === 'string')
+      : [],
+  );
+
+  for (const [key, propertySchema] of Object.entries(properties)) {
+    if (!(key in out) || out[key] === undefined) {
+      if (required.has(key) && jsonSchemaAllowsNull(propertySchema)) out[key] = null;
+      continue;
+    }
+    out[key] = materializeStrictNullableFields(out[key], propertySchema);
+  }
+  return out;
 }
 
 /**

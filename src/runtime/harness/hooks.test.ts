@@ -25,9 +25,12 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 
 // Dynamic imports — see eventlog.test.ts for why.
-const { resetEventLog, createSession, listEvents } = await import('./eventlog.js');
+const { resetEventLog, createSession, listEvents, appendEvent, resolveToolOutputForAuthority } = await import('./eventlog.js');
 const { attachEventLogHooks, extractSessionIdFromContext, effectiveReflectionTool } = await import('./hooks.js');
 const { ToolCallsCounter, withHarnessRunContext } = await import('./brackets.js');
+const { activateDispatchLease } = await import('./dispatch-lease.js');
+const { settledReadRepeatReplayMarker } = await import('./settled-read-repeat.js');
+const { projectCanonicalTopLevelToolEvents } = await import('./tool-effect.js');
 type RunHooksLike = import('./hooks.js').RunHooksLike;
 
 test('effectiveReflectionTool unwraps composio_execute_tool to its action slug', () => {
@@ -139,6 +142,7 @@ test('tool hooks persist exact request ownership on calls and returns', () => {
     {
       sessionId: sess.id,
       sourceUserSeq: 17,
+      runAttemptId: 'attempt-owned-17',
       behaviorScopeId: 'owned-run',
       counter: new ToolCallsCounter(),
     },
@@ -152,6 +156,307 @@ test('tool hooks persist exact request ownership on calls and returns', () => {
   assert.equal(events.length, 2);
   assert.ok(events.every((event) => event.data.sourceUserSeq === 17));
   assert.ok(events.every((event) => event.data.runScopeId === 'owned-run'));
+  assert.ok(events.every((event) => event.data.attemptId === 'attempt-owned-17'));
+});
+
+test('tool hooks quarantine callbacks from a superseded physical dispatch generation', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  const staleLease = activateDispatchLease({
+    sessionId: sess.id,
+    scopeId: `${sess.id}::provider-attempt`,
+  });
+  const currentLease = activateDispatchLease({
+    sessionId: sess.id,
+    scopeId: `${sess.id}::provider-attempt`,
+  });
+  const staleDetails = { toolCall: { callId: 'reused-call', arguments: '{}' } };
+  const currentDetails = { toolCall: { callId: 'reused-call', arguments: '{}' } };
+
+  withHarnessRunContext(
+    {
+      sessionId: sess.id,
+      sourceUserSeq: 17,
+      behaviorScopeId: 'same-logical-run',
+      counter: new ToolCallsCounter(),
+      dispatchLease: staleLease,
+    },
+    () => {
+      stub.emit('agent_start', ctx(sess.id), { name: 'stale' });
+      stub.emit('agent_tool_start', ctx(sess.id), { name: 'stale' }, { name: 'composio_execute_tool' }, staleDetails);
+      stub.emit('agent_tool_end', ctx(sess.id), { name: 'stale' }, { name: 'composio_execute_tool' }, 'Dispatch refused before provider I/O.', staleDetails);
+      stub.emit('agent_end', ctx(sess.id), { name: 'stale' }, 'late output');
+    },
+  );
+  withHarnessRunContext(
+    {
+      sessionId: sess.id,
+      sourceUserSeq: 17,
+      behaviorScopeId: 'same-logical-run',
+      counter: new ToolCallsCounter(),
+      dispatchLease: currentLease,
+    },
+    () => {
+      stub.emit('agent_start', ctx(sess.id), { name: 'current' });
+      stub.emit('agent_tool_start', ctx(sess.id), { name: 'current' }, { name: 'composio_execute_tool' }, currentDetails);
+      stub.emit('agent_tool_end', ctx(sess.id), { name: 'current' }, { name: 'composio_execute_tool' }, '{"successful":true}', currentDetails);
+      stub.emit('agent_end', ctx(sess.id), { name: 'current' }, 'fresh output');
+    },
+  );
+
+  const events = listEvents(sess.id);
+  assert.equal(events.some((event) => event.role === 'stale'), false);
+  assert.deepEqual(
+    events.filter((event) => event.type === 'tool_called' || event.type === 'tool_returned')
+      .map((event) => [event.type, event.data.callId]),
+    [
+      ['tool_called', 'reused-call'],
+      ['tool_returned', 'reused-call'],
+    ],
+  );
+});
+
+test('tool hooks pair a start admitted before lease rotation without consuming a reused current call id', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  const reflected: string[] = [];
+  attachEventLogHooks(stub, {
+    getSessionId: extractSessionIdFromContext,
+    scheduleReflection: (input) => { reflected.push(input.output); },
+  });
+  const firstLease = activateDispatchLease({
+    sessionId: sess.id,
+    scopeId: `${sess.id}::provider-attempt`,
+  });
+  const firstDetails = { toolCall: { callId: 'same-sdk-id', arguments: '{}' } };
+
+  withHarnessRunContext(
+    {
+      sessionId: sess.id,
+      sourceUserSeq: 23,
+      behaviorScopeId: 'same-logical-run',
+      counter: new ToolCallsCounter(),
+      dispatchLease: firstLease,
+    },
+    () => {
+      stub.emit('agent_tool_start', ctx(sess.id), { name: 'first' }, { name: 'composio_execute_tool' }, firstDetails);
+    },
+  );
+  const currentLease = activateDispatchLease({
+    sessionId: sess.id,
+    scopeId: `${sess.id}::provider-attempt`,
+  });
+  withHarnessRunContext(
+    {
+      sessionId: sess.id,
+      sourceUserSeq: 23,
+      behaviorScopeId: 'same-logical-run',
+      counter: new ToolCallsCounter(),
+      dispatchLease: firstLease,
+    },
+    () => {
+      stub.emit(
+        'agent_tool_end',
+        ctx(sess.id),
+        { name: 'first' },
+        { name: 'composio_execute_tool' },
+        `StaleDispatchLeaseError: Dispatch refused: provider attempt ${firstLease.leaseId} is no longer authoritative for ${firstLease.scopeId}.`,
+        firstDetails,
+      );
+    },
+  );
+  const currentDetails = { toolCall: { callId: 'same-sdk-id', arguments: '{}' } };
+  withHarnessRunContext(
+    {
+      sessionId: sess.id,
+      sourceUserSeq: 23,
+      behaviorScopeId: 'same-logical-run',
+      counter: new ToolCallsCounter(),
+      dispatchLease: currentLease,
+    },
+    () => {
+      stub.emit('agent_tool_start', ctx(sess.id), { name: 'current' }, { name: 'composio_execute_tool' }, currentDetails);
+      stub.emit('agent_tool_end', ctx(sess.id), { name: 'current' }, { name: 'composio_execute_tool' }, '{"successful":true}', currentDetails);
+    },
+  );
+
+  const raw = listEvents(sess.id, { types: ['tool_called', 'tool_returned'] });
+  assert.equal(raw.length, 4, 'the admitted superseded occurrence remains paired audit evidence');
+  assert.equal(raw[1]!.parentEventId, raw[0]!.id);
+  assert.equal(raw[1]!.data.providerDispatched, undefined,
+    'end-time staleness plus error prose is not nominal proof that provider I/O never began');
+  assert.equal(raw[3]!.parentEventId, raw[2]!.id,
+    'the reused SDK call id pairs inside the current physical generation');
+  assert.deepEqual(
+    projectCanonicalTopLevelToolEvents(raw).map((event) => [event.type, event.data.dispatchLeaseId]),
+    [
+      ['tool_called', firstLease.leaseId],
+      ['tool_returned', firstLease.leaseId],
+      ['tool_called', currentLease.leaseId],
+      ['tool_returned', currentLease.leaseId],
+    ],
+  );
+  const authority = resolveToolOutputForAuthority(sess.id, 'same-sdk-id');
+  assert.equal(authority.status, 'ambiguous',
+    'without a nominal pre-dispatch marker, reused-id physical outcomes fail closed');
+  assert.deepEqual(reflected, ['{"successful":true}'],
+    'the losing physical generation remains audit-only and cannot teach memory');
+});
+
+test('settled-read replay stays visible but never becomes fresh tool-output authority', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Refresh the queue once.' },
+  });
+  const stub = makeStub();
+  attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  const callId = 'settled-replay-hook';
+  const details = {
+    toolCall: {
+      callId,
+      arguments: JSON.stringify({
+        tool_slug: 'PROOF_LIST_TASKS',
+        arguments: '{}',
+        connected_account_id: null,
+      }),
+    },
+  };
+
+  withHarnessRunContext(
+    {
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: `${sess.id}::turn:2`,
+      counter: new ToolCallsCounter(),
+    },
+    () => {
+      stub.emit('agent_tool_start', ctx(sess.id), { name: 'Clem' }, { name: 'composio_execute_tool' }, details);
+      const replayCalled = listEvents(sess.id, { types: ['tool_called'], desc: true, limit: 1 })[0]!;
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: settledReadRepeatReplayMarker({
+          replayCallId: callId,
+          replayCalledEventId: replayCalled.id,
+          sourceCallId: 'settled-original-hook',
+          sourceUserSeq: source.seq,
+          toolSlug: 'PROOF_LIST_TASKS',
+          sourceBehaviorScopeId: `${sess.id}::turn:1`,
+          replayBehaviorScopeId: `${sess.id}::turn:2`,
+        }),
+      });
+      stub.emit(
+        'agent_tool_end',
+        ctx(sess.id),
+        { name: 'Clem' },
+        { name: 'composio_execute_tool' },
+        '{"successful":true,"data":{"items":[{"id":"one"}]}}\n\n[harness settled-read replay]',
+        details,
+      );
+    },
+  );
+
+  const returned = listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(returned.length, 1);
+  assert.equal(returned[0]!.data.providerDispatched, false);
+  assert.equal(returned[0]!.data.replayedFromCallId, 'settled-original-hook');
+  assert.equal(resolveToolOutputForAuthority(sess.id, callId).status, 'missing',
+    'replayed bytes are never parked as a new authoritative provider result');
+
+  const freshSource = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Refresh it for my new request.' },
+  });
+  const reusedDetails = {
+    toolCall: {
+      callId,
+      arguments: details.toolCall.arguments,
+    },
+  };
+  const freshProvider = '{"successful":true,"data":{"items":[{"id":"fresh"}]}}';
+  withHarnessRunContext(
+    {
+      sessionId: sess.id,
+      sourceUserSeq: freshSource.seq,
+      behaviorScopeId: `${sess.id}::turn:3`,
+      counter: new ToolCallsCounter(),
+    },
+    () => {
+      stub.emit('agent_tool_start', ctx(sess.id), { name: 'Clem' }, { name: 'composio_execute_tool' }, reusedDetails);
+      stub.emit('agent_tool_end', ctx(sess.id), { name: 'Clem' }, { name: 'composio_execute_tool' }, freshProvider, reusedDetails);
+    },
+  );
+  const reusedReturns = listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(reusedReturns.length, 2);
+  assert.equal(reusedReturns[1]!.data.providerDispatched, undefined,
+    'a later real occurrence reusing the SDK call id must not inherit replay disposition');
+  const freshAuthority = resolveToolOutputForAuthority(sess.id, callId);
+  assert.equal(freshAuthority.status, 'ok');
+  if (freshAuthority.status === 'ok') assert.equal(freshAuthority.record.output, freshProvider);
+});
+
+test('settled-read steering is model-facing only and never enters authority or reflection', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'List the queue once.' },
+  });
+  const reflected: Array<{ output: string }> = [];
+  const stub = makeStub();
+  attachEventLogHooks(stub, {
+    getSessionId: extractSessionIdFromContext,
+    scheduleReflection: (input) => { reflected.push({ output: input.output }); },
+  });
+  const callId = 'settled-first-success';
+  const details = {
+    toolCall: {
+      callId,
+      arguments: JSON.stringify({
+        tool_slug: 'PROOF_LIST_TASKS',
+        arguments: '{}',
+        connected_account_id: null,
+      }),
+    },
+  };
+  const provider = '{"successful":true,"data":{"items":[{"id":"one"}]}}';
+  const modelFacing = `${provider}\n\n[harness settled-read] Fresh PROOF_LIST_TASKS data is above. Use it or answer naturally.`;
+
+  withHarnessRunContext(
+    {
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: `${sess.id}::turn:1`,
+      counter: new ToolCallsCounter(),
+    },
+    () => {
+      stub.emit('agent_tool_start', ctx(sess.id), { name: 'Clem' }, { name: 'composio_execute_tool' }, details);
+      stub.emit('agent_tool_end', ctx(sess.id), { name: 'Clem' }, { name: 'composio_execute_tool' }, modelFacing, details);
+    },
+  );
+
+  assert.deepEqual(reflected, [{ output: provider }]);
+  const authority = resolveToolOutputForAuthority(sess.id, callId);
+  assert.equal(authority.status, 'ok');
+  if (authority.status === 'ok') assert.equal(authority.record.output, provider);
+  assert.equal(listEvents(sess.id, { types: ['tool_returned'] })[0]!.data.result, modelFacing,
+    'the model-facing lifecycle remains conversationally steered');
 });
 
 test('agent_start emits turn_started with the agent name', () => {

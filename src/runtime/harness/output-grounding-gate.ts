@@ -149,6 +149,10 @@ export function extractNumericClaims(text: string): NumericClaim[] {
     // Real prose figures have a token boundary; IDs, hashes, and compact codes
     // do not.
     if (/[A-Za-z0-9_]$/.test(before) || /^[A-Za-z0-9_]/.test(after)) continue;
+    // Hyphenated release/ticket/product identifiers are labels, not report
+    // figures (Cedar-17, INC-420, 17-beta). Preserve actual negative numbers:
+    // only drop a dash joined to an alphanumeric token on either side.
+    if (/[A-Za-z0-9][-–—]$/.test(before) || /^[-–—][A-Za-z0-9]/.test(after)) continue;
     // URL / path-embedded number.
     if (/[/=?&#]\s*$/.test(before) || /https?:\/\/\S*$/.test(before)) continue;
     // Version string (v1.2, 0.5.20, or "version 3").
@@ -318,7 +322,7 @@ export function _setOutputGroundingJudgeForTests(fn: OutputGroundingJudgeFn | nu
 export function buildOutputGroundingPrompt(claims: NumericClaim[], sources: GroundingSource[]): string {
   return [
     'You are a NUMERIC INTEGRITY judge. An agent is about to DELIVER a report/message to a user.',
-    "Verify every LOAD-BEARING FIGURE listed below traces to the agent's own sources: captured tool results from THIS session, or its consolidated memory facts (sources labeled memory:fact — remembered knowledge counts as grounded).",
+    "Verify every LOAD-BEARING FIGURE listed below traces to the agent's own sources: deterministic arithmetic from THIS turn's accepted input, source-owned captured tool results, or consolidated memory facts (sources labeled memory:fact — remembered knowledge counts as grounded).",
     '',
     'CRITICAL — numbers are usually DERIVED, not copied verbatim. Treat a figure as GROUNDED when it is plausibly derivable from the sources by:',
     '  • rounding (raw 6460.78 reported as 6,461 — grounded)',
@@ -336,7 +340,7 @@ export function buildOutputGroundingPrompt(claims: NumericClaim[], sources: Grou
     '=== FIGURES TO VERIFY ===',
     ...claims.map((c) => `- ${c.raw} (${c.unit}) — context: ${c.context}`),
     '',
-    '=== SOURCE TOOL RESULTS (this session; research before confirmations) ===',
+    '=== AUTHORITY SOURCES (accepted-input arithmetic, source-owned tool results, and memory) ===',
     ...sources.map((s) => `--- ${s.callId} (${s.tool ?? 'unknown'}, ${s.createdAt}) ---\n${s.excerpt}`),
     '',
     'Respond with exactly one verdict line.',
@@ -443,6 +447,62 @@ export interface OutputGroundingGateResult {
   commitFailure?: () => void;
 }
 
+export interface OutputGroundingGateOptions {
+  kind?: 'chat' | 'write';
+  toolName?: string;
+  deferCommit?: boolean;
+  /** Exact accepted source that owns this chat completion. When present, tool
+   * evidence is source-scoped instead of session-scoped. */
+  sourceUserSeq?: number;
+  /** Exact accepted user text for sourceUserSeq. Only arithmetic computed from
+   * it becomes evidence; a user's unverified factual premise never does. */
+  acceptedUserInput?: string;
+  /** Explicit typed parent lineage for a non-decline continuation. */
+  parentSourceUserSeq?: number;
+}
+
+function simpleArithmeticEvidence(text: string): string[] {
+  const rows: string[] = [];
+  const expression = /(-?\d+(?:\.\d+)?)\s*(\+|\s-\s|×|x|\*|÷|\/)\s*(-?\d+(?:\.\d+)?)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = expression.exec(text)) && rows.length < 8) {
+    const left = Number(match[1]);
+    const right = Number(match[3]);
+    const operator = match[2].trim().toLowerCase();
+    if (!Number.isFinite(left) || !Number.isFinite(right)) continue;
+    let result: number;
+    if (operator === '+') result = left + right;
+    else if (operator === '-') result = left - right;
+    else if (operator === '×' || operator === 'x' || operator === '*') result = left * right;
+    else {
+      if (right === 0) continue;
+      result = left / right;
+    }
+    if (!Number.isFinite(result) || Math.abs(result) > 1e15) continue;
+    const stable = Number.isInteger(result) ? String(result) : String(Number(result.toPrecision(12)));
+    rows.push(`${match[1]} ${match[2].trim()} ${match[3]} = ${stable}`);
+  }
+  return rows;
+}
+
+function acceptedUserGroundingSource(opts: OutputGroundingGateOptions): GroundingSource | null {
+  if (
+    opts.kind !== 'chat'
+    || !Number.isSafeInteger(opts.sourceUserSeq)
+    || (opts.sourceUserSeq ?? 0) <= 0
+    || typeof opts.acceptedUserInput !== 'string'
+    || !opts.acceptedUserInput.trim()
+  ) return null;
+  const arithmetic = simpleArithmeticEvidence(opts.acceptedUserInput);
+  if (arithmetic.length === 0) return null;
+  return {
+    callId: `user:source:${opts.sourceUserSeq}`,
+    tool: 'accepted_input_arithmetic',
+    excerpt: ['[deterministic arithmetic from the accepted input]', ...arithmetic].join('\n'),
+    createdAt: 'accepted-turn',
+  };
+}
+
 /**
  * Evaluate numeric grounding for a deliverable. Fail-open at every step:
  * no claims / no sources / all-deterministically-verified / judge error → allow.
@@ -450,7 +510,7 @@ export interface OutputGroundingGateResult {
 export async function evaluateOutputGrounding(
   sessionId: string,
   deliverableText: string,
-  _opts: { kind?: 'chat' | 'write'; toolName?: string; deferCommit?: boolean } = {},
+  _opts: OutputGroundingGateOptions = {},
 ): Promise<OutputGroundingGateResult> {
   const deferCommit = _opts.deferCommit === true;
   const claims = extractNumericClaims(deliverableText);
@@ -467,14 +527,27 @@ export async function evaluateOutputGrounding(
     // report's wording — also look at the most recent captured data.
     const merged = new Map<string, { callId: string; tool: string | null; output: string; createdAt: string }>();
     for (const r of byLabel) merged.set(r.callId, r);
-    if (merged.size < 2) for (const r of recentToolOutputs(sessionId, { limit: 8 })) merged.set(r.callId, r);
+    const sourceScoped = Number.isSafeInteger(_opts.sourceUserSeq) && (_opts.sourceUserSeq ?? 0) > 0;
+    if (merged.size < 2 && !sourceScoped) {
+      for (const r of recentToolOutputs(sessionId, { limit: 8 })) merged.set(r.callId, r);
+    }
+    const allowedSourceUserSeqs = sourceScoped
+      ? [_opts.sourceUserSeq, _opts.parentSourceUserSeq]
+          .filter((value): value is number => Number.isSafeInteger(value) && (value ?? 0) > 0)
+      : undefined;
     sources = rankSources(
-      resolveToolOutputsForAuthority(sessionId, [...merged.values()], { readOrComputeOnly: true }),
+      resolveToolOutputsForAuthority(sessionId, [...merged.values()], {
+        readOrComputeOnly: true,
+        ...(allowedSourceUserSeqs ? { allowedSourceUserSeqs } : {}),
+      }),
       { limit: 8 },
     );
   } catch {
     return { action: 'allow', reason: 'source retrieval failed — fail open', figures: [], sourceCallIds: [] };
   }
+  const acceptedUserSource = acceptedUserGroundingSource(_opts);
+  if (acceptedUserSource) sources.push(acceptedUserSource);
+
   // MEMORY IS A GROUNDING SOURCE (2026-07-30, live false-flag): an ever-learning
   // employee's consolidated memory is her knowledge — a recalled figure ("your
   // 120 accounts") is grounded, not fabricated. The source universe previously
@@ -485,7 +558,7 @@ export async function evaluateOutputGrounding(
   // Memory may only SUPPORT a figure, never convict one: with zero session tool
   // captures, "the fact store doesn't mention 29" is expected for fresh work and
   // must not open the judge/advisory pathway (see toolSourceCount below).
-  const toolSourceCount = sources.length;
+  const nonMemorySourceCount = sources.length;
   try {
     const factQuery = [...new Set(claims.flatMap((c) => c.labels))].slice(0, 12).join(' ');
     if (factQuery) {
@@ -508,7 +581,7 @@ export async function evaluateOutputGrounding(
   if (residual.length === 0) {
     return { action: 'allow', reason: 'every figure traces to captured tool results (deterministic)', figures: [], sourceCallIds };
   }
-  if (toolSourceCount === 0) {
+  if (nonMemorySourceCount === 0) {
     // Only memory sources exist and they didn't clear the residual. Absence
     // from memory is not evidence against a figure about work just performed —
     // preserve the pre-memory behavior for capture-less sessions.

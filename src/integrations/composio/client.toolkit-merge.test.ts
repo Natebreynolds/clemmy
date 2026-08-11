@@ -10,7 +10,15 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { listComposioToolkitTools, resolveComposioToolVersion, bustToolkitToolsCache } from './client.js';
+import {
+  bustToolkitToolsCache,
+  composioToolSchemaObservedAt,
+  __test__,
+  getComposioToolBySlug,
+  listComposioToolkitTools,
+  resetComposioClient,
+  resolveComposioToolVersion,
+} from './client.js';
 
 function withMockedFetch(impl: typeof fetch, run: () => Promise<void>): Promise<void> {
   const prevFetch = globalThis.fetch;
@@ -51,6 +59,7 @@ test('merges curated (direct v3, no version pin) with the raw SDK set and de-dup
   };
 
   await withMockedFetch(mockFetch, async () => {
+    const startedAt = Date.now();
     const tools = await listComposioToolkitTools('outlook', 50, fakeComposio);
     const slugs = tools.map((t) => t.slug);
 
@@ -65,6 +74,13 @@ test('merges curated (direct v3, no version pin) with the raw SDK set and de-dup
     // The curated fetch must hit the v3 tools endpoint WITHOUT a version pin.
     assert.match(fetchedUrl, /\/api\/v3\/tools\?toolkit_slug=outlook/);
     assert.doesNotMatch(fetchedUrl, /toolkit_versions/);
+    for (const item of tools) {
+      const observedAt = composioToolSchemaObservedAt(item);
+      assert.ok(observedAt && observedAt >= startedAt && observedAt <= Date.now(),
+        'every live catalog schema carries a bounded out-of-band observation time');
+      assert.equal(Object.prototype.hasOwnProperty.call(item, 'providerObservedAt'), false,
+        'schema provenance never leaks into catalog output');
+    }
   });
 });
 
@@ -116,6 +132,65 @@ test('the toolkit tool-list cache NEVER caches the override path (tests + specia
   });
   // bust is a no-throw clear.
   assert.doesNotThrow(() => bustToolkitToolsCache());
+});
+
+test('a toolkit cache hit preserves the original provider observation time', async () => {
+  bustToolkitToolsCache();
+  let rawCalls = 0;
+  __test__.setComposioClient({
+    client: { baseURL: 'https://x' },
+    tools: {
+      getRawComposioTools: async () => {
+        rawCalls += 1;
+        return [{ slug: 'OUTLOOK_GET_PROFILE', name: 'profile', inputParameters: { type: 'object' } }];
+      },
+    },
+  });
+  const mockFetch = (async () => ({ ok: true, json: async () => ({ items: [] }) } as Response)) as typeof fetch;
+  try {
+    await withMockedFetch(mockFetch, async () => {
+      const first = await listComposioToolkitTools('outlook', 50);
+      const firstObservedAt = composioToolSchemaObservedAt(first[0]!);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const second = await listComposioToolkitTools('outlook', 50);
+      assert.equal(rawCalls, 1, 'the second lookup is the in-process toolkit cache');
+      assert.equal(composioToolSchemaObservedAt(second[0]!), firstObservedAt,
+        'cache replay cannot renew provider schema authority');
+    });
+  } finally {
+    resetComposioClient();
+  }
+});
+
+test('exact-slug fallback bypasses a stale toolkit cache before granting authority', async () => {
+  bustToolkitToolsCache();
+  let requiredField = 'old_field';
+  __test__.setComposioClient({
+    client: { baseURL: 'https://x' },
+    tools: {
+      getRawComposioTools: async (options: Record<string, unknown>) => {
+        if (Array.isArray(options.tools)) throw new Error('exact filter unsupported by this SDK');
+        return [{
+          slug: 'OUTLOOK_GET_PROFILE',
+          name: 'profile',
+          inputParameters: { type: 'object', required: [requiredField] },
+        }];
+      },
+    },
+  });
+  const mockFetch = (async () => ({ ok: true, json: async () => ({ items: [] }) } as Response)) as typeof fetch;
+  try {
+    await withMockedFetch(mockFetch, async () => {
+      const primed = await listComposioToolkitTools('outlook', 500);
+      assert.deepEqual((primed[0]?.inputParameters as { required?: string[] }).required, ['old_field']);
+      requiredField = 'new_field';
+      const exact = await getComposioToolBySlug('OUTLOOK_GET_PROFILE');
+      assert.deepEqual((exact?.inputParameters as { required?: string[] }).required, ['new_field'],
+        'authority refresh must use a live fallback listing, not the primed cache');
+    });
+  } finally {
+    resetComposioClient();
+  }
 });
 
 // ─── v0.5.65: execute-side version resolution for curated slugs ─────────────

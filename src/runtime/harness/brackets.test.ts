@@ -22,7 +22,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 // Dynamic imports — see eventlog.test.ts for why.
-const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput, listEvents } = await import('./eventlog.js');
+const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput, listEvents, openEventLog } = await import('./eventlog.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const { formatRecallableToolText } = await import('./tool-output-format.js');
 const { getToolOutputContext } = await import('./tool-output-context.js');
 const {
@@ -90,6 +91,19 @@ function writeAuthoritativeToolOutput(input: Parameters<typeof writeToolOutput>[
     type: 'tool_returned',
     parentEventId: called.id,
     data: { tool: input.tool ?? 'unknown_tool', callId: input.callId, effect, result: 'stored separately' },
+  });
+}
+
+function setEnvForTest(
+  context: { after: (fn: () => void) => void },
+  key: string,
+  value: string,
+): void {
+  const previous = process.env[key];
+  process.env[key] = value;
+  context.after(() => {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
   });
 }
 
@@ -1752,9 +1766,12 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
     closePlanScope(sess.id, 'test');
     await assert.rejects(async () => { await sendNo(6); }, (err: Error) => /CONFIRM_FIRST_REQUIRED/.test(err.message));
   } finally {
-    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
-    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
-    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    if (prevConfirm === undefined) delete process.env.CLEMMY_CONFIRM_FIRST;
+    else process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    if (prevExecGate === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
+    else process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
   }
 });
 
@@ -2000,6 +2017,176 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
     process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
     if (prevNudge === undefined) delete process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE;
     else process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE = prevNudge;
+  }
+});
+
+test('same-source settled Composio read is recovered without a second provider dispatch, while a new user source stays fresh', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevSettled = process.env.CLEMMY_SETTLED_READ_REPEAT;
+  const prevGuardrail = process.env.CLEMMY_TOOL_GUARDRAIL;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_SETTLED_READ_REPEAT = 'on';
+  process.env.CLEMMY_TOOL_GUARDRAIL = 'warn';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Refresh the proof release queue once.' },
+  });
+  const args = { tool_slug: 'PROOF_LIST_TASKS', arguments: '{}', connected_account_id: null };
+  const providerResult = JSON.stringify({
+    successful: true,
+    data: {
+      sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+      revision: 2,
+      items: [{ id: 'proof-release-1', status: 'done' }],
+    },
+  });
+  let providerDispatches = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      providerDispatches += 1;
+      return providerResult;
+    },
+  }) as unknown as { invoke: (rc: unknown, input: unknown, details: unknown) => Promise<unknown> };
+  const counter = new ToolCallsCounter(20);
+  const callEvent = (callId: string, runScopeId: string, sourceUserSeq: number) => appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq,
+      runScopeId,
+      tool: 'composio_execute_tool',
+      callId,
+      canonicalCallId: callId,
+      accounting: 'top_level',
+      effect: 'read',
+      effectiveTool: 'PROOF_LIST_TASKS',
+      toolSlug: 'PROOF_LIST_TASKS',
+      arguments: JSON.stringify(args),
+    },
+  });
+  const invoke = (
+    callId: string,
+    runScopeId: string,
+    sourceUserSeq: number,
+    directOrchestrator?: boolean,
+  ) => withHarnessRunContext(
+    { sessionId: sess.id, sourceUserSeq, behaviorScopeId: runScopeId, counter, ...(directOrchestrator !== undefined ? { directOrchestrator } : {}) },
+    () => wrapped.invoke(null, JSON.stringify(args), { toolCall: { callId } }),
+  );
+  try {
+    const scopeOne = `${sess.id}::turn:1`;
+    const firstCalled = callEvent('settled-source', scopeOne, source.seq);
+    const first = String(await invoke('settled-source', scopeOne, source.seq));
+    assert.match(first, /\[harness settled-read\]/, 'first verified result steers away from a duplicate');
+    writeToolOutput({
+      sessionId: sess.id,
+      callId: 'settled-source',
+      invocationNonce: 'nonce-settled-source',
+      tool: 'composio_execute_tool',
+      output: first,
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'tool_returned',
+      parentEventId: firstCalled.id,
+      data: {
+        sourceUserSeq: source.seq,
+        runScopeId: scopeOne,
+        tool: 'composio_execute_tool',
+        callId: 'settled-source',
+        canonicalCallId: 'settled-source',
+        accounting: 'top_level',
+        effect: 'read',
+        effectiveTool: 'PROOF_LIST_TASKS',
+        toolSlug: 'PROOF_LIST_TASKS',
+        result: first,
+      },
+    });
+
+    const recoveryScope = `${sess.id}::turn:2`;
+    callEvent('settled-replay', recoveryScope, source.seq);
+    const replay = String(await invoke('settled-replay', recoveryScope, source.seq));
+    assert.equal(providerDispatches, 1, 'same accepted source reuses the first physical read');
+    assert.match(replay, /PROOF_RELEASE_QUEUE:LOCAL_ONLY/);
+    assert.match(replay, /\[harness settled-read replay\]/);
+    assert.doesNotMatch(replay, /\[harness settled-read\]/,
+      'the first-success steering is not laundered into a replay');
+    const replayEvents = listEvents(sess.id, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data.kind === 'same_source_settled_read_replay');
+    assert.equal(replayEvents.length, 1);
+    assert.equal(replayEvents[0]!.data.sourceCallId, 'settled-source');
+
+    // Replay depends on a durable exact-occurrence marker. If SQLite refuses
+    // that write, the optimization must fall through and perform the provider
+    // read; treating marker persistence as best-effort telemetry would make the
+    // later hook misclassify recovered bytes as fresh authority.
+    const { openEventLog } = await import('./eventlog.js');
+    const db = openEventLog();
+    db.exec(`
+      CREATE TRIGGER fail_settled_replay_marker
+      BEFORE INSERT ON events
+      WHEN NEW.type = 'guardrail_tripped'
+        AND json_extract(NEW.data_json, '$.kind') = 'same_source_settled_read_replay'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced replay marker failure');
+      END;
+    `);
+    try {
+      const markerFailureScope = `${sess.id}::turn:marker-failure`;
+      callEvent('settled-marker-failure', markerFailureScope, source.seq);
+      const markerFailure = String(await invoke('settled-marker-failure', markerFailureScope, source.seq));
+      assert.equal(providerDispatches, 2, 'marker persistence failure falls through to normal provider dispatch');
+      assert.match(markerFailure, /PROOF_RELEASE_QUEUE:LOCAL_ONLY/);
+      assert.doesNotMatch(markerFailure, /\[harness settled-read replay\]/);
+    } finally {
+      db.exec('DROP TRIGGER IF EXISTS fail_settled_replay_marker');
+    }
+
+    // Claude workers/workflow steps carry an explicit false bit. Preserve the
+    // existing Codex/BYO undefined behavior above, while proving the bridge's
+    // non-parent lane gets neither recovery nor first-success steering.
+    const workerScope = `${sess.id}::worker:read`;
+    callEvent('settled-worker-read', workerScope, source.seq);
+    const workerRead = String(await invoke('settled-worker-read', workerScope, source.seq, false));
+    assert.equal(providerDispatches, 3, 'an explicit non-orchestrator lane performs its own read');
+    assert.doesNotMatch(workerRead, /\[harness settled-read/);
+
+    const nextSource = appendEvent({
+      sessionId: sess.id,
+      turn: 2,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Refresh it again now.' },
+    });
+    const freshScope = `${sess.id}::turn:3`;
+    callEvent('settled-new-source', freshScope, nextSource.seq);
+    await invoke('settled-new-source', freshScope, nextSource.seq);
+    assert.equal(providerDispatches, 4, 'a new accepted request still performs a fresh provider read');
+  } finally {
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    if (prevConfirm === undefined) delete process.env.CLEMMY_CONFIRM_FIRST;
+    else process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    if (prevExecGate === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
+    else process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevSettled === undefined) delete process.env.CLEMMY_SETTLED_READ_REPEAT;
+    else process.env.CLEMMY_SETTLED_READ_REPEAT = prevSettled;
+    if (prevGuardrail === undefined) delete process.env.CLEMMY_TOOL_GUARDRAIL;
+    else process.env.CLEMMY_TOOL_GUARDRAIL = prevGuardrail;
   }
 });
 
@@ -3294,11 +3481,13 @@ async function runCertifiedSendProbe(opts: { certifiedBatch?: { batchId: string;
   const { _setGoalFidelityJudgeForTests, _resetGoalFidelityStateForTests } = await import('./goal-fidelity-gate.js');
   const saved: Record<string, string | undefined> = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
     CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
     CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
     CLEMMY_BATCH_SKIP_ITEM_JUDGE: process.env.CLEMMY_BATCH_SKIP_ITEM_JUDGE,
   };
   process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
   // Isolate goal-fidelity: the other two per-write judges are off so the counter
   // reflects ONLY whether the goal-fidelity judge ran.
   process.env.CLEMMY_GROUNDING_GATE = 'off';
@@ -3622,6 +3811,16 @@ test('P0c: kill-switch CLEMMY_JUDGE_FAIL_APPROVAL=off restores plain refusal (no
 test('Layer 1: a $fromToolOutput reference is resolved to REAL store values before the tool runs', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Use the exact grounded roster for the team sync.' },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: sess.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
   const roster = { result: { records: [{ Email: 'real1@scorpion.co' }, { Email: 'real2@scorpion.co' }] } };
   writeAuthoritativeToolOutput({
     sessionId: sess.id,
@@ -3634,13 +3833,25 @@ test('Layer 1: a $fromToolOutput reference is resolved to REAL store values befo
   let received: any;
   const wrapped = wrapToolForHarness({ name: 'echo', execute: async (input) => { received = input; return 'ok'; } });
   const counter = new ToolCallsCounter(10);
-  const result = await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({
+  const result = await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: source.seq, turn: 1, counter }, () => wrapped.execute!({
     subject: 'Team sync',
     attendees: { $fromToolOutput: { callId: 'call_sf', path: 'result.records[*].Email' } },
   }));
   assert.equal(result, 'ok');
   assert.deepEqual(received.attendees, ['real1@scorpion.co', 'real2@scorpion.co'], 'the tool got the REAL resolved values, not the reference');
   assert.equal(received.subject, 'Team sync', 'non-reference fields untouched');
+  const authority = openEventLog().prepare(`
+    SELECT argument_digest, raw_argument_digest, effective_argument_digest
+      FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(sess.id, source.seq) as {
+    argument_digest: string;
+    raw_argument_digest: string;
+    effective_argument_digest: string;
+  };
+  assert.notEqual(authority.raw_argument_digest, authority.effective_argument_digest);
+  assert.equal(authority.argument_digest, authority.effective_argument_digest);
+  assert.equal(listEvents(sess.id, { types: ['logical_call_contract_refined'] }).length, 1);
 });
 
 test('Layer 1: an unresolvable reference fails closed — the tool never runs', async () => {
@@ -3656,7 +3867,8 @@ test('Layer 1: an unresolvable reference fails closed — the tool never runs', 
   assert.match(String(result), /reference_resolution_failed/);
 });
 
-test('a RESOLVED typed refusal (SDK-built tool path) settles failed — the 2026-08-06 draft-batch class', async () => {
+test('a RESOLVED typed refusal (SDK-built tool path) settles failed — the 2026-08-06 draft-batch class', async (context) => {
+  setEnvForTest(context, 'CLEMMY_EXECUTION_GATE', 'off');
   // REGRESSION PIN — the live incident: composio's gateway refusal
   // ("which Outlook account?") crossed the SDK's error_as_result as prose,
   // settled `external_write_orphaned`, and the orphan-retry gate then blocked
@@ -3719,7 +3931,8 @@ test('a RESOLVED typed refusal (SDK-built tool path) settles failed — the 2026
   });
 });
 
-test('the SDK PROSE shape of a swallowed typed error still settles orphaned — doctrine pin, never string-match it to failed', async () => {
+test('the SDK PROSE shape of a swallowed typed error still settles orphaned — doctrine pin, never string-match it to failed', async (context) => {
+  setEnvForTest(context, 'CLEMMY_EXECUTION_GATE', 'off');
   // The doctrine (integrations/composio/client.ts): prose containing the
   // not-started marker can be echoed by a provider AFTER a real commit, so a
   // STRING can never prove no-dispatch. Only the resolved class instance may.
@@ -3816,7 +4029,8 @@ test('a steer note is appended to the next tool result exactly once — settleme
 });
 
 // ── Timed-out job starts keep their provider work (2026-08-07 live scrape) ──
-test('a timed-out job-starting call is NOT cancelled, so its late result can self-park', async () => {
+test('a timed-out job-starting call is NOT cancelled, so its late result can self-park', async (context) => {
+  setEnvForTest(context, 'CLEMMY_EXECUTION_GATE', 'off');
   const { toolCallMayStartProviderJob } = await import('./brackets.js');
 
   // The predicate is verb-shaped and vendor-agnostic — it must cover job
@@ -3874,7 +4088,8 @@ test('a timed-out job-starting call is NOT cancelled, so its late result can sel
 });
 
 // ── Knowing what it already built this run (2026-08-07 double table) ──
-test('a repeated CREATE is told it already exists — informed, never blocked', async () => {
+test('a repeated CREATE is told it already exists — informed, never blocked', async (context) => {
+  setEnvForTest(context, 'CLEMMY_EXECUTION_GATE', 'off');
   const session = createSession({ id: 'sess-repeat-create', kind: 'chat' });
   let dispatches = 0;
   const wrapped = wrapToolForHarness({
@@ -3909,7 +4124,8 @@ test('a repeated CREATE is told it already exists — informed, never blocked', 
 });
 
 // ── The manager speaks on advisory drift (owner ask, 2026-08-07) ──
-test('an advisory goal-alignment miss reaches the MODEL as a manager nudge, and the work still proceeds', async () => {
+test('an advisory goal-alignment miss reaches the MODEL as a manager nudge, and the work still proceeds', async (context) => {
+  setEnvForTest(context, 'CLEMMY_EXECUTION_GATE', 'off');
   const { _setGoalFidelityJudgeForTests, _resetGoalFidelityStateForTests } =
     await import('./goal-fidelity-gate.js');
   resetEventLog();

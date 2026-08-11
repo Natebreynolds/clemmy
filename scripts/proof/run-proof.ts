@@ -12,10 +12,34 @@
  * (SKIPs don't count) — usable as a pre-release gate next to test:smoke.
  */
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { planBrain, provisionDaemon } from './provision.js';
+import {
+  parseProofBenchmarkFlags,
+  proofBenchmarkMetadata,
+} from './benchmark-comparison.js';
+import {
+  assertRequiredBrainsSelected,
+  parseRequiredBrains,
+  unavailableBrainDisposition,
+} from './required-brains.js';
+import {
+  routeSessionsForRouteCheck,
+  servedModelSessionIdsForOutcomes,
+} from './route-expectation.js';
+import { DIRTY_DEV_EVIDENCE_BANNER, decideProofSourceGuard } from './source-guard.js';
+import {
+  evaluateProofSourceStability,
+  fingerprintProofSourceFromGit,
+  PROOF_SOURCE_PATHS,
+  writeProofReportFiles,
+} from './report-output.js';
+import {
+  assertProofTempCapacity,
+  proofDaemonStopChecks,
+} from './runtime-safety.js';
 import {
   exactBrainRouteChecks,
   exactBrainServedChecks,
@@ -40,6 +64,7 @@ import { gatedMutation } from './scenarios/gated-mutation.js';
 import { converseFirst } from './scenarios/converse-first.js';
 import { chatSpineGraphDrive } from './scenarios/chat-spine-graph-drive.js';
 import { clarifyThenExecute } from './scenarios/clarify-then-execute.js';
+import { clarifyThenDecline } from './scenarios/clarify-then-decline.js';
 import { workspaceBuild } from './scenarios/workspace-build.js';
 import { teamAgentHandoff } from './scenarios/team-agent-handoff.js';
 import { teamDelegationRoundtrip } from './scenarios/team-delegation-roundtrip.js';
@@ -58,7 +83,9 @@ import { socialStudioLifecycle } from './scenarios/social-studio-lifecycle.js';
 import { pendingActionExactOnce } from './scenarios/pending-action-exact-once.js';
 import { bookkeepingReceiptExactOnce } from './scenarios/bookkeeping-receipt-exact-once.js';
 import { workspaceTemporalHistory } from './scenarios/workspace-temporal-history.js';
-import type { BrainKind, FusionProofMode, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
+import { discoveryReuseHorizon } from './scenarios/discovery-reuse-horizon.js';
+import { conversationSwitchResumeHorizon } from './scenarios/conversation-switch-resume-horizon.js';
+import type { BrainKind, Check, FusionProofMode, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
 const DEFAULT_SCENARIOS: ScenarioDef[] = [
   fanoutMultiItem,
@@ -88,6 +115,7 @@ const DEFAULT_SCENARIOS: ScenarioDef[] = [
 ];
 const SCENARIO_CATALOG: ScenarioDef[] = [
   ...DEFAULT_SCENARIOS,
+  clarifyThenDecline,
   fusionBoundedVerifier,
   socialStudioLifecycle,
   pendingActionExactOnce,
@@ -96,8 +124,11 @@ const SCENARIO_CATALOG: ScenarioDef[] = [
   correctionSupersedesStore,
   businessDayLive,
   growsWithUserLive,
+  discoveryReuseHorizon,
+  conversationSwitchResumeHorizon,
 ];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 function parseArgs(argv: string[]): {
   brains: BrainKind[];
@@ -105,18 +136,27 @@ function parseArgs(argv: string[]): {
   scoreOnly?: string;
   keep: boolean;
   fusionMode: FusionProofMode;
+  allowDirtyDev: boolean;
+  requiredBrains: BrainKind[];
+  benchmarkRequest: ReturnType<typeof parseProofBenchmarkFlags>;
 } {
+  const benchmarkRequest = parseProofBenchmarkFlags(argv);
   const brains: BrainKind[] = [];
   const scenarioNames: string[] = [];
   let scoreOnly: string | undefined;
   let keep = false;
   let fusionMode: FusionProofMode = 'off';
+  let allowDirtyDev = false;
+  const requiredBrains: BrainKind[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--brain') brains.push(...(argv[++i] ?? '').split(',').filter((b): b is BrainKind => ALL_BRAINS.includes(b as BrainKind)));
     else if (a === '--scenario') scenarioNames.push(...(argv[++i] ?? '').split(','));
     else if (a === '--score-only') scoreOnly = argv[++i];
     else if (a === '--keep') keep = true;
+    else if (a === '--allow-dirty-dev') allowDirtyDev = true;
+    else if (a === '--require-brains') requiredBrains.push(...parseRequiredBrains(argv[++i]));
+    else if (a === '--benchmark-cohort' || a === '--benchmark-sample') i += 1;
     else if (a === '--fusion') {
       const raw = (argv[++i] ?? '').trim().toLowerCase();
       if (raw !== 'high' && raw !== 'all') throw new Error('--fusion requires high or all');
@@ -128,7 +168,19 @@ function parseArgs(argv: string[]): {
     : DEFAULT_SCENARIOS;
   const missing = scenarioNames.filter((name) => !scenarios.some((scenario) => scenario.name === name));
   if (missing.length > 0) throw new Error(`Unknown proof scenario(s): ${missing.join(', ')}`);
-  return { brains: brains.length ? brains : [...ALL_BRAINS], scenarios, scoreOnly, keep, fusionMode };
+  const selectedBrains = brains.length ? [...new Set(brains)] : [...ALL_BRAINS];
+  const uniqueRequiredBrains = [...new Set(requiredBrains)];
+  assertRequiredBrainsSelected(selectedBrains, uniqueRequiredBrains);
+  return {
+    brains: selectedBrains,
+    scenarios,
+    scoreOnly,
+    keep,
+    fusionMode,
+    allowDirtyDev,
+    requiredBrains: uniqueRequiredBrains,
+    benchmarkRequest,
+  };
 }
 
 function fmtMs(ms: number | null | undefined): string {
@@ -150,9 +202,19 @@ function printScoreboard(outcomes: ScenarioOutcome[]): void {
 }
 
 async function main(): Promise<void> {
-  const { brains, scenarios, scoreOnly, keep, fusionMode } = parseArgs(process.argv.slice(2));
+  const {
+    brains,
+    scenarios,
+    scoreOnly,
+    keep,
+    fusionMode,
+    allowDirtyDev,
+    requiredBrains,
+    benchmarkRequest,
+  } = parseArgs(process.argv.slice(2));
 
   if (scoreOnly) {
+    if (benchmarkRequest) throw new Error('benchmark metadata is unavailable in --score-only mode');
     const db = openHarnessDb(scoreOnly);
     const all = summarizeAllSessions(db);
     db.close();
@@ -162,20 +224,27 @@ async function main(): Promise<void> {
 
   const startedAt = new Date().toISOString();
   let gitHead = 'unknown';
+  let sourceFingerprint = '';
   let sourceClean = false;
   try {
-    gitHead = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    gitHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    }).trim();
     const dirty = execFileSync(
       'git',
-      ['status', '--porcelain', '--untracked-files=all', '--', 'src', 'apps', 'scripts', 'docs', 'package.json', 'package-lock.json'],
-      { encoding: 'utf-8' },
+      ['status', '--porcelain', '--untracked-files=all', '--', ...PROOF_SOURCE_PATHS],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
     ).trim();
-    sourceClean = dirty.length === 0;
-    if (!sourceClean) {
-      throw new Error(
-        `Live proof requires one reproducible candidate commit. Commit the intended source first (no tag required).\n${dirty.slice(0, 4_000)}`,
-      );
-    }
+    const sourceDecision = decideProofSourceGuard(dirty, allowDirtyDev);
+    if (!sourceDecision.allowed) throw new Error(sourceDecision.error);
+    sourceClean = sourceDecision.sourceClean;
+    if (sourceDecision.devEvidence) console.warn(`\n${sourceDecision.warning}`);
+    sourceFingerprint = fingerprintProofSourceFromGit({
+      repoRoot: REPO_ROOT,
+      gitHead,
+      sourcePaths: PROOF_SOURCE_PATHS,
+    });
   } catch (error) {
     if (error instanceof Error && /reproducible candidate commit/.test(error.message)) throw error;
     // Not a Git checkout is still scoreable, but it is not release evidence.
@@ -186,27 +255,44 @@ async function main(): Promise<void> {
   // from the fingerprinted commit before every live matrix so a green proof can
   // never come from stale generated JS (a source-only Workspace fix was once
   // "validated" against the previous dist and produced the old tool schema).
-  console.log(`\n→ building candidate ${gitHead.slice(0, 12)} …`);
+  console.log(sourceClean
+    ? `\n→ building candidate ${gitHead.slice(0, 12)} …`
+    : `\n→ building dirty working tree at ${gitHead.slice(0, 12)} …`);
   try {
-    execFileSync('npm', ['run', 'build'], { stdio: 'inherit' });
+    execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'inherit' });
   } catch (error) {
     throw new Error(`Candidate build failed before live proof: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   const outcomes: ScenarioOutcome[] = [];
+  const runtimeChecks: Check[] = [];
   for (const brainKind of brains) {
     const plan = planBrain(brainKind);
     if (plan.skipReason) {
+      const unavailable = unavailableBrainDisposition(brainKind, plan.skipReason, requiredBrains);
       for (const s of scenarios) {
-        outcomes.push({ scenario: s.name, brain: brainKind, status: 'SKIP', checks: [], latency: [], error: plan.skipReason });
+        outcomes.push({
+          scenario: s.name,
+          brain: brainKind,
+          status: unavailable.status,
+          checks: [],
+          latency: [],
+          error: unavailable.error,
+        });
       }
-      console.log(`⏭️  ${brainKind}: SKIP (${plan.skipReason})`);
+      console.log(unavailable.status === 'FAIL'
+        ? `❌ ${brainKind}: FAIL (${unavailable.error})`
+        : `⏭️  ${brainKind}: SKIP (${unavailable.error})`);
       continue;
     }
     console.log(`\n→ provisioning daemon for brain=${brainKind} …`);
     let daemon;
     try {
-      daemon = await provisionDaemon(plan, { keepHome: keep, fusionMode });
+      daemon = await provisionDaemon(plan, {
+        keepHome: keep,
+        fusionMode,
+        requireWorkerProvider: scenarios.some((scenario) => scenario.workerRouteExpectation),
+      });
     } catch (err) {
       for (const s of scenarios) {
         outcomes.push({ scenario: s.name, brain: brainKind, status: 'FAIL', checks: [], latency: [], error: `provision: ${err instanceof Error ? err.message : String(err)}` });
@@ -215,76 +301,185 @@ async function main(): Promise<void> {
     }
     console.log(`  daemon up on :${daemon.port} home=${daemon.home}`);
     let anyFailed = false;
-    for (const scenario of scenarios) {
-      console.log(`  ▶ ${scenario.name} …`);
-      daemon.markLog(); // scope daemon.log() (storm check) to THIS scenario
-      try {
-        const result = await scenario.run(daemon);
-        const checks = [...result.checks];
-        if (scenario.routeExpectation === 'exact-brain') {
-          if (result.sessionId) checks.push(...exactBrainRouteChecks(daemon.home, result.sessionId, brainKind, result.latency.length, plan.expectedBrain));
-          else checks.push({ name: 'exact route has a scenario session id', pass: false, detail: 'scenario returned no sessionId' });
-        } else if (scenario.routeExpectation === 'exact-workflow-step') {
-          if (result.sessionId) checks.push(...exactWorkflowStepRouteChecks(daemon.home, result.sessionId, brainKind, plan.expectedBrain));
-          else checks.push({ name: 'exact workflow route has a step session id', pass: false, detail: 'scenario returned no sessionId' });
+    try {
+      for (const scenario of scenarios) {
+        console.log(`  ▶ ${scenario.name} …`);
+        try {
+          // A leg can consume disk after provisioning. Fail closed again before
+          // every scenario so the first paid/provider-capable action never starts
+          // against an already unsafe volume.
+          assertProofTempCapacity(daemon.home);
+          daemon.markLog(); // scope daemon.log() (storm check) to THIS scenario
+          const result = await scenario.run(daemon, { brain: brainKind });
+          const checks = [...result.checks];
+          if (scenario.routeExpectation === 'exact-brain') {
+            const routeSessions = routeSessionsForRouteCheck(scenario, {
+              sessionId: result.sessionId,
+              routeSessions: result.routeSessions,
+              latencySampleCount: result.latency.length,
+            });
+            if (routeSessions.length > 0) {
+              for (const route of routeSessions) {
+                checks.push(...exactBrainRouteChecks(
+                  daemon.home,
+                  route.sessionId,
+                  brainKind,
+                  route.expectedModelTurns,
+                  plan.expectedBrain,
+                ).map((check) => ({ ...check, name: `${route.sessionId}: ${check.name}` })));
+                // A route marker proves intent before dispatch. Require completed
+                // exact-model usage in EACH routed session so a green warm leg
+                // cannot hide a cold leg that never reached the configured brain.
+                checks.push(...exactBrainServedChecks(
+                  daemon.home,
+                  [route.sessionId],
+                  plan.expectedBrain,
+                ).map((check) => ({ ...check, name: `${route.sessionId}: ${check.name}` })));
+              }
+            } else checks.push({ name: 'exact route has a scenario session id', pass: false, detail: 'scenario returned no sessionId or routeSessions' });
+          } else if (scenario.routeExpectation === 'exact-workflow-step') {
+            if (result.sessionId) checks.push(...exactWorkflowStepRouteChecks(daemon.home, result.sessionId, brainKind, plan.expectedBrain));
+            else checks.push({ name: 'exact workflow route has a step session id', pass: false, detail: 'scenario returned no sessionId' });
+          }
+          if (scenario.workerRouteExpectation) {
+            if (result.sessionId) checks.push(...exactWorkerRouteChecks(daemon.home, result.sessionId, plan.expectedWorker));
+            else checks.push({ name: 'exact worker route has a scenario session id', pass: false, detail: 'scenario returned no sessionId' });
+          }
+          const fusionSessionIds = [...new Set([
+            ...(result.routeSessions ?? []).map((route) => route.sessionId),
+            ...(result.sessionId ? [result.sessionId] : []),
+          ])];
+          for (const fusionSessionId of fusionSessionIds) {
+            checks.push(...(
+              fusionMode === 'off'
+                ? fusionDisabledChecks(daemon.home, fusionSessionId)
+                : fusionBoundedChecks(daemon.home, fusionSessionId, brainKind, plan.expectedFusionChecker)
+            ).map((check) => ({ ...check, name: `${fusionSessionId}: ${check.name}` })));
+          }
+          const failed = checks.some((c) => !c.pass);
+          anyFailed ||= failed;
+          outcomes.push({ ...result, checks, scenario: scenario.name, brain: brainKind, status: failed ? 'FAIL' : 'PASS' });
+          console.log(`    ${failed ? '❌ FAIL' : '✅ PASS'} (${checks.filter((c) => c.pass).length}/${checks.length} checks)`);
+        } catch (err) {
+          anyFailed = true;
+          outcomes.push({ scenario: scenario.name, brain: brainKind, status: 'FAIL', checks: [], latency: [], error: err instanceof Error ? err.message : String(err) });
+          console.log(`    ❌ FAIL (${err instanceof Error ? err.message : String(err)})`);
         }
-        if (scenario.workerRouteExpectation) {
-          if (result.sessionId) checks.push(...exactWorkerRouteChecks(daemon.home, result.sessionId, plan.expectedWorker));
-          else checks.push({ name: 'exact worker route has a scenario session id', pass: false, detail: 'scenario returned no sessionId' });
-        }
-        if (result.sessionId) {
-          checks.push(...(
-            fusionMode === 'off'
-              ? fusionDisabledChecks(daemon.home, result.sessionId)
-              : fusionBoundedChecks(daemon.home, result.sessionId, brainKind, plan.expectedFusionChecker)
-          ));
-        }
-        const failed = checks.some((c) => !c.pass);
-        anyFailed ||= failed;
-        outcomes.push({ ...result, checks, scenario: scenario.name, brain: brainKind, status: failed ? 'FAIL' : 'PASS' });
-        console.log(`    ${failed ? '❌ FAIL' : '✅ PASS'} (${checks.filter((c) => c.pass).length}/${checks.length} checks)`);
-      } catch (err) {
+      }
+      // A route marker alone is not proof of a completed provider call. Bind the
+      // whole-leg backstop to only this leg's scenario sessions and exact model.
+      const legSessionIds = servedModelSessionIdsForOutcomes(
+        outcomes.filter((outcome) => outcome.brain === brainKind),
+      );
+      const servedChecks = exactBrainServedChecks(daemon.home, legSessionIds, plan.expectedBrain);
+      const brainOk = servedChecks.every((check) => check.pass);
+      outcomes.push({
+        scenario: '(brain-served)',
+        brain: brainKind,
+        status: brainOk ? 'PASS' : 'FAIL',
+        checks: servedChecks,
+        latency: [],
+      });
+      if (!brainOk) {
         anyFailed = true;
-        outcomes.push({ scenario: scenario.name, brain: brainKind, status: 'FAIL', checks: [], latency: [], error: err instanceof Error ? err.message : String(err) });
-        console.log(`    ❌ FAIL (${err instanceof Error ? err.message : String(err)})`);
+        console.log(`  ❌ exact model proof failed — expected ${plan.expectedBrain.provider}:${plan.expectedBrain.modelId || '(missing)'}`);
+      }
+    } catch (error) {
+      anyFailed = true;
+      const detail = error instanceof Error ? error.message : String(error);
+      outcomes.push({
+        scenario: '(brain-runner)',
+        brain: brainKind,
+        status: 'FAIL',
+        checks: [],
+        latency: [],
+        error: detail,
+      });
+      console.log(`  ❌ brain runner failed (${detail})`);
+    } finally {
+      if (anyFailed) console.log(`  (keeping ${daemon.home} for forensics)`);
+      try {
+        const stopResult = await daemon.stop({ keepHome: anyFailed || keep });
+        const stopChecks = proofDaemonStopChecks(brainKind, stopResult);
+        runtimeChecks.push(...stopChecks);
+        for (const check of stopChecks.filter((candidate) => !candidate.pass)) {
+          console.log(`  ❌ ${check.name}${check.detail ? ` — ${check.detail}` : ''}`);
+        }
+      } catch (error) {
+        // `stop()` is designed to return failures, but keep this final guard so a
+        // teardown regression cannot erase the otherwise-complete proof report.
+        runtimeChecks.push({
+          name: `${brainKind} daemon teardown completed with reportable evidence`,
+          pass: false,
+          detail: error instanceof Error ? error.message : String(error),
+        });
       }
     }
-    // A route marker alone is not proof of a completed provider call. Bind the
-    // whole-leg backstop to only this leg's scenario sessions and exact model.
-    const legSessionIds = outcomes
-      .filter((outcome) => outcome.brain === brainKind && outcome.sessionId)
-      .map((outcome) => outcome.sessionId as string);
-    const servedChecks = exactBrainServedChecks(daemon.home, legSessionIds, plan.expectedBrain);
-    const brainOk = servedChecks.every((check) => check.pass);
-    outcomes.push({
-      scenario: '(brain-served)',
-      brain: brainKind,
-      status: brainOk ? 'PASS' : 'FAIL',
-      checks: servedChecks,
-      latency: [],
-    });
-    if (!brainOk) {
-      anyFailed = true;
-      console.log(`  ❌ exact model proof failed — expected ${plan.expectedBrain.provider}:${plan.expectedBrain.modelId || '(missing)'}`);
-    }
-    if (anyFailed) console.log(`  (keeping ${daemon.home} for forensics)`);
-    await daemon.stop({ keepHome: anyFailed || keep });
   }
 
-  const failures = outcomes.filter((o) => o.status === 'FAIL').length;
+  let gitHeadEnd: string | undefined;
+  let sourceFingerprintEnd: string | undefined;
+  let sourceCleanAtEnd = false;
+  try {
+    gitHeadEnd = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    }).trim();
+    sourceFingerprintEnd = fingerprintProofSourceFromGit({
+      repoRoot: REPO_ROOT,
+      gitHead: gitHeadEnd,
+      sourcePaths: PROOF_SOURCE_PATHS,
+    });
+    sourceCleanAtEnd = execFileSync(
+      'git',
+      ['status', '--porcelain', '--untracked-files=all', '--', ...PROOF_SOURCE_PATHS],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    ).trim().length === 0;
+  } catch { /* the pure stability decision below fails closed */ }
+  const sourceStability = evaluateProofSourceStability({
+    sourceFingerprintStart: sourceFingerprint,
+    sourceFingerprintEnd,
+    sourceCleanAtStart: sourceClean,
+    sourceCleanAtEnd,
+  });
+  sourceClean = sourceStability.sourceClean;
+  const reportChecks = [sourceStability.check, ...runtimeChecks];
+  const failures = outcomes.filter((o) => o.status === 'FAIL').length
+    + reportChecks.filter((check) => !check.pass).length;
+  const benchmark = benchmarkRequest
+    ? proofBenchmarkMetadata(benchmarkRequest, {
+        fusionMode,
+        scenarios: scenarios.map((scenario) => ({
+          name: scenario.name,
+          inputs: scenario.benchmarkWorkload,
+        })),
+      })
+    : undefined;
   const report: ProofReport = {
     startedAt,
     finishedAt: new Date().toISOString(),
     gitHead,
+    ...(gitHeadEnd ? { gitHeadEnd } : {}),
+    sourceFingerprint,
+    ...(sourceStability.sourceFingerprintEnd
+      ? { sourceFingerprintEnd: sourceStability.sourceFingerprintEnd }
+      : {}),
+    sourceStable: sourceStability.sourceStable,
     sourceClean,
     fusionMode,
+    ...(benchmark ? { benchmark } : {}),
+    reportChecks,
     outcomes,
     failures,
   };
-  const reportPath = path.resolve('proof-report.json');
-  writeFileSync(reportPath, JSON.stringify(report, null, 2));
+  const reportPaths = writeProofReportFiles({ report, outputRoot: REPO_ROOT });
   printScoreboard(outcomes);
-  console.log(`\nreport: ${reportPath}`);
+  for (const check of reportChecks.filter((candidate) => !candidate.pass)) {
+    console.log(`❌ report × ${check.name}${check.detail ? ` — ${check.detail}` : ''}`);
+  }
+  console.log(`\nreport: ${reportPaths.latestPath}`);
+  console.log(`archive: ${reportPaths.archivePath}`);
+  if (!sourceClean) console.warn(`\n${DIRTY_DEV_EVIDENCE_BANNER}`);
   console.log(failures === 0 ? '✅ proof green' : `❌ ${failures} failure(s)`);
   process.exit(failures);
 }

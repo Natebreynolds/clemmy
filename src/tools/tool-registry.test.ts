@@ -225,9 +225,18 @@ test('WORKFLOW_STEP_BLOCKED_TOOL_NAMES == deriveWorkflowStepBlocked() (minus kno
   assertSetEqual(deriveWorkflowStepBlocked(), expected, 'F1 workflow-step blocked');
 });
 
-test('workerBlockedToolNames (F1 ∪ {notify_user}) == deriveWorkerBlocked() (minus known phantoms)', () => {
-  // sub-agents.ts defines workerBlockedToolNames = WORKFLOW_STEP_BLOCKED ∪ {notify_user}.
-  const f2 = new Set<string>([...WORKFLOW_STEP_BLOCKED_TOOL_NAMES, 'notify_user']);
+test('workerBlockedToolNames (F1 + collision/commit vectors) == deriveWorkerBlocked() (minus known phantoms)', () => {
+  // sub-agents.ts adds user-collision and parent-only compose→commit vectors
+  // to the workflow-step recursion/meta baseline.
+  const f2 = new Set<string>([
+    ...WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
+    'notify_user',
+    'run_batch',
+    'request_approval',
+    'pending_action_queue',
+    'pending_action_execute',
+    'pending_action_record_result',
+  ]);
   const expected = new Set([...f2].filter((n) => !KNOWN_UNREGISTERED_BLOCKLIST.has(n)));
   assertSetEqual(deriveWorkerBlocked(), expected, 'F2 worker blocked');
 });

@@ -40,6 +40,11 @@ import {
   toolFamilyForChoice,
   type StepToolChoiceMatch,
 } from '../../memory/tool-choice-store.js';
+import {
+  capabilityEffectIsCompatible,
+  requestedCapabilityEffectScope,
+  type CapabilityEffect,
+} from '../../memory/capability-effect-scope.js';
 
 export type CapabilityCandidateTier = 'exact' | 'semantic';
 
@@ -53,6 +58,8 @@ export type CapabilityCandidate = {
   accountIdentity?: string;
   via: CapabilityCandidateTier;
   score: number;
+  /** Receipt-backed aliases are read; legacy lexical rows may be unknown. */
+  effectClass?: CapabilityEffect;
 };
 
 export type TurnCapabilityCandidates = {
@@ -79,6 +86,7 @@ function candidateFromMatch(match: StepToolChoiceMatch): CapabilityCandidate {
     ...(match.accountIdentity ? { accountIdentity: match.accountIdentity } : {}),
     via: 'exact',
     score: match.score,
+    ...(match.effectClass ? { effectClass: match.effectClass } : {}),
   };
 }
 
@@ -97,6 +105,9 @@ function candidateFromAlias(row: CapabilityAliasRow, score: number): CapabilityC
     ...(row.accountIdentity ? { accountIdentity: row.accountIdentity } : {}),
     via: 'semantic',
     score,
+    // The semantic alias index is materialized only from verified successful
+    // read receipts; writes never enter this retrieval class.
+    effectClass: 'read',
   };
 }
 
@@ -142,6 +153,7 @@ export async function resolveTurnCapabilityCandidates(options: {
   if (!input) return empty;
   const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_LIMIT, 10));
   const scope = options.scope ?? daemonAliasScope();
+  const requestedEffect = requestedCapabilityEffectScope(input);
 
   let matches: StepToolChoiceMatch[] = [];
   try {
@@ -176,6 +188,7 @@ export async function resolveTurnCapabilityCandidates(options: {
       });
       for (const hit of hits) {
         const candidate = candidateFromAlias(hit.row, hit.score);
+        if (!capabilityEffectIsCompatible(requestedEffect, candidate.effectClass ?? 'unknown')) continue;
         if (byIdentifier.has(candidateKey(candidate))) continue;
         byIdentifier.set(candidateKey(candidate), candidate);
       }
@@ -244,11 +257,15 @@ export function renderCapabilityCandidateCard(resolved: TurnCapabilityCandidates
       c.via === 'semantic' ? `matched by meaning (${c.score.toFixed(2)})` : 'proven for phrasing like this',
       ...(c.accountIdentity ? [`account ${c.accountIdentity}`] : []),
     ].join('; ');
-    return `- ${c.kind} \`${c.identifier}\` (${c.intent}) — ${provenance}`;
+    const execution = c.kind === 'composio'
+      ? `Execute with \`composio_execute_tool\`; set \`tool_slug\` to exactly \`${c.identifier}\`.`
+      : `Exact ${c.kind} identifier: \`${c.identifier}\`.`;
+    return `- ${execution} Learned intent label (metadata only; NEVER a tool name): ${JSON.stringify(c.intent)} — ${provenance}`;
   });
   return [
-    '## Proven capabilities for this request (advisory)',
-    'These worked before for requests like this one. Verify fit and choose your own arguments/account — nothing here is pre-authorized.',
+    '## Proven execution paths for this request (advisory)',
+    'These worked before for requests like this one. Verify fit and choose fresh arguments/account — nothing here is pre-authorized.',
+    'A learned intent label is descriptive metadata, not an executable tool. NEVER pass it to `call_tool`. For a Composio row, call `composio_execute_tool` with the exact identifier as `tool_slug`; do not rediscover that capability.',
     ...lines,
   ].join('\n');
 }

@@ -44,6 +44,13 @@ import {
   externalWriteSemanticFingerprint,
 } from './external-write-admission.js';
 import { exactApprovalAuthorityMatches } from './approval-authority.js';
+import {
+  decodedToolArgs,
+  extractComposioSlug,
+  isComposioMultiplexerName,
+  resolveToolInvocation,
+  toolActionSegment,
+} from '../../agents/tool-invocation.js';
 
 /**
  * The tool-choice identifier an approval maps to (Thread 2 — outcome loop).
@@ -195,14 +202,6 @@ function normalizedResendApprovalKey(key: string): string {
     .toLowerCase();
 }
 
-function decodedApprovalArgs(value: unknown): Record<string, unknown> | null {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  if (typeof value !== 'string') return null;
-  return safeParse(value);
-}
-
 /**
  * Derive authority from the action the human actually approved. The registry's
  * wrapper name is not enough for Composio/call_tool approvals: their concrete
@@ -213,23 +212,18 @@ function approvedResendActionKey(
   tool: string | null,
   args: Record<string, unknown> | null,
 ): string | null {
-  const approvedTool = tool?.trim();
-  if (!approvedTool) return null;
-  const normalizedTool = approvedTool.replace(/^mcp__/, '');
-  const tail = normalizedTool.split('__').at(-1)?.toLowerCase() ?? normalizedTool.toLowerCase();
+  const outerTool = tool?.trim();
+  if (!outerTool) return null;
+  const resolved = resolveToolInvocation(outerTool, args ?? {});
+  if (!resolved.valid) return null;
+  const approvedTool = resolved.toolName;
+  const approvedArgs = decodedToolArgs(resolved.args) ?? {};
+  const tail = toolActionSegment(approvedTool);
 
-  if (approvedTool === 'composio_execute_tool' || tail === 'composio_execute_tool') {
-    const slug = typeof args?.tool_slug === 'string' ? args.tool_slug.trim() : '';
+  if (isComposioMultiplexerName(approvedTool)) {
+    const slug = extractComposioSlug(approvedArgs);
     return slug ? canonicalExternalWriteActionKey(approvedTool, slug) : null;
   }
-
-  if (tail === 'call_tool') {
-    const delegatedTool = typeof args?.name === 'string' ? args.name.trim() : '';
-    if (!delegatedTool || delegatedTool === approvedTool) return null;
-    const delegatedArgs = decodedApprovalArgs(args?.args_json ?? args?.arguments ?? {});
-    return approvedResendActionKey(delegatedTool, delegatedArgs);
-  }
-
   if (tail.startsWith('cx_')) {
     return canonicalExternalWriteActionKey(approvedTool, tail.slice('cx_'.length));
   }
@@ -525,17 +519,31 @@ export type ResumableApprovalClaim =
  * Inspect and, for an approved row, atomically consume the exact-payload grant.
  * Only the first caller receives `approved`; every later caller sees `consumed`.
  * Rejected/expired/cancelled decisions remain terminal for this parked step and
- * can never be replaced by a silently minted approval.
+ * can never be replaced by a silently minted approval. A live WAIT caller may
+ * also provide the exact card id it awaited so a newer same-key row cannot be
+ * selected during the poll-to-claim race window.
  */
-export function claimResumableApproval(resumeKey: string): ResumableApprovalClaim {
+export function claimResumableApproval(
+  resumeKey: string,
+  expectedApprovalId?: string,
+): ResumableApprovalClaim {
   const db = openEventLog();
   const claim = db.transaction((): ResumableApprovalClaim => {
-    const row = db.prepare(`
-      SELECT * FROM pending_approvals
-       WHERE resume_key = ?
-       ORDER BY requested_at DESC, rowid DESC
-       LIMIT 1
-    `).get(resumeKey) as ApprovalSqlRow | undefined;
+    // WAIT callers already know the exact card they awaited. Constraining the
+    // atomic claim by that id prevents a newer same-payload card from being
+    // consumed in its place between the poll result and this transaction.
+    const row = expectedApprovalId
+      ? db.prepare(`
+          SELECT * FROM pending_approvals
+           WHERE resume_key = ? AND approval_id = ?
+           LIMIT 1
+        `).get(resumeKey, expectedApprovalId) as ApprovalSqlRow | undefined
+      : db.prepare(`
+          SELECT * FROM pending_approvals
+           WHERE resume_key = ?
+           ORDER BY requested_at DESC, rowid DESC
+           LIMIT 1
+        `).get(resumeKey) as ApprovalSqlRow | undefined;
     if (!row) return { state: 'none' };
 
     const current = rowToPublic(row);

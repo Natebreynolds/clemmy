@@ -12,9 +12,15 @@ import {
   stripMcpToolCarrier,
 } from './mcp-tool-authority.js';
 import { rankToolsBySemantic, semanticToolRankEnabled } from './mcp-tool-rank.js';
+import { harnessRunContextStorage } from './harness/brackets.js';
+import { appendEvent } from './harness/eventlog.js';
 import { isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { listToolChoices, type ToolChoiceRecord, type ToolChoiceRecordChoice } from '../memory/tool-choice-store.js';
-import type { McpToolScope } from './mcp-tool-scope.js';
+import {
+  mcpToolScopeAuthority,
+  mergeDeniedServerSlugs,
+  type McpToolScope,
+} from './mcp-tool-scope.js';
 import type { ManagedMcpServer } from '../types.js';
 
 function positiveIntEnv(key: string, fallback: number): number {
@@ -311,12 +317,140 @@ function scopeCacheKey(scope: McpToolScope): string {
   });
 }
 
+function recordToolAcquisition(data: Record<string, unknown>): void {
+  const ctx = harnessRunContextStorage.getStore();
+  if (!ctx?.sessionId) return;
+  try {
+    appendEvent({
+      sessionId: ctx.sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'mcp_tool_acquired',
+      data: {
+        ...data,
+        ...(Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0
+          ? { sourceUserSeq: ctx.sourceUserSeq }
+          : {}),
+      },
+    });
+  } catch {
+    // Acquisition authority is the catalog, never telemetry availability.
+  }
+}
+
+/**
+ * Admit an authorized tool the working set did not advertise, and return the
+ * shim that can actually reach it.
+ *
+ * Authorization is checked against the CONFIGURED catalog — the servers the
+ * user enabled — not against this turn's base shim. A turn scoped to one
+ * keyword family holds a base containing only that family's servers, and a
+ * sibling system the user connected is no less authorized for being off-topic
+ * a moment ago. Resolving through config also means the check costs nothing:
+ * only the one server that is actually needed gets connected.
+ *
+ * Mutates `selected` so the acquisition holds for the rest of the turn — a tool
+ * proven necessary once should not have to be re-argued on the next call.
+ */
+async function acquireToolIntoWorkingSet(
+  base: MCPServer,
+  scope: McpToolScope,
+  executableToolName: string,
+  selected: Set<string> | null,
+): Promise<MCPServer> {
+  const advertised = selected ? selected.size : null;
+  const parsed = parseNamespacedTool(executableToolName);
+  if (!parsed) {
+    throw new Error(`Malformed namespaced MCP tool name: "${executableToolName}".`);
+  }
+
+  const admit = (serverSlug: string, target: MCPServer, widened: boolean): MCPServer => {
+    selected?.add(executableToolName);
+    recordToolAcquisition({
+      tool: executableToolName,
+      serverSlug,
+      reason: 'named_outside_working_set',
+      scopeReason: scope.reason,
+      advertised,
+      widenedBeyondTurnBase: widened,
+    });
+    return target;
+  };
+
+  // The turn's own base was built from the user's configured servers, so a tool
+  // it can already see is authorized by construction — and reaching it costs
+  // nothing extra.
+  const reachable = await base.listTools()
+    .then((tools) => tools.some((tool) => stripMcpToolCarrier(tool.name) === executableToolName))
+    .catch(() => false);
+  if (reachable) return admit(parsed.serverSlug, base, false);
+
+  // Otherwise the tool belongs to a system this turn did not attach. Consult
+  // the configured catalog, and bring up only that one server.
+  const configured = enabledExternalServers().find(
+    (server) => mcpServerAliasMatches(slugifyServerName(server.name), parsed.serverSlug),
+  );
+  if (!configured) {
+    const available = enabledExternalServers().map((server) => slugifyServerName(server.name));
+    throw new Error(
+      `external MCP tool "${executableToolName}" is not in your connected, authorized catalog. `
+      + `Connected servers: ${available.length > 0 ? available.join(', ') : '(none)'}.`,
+    );
+  }
+  const serverSlug = slugifyServerName(configured.name);
+  const resolved = serverShimResolverForTests
+    ? serverShimResolverForTests(serverSlug)
+    : ensureScopedExternalBaseShim({ allowedServerSlugs: [serverSlug] });
+  return admit(serverSlug, resolved, true);
+}
+
+/** Test seam for the cross-server acquisition route. Production always resolves
+ *  through the configured-server base shim. */
+let serverShimResolverForTests: ((slug: string) => MCPServer) | null = null;
+
+/**
+ * Advertises nothing and connects nothing, yet remains reachable.
+ *
+ * This is what a zero-width turn should always have been: no schema tax, no
+ * cold-started servers, and no false claim that the user's connectors are gone.
+ * The first exactly-named authorized tool brings up only its own server.
+ */
+function acquireOnlyExternalShim(scope: McpToolScope): MCPServer {
+  const acquired = new Set<string>();
+  return {
+    cacheToolsList: false,
+    name: 'clementine-external-acquire-only',
+    async connect() {},
+    async close() {},
+    async listTools() {
+      return [];
+    },
+    async callTool(toolName, args) {
+      const executableToolName = stripMcpToolCarrier(toolName);
+      if (!mcpToolAllowedByScope(toolName, scope)) {
+        throw new Error(`external MCP tool is outside this turn's scope: ${toolName}`);
+      }
+      const target = await acquireToolIntoWorkingSet(
+        emptyExternalShim, scope, executableToolName, acquired,
+      );
+      return target.callTool(executableToolName, args);
+    },
+    async invalidateToolsCache() {
+      acquired.clear();
+    },
+  };
+}
+
 function createScopedExternalShim(
   base: MCPServer,
   scope: McpToolScope,
   opts: { semantic?: boolean } = {},
 ): MCPServer {
   let selectedToolNames: Set<string> | null = null;
+  // Where an acquired tool actually lives. Without this the first cross-server
+  // call succeeds and the second one goes back to the turn's base — which never
+  // hosted that server — so a recovery that worked once broke on the next call.
+  const acquiredTargets = new Map<string, MCPServer>();
   const listScopedTools = async () => {
     const tools = await base.listTools();
     // T1: on the fail-open surface, rank the user's connected tools by
@@ -349,21 +483,32 @@ function createScopedExternalShim(
     },
     async callTool(toolName, args) {
       const executableToolName = stripMcpToolCarrier(toolName);
-      // Models can remember or guess a namespaced tool that was not advertised
-      // this turn. Treat the filtered list as executable authority too: server
-      // slug/pattern checks reject cheaply, while exact membership also
-      // enforces maxTools/semantic caps before the base shim can dispatch.
       if (!mcpToolAllowedByScope(toolName, scope)) {
         throw new Error(`external MCP tool is outside this turn's scope: ${toolName}`);
       }
+      const alreadyAcquired = acquiredTargets.get(executableToolName);
+      if (alreadyAcquired) return alreadyAcquired.callTool(executableToolName, args);
       if (!selectedToolNames) await listScopedTools();
-      if (!selectedToolNames?.has(executableToolName)) {
-        throw new Error(`external MCP tool was not selected for this turn: ${toolName}`);
+      if (selectedToolNames?.has(executableToolName)) {
+        return base.callTool(executableToolName, args);
       }
-      return base.callTool(executableToolName, args);
+      // Naming a tool the cap left out is the model doing the right thing: it
+      // found the capability this turn's relevance guess missed. Acquire it
+      // from the user's authorized catalog and widen the working set, so the
+      // rest of the turn can see what it just proved it needs.
+      //
+      // A name the catalog does not contain still fails — but it fails saying
+      // what IS connected, instead of "not selected for this turn", which told
+      // the user nothing and told the model to go guess again.
+      const target = await acquireToolIntoWorkingSet(
+        base, scope, executableToolName, selectedToolNames,
+      );
+      if (target !== base) acquiredTargets.set(executableToolName, target);
+      return target.callTool(executableToolName, args);
     },
     async invalidateToolsCache() {
       selectedToolNames = null;
+      acquiredTargets.clear();
       await base.invalidateToolsCache?.();
     },
   };
@@ -387,6 +532,12 @@ function parseServerSlugCsv(raw: string | undefined | null): string[] {
 
 function enabledExternalServers(): ManagedMcpServer[] {
   return discoverMcpServers().filter((server) => server.enabled);
+}
+
+/** The user's configured server names, for callers that must resolve a request
+ *  (or a refusal) against the catalog rather than against a hardcoded list. */
+export function enabledExternalServerNames(): string[] {
+  return enabledExternalServers().map((server) => server.name);
 }
 
 function resolveConfiguredExternalServerSlugs(allowedServerSlugs: string[]): string[] {
@@ -543,13 +694,131 @@ function getOrCreateFailOpenExternalShim(scope: McpToolScope): MCPServer {
   return cachedFailOpenExternalShim;
 }
 
-export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
+/**
+ * The turn's authority is a ceiling, not a suggestion.
+ *
+ * Helpers that build their own scope — the on-demand inventory tool, code mode,
+ * status probes — were each free to mint a broad one and hand it straight here,
+ * which made every such helper a side door around the decision the user
+ * actually made. Narrowing at the single construction point closes all of them
+ * at once, including the ones nobody has written yet.
+ *
+ * A locally-minted scope may only ever be equal to or tighter than ambient.
+ */
+function serversOfExactLease(toolNames: string[] | undefined): string[] {
+  return [...new Set((toolNames ?? [])
+    .map((name) => parseNamespacedTool(stripMcpToolCarrier(name))?.serverSlug)
+    .filter((slug): slug is string => Boolean(slug)))];
+}
+
+function narrowToAmbientAuthority(scope: McpToolScope | undefined): McpToolScope | undefined {
+  const ambient = harnessRunContextStorage.getStore()?.mcpToolScope;
+  if (ambient === undefined) return scope;
+
+  const base: McpToolScope = scope ?? { reason: 'unscoped caller', allowAll: true };
+  if (ambient === null) {
+    return { ...base, reason: `${base.reason}; denied by locked lane`, authority: 'none', allowedServerSlugs: [], maxTools: 0 };
+  }
+
+  const ceiling = mcpToolScopeAuthority(ambient);
+  const denied = mergeDeniedServerSlugs(base.deniedServerSlugs, ambient.deniedServerSlugs);
+  const withDenied = denied ? { ...base, deniedServerSlugs: denied } : base;
+  if (ceiling === 'catalog') return withDenied;
+  if (ceiling === 'none') {
+    return {
+      ...withDenied,
+      reason: `${withDenied.reason}; denied by turn authority`,
+      authority: 'none',
+      allowedServerSlugs: [],
+      maxTools: 0,
+    };
+  }
+
+  // Both remaining ceilings bind a SERVER SET; an exact lease simply derives
+  // its set from the tools it named. Narrowing the servers — not just the
+  // tools — is what stops a helper connecting a system the turn cannot use.
+  const bound = ceiling === 'exact'
+    ? serversOfExactLease(ambient.allowedToolNames)
+    : (ambient.allowedServerSlugs ?? []);
+  const requestedBroad = withDenied.allowAll === true || withDenied.failOpenCandidate === true;
+  const requested = withDenied.allowedServerSlugs ?? [];
+  const intersected = requestedBroad || requested.length === 0
+    ? bound
+    : requested.filter((slug) => bound.some((allowed) => mcpServerAliasMatches(slug, allowed)));
+
+  return {
+    ...withDenied,
+    reason: `${withDenied.reason}; bounded by the turn's ${ceiling === 'exact' ? 'exact lease' : 'server set'}`,
+    authority: ceiling,
+    allowAll: undefined,
+    failOpenCandidate: undefined,
+    allowedServerSlugs: intersected,
+    ...(ceiling === 'exact' ? { allowedToolNames: ambient.allowedToolNames ?? [] } : {}),
+    ...(intersected.length === 0 ? { maxTools: 0 } : {}),
+  };
+}
+
+/**
+ * Remove excluded systems BEFORE anything is built.
+ *
+ * Filtering an excluded server out of the advertised list would still have
+ * connected it, listed it, and paid for its handshake — the user said don't
+ * touch it, and a process that spawns to be ignored has already touched it.
+ * So exclusions are applied to the server SET, not to the tools it returns.
+ */
+function withoutDeniedServers(scope: McpToolScope): McpToolScope {
+  const denied = scope.deniedServerSlugs ?? [];
+  if (denied.length === 0) return scope;
+  const isDenied = (slug: string): boolean =>
+    denied.some((raw) => mcpServerAliasMatches(slug, raw));
+
+  const requested = scope.allowedServerSlugs;
+  const survivors = (requested ?? enabledExternalServers().map((s) => slugifyServerName(s.name)))
+    .filter((slug) => !isDenied(slug));
+
+  if (survivors.length === 0) {
+    return {
+      ...scope,
+      reason: `${scope.reason}; every candidate server was excluded by the user`,
+      authority: 'none',
+      allowedServerSlugs: [],
+      maxTools: 0,
+    };
+  }
+  return {
+    ...scope,
+    // A broad surface stops being broad once part of it is off-limits: it must
+    // become the explicit list of what remains, or construction would widen
+    // straight past the exclusion.
+    allowAll: undefined,
+    failOpenCandidate: undefined,
+    allowedServerSlugs: survivors,
+  };
+}
+
+export function getOrCreateExternalMcpServers(rawScope?: McpToolScope): MCPServer {
+  // The ceiling applies to EVERY caller shape, including the ones that pass
+  // nothing or ask for everything — those are exactly the ones that used to
+  // slip past a restrictive turn.
+  const narrowed = narrowToAmbientAuthority(rawScope);
+  const scope = narrowed ? withoutDeniedServers(narrowed) : narrowed;
   if (!scope || scope.allowAll) {
     return ensureAllExternalBaseShim();
   }
 
-  if (scope.maxTools === 0) {
+  // The user withheld external access. Nothing to advertise and nothing to
+  // acquire — the only genuinely empty surface.
+  if (mcpToolScopeAuthority(scope) === 'none') {
     return emptyExternalShim;
+  }
+
+  // Advertising nothing is a budget, not a boundary. Hand back a shim that
+  // shows no tools and stays cold — but can still fetch one exact authorized
+  // tool if the work turns out to need it. This precedes the fail-open branch
+  // so a zero-width turn never cold-starts every configured provider just to
+  // populate a surface it is not going to show.
+  if (scope.maxTools === 0) {
+    return acquireOnlyExternalShim(scope);
   }
 
   // Fail-open BEFORE the empty-SLUG guard: a positive-width failOpenCandidate
@@ -559,7 +828,7 @@ export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
   }
 
   if ((scope.allowedServerSlugs ?? []).length === 0) {
-    return emptyExternalShim;
+    return acquireOnlyExternalShim(scope);
   }
 
   const key = scopeCacheKey(scope);
@@ -599,6 +868,7 @@ export function getOrCreateExternalMcpServerForTool(
     }
     return getOrCreateExternalMcpServers(scope ?? {
       reason: 'explicit no-external-tools scope',
+      authority: 'none',
       allowedServerSlugs: [],
       maxTools: 0,
     });
@@ -610,6 +880,43 @@ export function getOrCreateExternalMcpServerForTool(
     throw new Error(`No enabled MCP server matches namespace "${parsed.serverSlug}".`);
   }
   return ensureScopedExternalBaseShim({ allowedServerSlugs: [parsed.serverSlug] });
+}
+
+export interface AuthorizedExternalMcpToolDefinition {
+  name: string;
+  description?: unknown;
+  inputSchema?: unknown;
+}
+
+/**
+ * Resolve one already-named external tool against its authorized server's
+ * uncapped catalog. Advertisement limits are context budgets, so they cannot
+ * erase the callable schema needed for pre-dispatch evidence refinement.
+ */
+export async function resolveAuthorizedExternalMcpToolDefinition(
+  toolName: string,
+  scope: McpToolScope | null | undefined,
+): Promise<AuthorizedExternalMcpToolDefinition | undefined> {
+  const executableToolName = stripMcpToolCarrier(toolName);
+  const parsed = parseNamespacedTool(executableToolName);
+  if (!parsed || !mcpToolAllowedByScope(toolName, scope)) return undefined;
+  const configured = enabledExternalServers().find(
+    (server) => mcpServerAliasMatches(slugifyServerName(server.name), parsed.serverSlug),
+  );
+  if (!configured) return undefined;
+  try {
+    const serverSlug = slugifyServerName(configured.name);
+    // Reuse the same exact-server seam as named on-demand acquisition. Besides
+    // keeping tests hermetic, this guarantees schema resolution and dispatch
+    // consult the same server instance/catalog during one accepted turn.
+    const base = serverShimResolverForTests
+      ? serverShimResolverForTests(serverSlug)
+      : ensureScopedExternalBaseShim({ allowedServerSlugs: [serverSlug] });
+    const tools = await base.listTools() as AuthorizedExternalMcpToolDefinition[];
+    return tools.find((tool) => stripMcpToolCarrier(tool.name) === executableToolName);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -730,6 +1037,21 @@ export const mcpServersTestHooks = {
   },
   rawExternalServerNames(allowedServerSlugs?: string[]): string[] {
     return buildRawMcpServers({ excludeLocal: true, allowedServerSlugs }).map((server) => server.name);
+  },
+  setServerShimResolverForTests(resolver: (slug: string) => MCPServer): () => void {
+    serverShimResolverForTests = resolver;
+    return () => { serverShimResolverForTests = null; };
+  },
+  /** The real constructor, so a pin can assert what was (and was not) built. */
+  getOrCreate(scope?: McpToolScope): MCPServer {
+    return getOrCreateExternalMcpServers(scope);
+  },
+  resetCachesForTests(): void {
+    cachedExternalShim = null;
+    cachedScopedExternalBaseShims.clear();
+    cachedScopedExternalShims.clear();
+    cachedFailOpenExternalShim = null;
+    cachedFailOpenKey = '';
   },
   rawExternalStdioLaunches(allowedServerSlugs?: string[]): Array<{
     name: string;

@@ -23,6 +23,7 @@ const {
   markBackgroundTaskAwaitingInput,
 } = await import('../execution/background-tasks.js');
 const {
+  appendEvent,
   createSession,
   getActiveRunAttempt,
   isKillRequested,
@@ -50,7 +51,7 @@ function transport() {
   };
 }
 
-test('Discord/Slack parked background question captures the next freeform reply', async () => {
+test('Discord/Slack parked background question routes a bounded slot answer', async () => {
   const origin = createSession({ kind: 'chat', channel: 'discord' });
   const task = createBackgroundTask({
     title: 'Segment prospects',
@@ -73,6 +74,91 @@ test('Discord/Slack parked background question captures the next freeform reply'
   assert.equal(stored?.status, 'pending');
   assert.equal(stored?.inputResolution?.answer, 'healthcare only');
   assert.match(tx.sent[0], /Answer sent to "Segment prospects"/);
+});
+
+test('Discord/Slack exact option answer resumes once using the durable question shape', async () => {
+  const origin = createSession({ kind: 'chat', channel: 'discord' });
+  const task = createBackgroundTask({
+    title: 'Deploy release',
+    prompt: 'deploy the release',
+    originSessionId: origin.id,
+    channel: 'discord:chan-option',
+    source: 'discord',
+  });
+  createSession({ id: task.runSessionId, kind: 'execution', channel: 'discord' });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: 'Choose the deployment target.',
+      options: ['Staging', 'Production'],
+      purpose: 'clarification',
+    },
+  });
+  markBackgroundTaskAwaitingInput(
+    task.id,
+    'q-bg-option',
+    'Choose the deployment target.\n1. Staging\n2. Production\n(Reply with a number or in your own words.)',
+  );
+  assert.deepEqual(getBackgroundTask(task.id)?.pendingQuestionOptions, ['Staging', 'Production']);
+
+  const tx = transport();
+  const first = await __test__.maybeRouteParkedBackgroundReply({
+    sessionId: origin.id,
+    message: 'Production',
+    transport: tx.api,
+  });
+  assert.equal(first, true);
+  const queuedAt = getBackgroundTask(task.id)?.inputResolution?.queuedAt;
+  assert.equal(getBackgroundTask(task.id)?.status, 'pending');
+  assert.equal(getBackgroundTask(task.id)?.inputResolution?.answer, 'Production');
+
+  const replayedAsNewMessage = await __test__.maybeRouteParkedBackgroundReply({
+    sessionId: origin.id,
+    message: 'Production',
+    transport: tx.api,
+  });
+  assert.equal(replayedAsNewMessage, false, 'a second message cannot queue the same answer again');
+  assert.equal(getBackgroundTask(task.id)?.inputResolution?.queuedAt, queuedAt);
+  assert.equal(tx.sent.length, 1, 'only the accepted answer receives a background acknowledgement');
+});
+
+test('Discord/Slack decline, command, compound correction, and unrelated ask fall through', async () => {
+  const origin = createSession({ kind: 'chat', channel: 'slack' });
+  const task = createBackgroundTask({
+    title: 'Send client update',
+    prompt: 'send the client update',
+    originSessionId: origin.id,
+    channel: 'slack:chan-fresh-turn',
+    source: 'slack',
+  });
+  markBackgroundTaskAwaitingInput(
+    task.id,
+    'q-bg-decline',
+    'Should I send the update?',
+    { options: ['Yes', 'No'] },
+  );
+
+  const tx = transport();
+  for (const message of [
+    'No.',
+    '/cancel',
+    'new',
+    'No, but send it to Alice instead',
+    'What should we improve in Clem next?',
+  ]) {
+    const handled = await __test__.maybeRouteParkedBackgroundReply({
+      sessionId: origin.id,
+      message,
+      transport: tx.api,
+    });
+    assert.equal(handled, false, `${message} remains a foreground turn`);
+    assert.equal(getBackgroundTask(task.id)?.status, 'awaiting_input');
+    assert.equal(getBackgroundTask(task.id)?.inputResolution, undefined);
+  }
+  assert.equal(tx.sent.length, 0);
 });
 
 test('Discord/Slack continue resumes one parked background continuation', async () => {

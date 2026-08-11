@@ -111,6 +111,10 @@ export interface MultiItemIntent {
   itemKind: string | null;
   sameShapeWork: boolean;
   explicitParallelRequest: boolean;
+  /** Exact bodies of an unambiguous user-authored numbered/bulleted list.
+   * Count-only and prose-inferred batches deliberately omit this field: they
+   * prove cardinality, but not the identity of every accepted member. */
+  exactMembers?: string[];
   carriedFromPrior?: boolean;
 }
 
@@ -328,6 +332,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
       itemKind: kind,
       sameShapeWork: true,
       explicitParallelRequest,
+      ...(enumerated ? { exactMembers: [...listedBodies] } : {}),
     };
   } catch {
     return NO_MULTI_ITEM;

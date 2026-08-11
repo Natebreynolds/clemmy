@@ -35,7 +35,7 @@ test('previewToolCall safely degrades malformed and recursively nested call_tool
   assert.equal(previewToolCall('call_tool', {
     name: 'composio_execute_tool',
     args_json: '{not-json',
-  }), 'using composio_execute_tool');
+  }), 'call_tool');
   assert.equal(previewToolCall('call_tool', {
     name: 'call_tool',
     args_json: JSON.stringify({
@@ -48,6 +48,28 @@ test('previewToolCall safely degrades malformed and recursively nested call_tool
     name: 'call_tool',
     args_json: JSON.stringify({ name: 'call_tool', args_json: '{}' }),
   }), 'call_tool');
+});
+
+test('previewToolCall projects every namespaced external broker spelling', () => {
+  for (const variant of ['call_tool', 'call-tool', 'call.tool', 'callTool']) {
+    assert.equal(previewToolCall(`m365__${variant}`, {
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'GMAIL_LIST_MESSAGES' }),
+    }), 'composio · GMAIL_LIST_MESSAGES', variant);
+    assert.equal(previewToolCall(`m365__${variant}`, {
+      name: 'deleteItem',
+      payload: { item_id: 'item-1' },
+    }), 'using m365__deleteItem', variant);
+  }
+  assert.equal(previewToolCall('m365__callTool', {
+    name: 'deleteItem',
+    args_json: JSON.stringify({ item_id: 'item-1' }),
+    payload: { item_id: 'item-2' },
+  }), 'm365__callTool', 'presentation rejects the same conflicting carrier policy');
+  assert.equal(previewToolCall('m365__callTool', {
+    name: 'deleteItem',
+    item_id: 'top-level-is-not-semantic-args',
+  }), 'm365__callTool', 'presentation rejects unrecognized top-level fields');
 });
 
 test('extractApprovalContentPreview: pulls caption + image from a social-post tool call', () => {

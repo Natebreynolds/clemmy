@@ -14,7 +14,7 @@ import type {
   SDKSystemMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { BASE_DIR, PKG_DIR, getRuntimeEnv } from '../../config.js';
-import { deriveSdkProfile } from '../../tools/tool-registry.js';
+import { actionTopologyRoleFor, deriveSdkProfile } from '../../tools/tool-registry.js';
 import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { scheduleReflection } from '../../memory/reflection.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
@@ -36,7 +36,7 @@ import { estimateTokens } from './budget.js';
 import { recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
-import { appendEvent, listEvents, writeToolOutput } from './eventlog.js';
+import { appendEvent, listEvents, listToolOutputInvocations, writeToolOutput } from './eventlog.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { isProviderCapacityExhausted } from '../../shared/provider-capacity.js';
@@ -49,6 +49,19 @@ import {
 import { classifyRuntimeToolEffect, runtimeToolAccountingMetadata } from './tool-effect.js';
 import { countDominantArray } from './tool-output-digest.js';
 import { toolCallCorrelationFingerprint } from './tool-correlation.js';
+import {
+  findClaimedClaudeLocalCanonicalCall,
+  isClaudeLocalCorrelatableSdkTool,
+  isClaudeLocalComposioSdkTool,
+  recordClaudeLocalPermissionAdmission,
+} from './claude-local-tool-correlation.js';
+import { expectedTaskFor } from './resolution-ledger.js';
+import { actionExpectedWorkCarrierSelection } from './action-expected-work-boundary.js';
+import {
+  SETTLED_READ_REPEAT_REPLAY_KIND,
+  settledReadRepeatReplayDisposition,
+  stripSettledReadHarnessAdvisory,
+} from './settled-read-repeat.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import {
   detectDuplicateTarget,
@@ -72,7 +85,11 @@ import {
 } from './tool-economy.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
-import { createClementineMcpServer, listClementineMcpToolNames } from '../../tools/mcp-server.js';
+import {
+  createClementineMcpServer,
+  initializeClementineMcpCapabilityAuthority,
+  listClementineMcpToolNames,
+} from '../../tools/mcp-server.js';
 import {
   activateDispatchLease,
   assertDispatchLeaseCurrent,
@@ -113,6 +130,18 @@ import {
 } from './artifact-ledger.js';
 import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
 import { resolveHotSet } from '../../agents/tool-catalog.js';
+import {
+  admitDiscoveryBoundary,
+  DiscoveryBudgetDeniedError,
+  isClaudeParentDiscoverySurface,
+  settleDiscoveryBoundary,
+  type DiscoveryBoundaryLease,
+} from './discovery-boundary.js';
+import { discoveryGovernor } from './discovery-governor.js';
+import { progressNarration } from '../activity-format.js';
+import { WorkCallInputSchema } from '../../tools/work-call.js';
+import { withLogicalToolCall } from './attempt-identity.js';
+import { settleToolAttempt } from './attempt-settlement.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -246,6 +275,22 @@ export class ClaudeAgentSdkToolSurfaceError extends Error {
     this.reason = opts.reason;
     this.startupTimeoutMs = opts.startupTimeoutMs;
   }
+}
+
+export function claudeActionExpectedWorkRequired(
+  options: Pick<ClaudeAgentSdkRunOptions, 'sessionId' | 'sourceUserSeq'>,
+): boolean {
+  const sessionId = options.sessionId?.trim();
+  const sourceUserSeq = options.sourceUserSeq;
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return false;
+  const expected = expectedTaskFor(sessionId, sourceUserSeq as number);
+  // Direct SDK worker/test routes without a persisted chat graph retain their
+  // historical surface. A known direct/retrieve graph is explicitly non-action.
+  if (expected.status !== 'ok' || expected.graph.classification.route !== 'act') return false;
+  return actionExpectedWorkCarrierSelection({
+    sessionId,
+    sourceUserSeq: sourceUserSeq as number,
+  }) !== false;
 }
 
 /** Anthropic/Codex SDK overloads embed the status in the message text. */
@@ -498,6 +543,13 @@ export function buildClaudeAgentSdkLocalMcpServers(
     stepId?: string;
     runScopeId?: string;
     sourceUserSeq?: number;
+    directOrchestrator?: boolean;
+    /** Exact persisted act route whose action authority is already active. */
+    actionExpectedWork?: boolean;
+    /** True only for a run_worker child. This survives both in-process and
+     * stdio MCP transports so the provider gateway can enforce compose-only
+     * external mutations without confusing workflow steps with workers. */
+    workerScope?: boolean;
     mcpToolScope?: McpToolScope | null;
     dispatchLease?: DispatchLeaseRef;
   },
@@ -523,6 +575,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
           sessionId,
           runScopeId: attribution?.runScopeId,
           sourceUserSeq: attribution?.sourceUserSeq,
+          directOrchestrator: attribution?.directOrchestrator,
+          actionExpectedWork: attribution?.actionExpectedWork,
+          workerScope: attribution?.workerScope,
           mcpToolScope: attribution?.mcpToolScope,
           dispatchLease: attribution?.dispatchLease,
           gatedMutations,
@@ -542,6 +597,15 @@ export function buildClaudeAgentSdkLocalMcpServers(
     ...(attribution?.runScopeId?.trim() ? { CLEMENTINE_MCP_RUN_SCOPE_ID: attribution.runScopeId.trim() } : {}),
     ...(Number.isSafeInteger(attribution?.sourceUserSeq) && (attribution?.sourceUserSeq ?? 0) > 0
       ? { CLEMENTINE_MCP_SOURCE_USER_SEQ: String(attribution?.sourceUserSeq) }
+      : {}),
+    ...(attribution?.directOrchestrator !== undefined
+      ? { CLEMENTINE_MCP_DIRECT_ORCHESTRATOR: attribution.directOrchestrator ? 'on' : 'off' }
+      : {}),
+    ...(attribution?.actionExpectedWork
+      ? { CLEMENTINE_MCP_ACTION_EXPECTED_WORK: 'on' }
+      : {}),
+    ...(attribution?.workerScope !== undefined
+      ? { CLEMENTINE_MCP_WORKER_SCOPE: attribution.workerScope ? 'on' : 'off' }
       : {}),
     ...(attribution?.mcpToolScope !== undefined
       ? { CLEMENTINE_MCP_TOOL_SCOPE_JSON: JSON.stringify(attribution.mcpToolScope) }
@@ -598,23 +662,22 @@ function claudeSdkNativeMcpEnabled(): boolean {
 }
 
 /**
- * ToolSearch adoption (SOTA 2026, [[project_2026_harness_sota_gap]]). DEFAULT OFF —
- * model-facing, needs a live smoke before default-on. When ON, the user's EXTERNAL
- * native MCP servers (dataforseo, browsermcp, …) are marked `alwaysLoad: false` so
- * the SDK DEFERS their tool schemas — the model sees them by name and loads the
- * full schema on demand via tool search. Two wins at once: (1) token — those large
- * schemas leave the per-turn prompt; (2) cold-start — a deferred server does NOT
- * block the `claude` child's startup on connect (alwaysLoad servers "must be present
- * when the turn-1 prompt is built"). The LOCAL `clementine-local` core stays
- * alwaysLoad:true (memory/recall/composio_search/notify — the acquisition hatches
- * must never defer), so the brain never loses tool reachability.
+ * ToolSearch/schema-on-demand adoption (SOTA 2026,
+ * [[project_2026_harness_sota_gap]]). DEFAULT ON. The user's EXTERNAL native MCP
+ * servers (dataforseo, browsermcp, …) are marked `alwaysLoad: false`, so the SDK
+ * can defer their schemas and acquire them through native ToolSearch without
+ * blocking cold start on every server.
+ *
+ * The LOCAL `clementine-local` path is different. Native deferral still accounted
+ * every registered local schema, so the agentic path registers only a tiny hot set
+ * plus `tool_search` / `call_tool`; omitted local tools stay callable this turn
+ * through that acquisition bridge. Work tools such as `run_shell_command`,
+ * `composio_search_tools`, and `notify_user` are deferred unless the hot-set logic
+ * promotes them — they are not an unconditional always-loaded core.
  */
 export function claudeToolSearchEnabled(): boolean {
-  // DEFAULT ON (v1.0): live-validated with ZERO tool-calling regressions — local core
-  // tools (memory/recall/composio_search/sf CLI/notify) are alwaysLoad and never
-  // defer, and external MCP tools (dataforseo, …) are reachable on demand via tool
-  // search in BOTH the chat and workflow lanes. Cuts the per-turn cold-start (deferred
-  // servers don't block the claude child's startup) + trims the prompt. =off reverts.
+  // =off restores the legacy non-schema-on-demand behavior for both the local
+  // registration filter and external native-MCP deferral.
   return (getRuntimeEnv('CLEMMY_CLAUDE_TOOL_SEARCH', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
@@ -828,6 +891,11 @@ function sdkToolResultPreview(output: unknown): string {
   try { return JSON.stringify(output ?? '').slice(0, 400); } catch { return String(output ?? '').slice(0, 400); }
 }
 
+function sdkToolResultText(output: unknown): string {
+  if (typeof output === 'string') return output.slice(0, 8_000);
+  try { return JSON.stringify(output ?? '').slice(0, 8_000); } catch { return String(output ?? '').slice(0, 8_000); }
+}
+
 /**
  * The visibility-window glimpse of a READ result: how many records landed and
  * what they look like ("12 records · name, website, phone · Acme Roofing").
@@ -884,8 +952,15 @@ function appendSdkTopLevelToolEvent(
   type: 'tool_called' | 'tool_returned',
   callId: string,
   source: { name: string; input: unknown } | undefined,
-  result?: { isError: boolean; output?: unknown; invocationNonce?: string },
+  result?: {
+    isError: boolean;
+    output?: unknown;
+    invocationNonce?: string;
+    providerDispatched?: boolean;
+    replayedFromCallId?: string;
+  },
   parentEventId?: string,
+  attribution?: { sourceUserSeq?: number; runScopeId?: string; attemptId?: string },
 ): string | undefined {
   if (!sessionId) return undefined;
   try {
@@ -898,6 +973,9 @@ function appendSdkTopLevelToolEvent(
       type,
       ...(type === 'tool_returned' && parentEventId ? { parentEventId } : {}),
       data: {
+        ...(attribution?.sourceUserSeq ? { sourceUserSeq: attribution.sourceUserSeq } : {}),
+        ...(attribution?.runScopeId ? { runScopeId: attribution.runScopeId } : {}),
+        ...(attribution?.attemptId ? { attemptId: attribution.attemptId } : {}),
         tool: name ? mcpToolTail(name) : undefined,
         callId,
         canonicalCallId: callId,
@@ -916,6 +994,14 @@ function appendSdkTopLevelToolEvent(
           // The full payload still lives in tool_outputs; this matches the
           // existing bounded transport preview without duplicating the body.
           ...(result?.output !== undefined ? { preview: sdkToolResultPreview(result.output) } : {}),
+          ...(result?.output !== undefined && isClaudeLocalComposioSdkTool(name)
+            ? { result: sdkToolResultText(result.output) }
+            : {}),
+          ...(result?.providerDispatched === false ? {
+            providerDispatched: false,
+            ...(result.replayedFromCallId ? { replayedFromCallId: result.replayedFromCallId } : {}),
+            replayKind: SETTLED_READ_REPEAT_REPLAY_KIND,
+          } : {}),
           ...(!result?.isError && result?.output !== undefined
             ? (() => { const g = sdkToolResultGlimpse(result.output); return g ? { glimpse: g } : {}; })()
             : {}),
@@ -1260,6 +1346,14 @@ export interface ClaudeAgentSdkRunOptions {
    *  run_tool_program (the recovery the refusal steers to) exists; workers/steps
    *  leave it off so a refusal never strands a run with no recovery. */
   readFanoutGuard?: boolean;
+  /** Explicitly marks the foreground conversational orchestrator. Only this
+   * Claude local-MCP lane may emit/recover one-shot settled-read steering;
+   * workers and workflow steps leave it false/absent. */
+  directOrchestrator?: boolean;
+  /** Explicit run_worker child identity. Worker Composio reads remain usable,
+   * while mutations are composed and returned to the parent for one immutable
+   * run_batch approval/commit. */
+  workerScope?: boolean;
   /** Stable, isolated loop-guard identity for this logical run/attempt. The
    *  real sessionId remains approval/kill/event authority. Workers pass a
    *  packet-derived scope; workflow steps derive run+step; chat derives the
@@ -1472,6 +1566,41 @@ function renderTerminalToolReply(rawName: string, input: unknown, output: string
   return output.trim() || `${bare} completed.`;
 }
 
+function claudeSdkToolOutputLooksSuccessful(rawName: string | undefined, output: unknown): boolean {
+  if (!toolOutputLooksSuccessful(output)) return false;
+  if (!rawName || bareMcpToolName(rawName) !== 'ask_user_question' || typeof output !== 'string') return true;
+  // The in-process MCP ask helper returns these as ordinary text blocks rather
+  // than setting is_error. They are corrective steers, not posted questions.
+  return !/^\s*Question\s+(?:deferred|rejected)\b/i.test(output);
+}
+
+interface TerminalToolReply {
+  rawName: string;
+  text: string;
+  reason: RunStoppedReason | undefined;
+  order: number;
+}
+
+/** One Claude assistant frame may issue several independent questions in
+ * parallel, whose tool results arrive together in the following user frame.
+ * Preserve the exact single-question beat, but turn parallel questions into one
+ * natural public message without spending another model turn to compose it. */
+function renderTerminalToolReplyBundle(replies: readonly TerminalToolReply[]): string {
+  const ordered = [...replies].sort((left, right) => left.order - right.order);
+  if (ordered.length === 1) return ordered[0]!.text;
+  const questions = ordered.filter((reply) => bareMcpToolName(reply.rawName) === 'ask_user_question');
+  if (questions.length < 2) return ordered.map((reply) => reply.text).join('\n\n');
+  const bundledQuestions = [
+    'Before I continue, could you answer these together?',
+    '',
+    ...questions.map((reply, index) => `${index + 1}. ${reply.text}`),
+  ].join('\n');
+  const otherReplies = ordered
+    .filter((reply) => bareMcpToolName(reply.rawName) !== 'ask_user_question')
+    .map((reply) => reply.text);
+  return [...otherReplies, bundledQuestions].join('\n\n');
+}
+
 function terminalToolStoppedReason(rawName: string): RunStoppedReason | undefined {
   return bareMcpToolName(rawName) === 'ask_user_question' ? 'awaiting-input' : undefined;
 }
@@ -1479,7 +1608,7 @@ function terminalToolStoppedReason(rawName: string): RunStoppedReason | undefine
 function reflectionToolName(rawName: string | null, input: unknown): string | null {
   if (!rawName) return null;
   const bare = bareMcpToolName(rawName);
-  if (bare === 'call_tool') {
+  if (bare === 'call_tool' || bare === 'work_call') {
     const deferred = (input as { name?: unknown; args_json?: unknown } | null | undefined)?.name;
     if (typeof deferred !== 'string' || !deferred.trim()) return bare;
     let deferredInput: unknown = undefined;
@@ -1487,7 +1616,7 @@ function reflectionToolName(rawName: string | null, input: unknown): string | nu
     if (typeof argsJson === 'string' && argsJson.trim()) {
       try { deferredInput = JSON.parse(argsJson); } catch { /* attribution still uses the inner name */ }
     }
-    // Recurse so call_tool(composio_execute_tool) receives the same exact action
+    // Recurse so either generic carrier receives the same exact inner action
     // attribution as a first-class Composio call. This also lets the reflection
     // deny-list suppress catalog/status tools instead of learning wrapper noise.
     return reflectionToolName(deferred.trim(), deferredInput);
@@ -1646,33 +1775,136 @@ function readUsageField(obj: Record<string, unknown> | undefined, snake: string,
   return numeric(obj[snake]) || numeric(obj[camel]);
 }
 
-function usageTotalsFromResult(result: SDKResultMessage | null): {
+interface ClaudeAgentSdkUsageTotals {
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens?: number;
   outputTokens: number;
   totalTokens: number;
-} | null {
+}
+
+interface ClaudeAgentSdkUsageFallback extends ClaudeAgentSdkUsageTotals {
+  responseId?: string;
+}
+
+function optionalUsageField(
+  usage: Record<string, unknown>,
+  snake: string,
+  camel: string,
+): number | undefined {
+  if (
+    !Object.prototype.hasOwnProperty.call(usage, snake)
+    && !Object.prototype.hasOwnProperty.call(usage, camel)
+  ) return undefined;
+  return readUsageField(usage, snake, camel);
+}
+
+function usageTotalsFromRecord(usage: Record<string, unknown> | undefined): ClaudeAgentSdkUsageTotals | null {
+  if (!usage) return null;
+  const cacheCreationInputTokens = optionalUsageField(
+    usage,
+    'cache_creation_input_tokens',
+    'cacheCreationInputTokens',
+  );
+  const inputTokens =
+    readUsageField(usage, 'input_tokens', 'inputTokens')
+    + (cacheCreationInputTokens ?? 0)
+    + readUsageField(usage, 'cache_read_input_tokens', 'cacheReadInputTokens');
+  const cachedInputTokens = readUsageField(usage, 'cache_read_input_tokens', 'cacheReadInputTokens');
+  const outputTokens = readUsageField(usage, 'output_tokens', 'outputTokens');
+  if (inputTokens === 0 && outputTokens === 0) return null;
+  return {
+    inputTokens,
+    cachedInputTokens,
+    ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+  };
+}
+
+function assistantUsageFrame(message: SDKMessage): (ClaudeAgentSdkUsageTotals & {
+  responseId: string;
+  supersedes: string[];
+}) | null {
+  if (message.type !== 'assistant') return null;
+  const assistant = message as SDKMessage & {
+    uuid?: unknown;
+    supersedes?: unknown;
+    message?: { usage?: unknown };
+  };
+  if (typeof assistant.uuid !== 'string' || !assistant.uuid) return null;
+  const usage = assistant.message?.usage;
+  const totals = usage && typeof usage === 'object'
+    ? usageTotalsFromRecord(usage as Record<string, unknown>)
+    : null;
+  if (!totals) return null;
+  return {
+    ...totals,
+    responseId: assistant.uuid,
+    supersedes: Array.isArray(assistant.supersedes)
+      ? assistant.supersedes.filter((id): id is string => typeof id === 'string' && Boolean(id))
+      : [],
+  };
+}
+
+function usageTotalsFromResult(result: SDKResultMessage | null): ClaudeAgentSdkUsageTotals | null {
   if (!result) return null;
   const usage = result.usage as Record<string, unknown> | undefined;
-  let inputTokens =
-    readUsageField(usage, 'input_tokens', 'inputTokens')
-    + readUsageField(usage, 'cache_creation_input_tokens', 'cacheCreationInputTokens')
-    + readUsageField(usage, 'cache_read_input_tokens', 'cacheReadInputTokens');
-  let cachedInputTokens = readUsageField(usage, 'cache_read_input_tokens', 'cacheReadInputTokens');
-  let outputTokens = readUsageField(usage, 'output_tokens', 'outputTokens');
+  const aggregate = usageTotalsFromRecord(usage);
+  let inputTokens = aggregate?.inputTokens ?? 0;
+  let cachedInputTokens = aggregate?.cachedInputTokens ?? 0;
+  let cacheCreationInputTokens = aggregate?.cacheCreationInputTokens;
+  let outputTokens = aggregate?.outputTokens ?? 0;
 
   // Some SDK versions emphasize modelUsage; keep it as a fallback when the
   // aggregate usage is absent/zero.
   if (inputTokens === 0 && outputTokens === 0 && result.modelUsage && typeof result.modelUsage === 'object') {
+    let creationTotal = 0;
+    let creationRecorded = 0;
+    let modelUsageRows = 0;
     for (const raw of Object.values(result.modelUsage as Record<string, unknown>)) {
       const m = raw as Record<string, unknown>;
-      inputTokens += numeric(m.inputTokens) + numeric(m.cacheCreationInputTokens) + numeric(m.cacheReadInputTokens);
+      modelUsageRows += 1;
+      const creation = optionalUsageField(m, 'cache_creation_input_tokens', 'cacheCreationInputTokens');
+      inputTokens += numeric(m.inputTokens) + (creation ?? 0) + numeric(m.cacheReadInputTokens);
       cachedInputTokens += numeric(m.cacheReadInputTokens);
+      if (creation !== undefined) {
+        creationTotal += creation;
+        creationRecorded += 1;
+      }
       outputTokens += numeric(m.outputTokens);
     }
+    cacheCreationInputTokens = modelUsageRows > 0 && creationRecorded === modelUsageRows
+      ? creationTotal
+      : undefined;
   }
   if (inputTokens === 0 && outputTokens === 0) return null;
-  return { inputTokens, cachedInputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
+  return {
+    inputTokens,
+    cachedInputTokens,
+    ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+  };
+}
+
+/** Explicit usage-role identity from facts already owned by the SDK caller.
+ * No prompt/model/timestamp inference: an older or generic call stays visibly
+ * unattributed until its caller supplies a real lane. */
+export function claudeAgentSdkUsageLane(
+  options: Pick<
+    ClaudeAgentSdkRunOptions,
+    'workerScope' | 'directOrchestrator' | 'workflowRunId' | 'stepId' | 'sessionId'
+  >,
+): 'worker' | 'brain' | 'workflow_step' | 'unattributed' {
+  if (options.workerScope === true) return 'worker';
+  if (options.directOrchestrator === true) return 'brain';
+  if (
+    options.workflowRunId?.trim()
+    || options.stepId?.trim()
+    || options.sessionId?.startsWith('workflow:')
+  ) return 'workflow_step';
+  return 'unattributed';
 }
 
 function recordClaudeAgentSdkUsage(
@@ -1680,11 +1912,21 @@ function recordClaudeAgentSdkUsage(
   result: SDKResultMessage | null,
   init: SDKSystemMessage | null,
   timing?: { firstByteMs: number | null },
+  fallback?: ClaudeAgentSdkUsageFallback | null,
 ): void {
   try {
-    const totals = usageTotalsFromResult(result);
+    // A terminal handoff tool deliberately interrupts the SDK stream as soon
+    // as its tool result is durable. Anthropic may therefore never emit the
+    // aggregate `result` frame even though the assistant frame already carries
+    // authoritative usage. Prefer the aggregate whenever it exists; use the
+    // frame sum only for that result-less terminal boundary.
+    const totals = usageTotalsFromResult(result) ?? fallback;
     if (!totals) return;
-    const responseId = (result as { uuid?: unknown } | null)?.uuid;
+    const resultResponseId = (result as { uuid?: unknown } | null)?.uuid;
+    const responseId = typeof resultResponseId === 'string' && resultResponseId
+      ? resultResponseId
+      : fallback?.responseId;
+    const durationMs = (result as { duration_ms?: unknown } | null)?.duration_ms;
     const providerApiDurationMs = (result as { duration_api_ms?: unknown } | null)?.duration_api_ms;
     const contextWindowTokens = contextWindowFromResult(result);
     const priorTranscript = options.priorTurns && options.priorTurns.length > 0
@@ -1713,20 +1955,25 @@ function recordClaudeAgentSdkUsage(
     }), options.sourceUserSeq);
     recordModelUsage({
       sessionId: options.sessionId?.trim() || result?.session_id || init?.session_id || 'unknown',
+      sourceUserSeq: options.sourceUserSeq,
+      attemptId: options.dispatchLease?.runAttemptId,
       model: init?.model || options.modelId || 'claude-agent-sdk',
       // This adapter pre-folds cache_read/cache_creation into inputTokens, so
       // its DECLARED convention is inclusive (cached ⊆ input).
       cacheDialect: 'inclusive',
       trace: {
-        acceptedSource: options.sessionId?.trim() || 'unknown',
         brain: 'claude',
+        lane: claudeAgentSdkUsageLane(options),
         ...(typeof responseId === 'string' && responseId ? { modelCallId: responseId } : {}),
       },
       inputTokens: totals.inputTokens,
       cachedInputTokens: totals.cachedInputTokens,
+      ...(totals.cacheCreationInputTokens !== undefined
+        ? { cacheCreationInputTokens: totals.cacheCreationInputTokens }
+        : {}),
       outputTokens: totals.outputTokens,
       totalTokens: totals.totalTokens,
-      durationMs: numeric((result as { duration_ms?: unknown } | null)?.duration_ms),
+      ...(typeof durationMs === 'number' && Number.isFinite(durationMs) ? { durationMs } : {}),
       ...(typeof providerApiDurationMs === 'number' && Number.isFinite(providerApiDurationMs) ? { providerApiDurationMs } : {}),
       responseId: typeof responseId === 'string' ? responseId : undefined,
       promptComponents,
@@ -1752,6 +1999,12 @@ function recordClaudeAgentSdkUsage(
           cacheHitRatio: Math.round((totals.cachedInputTokens / totals.inputTokens) * 1000) / 1000,
           cachedInputTokens: totals.cachedInputTokens,
           inputTokens: totals.inputTokens,
+          ...(Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+            ? { sourceUserSeq: options.sourceUserSeq }
+            : {}),
+          ...(options.dispatchLease?.runAttemptId
+            ? { attemptId: options.dispatchLease.runAttemptId }
+            : {}),
         },
       });
     }
@@ -1759,7 +2012,10 @@ function recordClaudeAgentSdkUsage(
 }
 
 function requiredLocalMcpTools(options: ClaudeAgentSdkRunOptions): string[] {
-  return [...new Set((options.requiredLocalMcpTools ?? []).map((t) => t.trim()).filter(Boolean))];
+  return [...new Set([
+    ...(options.requiredLocalMcpTools ?? []).map((t) => t.trim()).filter(Boolean),
+    ...(claudeActionExpectedWorkRequired(options) ? ['work_call'] : []),
+  ])];
 }
 
 function emitToolSurfaceRetryEvent(
@@ -1853,6 +2109,30 @@ function bestSuccessText(resultText: string | undefined, lastAssistantText: stri
 }
 
 export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Promise<ClaudeAgentSdkRunResult> {
+  // Direct SDK workflow/worker lanes do not necessarily build the chat context
+  // packet that initializes capability policy. Establish the same conservative
+  // baseline here before the provider starts; a prior chat resolution can only
+  // have tightened this task to known, never loosened by this call.
+  if (
+    options.sessionId?.trim()
+    && Number.isSafeInteger(options.sourceUserSeq)
+    && (options.sourceUserSeq ?? 0) > 0
+  ) {
+    try {
+      discoveryGovernor.initializeTask({
+        sessionId: options.sessionId,
+        sourceUserSeq: options.sourceUserSeq as number,
+        knownCapability: false,
+      });
+    } catch {
+      // A non-authoritative fixture may carry display-only ids. Any attempted
+      // discovery remains fail-closed in admitDiscoveryBoundary.
+    }
+  }
+  // Resolve from the persisted graph/authority, never from prompt wording or a
+  // caller-supplied tool list. A known act route that was not activated fails
+  // here, before environment/model/MCP construction.
+  const actionExpectedWork = claudeActionExpectedWorkRequired(options);
   const env = await buildClaudeHeadlessEnv();
   // The local MCP server imports the whole harness (~13s cold boot measured on
   // the packaged app; worse under load) — the CLI's default MCP startup window
@@ -1860,7 +2140,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // live 2026-07-01 'only SEO tools' incidents). Give startup a real budget;
   // per-call timeouts still come from the server config's own `timeout`.
   if (!env.MCP_TIMEOUT) env.MCP_TIMEOUT = '120000';
-  const allowed = options.allowedLocalMcpTools ?? defaultClaudeAgentSdkAllowedLocalTools();
+  const configuredAllowed = options.allowedLocalMcpTools ?? defaultClaudeAgentSdkAllowedLocalTools();
+  const allowed = actionExpectedWork
+    ? [...new Set([
+        ...configuredAllowed.filter((name) => actionTopologyRoleFor(name) === 'control'),
+        'work_call',
+      ])].filter((name) => name !== 'call_tool')
+    : configuredAllowed;
   // Agentic lane requires a session id (the gate chain + approval read/write the
   // session's event log). Without one, fall back to the read-only allowlist.
   const agentic = Boolean(options.agentic && options.sessionId?.trim());
@@ -1886,6 +2172,21 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     || options.prompt;
   const nativeArtifactClaims = new Map<string, { artifactId: string; intent: ArtifactIntent }>();
   const nativeExternalWrites = new Map<string, NativeExternalWriteAttempt>();
+  // Direct local discovery helpers and SDK-native ToolSearch do not enter the
+  // wrapped-tool bracket chain. Hold their durable admission leases here until
+  // the exact provider tool_result arrives. Static Composio MCP tools are
+  // intentionally excluded at admission time because their inner handler does
+  // re-enter wrapToolForHarness and owns the one physical claim there.
+  const claudeDiscoveryClaims = new Map<string, DiscoveryBoundaryLease>();
+  const settleUnreturnedClaudeDiscovery = (
+    outcome: 'failed' | 'timed_out',
+    detail: string,
+  ): void => {
+    for (const lease of claudeDiscoveryClaims.values()) {
+      settleDiscoveryBoundary(lease, outcome, detail);
+    }
+    claudeDiscoveryClaims.clear();
+  };
   const nativePermissionResults = new Map<string, { signature: string; result: PermissionResult | null }>();
   const nativePermissionInFlight = new Map<string, {
     signature: string;
@@ -1971,6 +2272,53 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     const providerCallId = typeof opts.toolUseID === 'string' && opts.toolUseID.trim()
       ? opts.toolUseID.trim()
       : '';
+    const isActionWorkCall = actionExpectedWork
+      && isClaudeLocalCorrelatableSdkTool(toolName)
+      && mcpToolTail(toolName) === 'work_call';
+    const actionWorkCallRefusal = (
+      error: 'work_contract_invalid' | 'work_authority_unavailable',
+      detail: string,
+      repair: string,
+    ): string => JSON.stringify({
+      isError: true,
+      ok: false,
+      error,
+      dispatch_state: 'not_started',
+      detail,
+      repair,
+    });
+    const settleActionWorkCallRefusal = (corrective: string): void => {
+      if (
+        !options.sessionId
+        || !Number.isSafeInteger(options.sourceUserSeq)
+        || (options.sourceUserSeq ?? 0) <= 0
+        || !providerCallId
+      ) return;
+      withLogicalToolCall({
+        sessionId: options.sessionId,
+        sourceUserSeq: options.sourceUserSeq as number,
+        logicalToolCallId: providerCallId,
+        tool: 'work_call',
+        args: input,
+      }, () => {
+        settleToolAttempt({
+          sessionId: options.sessionId,
+          sourceUserSeq: options.sourceUserSeq,
+          lane: 'claude_sdk',
+          toolName: 'work_call',
+          callId: providerCallId,
+          args: input,
+          businessCall: false,
+          result: corrective,
+          signals: {
+            preDispatch: true,
+            argumentValidationFailed: true,
+            schemaAvailable: true,
+          },
+        });
+      });
+    };
+    const claudeParentDiscovery = isClaudeParentDiscoverySurface(toolName, input);
     let permissionSignature = '';
     try { permissionSignature = `${toolName}\0${JSON.stringify(input ?? {})}`; } catch { permissionSignature = `${toolName}\0${String(input)}`; }
     if (providerCallId) {
@@ -2012,6 +2360,40 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       }
     }
     const evaluatePermission = async (): Promise<PermissionResult | null> => {
+      // MCP rejects schema-invalid input before its handler can open/settle a
+      // logical call. Validate the action carrier at the host permission seam
+      // first, where Claude's provider call id is available, so even malformed
+      // input has one durable pre-dispatch outcome and a typed corrective.
+      if (isActionWorkCall) {
+        if (!providerCallId) {
+          return {
+            behavior: 'deny',
+            interrupt: false,
+            message: actionWorkCallRefusal(
+              'work_authority_unavailable',
+              'Claude omitted the provider tool-use id required to bind this action call.',
+              'Retry the same intended work through one fresh work_call. If the problem repeats, explain the blocker conversationally.',
+            ),
+          } as PermissionResult;
+        }
+        const parsed = WorkCallInputSchema.safeParse(input);
+        if (!parsed.success) {
+          const issues = parsed.error.issues
+            .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+            .slice(0, 12);
+          const corrective = actionWorkCallRefusal(
+            'work_contract_invalid',
+            issues.join('; '),
+            'Retry work_call with the required carrier fields and one complete provider-neutral proposal on the first call.',
+          );
+          settleActionWorkCallRefusal(corrective);
+          return {
+            behavior: 'deny',
+            interrupt: false,
+            message: corrective,
+          } as PermissionResult;
+        }
+      }
       if (options.artifactVerificationOnly) {
         const verification = artifactVerificationIntentForTool(toolName, input);
         const exactAllowed = Boolean(verification && options.artifactVerificationOnly.some(
@@ -2228,6 +2610,81 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             const staleBeforeDispatch = staleLeaseDenial();
             if (staleBeforeDispatch) return staleBeforeDispatch;
           }
+
+          // The durable discovery claim is the final read-only admission
+          // decision before canUseTool returns ALLOW. All earlier economy,
+          // scope, artifact, approval, and stale-generation refusals therefore
+          // remain free. A live accepted task must carry the SDK's physical
+          // tool-use id so retries cannot masquerade as one free replay.
+          if (
+            claudeParentDiscovery
+            && options.sessionId?.trim()
+            && Number.isSafeInteger(options.sourceUserSeq)
+            && (options.sourceUserSeq ?? 0) > 0
+          ) {
+            if (!providerCallId) {
+              return {
+                behavior: 'deny',
+                interrupt: false,
+                message: 'DISCOVERY_CORRELATION_REQUIRED: the provider omitted its tool-use id, so Clementine refused untraceable discovery before dispatch.',
+              } as PermissionResult;
+            }
+            try {
+              const lease = admitDiscoveryBoundary({
+                sessionId: options.sessionId,
+                sourceUserSeq: options.sourceUserSeq,
+                toolName,
+                input,
+                callId: providerCallId,
+              });
+              if (lease) claudeDiscoveryClaims.set(providerCallId, lease);
+            } catch (error) {
+              if (error instanceof DiscoveryBudgetDeniedError) {
+                return {
+                  behavior: 'deny',
+                  interrupt: false,
+                  message: `Tool call refused by harness: ${error.message}`,
+                } as PermissionResult;
+              }
+              throw error;
+            }
+          }
+          // Claude's permission callback owns the outer provider toolUseID,
+          // while the local MCP handler otherwise sees only its transport id.
+          // Persist the final admission so handler entry can author the one
+          // canonical occurrence. A legacy Composio read can tolerate a missed
+          // correlation marker; action work_call cannot — the marker is part of
+          // its dispatch authority and therefore fails closed before ALLOW.
+          if (permission.behavior === 'allow' && isClaudeLocalCorrelatableSdkTool(toolName)) {
+            const localPermissionAdmission = options.sessionId
+              && options.sourceUserSeq
+              && trackerScopeId
+              && providerCallId
+              ? recordClaudeLocalPermissionAdmission({
+                  sessionId: options.sessionId,
+                  sourceUserSeq: options.sourceUserSeq,
+                  runScopeId: trackerScopeId,
+                  providerCallId,
+                  sdkToolName: toolName,
+                  input,
+                  directOrchestrator: options.directOrchestrator === true,
+                  dispatchLease,
+                })
+              : null;
+            if (isActionWorkCall && !localPermissionAdmission) {
+              const corrective = actionWorkCallRefusal(
+                'work_authority_unavailable',
+                'Clementine could not durably bind this work_call to the exact Claude permission admission.',
+                'Retry the same intended work through one fresh work_call. If the problem repeats, explain the blocker conversationally.',
+              );
+              settleActionWorkCallRefusal(corrective);
+              return {
+                behavior: 'deny',
+                interrupt: false,
+                message: corrective,
+              } as PermissionResult;
+            }
+          }
           admittedForDispatch = true;
           return permission;
         };
@@ -2261,14 +2718,19 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
   // True schema-on-demand for every agentic Claude SDK lane. Native MCP
   // `alwaysLoad:false` hid definitions from Claude's initial list but Anthropic
-  // still accounted the registered schemas (~85K input tokens on a trivial live
-  // turn). Register only a tiny hot set plus tool_search/call_tool; the omitted
-  // authority surface stays same-turn reachable through the generic dispatcher,
+  // still accounted all 166 registered local schemas: 82,740 provider-counted
+  // input tokens on 2026-08-08. Register only a tiny hot set plus
+  // tool_search/call_tool; the omitted authority surface stays same-turn
+  // reachable through the generic dispatcher,
   // whose INNER call uses the existing schema validation and harness gates.
   const localUniverse = [...new Set(
-    (options.localMcpToolUniverse !== undefined ? options.localMcpToolUniverse : allowed)
+    (options.localMcpToolUniverse !== undefined
+      ? options.localMcpToolUniverse
+      : actionExpectedWork
+        ? configuredAllowed
+        : allowed)
       .map((name) => name.trim())
-      .filter(Boolean),
+      .filter((name) => Boolean(name) && name !== 'call_tool' && name !== 'work_call'),
   )];
   const explicitEmptyMcpAllowlist =
     options.mcpToolAllowlist !== undefined
@@ -2294,6 +2756,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     const requestedFirstClass = options.mcpToolAllowlist !== undefined
       ? new Set(options.mcpToolAllowlist.filter((name) => universeSet.has(name)))
       : resolveHotSet(options.sessionId, options.prompt, { allowedNames: universeSet });
+    if (actionExpectedWork) {
+      for (const name of [...requestedFirstClass]) {
+        if (actionTopologyRoleFor(name) !== 'control') requestedFirstClass.delete(name);
+      }
+    }
     for (const name of options.requiredLocalMcpTools ?? []) {
       if (universeSet.has(name)) requestedFirstClass.add(name);
     }
@@ -2309,15 +2776,29 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     // the profile/universe because they are transport primitives, not business
     // capabilities.
     selected.add('tool_search');
-    selected.add('call_tool');
+    selected.add(actionExpectedWork ? 'work_call' : 'call_tool');
     const deferredTools = localUniverse.filter((name) => !selected.has(name));
     if (deferredTools.length > 0) {
       localMcpToolAllowlist = [...selected];
       localMcpLoading = { deferredTools };
     }
   }
+  // An action graph always has exactly one generic business carrier. This
+  // override also covers the schema-on-demand kill switch and explicit hot
+  // lists: control/discovery tools may stay first-class, while every business
+  // capability remains reachable only as an inner work_call target.
+  if (actionExpectedWork) {
+    const requested = localMcpToolAllowlist ?? localUniverse;
+    const firstClassControls = requested.filter(
+      (name) => actionTopologyRoleFor(name) === 'control',
+    );
+    localMcpToolAllowlist = [...new Set([...firstClassControls, 'tool_search', 'work_call'])];
+    localMcpLoading = {
+      deferredTools: localUniverse.filter((name) => !localMcpToolAllowlist!.includes(name)),
+    };
+  }
   const runScopeId = trackerScopeId;
-  const nativeMcpServers = agentic
+  const nativeMcpServers = agentic && !actionExpectedWork
     ? buildScopedNativeMcpServers(options.nativeMcpScopeInput, {
         mode: options.nativeMcpScopeMode,
         ...(options.nativeMcpToolScope !== undefined
@@ -2334,6 +2815,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       stepId: options.stepId,
       runScopeId,
       sourceUserSeq: options.sourceUserSeq,
+      directOrchestrator: options.directOrchestrator === true,
+      actionExpectedWork,
+      workerScope: options.workerScope === true,
       mcpToolScope: options.nativeMcpToolScope,
       dispatchLease,
     }, localMcpLoading),
@@ -2404,6 +2888,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
 
   let result: SDKResultMessage | null = null;
   let init: SDKSystemMessage | null = null;
+  const assistantUsageByResponseId = new Map<string, ClaudeAgentSdkUsageTotals>();
+  let latestAssistantUsageResponseId: string | undefined;
   let toolUses: string[] = [];
   let successfulToolUses: string[] = [];
   const toolCallLedger: Array<{ callId: string; name: string; argsPreview: string }> = [];
@@ -2460,9 +2946,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     source: { name: string; input: unknown } | undefined;
     useFingerprint: string;
     calledEventId: string | undefined;
+    preauthoredLocalCanonical: boolean;
     resultFingerprint?: string;
+    order: number;
   };
   const topLevelToolOccurrences = new Map<string, TopLevelToolOccurrence[]>();
+  let nextTopLevelToolOrder = 0;
   const startTopLevelToolOccurrence = (
     callId: string,
     source: { name: string; input: unknown } | undefined,
@@ -2473,6 +2962,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         ? toolCallCorrelationFingerprint(source.name, source.input)
         : '',
       calledEventId: undefined,
+      preauthoredLocalCanonical: false,
+      order: nextTopLevelToolOrder++,
     };
     const occurrences = topLevelToolOccurrences.get(callId) ?? [];
     occurrences.push(occurrence);
@@ -2486,12 +2977,33 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       });
     } catch { /* ledger is best-effort */ }
     toolUses.push(source.name);
-    occurrence.calledEventId = appendSdkTopLevelToolEvent(
-      options.sessionId,
-      'tool_called',
-      callId,
-      source,
-    );
+    const claimedCanonical = options.sessionId
+      && options.sourceUserSeq
+      && trackerScopeId
+      ? findClaimedClaudeLocalCanonicalCall({
+          sessionId: options.sessionId,
+          sourceUserSeq: options.sourceUserSeq,
+          runScopeId: trackerScopeId,
+          providerCallId: callId,
+          sdkToolName: source.name,
+          rawInput: source.input,
+        })
+      : null;
+    occurrence.calledEventId = claimedCanonical?.id
+      ?? appendSdkTopLevelToolEvent(
+        options.sessionId,
+        'tool_called',
+        callId,
+        source,
+        undefined,
+        undefined,
+        {
+          sourceUserSeq: options.sourceUserSeq,
+          runScopeId: trackerScopeId,
+          attemptId: options.dispatchLease?.runAttemptId,
+        },
+      );
+    occurrence.preauthoredLocalCanonical = claimedCanonical !== null;
     emitSdkToolCallEvent(options.sessionId, 'tool_call_started', callId, source.name);
     return occurrence;
   };
@@ -2504,6 +3016,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   for (let attempt = 0; ; attempt++) {
     result = null;
     init = null;
+    assistantUsageByResponseId.clear();
+    latestAssistantUsageResponseId = undefined;
     toolUses = [];
     successfulToolUses = [];
     toolCallLedger.length = 0;
@@ -2537,9 +3051,18 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           parentLease: options.dispatchLease,
         })
       : options.dispatchLease;
+    const queryMcpServers = buildMcpServersForDispatchLease(queryDispatchLease);
+    const localCapabilityServer = queryMcpServers['clementine-local'];
+    if (localCapabilityServer?.type === 'sdk') {
+      // One physical SDK query owns one in-process server and therefore one
+      // isolated capability revision chain. Seal revision 1 before model work;
+      // call_tool still awaits the same promise and fails closed if sealing
+      // refused. Stdio children perform this initialization in their own main.
+      await initializeClementineMcpCapabilityAuthority(localCapabilityServer.instance);
+    }
     const querySdkOptions: ClaudeAgentOptions = {
       ...sdkOptions,
-      mcpServers: buildMcpServersForDispatchLease(queryDispatchLease),
+      mcpServers: queryMcpServers,
       canUseTool: buildCanUseTool(queryDispatchLease),
     };
     let queryDispatchRevoked = false;
@@ -2597,7 +3120,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                     kind: 'progress_check_in',
                     toolCalls: toolCallLedger.length,
                     elapsedMs: now - startedAt,
-                    message: `Still working (${toolCallLedger.length} tool call${toolCallLedger.length === 1 ? '' : 's'} so far).`,
+                    message: progressNarration(toolCallLedger.map((entry) => entry.name)),
                     transport: 'claude_agent_sdk',
                   },
                 });
@@ -2618,6 +3141,19 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         );
         if (next.done) break;
         const message = next.value;
+        const assistantUsage = assistantUsageFrame(message);
+        if (assistantUsage) {
+          // The SDK may replay an assistant frame or replace it during refusal
+          // fallback. Count each provider response once and remove any response
+          // ids the new canonical frame explicitly supersedes.
+          for (const superseded of assistantUsage.supersedes) {
+            assistantUsageByResponseId.delete(superseded);
+          }
+          if (!assistantUsageByResponseId.has(assistantUsage.responseId)) {
+            assistantUsageByResponseId.set(assistantUsage.responseId, assistantUsage);
+          }
+          latestAssistantUsageResponseId = assistantUsage.responseId;
+        }
         const apiRetry = extractApiRetry(message);
         if (apiRetry) {
           sawSdkApiRetry = true;
@@ -2690,7 +3226,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                 kind: 'progress_check_in',
                 toolCalls: toolCallLedger.length,
                 elapsedMs: Date.now() - startedAt,
-                message: `Still working (${toolCallLedger.length} tool call${toolCallLedger.length === 1 ? '' : 's'} so far).`,
+                message: progressNarration(toolCallLedger.map((entry) => entry.name)),
                 transport: 'claude_agent_sdk',
               },
             });
@@ -2765,6 +3301,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // Legacy/id-less tool blocks remain visible because there is no provider
         // identity with which to correlate or coalesce them safely.
         toolUses.push(...extractIdlessAssistantToolUses(message));
+        const terminalRepliesThisMessage: TerminalToolReply[] = [];
         for (const tr of extractToolResults(message)) {
           const resultFingerprint = sdkToolResultFingerprint(tr);
           const occurrences = topLevelToolOccurrences.get(tr.callId) ?? [];
@@ -2779,20 +3316,113 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           occurrence.resultFingerprint = resultFingerprint;
           const source = occurrence.source;
           const resultFailed = tr.isError || !tr.valid;
+          const sourceAccounting = source
+            ? runtimeToolAccountingMetadata(mcpToolTail(source.name), source.input)
+            : null;
+          const settledReadReplay = options.sessionId
+            && options.sourceUserSeq
+            && trackerScopeId
+            && occurrence.calledEventId
+            && source
+            && isClaudeLocalComposioSdkTool(source.name)
+            && sourceAccounting?.effect === 'read'
+            && sourceAccounting.toolSlug
+            ? settledReadRepeatReplayDisposition({
+                sessionId: options.sessionId,
+                replayCallId: tr.callId,
+                replayCalledEventId: occurrence.calledEventId,
+                toolName: mcpToolTail(source.name),
+                effect: sourceAccounting.effect,
+                sourceUserSeq: options.sourceUserSeq,
+                replayBehaviorScopeId: trackerScopeId,
+                toolSlug: sourceAccounting.toolSlug,
+              })
+            : null;
+          // The exact SDK hook name remains namespaced
+          // (mcp__clementine-local__composio_execute_tool). Normalize by server
+          // identity/tail before stripping model-only harness prose, so neither
+          // first-success steering nor replay steering can become authority or
+          // reflection input.
+          const authorityOutput = source
+            && isClaudeLocalComposioSdkTool(source.name)
+            && typeof tr.output === 'string'
+            ? stripSettledReadHarnessAdvisory(tr.output)
+            : tr.output;
+          const resultLooksSuccessful = !resultFailed
+            && claudeSdkToolOutputLooksSuccessful(source?.name, tr.output);
+          const discoveryLease = claudeDiscoveryClaims.get(tr.callId);
+          if (discoveryLease) {
+            const outputText = typeof tr.output === 'string'
+              ? tr.output
+              : JSON.stringify(tr.output ?? '');
+            const timedOut = /\b(?:timeout|timed out|deadline|etimedout)\b/i.test(outputText);
+            const succeeded = !resultFailed && toolOutputLooksSuccessful(tr.output);
+            settleDiscoveryBoundary(
+              discoveryLease,
+              timedOut ? 'timed_out' : succeeded ? 'succeeded' : 'failed',
+              timedOut ? 'provider_timeout' : succeeded ? undefined : coarseToolErrorClass(outputText),
+            );
+            claudeDiscoveryClaims.delete(tr.callId);
+          }
           let invocationNonce: string | undefined;
+          // The SDK can publish its assistant tool_use frame before the local
+          // MCP handler enters. Re-resolve the durable handler claim at result
+          // time so that stream-first ordering still reuses the one output row
+          // parked inside the bracket.
+          const claimedCanonicalAtResult = !occurrence.preauthoredLocalCanonical
+            && options.sessionId
+            && options.sourceUserSeq
+            && trackerScopeId
+            && occurrence.calledEventId
+            && source
+            ? findClaimedClaudeLocalCanonicalCall({
+                sessionId: options.sessionId,
+                sourceUserSeq: options.sourceUserSeq,
+                runScopeId: trackerScopeId,
+                providerCallId: tr.callId,
+                sdkToolName: source.name,
+                rawInput: source.input,
+              })
+            : null;
+          const locallyCorrelatedCanonical = occurrence.preauthoredLocalCanonical
+            || claimedCanonicalAtResult?.id === occurrence.calledEventId;
+          const locallyParkedInvocations = options.sessionId
+            && locallyCorrelatedCanonical
+            && source
+            && isClaudeLocalCorrelatableSdkTool(source.name)
+            ? (() => {
+                try { return listToolOutputInvocations(options.sessionId as string, tr.callId); }
+                catch { return []; }
+              })()
+            : [];
           // Persist the exact bytes before the parented terminal event. That
           // ordering lets authority consumers prove the row belongs inside this
           // one physical call/return occurrence even after a reused SDK id.
-          if (options.sessionId && tr.output !== undefined && tr.output !== null && !resultFailed) {
+          if (
+            options.sessionId
+            && authorityOutput !== undefined
+            && authorityOutput !== null
+            && !resultFailed
+            && !settledReadReplay
+          ) {
             try {
-              invocationNonce = randomUUID();
-              writeToolOutput({
-                sessionId: options.sessionId,
-                callId: tr.callId,
-                tool: source ? mcpToolTail(source.name) : null,
-                output: tr.output,
-                invocationNonce,
-              });
+              if (locallyParkedInvocations.length === 1) {
+                // The correlated local bracket already parked the physical
+                // provider bytes under this outer call id. Reuse its nonce;
+                // writing again here would create a second exact invocation
+                // and make authority resolution correctly (but needlessly)
+                // ambiguous.
+                invocationNonce = locallyParkedInvocations[0]!.invocationNonce;
+              } else if (locallyParkedInvocations.length === 0) {
+                invocationNonce = randomUUID();
+                writeToolOutput({
+                  sessionId: options.sessionId,
+                  callId: tr.callId,
+                  tool: source ? mcpToolTail(source.name) : null,
+                  output: authorityOutput,
+                  invocationNonce,
+                });
+              }
             } catch {
               invocationNonce = undefined;
               // Recall parking must never break the run.
@@ -2889,7 +3519,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               })()
             : {};
           emitSdkToolCallEvent(options.sessionId, resultFailed ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name, failExtra);
-          if (source?.name && !resultFailed && toolOutputLooksSuccessful(tr.output)) {
+          if (source?.name && resultLooksSuccessful) {
             successfulToolUses.push(completionEvidenceToolName(source.name, source.input));
           }
           appendSdkTopLevelToolEvent(
@@ -2897,36 +3527,62 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             'tool_returned',
             tr.callId,
             source,
-            { isError: resultFailed, output: tr.output, invocationNonce },
+            {
+              isError: resultFailed,
+              output: tr.output,
+              invocationNonce,
+              ...(settledReadReplay ? {
+                providerDispatched: false,
+                replayedFromCallId: settledReadReplay.sourceCallId,
+              } : {}),
+            },
             occurrence.calledEventId,
+            {
+              sourceUserSeq: options.sourceUserSeq,
+              runScopeId: trackerScopeId,
+              attemptId: options.dispatchLease?.runAttemptId,
+            },
           );
-          if (reflectLearning && tr.output) {
+          if (reflectLearning && authorityOutput && !settledReadReplay) {
             const tool = source ? reflectionToolName(source.name, source.input) : null;
             reflectImpl({
               sessionId: reflectSessionId as string,
               callId: tr.callId,
               tool,
-              output: tr.output,
+              output: authorityOutput,
               scopeId: options.trackerScopeId
                 ?? (options.sourceUserSeq !== undefined && options.sessionId
                   ? `${options.sessionId}:user:${options.sourceUserSeq}`
                   : undefined),
             });
           }
-          if (!resultFailed && source && isTerminalAfterTool(source.name)) {
+          if (resultLooksSuccessful && source && isTerminalAfterTool(source.name)) {
             if (!terminalToolShouldHalt(source.name, tr.output)) continue;
-            terminalToolReply = renderTerminalToolReply(source.name, source.input, tr.output);
-            terminalToolReason = terminalToolStoppedReason(source.name);
-            await interruptQuery();
-            break;
+            // Do not interrupt inside the result loop. Parallel tool uses from
+            // one assistant frame are returned in this same user frame; breaking
+            // on the first ask dropped the remaining questions and their return
+            // accounting. Settle the whole frame, then interrupt exactly once.
+            terminalRepliesThisMessage.push({
+              rawName: source.name,
+              text: renderTerminalToolReply(source.name, source.input, tr.output),
+              reason: terminalToolStoppedReason(source.name),
+              order: occurrence.order,
+            });
           }
         }
-        if (terminalToolReply) break;
+        if (terminalRepliesThisMessage.length > 0) {
+          terminalToolReply = renderTerminalToolReplyBundle(terminalRepliesThisMessage);
+          terminalToolReason = terminalRepliesThisMessage.find((reply) => reply.reason === 'awaiting-input')?.reason
+            ?? terminalRepliesThisMessage.find((reply) => reply.reason !== undefined)?.reason;
+          await interruptQuery();
+          break;
+        }
         result = extractResult(message) ?? result;
       }
       // The provider iterator has ended; no further tool callback belongs to
       // this query even while result/orphan bookkeeping below is still running.
       await revokeQueryDispatch();
+      settleUnreturnedClaudeDiscovery('failed', 'sdk_stream_ended_without_tool_result');
       const required = requiredLocalMcpTools(options);
       if (options.sessionId && nativeArtifactClaims.size > 0) {
         for (const [callId, claim] of nativeArtifactClaims) {
@@ -2952,6 +3608,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       // A thrown iterator/startup path loses authority before any catch-side
       // settlement, close(), backoff, or retry work.
       await revokeQueryDispatch();
+      const msg = err instanceof Error ? err.message : String(err);
+      settleUnreturnedClaudeDiscovery(
+        /\b(?:timeout|timed out|deadline|etimedout)\b/i.test(msg) ? 'timed_out' : 'failed',
+        /\b(?:timeout|timed out|deadline|etimedout)\b/i.test(msg)
+          ? 'sdk_stream_timeout_without_tool_result'
+          : 'sdk_stream_failed_without_tool_result',
+      );
       if (options.sessionId && nativeArtifactClaims.size > 0) {
         for (const [callId, claim] of nativeArtifactClaims) {
           try { markClaimedArtifactUncertain(claim.artifactId, callId); } catch { /* pending claim remains fail-closed */ }
@@ -2967,7 +3630,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         }
         nativeExternalWrites.clear();
       }
-      const msg = err instanceof Error ? err.message : String(err);
       // Our OWN interrupt (tool ceiling / wall-clock) may surface as a thrown
       // stream error rather than a clean result — it's a graceful self-stop, not
       // a crash. Route it to the limitHit path below (handled after finally).
@@ -3038,6 +3700,33 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // Prefer the self-stop reason (ceiling/wall-clock) over the generic turn-budget
   // copy so the user sees WHY Clem held off.
   const partialLimitText = (): string => ceilingState.stopped ?? bestLimitHitText(lastAssistantText, streamedText);
+  const assistantUsageFallback = (): ClaudeAgentSdkUsageFallback | null => {
+    if (assistantUsageByResponseId.size === 0) return null;
+    let inputTokens = 0;
+    let cachedInputTokens = 0;
+    let cacheCreationInputTokens = 0;
+    let cacheCreationRecordedCalls = 0;
+    let outputTokens = 0;
+    for (const usage of assistantUsageByResponseId.values()) {
+      inputTokens += usage.inputTokens;
+      cachedInputTokens += usage.cachedInputTokens;
+      if (usage.cacheCreationInputTokens !== undefined) {
+        cacheCreationInputTokens += usage.cacheCreationInputTokens;
+        cacheCreationRecordedCalls += 1;
+      }
+      outputTokens += usage.outputTokens;
+    }
+    return {
+      inputTokens,
+      cachedInputTokens,
+      ...(cacheCreationRecordedCalls === assistantUsageByResponseId.size
+        ? { cacheCreationInputTokens }
+        : {}),
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+      ...(latestAssistantUsageResponseId ? { responseId: latestAssistantUsageResponseId } : {}),
+    };
+  };
 
   const exactApprovalBoundary = approvalBoundary as ClaudeAgentApprovalBoundary | null;
   if (exactApprovalBoundary) {
@@ -3045,7 +3734,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   }
 
   if (terminalToolReply) {
-    recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
+    recordClaudeAgentSdkUsage(options, result, init, { firstByteMs }, assistantUsageFallback());
     return {
       text: terminalToolReply,
       sessionId: result?.session_id ?? init?.session_id,

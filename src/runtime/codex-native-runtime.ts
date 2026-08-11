@@ -5,7 +5,13 @@ import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRun
 import { ApprovalStore } from './approval-store.js';
 import { addNotification, getNotification } from './notifications.js';
 import { ASSISTANT_NAME, BASE_DIR, DEFAULT_CODEX_MODEL } from '../config.js';
-import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, isCodexAuthDead, getCodexAuthDead } from './auth-store.js';
+import {
+  assertCodexAccessTokenCanCoverCall,
+  getStoredCodexOAuthTokens,
+  refreshStoredNativeOAuth,
+  isCodexAuthDead,
+  getCodexAuthDead,
+} from './auth-store.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
 import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
@@ -646,6 +652,7 @@ async function performCodexRequest(
   if (!tokens?.accessToken) {
     throw new CodexRuntimeError('No ChatGPT/Codex sign-in is available. Open Settings → Models & routing → Re-authenticate (or run `clementine auth login-device`) to finish signing in.');
   }
+  assertCodexAccessTokenCanCoverCall(tokens, request.maxWallClockMs);
 
   // `prompt_cache_key` lets Codex re-use a cached prefix across calls
   // in the same session. The Codex backend ignores `previous_response_id`
@@ -886,6 +893,7 @@ async function performCodexRequest(
 	              const { inputTokens, outputTokens, totalTokens, cachedInputTokens, reasoningTokens } = parseCodexUsage(usage);
 	              recordModelUsage({
 	                sessionId: request.sessionId ?? 'unknown',
+	                sourceUserSeq: request.sourceUserSeq,
 	                channel: request.channel,
 	                model: resolveCodexModel(request.model),
 	                cacheDialect: 'inclusive', // OpenAI Responses wire: input_tokens ⊇ cached

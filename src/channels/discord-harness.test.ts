@@ -680,7 +680,9 @@ test('parseHarnessCommand: recognizes /continue, continue, and "keep going" (T1.
   assert.equal(parseHarnessCommand('/continue'), 'continue');
   assert.equal(parseHarnessCommand('continue'), 'continue');
   assert.equal(parseHarnessCommand('Continue'), 'continue');
+  assert.equal(parseHarnessCommand('Continue.'), 'continue');
   assert.equal(parseHarnessCommand('keep going'), 'continue');
+  assert.equal(parseHarnessCommand('keep going!'), 'continue');
   assert.equal(parseHarnessCommand('  CONTINUE  '), 'continue');
 });
 

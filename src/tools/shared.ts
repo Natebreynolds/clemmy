@@ -73,11 +73,41 @@ export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_R
 
 export { DEFAULT_TOOL_RESULT_MAX_CHARS };
 
-export function textResult(text: string, options?: { maxChars?: number }): { content: Array<{ type: 'text'; text: string }> } {
+export function textResult(
+  text: string,
+  options?: { maxChars?: number; isError?: boolean },
+): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } {
   const capped = formatRecallableToolText(text, {
     maxChars: options?.maxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
   });
-  return { content: [{ type: 'text', text: capped }] };
+  return {
+    content: [{ type: 'text', text: capped }],
+    ...(options?.isError ? { isError: true } : {}),
+  };
+}
+
+/**
+ * Did the HARNESS refuse this call, rather than the tool answering it?
+ *
+ * The four transport truths — succeeded, failed before dispatch, may have
+ * executed, needs clarification — are all recorded correctly in the ledger and
+ * then collapse to one at the MCP boundary, because a local tool result never
+ * carries `isError`. The consumer already reads it
+ * (`claude-agent-sdk.ts`: `ok: !result?.isError`); nothing has ever set it.
+ *
+ * Live 2026-08-09: a pre-dispatch schema refusal naming the exact missing field
+ * arrived as an ordinary successful result, and the identical payload was sent
+ * again. A refusal that reads as an answer cannot teach.
+ *
+ * Detection keys on the harness's OWN typed refusal markers — the prefixes it
+ * writes when it declines — never on tool names, slugs, or providers. A tool
+ * that genuinely returns the word "refused" in its data is unaffected, because
+ * these markers are structural and always lead the result.
+ */
+export function isHarnessRefusalText(text: string): boolean {
+  const head = text.slice(0, 240);
+  return /^\s*(?:\{\s*")?(?:Tool call refused by harness|\[provider-dispatch:not-started:)/i.test(head)
+    || /"error"\s*:\s*"(?:requires_readmission|arg_validation|not_allowed|unknown_tool)"/i.test(head);
 }
 
 export function ensureDir(dir: string): void {

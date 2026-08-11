@@ -67,6 +67,80 @@ test('guardrail_tripped → ERROR guardrail span carrying the gate kind', () => 
   assert.equal(g?.attributes['clem.guardrail.kind'], 'duplicate_external_write');
 });
 
+test('settled-read reuse stays a logical tool attempt without claiming provider CLIENT I/O', () => {
+  const called = ev(
+    'tool_called',
+    { tool: 'composio_execute_tool', callId: 'reuse-1', accounting: 'top_level' },
+    '2026-06-21T00:00:00.000Z',
+  );
+  const returned = {
+    ...ev(
+      'tool_returned',
+      {
+        tool: 'composio_execute_tool',
+        callId: 'reuse-1',
+        accounting: 'top_level',
+        providerDispatched: false,
+        replayKind: 'same_source_settled_read_replay',
+        result: '12 records',
+      },
+      '2026-06-21T00:00:00.010Z',
+    ),
+    parentEventId: called.id,
+  };
+  const spans = toGenAiSpans([called, returned]);
+  const tool = spans.find((span) => span.attributes['gen_ai.tool.call.id'] === 'reuse-1');
+  assert.ok(tool, 'the canonical model attempt remains observable');
+  assert.equal(tool.kind, 'INTERNAL', 'reuse is not a provider CLIENT dispatch');
+  assert.equal(tool.attributes['clem.tool.reused'], true);
+  assert.equal(tool.attributes['clem.provider.dispatched'], false);
+  assert.equal(tool.status, undefined);
+});
+
+test('settled-read reuse is parent-scoped when a provider reuses one call id', () => {
+  const first = ev(
+    'tool_called',
+    { tool: 'composio_execute_tool', callId: 'sdk-reused', accounting: 'top_level' },
+    '2026-06-21T00:00:00.000Z',
+  );
+  const second = ev(
+    'tool_called',
+    { tool: 'composio_execute_tool', callId: 'sdk-reused', accounting: 'top_level' },
+    '2026-06-21T00:00:00.010Z',
+  );
+  const replay = {
+    ...ev('tool_returned', {
+      tool: 'composio_execute_tool',
+      callId: 'sdk-reused',
+      accounting: 'top_level',
+      providerDispatched: false,
+      replayKind: 'same_source_settled_read_replay',
+      result: '12 records',
+    }, '2026-06-21T00:00:00.020Z'),
+    parentEventId: second.id,
+  };
+  const toolSpans = toGenAiSpans([first, second, replay])
+    .filter((span) => span.attributes['gen_ai.tool.call.id'] === 'sdk-reused');
+  assert.equal(toolSpans.length, 2, 'both canonical attempts stay visible');
+  assert.deepEqual(toolSpans.map((span) => span.kind), ['CLIENT', 'INTERNAL']);
+  assert.equal(toolSpans[0].attributes['clem.tool.reused'], undefined);
+  assert.equal(toolSpans[1].attributes['clem.tool.reused'], true);
+});
+
+test('settled-read replay marker is an informational OTel advisory, not an ERROR', () => {
+  const spans = toGenAiSpans([
+    ev('guardrail_tripped', {
+      kind: 'same_source_settled_read_replay',
+      toolName: 'composio_execute_tool',
+    }, '2026-06-21T00:00:03.000Z'),
+  ]);
+  const advisory = spans.find((span) => span.name.startsWith('advisory'));
+  assert.ok(advisory);
+  assert.equal(advisory.status?.code, 'OK');
+  assert.equal(advisory.attributes['clem.advisory'], true);
+  assert.equal(advisory.attributes['clem.tool.reused'], true);
+});
+
 test('turn_started + turn_ended → invoke_agent span; run_failed → ERROR span; spans sorted by start', () => {
   const spans = toGenAiSpans([
     ev('turn_started', {}, '2026-06-21T00:00:00.000Z', 1),

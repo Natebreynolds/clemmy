@@ -38,9 +38,12 @@
  *     richer event log instead. `onToolActivity` / `onReasoning` are relayed
  *     best-effort from harness events for legacy progress surfaces.
  */
-import { runConversation, verifiedWorkflowRunDispatchReceipts } from './loop.js';
+import { runConversation, verifiedWorkflowRunDispatchReceipts, type RunConversationOptions } from './loop.js';
 import { resolveAcceptedTurnRead, type AcceptedTurnReadPorts, type AcceptedTurnReadResult } from '../read-path/read-lane-chat.js';
-import { resolveTurnCapabilityCandidates, type TurnCapabilityCandidates } from '../read-path/capability-candidates.js';
+import { buildProductionReadPortsForAcceptedTurn } from '../read-path/read-lane-adapters.js';
+import { currentAcceptedReadAuthority } from '../read-path/accepted-read-authority.js';
+import type { TurnCapabilityCandidates } from '../read-path/capability-candidates.js';
+import { enrichAcceptedRequestWithTaskContinuity } from './task-continuity-runtime.js';
 import {
   PendingWorkflowChatDispatchOwnershipError,
   readPendingWorkflowChatDispatchOwnership,
@@ -57,7 +60,9 @@ import {
   finishRunAttempt,
   getLatestRunAttempt,
   getLatestRunAttemptByRunId,
+  getRunAttemptBySourceUserSeq,
   getSession,
+  isKillRequested,
   listEvents,
   preserveCurrentKillAndClearStale,
   recordRunAttemptUserInput,
@@ -94,8 +99,16 @@ import {
   type PresentationEvent,
   type TurnIdentity,
 } from './turn-outcome.js';
-import { markRunInFlight } from './restart-recovery.js';
+import { clearRunInFlightAfterTerminal, markRunInFlight } from './restart-recovery.js';
 import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
+import { recordWarmProcedureUse } from '../../memory/procedure-receipts.js';
+import { warmReadToolPolicyDigest } from '../read-path/warm-read-policy.js';
+import {
+  assessCompletedAnswerReplay,
+  isExplicitCompletedAnswerReplay,
+  readCompletedAnswerReplayProtection,
+  type CompletedAnswerReplayProtectionReader,
+} from './completed-answer-replay.js';
 
 export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow' | 'discord' | 'slack';
 
@@ -113,6 +126,7 @@ function observeAcceptedBridgeTurnGraph(
     surface,
     allowedToolNames: request.allowedToolNames,
     excludedToolNames: request.excludeToolNames,
+    verifiedTaskContinuation: request.taskContinuation,
   });
 }
 
@@ -330,53 +344,181 @@ function blockedPreRunResponse(
  * machinery as every other bridge terminal: nothing here is a second
  * committer.
  */
-async function tryServeAcceptedTurnRead(
+async function serveAcceptedTurnReadUnderAuthority(
   surface: HarnessSurface,
   request: AssistantRequest,
+  authority: NonNullable<ReturnType<typeof currentAcceptedReadAuthority>>,
 ): Promise<AssistantResponse | null> {
   let ports: AcceptedTurnReadPorts | null = null;
   try {
-    ports = acceptedTurnReadPortsImpl(surface, request);
+    ports = await acceptedTurnReadPortsImpl(surface, request);
   } catch { ports = null; }
   if (!ports) return null; // fail closed: no derived authority, no lane
+  if (await warmReadCancellationRequested(request, authority)) return null;
   let served: AcceptedTurnReadResult;
   try {
     served = await resolveAcceptedTurnRead(
-      { sessionId: request.sessionId, message: request.message, seq: `${Date.now().toString(36)}` },
+      { sessionId: request.sessionId, message: request.message, seq: String(authority.source.seq) },
       ports,
     );
   } catch {
     return null; // typed resolver trouble never breaks an ordinary turn
   }
-  if (served.kind !== 'served') return null;
-  try {
-    if (!getSession(request.sessionId)) {
-      const config = SURFACE_CONFIG[surface];
-      const titleSeed = (request.displayMessage ?? request.message).trim().replace(/\s+/g, ' ');
-      createSession({
-        id: request.sessionId,
-        kind: config.kind,
-        channel: request.channel,
-        userId: request.userId,
-        title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
-        metadata: { source: `bridge:${surface}` },
-      });
-    }
-    const attempt = beginRunAttempt(request.sessionId, { runId: request.runId });
-    const sourceUserEvent = recordRunAttemptUserInput(attempt, {
-      turn: 1,
-      role: 'user',
-      data: {
-        text: request.displayMessage ?? request.message,
-        ...(request.runId ? { runId: request.runId } : {}),
-        attemptId: attempt.attemptId,
-        source: `bridge:${surface}`,
+  if (served.kind === 'spent') {
+    const stoppedResponse = (): AssistantResponse => withRouteDiagnostics({
+      text: 'That read stopped after the provider was contacted, so I did not run it again.',
+      sessionId: request.sessionId,
+      stoppedReason: 'cancelled',
+      raw: {
+        readLane: {
+          warm: true,
+          spent: true,
+          terminalCommitted: false,
+          counters: served.counters,
+        },
       },
-    }, { existingEventSeq: request.sourceUserSeq, armRunInFlight: true });
+    }, {
+      routeKind: 'harness',
+      surface,
+      requestedModel: request.model,
+      effectiveModel: 'read-lane-warm',
+      provider: 'verified-procedure',
+      transport: 'read_lane_warm_spent',
+      mode: getModelRoutingMode(),
+    });
+
+    // A spent read must never fall through into another brain/provider. Only
+    // the still-current, non-killed attempt may publish a durable blocked
+    // terminal; a stale invocation returns a non-retrying stopped response and
+    // leaves a newer attempt's terminal authority untouched.
+    const current = currentAcceptedReadAuthority(
+      request.sessionId,
+      request.sourceUserSeq,
+      request.runId,
+      request.message,
+    );
+    if (!current || current.attempt.attemptId !== authority.attempt.attemptId
+      || await warmReadCancellationRequested(request, authority)) {
+      try { finishRunAttempt(authority.attempt, 'cancelled'); } catch { /* telemetry */ }
+      return stoppedResponse();
+    }
+    try {
+      const sourceUserEvent = authority.source;
+      const identity: TurnIdentity = {
+        sessionId: request.sessionId,
+        turn: sourceUserEvent.turn,
+        sourceUserSeq: sourceUserEvent.seq,
+      };
+      const committedCounters = {
+        ...served.counters,
+        public_terminals: served.counters.public_terminals + 1,
+      };
+      const committed = commitTurnOutcomeImpl({
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'blocked',
+        resumable: false,
+        presentation: {
+          kind: 'blocked',
+          text: 'The connected read ran, but its result could not be safely presented. I did not run it again.',
+        },
+      }, {
+        legacyReason: 'warm_read_spent',
+        metadata: {
+          transport: 'read_lane_warm_spent',
+          laneDigest: served.laneDigest,
+          counters: committedCounters as unknown as Record<string, unknown>,
+          warmReadPolicyDigest: warmReadToolPolicyDigest(request),
+        },
+      });
+      if (!committed.inserted) {
+        try { finishRunAttempt(authority.attempt, 'superseded'); } catch { /* telemetry */ }
+        return responseForExactTerminalReplayUnderPolicy(surface, request, committed.event);
+      }
+      served.counters.public_terminals = committedCounters.public_terminals;
+      observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+      try { finishRunAttempt(authority.attempt, 'failed'); } catch { /* telemetry */ }
+      clearRunInFlightAfterTerminal(
+        request.sessionId,
+        authority.attempt.attemptId,
+        authority.source.seq,
+      );
+      return withRouteDiagnostics({
+        text: committed.presentation.text,
+        sessionId: request.sessionId,
+        stoppedReason: 'error',
+        raw: {
+          readLane: {
+            warm: true,
+            spent: true,
+            terminalCommitted: true,
+            counters: served.counters,
+          },
+        },
+      }, {
+        routeKind: 'harness',
+        surface,
+        requestedModel: request.model,
+        effectiveModel: 'read-lane-warm',
+        provider: 'verified-procedure',
+        transport: 'read_lane_warm_spent',
+        mode: getModelRoutingMode(),
+      });
+    } catch {
+      return stoppedResponse();
+    }
+  }
+  if (served.kind !== 'served') return null;
+  const stoppedAfterSuccessfulDispatch = (): AssistantResponse => withRouteDiagnostics({
+    text: 'That read stopped after the provider returned, so I did not run it again.',
+    sessionId: request.sessionId,
+    stoppedReason: 'cancelled',
+    raw: {
+      readLane: {
+        warm: true,
+        spent: true,
+        terminalCommitted: false,
+        artifactId: served.artifactId,
+        counters: served.counters,
+      },
+    },
+  }, {
+    routeKind: 'harness',
+    surface,
+    requestedModel: request.model,
+    effectiveModel: 'read-lane-warm',
+    provider: 'verified-procedure',
+    transport: 'read_lane_warm_stopped',
+    mode: getModelRoutingMode(),
+  });
+  if (await warmReadCancellationRequested(request, authority)) {
+    try { finishRunAttempt(authority.attempt, 'cancelled'); } catch { /* telemetry */ }
+    return stoppedAfterSuccessfulDispatch();
+  }
+  try {
+    // Provider work may have awaited account/schema state. Re-prove that the
+    // exact same physical attempt still owns this accepted source before the
+    // public terminal is committed.
+    const current = currentAcceptedReadAuthority(
+      request.sessionId,
+      request.sourceUserSeq,
+      request.runId,
+      request.message,
+    );
+    if (!current || current.attempt.attemptId !== authority.attempt.attemptId) {
+      try { finishRunAttempt(authority.attempt, 'cancelled'); } catch { /* telemetry */ }
+      return stoppedAfterSuccessfulDispatch();
+    }
+    const sourceUserEvent = authority.source;
     const identity: TurnIdentity = {
       sessionId: request.sessionId,
       turn: sourceUserEvent.turn,
       sourceUserSeq: sourceUserEvent.seq,
+    };
+    const committedCounters = {
+      ...served.counters,
+      public_terminals: served.counters.public_terminals + 1,
     };
     const committed = commitTurnOutcomeImpl({
       version: 2,
@@ -390,11 +532,25 @@ async function tryServeAcceptedTurnRead(
         transport: 'read_lane_warm',
         artifactId: served.artifactId,
         laneDigest: served.laneDigest,
-        counters: served.counters as unknown as Record<string, unknown>,
+        counters: committedCounters as unknown as Record<string, unknown>,
+        warmReadPolicyDigest: warmReadToolPolicyDigest(request),
       },
     });
-    try { finishRunAttempt(attempt, 'completed'); } catch { /* telemetry */ }
-    markRunInFlight(request.sessionId, false);
+    if (!committed.inserted) {
+      try { finishRunAttempt(authority.attempt, 'superseded'); } catch { /* telemetry */ }
+      return responseForExactTerminalReplayUnderPolicy(surface, request, committed.event);
+    }
+    served.counters.public_terminals = committedCounters.public_terminals;
+    // A provider receipt is not a served answer. Credit the artifact only
+    // after its exact public TurnOutcome has durably won publication.
+    try { recordWarmProcedureUse(served.artifactId); } catch { /* telemetry */ }
+    observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+    try { finishRunAttempt(authority.attempt, 'completed'); } catch { /* telemetry */ }
+    clearRunInFlightAfterTerminal(
+      request.sessionId,
+      authority.attempt.attemptId,
+      authority.source.seq,
+    );
     return withRouteDiagnostics({
       text: committed.presentation.text,
       sessionId: request.sessionId,
@@ -415,9 +571,111 @@ async function tryServeAcceptedTurnRead(
       mode: getModelRoutingMode(),
     });
   } catch {
-    // The commit machinery refused (duplicate source, kill, ...): let the
-    // ordinary brain own the turn rather than inventing a second terminal.
-    return null;
+    // Provider work and a verified receipt already exist. A commit race may
+    // replay its durable winner, but must never fall through to another brain.
+    try {
+      const winner = exactTerminalReplayForRequest(request);
+      if (winner) return responseForExactTerminalReplayUnderPolicy(surface, request, winner);
+    } catch { /* return the non-retrying stopped response below */ }
+    return stoppedAfterSuccessfulDispatch();
+  }
+}
+
+/**
+ * One daemon owns one in-process warm activation per accepted attempt/source.
+ * Followers await the exact same promise, so two concurrent transports cannot
+ * both pass the preflight check and dispatch before terminal de-duplication.
+ * Cross-process/durable admission remains graph-engine work; this deliberately
+ * does not pretend to provide it.
+ */
+interface AcceptedWarmReadInFlight {
+  policyDigest: string;
+  promise: Promise<AssistantResponse | null>;
+}
+const acceptedWarmReadsInFlight = new Map<string, AcceptedWarmReadInFlight>();
+
+function responseForWarmReadPolicyConflict(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+): AssistantResponse {
+  return withRouteDiagnostics({
+    text: 'This duplicate invocation had a different tool boundary, so I did not run it.',
+    sessionId: request.sessionId,
+    stoppedReason: 'error',
+    raw: { readLane: { warm: false, policyConflict: true } },
+  }, {
+    ...routeForHarness(surface, request),
+    transport: 'read_lane_policy_conflict',
+  });
+}
+
+async function warmReadCancellationRequested(
+  request: AssistantRequest,
+  authority: NonNullable<ReturnType<typeof currentAcceptedReadAuthority>>,
+): Promise<boolean> {
+  if (isKillRequested(request.sessionId, {
+    attemptId: authority.attempt.attemptId,
+    runId: authority.attempt.runId,
+    sourceUserSeq: authority.source.seq,
+  })) return true;
+  const current = currentAcceptedReadAuthority(
+    request.sessionId,
+    request.sourceUserSeq,
+    request.runId,
+    request.message,
+  );
+  if (!current || current.attempt.attemptId !== authority.attempt.attemptId) return true;
+  if (!request.shouldCancel) return false;
+  try {
+    if (!await request.shouldCancel()) return false;
+    try {
+      requestKill(request.sessionId, 'cancelled by caller before warm-read dispatch', authority.attempt);
+    } catch { /* the exact attempt may have been superseded while polling */ }
+    return true;
+  } catch {
+    // Match the ordinary bridge cancellation contract: a broken predicate is
+    // observability trouble, not cancellation authority.
+    return false;
+  }
+}
+
+async function tryServeAcceptedTurnRead(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+): Promise<AssistantResponse | null> {
+  // Warm execution never creates its own authority. Only an outer surface that
+  // already accepted the user event and bound the current active attempt may
+  // enter; every other request continues through the ordinary brain, whose
+  // existing acceptance path remains unchanged.
+  const authority = currentAcceptedReadAuthority(
+    request.sessionId,
+    request.sourceUserSeq,
+    request.runId,
+    request.message,
+  );
+  if (!authority) return null;
+  if (Array.isArray(request.allowedToolNames)
+    && !request.allowedToolNames.includes('composio_execute_tool')) return null;
+  if (request.excludeToolNames?.includes('composio_execute_tool')) return null;
+  if (await warmReadCancellationRequested(request, authority)) return null;
+
+  const key = `${request.sessionId}:${authority.source.seq}:${authority.attempt.attemptId}`;
+  const existing = acceptedWarmReadsInFlight.get(key);
+  const policyDigest = warmReadToolPolicyDigest(request);
+  if (existing) {
+    if (existing.policyDigest === policyDigest) return existing.promise;
+    // Same accepted source presented concurrently under different authority is
+    // not coalescible and must not fall through to a second brain/provider.
+    return responseForWarmReadPolicyConflict(surface, request);
+  }
+
+  const activation = serveAcceptedTurnReadUnderAuthority(surface, request, authority);
+  const entry = { policyDigest, promise: activation };
+  acceptedWarmReadsInFlight.set(key, entry);
+  try {
+    return await activation;
+  } finally {
+    if (acceptedWarmReadsInFlight.get(key) === entry) acceptedWarmReadsInFlight.delete(key);
   }
 }
 
@@ -463,17 +721,38 @@ type RecoveryListEventsFn = typeof listEvents;
 type CommitTurnOutcomeFn = typeof commitTurnOutcome;
 /** The shared accepted-turn read resolver (E4). Production default builds
  *  fail-closed ports; tests inject deterministic ones. */
-type AcceptedTurnReadFn = (
+type AcceptedTurnReadPortsFactory = (
   surface: HarnessSurface,
   request: AssistantRequest,
-) => Promise<AcceptedTurnReadResult | null>;
+) => AcceptedTurnReadPorts | null | Promise<AcceptedTurnReadPorts | null>;
 let runConversationImpl: RunConversationFn = runConversation;
 let buildAgentImpl: BuildAgentFn = buildOrchestratorAgent;
 let configureImpl: ConfigureFn = configureHarnessRuntime;
 let claudeAgentBrainImpl: ClaudeAgentBrainFn = respondViaClaudeAgentSdkBrain;
 let recoveryListEventsImpl: RecoveryListEventsFn = listEvents;
 let commitTurnOutcomeImpl: CommitTurnOutcomeFn = commitTurnOutcome;
-let acceptedTurnReadPortsImpl: ((surface: HarnessSurface, request: AssistantRequest) => AcceptedTurnReadPorts | null) = () => null;
+let completedAnswerReplayProtectionImpl: CompletedAnswerReplayProtectionReader = readCompletedAnswerReplayProtection;
+const productionAcceptedTurnReadPorts: AcceptedTurnReadPortsFactory = async (_surface, request) => {
+  const authority = currentAcceptedReadAuthority(
+    request.sessionId,
+    request.sourceUserSeq,
+    request.runId,
+    request.message,
+  );
+  if (!authority) return null;
+  return buildProductionReadPortsForAcceptedTurn({
+    sessionId: request.sessionId,
+    sourceUserSeq: authority.source.seq,
+    sourceTurn: authority.source.turn,
+    attemptId: authority.attempt.attemptId,
+    runId: authority.attempt.runId,
+    message: request.message,
+    allowedToolNames: request.allowedToolNames,
+    excludedToolNames: request.excludeToolNames,
+    cancellationRequested: () => warmReadCancellationRequested(request, authority),
+  });
+};
+let acceptedTurnReadPortsImpl: AcceptedTurnReadPortsFactory = productionAcceptedTurnReadPorts;
 export function _setBridgeImplsForTests(impls: {
   runConversation?: RunConversationFn | null;
   buildAgent?: BuildAgentFn | null;
@@ -481,7 +760,8 @@ export function _setBridgeImplsForTests(impls: {
   claudeAgentBrain?: ClaudeAgentBrainFn | null;
   recoveryListEvents?: RecoveryListEventsFn | null;
   commitTurnOutcome?: CommitTurnOutcomeFn | null;
-  acceptedTurnReadPorts?: ((surface: HarnessSurface, request: AssistantRequest) => AcceptedTurnReadPorts | null) | null;
+  completedAnswerReplayProtection?: CompletedAnswerReplayProtectionReader | null;
+  acceptedTurnReadPorts?: AcceptedTurnReadPortsFactory | null;
 }): void {
   runConversationImpl = impls.runConversation ?? runConversation;
   buildAgentImpl = impls.buildAgent ?? buildOrchestratorAgent;
@@ -489,7 +769,8 @@ export function _setBridgeImplsForTests(impls: {
   claudeAgentBrainImpl = impls.claudeAgentBrain ?? respondViaClaudeAgentSdkBrain;
   recoveryListEventsImpl = impls.recoveryListEvents ?? listEvents;
   commitTurnOutcomeImpl = impls.commitTurnOutcome ?? commitTurnOutcome;
-  acceptedTurnReadPortsImpl = impls.acceptedTurnReadPorts ?? (() => null);
+  completedAnswerReplayProtectionImpl = impls.completedAnswerReplayProtection ?? readCompletedAnswerReplayProtection;
+  acceptedTurnReadPortsImpl = impls.acceptedTurnReadPorts ?? productionAcceptedTurnReadPorts;
 }
 
 /** Poll cadence for mapping the legacy `shouldCancel` callback onto the
@@ -713,6 +994,60 @@ function exactTerminalForSource(sessionId: string, sourceUserSeq: number): Event
     ?? null;
 }
 
+/** A source sequence is not a bearer token. Replay requires the literal
+ * accepted input identity and, when supplied, the same external run/attempt
+ * correlation that owned it. */
+function durableSourceEventForRequest(request: AssistantRequest): EventRow | null {
+  const sourceUserSeq = Number(request.sourceUserSeq);
+  if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return null;
+  return listEvents(request.sessionId, {
+    sinceSeq: sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === sourceUserSeq) ?? null;
+}
+
+function acceptedSourceIdentityForReplay(request: AssistantRequest): EventRow | null {
+  const source = durableSourceEventForRequest(request);
+  if (!source) return null;
+  const sourceUserSeq = source.seq;
+  const acceptedText = typeof source.data.text === 'string' ? source.data.text : null;
+  if (acceptedText === null || acceptedText !== (request.displayMessage ?? request.message)) return null;
+  const attempt = getRunAttemptBySourceUserSeq(request.sessionId, sourceUserSeq);
+  if (!attempt) return null;
+  const correlation = request.runId?.trim();
+  if (correlation && attempt.runId !== correlation && attempt.attemptId !== correlation) return null;
+  return source;
+}
+
+function exactTerminalReplayForRequest(request: AssistantRequest): EventRow | null {
+  const source = acceptedSourceIdentityForReplay(request);
+  return source ? exactTerminalForSource(request.sessionId, source.seq) : null;
+}
+
+/** Canonical warm tool lifecycle is also the durable paid-call no-retry
+ * marker. It survives a Stop, supersession, or terminal-commit failure that
+ * intentionally leaves no old-source public terminal. */
+function exactWarmProviderSpentForRequest(request: AssistantRequest): EventRow | null {
+  const source = acceptedSourceIdentityForReplay(request);
+  if (!source) return null;
+  return listEvents(request.sessionId, { types: ['tool_returned'], desc: true })
+    .find((event) => event.seq > source.seq
+      && event.data.warmRead === true
+      && event.data.providerDispatched === true
+      && event.data.sourceUserSeq === source.seq)
+    ?? null;
+}
+
+function durableWarmReadPolicyMatches(request: AssistantRequest, event: EventRow): boolean {
+  const transport = typeof event.data.transport === 'string' ? event.data.transport : '';
+  const isWarm = event.data.warmRead === true
+    || transport === 'read_lane_warm'
+    || transport === 'read_lane_warm_spent';
+  if (!isWarm) return true;
+  return event.data.warmReadPolicyDigest === warmReadToolPolicyDigest(request);
+}
+
 function stoppedReasonForPresentation(
   presentation: PresentationEvent,
 ): NonNullable<AssistantResponse['stoppedReason']> {
@@ -739,6 +1074,212 @@ function responseForCommittedTerminal(
     ...(presentation?.approvalId ? { pendingApprovalId: presentation.approvalId } : {}),
     ...(extraRaw ? { raw: extraRaw } : {}),
   };
+}
+
+/** A transport retry for an already-published accepted source is a pure
+ * durable replay. It must not create a new attempt, rebuild warm ports, or run
+ * a brain merely to lose a second exactly-once commit race. */
+function responseForExactTerminalReplay(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+  event: EventRow,
+): AssistantResponse {
+  const response = responseForCommittedTerminal(event, {
+    terminalReplay: true,
+    sourceUserSeq: request.sourceUserSeq,
+  });
+  const priorTransport = readRawString(event.data, 'transport');
+  if (priorTransport === 'read_lane_warm') {
+    return withRouteDiagnostics(response, {
+      routeKind: 'harness',
+      surface,
+      requestedModel: request.model,
+      effectiveModel: 'read-lane-warm',
+      provider: 'verified-procedure',
+      transport: 'read_lane_warm',
+      mode: getModelRoutingMode(),
+    });
+  }
+  if (
+    priorTransport === 'completed_answer_replay'
+    || priorTransport === 'completed_continuation_replay'
+  ) {
+    return withRouteDiagnostics({ ...response, turnsUsed: 0 }, completedAnswerReplayRoute(surface));
+  }
+  return withRouteDiagnostics(response, {
+    ...routeForHarness(surface, request),
+    transport: priorTransport ?? 'committed_terminal_replay',
+  });
+}
+
+function responseForExactTerminalReplayUnderPolicy(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+  event: EventRow,
+): AssistantResponse {
+  return durableWarmReadPolicyMatches(request, event)
+    ? responseForExactTerminalReplay(surface, request, event)
+    : responseForWarmReadPolicyConflict(surface, request);
+}
+
+function responseForWarmProviderSpentReplay(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+): AssistantResponse {
+  return withRouteDiagnostics({
+    text: 'That read already contacted the provider but did not publish a safe result, so I did not run it again.',
+    sessionId: request.sessionId,
+    stoppedReason: 'cancelled',
+    raw: { readLane: { warm: true, spent: true, durableReplayBlock: true } },
+  }, {
+    routeKind: 'harness',
+    surface,
+    requestedModel: request.model,
+    effectiveModel: 'read-lane-warm',
+    provider: 'verified-procedure',
+    transport: 'read_lane_warm_spent_replay',
+    mode: getModelRoutingMode(),
+  });
+}
+
+function responseForAcceptedSourceIdentityMismatch(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+): AssistantResponse {
+  return withRouteDiagnostics({
+    text: 'This invocation did not match the accepted turn identity, so I did not run or replay it.',
+    sessionId: request.sessionId,
+    stoppedReason: 'error',
+    raw: { blockedBy: 'accepted_source_identity_mismatch' },
+  }, {
+    ...routeForHarness(surface, request),
+    transport: 'accepted_source_identity_mismatch',
+  });
+}
+
+function completedAnswerReplayRoute(
+  surface: HarnessSurface,
+): AssistantRouteDiagnostics {
+  return {
+    routeKind: 'harness',
+    surface,
+    transport: 'completed_answer_replay',
+  };
+}
+
+function responseForCompletedAnswerReplay(
+  surface: HarnessSurface,
+  event: EventRow,
+  raw: Record<string, unknown>,
+): AssistantResponse {
+  return withRouteDiagnostics({
+    ...responseForCommittedTerminal(event, raw),
+    // This lane ran no model/tool turn. Event.turn is logical transcript
+    // identity, not usage, so do not expose it as paid turns here.
+    turnsUsed: 0,
+  }, completedAnswerReplayRoute(surface));
+}
+
+/**
+ * An explicit request to repeat the prior completed answer is a read of
+ * durable presentation state, not a reason to invoke another brain. The
+ * strict audit deliberately runs only for an already-accepted source and
+ * before auth, capability retrieval, provider routing, or tool assembly.
+ */
+async function tryServeCompletedAnswerReplay(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+): Promise<AssistantResponse | null> {
+  // Preserve the synchronous fall-through timing of every ordinary request.
+  // The strict assessor repeats this check, but reaching its first await for a
+  // cron/background prompt would otherwise add a microtask to unrelated work.
+  const acceptedText = request.displayMessage ?? request.message;
+  if (!isExplicitCompletedAnswerReplay(acceptedText)) return null;
+  const authority = currentAcceptedReadAuthority(
+    request.sessionId,
+    request.sourceUserSeq,
+    request.runId,
+    acceptedText,
+  );
+  if (!authority) return null;
+  const candidate = await assessCompletedAnswerReplay({
+    authority,
+    readProtection: completedAnswerReplayProtectionImpl,
+  });
+  if (!candidate) return null;
+
+  try {
+    // The cross-store protection read can await module/file state. Re-prove
+    // exact active ownership immediately before publication.
+    const current = currentAcceptedReadAuthority(
+      request.sessionId,
+      request.sourceUserSeq,
+      request.runId,
+      acceptedText,
+    );
+    if (!current || current.attempt.attemptId !== authority.attempt.attemptId) return null;
+    const identity: TurnIdentity = {
+      sessionId: request.sessionId,
+      turn: current.source.turn,
+      sourceUserSeq: current.source.seq,
+      attemptId: current.attempt.attemptId,
+      ...(current.attempt.runId ? { runId: current.attempt.runId } : {}),
+    };
+    const committed = commitTurnOutcomeImpl({
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'done',
+      resumable: false,
+      presentation: { kind: 'answer', text: candidate.text },
+    }, {
+      legacyReason: 'completed_answer_replay',
+      metadata: {
+        steps: 0,
+        transport: 'completed_answer_replay',
+        replayedFromSourceUserSeq: candidate.priorSource.seq,
+        replayedFromTerminalId: candidate.priorTerminal.id,
+        replayedFromPresentationId: candidate.priorPresentationId,
+      },
+    });
+    if (!committed.inserted) {
+      try { finishRunAttempt(current.attempt, 'superseded'); } catch { /* telemetry */ }
+      clearRunInFlightAfterTerminal(
+        request.sessionId,
+        current.attempt.attemptId,
+        current.source.seq,
+      );
+      return responseForExactTerminalReplayUnderPolicy(surface, request, committed.event);
+    }
+    observeAcceptedBridgeTurnGraph(surface, request, current.source);
+    try { finishRunAttempt(current.attempt, 'completed'); } catch { /* telemetry */ }
+    clearRunInFlightAfterTerminal(
+      request.sessionId,
+      current.attempt.attemptId,
+      current.source.seq,
+    );
+    return responseForCompletedAnswerReplay(surface, committed.event, {
+      completedAnswerReplay: true,
+      replayedFromSourceUserSeq: candidate.priorSource.seq,
+      replayedFromTerminalId: candidate.priorTerminal.id,
+    });
+  } catch {
+    // The committer may have won before a later bookkeeping error. Re-read the
+    // current logical terminal before allowing ordinary work to proceed.
+    try {
+      const winner = exactTerminalReplayForRequest(request);
+      if (winner) {
+        try { finishRunAttempt(authority.attempt, 'completed'); } catch { /* telemetry */ }
+        clearRunInFlightAfterTerminal(
+          request.sessionId,
+          authority.attempt.attemptId,
+          authority.source.seq,
+        );
+        return responseForExactTerminalReplayUnderPolicy(surface, request, winner);
+      }
+    } catch { /* normal authority retains recovery ownership */ }
+    return null;
+  }
 }
 
 function exactAsyncDispatchForSource(source: EventRow): ReturnType<typeof publicAsyncWorkDispatchedData> {
@@ -916,6 +1457,9 @@ export async function respondViaHarness(
       source: `bridge:${surface}`,
     },
   }, { existingEventSeq: acceptedSourceUserSeq, armRunInFlight: true });
+  // Rehydrate private continuation state only from the exact durable source.
+  // Caller-supplied semantic context is stripped when no valid packet exists.
+  request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq);
   observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
   // Source binding and the chat recovery marker committed atomically above, so
   // failures while building the agent/tool surface remain restart-recoverable.
@@ -943,32 +1487,43 @@ export async function respondViaHarness(
   let preserveRequestAttemptOwnership = false;
   try {
     const modelForRun = opts.modelOverride ?? (config.honorModel && request.model ? request.model : undefined);
+    // A verified clarification continuation may carry a richer private query
+    // for retrieval/tool ranking. The actual user turn remains request.message
+    // all the way into runConversation and the provider prompt.
     // Capability interior (Clem 4): the agent is BUILT at the spine's
     // capability_resolve node, not before the turn — tool/capability assembly
     // is graph work with a real trace step. Same builder, same arguments,
     // moved in time; the fallover wiring keeps its own builder for rebuilds.
-    const buildAgent = () => buildAgentImpl({
-      userInput: request.message,
-      sessionId,
-      allowedToolNames: request.allowedToolNames,
-      excludeToolNames: request.excludeToolNames,
-      // The turn's advisory capability candidates ride the request into the
-      // agent build — the only delivery path, shared by both brains.
-      ...(request.turnCandidates ? { turnCandidates: request.turnCandidates } : {}),
-      // Only surfaces flagged honorModel forward request.model (workflow steps);
-      // every other surface keeps the harness's configured model (byte-identical).
-      ...(modelForRun ? { model: modelForRun } : {}),
-      // Schema-on-demand lane admission. Chat always qualifies. Execution
-      // surfaces (cron / background / workflow) qualify only while the
-      // deferred tool-search surface is globally ON — recovery there is the
-      // model calling tool_search → call_tool, which needs no user in the
-      // loop. When tool-search is off, execution lanes stay on the FULL
-      // surface: the legacy JIT pruner has no catalog recovery and must
-      // never run on an unattended lane. Kill-switch:
-      // CLEMMY_EXECUTION_TOOL_SEARCH=off (execution lanes only).
-      allowToolJit: config.kind === 'chat'
-        || (config.kind === 'execution' && executionLaneToolSearchEnabled()),
-    });
+    let acceptedBuildIdentity: Parameters<NonNullable<RunConversationOptions['buildAgent']>>[0] | undefined;
+    const buildAgent: NonNullable<RunConversationOptions['buildAgent']> = (identity) => {
+      acceptedBuildIdentity = identity;
+      return buildAgentImpl({
+        userInput: request.message,
+        sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        acceptedRoute: identity.route,
+        allowedToolNames: request.allowedToolNames,
+        excludeToolNames: request.excludeToolNames,
+        // The turn's advisory capability candidates ride the request into the
+        // agent build — the only delivery path, shared by both brains.
+        ...(request.turnCandidates ? { turnCandidates: request.turnCandidates } : {}),
+        ...(request.taskContinuation ? { taskContinuation: request.taskContinuation } : {}),
+        ...(request.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
+        // Only surfaces flagged honorModel forward request.model (workflow steps);
+        // every other surface keeps the harness's configured model (byte-identical).
+        ...(modelForRun ? { model: modelForRun } : {}),
+        // Schema-on-demand lane admission. Chat always qualifies. Execution
+        // surfaces (cron / background / workflow) qualify only while the
+        // deferred tool-search surface is globally ON — recovery there is the
+        // model calling tool_search → call_tool, which needs no user in the
+        // loop. When tool-search is off, execution lanes stay on the FULL
+        // surface: the legacy JIT pruner has no catalog recovery and must
+        // never run on an unattended lane. Kill-switch:
+        // CLEMMY_EXECUTION_TOOL_SEARCH=off (execution lanes only).
+        allowToolJit: config.kind === 'chat'
+          || (config.kind === 'execution' && executionLaneToolSearchEnabled()),
+      });
+    };
     // W1a — chat step-boundary brain fallover. On a CHAT surface, hand
     // runConversation the ordered next-brain
     // model ids + a rebuild factory so a transient model/codex error mid-turn
@@ -982,6 +1537,9 @@ export async function respondViaHarness(
           excludeToolNames: request.excludeToolNames,
           allowToolJit: true,
           ...(request.turnCandidates ? { turnCandidates: request.turnCandidates } : {}),
+          ...(request.taskContinuation ? { taskContinuation: request.taskContinuation } : {}),
+          ...(request.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
+          acceptedIdentity: () => acceptedBuildIdentity,
           buildAgent: buildAgentImpl,
         })
       : {};
@@ -1003,6 +1561,8 @@ export async function respondViaHarness(
           mode: routed.mode,
           routeKind: routed.routeKind,
           surface,
+          sourceUserSeq: sourceUserEvent.seq,
+          attemptId: requestAttempt.attemptId,
         },
       });
     } catch { /* telemetry only */ }
@@ -1020,6 +1580,9 @@ export async function respondViaHarness(
       buildAgent,
       sessionId,
       input: request.message,
+      ...(request.semanticTaskInput ? { semanticTaskInput: request.semanticTaskInput } : {}),
+      ...(request.taskContinuation ? { taskContinuation: request.taskContinuation } : {}),
+      ...(request.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
       sourceUserSeq: sourceUserEvent.seq,
       runAttemptId: requestAttempt.attemptId,
       maxWallClockMs: request.maxWallClockMs,
@@ -1307,11 +1870,38 @@ export async function respondViaHarness(
  * Falls back to legacy ONLY pre-run (flag off, per-call tool excludes, auth
  * unavailable) — never after the harness run has started.
  */
-export async function respondPreferHarness(
+async function respondPreferHarnessOnce(
   surface: HarnessSurface,
   request: AssistantRequest,
   legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
 ): Promise<AssistantResponse> {
+  // Idempotent transport replay is resolved before runtime availability or
+  // tool-surface checks: the durable terminal is already the public winner.
+  // Requiring model auth here would both waste work and make an already
+  // delivered answer temporarily unreadable during an outage.
+  if (Number.isSafeInteger(request.sourceUserSeq) && Number(request.sourceUserSeq) > 0) {
+    try {
+      if (durableSourceEventForRequest(request) && !acceptedSourceIdentityForReplay(request)) {
+        return responseForAcceptedSourceIdentityMismatch(surface, request);
+      }
+      const committed = exactTerminalReplayForRequest(request);
+      if (committed) return responseForExactTerminalReplayUnderPolicy(surface, request, committed);
+      const warmSpent = exactWarmProviderSpentForRequest(request);
+      if (warmSpent) {
+        return durableWarmReadPolicyMatches(request, warmSpent)
+          ? responseForWarmProviderSpentReplay(surface, request)
+          : responseForWarmReadPolicyConflict(surface, request);
+      }
+    } catch { /* no readable exact terminal: proceed through normal authority */ }
+  }
+  // Do not introduce an async boundary into the established hot path merely
+  // to discover that an ordinary request is not an answer-repeat request. Cron and
+  // background admission rely on synchronous fall-through up to their chosen
+  // runtime lane.
+  if (isExplicitCompletedAnswerReplay(request.displayMessage ?? request.message)) {
+    const completedAnswerReplay = await tryServeCompletedAnswerReplay(surface, request);
+    if (completedAnswerReplay) return completedAnswerReplay;
+  }
   if (!harnessSurfaceEnabled(surface)) {
     if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, reason: 'surface_disabled' }, 'explicit legacy respond fallback engaged');
@@ -1368,18 +1958,17 @@ export async function respondPreferHarness(
   const readServed = await tryServeAcceptedTurnRead(surface, request);
   if (readServed) return readServed;
 
-  // When the read lane declines, the ordinary brain runs — but it should not
-  // have to rediscover a capability this workspace has already proven. One
-  // bounded, deadline-capped retrieval per accepted turn, delivered ON THE
-  // REQUEST into whichever brain serves it, so desktop, Discord, and Slack get
-  // the identical surface from the identical seam. Candidates are advisory:
-  // they widen what the brain may choose from and decide nothing.
-  try {
-    const resolved = await resolveTurnCapabilityCandidates({ userInput: request.message });
-    if (resolved.candidates.length > 0) request = { ...request, turnCandidates: resolved };
-  } catch { /* retrieval never blocks a turn */ }
-
   if (claudeAgentSdkBrainEnabled(surface)) {
+    // Claude diverges before respondViaHarness, so rehydrate only an actual
+    // exact-source continuation here. Ordinary turns avoid a duplicate semantic
+    // candidate-resolution pass; the Claude lane owns their normal routing.
+    if (Number.isSafeInteger(request.sourceUserSeq) && Number(request.sourceUserSeq) > 0) {
+      request = await enrichAcceptedRequestWithTaskContinuity(
+        request,
+        Number(request.sourceUserSeq),
+        { continuationOnly: true },
+      );
+    }
     const detachProgressRelay = attachLegacyProgressRelay(request);
     // Whole-turn recovery may re-drive every tool call on another brain. Bind
     // its safety check to THIS Claude attempt so old writes in the same session
@@ -1397,6 +1986,7 @@ export async function respondPreferHarness(
       // harness-lane emit below; the route carries the model the SDK reported.
       try {
         const routed = routeForClaudeSdkBrain(surface, request, response);
+        const owner = ensureAcceptedRecoveryTurn(surface, request);
         appendEvent({
           sessionId: request.sessionId,
           turn: 0,
@@ -1409,6 +1999,8 @@ export async function respondPreferHarness(
             mode: routed.mode,
             routeKind: routed.routeKind,
             surface,
+            sourceUserSeq: owner.sourceUserSeq,
+            attemptId: owner.attempt.attemptId,
           },
         });
       } catch { /* telemetry only */ }
@@ -1494,6 +2086,52 @@ export async function respondPreferHarness(
     }
   }
   return respondViaHarness(surface, request);
+}
+
+/** Same-daemon admission for the entire accepted-source response, not merely
+ * the warm branch. This prevents an authority-restricted duplicate from
+ * starting a brain while its sibling is inside warm provider I/O (and the
+ * reverse ordering). Durable/cross-process admission belongs to the graph
+ * engine; this map is intentionally only the local race fence. */
+interface AcceptedSourceInvocationInFlight {
+  policyDigest: string;
+  promise: Promise<AssistantResponse>;
+}
+const acceptedSourceInvocationsInFlight = new Map<string, AcceptedSourceInvocationInFlight>();
+
+export async function respondPreferHarness(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+  legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
+): Promise<AssistantResponse> {
+  let key: string | null = null;
+  try {
+    const source = acceptedSourceIdentityForReplay(request);
+    // source.seq is the immutable logical-turn identity. The ordinary harness
+    // may rotate its physical run attempt while this promise is in flight;
+    // that must not split ownership and admit a warm sibling.
+    if (source) key = `${request.sessionId}:${source.seq}`;
+  } catch { key = null; }
+  if (!key) return respondPreferHarnessOnce(surface, request, legacyRespond);
+
+  const policyDigest = warmReadToolPolicyDigest(request);
+  const existing = acceptedSourceInvocationsInFlight.get(key);
+  if (existing) {
+    return existing.policyDigest === policyDigest
+      ? existing.promise
+      : responseForWarmReadPolicyConflict(surface, request);
+  }
+
+  const promise = respondPreferHarnessOnce(surface, request, legacyRespond);
+  const entry = { policyDigest, promise };
+  acceptedSourceInvocationsInFlight.set(key, entry);
+  try {
+    return await promise;
+  } finally {
+    if (acceptedSourceInvocationsInFlight.get(key) === entry) {
+      acceptedSourceInvocationsInFlight.delete(key);
+    }
+  }
 }
 
 const bridgeLogger = pino({ name: 'clementine.respond-bridge' });
@@ -1746,7 +2384,13 @@ export function buildChatFalloverWiring(opts: {
    *  accepted turn — the second brain must not pay rediscovery for state the
    *  first brain already had. */
   turnCandidates?: TurnCapabilityCandidates;
-  buildAgent: (o: { userInput?: string; sessionId: string; allowedToolNames?: string[]; excludeToolNames?: string[]; model?: string; allowToolJit?: boolean; turnCandidates?: TurnCapabilityCandidates }) => Promise<BuiltAgent>;
+  taskContinuation?: import('../../types.js').TaskContinuationContext;
+  taskContinuationResolved?: true;
+  acceptedIdentity?: () => {
+    sourceUserSeq: number;
+    route: 'direct_reply' | 'retrieve' | 'act';
+  } | undefined;
+  buildAgent: (o: { userInput?: string; sessionId: string; sourceUserSeq?: number; acceptedRoute?: 'direct_reply' | 'retrieve' | 'act'; allowedToolNames?: string[]; excludeToolNames?: string[]; model?: string; allowToolJit?: boolean; turnCandidates?: TurnCapabilityCandidates; taskContinuation?: import('../../types.js').TaskContinuationContext; taskContinuationResolved?: true }) => Promise<BuiltAgent>;
 }): { falloverModelIds?: string[]; rebuildAgentForBrain?: (modelId: string) => Promise<BuiltAgent> } {
   if (!chatBrainFalloverEnabled()) return {};
   try {
@@ -1754,15 +2398,21 @@ export function buildChatFalloverWiring(opts: {
       const modelIds = falloverChainForTest;
       return {
         falloverModelIds: modelIds,
-        rebuildAgentForBrain: (modelId: string) => opts.buildAgent({
+        rebuildAgentForBrain: (modelId: string) => {
+          const identity = opts.acceptedIdentity?.();
+          return opts.buildAgent({
           userInput: opts.userInput,
           sessionId: opts.sessionId,
+          ...(identity ? { sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route } : {}),
           ...(opts.turnCandidates ? { turnCandidates: opts.turnCandidates } : {}),
+          ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
+          ...(opts.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
           allowedToolNames: opts.allowedToolNames,
           excludeToolNames: opts.excludeToolNames,
           model: modelId,
           allowToolJit: opts.allowToolJit,
-        }),
+        });
+        },
       };
     }
     const currentProvider = providerFor(resolveRoleModel('brain').modelId) as BrainProviderClass | undefined;
@@ -1771,15 +2421,21 @@ export function buildChatFalloverWiring(opts: {
     if (nextBrains.length === 0) return {};
     return {
       falloverModelIds: nextBrains.map((b) => b.modelId),
-      rebuildAgentForBrain: (modelId: string) => opts.buildAgent({
+      rebuildAgentForBrain: (modelId: string) => {
+        const identity = opts.acceptedIdentity?.();
+        return opts.buildAgent({
         userInput: opts.userInput,
         sessionId: opts.sessionId,
+        ...(identity ? { sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route } : {}),
         ...(opts.turnCandidates ? { turnCandidates: opts.turnCandidates } : {}),
+        ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
+        ...(opts.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
         allowedToolNames: opts.allowedToolNames,
         excludeToolNames: opts.excludeToolNames,
         model: modelId,
         allowToolJit: opts.allowToolJit ?? true,
-      }),
+      });
+      },
     };
   } catch {
     return {};

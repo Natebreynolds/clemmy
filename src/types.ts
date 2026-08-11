@@ -13,6 +13,8 @@ export interface RunRequest {
   model?: string;
   prompt: string;
   sessionId?: string;
+  /** Exact accepted user event that owns this runtime call. */
+  sourceUserSeq?: number;
   userId?: string;
   channel?: string;
   /**
@@ -215,6 +217,40 @@ export interface AssembledPromptContext {
 }
 
 import type { TurnCapabilityCandidates } from './runtime/read-path/capability-candidates.js';
+import type { TaskContinuityCapabilityEvidence } from './memory/task-continuity.js';
+
+export type ContinuationAnswerDisposition =
+  | 'affirmed'
+  | 'declined'
+  | 'declined_with_new_task'
+  | 'selected'
+  | 'provided';
+
+/** Runtime-derived explanation of one exact clarification answer. Different
+ * consumers deliberately use different fields: retrieval gets retrievalQuery,
+ * MCP scope keeps answer as the current input and parentInput as prior context,
+ * while durable/model-visible user history remains answer alone. */
+export interface TaskContinuationContext {
+  packetId: string;
+  parentSourceUserSeq: number;
+  consumingSourceUserSeq: number;
+  parentInput: string;
+  question: string;
+  options: string[];
+  answer: string;
+  /** Runtime-classified meaning of B relative to the exact durable question.
+   * In particular, neither decline disposition can inherit A's tool/effect
+   * authority. `declined_with_new_task` keeps processing only activeTaskInput. */
+  disposition: ContinuationAnswerDisposition;
+  /** Fresh clause following an explicit parent decline. This is the sole
+   * semantic/retrieval/tool-ranking input for `declined_with_new_task`; the
+   * provider-visible answer remains byte-exact in `answer`. */
+  activeTaskInput?: string;
+  /** Canonical option selected by exact text/wrapper/ordinal, when applicable. */
+  selectedOption?: string;
+  retrievalQuery: string;
+  capabilities: TaskContinuityCapabilityEvidence[];
+}
 
 export interface AssistantRequest {
   /** Advisory capability candidates resolved ONCE for this accepted turn by
@@ -222,6 +258,21 @@ export interface AssistantRequest {
    * request — never to a phrase, a session global, or a cache. Candidates
    * widen what the brain can see; they decide nothing. */
   turnCandidates?: TurnCapabilityCandidates;
+  /** Private runtime-owned task context for a narrowly verified continuation
+   * (for example, an answer to Clementine's immediately preceding
+   * clarification). Affirmed/selected/provided answers may use this richer
+   * text for retrieval, capability ranking, and tool scoping. A decline keeps
+   * A/Q/B only in `taskContinuation` and uses literal B here so cancelled work
+   * cannot keep spending retrieval or schema-warming effort. The model's user
+   * message and durable user history MUST stay `message` / `displayMessage`.
+   * This is context, never user authority. */
+  semanticTaskInput?: string;
+  /** Exact, bridge-validated source of semanticTaskInput. Callers must not mint
+   * this field; runtime entry points rehydrate it from the durable packet. */
+  taskContinuation?: TaskContinuationContext;
+  /** Set by the accepted-source resolver even when no packet qualifies. It
+   * prevents legacy session heuristics from reviving a dismissed/fresh topic. */
+  taskContinuationResolved?: true;
   /** Private model directive for this execution. For an ordinary fresh turn it
    * is also the literal user text persisted in the conversation. */
   message: string;

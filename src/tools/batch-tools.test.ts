@@ -34,6 +34,8 @@ const {
   revokeComposioCliDefaultAccountAuthority,
 } = await import('../integrations/composio/cli-default-account-authority.js');
 const { pendingActionApprovalView } = await import('../runtime/harness/pending-action-view.js');
+const { rememberAccountAlias } = await import('../memory/account-alias-store.js');
+const { rememberFact, forgetFact } = await import('../memory/facts.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 
 type ToolResult = { content: Array<{ type: 'text'; text: string }> };
@@ -567,6 +569,517 @@ test('run_batch execute refuses a foreign session without claiming or dispatchin
   assert.deepEqual(dispatchedSessionIds, [ownerSessionId], 'the ledger and dispatch retain the owner session');
   assert.equal(getPendingAction(pending.id)?.status, 'executed');
   _setBatchPlanRunnerForTests(null);
+});
+
+test('run_batch exposes a stable per-item account_alias and carries no raw connection id', async () => {
+  _setCertifyJudgeForTests(async () => ({
+    allow: true,
+    reason: 'read payload is exact',
+    concerns: [],
+    judged: true,
+  }));
+  const sessionId = 'sess-batch-account-alias';
+  rememberAccountAlias({
+    toolkit: 'outlook',
+    label: 'Scorpion',
+    email: 'scorpion@corp.example',
+    connectionId: 'ca_scorpion_before_rotation',
+  });
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Read both folders from my Scorpion mailbox.' },
+  });
+  let capturedPlan: {
+    items: Array<{ args: Record<string, unknown>; connectedAccountId?: string | null }>;
+  } | undefined;
+  let runCount = 0;
+  _setBatchPlanRunnerForTests(async (plan, runnerSessionId) => {
+    capturedPlan = plan;
+    runCount += 1;
+    return {
+      batchId: 'batch-stable-account-alias',
+      sessionId: runnerSessionId,
+      tool: plan.tool,
+      composioSlug: plan.composioSlug,
+      sideEffect: plan.sideEffect,
+      objective: plan.objective,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      total: plan.items.length,
+      succeeded: plan.items.length,
+      failed: 0,
+      halted: false,
+      outcomes: plan.items.map((item) => ({ id: item.id, ok: true, attempts: 1, ms: 1 })),
+    };
+  });
+
+  const handler = batchHandler();
+  const invoke = (
+    items: Array<Record<string, unknown>>,
+    sideEffect: 'read' | 'write' | 'send' = 'read',
+    composioSlug = 'OUTLOOK_LIST_MESSAGES',
+  ) => withToolOutputContext(
+    { sessionId, runScopeId: 'batch-account-alias-run' },
+    () => withHarnessRunContext(
+      {
+        sessionId,
+        behaviorScopeId: 'batch-account-alias-run',
+        sourceUserSeq: source.seq,
+        counter: new ToolCallsCounter(100),
+      },
+      () => handler({
+        action: 'propose',
+        plan: {
+          tool: 'composio_execute_tool',
+          composioSlug,
+          sideEffect,
+          objective: 'read the two named Outlook folders from one stable mailbox',
+          items,
+        },
+      }),
+    ),
+  ) as Promise<ToolResult>;
+
+  try {
+    const result = await invoke([
+      {
+        id: 'inbox',
+        account_alias: 'Scorpion',
+        args: JSON.stringify({
+          tool_slug: 'OUTLOOK_LIST_MESSAGES',
+          arguments: JSON.stringify({ folder: 'Inbox' }),
+        }),
+      },
+      {
+        id: 'archive',
+        account_alias: 'scorpion@corp.example',
+        args: JSON.stringify({ folder: 'Archive' }),
+      },
+    ]);
+    assert.match(result.content[0].text, /batch-stable-account-alias/);
+    assert.equal(runCount, 1);
+    assert.equal(capturedPlan?.items[0]?.args.account_alias, 'scorpion@corp.example');
+    assert.equal(capturedPlan?.items[1]?.args.account_alias, 'scorpion@corp.example');
+    assert.equal(capturedPlan?.items[0]?.connectedAccountId, undefined);
+    assert.equal(capturedPlan?.items[1]?.connectedAccountId, undefined);
+
+    const conflict = await invoke([{
+      id: 'conflict',
+      account_alias: 'Scorpion',
+      args: JSON.stringify({
+        tool_slug: 'OUTLOOK_LIST_MESSAGES',
+        arguments: JSON.stringify({ folder: 'Inbox', account_alias: 'Personal' }),
+      }),
+    }]);
+    assert.match(conflict.content[0].text, /account_alias conflicts/i);
+    assert.equal(runCount, 1, 'a conflicting account selector never reaches the batch runner');
+
+    const dualAuthority = await invoke([{
+      id: 'dual-authority',
+      account_alias: 'Scorpion',
+      args: JSON.stringify({
+        tool_slug: 'OUTLOOK_LIST_MESSAGES',
+        arguments: JSON.stringify({ folder: 'Inbox' }),
+        connected_account_id: 'ca_scorpion_before_rotation',
+      }),
+    }]);
+    assert.match(dualAuthority.content[0].text, /account_alias conflicts with connected_account_id/i);
+    assert.equal(runCount, 1, 'dual account authorities never reach the batch runner');
+
+    const unstableWrite = await invoke([{
+      id: 'unstable-write',
+      account_alias: 'not-yet-bound',
+      args: JSON.stringify({ subject: 'draft', body: 'review me' }),
+    }], 'write', 'OUTLOOK_CREATE_DRAFT');
+    assert.match(unstableWrite.content[0].text, /not bound to a stable outlook identity/i);
+    assert.equal(runCount, 1, 'an unresolved write destination never reaches certification or execution');
+  } finally {
+    _setBatchPlanRunnerForTests(null);
+    _setCertifyJudgeForTests(null);
+  }
+});
+
+test('run_batch freezes legacy nested aliases and standing Outlook draft routing before approval', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'sdk';
+  _setCertifyJudgeForTests(async () => ({
+    allow: true,
+    reason: 'draft payloads are exact',
+    concerns: [],
+    judged: true,
+  }));
+  const aliasLabel = 'Legacy Draft Box';
+  rememberAccountAlias({
+    toolkit: 'outlook',
+    label: aliasLabel,
+    email: 'legacy-a@corp.example',
+    connectionId: 'ca_legacy_a',
+  });
+  const standingA = rememberFact({
+    kind: 'constraint',
+    content: 'Always send Outlook email from standing-a@corp.example unless the user explicitly chooses another mailbox.',
+  });
+  const sessionId = 'sess-batch-frozen-account-bindings';
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create these reviewed drafts in the selected Outlook mailboxes.' },
+  });
+  let capturedAliases: unknown[] = [];
+  _setBatchPlanRunnerForTests(async (plan, runnerSessionId) => {
+    capturedAliases = plan.items.map((item) => item.args.account_alias);
+    return {
+      batchId: 'batch-frozen-account-bindings',
+      sessionId: runnerSessionId,
+      tool: plan.tool,
+      composioSlug: plan.composioSlug,
+      sideEffect: plan.sideEffect,
+      objective: plan.objective,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      total: plan.items.length,
+      succeeded: plan.items.length,
+      failed: 0,
+      halted: false,
+      outcomes: plan.items.map((item) => ({ id: item.id, ok: true, attempts: 1, ms: 1 })),
+    };
+  });
+  const handler = batchHandler();
+  let standingB: ReturnType<typeof rememberFact> | undefined;
+  try {
+    const proposed = await withToolOutputContext(
+      { sessionId, runScopeId: 'batch-frozen-binding-run' },
+      () => withHarnessRunContext(
+        {
+          sessionId,
+          behaviorScopeId: 'batch-frozen-binding-run',
+          sourceUserSeq: source.seq,
+          counter: new ToolCallsCounter(100),
+        },
+        () => handler({
+          action: 'propose',
+          plan: {
+            tool: 'composio_execute_tool',
+            composioSlug: 'OUTLOOK_CREATE_DRAFT',
+            sideEffect: 'write',
+            objective: 'create two reviewed Outlook drafts in their frozen mailboxes',
+            items: [
+              {
+                id: 'legacy-alias',
+                // Legacy carrier: no first-class item.account_alias.
+                args: JSON.stringify({
+                  subject: 'Legacy alias',
+                  body: 'one',
+                  to_email: 'one@example.com',
+                  account_alias: aliasLabel,
+                }),
+              },
+              {
+                id: 'standing-draft-rule',
+                args: JSON.stringify({ subject: 'Standing rule', body: 'two', to_email: 'two@example.com' }),
+              },
+            ],
+          },
+        }),
+      ),
+    ) as ToolResult;
+    const [record] = listPendingActions({ sessionId, status: 'all' });
+    assert.ok(record, proposed.content[0].text);
+    const storedItems = (record.payload as { items: Array<{ args: Record<string, unknown> }> }).items;
+    assert.equal(storedItems[0]?.args.account_alias, 'legacy-a@corp.example');
+    assert.equal(storedItems[1]?.args.account_alias, 'standing-a@corp.example');
+    if (record.status === 'queued') approveExactPendingAction(record, 'approve frozen Outlook draft batch');
+
+    // Both mutable names now point at B. The approved plan must still execute A.
+    rememberAccountAlias({
+      toolkit: 'outlook',
+      label: aliasLabel,
+      email: 'legacy-b@corp.example',
+      connectionId: 'ca_legacy_b',
+    });
+    assert.equal(forgetFact(standingA.id), true);
+    standingB = rememberFact({
+      kind: 'constraint',
+      content: 'Always send Outlook email from standing-b@corp.example unless the user explicitly chooses another mailbox.',
+    });
+
+    const executed = await withToolOutputContext(
+      { sessionId },
+      () => handler({ action: 'execute', pending_action_id: record.id }),
+    ) as ToolResult;
+    assert.match(executed.content[0].text, /batch-frozen-account-bindings/);
+    assert.deepEqual(capturedAliases, ['legacy-a@corp.example', 'standing-a@corp.example']);
+  } finally {
+    forgetFact(standingA.id);
+    if (standingB) forgetFact(standingB.id);
+    _setBatchPlanRunnerForTests(null);
+    _setCertifyJudgeForTests(null);
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
+});
+
+test('run_batch rejects explicit-alias and standing-draft bindings on the CLI lane before certification', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  let certifications = 0;
+  _setCertifyJudgeForTests(async () => {
+    certifications += 1;
+    return { allow: true, reason: 'exact', concerns: [], judged: true };
+  });
+  const authority = await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'outlook',
+    label: 'Authorized Outlook CLI default',
+    grantedBy: 'test',
+  });
+  assert.ok(authority, 'test precondition: a valid CLI-default grant exists');
+  const standing = rememberFact({
+    kind: 'constraint',
+    content: 'Always send Outlook email from cli-standing@corp.example unless the user explicitly chooses another mailbox.',
+  });
+  const handler = batchHandler();
+  const propose = async (sessionId: string, accountAlias?: string): Promise<ToolResult> => {
+    createSession({ id: sessionId, kind: 'chat' });
+    const source = appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Create the reviewed Outlook draft.' },
+    });
+    return withToolOutputContext(
+      { sessionId },
+      () => withHarnessRunContext(
+        { sessionId, sourceUserSeq: source.seq, counter: new ToolCallsCounter(100) },
+        () => handler({
+          action: 'propose',
+          plan: {
+            tool: 'composio_execute_tool',
+            composioSlug: 'OUTLOOK_CREATE_DRAFT',
+            sideEffect: 'write',
+            objective: 'create one reviewed Outlook draft in the intended mailbox',
+            items: [{
+              id: 'draft',
+              ...(accountAlias ? { account_alias: accountAlias } : {}),
+              args: JSON.stringify({ subject: 'Review', body: 'Body', to_email: 'review@example.com' }),
+            }],
+          },
+        }),
+      ),
+    ) as Promise<ToolResult>;
+  };
+  try {
+    const explicit = await propose('sess-batch-cli-explicit-alias', 'explicit@corp.example');
+    assert.match(explicit.content[0].text, /refused before certification.*CLI.*cannot honor.*alias/is);
+    assert.equal(listPendingActions({ sessionId: 'sess-batch-cli-explicit-alias', status: 'all' }).length, 0);
+
+    const standingBound = await propose('sess-batch-cli-standing-draft');
+    assert.match(standingBound.content[0].text, /refused before certification.*CLI.*cannot honor.*draft-mailbox|account_alias/is);
+    assert.equal(listPendingActions({ sessionId: 'sess-batch-cli-standing-draft', status: 'all' }).length, 0);
+    assert.equal(certifications, 0, 'CLI-only account-bound plans stop before the batch judge');
+  } finally {
+    forgetFact(standing.id);
+    await revokeComposioCliDefaultAccountAuthority('outlook');
+    _setCertifyJudgeForTests(null);
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
+});
+
+test('run_batch claim refuses a valid CLI-default grant for an alias-bound approved plan', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  const authority = await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'outlook',
+    label: 'Different Outlook CLI default',
+    grantedBy: 'test',
+  });
+  const sessionId = 'sess-batch-alias-lane-drift';
+  createSession({ id: sessionId, kind: 'chat' });
+  const pending = queuePendingAction({
+    title: 'Alias-bound SDK batch',
+    summary: 'approved account-addressable plan',
+    kind: 'external_write',
+    toolName: 'run_batch',
+    payload: {
+      tool: 'composio_execute_tool',
+      composioSlug: 'OUTLOOK_CREATE_DRAFT',
+      sideEffect: 'write',
+      objective: 'create the approved draft in one exact mailbox',
+      items: [{
+        id: 'draft',
+        args: {
+          subject: 'Pinned route',
+          body: 'Body',
+          to_email: 'review@example.com',
+          account_alias: 'sdk-mailbox@corp.example',
+        },
+      }],
+    },
+    executionAuthority: authority,
+    sessionId,
+    createdBy: 'test',
+  });
+  approveExactPendingAction(pending, 'approve alias-bound plan');
+  let runs = 0;
+  _setBatchPlanRunnerForTests(async () => {
+    runs += 1;
+    throw new Error('must not dispatch');
+  });
+  try {
+    const result = await withToolOutputContext(
+      { sessionId },
+      () => batchHandler()({ action: 'execute', pending_action_id: pending.id }),
+    ) as ToolResult;
+    assert.match(result.content[0].text, /CLI-default capability does not match|account_alias.*CLI|default account cannot be substituted/i);
+    assert.equal(runs, 0, 'claim-time lane drift blocks before the batch runner');
+    assert.equal(getPendingAction(pending.id)?.status, 'failed');
+  } finally {
+    _setBatchPlanRunnerForTests(null);
+    await revokeComposioCliDefaultAccountAuthority('outlook');
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
+});
+
+test('run_batch claim refuses a legacy wrapper alias rebind before batch dispatch', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'sdk';
+  const aliasLabel = 'Legacy Claim Box';
+  rememberAccountAlias({
+    toolkit: 'outlook',
+    label: aliasLabel,
+    email: 'legacy-claim-a@corp.example',
+    connectionId: 'ca_legacy_claim_a',
+  });
+  const sessionId = 'sess-batch-legacy-wrapper-alias-claim';
+  createSession({ id: sessionId, kind: 'chat' });
+  const pending = queuePendingAction({
+    title: 'Legacy nested-wrapper Outlook draft',
+    summary: 'This historical approved payload still carries a mutable account label inside the wrapper.',
+    kind: 'external_write',
+    toolName: 'run_batch',
+    payload: {
+      tool: 'composio_execute_tool',
+      composioSlug: 'OUTLOOK_CREATE_DRAFT',
+      sideEffect: 'write',
+      objective: 'create the approved draft in the originally selected mailbox',
+      items: [{
+        id: 'legacy-wrapper-draft',
+        args: {
+          tool_slug: 'OUTLOOK_CREATE_DRAFT',
+          arguments: JSON.stringify({
+            subject: 'Pinned before alias rotation',
+            body: 'Body',
+            to_email: 'review@example.com',
+            account_alias: aliasLabel,
+          }),
+        },
+      }],
+    },
+    sessionId,
+    createdBy: 'test',
+  });
+  approveExactPendingAction(pending, 'approve the legacy nested-wrapper draft');
+
+  // Rebinding the conversational label after approval must not retarget the
+  // stored payload when claim-time normalization unwraps its legacy carrier.
+  rememberAccountAlias({
+    toolkit: 'outlook',
+    label: aliasLabel,
+    email: 'legacy-claim-b@corp.example',
+    connectionId: 'ca_legacy_claim_b',
+  });
+  let runs = 0;
+  _setBatchPlanRunnerForTests(async () => {
+    runs += 1;
+    throw new Error('must not dispatch');
+  });
+  try {
+    const result = await withToolOutputContext(
+      { sessionId },
+      () => batchHandler()({ action: 'execute', pending_action_id: pending.id }),
+    ) as ToolResult;
+    assert.match(result.content[0].text, /legacy Composio wrapper|normalization after approval|immutable account authority/i);
+    assert.equal(runs, 0, 'legacy wrapper route repair must fail inside claim before the batch runner');
+    assert.equal(getPendingAction(pending.id)?.status, 'failed');
+  } finally {
+    _setBatchPlanRunnerForTests(null);
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
+});
+
+test('run_batch claim evaluates account selectors per item: mixed alias and ca routes pass SDK', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'sdk';
+  const sessionId = 'sess-batch-mixed-account-selectors';
+  createSession({ id: sessionId, kind: 'chat' });
+  const pending = queuePendingAction({
+    title: 'Mixed account-addressable batch',
+    summary: 'Each item owns exactly one immutable SDK selector.',
+    kind: 'external_write',
+    toolName: 'run_batch',
+    payload: {
+      tool: 'composio_execute_tool',
+      composioSlug: 'OUTLOOK_CREATE_DRAFT',
+      sideEffect: 'write',
+      objective: 'create two approved drafts through their exact SDK account routes',
+      items: [
+        {
+          id: 'alias-item',
+          args: {
+            subject: 'Alias route',
+            body: 'A',
+            to_email: 'a@example.com',
+            account_alias: 'alias-route@corp.example',
+          },
+        },
+        {
+          id: 'connection-item',
+          args: { subject: 'Connection route', body: 'B', to_email: 'b@example.com' },
+          connectedAccountId: 'ca_reviewed_outer',
+        },
+      ],
+    },
+    sessionId,
+    createdBy: 'test',
+  });
+  approveExactPendingAction(pending, 'approve mixed account-addressable batch');
+  let runs = 0;
+  _setBatchPlanRunnerForTests(async (plan, runnerSessionId) => {
+    runs += 1;
+    return {
+      batchId: 'batch-mixed-account-selectors',
+      sessionId: runnerSessionId,
+      tool: plan.tool,
+      composioSlug: plan.composioSlug,
+      sideEffect: plan.sideEffect,
+      objective: plan.objective,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      total: plan.items.length,
+      succeeded: plan.items.length,
+      failed: 0,
+      halted: false,
+      outcomes: plan.items.map((item) => ({ id: item.id, ok: true, attempts: 1, ms: 1 })),
+    };
+  });
+  try {
+    const result = await withToolOutputContext(
+      { sessionId },
+      () => batchHandler()({ action: 'execute', pending_action_id: pending.id }),
+    ) as ToolResult;
+    assert.match(result.content[0].text, /batch-mixed-account-selectors/);
+    assert.equal(runs, 1, 'different items may safely use different selector carrier kinds');
+    assert.equal(getPendingAction(pending.id)?.status, 'executed');
+  } finally {
+    _setBatchPlanRunnerForTests(null);
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
 });
 
 // ── Consent-scope wave (2026-08-07): the beat's approval carries into the batch lane ──

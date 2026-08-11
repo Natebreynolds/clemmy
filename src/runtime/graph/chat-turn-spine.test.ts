@@ -219,3 +219,125 @@ test('capability resolves AT the capability_resolve node, exactly once, before a
   });
   assert.deepEqual(direct, ['capability', 'core'], 'the direct shape did not resolve capability before its core');
 });
+
+test('context resolves AT the context_resolve node, before capability, exactly once on every path', async () => {
+  // The context interior's slice, held to the same contract capability got:
+  // the memory warm is graph work. On shapes WITH the node it happens there,
+  // ordered UPSTREAM of capability construction so the embed overlaps tool
+  // assembly instead of racing the first model call from inside the core.
+  const order: string[] = [];
+  const retrieval = await driveChatTurnSpine({
+    identity: { sessionId: 'ctx-spine', turn: 1, sourceUserSeq: 21 },
+    input: 'What is the current status of the Acme account?',
+    surface: 'direct',
+    policy: POLICY,
+    phases: {
+      resolveContext: async () => { order.push('context'); },
+      resolveCapability: async () => { order.push('capability'); },
+      runCore: async () => { order.push('core'); return { ok: true }; },
+      shouldPublish: () => true,
+      publish: () => { order.push('publish'); },
+      delivered: () => true,
+    },
+  });
+  assert.equal(retrieval.engine, 'graph');
+  assert.deepEqual(
+    order,
+    ['context', 'capability', 'core', 'publish'],
+    'context did not resolve before capability and the core',
+  );
+  const contextStep = retrieval.trace!.find((t) => t.kind === 'context_resolve')!;
+  const capabilityStep = retrieval.trace!.find((t) => t.kind === 'capability_resolve')!;
+  assert.ok(contextStep, 'the context node produced no trace step — it was a pass-through, not work');
+  assert.ok(
+    contextStep.wave < capabilityStep.wave,
+    'the context node did not precede the capability node in the trace',
+  );
+
+  // The direct-reply shape compiles no context node; the warm must still
+  // happen, lazily, before the core — an extraction may never leave a lane cold.
+  const direct: string[] = [];
+  await driveChatTurnSpine({
+    identity: { sessionId: 'ctx-spine', turn: 2, sourceUserSeq: 22 },
+    input: 'hello',
+    surface: 'direct',
+    policy: POLICY,
+    phases: {
+      resolveContext: async () => { direct.push('context'); },
+      resolveCapability: async () => { direct.push('capability'); },
+      runCore: async () => { direct.push('core'); return { ok: true }; },
+      shouldPublish: () => true,
+      publish: () => {},
+    },
+  });
+  assert.deepEqual(direct, ['context', 'capability', 'core'], 'the direct shape skipped the context warm');
+});
+
+test('the verify node evaluates its declared evidence contract, and fails open when it cannot', async () => {
+  // Third interior slice. The compiler declares `any of tool_result/source/
+  // memory` on a retrieval verify node; until this slice nothing read it, so
+  // the requirement guarded nothing. A delivered core whose evidence does NOT
+  // meet the contract must route evidence_insufficient — publication still
+  // happens (the blocked answer is a real answer), but the sufficient route
+  // must not be the one that fired.
+  const met = await driveChatTurnSpine({
+    identity: { sessionId: 'verify-spine', turn: 1, sourceUserSeq: 31 },
+    input: 'What is the current status of the Acme account?',
+    surface: 'direct',
+    policy: POLICY,
+    phases: {
+      runCore: async () => ({ ok: true }),
+      shouldPublish: () => true,
+      publish: () => {},
+      delivered: () => true,
+      evidenceKinds: () => ['tool_result'],
+    },
+  });
+  assert.equal(met.engine, 'graph');
+  assert.ok(
+    met.trace!.some((t) => t.kind === 'compose_reply'),
+    'a turn whose evidence met the contract did not reach compose_reply',
+  );
+
+  const unmet = await driveChatTurnSpine({
+    identity: { sessionId: 'verify-spine', turn: 2, sourceUserSeq: 32 },
+    input: 'What is the current status of the Acme account?',
+    surface: 'direct',
+    policy: POLICY,
+    phases: {
+      runCore: async () => ({ ok: true }),
+      shouldPublish: () => true,
+      publish: () => {},
+      // The core believes it delivered; the evidence says otherwise.
+      delivered: () => true,
+      evidenceKinds: () => [],
+    },
+  });
+  assert.ok(
+    !unmet.trace!.some((t) => t.kind === 'compose_reply'),
+    'an unmet evidence contract still routed the evidence_sufficient edge',
+  );
+  assert.ok(
+    unmet.trace!.some((t) => t.kind === 'compose_blocked'),
+    'an unmet evidence contract did not route evidence_insufficient',
+  );
+
+  // FAIL-OPEN: a caller that supplies no evidence phase keeps the exact
+  // pre-slice verdict — the contract may strengthen a turn, never lose one.
+  const unevaluated = await driveChatTurnSpine({
+    identity: { sessionId: 'verify-spine', turn: 3, sourceUserSeq: 33 },
+    input: 'What is the current status of the Acme account?',
+    surface: 'direct',
+    policy: POLICY,
+    phases: {
+      runCore: async () => ({ ok: true }),
+      shouldPublish: () => true,
+      publish: () => {},
+      delivered: () => true,
+    },
+  });
+  assert.ok(
+    unevaluated.trace!.some((t) => t.kind === 'compose_reply'),
+    'an unevaluated contract must not block a turn the core delivered',
+  );
+});

@@ -191,7 +191,7 @@ function matchCount(text: string, cues: readonly string[]): { count: number; mat
   return { count: matched.length, matched };
 }
 
-function hasExplicitActionContinuation(text: string, includePlainAnd: boolean): boolean {
+export function hasExplicitActionContinuation(text: string, includePlainAnd: boolean): boolean {
   return (
     includePlainAnd
       ? ACTION_CONTINUATION_WITH_AND_RE

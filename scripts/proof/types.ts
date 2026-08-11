@@ -12,6 +12,19 @@
 export type BrainKind = 'claude' | 'codex' | 'glm';
 export type FusionProofMode = 'off' | 'high' | 'all';
 export type ProofModelProvider = 'claude' | 'codex' | 'byo';
+export type ProofBenchmarkSample = 'prime' | 'measured';
+
+/** Explicit identity for one member of a deliberately paired benchmark.
+ * `prime`/`measured` describe protocol order only; observed cache telemetry,
+ * never the label, decides whether either sample was actually cold or warm. */
+export interface ProofBenchmarkMetadata {
+  protocolVersion: 1;
+  cohortId: string;
+  sample: ProofBenchmarkSample;
+  /** Stable hash of scenario names + declared workload inputs + Fusion mode.
+   * Source and route identity remain separate comparison gates. */
+  workloadKey: string;
+}
 
 /** Non-secret release expectation derived from the candidate install's model
  * configuration. Live scoring must prove this exact provider/model pair from
@@ -40,8 +53,64 @@ export interface TurnResult {
   text: string;
   sessionId: string;
   wallMs: number;
+  /** Exact durable user edge accepted for this turn when the drive surface
+   * exposes it. The synchronous console compatibility route does not. */
+  sourceUserSeq?: number;
   pendingApprovalId?: string;
   httpStatus: number;
+}
+
+/** Bounded stdout/stderr capture evidence for one isolated brain leg. The
+ * forensic tail spans daemon restarts; the scenario counters describe only the
+ * window since the runner's latest markLog(). */
+export interface ProofLogCaptureEvidence {
+  totalBytes: number;
+  /** Maximum bytes exposed by the already-redacted forensic snapshot. */
+  forensicMaxBytes: number;
+  forensicStoredBytes: number;
+  forensicDroppedBytes: number;
+  /** Raw ring is bounded to final output plus one maximum-secret overlap so
+   * redaction always precedes the final tail boundary. */
+  forensicRawMaxBytes: number;
+  forensicRawStoredBytes: number;
+  forensicRawDroppedBytes: number;
+  forensicRedactionOverlapBytes: number;
+  scenarioMaxBytes: number;
+  currentScenarioBytes: number;
+  currentScenarioStoredBytes: number;
+  currentScenarioDroppedBytes: number;
+  scenarioDroppedBytes: number;
+  overflowPeriods: number;
+  overflowed: boolean;
+}
+
+export interface DaemonStopResult {
+  /** The home was intentionally retained (including forced retention after a
+   * shutdown failure) rather than recursively removed. */
+  retainedHome: boolean;
+  forensicLog: {
+    status: 'not-requested' | 'persisted' | 'failed';
+    path?: string;
+    error?: string;
+  };
+  /** Verified disposition of the exact mkdtemp proof home. A green teardown
+   * must prove the home is absent; retained forensics must prove every copied
+   * credential path is absent without following a workload-created symlink. */
+  cleanup: {
+    intent: 'sanitize-and-retain' | 'remove';
+    status: 'succeeded' | 'failed';
+    homeExists: boolean;
+    errors?: string[];
+  };
+  /** A bounded SIGTERM/SIGKILL completed, but process close/pipe EOF could not
+   * be proven. The log may still be useful, but it is not complete evidence. */
+  shutdownError?: string;
+  /** Always present for provisionDaemon-produced results. Optional only so
+   * small pure-test fixtures from older callers remain structurally valid. */
+  logCapture?: ProofLogCaptureEvidence;
+  /** Sticky fail-closed evidence: at least one boot/scenario period exceeded
+   * the semantic scenario window, even if no later scenario called log(). */
+  logCaptureError?: string;
 }
 
 /** Handle to a provisioned daemon + the drive surface scenarios use. */
@@ -51,6 +120,9 @@ export interface DaemonHandle {
   secret: string;
   baseUrl: string;
   chat(message: string, sessionId: string, timeoutMs?: number): Promise<TurnResult>;
+  /** Drive the durable 202/SSE chat ingress, then read only the exact accepted
+   * source's typed terminal from the isolated harness database. */
+  acceptedChat(message: string, sessionId: string, timeoutMs?: number): Promise<TurnResult>;
   approve(approvalId: string, decision: 'approve' | 'reject'): Promise<number>;
   /** Authenticated JSON request against the daemon's console API. */
   request(method: string, apiPath: string, body?: unknown): Promise<{ status: number; json: unknown }>;
@@ -62,8 +134,10 @@ export interface DaemonHandle {
   /** Restart the real daemon against the SAME isolated home, port, and auth
    *  sandbox. Used to prove durable recovery instead of simulating it in-process. */
   restart(): Promise<void>;
-  /** keepHome=true preserves the temp home for forensics (failed runs). */
-  stop(opts?: { keepHome?: boolean }): Promise<void>;
+  /** keepHome=true preserves the temp home for forensics (failed runs). The
+   * result is report evidence: a requested retained log may never fail only as
+   * a console warning. */
+  stop(opts?: { keepHome?: boolean }): Promise<DaemonStopResult>;
 }
 
 export interface Check {
@@ -79,6 +153,14 @@ export interface TurnLatency {
   ttftMs: number | null;
 }
 
+/** Exact model-route expectation for one durable session owned by a scenario.
+ * Multi-session horizon proofs use this so a cold acquisition cannot hide
+ * behind route evidence from a later learned/replay session. */
+export interface ScenarioRouteSession {
+  sessionId: string;
+  expectedModelTurns: number;
+}
+
 export type ScenarioStatus = 'PASS' | 'FAIL' | 'SKIP';
 
 export interface ScenarioOutcome {
@@ -90,6 +172,9 @@ export interface ScenarioOutcome {
   sessionId?: string;
   /** Raw metric snapshot for the report (turns, tool calls, tokens, …). */
   metrics?: Record<string, unknown>;
+  /** Optional per-session route proof. When present, runner scoring validates
+   * every entry instead of collapsing a multi-session scenario to sessionId. */
+  routeSessions?: ScenarioRouteSession[];
   error?: string;
 }
 
@@ -99,17 +184,38 @@ export interface ScenarioDef {
   summary: string;
   /** Require session-scoped provider identity and zero fallover for this run. */
   routeExpectation?: 'exact-brain' | 'exact-workflow-step';
+  /** Number of turns expected to invoke the brain model. Defaults to the
+   * scenario's latency sample count. Set this when latency also records
+   * deterministic fast-path turns that deliberately make no model call. */
+  expectedModelTurns?: number;
   /** This scenario deliberately dispatches the configured worker role. */
   workerRouteExpectation?: boolean;
-  run(daemon: DaemonHandle): Promise<Omit<ScenarioOutcome, 'brain' | 'scenario' | 'status'> & { checks: Check[] }>;
+  /** Stable, non-secret inputs that materially change benchmark work. Runtime
+   * output, timestamps, session ids, and model responses never belong here. */
+  benchmarkWorkload?: Readonly<Record<string, string | number | boolean | null>>;
+  run(
+    daemon: DaemonHandle,
+    context?: { brain: BrainKind },
+  ): Promise<Omit<ScenarioOutcome, 'brain' | 'scenario' | 'status'> & { checks: Check[] }>;
 }
 
 export interface ProofReport {
   startedAt: string;
   finishedAt: string;
   gitHead: string;
+  /** Finish-time HEAD. Optional on archived reports predating stability proof. */
+  gitHeadEnd?: string;
+  /** SHA-256 of HEAD plus the scoped tracked diff and untracked source bytes. */
+  sourceFingerprint: string;
+  /** Finish-time fingerprint. Optional so archived v1 reports remain readable. */
+  sourceFingerprintEnd?: string;
+  /** False when source changed, or could not be re-fingerprinted, during proof. */
+  sourceStable?: boolean;
   sourceClean: boolean;
   fusionMode: FusionProofMode;
+  benchmark?: ProofBenchmarkMetadata;
+  /** Report-wide evidence checks which do not belong to one brain/scenario. */
+  reportChecks?: Check[];
   outcomes: ScenarioOutcome[];
   failures: number;
 }

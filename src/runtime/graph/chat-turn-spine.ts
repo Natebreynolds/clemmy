@@ -23,9 +23,9 @@
  * authority never does (authority lives in the phases themselves).
  */
 import type { ProactivityPolicySnapshot } from '../../agents/proactivity-policy.js';
-import { compileTurnGraph } from './turn-graph-compiler.js';
+import { compileTurnGraph, validateTurnGraph } from './turn-graph-compiler.js';
 import { snapshotTurnGraphPolicy } from './turn-graph-compiler.js';
-import type { TurnGraphSurface } from './turn-graph-ir.js';
+import type { TurnGraphIR, TurnGraphSurface } from './turn-graph-ir.js';
 import { runGraph, type GraphRunResult, type GraphTraceEntry } from './graph-executor.js';
 
 export interface ChatTurnSpinePhases<CoreResult> {
@@ -46,6 +46,37 @@ export interface ChatTurnSpinePhases<CoreResult> {
    */
   resolveCapability?: () => Promise<void>;
   /**
+   * Context resolution — the turn's memory warm — owned by the
+   * context_resolve node, which the compiler already declares as carrying a
+   * deferred `memory` capability. Second interior slice, same contract as
+   * resolveCapability: it runs AT its node as a real trace step, exactly once
+   * per turn, before the capability node and before any model call, on both
+   * the graph and the legacy-order paths.
+   *
+   * The core still owns everything else it does with memory; this moves only
+   * the warm that previously fired deep inside the core, where it was neither
+   * a trace step nor orderable against capability construction. Fire-and-
+   * forget by construction — a node that cannot fail cannot fail a turn.
+   */
+  resolveContext?: () => Promise<void>;
+  /**
+   * The evidence kinds this turn ACTUALLY produced, read at the verify node
+   * against the contract the compiler declared there (`any` of tool_result /
+   * source / memory for a retrieval shape; `all` of external_receipt when the
+   * route requests an external effect).
+   *
+   * Third interior slice. Until now the verify node was a pass-through and its
+   * declared contract was never evaluated — both verdict routes keyed on the
+   * core's single `delivered` boolean, so a compiled evidence requirement
+   * guarded nothing. Supplying this makes the requirement real.
+   *
+   * FAIL-OPEN BY CONSTRUCTION: when absent, evidence stays unevaluated and the
+   * verdict is exactly the core's, byte-identical to the pre-slice behaviour.
+   * A caller that cannot enumerate its evidence never loses a turn to the
+   * check — it only declines to strengthen it.
+   */
+  evidenceKinds?: (core: CoreResult) => Iterable<string>;
+  /**
    * Was the answer DELIVERED (evidence sufficient), per the core's own
    * delivery verdict? Drives which verdict route fires: `true` grants
    * `evidence_sufficient` (compose_reply), `false` grants
@@ -61,6 +92,13 @@ export interface ChatTurnSpineInput<CoreResult> {
   input: string;
   surface: TurnGraphSurface;
   policy: ProactivityPolicySnapshot;
+  /**
+   * The exact graph already persisted for this accepted source. Production
+   * callers pass this so the executor cannot silently compile a sibling graph
+   * with a different policy/tool surface. Tests and callers that have not yet
+   * recorded a graph retain the existing deterministic compile path.
+   */
+  graph?: TurnGraphIR;
   phases: ChatTurnSpinePhases<CoreResult>;
 }
 
@@ -95,13 +133,28 @@ export async function driveChatTurnSpine<CoreResult>(
   let compiled: ReturnType<typeof compileTurnGraph> | null = null;
   let compileError: string | undefined;
   try {
-    compiled = compileTurnGraph({
-      identity: spine.identity,
-      input: spine.input,
-      sessionKind: 'chat',
-      surface: spine.surface,
-      policy: snapshotTurnGraphPolicy(spine.policy),
-    });
+    if (spine.graph) {
+      const identityMatches = spine.graph.identity.sessionId === spine.identity.sessionId
+        && spine.graph.identity.turn === spine.identity.turn
+        && spine.graph.identity.sourceUserSeq === spine.identity.sourceUserSeq;
+      const validation = validateTurnGraph(spine.graph);
+      if (!identityMatches || !validation.ok) {
+        throw new Error(
+          !identityMatches
+            ? 'persisted turn graph belongs to a different accepted source'
+            : validation.errors.join('; '),
+        );
+      }
+      compiled = { graph: spine.graph, validation };
+    } else {
+      compiled = compileTurnGraph({
+        identity: spine.identity,
+        input: spine.input,
+        sessionKind: 'chat',
+        surface: spine.surface,
+        policy: snapshotTurnGraphPolicy(spine.policy),
+      });
+    }
     if (!compiled.validation.ok) {
       compileError = compiled.validation.errors.join('; ');
       compiled = null;
@@ -113,6 +166,7 @@ export async function driveChatTurnSpine<CoreResult>(
 
   if (!compiled) {
     // Legacy ORDER, same phases: behavior-identical spine, minus the trace.
+    await spine.phases.resolveContext?.();
     await spine.phases.resolveCapability?.();
     const core = await spine.phases.runCore();
     if (spine.phases.shouldPublish(core)) spine.phases.publish(core);
@@ -137,6 +191,21 @@ export async function driveChatTurnSpine<CoreResult>(
     capabilityResolved = true;
     await spine.phases.resolveCapability?.();
   };
+  // The compiler declares an evidence contract on each verify node; carry it
+  // by node id so the executor's flattened node view stays unchanged.
+  const evidenceContracts = new Map<string, { mode: string; kinds: readonly string[] }>();
+  for (const node of graph.nodes) {
+    const contract = (node as { evidence?: { mode: string; kinds: readonly string[] } }).evidence;
+    if (node.kind === 'verify' && contract) evidenceContracts.set(node.id, contract);
+  }
+  /** undefined = not evaluated (no phase, or nothing to check) — never a refusal. */
+  let evidenceSatisfied: boolean | undefined;
+  let contextResolved = false;
+  const resolveContextOnce = async (): Promise<void> => {
+    if (contextResolved) return;
+    contextResolved = true;
+    await spine.phases.resolveContext?.();
+  };
 
   const run = await runGraph(
     {
@@ -152,6 +221,42 @@ export async function driveChatTurnSpine<CoreResult>(
     {
       runner: {
         run: async (node) => {
+          if (node.kind === 'verify') {
+            // The contract is evaluated HERE, against what the turn produced,
+            // so an unmet requirement routes evidence_insufficient instead of
+            // being a decoration on a node nobody read.
+            const contract = evidenceContracts.get(node.id);
+            if (contract && contract.mode !== 'none' && spine.phases.evidenceKinds && coreRan) {
+              let produced: Set<string>;
+              try {
+                produced = new Set(spine.phases.evidenceKinds(core as CoreResult));
+              } catch {
+                // An enumeration failure is not a refusal: leave it unevaluated.
+                return { status: 'completed' };
+              }
+              evidenceSatisfied = contract.mode === 'all'
+                ? contract.kinds.every((kind) => produced.has(kind))
+                : contract.kinds.some((kind) => produced.has(kind));
+            }
+            return { status: 'completed' };
+          }
+          if (node.kind === 'context_resolve') {
+            // The memory warm becomes a real trace step here, upstream of
+            // capability construction, so the turn's context is resolving
+            // while tools assemble instead of racing the first model call
+            // from inside the core.
+            try {
+              await resolveContextOnce();
+              return { status: 'completed' };
+            } catch (error) {
+              coreError = error;
+              return {
+                status: 'failed',
+                reason: error instanceof Error ? error.message : String(error),
+                settlementClass: 'infrastructure',
+              };
+            }
+          }
           if (node.kind === 'capability_resolve') {
             // Construction happens AT the node — a real trace step, not a
             // pass-through. Failure here is the node's own failure.
@@ -175,8 +280,10 @@ export async function driveChatTurnSpine<CoreResult>(
             // can never route this turn into a second provider call.
             coreAttempted = true;
             try {
-              // Direct-reply shapes have no capability_resolve node; resolve
-              // here, idempotently, before the first model call.
+              // Direct-reply shapes have neither a context_resolve nor a
+              // capability_resolve node; resolve both here, idempotently,
+              // before the first model call.
+              await resolveContextOnce();
               await resolveCapabilityOnce();
               core = await spine.phases.runCore();
               coreRan = true;
@@ -213,8 +320,14 @@ export async function driveChatTurnSpine<CoreResult>(
         // extracts. When await_input/await_approval topology lands, its
         // condition gets granted here from its own real signal, on purpose.
         edgeSatisfied: (edge) => {
-          if (edge.when === 'evidence_sufficient') return coreRan && coreDelivered;
-          if (edge.when === 'evidence_insufficient') return coreRan && !coreDelivered;
+          // `evidenceSatisfied === undefined` means the contract was never
+          // evaluated, so the core's verdict stands alone exactly as before.
+          if (edge.when === 'evidence_sufficient') {
+            return coreRan && coreDelivered && evidenceSatisfied !== false;
+          }
+          if (edge.when === 'evidence_insufficient') {
+            return coreRan && (!coreDelivered || evidenceSatisfied === false);
+          }
           return false;
         },
       },
@@ -236,6 +349,7 @@ export async function driveChatTurnSpine<CoreResult>(
     // The graph never reached compose_reply — a spine defect, not a user
     // outcome, and the core was NEVER attempted, so running the legacy order
     // is a first execution rather than a duplicate. Surface the anomaly.
+    await resolveContextOnce();
     await resolveCapabilityOnce();
     const fallbackCore = await spine.phases.runCore();
     if (spine.phases.shouldPublish(fallbackCore)) spine.phases.publish(fallbackCore);

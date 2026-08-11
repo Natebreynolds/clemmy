@@ -39,6 +39,7 @@ export const blockedAuthTruth: ScenarioDef = {
     const dispatched = await dispatchBackground(daemon, originSessionId, prompt);
     const settled = await waitForTerminal(daemon, dispatched.taskId, 20 * 60_000);
     const task = settled.detail.task;
+    const backgroundTiming = dispatched.settlementTimer.observe(task.status, dispatched.turn.wallMs);
     const artifact = localArtifactText(artifactPath);
     const result = task.resultFull ?? task.result ?? task.pendingQuestion ?? task.error ?? '';
     const factualText = [
@@ -127,13 +128,17 @@ export const blockedAuthTruth: ScenarioDef = {
     return {
       checks,
       latency: [{
-        wallMs: dispatched.turn.wallMs,
+        wallMs: backgroundTiming.observedSettlementWallMs,
         ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null,
       }],
       sessionId: task.runSessionId,
       metrics: {
         status: task.status,
         artifactPath,
+        observedSettlementWallMs: backgroundTiming.observedSettlementWallMs,
+        dispatchAcknowledgementWallMs: backgroundTiming.dispatchAcknowledgementWallMs,
+        terminalStatus: backgroundTiming.terminalStatus,
+        wallMsLabel: backgroundTiming.wallMsLabel,
         toolCalls: metrics?.toolCalls,
         tokensUsed: metrics?.tokensUsed,
         outcomeStatuses: outcomes.map((event) => event.data.status),

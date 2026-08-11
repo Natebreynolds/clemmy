@@ -62,6 +62,14 @@ function entryFor(planId: string) {
   return projectActivitySnapshot().entries.find((entry) => entry.planId === planId);
 }
 
+function durableTaskState(taskId: string): 'alive' | 'done' | 'failed' | 'missing' {
+  const task = bg.getBackgroundTask(taskId);
+  if (!task) return 'missing';
+  if (task.status === 'pending' || task.status === 'running') return 'alive';
+  if (task.status === 'done') return 'done';
+  return 'failed';
+}
+
 test('a plan reports the journal’s own counts, not an estimate', () => {
   const plan = admitPlan('Summarize five accounts', ['a', 'b', 'c', 'd', 'e']);
 
@@ -122,18 +130,26 @@ test('the notch, App Home and Discord status show the plan and none of its windo
   );
 });
 
-test('a reducer holding its lease is live, and combining says so', () => {
+test('an admitted reducer is live, and combining says so', () => {
   const plan = admitPlan('Combine three regions', ['r1', 'r2', 'r3']);
-  fanout.scheduleDurableFanout(plan.planId);
+  const scheduled = fanout.scheduleDurableFanout(plan.planId);
   for (const itemId of ['r1', 'r2', 'r3']) {
     fanout.settleFanoutActivation({ planId: plan.planId, itemId, phaseId: 'execute', status: 'done' });
   }
-  assert.equal(fanout.acquireFanoutReducerLease(plan.planId, 'reducer-under-test'), true);
+  for (const worker of scheduled!.workerTasks) {
+    assert.equal(bg.markBackgroundTaskDone(worker.id, 'Worker window completed.')?.status, 'done');
+  }
+  const reconciled = fanout.reconcileDurableFanout({
+    taskState: durableTaskState,
+    reducerOwner: 'reducer-under-test',
+  });
+  assert.equal(reconciled.reduced.includes(plan.planId), true,
+    'the durable worker terminals did not admit the reducer');
 
   const entry = entryFor(plan.planId)!;
   assert.equal(entry.lifecycle, 'reducing', 'a plan whose items all settled is combining, not fanning out');
   assert.equal(entry.owner, 'reducer-under-test', 'the durable owner is not carried');
-  assert.equal(entry.liveness, 'live', 'a held reducer lease read as dead while it combined');
+  assert.notEqual(entry.liveness, 'stale', 'a newly admitted reducer read as abandoned while it combined');
   assert.equal(entry.activity?.text, 'Combining results');
   assert.deepEqual(entry.progress, { completed: 3, total: 3 });
   assert.equal(entry.terminal, undefined,
@@ -178,13 +194,23 @@ test('a settled plan settles the notebook action linked by its plan id', () => {
     }],
   });
 
-  fanout.scheduleDurableFanout(plan.planId);
+  const scheduled = fanout.scheduleDurableFanout(plan.planId);
   for (const itemId of ['s1', 's2']) {
     fanout.settleFanoutActivation({ planId: plan.planId, itemId, phaseId: 'execute', status: 'done' });
   }
-  // The real reducer lifecycle: lease → admitted reducer task → its terminal.
-  const reducerTask = fanout.maybeAdmitFanoutReducer(plan.planId, { owner: 'reducer-under-test' });
+  for (const worker of scheduled!.workerTasks) {
+    assert.equal(bg.markBackgroundTaskDone(worker.id, 'Worker window completed.')?.status, 'done');
+  }
+  // The real reducer lifecycle: worker terminals close their windows, then
+  // reconciliation leases and admits one reducer task on the plan.
+  const reconciled = fanout.reconcileDurableFanout({
+    taskState: durableTaskState,
+    reducerOwner: 'reducer-under-test',
+  });
+  assert.equal(reconciled.reduced.includes(plan.planId), true);
+  const reducerTask = bg.getBackgroundTask(fanout.loadFanoutPlan(plan.planId)!.reducerTaskId!);
   assert.ok(reducerTask, 'the reducer was never admitted');
+  assert.equal(bg.markBackgroundTaskDone(reducerTask!.id, 'Combined result delivered.')?.status, 'done');
   assert.equal(
     fanout.recordFanoutReducerOutcome(plan.planId, { taskId: reducerTask!.id, outcome: 'completed' }),
     true,

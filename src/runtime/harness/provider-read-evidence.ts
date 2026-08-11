@@ -41,10 +41,16 @@ const FAILURE_STATUS_RE = /^(?:aborted|cancelled|canceled|declined|denied|error|
 const ERROR_TERM_RE = /\b(?:bad|denied|does not exist|error|fail(?:ed|ure)?|forbidden|invalid|missing|no such|not found|reject(?:ed|ion)?|refus(?:ed|al)?|timeout|timed out|unauthori[sz]ed|unavailable)\b/i;
 
 function errorFieldIsFailure(value: unknown): boolean {
-  if (value === undefined || value === null || value === false || value === '') return false;
+  if (
+    value === undefined
+    || value === null
+    || value === ''
+    || structuredFalse(value)
+  ) return false;
   if (typeof value === 'string') {
     const text = value.trim();
     if (!text) return false;
+    if (/^(?:none|null|ok|success)$/i.test(text)) return false;
     if (ERROR_TERM_RE.test(text)) return true;
     return !/\bdeprecat(?:ed|ion)\b/i.test(text);
   }
@@ -58,33 +64,84 @@ function errorFieldIsFailure(value: unknown): boolean {
   return value === true || (typeof value === 'number' && value !== 0);
 }
 
+const CONTRADICTION_MAX_DEPTH = 8;
+const CONTRADICTION_MAX_NODES = 512;
+const CONTRADICTION_MAX_ENTRIES = 128;
+const CONTRADICTION_RESULT_ARRAY_KEYS = new Set([
+  'data', 'documents', 'drafts', 'entries', 'events', 'items', 'messages',
+  'records', 'resources', 'results', 'rows', 'value', 'values',
+]);
+const NEGATIVE_SUCCESS_KEYS = new Set(['ok', 'success', 'successful']);
+const FAILURE_FLAG_KEYS = new Set(['failed', 'haserror', 'iserror', 'isfailed']);
+const ERROR_FIELD_KEYS = new Set([
+  'error', 'errors', 'exception', 'exceptions', 'failure', 'failures', 'httperror',
+]);
+const STATUS_FIELD_KEYS = new Set([
+  'httpcode', 'httpstatus', 'httpstatuscode', 'responsecode', 'status', 'statuscode',
+]);
+const BUSINESS_IDENTITY_KEYS = new Set([
+  'id', 'identifier', 'key', 'recordid', 'uid', 'uuid',
+]);
+
+function normalizedEnvelopeKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 /** Contradictory provider envelopes (`successful:true` plus 404/error) are not
- * evidence. Recurse through known envelope carriers only. */
+ * evidence. Traversal is provider-neutral and bounded. Request echoes and
+ * returned business-record arrays are not themselves transport envelopes. */
 export function providerEnvelopeHasContradiction(value: unknown, depth = 0): boolean {
-  if (!value || typeof value !== 'object' || depth > 4) return false;
-  if (Array.isArray(value)) return value.some((entry) => providerEnvelopeHasContradiction(entry, depth + 1));
-  const record = value as Record<string, unknown>;
-  if (
-    structuredFalse(record.successful)
-    || structuredFalse(record.success)
-    || structuredFalse(record.ok)
-    || structuredTrue(record.failed)
-    || errorFieldIsFailure(record.error)
-    || errorFieldIsFailure(record.errors)
-    || errorFieldIsFailure(record.http_error)
-    || errorFieldIsFailure(record.exception)
-  ) return true;
-  if (
-    statusCodeIsFailure(record.status_code)
-    || statusCodeIsFailure(record.statusCode)
-    || statusCodeIsFailure(record.http_status)
-    || statusCodeIsFailure(record.httpStatus)
-  ) return true;
-  if (typeof record.status === 'string' && FAILURE_STATUS_RE.test(record.status.trim())) return true;
-  for (const key of ['data', 'response', 'result', 'output']) {
-    if (providerEnvelopeHasContradiction(record[key], depth + 1)) return true;
-  }
-  return false;
+  if (!value || typeof value !== 'object') return false;
+  // A top-level array is a business result set, not an envelope collection.
+  if (Array.isArray(value) && depth === 0) return false;
+  let visited = 0;
+
+  const visit = (node: unknown, currentDepth: number, parentKey: string): boolean => {
+    if (!node || typeof node !== 'object') return false;
+    visited += 1;
+    if (currentDepth > CONTRADICTION_MAX_DEPTH || visited > CONTRADICTION_MAX_NODES) {
+      // If the host cannot inspect the whole bounded envelope, it cannot use
+      // that envelope as affirmative evidence.
+      return true;
+    }
+    if (Array.isArray(node)) {
+      if (node.length > CONTRADICTION_MAX_ENTRIES) return true;
+      return node.some((entry) => visit(entry, currentDepth + 1, parentKey));
+    }
+
+    const record = node as Record<string, unknown>;
+    const entries = Object.entries(record);
+    if (entries.length > CONTRADICTION_MAX_ENTRIES) return true;
+    const normalizedKeys = entries.map(([key]) => normalizedEnvelopeKey(key));
+    const businessEntity = normalizedKeys.some((key) => BUSINESS_IDENTITY_KEYS.has(key));
+    for (const [rawKey, child] of entries) {
+      const key = normalizedEnvelopeKey(rawKey);
+      if (NEGATIVE_SUCCESS_KEYS.has(key) && structuredFalse(child)) return true;
+      if (FAILURE_FLAG_KEYS.has(key) && structuredTrue(child)) return true;
+      if (ERROR_FIELD_KEYS.has(key) && errorFieldIsFailure(child)) return true;
+      if (STATUS_FIELD_KEYS.has(key)) {
+        // `status` on an identified returned entity is domain data (a failed
+        // job/order is still a successful read). Explicit HTTP/status-code
+        // fields remain transport evidence.
+        if (key === 'status' && businessEntity) continue;
+        if (statusCodeIsFailure(child)) return true;
+        if (typeof child === 'string' && FAILURE_STATUS_RE.test(child.trim())) return true;
+      }
+    }
+
+    for (const [rawKey, child] of entries) {
+      if (!child || typeof child !== 'object') continue;
+      const key = normalizedEnvelopeKey(rawKey);
+      // Plain `payload` is also a common response carrier, so only skip keys
+      // that are unmistakably request/input echoes.
+      if (providerRequestEchoKey(rawKey) && key !== 'payload') continue;
+      if (Array.isArray(child) && CONTRADICTION_RESULT_ARRAY_KEYS.has(key)) continue;
+      if (visit(child, currentDepth + 1, key)) return true;
+    }
+    return false;
+  };
+
+  return visit(value, depth, '');
 }
 
 const COUNT_KEYS = new Set(['count', 'total', 'totalcount', 'rowcount', 'recordcount', 'resultcount']);

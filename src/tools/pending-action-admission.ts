@@ -17,6 +17,7 @@ import {
   type ComposioCliDefaultAccountAuthority,
 } from '../integrations/composio/cli-default-account-authority.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+import { resolveAccountAlias } from '../memory/account-alias-store.js';
 
 const BUILT_IN_TOOL_NAMES = new Set(TOOL_REGISTRY.map((tool) => tool.name));
 
@@ -34,6 +35,9 @@ export interface AdmittedPendingActionCall extends CanonicalPendingActionCall {
 export interface PendingComposioExecutionAuthorityCheck {
   toolSlug: string;
   connectedAccountIds: Array<string | null | undefined>;
+  /** Stable account identities snapshotted into action arguments. The CLI
+   * cannot honor these selectors, even when its unrelated default is granted. */
+  accountAliases?: unknown[];
   executionAuthority: ComposioCliDefaultAccountAuthority | null | undefined;
 }
 
@@ -49,6 +53,25 @@ function isBareComposioActionSlug(value: string): boolean {
   return /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(value)
     && !listDynamicToolNames().includes(value)
     && isWrappedComposioActionSlug(value);
+}
+
+function stableEmail(value: unknown): string | undefined {
+  const normalized = typeof value === 'string'
+    ? value.trim().toLowerCase().replace(/^smtp:/, '')
+    : '';
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalized) ? normalized : undefined;
+}
+
+/** Resolve a conversational account label exactly once at queue/proposal time.
+ * Claim-time verification deliberately does NOT call this mutable store. */
+export function resolveStableComposioAccountAlias(
+  toolSlug: string,
+  value: unknown,
+): string | undefined {
+  const direct = stableEmail(value);
+  if (direct) return direct;
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  return stableEmail(resolveAccountAlias(value, registeredToolkitOfSlug(toolSlug))?.email);
 }
 
 function assertPendingIrreversibleSendPayload(
@@ -170,7 +193,7 @@ export function admitPendingActionCall(
   payloadInput: unknown,
   options: { approvalIntent: PendingActionAdmissionIntent },
 ): AdmittedPendingActionCall {
-  const canonical = canonicalizePendingActionCall(toolNameInput, payloadInput);
+  let canonical = canonicalizePendingActionCall(toolNameInput, payloadInput);
   if (canonical.toolName !== 'composio_execute_tool' || !isPlainRecord(canonical.payload)) {
     return { ...canonical, executionAuthority: null };
   }
@@ -184,9 +207,49 @@ export function admitPendingActionCall(
   const cliOnlyLane = composioExecutionUsesCliOnlyLane(getComposioCredentialStatus());
   const formalApproval = options.approvalIntent !== 'queue_only';
   const write = classifyComposioSlugEffect(slug) !== 'read';
+  let accountAlias = '';
+  const canonicalPayload = canonical.payload;
+  const parsedArguments = typeof canonicalPayload.arguments === 'string'
+    ? JSON.parse(canonicalPayload.arguments) as unknown
+    : canonicalPayload.arguments;
+  if (isPlainRecord(parsedArguments) && Object.prototype.hasOwnProperty.call(parsedArguments, 'account_alias')) {
+    const rawAccountAlias = parsedArguments.account_alias;
+    const stableAlias = resolveStableComposioAccountAlias(slug, rawAccountAlias);
+    if (!stableAlias && (write || formalApproval)) {
+      const detail = typeof rawAccountAlias === 'string' && rawAccountAlias.trim()
+        ? `account_alias "${rawAccountAlias.trim()}" is not bound to a stable ${registeredToolkitOfSlug(slug)} email identity`
+        : 'account_alias must be a non-empty string bound to a stable email identity';
+      throw new Error(`${slug} ${detail}. No approval card or provider dispatch was created.`);
+    }
+    if (stableAlias) {
+      accountAlias = stableAlias;
+      canonical = {
+        ...canonical,
+        payload: {
+          ...canonicalPayload,
+          arguments: JSON.stringify({ ...parsedArguments, account_alias: stableAlias }),
+        },
+      };
+    }
+  }
   const accountScopedBroadcast =
     isIrreversibleSendSlug(slug)
     && !irreversibleSendRequiresExplicitTarget(slug);
+
+  if (accountAlias && connectedAccountId) {
+    throw new Error(
+      `${slug} carries both account_alias "${accountAlias}" and connected_account_id "${connectedAccountId}". `
+      + 'Choose one immutable account selector. No approval card or provider dispatch was created.',
+    );
+  }
+
+  if (cliOnlyLane && accountAlias && formalApproval) {
+    throw new Error(
+      `${slug} is bound to account_alias "${accountAlias}", but the Composio CLI can execute only against its `
+      + 'provider-side default and cannot honor an alias or standing draft-mailbox selector. Use the SDK/AUTO lane '
+      + 'with a Composio API key. No approval card or provider dispatch was created.',
+    );
+  }
 
   if (cliOnlyLane && connectedAccountId && formalApproval) {
     throw new Error(
@@ -210,7 +273,7 @@ export function admitPendingActionCall(
     return { ...canonical, executionAuthority: null };
   }
 
-  if (accountScopedBroadcast && !connectedAccountId && formalApproval) {
+  if (accountScopedBroadcast && !connectedAccountId && !accountAlias && formalApproval) {
     throw new Error(
       `${slug} is an account-scoped publish, so its formal approval path requires either a non-empty connected_account_id `
       + 'in the immutable SDK snapshot or a durable operator-authorized CLI-default snapshot. Resolve the exact destination, '
@@ -233,21 +296,41 @@ export function verifyPendingComposioExecutionAuthority(
 ): string | null {
   const slug = input.toolSlug.trim();
   const authority = input.executionAuthority ?? null;
-  const accountIds = input.connectedAccountIds.length > 0
-    ? input.connectedAccountIds.map((value) => (
-        typeof value === 'string' && value.trim() ? value.trim() : null
-      ))
-    : [null];
-  const hasPinnedAccount = accountIds.some(Boolean);
-  const hasUnpinnedAccount = accountIds.some((value) => !value);
+  const rawAliases = input.accountAliases ?? [];
+  const selectorCount = Math.max(input.connectedAccountIds.length, rawAliases.length, 1);
+  const selectors = Array.from({ length: selectorCount }, (_, index) => {
+    const rawConnection = input.connectedAccountIds[index];
+    const connectedAccountId = typeof rawConnection === 'string' && rawConnection.trim()
+      ? rawConnection.trim()
+      : null;
+    const rawAlias = rawAliases[index];
+    const aliasCarrierPresent = index < rawAliases.length && rawAlias !== undefined;
+    const accountAlias = aliasCarrierPresent ? stableEmail(rawAlias) ?? null : null;
+    return {
+      connectedAccountId,
+      accountAlias,
+      invalidAlias: aliasCarrierPresent && !accountAlias,
+    };
+  });
+  const hasPinnedAccount = selectors.some((selector) => Boolean(selector.connectedAccountId));
+  const hasUnpinnedAccount = selectors.some((selector) => !selector.connectedAccountId);
+  const hasAliasBoundAccount = selectors.some((selector) => Boolean(selector.accountAlias));
+  const hasUnboundAccount = selectors.some((selector) => !selector.connectedAccountId && !selector.accountAlias);
   const write = classifyComposioSlugEffect(slug) !== 'read';
   const cliOnlyLane = composioExecutionUsesCliOnlyLane(getComposioCredentialStatus());
   const accountScopedBroadcast =
     isIrreversibleSendSlug(slug)
     && !irreversibleSendRequiresExplicitTarget(slug);
 
+  if (selectors.some((selector) => selector.invalidAlias)) {
+    return 'The approved action carries an account_alias that is not a stable email identity; mutable labels and non-string aliases cannot be resolved at claim time.';
+  }
+  if (selectors.some((selector) => selector.accountAlias && selector.connectedAccountId)) {
+    return 'The approved action carries conflicting account_alias and connected_account_id selectors on the same item.';
+  }
+
   if (authority) {
-    if (!write || hasPinnedAccount) {
+    if (!write || hasPinnedAccount || hasAliasBoundAccount) {
       return 'The CLI-default capability does not match this action route.';
     }
     if (!cliOnlyLane) {
@@ -260,7 +343,11 @@ export function verifyPendingComposioExecutionAuthority(
     return verified.ok ? null : verified.reason;
   }
 
-  if (accountScopedBroadcast && hasUnpinnedAccount) {
+  if (cliOnlyLane && hasAliasBoundAccount) {
+    return 'The Composio CLI cannot honor one or more account_alias selectors in this approved action; its default account cannot be substituted.';
+  }
+
+  if (accountScopedBroadcast && hasUnboundAccount) {
     return `${slug || 'This social publish'} has no immutable account destination: neither connected_account_id nor a CLI-default grant snapshot is present for every item.`;
   }
   if (cliOnlyLane && hasPinnedAccount) {

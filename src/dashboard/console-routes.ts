@@ -313,6 +313,7 @@ import {
   truncateResultBody,
   deriveTaskTitle,
 } from '../execution/background-tasks.js';
+import { classifyBackgroundInputReply } from '../execution/background-input-reply.js';
 import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
@@ -14558,21 +14559,38 @@ export function registerConsoleRoutes(
     // Resolve deterministic route intent before acceptance, but do not mutate
     // anything yet. The selected target is copied onto the accepted user edge
     // below, making it the recovery authority after a lost response or crash.
-    // Background replies retain priority over command parsing, matching the
-    // historical desktop behavior.
+    // Session commands own the turn before any parked task. A background task
+    // receives the message only when the shared typed clarification classifier
+    // can bind it to that exact question.
     const command = parsedHarnessCommand;
     let proposedEarlyRoute: ConsoleAcceptedEarlyRoute | null = null;
-    if (requestedSessionId && input) {
+    if (command === 'cancel') {
+      proposedEarlyRoute = {
+        kind: 'cancel',
+        approvalIds: approvalRegistry.listPending({ sessionId, status: 'pending' })
+          .map((row) => row.approvalId),
+      };
+    } else if (command === 'new') {
+      proposedEarlyRoute = { kind: 'new' };
+    }
+    if (!proposedEarlyRoute && requestedSessionId && input && command !== 'sessions') {
       const parkedTask = findSoleAwaitingInputTaskForOrigin(requestedSessionId);
       if (parkedTask?.pendingQuestionId) {
-        proposedEarlyRoute = {
-          kind: 'background_input',
-          taskId: parkedTask.id,
-          taskTitle: parkedTask.title,
-          questionId: parkedTask.pendingQuestionId,
-          answer: input,
-        };
-      } else if (/^\/?(continue|resume|keep going)$/i.test(input)) {
+        const replyDecision = classifyBackgroundInputReply({
+          message: input,
+          question: parkedTask.pendingQuestion,
+          options: parkedTask.pendingQuestionOptions,
+        });
+        if (replyDecision.kind === 'resume') {
+          proposedEarlyRoute = {
+            kind: 'background_input',
+            taskId: parkedTask.id,
+            taskTitle: parkedTask.title,
+            questionId: parkedTask.pendingQuestionId,
+            answer: input,
+          };
+        }
+      } else if (/^\/?(continue|resume|keep going)[.!?]*$/i.test(input)) {
         const continueTask = findSoleAwaitingContinueTaskForOrigin(requestedSessionId);
         if (continueTask) {
           proposedEarlyRoute = {
@@ -14582,15 +14600,6 @@ export function registerConsoleRoutes(
           };
         }
       }
-    }
-    if (!proposedEarlyRoute && command === 'cancel') {
-      proposedEarlyRoute = {
-        kind: 'cancel',
-        approvalIds: approvalRegistry.listPending({ sessionId, status: 'pending' })
-          .map((row) => row.approvalId),
-      };
-    } else if (!proposedEarlyRoute && command === 'new') {
-      proposedEarlyRoute = { kind: 'new' };
     }
 
     // MID-RUN STEERING (2026-08-07): a message for a session whose attempt is
@@ -15600,13 +15609,14 @@ export function registerConsoleRoutes(
             userId: 'desktop',
           },
           async (req) => {
-            const agent = await buildOrchestratorAgent({
-              userInput: req.message,
-              sessionId,
-              allowToolJit: true,
-            });
             const result = await runConversation({
-              agent,
+              buildAgent: (identity) => buildOrchestratorAgent({
+                userInput: req.message,
+                sessionId,
+                sourceUserSeq: identity.sourceUserSeq,
+                acceptedRoute: identity.route,
+                allowToolJit: true,
+              }),
               sessionId,
               input: req.message,
               sourceUserSeq: requestSourceUserSeq,
@@ -16010,20 +16020,34 @@ export function registerConsoleRoutes(
       return;
     }
     const sessionId = requestedId || 'console:home';
-    // Background needs_input round-trip: if exactly one background task is parked
-    // on a clarifying question for THIS chat, route the user's reply as the
-    // answer and resume it (mirrors how an approval button short-circuits). Only
-    // fires while a task is parked here, so the mis-route window is narrow.
+    // Background needs_input round-trip: route only a reply that binds to the
+    // exact parked question. Commands, declines, compound corrections, and
+    // unrelated turns remain normal conversation.
+    const command = parseHarnessCommand(message);
     const parkedTask = findSoleAwaitingInputTaskForOrigin(sessionId);
-    if (parkedTask?.pendingQuestionId) {
-      queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, message);
-      res.json({
-        sessionId,
-        text: `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`,
+    if (
+      parkedTask?.pendingQuestionId
+      && command !== 'cancel'
+      && command !== 'new'
+      && command !== 'sessions'
+    ) {
+      const replyDecision = classifyBackgroundInputReply({
+        message,
+        question: parkedTask.pendingQuestion,
+        options: parkedTask.pendingQuestionOptions,
       });
-      return;
+      if (replyDecision.kind === 'resume') {
+        const queued = queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, message);
+        if (queued) {
+          res.json({
+            sessionId,
+            text: `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`,
+          });
+          return;
+        }
+      }
     }
-    if (/^\/?(continue|resume|keep going)$/i.test(message)) {
+    if (!parkedTask && /^\/?(continue|resume|keep going)[.!?]*$/i.test(message)) {
       const continueTask = findSoleAwaitingContinueTaskForOrigin(sessionId);
       if (continueTask) {
         queueBackgroundTaskContinue(continueTask.id);

@@ -125,6 +125,14 @@ export interface DurableReceiptRecord {
   scope: ProcedureScope;
   /** The settled dispatch outcome. Only 'succeeded' promotes. */
   dispatchOutcome: 'succeeded' | 'failed' | 'ambiguous';
+  /** Exact accepted runtime source for receipts that may later authorize
+   * bounded cross-session read history. Legacy receipts omit this and remain
+   * usable for capability learning, but cannot grant history authority. */
+  source?: {
+    sessionId: string;
+    sourceUserSeq: number;
+    attemptId?: string;
+  };
   /** Reads: the evidence reference for the data actually returned. */
   readEvidenceRef?: string;
   /** Writes/sends: the observation/commit reference. */
@@ -381,6 +389,23 @@ export function recordWarmProcedureUse(artifactId: string): void {
     updatedAt: now,
     artifactVersion: PROCEDURE_ARTIFACT_VERSION,
   } as ProcedureArtifact & { artifactVersion: number });
+}
+
+/** Retire one exact active artifact after a reproducible execution-parity
+ * failure. An async handle cannot be settled by the current one-shot warm
+ * lane; keeping it active would launch another paid job on each fresh source.
+ * Only a new verified receipt can reactivate the procedure. */
+export function quarantineWarmProcedureArtifact(artifactId: string, reason: string): boolean {
+  const parsed = parseProcedureArtifactDocument(loadArtifactRow(artifactId));
+  if (!parsed.ok || parsed.artifact.status !== 'active') return false;
+  const keyDigest = logicalKeyDigest(parsed.artifact);
+  if (loadPointer(keyDigest) !== artifactId) return false;
+  quarantineRow(
+    parsed.artifact,
+    keyDigest,
+    reason.trim().slice(0, 300) || 'warm execution parity failure',
+  );
+  return true;
 }
 
 /** Read the current pointer target (validated), for tests and diagnostics. */

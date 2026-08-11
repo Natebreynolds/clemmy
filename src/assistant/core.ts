@@ -206,6 +206,7 @@ export class ClementineAssistant {
         model: request.model ?? MODELS.primary,
         prompt: promptParts.join('\n\n'),
         sessionId: request.sessionId,
+        sourceUserSeq: request.sourceUserSeq,
         userId: request.userId,
         channel: request.channel,
         maxWallClockMs: request.maxWallClockMs ?? defaultWallClockForChannel(request.channel),

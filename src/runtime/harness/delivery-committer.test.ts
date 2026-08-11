@@ -1,6 +1,7 @@
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -63,6 +64,20 @@ function acceptedAnswer(
   };
 }
 
+function verifiedReadReceipt(outcome: TurnOutcome, salt = 'a'): Record<string, unknown> {
+  return {
+    version: 1,
+    kind: 'single_collection_read',
+    sourceUserSeq: outcome.identity.sourceUserSeq,
+    attemptId: `verified-attempt-${salt}`,
+    callId: `verified-call-${salt}`,
+    toolName: 'PROOF_LIST_TASKS',
+    outputDigest: createHash('sha256').update(`output-${salt}`).digest('hex'),
+    objectiveDigest: createHash('sha256').update(`objective-${salt}`).digest('hex'),
+    presentationDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
+  };
+}
+
 test('typed outcome projection ignores runtime-cast internal fields', () => {
   const outcome = {
     ...answer('projection', 'The account is healthy.'),
@@ -84,6 +99,21 @@ test('typed outcome projection ignores runtime-cast internal fields', () => {
   assert.equal(data.reply, 'The account is healthy.');
   assert.equal(data.steps, 3);
   assert.equal('internalSummary' in data, false);
+
+  const nonWarm = completionDataForTurnOutcome(outcome, {
+    metadata: {
+      transport: 'openai_agents_harness',
+      artifactId: 'not-a-procedure-artifact',
+      laneDigest: 'not-a-digest',
+      counters: { providerPayload: 'must not cross' },
+      warmReadPolicyDigest: 'not-a-digest',
+    },
+  });
+  assert.equal(nonWarm.transport, 'openai_agents_harness');
+  assert.equal('artifactId' in nonWarm, false);
+  assert.equal('laneDigest' in nonWarm, false);
+  assert.equal('counters' in nonWarm, false);
+  assert.equal('warmReadPolicyDigest' in nonWarm, false);
 });
 
 test('outcome id must be the canonical id derived from its exact turn identity', () => {
@@ -117,7 +147,9 @@ test('the committer persists and publishes exactly one winning public answer', (
   });
   try {
     const first = commitTurnOutcome(firstProposal);
-    const raced = commitTurnOutcome(racedProposal);
+    const raced = commitTurnOutcome(racedProposal, {
+      metadata: { verifiedReadCompletionReceipt: verifiedReadReceipt(racedProposal, 'loser') },
+    });
     assert.equal(first.inserted, true);
     assert.equal(raced.inserted, false);
     assert.equal(raced.presentation.text, 'First committed answer.');
@@ -126,6 +158,11 @@ test('the committer persists and publishes exactly one winning public answer', (
     assert.equal(completions.length, 1);
     assert.equal(completions[0].data.reply, 'First committed answer.');
     assert.equal(
+      completions[0].data.verifiedReadCompletionReceipt,
+      undefined,
+      'a losing attempt cannot append proof metadata to the first writer',
+    );
+    assert.equal(
       (completions[0].data.presentation as { audience?: string }).audience,
       'user',
     );
@@ -133,6 +170,52 @@ test('the committer persists and publishes exactly one winning public answer', (
   } finally {
     detach();
   }
+});
+
+test('verified read receipt is strictly validated and atomically follows the winning answer', () => {
+  const sessionId = 'atomic-verified-read-receipt';
+  createSession({ id: sessionId, kind: 'chat' });
+  const firstProposal = acceptedAnswer(sessionId, 'First verified answer.');
+  const firstReceipt = verifiedReadReceipt(firstProposal, 'first');
+  const winner = commitTurnOutcome(firstProposal, {
+    metadata: { verifiedReadCompletionReceipt: firstReceipt },
+  });
+  assert.equal(winner.inserted, true);
+  assert.deepEqual(winner.event.data.verifiedReadCompletionReceipt, firstReceipt);
+
+  const racedProposal = {
+    ...firstProposal,
+    presentation: { kind: 'answer', text: 'A different losing answer.' },
+  } as TurnOutcome;
+  const racedReceipt = verifiedReadReceipt(racedProposal, 'raced');
+  const loser = commitTurnOutcome(racedProposal, {
+    metadata: { verifiedReadCompletionReceipt: racedReceipt },
+  });
+  assert.equal(loser.inserted, false);
+  assert.equal(loser.presentation.text, 'First verified answer.');
+  assert.deepEqual(loser.event.data.verifiedReadCompletionReceipt, firstReceipt);
+
+  const badSource = { ...firstReceipt, sourceUserSeq: firstProposal.identity.sourceUserSeq + 1 };
+  assert.throws(
+    () => completionDataForTurnOutcome(firstProposal, {
+      metadata: { verifiedReadCompletionReceipt: badSource },
+    }),
+    InvalidTurnOutcomeError,
+  );
+  const badDigest = { ...firstReceipt, presentationDigest: '0'.repeat(64) };
+  assert.throws(
+    () => completionDataForTurnOutcome(firstProposal, {
+      metadata: { verifiedReadCompletionReceipt: badDigest },
+    }),
+    InvalidTurnOutcomeError,
+  );
+  const extraKey = { ...firstReceipt, untrusted: true };
+  assert.throws(
+    () => completionDataForTurnOutcome(firstProposal, {
+      metadata: { verifiedReadCompletionReceipt: extraKey },
+    }),
+    InvalidTurnOutcomeError,
+  );
 });
 
 test('invalid status/presentation combinations and narrated control text fail closed', () => {

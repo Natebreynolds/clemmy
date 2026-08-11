@@ -28,8 +28,7 @@
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText } from '../memory/facts.js';
 import { getRuntimeEnv } from '../config.js';
-import { getActiveObjective, getFocusSnapshot, getFocusWorkstate } from '../memory/focus.js';
-import type { FocusRow } from '../memory/db.js';
+import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { renderRunStrategiesForContext } from '../memory/run-strategy-store.js';
@@ -44,69 +43,16 @@ import { modelParityEnabled, CACHE_BREAK_SENTINEL } from '../runtime/harness/mod
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { renderRecentActionsForHarnessHistory } from '../runtime/harness/session-transcript.js';
 import { appendFactRecallTrace } from '../memory/recall-trace.js';
-import {
-  focusSummaryIsHistoricalForRequest,
-  renderHistoricalFocusPointer,
-} from '../runtime/harness/focus-projection.js';
+import { renderActiveTaskContextForInstructions } from '../runtime/harness/active-task-context.js';
+
+// Legacy chat and journey callers still import the focus-only view from this
+// module. Keep that API while the harness itself consumes the richer shared
+// active-task projection below.
+export { renderFocusForInstructions } from '../runtime/harness/active-task-context.js';
 
 function section(title: string, body: string | undefined | null): string {
   if (!body || !body.trim()) return '';
   return `## ${title}\n${body.trim()}`;
-}
-
-const FOCUS_WORKSTATE_PROMPT_MAX_CHARS = 6_000;
-const FOCUS_WORKSTATE_LINE_MAX_CHARS = 180;
-
-function compactFocusWorkstateLine(value: string): string {
-  const compact = value.replace(/\s+/g, ' ').trim();
-  if (compact.length <= FOCUS_WORKSTATE_LINE_MAX_CHARS) return compact;
-  return `${compact.slice(0, FOCUS_WORKSTATE_LINE_MAX_CHARS - 1).trimEnd()}…`;
-}
-
-function renderBoundedLines(label: string, values: string[], limit = 8): string[] {
-  if (values.length === 0) return [];
-  const shown = values.slice(0, limit);
-  const lines = [`${label}:`, ...shown.map((value) => `  - ${compactFocusWorkstateLine(value)}`)];
-  if (values.length > shown.length) {
-    lines.push(`  - … +${values.length - shown.length} more saved; use focus_get only if needed`);
-  }
-  return lines;
-}
-
-/** Compact, provider-neutral rendering of the shared conversational notebook. */
-function renderFocusWorkstateForInstructions(row: FocusRow): string {
-  const state = getFocusWorkstate(row);
-  if (!state) return '';
-  const candidates = [...state.candidates]
-    .sort((a, b) => {
-      const rank = { selected: 0, considering: 1, rejected: 2 } as const;
-      return rank[a.status] - rank[b.status];
-    })
-    .map((item) =>
-      `[${item.status}] ${item.id}: ${item.label}`
-      + (item.note ? ` — ${item.note}` : '')
-      + (item.ref ? ` (${item.ref})` : ''),
-    );
-  const actions = state.actions.map((item) =>
-    `[${item.status}] ${item.id}: ${item.label}`
-    + (item.kind ? ` · ${item.kind}` : '')
-    + (item.ref ? ` · ${item.ref}` : '')
-    + (item.note ? ` — ${item.note}` : ''),
-  );
-  const rendered = [
-    `Shared workstate v${state.version}${state.mode ? ` · ${state.mode}` : ''} (advisory facts, not a required plan):`,
-    ...(state.objective ? [`Objective: ${compactFocusWorkstateLine(state.objective)}`] : []),
-    ...renderBoundedLines('Candidates', candidates),
-    ...renderBoundedLines('Constraints', state.constraints, 5),
-    ...renderBoundedLines('Decisions', state.decisions, 5),
-    ...renderBoundedLines('Open loops', state.openLoops, 5),
-    ...renderBoundedLines('Linked actions', actions),
-  ].join('\n');
-  if (rendered.length <= FOCUS_WORKSTATE_PROMPT_MAX_CHARS) return rendered;
-  const suffix = '\n… shared notebook truncated; use focus_get only if needed';
-  const maxBody = FOCUS_WORKSTATE_PROMPT_MAX_CHARS - suffix.length;
-  const lineBreak = rendered.lastIndexOf('\n', maxBody);
-  return `${rendered.slice(0, lineBreak > 0 ? lineBreak : maxBody).trimEnd()}${suffix}`;
 }
 
 /**
@@ -178,60 +124,6 @@ export function renderCurrentTimeForInstructions(): string {
   } catch {
     return '';
   }
-}
-
-/**
- * Render the Current Focus block (active / stale / parked). Extracted so BOTH
- * the harness self-assembler and the chat assembler emit the SAME focus surface
- * (CANON-SELFASM) so every provider sees it without a redundant tool round-trip.
- * Returns the inner content (wrap with section('Current Focus', …)); '' on no
- * focus or error.
- */
-export function renderFocusForInstructions(opts?: {
-  sessionId?: string;
-  input?: string;
-}): string {
-  let focus = '';
-  try {
-    const snap = getFocusSnapshot();
-    if (snap.active && !snap.needsConfirm) {
-      if (focusSummaryIsHistoricalForRequest(snap.active, opts?.input, opts?.sessionId)) {
-        focus = renderHistoricalFocusPointer(snap.active);
-      } else {
-        const workstate = renderFocusWorkstateForInstructions(snap.active);
-        focus = [
-          `ACTIVE focus #${snap.active.id}: ${snap.active.title}`,
-          `Summary: ${snap.active.summary}`,
-          `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
-          `Last touched: ${snap.active.last_touched_at}`,
-          ...(workstate ? [workstate] : []),
-        ].join('\n');
-      }
-      if (snap.parked.length > 0) {
-        focus += `\n\nParked (resumable via focus_activate):\n`
-          + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');
-      }
-    } else if (snap.active && snap.needsConfirm) {
-      focus = [
-        'No confirmed active focus.',
-        `STALE focus #${snap.active.id}: ${snap.active.title}`,
-        `Summary: ${snap.active.summary}`,
-        `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
-        `Last touched: ${snap.active.last_touched_at}`,
-        'Do not treat the stale focus as authoritative. If the user is clearly continuing it, call focus_touch(id). If the user moved on or asks for unrelated work, call focus_clear(id, resolution:"abandoned") or focus_park(id, reason) before proceeding.',
-      ].join('\n');
-      if (snap.parked.length > 0) {
-        focus += `\n\nParked (resumable via focus_activate):\n`
-          + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');
-      }
-    } else if (snap.parked.length > 0) {
-      focus = 'No active focus. Parked threads (resumable):\n'
-        + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title} — ${p.summary}`).join('\n');
-    }
-  } catch {
-    focus = '';
-  }
-  return focus;
 }
 
 // Per-line bound for injected memory content (recall bullets, constraint
@@ -442,9 +334,10 @@ export function renderHarnessMemoryContext(opts?: {
     try { relevantSkills = renderRelevantSkillsForPrompt(opts?.query ?? ''); } catch { relevantSkills = ''; }
   }
 
-  // Current Focus block — rendered once for this turn, so it is the current
-  // state and does not need an immediate focus_get round-trip.
-  const focus = renderFocusForInstructions({
+  // Active task block — one typed projection composes Current Focus with this
+  // session's exact active goal. It is rendered once per turn and remains in
+  // the volatile partition for every provider lane.
+  const activeTask = renderActiveTaskContextForInstructions({
     sessionId: opts?.sessionId,
     input: opts?.focusInput ?? opts?.query,
   });
@@ -497,7 +390,7 @@ export function renderHarnessMemoryContext(opts?: {
     { title: 'Long-Term Memory', text: section('Long-Term Memory', memContext.memory) },
     { title: 'Active Goals', text: section('Active Goals', goals) },
     { title: 'Held For Later', text: section('Held For Later', heldTasks) },
-    { title: 'Current Focus', text: section('Current Focus', focus) },
+    { title: 'Current Focus', text: section('Current Focus', activeTask) },
     { title: 'Skill Discovery', text: section('Skill Discovery', skillDiscovery) },
     { title: 'Relevant Skills', text: section('Relevant Skills', relevantSkills) },
   ];

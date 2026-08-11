@@ -15,10 +15,13 @@ import { loadToolContract, saveToolContract } from './tool-contract-store.js';
  * fact. The false positive cannot strike twice in a session.
  *
  * Design constraints:
- *   - TTL-bounded (30 min) so a schema change upstream is picked up within
- *     minutes. Safe to keep generous: the cache is validation-only and
- *     fail-open, so a slightly-stale schema can only make a check less precise,
- *     never wrongly block (D3 — fewer re-fetches across a session).
+ *   - Validation and executable authority are distinct. Validation may use a
+ *     durable contract as a best-effort hint. Autonomous execution requires a
+ *     provider observation no older than 30 minutes, and a validation read can
+ *     never refresh that observation timestamp.
+ *   - Executable authority is TTL-bounded (30 min) so a schema change upstream
+ *     is picked up within minutes. A restart preserves only the unused portion
+ *     of that same lease; it never mints a new one.
  *   - Size-capped (LRU-ish: oldest insertion evicted) so a long-running
  *     daemon cannot grow unbounded.
  *   - Never authoritative for BLOCKING on its own: consumers must
@@ -31,7 +34,12 @@ const MAX_ENTRIES = 500;
 
 interface CachedSchema {
   schema: Record<string, unknown>;
+  /** When this entry was loaded for validation/cache eviction purposes. */
   cachedAt: number;
+  /** Original provider observation. Only this timestamp grants live authority. */
+  providerObservedAt?: number;
+  /** Exact schema fingerprint bound to that provider observation. */
+  providerObservedFingerprint?: string;
 }
 
 const cache = new Map<string, CachedSchema>();
@@ -40,15 +48,106 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
+function cachedProviderObservation(entry: CachedSchema | undefined): number | undefined {
+  const observedAt = entry?.providerObservedAt;
+  if (!entry
+    || !Number.isFinite(observedAt)
+    || observedAt! < 0
+    || observedAt! > Date.now()) return undefined;
+  try {
+    return fingerprintSchema(entry.schema) === entry.providerObservedFingerprint
+      ? observedAt
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function durableProviderObservation(record: ToolContract | null): number | undefined {
+  if (!record || record.providerObservedFingerprint !== record.fingerprint) return undefined;
+  const observedAt = Date.parse(record.providerObservedAt ?? '');
+  return Number.isFinite(observedAt) && observedAt >= 0 && observedAt <= Date.now()
+    ? observedAt
+    : undefined;
+}
+
 /** Deposit one action's input schema. Ignores non-object schemas. */
-export function rememberToolSchema(toolSlug: string, inputParameters: unknown): void {
+export function rememberToolSchema(
+  toolSlug: string,
+  inputParameters: unknown,
+  providerObservedAt?: number,
+): void {
   if (!toolSlug || !isRecord(inputParameters)) return;
-  // Refresh insertion order so hot slugs survive the size cap.
-  cache.delete(toolSlug);
-  cache.set(toolSlug, { schema: inputParameters, cachedAt: Date.now() });
+  let schema: Record<string, unknown>;
+  try {
+    // Provider/SDK objects are caller-owned. Snapshot before caching so a later
+    // mutation cannot silently reshape the contract under an existing lease.
+    schema = structuredClone(inputParameters);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  const observedAt = providerObservedAt;
+  const validProviderObservation = Number.isFinite(observedAt)
+    && observedAt! >= 0
+    && observedAt! <= now;
+  const observedFingerprint = fingerprintSchema(schema);
+  const currentEntry = cache.get(toolSlug);
+  const currentObservation = cachedProviderObservation(currentEntry);
+  let equalTimeConflict = false;
+  if (currentObservation !== undefined
+    && (!validProviderObservation || observedAt! <= currentObservation)) {
+    if (validProviderObservation && observedAt === currentObservation) {
+      let currentFingerprint: string | undefined;
+      try { currentFingerprint = fingerprintSchema(currentEntry?.schema); } catch { /* conflict below */ }
+      if (currentFingerprint !== observedFingerprint) equalTimeConflict = true;
+      else return;
+    } else {
+      // Never let an older catalog replay or an unproven validation hint roll
+      // back a newer provider observation.
+      return;
+    }
+  }
   // Learn it once, keep it forever: the same deposit that warms this session
   // also survives the restart, so discovery is paid a single time per tool.
-  saveToolContract({ identifier: toolSlug, schema: inputParameters });
+  const accepted = saveToolContract({
+    identifier: toolSlug,
+    schema: equalTimeConflict && currentEntry ? currentEntry.schema : schema,
+    ...(equalTimeConflict
+      ? { providerAuthorityConflictAt: new Date(observedAt!).toISOString() }
+      : validProviderObservation
+      ? { providerObservedAt: new Date(observedAt!).toISOString() }
+      : {}),
+  });
+
+  let acceptedSchema = equalTimeConflict && currentEntry
+    ? structuredClone(currentEntry.schema)
+    : schema;
+  let acceptedObservedAt = validProviderObservation && !equalTimeConflict ? observedAt : undefined;
+  let acceptedObservedFingerprint = validProviderObservation && !equalTimeConflict
+    ? observedFingerprint
+    : undefined;
+  if (accepted) {
+    acceptedSchema = structuredClone(accepted.schema);
+    const durableObservedAt = durableProviderObservation(accepted);
+    acceptedObservedAt = durableObservedAt;
+    acceptedObservedFingerprint = durableObservedAt !== undefined
+      ? accepted.providerObservedFingerprint
+      : undefined;
+  }
+
+  // Refresh insertion order so hot slugs survive the size cap.
+  cache.delete(toolSlug);
+  cache.set(toolSlug, {
+    schema: acceptedSchema,
+    cachedAt: now,
+    ...(acceptedObservedAt !== undefined && acceptedObservedFingerprint
+      ? {
+        providerObservedAt: acceptedObservedAt,
+        providerObservedFingerprint: acceptedObservedFingerprint,
+      }
+      : {}),
+  });
   while (cache.size > MAX_ENTRIES) {
     const oldest = cache.keys().next().value;
     if (oldest === undefined) break;
@@ -58,14 +157,14 @@ export function rememberToolSchema(toolSlug: string, inputParameters: unknown): 
 
 /** Convenience: deposit a batch of {slug, inputParameters} items. */
 export function rememberToolSchemas(
-  items: Array<{ slug?: string; inputParameters?: unknown }>,
+  items: Array<{ slug?: string; inputParameters?: unknown; providerObservedAt?: number }>,
 ): void {
   for (const item of items) {
-    if (item?.slug) rememberToolSchema(item.slug, item.inputParameters);
+    if (item?.slug) rememberToolSchema(item.slug, item.inputParameters, item.providerObservedAt);
   }
 }
 
-/** Fetch a live (non-expired) schema, or null.
+/** Fetch a validation schema, or null.
  *
  * Falls through to the DURABLE contract store on a miss. Before that, this map
  * died with the process, so a restart re-paid discovery for tools used a
@@ -115,18 +214,7 @@ export async function ensureToolSchema(toolSlug: string): Promise<Record<string,
   if (cached) return cached;
   if (!toolSlug || schemaLoadAttempted.has(toolSlug)) return null;
   schemaLoadAttempted.add(toolSlug);
-  try {
-    const load = schemaLoader ?? (async (slug: string) => {
-      const client = await import('../integrations/composio/client.js');
-      // Ask ONLY when an SDK client already exists. Without one, the slug
-      // lookup falls back to listing the whole toolkit — a side effect no
-      // validation step should cause on a keyless/CLI-only install.
-      if (!client.getComposio()) return null;
-      return client.getComposioToolBySlug(slug);
-    });
-    const tool = await load(toolSlug);
-    if (tool?.inputParameters) rememberToolSchema(toolSlug, tool.inputParameters);
-  } catch { /* fail-open: heuristic validation still applies */ }
+  await refreshSchemaFromProvider(toolSlug);
   return getCachedToolSchema(toolSlug);
 }
 
@@ -141,45 +229,85 @@ export function inMemorySchemaCount(): number {
 export function resetToolSchemaCache(): void {
   cache.clear();
   schemaLoadAttempted.clear();
+  liveSchemaNegativeUntil.clear();
+  providerSchemaLoads.clear();
 }
 
 /**
- * The live contract digest for one identifier — sorted-key canonical JSON, so
- * two loads of an identical contract agree and any structural change moves
- * the digest. Undefined when no live schema is known this session: absence of
- * a contract is absence of proof, and consumers treat it accordingly
- * (learning fails closed; retrieval cannot prove a mismatch and serves).
+ * The executable contract digest for one identifier. Only a real provider
+ * observation inside the 30-minute authority lease qualifies. A durable
+ * validation-cache read never moves providerObservedAt and therefore cannot
+ * mint autonomous execution authority.
  */
 export function liveComposioSchemaFingerprint(toolSlug: string): string | undefined {
-  // Deliberately reads the PROCESS cache only, never the durable store. This
-  // digest is what lets a proven procedure be learned, and learning must fail
-  // CLOSED on a restart: a contract recovered from disk proves we once saw the
-  // schema, not that the provider still serves it. Validation may lean on the
-  // durable copy (it can only ever make a local check more precise); learning
-  // may not. Conflating the two would let a stale on-disk contract mint a
-  // proven procedure nobody re-verified.
   const hit = cache.get(toolSlug);
-  const schema = hit && Date.now() - hit.cachedAt <= SCHEMA_TTL_MS ? hit.schema : null;
-  if (!schema) return undefined;
-  const canonical = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(canonical);
-    if (value && typeof value === 'object') {
-      return Object.fromEntries(
-        Object.keys(value as Record<string, unknown>).sort()
-          .map((key) => [key, canonical((value as Record<string, unknown>)[key])]),
-      );
-    }
-    return value;
-  };
+  if (!hit) return undefined;
+  const age = Date.now() - (hit.providerObservedAt ?? Number.NaN);
+  if (!Number.isFinite(age) || age < 0 || age > SCHEMA_TTL_MS) return undefined;
   try {
-    return createHash('sha256').update(JSON.stringify(canonical(schema)), 'utf-8').digest('hex').slice(0, 32);
-  } catch {
-    return undefined;
-  }
+    const currentFingerprint = fingerprintSchema(hit.schema);
+    return hit.providerObservedFingerprint === currentFingerprint
+      ? currentFingerprint
+      : undefined;
+  } catch { return undefined; }
 }
 
-/** Test hook: empty the process cache — the daemon-restart / TTL-expiry
- *  shape, under which schema-bound retrieval must decline (fail closed). */
+/** Restore only the unused part of a real provider-observation lease. */
+function hydrateRecentProviderAuthority(toolSlug: string): string | undefined {
+  if (!toolSlug) return undefined;
+  const durable = loadToolContract(toolSlug);
+  const observedAt = durable ? Date.parse(durable.providerObservedAt ?? '') : Number.NaN;
+  const age = Date.now() - observedAt;
+  if (!durable
+    || durable.identifier !== toolSlug
+    || !Number.isFinite(age)
+    || age < 0
+    || age > SCHEMA_TTL_MS
+    || fingerprintSchema(durable.schema) !== durable.fingerprint
+    || durable.providerObservedFingerprint !== durable.fingerprint) return undefined;
+  cache.set(toolSlug, {
+    schema: durable.schema,
+    cachedAt: Date.now(),
+    providerObservedAt: observedAt,
+    providerObservedFingerprint: durable.providerObservedFingerprint,
+  });
+  return liveComposioSchemaFingerprint(toolSlug);
+}
+
+/**
+ * Resolve TTL-bounded schema authority for a warm candidate. A recent durable
+ * observation answers without network I/O; an expired/missing observation
+ * performs one exact-slug metadata refresh for this daemon. This never
+ * executes the business tool and is called only after a deterministic active
+ * procedure match, so unrelated chat still performs zero provider work.
+ */
+export async function ensureLiveComposioSchemaFingerprint(
+  toolSlug: string,
+  observer?: LiveSchemaProviderRefreshObserver,
+): Promise<string | undefined> {
+  const current = liveComposioSchemaFingerprint(toolSlug)
+    ?? hydrateRecentProviderAuthority(toolSlug);
+  if (current) return current;
+  if (!toolSlug) return undefined;
+  const inFlight = providerSchemaLoads.get(toolSlug);
+  if (inFlight) {
+    if (!inFlight.observer && observer) inFlight.observer = observer;
+    await inFlight.promise;
+    return liveComposioSchemaFingerprint(toolSlug);
+  }
+  if ((liveSchemaNegativeUntil.get(toolSlug) ?? 0) > Date.now()) return undefined;
+  const refreshed = await refreshSchemaFromProvider(toolSlug, observer);
+  if (refreshed.outcome !== 'refreshed') {
+    liveSchemaNegativeUntil.set(toolSlug, Date.now() + LIVE_SCHEMA_NEGATIVE_TTL_MS);
+  }
+  else liveSchemaNegativeUntil.delete(toolSlug);
+  return liveComposioSchemaFingerprint(toolSlug);
+}
+
+/** Test hook: empty all process-only state, the shape of a daemon restart. */
 export function _clearToolSchemaCacheForTest(): void {
   cache.clear();
+  schemaLoadAttempted.clear();
+  liveSchemaNegativeUntil.clear();
+  providerSchemaLoads.clear();
 }

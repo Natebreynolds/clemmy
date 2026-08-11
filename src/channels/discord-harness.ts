@@ -68,6 +68,7 @@ import {
   queueBackgroundTaskInputResolution,
   type BackgroundTaskRecord,
 } from '../execution/background-tasks.js';
+import { classifyBackgroundInputReply } from '../execution/background-input-reply.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { pullRecentTurnsForSession, renderTranscriptTurns } from '../runtime/harness/session-transcript.js';
@@ -1459,7 +1460,7 @@ export function parseHarnessCommand(prompt: string): HarnessCommand | null {
   // `continue` to keep going" message when it hits a step or wall-clock
   // limit. Honor a bare `continue` or `keep going` so the user can
   // resume long-running work without re-typing the original request.
-  if (t === '/continue' || t === 'continue' || t === 'keep going') return 'continue';
+  if (/^\/?(?:continue|keep going)[.!?]*$/.test(t)) return 'continue';
   return null;
 }
 
@@ -2275,10 +2276,9 @@ function findSoleAwaitingContinueTaskForChannel(input: { channelLabel: string; c
 }
 
 /**
- * Route a user's reply back into a parked background task before any brain sees
- * it as a fresh chat turn. This mirrors console-home behavior for Discord and
- * Slack: one parked question captures the next freeform reply; one task awaiting
- * continuation captures `continue` / `resume` / `keep going`.
+ * Route a reply back into a parked background task only when it binds to the
+ * exact stored question. Commands are owned by the channel router; declines,
+ * compound corrections, and unrelated asks fall through as fresh chat turns.
  */
 async function maybeRouteParkedBackgroundReply(input: {
   sessionId?: string;
@@ -2289,6 +2289,8 @@ async function maybeRouteParkedBackgroundReply(input: {
   transport: DiscordHarnessTransport;
 }): Promise<boolean> {
   const answer = input.message.trim();
+  const command = parseHarnessCommand(answer);
+  if (command === 'cancel' || command === 'new' || command === 'sessions') return false;
   const channelLookup = !input.sessionId && input.channelLabel && input.channelId && input.channel
     ? { channelLabel: input.channelLabel, channelId: input.channelId, channel: input.channel }
     : null;
@@ -2298,11 +2300,18 @@ async function maybeRouteParkedBackgroundReply(input: {
       ? findSoleAwaitingInputTaskForChannel(channelLookup)
       : null;
   if (parkedTask?.pendingQuestionId) {
-    queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, answer);
+    const replyDecision = classifyBackgroundInputReply({
+      message: answer,
+      question: parkedTask.pendingQuestion,
+      options: parkedTask.pendingQuestionOptions,
+    });
+    if (replyDecision.kind !== 'resume') return false;
+    const queued = queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, answer);
+    if (!queued) return false;
     await sendParkedBackgroundAck(
       input.transport,
       `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`,
-      { sessionId: parkedTask.originSessionId ?? input.sessionId ?? input.channelLabel ?? 'unknown', taskId: parkedTask.id },
+      { sessionId: queued.originSessionId ?? input.sessionId ?? input.channelLabel ?? 'unknown', taskId: queued.id },
     );
     return true;
   }
@@ -3538,13 +3547,14 @@ export async function runDiscordHarnessConversation(opts: {
       // The Codex/GLM harness path for this channel. The bridge decides whether
       // to use Claude, recover to this harness path, or run this path directly.
       const runCodexPath = async (): Promise<void> => {
-        const agent = await buildOrchestratorAgent({
-          userInput: effectiveInput,
-          sessionId: session.id,
-          allowToolJit: true,
-        });
         await runConversation({
-          agent,
+          buildAgent: (identity) => buildOrchestratorAgent({
+            userInput: effectiveInput,
+            sessionId: session.id,
+            sourceUserSeq: identity.sourceUserSeq,
+            acceptedRoute: identity.route,
+            allowToolJit: true,
+          }),
           sessionId: session.id,
           input: effectiveInput,
           sourceUserSeq: acceptedUserInput.seq,

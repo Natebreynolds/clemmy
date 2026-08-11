@@ -20,16 +20,19 @@
  */
 import { createHash } from 'node:crypto';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
-import { getActiveRunAttempt } from '../runtime/harness/eventlog.js';
+import { getActiveRunAttempt, getRunAttemptSourceUserEvent } from '../runtime/harness/eventlog.js';
 import {
   enqueuePendingLearning,
   type PendingLearningRecord,
 } from '../memory/capability-alias-index.js';
 import {
+  acceptedPhraseDigest,
   acceptedIntentPhraseForSettlement,
+  boundedAliasTerms,
   settlementCarriesVerifiedData,
 } from '../memory/verified-read-learning.js';
 import { scheduleLearningDrain } from '../memory/learning-worker.js';
+import { normalizeProcedureAccountIdentity } from '../runtime/read-path/procedure-scope.js';
 
 function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -44,11 +47,26 @@ export interface VerifiedComposioSettlementInput {
   sourceUserSeq?: number;
   /** Stable account identity (an email, never a rotating connection id). */
   accountIdentity?: string;
+  /** Exact schema fingerprint held by the gateway when this call validated. */
+  schemaFingerprint?: string;
+  /** Post-carrier normalized provider args. Only an exactly empty plain object
+   * can produce a structural executable artifact; values are never persisted. */
+  normalizedArgs?: unknown;
 }
 
 export type SettlementVerdict =
   | { queued: true; pending: PendingLearningRecord }
   | { queued: false; reason: string };
+
+/** `Object.keys([])` and class instances are both empty, but neither is the
+ * complete typed `{}` invocation shape. Symbols also make an object nonempty
+ * even though JSON would omit them. */
+function isExactlyEmptyPlainObject(value: unknown): value is Record<string, never> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return (prototype === Object.prototype || prototype === null)
+    && Reflect.ownKeys(value).length === 0;
+}
 
 /**
  * Queue the learning intent for one verified read. Fail-closed at every
@@ -74,7 +92,24 @@ export function settleVerifiedComposioRead(input: VerifiedComposioSettlementInpu
   // the worker runs — capture the intent phrase and identity here.
   const captured = acceptedIntentPhraseForSettlement(input.sessionId, input.sourceUserSeq);
   if (!captured) return { queued: false, reason: 'no exact accepted source phrase' };
-  const attemptId = getActiveRunAttempt(input.sessionId)?.attemptId;
+  const activeAttempt = getActiveRunAttempt(input.sessionId);
+  const activeSource = activeAttempt ? getRunAttemptSourceUserEvent(activeAttempt) : null;
+  const exactActiveAuthority = Boolean(activeAttempt
+    && activeSource
+    && activeSource.seq === captured.sourceUserSeq);
+  const attemptId = exactActiveAuthority ? activeAttempt!.attemptId : undefined;
+  let accountIdentity = '';
+  try {
+    accountIdentity = normalizeProcedureAccountIdentity(input.accountIdentity);
+  } catch {
+    // Capability-only learning may remain unbound. A rotating connection id
+    // must never become durable stable-account or executable authority.
+  }
+  const schemaFingerprint = input.schemaFingerprint?.trim() ?? '';
+  // Derive the only retrievable identity while the accepted source is live.
+  // The durable queue never receives the raw prompt.
+  const aliasDigest = acceptedPhraseDigest(captured.phrase);
+  const aliasTerms = boundedAliasTerms(captured.phrase);
 
   const pending = enqueuePendingLearning({
     sessionId: input.sessionId,
@@ -82,9 +117,14 @@ export function settleVerifiedComposioRead(input: VerifiedComposioSettlementInpu
     ...(attemptId ? { attemptId } : {}),
     identifier: toolSlug,
     kind: 'composio',
-    accountIdentity: input.accountIdentity?.trim() ?? '',
-    phrase: captured.phrase,
+    accountIdentity,
+    aliasDigest,
+    aliasTerms,
     evidenceDigest,
+    schemaFingerprint,
+    executableEmptyArgs: exactActiveAuthority
+      && Boolean(accountIdentity && schemaFingerprint)
+      && isExactlyEmptyPlainObject(input.normalizedArgs),
   });
   if (!pending) return { queued: false, reason: 'the durable pending-learning record could not be written' };
   scheduleLearningDrain();

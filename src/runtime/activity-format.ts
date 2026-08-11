@@ -18,6 +18,7 @@ import {
   isWorkflowTerminalOutcome,
   type WorkflowTerminalOutcome,
 } from '../execution/workflow-terminal-outcome.js';
+import { SETTLED_READ_REUSE_LABEL } from './harness/settled-read-replay-semantics.js';
 
 /** A run/event shape permissive enough to accept legacy run-store records,
  *  harness-session-derived activity runs, and workflow-run records. */
@@ -177,7 +178,7 @@ export function friendlyEventMessage(event: ActivityEventLike): string {
       return 'Queued to run in the background';
     case 'tool_called':
     case 'tool_started':
-      return `Used ${toolName(event)}`;
+      return data.reused === true ? SETTLED_READ_REUSE_LABEL : `Used ${toolName(event)}`;
     case 'tool_returned':
       return `Finished ${toolName(event)}`;
     case 'approval_requested':
@@ -464,7 +465,11 @@ export function liveLine(run: ActivityRunLike): string {
     const event = events[i];
     const type = event.type ?? '';
     if (eventVisibility(type) !== 'milestone' || TERMINAL_TYPES.has(type)) continue;
-    if (type === 'tool_called' || type === 'tool_started') return `Using ${toolName(event)}…`;
+    if (type === 'tool_called' || type === 'tool_started') {
+      return event.data?.reused === true
+        ? SETTLED_READ_REUSE_LABEL
+        : `Using ${toolName(event)}…`;
+    }
     if (type === 'step_started') return stepsStarted > 0 ? `Working on step ${stepsStarted}…` : 'Working on a step…';
     if (type === 'approval_requested' || type === 'approval_required') return 'Waiting for your approval';
     return friendlyEventMessage(event);
@@ -497,4 +502,86 @@ export function friendlyTimeline(
       message: friendlyEventMessage(event),
       createdAt: event.createdAt,
     }));
+}
+
+// ── PROGRESS NARRATION ────────────────────────────────────────────────────────
+//
+// A long turn used to report itself as "Still working (18 tool calls so far)."
+// on every surface that has no activity pane — Discord, Slack, relay. Live
+// 2026-08-09: a four-minute workflow build showed three of those, sixty seconds
+// apart, differing only by a number, while the ledger knew she was reading the
+// workflow, editing its steps, scheduling it and turning it on. The count is
+// the mechanism; the work was already known and thrown away.
+//
+// The phrasing derives from the tool's own shape rather than a curated
+// vocabulary, so a slug nobody has seen before still narrates. Nothing is
+// invented: an unrecognised shape falls back to plain liveness rather than
+// guessing at intent, because a confident wrong sentence is worse than a
+// vague true one.
+
+/** Acquisition/bookkeeping tools. Narrating these is narrating the walk to the
+ *  filing cabinet — the same rule the activity feed already applies. */
+const NARRATION_SKIPPED =
+  /^(?:tool_search|composio_search_tools|composio_list_tools|recall_tool_result|tool_output_query|memory_recall_all|ping)$/i;
+/** Generic dispatchers carry someone else's work. Live 2026-08-09: a Slack
+ *  lookup narrated as "running" because `run_tool_program` won the last slot
+ *  while `SLACK_FIND_USER_BY_EMAIL_ADDRESS` sat one frame behind it. Skip the
+ *  wrapper and let the tool that actually ran speak — the same reason the
+ *  ledger reads `effectiveTool` over `tool`. */
+const NARRATION_DISPATCHERS = /^(?:run_tool_program|composio_execute_tool|call_tool|code_mode|run_code|execution_create)$/i;
+
+/** Verb families, most specific first. Keyed on how tool slugs are actually
+ *  built (VERB_OBJECT / object.verb), not on any provider's catalogue. */
+const NARRATION_VERBS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Each verb must sit on BOTH boundaries of a slug segment. Without the
+  // trailing boundary `SLACK_FIND_USER_BY_EMAIL_ADDRESS` matches "add" inside
+  // "ADDRESS" and a Slack lookup narrates as "drafting Slack" (live
+  // 2026-08-09). Segment-anchored, most specific first.
+  [/(?:^|[._])(?:schedule|scheduled|cron)(?:[._]|$)/i, 'scheduling'],
+  [/(?:^|[._])(?:activate|enable|publish|deploy)(?:[._]|$)/i, 'turning on'],
+  [/(?:^|[._])(?:disable|deactivate|archive)(?:[._]|$)/i, 'turning off'],
+  [/(?:^|[._])(?:send|dispatch|post|notify)(?:[._]|$)/i, 'sending'],
+  [/(?:^|[._])(?:delete|remove|trash)(?:[._]|$)/i, 'removing'],
+  [/(?:^|[._])(?:create|add|insert|new|draft)(?:[._]|$)/i, 'drafting'],
+  [/(?:^|[._])(?:update|edit|modify|patch|set|move|rename)(?:[._]|$)/i, 'updating'],
+  [/(?:^|[._])(?:get|list|read|search|find|query|fetch|describe|lookup)(?:[._]|$)/i, 'reading'],
+  [/(?:^|[._])(?:run|execute|invoke)(?:[._]|$)/i, 'running'],
+];
+
+/** The thing being worked on, in the user's words rather than the slug's. */
+const NARRATION_SUBJECTS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^workflow/i, 'the workflow'],
+  [/^(?:space|workspace)/i, 'the workspace'],
+  [/^(?:outlook|gmail|mail)/i, 'your email'],
+  [/(?:^|_)calendar/i, 'your calendar'],
+  [/^salesforce|^sf[_.]/i, 'Salesforce'],
+  [/^slack/i, 'Slack'],
+  [/^(?:googlesheets|sheets|airtable|notion)/i, 'the sheet'],
+  [/^(?:goal|plan)/i, 'the plan'],
+  [/^(?:memory|fact|recall)/i, 'what I remember'],
+  [/^(?:run_shell_command|shell|cli)/i, 'a command'],
+  [/^(?:write_file|read_file|file_query|produce_document)/i, 'the file'],
+];
+
+/**
+ * One short, true sentence about what a turn is doing right now.
+ *
+ * `recentToolNames` is oldest-to-newest; the most recent tool that is real work
+ * wins, because that is what she is doing at the moment the user is wondering.
+ */
+export function progressNarration(recentToolNames: readonly string[]): string {
+  for (let i = recentToolNames.length - 1; i >= 0; i -= 1) {
+    const raw = (recentToolNames[i] ?? '').trim();
+    if (!raw) continue;
+    // MCP-namespaced tools carry their real name in the last segment.
+    const name = raw.split('__').at(-1) ?? raw;
+    if (NARRATION_SKIPPED.test(name) || NARRATION_DISPATCHERS.test(name)) continue;
+    const verb = NARRATION_VERBS.find(([pattern]) => pattern.test(name))?.[1];
+    const subject = NARRATION_SUBJECTS.find(([pattern]) => pattern.test(name))?.[1];
+    if (verb && subject) return `Still working — ${verb} ${subject}.`;
+    // A verb with nothing to attach it to reads as a fragment ("— running."),
+    // which is worse than saying less. Subjects earn the clause, not verbs.
+    return 'Still working.';
+  }
+  return 'Still working.';
 }

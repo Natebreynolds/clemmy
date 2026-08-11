@@ -123,13 +123,17 @@ const GOLDEN = {
   // literal valid-JSON inputs — recall_tool_result {"call_id":"call_abc123"} —
   // instead of paren/kwargs pseudo-signatures the model copied verbatim into
   // unparseable tool calls (live InputValidationError class, 4/4 occurrences).
-  instructions: { len: 35266, sha16: '241c132876912f4c' },
-  native: { len: 34369, sha16: 'd5ce61448272d292' },
-  claudeBrain: { len: 8174, sha16: '837d5fe4608c35ce' },
+  // 2026-08-08 compose→commit: workers may investigate and read broadly, but
+  // return exact mutation payloads for one parent-owned batch proposal/commit.
+  // This preserves conversational/model reasoning while preventing worker-side
+  // Composio writes and the duplicate/fallback dispatches observed live.
+  instructions: { len: 35773, sha16: '3c0040a116087153' },
+  native: { len: 34876, sha16: '0b1f795ddfe39836' },
+  claudeBrain: { len: 8316, sha16: '38747549671f7f3c' },
   // 2026-07-27 live efficiency proof: execution_create already guards against
   // a duplicate active lane, so the lean rubric no longer makes the model dump
   // every user's old executions before opening/reusing the current one.
-  lean: { len: 11734, sha16: 'd99facc1b69b0cc3' },
+  lean: { len: 12008, sha16: 'ada12ab4276fba2f' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

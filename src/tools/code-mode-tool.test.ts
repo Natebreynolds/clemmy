@@ -156,6 +156,7 @@ test('local-only scope is a hard code-mode authority wall before discovery or pr
         counter: new ToolCallsCounter(20),
         mcpToolScope: {
           reason: 'explicit local-only regression',
+          authority: 'none',
           allowedServerSlugs: [],
           maxTools: 0,
         },

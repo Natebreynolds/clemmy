@@ -22,6 +22,7 @@ const {
   DEFAULT_SCOPE_ALLOWED_TOOLS,
   closePlanScope,
   evaluateAutoApprove,
+  destructivePlanActionKey,
   getPlanScope,
   isAutoApprovedByScope,
   listActiveScopes,
@@ -32,6 +33,7 @@ const {
   grantStandingApproval,
   revokeStandingApproval,
   isStandingGranted,
+  isUngrantableMultiplexer,
   listStandingGrants,
   grantSendTrust,
   grantSendTrustFromApprovedAction,
@@ -580,4 +582,160 @@ test('allowAnySend: an authored send step scope auto-approves sends; the wildcar
     false,
     'without the authored flag, a wildcard scope still never auto-approves a send',
   );
+});
+
+test('nested broker sends cannot ride a wildcard or the outer broker name', () => {
+  for (const [index, variant] of ['call_tool', 'call-tool', 'call.tool', 'callTool'].entries()) {
+    const tool = `m365__${variant}`;
+    const args = {
+      name: 'send_email',
+      args_json: JSON.stringify({ to: 'person@example.com', subject: 'Hello' }),
+    };
+    const wildcardSession = `nested-send-wild-${index}`;
+    openPlanScope({
+      sessionId: wildcardSession,
+      planProposalId: `p-wild-${index}`,
+      approvedPlanObjective: 'reversible background work',
+      allowedTools: ['*'],
+    });
+    assert.equal(
+      isAutoApprovedByScope(wildcardSession, tool, args, 'send'),
+      false,
+      `${variant}: wildcard cannot authorize the nested send`,
+    );
+
+    const outerSession = `nested-send-outer-${index}`;
+    openPlanScope({
+      sessionId: outerSession,
+      planProposalId: `p-outer-${index}`,
+      approvedPlanObjective: 'use the broker',
+      allowedTools: [tool],
+    });
+    assert.equal(
+      isAutoApprovedByScope(outerSession, tool, args, 'send'),
+      false,
+      `${variant}: naming the outer broker is not nested send consent`,
+    );
+  }
+});
+
+test('nested Composio sends require exact slug narrowing', () => {
+  const sid = 'nested-composio-send';
+  openPlanScope({
+    sessionId: sid,
+    planProposalId: 'p-nested-composio',
+    approvedPlanObjective: 'send one approved Gmail action',
+    allowedTools: ['m365__callTool'],
+    allowedComposioSlugs: ['GMAIL_SEND_EMAIL'],
+  });
+  const carrier = (slug: string): Record<string, unknown> => ({
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({ tool_slug: slug, arguments: { to: 'person@example.com' } }),
+  });
+  assert.equal(isAutoApprovedByScope(sid, 'm365__callTool', carrier('GMAIL_SEND_EMAIL'), 'send'), true);
+  assert.equal(
+    isAutoApprovedByScope(sid, 'm365__callTool', carrier('SLACK_SEND_MESSAGE'), 'send'),
+    false,
+    'a different nested slug cannot reuse the broker scope',
+  );
+});
+
+test('destructive scope requires the exact nested authority and args; wildcard and outer broker names never suffice', () => {
+  const tool = 'm365__call-tool';
+  const exactArgs = {
+    name: 'deleteItem',
+    args_json: JSON.stringify({ item_id: 'item-1', site_id: 'site-a' }),
+  };
+  const exactKey = destructivePlanActionKey(tool, exactArgs);
+  assert.ok(exactKey);
+  openPlanScope({
+    sessionId: 'nested-delete-exact',
+    planProposalId: 'p-delete-exact',
+    approvedPlanObjective: 'delete the one duplicate item',
+    allowedTools: [tool, '*'],
+    allowedDestructiveActions: [exactKey!],
+  });
+  assert.equal(isAutoApprovedByScope('nested-delete-exact', tool, exactArgs), true);
+  assert.equal(isAutoApprovedByScope('nested-delete-exact', tool, {
+    ...exactArgs,
+    args_json: JSON.stringify({ item_id: 'item-2', site_id: 'site-a' }),
+  }), false, 'one changed nested argument invalidates the destructive authority');
+
+  openPlanScope({
+    sessionId: 'nested-delete-wild',
+    planProposalId: 'p-delete-wild',
+    approvedPlanObjective: 'generic background work',
+    allowedTools: ['*', tool],
+  });
+  assert.equal(isAutoApprovedByScope('nested-delete-wild', tool, exactArgs), false);
+});
+
+test('payload-backed destructive keys separate exact targets and reject flat argument lookalikes', () => {
+  const tool = 'm365__callTool';
+  const itemOne = { name: 'deleteItem', payload: { item_id: 'one' } };
+  const itemTwo = { name: 'deleteItem', payload: { item_id: 'two' } };
+  const keyOne = destructivePlanActionKey(tool, itemOne);
+  const keyTwo = destructivePlanActionKey(tool, itemTwo);
+  assert.ok(keyOne);
+  assert.ok(keyTwo);
+  assert.notEqual(keyOne, keyTwo, 'each payload target has distinct destructive authority');
+  assert.equal(
+    destructivePlanActionKey(tool, { name: 'deleteItem', item_id: 'one' }),
+    null,
+    'unrecognized top-level fields cannot collapse to empty semantic args',
+  );
+});
+
+test('standing grants reject every broker spelling and foreign shell/Composio namespace', () => {
+  for (const tool of [
+    'call_tool',
+    'm365__call-tool',
+    'mcp__m365__call.tool',
+    'm365__callTool',
+    'foreign__run_shell_command',
+    'mcp__foreign__composio_execute_tool',
+  ]) {
+    assert.equal(isUngrantableMultiplexer(tool), true, tool);
+    assert.equal(grantStandingApproval(tool, { kind: 'execute' }), null, tool);
+  }
+});
+
+test('foreign arbitrary multiplexers never ride YOLO; exact local shell behavior remains', () => {
+  assert.equal(evaluateAutoApprove({
+    sessionId: undefined,
+    toolName: 'mcp__foreign__run_shell_command',
+    args: { command: 'pwd' },
+    scope: 'yolo',
+    insideWorkspace: false,
+  }).autoApproved, false);
+  assert.equal(evaluateAutoApprove({
+    sessionId: undefined,
+    toolName: 'foreign__composio_execute_tool',
+    args: { tool_slug: 'GOOGLESHEETS_GET_VALUES' },
+    scope: 'yolo',
+    insideWorkspace: false,
+  }).autoApproved, false);
+  assert.equal(evaluateAutoApprove({
+    sessionId: undefined,
+    toolName: 'mcp__clementine-local__run_shell_command',
+    args: { command: 'pwd' },
+    scope: 'yolo',
+    insideWorkspace: false,
+  }).autoApproved, true);
+});
+
+test('a standing grant follows a safe nested semantic target, not the broker', () => {
+  assert.ok(grantStandingApproval('m365__update_item', { kind: 'write' }));
+  try {
+    assert.equal(isAutoApprovedByScope(undefined, 'm365__call.tool', {
+      name: 'update_item',
+      args_json: JSON.stringify({ item_id: 'one', title: 'Updated' }),
+    }), true);
+    assert.equal(isAutoApprovedByScope(undefined, 'm365__call.tool', {
+      name: 'delete_item',
+      args_json: JSON.stringify({ item_id: 'one' }),
+    }), false);
+  } finally {
+    revokeStandingApproval('m365__update_item');
+  }
 });

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+export { attachEvidenceObligations, type EvidenceObligation, type NodeObligation } from './turn-graph-obligations.js';
 import type { ProactivityPolicySnapshot } from '../../agents/proactivity-policy.js';
 import { classifyProjectShape } from '../../assistant/project-shape.js';
 import {
@@ -185,6 +186,19 @@ function graphHashMaterial(graph: TurnGraphIR): unknown {
   return { ...graph, compiler };
 }
 
+/**
+ * Recompute the graph's content address from the closed IR.
+ *
+ * A persisted graph is about to become the accepted task's expectation. Merely
+ * checking that `graphHash` looks like a SHA-256 digest is not enough: a damaged
+ * or hand-edited graph could otherwise keep its old digest and still be treated
+ * as the graph that ran. Keep the calculation beside the compiler so every
+ * reader uses exactly the same canonical material.
+ */
+export function turnGraphHashMatches(graph: TurnGraphIR): boolean {
+  return graph.compiler.graphHash === sha256(stableJson(graphHashMaterial(graph)));
+}
+
 export function validateTurnGraph(graph: TurnGraphIR): TurnGraphValidation {
   const errors: string[] = [];
   const warnings = [...graph.diagnostics.warnings];
@@ -203,6 +217,7 @@ export function validateTurnGraph(graph: TurnGraphIR): TurnGraphValidation {
   }
   if (!/^[a-f0-9]{64}$/.test(graph.compiler.policyHash)) errors.push('Turn graph policy hash is invalid.');
   if (!/^[a-f0-9]{64}$/.test(graph.compiler.graphHash)) errors.push('Turn graph content hash is invalid.');
+  else if (!turnGraphHashMatches(graph)) errors.push('Turn graph content does not match its hash.');
 
   const nodeIds = new Set<string>();
   for (const node of graph.nodes) {

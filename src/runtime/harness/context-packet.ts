@@ -71,6 +71,9 @@ export interface RankedContextCandidate {
 
 export interface AgentContextPacket {
   inputPreview: string;
+  /** Explicit proof that relevance/discovery work was intentionally bypassed,
+   * rather than merely returning an empty result. */
+  semanticEnrichmentSkippedReason: 'declined_continuation' | null;
   complexity: 'simple' | 'moderate' | 'complex';
   /** Shared "is this turn consequential" signal (turn-intent.ts). 'qa' turns
    *  skip the safe-to-skip preflight I/O (health probes, fan-out detection);
@@ -596,9 +599,25 @@ function providerAccessLine(): string {
 export function buildAgentContextPacket(
   input: string,
   memory: MemoryPrimerSummary,
-  opts?: { sessionKind?: string; sessionId?: string; sourceUserSeq?: number; suppressConfirmBeat?: boolean },
+  opts?: {
+    sessionKind?: string;
+    sessionId?: string;
+    sourceUserSeq?: number;
+    suppressConfirmBeat?: boolean;
+    /** Skip relevance work for a typed decline while retaining the bounded
+     *  deterministic conversation/safety packet. */
+    suppressSemanticEnrichment?: boolean;
+    /** Literal current-turn authority when `input` is private retrieval text. */
+    authorityInput?: string;
+    /** The user explicitly declined the prior task and supplied a separate
+     * active clause. Semantic work proceeds for `input`; parent authority does
+     * not. This affects policy guidance only, never the user's wording. */
+    declinedParentWithNewTask?: boolean;
+  },
 ): AgentContextPacket {
-  const complexity = classifyComplexity(input);
+  const authorityInput = opts?.authorityInput ?? input;
+  const suppressSemanticEnrichment = opts?.suppressSemanticEnrichment === true;
+  const complexity = classifyComplexity(suppressSemanticEnrichment ? authorityInput : input);
   // Pure-Q&A turns skip ONLY the health probes (disk + MCP I/O) — pure telemetry
   // that never changes what the model CAN do, so it's safe to drop on a question.
   // Everything that affects capability — skills, workflows, fan-out detection,
@@ -607,7 +626,7 @@ export function buildAgentContextPacket(
   // risk). Honors a kill-switch; default-on. A continuation turn may classify
   // 'qa' and be lightened too — that's safe, since lightening drops ONLY
   // health-probe telemetry, never anything the turn's work depends on.
-  const turnIntent: 'qa' | 'action' = classifyTurnIntent(input);
+  const turnIntent: 'qa' | 'action' = classifyTurnIntent(authorityInput);
   const lightenQa = lightQaTurnsEnabled() && turnIntent === 'qa';
   // A workflow node already has a pinned graph, exact step prompt, allowed-tool
   // scope, upstream data, and (when authored) its explicit usesSkill body.
@@ -616,24 +635,28 @@ export function buildAgentContextPacket(
   // merely because their prompt contained generic words such as "manager" and
   // "report". Route only node-owned context here.
   const constrainedWorkflowNode = opts?.sessionKind === 'workflow';
-  const skills = constrainedWorkflowNode ? [] : rankSkills(input);
-  const workflows = constrainedWorkflowNode ? [] : rankWorkflows(input);
-  const projectCommands = constrainedWorkflowNode ? [] : rankProjectCommands(input);
-  const toolScope = summarizeToolScope(input);
-  const mcp = lightenQa || constrainedWorkflowNode ? [] : mcpHealth();
-  const healthWarnings = [
-    ...harnessCapabilityHealthWarnings(),
-    ...(lightenQa
-      ? []
-      : [
-          ...diskHealthWarnings(),
-          ...mcp.map((server) => `MCP ${server.slug} is ${server.state}${server.lastError ? `: ${server.lastError}` : ''}`),
-        ]),
-  ];
-  const focus = focusLine(input, opts?.sessionId);
-  const memoryLine = memory.enabled
-    ? `Memory preflight: ${memory.hitCount} hit${memory.hitCount === 1 ? '' : 's'} via ${memory.source ?? 'local search'}${memory.injected ? ' and injected below' : ''}${memory.skippedReason ? ` (${memory.skippedReason})` : ''}.`
-    : 'Memory preflight: disabled.';
+  const skills = constrainedWorkflowNode || suppressSemanticEnrichment ? [] : rankSkills(input);
+  const workflows = constrainedWorkflowNode || suppressSemanticEnrichment ? [] : rankWorkflows(input);
+  const projectCommands = constrainedWorkflowNode || suppressSemanticEnrichment ? [] : rankProjectCommands(input);
+  const toolScope = summarizeToolScope(authorityInput);
+  const mcp = lightenQa || constrainedWorkflowNode || suppressSemanticEnrichment ? [] : mcpHealth();
+  const healthWarnings = suppressSemanticEnrichment
+    ? []
+    : [
+        ...harnessCapabilityHealthWarnings(),
+        ...(lightenQa
+          ? []
+          : [
+              ...diskHealthWarnings(),
+              ...mcp.map((server) => `MCP ${server.slug} is ${server.state}${server.lastError ? `: ${server.lastError}` : ''}`),
+            ]),
+      ];
+  const focus = suppressSemanticEnrichment ? '' : focusLine(input, opts?.sessionId);
+  const memoryLine = memory.skippedReason === 'declined_continuation'
+    ? 'Memory preflight: skipped (declined_continuation).'
+    : memory.enabled
+      ? `Memory preflight: ${memory.hitCount} hit${memory.hitCount === 1 ? '' : 's'} via ${memory.source ?? 'local search'}${memory.injected ? ' and injected below' : ''}${memory.skippedReason ? ` (${memory.skippedReason})` : ''}.`
+      : 'Memory preflight: disabled.';
   let prospective = { text: '', count: 0, ids: [] as string[], bytes: 0 };
   let prospectiveCapture: string | null = null;
   // Standing-rule capture steer (2026-07-31): a rule-shaped user statement
@@ -641,14 +664,16 @@ export function buildAgentContextPacket(
   // at the moment it is said, not stay chat prose the next session forgets.
   // Deterministic detection, model-owned decision — same conditional pattern
   // as the prospective steer. Workflow nodes never capture rules.
-  const ruleCapture = constrainedWorkflowNode ? null : standingRuleCaptureDirective(input);
-  if (!constrainedWorkflowNode) {
+  const ruleCapture = constrainedWorkflowNode || suppressSemanticEnrichment
+    ? null
+    : standingRuleCaptureDirective(authorityInput);
+  if (!constrainedWorkflowNode && !suppressSemanticEnrichment) {
     try {
       prospective = buildProspectiveIntentionContext({
         query: input,
         sessionId: opts?.sessionId,
       });
-      prospectiveCapture = prospectiveCaptureDirective(input);
+      prospectiveCapture = prospectiveCaptureDirective(authorityInput);
     } catch {
       // Future-intention projection is advisory context, never turn authority.
     }
@@ -662,8 +687,8 @@ export function buildAgentContextPacket(
   // Fan-out detection always runs — a multi-item request ("research these 8
   // companies") has no action verb but is NOT light; dropping it would lose the
   // parallelism directive. Only the health probes (below) are safe to skip on qa.
-  const multiItem = detectMultiItemIntent(input);
-  const agentSystem = renderAgentSystemGuidance(input, opts?.sessionKind);
+  const multiItem = detectMultiItemIntent(authorityInput);
+  const agentSystem = renderAgentSystemGuidance(authorityInput, opts?.sessionKind);
   const fanoutPosture = agentSystem.policy?.fanoutPosture ?? 'unknown';
   const recommendedWorkerWaveSize = agentSystem.policy?.recommendedWorkerWaveSize ?? 8;
   // The count-aware fan-out directive belongs to EVERY non-workflow lane.
@@ -698,7 +723,7 @@ export function buildAgentContextPacket(
   const preflightDecision = opts?.suppressConfirmBeat
     ? { phase: 'execute', consequential: false, reason: 'ordinary_execution' } as const
     : classifyTurnPreflight({
-        message: input,
+        message: authorityInput,
         sessionId: opts?.sessionId,
         sessionKind: opts?.sessionKind,
         isMultiItem: multiItem.isMultiItem,
@@ -719,7 +744,7 @@ export function buildAgentContextPacket(
   }
   const confirmBeat = preflightDecision.phase === 'align'
     ? confirmBeatDirective({
-        message: input,
+        message: authorityInput,
         sessionId: opts?.sessionId,
         sessionKind: opts?.sessionKind,
         isMultiItem: multiItem.isMultiItem,
@@ -733,9 +758,9 @@ export function buildAgentContextPacket(
   // Same chat-only persistence condition as the preflight decision.
   let capabilityResolution: CapabilityResolution = { entries: [], registryAvailable: false };
   let capabilityBlock = '';
-  if (!constrainedWorkflowNode) {
+  if (!constrainedWorkflowNode && !suppressSemanticEnrichment) {
     try {
-      capabilityResolution = resolveTurnCapabilities(input);
+      capabilityResolution = resolveTurnCapabilities(input, { sessionId: opts?.sessionId });
       capabilityBlock = renderCapabilityResolutionForContext(capabilityResolution);
       if (
         opts?.sessionKind === 'chat'
@@ -752,7 +777,15 @@ export function buildAgentContextPacket(
 
   const lines = [
     '[AGENT CONTEXT PACKET]',
-    'This deterministic preflight ran before the model call. Use it to choose memory, skills, workflows, and tools instead of guessing.',
+    suppressSemanticEnrichment
+      ? ''
+      : 'This deterministic preflight ran before the model call. Use it to choose memory, skills, workflows, and tools instead of guessing.',
+    suppressSemanticEnrichment
+      ? 'Typed continuation result: the user declined the prior proposal. Keep the conversation natural, but do not revive, retrieve for, or prepare tools for the declined work.'
+      : '',
+    opts?.declinedParentWithNewTask
+      ? 'Typed continuation result: the user declined the prior proposal and supplied separate new work. Keep the full reply conversationally intact, but treat only the fresh clause as active authority; do not revive, retrieve for, or prepare tools from the declined parent.'
+      : '',
     `Complexity: ${complexity}.`,
     focus,
     memoryLine,
@@ -760,24 +793,37 @@ export function buildAgentContextPacket(
     prospectiveCapture,
     ruleCapture,
     `External MCP scope: ${toolScope.allowAll ? 'all external tools allowed' : `${(toolScope.allowedServerSlugs ?? []).join(', ') || 'none'}${toolScope.maxTools ? `, max ${toolScope.maxTools} tools` : ''}`} (${toolScope.reason}).`,
-    providerAccessLine(),
-    ...renderCandidates('Likely skills', skills, 'If one is relevant, call skill_read before creating the deliverable.'),
+    suppressSemanticEnrichment ? '' : providerAccessLine(),
+    ...(suppressSemanticEnrichment
+      ? []
+      : renderCandidates('Likely skills', skills, 'If one is relevant, call skill_read before creating the deliverable.')),
     // Pre-flight error library: the freshest distilled lessons for the skills
     // this turn will likely use — surfaced BEFORE acting so a known mistake
     // isn't repeated (they used to be reachable only via skill_read).
-    pitfallsForSkills(skills.map((s) => s.name)),
-    ...renderCandidates('Project commands (the real deliverable route)', projectCommands, PROJECT_COMMANDS_INSTRUCTION),
-    ...renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. If the user asks to RUN/start/kick off something by name — even a loose one ("run my email flow", "kick off the prospect routine") — call workflow_run with their exact phrasing: the resolver matches it to the right saved workflow (or asks which) and confirms before anything runs, then it executes in the background and reports back here. Do NOT auto-run a workflow the user did not ask to run; for a task that merely resembles a saved workflow, do it directly and offer to save it as a workflow afterward.'),
-    healthWarnings.length > 0 ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}` : 'Health warnings: none.',
+    suppressSemanticEnrichment ? '' : pitfallsForSkills(skills.map((s) => s.name)),
+    ...(suppressSemanticEnrichment
+      ? []
+      : renderCandidates('Project commands (the real deliverable route)', projectCommands, PROJECT_COMMANDS_INSTRUCTION)),
+    ...(suppressSemanticEnrichment
+      ? []
+      : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. If the user asks to RUN/start/kick off something by name — even a loose one ("run my email flow", "kick off the prospect routine") — call workflow_run with their exact phrasing: the resolver matches it to the right saved workflow (or asks which) and confirms before anything runs, then it executes in the background and reports back here. Do NOT auto-run a workflow the user did not ask to run; for a task that merely resembles a saved workflow, do it directly and offer to save it as a workflow afterward.')),
+    suppressSemanticEnrichment
+      ? ''
+      : healthWarnings.length > 0
+        ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}`
+        : 'Health warnings: none.',
     agentSystem.text,
-    parallelismLine,
+    suppressSemanticEnrichment ? '' : parallelismLine,
     confirmBeat,
     capabilityBlock,
-    'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
+    suppressSemanticEnrichment ? '' : 'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
   ].filter((line): line is string => Boolean(line));
 
   return {
-    inputPreview: clip(input, 200),
+    inputPreview: clip(suppressSemanticEnrichment ? authorityInput : input, 200),
+    semanticEnrichmentSkippedReason: suppressSemanticEnrichment
+      ? 'declined_continuation'
+      : null,
     complexity,
     turnIntent,
     memory,

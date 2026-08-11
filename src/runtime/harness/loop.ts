@@ -1,5 +1,6 @@
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
+import type { Model } from '@openai/agents-core';
 import { randomUUID } from 'node:crypto';
 import { HarnessSession } from './session.js';
 import { clearRunInFlightAfterTerminal } from './restart-recovery.js';
@@ -58,6 +59,7 @@ import {
 import { selectReasoningEffort, dynamicReasoningEnabled, continuationClassifyEnabled } from './reasoning-effort.js';
 import { buildCanonicalContextPack } from './canonical-context.js';
 import { renderCapabilityResolutionForContext } from './capability-resolution.js';
+import { discoveryGovernor } from './discovery-governor.js';
 import { recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
 import {
   renderTurnOpennessForContext,
@@ -87,6 +89,11 @@ import {
   publicReplyText,
 } from './public-presentation.js';
 import { commitTurnOutcome } from './delivery-committer.js';
+import {
+  repairActionTerminalBeforeCommit,
+  type TerminalPresentationRepairPort,
+} from './terminal-presentation-repair.js';
+import { createAgentsTerminalPresentationRepairPort } from './terminal-presentation-repair-port.js';
 import {
   turnOutcomeId,
   type PresentationEvent,
@@ -137,6 +144,13 @@ import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import {
+  looksLikeHealthyDurableMemoryAcknowledgement,
+} from './durable-memory-receipt.js';
+import {
+  prepareDurableMemoryIntakeHostCompletion,
+  redeemDurableMemoryIntakeReceipt,
+} from './durable-memory-intake-receipt.js';
+import {
   evaluateLearningCandidate,
   recordLearningDecision,
   type LearningReceipt,
@@ -144,7 +158,7 @@ import {
 import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
 import { isUserFacingSession } from '../../execution/scope.js';
 import { handoffTransferForSource } from '../../execution/continuation-capsule.js';
-import { primeTurnRecallVector, recordFactImpression, searchFactsByText } from '../../memory/facts.js';
+import { primeTurnRecallVector, recordFactImpression, searchFactsByText, withTurnQueryVectorScope } from '../../memory/facts.js';
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
 import { recordRecallRun } from '../../memory/recall-usage.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
@@ -159,6 +173,10 @@ import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
+import {
+  EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
+  explicitlyOptsOutOfAutomaticMemoryRecall,
+} from '../../memory/automatic-recall-opt-out.js';
 import { extractFunctionCallArgTexts } from '../../memory/recall-auto-credit.js';
 import { runPostTurnHooks } from './post-turn.js';
 import {
@@ -171,8 +189,13 @@ import {
   runTokenBudgetEnforcementEnabled,
 } from './run-token-budget.js';
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
+import { withModelUsageAttribution } from '../usage-log.js';
+import type { TaskContinuationContext } from '../../types.js';
 import { effectiveTurnObjective } from './turn-control.js';
-import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
+import { recordTurnGraphShadow, turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
+import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
+import { requireKnownExpectedWorkContract } from './expected-work-contract.js';
+import { requireActionExpectedWorkActivation } from './action-expected-work-boundary.js';
 import { driveChatTurnSpine } from '../graph/chat-turn-spine.js';
 import { getProactivityPolicySnapshot } from '../../agents/proactivity-policy.js';
 import { claimGroundingNudge, extractDeliverablePointers, ungroundedPointers } from './claim-grounding.js';
@@ -209,6 +232,15 @@ import {
   type FreshExternalWriteEvidenceStatus,
   toolOutputLooksSuccessful,
 } from './tool-evidence.js';
+import {
+  exactVerifiedReadCompletionCertificate,
+  type ExactVerifiedReadCompletionCertificate,
+} from './verified-read-completion.js';
+import {
+  resolveSettledReadForInfraRecovery,
+  settledReadRepeatEnabled,
+  type SettledReadInfraRecovery,
+} from './settled-read-repeat.js';
 import { summarizeWorkManifests } from './work-manifest.js';
 // Turn-decision classification lives in turn-decision.ts (extracted 2026-07-08);
 // re-export its public surface so existing importers of loop.js keep working.
@@ -908,6 +940,7 @@ function finalizeStandardConversation(input: {
   turn: number;
   eventData: Record<string, unknown>;
   result: RunConversationResult;
+  verifiedReadCompletionReceipt?: ExactVerifiedReadCompletionCertificate;
 }): RunConversationResult {
   const summary = typeof input.eventData.summary === 'string'
     ? input.eventData.summary
@@ -961,6 +994,13 @@ function finalizeStandardConversation(input: {
       },
     });
     return input.result;
+  }
+  // Bind the deterministic read proof to the same first-writer-wins row as
+  // the public answer. It is deliberately attached only after artifact parks
+  // and recovery-candidate exits, so a non-terminal can never carry a green
+  // completion receipt and a crash cannot split receipt from presentation.
+  if (input.verifiedReadCompletionReceipt) {
+    dataOut.verifiedReadCompletionReceipt = input.verifiedReadCompletionReceipt;
   }
   const identity = standardTurnIdentity(input);
   const text = publicReplyText(dataOut.reply, '')
@@ -1245,16 +1285,42 @@ function assessEffectArtifactSelfReconciliation(input: {
   };
 }
 
-/** An explicit user-memory candidate is persisted to the crash-safe intake
- * ledger before the model answers. That durable receipt is completion evidence
- * for a terse "Noted." even when the model correctly makes zero tool calls. */
-function turnHasDurableMemoryCaptureEvidence(sessionId: string, turn: number): boolean {
+interface DurableMemoryCaptureEvidence {
+  queuedCandidateCount: number;
+  conversationOnly: boolean;
+}
+
+/** Read capture telemetry for counts, but redeem the content-addressed host
+ * receipt for authority. A forged/stale `conversationOnly: true` event can
+ * never complete a turn. */
+function turnDurableMemoryCaptureEvidence(
+  sessionId: string,
+  turn: number,
+  activeSourceUserSeq?: number,
+): DurableMemoryCaptureEvidence | null {
   try {
-    return listEvents(sessionId, { types: ['memory_signals_captured'] })
-      .some((event) => event.turn === turn
-        && Number((event.data as { queuedCandidateCount?: unknown }).queuedCandidateCount ?? 0) > 0);
+    if (!Number.isSafeInteger(activeSourceUserSeq) || Number(activeSourceUserSeq) <= 0) return null;
+    const event = listEvents(sessionId, { types: ['memory_signals_captured'] })
+      .filter((candidate) => (
+        candidate.turn === turn
+        && candidate.seq > Number(activeSourceUserSeq)
+        && Number((candidate.data as { sourceUserSeq?: unknown }).sourceUserSeq) === activeSourceUserSeq
+      ))
+      .at(-1);
+    const queuedCandidateCount = Number(
+      (event?.data as { queuedCandidateCount?: unknown } | undefined)?.queuedCandidateCount ?? 0,
+    );
+    if (!event || !Number.isFinite(queuedCandidateCount) || queuedCandidateCount <= 0) return null;
+    const redeemed = redeemDurableMemoryIntakeReceipt({
+      sessionId,
+      sourceUserSeq: Number(activeSourceUserSeq),
+    });
+    return {
+      queuedCandidateCount,
+      conversationOnly: redeemed.status === 'redeemed',
+    };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1865,6 +1931,21 @@ export interface RunTurnOptions {
   agent: Agent<any, any>;
   sessionId: string;
   input: string;
+  /** The turn's memory warm already ran at the spine's context_resolve node.
+   *  Set only by the spine; a turn reached any other way still warms here, so
+   *  the extraction can never leave a lane cold. */
+  contextWarmedAtNode?: boolean;
+  /** Runtime-owned semantic context for a verified resumed task. It may steer
+   * retrieval/classification, but it never replaces `input` in model-visible
+   * user history and never grants tool or approval authority. */
+  semanticTaskInput?: string;
+  /** Exact accepted-source continuation classification. A declined answer
+   * keeps its parent/question here for conversation continuity, while semantic
+   * preflight is deliberately limited to the literal current answer. */
+  taskContinuation?: TaskContinuationContext;
+  /** One-turn model-only guidance for a conversational continuation. Injected
+   * as transient system context so the literal user item remains `input`. */
+  continuationSteer?: string;
   /** The real user-authored text when `input` includes a harness directive.
    * Used for memory capture, semantic recall, correction detection, and durable
    * user history so internal steering can never become learned memory. */
@@ -1975,7 +2056,23 @@ export type RunConversationStatus =
   | 'limit_exceeded'
   | 'failed';
 
+/**
+ * The context node must honour the SAME boundaries the core's inline warm
+ * honoured: a declined continuation has no fresh intent to embed, and an
+ * explicit request-local no-memory boundary skips the hidden embedding
+ * warm-up as well as the visible primer. Moving the warm must not quietly
+ * widen what it warms.
+ */
+function declinesAutomaticContextWarm(options: RunConversationOptions): boolean {
+  if (options.taskContinuation?.disposition === 'declined_with_new_task') return true;
+  const semantic = options.semanticTaskInput ?? options.input;
+  return !semantic.trim() || explicitlyOptsOutOfAutomaticMemoryRecall(semantic);
+}
+
 export interface RunConversationOptions {
+  /** The spine's context_resolve node already warmed this turn's memory
+   *  (Clem 4, context interior). Set by the spine only. */
+  contextWarmedAtNode?: boolean;
   /** Pre-built agent. Optional when `buildAgent` is supplied — the spine's
    *  capability_resolve node then owns construction (Clem 4, capability
    *  interior). Exactly one of `agent`/`buildAgent` is required. */
@@ -1983,9 +2080,22 @@ export interface RunConversationOptions {
   /** Build the agent AT the capability_resolve node instead of before the
    *  turn — tool/capability assembly becomes graph work with a real trace
    *  step. Invoked exactly once per turn, before any model call. */
-  buildAgent?: () => Promise<Agent<any, any>>;
+  buildAgent?: (identity: {
+    sessionId: string;
+    sourceUserSeq: number;
+    route: 'direct_reply' | 'retrieve' | 'act';
+  }) => Promise<Agent<any, any>>;
   sessionId: string;
   input: string;
+  /** See RunTurnOptions.semanticTaskInput. Threaded across internal
+   * continuations while the literal accepted user message remains `input`. */
+  semanticTaskInput?: string;
+  /** See RunTurnOptions.taskContinuation. Threaded without changing the
+   * model-visible user message. */
+  taskContinuation?: TaskContinuationContext;
+  /** Exact accepted-source continuity classification completed, including a
+   * negative/fresh-topic result. Suppresses legacy session-only inference. */
+  taskContinuationResolved?: true;
   /** Max auto-continuation hops. Defaults to 12. */
   maxSteps?: number;
   /** Wall-clock budget across all hops. Defaults to 30 minutes. */
@@ -2021,6 +2131,9 @@ export interface RunConversationOptions {
   makeRunner?: () => Runner;
   /** Test injection. */
   runRunner?: RunRunnerFn;
+  /** Test injection for the one sealed text-only presentation repair. Live
+   * callers omit this and reuse the active brain model with no tools/history. */
+  terminalPresentationRepairPort?: TerminalPresentationRepairPort;
   /** @deprecated Raw executor deltas are private. Retained temporarily for API
    * compatibility; terminal delivery occurs through committed public events. */
   onChunk?: (delta: string) => void | Promise<void>;
@@ -3238,6 +3351,15 @@ async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<Tur
   if (isSyntheticStallRetryInput(query)) {
     return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'synthetic_retry' };
   }
+  if (explicitlyOptsOutOfAutomaticMemoryRecall(query)) {
+    return {
+      enabled: true,
+      query,
+      hitCount: 0,
+      injectedBytes: 0,
+      skippedReason: EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
+    };
+  }
   scheduleRecallShadow({ query, surface: 'automatic_primer', limit: TURN_MEMORY_PRIMER_FACT_TOP_K });
 
   try {
@@ -3502,16 +3624,61 @@ export async function runConversation(
   // candidate remains armed while the bridge tries the next brain.
   const sourceUserSeq = acceptFreshConversationInput(options);
   const acceptedSource = acceptedUserEvent(options.sessionId, sourceUserSeq);
-  recordTurnGraphShadow({
+  const graphEvent = recordTurnGraphShadow({
     identity: {
       sessionId: options.sessionId,
       turn: acceptedSource.turn,
       sourceUserSeq,
     },
     surface: 'direct',
+    verifiedTaskContinuation: options.taskContinuation,
   });
-  let foregroundReleased = false;
-  try {
+  const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
+  const acceptedCapabilityRoute = getSession(options.sessionId)?.kind === 'chat'
+    ? acceptedTurnGraph?.classification.route ?? 'direct_reply'
+    : 'direct_reply';
+  // The graph is now execution authority rather than best-effort telemetry.
+  // Arm its exact accepted source before capability construction, context
+  // warming, model invocation, or any tool can run. A bridge/fallover may enter
+  // this seam again with the same source; exact re-admission is idempotent.
+  // TurnGraph v1 currently contracts chat sources only. Execution/workflow
+  // sessions do not yet emit this graph and therefore cannot be armed through
+  // this protocol; leave their existing, separately-owned execution authority
+  // unchanged instead of manufacturing a chat graph for them here.
+  if (getSession(options.sessionId)?.kind === 'chat') {
+    requireAcceptedTaskAuthority({
+      sessionId: options.sessionId,
+      sourceUserSeq,
+    });
+    const expectedWork = requireKnownExpectedWorkContract({
+      sessionId: options.sessionId,
+      sourceUserSeq,
+    });
+    if (acceptedCapabilityRoute === 'act') {
+      if (expectedWork.status !== 'action_deferred') {
+        throw new BoundaryError({
+          kind: 'state.read_corrupted',
+          retryable: false,
+          userMessage: 'I could not safely start that action because its local work authority conflicted. Please retry.',
+          operatorMessage: 'accepted action unexpectedly owned a deterministic expected-work contract',
+          context: { sessionId: options.sessionId, sourceUserSeq },
+        });
+      }
+      requireActionExpectedWorkActivation({ sessionId: options.sessionId, sourceUserSeq });
+    }
+  }
+  // Semantic recall state is turn-local. Concurrent graph activations may
+  // share this daemon process, but they must never share the opportunistic
+  // query vector that later memory/tool boundaries consult.
+  return withModelUsageAttribution(
+    {
+      sessionId: options.sessionId,
+      sourceUserSeq,
+      ...(options.runAttemptId ? { attemptId: options.runAttemptId } : {}),
+    },
+    () => withTurnQueryVectorScope(async () => {
+    let foregroundReleased = false;
+    try {
     // G5b slice 1: the compiled turn graph DRIVES the spine instead of being
     // observed and discarded. The provider core remains one interim node
     // (charter Phase 2 — "keep the existing loops as temporary executor
@@ -3526,14 +3693,40 @@ export async function runConversation(
       throw new Error('runConversation requires either agent or buildAgent.');
     }
     const resolveCapability = options.buildAgent
-      ? async () => { if (!options.agent) activeAgent = await options.buildAgent!(); }
+      ? async () => {
+          if (!options.agent) {
+            activeAgent = await options.buildAgent!({
+              sessionId: options.sessionId,
+              sourceUserSeq,
+              route: acceptedCapabilityRoute,
+            });
+          }
+        }
       : undefined;
+    // CONTEXT INTERIOR (Clem 4): the turn's memory warm, moved out of the core
+    // and onto its own node. It runs upstream of capability construction, so
+    // the embed overlaps tool assembly instead of racing the first model call
+    // from inside runTurn. Fire-and-forget exactly as it was — the node cannot
+    // fail the turn — and the core is told not to warm again.
+    let contextWarmedAtNode = false;
+    const resolveContext = async (): Promise<void> => {
+      if (declinesAutomaticContextWarm(options)) return;
+      contextWarmedAtNode = true;
+      void primeTurnRecallVector(options.semanticTaskInput ?? options.input).catch(() => {});
+    };
     const spine = await driveChatTurnSpine<SpineCore>({
       identity: { sessionId: options.sessionId, turn: acceptedSource.turn, sourceUserSeq },
-      input: options.input,
+      // Graph topology follows the exact runtime-classified fresh clause after
+      // a parent decline. The provider core below still receives the complete
+      // accepted message through options.input.
+      input: options.taskContinuation?.disposition === 'declined_with_new_task'
+        ? options.taskContinuation.activeTaskInput ?? options.semanticTaskInput ?? options.input
+        : options.input,
       surface: 'direct',
       policy: getProactivityPolicySnapshot(),
+      ...(acceptedTurnGraph ? { graph: acceptedTurnGraph } : {}),
       phases: {
+        resolveContext,
         ...(resolveCapability ? { resolveCapability } : {}),
         runCore: async () => {
           if (!activeAgent) throw new Error('capability_resolve did not produce an agent before the core.');
@@ -3542,6 +3735,7 @@ export async function runConversation(
             agent: activeAgent,
             sourceUserSeq,
             reuseRecordedUserInput: true,
+            ...(contextWarmedAtNode ? { contextWarmedAtNode: true } : {}),
           });
           if (result.status === 'dispatched') return { kind: 'dispatched', result };
           return { kind: 'reduced', reduced: reduceStandardConversationTerminal({ result, sourceUserSeq }) };
@@ -3577,11 +3771,13 @@ export async function runConversation(
     if (core.reduced.completedReason) return core.reduced;
     foregroundReleased = Boolean(core.reduced.publicPresentation);
     return core.reduced;
-  } finally {
-    if (foregroundReleased) {
-      clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId, sourceUserSeq);
+    } finally {
+      if (foregroundReleased) {
+        clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId, sourceUserSeq);
+      }
     }
-  }
+    }),
+  );
 }
 
 /** Refresh short-term memory only after the conversation terminal is durable.
@@ -3649,18 +3845,20 @@ async function runConversationCore(
 
   let stepIndex = 0;
   let nextInput = options.input;
-  // CONVERGENCE (one beat, then execute): if Clem's previous turn ended by asking
-  // a clarifying question and the user is now answering it, prepend an EXECUTE-now
-  // directive so the model plans ONCE and acts — not another back-to-back question.
+  // CONVERGENCE: if Clem's previous turn ended by asking a clarifying question,
+  // carry one private guidance beat so the model does not re-ask it.
   // This standard harness lane serves Codex, OpenAI, and BYO models. Derive the
-  // conversational state once and carry it through the run so prompt and code
-  // rails agree. options.input is always the user's real message (continuations
-  // re-assign nextInput inside the loop, never options.input).
+  // conversational state once and carry it through the run. Crucially, do not
+  // prepend it to nextInput: the accepted/model-visible user item must remain
+  // byte-for-byte the user's own sentence.
   const resolvingClarification = convergenceSteerEnabled()
-    && priorTurnEndedAwaitingClarification(options.sessionId);
-  if (resolvingClarification) {
-    nextInput = `${CONVERGENCE_STEER}\n\n${options.input}`;
-  }
+    && (Boolean(options.semanticTaskInput)
+      // Render-only/legacy direct callers without an exact accepted source may
+      // still use the historical conversational hint. A real accepted turn
+      // requires the packet-derived decision above.
+      || (!options.taskContinuationResolved
+        && !options.sourceUserSeq
+        && priorTurnEndedAwaitingClarification(options.sessionId)));
   // Artifact-park retry MUST verify (2026-07-22 Netlify incident): a session
   // parked on unresolved provider creates that receives a retry-shaped reply
   // used to run a plain turn — the model re-emitted the park message with ZERO
@@ -3720,9 +3918,19 @@ async function runConversationCore(
   // On an approval/control turn ("go ahead"), keep every completion check
   // anchored to the consequential request that was actually aligned. The
   // objective lives in typed event state; no extra prompt block is injected.
-  let objective = options.sourceUserSeq
+  // Completion/effect policy is owned by the exact accepted user turn. Private
+  // A/Q/B semantic context may improve retrieval, but can never become the
+  // objective that a judge or corrective continuation tries to force through.
+  const declinedParentWithNewTask =
+    options.taskContinuation?.disposition === 'declined_with_new_task';
+  const parentAuthorityDeclined = options.taskContinuation?.disposition === 'declined'
+    || declinedParentWithNewTask;
+  const activeContinuationObjective = declinedParentWithNewTask
+    ? options.taskContinuation?.activeTaskInput?.trim() || options.semanticTaskInput?.trim() || options.input
+    : null;
+  let objective = activeContinuationObjective ?? (options.sourceUserSeq
     ? effectiveTurnObjective(options.sessionId, options.input, options.sourceUserSeq)
-    : options.input;
+    : options.input);
   let objectiveJudgeActionIntent = classifyMessageIntent(objective).intent === 'action';
   // When a legacy/direct caller did not thread the accepted source row, the
   // first runTurn records it. Pin that exact row afterward so every synthetic
@@ -3849,6 +4057,14 @@ async function runConversationCore(
       agent: currentAgent,
       sessionId: options.sessionId,
       input: nextInput,
+      // Only the FIRST turn of the core inherits the node's warm; a
+      // continuation turn has its own input and warms itself.
+      ...(options.contextWarmedAtNode && stepIndex === 1 ? { contextWarmedAtNode: true } : {}),
+      ...(options.semanticTaskInput ? { semanticTaskInput: options.semanticTaskInput } : {}),
+      ...(options.taskContinuation ? { taskContinuation: options.taskContinuation } : {}),
+      ...(resolvingClarification && (stepIndex === 1 || falloverReattempt)
+        ? { continuationSteer: CONVERGENCE_STEER }
+        : {}),
       authoritativeUserInput: stepIndex === 1 ? options.input : undefined,
       // Only the first step carries the real user message; every later step is a
       // harness continuation (judge/stall/grounding re-prompt) → don't learn it.
@@ -3889,16 +4105,20 @@ async function runConversationCore(
         `${options.sessionId}::turn:${turnResult.turn}`,
         activeSourceUserSeq,
       );
-      objective = effectiveTurnObjective(options.sessionId, options.input, activeSourceUserSeq);
+      objective = activeContinuationObjective
+        ?? effectiveTurnObjective(options.sessionId, options.input, activeSourceUserSeq);
       objectiveJudgeActionIntent = classifyMessageIntent(objective).intent === 'action';
     }
     totalToolCalls += turnResult.toolCalls ?? 0;
     meaningfulToolEvidence = meaningfulToolEvidence
       || turnHasMeaningfulSuccessfulToolEvidence(options.sessionId, turnResult.turn, objective);
-    const durableMemoryCaptureEvidence = turnHasDurableMemoryCaptureEvidence(
+    const durableMemoryCapture = turnDurableMemoryCaptureEvidence(
       options.sessionId,
       turnResult.turn,
+      activeSourceUserSeq,
     );
+    const durableMemoryCaptureEvidence = durableMemoryCapture !== null;
+    const durableMemoryConversationOnly = durableMemoryCapture?.conversationOnly === true;
 
     // A verified queue receipt transfers ownership to the durable workflow
     // graph. This check precedes model-status/prose handling on purpose: a
@@ -3924,6 +4144,12 @@ async function runConversationCore(
     // error (infraTransientKind set, ask NOT yet written) → re-attempt on the next
     // brain, guarded so a turn that already wrote externally is never re-run.
     if (turnResult.infraTransientKind && falloverCapable) {
+      const settledReadRecovery = resolveInfraSettledReadRecovery({
+        sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        runAttemptId: options.runAttemptId,
+        failedTurn: turnResult.turn,
+      });
       const canSwitch = !externalWriteReplayRiskAfter(
         options.sessionId,
         externalWriteBoundarySeq,
@@ -3946,6 +4172,9 @@ async function runConversationCore(
           });
           stepIndex -= 1; // re-attempt the SAME step on the next brain
           falloverReattempt = true; // its input is already recorded — don't duplicate
+          if (settledReadRecovery) {
+            nextInput = buildInfraRetryDirective(turnResult.infraTransientKind, settledReadRecovery);
+          }
           continue;
         }
       }
@@ -3955,7 +4184,7 @@ async function runConversationCore(
       const infraDecision = decideInfraRecovery(options.sessionId);
       if (infraDecision === 'auto_retry') {
         emitInfraAutoRecoverEvent(options.sessionId, turnResult.turn, turnResult.infraTransientKind, countInfraAutoRecover(options.sessionId) + 1);
-        nextInput = buildInfraRetryDirective(turnResult.infraTransientKind);
+        nextInput = buildInfraRetryDirective(turnResult.infraTransientKind, settledReadRecovery);
         falloverReattempt = false;
         continue;
       }
@@ -4233,6 +4462,7 @@ async function runConversationCore(
           reason: 'structured_no_tool_result',
         }
       : toOrchestratorDecision(turnResult.finalOutput);
+    let durableMemoryAcknowledgementCompleted = false;
     // A terse completion acknowledgement after verified work is a valid
     // terminal reply, not an unparseable decision. `parseDecisionText` keeps
     // bare acknowledgements null so a true ZERO-work "Noted." / "Done." cannot
@@ -4240,15 +4470,20 @@ async function runConversationCore(
     // crash-safe memory-intake evidence, retrying the acknowledgement repeats
     // completed work (live repro: memory_remember ran twice and burned three
     // model turns after the first write had already succeeded). Preserve the
-    // strict zero-work stall behavior while letting evidence-backed
-    // acknowledgements finish through the ordinary completion/delivery gates.
+    // strict zero-work stall behavior while letting a memory-only request with
+    // an exact durable receipt finish without generic stall/completion judges.
     if (
       !decision
       && (meaningfulToolEvidence || durableMemoryCaptureEvidence)
       && typeof turnResult.finalOutput === 'string'
     ) {
       const acknowledgement = turnResult.finalOutput.trim();
-      if (/^(?:ok|okay|done|got it|understood|noted|yes|alright|certainly)\.?$/i.test(acknowledgement)) {
+      const bareAcknowledgement = /^(?:ok|okay|done|got it|understood|noted|yes|alright|certainly)\.?$/i.test(acknowledgement);
+      const naturalMemoryAcknowledgement = durableMemoryConversationOnly
+        && looksLikeHealthyDurableMemoryAcknowledgement(acknowledgement);
+      if (bareAcknowledgement || naturalMemoryAcknowledgement) {
+        durableMemoryAcknowledgementCompleted = durableMemoryConversationOnly
+          && (bareAcknowledgement || naturalMemoryAcknowledgement);
         decision = {
           summary: acknowledgement,
           reply: acknowledgement,
@@ -4257,6 +4492,21 @@ async function runConversationCore(
           reason: 'durable_work_acknowledged',
         };
       }
+    }
+    // Plain-text replies parse into a completed decision before the legacy
+    // acknowledgement recovery above, and structured providers return that
+    // shape directly. Honor the same exact receipt for either representation.
+    // The model's reply remains the model's reply: this only removes redundant
+    // private stall/completion/delivery judges after durable intake succeeded.
+    if (
+      decision?.done === true
+      && decision.nextAction === 'completed'
+      && durableMemoryConversationOnly
+      && (turnResult.toolCalls ?? 0) === 0
+      && typeof decision.reply === 'string'
+      && looksLikeHealthyDurableMemoryAcknowledgement(decision.reply)
+    ) {
+      durableMemoryAcknowledgementCompleted = true;
     }
     // Fire-and-forget dispatch handoff (live 2026-07-23): the turn queued a
     // background run (workflow_run) and replied exactly as the rubric mandates
@@ -4334,7 +4584,9 @@ async function runConversationCore(
       },
     });
 
-    const structuredStallInfo = decision && !structuredNoToolResult
+    const structuredStallInfo = decision
+      && !structuredNoToolResult
+      && !durableMemoryAcknowledgementCompleted
       ? evaluateStructuredDecisionStall({
           decision,
           toolCalls: turnResult.toolCalls ?? 0,
@@ -5122,7 +5374,17 @@ async function runConversationCore(
         && objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
         && eagerDeliverable && eagerDeliverable.trim()
       )
-        ? startGate(evaluateOutputGrounding(options.sessionId, eagerDeliverable, { kind: 'chat', deferCommit: true }))
+        ? startGate(evaluateOutputGrounding(options.sessionId, eagerDeliverable, {
+            kind: 'chat',
+            deferCommit: true,
+            sourceUserSeq: activeSourceUserSeq,
+            acceptedUserInput: options.input,
+            ...(options.taskContinuation
+              && options.taskContinuation.disposition !== 'declined'
+              && options.taskContinuation.disposition !== 'declined_with_new_task'
+              ? { parentSourceUserSeq: options.taskContinuation.parentSourceUserSeq }
+              : {}),
+          }))
         : null;
       const activeGoal = safeActiveGoal(options.sessionId);
       const goalGate = Boolean(activeGoal)
@@ -5144,6 +5406,53 @@ async function runConversationCore(
           currentExternalWriteStatus,
           acceptedExecutionEvidenceThisRequest,
         );
+      const completionResponseText = decision.reply && decision.reply.trim()
+        ? decision.reply
+        : decision.summary;
+      const multiResultObjective = objectiveMayRequireMultipleResults(objective);
+      const skillExecutionGateEnabled = (getRuntimeEnv('HARNESS_SKILL_EXEC_GATE', 'on') ?? 'on').toLowerCase() !== 'off';
+      let skillExecutionGapEvaluated = false;
+      let cachedSkillExecutionGap: ReturnType<typeof skillExecutionShortfall> = null;
+      const currentSkillExecutionGap = (): ReturnType<typeof skillExecutionShortfall> => {
+        if (!skillExecutionGateEnabled) return null;
+        if (!skillExecutionGapEvaluated) {
+          cachedSkillExecutionGap = skillExecutionShortfall(options.sessionId);
+          skillExecutionGapEvaluated = true;
+        }
+        return cachedSkillExecutionGap;
+      };
+      // A bare plural collection noun ("items", "records") used to force a
+      // second model to re-judge one already-settled connected read. Replace
+      // only that false multi-result signal with an exact-source certificate:
+      // active attempt + parented current-turn read lifecycle + authoritative
+      // untruncated output + named-field coverage. This does not publish or
+      // rewrite the provider reply, and every downstream honesty/grounding gate
+      // remains active. Promise-shaped text cannot earn the certificate.
+      const verifiedReadCompletionCandidate = !activeGoal
+        && objectiveJudgeOptIn
+        && multiResultObjective
+        && decision.nextAction === 'completed'
+        ? exactVerifiedReadCompletionCertificate({
+            sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
+            turn: turnResult.turn,
+            runAttemptId: options.runAttemptId,
+            acceptedUserInput: options.input,
+            objective,
+            reply: completionResponseText ?? '',
+            openApprovalCard: hasOpenApprovalCard(options.sessionId),
+          })
+        : null;
+      // Only a read that already passed the exact certificate pays the
+      // deterministic skill scan here. Other turns evaluate it lazily inside
+      // the judge branch, preserving the skill floor without charging casual
+      // plural conversation or an active goal-validation path.
+      const verifiedReadSkillGap = verifiedReadCompletionCandidate
+        ? currentSkillExecutionGap()
+        : null;
+      const verifiedReadCompletion = verifiedReadSkillGap
+        ? null
+        : verifiedReadCompletionCandidate;
       if (activeGoal && goalGate && freshExternalWriteVerified) {
         const goalPlan = activeGoal.approvedPlan ?? activeGoal.plan;
         const evidenceText = (decision.reply?.trim() ? decision.reply : decision.summary) ?? '';
@@ -5306,7 +5615,6 @@ async function runConversationCore(
             ? 'Note: the pinned goal could not be validated (completion judge unavailable). The goal stays pinned — say "continue" to retry, or /goal cancel to drop it.'
             : `Note: the pinned goal still has unmet criteria after ${attempt}/${maxAttempts} validation attempts: ${failures.slice(0, 3).map((f) => f.criterion).join('; ')}. The goal stays pinned — say "continue" to keep working, or /goal cancel to drop it.`;
         }
-      } else if (
       // Independent completion gate (Hermes-style): the model just declared
       // itself done. For a multi-step action objective, verify with an
       // INDEPENDENT judge before yielding — LLMs over-declare completion
@@ -5314,14 +5622,24 @@ async function runConversationCore(
       // what turns the agent back into a chatbot you have to re-prompt. If the
       // judge sees no real evidence, inject a continuation and keep working.
       // Bounded + fail-open (judge defaults to done) so it can never wedge.
-        shouldRunObjectiveJudge({
+      } else if (
+        !durableMemoryAcknowledgementCompleted
+        && shouldRunObjectiveJudge({
           optIn: objectiveJudgeOptIn,
           actionIntent: objectiveJudgeActionIntent || freshExternalWriteRequired,
           // A local mutation or bookkeeping tool cannot certify a requested
           // external write. Force the judge path until this exact request owns
           // a durable external receipt (or an accepted execution completion).
-          meaningfulToolEvidence: meaningfulToolEvidence && freshExternalWriteVerified,
-          multiResultObjective: objectiveMayRequireMultipleResults(objective),
+          // The exact certificate is itself request-bound meaningful evidence.
+          // This matters for the cold scaffold: its literal "call ... then
+          // call ..." transport instruction is conservatively action-shaped,
+          // so the generic evidence classifier refuses to credit the read.
+          // Once the certificate proves that those calls were exactly one
+          // read-only discovery plus its single settled business read, keeping
+          // meaningfulToolEvidence=false would still pay the redundant judge.
+          meaningfulToolEvidence: (meaningfulToolEvidence || Boolean(verifiedReadCompletion))
+            && freshExternalWriteVerified,
+          multiResultObjective: multiResultObjective && !verifiedReadCompletion,
           acceptedExecutionEvidence: acceptedExecutionEvidenceThisRequest,
           continuationsUsed: objectiveJudgeContinuations,
           maxContinuations: MAX_OBJECTIVE_JUDGE_CONTINUATIONS,
@@ -5364,14 +5682,16 @@ async function runConversationCore(
         // REAL user messages (harness drips filtered) so the judge audits
         // what the user actually asked for. Fail-open to the raw input.
         let judgedObjective = objective;
-        try {
-          const priorInputs = listEvents(options.sessionId, { types: ['user_input_received'] })
-            .map((ev) => String((ev.data as { text?: string } | undefined)?.text ?? ''))
-            .filter((t) => t.trim().length > 0);
-          // The current conversation's own input is the most recent entry — drop it.
-          if (priorInputs.length > 0 && priorInputs[priorInputs.length - 1] === objective) priorInputs.pop();
-          judgedObjective = composeJudgedObjective(objective, priorInputs);
-        } catch { /* fail-open: judge the raw input */ }
+        if (!parentAuthorityDeclined) {
+          try {
+            const priorInputs = listEvents(options.sessionId, { types: ['user_input_received'] })
+              .map((ev) => String((ev.data as { text?: string } | undefined)?.text ?? ''))
+              .filter((t) => t.trim().length > 0);
+            // The current conversation's own input is the most recent entry — drop it.
+            if (priorInputs.length > 0 && priorInputs[priorInputs.length - 1] === objective) priorInputs.pop();
+            judgedObjective = composeJudgedObjective(objective, priorInputs);
+          } catch { /* fail-open: judge the raw input */ }
+        }
         const rawVerdict = await objectiveJudge(judgedObjective, responseText ?? '', skillContext);
         const freshnessGap = rawVerdict.done
           && !rawVerdict.awaitingUser
@@ -5425,9 +5745,7 @@ async function runConversationCore(
         // was not executed → NOT done, regardless of the judge. Kill-switch
         // HARNESS_SKILL_EXEC_GATE=off; fail-open (null → no gate). Conservative
         // zero-ran threshold never false-bounces a partial-but-real run.
-        const skillGap = (getRuntimeEnv('HARNESS_SKILL_EXEC_GATE', 'on') ?? 'on').toLowerCase() !== 'off'
-          ? skillExecutionShortfall(options.sessionId)
-          : null;
+        const skillGap = currentSkillExecutionGap();
         // AWAITING verdict: the judge ruled the reply's question/pause IS the
         // deliverable (backstop for shapes the deterministic ask-first invariant
         // can't classify, e.g. an honest partial-progress report). Yield to the
@@ -5827,7 +6145,10 @@ async function runConversationCore(
       // verification — skip the gate so its weaker promise-shaped heuristic can't
       // override a contract-verified completion into awaiting_user_input.
       const cachedObjectiveVerdict = objectiveJudgeVerdictThisTurn;
-      const deliveryGateRan = verifyDeliveredEnabled() && !goalSatisfiedThisTurn && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn);
+      const deliveryGateRan = verifyDeliveredEnabled()
+        && !durableMemoryAcknowledgementCompleted
+        && !goalSatisfiedThisTurn
+        && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn);
       const delivery: DeliveryVerdict = terminalFreshWriteGap
         ? {
             delivered: false,
@@ -5895,7 +6216,111 @@ async function runConversationCore(
         };
       }
 
-      return finalizeStandardConversation({
+      // Terminal truth can reject an action after its provider-authored reply
+      // says "done". Repair that presentation BEFORE the synchronous durable
+      // committer, while the task's one CAS-backed grant can still produce a
+      // natural blocked response. Direct/retrieve and verified action terminals
+      // return `unchanged` without a repair model call.
+      if (isCompletedAction && activeSourceUserSeq) {
+        const activeModel = (currentAgent as unknown as { model?: string | Model } | undefined)?.model
+          ?? MODELS.primary;
+        const repaired = await repairActionTerminalBeforeCommit({
+          sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          proposedReply: userVisibleSummary,
+          port: options.terminalPresentationRepairPort
+            ?? createAgentsTerminalPresentationRepairPort({ model: activeModel }),
+        });
+        if (repaired.status !== 'unchanged') {
+          const publicPresentation = commitStandardBlockedTerminal({
+            sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
+            turn: turnResult.turn,
+            text: repaired.text,
+            legacyReason: 'verification_required',
+            metadata: {
+              steps: stepIndex,
+              blockedReason: 'authoritative_terminal_verification_incomplete',
+              terminalRepairStatus: repaired.status,
+              terminalRepairGrantId: repaired.grantId,
+              terminalMissing: repaired.missing,
+            },
+          });
+          return {
+            sessionId: options.sessionId,
+            status: 'awaiting_user_input',
+            steps: stepIndex,
+            lastDecision: decision,
+            lastTurn,
+            publicPresentation,
+          };
+        }
+      }
+
+      let terminalVerifiedReadReceipt = verifiedReadCompletion && isCompletedAction
+        ? exactVerifiedReadCompletionCertificate({
+            sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
+            turn: turnResult.turn,
+            runAttemptId: options.runAttemptId,
+            acceptedUserInput: options.input,
+            objective,
+            reply: userVisibleSummary,
+            openApprovalCard: hasOpenApprovalCard(options.sessionId),
+          })
+        : null;
+      if (verifiedReadCompletion && isCompletedAction && !terminalVerifiedReadReceipt) {
+        // A downstream honesty gate may legitimately qualify the draft. Once
+        // those bytes differ, the early exact certificate no longer owns the
+        // terminal. Route that rare shape through the ordinary judge before
+        // publishing instead of leaving a receiptless optimized completion.
+        const lateVerdict = await objectiveJudge(objective, userVisibleSummary, {
+          skills: gatherSessionSkills(options.sessionId),
+          toolCallSummary: summarizeToolCallsForJudge(options.sessionId),
+        });
+        recordVerdictEvent(options.sessionId, turnResult.turn, {
+          door: 'completion',
+          pass: lateVerdict.done,
+          reason: lateVerdict.reason,
+          failedOpen: lateVerdict.failedOpen,
+          selfJudge: lateVerdict.selfJudge,
+          detail: { fallback: 'verified_read_terminal_changed' },
+        });
+        if (!lateVerdict.done || lateVerdict.awaitingUser) {
+          objectiveJudgeContinuations += 1;
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'heartbeat',
+            data: {
+              kind: 'progress_check_in',
+              steps: stepIndex,
+              message: 'The final read presentation changed after verification; ordinary completion review kept working.',
+              objectiveJudge: {
+                attempt: objectiveJudgeContinuations,
+                reason: lateVerdict.reason,
+                fallback: 'verified_read_terminal_changed',
+              },
+            },
+          });
+          nextInput = [
+            `Your final presentation changed after the read evidence was verified, and completion review found it is not yet safe to publish: ${lateVerdict.reason}`,
+            `ORIGINAL USER OBJECTIVE (immutable): ${objective.slice(0, 4000)}`,
+            'Finish within the original read-only boundaries and report the exact current fields in your own natural voice.',
+          ].join(' ');
+          continue;
+        }
+        if (lateVerdict.failedOpen || lateVerdict.selfJudge) {
+          completionVerification = {
+            failedOpen: lateVerdict.failedOpen,
+            selfJudge: lateVerdict.selfJudge,
+          };
+        }
+        terminalVerifiedReadReceipt = null;
+      }
+
+      const finalized = finalizeStandardConversation({
         sessionId: options.sessionId,
         sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
@@ -5926,7 +6351,11 @@ async function runConversationCore(
           lastDecision: decision,
           lastTurn,
         },
+        ...(terminalVerifiedReadReceipt
+          ? { verifiedReadCompletionReceipt: terminalVerifiedReadReceipt }
+          : {}),
       });
+      return finalized;
     }
 
     if (decision.nextAction === 'awaiting_user_input') {
@@ -6479,7 +6908,14 @@ function modelStreamStallRetries(): number {
 /** Typed marker for a stalled model stream so the runner can distinguish a
  *  retryable pre-content stall from a real failure. */
 class ModelStreamStalledError extends Error {
-  constructor(public readonly seconds: number, public readonly preContent: boolean) {
+  constructor(
+    public readonly seconds: number,
+    public readonly preContent: boolean,
+    /** A paid non-streaming provider request was still owned by the adapter at
+     * timeout. Transport abort is best-effort and does not prove billing stopped,
+     * so this physical attempt must never be replayed automatically in parallel. */
+    public readonly bufferedProviderRequestInFlight = false,
+  ) {
     // User-facing message: name the REAL cause (the model provider/brain didn't
     // respond), not internal stream-watchdog env-var jargon. A pre-content hang
     // (no first byte) is almost always the provider being overloaded or a
@@ -6585,33 +7021,6 @@ function safeStageCheckin(
   } catch { /* check-in is best-effort */ }
 }
 
-function renderGoalContextBlock(goal: PlanProposal): string {
-  const plan = goal.approvedPlan ?? goal.plan;
-  const ledger = (goal.progressLedger ?? []).slice(-8);
-  // Staged goals show ONLY the current milestone's criteria (the model works
-  // one stage at a time) plus a "stage X/N" header; unstaged goals show the
-  // full criteria exactly as before.
-  const stages = goal.stages ?? [];
-  const currentStage = getCurrentGoalStage(goal);
-  const doneCount = stages.filter((s) => s.status === 'done').length;
-  const shownCriteria = (
-    currentStage ? currentStage.criteria : (plan.successCriteria ?? [])
-  ).map((c) => c.trim()).filter(Boolean);
-  const stageHeader = currentStage
-    ? `Current stage ${doneCount + 1}/${stages.length}: ${currentStage.title}`
-    : '';
-  const criteriaLabel = currentStage ? 'Success criteria for THIS stage' : 'Success criteria';
-  return [
-    '[ACTIVE GOAL — parked outside this conversation. Completion is validated EXTERNALLY against the criteria below; declaring done triggers that validation, it does not decide it.]',
-    `Objective: ${plan.objective}`,
-    stageHeader,
-    shownCriteria.length > 0 ? `${criteriaLabel}:\n${shownCriteria.map((c, i) => `${i + 1}. ${c}`).join('\n')}` : '',
-    ledger.length > 0 ? `Progress so far:\n${ledger.map((l) => `- ${l}`).join('\n')}` : '',
-    `Validation attempts used: ${goal.attempt ?? 0}/${goal.maxAttempts ?? GOAL_DEFAULT_MAX_ATTEMPTS}.`,
-    'If a criterion is genuinely impossible, say so explicitly with the concrete reason instead of declaring done without it.',
-  ].filter(Boolean).join('\n');
-}
-
 /**
  * Build the complexity-classification input for a self-continuation turn from
  * the parked goal: the objective plus the criteria she is CURRENTLY working
@@ -6669,6 +7078,25 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     sourceUserSeq = listEvents(options.sessionId, { types: ['user_input_received'] }).at(-1)?.seq;
   }
 
+  // Every accepted loop task gets a durable default discovery policy before
+  // any provider can call a tool. The capability resolver later in preflight
+  // may monotonically tighten this from novel (one broad lookup) to known
+  // (zero broad lookups). Constrained workflow nodes intentionally skip that
+  // resolver, so this baseline also prevents their discovery seam from failing
+  // merely because no chat-oriented context packet ran.
+  if (Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0) {
+    try {
+      discoveryGovernor.initializeTask({
+        sessionId: options.sessionId,
+        sourceUserSeq: sourceUserSeq as number,
+        knownCapability: false,
+      });
+    } catch {
+      // Legacy/render-only fixtures may not own an accepted source row. The
+      // live boundary still fails closed if such a caller attempts discovery.
+    }
+  }
+
   // Memory writeback. The harness path was previously missing this —
   // every user message went into the conversation log but no durable
   // facts or profile patches were extracted. The recall side (loaded
@@ -6697,11 +7125,35 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   if (shouldCapture) {
     queueMicrotask(() => {
       try {
+        const captureMessage = options.taskContinuation?.disposition === 'declined_with_new_task'
+          ? options.taskContinuation.activeTaskInput
+            ?? options.authoritativeUserInput
+            ?? options.input
+          : options.authoritativeUserInput ?? options.input;
         const captured = captureInteractionSignals({
-          message: options.authoritativeUserInput ?? options.input,
+          // A dual-clause continuation keeps the full accepted sentence in the
+          // transcript, while memory admission sees only the independent fresh
+          // clause. The cancelled parent must not be re-learned merely because
+          // its noun appears in the user's natural decline.
+          message: captureMessage,
           sessionId: options.sessionId,
-          sourceEventId: `turn:${turn}`,
+          // Durable memory identity follows the exact accepted user source,
+          // not this physical loop turn. A whole-turn retry/fallover can run
+          // the same source at a later turn number; source ownership must make
+          // that re-drive an idempotent intake replay. Legacy source-less
+          // callers retain the prior stable physical-turn fallback.
+          sourceEventId: Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+            ? `user-source:${sourceUserSeq}`
+            : `turn:${turn}`,
         });
+        const queuedCandidateCount = captured.queuedCandidateIds?.length ?? 0;
+        const hostCompletion = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+          ? prepareDurableMemoryIntakeHostCompletion({
+              sessionId: options.sessionId,
+              sourceUserSeq: Number(sourceUserSeq),
+            })
+          : { status: 'missing' as const, reason: 'accepted source identity is unavailable' };
+        const conversationOnly = hostCompletion.status === 'redeemed';
         if (captured.candidates.length > 0 || captured.profilePatch) {
           safeAppend({
             sessionId: options.sessionId,
@@ -6710,10 +7162,15 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
             type: 'memory_signals_captured',
             data: {
               factCount: captured.candidates.length,
-              queuedCandidateCount: captured.queuedCandidateIds?.length ?? 0,
+              queuedCandidateCount,
               episodeId: captured.episodeId ?? null,
               profilePatch: captured.profilePatch ?? null,
               reasons: captured.candidates.map((c) => c.reason),
+              sourceUserSeq: sourceUserSeq ?? null,
+              conversationOnly,
+              hostReceiptId: hostCompletion.status === 'redeemed'
+                ? hostCompletion.receiptId
+                : null,
             },
           });
         }
@@ -6776,7 +7233,15 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const syntheticRetryOriginalInput = isSyntheticStallRetryInput(options.input)
     ? latestHumanInputForStallRetry(options.sessionId)
     : undefined;
-  let semanticInput = syntheticRetryOriginalInput ?? options.authoritativeUserInput ?? options.input;
+  const declinedContinuation = options.taskContinuation?.disposition === 'declined';
+  const declinedParentWithNewTask =
+    options.taskContinuation?.disposition === 'declined_with_new_task';
+  let semanticInput = declinedContinuation
+    ? options.taskContinuation!.answer
+    : (options.semanticTaskInput
+      ?? syntheticRetryOriginalInput
+      ?? options.authoritativeUserInput
+      ?? options.input);
   // On a self-continuation the input is the canned nudge, so the memory primer
   // and tool-recall breadcrumbs were querying "Continue with the next step of
   // your plan…" on nearly EVERY step of a long unattended run — boilerplate
@@ -6802,14 +7267,33 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // turn's first token (live 2026-07-03: 9.9s pre-brain on a greeting, 3.8s on
   // the next ask, both from embed fetch timeouts while the primer had already
   // fallen back). primeTurnRecallVector never rejects; the catch is belt.
-  void primeTurnRecallVector(semanticInput).catch(() => {});
-  const assemblyPromise = Promise.race([
-    buildTurnMemoryPrimer(semanticInput, options.sessionId),
-    new Promise<null>((resolve) => {
-      const t = setTimeout(() => resolve(null), 15_000);
-      (t as unknown as { unref?: () => void }).unref?.();
-    }),
-  ]);
+  // An explicit request-local no-memory boundary skips both the visible query
+  // primer and its otherwise hidden embedding warm-up. The surrounding stable
+  // policy context remains untouched, including pinned safety constraints.
+  // MOVED TO THE GRAPH (Clem 4, context interior slice): the spine's
+  // context_resolve node owns this warm and has already fired it upstream of
+  // capability construction. Skipping here is what makes the node a MOVE
+  // rather than an addition — two warms would double the embed for one turn.
+  if (!options.contextWarmedAtNode
+    && !declinedContinuation
+    && !explicitlyOptsOutOfAutomaticMemoryRecall(semanticInput)) {
+    void primeTurnRecallVector(semanticInput).catch(() => {});
+  }
+  const assemblyPromise: Promise<TurnMemoryPrimer | null> = declinedContinuation
+    ? Promise.resolve({
+        enabled: true,
+        query: semanticInput.replace(/\s+/g, ' ').trim(),
+        hitCount: 0,
+        injectedBytes: 0,
+        skippedReason: 'declined_continuation',
+      })
+    : Promise.race([
+        buildTurnMemoryPrimer(semanticInput, options.sessionId),
+        new Promise<null>((resolve) => {
+          const t = setTimeout(() => resolve(null), 15_000);
+          (t as unknown as { unref?: () => void }).unref?.();
+        }),
+      ]);
   // Both arms are internally guarded and cannot reject today, but launching the
   // promise here (rather than at the await site) opens a window — the compaction
   // span below — where a rejection would have no attached handler and surface as
@@ -7134,12 +7618,26 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   }
   const canonicalContext = buildCanonicalContextPack({
     input: classifierInput,
+    // A harness-generated retry is not a new authority source. Reuse the exact
+    // human ask it is retrying; ordinary typed continuations still use literal
+    // B through authoritativeUserInput/options.input.
+    authorityInput: declinedContinuation
+      ? options.taskContinuation!.answer
+      : declinedParentWithNewTask
+        ? options.taskContinuation!.activeTaskInput ?? semanticInput
+      : (options.authoritativeUserInput
+        ?? syntheticRetryOriginalInput
+        ?? options.input),
     sessionId: options.sessionId,
     sessionKind: session.sessionRow.kind,
     // The confirm beat only ever evaluates a REAL user message: synthetic
     // continuation nudges (classified against the goal objective above) and
     // stall-retry boilerplate must not trip it mid-run (turn-control review).
-    suppressConfirmBeat: options.input === CONTINUATION_INPUT || Boolean(syntheticRetryOriginalInput),
+    suppressConfirmBeat: options.input === CONTINUATION_INPUT
+      || Boolean(syntheticRetryOriginalInput)
+      || Boolean(options.semanticTaskInput),
+    suppressSemanticEnrichment: declinedContinuation,
+    declinedParentWithNewTask,
     sourceUserSeq,
     memory: {
       enabled: turnMemoryPrimer.enabled,
@@ -7158,6 +7656,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   let opennessBlock = '';
   if (
     session.sessionRow.kind === 'chat'
+    && !declinedContinuation
     && turnOpennessEnabled()
     // Either signal suffices — see the Claude lane for the live miss this
     // fixes. A consequential turn with no proven capability history is the
@@ -7205,6 +7704,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     type: 'agent_context_packet',
     data: {
       inputPreview: contextPacket.inputPreview,
+      semanticEnrichmentSkippedReason: contextPacket.semanticEnrichmentSkippedReason,
       complexity: contextPacket.complexity,
       memory: contextPacket.memory,
       prospective: contextPacket.prospective,
@@ -7252,7 +7752,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // the SDK will invoke just before the LLM call. It appends transient
   // model-only context that should NOT persist into session history:
   // (1) a per-turn memory primer from local FTS/hybrid recall, and
-  // (2) retry context for infra-error recovery. Honors
+  // (2) retry context for infra-error recovery. The active goal now rides in
+  // the canonical volatile active-task block assembled by harnessInstructions,
+  // so injecting it here as well would show Codex/BYO two competing copies.
+  // Honors
   // CLEMMY_TURN_MEMORY_PRIMER=off and CLEMMY_RETRY_CONTEXT_INJECT=off.
   let inFlightCompactionReported = false;
   const toolPromptComponents = estimateAgentToolPromptComponents(options.agent);
@@ -7278,7 +7781,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // Observation only — this reads what is already being sent.
       recordPromptComposition(options.sessionId, 'codex', summarizePromptComposition({
         instructions: value.instructions ?? '',
-        contextPacket: contextPacket.text,
+        contextPacket: [contextPacket.text, opennessBlock, options.continuationSteer]
+          .filter(Boolean).join('\n\n'),
         currentMessage: typeof options.input === 'string' ? options.input : '',
       }), sourceUserSeq);
       return value;
@@ -7341,7 +7845,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         ...toolPromptComponents,
       };
 
-      const contextPacketText = [contextPacket.text, opennessBlock].filter(Boolean).join('\n\n');
+      const contextPacketText = [contextPacket.text, opennessBlock, options.continuationSteer]
+        .filter(Boolean).join('\n\n');
       if (contextPacketText) {
         promptComponents.contextPacket = estimateTokens(contextPacketText);
         modelData = {
@@ -7359,21 +7864,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           input: [
             ...modelData.input,
             { role: 'system', content: turnMemoryPrimer.text } as AgentInputItem,
-          ],
-          instructions: modelData.instructions,
-        };
-      }
-
-      // Goal contract: the parked goal block rides with the model-only
-      // transient context (like the memory primer — never persisted into
-      // session history, re-rendered fresh from the store each turn).
-      if (activeGoalForTurn) {
-        const goalContext = renderGoalContextBlock(activeGoalForTurn);
-        promptComponents.goal = estimateTokens(goalContext);
-        modelData = {
-          input: [
-            ...modelData.input,
-            { role: 'system', content: goalContext } as AgentInputItem,
           ],
           instructions: modelData.instructions,
         };
@@ -7528,6 +8018,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         );
         harnessCtx = {
           sessionId: options.sessionId,
+          turn,
           counter: toolCounter,
           sourceUserSeq,
           ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
@@ -7607,7 +8098,12 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     runPostTurnHooks({
       sessionId: options.sessionId,
       turn,
-      userInput: options.authoritativeUserInput ?? options.input,
+      userInput: options.taskContinuation?.disposition === 'declined_with_new_task'
+        ? options.taskContinuation.activeTaskInput
+          ?? options.semanticTaskInput
+          ?? options.authoritativeUserInput
+          ?? options.input
+        : options.authoritativeUserInput ?? options.input,
       recallIds: [turnMemoryPrimer.recallId, ...(harnessCtx?.turnRecallRunIds ?? [])],
       turnStartedAt: turnStartedAtIso,
       replyText: typeof outcome.finalOutput === 'string'
@@ -7641,6 +8137,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     return handleRunError(options.sessionId, turn, session, err, {
       deferInfraAsk: options.deferInfraAsk,
       sourceUserSeq,
+      runAttemptId: options.runAttemptId,
     });
   } finally {
     detachLogHooks();
@@ -8066,6 +8563,7 @@ export async function resumePendingApproval(
         if (useToolWrapper) {
           resumeCtx = {
             sessionId: options.sessionId,
+            turn,
             counter: toolCounter,
             ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
             ...(resumeAgentScopeBinding.bound ? { mcpToolScope: resumeAgentScopeBinding.scope } : {}),
@@ -8178,7 +8676,10 @@ export async function resumePendingApproval(
       toolCalls: toolCounter.currentCount,
     };
   } catch (err) {
-    return handleRunError(options.sessionId, turn, session, err, { sourceUserSeq: resumeSourceUserSeq });
+    return handleRunError(options.sessionId, turn, session, err, {
+      sourceUserSeq: resumeSourceUserSeq,
+      runAttemptId: options.runAttemptId,
+    });
   } finally {
     detachLogHooks();
     (runner as unknown as RunHooksLike).off(
@@ -8239,7 +8740,7 @@ export async function runConversationFromResume(opts: {
 }): Promise<RunConversationResult> {
   const sourceUserSeq = acceptResumeConversationInput(opts);
   const acceptedSource = acceptedUserEvent(opts.sessionId, sourceUserSeq);
-  recordTurnGraphShadow({
+  const graphEvent = recordTurnGraphShadow({
     identity: {
       sessionId: opts.sessionId,
       turn: acceptedSource.turn,
@@ -8247,7 +8748,15 @@ export async function runConversationFromResume(opts: {
     },
     surface: 'approval_resume',
   });
+  const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
   let foregroundReleased = false;
+  return withModelUsageAttribution(
+    {
+      sessionId: opts.sessionId,
+      sourceUserSeq,
+      ...(opts.runAttemptId ? { attemptId: opts.runAttemptId } : {}),
+    },
+    async () => {
   try {
     // G5b: the resume family rides the same executor-driven spine as fresh
     // turns — an approval resume was the one chat entry still running the
@@ -8263,6 +8772,7 @@ export async function runConversationFromResume(opts: {
       input: `approval ${opts.decision}`,
       surface: 'approval_resume',
       policy: getProactivityPolicySnapshot(),
+      ...(acceptedTurnGraph ? { graph: acceptedTurnGraph } : {}),
       phases: {
         runCore: async () => {
           const result = await runConversationFromResumeCore({ ...opts, sourceUserSeq });
@@ -8305,6 +8815,8 @@ export async function runConversationFromResume(opts: {
       clearRunInFlightAfterTerminal(opts.sessionId, opts.runAttemptId, sourceUserSeq);
     }
   }
+    },
+  );
 }
 
 async function runConversationFromResumeCore(opts: {
@@ -9198,10 +9710,42 @@ function decideInfraRecovery(sessionId: string): InfraRecoveryDecision {
   return countInfraAutoRecover(sessionId) < ATTENDED_QUIET_RETRY_BUDGET ? 'auto_retry' : 'ask';
 }
 
-/** The self-heal directive fed back into the loop — synthesizes what a human
- *  typing "Retry" produces (re-issue the failed call via retry_context). Works
- *  for both lanes: an attended quiet-retry and an unattended auto-recovery. */
-function buildInfraRetryDirective(kind: string): string {
+function resolveInfraSettledReadRecovery(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  runAttemptId?: string;
+  failedTurn: number;
+}): SettledReadInfraRecovery | null {
+  if (!settledReadRepeatEnabled()
+    || !Number.isSafeInteger(input.sourceUserSeq)
+    || Number(input.sourceUserSeq) <= 0
+    || !input.runAttemptId?.trim()) return null;
+  return resolveSettledReadForInfraRecovery({
+    sessionId: input.sessionId,
+    sourceUserSeq: Number(input.sourceUserSeq),
+    runAttemptId: input.runAttemptId,
+    failedTurn: input.failedTurn,
+  });
+}
+
+/** The self-heal directive fed back into the loop. When an exact connected read
+ * already settled before the model boundary failed, the replacement turn owns
+ * composition only: repeating the provider call would discard durable work. */
+function buildInfraRetryDirective(
+  kind: string,
+  settledRead?: SettledReadInfraRecovery | null,
+): string {
+  if (settledRead) {
+    return [
+      `The previous model step hit a transient backend error (${kind}) after the exact connected read below had already completed for this same accepted request.`,
+      'Do not call another tool or repeat this read. Use the recovered durable result below and reply to the user now in a natural, conversational way that answers their request. Do not mention the recovery unless it materially affects the answer.',
+      `Recovered tool: ${settledRead.toolSlug}`,
+      `Recovered call_id: ${settledRead.sourceCallId}`,
+      '[RECOVERED SETTLED READ]',
+      settledRead.output,
+      '[/RECOVERED SETTLED READ]',
+    ].join('\n');
+  }
   return [
     `The previous step hit a transient backend error (${kind}). Recover automatically — retry the SAME failed call now.`,
     'Re-issue it exactly as before, using your retry_context (the last tool_called before the error). Do NOT ask the user, do NOT restart from the plan top, do NOT switch objective.',
@@ -9540,7 +10084,7 @@ function handleRunError(
   turn: number,
   session: HarnessSession,
   err: unknown,
-  opts: { deferInfraAsk?: boolean; sourceUserSeq?: number } = {},
+  opts: { deferInfraAsk?: boolean; sourceUserSeq?: number; runAttemptId?: string } = {},
 ): RunTurnResult {
   // A kill that lands while a tool call is in flight throws KillRequested
   // INSIDE the SDK's tool execution, and the SDK re-wraps it as a plain
@@ -9695,7 +10239,13 @@ function handleRunError(
     const infraDecision = decideInfraRecovery(sessionId);
     if (infraDecision === 'auto_retry') {
       bumpTurnNumber(sessionId, turn);
-      return { sessionId, turn, status: 'failed', error: normalizeError(err), infraAutoRetry: { kind: 'tool.timeout', directive: buildInfraRetryDirective('tool.timeout') } };
+      const settledRead = resolveInfraSettledReadRecovery({
+        sessionId,
+        sourceUserSeq: opts.sourceUserSeq,
+        runAttemptId: opts.runAttemptId,
+        failedTurn: turn,
+      });
+      return { sessionId, turn, status: 'failed', error: normalizeError(err), infraAutoRetry: { kind: 'tool.timeout', directive: buildInfraRetryDirective('tool.timeout', settledRead) } };
     }
     recordOrphanedToolInFlight(sessionId, turn);
     if (infraDecision === 'exhausted') {
@@ -9803,7 +10353,13 @@ function handleRunError(
       const infraDecision = decideInfraRecovery(sessionId);
       if (infraDecision === 'auto_retry') {
         bumpTurnNumber(sessionId, turn);
-        return { sessionId, turn, status: 'failed', error: message, infraAutoRetry: { kind: err.kind, directive: buildInfraRetryDirective(err.kind) } };
+        const settledRead = resolveInfraSettledReadRecovery({
+          sessionId,
+          sourceUserSeq: opts.sourceUserSeq,
+          runAttemptId: opts.runAttemptId,
+          failedTurn: turn,
+        });
+        return { sessionId, turn, status: 'failed', error: message, infraAutoRetry: { kind: err.kind, directive: buildInfraRetryDirective(err.kind, settledRead) } };
       }
       // The turn is ENDING (ask/exhausted) — register any tool still in flight so
       // its eventual result is reunified into a report turn (never orphaned).
@@ -10132,6 +10688,25 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     : undefined;
   for (let attempt = 0; ; attempt += 1) {
     activeAttempt = attempt;
+    // StreamedRunResult exposes no public cancellation method. Give every
+    // physical Runner attempt its own signal and link it to the caller so the
+    // watchdog/kill boundary can actually abort the model request passed to
+    // provider adapters instead of only abandoning local iteration.
+    const attemptAbortController = new AbortController();
+    const callerSignal = (opts as unknown as { signal?: AbortSignal } | undefined)?.signal;
+    const abortFromCaller = (): void => {
+      if (!attemptAbortController.signal.aborted) {
+        attemptAbortController.abort(callerSignal?.reason);
+      }
+    };
+    if (callerSignal?.aborted) abortFromCaller();
+    else callerSignal?.addEventListener('abort', abortFromCaller, { once: true });
+    const cleanupAttemptAbortLink = (): void => {
+      callerSignal?.removeEventListener('abort', abortFromCaller);
+    };
+    const abortPhysicalAttempt = (): void => {
+      if (!attemptAbortController.signal.aborted) attemptAbortController.abort();
+    };
     const dispatchLease: DispatchLeaseRef | undefined =
       parentHarnessContext && runnerDispatchScopeId && getSession(parentHarnessContext.sessionId)
         ? activateDispatchLease({
@@ -10150,11 +10725,21 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
       result = physicalAttemptContext
         ? await withHarnessRunContext(
             physicalAttemptContext,
-            () => run(agent, items, { ...opts, stream: true }),
+            () => run(agent, items, {
+              ...opts,
+              stream: true,
+              signal: attemptAbortController.signal,
+            }),
           )
-        : await run(agent, items, { ...opts, stream: true });
+        : await run(agent, items, {
+            ...opts,
+            stream: true,
+            signal: attemptAbortController.signal,
+          });
     } catch (err) {
       await revokeDispatchLeaseBeforeRecovery(dispatchLease);
+      abortPhysicalAttempt();
+      cleanupAttemptAbortLink();
       throw err;
     }
     const myResult = result;
@@ -10209,7 +10794,22 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
       if (!iterable || streamMs <= 0) return; // mocks / kill-switch: no watchdog
       const tickMs = Math.min(15_000, Math.max(250, Math.floor(Math.min(firstByteMs, streamMs) / 4)));
       stallTimer = setInterval(() => {
-        const win = yieldedContent ? streamMs : firstByteMs;
+        const activeBufferedProviderRequests = [
+          ...(physicalAttemptContext?.bufferedProviderRequests ?? []),
+        ].filter((request) => request.active);
+        const bufferedProviderRequestInFlight = !yieldedContent
+          && activeBufferedProviderRequests.length > 0;
+        const oldestBufferedProviderRequestAt = bufferedProviderRequestInFlight
+          ? Math.min(...activeBufferedProviderRequests.map((request) => request.startedAt))
+          : 0;
+        // A BYO compatibility request produces no Runner events until its full
+        // completion has been buffered. Give that paid request the same finite
+        // deadline as an active stream instead of the first-byte deadline. This
+        // prevents a healthy slow completion from overlapping an automatic
+        // second paid call while preserving a hard stop on genuine silence.
+        const win = yieldedContent || bufferedProviderRequestInFlight
+          ? streamMs
+          : firstByteMs;
         // The fallback boundary buffers provider-private reasoning until an
         // actionable text/tool item appears, so those raw frames cannot safely
         // enter Runner history and then be replayed on another brain. It records
@@ -10220,17 +10820,27 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
           physicalAttemptContext?.privateModelActivityAt
           ?? harnessRunContextStorage.getStore()?.privateModelActivityAt
           ?? 0;
-        const observedActivityAt = Math.max(lastEventAt, privateActivityAt);
+        const observedActivityAt = Math.max(
+          lastEventAt,
+          privateActivityAt,
+          oldestBufferedProviderRequestAt,
+        );
         if (Date.now() - observedActivityAt > win) {
           if (stallTimer) clearInterval(stallTimer);
           // Revoke authority BEFORE transport cancellation or recovery. A late
           // cancel callback/tool frame can now only observe the stale lease.
           void revokeDispatchLeaseBeforeRecovery(dispatchLease).then(
             () => {
-              // Best-effort: release the underlying stream so the dangling
-              // request doesn't pin sockets after we abandon the turn.
-              try { (myResult as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
-              reject(new ModelStreamStalledError(Math.round(win / 1000), !yieldedContent));
+              // This is the real Runner/provider cancellation path. The
+              // installed SDK has no StreamedRunResult.cancel(); aborting the
+              // exact signal passed into runner.run propagates to the adapter's
+              // requestOptions.signal and prevents an abort-time wire fallback.
+              abortPhysicalAttempt();
+              reject(new ModelStreamStalledError(
+                Math.round(win / 1000),
+                !yieldedContent,
+                bufferedProviderRequestInFlight,
+              ));
             },
             reject,
           );
@@ -10261,7 +10871,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
             if (killTimer) clearInterval(killTimer);
             void revokeDispatchLeaseBeforeRecovery(dispatchLease).then(
               () => {
-                try { (myResult as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
+                abortPhysicalAttempt();
                 reject(new KillRequested(killSessionId));
               },
               reject,
@@ -10277,15 +10887,23 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     try {
       await Promise.race([drain, watchdog, killWatch]);
       await revokeDispatchLeaseBeforeRecovery(dispatchLease);
+      cleanupAttemptAbortLink();
       recoveryStreamText = attemptStreamText;
       break; // turn drained successfully
     } catch (err) {
       // Exact-generation revoke is idempotent. It must finish before any retry
       // can acquire the next generation.
       await revokeDispatchLeaseBeforeRecovery(dispatchLease);
+      abortPhysicalAttempt();
+      cleanupAttemptAbortLink();
       // A pre-content stall is retryable: nothing streamed, so no tool ran and
       // no partial reply reached the user — re-run cleanly before giving up.
-      if (err instanceof ModelStreamStalledError && err.preContent && attempt < maxStallRetries) {
+      if (
+        err instanceof ModelStreamStalledError
+        && err.preContent
+        && !err.bufferedProviderRequestInFlight
+        && attempt < maxStallRetries
+      ) {
         const recoveryCheck = dispatchLease
           ? checkDispatchRecoveryLedger(dispatchLease.sessionId, dispatchRecoveryBaseline)
           : { safeToReplay: true as const, evidence: [] };

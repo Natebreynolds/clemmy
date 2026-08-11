@@ -47,6 +47,7 @@ export const restartResume: ScenarioDef = {
   name: 'restart-resume',
   summary: 'partial read-only swarm → real restart → same task/session resumes',
   routeExpectation: 'exact-brain',
+  workerRouteExpectation: true,
   async run(daemon: DaemonHandle) {
     const originSessionId = proofSessionId('restart-origin');
     const dispatched = await dispatchBackground(daemon, originSessionId, PROMPT);
@@ -65,6 +66,7 @@ export const restartResume: ScenarioDef = {
     await daemon.restart();
     const settled = await waitForTerminal(daemon, dispatched.taskId, 40 * 60_000);
     const task = settled.detail.task;
+    const backgroundTiming = dispatched.settlementTimer.observe(task.status, dispatched.turn.wallMs);
     const manifest = manifestFor(settled.detail, MANIFEST_ID);
     const executionCounts = workerExecutionCounts(daemon, task.runSessionId);
     const replayedSucceeded = completedBeforeRestart.filter((item) => (executionCounts.get(item) ?? 0) > 1);
@@ -139,7 +141,7 @@ export const restartResume: ScenarioDef = {
     return {
       checks,
       latency: [{
-        wallMs: dispatched.turn.wallMs,
+        wallMs: backgroundTiming.observedSettlementWallMs,
         ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null,
       }],
       sessionId: task.runSessionId,
@@ -148,6 +150,10 @@ export const restartResume: ScenarioDef = {
         resumeCount: task.resumeCount,
         restartRecovery: task.restartRecovery,
         manifest: manifest ?? null,
+        observedSettlementWallMs: backgroundTiming.observedSettlementWallMs,
+        dispatchAcknowledgementWallMs: backgroundTiming.dispatchAcknowledgementWallMs,
+        terminalStatus: backgroundTiming.terminalStatus,
+        wallMsLabel: backgroundTiming.wallMsLabel,
         toolCalls: metrics?.toolCalls,
         tokensUsed: metrics?.tokensUsed,
       },

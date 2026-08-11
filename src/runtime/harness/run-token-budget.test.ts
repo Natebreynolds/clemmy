@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 
 const {
   accrueSessionTokens,
+  appendEvent,
   createSession,
   getSession,
   getSessionTokensUsed,
@@ -30,7 +31,11 @@ const {
   resolveRunTokenCeiling,
   runTokenBudgetEnforcementEnabled,
 } = await import('./run-token-budget.js');
-const { recordModelUsage, readUsageEventsForDate } = await import('../usage-log.js');
+const {
+  recordModelUsage,
+  readUsageEventsForDate,
+  withModelUsageAttribution,
+} = await import('../usage-log.js');
 const { recordCodexHarnessUsage } = await import('./codex-model.js');
 const { harnessRunContextStorage, ToolCallsCounter } = await import('./brackets.js');
 
@@ -112,8 +117,17 @@ test('an UNDECLARED cache dialect debits conservatively — a guess never grants
 
 test('recordCodexHarnessUsage records under the ALS run session (the false-pass fix)', () => {
   const sess = freshSession();
+  const source = appendEvent({
+    sessionId: sess,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Measure this exact turn.' },
+  });
   harnessRunContextStorage.run({
     sessionId: sess,
+    sourceUserSeq: source.seq,
+    runAttemptId: 'attempt-usage-codex',
     counter: new ToolCallsCounter(100),
     promptComponents: { instructions: 2_500, toolSchemas: 1_000 },
   }, () => {
@@ -130,6 +144,87 @@ test('recordCodexHarnessUsage records under the ALS run session (the false-pass 
     toolSchemas: 1_000,
     providerAndToolOverhead: 6_500,
   });
+  assert.deepEqual(usage?.trace, {
+    acceptedSource: `${sess}:${source.seq}`,
+    logicalTurnId: `turn:${source.seq}`,
+    attemptId: 'attempt-usage-codex',
+    brain: 'codex',
+    modelCallId: 'resp-1',
+  });
+});
+
+test('turn-wide usage attribution covers post-run models and selects explicit child tuples atomically', () => {
+  const parent = freshSession();
+  const parentSource = appendEvent({
+    sessionId: parent, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Parent work.' },
+  });
+  const child = freshSession();
+  const childSource = appendEvent({
+    sessionId: child, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Child work.' },
+  });
+
+  withModelUsageAttribution({
+    sessionId: parent,
+    sourceUserSeq: parentSource.seq,
+    attemptId: 'attempt-parent',
+  }, () => {
+    // A post-Runner headless recorder may only know a provider UUID. The outer
+    // turn scope remains the accepted-source authority.
+    recordModelUsage({
+      sessionId: 'provider-session-uuid',
+      model: 'post-turn-judge',
+      cacheDialect: 'inclusive',
+      inputTokens: 10,
+      outputTokens: 1,
+      responseId: 'resp-post-turn-parent',
+    });
+    // Detached/nested work that carries its own complete tuple wins as a whole;
+    // parent session + child seq can never be synthesized.
+    recordModelUsage({
+      sessionId: child,
+      sourceUserSeq: childSource.seq,
+      attemptId: 'attempt-child',
+      model: 'child-model',
+      cacheDialect: 'inclusive',
+      inputTokens: 20,
+      outputTokens: 2,
+      responseId: 'resp-explicit-child',
+    });
+  });
+
+  const rows = readUsageEventsForDate();
+  const parentUsage = rows.find((event) => event.responseId === 'resp-post-turn-parent');
+  assert.equal(parentUsage?.source, parent);
+  assert.deepEqual(parentUsage?.trace, {
+    acceptedSource: `${parent}:${parentSource.seq}`,
+    logicalTurnId: `turn:${parentSource.seq}`,
+    attemptId: 'attempt-parent',
+    modelCallId: 'resp-post-turn-parent',
+  });
+  const childUsage = rows.find((event) => event.responseId === 'resp-explicit-child');
+  assert.equal(childUsage?.source, child);
+  assert.deepEqual(childUsage?.trace, {
+    acceptedSource: `${child}:${childSource.seq}`,
+    logicalTurnId: `turn:${childSource.seq}`,
+    attemptId: 'attempt-child',
+    modelCallId: 'resp-explicit-child',
+  });
+});
+
+test('a source sequence without a real session never mints an unknown accepted-source identity', () => {
+  recordModelUsage({
+    sessionId: 'unknown',
+    sourceUserSeq: 5,
+    model: 'unknown-source-model',
+    cacheDialect: 'none',
+    inputTokens: 1,
+    outputTokens: 1,
+    responseId: 'resp-unknown-source',
+  });
+  const usage = readUsageEventsForDate().find((event) => event.responseId === 'resp-unknown-source');
+  assert.equal(usage?.trace?.acceptedSource, undefined);
+  assert.equal(usage?.trace?.logicalTurnId, undefined);
+  assert.equal(usage?.trace?.modelCallId, 'resp-unknown-source');
 });
 
 test('sumSessionTokensUsedByPrefix sums a workflow run and escapes LIKE metacharacters', () => {

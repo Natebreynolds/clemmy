@@ -5,8 +5,20 @@ import { isExpired } from './approval-registry.js';
 import { appendEvent } from './eventlog.js';
 import { pendingActionApprovalViewFromArgs } from './pending-action-view.js';
 import { addNotification } from '../notifications.js';
-import { decideToolApproval, needsApprovalFromTaxonomy } from '../../agents/tool-taxonomy.js';
+import {
+  decideToolApproval,
+  isDestructiveExternalToolCall,
+  needsApprovalFromTaxonomy,
+} from '../../agents/tool-taxonomy.js';
 import { needsApprovalForShellSmart, needsApprovalForWriteFile } from '../../tools/computer-tools.js';
+import {
+  decodedToolArgs,
+  extractComposioSlug,
+  parseToolAuthority,
+  resolveToolInvocation,
+  toolActionSegment,
+} from '../../agents/tool-invocation.js';
+import { redactSensitiveText } from '../security.js';
 
 /** The execution trio must run the SAME per-call approval logic the Codex lane
  *  uses (smart shell deny-list, sensitive-path write checks, composio read/write
@@ -60,14 +72,95 @@ function bareToolName(toolName: string): string {
   return toolName.split('__').at(-1) ?? toolName;
 }
 
+interface ApprovalToolIdentity {
+  /** Exact durable authority. Native external tools retain `<server>__<tool>`. */
+  authority: string;
+  /** Human-friendly/local-runtime tail. Never use this as external authority. */
+  display: string;
+  nativeExternal: boolean;
+  /** `mcp__` carrier without a trustworthy `<server>__<tool>` split. */
+  malformedNative: boolean;
+}
+
+function approvalToolIdentity(toolName: string): ApprovalToolIdentity {
+  const trimmed = toolName.trim();
+  const parsed = parseToolAuthority(trimmed);
+  const display = parsed.tool || bareToolName(trimmed);
+  if (!parsed.valid) {
+    // Never collapse an unparseable native carrier onto a local fast-allow
+    // tail. Retain the whole raw identity for its card/resume authority and
+    // force a human gate below regardless of Autonomous policy.
+    return {
+      authority: parsed.authority || trimmed,
+      display: display || trimmed,
+      nativeExternal: true,
+      malformedNative: true,
+    };
+  }
+  return {
+    authority: parsed.authority,
+    display,
+    nativeExternal: parsed.external,
+    malformedNative: false,
+  };
+}
+
+const SAFE_TARGET_KEYS = [
+  'to',
+  'to_email',
+  'recipient',
+  'recipients',
+  'email',
+  'address',
+  'item_id',
+  'message_id',
+  'thread_id',
+  'event_id',
+  'file_id',
+  'resource_id',
+  'channel',
+  'channel_id',
+  'path',
+] as const;
+
+function brokerTargetDetail(args: unknown): string {
+  let obj = decodedToolArgs(args);
+  if (!obj) return '';
+  const wrapped = obj.arguments ?? obj.args ?? obj.payload ?? obj.input;
+  const nested = decodedToolArgs(wrapped);
+  if (nested) obj = nested;
+  const details: string[] = [];
+  for (const key of SAFE_TARGET_KEYS) {
+    const value = obj[key];
+    if (value === undefined || value === null) continue;
+    const rendered = Array.isArray(value)
+      ? value.filter((entry) => typeof entry === 'string' || typeof entry === 'number').slice(0, 3).join(', ')
+      : typeof value === 'string' || typeof value === 'number'
+        ? String(value)
+        : '';
+    if (!rendered) continue;
+    details.push(`${key}=${rendered.slice(0, 80)}`);
+    if (details.length >= 2) break;
+  }
+  return redactSensitiveText(details.join(' · ')).slice(0, 140);
+}
+
 function approvalSubject(tool: string, args: Record<string, unknown>): string {
+  const resolved = resolveToolInvocation(tool, args);
+  if (resolved.externalBroker) {
+    if (!resolved.valid) return `Run ${toolActionSegment(tool)} broker action?`;
+    const slug = extractComposioSlug(resolved.args);
+    const action = slug || resolved.toolName;
+    const detail = brokerTargetDetail(resolved.args);
+    return `Run ${action}${detail ? ` · ${detail}` : ''}?`.slice(0, 220);
+  }
   if (tool === 'composio_execute_tool') {
     const slug = typeof args.tool_slug === 'string' && args.tool_slug.trim() ? args.tool_slug.trim() : 'a Composio action';
     return `Run ${slug}?`;
   }
   if (tool === 'run_shell_command') {
     const cmd = typeof args.command === 'string' ? args.command : '';
-    return `Run shell: ${cmd.slice(0, 160)}`;
+    return `Run shell: ${redactSensitiveText(cmd).slice(0, 160)}`;
   }
   if (tool === 'run_batch') {
     // Same fix as the codex lane's extractApprovalSubject: never show a bare
@@ -184,8 +277,13 @@ export function workflowApprovalResumeKey(
   tool: string,
   args: Record<string, unknown>,
 ): string {
+  // Preserve the delimiter-bearing provider identity exactly. Normalizing
+  // `alpha__bc` and `alph__abc` into alphanumerics would collapse two distinct
+  // external authorities before the cryptographic hash. Bare/local names keep
+  // their historical normalization so outstanding local approvals still resume.
+  const authorityKey = tool.includes('__') ? tool.trim() : normalizeToolName(tool);
   const digest = createHash('sha256')
-    .update(canonicalJson({ sessionId, tool: normalizeToolName(tool), args }))
+    .update(canonicalJson({ sessionId, tool: authorityKey, args }))
     .digest('hex');
   return `claude-workflow-tool-v1:${digest}`;
 }
@@ -217,7 +315,9 @@ export function buildGatedToolPermission(
 ): CanUseTool {
   const fastAllow = new Set(fastAllowTools.map(normalizeToolName).filter(Boolean));
   return (async (toolName, input, options) => {
-    const bare = bareToolName(toolName);
+    const identity = approvalToolIdentity(toolName);
+    const bare = identity.display;
+    const authorityTool = identity.authority;
     // Permission is a decision boundary, not the canonical execution record.
     // The shared SDK stream emits exactly one top-level tool_called row from the
     // actual tool_use id for agentic, workflow, and allow-only lanes alike.
@@ -231,7 +331,10 @@ export function buildGatedToolPermission(
     // logic as the Codex lane: "Bash is bash" (reads auto-allow), destructive
     // shapes + CRM/SaaS writes + sensitive paths → human approval (plan-scope
     // and YOLO still auto-approve inside the shared decision path).
-    const executionApproval = EXECUTION_APPROVAL_FNS[bare];
+    // External providers cannot inherit the semantics of a same-tail local
+    // execution tool. `mcp__foreign__run_shell_command` is provider code, not
+    // Clementine's smart shell gate.
+    const executionApproval = identity.nativeExternal ? undefined : EXECUTION_APPROVAL_FNS[bare];
     if (executionApproval) {
       let needs = true;
       try {
@@ -240,18 +343,36 @@ export function buildGatedToolPermission(
       if (!needs) return { behavior: 'allow', updatedInput: args } as PermissionResult;
       // fall through to the register/surface/await flow below
     } else {
-      if (fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(bare))) {
+      // Preserve the original MCP namespace through destructive classification.
+      // `mcp__m365__sharepoint_delete_item` is a provable external delete, but
+      // its display-friendly tail `sharepoint_delete_item` is not: the shared
+      // classifier deliberately requires the MCP carrier before treating a bare
+      // name as external. Never let a read/local profile entry erase that proof.
+      const destructiveExternalCall = isDestructiveExternalToolCall(toolName, args);
+      if (
+        !destructiveExternalCall
+        && !identity.nativeExternal
+        && (fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(bare)))
+      ) {
         return { behavior: 'allow', updatedInput: args } as PermissionResult;
       }
-      const { needsApproval } = decideToolApproval({ sessionId, toolName: bare, args });
+      const needsApproval = identity.malformedNative
+        ? true
+        : decideToolApproval({
+            sessionId,
+            toolName: authorityTool,
+            args,
+            isDestructiveHint: destructiveExternalCall,
+          }).needsApproval;
       if (!needsApproval) return { behavior: 'allow', updatedInput: args } as PermissionResult;
     }
 
     let approvalId: string;
+    let resumeKey: string;
     try {
-      const subject = approvalSubject(bare, args);
+      const subject = approvalSubject(authorityTool, args);
       if (gateOptions.approvalMode === 'park') {
-        const resumeKey = workflowApprovalResumeKey(sessionId, bare, args);
+        resumeKey = workflowApprovalResumeKey(sessionId, authorityTool, args);
         const prior = approvalRegistry.claimResumableApproval(resumeKey);
         if (prior.state === 'approved') {
           // Atomic one-shot claim: this exact payload may proceed once. A later
@@ -262,7 +383,7 @@ export function buildGatedToolPermission(
           gateOptions.onApprovalBoundary?.({
             approvalId: prior.row.approvalId,
             sessionId,
-            tool: bare,
+            tool: authorityTool,
             args,
             state: 'pending',
           });
@@ -276,7 +397,7 @@ export function buildGatedToolPermission(
           gateOptions.onApprovalBoundary?.({
             approvalId: prior.row.approvalId,
             sessionId,
-            tool: bare,
+            tool: authorityTool,
             args,
             state: prior.state,
           });
@@ -309,16 +430,16 @@ export function buildGatedToolPermission(
         const registered = approvalRegistry.registerResumable({
           sessionId,
           subject,
-          tool: bare,
+          tool: authorityTool,
           args,
           resumeKey,
         });
         approvalId = registered.row.approvalId;
-        if (registered.created) surfaceApproval(sessionId, approvalId, bare, args, subject);
+        if (registered.created) surfaceApproval(sessionId, approvalId, authorityTool, args, subject);
         gateOptions.onApprovalBoundary?.({
           approvalId,
           sessionId,
-          tool: bare,
+          tool: authorityTool,
           args,
           state: 'pending',
         });
@@ -339,7 +460,7 @@ export function buildGatedToolPermission(
       // a fresh card, preserving the legacy re-ask semantics for a genuinely
       // new attempt: only registerResumable's pending-dedupe and the approved
       // one-shot claim change behavior, never the human's right to be asked.
-      const resumeKey = workflowApprovalResumeKey(sessionId, bare, args);
+      resumeKey = workflowApprovalResumeKey(sessionId, authorityTool, args);
       const prior = approvalRegistry.claimResumableApproval(resumeKey);
       if (prior.state === 'approved') {
         return { behavior: 'allow', updatedInput: args } as PermissionResult;
@@ -347,9 +468,9 @@ export function buildGatedToolPermission(
       if (prior.state === 'pending') {
         approvalId = prior.row.approvalId;
       } else {
-        const registered = approvalRegistry.registerResumable({ sessionId, subject, tool: bare, args, resumeKey });
+        const registered = approvalRegistry.registerResumable({ sessionId, subject, tool: authorityTool, args, resumeKey });
         approvalId = registered.row.approvalId;
-        if (registered.created) surfaceApproval(sessionId, approvalId, bare, args, subject);
+        if (registered.created) surfaceApproval(sessionId, approvalId, authorityTool, args, subject);
       }
     } catch (err) {
       return {
@@ -360,7 +481,30 @@ export function buildGatedToolPermission(
     }
 
     const decision = await awaitApproval(approvalId, options?.signal, approvalWaitParkMs());
-    if (decision === 'approved') return { behavior: 'allow', updatedInput: args } as PermissionResult;
+    if (decision === 'approved') {
+      try {
+        // `resolve(..., approved)` records the human decision; it does not spend
+        // its execution authority. Claim the exact row atomically before this
+        // live call proceeds, just as the park/resume path does on re-entry.
+        const claimed = approvalRegistry.claimResumableApproval(resumeKey, approvalId);
+        if (claimed.state === 'approved') {
+          return { behavior: 'allow', updatedInput: args } as PermissionResult;
+        }
+        return {
+          behavior: 'deny',
+          message: claimed.state === 'consumed'
+            ? 'This approval was already used by an identical action, so this duplicate was not run.'
+            : 'The approval could not be claimed for this exact action, so it was not run.',
+          interrupt: false,
+        } as PermissionResult;
+      } catch (err) {
+        return {
+          behavior: 'deny',
+          message: `Could not claim approval for ${bare}: ${err instanceof Error ? err.message : String(err)}`,
+          interrupt: false,
+        } as PermissionResult;
+      }
+    }
     if (decision === 'park_timeout') {
       // Fail-closed park: durable marker so chat-approval-resume can re-drive
       // this session when the card is approved later; the card itself stays
@@ -371,7 +515,7 @@ export function buildGatedToolPermission(
           turn: 0,
           role: 'system',
           type: 'approval_parked',
-          data: { approvalId, tool: bare, subject: approvalSubject(bare, args) },
+          data: { approvalId, tool: authorityTool, subject: approvalSubject(authorityTool, args) },
         });
       } catch { /* the marker is best-effort; the deny below is still honest */ }
       return {

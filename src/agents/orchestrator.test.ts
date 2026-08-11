@@ -48,6 +48,8 @@ const { TOOL_JIT_CORE } = await import('./tool-jit.js');
 const { RunContext, Usage } = await import('@openai/agents');
 const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
 const { summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
+const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
+const { boundAgentCapabilityEnvelope, boundAgentCapabilityRevision } = await import('./capability-envelope.js');
 const {
   markByoModelNotServed,
   clearByoNotServedForTest,
@@ -199,6 +201,48 @@ test('Orchestrator carries the harness guardrails', async () => {
   );
   assert.equal(inputNames.length, 0);
   assert.ok(outputNames.includes('secret_leak'));
+});
+
+test('production call_tool admits a deferred built-in against the orchestrator sealed universe before dispatch', async () => {
+  const session = createSession({ kind: 'chat', channel: 'test' });
+  let dispatches = 0;
+  _setCodeModeToolsForTests(new Map([['desktop_status', {
+    name: 'desktop_status',
+    invoke: async () => {
+      dispatches += 1;
+      return 'desktop-ok';
+    },
+  }]]));
+  try {
+    const agent = await buildOrchestratorAgent({
+      sessionId: session.id,
+      allowToolJit: true,
+      userInput: 'prove the sealed capability boundary',
+    });
+    const envelope = boundAgentCapabilityEnvelope(agent);
+    const before = boundAgentCapabilityRevision(agent);
+    assert.ok(envelope, 'production agent did not bind a sealed capability universe');
+    assert.ok(before, 'production agent did not bind an active capability revision');
+    assert.ok(envelope!.capabilities.some((capability) => capability.name === 'desktop_status'));
+    assert.equal(before!.bound.includes('desktop_status'), false, 'fixture must exercise a deferred capability');
+
+    const callTool = (agent.tools ?? []).find((toolRef) => (toolRef as { name?: string }).name === 'call_tool') as unknown as {
+      invoke: (context: unknown, input: string, details: unknown) => Promise<unknown>;
+    } | undefined;
+    assert.ok(callTool, 'schema-on-demand production surface omitted call_tool');
+    const output = await callTool!.invoke(
+      { context: { sessionId: session.id } },
+      JSON.stringify({ name: 'desktop_status', args_json: '{}' }),
+      { toolCall: { callId: 'orchestrator-capability-admission' } },
+    );
+    assert.equal(String(output), 'desktop-ok');
+    assert.equal(dispatches, 1, 'admitted production call dispatched more or less than once');
+    const after = boundAgentCapabilityRevision(agent)!;
+    assert.equal(after.revision, before!.revision + 1);
+    assert.deepEqual([...after.bound], [...before!.bound, 'desktop_status']);
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
 });
 
 test('Orchestrator: model override rides through (workflow-step worker-model routing on the gated loop)', async () => {
@@ -1302,7 +1346,7 @@ test('request_approval mints policy provenance only on a true YOLO auto-approval
 async function invokeFunctionTool(
   t: ReturnType<typeof buildRequestApprovalTool> | ReturnType<typeof buildAskUserQuestionTool>,
   args: Record<string, unknown>,
-  ctx: { sessionId?: string; turn?: number },
+  ctx: { sessionId?: string; turn?: number; sourceUserSeq?: number },
 ): Promise<string> {
   const invoke = (t as unknown as {
     invoke: (runContext: unknown, inputJson: string) => Promise<string>;
@@ -1310,6 +1354,24 @@ async function invokeFunctionTool(
   const runContext = { context: ctx };
   const result = await invoke(runContext, JSON.stringify(args));
   return typeof result === 'string' ? result : JSON.stringify(result);
+}
+
+function decodedToolOutput(result: string): unknown {
+  try { return JSON.parse(result) as unknown; } catch { return result; }
+}
+
+async function invokeAskWithArbitration(
+  t: ReturnType<typeof buildAskUserQuestionTool>,
+  args: Record<string, unknown>,
+  ctx: { sessionId?: string; turn?: number; sourceUserSeq?: number },
+) {
+  const receipt = await invokeFunctionTool(t, args, ctx);
+  const terminal = userChoiceToolUseBehavior({ context: ctx }, [{
+    type: 'function_output',
+    tool: { name: 'ask_user_question' },
+    output: decodedToolOutput(receipt),
+  }]);
+  return { receipt, terminal };
 }
 
 // offer_background ceremony stripped 2026-07-22 — backgrounding is the desktop
@@ -1364,38 +1426,162 @@ test('request_approval execute opens a slug-scoped plan scope for Outlook draft 
   assert.deepEqual(scope?.allowedComposioSlugs, ['OUTLOOK_CREATE_DRAFT']);
 });
 
-test('ask_user_question emits awaiting_user_input with options', async () => {
+test('ask_user_question preserves exact source provenance and a single typed clarification purpose', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const t = buildAskUserQuestionTool();
-  const result = await invokeFunctionTool(
+  const { receipt, terminal } = await invokeAskWithArbitration(
     t,
-    { question: 'which environment?', options: ['staging', 'prod'], purpose: null },
-    { sessionId: sess.id, turn: 1 },
+    { question: 'which environment?', options: ['staging', 'prod'], purpose: 'clarification' },
+    { sessionId: sess.id, turn: 1, sourceUserSeq: 41 },
   );
-  assert.match(result, /Question posted/);
+  assert.doesNotMatch(receipt, /Question posted/i, 'a staged tool call must not claim public delivery');
+  assert.deepEqual(decodedToolOutput(receipt), {
+    kind: 'clementine.ask_user_question.candidate',
+    status: 'staged',
+    posted: false,
+    question: 'which environment?',
+    options: ['staging', 'prod'],
+    purpose: 'clarification',
+  });
+  assert.equal(terminal.isFinalOutput, true);
+  assert.equal(terminal.finalOutput, 'Question posted: which environment?. Awaiting user reply.');
 
   const events = listEvents(sess.id, { types: ['awaiting_user_input'] });
   assert.equal(events.length, 1);
   assert.equal(events[0].data.question, 'which environment?');
   assert.deepEqual(events[0].data.options, ['staging', 'prod']);
+  assert.equal(events[0].data.purpose, 'clarification');
+  assert.equal(events[0].data.sourceUserSeq, 41);
 });
 
-test('ask_user_question publishes at most one pause per provider turn', async () => {
+test('parallel ask_user_question candidates become one provider-ordered natural bundle with exact dedupe', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const t = buildAskUserQuestionTool();
-  await invokeFunctionTool(
+  // Complete the crew call first, then the tracker call. Arbitration must use
+  // the SDK's provider-ordered result array below, never completion timing.
+  const crewReceipt = await invokeFunctionTool(
     t,
-    { question: 'Which environment?', options: ['staging', 'prod'], purpose: 'clarification' },
+    {
+      question: 'Who is the crew for the update, and where should they receive it?',
+      options: ['Slack or Discord', 'Email', 'Specific names'],
+      purpose: 'clarification',
+    },
     { sessionId: sess.id, turn: 4 },
   );
-  await invokeFunctionTool(
+  const trackerReceipt = await invokeFunctionTool(
     t,
-    { question: 'Which environment should I use?', options: ['staging', 'prod'], purpose: 'clarification' },
+    {
+      question: 'Where does the Zephyr deal tracker live?',
+      options: ['Spreadsheet', 'Notion', 'Salesforce'],
+      purpose: 'clarification',
+    },
     { sessionId: sess.id, turn: 4 },
   );
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'candidates do not race to publish');
+  for (const receipt of [trackerReceipt, crewReceipt]) {
+    assert.doesNotMatch(receipt, /Question posted/i);
+    assert.equal((decodedToolOutput(receipt) as { posted?: unknown }).posted, false);
+  }
+
+  const trackerOutput = decodedToolOutput(trackerReceipt);
+  const crewOutput = decodedToolOutput(crewReceipt);
+  const result = userChoiceToolUseBehavior({ context: { sessionId: sess.id, turn: 4, sourceUserSeq: 73 } }, [
+    { type: 'function_output', tool: { name: 'ask_user_question' }, output: trackerOutput },
+    // Exact duplicate: one public question, never a repeated numbered item.
+    { type: 'function_output', tool: { name: 'ask_user_question' }, output: trackerOutput },
+    { type: 'function_output', tool: { name: 'ask_user_question' }, output: crewOutput },
+  ]);
+  assert.equal(result.isFinalOutput, true);
+  const events = listEvents(sess.id, { types: ['awaiting_user_input'] });
+  assert.equal(events.length, 1);
+  const question = String(events[0].data.question);
+  assert.ok(question.indexOf('Where does the Zephyr deal tracker live?') < question.indexOf('Who is the crew'));
+  assert.equal(question.match(/Where does the Zephyr deal tracker live\?/g)?.length, 1, 'exact duplicate was not rendered twice');
+  assert.match(question, /1\. Where does the Zephyr deal tracker live\?[\s\S]*- Spreadsheet/);
+  assert.match(question, /2\. Who is the crew[\s\S]*- Slack or Discord/);
+  assert.equal(events[0].data.options, null, 'per-question choices stay inline instead of flattening ambiguously');
+  assert.equal(events[0].data.bundled, true);
+  assert.equal(events[0].data.purpose, 'clarification', 'homogeneous bundle projects its shared purpose');
+  assert.equal(events[0].data.sourceUserSeq, 73);
+  assert.equal((events[0].data.questions as unknown[]).length, 2);
+  assert.match(String(result.finalOutput), /Question posted:[\s\S]*Zephyr[\s\S]*crew/);
+
+  // Retrying arbitration for the same provider turn is idempotent.
+  userChoiceToolUseBehavior({ context: { sessionId: sess.id, turn: 4 } }, [
+    { type: 'function_output', tool: { name: 'ask_user_question' }, output: trackerOutput },
+    { type: 'function_output', tool: { name: 'ask_user_question' }, output: crewOutput },
+  ]);
   assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1);
+});
+
+test('typed-plus-null ask_user_question bundle records mixed purpose and exact source provenance', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  const sess = createSession({ kind: 'chat' });
+  const t = buildAskUserQuestionTool();
+  const clarification = decodedToolOutput(await invokeFunctionTool(
+    t,
+    {
+      question: 'Which environment contains the source data?',
+      options: ['Staging', 'Production'],
+      purpose: 'clarification',
+    },
+    { sessionId: sess.id, turn: 5, sourceUserSeq: 88 },
+  ));
+  const untyped = decodedToolOutput(await invokeFunctionTool(
+    t,
+    {
+      question: 'What should the report title be?',
+      options: null,
+      purpose: null,
+    },
+    { sessionId: sess.id, turn: 5, sourceUserSeq: 88 },
+  ));
+
+  userChoiceToolUseBehavior({ context: { sessionId: sess.id, turn: 5, sourceUserSeq: 88 } }, [
+    { type: 'function_output', tool: { name: 'ask_user_question' }, output: clarification },
+    { type: 'function_output', tool: { name: 'ask_user_question' }, output: untyped },
+  ]);
+
+  const [event] = listEvents(sess.id, { types: ['awaiting_user_input'] });
+  assert.ok(event);
+  assert.equal(event.data.bundled, true);
+  assert.equal(event.data.purpose, 'mixed');
+  assert.equal(event.data.sourceUserSeq, 88);
+  assert.deepEqual(
+    (event.data.questions as Array<{ purpose?: unknown }>).map((question) => question.purpose),
+    ['clarification', null],
+  );
+});
+
+test('all-null ask_user_question bundle preserves null top-level purpose', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  const sess = createSession({ kind: 'chat' });
+  const t = buildAskUserQuestionTool();
+  const first = decodedToolOutput(await invokeFunctionTool(
+    t,
+    { question: 'Which workspace?', options: null, purpose: null },
+    { sessionId: sess.id, turn: 6, sourceUserSeq: 89 },
+  ));
+  const second = decodedToolOutput(await invokeFunctionTool(
+    t,
+    { question: 'Which account?', options: null, purpose: null },
+    { sessionId: sess.id, turn: 6, sourceUserSeq: 89 },
+  ));
+
+  userChoiceToolUseBehavior({ context: { sessionId: sess.id, turn: 6, sourceUserSeq: 89 } }, [
+    { type: 'function_output', tool: { name: 'ask_user_question' }, output: first },
+    { type: 'function_output', tool: { name: 'ask_user_question' }, output: second },
+  ]);
+
+  const [event] = listEvents(sess.id, { types: ['awaiting_user_input'] });
+  assert.ok(event);
+  assert.equal(event.data.bundled, true);
+  assert.equal(event.data.purpose, null);
+  assert.equal(event.data.sourceUserSeq, 89);
 });
 
 // ─── YOLO: approval-purpose ask_user_question must NOT halt; clarification must ───
@@ -1414,10 +1600,47 @@ test('YOLO + purpose:"approval" does NOT halt — proceeds (typed signal)', asyn
       { sessionId: sess.id, turn: 1 },
     );
     assert.match(result, /standing approval|NOT pausing/i);
+    const arbitration = userChoiceToolUseBehavior({ context: { sessionId: sess.id, turn: 1 } }, [{
+      type: 'function_output',
+      tool: { name: 'ask_user_question' },
+      output: result,
+    }]);
+    assert.equal(arbitration.isFinalOutput, false, 'YOLO auto-resolution remains non-halting at arbitration');
     assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'approval purpose must not halt');
     const notes = listEvents(sess.id, { types: ['autonomy_note'] });
     assert.equal(notes.length, 1);
     assert.equal(notes[0].data.classifier, 'typed', 'declared purpose drives the typed path');
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
+});
+
+test('parallel YOLO approval plus genuine clarification pauses only on the clarification', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const t = buildAskUserQuestionTool();
+    const approval = await invokeFunctionTool(
+      t,
+      { question: 'Should I send the update once ready?', options: ['Yes', 'No'], purpose: 'approval' },
+      { sessionId: sess.id, turn: 2 },
+    );
+    const clarification = await invokeFunctionTool(
+      t,
+      { question: 'Which team owns the destination channel?', options: ['Sales', 'Support'], purpose: 'clarification' },
+      { sessionId: sess.id, turn: 2 },
+    );
+    const result = userChoiceToolUseBehavior({ context: { sessionId: sess.id, turn: 2 } }, [
+      { type: 'function_output', tool: { name: 'ask_user_question' }, output: approval },
+      { type: 'function_output', tool: { name: 'ask_user_question' }, output: decodedToolOutput(clarification) },
+    ]);
+    assert.equal(result.isFinalOutput, true);
+    const asks = listEvents(sess.id, { types: ['awaiting_user_input'] });
+    assert.equal(asks.length, 1);
+    assert.equal(asks[0].data.question, 'Which team owns the destination channel?');
+    assert.deepEqual(asks[0].data.options, ['Sales', 'Support']);
+    assert.equal(listEvents(sess.id, { types: ['autonomy_note'] }).length, 1);
   } finally {
     saveProactivityPolicy({ autoApproveScope: 'balanced' });
   }
@@ -1432,12 +1655,13 @@ test('YOLO + purpose:"clarification" still HALTS even in YOLO (she can still ask
     // Note: this text is approval-SHAPED by the regex (has "send" + "should I"),
     // so this proves the TYPED clarification signal overrides the regex — a real
     // clarification is never auto-proceeded just because of its wording.
-    const result = await invokeFunctionTool(
+    const { receipt, terminal } = await invokeAskWithArbitration(
       t,
       { question: 'Should I send to the staging list or the prod list?', options: ['staging', 'prod'], purpose: 'clarification' },
       { sessionId: sess.id, turn: 1 },
     );
-    assert.match(result, /Question posted/);
+    assert.doesNotMatch(receipt, /Question posted/);
+    assert.equal(terminal.isFinalOutput, true);
     assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1, 'typed clarification halts even in YOLO');
     assert.equal(listEvents(sess.id, { types: ['autonomy_note'] }).length, 0);
   } finally {
@@ -1477,12 +1701,13 @@ test('YOLO + purpose:null + genuine info text → halts (regex correctly decline
   try {
     const sess = createSession({ kind: 'chat' });
     const t = buildAskUserQuestionTool();
-    const result = await invokeFunctionTool(
+    const { receipt, terminal } = await invokeAskWithArbitration(
       t,
       { question: 'Which Salesforce environment should I read from, staging or prod?', options: ['staging', 'prod'], purpose: null },
       { sessionId: sess.id, turn: 1 },
     );
-    assert.match(result, /Question posted/);
+    assert.doesNotMatch(receipt, /Question posted/);
+    assert.equal(terminal.isFinalOutput, true);
     assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1);
   } finally {
     saveProactivityPolicy({ autoApproveScope: 'balanced' });
@@ -1494,7 +1719,7 @@ test('non-YOLO (balanced) + purpose:"approval" still halts (no default-user regr
   saveProactivityPolicy({ autoApproveScope: 'balanced' });
   const sess = createSession({ kind: 'chat' });
   const t = buildAskUserQuestionTool();
-  await invokeFunctionTool(
+  await invokeAskWithArbitration(
     t,
     { question: 'Should I send the rest of the emails now?', options: ['Yes send', 'No'], purpose: 'approval' },
     { sessionId: sess.id, turn: 1 },
@@ -1510,7 +1735,7 @@ test('kill-switch off → YOLO + purpose:"approval" halts (revert path)', async 
   try {
     const sess = createSession({ kind: 'chat' });
     const t = buildAskUserQuestionTool();
-    await invokeFunctionTool(
+    await invokeAskWithArbitration(
       t,
       { question: 'Want me to send them now?', options: null, purpose: 'approval' },
       { sessionId: sess.id, turn: 1 },
@@ -1541,7 +1766,8 @@ test('deliberation tools no-op silently when no sessionId is on the context', as
     { question: 'is anyone listening?', options: null, purpose: null },
     {},
   );
-  assert.match(result, /Question posted/);
+  assert.match(result, /No session was available to post it/);
+  assert.doesNotMatch(result, /Question posted/);
 });
 
 // ─── Continuity-aware tool scope: the orchestrator reads prior turns from the
@@ -1573,6 +1799,122 @@ test('continuity end-to-end: a bare confirmation inherits the active Outlook sco
   assert.ok((scope.maxTools ?? 0) > 0, 'tools are no longer stripped on the confirmation turn');
   assert.ok((scope.allowedServerSlugs ?? []).some((s) => /outlook|microsoft/.test(s)));
   assert.match(scope.reason, /continuity/);
+});
+
+test('typed decline keeps transcript context but does not reopen the parent Outlook scope', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  seedUserInput(sess.id, 1, 'send the client email through Outlook');
+  seedUserInput(sess.id, 2, 'No.');
+  const common = {
+    packetId: 'outlook-decline',
+    parentSourceUserSeq: 1,
+    consumingSourceUserSeq: 2,
+    parentInput: 'send the client email through Outlook',
+    question: 'Should I send it?',
+    options: ['Yes', 'No'],
+    retrievalQuery: ['send the client email through Outlook', 'Should I send it?', 'No.'].join('\n'),
+    capabilities: [],
+  };
+
+  const declined = await buildOrchestratorAgent({
+    userInput: 'No.',
+    sessionId: sess.id,
+    allowToolJit: true,
+    taskContinuation: {
+      ...common,
+      answer: 'No.',
+      disposition: 'declined',
+    },
+    taskContinuationResolved: true,
+  });
+  const declinedScope = boundAgentMcpToolScope(declined).scope;
+  assert.deepEqual(declinedScope?.allowedServerSlugs ?? [], []);
+  assert.equal(declinedScope?.maxTools ?? 0, 0);
+  const declinedPolicies = listEvents(sess.id, { types: ['tool_policy_resolved'] });
+  assert.ok(declinedPolicies.length > 0, 'decline records its explicit local tool boundary');
+  assert.ok(
+    declinedPolicies.every((event) => event.data.outputCount === 0),
+    'decline advertises zero local tool schemas',
+  );
+  assert.ok(
+    declinedPolicies.every((event) =>
+      event.data.shortCircuitReason === 'declined_continuation'
+      && event.data.semanticAcquisitionSkipped === true
+      && event.data.schemaWarmSkipped === true
+      && event.data.advertisedSchemaCount === 0
+      && event.data.catalogCount === 0),
+    'decline records positive proof that acquisition and schema work were bypassed',
+  );
+  assert.equal(
+    listEvents(sess.id, { types: ['tool_search_scope'] }).length,
+    0,
+    'decline bypasses schema-on-demand catalog construction',
+  );
+  assert.equal(
+    listEvents(sess.id, { types: ['tool_jit_scope'] }).length,
+    0,
+    'decline bypasses semantic JIT tool ranking',
+  );
+
+  const affirmed = await buildOrchestratorAgent({
+    userInput: 'Yes.',
+    sessionId: sess.id,
+    allowToolJit: true,
+    taskContinuation: {
+      ...common,
+      consumingSourceUserSeq: 3,
+      answer: 'Yes.',
+      disposition: 'affirmed',
+      retrievalQuery: ['send the client email through Outlook', 'Should I send it?', 'Yes.'].join('\n'),
+    },
+    taskContinuationResolved: true,
+  });
+  const affirmedScope = boundAgentMcpToolScope(affirmed).scope;
+  assert.ok((affirmedScope?.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+  assert.ok((affirmedScope?.maxTools ?? 0) > 0);
+});
+
+test('compound decline keeps the full conversational turn while scoping tools to only the independent new task', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  const fullMessage = 'No—leave that Outlook email alone. Instead, what is 15 × 9?';
+  const activeTaskInput = 'what is 15 × 9?';
+  seedUserInput(sess.id, 1, 'send the client email through Outlook');
+  seedUserInput(sess.id, 2, fullMessage);
+
+  const agent = await buildOrchestratorAgent({
+    userInput: fullMessage,
+    sessionId: sess.id,
+    allowToolJit: true,
+    taskContinuation: {
+      packetId: 'outlook-compound-decline',
+      parentSourceUserSeq: 1,
+      consumingSourceUserSeq: 2,
+      parentInput: 'send the client email through Outlook',
+      question: 'Should I send it?',
+      options: ['Yes', 'No'],
+      answer: fullMessage,
+      disposition: 'declined_with_new_task',
+      activeTaskInput,
+      retrievalQuery: activeTaskInput,
+      capabilities: [],
+    },
+    taskContinuationResolved: true,
+  });
+
+  const scope = boundAgentMcpToolScope(agent).scope;
+  assert.deepEqual(scope?.allowedServerSlugs ?? [], []);
+  assert.equal(
+    (scope?.reason ?? '').toLowerCase().includes('outlook'),
+    false,
+    'the declined parent must not leak into fresh-task capability scope',
+  );
+  assert.ok(
+    listEvents(sess.id, { types: ['tool_policy_resolved'] }).every((event) =>
+      !JSON.stringify(event.data).toLowerCase().includes('outlook')),
+    'private tool-policy evidence is derived from the arithmetic clause, not the visible parent decline',
+  );
 });
 
 test('continuity cross-session: a NEW session inherits scope via the continuation lineage', () => {

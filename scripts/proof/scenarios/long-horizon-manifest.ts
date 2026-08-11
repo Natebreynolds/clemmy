@@ -6,7 +6,14 @@
  * CLEMMY_PROOF_LONG_HORIZON_ITEMS=120 for the endurance leg; that deliberately
  * uses one 120-item phase to prove scale without doubling it to 240 workers.
  */
-import { narrationCheck, openHarnessDb, sessionMetrics, stormCheck, tokenCeilingCheck } from '../score.js';
+import {
+  narrationCheck,
+  openHarnessDb,
+  sessionMetrics,
+  sessionUsageBreakdown,
+  stormCheck,
+  tokenCeilingCheck,
+} from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
 import {
   compactManifestChecks,
@@ -73,11 +80,18 @@ export const longHorizonManifest: ScenarioDef = {
   summary: `${ITEM_COUNT} logical items → durable phase graph → exact completion`,
   routeExpectation: 'exact-brain',
   workerRouteExpectation: true,
+  benchmarkWorkload: {
+    itemCount: ITEM_COUNT,
+    phaseCount: TWO_PHASE ? 2 : 1,
+    manifestId: MANIFEST_ID,
+    manifestContractVersion: '1',
+  },
   async run(daemon: DaemonHandle) {
     const originSessionId = proofSessionId('long-horizon-origin');
     const dispatched = await dispatchBackground(daemon, originSessionId, prompt());
     const settled = await waitForTerminal(daemon, dispatched.taskId, ITEM_COUNT >= 100 ? 60 * 60_000 : 30 * 60_000);
     const task = settled.detail.task;
+    const backgroundTiming = dispatched.settlementTimer.observe(task.status, dispatched.turn.wallMs);
     const manifest = manifestFor(settled.detail, MANIFEST_ID);
     const eventCounts = manifestEventCounts(daemon, task.runSessionId, MANIFEST_ID);
     const outcomes = await waitForOutcomeEvents(
@@ -93,11 +107,15 @@ export const longHorizonManifest: ScenarioDef = {
       .filter((event) => /target already completed in this session/i.test(String(event.data.reason ?? '')));
 
     let metrics = null;
+    let usageBreakdown: ReturnType<typeof sessionUsageBreakdown> | null = null;
     try {
       const db = openHarnessDb(daemon.home);
       metrics = sessionMetrics(db, task.runSessionId);
       db.close();
     } catch { /* checks below surface missing evidence */ }
+    try {
+      usageBreakdown = sessionUsageBreakdown(daemon.home, task.runSessionId);
+    } catch { /* additive diagnostics must never hide the scenario result */ }
 
     const phaseCount = TWO_PHASE ? 2 : 1;
     const checks: Check[] = [
@@ -156,7 +174,7 @@ export const longHorizonManifest: ScenarioDef = {
     return {
       checks,
       latency: [{
-        wallMs: dispatched.turn.wallMs,
+        wallMs: backgroundTiming.observedSettlementWallMs,
         ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null,
       }],
       sessionId: task.runSessionId,
@@ -165,8 +183,13 @@ export const longHorizonManifest: ScenarioDef = {
         phaseCount,
         manifest: manifest ?? null,
         manifestEvents: eventCounts,
+        observedSettlementWallMs: backgroundTiming.observedSettlementWallMs,
+        dispatchAcknowledgementWallMs: backgroundTiming.dispatchAcknowledgementWallMs,
+        terminalStatus: backgroundTiming.terminalStatus,
+        wallMsLabel: backgroundTiming.wallMsLabel,
         toolCalls: metrics?.toolCalls,
         tokensUsed: metrics?.tokensUsed,
+        usageBreakdown,
       },
     };
   },

@@ -84,9 +84,14 @@ const {
   writeToolOutput,
   beginRunAttempt,
   finishRunAttempt,
+  recordRunAttemptUserInput,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText } = await import('./loop.js');
+const {
+  isSafeDurableMemoryReceiptPresentation,
+  looksLikeHealthyDurableMemoryAcknowledgement,
+} = await import('./durable-memory-receipt.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded, harnessRunContextStorage, wrapToolForHarness } = await import('./brackets.js');
@@ -617,6 +622,95 @@ test('unattended self-heal: a transient infra error auto-retries and recovers (n
   assert.equal(result.status, 'completed', 'the run self-healed and completed');
   assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 1, 'the self-heal is visible in the trace');
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'never asked an absent human');
+});
+
+test('infra recovery composes from one exact settled read instead of asking the model to call it again', async () => {
+  resetEventLog();
+  const objective = 'Refresh the proof release queue and tell me its current item naturally.';
+  const output = JSON.stringify({
+    successful: true,
+    data: {
+      sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+      revision: 4,
+      items: [{ id: 'proof-release-1', title: 'Review the release proof', status: 'open' }],
+      total: 1,
+    },
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'settled-read-infra-recovery' });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: objective },
+  });
+  let modelTurns = 0;
+  let recoveredInput = '';
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    modelTurns += 1;
+    if (modelTurns === 1) {
+      const ee = runner as unknown as EventEmitter;
+      const runContext = { context: opts.context };
+      const tool = { name: 'composio_execute_tool' };
+      const details = {
+        toolCall: {
+          callId: 'settled-before-5xx',
+          arguments: JSON.stringify({
+            tool_slug: 'PROOF_LIST_TASKS',
+            arguments: '{}',
+            connected_account_id: null,
+          }),
+        },
+      };
+      ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+      ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, output, details);
+      throw BoundaryError.from(new Error('backend 503 after the read settled'), {
+        kind: 'model.http_5xx',
+        retryable: true,
+        userMessage: 'transient',
+      });
+    }
+
+    const last = items.at(-1) as { content?: unknown } | undefined;
+    recoveredInput = typeof last?.content === 'string'
+      ? last.content
+      : JSON.stringify(last?.content ?? '');
+    const reply = 'The release queue currently has “Review the release proof” open.';
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: reply,
+        reply,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    input: objective,
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(modelTurns, 2, 'one replacement model turn composes the answer');
+  assert.match(recoveredInput, /\[RECOVERED SETTLED READ\]/);
+  assert.match(recoveredInput, /PROOF_RELEASE_QUEUE:LOCAL_ONLY/);
+  assert.match(recoveredInput, /Do not call another tool/);
+  assert.match(recoveredInput, /reply to the user now/i);
+  assert.doesNotMatch(recoveredInput, /retry the SAME failed call/i);
+  const physicalReads = listEventsForConv(sess.id, { types: ['tool_called'] })
+    .filter((event) => event.data.tool === 'composio_execute_tool'
+      && event.data.toolSlug === 'PROOF_LIST_TASKS'
+      && event.data.accounting === 'top_level');
+  assert.equal(physicalReads.length, 1, 'the provider read is represented exactly once');
+  assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 1);
 });
 
 test('unattended self-heal: a persistent infra error auto-retries twice then FAILS honestly (never asks, never fakes success)', async () => {
@@ -1334,7 +1428,7 @@ test('runTurn injects a transient memory primer before the first model response'
   await runTurn({
     agent: makeAgentStub(),
     sessionId: sess.id,
-    input: 'can you help me with some Salesforce prospecting',
+    input: 'can you help me with some Salesforce prospecting? Do not save this request as memory.',
     makeRunner: makeRunnerStub,
     runRunner,
   });
@@ -1357,6 +1451,389 @@ test('runTurn injects a transient memory primer before the first model response'
   assert.match(String(primerEvents[0].data.recallId), /^mr-/);
   assert.equal(typeof primerEvents[0].data.omittedCount, 'number');
   assert.equal(primerEvents[0].data.includedCount, primerEvents[0].data.hitCount);
+});
+
+test('verified continuation keeps the literal user item intact and injects convergence only as system context', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const literalAnswer = 'I think the first one.';
+  const semanticQuery = [
+    'List tomorrow’s calendar events.',
+    'Work or personal calendar?',
+    literalAnswer,
+  ].join('\n');
+  const convergence = 'CONVERGE — honor the answer and continue the conversation naturally.';
+  let filteredInput: AgentInputItem[] = [];
+
+  const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+    const filter = opts.callModelInputFilter as
+      | ((args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => { input: AgentInputItem[]; instructions?: string })
+      | undefined;
+    assert.equal(typeof filter, 'function');
+    filteredInput = filter!({ modelData: { input: items, instructions: 'base instructions' } }).input;
+    return {
+      history: [
+        ...items,
+        { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'I’ll use the work calendar.' }] },
+      ],
+      lastResponseId: undefined,
+      finalOutput: 'I’ll use the work calendar.',
+    };
+  };
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: literalAnswer,
+    semanticTaskInput: semanticQuery,
+    taskContinuation: {
+      packetId: 'selected-packet',
+      parentSourceUserSeq: 1,
+      consumingSourceUserSeq: 2,
+      parentInput: 'List tomorrow’s calendar events.',
+      question: 'Work or personal calendar?',
+      options: ['Work calendar', 'Personal calendar'],
+      answer: literalAnswer,
+      disposition: 'selected',
+      selectedOption: 'Work calendar',
+      retrievalQuery: semanticQuery,
+      capabilities: [],
+    },
+    continuationSteer: convergence,
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const userItems = filteredInput.filter((item) => (item as { role?: unknown }).role === 'user');
+  assert.equal((userItems.at(-1) as { content?: unknown } | undefined)?.content, literalAnswer);
+  assert.equal(userItems.some((item) => String((item as { content?: unknown }).content).includes('CONVERGE')), false);
+  assert.equal(userItems.some((item) => String((item as { content?: unknown }).content).includes('List tomorrow')), false);
+  const systemText = filteredInput
+    .filter((item) => (item as { role?: unknown }).role === 'system')
+    .map((item) => String((item as { content?: unknown }).content ?? ''))
+    .join('\n');
+  assert.match(systemText, /CONVERGE/);
+  const primer = listEvents(sess.id, { types: ['turn_memory_primer'] }).at(-1);
+  assert.ok(primer);
+  assert.match(String(primer.data.queryPreview), /List tomorrow’s calendar events/);
+  assert.notEqual(primer.data.skippedReason, 'declined_continuation');
+});
+
+test('typed decline stays conversational while skipping parent-task recall, capability, and openness work', async () => {
+  resetEventLog();
+  rememberFact({
+    kind: 'project',
+    content: 'Send the client email through Outlook after confirming with the user.',
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const semanticTaskInput = [
+    'Send the client email through Outlook.',
+    'Should I send it?',
+    'No.',
+  ].join('\n');
+  let filteredInput: AgentInputItem[] = [];
+  let opennessCalls = 0;
+  const { _setOpennessJudgeForTests } = await import('./turn-openness.js');
+  const previousOpenness = process.env.CLEMMY_TURN_OPENNESS;
+  process.env.CLEMMY_TURN_OPENNESS = 'on';
+  _setOpennessJudgeForTests(async () => {
+    opennessCalls += 1;
+    return { open: ['the declined email action'] };
+  });
+
+  try {
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'No.',
+      semanticTaskInput,
+      taskContinuation: {
+        packetId: 'decline-packet',
+        parentSourceUserSeq: 1,
+        consumingSourceUserSeq: 2,
+        parentInput: 'Send the client email through Outlook.',
+        question: 'Should I send it?',
+        options: ['Yes', 'No'],
+        answer: 'No.',
+        disposition: 'declined',
+        retrievalQuery: semanticTaskInput,
+        capabilities: [],
+      },
+      taskContinuationResolved: true,
+      makeRunner: makeRunnerStub,
+      runRunner: async (_runner, _agent, items, opts) => {
+        const filter = opts.callModelInputFilter as
+          | ((args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => { input: AgentInputItem[]; instructions?: string })
+          | undefined;
+        assert.equal(typeof filter, 'function');
+        filteredInput = filter!({ modelData: { input: items, instructions: 'base instructions' } }).input;
+        const decision = {
+          summary: 'The email will not be sent.',
+          reply: 'Understood — I won’t send it.',
+          done: true,
+          nextAction: 'completed' as const,
+          reason: null,
+        };
+        return {
+          history: [
+            ...items,
+            { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: decision.reply }] },
+          ],
+          lastResponseId: undefined,
+          finalOutput: decision,
+        };
+      },
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(result.lastDecision?.reply, 'Understood — I won’t send it.');
+    const userItems = filteredInput.filter((item) => (item as { role?: unknown }).role === 'user');
+    assert.equal((userItems.at(-1) as { content?: unknown } | undefined)?.content, 'No.');
+    const systemText = filteredInput
+      .filter((item) => (item as { role?: unknown }).role === 'system')
+      .map((item) => String((item as { content?: unknown }).content ?? ''))
+      .join('\n');
+    assert.match(systemText, /keep the conversation natural/i);
+    assert.doesNotMatch(systemText, /Send the client email through Outlook/i);
+    assert.doesNotMatch(systemText, /\[MEMORY PRIMER\]/);
+
+    const primer = listEvents(sess.id, { types: ['turn_memory_primer'] }).at(-1);
+    assert.ok(primer);
+    assert.equal(primer.data.queryPreview, 'No.');
+    assert.equal(primer.data.skippedReason, 'declined_continuation');
+    assert.equal(primer.data.hitCount, 0);
+    assert.equal(primer.data.injected, false);
+    assert.equal(listEvents(sess.id, { types: ['capability_resolution'] }).length, 0);
+    const contextPacket = listEvents(sess.id, { types: ['agent_context_packet'] }).at(-1);
+    assert.ok(contextPacket);
+    assert.equal(
+      contextPacket.data.semanticEnrichmentSkippedReason,
+      'declined_continuation',
+      'empty enrichment is an explicit typed skip, not an ambiguous empty result',
+    );
+    assert.equal(opennessCalls, 0);
+  } finally {
+    _setOpennessJudgeForTests(null);
+    if (previousOpenness === undefined) delete process.env.CLEMMY_TURN_OPENNESS;
+    else process.env.CLEMMY_TURN_OPENNESS = previousOpenness;
+  }
+});
+
+test('compound decline preserves the complete user message for the model but judges only the independent new task', async () => {
+  resetEventLog();
+  rememberFact({
+    kind: 'project',
+    content: 'Send the client email through Outlook after confirming with the user.',
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const fullMessage = 'No—leave that email alone. Instead, draft a two-line release note.';
+  const activeTaskInput = 'draft a two-line release note.';
+  const reply = 'Absolutely—I’ll leave the email alone.\n\nFaster startup, steadier recall.\nClem keeps the thread without the churn.';
+  const filteredInputs: AgentInputItem[][] = [];
+  const judgedObjectives: string[] = [];
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: fullMessage,
+    semanticTaskInput: activeTaskInput,
+    taskContinuation: {
+      packetId: 'compound-decline-packet',
+      parentSourceUserSeq: 1,
+      consumingSourceUserSeq: 2,
+      parentInput: 'Send the client email through Outlook.',
+      question: 'Should I send it?',
+      options: ['Yes', 'No'],
+      answer: fullMessage,
+      disposition: 'declined_with_new_task',
+      activeTaskInput,
+      retrievalQuery: activeTaskInput,
+      capabilities: [],
+    },
+    taskContinuationResolved: true,
+    judgeCompletion: true,
+    judgeFn: async (objective) => {
+      judgedObjectives.push(objective);
+      return { done: true, reason: 'the requested release note is present' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items, opts) => {
+      const filter = opts.callModelInputFilter as
+        | ((args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => { input: AgentInputItem[]; instructions?: string })
+        | undefined;
+      assert.equal(typeof filter, 'function');
+      filteredInputs.push(filter!({ modelData: { input: items, instructions: 'base instructions' } }).input);
+      const decision = {
+        summary: 'Left the email untouched and drafted the requested note.',
+        reply,
+        done: true,
+        nextAction: 'completed' as const,
+        reason: null,
+      };
+      return {
+        history: [
+          ...items,
+          { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: reply }] },
+        ],
+        lastResponseId: undefined,
+        finalOutput: decision,
+      };
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.lastDecision?.reply, reply, 'runtime scoping must not replace the provider-authored conversation');
+  const providerUserTexts = filteredInputs.flatMap((providerInput) =>
+    providerInput
+      .filter((item) => (item as { role?: unknown }).role === 'user')
+      .map((item) => String((item as { content?: unknown }).content ?? '')),
+  );
+  assert.ok(
+    providerUserTexts.includes(fullMessage),
+    'the provider sees the complete conversational message, including the decline',
+  );
+  assert.equal(
+    providerUserTexts.includes(activeTaskInput),
+    false,
+    'the private active clause never replaces the visible user turn',
+  );
+  assert.ok(judgedObjectives.length > 0);
+  assert.ok(judgedObjectives.every((objective) => objective === activeTaskInput));
+  const primer = listEvents(sess.id, { types: ['turn_memory_primer'] }).at(-1);
+  assert.ok(primer);
+  assert.equal(primer.data.queryPreview, activeTaskInput);
+});
+
+test('compound decline memory admission is fresh-clause-only and idempotent across exact-source re-drive', async () => {
+  resetEventLog();
+  const { openMemoryDb } = await import('../../memory/db.js');
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const parent = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update the local note with the retired marker PARENT-MUST-NOT-BE-LEARNED.' },
+  });
+  const fullMessage = 'No—leave that note and PARENT-MUST-NOT-BE-LEARNED alone. Instead, remember this: my standard-lane marker is FRESH-CLAUSE-ONLY-42.';
+  const activeTaskInput = 'remember this: my standard-lane marker is FRESH-CLAUSE-ONLY-42.';
+  const accepted = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: fullMessage },
+  });
+  const taskContinuation = {
+    packetId: 'compound-memory-idempotency-packet',
+    parentSourceUserSeq: parent.seq,
+    consumingSourceUserSeq: accepted.seq,
+    parentInput: String(parent.data.text),
+    question: 'Should I update it?',
+    options: ['Yes', 'No'],
+    answer: fullMessage,
+    disposition: 'declined_with_new_task' as const,
+    activeTaskInput,
+    retrievalQuery: activeTaskInput,
+    capabilities: [],
+  };
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
+    history: items,
+    lastResponseId: undefined,
+    finalOutput: {
+      summary: 'Stored the independent marker.',
+      reply: 'Noted.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  } as never);
+  const run = () => runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: fullMessage,
+    semanticTaskInput: activeTaskInput,
+    taskContinuation,
+    taskContinuationResolved: true,
+    sourceUserSeq: accepted.seq,
+    reuseRecordedUserInput: true,
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal((await run()).status, 'completed');
+  assert.equal((await run()).status, 'completed', 'a fresh physical run can re-drive the same durable source');
+
+  const expectedCallId = `auto-capture:user-source:${accepted.seq}`;
+  const episodes = openMemoryDb().prepare(`
+    SELECT call_id, evidence_excerpt, metadata_json
+    FROM memory_episodes
+    WHERE session_id = ? AND subtype = 'auto_capture'
+  `).all(sess.id) as Array<{ call_id: string; evidence_excerpt: string; metadata_json: string }>;
+  assert.equal(episodes.length, 1, 'both physical turns reuse one exact-source memory episode');
+  assert.equal(episodes[0]?.call_id, expectedCallId);
+  assert.equal(episodes[0]?.evidence_excerpt, activeTaskInput);
+  assert.equal(JSON.parse(episodes[0]?.metadata_json ?? '{}').sourceEventId, `user-source:${accepted.seq}`);
+  assert.doesNotMatch(episodes[0]?.evidence_excerpt ?? '', /PARENT-MUST-NOT-BE-LEARNED/);
+
+  const candidates = openMemoryDb().prepare(`
+    SELECT call_id, text
+    FROM memory_reflection_candidates
+    WHERE session_id = ? AND source_type = 'auto_capture'
+  `).all(sess.id) as Array<{ call_id: string; text: string }>;
+  assert.deepEqual(candidates, [{
+    call_id: expectedCallId,
+    text: 'my standard-lane marker is FRESH-CLAUSE-ONLY-42.',
+  }], 'the exact source owns one candidate derived only from the fresh clause');
+});
+
+test('runTurn skips only the optional query primer for an explicit coordinated no-memory request', async () => {
+  resetEventLog();
+  rememberFact({
+    kind: 'project',
+    content: 'Salesforce prospecting should prioritize stale untouched accounts before enrichment.',
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let filteredInput: AgentInputItem[] = [];
+
+  const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+    const filter = opts.callModelInputFilter as
+      | ((args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => { input: AgentInputItem[]; instructions?: string })
+      | undefined;
+    assert.equal(typeof filter, 'function');
+    filteredInput = filter!({ modelData: { input: items, instructions: 'base instructions' } }).input;
+    return {
+      history: [
+        ...items,
+        { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok' }] },
+      ],
+      lastResponseId: undefined,
+      finalOutput: 'ok',
+    };
+  };
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'For Salesforce prospecting, do not discover, use code mode, shell, workspace, or memory.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(
+    filteredInput.some((item) =>
+      (item as { role?: unknown }).role === 'system'
+      && typeof (item as { content?: unknown }).content === 'string'
+      && (item as { content: string }).content.includes('[MEMORY PRIMER]')),
+    false,
+  );
+  const primerEvent = listEvents(sess.id, { types: ['turn_memory_primer'] })[0];
+  assert.ok(primerEvent);
+  assert.equal(primerEvent.data.enabled, true, 'the feature is available; this request explicitly skipped it');
+  assert.equal(primerEvent.data.injected, false);
+  assert.equal(primerEvent.data.hitCount, 0);
+  assert.equal(primerEvent.data.source, null);
+  assert.equal(primerEvent.data.skippedReason, 'explicit_request_opt_out');
 });
 
 test('runTurn compacts oversized same-turn tool results only in model-facing input', async () => {
@@ -2862,7 +3339,9 @@ test('a local call_tool carrier rejection cannot manufacture ambiguity or replac
         }),
         { toolCall: { callId: 'call-workspace-cadence-loop-replay' } },
       );
-      assert.match(String(refusal), /non-empty tool_slug/);
+      assert.match(String(refusal), /arg_validation/);
+      assert.match(String(refusal), /slug.*not a field.*tool_slug/);
+      assert.match(String(refusal), /repair/);
     }
     return {
       history: items,
@@ -3483,9 +3962,20 @@ test('runConversation: an answer reaches the standard lane with non-coercive con
     data: { question: 'Win-back queue or loss diagnosis?', source: 'decision_awaiting' },
   });
   let modelInput = '';
-  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+  let transientSystemContext = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
     const last = items.at(-1) as { content?: unknown } | undefined;
     modelInput = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? '');
+    const filter = opts.callModelInputFilter as
+      | ((args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => { input: AgentInputItem[]; instructions?: string })
+      | undefined;
+    assert.equal(typeof filter, 'function');
+    transientSystemContext = filter!({
+      modelData: { input: items, instructions: 'base instructions' },
+    }).input
+      .filter((item) => (item as { role?: unknown }).role === 'system')
+      .map((item) => String((item as { content?: unknown }).content ?? ''))
+      .join('\n');
     return {
       history: items,
       lastResponseId: undefined,
@@ -3497,15 +3987,23 @@ test('runConversation: an answer reaches the standard lane with non-coercive con
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Use the win-back queue.',
+    semanticTaskInput: [
+      'Build the chosen retention workflow.',
+      'Win-back queue or loss diagnosis?',
+      'Use the win-back queue.',
+    ].join('\n'),
+    taskContinuationResolved: true,
     makeRunner: makeRunnerStub,
     runRunner,
   });
 
   assert.equal(result.status, 'completed');
-  assert.match(modelInput, /CONVERGE/);
-  assert.match(modelInput, /never re-ask the resolved point/);
-  assert.match(modelInput, /not automatic permission for external writes or durable execution/);
-  assert.doesNotMatch(modelInput, /EXECUTE the work this turn/);
+  assert.equal(modelInput, 'Use the win-back queue.');
+  assert.doesNotMatch(modelInput, /CONVERGE/);
+  assert.match(transientSystemContext, /CONVERGE/);
+  assert.match(transientSystemContext, /never re-ask the resolved point/);
+  assert.match(transientSystemContext, /not automatic permission for external writes or durable execution/);
+  assert.doesNotMatch(transientSystemContext, /EXECUTE the work this turn/);
   const recordedInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
   assert.equal(recordedInputs.at(-1)?.data.text, 'Use the win-back queue.');
   assert.ok(recordedInputs.every((event) => !String(event.data.text ?? '').includes('CONVERGE')), 'internal convergence text never enters durable user history');
@@ -3968,6 +4466,792 @@ test('objective judge: a successful read cannot certify a claimed build', async 
   });
   assert.equal(result.status, 'completed');
   assert.equal(judgeInvoked, true);
+});
+
+test('objective judge: exact-source collection receipt removes only the redundant plural-noun judge and preserves reply bytes', async () => {
+  resetEventLog();
+  const objective = [
+    'Back to the proof release queue: refresh its current items from the same connected source.',
+    'Reuse the capability already proved on this machine. Do not discover, inspect a contract, use code mode, shell, workspace, or memory.',
+    'Return the source marker, revision, item id, title, and status.',
+  ].join('\n');
+  const reply = [
+    'Here is the current release queue:',
+    '',
+    '- Source marker: `PROOF_RELEASE_QUEUE:LOCAL_ONLY`',
+    '- Revision: **1**',
+    '- Item ID: `proof-release-1`',
+    '- Title: Review the Clementine 4 release proof',
+    '- Status: **open**',
+  ].join('\n');
+  const output = JSON.stringify({
+    successful: true,
+    data: {
+      sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+      revision: 1,
+      items: [{
+        id: 'proof-release-1',
+        title: 'Review the Clementine 4 release proof',
+        status: 'open',
+      }],
+      total: 1,
+    },
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'verified-read-loop-receipt' });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: objective },
+  });
+  let judgeCalls = 0;
+  let modelTurns = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    modelTurns += 1;
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = { name: 'composio_execute_tool' };
+    const details = {
+      toolCall: {
+        callId: 'verified-read-business-call',
+        arguments: JSON.stringify({
+          tool_slug: 'PROOF_LIST_TASKS',
+          arguments: '{}',
+          connected_account_id: null,
+        }),
+      },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, output, details);
+    const decision = {
+      summary: reply,
+      reply,
+      done: true,
+      nextAction: 'completed' as const,
+      reason: null,
+    };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    input: objective,
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeCalls += 1;
+      return { done: true, reason: 'the read was already structurally verified' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(modelTurns, 1);
+  assert.equal(judgeCalls, 0, 'the exact read receipt replaces the plural-noun transcript judge');
+  assert.equal(result.lastDecision?.reply, reply, 'the terminal reply is byte-preserved');
+  const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1);
+  const receipt = terminal?.data.verifiedReadCompletionReceipt as Record<string, unknown> | undefined;
+  assert.equal(receipt?.kind, 'single_collection_read');
+  assert.equal(receipt?.sourceUserSeq, source.seq);
+  assert.equal(receipt?.callId, 'verified-read-business-call');
+  assert.equal(receipt?.presentationDigest, createHash('sha256').update(reply).digest('hex'));
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['heartbeat'] })
+      .some((event) => event.data.kind === 'verified_read_completion_receipt'),
+    false,
+    'the proof is atomic terminal metadata, never a second best-effort row',
+  );
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+      .some((event) => event.data.door === 'completion'),
+    false,
+  );
+  assert.equal(
+    terminal?.data.reply,
+    reply,
+  );
+});
+
+test('objective judge: exact read-only discovery scaffold counts as meaningful evidence and skips its transport-shaped judge', async () => {
+  resetEventLog();
+  const objective = [
+    'Now retrieve the proof release queue current items from the connected local provider.',
+    'You do not know the action identifier yet. Call composio_search_tools exactly once with query "proof release queue current items", choose its single read-only match, then call composio_execute_tool exactly once with that action and the empty argument object {}.',
+    'Do not use other discovery, code mode, shell, workspace, or memory. Return the source marker, revision, item id, title, and status.',
+  ].join('\n');
+  const reply = [
+    'Source marker: PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+    'Revision: 1',
+    'Item ID: proof-release-1',
+    'Title: Review the Clementine 4 release proof',
+    'Status: open',
+  ].join('\n');
+  const discoveryOutput = JSON.stringify({
+    configured: true,
+    query: 'proof release queue current items',
+    count: 1,
+    matches: [{
+      slug: 'PROOF_LIST_TASKS',
+      name: 'PROOF_LIST_TASKS',
+      inputParameters: { type: 'object', properties: {}, additionalProperties: false },
+    }],
+  });
+  const businessOutput = JSON.stringify({
+    successful: true,
+    data: {
+      sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+      revision: 1,
+      items: [{ id: 'proof-release-1', title: 'Review the Clementine 4 release proof', status: 'open' }],
+      total: 1,
+    },
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'verified-read-cold-scaffold' });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: objective },
+  });
+  let judgeCalls = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const searchTool = { name: 'composio_search_tools' };
+    const searchDetails = {
+      toolCall: {
+        callId: 'verified-read-search-call',
+        arguments: JSON.stringify({ query: 'proof release queue current items', limit: 5 }),
+      },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, searchTool, searchDetails);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, searchTool, discoveryOutput, searchDetails);
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'system',
+      type: 'capability_discovered',
+      data: {
+        sourceUserSeq: source.seq,
+        attemptId: attempt.attemptId,
+        capabilities: [{ identifier: 'PROOF_LIST_TASKS', effectClass: 'read' }],
+      },
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'system',
+      type: 'discovery_governor_outcome',
+      data: {
+        sourceUserSeq: source.seq,
+        attemptId: attempt.attemptId,
+        callId: 'verified-read-search-call',
+        outcome: 'succeeded',
+        recorded: true,
+        reason: 'outcome_recorded',
+      },
+    });
+    const businessTool = { name: 'composio_execute_tool' };
+    const businessDetails = {
+      toolCall: {
+        callId: 'verified-read-business-call',
+        arguments: JSON.stringify({
+          tool_slug: 'PROOF_LIST_TASKS',
+          arguments: '{}',
+          connected_account_id: null,
+        }),
+      },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, businessTool, businessDetails);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, businessTool, businessOutput, businessDetails);
+    const decision = { summary: reply, reply, done: true, nextAction: 'completed' as const, reason: null };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    input: objective,
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeCalls += 1;
+      return { done: true, reason: 'the exact read-only scaffold was already verified' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(judgeCalls, 0, 'literal read-carrier calls do not trigger a second completion judge');
+  const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1);
+  assert.equal((terminal?.data.verifiedReadCompletionReceipt as { kind?: unknown } | undefined)?.kind, 'read_discovery_scaffold');
+  assert.equal(terminal?.data.reply, reply);
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+      .some((event) => event.data.door === 'completion'),
+    false,
+  );
+});
+
+test('objective judge: restart change framing without prior authority stays judge-backed and byte-stable', async () => {
+  resetEventLog();
+  const objective = [
+    'Return to the proof release queue and refresh its current items now.',
+    'The provider state may have changed. Use the capability already proved, perform a fresh read, and do not replay an old answer or rediscover anything.',
+    'Return the source marker, revision, item id, title, and status.',
+  ].join('\n');
+  const reply = [
+    'Fresh read — the queue changed after restart:',
+    'Source marker: PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+    'Revision: 2',
+    'Item ID: proof-release-1',
+    'Title: Review the Clementine 4 release proof',
+    'Status: done',
+  ].join('\n');
+  const output = JSON.stringify({
+    successful: true,
+    data: {
+      sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+      revision: 2,
+      items: [{
+        id: 'proof-release-1',
+        title: 'Review the Clementine 4 release proof',
+        status: 'done',
+      }],
+      total: 1,
+    },
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'verified-read-restart-framing' });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: objective },
+  });
+  let judgeCalls = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = { name: 'composio_execute_tool' };
+    const details = {
+      toolCall: {
+        callId: 'verified-read-restart-business-call',
+        arguments: JSON.stringify({
+          tool_slug: 'PROOF_LIST_TASKS',
+          arguments: '{}',
+          connected_account_id: null,
+        }),
+      },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, output, details);
+    const decision = { summary: reply, reply, done: true, nextAction: 'completed' as const, reason: null };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    input: objective,
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeCalls += 1;
+      return { done: true, reason: 'the restart read was already structurally verified' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.lastDecision?.reply, reply);
+  assert.equal(judgeCalls, 1, 'a historical change claim without a prior receipt keeps semantic judging');
+  const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.verifiedReadCompletionReceipt, undefined);
+  assert.equal(terminal?.data.reply, reply);
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+      .some((event) => event.data.door === 'completion'),
+    true,
+  );
+});
+
+test('objective judge: compound work and contradictory presentations cannot borrow a read receipt', async () => {
+  const warmObjective = [
+    'Refresh the proof release queue current items from the same connected source.',
+    'Reuse the capability already proved on this machine. Do not discover, inspect a contract, use code mode, shell, workspace, or memory.',
+    'Return the source marker, revision, item id, title, and status.',
+  ].join('\n');
+  const exactReply = [
+    'Source marker: PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+    'Revision: 1',
+    'Item ID: proof-release-1',
+    'Title: Review the Clementine 4 release proof',
+    'Status: open',
+  ].join('\n');
+  const exactHorizontalReply = [
+    '| Source marker | Revision | Item ID | Title | Status |',
+    '|---|---:|---|---|---|',
+    '| PROOF_RELEASE_QUEUE:LOCAL_ONLY | 1 | proof-release-1 | Review the Clementine 4 release proof | open |',
+  ].join('\n');
+  const oneRowOutput = JSON.stringify({
+    successful: true,
+    data: {
+      sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+      revision: 1,
+      items: [{ id: 'proof-release-1', title: 'Review the Clementine 4 release proof', status: 'open' }],
+      total: 1,
+    },
+  });
+  const cases = [
+    {
+      name: 'navigation plus comparison',
+      objective: [
+      'Back to the proof release queue: refresh its current items from the same connected source.',
+      'Reuse the capability already proved on this machine.',
+      'Compare the result with the prior answer.',
+      'Return the source marker, revision, item id, title, and status.',
+      ].join('\n'),
+      reply: exactReply,
+      output: oneRowOutput,
+    },
+    {
+      name: 'restart plus summary',
+      objective: [
+        'Return to the proof release queue and refresh its current items now.',
+        'The provider state may have changed. Use the capability already proved, perform a fresh read, and do not replay an old answer or rediscover anything.',
+        'Summarize the release risk.',
+        'Return the source marker, revision, item id, title, and status.',
+      ].join('\n'),
+      reply: exactReply,
+      output: oneRowOutput,
+    },
+    {
+      name: 'dependent-clause audit work',
+      objective: warmObjective.replace(
+        'from the same connected source.',
+        'from the same connected source while auditing release risk.',
+      ),
+      reply: exactReply,
+      output: oneRowOutput,
+    },
+    {
+      name: 'passive ranking transformation',
+      objective: warmObjective.replace(
+        'current items from the same connected source.',
+        'current items ranked by release risk from the same connected source.',
+      ),
+      reply: exactReply,
+      output: oneRowOutput,
+    },
+    {
+      name: 'parallel audit noun work',
+      objective: warmObjective.replace(
+        'from the same connected source.',
+        'from the same connected source alongside an audit of release risk.',
+      ),
+      reply: exactReply,
+      output: oneRowOutput,
+    },
+    ...['Audit', 'Examine', 'Reconcile'].map((verb) => ({
+      name: `${verb.toLowerCase()} current-items clause is not a noun heading`,
+      objective: `${verb} current items.\n${warmObjective}`,
+      reply: exactReply,
+      output: oneRowOutput,
+    })),
+    ...[
+      'so you can audit them',
+      'in order to audit them',
+      'so that you can audit them',
+      'to help audit them',
+    ].map((purpose, index) => ({
+      name: `unowned retrieval purpose suffix ${index + 1}`,
+      objective: warmObjective.replace(
+        'from the same connected source.',
+        `from the same connected source ${purpose}.`,
+      ),
+      reply: exactReply,
+      output: oneRowOutput,
+    })),
+    {
+      name: 'contradictory whole-reply status narrative',
+      objective: warmObjective,
+      reply: `${exactReply}\nThe item is closed.`,
+      output: oneRowOutput,
+    },
+    ...[
+      'proof-release-1 is closed.',
+      'Item is not open.',
+      'The item isn’t open.',
+      'The item’s status is closed.',
+      "proof-release-1's status is closed.",
+      'Current state: closed.',
+    ].map((contradiction, index) => ({
+      name: `contradictory one-row status form ${index + 1}`,
+      objective: warmObjective,
+      reply: `${exactReply}\n${contradiction}`,
+      output: oneRowOutput,
+    })),
+    ...[
+      'However, the source marker is WRONG_SOURCE.',
+      'But the revision is 2.',
+      'In fact, the item ID is proof-release-2.',
+      'For clarity, the title is Publish the Clementine 4 release proof.',
+      'However, the status is closed.',
+      'But the current state is closed.',
+    ].map((contradiction, index) => ({
+      name: `discourse-prefixed current-field contradiction ${index + 1}`,
+      objective: warmObjective,
+      reply: `${exactReply}\n${contradiction}`,
+      output: oneRowOutput,
+    })),
+    {
+      name: 'identical second structured data row',
+      objective: warmObjective,
+      reply: [
+        'Source marker: PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+        'Revision: 1',
+        '| Item ID | Title | Status |',
+        '|---|---|---|',
+        '| proof-release-1 | Review the Clementine 4 release proof | open |',
+        '| proof-release-1 | Review the Clementine 4 release proof | open |',
+      ].join('\n'),
+      output: oneRowOutput,
+    },
+    {
+      name: 'duplicate horizontal snapshot table',
+      objective: warmObjective,
+      reply: [exactHorizontalReply, '', exactHorizontalReply].join('\n'),
+      output: oneRowOutput,
+    },
+    {
+      name: 'partial-result prose outside the JSON envelope',
+      objective: warmObjective,
+      reply: exactReply,
+      output: `${oneRowOutput}\nWarning: only a partial result was returned.`,
+    },
+    {
+      name: 'disputed empty-collection proposition',
+      objective: warmObjective,
+      reply: [
+        'Source marker: PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+        'Revision: 1',
+        'The claim “no current items were returned” is false.',
+      ].join('\n'),
+      output: JSON.stringify({
+        successful: true,
+        data: {
+          sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+          revision: 1,
+          items: [],
+          total: 0,
+        },
+      }),
+    },
+    ...[
+      '“No current items were returned.”',
+      'The provider reported that no current items were returned.',
+      'If no current items were returned, the queue would be clear.',
+      'Perhaps no current items were returned.',
+      'I am not sure whether no current items were returned.',
+      'There may be no current items.',
+      'It is possible that no current items were returned.',
+    ].map((claim, index) => ({
+      name: `non-affirmative empty-result form ${index + 1}`,
+      objective: warmObjective,
+      reply: [
+        'Source marker: PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+        'Revision: 1',
+        claim,
+      ].join('\n'),
+      output: JSON.stringify({
+        successful: true,
+        data: {
+          sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+          revision: 1,
+          items: [],
+          total: 0,
+        },
+      }),
+    })),
+  ];
+
+  for (const [index, fixture] of cases.entries()) {
+    resetEventLog();
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const attempt = beginRunAttempt(sess.id, { runId: `verified-read-compound-navigation-${index}` });
+    const source = recordRunAttemptUserInput(attempt, {
+      turn: 1,
+      role: 'user',
+      data: { text: fixture.objective },
+    });
+    let judgeCalls = 0;
+    const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+      const ee = runner as unknown as EventEmitter;
+      const runContext = { context: opts.context };
+      const tool = { name: 'composio_execute_tool' };
+      const details = {
+        toolCall: {
+          callId: `verified-read-compound-business-${index}`,
+          arguments: JSON.stringify({
+            tool_slug: 'PROOF_LIST_TASKS',
+            arguments: '{}',
+            connected_account_id: null,
+          }),
+        },
+      };
+      ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+      ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, fixture.output, details);
+      const decision = { summary: fixture.reply, reply: fixture.reply, done: true, nextAction: 'completed' as const, reason: null };
+      ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+      return { history: items, lastResponseId: undefined, finalOutput: decision };
+    };
+
+    await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      runAttemptId: attempt.attemptId,
+      input: fixture.objective,
+      judgeCompletion: true,
+      judgeFn: async () => {
+        judgeCalls += 1;
+        return { done: true, reason: 'compound work remains judge-owned' };
+      },
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    assert.equal(judgeCalls, 1, `${fixture.name} retained the ordinary completion judge`);
+    const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1);
+    assert.equal(terminal?.data.verifiedReadCompletionReceipt, undefined, fixture.name);
+    assert.equal(
+      listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+        .some((event) => event.data.door === 'completion'),
+      true,
+      fixture.name,
+    );
+  }
+});
+
+test('objective judge: a downstream claim-grounding bounce never leaves a premature read completion receipt', async () => {
+  resetEventLog();
+  const objective = [
+    'Refresh the proof release queue current items from the same connected source.',
+    'Return the source marker, revision, item id, title, and status.',
+  ].join('\n');
+  const exactReply = [
+    '- Source marker: PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+    '- Revision: 1',
+    '- Item ID: proof-release-1',
+    '- Title: Review the Clementine 4 release proof',
+    '- Status: open',
+  ].join('\n');
+  const firstDraft = `${exactReply}\n\nUnverified handoff: https://invented-read-receipt.example/final`;
+  const output = JSON.stringify({
+    successful: true,
+    data: {
+      sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+      revision: 1,
+      items: [{
+        id: 'proof-release-1',
+        title: 'Review the Clementine 4 release proof',
+        status: 'open',
+      }],
+      total: 1,
+    },
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'verified-read-deferred-receipt' });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: objective },
+  });
+  let modelTurns = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    modelTurns += 1;
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    if (modelTurns === 1) {
+      const tool = { name: 'composio_execute_tool' };
+      const details = {
+        toolCall: {
+          callId: 'verified-read-bounced-call',
+          arguments: JSON.stringify({
+            tool_slug: 'PROOF_LIST_TASKS',
+            arguments: '{}',
+            connected_account_id: null,
+          }),
+        },
+      };
+      ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+      ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, output, details);
+    }
+    const reply = modelTurns === 1 ? firstDraft : exactReply;
+    const decision = { summary: reply, reply, done: true, nextAction: 'completed' as const, reason: null };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    input: objective,
+    judgeCompletion: true,
+    judgeFn: async () => ({ done: true, reason: 'the corrected reply is complete' }),
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(modelTurns, 2, 'the invented pointer is corrected before terminal acceptance');
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data.kind === 'claim_grounding_nudge').length,
+    1,
+  );
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['heartbeat'] })
+      .filter((event) => event.data.kind === 'verified_read_completion_receipt').length,
+    0,
+    'a rejected first draft cannot leave a green receipt behind',
+  );
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)?.data.reply,
+    exactReply,
+  );
+});
+
+test('objective judge: an unexecuted script-backed skill prevents the read receipt from skipping its deterministic floor', async () => {
+  resetEventLog();
+  const objective = [
+    'Refresh the proof release queue current items from the same connected source.',
+    'Return the source marker, revision, item id, title, and status.',
+  ].join('\n');
+  const reply = [
+    'Source marker: PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+    'Revision: 1',
+    'Item ID: proof-release-1',
+    'Title: Review the Clementine 4 release proof',
+    'Status: open',
+  ].join('\n');
+  const output = JSON.stringify({
+    successful: true,
+    data: {
+      sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY',
+      revision: 1,
+      items: [{ id: 'proof-release-1', title: 'Review the Clementine 4 release proof', status: 'open' }],
+      total: 1,
+    },
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const skillCalled = appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'agent',
+    type: 'tool_called',
+    data: {
+      tool: 'skill_read',
+      callId: 'verified-read-script-skill',
+      effect: 'read',
+      arguments: JSON.stringify({ name: 'proof-renderer' }),
+    },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'verified-read-script-skill',
+    invocationNonce: 'verified-read-script-skill-output',
+    tool: 'skill_read',
+    output: [
+      '# proof-renderer',
+      '',
+      'manifest',
+      '',
+      '=== HOW TO RUN THIS SKILL ===',
+      'Follow the pipeline.',
+      '',
+      '---',
+      'Run `src/generate-html.js` to produce the artifact. Validation is mandatory.',
+    ].join('\n'),
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: skillCalled.id,
+    data: { tool: 'skill_read', callId: 'verified-read-script-skill', effect: 'read', ok: true },
+  });
+  const attempt = beginRunAttempt(sess.id, { runId: 'verified-read-skill-floor' });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: objective },
+  });
+  let modelTurns = 0;
+  let judgeCalls = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    modelTurns += 1;
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = modelTurns === 1
+      ? { name: 'composio_execute_tool' }
+      : { name: 'run_shell_command' };
+    const details = modelTurns === 1
+      ? {
+          toolCall: {
+            callId: 'verified-read-skill-business',
+            arguments: JSON.stringify({ tool_slug: 'PROOF_LIST_TASKS', arguments: '{}' }),
+          },
+        }
+      : {
+          toolCall: {
+            callId: 'verified-read-skill-render',
+            arguments: JSON.stringify({ command: 'node src/generate-html.js' }),
+          },
+        };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, modelTurns === 1 ? output : 'rendered', details);
+    const decision = { summary: reply, reply, done: true, nextAction: 'completed' as const, reason: null };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    input: objective,
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeCalls += 1;
+      return { done: true, reason: 'the read fields are present' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(modelTurns, 2, 'the missing prescribed script forces one corrective continuation');
+  assert.equal(judgeCalls, 2, 'the read receipt never bypasses the skill-owned completion path');
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['heartbeat'] })
+      .filter((event) => event.data.kind === 'verified_read_completion_receipt').length,
+    0,
+  );
 });
 
 test('objective judge: a successful concrete send slug is completion evidence', async () => {
@@ -6348,6 +7632,413 @@ test('runConversation: a generic acknowledgement after durable auto-capture comp
   assert.equal(result.lastDecision?.reply, 'Noted.');
   assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
   assert.equal(listEventsForConv(sess.id, { types: ['tool_called'] }).length, 0);
+});
+
+test('runConversation: a natural provider-authored memory acknowledgement does not enter the stall judge', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const reply = "Got it — Cedar's current release is **Cedar-9012**. I'll remember that.";
+  let modelTurns = 0;
+  let judgeCalls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    modelTurns += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: reply };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: "Remember this: Cedar's current release number is Cedar-9012. A natural acknowledgement is enough.",
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeCalls += 1;
+      return { done: true, reason: 'the durable memory receipt satisfies the request' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const capture = listEventsForConv(sess.id, { types: ['memory_signals_captured'] }).at(-1);
+  assert.ok(Number((capture?.data as { queuedCandidateCount?: number } | undefined)?.queuedCandidateCount ?? 0) > 0);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(modelTurns, 1);
+  assert.equal(judgeCalls, 0, 'the exact durable receipt replaces both generic completion judges');
+  assert.equal(result.lastDecision?.reply, reply, 'the provider-authored wording is preserved exactly');
+  assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['conversation_completed'] })
+      .some((event) => event.data.reason === 'stall_judge_delivered'),
+    false,
+    'durable capture evidence resolves the natural acknowledgement before the announcement heuristic',
+  );
+});
+
+test('runConversation: parsed structured remember and correction acknowledgements trust the exact receipt without changing provider prose', async () => {
+  for (const [index, fixture] of [
+    {
+      message: 'Remember this: Cedar receipt marker is STRUCTURED-REMEMBER-9201. A natural acknowledgement is enough.',
+      reply: 'Understood — Cedar receipt marker is STRUCTURED-REMEMBER-9201.',
+    },
+    {
+      message: 'Small correction for later: Cedar receipt marker is STRUCTURED-CORRECTION-9202. STRUCTURED-REMEMBER-9201 is retired. A natural acknowledgement is enough.',
+      reply: 'Got it — STRUCTURED-CORRECTION-9202 is current, and STRUCTURED-REMEMBER-9201 is retired.',
+    },
+    {
+      message: 'Small correction for later: Cedar receipt marker is STRUCTURED-UPDATE-9203. A natural acknowledgement is enough.',
+      reply: "Got it — I'll update that.",
+    },
+    {
+      message: 'Remember this: Cedar receipt marker is STRUCTURED-UPDATED-9204. A natural acknowledgement is enough.',
+      reply: "Understood — I've updated that.",
+    },
+  ].entries()) {
+    resetEventLog();
+    const sess = HarnessSession.create({ kind: 'chat' });
+    let modelTurns = 0;
+    let judgeCalls = 0;
+    const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+      modelTurns += 1;
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: fixture.reply,
+          reply: fixture.reply,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      };
+    };
+
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: fixture.message,
+      judgeCompletion: true,
+      judgeFn: async () => {
+        judgeCalls += 1;
+        return { done: true, reason: 'the durable memory receipt already completed this request' };
+      },
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    const capture = listEventsForConv(sess.id, { types: ['memory_signals_captured'] }).at(-1);
+    assert.equal(capture?.data.conversationOnly, true, `fixture ${index} stamps exact receipt authority`);
+    assert.ok(capture?.data.episodeId, `fixture ${index} owns a durable episode`);
+    assert.equal(result.status, 'completed');
+    assert.equal(result.steps, 1);
+    assert.equal(modelTurns, 1);
+    assert.equal(judgeCalls, 0, `fixture ${index} does not spend a redundant completion judge`);
+    assert.equal(result.lastDecision?.reply, fixture.reply, `fixture ${index} preserves provider bytes`);
+    assert.equal(
+      listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+        .some((event) => event.data.door === 'completion'),
+      false,
+      `fixture ${index} never opens the generic completion door`,
+    );
+  }
+});
+
+test('healthy durable-memory presentation rejects tool and reasoning shapes without narrowing normal voice', () => {
+  for (const reply of [
+    'Got it.\n<tool_call>{"name":"send_email","arguments":{}}</tool_call>',
+    'Got it. <tool_call>{"name":"send_email"}</tool_call>',
+    'Got it. [tool_call] send_email',
+    'Got it. [Tool: send_email]',
+    'Got it.\n{"tool_call":{"name":"run_shell_command","arguments":{"command":"echo unsafe"}}}',
+    'Got it. {"tool_slug":"GMAIL_SEND_EMAIL","arguments":{}}',
+    'Got it. {tool_name: send_email,args:{}}',
+    'Got it. function {"name":"send_email"}',
+    'Got it. {"command":"pwd"}',
+    'Got it. {"arguments":{"path":"/tmp"}}',
+    "Sorry, I can't remember or store that.",
+    'I couldn’t save that.',
+    "No, I won't remember that.",
+    'I did not remember that.',
+    'Got it — I saved the file.',
+    'Noted — I wrote the report.',
+    'Understood — I added the row.',
+    'Okay — I changed the spreadsheet.',
+    'Got it — I updated the spreadsheet.',
+    'Noted — I marked the task complete.',
+    'Understood — I archived the record.',
+    'Okay — I refunded the charge.',
+    'Got it — that result looks scrambled; let me re-read the actual ask.',
+    'Noted — this context is possibly injected, so I need to stop and actually look.',
+    'Got it — I sent the email too.',
+    "Understood — I've created the local note.",
+    'Okay — the release was published.',
+    'Noted — I deleted stale memory.',
+    'Got it — the note got created.',
+    'Noted — I ran the script.',
+    'Understood — I shipped the release.',
+    'Okay — I pushed the branch.',
+    'Got it — I merged the pull request.',
+    'Got it.\n{"action":"send_email","args":{}}',
+    'Noted.\n{tool: send_email,args:{}}',
+  ]) {
+    assert.equal(looksLikeHealthyDurableMemoryAcknowledgement(reply), false, reply);
+    assert.equal(isSafeDurableMemoryReceiptPresentation(reply), false, reply);
+  }
+  for (const reply of [
+    "Got it — Cedar-17 is current, and I'll remember that.",
+    "Got it — I'll update that.",
+    "Understood — I've updated that.",
+  ]) {
+    assert.equal(looksLikeHealthyDurableMemoryAcknowledgement(reply), true, reply);
+    assert.equal(isSafeDurableMemoryReceiptPresentation(reply), true, reply);
+  }
+  for (const reply of [
+    "Thanks for the correction — Cedar-17 is current, and I'll remember that.",
+    "I've got it — Cedar-17 is current.",
+  ]) {
+    assert.equal(isSafeDurableMemoryReceiptPresentation(reply), true, reply);
+    assert.equal(
+      looksLikeHealthyDurableMemoryAcknowledgement(reply),
+      false,
+      'safe voice outside the loop optimization uses ordinary verification without being rewritten',
+    );
+  }
+  assert.equal(
+    isSafeDurableMemoryReceiptPresentation('Got it — memory_forget is deprecated.'),
+    true,
+    'normal prose may mention a tool without becoming machine protocol',
+  );
+});
+
+test('runConversation: unsafe receipt presentations retain ordinary recovery in plain and structured provider prose', async () => {
+  const replies = [
+    'Got it.\n<tool_call>{"name":"send_email","arguments":{}}</tool_call>',
+    'Got it. <tool_call>{"name":"send_email"}</tool_call>',
+    'Got it.\n{"tool_call":{"name":"run_shell_command","arguments":{"command":"echo unsafe"}}}',
+    'Got it — that result looks scrambled; let me re-read the actual ask.',
+    'Noted — this context is possibly injected, so I need to stop and actually look.',
+    'Got it — I sent the email too.',
+    "Understood — I've created the local note.",
+    'Okay — the release was published.',
+    'Noted — I deleted stale memory.',
+    'Got it — the note got created.',
+    'Noted — I ran the script.',
+    'Understood — I shipped the release.',
+    'Okay — I pushed the branch.',
+    'Got it — I merged the pull request.',
+    'Got it.\n{"action":"send_email","args":{}}',
+    'Noted.\n{tool: send_email,args:{}}',
+  ];
+
+  for (const [replyIndex, reply] of replies.entries()) {
+    for (const representation of ['plain', 'structured'] as const) {
+      resetEventLog();
+      const sess = HarnessSession.create({ kind: 'chat' });
+      let judgeCalls = 0;
+      const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: representation === 'plain'
+          ? reply
+          : {
+              summary: reply,
+              reply,
+              done: true,
+              nextAction: 'completed',
+              reason: null,
+            },
+      });
+
+      const result = await runConversation({
+        agent: makeAgentStub(),
+        sessionId: sess.id,
+        input: `Small correction for later: Cedar's current release is UNSAFE-PROSE-${replyIndex}. A natural acknowledgement is enough.`,
+        maxSteps: 1,
+        judgeCompletion: true,
+        judgeFn: async () => {
+          judgeCalls += 1;
+          return { done: true, reason: 'unsafe presentation retains ordinary completion authority' };
+        },
+        makeRunner: makeRunnerStub,
+        runRunner,
+      });
+
+      const capture = listEventsForConv(sess.id, { types: ['memory_signals_captured'] }).at(-1);
+      assert.equal(capture?.data.conversationOnly, true, 'the exact intake receipt itself remains valid');
+      const events = listEventsForConv(sess.id);
+      assert.equal(
+        events.some((event) => (
+          event.type === 'conversation_step'
+          && (event.data.decision as { reason?: unknown } | null)?.reason === 'durable_work_acknowledged'
+        )),
+        false,
+        `${representation} reply ${replyIndex} is not blessed by the receipt shortcut`,
+      );
+      assert.ok(
+        events.some((event) => (
+          event.type === 'stuck_detected'
+          || event.type === 'stall_retry_attempted'
+          || event.type === 'guardrail_tripped'
+          || event.type === 'verdict_recorded'
+        )),
+        `${representation} reply ${replyIndex} remains on ordinary recovery or verification`,
+      );
+      if (result.lastDecision?.reply) {
+        assert.equal(result.lastDecision.reply, reply, `${representation} reply ${replyIndex} remains byte-preserved`);
+      }
+      assert.ok(judgeCalls >= 0);
+    }
+  }
+});
+
+test('runConversation: a receipt marker cannot be borrowed from another accepted source', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const reply = 'Got it — the release note is handled.';
+  let judgeCalls = 0;
+  let acceptedSourceSeq = 0;
+  let foreignSourceSeq = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const acceptedSource = listEventsForConv(sess.id, { types: ['user_input_received'] }).at(-1)!;
+    acceptedSourceSeq = acceptedSource.seq;
+    const foreignSource = appendEvent({
+      sessionId: sess.id,
+      turn: acceptedSource.turn,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Unrelated accepted source used only for the receipt-binding regression.' },
+    });
+    foreignSourceSeq = foreignSource.seq;
+    appendEvent({
+      sessionId: sess.id,
+      turn: acceptedSource.turn,
+      role: 'system',
+      type: 'memory_signals_captured',
+      data: {
+        factCount: 1,
+        queuedCandidateCount: 1,
+        episodeId: 'foreign-episode',
+        reasons: ['explicit remember request'],
+        sourceUserSeq: foreignSource.seq,
+        conversationOnly: true,
+      },
+    });
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: reply,
+        reply,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create a local release note.',
+    maxSteps: 1,
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeCalls += 1;
+      return { done: true, reason: 'the active request owns no memory receipt' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.notEqual(foreignSourceSeq, acceptedSourceSeq);
+  assert.equal(judgeCalls, 1, 'a same-turn marker bound to another source grants no completion authority');
+  assert.equal(result.lastDecision?.reply, reply, 'the provider reply remains byte-preserved');
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+      .some((event) => event.data.door === 'completion'),
+    true,
+  );
+});
+
+test('runConversation: compound question, admin, tool, and write clauses cannot borrow memory receipt authority', async () => {
+  const messages = [
+    'Remember this: Cedar release marker is NEGATIVE-COMPOUND-9301. Also summarize the launch plan. Just confirm.',
+    'Remember this: Cedar release marker is NEGATIVE-QUESTION-9302. Also what is 8 x 7? Just confirm.',
+    'Remember this: Cedar release marker is NEGATIVE-ADMIN-9303. Also forget fact #1. Just confirm.',
+    'Remember this: Cedar release marker is NEGATIVE-TOOL-9304. Also use memory_forget on Cedar-12. Just confirm.',
+    'Remember this: Cedar release marker is NEGATIVE-WRITE-9305. Also send the release note to the team. Just confirm.',
+  ];
+
+  for (const [index, message] of messages.entries()) {
+    resetEventLog();
+    const sess = HarnessSession.create({ kind: 'chat' });
+    let judgeCalls = 0;
+    const reply = `Got it — I captured NEGATIVE-${index}.`;
+    const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: reply,
+        reply,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    });
+
+    await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: message,
+      maxSteps: 1,
+      judgeCompletion: true,
+      judgeFn: async () => {
+        judgeCalls += 1;
+        return { done: true, reason: 'ordinary completion authority remains active' };
+      },
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    const capture = listEventsForConv(sess.id, { types: ['memory_signals_captured'] }).at(-1);
+    assert.ok(capture, `fixture ${index} still durably captures the isolated fact`);
+    assert.equal(capture!.data.conversationOnly, false, `fixture ${index} fails closed at intake`);
+    assert.equal(judgeCalls, 1, `fixture ${index} retains the ordinary completion judge`);
+    assert.equal(
+      listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+        .some((event) => event.data.door === 'completion'),
+      true,
+      `fixture ${index} records the ordinary completion verdict`,
+    );
+  }
+});
+
+test('runConversation: memory capture cannot hide unfinished work in a compound request', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const reply = "Got it — I'll remember that.";
+  let modelTurns = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    modelTurns += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: reply };
+  };
+
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Remember this: my compound marker is MIXED-MEMORY-9013, and create a local note afterward.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const capture = listEventsForConv(sess.id, { types: ['memory_signals_captured'] }).at(-1);
+  assert.ok(Number((capture?.data as { queuedCandidateCount?: number } | undefined)?.queuedCandidateCount ?? 0) > 0);
+  assert.ok(modelTurns > 1, 'the unfinished create clause remains in the normal stall/recovery path');
+  const decisions = listEventsForConv(sess.id, { types: ['conversation_step'] });
+  assert.equal(
+    decisions.some((event) => (event.data.decision as { reason?: unknown } | null)?.reason === 'durable_work_acknowledged'),
+    false,
+    'the memory receipt cannot certify the unrelated action clause',
+  );
 });
 
 test('runConversation: a zero-tool ACKNOWLEDGMENT turn is NOT flagged as a stall', async () => {

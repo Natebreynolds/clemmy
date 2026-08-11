@@ -47,7 +47,8 @@ function previewArgs(input: unknown): Record<string, unknown> {
  * goal-fidelity / destination / confirm-first) fires identically. The MCP
  * subprocess shares the chat session's `harness.db` via `CLEMENTINE_HOME` +
  * `CLEMENTINE_MCP_SESSION_ID`, so the gates read the real session history and
- * plan-scope (this is what lets a batch approval cover a worker fan-out).
+ * plan-scope. Worker Composio mutations are still refused centrally: workers
+ * compose exact payloads, and the parent freezes them into one approved batch.
  *
  * Registered ONLY when `CLEMENTINE_MCP_GATED_MUTATIONS=on` (set by the Agent SDK
  * lane in buildClaudeAgentSdkLocalMcpServers), so the Codex/OpenAI MCP wiring is
@@ -108,7 +109,7 @@ export function getGatedToolSchemas(): Record<string, z.ZodRawShape> {
  *  turns; cross-call runaways are still caught by the event-log loop-guard). */
 const PER_CALL_COUNTER_LIMIT = 1000;
 
-type InvokableTool = Tool<unknown> & {
+export type GatedInvokableTool = Tool<unknown> & {
   invoke?: (runContext: unknown, input: string, details: unknown) => Promise<unknown>;
   description?: string;
 };
@@ -123,6 +124,15 @@ export interface RegisterGatedMutatingToolsOptions {
   runScopeId?: string;
   sourceUserSeq?: number;
   dispatchLease?: DispatchLeaseRef;
+  /** True only for the foreground orchestrator. Claude workers/workflow steps
+   * explicitly carry false so settled-read steering never leaks into them. */
+  directOrchestrator?: boolean;
+  /** True only for run_worker children. Carried into the inner harness context
+   * so the central Composio gateway—not prompt wording—owns compose-only
+   * mutation enforcement. */
+  workerScope?: boolean;
+  /** Focused unit-test seam; production always resolves the real registry. */
+  runtimeToolsForTest?: GatedInvokableTool[];
 }
 
 /**
@@ -143,16 +153,22 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
   })();
   const dispatchLease = opts.dispatchLease
     ?? parseDispatchLease(process.env.CLEMENTINE_MCP_DISPATCH_LEASE_JSON);
+  const directOrchestrator = opts.directOrchestrator
+    ?? (process.env.CLEMENTINE_MCP_DIRECT_ORCHESTRATOR ?? '').trim().toLowerCase() === 'on';
+  const workerScope = opts.workerScope
+    ?? (process.env.CLEMENTINE_MCP_WORKER_SCOPE ?? '').trim().toLowerCase() === 'on';
 
-  const byName = new Map<string, InvokableTool>();
-  for (const t of [...getComputerTools(), ...getComposioRuntimeTools()] as InvokableTool[]) {
+  const byName = new Map<string, GatedInvokableTool>();
+  const runtimeTools = opts.runtimeToolsForTest
+    ?? ([...getComputerTools(), ...getComposioRuntimeTools()] as GatedInvokableTool[]);
+  for (const t of runtimeTools) {
     if (t && typeof t.name === 'string') byName.set(t.name, t);
   }
 
   for (const [name, shape] of Object.entries(getGatedToolSchemas())) {
     const realTool = byName.get(name);
     if (!realTool || typeof realTool.invoke !== 'function') continue;
-    const wrapped = wrapToolForHarness(realTool as never) as InvokableTool;
+    const wrapped = wrapToolForHarness(realTool as never) as GatedInvokableTool;
 
     server.tool(
       name,
@@ -161,7 +177,7 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
       async (rawInput: Record<string, unknown>) => {
         assertDispatchLeaseCurrent(dispatchLease);
         const counter = new ToolCallsCounter(PER_CALL_COUNTER_LIMIT);
-        const callId = `mcp-${randomUUID()}`;
+        const innerCallId = `mcp-${randomUUID()}`;
         // Compute this from the original full MCP payload before previewArgs
         // clips long strings. The canonical SDK row computes the same digest,
         // allowing one logical call to be reconstructed without storing another
@@ -181,6 +197,16 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
         for (const key of Object.keys(shape)) {
           input[key] = rawInput?.[key] ?? null;
         }
+        const canonicalClaim = claimClaudeLocalPermissionAdmission({
+          sessionId,
+          sourceUserSeq: sourceUserSeq ?? 0,
+          runScopeId: runScopeId ?? '',
+          toolName: name,
+          rawInput,
+          directOrchestrator,
+          dispatchLease,
+        });
+        const callId = canonicalClaim?.providerCallId ?? innerCallId;
         // Synthesize the shapes the gated execute reads: sessionIdFromRunContext
         // wants { context: { sessionId } }; callIdFromToolDetails wants
         // { toolCall: { callId } } (see tool-output-context.ts).
@@ -199,8 +225,14 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
             type: 'tool_called',
             data: {
               ...(sourceUserSeq ? { sourceUserSeq } : {}),
+              ...(runScopeId ? { runScopeId } : {}),
               tool: name,
-              callId,
+              callId: innerCallId,
+              ...(canonicalClaim ? {
+                canonicalCallId: canonicalClaim.providerCallId,
+                canonicalCalledEventId: canonicalClaim.calledEventId,
+                claudePermissionAdmissionEventId: canonicalClaim.admissionEventId,
+              } : {}),
               args: previewArgs(input),
               accounting: 'transport_mirror',
               correlationFingerprint,
@@ -212,6 +244,9 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
             sessionId,
             counter,
             behaviorScopeId: runScopeId,
+            directOrchestrator,
+            workerScope,
+            ...(canonicalClaim ? { settledReadCanonicalArgs: rawInput } : {}),
             ...(sourceUserSeq ? { sourceUserSeq } : {}),
             ...(dispatchLease ? {
               dispatchLease,
@@ -242,4 +277,31 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
       },
     );
   }
+}
+
+
+/**
+ * Render a typed refusal as a FAILED result the model can see.
+ *
+ * The gated local MCP lane returned refusals as ordinary text, so a policy
+ * denial and a successful read were the same shape on the wire: the model had
+ * to read the sentence to find out whether anything happened. MCP has a field
+ * for this, and a refusal that does not set it is a failure pretending to be
+ * an answer.
+ */
+export function renderTypedRefusalForModel(outcome: {
+  kind: string;
+  detail?: string;
+  directive?: { action?: string };
+}): { isError: true; ok: false; content: Array<{ type: 'text'; text: string }>; kind: string } {
+  const action = outcome.directive?.action ?? 'stop_and_explain';
+  return {
+    isError: true,
+    ok: false,
+    kind: outcome.kind,
+    content: [{
+      type: 'text',
+      text: `refused: ${outcome.kind}${outcome.detail ? ` (${outcome.detail})` : ''} — recovery: ${action}`,
+    }],
+  };
 }

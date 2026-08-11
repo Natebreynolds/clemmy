@@ -675,6 +675,64 @@ test('lost background-input response replays one accepted source, terminal, and 
   }
 });
 
+test('desktop parked background question leaves declines and fresh turns in the foreground', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let configureCalls = 0;
+  _setBridgeImplsForTests({
+    configure: (async () => {
+      configureCalls += 1;
+      return { ok: false, reason: 'test runtime intentionally unavailable' };
+    }) as never,
+    claudeAgentBrain: (async () => {
+      assert.fail('a foreground-auth rejection must not call the brain');
+    }) as never,
+  });
+  const { createBackgroundTask, updateBackgroundTask } = await import('../execution/background-tasks.js');
+  const harness = await boot();
+  try {
+    const messages = [
+      'No.',
+      'No, but send it to Alice instead',
+      'What should we improve in Clem next?',
+    ];
+    for (const [index, input] of messages.entries()) {
+      const session = createSession({
+        id: `sess-desktop-background-fresh-${index}`,
+        kind: 'chat',
+        channel: 'desktop',
+      });
+      const task = createBackgroundTask({
+        title: `Parked choice ${index}`,
+        prompt: 'Deploy the release.',
+        originSessionId: session.id,
+        source: 'desktop',
+      });
+      updateBackgroundTask(task.id, {
+        status: 'awaiting_input',
+        pendingQuestionId: `q-desktop-fresh-${index}`,
+        pendingQuestion: 'Which deployment environment should I use?',
+        pendingQuestionOptions: ['Staging', 'Production'],
+      });
+      const clientRequestId = `desktop-background-fresh-request-${index}`;
+      const response = await fetch(`${harness.url}/api/harness/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input, sessionId: session.id, clientRequestId, steerOnly: true }),
+      });
+      assert.equal(response.status, 409, `${input} reaches the non-background foreground path`);
+      const body = await response.json() as { code?: string; routedToBackgroundTask?: string };
+      assert.equal(body.code, 'RUN_NOT_ACTIVE');
+      assert.equal(body.routedToBackgroundTask, undefined);
+      assert.equal(getBackgroundTask(task.id)?.status, 'awaiting_input');
+      assert.equal(getBackgroundTask(task.id)?.inputResolution, undefined);
+    }
+    assert.equal(configureCalls, 0, 'steer-only rejection happens before model auth');
+  } finally {
+    await harness.close();
+  }
+});
+
 test('lost background-continue response replays one accepted source, terminal, and task mutation', async () => {
   resetEventLog();
   resetHarnessRuntimeConfig();
@@ -753,6 +811,71 @@ test('lost background-continue response replays one accepted source, terminal, a
   }
 });
 
+test('desktop harness routes punctuated continuation phrases to parked background work before auth or model', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let configureCalls = 0;
+  let brainCalls = 0;
+  _setBridgeImplsForTests({
+    configure: (async () => {
+      configureCalls += 1;
+      return { ok: true };
+    }) as never,
+    claudeAgentBrain: (async () => {
+      brainCalls += 1;
+      return { text: 'model must not run for background continue', sessionId: 'none', stoppedReason: 'success' };
+    }) as never,
+  });
+  const {
+    createBackgroundTask,
+    markBackgroundTaskAwaitingContinue,
+  } = await import('../execution/background-tasks.js');
+  const harness = await boot();
+  try {
+    for (const [index, input] of ['Continue.', 'keep going!'].entries()) {
+      const session = createSession({
+        id: `sess-desktop-punctuated-continue-${index}`,
+        kind: 'chat',
+        channel: 'desktop',
+      });
+      const task = createBackgroundTask({
+        title: `Punctuated continuation ${index}`,
+        prompt: 'Finish the pipeline.',
+        originSessionId: session.id,
+      });
+      markBackgroundTaskAwaitingContinue(task.id, 'turn budget', 'partial work');
+      const clientRequestId = `bridge-punctuated-continue-${index}`;
+
+      const response = await fetch(`${harness.url}/api/harness/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input, sessionId: session.id, clientRequestId }),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json() as { routedToBackgroundTask?: string; replayed?: boolean };
+      assert.equal(body.replayed, false);
+      assert.equal(body.routedToBackgroundTask, task.id);
+      assert.equal(getBackgroundTask(task.id)?.status, 'pending');
+      assert.ok(getBackgroundTask(task.id)?.continueResolution);
+
+      const accepted = listEvents(session.id, { types: ['user_input_received'] })
+        .find((event) => event.data.clientRequestId === clientRequestId);
+      assert.equal(accepted?.data.text, input, 'the exact public continuation phrase remains the accepted source');
+      assert.equal(
+        listEvents(session.id, { types: ['conversation_completed'] })
+          .filter((event) => event.data.sourceUserSeq === accepted?.seq).length,
+        1,
+        'the model-free route still owns one typed terminal',
+      );
+    }
+
+    assert.equal(configureCalls, 0, 'background continuation routing happens before model auth');
+    assert.equal(brainCalls, 0, 'background continuation routing happens before the model');
+  } finally {
+    await harness.close();
+  }
+});
+
 test('desktop /new and /cancel acknowledgements are typed source-bound outcomes', async () => {
   resetEventLog();
   resetHarnessRuntimeConfig();
@@ -765,9 +888,21 @@ test('desktop /new and /cancel acknowledgements are typed source-bound outcomes'
     }) as never,
   });
   const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const { createBackgroundTask, updateBackgroundTask } = await import('../execution/background-tasks.js');
   const harness = await boot();
   try {
     const session = createSession({ id: 'sess-desktop-typed-commands', kind: 'chat', channel: 'desktop' });
+    const parkedTask = createBackgroundTask({
+      title: 'Parked command collision',
+      prompt: 'Finish the client update.',
+      originSessionId: session.id,
+      source: 'desktop',
+    });
+    updateBackgroundTask(parkedTask.id, {
+      status: 'awaiting_input',
+      pendingQuestionId: 'q-desktop-command-collision',
+      pendingQuestion: 'Which client account should I use?',
+    });
     const pending = approvalRegistry.register({
       sessionId: session.id,
       channel: 'desktop',
@@ -783,8 +918,12 @@ test('desktop /new and /cancel acknowledgements are typed source-bound outcomes'
 
     const fresh = await post('/new', 'typed-new-command-request');
     assert.equal(fresh.status, 202);
+    assert.equal(getBackgroundTask(parkedTask.id)?.status, 'awaiting_input', '/new cannot become the parked answer');
+    assert.equal(getBackgroundTask(parkedTask.id)?.inputResolution, undefined);
     const stopped = await post('/cancel', 'typed-cancel-command-request');
     assert.equal(stopped.status, 202);
+    assert.equal(getBackgroundTask(parkedTask.id)?.status, 'awaiting_input', '/cancel cannot resume the old task');
+    assert.equal(getBackgroundTask(parkedTask.id)?.inputResolution, undefined);
     const firstResolution = approvalRegistry.get(pending.approvalId);
     assert.equal(firstResolution?.resolution, 'cancelled_by_user');
     assert.equal(firstResolution?.resolver, 'chat-dock-user:typed-cancel-command-request');

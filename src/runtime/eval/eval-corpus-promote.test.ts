@@ -48,6 +48,19 @@ test('an ADVISORY-only nudge (fanout_nudge) is NOT a failure → null', () => {
   assert.equal(buildFailureCase('s', [ev('guardrail_tripped', { kind: 'fanout_nudge' })]), null);
 });
 
+test('a settled-read replay marker is accounting, not a production failure case', () => {
+  assert.equal(buildFailureCase('s', [
+    ev('tool_called', { tool: 'composio_execute_tool', callId: 'reuse-1' }),
+    ev('guardrail_tripped', { kind: 'same_source_settled_read_replay' }),
+    ev('tool_returned', {
+      tool: 'composio_execute_tool',
+      callId: 'reuse-1',
+      providerDispatched: false,
+      replayKind: 'same_source_settled_read_replay',
+    }),
+  ]), null);
+});
+
 test('mixed advisory + real → only the real kind is kept', () => {
   const c = buildFailureCase('s', [
     ev('guardrail_tripped', { kind: 'fanout_nudge' }),

@@ -560,6 +560,49 @@ test('a legacy approved call_tool carrier is refused before dispatch because its
   assert.match(result.resultSummary, /No provider commit occurred/i);
 });
 
+test('claim-time authority refuses legacy mutable-label and non-string account_alias payloads', async () => {
+  for (const [name, accountAlias] of [
+    ['mutable-label', 'Review Mailbox'],
+    ['non-string', { label: 'Review Mailbox' }],
+    ['null-carrier', null],
+  ] as Array<[string, unknown]>) {
+    const record = queuePendingAction({
+      title: `Legacy ${name} alias`,
+      summary: 'This old record predates stable alias canonicalization.',
+      kind: 'external_write',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'OUTLOOK_CREATE_DRAFT',
+        arguments: JSON.stringify({
+          subject: 'Legacy route',
+          body: 'Must remain pre-dispatch.',
+          to_email: 'review@example.com',
+          account_alias: accountAlias,
+        }),
+        connected_account_id: null,
+      },
+      sessionId: 'sess-pae',
+    });
+    markPendingActionApprovalResolved(
+      record.id,
+      'approved',
+      realApprovedCardId(record, `legacy ${name} alias`),
+    );
+    let dispatches = 0;
+    const result = await executeApprovedPendingActionCall(record.id, {
+      sessionId: 'sess-pae',
+      dispatch: async () => {
+        dispatches += 1;
+        return 'must not run';
+      },
+    });
+    assert.equal(result.status, 'failed', name);
+    assert.equal(dispatches, 0, `${name}: invalid alias fails inside the claim`);
+    assert.match(result.resultSummary, /account_alias.*not a stable email identity|mutable labels|non-string/i);
+    assert.equal(getPendingAction(record.id)?.status, 'failed');
+  }
+});
+
 test('a structured provider failure is recorded FAILED, never executed', async () => {
   const record = queueSingleCall();
   markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId(record, 'provider failed call'));

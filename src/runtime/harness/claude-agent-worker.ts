@@ -54,11 +54,12 @@ function thrashGuardOn(): boolean {
 export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agentic = false): string {
   const boundary = agentic
     ? [
-        'Current capability — you CAN execute the gated tools for THIS item:',
-        '- run_shell_command, composio discovery + composio_execute_tool, write_file, plus read/recall tools.',
+        'Current capability — you CAN use the gated tools for THIS item:',
+        '- run_shell_command, write_file, read/recall tools, and Composio discovery + READ actions.',
         '- If a needed local tool schema is not loaded, use `tool_search` and then invoke the selected result with `call_tool(name, args_json)`.',
-        '- Every call runs through Clementine\'s safety gates; irreversible/external actions pause for the user\'s approval. The PARENT already opened the execution lane and the batch approval, so just do the item — do not call execution_create or request_approval yourself.',
-        '- Do NOT claim a mutation happened unless the tool result proves it. If a tool result begins with `ERROR:`, return `ERROR: <reason>` for this item instead of fabricating completion.',
+        '- COMPOSE → PARENT COMMIT: never execute a mutating Composio action here. Complete the reads/reasoning, then return exactly one payload {"id":"<stable item id>","composioSlug":"<exact slug>","args":{...},"account_alias":"<stable email or saved alias, only when supplied>"}. The parent aggregates all worker payloads into one immutable run_batch proposal and one approval/commit.',
+        '- A WORKER_COMPOSE_ONLY tool result proves no provider dispatch started. Do not retry that mutation, call run_batch, or call pending_action/request_approval tools from this worker.',
+        '- Do NOT claim a mutation happened. If another required tool call begins with `ERROR:`, return `ERROR: <reason>` for this item instead of fabricating completion.',
         '- If the packet names a skill, a style guide, or installed skill rules, call `skill_read` for it before producing the output.',
       ]
     : [
@@ -134,6 +135,7 @@ export async function runClaudeAgentSdkWorker(
     nativeMcpScopeMode: 'resolved_tools',
     nativeMcpToolScope,
     agentic,
+    workerScope: true,
     maxTurns: resolvedMaxTurns,
     // Isolation and authority are separate: this packet-stable scope enforces
     // the full grind ladder per worker (and survives resume), while sessionId

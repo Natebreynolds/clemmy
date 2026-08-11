@@ -1,6 +1,12 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
-import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow } from './db.js';
+import {
+  hardDeleteConsolidatedFacts,
+  openMemoryDb,
+  type ConsolidatedFactKind,
+  type ConsolidatedFactRow,
+} from './db.js';
 import { cosine, embedQuery, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadArchivedFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
 import { getRecallStats } from './recall.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
@@ -20,12 +26,33 @@ import { attachGroundedFactResources, resolveEntityIdsForText, setFactEntityLink
 // vector can never leak into an unrelated later call. Flag CLEMMY_SEMANTIC_RECALL
 // (default on); off → byte-identical to the prior lexical ranking.
 const TURN_QUERY_TTL_MS = 60_000;
-let turnQuery: { text: string; vector: Float32Array; atMs: number } | null = null;
+interface TurnQueryScope {
+  query: { text: string; vector: Float32Array; atMs: number } | null;
+}
+
+// A daemon can drive several chat/workflow turns concurrently. The old single
+// process slot let the last embedding to settle become every turn's semantic
+// query until TTL expiry. Keep an unscoped fallback for direct callers/tests,
+// but production turns run inside an isolated async scope installed by the
+// harness entry point.
+const turnQueryStorage = new AsyncLocalStorage<TurnQueryScope>();
+let unscopedTurnQuery: TurnQueryScope['query'] = null;
+
+export function withTurnQueryVectorScope<T>(run: () => T): T {
+  return turnQueryStorage.run({ query: null }, run);
+}
 
 export function setTurnQueryVector(text: string, vector: Float32Array | null, nowMs: number = Date.now()): void {
-  turnQuery = vector && vector.length > 0 ? { text, vector, atMs: nowMs } : null;
+  const query = vector && vector.length > 0 ? { text, vector, atMs: nowMs } : null;
+  const scope = turnQueryStorage.getStore();
+  if (scope) scope.query = query;
+  else unscopedTurnQuery = query;
 }
-export function clearTurnQueryVector(): void { turnQuery = null; }
+export function clearTurnQueryVector(): void {
+  const scope = turnQueryStorage.getStore();
+  if (scope) scope.query = null;
+  else unscopedTurnQuery = null;
+}
 
 /** Compute + stash the turn's query embedding so the (sync) per-turn fact
  *  recall can add a semantic-relevance term. Fire concurrently with the memory
@@ -42,9 +69,11 @@ export async function primeTurnRecallVector(input: string): Promise<void> {
 }
 
 function getActiveTurnQueryVector(nowMs: number): Float32Array | null {
-  if (!turnQuery) return null;
-  if (nowMs - turnQuery.atMs > TURN_QUERY_TTL_MS) return null;
-  return turnQuery.vector;
+  const scope = turnQueryStorage.getStore();
+  const query = scope ? scope.query : unscopedTurnQuery;
+  if (!query) return null;
+  if (nowMs - query.atMs > TURN_QUERY_TTL_MS) return null;
+  return query.vector;
 }
 
 function semanticRecallEnabled(): boolean {
@@ -1507,8 +1536,7 @@ export function getFactWithEvidence(id: number): ConsolidatedFact | null {
 export function forgetFact(id: number, options: { hard?: boolean } = {}): boolean {
   const db = openMemoryDb();
   if (options.hard) {
-    const info = db.prepare('DELETE FROM consolidated_facts WHERE id = ?').run(id);
-    return Number(info.changes ?? 0) > 0;
+    return hardDeleteConsolidatedFacts(db, [id]) > 0;
   }
   const info = db.prepare(`
     UPDATE consolidated_facts

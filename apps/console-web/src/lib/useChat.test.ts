@@ -408,6 +408,36 @@ test('reduceActivity pairs overlapping same-name tool calls by callId when prese
   );
 });
 
+test('reduceActivity renders a replay settlement as reuse, not a fresh fetch', () => {
+  let activity: ActivityItem[] = [];
+  activity = reduceActivity(activity, ev('tool_called', {
+    tool: 'composio_execute_tool',
+    callId: 'reuse-1',
+    publicSlug: 'OUTLOOK_LIST_MESSAGES',
+  }));
+  assert.equal(activity[0].label, 'outlook list messages');
+  activity = reduceActivity(activity, ev('tool_returned', {
+    tool: 'composio_execute_tool',
+    callId: 'reuse-1',
+    publicSlug: 'OUTLOOK_LIST_MESSAGES',
+    ok: true,
+    reused: true,
+  }));
+  assert.equal(activity.length, 1, 'the canonical attempt remains one activity row');
+  assert.equal(activity[0].label, 'Reused earlier result');
+  assert.equal(activity[0].detail, 'outlook list messages');
+  assert.equal(activity[0].status, 'done');
+
+  const replaySeed = reduceActivity([], ev('tool_called', {
+    tool: 'composio_execute_tool',
+    callId: 'reuse-2',
+    publicSlug: 'OUTLOOK_LIST_MESSAGES',
+    reused: true,
+  }));
+  assert.equal(replaySeed[0].label, 'Reused earlier result');
+  assert.equal(replaySeed[0].detail, 'outlook list messages');
+});
+
 test('reduceActivity falls back to label matching for legacy tool return events without callId', () => {
   let activity: ActivityItem[] = [];
   activity = reduceActivity(activity, ev('tool_called', { tool: 'read_file' }));

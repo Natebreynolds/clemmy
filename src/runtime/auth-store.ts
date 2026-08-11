@@ -9,6 +9,7 @@ import type { NativeCodexTokenSet } from './codex-native-oauth.js';
 import { claudeVaultFallbackReady, hasClaudeCodeCredentialFile } from './claude-oauth.js';
 
 const AUTH_STATE_FILE = path.join(BASE_DIR, 'state', 'auth.json');
+const CODEX_ACCESS_ONLY_FILE = path.join(BASE_DIR, 'state', 'codex-access-only.json');
 
 // ─────────────────────────────────────────────────────────────────
 // Codex OAuth refresh concurrency control.
@@ -269,6 +270,46 @@ export interface StoredCodexOAuthTokens {
   idToken?: string;
   accountId?: string;
   lastRefresh?: string;
+  /** True only for an isolated proof snapshot. Such a credential can be used
+   * for inference until its JWT expiry, but must never enter refresh logic. */
+  accessOnly?: true;
+  /** Authoritative JWT expiry for an access-only proof snapshot. */
+  expiresAt?: number;
+}
+
+export const CODEX_ACCESS_ONLY_DEFAULT_CALL_BUDGET_MS = 10 * 60_000;
+export const CODEX_ACCESS_ONLY_EXPIRY_SKEW_MS = 60_000;
+
+/**
+ * Fail before dispatch when a non-refreshable proof token cannot cover the
+ * entire model-call budget. Long-horizon runs invoke this at every model edge,
+ * so a leg may use successive calls while the token is healthy but can never
+ * begin a call that could legally outlive the token.
+ */
+export function assertCodexAccessTokenCanCoverCall(
+  tokens: StoredCodexOAuthTokens,
+  callBudgetMs: number | undefined = CODEX_ACCESS_ONLY_DEFAULT_CALL_BUDGET_MS,
+  nowMs = Date.now(),
+): void {
+  if (!tokens.accessOnly) return;
+  if (!Number.isFinite(callBudgetMs) || (callBudgetMs ?? 0) <= 0) {
+    throw new Error(
+      'The isolated Codex proof access token cannot cover an unbounded model call; configure a finite call budget or provision refreshable auth outside the proof sandbox.',
+    );
+  }
+  const requiredMs = (callBudgetMs as number) + CODEX_ACCESS_ONLY_EXPIRY_SKEW_MS;
+  if (typeof tokens.expiresAt !== 'number' || tokens.expiresAt <= nowMs + requiredMs) {
+    throw new Error(
+      `The isolated Codex proof access token cannot cover this model call (${Math.ceil(requiredMs / 60_000)}m required); provision a fresh proof daemon.`,
+    );
+  }
+}
+
+interface IsolatedCodexAccessState {
+  version: 1;
+  accessToken: string;
+  expiresAt: number;
+  accountId?: string;
 }
 
 interface CodexBootstrapState {
@@ -293,6 +334,36 @@ function loadLocalAuthState(): LocalAuthState {
   }
 }
 
+/** Read the deliberately non-refreshable credential accepted by isolated proof
+ * homes. Its closed schema prevents a refresh/id token from being smuggled into
+ * the snapshot, and JWT expiry remains the authority over the metadata field. */
+function loadIsolatedCodexAccessState(options: { allowExpired?: boolean } = {}): IsolatedCodexAccessState | null {
+  if (!existsSync(CODEX_ACCESS_ONLY_FILE)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(CODEX_ACCESS_ONLY_FILE, 'utf-8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    const allowed = new Set(['version', 'accessToken', 'expiresAt', 'accountId']);
+    if (Object.keys(record).some((key) => !allowed.has(key))) return null;
+    if (record.version !== 1 || typeof record.accessToken !== 'string' || !record.accessToken.trim()) return null;
+    if (typeof record.expiresAt !== 'number' || !Number.isFinite(record.expiresAt)) return null;
+    const jwtExpiry = accessTokenExpMs(record.accessToken);
+    if (jwtExpiry === null || jwtExpiry !== record.expiresAt) return null;
+    if (!options.allowExpired && jwtExpiry <= Date.now()) return null;
+    const accountId = typeof record.accountId === 'string' && record.accountId.trim()
+      ? record.accountId
+      : undefined;
+    return {
+      version: 1,
+      accessToken: record.accessToken,
+      expiresAt: jwtExpiry,
+      ...(accountId ? { accountId } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function getStoredCodexOAuthTokens(): StoredCodexOAuthTokens | null {
   // VAULT ONLY. Clementine never runs off ~/.codex/auth.json (the Codex CLI's
   // file). Reading it as a fallback coupled Clem to the CLI's rotating token
@@ -307,6 +378,15 @@ export function getStoredCodexOAuthTokens(): StoredCodexOAuthTokens | null {
       idToken: local.codexOauth.idToken,
       accountId: local.codexOauth.accountId,
       lastRefresh: local.codexOauth.lastRefresh,
+    };
+  }
+  const isolated = loadIsolatedCodexAccessState();
+  if (isolated) {
+    return {
+      accessToken: isolated.accessToken,
+      accountId: isolated.accountId,
+      accessOnly: true,
+      expiresAt: isolated.expiresAt,
     };
   }
   return null;
@@ -355,6 +435,14 @@ export function getCodexBootstrapAvailability(sourceFile = getCodexAuthSourceFil
       source: 'local_store',
       accountId: state.localCodex.accountId,
       lastRefresh: state.localCodex.lastRefresh,
+    };
+  }
+  const isolated = loadIsolatedCodexAccessState();
+  if (isolated) {
+    return {
+      available: true,
+      source: 'local_store',
+      accountId: isolated.accountId,
     };
   }
   return {
@@ -523,6 +611,17 @@ export async function loginWithCodexDeviceCode(
  *  notes near REFRESH_LOCK_FILE for why this matters (reuse → token_revoked). */
 export async function refreshStoredNativeOAuth(options: { force?: boolean; sourceFile?: string } = {}): Promise<{ ok: boolean; message: string; terminal?: boolean }> {
   const { force = false, sourceFile = getCodexAuthSourceFile() } = options;
+  // Disposable proof homes intentionally carry no rotating refresh token. Stop
+  // before single-flight or the BASE_DIR-local lock: the snapshot can never
+  // race the real daemon's grant, and expiry requires reprovisioning the proof.
+  const local = loadLocalAuthState();
+  if (!local.codexOauth?.refreshToken && loadIsolatedCodexAccessState({ allowExpired: true })) {
+    return {
+      ok: false,
+      terminal: true,
+      message: 'The isolated Codex proof access token cannot be refreshed; provision a fresh proof daemon.',
+    };
+  }
   // 0. DEAD latch: a prior terminal revoke means the refresh token is gone.
   // Re-POSTing it can't recover and risks tripping further family revokes —
   // short-circuit until a re-auth lands and clears the latch.
@@ -679,16 +778,20 @@ export function importCodexCliAuth(sourceFile = getCodexAuthSourceFile()): { ok:
 
 export function clearImportedAuth(): void {
   rmSync(AUTH_STATE_FILE, { force: true });
+  rmSync(CODEX_ACCESS_ONLY_FILE, { force: true });
   clearCodexAuthDead();
 }
 
 export function getAuthStatus(): AuthStatus {
   const local = loadLocalAuthState();
+  const isolatedCodex = loadIsolatedCodexAccessState();
   const codexCli = loadCodexCliAuth();
   const codexAuthSourceFile = getCodexAuthSourceFile();
   const localCodex = local.codexOauth;
   const openaiApiKeyPresent = Boolean(getOpenAiApiKey());
-  const codexOauthPresent = Boolean(localCodex?.accessToken && localCodex?.refreshToken);
+  const refreshableCodexPresent = Boolean(localCodex?.accessToken && localCodex?.refreshToken);
+  const codexOauthPresent = refreshableCodexPresent || Boolean(isolatedCodex);
+  const codexAccountId = localCodex?.accountId ?? isolatedCodex?.accountId;
 
   // Shared-family detection: Clem's grant is coupled to the Codex CLI's rotating
   // refresh-token family ONLY when it was explicitly imported from the CLI
@@ -696,7 +799,7 @@ export function getAuthStatus(): AuthStatus {
   // ~/.codex/auth.json, so a mere present CLI file is NOT coupling. In the
   // coupled state a `codex logout` revokes the family server-side and signs Clem
   // out — the user should re-login to mint an independent grant.
-  const codexSharedWithCli = codexOauthPresent && local.source === 'codex_cli';
+  const codexSharedWithCli = refreshableCodexPresent && local.source === 'codex_cli';
   const sharedHint = ' ⚠ This sign-in was imported from the Codex CLI — signing out of the CLI (`codex logout`) will sign Clementine out too. Run `clementine auth login-device` (or desktop → Re-authenticate) to give Clementine its own independent sign-in.';
   // Tailored hint for someone who used to run off the CLI file before the decouple.
   const legacyCliFilePresent = Boolean(codexCli?.tokens?.access_token && codexCli.tokens.refresh_token);
@@ -711,7 +814,7 @@ export function getAuthStatus(): AuthStatus {
         : 'Missing OPENAI_API_KEY for API-key runtime.',
       openaiApiKeyPresent,
       codexOauthPresent,
-      codexAccountId: localCodex?.accountId,
+      codexAccountId,
       codexLastRefresh: localCodex?.lastRefresh,
       codexImportPath: codexAuthSourceFile,
       codexSharedWithCli,
@@ -736,7 +839,7 @@ export function getAuthStatus(): AuthStatus {
         : 'AUTH_MODE=claude_oauth but no Claude sign-in was found. Open Settings → Models & routing → Re-authenticate to sign in with Claude.',
       openaiApiKeyPresent,
       codexOauthPresent,
-      codexAccountId: localCodex?.accountId,
+      codexAccountId,
       codexLastRefresh: localCodex?.lastRefresh,
       codexImportPath: codexAuthSourceFile,
       codexSharedWithCli,
@@ -747,14 +850,16 @@ export function getAuthStatus(): AuthStatus {
     return {
       mode: AUTH_MODE,
       configured: true,
-      source: local.source === 'native' ? 'native' : 'local_store',
-      message: (local.source === 'native'
-        ? 'Native ChatGPT/Codex credentials are stored locally. Codex CLI is optional.'
-        : 'Codex OAuth credentials are imported locally. Codex CLI is optional.')
-        + (codexSharedWithCli ? sharedHint : ''),
+      source: refreshableCodexPresent && local.source === 'native' ? 'native' : 'local_store',
+      message: isolatedCodex && !refreshableCodexPresent
+        ? `A non-refreshable Codex proof access token is available until ${new Date(isolatedCodex.expiresAt).toISOString()}.`
+        : (local.source === 'native'
+          ? 'Native ChatGPT/Codex credentials are stored locally. Codex CLI is optional.'
+          : 'Codex OAuth credentials are imported locally. Codex CLI is optional.')
+          + (codexSharedWithCli ? sharedHint : ''),
       openaiApiKeyPresent,
       codexOauthPresent,
-      codexAccountId: localCodex?.accountId,
+      codexAccountId,
       codexLastRefresh: localCodex?.lastRefresh,
       codexImportPath: codexAuthSourceFile,
       codexSharedWithCli,

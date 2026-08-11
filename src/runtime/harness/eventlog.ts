@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { BASE_DIR } from '../../config.js';
 import { actionBus } from '../action-bus.js';
@@ -14,6 +14,12 @@ import {
 } from './public-presentation.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
+import { isSettledReadReplayReturnData } from './settled-read-replay-semantics.js';
+import { presentationEventFromCompletionData } from './turn-outcome.js';
+import { validateTurnGraph } from '../graph/turn-graph-compiler.js';
+import type { TurnGraphIR } from '../graph/turn-graph-ir.js';
+import { verifyAcceptedTaskTerminalProofInTransaction } from './terminal-publication-proof.js';
+import type { ObligationManifest } from './obligation-manifest.js';
 import {
   exactOriginDeliveryTargetDigest,
   exactOriginDeliveryTargetFromSessionSnapshot,
@@ -55,6 +61,16 @@ export const EVENT_TYPES = [
   'plan_revised',
   'plan_rejected',
   'step_started',
+  // Private Claude local-MCP handoff: canUseTool has the provider's outer
+  // toolUseID before the in-process handler sees its transport request. This
+  // is permission/correlation state, not a physical tool attempt, so it must
+  // never share tool_called accounting.
+  'claude_local_permission_admitted',
+  // Private handler-consumption proof used only when the SDK stream authored
+  // the outer canonical call before the local MCP handler entered. Keeping the
+  // claim separate preserves append-only event history and prevents a second
+  // identical handler from consuming the same admission.
+  'claude_local_permission_claimed',
   'tool_called',
   'tool_returned',
   'step_verified',
@@ -124,6 +140,11 @@ export const EVENT_TYPES = [
   // captureInteractionSignals. Lets the trace show "Clementine learned
   // X from this turn" so memory growth is observable.
   'memory_signals_captured',
+  // Content-addressed host authority for an acknowledgement-only durable
+  // memory action. Unlike memory_signals_captured telemetry, this event is
+  // issued only after the host independently redeems the exact accepted source
+  // against its episode and auto-capture candidate rows.
+  'durable_memory_intake_receipt',
   // Evidence-first procedural learning boundary. Every automatic candidate
   // records whether it was eligible, which runtime authority verified it, and
   // why a paused/degraded/ambiguous run was refused. The event never drives the
@@ -208,6 +229,10 @@ export const EVENT_TYPES = [
   // chat source. Observational only: it cannot grant authority or alter the
   // active v3.6 execution path.
   'turn_graph_compiled',
+  // Fail-closed cutover marker for the Clem 4 evidence protocol. The graph
+  // remains observational by itself; this row records that the host accepted
+  // its exact identity as the authority contract before provider work began.
+  'accepted_task_authority_armed',
   // Planner-first gate: fresh complex requests get a read-only plan
   // proposal before the full external MCP surface is opened.
   'plan_first_started',
@@ -390,12 +415,60 @@ export const EVENT_TYPES = [
   // the promotion/verification authority the resolver reads back by id.
   // Internal evidence: the public-presentation allowlist does not carry it.
   'read_receipt',
+  // A governed warm candidate needed one physical exact-slug provider metadata
+  // refresh to restore schema authority. This is not a business tool call and
+  // not cold-lane discovery. Payload is deliberately identifier/account-free:
+  // {sourceUserSeq, attemptId, artifactId, durationMs, outcome}.
+  'warm_schema_metadata_refresh',
+  // Durable discovery-budget admission and settlement telemetry. These rows
+  // make the one-broad/one-exact-refresh task budget auditable across process
+  // restarts without exposing provider identifiers or request payloads.
+  'discovery_governor_decision',
+  'discovery_governor_outcome',
+  // Why a spent discovery budget reopened. Carries {kind, outcome,
+  // previousEpoch, epoch, detail} — the observed fact that made the previous
+  // search stale, so a task that keeps searching can be told apart from one
+  // that keeps LEARNING.
+  'discovery_governor_evidence',
+  // One typed settlement per tool attempt, from the shared seam every lane
+  // ends in. Carries {lane, tool, kind, evidence, action, businessCall,
+  // mutating, openedDiscoveryEpoch, creditedProgress} — the audit trail for
+  // "which recovery ran, and why".
+  'tool_attempt_settled',
+  // Durable requirement satisfaction for an accepted task, so a restart does
+  // not lose what the task already proved.
+  'requirement_state',
+  'evidence_receipt',
+  'write_evidence_proved',
+  'obligation_manifest',
+  'obligation_satisfied',
+  // One bounded, host-owned chance to gather missing terminal proof. These are
+  // control-plane facts, never model-facing scripts or new user turns.
+  'terminal_authority_repair_granted',
+  'terminal_authority_repair_consumed',
+  'terminal_authority_backstop_fired',
+  'resolution_operation',
+  'resolution_finalized',
+  'logical_call_contract_refined',
+  'provider_dispatch_started',
+  'provider_dispatch_settled',
+  // An authorized tool the turn did not advertise was named and fetched.
+  // Carries {tool, serverSlug, reason, scopeReason, advertised,
+  // widenedBeyondTurnBase} — the audit trail for "the cap was wrong, and the
+  // run recovered anyway".
+  'mcp_tool_acquired',
   // Typed capability resolution: what this turn's ask can already rely on
   // (proven procedures), what has failed before (invalidated memos), and the
   // connection state of each — resolved by the runtime at preflight. The UI's
   // live "what Clem knows going in" frame and the graph's future admission
   // input. Carries {entries, registryAvailable, sourceUserSeq?}.
   'capability_resolution',
+  // Exact schema-backed capabilities surfaced by one governed discovery call.
+  // This is restart-safe continuation evidence only: no query, arguments,
+  // provider payload, or dispatch authority is stored. Carries
+  // {sourceUserSeq, capabilities[{kind,identifier,effectClass,
+  // schemaFingerprint?}]}.
+  'capability_discovered',
   // What occupied this turn's prompt, split by whether it can be cached.
   // Per-step prompt cost is paid once per step and therefore ~100x per task,
   // so the lever on latency is keeping the LARGE part invariant and the
@@ -1296,6 +1369,2140 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     },
   },
+  {
+    // Discovery is a per-accepted-source resource, not a per-process courtesy.
+    // Persist both policy and the category claim so daemon restarts and
+    // concurrent workers cannot silently reset or double-spend its allowance.
+    version: 21,
+    sql: `
+      CREATE TABLE IF NOT EXISTS discovery_governor_tasks (
+        session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_user_seq   INTEGER NOT NULL CHECK (source_user_seq > 0),
+        known_capability  INTEGER NOT NULL CHECK (known_capability IN (0, 1)),
+        initialized_at    TEXT NOT NULL,
+        updated_at        TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq)
+      );
+
+      CREATE TABLE IF NOT EXISTS discovery_governor_claims (
+        session_id       TEXT NOT NULL,
+        source_user_seq  INTEGER NOT NULL,
+        category         TEXT NOT NULL
+                         CHECK (category IN ('broad_discovery', 'exact_schema_refresh')),
+        call_id          TEXT NOT NULL,
+        outcome          TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (outcome IN ('pending', 'succeeded', 'empty', 'failed', 'timed_out')),
+        outcome_detail   TEXT,
+        admitted_at      TEXT NOT NULL,
+        settled_at       TEXT,
+        PRIMARY KEY (session_id, source_user_seq, category),
+        FOREIGN KEY (session_id, source_user_seq)
+          REFERENCES discovery_governor_tasks(session_id, source_user_seq)
+          ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_discovery_governor_claims_call
+        ON discovery_governor_claims(session_id, source_user_seq, call_id);
+    `,
+  },
+  {
+    // Clem 4 accepted-task evidence authority.
+    //
+    // Resolution is mutable state (open -> finalized), so unlike telemetry it
+    // belongs in normalized rows with database-enforced ownership. Operation
+    // admission, the mirror event, and finalization are committed by the domain
+    // API in one IMMEDIATE transaction. A process crash therefore cannot leave
+    // an event claiming a transition the state machine did not make, or vice
+    // versa. Raw provider arguments never enter these tables.
+    version: 22,
+    sql: `
+      -- Existing feature code created this table lazily. Fresh homes get the
+      -- complete schema here; the guarded backfill below upgrades partial dev
+      -- schemas without pretending an old two-column claim carried evidence.
+      CREATE TABLE IF NOT EXISTS obligation_transitions (
+        obligation_key       TEXT PRIMARY KEY,
+        session_id           TEXT NOT NULL,
+        source_user_seq      INTEGER NOT NULL,
+        manifest_id          TEXT NOT NULL,
+        node_id              TEXT NOT NULL,
+        obligation           TEXT NOT NULL,
+        receipt_id           TEXT NOT NULL,
+        physical_attempt_id  TEXT NOT NULL,
+        logical_tool_call_id TEXT,
+        physical_dispatch_id TEXT,
+        claimed_at           TEXT NOT NULL
+      );
+
+      -- Compatibility only. It ceases to be settlement authority in the next
+      -- slice, but centralizing its schema prevents another lazy-schema fork.
+      CREATE TABLE IF NOT EXISTS settlement_claims (
+        settlement_key TEXT PRIMARY KEY,
+        session_id     TEXT NOT NULL,
+        claimed_at     TEXT NOT NULL
+      );
+    `,
+    backfill: (db) => {
+      // Upgrade rehearsals intentionally construct only the historical table
+      // under test. A resolution cannot exist without the canonical events
+      // spine, so do not create FKs to a table that fixture does not contain.
+      const hasEvents = Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'`,
+      ).get());
+      if (hasEvents) {
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS accepted_task_resolutions (
+            session_id                TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            source_user_seq           INTEGER NOT NULL CHECK (source_user_seq > 0),
+            accepted_task_id          TEXT NOT NULL UNIQUE,
+            graph_event_id            TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+            graph_id                  TEXT NOT NULL,
+            graph_hash                TEXT NOT NULL,
+            compiler_version          TEXT NOT NULL,
+            route                     TEXT NOT NULL CHECK (route IN ('direct_reply','retrieve','act')),
+            work_node_id              TEXT,
+            work_kind                 TEXT NOT NULL CHECK (work_kind IN ('conversation','retrieve','execute','fanout')),
+            effect_ceiling            TEXT NOT NULL,
+            external_effect_requested INTEGER NOT NULL CHECK (external_effect_requested IN (0, 1)),
+            external_effect_kinds_json TEXT NOT NULL DEFAULT '[]',
+            state                     TEXT NOT NULL DEFAULT 'open'
+                                      CHECK (state IN ('open','finalized','legacy_ambiguous')),
+            revision                  INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+            operation_count           INTEGER NOT NULL DEFAULT 0 CHECK (operation_count >= 0),
+            operations_digest         TEXT,
+            expectations_satisfied    INTEGER CHECK (expectations_satisfied IN (0, 1)),
+            opened_at                 TEXT NOT NULL,
+            finalized_at              TEXT,
+            finalize_event_id         TEXT REFERENCES events(id) ON DELETE RESTRICT,
+            PRIMARY KEY (session_id, source_user_seq)
+          );
+
+          CREATE TABLE IF NOT EXISTS accepted_task_operations (
+            session_id             TEXT NOT NULL,
+            source_user_seq        INTEGER NOT NULL,
+            operation_id           TEXT NOT NULL,
+            logical_tool_call_id   TEXT NOT NULL,
+            graph_node_id          TEXT NOT NULL,
+            resolved_tool          TEXT NOT NULL,
+            effect_kind            TEXT NOT NULL
+                                   CHECK (effect_kind IN ('read','compute','local_write','external_write','admin','unknown')),
+            reversibility          TEXT NOT NULL
+                                   CHECK (reversibility IN ('read_only','reversible','irreversible','not_applicable','unknown')),
+            effect_source          TEXT NOT NULL,
+            argument_keys_json     TEXT NOT NULL DEFAULT '[]',
+            argument_digest        TEXT NOT NULL,
+            physical_dispatch_id  TEXT,
+            outcome_kind           TEXT,
+            dispatch_state         TEXT CHECK (dispatch_state IN ('not_started','dispatched')),
+            recorded_at            TEXT NOT NULL,
+            operation_event_id     TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+            PRIMARY KEY (session_id, source_user_seq, operation_id),
+            UNIQUE (session_id, source_user_seq, logical_tool_call_id),
+            FOREIGN KEY (session_id, source_user_seq)
+              REFERENCES accepted_task_resolutions(session_id, source_user_seq)
+              ON DELETE CASCADE
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_accepted_task_operations_effect
+            ON accepted_task_operations(session_id, source_user_seq, effect_kind);
+        `);
+      }
+
+      const table = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'obligation_transitions'`,
+      ).get();
+      if (!table) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(obligation_transitions)').all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      const required = [
+        'obligation_key', 'session_id', 'source_user_seq', 'manifest_id', 'node_id',
+        'obligation', 'receipt_id', 'physical_attempt_id', 'logical_tool_call_id',
+        'physical_dispatch_id', 'claimed_at',
+      ];
+      const missing = required.filter((name) => !columns.has(name));
+      if (missing.length === 0) {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_obligation_transitions_task
+          ON obligation_transitions(session_id, source_user_seq)`);
+        return;
+      }
+
+      const priorAuthorityColumns = required.filter((name) =>
+        name !== 'logical_tool_call_id' && name !== 'physical_dispatch_id');
+      if (priorAuthorityColumns.every((name) => columns.has(name))) {
+        // The immediately preceding schema is complete authority and only lacks
+        // the corrected identity names. Preserve every row; the legacy
+        // physical_attempt_id is compatibility data and is deliberately NOT
+        // copied into physical_dispatch_id.
+        if (!columns.has('logical_tool_call_id')) {
+          db.exec('ALTER TABLE obligation_transitions ADD COLUMN logical_tool_call_id TEXT');
+        }
+        if (!columns.has('physical_dispatch_id')) {
+          db.exec('ALTER TABLE obligation_transitions ADD COLUMN physical_dispatch_id TEXT');
+        }
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_obligation_transitions_task
+          ON obligation_transitions(session_id, source_user_seq)`);
+        return;
+      }
+
+      // Keep the incompatible rows for forensic inspection. Their absent owner,
+      // manifest, receipt, and attempt fields cannot be reconstructed honestly,
+      // so none are promoted into terminal authority.
+      const legacyExists = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'obligation_transitions_legacy_v21'`,
+      ).get();
+      if (!legacyExists) {
+        db.exec('ALTER TABLE obligation_transitions RENAME TO obligation_transitions_legacy_v21');
+      } else {
+        db.exec('DROP TABLE obligation_transitions');
+      }
+      db.exec(`
+        CREATE TABLE obligation_transitions (
+          obligation_key       TEXT PRIMARY KEY,
+          session_id           TEXT NOT NULL,
+          source_user_seq      INTEGER NOT NULL,
+          manifest_id          TEXT NOT NULL,
+          node_id              TEXT NOT NULL,
+          obligation           TEXT NOT NULL,
+          receipt_id           TEXT NOT NULL,
+          physical_attempt_id  TEXT NOT NULL,
+          logical_tool_call_id TEXT,
+          physical_dispatch_id TEXT,
+          claimed_at           TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_obligation_transitions_task
+          ON obligation_transitions(session_id, source_user_seq);
+      `);
+    },
+  },
+  {
+    // Clem 4 logical-call and paid-crossing authority. Inserting a physical
+    // dispatch is the permission to let control leave for a provider, not
+    // merely telemetry. Domain APIs mirror events in the same transaction and
+    // refuse provider I/O when this state cannot be committed.
+    version: 23,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (
+        !tables.has('sessions')
+        || !tables.has('events')
+        || !tables.has('accepted_task_resolutions')
+      ) return;
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS logical_tool_calls (
+          session_id           TEXT NOT NULL,
+          source_user_seq      INTEGER NOT NULL,
+          accepted_task_id     TEXT NOT NULL,
+          logical_tool_call_id TEXT NOT NULL,
+          tool_name            TEXT NOT NULL,
+          argument_digest      TEXT NOT NULL,
+          state                TEXT NOT NULL DEFAULT 'open'
+                               CHECK (state IN ('open','settled','conflict')),
+          opened_at            TEXT NOT NULL,
+          settled_at           TEXT,
+          settlement_event_id  TEXT REFERENCES events(id) ON DELETE RESTRICT,
+          outcome_kind         TEXT,
+          PRIMARY KEY (session_id, source_user_seq, logical_tool_call_id),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES accepted_task_resolutions(session_id, source_user_seq)
+            ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS physical_dispatches (
+          session_id           TEXT NOT NULL,
+          source_user_seq      INTEGER NOT NULL,
+          accepted_task_id     TEXT NOT NULL,
+          logical_tool_call_id TEXT NOT NULL,
+          physical_dispatch_id TEXT NOT NULL,
+          ordinal              INTEGER NOT NULL CHECK (ordinal > 0),
+          relation             TEXT NOT NULL
+                               CHECK (relation IN ('primary','retry','poll','probe','child')),
+          retry_of             TEXT,
+          tool_name            TEXT NOT NULL,
+          argument_digest      TEXT NOT NULL,
+          state                TEXT NOT NULL DEFAULT 'started'
+                               CHECK (state IN ('started','returned','threw','timed_out','cancelled','unknown')),
+          started_at           TEXT NOT NULL,
+          settled_at           TEXT,
+          start_event_id       TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+          settle_event_id      TEXT REFERENCES events(id) ON DELETE RESTRICT,
+          PRIMARY KEY (session_id, source_user_seq, physical_dispatch_id),
+          UNIQUE (session_id, source_user_seq, logical_tool_call_id, ordinal),
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES logical_tool_calls(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_physical_dispatches_open
+          ON physical_dispatches(session_id, source_user_seq, state);
+        CREATE INDEX IF NOT EXISTS idx_physical_dispatches_logical
+          ON physical_dispatches(session_id, source_user_seq, logical_tool_call_id, ordinal);
+      `);
+    },
+  },
+  {
+    // Clem 4 atomic logical-call settlement.  Migration 23 established paid
+    // crossing admission, but left logical settlement as a separate legacy
+    // claim plus a best-effort event.  These normalized rows let one domain
+    // transaction freeze the exact semantic result and every paid crossing,
+    // mirror it once, and close the logical call by CAS.
+    //
+    // Do not promote `settlement_claims`: those rows carry neither accepted
+    // source, result, contract nor crossing evidence and cannot be upgraded
+    // honestly.  They remain forensic compatibility data until cutover.
+    version: 24,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      // Historical migration rehearsals intentionally contain no event spine.
+      // Keep them sparse.  A real harness database has both tables; on that
+      // spine a missing v23 authority table is corruption, not an optional
+      // feature, so abort without stamping this migration as applied.
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        'accepted_task_resolutions',
+        'logical_tool_calls',
+        'physical_dispatches',
+      ]) {
+        if (!tables.has(prerequisite)) {
+          throw new Error(`schema v24 prerequisite missing: ${prerequisite}`);
+        }
+      }
+
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_physical_dispatch_exact_parent
+          ON physical_dispatches(
+            session_id, source_user_seq, logical_tool_call_id, physical_dispatch_id
+          );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_logical_call_settlement_event
+          ON logical_tool_calls(settlement_event_id)
+          WHERE settlement_event_id IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS logical_call_settlements (
+          session_id                TEXT NOT NULL,
+          source_user_seq           INTEGER NOT NULL CHECK (source_user_seq > 0),
+          logical_tool_call_id      TEXT NOT NULL,
+          protocol_version          INTEGER NOT NULL CHECK (protocol_version = 1),
+          semantic_digest           TEXT NOT NULL CHECK (length(semantic_digest) = 64),
+          execution_kind            TEXT NOT NULL
+                                    CHECK (execution_kind IN (
+                                      'refused_pre_dispatch',
+                                      'local_execution',
+                                      'provider_execution'
+                                    )),
+          outcome_kind              TEXT NOT NULL
+                                    CHECK (outcome_kind IN (
+                                      'succeeded','invalid_arguments','transient',
+                                      'unsupported_capability','ignored_requirement',
+                                      'input_required','auth_failure','policy_denial',
+                                      'uncertain_write','empty_result','unknown'
+                                    )),
+          outcome_evidence          TEXT NOT NULL
+                                    CHECK (outcome_evidence IN ('nominal','structured','text')),
+          provider_status           TEXT CHECK (provider_status IS NULL OR length(provider_status) <= 64),
+          outcome_detail            TEXT CHECK (outcome_detail IS NULL OR length(outcome_detail) <= 160),
+          business_call             INTEGER NOT NULL CHECK (business_call IN (0, 1)),
+          mutating                  INTEGER NOT NULL CHECK (mutating IN (0, 1)),
+          requirement_id            TEXT CHECK (requirement_id IS NULL OR length(requirement_id) <= 256),
+          continues_requirement     INTEGER NOT NULL CHECK (continues_requirement IN (0, 1)),
+          recovery_action           TEXT NOT NULL
+                                    CHECK (recovery_action IN (
+                                      'settle','repair_arguments','retry_with_backoff',
+                                      'try_sibling_candidate','ask_user','recover_connection',
+                                      'stop_and_explain','reconcile_then_decide'
+                                    )),
+          retry_same_candidate      INTEGER NOT NULL CHECK (retry_same_candidate IN (0, 1)),
+          eliminates_candidate      INTEGER NOT NULL CHECK (eliminates_candidate IN (0, 1)),
+          discovery_epoch_requested INTEGER NOT NULL CHECK (discovery_epoch_requested IN (0, 1)),
+          requires_reconciliation   INTEGER NOT NULL CHECK (requires_reconciliation IN (0, 1)),
+          progress_key_digest       TEXT CHECK (
+                                      progress_key_digest IS NULL OR length(progress_key_digest) = 64
+                                    ),
+          progress_claimed          INTEGER NOT NULL CHECK (progress_claimed IN (0, 1)),
+          physical_crossing_count   INTEGER NOT NULL CHECK (physical_crossing_count >= 0),
+          physical_crossings_digest TEXT NOT NULL CHECK (length(physical_crossings_digest) = 64),
+          observer_lane             TEXT NOT NULL
+                                    CHECK (observer_lane IN (
+                                      'agents_runner','native_mcp','claude_sdk',
+                                      'composio','code_mode','byo'
+                                    )),
+          observer_call_id          TEXT CHECK (observer_call_id IS NULL OR length(observer_call_id) <= 256),
+          settlement_event_id       TEXT NOT NULL UNIQUE
+                                    REFERENCES events(id) ON DELETE RESTRICT,
+          settled_at                TEXT NOT NULL,
+          PRIMARY KEY (session_id, source_user_seq, logical_tool_call_id),
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES logical_tool_calls(
+              session_id, source_user_seq, logical_tool_call_id
+            ) ON DELETE CASCADE,
+          CHECK (
+            (execution_kind IN ('refused_pre_dispatch','local_execution')
+              AND physical_crossing_count = 0)
+            OR
+            (execution_kind = 'provider_execution'
+              AND physical_crossing_count > 0)
+          ),
+          CHECK (
+            execution_kind != 'refused_pre_dispatch'
+            OR outcome_kind NOT IN ('succeeded','empty_result','uncertain_write')
+          ),
+          CHECK (progress_claimed = 0 OR progress_key_digest IS NOT NULL)
+        );
+
+        CREATE TABLE IF NOT EXISTS logical_call_settlement_crossings (
+          session_id            TEXT NOT NULL,
+          source_user_seq       INTEGER NOT NULL,
+          logical_tool_call_id  TEXT NOT NULL,
+          physical_dispatch_id  TEXT NOT NULL,
+          ordinal               INTEGER NOT NULL CHECK (ordinal > 0),
+          relation              TEXT NOT NULL
+                                CHECK (relation IN ('primary','retry','poll','probe','child')),
+          retry_of              TEXT,
+          tool_name             TEXT NOT NULL,
+          argument_digest       TEXT NOT NULL CHECK (length(argument_digest) = 64),
+          PRIMARY KEY (
+            session_id, source_user_seq,
+            logical_tool_call_id, physical_dispatch_id
+          ),
+          UNIQUE (session_id, source_user_seq, logical_tool_call_id, ordinal),
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES logical_call_settlements(
+              session_id, source_user_seq, logical_tool_call_id
+            ) ON DELETE CASCADE,
+          FOREIGN KEY (
+            session_id, source_user_seq,
+            logical_tool_call_id, physical_dispatch_id
+          ) REFERENCES physical_dispatches(
+            session_id, source_user_seq,
+            logical_tool_call_id, physical_dispatch_id
+          ) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS logical_call_progress_claims (
+          session_id           TEXT NOT NULL,
+          source_user_seq      INTEGER NOT NULL,
+          progress_key_digest TEXT NOT NULL CHECK (length(progress_key_digest) = 64),
+          logical_tool_call_id TEXT NOT NULL,
+          claimed_at           TEXT NOT NULL,
+          PRIMARY KEY (session_id, source_user_seq, progress_key_digest),
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES logical_call_settlements(
+              session_id, source_user_seq, logical_tool_call_id
+            ) ON DELETE CASCADE
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_physical_dispatch_requires_open_logical
+        BEFORE INSERT ON physical_dispatches
+        WHEN NOT EXISTS (
+          SELECT 1 FROM logical_tool_calls
+           WHERE session_id = NEW.session_id
+             AND source_user_seq = NEW.source_user_seq
+             AND logical_tool_call_id = NEW.logical_tool_call_id
+             AND accepted_task_id = NEW.accepted_task_id
+             AND state = 'open'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'physical dispatch requires its exact open logical parent');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_physical_dispatch_identity_immutable
+        BEFORE UPDATE OF accepted_task_id, logical_tool_call_id,
+                         physical_dispatch_id, ordinal, relation, retry_of,
+                         tool_name, argument_digest
+        ON physical_dispatches
+        WHEN OLD.accepted_task_id IS NOT NEW.accepted_task_id
+          OR OLD.logical_tool_call_id IS NOT NEW.logical_tool_call_id
+          OR OLD.physical_dispatch_id IS NOT NEW.physical_dispatch_id
+          OR OLD.ordinal IS NOT NEW.ordinal
+          OR OLD.relation IS NOT NEW.relation
+          OR OLD.retry_of IS NOT NEW.retry_of
+          OR OLD.tool_name IS NOT NEW.tool_name
+          OR OLD.argument_digest IS NOT NEW.argument_digest
+        BEGIN
+          SELECT RAISE(ABORT, 'physical dispatch identity is immutable');
+        END;
+      `);
+    },
+  },
+  {
+    // Settlement is also the recovery linearization point. Keep the governor
+    // decision beside the normalized call so a crash cannot durably settle a
+    // failed candidate while losing the discovery epoch that makes recovery
+    // possible (or credit a step without its one task-scoped progress claim).
+    version: 25,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      if (!tables.has('logical_call_settlements')) {
+        throw new Error('schema v25 prerequisite missing: logical_call_settlements');
+      }
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(logical_call_settlements)').all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!columns.has('governor_evidence_kind')) {
+        db.exec(`
+          ALTER TABLE logical_call_settlements ADD COLUMN governor_evidence_kind TEXT
+            CHECK (governor_evidence_kind IS NULL OR governor_evidence_kind IN (
+              'candidate_unsupported','candidate_unavailable','catalog_revision_changed',
+              'auth_recovered','capability_satisfied','user_input_provided'
+            ));
+          ALTER TABLE logical_call_settlements ADD COLUMN governor_evidence_detail TEXT;
+          ALTER TABLE logical_call_settlements ADD COLUMN governor_requires_progress INTEGER NOT NULL DEFAULT 0
+            CHECK (governor_requires_progress IN (0, 1));
+          ALTER TABLE logical_call_settlements ADD COLUMN governor_outcome TEXT
+            CHECK (governor_outcome IS NULL OR governor_outcome IN (
+              'epoch_opened','epoch_already_fresh','epoch_ceiling_reached','task_not_initialized'
+            ));
+          ALTER TABLE logical_call_settlements ADD COLUMN opened_discovery_epoch INTEGER NOT NULL DEFAULT 0
+            CHECK (opened_discovery_epoch IN (0, 1));
+          ALTER TABLE logical_call_settlements ADD COLUMN credited_progress INTEGER NOT NULL DEFAULT 0
+            CHECK (credited_progress IN (0, 1));
+        `);
+      }
+    },
+  },
+  {
+    // Per-accepted-source cutover state. Presence is not inferred from a
+    // manifest: a source is explicitly armed before provider work, so losing a
+    // later manifest can never fall through to legacy success. Manifest freeze,
+    // repair grants, and terminal publication advance this row by CAS.
+    version: 26,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS accepted_task_authority (
+          session_id             TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          source_user_seq        INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id       TEXT NOT NULL UNIQUE,
+          authority_protocol     INTEGER NOT NULL CHECK (authority_protocol = 1),
+          graph_event_id         TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+          graph_id               TEXT NOT NULL,
+          graph_hash             TEXT NOT NULL,
+          state                  TEXT NOT NULL DEFAULT 'armed'
+                                 CHECK (state IN ('armed','manifested_verifying','terminal','conflict')),
+          manifest_id            TEXT,
+          revision               INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+          repair_grants_used     INTEGER NOT NULL DEFAULT 0 CHECK (repair_grants_used BETWEEN 0 AND 1),
+          repair_grant_id        TEXT,
+          repair_grant_status    TEXT NOT NULL DEFAULT 'none'
+                                 CHECK (repair_grant_status IN ('none','issued','consumed')),
+          repair_grant_issued_at TEXT,
+          repair_grant_consumed_at TEXT,
+          terminal_event_id      TEXT REFERENCES events(id) ON DELETE RESTRICT,
+          backstop_event_id      TEXT REFERENCES events(id) ON DELETE RESTRICT,
+          armed_at               TEXT NOT NULL,
+          updated_at             TEXT NOT NULL,
+          PRIMARY KEY (session_id, source_user_seq),
+          CHECK (
+            (repair_grant_status = 'none' AND repair_grant_id IS NULL AND repair_grants_used = 0)
+            OR
+            (repair_grant_status IN ('issued','consumed') AND repair_grant_id IS NOT NULL AND repair_grants_used = 1)
+          ),
+          CHECK (state = 'armed' OR state = 'conflict' OR manifest_id IS NOT NULL)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_accepted_task_authority_state
+          ON accepted_task_authority(state, updated_at);
+
+        CREATE TRIGGER IF NOT EXISTS trg_accepted_task_authority_identity_immutable
+        BEFORE UPDATE ON accepted_task_authority
+        WHEN OLD.session_id IS NOT NEW.session_id
+          OR OLD.source_user_seq IS NOT NEW.source_user_seq
+          OR OLD.accepted_task_id IS NOT NEW.accepted_task_id
+          OR OLD.authority_protocol IS NOT NEW.authority_protocol
+          OR OLD.graph_event_id IS NOT NEW.graph_event_id
+          OR OLD.graph_id IS NOT NEW.graph_id
+          OR OLD.graph_hash IS NOT NEW.graph_hash
+        BEGIN
+          SELECT RAISE(ABORT, 'accepted task authority identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_accepted_task_authority_state_machine
+        BEFORE UPDATE OF state ON accepted_task_authority
+        WHEN OLD.state IS NOT NEW.state AND NOT (
+          (OLD.state = 'armed' AND NEW.state IN ('manifested_verifying','conflict'))
+          OR (OLD.state = 'manifested_verifying' AND NEW.state IN ('terminal','conflict'))
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'invalid accepted task authority transition');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_accepted_task_authority_grant_monotonic
+        BEFORE UPDATE OF repair_grants_used ON accepted_task_authority
+        WHEN NEW.repair_grants_used < OLD.repair_grants_used
+          OR NEW.repair_grants_used > OLD.repair_grants_used + 1
+        BEGIN
+          SELECT RAISE(ABORT, 'terminal repair grant count is monotonic');
+        END;
+      `);
+    },
+  },
+  {
+    // Durable result authority. Provider payloads and opaque continuations used
+    // to live in process-local Maps, so a restart made an apparently valid
+    // handle irredeemable and removed the only host-side copy of its cursor.
+    // Authoritative rows are tied to the exact accepted source, logical call,
+    // physical crossing and canonical base call. A legacy-unscoped mode exists
+    // only for projection helpers that have not entered a dispatch boundary;
+    // those rows can never satisfy task-scoped redemption.
+    version: 27,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        'accepted_task_resolutions',
+        'logical_tool_calls',
+        'physical_dispatches',
+      ]) {
+        if (!tables.has(prerequisite)) {
+          throw new Error(`schema v27 prerequisite missing: ${prerequisite}`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS durable_result_handles (
+          handle_id              TEXT PRIMARY KEY,
+          scope_kind             TEXT NOT NULL
+                                 CHECK (scope_kind IN ('authoritative','legacy_unscoped')),
+          session_id             TEXT,
+          source_user_seq        INTEGER,
+          accepted_task_id       TEXT,
+          logical_tool_call_id   TEXT,
+          physical_dispatch_id   TEXT,
+          continuation_chain_id  TEXT NOT NULL
+                                 CHECK (length(continuation_chain_id) BETWEEN 1 AND 256),
+          tool_name              TEXT NOT NULL,
+          argument_digest        TEXT NOT NULL CHECK (length(argument_digest) = 64),
+          base_argument_digest   TEXT NOT NULL CHECK (length(base_argument_digest) = 64),
+          raw_location           TEXT UNIQUE,
+          raw_payload_json       TEXT,
+          raw_payload_sha256     TEXT CHECK (
+                                   raw_payload_sha256 IS NULL OR length(raw_payload_sha256) = 64
+                                 ),
+          raw_byte_count         INTEGER NOT NULL CHECK (raw_byte_count >= 0),
+          rejection_reason       TEXT CHECK (rejection_reason IN (
+                                   'unserializable','oversized','cursor_oversized','raw_store_skipped'
+                                 )),
+          success                INTEGER NOT NULL CHECK (success IN (0, 1)),
+          record_path            TEXT,
+          record_count           INTEGER NOT NULL CHECK (record_count >= 0),
+          envelope_meta_json     TEXT,
+          completeness           TEXT NOT NULL CHECK (completeness IN ('complete','partial','unknown')),
+          projected_records_json TEXT NOT NULL,
+          status_code            INTEGER,
+          continuation_ref       TEXT UNIQUE,
+          cursor_bytes           BLOB,
+          cursor_sha256          TEXT CHECK (cursor_sha256 IS NULL OR length(cursor_sha256) = 64),
+          cursor_repeated        INTEGER NOT NULL DEFAULT 0 CHECK (cursor_repeated IN (0, 1)),
+          created_at             TEXT NOT NULL,
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id, physical_dispatch_id)
+            REFERENCES physical_dispatches(
+              session_id, source_user_seq, logical_tool_call_id, physical_dispatch_id
+            ) ON DELETE CASCADE,
+          CHECK (
+            (scope_kind = 'authoritative'
+              AND session_id IS NOT NULL
+              AND source_user_seq IS NOT NULL AND source_user_seq > 0
+              AND accepted_task_id IS NOT NULL
+              AND logical_tool_call_id IS NOT NULL
+              AND physical_dispatch_id IS NOT NULL)
+            OR
+            (scope_kind = 'legacy_unscoped'
+              AND session_id IS NULL
+              AND source_user_seq IS NULL
+              AND accepted_task_id IS NULL
+              AND logical_tool_call_id IS NULL
+              AND physical_dispatch_id IS NULL)
+          ),
+          CHECK (
+            (raw_payload_json IS NOT NULL
+              AND raw_location IS NOT NULL
+              AND raw_payload_sha256 IS NOT NULL
+              AND rejection_reason IS NULL)
+            OR
+            (raw_payload_json IS NULL
+              AND raw_location IS NULL
+              AND rejection_reason IS NOT NULL)
+          ),
+          CHECK (
+            (continuation_ref IS NULL AND cursor_bytes IS NULL AND cursor_sha256 IS NULL
+              AND cursor_repeated = 0)
+            OR
+            (continuation_ref IS NOT NULL AND cursor_bytes IS NOT NULL
+              AND cursor_sha256 IS NOT NULL)
+          )
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_durable_result_physical
+          ON durable_result_handles(
+            session_id, source_user_seq, logical_tool_call_id, physical_dispatch_id
+          )
+          WHERE scope_kind = 'authoritative';
+
+        CREATE INDEX IF NOT EXISTS idx_durable_result_cursor_history
+          ON durable_result_handles(
+            session_id, source_user_seq, continuation_chain_id,
+            base_argument_digest, cursor_sha256, created_at
+          )
+          WHERE cursor_sha256 IS NOT NULL;
+
+        CREATE TRIGGER IF NOT EXISTS trg_durable_result_exact_authority
+        BEFORE INSERT ON durable_result_handles
+        WHEN NEW.scope_kind = 'authoritative' AND NOT EXISTS (
+          SELECT 1
+            FROM physical_dispatches p
+           WHERE p.session_id = NEW.session_id
+             AND p.source_user_seq = NEW.source_user_seq
+             AND p.accepted_task_id = NEW.accepted_task_id
+             AND p.logical_tool_call_id = NEW.logical_tool_call_id
+             AND p.physical_dispatch_id = NEW.physical_dispatch_id
+             AND p.tool_name = NEW.tool_name
+             AND p.argument_digest = NEW.argument_digest
+             AND p.state = 'returned'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'durable result requires its exact returned physical crossing');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_durable_result_base_immutable
+        BEFORE INSERT ON durable_result_handles
+        WHEN NEW.scope_kind = 'authoritative' AND EXISTS (
+          SELECT 1
+            FROM durable_result_handles h
+           WHERE h.scope_kind = 'authoritative'
+             AND h.session_id = NEW.session_id
+             AND h.source_user_seq = NEW.source_user_seq
+             AND h.continuation_chain_id = NEW.continuation_chain_id
+             AND (h.tool_name IS NOT NEW.tool_name
+               OR h.base_argument_digest IS NOT NEW.base_argument_digest)
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'durable result base call is immutable per logical call');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_durable_result_identity_immutable
+        BEFORE UPDATE ON durable_result_handles
+        BEGIN
+          SELECT RAISE(ABORT, 'durable result handles are immutable');
+        END;
+      `);
+    },
+  },
+  {
+    // A logical invocation enters before policy and resolver gates with the
+    // exact model/carrier arguments, but trusted host resolution may replace
+    // references, remove routing-only metadata, or materialize strict nullable
+    // fields before provider I/O. Preserve both value-opaque digests and allow
+    // one monotonic raw -> effective transition before the first crossing.
+    version: 28,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        'accepted_task_resolutions',
+        'logical_tool_calls',
+        'physical_dispatches',
+        'logical_call_settlements',
+      ]) {
+        if (!tables.has(prerequisite)) {
+          throw new Error(`schema v28 prerequisite missing: ${prerequisite}`);
+        }
+      }
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(logical_tool_calls)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.has('raw_argument_digest')) {
+        db.exec('ALTER TABLE logical_tool_calls ADD COLUMN raw_argument_digest TEXT');
+      }
+      if (!columns.has('effective_argument_digest')) {
+        db.exec('ALTER TABLE logical_tool_calls ADD COLUMN effective_argument_digest TEXT');
+      }
+      if (!columns.has('refined_at')) {
+        db.exec('ALTER TABLE logical_tool_calls ADD COLUMN refined_at TEXT');
+      }
+      if (!columns.has('refinement_event_id')) {
+        db.exec(`ALTER TABLE logical_tool_calls ADD COLUMN refinement_event_id TEXT
+          REFERENCES events(id) ON DELETE RESTRICT`);
+      }
+      db.exec(`
+        UPDATE logical_tool_calls
+           SET raw_argument_digest = argument_digest
+         WHERE raw_argument_digest IS NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_logical_call_refinement_event
+          ON logical_tool_calls(refinement_event_id)
+          WHERE refinement_event_id IS NOT NULL;
+
+        CREATE TRIGGER IF NOT EXISTS trg_logical_call_contract_insert_valid
+        BEFORE INSERT ON logical_tool_calls
+        WHEN NEW.raw_argument_digest IS NULL
+          OR length(NEW.raw_argument_digest) != 64
+          OR NEW.argument_digest IS NOT NEW.raw_argument_digest
+          OR NEW.effective_argument_digest IS NOT NULL
+          OR NEW.refined_at IS NOT NULL
+          OR NEW.refinement_event_id IS NOT NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'new logical call requires one exact raw contract');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_logical_call_contract_identity_immutable
+        BEFORE UPDATE OF accepted_task_id, logical_tool_call_id, tool_name, raw_argument_digest
+        ON logical_tool_calls
+        WHEN OLD.accepted_task_id IS NOT NEW.accepted_task_id
+          OR OLD.logical_tool_call_id IS NOT NEW.logical_tool_call_id
+          OR OLD.tool_name IS NOT NEW.tool_name
+          OR OLD.raw_argument_digest IS NOT NEW.raw_argument_digest
+        BEGIN
+          SELECT RAISE(ABORT, 'logical call raw contract identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_logical_call_contract_refinement_once
+        BEFORE UPDATE OF argument_digest, effective_argument_digest,
+                         refined_at, refinement_event_id
+        ON logical_tool_calls
+        WHEN NOT (
+          OLD.state = 'open'
+          AND NEW.state = 'open'
+          AND OLD.argument_digest = OLD.raw_argument_digest
+          AND OLD.effective_argument_digest IS NULL
+          AND OLD.refined_at IS NULL
+          AND OLD.refinement_event_id IS NULL
+          AND NEW.raw_argument_digest = OLD.raw_argument_digest
+          AND NEW.effective_argument_digest IS NOT NULL
+          AND length(NEW.effective_argument_digest) = 64
+          AND NEW.argument_digest = NEW.effective_argument_digest
+          AND NEW.argument_digest != NEW.raw_argument_digest
+          AND NEW.refined_at IS NOT NULL
+          AND NEW.refinement_event_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM accepted_task_resolutions r
+             WHERE r.session_id = OLD.session_id
+               AND r.source_user_seq = OLD.source_user_seq
+               AND r.accepted_task_id = OLD.accepted_task_id
+               AND r.state = 'open'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM physical_dispatches p
+             WHERE p.session_id = OLD.session_id
+               AND p.source_user_seq = OLD.source_user_seq
+               AND p.logical_tool_call_id = OLD.logical_tool_call_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM logical_call_settlements s
+             WHERE s.session_id = OLD.session_id
+               AND s.source_user_seq = OLD.source_user_seq
+               AND s.logical_tool_call_id = OLD.logical_tool_call_id
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'logical call contract refinement is not monotonic');
+        END;
+      `);
+    },
+  },
+  {
+    // Immutable expected-work authority for one exact accepted source.
+    //
+    // This is deliberately separate from accepted_task_operations: expected
+    // work is fixed before business dispatch, while observed calls may only
+    // discharge it later.  The nullable marker on accepted_task_authority is a
+    // staged cutover — direct/retrieve turns can bind now, while action turns
+    // remain on the existing runtime until the bounded planner seam exists.
+    version: 29,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      if (!tables.has('accepted_task_authority')) {
+        throw new Error('schema v29 prerequisite missing: accepted_task_authority');
+      }
+      const authorityColumns = new Set(
+        (db.prepare('PRAGMA table_info(accepted_task_authority)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!authorityColumns.has('work_contract_id')) {
+        db.exec('ALTER TABLE accepted_task_authority ADD COLUMN work_contract_id TEXT');
+      }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS accepted_task_work_contracts (
+          session_id         TEXT NOT NULL,
+          source_user_seq    INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id   TEXT NOT NULL UNIQUE,
+          contract_version   INTEGER NOT NULL CHECK (contract_version = 1),
+          contract_id        TEXT NOT NULL UNIQUE CHECK (length(contract_id) = 81),
+          graph_event_id     TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+          graph_id           TEXT NOT NULL,
+          graph_hash         TEXT NOT NULL CHECK (length(graph_hash) = 64),
+          planner_source     TEXT NOT NULL
+                             CHECK (planner_source IN ('deterministic','structured_model')),
+          contract_json      TEXT NOT NULL,
+          operation_count    INTEGER NOT NULL CHECK (operation_count BETWEEN 0 AND 32),
+          universe_count     INTEGER NOT NULL CHECK (universe_count BETWEEN 0 AND 16),
+          fixed_at           TEXT NOT NULL,
+          PRIMARY KEY (session_id, source_user_seq),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES accepted_task_authority(session_id, source_user_seq)
+            ON DELETE CASCADE
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_accepted_task_work_contract_exact_authority
+        BEFORE INSERT ON accepted_task_work_contracts
+        WHEN NOT EXISTS (
+          SELECT 1 FROM accepted_task_authority a
+           WHERE a.session_id = NEW.session_id
+             AND a.source_user_seq = NEW.source_user_seq
+             AND a.accepted_task_id = NEW.accepted_task_id
+             AND a.graph_event_id = NEW.graph_event_id
+             AND a.graph_id = NEW.graph_id
+             AND a.graph_hash = NEW.graph_hash
+             AND a.state != 'conflict'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'expected-work contract requires its exact accepted authority');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_accepted_task_work_contracts_update_immutable
+        BEFORE UPDATE ON accepted_task_work_contracts
+        BEGIN
+          SELECT RAISE(ABORT, 'accepted task work contracts are immutable');
+        END;
+
+        -- Do not block DELETE here: session retention owns parent cascades.
+        -- A standalone deletion leaves the authority's immutable contract id
+        -- behind, so rehydration fails closed and no replacement can bind.
+
+        CREATE TRIGGER IF NOT EXISTS trg_accepted_task_authority_contract_binding
+        BEFORE UPDATE OF work_contract_id ON accepted_task_authority
+        WHEN (
+          OLD.work_contract_id IS NOT NULL
+          AND OLD.work_contract_id IS NOT NEW.work_contract_id
+        ) OR (
+          NEW.work_contract_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM accepted_task_work_contracts c
+             WHERE c.session_id = NEW.session_id
+               AND c.source_user_seq = NEW.source_user_seq
+               AND c.accepted_task_id = NEW.accepted_task_id
+               AND c.graph_event_id = NEW.graph_event_id
+               AND c.graph_id = NEW.graph_id
+               AND c.graph_hash = NEW.graph_hash
+               AND c.contract_id = NEW.work_contract_id
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'accepted task work-contract binding is invalid or immutable');
+        END;
+      `);
+    },
+  },
+  {
+    // Host-issued evidence authority. A successful result becomes evidence
+    // only when the logical settlement names the handle in the same commit;
+    // finding a handle later beside a returned crossing is not proof that it
+    // was the result which closed the call. Read receipts then bind that exact
+    // settlement result to one manifest node and one declared obligation.
+    version: 30,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        'accepted_task_authority',
+        'logical_tool_calls',
+        'physical_dispatches',
+        'logical_call_settlements',
+        'logical_call_settlement_crossings',
+        'durable_result_handles',
+        'obligation_transitions',
+      ]) {
+        if (!tables.has(prerequisite)) {
+          throw new Error(`schema v30 prerequisite missing: ${prerequisite}`);
+        }
+      }
+
+      const settlementColumns = new Set(
+        (db.prepare('PRAGMA table_info(logical_call_settlements)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!settlementColumns.has('result_handle_id')) {
+        db.exec(`ALTER TABLE logical_call_settlements ADD COLUMN result_handle_id TEXT
+          REFERENCES durable_result_handles(handle_id) ON DELETE RESTRICT`);
+      }
+
+      // Promote only rows whose immutable settlement mirror named the handle
+      // and exact returned physical crossing at commit time. A plausible later
+      // handle beside the same call remains null and therefore unredeemable.
+      db.exec(`
+        UPDATE logical_call_settlements AS s
+           SET result_handle_id = (
+             SELECT h.handle_id
+               FROM events e
+               JOIN durable_result_handles h
+                 ON h.handle_id = json_extract(e.data_json, '$.resultHandleId')
+               JOIN logical_tool_calls l
+                 ON l.session_id = s.session_id
+                AND l.source_user_seq = s.source_user_seq
+                AND l.logical_tool_call_id = s.logical_tool_call_id
+               JOIN physical_dispatches p
+                 ON p.session_id = h.session_id
+                AND p.source_user_seq = h.source_user_seq
+                AND p.logical_tool_call_id = h.logical_tool_call_id
+                AND p.physical_dispatch_id = h.physical_dispatch_id
+              WHERE e.id = s.settlement_event_id
+                AND e.session_id = s.session_id
+                AND e.type = 'tool_attempt_settled'
+                AND json_extract(e.data_json, '$.sourceUserSeq') = s.source_user_seq
+                AND json_extract(e.data_json, '$.acceptedTaskId') = l.accepted_task_id
+                AND json_extract(e.data_json, '$.logicalToolCallId') = s.logical_tool_call_id
+                AND json_extract(e.data_json, '$.physicalDispatchId') = h.physical_dispatch_id
+                AND h.scope_kind = 'authoritative'
+                AND h.session_id = s.session_id
+                AND h.source_user_seq = s.source_user_seq
+                AND h.accepted_task_id = l.accepted_task_id
+                AND h.logical_tool_call_id = s.logical_tool_call_id
+                AND h.tool_name = l.tool_name
+                AND h.argument_digest = l.argument_digest
+                AND h.success = 1
+                AND p.state = 'returned'
+                AND p.ordinal = (
+                  SELECT MAX(p2.ordinal) FROM physical_dispatches p2
+                   WHERE p2.session_id = s.session_id
+                     AND p2.source_user_seq = s.source_user_seq
+                     AND p2.logical_tool_call_id = s.logical_tool_call_id
+                )
+              LIMIT 1
+           )
+         WHERE s.result_handle_id IS NULL
+           AND s.execution_kind = 'provider_execution'
+           AND s.outcome_kind IN ('succeeded','empty_result')
+           AND EXISTS (
+             SELECT 1 FROM events e
+              WHERE e.id = s.settlement_event_id
+                AND json_type(e.data_json, '$.resultHandleId') = 'text'
+           );
+
+        CREATE INDEX IF NOT EXISTS idx_logical_settlement_result_handle
+          ON logical_call_settlements(result_handle_id)
+          WHERE result_handle_id IS NOT NULL;
+
+        CREATE TRIGGER IF NOT EXISTS trg_logical_settlement_result_required
+        BEFORE INSERT ON logical_call_settlements
+        WHEN (
+          NEW.execution_kind = 'provider_execution'
+          AND NEW.outcome_kind IN ('succeeded','empty_result')
+          AND NEW.result_handle_id IS NULL
+        ) OR (
+          NOT (
+            NEW.execution_kind = 'provider_execution'
+            AND NEW.outcome_kind IN ('succeeded','empty_result')
+          )
+          AND NEW.result_handle_id IS NOT NULL
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'logical settlement result-handle binding is inconsistent');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_logical_settlement_result_exact
+        BEFORE INSERT ON logical_call_settlements
+        WHEN NEW.result_handle_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1
+            FROM durable_result_handles h
+            JOIN logical_tool_calls l
+              ON l.session_id = NEW.session_id
+             AND l.source_user_seq = NEW.source_user_seq
+             AND l.logical_tool_call_id = NEW.logical_tool_call_id
+            JOIN physical_dispatches p
+              ON p.session_id = h.session_id
+             AND p.source_user_seq = h.source_user_seq
+             AND p.logical_tool_call_id = h.logical_tool_call_id
+             AND p.physical_dispatch_id = h.physical_dispatch_id
+           WHERE h.handle_id = NEW.result_handle_id
+             AND h.scope_kind = 'authoritative'
+             AND h.session_id = NEW.session_id
+             AND h.source_user_seq = NEW.source_user_seq
+             AND h.accepted_task_id = l.accepted_task_id
+             AND h.logical_tool_call_id = NEW.logical_tool_call_id
+             AND h.tool_name = l.tool_name
+             AND h.argument_digest = l.argument_digest
+             AND h.success = 1
+             AND p.state = 'returned'
+             AND p.ordinal = (
+               SELECT MAX(p2.ordinal) FROM physical_dispatches p2
+                WHERE p2.session_id = NEW.session_id
+                  AND p2.source_user_seq = NEW.source_user_seq
+                  AND p2.logical_tool_call_id = NEW.logical_tool_call_id
+             )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'logical settlement requires its exact returned result handle');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_logical_settlement_result_immutable
+        BEFORE UPDATE OF result_handle_id ON logical_call_settlements
+        WHEN OLD.result_handle_id IS NOT NEW.result_handle_id
+        BEGIN
+          SELECT RAISE(ABORT, 'logical settlement result handle is immutable');
+        END;
+
+        CREATE TABLE IF NOT EXISTS evidence_receipts (
+          receipt_id             TEXT PRIMARY KEY,
+          protocol_version       INTEGER NOT NULL CHECK (protocol_version = 1),
+          semantic_digest        TEXT NOT NULL UNIQUE CHECK (length(semantic_digest) = 64),
+          kind                   TEXT NOT NULL CHECK (kind IN ('observation','collection')),
+          session_id             TEXT NOT NULL,
+          source_user_seq        INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id       TEXT NOT NULL,
+          manifest_id            TEXT NOT NULL,
+          node_id                TEXT NOT NULL,
+          obligation             TEXT NOT NULL CHECK (obligation IN ('source_observed','source_completeness')),
+          logical_tool_call_id   TEXT NOT NULL,
+          physical_dispatch_id   TEXT NOT NULL,
+          result_handle_id       TEXT NOT NULL REFERENCES durable_result_handles(handle_id) ON DELETE RESTRICT,
+          tool_name              TEXT NOT NULL,
+          operation_mode         TEXT NOT NULL CHECK (operation_mode IN ('point_read','collection_read')),
+          raw_payload_sha256     TEXT NOT NULL CHECK (length(raw_payload_sha256) = 64),
+          raw_byte_count         INTEGER NOT NULL CHECK (raw_byte_count >= 0),
+          record_identities_json TEXT NOT NULL,
+          aggregate_digest       TEXT NOT NULL CHECK (length(aggregate_digest) = 64),
+          completeness           TEXT NOT NULL CHECK (completeness IN ('complete','partial','unknown')),
+          continuation_outstanding INTEGER NOT NULL CHECK (continuation_outstanding IN (0, 1)),
+          cursor_repeated        INTEGER NOT NULL CHECK (cursor_repeated IN (0, 1)),
+          receipt_event_id       TEXT NOT NULL UNIQUE REFERENCES events(id) ON DELETE RESTRICT,
+          issued_at              TEXT NOT NULL,
+          UNIQUE (session_id, source_user_seq, manifest_id, node_id, obligation),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES accepted_task_authority(session_id, source_user_seq) ON DELETE CASCADE,
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES logical_call_settlements(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_evidence_receipts_task
+          ON evidence_receipts(session_id, source_user_seq, manifest_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_evidence_receipt_exact_authority
+        BEFORE INSERT ON evidence_receipts
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM accepted_task_authority a
+            JOIN logical_call_settlements s
+              ON s.session_id = a.session_id
+             AND s.source_user_seq = a.source_user_seq
+             AND s.logical_tool_call_id = NEW.logical_tool_call_id
+            JOIN logical_tool_calls l
+              ON l.session_id = s.session_id
+             AND l.source_user_seq = s.source_user_seq
+             AND l.logical_tool_call_id = s.logical_tool_call_id
+            JOIN durable_result_handles h
+              ON h.handle_id = s.result_handle_id
+            JOIN events e
+              ON e.id = NEW.receipt_event_id
+           WHERE a.session_id = NEW.session_id
+             AND a.source_user_seq = NEW.source_user_seq
+             AND a.accepted_task_id = NEW.accepted_task_id
+             AND a.manifest_id = NEW.manifest_id
+             AND a.state = 'manifested_verifying'
+             AND l.accepted_task_id = NEW.accepted_task_id
+             AND l.state = 'settled'
+             AND s.execution_kind = 'provider_execution'
+             AND s.outcome_kind IN ('succeeded','empty_result')
+             AND s.result_handle_id = NEW.result_handle_id
+             AND h.scope_kind = 'authoritative'
+             AND h.session_id = NEW.session_id
+             AND h.source_user_seq = NEW.source_user_seq
+             AND h.accepted_task_id = NEW.accepted_task_id
+             AND h.logical_tool_call_id = NEW.logical_tool_call_id
+             AND h.physical_dispatch_id = NEW.physical_dispatch_id
+             AND h.tool_name = NEW.tool_name
+             AND h.raw_payload_sha256 = NEW.raw_payload_sha256
+             AND h.raw_byte_count = NEW.raw_byte_count
+             AND h.success = 1
+             AND e.session_id = NEW.session_id
+             AND e.type = 'evidence_receipt'
+             AND json_extract(e.data_json, '$.receiptId') = NEW.receipt_id
+             AND json_extract(e.data_json, '$.sourceUserSeq') = NEW.source_user_seq
+             AND json_extract(e.data_json, '$.acceptedTaskId') = NEW.accepted_task_id
+             AND json_extract(e.data_json, '$.manifestId') = NEW.manifest_id
+             AND json_extract(e.data_json, '$.nodeId') = NEW.node_id
+             AND json_extract(e.data_json, '$.obligation') = NEW.obligation
+             AND json_extract(e.data_json, '$.logicalToolCallId') = NEW.logical_tool_call_id
+             AND json_extract(e.data_json, '$.physicalDispatchId') = NEW.physical_dispatch_id
+             AND json_extract(e.data_json, '$.resultHandleId') = NEW.result_handle_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'evidence receipt requires exact manifested settlement authority');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_evidence_receipt_identity_immutable
+        BEFORE UPDATE ON evidence_receipts
+        BEGIN
+          SELECT RAISE(ABORT, 'evidence receipts are immutable');
+        END;
+      `);
+    },
+  },
+  {
+    // A settlement is the normalized authority for outcome, requirement
+    // routing, business-vs-discovery identity and continuation state. v30 made
+    // its result-handle binding immutable; v31 closes the wider row so those
+    // other fields cannot be rewritten beneath expected-work replay.
+    version: 31,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      if (!tables.has('logical_call_settlements')) {
+        throw new Error('schema v31 prerequisite missing: logical_call_settlements');
+      }
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_logical_call_settlement_row_immutable
+        BEFORE UPDATE ON logical_call_settlements
+        BEGIN
+          SELECT RAISE(ABORT, 'logical call settlements are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_logical_call_settlement_delete_immutable
+        BEFORE DELETE ON logical_call_settlements
+        -- Parent session retention remains the one deletion authority. During
+        -- its FK cascade the parent session row is already absent; a direct
+        -- settlement/logical-call delete still sees the live parent and stops.
+        WHEN EXISTS (
+          SELECT 1 FROM sessions WHERE id = OLD.session_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'logical call settlements are immutable');
+        END;
+      `);
+    },
+  },
+  {
+    // Action expected-work admission. One immutable row binds an already-open,
+    // zero-crossing logical call to the exact frozen semantic requirement it
+    // is allowed to discharge. The same row carries the request-side witness
+    // needed by read-evidence refinement; no parallel read authority exists.
+    //
+    // The two cleanup statements are deliberately parent-session based. A
+    // live session may legitimately retain a historical run_attempt whose
+    // source event was lost by an old/partial writer; that is degraded history,
+    // not an orphan attempt. Only rows whose owning session is absent are
+    // unreachable and safe to remove before foreign keys are relied upon.
+    version: 32,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+
+      if (tables.has('run_dispatch_leases')) {
+        db.exec(`
+          DELETE FROM run_dispatch_leases
+           WHERE NOT EXISTS (
+             SELECT 1 FROM sessions s WHERE s.id = run_dispatch_leases.session_id
+           )
+        `);
+      }
+      if (tables.has('run_attempts')) {
+        db.exec(`
+          DELETE FROM run_attempts
+           WHERE NOT EXISTS (
+             SELECT 1 FROM sessions s WHERE s.id = run_attempts.session_id
+           )
+        `);
+      }
+
+      for (const prerequisite of [
+        'accepted_task_authority',
+        'accepted_task_work_contracts',
+        'logical_tool_calls',
+        'physical_dispatches',
+      ]) {
+        if (!tables.has(prerequisite)) {
+          throw new Error(`schema v32 prerequisite missing: ${prerequisite}`);
+        }
+      }
+
+      const authorityColumns = new Set(
+        (db.prepare('PRAGMA table_info(accepted_task_authority)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!authorityColumns.has('expected_work_required')) {
+        db.exec(`ALTER TABLE accepted_task_authority
+          ADD COLUMN expected_work_required INTEGER NOT NULL DEFAULT 0
+          CHECK (expected_work_required IN (0, 1))`);
+      }
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_accepted_task_expected_work_activation
+        BEFORE UPDATE OF expected_work_required ON accepted_task_authority
+        WHEN NOT (
+          OLD.expected_work_required = NEW.expected_work_required
+          OR (
+            OLD.expected_work_required = 0
+            AND NEW.expected_work_required = 1
+            AND OLD.state = 'armed'
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'expected-work activation is one-way and requires armed authority');
+        END;
+
+        CREATE TABLE IF NOT EXISTS expected_work_call_bindings (
+          session_id              TEXT NOT NULL,
+          source_user_seq         INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id        TEXT NOT NULL,
+          logical_tool_call_id    TEXT NOT NULL,
+          contract_id             TEXT NOT NULL,
+          requirement_id          TEXT NOT NULL,
+          tool_name                TEXT NOT NULL,
+          argument_digest          TEXT NOT NULL CHECK (length(argument_digest) = 64),
+          effect_kind              TEXT NOT NULL
+                                   CHECK (effect_kind IN ('read','compute','local_write','external_write','admin')),
+          cardinality_kind         TEXT NOT NULL
+                                   CHECK (cardinality_kind IN ('once','each','set')),
+          universe_id              TEXT,
+          universe_seal            TEXT
+                                   CHECK (universe_seal IS NULL OR universe_seal IN ('accepted_input','complete_source_receipt')),
+          universe_item_id         TEXT,
+          universe_selector_json   TEXT,
+          universe_member_digest   TEXT
+                                   CHECK (universe_member_digest IS NULL OR length(universe_member_digest) = 64),
+          universe_member_count    INTEGER
+                                   CHECK (universe_member_count IS NULL OR universe_member_count > 0),
+          input_source_kind        TEXT
+                                   CHECK (input_source_kind IS NULL OR input_source_kind IN ('accepted_user_input','complete_source_receipt')),
+          input_source_ref         TEXT,
+          input_source_digest      TEXT
+                                   CHECK (input_source_digest IS NULL OR length(input_source_digest) = 64),
+          evidence_mode            TEXT
+                                   CHECK (evidence_mode IS NULL OR evidence_mode IN ('point_read','collection_read','finite_read')),
+          evidence_basis           TEXT,
+          schema_fingerprint       TEXT,
+          schema_digest            TEXT
+                                   CHECK (schema_digest IS NULL OR length(schema_digest) = 64),
+          bound_at                 TEXT NOT NULL,
+          PRIMARY KEY (session_id, source_user_seq, logical_tool_call_id),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES accepted_task_work_contracts(session_id, source_user_seq)
+            ON DELETE CASCADE,
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES logical_tool_calls(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE CASCADE,
+          FOREIGN KEY (contract_id)
+            REFERENCES accepted_task_work_contracts(contract_id)
+            ON DELETE RESTRICT,
+          CHECK (
+            (cardinality_kind = 'once'
+              AND universe_id IS NULL
+              AND universe_seal IS NULL
+              AND universe_item_id IS NULL
+              AND universe_selector_json IS NULL
+              AND universe_member_digest IS NULL
+              AND universe_member_count IS NULL
+              AND input_source_kind IS NULL
+              AND input_source_ref IS NULL
+              AND input_source_digest IS NULL)
+            OR
+            (cardinality_kind = 'each'
+              AND universe_id IS NOT NULL
+              AND universe_seal IS NOT NULL
+              AND universe_item_id IS NOT NULL
+              AND universe_selector_json IS NOT NULL
+              AND json_valid(universe_selector_json)
+              AND json_type(universe_selector_json) = 'object'
+              AND universe_member_digest IS NOT NULL
+              AND universe_member_count = 1
+              AND input_source_kind IS NOT NULL
+              AND input_source_ref IS NOT NULL
+              AND input_source_digest IS NOT NULL)
+            OR
+            (cardinality_kind = 'set'
+              AND universe_id IS NOT NULL
+              AND universe_seal IS NOT NULL
+              AND universe_item_id IS NULL
+              AND universe_selector_json IS NOT NULL
+              AND json_valid(universe_selector_json)
+              AND json_type(universe_selector_json) = 'object'
+              AND universe_member_digest IS NOT NULL
+              AND universe_member_count > 0
+              AND input_source_kind IS NOT NULL
+              AND input_source_ref IS NOT NULL
+              AND input_source_digest IS NOT NULL)
+          ),
+          CHECK (
+            (evidence_mode IS NULL AND evidence_basis IS NULL)
+            OR (evidence_mode IS NOT NULL AND evidence_basis IS NOT NULL)
+          ),
+          CHECK (
+            (schema_fingerprint IS NULL AND schema_digest IS NULL)
+            OR (schema_fingerprint IS NOT NULL AND schema_digest IS NOT NULL)
+          )
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_expected_work_call_bindings_requirement
+          ON expected_work_call_bindings(
+            session_id, source_user_seq, requirement_id, universe_item_id
+          );
+
+        CREATE TRIGGER IF NOT EXISTS trg_expected_work_call_binding_exact_authority
+        BEFORE INSERT ON expected_work_call_bindings
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM accepted_task_authority a
+            JOIN accepted_task_work_contracts c
+              ON c.session_id = a.session_id
+             AND c.source_user_seq = a.source_user_seq
+            JOIN logical_tool_calls l
+              ON l.session_id = a.session_id
+             AND l.source_user_seq = a.source_user_seq
+             AND l.logical_tool_call_id = NEW.logical_tool_call_id
+           WHERE a.session_id = NEW.session_id
+             AND a.source_user_seq = NEW.source_user_seq
+             AND a.accepted_task_id = NEW.accepted_task_id
+             AND a.expected_work_required = 1
+             AND a.work_contract_id = NEW.contract_id
+             AND a.state = 'armed'
+             AND c.contract_id = NEW.contract_id
+             AND l.accepted_task_id = NEW.accepted_task_id
+             AND l.tool_name = NEW.tool_name
+             AND l.argument_digest = NEW.argument_digest
+             AND l.state = 'open'
+             AND NOT EXISTS (
+               SELECT 1 FROM physical_dispatches p
+                WHERE p.session_id = l.session_id
+                  AND p.source_user_seq = l.source_user_seq
+                  AND p.logical_tool_call_id = l.logical_tool_call_id
+             )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'expected-work call binding requires exact open zero-crossing authority');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_expected_work_call_bindings_update_immutable
+        BEFORE UPDATE ON expected_work_call_bindings
+        BEGIN
+          SELECT RAISE(ABORT, 'expected-work call bindings are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_expected_work_call_bindings_delete_immutable
+        BEFORE DELETE ON expected_work_call_bindings
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN
+          SELECT RAISE(ABORT, 'expected-work call bindings are immutable');
+        END;
+      `);
+    },
+  },
+  {
+    // Provider-neutral write proof authority.  The pre-dispatch binding is
+    // intentionally independent of an obligation manifest: selectors and
+    // projections must be fixed before provider I/O, while the authoritative
+    // manifest is only available after observed resolution closes.  A later
+    // content-addressed proof receipt binds the immutable call contract to the
+    // exact manifest node without rewriting either artifact.
+    //
+    // This migration performs no historical promotion or broad cleanup.  Old
+    // event prose and external-write rows do not contain the schema, target,
+    // exact input, or crossing identity needed to manufacture v33 authority.
+    version: 33,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        'accepted_task_authority',
+        'accepted_task_work_contracts',
+        'expected_work_call_bindings',
+        'logical_tool_calls',
+        'physical_dispatches',
+        'logical_call_settlements',
+        'durable_result_handles',
+        'obligation_transitions',
+      ]) {
+        if (!tables.has(prerequisite)) {
+          throw new Error(`schema v33 prerequisite missing: ${prerequisite}`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS write_evidence_bindings (
+          binding_id                  TEXT PRIMARY KEY CHECK (length(binding_id) = 81),
+          protocol_version            INTEGER NOT NULL CHECK (protocol_version = 1),
+          semantic_digest             TEXT NOT NULL UNIQUE CHECK (length(semantic_digest) = 64),
+          session_id                  TEXT NOT NULL,
+          source_user_seq             INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id            TEXT NOT NULL,
+          work_contract_id            TEXT NOT NULL,
+          requirement_id              TEXT NOT NULL,
+          logical_tool_call_id        TEXT NOT NULL,
+          tool_name                   TEXT NOT NULL,
+          argument_digest             TEXT NOT NULL CHECK (length(argument_digest) = 64),
+          effect_kind                 TEXT NOT NULL CHECK (effect_kind IN ('external_write','admin')),
+          reversibility               TEXT NOT NULL CHECK (reversibility IN ('reversible','irreversible')),
+          target_selector_json        TEXT NOT NULL CHECK (
+                                         json_valid(target_selector_json)
+                                         AND json_type(target_selector_json) = 'array'
+                                       ),
+          target_digest               TEXT NOT NULL CHECK (length(target_digest) = 64),
+          write_input_json            TEXT NOT NULL CHECK (json_valid(write_input_json)),
+          write_input_digest          TEXT NOT NULL CHECK (length(write_input_digest) = 64),
+          input_schema_json           TEXT NOT NULL CHECK (json_valid(input_schema_json)),
+          source_requirement_ids_json TEXT NOT NULL CHECK (
+                                         json_valid(source_requirement_ids_json)
+                                         AND json_type(source_requirement_ids_json) = 'array'
+                                       ),
+          verification_json           TEXT NOT NULL CHECK (
+                                         json_valid(verification_json)
+                                         AND json_type(verification_json) = 'object'
+                                       ),
+          schema_digest               TEXT NOT NULL CHECK (length(schema_digest) = 64),
+          mapping_digest              TEXT NOT NULL CHECK (length(mapping_digest) = 64),
+          frozen_at                   TEXT NOT NULL,
+          UNIQUE (session_id, source_user_seq, logical_tool_call_id),
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES expected_work_call_bindings(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE CASCADE,
+          FOREIGN KEY (work_contract_id)
+            REFERENCES accepted_task_work_contracts(contract_id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_write_evidence_bindings_task
+          ON write_evidence_bindings(session_id, source_user_seq, requirement_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_binding_exact_authority
+        BEFORE INSERT ON write_evidence_bindings
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM expected_work_call_bindings b
+            JOIN accepted_task_authority a
+              ON a.session_id = b.session_id
+             AND a.source_user_seq = b.source_user_seq
+            JOIN logical_tool_calls l
+              ON l.session_id = b.session_id
+             AND l.source_user_seq = b.source_user_seq
+             AND l.logical_tool_call_id = b.logical_tool_call_id
+           WHERE b.session_id = NEW.session_id
+             AND b.source_user_seq = NEW.source_user_seq
+             AND b.logical_tool_call_id = NEW.logical_tool_call_id
+             AND b.accepted_task_id = NEW.accepted_task_id
+             AND b.contract_id = NEW.work_contract_id
+             AND b.requirement_id = NEW.requirement_id
+             AND b.tool_name = NEW.tool_name
+             AND b.argument_digest = NEW.argument_digest
+             AND b.effect_kind = NEW.effect_kind
+             AND a.accepted_task_id = NEW.accepted_task_id
+             AND a.work_contract_id = NEW.work_contract_id
+             AND a.expected_work_required = 1
+             AND a.state = 'armed'
+             AND l.accepted_task_id = NEW.accepted_task_id
+             AND l.tool_name = NEW.tool_name
+             AND l.argument_digest = NEW.argument_digest
+             AND l.state = 'open'
+             AND NOT EXISTS (
+               SELECT 1 FROM physical_dispatches p
+                WHERE p.session_id = NEW.session_id
+                  AND p.source_user_seq = NEW.source_user_seq
+                  AND p.logical_tool_call_id = NEW.logical_tool_call_id
+             )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'write evidence binding requires exact pre-dispatch work authority');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_bindings_update_immutable
+        BEFORE UPDATE ON write_evidence_bindings
+        BEGIN
+          SELECT RAISE(ABORT, 'write evidence bindings are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_bindings_delete_immutable
+        BEFORE DELETE ON write_evidence_bindings
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN
+          SELECT RAISE(ABORT, 'write evidence bindings are immutable');
+        END;
+
+        CREATE TABLE IF NOT EXISTS write_evidence_dispatch_reservations (
+          reservation_id       TEXT PRIMARY KEY CHECK (length(reservation_id) = 85),
+          binding_id           TEXT NOT NULL REFERENCES write_evidence_bindings(binding_id) ON DELETE CASCADE,
+          session_id           TEXT NOT NULL,
+          source_user_seq      INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id     TEXT NOT NULL,
+          logical_tool_call_id TEXT NOT NULL,
+          physical_dispatch_id TEXT NOT NULL,
+          ordinal              INTEGER NOT NULL CHECK (ordinal > 0),
+          target_digest        TEXT NOT NULL CHECK (length(target_digest) = 64),
+          write_input_digest   TEXT NOT NULL CHECK (length(write_input_digest) = 64),
+          reserved_at          TEXT NOT NULL,
+          UNIQUE (session_id, source_user_seq, physical_dispatch_id),
+          UNIQUE (binding_id, ordinal),
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES logical_tool_calls(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE CASCADE
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_reservation_exact_binding
+        BEFORE INSERT ON write_evidence_dispatch_reservations
+        WHEN NOT EXISTS (
+          SELECT 1 FROM write_evidence_bindings b
+           WHERE b.binding_id = NEW.binding_id
+             AND b.session_id = NEW.session_id
+             AND b.source_user_seq = NEW.source_user_seq
+             AND b.accepted_task_id = NEW.accepted_task_id
+             AND b.logical_tool_call_id = NEW.logical_tool_call_id
+             AND b.target_digest = NEW.target_digest
+             AND b.write_input_digest = NEW.write_input_digest
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'write reservation conflicts with its frozen binding');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_bound_write_dispatch_requires_reservation
+        BEFORE INSERT ON physical_dispatches
+        WHEN EXISTS (
+          SELECT 1 FROM write_evidence_bindings b
+           WHERE b.session_id = NEW.session_id
+             AND b.source_user_seq = NEW.source_user_seq
+             AND b.logical_tool_call_id = NEW.logical_tool_call_id
+        ) AND NOT EXISTS (
+          SELECT 1
+            FROM write_evidence_dispatch_reservations r
+            JOIN write_evidence_bindings b ON b.binding_id = r.binding_id
+           WHERE r.session_id = NEW.session_id
+             AND r.source_user_seq = NEW.source_user_seq
+             AND r.accepted_task_id = NEW.accepted_task_id
+             AND r.logical_tool_call_id = NEW.logical_tool_call_id
+             AND r.physical_dispatch_id = NEW.physical_dispatch_id
+             AND r.ordinal = NEW.ordinal
+             AND b.tool_name = NEW.tool_name
+             AND b.argument_digest = NEW.argument_digest
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'bound write dispatch requires an atomic reservation');
+        END;
+
+        CREATE TABLE IF NOT EXISTS write_evidence_dispatch_outcomes (
+          outcome_id            TEXT PRIMARY KEY CHECK (length(outcome_id) = 81),
+          reservation_id        TEXT NOT NULL UNIQUE
+                                REFERENCES write_evidence_dispatch_reservations(reservation_id)
+                                ON DELETE CASCADE,
+          binding_id            TEXT NOT NULL REFERENCES write_evidence_bindings(binding_id) ON DELETE CASCADE,
+          session_id            TEXT NOT NULL,
+          source_user_seq       INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id      TEXT NOT NULL,
+          logical_tool_call_id  TEXT NOT NULL,
+          physical_dispatch_id  TEXT NOT NULL,
+          kind                  TEXT NOT NULL CHECK (kind IN ('succeeded','failed','orphaned')),
+          result_handle_id      TEXT REFERENCES durable_result_handles(handle_id) ON DELETE RESTRICT,
+          settlement_event_id   TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+          target_digest         TEXT NOT NULL CHECK (length(target_digest) = 64),
+          write_input_digest    TEXT NOT NULL CHECK (length(write_input_digest) = 64),
+          recorded_at           TEXT NOT NULL,
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES logical_call_settlements(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE RESTRICT,
+          CHECK ((kind = 'succeeded' AND result_handle_id IS NOT NULL)
+              OR (kind != 'succeeded' AND result_handle_id IS NULL))
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_outcome_exact_authority
+        BEFORE INSERT ON write_evidence_dispatch_outcomes
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM write_evidence_dispatch_reservations r
+            JOIN write_evidence_bindings b ON b.binding_id = r.binding_id
+            JOIN logical_call_settlements s
+              ON s.session_id = r.session_id
+             AND s.source_user_seq = r.source_user_seq
+             AND s.logical_tool_call_id = r.logical_tool_call_id
+            JOIN physical_dispatches p
+              ON p.session_id = r.session_id
+             AND p.source_user_seq = r.source_user_seq
+             AND p.logical_tool_call_id = r.logical_tool_call_id
+             AND p.physical_dispatch_id = r.physical_dispatch_id
+           WHERE r.reservation_id = NEW.reservation_id
+             AND r.binding_id = NEW.binding_id
+             AND r.session_id = NEW.session_id
+             AND r.source_user_seq = NEW.source_user_seq
+             AND r.accepted_task_id = NEW.accepted_task_id
+             AND r.logical_tool_call_id = NEW.logical_tool_call_id
+             AND r.physical_dispatch_id = NEW.physical_dispatch_id
+             AND r.target_digest = NEW.target_digest
+             AND r.write_input_digest = NEW.write_input_digest
+             AND s.settlement_event_id = NEW.settlement_event_id
+             AND p.state != 'started'
+             AND (
+               (NEW.kind = 'succeeded'
+                 AND p.state = 'returned'
+                 AND s.execution_kind = 'provider_execution'
+                 AND s.outcome_kind IN ('succeeded','empty_result')
+                 AND s.result_handle_id = NEW.result_handle_id
+                 AND EXISTS (
+                   SELECT 1 FROM durable_result_handles h
+                    WHERE h.handle_id = NEW.result_handle_id
+                      AND h.session_id = NEW.session_id
+                      AND h.source_user_seq = NEW.source_user_seq
+                      AND h.accepted_task_id = NEW.accepted_task_id
+                      AND h.logical_tool_call_id = NEW.logical_tool_call_id
+                      AND h.physical_dispatch_id = NEW.physical_dispatch_id
+                 ))
+               OR
+               (NEW.kind != 'succeeded'
+                 AND s.outcome_kind NOT IN ('succeeded','empty_result'))
+             )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'write outcome conflicts with reservation, settlement, or result');
+        END;
+
+        CREATE TABLE IF NOT EXISTS write_evidence_readback_bindings (
+          readback_binding_id      TEXT PRIMARY KEY CHECK (length(readback_binding_id) = 90),
+          binding_id               TEXT NOT NULL REFERENCES write_evidence_bindings(binding_id) ON DELETE CASCADE,
+          session_id               TEXT NOT NULL,
+          source_user_seq          INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id         TEXT NOT NULL,
+          work_contract_id         TEXT NOT NULL,
+          write_requirement_id     TEXT NOT NULL,
+          read_requirement_id      TEXT NOT NULL,
+          read_logical_tool_call_id TEXT NOT NULL,
+          read_tool_name           TEXT NOT NULL,
+          read_argument_digest     TEXT NOT NULL CHECK (length(read_argument_digest) = 64),
+          target_selector_json     TEXT NOT NULL CHECK (
+                                     json_valid(target_selector_json)
+                                     AND json_type(target_selector_json) = 'array'
+                                   ),
+          target_digest            TEXT NOT NULL CHECK (length(target_digest) = 64),
+          schema_digest            TEXT NOT NULL CHECK (length(schema_digest) = 64),
+          verification_contract_id TEXT NOT NULL,
+          frozen_at                TEXT NOT NULL,
+          UNIQUE (binding_id, read_logical_tool_call_id),
+          FOREIGN KEY (session_id, source_user_seq, read_logical_tool_call_id)
+            REFERENCES expected_work_call_bindings(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE CASCADE
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_write_readback_exact_authority
+        BEFORE INSERT ON write_evidence_readback_bindings
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM write_evidence_bindings w
+            JOIN expected_work_call_bindings r
+              ON r.session_id = w.session_id
+             AND r.source_user_seq = w.source_user_seq
+             AND r.logical_tool_call_id = NEW.read_logical_tool_call_id
+            JOIN logical_tool_calls l
+              ON l.session_id = r.session_id
+             AND l.source_user_seq = r.source_user_seq
+             AND l.logical_tool_call_id = r.logical_tool_call_id
+           WHERE w.binding_id = NEW.binding_id
+             AND w.session_id = NEW.session_id
+             AND w.source_user_seq = NEW.source_user_seq
+             AND w.accepted_task_id = NEW.accepted_task_id
+             AND w.work_contract_id = NEW.work_contract_id
+             AND w.requirement_id = NEW.write_requirement_id
+             AND w.target_digest = NEW.target_digest
+             AND w.binding_id = NEW.verification_contract_id
+             AND r.accepted_task_id = NEW.accepted_task_id
+             AND r.contract_id = NEW.work_contract_id
+             AND r.requirement_id = NEW.read_requirement_id
+             AND r.effect_kind = 'read'
+             AND r.tool_name = NEW.read_tool_name
+             AND r.argument_digest = NEW.read_argument_digest
+             AND l.state = 'open'
+             AND NOT EXISTS (
+               SELECT 1 FROM physical_dispatches p
+                WHERE p.session_id = NEW.session_id
+                  AND p.source_user_seq = NEW.source_user_seq
+                  AND p.logical_tool_call_id = NEW.read_logical_tool_call_id
+             )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'readback binding requires exact pre-dispatch read authority');
+        END;
+
+        CREATE TABLE IF NOT EXISTS write_evidence_derivations (
+          derivation_id             TEXT PRIMARY KEY CHECK (length(derivation_id) = 84),
+          binding_id                TEXT NOT NULL UNIQUE REFERENCES write_evidence_bindings(binding_id) ON DELETE CASCADE,
+          session_id                TEXT NOT NULL,
+          source_user_seq           INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id          TEXT NOT NULL,
+          work_contract_id          TEXT NOT NULL,
+          requirement_id            TEXT NOT NULL,
+          output_digest             TEXT NOT NULL CHECK (length(output_digest) = 64),
+          transform_artifact_digest TEXT NOT NULL CHECK (length(transform_artifact_digest) = 64),
+          source_count              INTEGER NOT NULL CHECK (source_count > 0),
+          semantic_digest           TEXT NOT NULL UNIQUE CHECK (length(semantic_digest) = 64),
+          recorded_at               TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS write_evidence_derivation_sources (
+          derivation_id         TEXT NOT NULL REFERENCES write_evidence_derivations(derivation_id) ON DELETE CASCADE,
+          session_id            TEXT NOT NULL,
+          source_user_seq       INTEGER NOT NULL CHECK (source_user_seq > 0),
+          requirement_id        TEXT NOT NULL,
+          logical_tool_call_id  TEXT NOT NULL,
+          result_handle_id      TEXT NOT NULL REFERENCES durable_result_handles(handle_id) ON DELETE RESTRICT,
+          content_digest        TEXT NOT NULL CHECK (length(content_digest) = 64),
+          PRIMARY KEY (derivation_id, requirement_id),
+          UNIQUE (derivation_id, logical_tool_call_id),
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES logical_call_settlements(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS write_evidence_execution_snapshots (
+          snapshot_id          TEXT PRIMARY KEY CHECK (length(snapshot_id) = 82),
+          binding_id           TEXT NOT NULL UNIQUE REFERENCES write_evidence_bindings(binding_id) ON DELETE CASCADE,
+          session_id           TEXT NOT NULL,
+          source_user_seq      INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id     TEXT NOT NULL,
+          executions_json      TEXT NOT NULL CHECK (
+                                 json_valid(executions_json)
+                                 AND json_type(executions_json) = 'array'
+                               ),
+          opened_ids_json      TEXT NOT NULL CHECK (
+                                 json_valid(opened_ids_json)
+                                 AND json_type(opened_ids_json) = 'array'
+                               ),
+          semantic_digest      TEXT NOT NULL UNIQUE CHECK (length(semantic_digest) = 64),
+          recorded_at          TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS write_evidence_proofs (
+          proof_id                   TEXT PRIMARY KEY CHECK (length(proof_id) = 82),
+          protocol_version           INTEGER NOT NULL CHECK (protocol_version = 1),
+          binding_id                 TEXT NOT NULL REFERENCES write_evidence_bindings(binding_id) ON DELETE RESTRICT,
+          session_id                 TEXT NOT NULL,
+          source_user_seq            INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id           TEXT NOT NULL,
+          work_contract_id           TEXT NOT NULL,
+          manifest_id                TEXT NOT NULL,
+          node_id                    TEXT NOT NULL,
+          requirement_id             TEXT NOT NULL,
+          obligation                 TEXT NOT NULL CHECK (obligation IN (
+                                             'derivation_from_current_source','commit_effect',
+                                             'verify_committed_readback','stale_destination_reconciled',
+                                             'verify_committed_receipt','execution_terminal'
+                                           )),
+          logical_tool_call_id       TEXT NOT NULL,
+          anchor_physical_dispatch_id TEXT NOT NULL,
+          target_digest              TEXT NOT NULL CHECK (length(target_digest) = 64),
+          physical_dispatch_ids_json TEXT NOT NULL CHECK (
+                                         json_valid(physical_dispatch_ids_json)
+                                         AND json_type(physical_dispatch_ids_json) = 'array'
+                                       ),
+          evidence_digests_json      TEXT NOT NULL CHECK (
+                                         json_valid(evidence_digests_json)
+                                         AND json_type(evidence_digests_json) = 'array'
+                                       ),
+          proof_json                 TEXT NOT NULL CHECK (
+                                         json_valid(proof_json)
+                                         AND json_type(proof_json) = 'object'
+                                       ),
+          receipt_event_id           TEXT NOT NULL UNIQUE REFERENCES events(id) ON DELETE RESTRICT,
+          issued_at                  TEXT NOT NULL,
+          UNIQUE (session_id, source_user_seq, manifest_id, node_id, obligation),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES accepted_task_authority(session_id, source_user_seq) ON DELETE CASCADE,
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id, anchor_physical_dispatch_id)
+            REFERENCES physical_dispatches(
+              session_id, source_user_seq, logical_tool_call_id, physical_dispatch_id
+            ) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_write_evidence_proofs_task
+          ON write_evidence_proofs(session_id, source_user_seq, manifest_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_proof_exact_authority
+        BEFORE INSERT ON write_evidence_proofs
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM write_evidence_bindings b
+            JOIN accepted_task_authority a
+              ON a.session_id = b.session_id
+             AND a.source_user_seq = b.source_user_seq
+            JOIN events e ON e.id = NEW.receipt_event_id
+           WHERE b.binding_id = NEW.binding_id
+             AND b.session_id = NEW.session_id
+             AND b.source_user_seq = NEW.source_user_seq
+             AND b.accepted_task_id = NEW.accepted_task_id
+             AND b.work_contract_id = NEW.work_contract_id
+             AND b.requirement_id = NEW.requirement_id
+             AND b.logical_tool_call_id = NEW.logical_tool_call_id
+             AND b.target_digest = NEW.target_digest
+             AND a.accepted_task_id = NEW.accepted_task_id
+             AND a.work_contract_id = NEW.work_contract_id
+             AND a.manifest_id = NEW.manifest_id
+             AND a.state = 'manifested_verifying'
+             AND e.session_id = NEW.session_id
+             AND e.type = 'write_evidence_proved'
+             AND json_extract(e.data_json, '$.proofId') = NEW.proof_id
+             AND json_extract(e.data_json, '$.sourceUserSeq') = NEW.source_user_seq
+             AND json_extract(e.data_json, '$.acceptedTaskId') = NEW.accepted_task_id
+             AND json_extract(e.data_json, '$.manifestId') = NEW.manifest_id
+             AND json_extract(e.data_json, '$.nodeId') = NEW.node_id
+             AND json_extract(e.data_json, '$.obligation') = NEW.obligation
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'write proof requires exact manifested authority and event mirror');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_normalized_rows_immutable
+        BEFORE UPDATE ON write_evidence_dispatch_reservations
+        BEGIN SELECT RAISE(ABORT, 'write evidence reservations are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_outcomes_immutable
+        BEFORE UPDATE ON write_evidence_dispatch_outcomes
+        BEGIN SELECT RAISE(ABORT, 'write evidence outcomes are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_readbacks_immutable
+        BEFORE UPDATE ON write_evidence_readback_bindings
+        BEGIN SELECT RAISE(ABORT, 'write evidence readback bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_derivations_immutable
+        BEFORE UPDATE ON write_evidence_derivations
+        BEGIN SELECT RAISE(ABORT, 'write evidence derivations are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_derivation_sources_immutable
+        BEFORE UPDATE ON write_evidence_derivation_sources
+        BEGIN SELECT RAISE(ABORT, 'write evidence derivation sources are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_execution_snapshots_immutable
+        BEFORE UPDATE ON write_evidence_execution_snapshots
+        BEGIN SELECT RAISE(ABORT, 'write evidence execution snapshots are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_proofs_immutable
+        BEFORE UPDATE ON write_evidence_proofs
+        BEGIN SELECT RAISE(ABORT, 'write evidence proofs are immutable'); END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_reservations_delete_immutable
+        BEFORE DELETE ON write_evidence_dispatch_reservations
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN SELECT RAISE(ABORT, 'write evidence reservations are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_outcomes_delete_immutable
+        BEFORE DELETE ON write_evidence_dispatch_outcomes
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN SELECT RAISE(ABORT, 'write evidence outcomes are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_readbacks_delete_immutable
+        BEFORE DELETE ON write_evidence_readback_bindings
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN SELECT RAISE(ABORT, 'write evidence readback bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_derivations_delete_immutable
+        BEFORE DELETE ON write_evidence_derivations
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN SELECT RAISE(ABORT, 'write evidence derivations are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_derivation_sources_delete_immutable
+        BEFORE DELETE ON write_evidence_derivation_sources
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN SELECT RAISE(ABORT, 'write evidence derivation sources are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_execution_snapshots_delete_immutable
+        BEFORE DELETE ON write_evidence_execution_snapshots
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN SELECT RAISE(ABORT, 'write evidence execution snapshots are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_write_evidence_proofs_delete_immutable
+        BEFORE DELETE ON write_evidence_proofs
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN SELECT RAISE(ABORT, 'write evidence proofs are immutable'); END;
+      `);
+    },
+  },
+  {
+    // Exact host completion authority for acknowledgement-only durable-memory
+    // actions. The normalized receipt is independent of provider prose and is
+    // bound to one accepted source, graph, memory episode, intake call, and
+    // candidate-row digest. Historical telemetry is deliberately not
+    // backfilled: it lacks enough evidence to manufacture this authority.
+    version: 34,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      if (!tables.has('accepted_task_authority')) {
+        throw new Error('schema v34 prerequisite missing: accepted_task_authority');
+      }
+      const authorityColumns = new Set(
+        (db.prepare('PRAGMA table_info(accepted_task_authority)').all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!authorityColumns.has('host_completion_receipt_id')) {
+        db.exec('ALTER TABLE accepted_task_authority ADD COLUMN host_completion_receipt_id TEXT');
+      }
+      if (!authorityColumns.has('host_completion_event_id')) {
+        db.exec('ALTER TABLE accepted_task_authority ADD COLUMN host_completion_event_id TEXT REFERENCES events(id) ON DELETE RESTRICT');
+      }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS durable_memory_intake_receipts (
+          receipt_id             TEXT PRIMARY KEY
+                                 CHECK (length(receipt_id) = 81 AND receipt_id LIKE 'memory-intake:v1:%'),
+          protocol_version       INTEGER NOT NULL CHECK (protocol_version = 1),
+          session_id             TEXT NOT NULL,
+          source_user_seq        INTEGER NOT NULL CHECK (source_user_seq > 0),
+          accepted_task_id       TEXT NOT NULL,
+          graph_event_id         TEXT NOT NULL,
+          graph_id               TEXT NOT NULL,
+          graph_hash             TEXT NOT NULL CHECK (length(graph_hash) = 64),
+          source_event_id        TEXT NOT NULL,
+          source_message_digest  TEXT NOT NULL CHECK (length(source_message_digest) = 64),
+          episode_id             TEXT NOT NULL,
+          call_id                TEXT NOT NULL,
+          episode_content_hash   TEXT NOT NULL CHECK (length(episode_content_hash) = 64),
+          candidate_count        INTEGER NOT NULL CHECK (candidate_count > 0 AND candidate_count <= 3),
+          candidate_digest       TEXT NOT NULL CHECK (length(candidate_digest) = 64),
+          evidence_digest        TEXT NOT NULL CHECK (length(evidence_digest) = 64),
+          receipt_json           TEXT NOT NULL CHECK (
+                                   json_valid(receipt_json)
+                                   AND json_type(receipt_json) = 'object'
+                                 ),
+          receipt_event_id       TEXT NOT NULL UNIQUE REFERENCES events(id) ON DELETE RESTRICT,
+          issued_at              TEXT NOT NULL,
+          UNIQUE (session_id, source_user_seq),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES accepted_task_authority(session_id, source_user_seq) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_durable_memory_intake_receipt_task
+          ON durable_memory_intake_receipts(accepted_task_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_durable_memory_intake_receipt_exact_authority
+        BEFORE INSERT ON durable_memory_intake_receipts
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM accepted_task_authority a
+            JOIN events e ON e.id = NEW.receipt_event_id
+           WHERE a.session_id = NEW.session_id
+             AND a.source_user_seq = NEW.source_user_seq
+             AND a.accepted_task_id = NEW.accepted_task_id
+             AND a.graph_event_id = NEW.graph_event_id
+             AND a.graph_id = NEW.graph_id
+             AND a.graph_hash = NEW.graph_hash
+             AND a.state = 'armed'
+             AND a.expected_work_required = 1
+             AND a.work_contract_id IS NULL
+             AND a.host_completion_receipt_id IS NULL
+             AND e.session_id = NEW.session_id
+             AND e.type = 'durable_memory_intake_receipt'
+             AND json_extract(e.data_json, '$.receiptId') = NEW.receipt_id
+             AND json_extract(e.data_json, '$.sourceUserSeq') = NEW.source_user_seq
+             AND json_extract(e.data_json, '$.acceptedTaskId') = NEW.accepted_task_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'durable memory receipt requires exact armed host authority');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_durable_memory_intake_receipts_update_immutable
+        BEFORE UPDATE ON durable_memory_intake_receipts
+        BEGIN
+          SELECT RAISE(ABORT, 'durable memory intake receipts are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_durable_memory_intake_receipts_delete_immutable
+        BEFORE DELETE ON durable_memory_intake_receipts
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN
+          SELECT RAISE(ABORT, 'durable memory intake receipts are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_accepted_task_host_completion_monotonic
+        BEFORE UPDATE OF host_completion_receipt_id, host_completion_event_id
+        ON accepted_task_authority
+        WHEN (OLD.host_completion_receipt_id IS NOT NULL
+              AND OLD.host_completion_receipt_id IS NOT NEW.host_completion_receipt_id)
+          OR (OLD.host_completion_event_id IS NOT NULL
+              AND OLD.host_completion_event_id IS NOT NEW.host_completion_event_id)
+          OR (NEW.host_completion_receipt_id IS NULL) IS NOT (NEW.host_completion_event_id IS NULL)
+          OR (NEW.host_completion_receipt_id IS NOT NULL AND (
+            NEW.work_contract_id IS NOT NULL
+            OR NEW.manifest_id IS NOT NEW.host_completion_receipt_id
+            OR NEW.backstop_event_id IS NOT NEW.host_completion_event_id
+            OR NEW.state NOT IN ('manifested_verifying','terminal')
+          ))
+          OR (NEW.host_completion_receipt_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM durable_memory_intake_receipts r
+             WHERE r.receipt_id = NEW.host_completion_receipt_id
+               AND r.receipt_event_id = NEW.host_completion_event_id
+               AND r.session_id = NEW.session_id
+               AND r.source_user_seq = NEW.source_user_seq
+               AND r.accepted_task_id = NEW.accepted_task_id
+               AND r.graph_event_id = NEW.graph_event_id
+               AND r.graph_id = NEW.graph_id
+               AND r.graph_hash = NEW.graph_hash
+          ))
+        BEGIN
+          SELECT RAISE(ABORT, 'accepted task host-completion binding is not exact or monotonic');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_accepted_task_host_terminal_exact
+        BEFORE UPDATE OF state ON accepted_task_authority
+        WHEN OLD.host_completion_receipt_id IS NOT NULL
+          AND NEW.state = 'terminal'
+          AND NOT EXISTS (
+            SELECT 1
+              FROM durable_memory_intake_receipts r
+              JOIN events receipt_event ON receipt_event.id = r.receipt_event_id
+              JOIN events terminal_event ON terminal_event.id = NEW.terminal_event_id
+             WHERE r.receipt_id = OLD.host_completion_receipt_id
+               AND r.receipt_event_id = OLD.host_completion_event_id
+               AND r.session_id = NEW.session_id
+               AND r.source_user_seq = NEW.source_user_seq
+               AND r.accepted_task_id = NEW.accepted_task_id
+               AND r.graph_event_id = NEW.graph_event_id
+               AND r.graph_id = NEW.graph_id
+               AND r.graph_hash = NEW.graph_hash
+               AND NEW.manifest_id = r.receipt_id
+               AND NEW.backstop_event_id = r.receipt_event_id
+               AND NEW.work_contract_id IS NULL
+               AND receipt_event.session_id = NEW.session_id
+               AND receipt_event.type = 'durable_memory_intake_receipt'
+               AND terminal_event.session_id = NEW.session_id
+               AND terminal_event.type = 'conversation_completed'
+               AND COALESCE(
+                 json_extract(terminal_event.data_json, '$.sourceUserSeq'),
+                 json_extract(terminal_event.data_json, '$.presentation.identity.sourceUserSeq')
+               ) = NEW.source_user_seq
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'host-completed terminal requires its exact receipt and terminal event');
+        END;
+      `);
+    },
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
@@ -1323,13 +3530,21 @@ export function openEventLog(): Database.Database {
   if (cached) return cached;
   ensureStateDir();
   const db = new Database(HARNESS_DB_PATH);
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
-  db.pragma('foreign_keys = ON');
-  db.pragma('busy_timeout = 5000');
-  runMigrations(db);
-  cached = db;
-  return db;
+  try {
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    db.pragma('foreign_keys = ON');
+    db.pragma('busy_timeout = 5000');
+    runMigrations(db);
+    cached = db;
+    return db;
+  } catch (error) {
+    // A failed prerequisite migration must not leave a hidden live handle (or
+    // a future caller that accidentally treats the half-open connection as a
+    // usable store). The migration transaction has rolled back; close too.
+    try { db.close(); } catch { /* preserve the original migration error */ }
+    throw error;
+  }
 }
 
 export function closeEventLog(): void {
@@ -1660,6 +3875,983 @@ function publishPersistedEvent(event: EventRow): EventRow {
   return event;
 }
 
+/**
+ * Insert a closed internal event as part of a domain-owned transaction.
+ *
+ * This is intentionally lower-level than `appendEvent`: it does not publish to
+ * the action bus and it does not implement terminal-event ownership rewriting.
+ * Resolution/settlement stores use it only while mutating their normalized
+ * authority rows on this SAME database connection. The caller publishes the
+ * returned row after its outer transaction commits.
+ */
+export function insertInternalEventInTransaction(
+  db: Database.Database,
+  input: AppendEventInput,
+): EventRow {
+  if (!EVENT_TYPE_SET.has(input.type)) throw new Error(`unknown event type: ${input.type}`);
+  if (input.type === 'conversation_completed') {
+    throw new Error('conversation_completed must use the terminal ownership writer');
+  }
+  const id = randomUUID();
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO events
+       (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    input.sessionId,
+    input.turn,
+    input.role,
+    input.type,
+    input.parentEventId ?? null,
+    JSON.stringify(input.data ?? {}),
+    now,
+  );
+  db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+  const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+  return rowToEvent(row);
+}
+
+/** Publish a domain event only AFTER its authority transaction has committed. */
+export function publishCommittedInternalEvent(event: EventRow): EventRow {
+  return publishPersistedEvent(event);
+}
+
+type AcceptedTaskAuthorityState = 'armed' | 'manifested_verifying' | 'terminal' | 'conflict';
+
+interface TerminalPublicationAuthorityRow {
+  session_id: string;
+  source_user_seq: number;
+  accepted_task_id: string;
+  graph_event_id: string;
+  graph_id: string;
+  graph_hash: string;
+  work_contract_id: string | null;
+  host_completion_receipt_id: string | null;
+  host_completion_event_id: string | null;
+  backstop_event_id: string | null;
+  state: AcceptedTaskAuthorityState;
+  manifest_id: string | null;
+  revision: number;
+  terminal_event_id: string | null;
+}
+
+interface TerminalPublicationContractRow {
+  session_id: string;
+  source_user_seq: number;
+  accepted_task_id: string;
+  contract_version: number;
+  contract_id: string;
+  graph_event_id: string;
+  graph_id: string;
+  graph_hash: string;
+  planner_source: string;
+  contract_json: string;
+  operation_count: number;
+  universe_count: number;
+}
+
+export type AcceptedTaskTerminalPublicationErrorStatus =
+  | 'not_ready'
+  | 'conflict'
+  | 'storage_error';
+
+/**
+ * A staged accepted task is never allowed to degrade into a legacy terminal.
+ * This error is deliberately machine-readable so a caller can distinguish
+ * incomplete proof from corrupt authority and an unavailable store without
+ * inspecting user-facing prose.
+ */
+export class AcceptedTaskTerminalPublicationError extends Error {
+  readonly status: AcceptedTaskTerminalPublicationErrorStatus;
+  readonly reason: string;
+
+  constructor(status: AcceptedTaskTerminalPublicationErrorStatus, reason: string) {
+    super(`accepted-task terminal publication ${status}: ${reason}`);
+    this.name = 'AcceptedTaskTerminalPublicationError';
+    this.status = status;
+    this.reason = reason;
+  }
+}
+
+export type AcceptedTaskTerminalPublicationRead =
+  | { status: 'legacy' }
+  | {
+      status: 'unstaged';
+      acceptedTaskId: string;
+      authorityState: AcceptedTaskAuthorityState;
+    }
+  | {
+      status: 'pending';
+      acceptedTaskId: string;
+      authorityState: 'armed' | 'manifested_verifying';
+      workContractId?: string;
+      hostReceiptId?: string;
+      manifestId?: string;
+    }
+  | {
+      status: 'published';
+      acceptedTaskId: string;
+      workContractId?: string;
+      hostReceiptId?: string;
+      manifestId: string;
+      terminalEventId: string;
+      event: EventRow;
+    }
+  | { status: 'conflict' | 'unreadable'; reason: string };
+
+function terminalPublicationRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function terminalPublicationCanonicalize(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') {
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(terminalPublicationCanonicalize).join(',')}]`;
+  }
+  if (!terminalPublicationRecord(value)) throw new Error('non-canonical JSON value');
+  return `{${Object.keys(value)
+    .filter((key) => value[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${terminalPublicationCanonicalize(value[key])}`)
+    .join(',')}}`;
+}
+
+function terminalPublicationSourceUserSeq(data: Record<string, unknown>): number | null {
+  if (Number.isSafeInteger(data.sourceUserSeq) && Number(data.sourceUserSeq) > 0) {
+    return Number(data.sourceUserSeq);
+  }
+  if (terminalPublicationRecord(data.presentation)) {
+    const identity = data.presentation.identity;
+    if (
+      terminalPublicationRecord(identity)
+      && Number.isSafeInteger(identity.sourceUserSeq)
+      && Number(identity.sourceUserSeq) > 0
+    ) return Number(identity.sourceUserSeq);
+  }
+  if (typeof data.terminalKey === 'string') {
+    const match = /^turn:([1-9]\d*)$/.exec(data.terminalKey.trim());
+    if (match) {
+      const parsed = Number(match[1]);
+      if (Number.isSafeInteger(parsed)) return parsed;
+    }
+  }
+  return null;
+}
+
+function terminalPublicationAuthorityRow(
+  db: Database.Database,
+  sessionId: string,
+  sourceUserSeq: number,
+): TerminalPublicationAuthorityRow | undefined {
+  return db.prepare(`
+    SELECT session_id, source_user_seq, accepted_task_id, graph_event_id,
+           graph_id, graph_hash, work_contract_id, host_completion_receipt_id,
+           host_completion_event_id, backstop_event_id, state, manifest_id,
+           revision, terminal_event_id
+      FROM accepted_task_authority
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(sessionId, sourceUserSeq) as TerminalPublicationAuthorityRow | undefined;
+}
+
+function terminalPublicationContractRow(
+  db: Database.Database,
+  sessionId: string,
+  sourceUserSeq: number,
+): TerminalPublicationContractRow | undefined {
+  return db.prepare(`
+    SELECT session_id, source_user_seq, accepted_task_id, contract_version,
+           contract_id, graph_event_id, graph_id, graph_hash, planner_source,
+           contract_json, operation_count, universe_count
+      FROM accepted_task_work_contracts
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(sessionId, sourceUserSeq) as TerminalPublicationContractRow | undefined;
+}
+
+function terminalPublicationContractIsExact(
+  authority: TerminalPublicationAuthorityRow,
+  contract: TerminalPublicationContractRow | undefined,
+  sourceTurn: number,
+): boolean {
+  if (
+    !contract
+    || contract.contract_version !== 1
+    || contract.session_id !== authority.session_id
+    || contract.source_user_seq !== authority.source_user_seq
+    || contract.accepted_task_id !== authority.accepted_task_id
+    || contract.contract_id !== authority.work_contract_id
+    || contract.graph_event_id !== authority.graph_event_id
+    || contract.graph_id !== authority.graph_id
+    || contract.graph_hash !== authority.graph_hash
+    || (contract.planner_source !== 'deterministic' && contract.planner_source !== 'structured_model')
+  ) return false;
+  let value: unknown;
+  try {
+    value = JSON.parse(contract.contract_json);
+  } catch {
+    return false;
+  }
+  if (!terminalPublicationRecord(value) || !terminalPublicationRecord(value.identity)) return false;
+  const exactTopLevelKeys = [
+    'acceptedTaskId', 'contractId', 'graphEventId', 'graphHash', 'graphId',
+    'identity', 'operations', 'plannerSource', 'universes', 'version',
+  ];
+  const exactIdentityKeys = ['sessionId', 'sourceUserSeq', 'turn'];
+  const material = {
+    version: value.version,
+    identity: value.identity,
+    acceptedTaskId: value.acceptedTaskId,
+    graphEventId: value.graphEventId,
+    graphId: value.graphId,
+    graphHash: value.graphHash,
+    plannerSource: value.plannerSource,
+    operations: value.operations,
+    universes: value.universes,
+  };
+  const contentAddress = `expected-work:v1:${createHash('sha256')
+    .update(terminalPublicationCanonicalize(material))
+    .digest('hex')}`;
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify(exactTopLevelKeys)
+    && JSON.stringify(Object.keys(value.identity).sort()) === JSON.stringify(exactIdentityKeys)
+    && contract.contract_json === terminalPublicationCanonicalize(value)
+    && contentAddress === contract.contract_id
+    && value.version === 1
+    && value.contractId === contract.contract_id
+    && value.acceptedTaskId === contract.accepted_task_id
+    && value.graphEventId === contract.graph_event_id
+    && value.graphId === contract.graph_id
+    && value.graphHash === contract.graph_hash
+    && value.plannerSource === contract.planner_source
+    && value.identity.sessionId === contract.session_id
+    && value.identity.sourceUserSeq === contract.source_user_seq
+    && value.identity.turn === sourceTurn
+    && Array.isArray(value.operations)
+    && value.operations.length === contract.operation_count
+    && Array.isArray(value.universes)
+    && value.universes.length === contract.universe_count;
+}
+
+function terminalPublicationManifestForAuthority(
+  db: Database.Database,
+  authority: TerminalPublicationAuthorityRow,
+): ObligationManifest | null {
+  if (!authority.manifest_id) return null;
+  const rows = db.prepare(`
+    SELECT data_json
+      FROM events
+     WHERE session_id = ?
+       AND type = 'obligation_manifest'
+       AND json_extract(data_json, '$.sourceUserSeq') = ?
+     ORDER BY seq ASC
+     LIMIT 2
+  `).all(authority.session_id, authority.source_user_seq) as Array<{ data_json: string }>;
+  if (rows.length !== 1) return null;
+  let data: unknown;
+  try {
+    data = JSON.parse(rows[0]!.data_json);
+  } catch {
+    return null;
+  }
+  if (!terminalPublicationRecord(data) || !terminalPublicationRecord(data.manifest)) return null;
+  const manifest = data.manifest;
+  if (!terminalPublicationRecord(manifest.identity)) return null;
+  const exactTopLevelKeys = [
+    'edges', 'graphHash', 'graphId', 'identity', 'manifestId',
+    'mode', 'nodes', 'readiness', 'version',
+  ];
+  const exactIdentityKeys = ['sessionId', 'sourceUserSeq', 'turn'];
+  const material = {
+    version: manifest.version,
+    mode: manifest.mode,
+    readiness: manifest.readiness,
+    identity: manifest.identity,
+    graphId: manifest.graphId,
+    graphHash: manifest.graphHash,
+    nodes: manifest.nodes,
+    edges: manifest.edges,
+  };
+  const contentAddress = `manifest:v1:${createHash('sha256')
+    .update(terminalPublicationCanonicalize(material))
+    .digest('hex')}`;
+  const exact = JSON.stringify(Object.keys(manifest).sort()) === JSON.stringify(exactTopLevelKeys)
+    && JSON.stringify(Object.keys(manifest.identity).sort()) === JSON.stringify(exactIdentityKeys)
+    && Array.isArray(manifest.nodes)
+    && Array.isArray(manifest.edges)
+    && data.sourceUserSeq === authority.source_user_seq
+    && manifest.version === 1
+    && manifest.mode === 'authoritative'
+    && manifest.readiness === 'ready'
+    && manifest.manifestId === authority.manifest_id
+    && manifest.manifestId === contentAddress
+    && manifest.graphId === authority.graph_id
+    && manifest.graphHash === authority.graph_hash
+    && manifest.identity.sessionId === authority.session_id
+    && manifest.identity.sourceUserSeq === authority.source_user_seq;
+  return exact ? manifest as unknown as ObligationManifest : null;
+}
+
+function terminalPublicationManifestIsExact(
+  db: Database.Database,
+  authority: TerminalPublicationAuthorityRow,
+): boolean {
+  return terminalPublicationManifestForAuthority(db, authority) !== null;
+}
+
+function terminalPublicationPresentation(
+  data: Record<string, unknown>,
+  input: { sessionId: string; sourceUserSeq: number; turn: number },
+): NonNullable<ReturnType<typeof presentationEventFromCompletionData>> {
+  let presentation: ReturnType<typeof presentationEventFromCompletionData>;
+  try {
+    presentation = presentationEventFromCompletionData(data);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      `typed completion projection is invalid: ${reason}`,
+    );
+  }
+  if (!presentation) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'a staged accepted task requires a typed completion projection',
+    );
+  }
+  if (
+    presentation.identity.sessionId !== input.sessionId
+    || presentation.identity.sourceUserSeq !== input.sourceUserSeq
+    || presentation.identity.turn !== input.turn
+  ) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'completion identity does not match the exact accepted source',
+    );
+  }
+  return presentation;
+}
+
+function assertExactTerminalPublicationGraphStructure(
+  db: Database.Database,
+  authority: TerminalPublicationAuthorityRow,
+): number {
+  if (authority.accepted_task_id !== `task:${authority.session_id}#${authority.source_user_seq}`) {
+    throw new AcceptedTaskTerminalPublicationError('conflict', 'accepted-task identity is inconsistent');
+  }
+  const source = db.prepare(`
+    SELECT id, turn FROM events
+     WHERE session_id = ? AND seq = ? AND type = 'user_input_received'
+  `).get(authority.session_id, authority.source_user_seq) as {
+    id: string;
+    turn: number;
+  } | undefined;
+  const graphRow = db.prepare(`
+    SELECT * FROM events
+     WHERE id = ? AND session_id = ? AND type = 'turn_graph_compiled'
+       AND json_extract(data_json, '$.sourceUserSeq') = ?
+  `).get(
+    authority.graph_event_id,
+    authority.session_id,
+    authority.source_user_seq,
+  ) as RawEventRow | undefined;
+  if (!source || !graphRow) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'accepted-task source or graph authority is missing',
+    );
+  }
+  const graphEvent = rowToEvent(graphRow);
+  const graph = graphEvent.data.graph as TurnGraphIR | undefined;
+  const graphValidation = graph ? validateTurnGraph(graph) : null;
+  if (
+    !graph
+    || !graphValidation?.ok
+    || graphEvent.turn !== source.turn
+    || graphEvent.parentEventId !== source.id
+    || graph.identity.sessionId !== authority.session_id
+    || graph.identity.sourceUserSeq !== authority.source_user_seq
+    || graph.identity.turn !== source.turn
+    || graph.graphId !== authority.graph_id
+    || graph.compiler.graphHash !== authority.graph_hash
+    || graphEvent.data.graphId !== authority.graph_id
+    || graphEvent.data.graphHash !== authority.graph_hash
+  ) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'accepted-task graph bytes do not match their authority',
+    );
+  }
+  return source.turn;
+}
+
+function assertExactTerminalPublicationStructure(
+  db: Database.Database,
+  authority: TerminalPublicationAuthorityRow,
+): void {
+  const sourceTurn = assertExactTerminalPublicationGraphStructure(db, authority);
+  const contract = terminalPublicationContractRow(
+    db,
+    authority.session_id,
+    authority.source_user_seq,
+  );
+  if (!terminalPublicationContractIsExact(authority, contract, sourceTurn)) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'accepted-task work contract is missing or does not match its authority',
+    );
+  }
+}
+
+interface TerminalPublicationMemoryReceiptRow {
+  receipt_id: string;
+  protocol_version: number;
+  session_id: string;
+  source_user_seq: number;
+  accepted_task_id: string;
+  graph_event_id: string;
+  graph_id: string;
+  graph_hash: string;
+  source_event_id: string;
+  source_message_digest: string;
+  episode_id: string;
+  call_id: string;
+  episode_content_hash: string;
+  candidate_count: number;
+  candidate_digest: string;
+  evidence_digest: string;
+  receipt_json: string;
+  receipt_event_id: string;
+}
+
+/** Validate the immutable normalized host receipt inside the terminal writer
+ * transaction. The memory ledger was independently re-redeemed immediately
+ * before publication; this check ensures the transaction closes only the exact
+ * receipt-bound authority and never an armed boolean/event shortcut. */
+function assertExactDurableMemoryHostReceipt(
+  db: Database.Database,
+  authority: TerminalPublicationAuthorityRow,
+): TerminalPublicationMemoryReceiptRow {
+  assertExactTerminalPublicationGraphStructure(db, authority);
+  if (
+    authority.work_contract_id !== null
+    || !authority.host_completion_receipt_id
+    || !authority.host_completion_event_id
+    || authority.manifest_id !== authority.host_completion_receipt_id
+    || authority.backstop_event_id !== authority.host_completion_event_id
+  ) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'durable memory host authority is not exactly receipt-bound',
+    );
+  }
+  const row = db.prepare(`
+    SELECT * FROM durable_memory_intake_receipts
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(authority.session_id, authority.source_user_seq) as TerminalPublicationMemoryReceiptRow | undefined;
+  if (
+    !row
+    || row.protocol_version !== 1
+    || row.receipt_id !== authority.host_completion_receipt_id
+    || row.receipt_event_id !== authority.host_completion_event_id
+    || row.accepted_task_id !== authority.accepted_task_id
+    || row.graph_event_id !== authority.graph_event_id
+    || row.graph_id !== authority.graph_id
+    || row.graph_hash !== authority.graph_hash
+    || row.session_id !== authority.session_id
+    || row.source_user_seq !== authority.source_user_seq
+  ) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'durable memory host receipt is missing or contradicts its authority',
+    );
+  }
+  let receipt: unknown;
+  try { receipt = JSON.parse(row.receipt_json); } catch {
+    throw new AcceptedTaskTerminalPublicationError('conflict', 'durable memory host receipt JSON is malformed');
+  }
+  const canonical = terminalPublicationCanonicalize(receipt);
+  if (
+    row.receipt_json !== canonical
+    || row.receipt_id !== `memory-intake:v1:${createHash('sha256').update(canonical).digest('hex')}`
+    || !terminalPublicationRecord(receipt)
+    || receipt.protocol !== 1
+    || receipt.kind !== 'durable_memory_intake'
+    || !terminalPublicationRecord(receipt.identity)
+    || !terminalPublicationRecord(receipt.graph)
+    || !terminalPublicationRecord(receipt.source)
+    || !terminalPublicationRecord(receipt.memory)
+    || receipt.identity.sessionId !== row.session_id
+    || receipt.identity.sourceUserSeq !== row.source_user_seq
+    || receipt.identity.acceptedTaskId !== row.accepted_task_id
+    || receipt.graph.graphEventId !== row.graph_event_id
+    || receipt.graph.graphId !== row.graph_id
+    || receipt.graph.graphHash !== row.graph_hash
+    || receipt.source.eventId !== row.source_event_id
+    || receipt.source.messageDigest !== row.source_message_digest
+    || receipt.memory.episodeId !== row.episode_id
+    || receipt.memory.callId !== row.call_id
+    || receipt.memory.episodeContentHash !== row.episode_content_hash
+    || !Array.isArray(receipt.candidates)
+    || receipt.candidates.length !== row.candidate_count
+    || receipt.candidateDigest !== row.candidate_digest
+    || receipt.evidenceDigest !== row.evidence_digest
+  ) {
+    throw new AcceptedTaskTerminalPublicationError('conflict', 'durable memory host receipt content address is invalid');
+  }
+  const receiptEvents = db.prepare(`
+    SELECT id, data_json FROM events
+     WHERE session_id = ? AND type = 'durable_memory_intake_receipt'
+       AND json_extract(data_json, '$.sourceUserSeq') = ?
+     ORDER BY seq
+  `).all(authority.session_id, authority.source_user_seq) as Array<{ id: string; data_json: string }>;
+  if (receiptEvents.length !== 1 || receiptEvents[0]!.id !== row.receipt_event_id) {
+    throw new AcceptedTaskTerminalPublicationError('conflict', 'durable memory host receipt event is not unique');
+  }
+  let eventData: unknown;
+  try { eventData = JSON.parse(receiptEvents[0]!.data_json); } catch {
+    throw new AcceptedTaskTerminalPublicationError('conflict', 'durable memory host receipt event is malformed');
+  }
+  if (
+    !terminalPublicationRecord(eventData)
+    || eventData.receiptId !== row.receipt_id
+    || eventData.sourceUserSeq !== row.source_user_seq
+    || eventData.acceptedTaskId !== row.accepted_task_id
+    || !isDeepStrictEqual(eventData.receipt, receipt)
+  ) {
+    throw new AcceptedTaskTerminalPublicationError('conflict', 'durable memory host receipt event is not exact');
+  }
+  const crossings = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM logical_tool_calls
+        WHERE session_id = ? AND source_user_seq = ?) AS logical_n,
+      (SELECT COUNT(*) FROM physical_dispatches
+        WHERE session_id = ? AND source_user_seq = ?) AS dispatch_n,
+      (SELECT COUNT(*) FROM accepted_task_work_contracts
+        WHERE session_id = ? AND source_user_seq = ?) AS contract_n
+  `).get(
+    authority.session_id,
+    authority.source_user_seq,
+    authority.session_id,
+    authority.source_user_seq,
+    authority.session_id,
+    authority.source_user_seq,
+  ) as { logical_n: number; dispatch_n: number; contract_n: number };
+  if (crossings.logical_n !== 0 || crossings.dispatch_n !== 0 || crossings.contract_n !== 0) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'durable memory host receipt has competing provider work',
+    );
+  }
+  return row;
+}
+
+function closeAcceptedTaskTerminalPublicationInTransaction(input: {
+  db: Database.Database;
+  eventId: string;
+  sessionId: string;
+  turn: number;
+  eventData: Record<string, unknown>;
+  now: string;
+}): void {
+  const sourceUserSeq = terminalPublicationSourceUserSeq(input.eventData);
+  if (sourceUserSeq === null) return;
+  const authority = terminalPublicationAuthorityRow(input.db, input.sessionId, sourceUserSeq);
+  if (!authority || (!authority.work_contract_id && !authority.host_completion_receipt_id)) return;
+  if (authority.work_contract_id && authority.host_completion_receipt_id) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'accepted task cannot own both provider work and a host completion receipt',
+    );
+  }
+  if (authority.host_completion_receipt_id) {
+    assertExactDurableMemoryHostReceipt(input.db, authority);
+    const presentation = terminalPublicationPresentation(input.eventData, {
+      sessionId: input.sessionId,
+      sourceUserSeq,
+      turn: input.turn,
+    });
+    if (presentation.status !== 'done') return;
+    if (authority.state !== 'manifested_verifying') {
+      throw new AcceptedTaskTerminalPublicationError(
+        authority.state === 'armed' ? 'not_ready' : 'conflict',
+        `durable memory host authority cannot publish done from ${authority.state}`,
+      );
+    }
+    const updated = input.db.prepare(`
+      UPDATE accepted_task_authority
+         SET state = 'terminal', terminal_event_id = ?,
+             revision = revision + 1, updated_at = ?
+       WHERE session_id = ? AND source_user_seq = ?
+         AND state = 'manifested_verifying'
+         AND revision = ?
+         AND work_contract_id IS NULL
+         AND manifest_id = ?
+         AND host_completion_receipt_id = ?
+         AND host_completion_event_id = ?
+         AND terminal_event_id IS NULL
+    `).run(
+      input.eventId,
+      input.now,
+      input.sessionId,
+      sourceUserSeq,
+      authority.revision,
+      authority.host_completion_receipt_id,
+      authority.host_completion_receipt_id,
+      authority.host_completion_event_id,
+    );
+    if (updated.changes !== 1) {
+      throw new AcceptedTaskTerminalPublicationError(
+        'conflict',
+        'durable memory host terminal authority CAS lost',
+      );
+    }
+    return;
+  }
+  assertExactTerminalPublicationStructure(input.db, authority);
+  const presentation = terminalPublicationPresentation(input.eventData, {
+    sessionId: input.sessionId,
+    sourceUserSeq,
+    turn: input.turn,
+  });
+  // A blocked/needs-input/failed/cancelled/transferred presentation remains a
+  // truthful public stop, but it is not completion evidence. Only done closes
+  // the accepted-task authority.
+  if (presentation.status !== 'done') return;
+  if (authority.state === 'armed') {
+    throw new AcceptedTaskTerminalPublicationError(
+      'not_ready',
+      'accepted-task authority has not entered manifested verification',
+    );
+  }
+  if (authority.state !== 'manifested_verifying') {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      `accepted-task authority cannot publish done from ${authority.state}`,
+    );
+  }
+  const manifest = terminalPublicationManifestForAuthority(input.db, authority);
+  if (!manifest) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'accepted-task manifest is missing or does not match its authority',
+    );
+  }
+  const proof = verifyAcceptedTaskTerminalProofInTransaction({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq,
+    acceptedTaskId: authority.accepted_task_id,
+    manifest,
+  });
+  if (!proof.ok) {
+    throw new AcceptedTaskTerminalPublicationError(
+      proof.status === 'unreadable' ? 'storage_error' : proof.status,
+      proof.reason,
+    );
+  }
+  const updated = input.db.prepare(`
+    UPDATE accepted_task_authority
+       SET state = 'terminal', terminal_event_id = ?,
+           revision = revision + 1, updated_at = ?
+     WHERE session_id = ? AND source_user_seq = ?
+       AND state = 'manifested_verifying'
+       AND revision = ?
+       AND work_contract_id = ?
+       AND manifest_id = ?
+       AND terminal_event_id IS NULL
+  `).run(
+    input.eventId,
+    input.now,
+    input.sessionId,
+    sourceUserSeq,
+    authority.revision,
+    authority.work_contract_id,
+    authority.manifest_id,
+  );
+  if (updated.changes !== 1) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'accepted-task terminal authority CAS lost',
+    );
+  }
+}
+
+function terminalEventForAcceptedSource(
+  db: Database.Database,
+  sessionId: string,
+  sourceUserSeq: number,
+): RawEventRow | undefined {
+  return db.prepare(`
+    SELECT * FROM events
+     WHERE session_id = ?
+       AND type = 'conversation_completed'
+       AND COALESCE(
+         json_extract(data_json, '$.sourceUserSeq'),
+         json_extract(data_json, '$.presentation.identity.sourceUserSeq')
+       ) = ?
+     ORDER BY seq ASC
+     LIMIT 1
+  `).get(sessionId, sourceUserSeq) as RawEventRow | undefined;
+}
+
+function validatePersistedTerminalPublicationWinner(
+  db: Database.Database,
+  row: RawEventRow,
+  sessionId: string,
+  sourceUserSeq: number,
+): EventRow {
+  const event = rowToEvent(row);
+  if (event.sessionId !== sessionId || event.type !== 'conversation_completed') {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'persisted terminal winner belongs to another accepted source',
+    );
+  }
+  const authority = terminalPublicationAuthorityRow(db, sessionId, sourceUserSeq);
+  if (!authority || (!authority.work_contract_id && !authority.host_completion_receipt_id)) return event;
+  if (authority.host_completion_receipt_id) {
+    assertExactDurableMemoryHostReceipt(db, authority);
+    const presentation = terminalPublicationPresentation(event.data, {
+      sessionId,
+      sourceUserSeq,
+      turn: event.turn,
+    });
+    if (presentation.status === 'done') {
+      if (
+        authority.state !== 'terminal'
+        || authority.terminal_event_id !== event.id
+        || authority.manifest_id !== authority.host_completion_receipt_id
+      ) {
+        throw new AcceptedTaskTerminalPublicationError(
+          'conflict',
+          'persisted done event is not the host-receipt authority winner',
+        );
+      }
+    } else if (authority.state === 'terminal' || authority.terminal_event_id) {
+      throw new AcceptedTaskTerminalPublicationError(
+        'conflict',
+        'non-done event cannot own durable-memory terminal authority',
+      );
+    }
+    return event;
+  }
+  assertExactTerminalPublicationStructure(db, authority);
+  const presentation = terminalPublicationPresentation(event.data, {
+    sessionId,
+    sourceUserSeq,
+    turn: event.turn,
+  });
+  if (presentation.status === 'done') {
+    const manifest = terminalPublicationManifestForAuthority(db, authority);
+    if (
+      authority.state !== 'terminal'
+      || authority.terminal_event_id !== event.id
+      || !authority.manifest_id
+      || !manifest
+    ) {
+      throw new AcceptedTaskTerminalPublicationError(
+        'conflict',
+        'persisted done event is not the authority-linked terminal winner',
+      );
+    }
+    const proof = verifyAcceptedTaskTerminalProofInTransaction({
+      db,
+      sessionId,
+      sourceUserSeq,
+      acceptedTaskId: authority.accepted_task_id,
+      manifest,
+    });
+    if (!proof.ok) {
+      throw new AcceptedTaskTerminalPublicationError(
+        proof.status === 'unreadable' ? 'storage_error' : proof.status,
+        proof.reason,
+      );
+    }
+  } else if (authority.state === 'terminal' || authority.terminal_event_id) {
+    throw new AcceptedTaskTerminalPublicationError(
+      'conflict',
+      'non-done event cannot own terminal accepted-task authority',
+    );
+  }
+  return event;
+}
+
+/**
+ * Read and revalidate terminal publication state for one exact accepted task.
+ * The result never infers staging from a reply/reason string: only the durable
+ * authority's immutable work_contract_id opts the source into this protocol.
+ */
+export function readAcceptedTaskTerminalPublication(
+  sessionId: string,
+  sourceUserSeq: number,
+): AcceptedTaskTerminalPublicationRead {
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
+    return { status: 'unreadable', reason: 'accepted source identity is invalid' };
+  }
+  try {
+    const db = openEventLog();
+    const authority = terminalPublicationAuthorityRow(db, sessionId, sourceUserSeq);
+    if (!authority) return { status: 'legacy' };
+    const strayContract = terminalPublicationContractRow(db, sessionId, sourceUserSeq);
+    if (authority.host_completion_receipt_id) {
+      if (authority.work_contract_id || strayContract) {
+        return { status: 'conflict', reason: 'host-completed authority also owns provider work' };
+      }
+      try {
+        assertExactDurableMemoryHostReceipt(db, authority);
+      } catch (error) {
+        return {
+          status: 'conflict',
+          reason: error instanceof AcceptedTaskTerminalPublicationError
+            ? error.reason
+            : String(error),
+        };
+      }
+      if (authority.state === 'conflict') {
+        return { status: 'conflict', reason: 'accepted-task authority is conflicted' };
+      }
+      const terminalRow = terminalEventForAcceptedSource(db, sessionId, sourceUserSeq);
+      if (authority.state === 'terminal') {
+        if (!authority.terminal_event_id || !terminalRow || terminalRow.id !== authority.terminal_event_id) {
+          return { status: 'conflict', reason: 'host terminal authority does not name its exact event' };
+        }
+        try {
+          const event = validatePersistedTerminalPublicationWinner(
+            db,
+            terminalRow,
+            sessionId,
+            sourceUserSeq,
+          );
+          return {
+            status: 'published',
+            acceptedTaskId: authority.accepted_task_id,
+            hostReceiptId: authority.host_completion_receipt_id,
+            manifestId: authority.host_completion_receipt_id,
+            terminalEventId: authority.terminal_event_id,
+            event,
+          };
+        } catch (error) {
+          return {
+            status: 'conflict',
+            reason: error instanceof AcceptedTaskTerminalPublicationError
+              ? error.reason
+              : String(error),
+          };
+        }
+      }
+      if (authority.state !== 'manifested_verifying' || authority.terminal_event_id) {
+        return { status: 'conflict', reason: 'host receipt authority is not in a valid pending state' };
+      }
+      return {
+        status: 'pending',
+        acceptedTaskId: authority.accepted_task_id,
+        authorityState: authority.state,
+        hostReceiptId: authority.host_completion_receipt_id,
+        manifestId: authority.host_completion_receipt_id,
+      };
+    }
+    if (!authority.work_contract_id) {
+      if (strayContract) {
+        return { status: 'conflict', reason: 'unbound authority has a staged work-contract row' };
+      }
+      return {
+        status: 'unstaged',
+        acceptedTaskId: authority.accepted_task_id,
+        authorityState: authority.state,
+      };
+    }
+    try {
+      assertExactTerminalPublicationStructure(db, authority);
+    } catch (error) {
+      return {
+        status: 'conflict',
+        reason: error instanceof AcceptedTaskTerminalPublicationError
+          ? error.reason
+          : String(error),
+      };
+    }
+    if (authority.state === 'conflict') {
+      return { status: 'conflict', reason: 'accepted-task authority is conflicted' };
+    }
+    const terminalRow = terminalEventForAcceptedSource(db, sessionId, sourceUserSeq);
+    if (authority.state === 'terminal') {
+      if (!authority.terminal_event_id || !terminalRow || terminalRow.id !== authority.terminal_event_id) {
+        return { status: 'conflict', reason: 'terminal authority does not name its exact event' };
+      }
+      if (!authority.manifest_id || !terminalPublicationManifestIsExact(db, authority)) {
+        return { status: 'conflict', reason: 'terminal authority does not retain its exact manifest' };
+      }
+      try {
+        const event = validatePersistedTerminalPublicationWinner(
+          db,
+          terminalRow,
+          sessionId,
+          sourceUserSeq,
+        );
+        return {
+          status: 'published',
+          acceptedTaskId: authority.accepted_task_id,
+          workContractId: authority.work_contract_id,
+          manifestId: authority.manifest_id,
+          terminalEventId: authority.terminal_event_id,
+          event,
+        };
+      } catch (error) {
+        return {
+          status: 'conflict',
+          reason: error instanceof AcceptedTaskTerminalPublicationError
+            ? error.reason
+            : String(error),
+        };
+      }
+    }
+    if (authority.state === 'manifested_verifying') {
+      if (!authority.manifest_id || !terminalPublicationManifestIsExact(db, authority)) {
+        return { status: 'conflict', reason: 'verifying authority does not retain its exact manifest' };
+      }
+    } else if (authority.manifest_id) {
+      return { status: 'conflict', reason: 'armed authority unexpectedly names a manifest' };
+    }
+    if (authority.terminal_event_id) {
+      return { status: 'conflict', reason: 'nonterminal authority unexpectedly names a terminal event' };
+    }
+    if (terminalRow) {
+      try {
+        const presentation = terminalPublicationPresentation(rowToEvent(terminalRow).data, {
+          sessionId,
+          sourceUserSeq,
+          turn: terminalRow.turn,
+        });
+        if (presentation.status === 'done') {
+          return { status: 'conflict', reason: 'done event exists without the terminal authority CAS' };
+        }
+      } catch (error) {
+        return {
+          status: 'conflict',
+          reason: error instanceof AcceptedTaskTerminalPublicationError
+            ? error.reason
+            : String(error),
+        };
+      }
+    }
+    return {
+      status: 'pending',
+      acceptedTaskId: authority.accepted_task_id,
+      authorityState: authority.state,
+      workContractId: authority.work_contract_id,
+      ...(authority.manifest_id ? { manifestId: authority.manifest_id } : {}),
+    };
+  } catch (error) {
+    return {
+      status: 'unreadable',
+      reason: String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 240),
+    };
+  }
+}
+
 export function appendEvent(input: AppendEventInput): EventRow {
   if (!EVENT_TYPE_SET.has(input.type)) {
     throw new Error(`unknown event type: ${input.type}`);
@@ -1667,6 +4859,7 @@ export function appendEvent(input: AppendEventInput): EventRow {
   const db = openEventLog();
   const id = randomUUID();
   const now = nowIso();
+  let stagedTerminalPublicationAttempted = false;
   const tx = db.transaction(() => {
     let eventData = input.data ?? {};
     if (input.type === 'conversation_completed') {
@@ -1752,9 +4945,46 @@ export function appendEvent(input: AppendEventInput): EventRow {
       data,
       now,
     );
+    if (input.type === 'conversation_completed') {
+      const terminalSourceUserSeq = terminalPublicationSourceUserSeq(eventData);
+      if (terminalSourceUserSeq !== null) {
+        const terminalAuthority = terminalPublicationAuthorityRow(
+          db,
+          input.sessionId,
+          terminalSourceUserSeq,
+        );
+        stagedTerminalPublicationAttempted = Boolean(
+          terminalAuthority?.work_contract_id || terminalAuthority?.host_completion_receipt_id,
+        );
+      }
+      closeAcceptedTaskTerminalPublicationInTransaction({
+        db,
+        eventId: id,
+        sessionId: input.sessionId,
+        turn: input.turn,
+        eventData,
+        now,
+      });
+    }
     db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
   });
-  tx();
+  try {
+    // A deferred read-then-write transaction can lose a concurrent terminal
+    // race with SQLITE_BUSY even with a busy timeout. IMMEDIATE acquires the
+    // single writer slot before inspecting authority, so concurrent processes
+    // deterministically become winner + replay instead.
+    if (input.type === 'conversation_completed') tx.immediate();
+    else tx();
+  } catch (error) {
+    if (error instanceof AcceptedTaskTerminalPublicationError) throw error;
+    if (input.type === 'conversation_completed' && stagedTerminalPublicationAttempted) {
+      throw new AcceptedTaskTerminalPublicationError(
+        'storage_error',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    throw error;
+  }
   const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
   const event = rowToEvent(row);
   // Durable audit mirror (2026-07-20 attorney-bar B3): trust-relevant events
@@ -2438,7 +5668,19 @@ export function appendTerminalEventOnce(
   // brain:<attempt> key. It is still the durable first writer; never append a
   // parallel turn:<source> row beside it.
   const logicalWinner = findByLogicalSource();
-  if (logicalWinner) return { event: rowToEvent(logicalWinner), inserted: false };
+  if (logicalWinner) {
+    return {
+      event: sourceUserSeq === null
+        ? rowToEvent(logicalWinner)
+        : validatePersistedTerminalPublicationWinner(
+          openEventLog(),
+          logicalWinner,
+          input.sessionId,
+          sourceUserSeq,
+        ),
+      inserted: false,
+    };
+  }
   try {
     const event = appendEvent({
       ...input,
@@ -2461,7 +5703,17 @@ export function appendTerminalEventOnce(
         LIMIT 1`,
     ).get(input.sessionId, key) as RawEventRow | undefined;
     if (!row) throw err;
-    return { event: rowToEvent(row), inserted: false };
+    return {
+      event: sourceUserSeq === null
+        ? rowToEvent(row)
+        : validatePersistedTerminalPublicationWinner(
+          openEventLog(),
+          row,
+          input.sessionId,
+          sourceUserSeq,
+        ),
+      inserted: false,
+    };
   }
 }
 
@@ -3908,6 +7160,10 @@ export type AuthorityToolOutputResolution =
       /** Effect proven by the sole parented lifecycle. Detached exact rows have
        * no effect authority and therefore expose null. */
       effect: string | null;
+      /** Exact accepted user source shared by the parented call/return pair.
+       * Legacy or detached rows expose null and cannot satisfy a source-scoped
+       * authority request. */
+      sourceUserSeq: number | null;
     }
   | { status: 'missing' }
   | { status: 'failed'; reason: string }
@@ -3918,6 +7174,7 @@ interface DurableToolOutputOccurrence {
   returned: EventRow;
   tool: string;
   effect: string | null;
+  sourceUserSeq: number | null;
   /** Explicit terminal success when the transport supplied it. Older SDK
    * lifecycle rows legitimately omit this field and remain null. */
   explicitOk: boolean | null;
@@ -3929,6 +7186,11 @@ function authorityEventString(
 ): string {
   const value = event.data[field];
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function authorityEventSourceUserSeq(event: EventRow): number | null {
+  const value = event.data.sourceUserSeq;
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : null;
 }
 
 function durableReturnExplicitOk(returned: EventRow): boolean | null {
@@ -4058,19 +7320,33 @@ function durableToolOutputOccurrence(
   returnCount: number;
   reason?: string;
 } {
+  // Intentionally no ORDER BY: a valid authority has exactly one call and one
+  // return and validates their seq relationship below. Ordering here makes
+  // SQLite choose the broad session/seq index instead of the existing
+  // call-lifecycle expression index on long sessions.
   const events = openEventLog().prepare(`
     SELECT seq, id, session_id, turn, role, type, parent_event_id, data_json, created_at
       FROM events
      WHERE session_id = ?
        AND type IN ('tool_called', 'tool_returned')
        AND json_extract(data_json, '$.callId') = ?
-     ORDER BY seq ASC
   `).all(sessionId, callId).map((row) => rowToEvent(row as RawEventRow));
+  // A deterministic replay remains a canonical model attempt in the audit,
+  // but it is not a second provider observation. Remove its parented pair from
+  // authority occurrence counting so a later REAL invocation that legitimately
+  // reuses the SDK call id can still prove its own fresh bytes.
+  const replayParentIds = new Set(events
+    .filter((event) => event.type === 'tool_returned'
+      && isSettledReadReplayReturnData(event.data)
+      && typeof event.parentEventId === 'string')
+    .map((event) => event.parentEventId as string));
   const calls = events.filter((event) =>
     event.type === 'tool_called' && authorityEventString(event, 'callId') === callId
+      && !replayParentIds.has(event.id)
   );
   const returns = events.filter((event) =>
     event.type === 'tool_returned' && authorityEventString(event, 'callId') === callId
+      && !isSettledReadReplayReturnData(event.data)
   );
   if (calls.length !== 1 || returns.length !== 1) {
     return {
@@ -4109,6 +7385,11 @@ function durableToolOutputOccurrence(
       returned,
       tool: callTool,
       effect: callEffect || null,
+      sourceUserSeq: (() => {
+        const callSource = authorityEventSourceUserSeq(call);
+        const returnSource = authorityEventSourceUserSeq(returned);
+        return callSource !== null && callSource === returnSource ? callSource : null;
+      })(),
       explicitOk: durableReturnExplicitOk(returned),
     },
     callCount: 1,
@@ -4146,7 +7427,9 @@ export function resolveToolOutputForAuthority(
     if (lifecycle.callCount === 0 && lifecycle.returnCount === 0) {
       const failureReason = authorityOutputFailureReason(invocations[0], null);
       if (failureReason) return { status: 'failed', reason: failureReason };
-      return { status: 'ok', record: invocations[0], source: 'exact', effect: null };
+      return {
+        status: 'ok', record: invocations[0], source: 'exact', effect: null, sourceUserSeq: null,
+      };
     }
     if (
       lifecycle.occurrence
@@ -4159,6 +7442,7 @@ export function resolveToolOutputForAuthority(
         record: invocations[0],
         source: 'exact',
         effect: lifecycle.occurrence.effect,
+        sourceUserSeq: lifecycle.occurrence.sourceUserSeq,
       };
     }
     return {
@@ -4185,6 +7469,7 @@ export function resolveToolOutputForAuthority(
       record: legacy,
       source: 'legacy',
       effect: lifecycle.occurrence.effect,
+      sourceUserSeq: lifecycle.occurrence.sourceUserSeq,
     };
   }
   return {
@@ -4197,6 +7482,7 @@ export function resolveToolOutputForAuthority(
 export interface AuthorityToolOutputRecord extends ToolOutputRecord {
   callId: string;
   effect: string | null;
+  sourceUserSeq: number | null;
 }
 
 /** Convert presentation/search rows into evidence rows.  Candidate bytes are
@@ -4206,10 +7492,13 @@ export interface AuthorityToolOutputRecord extends ToolOutputRecord {
 export function resolveToolOutputsForAuthority(
   sessionId: string,
   candidates: readonly { callId: string }[],
-  options: { readOrComputeOnly?: boolean } = {},
+  options: { readOrComputeOnly?: boolean; allowedSourceUserSeqs?: readonly number[] } = {},
 ): AuthorityToolOutputRecord[] {
   const resolved: AuthorityToolOutputRecord[] = [];
   const seen = new Set<string>();
+  const allowedSources = options.allowedSourceUserSeqs === undefined
+    ? null
+    : new Set(options.allowedSourceUserSeqs.filter((value) => Number.isSafeInteger(value) && value > 0));
   for (const candidate of candidates) {
     const callId = candidate.callId.trim();
     if (!callId || seen.has(callId)) continue;
@@ -4221,7 +7510,16 @@ export function resolveToolOutputsForAuthority(
       && authority.effect !== 'read'
       && authority.effect !== 'compute'
     ) continue;
-    resolved.push({ callId, ...authority.record, effect: authority.effect });
+    if (
+      allowedSources
+      && (authority.sourceUserSeq === null || !allowedSources.has(authority.sourceUserSeq))
+    ) continue;
+    resolved.push({
+      callId,
+      ...authority.record,
+      effect: authority.effect,
+      sourceUserSeq: authority.sourceUserSeq,
+    });
   }
   return resolved;
 }

@@ -61,6 +61,14 @@ function originSession(): { sessionId: string; sourceUserSeq: number } {
   return { sessionId, sourceUserSeq: event.seq };
 }
 
+function durableTaskState(taskId: string): 'alive' | 'done' | 'failed' | 'missing' {
+  const task = tasks.getBackgroundTask(taskId);
+  if (!task) return 'missing';
+  if (task.status === 'pending' || task.status === 'running') return 'alive';
+  if (task.status === 'done') return 'done';
+  return 'failed';
+}
+
 // ─── C.1: plan identity is the whole contract ────────────────────────────────
 
 test('two different manifests in one reusable chat produce two plans; an exact replay rejoins', () => {
@@ -191,6 +199,37 @@ test('a worker may settle only its own claimed window, never another worker’s 
   assert.equal(legit.settled, true, 'window authority refused the window’s own worker');
 });
 
+test('completed activations cannot admit the reducer while their worker window is still claimed', () => {
+  const origin = originSession();
+  const admitted = fanout.admitDurableFanoutPlan(
+    dispositionOf(2, 'claimed-window reducer race'),
+    { originSessionId: origin.sessionId, sourceUserSeq: origin.sourceUserSeq },
+  );
+  assert.equal(admitted.ok, true);
+  const planId = (admitted as Extract<typeof admitted, { ok: true }>).plan.planId;
+  const scheduled = fanout.scheduleDurableFanout(planId);
+  assert.equal(scheduled?.workerTasks.length, 1, 'the fixture did not claim a worker window');
+  const window = fanout.listFanoutWindows(planId)[0]!;
+  assert.equal(window.status, 'claimed');
+  assert.ok(window.runSessionId);
+
+  for (const itemId of window.itemIds) {
+    const settled = fanout.settleFanoutActivationAs({
+      planId,
+      itemId,
+      phaseId: 'execute',
+      status: 'done',
+      callerRunSessionId: window.runSessionId!,
+    });
+    assert.equal(settled.settled, true);
+  }
+
+  assert.equal(fanout.fanoutReducerReady(planId).ready, false,
+    'journal completion raced past a still-live worker window');
+  assert.equal(fanout.maybeAdmitFanoutReducer(planId), null,
+    'a reducer was admitted while its worker still owned a claimed window');
+});
+
 // ─── C.6/C.7: one kickoff, one reducer terminal, on the originating route ────
 
 test('internal windows never report back to the user; the reducer terminal rides the stored route', async () => {
@@ -212,7 +251,16 @@ test('internal windows never report back to the user; the reducer terminal rides
   for (const a of fanout.listFanoutActivations(planId)) {
     fanout.settleFanoutActivation({ planId, itemId: a.itemId, phaseId: a.phaseId, status: 'done' });
   }
-  const reducer = fanout.maybeAdmitFanoutReducer(planId);
+  for (const worker of scheduled!.workerTasks) {
+    assert.equal(tasks.markBackgroundTaskDone(worker.id, 'Worker window completed.')?.status, 'done');
+  }
+  const reconciled = fanout.reconcileDurableFanout({
+    taskState: durableTaskState,
+    reducerOwner: 'route-test-reducer',
+  });
+  assert.equal(reconciled.reduced.includes(planId), true,
+    'the real worker terminals did not release their windows for reduction');
+  const reducer = tasks.getBackgroundTask(fanout.loadFanoutPlan(planId)!.reducerTaskId!);
   assert.ok(reducer, 'no reducer admitted');
   assert.equal(reducer!.originSessionId, origin.sessionId,
     'the reducer terminal does not return to the originating chat');
@@ -229,11 +277,21 @@ test('the reducer lifecycle is ready→leased→admitted→running→completed, 
     { originSessionId: origin.sessionId, sourceUserSeq: origin.sourceUserSeq },
   );
   const planId = (admitted as Extract<typeof admitted, { ok: true }>).plan.planId;
+  const scheduled = fanout.scheduleDurableFanout(planId);
+  assert.ok(scheduled?.workerTasks.length);
   for (const a of fanout.listFanoutActivations(planId)) {
     fanout.settleFanoutActivation({ planId, itemId: a.itemId, phaseId: a.phaseId, status: 'done' });
   }
+  for (const worker of scheduled!.workerTasks) {
+    assert.equal(tasks.markBackgroundTaskDone(worker.id, 'Worker window completed.')?.status, 'done');
+  }
 
-  const reducerTask = fanout.maybeAdmitFanoutReducer(planId);
+  const reconciled = fanout.reconcileDurableFanout({
+    taskState: durableTaskState,
+    reducerOwner: 'lifecycle-test-reducer',
+  });
+  assert.equal(reconciled.reduced.includes(planId), true);
+  const reducerTask = tasks.getBackgroundTask(fanout.loadFanoutPlan(planId)!.reducerTaskId!);
   assert.ok(reducerTask);
   let plan = fanout.loadFanoutPlan(planId)!;
   assert.equal(plan.reducerState, 'admitted',
@@ -242,6 +300,7 @@ test('the reducer lifecycle is ready→leased→admitted→running→completed, 
 
   // The reducer task FAILS on the scheduler → the lifecycle records failure
   // and a bounded retry re-admits a fresh reducer task.
+  assert.equal(tasks.markBackgroundTaskFailed(reducerTask!.id, 'Reducer failed.')?.status, 'failed');
   fanout.recordFanoutReducerOutcome(planId, { taskId: reducerTask!.id, outcome: 'failed' });
   plan = fanout.loadFanoutPlan(planId)!;
   assert.equal(plan.reducerState, 'failed');
@@ -249,7 +308,16 @@ test('the reducer lifecycle is ready→leased→admitted→running→completed, 
   assert.ok(retry, 'a failed reduction cannot retry — the lease was never recoverable');
   assert.notEqual(retry!.id, reducerTask!.id);
 
-  fanout.recordFanoutReducerOutcome(planId, { taskId: retry!.id, outcome: 'completed' });
+  assert.equal(
+    fanout.recordFanoutReducerOutcome(planId, { taskId: retry!.id, outcome: 'completed' }),
+    false,
+    'a caller assertion closed the plan before the reducer task durably completed',
+  );
+  assert.equal(tasks.markBackgroundTaskDone(retry!.id, 'Combined result delivered.')?.status, 'done');
+  assert.equal(
+    fanout.recordFanoutReducerOutcome(planId, { taskId: retry!.id, outcome: 'completed' }),
+    true,
+  );
   plan = fanout.loadFanoutPlan(planId)!;
   assert.equal(plan.reducerState, 'completed');
   assert.equal(plan.status, 'reduced');

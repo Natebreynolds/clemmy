@@ -1,5 +1,6 @@
 import { Agent, tool } from '@openai/agents';
 import type { Tool, ToolUseBehavior } from '@openai/agents';
+import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -20,13 +21,22 @@ import {
   TOOL_SEARCH_ALWAYS_LOADED,
 } from './tool-catalog.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
-import { buildCallTool } from '../tools/call-tool.js';
+import { buildCallTool, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import { peekStepResult } from '../tools/step-result-tool.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 import { runWorkspaceDir } from '../execution/workflow-run-workspace.js';
 import { STEP_STRUCTURAL_BASELINE_TOOLS } from '../execution/workflow-step-structural-tools.js';
 import { queryWorkspaceArtifact } from '../tools/workspace-artifact-tools.js';
+import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
+import { getProactivityPolicySnapshot } from './proactivity-policy.js';
+import {
+  appendAgentCapabilityBinding,
+  bindAgentCapabilityEnvelope,
+  bindAgentCapabilityRevision,
+  sealAgentCapabilityUniverse,
+  type SealableToolLike,
+} from './capability-envelope.js';
 
 import { harnessInputGuardrails, harnessOutputGuardrails } from '../runtime/harness/guardrails.js';
 
@@ -435,8 +445,17 @@ export async function buildWorkflowStepAgent(
   // can remove a tool. Explicit allowedTools locks stay exact and bypass this
   // layer entirely.
   const schemaOnDemand = !surfaceLocked && codexToolSearchEnabled();
+  const capabilityUniverseTools = [...lockedTools];
   let tools = lockedTools;
   let catalogBlock = '';
+  // The dispatcher is built before its Agent. Missing/failed sealing therefore
+  // remains a typed refusal until this per-step cell is replaced after binding.
+  let admitBuiltinAcquisition = (targetName: string): BuiltinCapabilityAdmissionResult => ({
+    ok: false,
+    kind: 'requires_readmission',
+    outside: [targetName],
+    reason: 'the workflow-step capability universe or binding revision is not sealed',
+  });
   if (schemaOnDemand) {
     const availableNames = new Set(
       lockedTools
@@ -471,6 +490,7 @@ export async function buildWorkflowStepAgent(
       firstClassNames,
       deniedNames: WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
       mcpToolScope: externalMcpScope,
+      admitBuiltinAcquisition: (targetName) => admitBuiltinAcquisition(targetName),
     }) as Tool<RuntimeContextValue>;
     tools = [...firstClassTools, dispatcher];
     const compactCatalog = buildCompactToolCatalog({ allowedNames: deferredNames });
@@ -498,7 +518,11 @@ export async function buildWorkflowStepAgent(
       : []),
     catalogBlock,
   ].filter(Boolean).join('\n\n');
-  const baseInstructions = harnessInstructions(staticInstructions, { includeRememberedToolChoices: false });
+  const baseInstructions = harnessInstructions(staticInstructions, {
+    sessionId: options.sessionId ?? undefined,
+    focusInput: options.userInput ?? undefined,
+    includeRememberedToolChoices: false,
+  });
   const instructions = learnedRecall
     ? () => `${baseInstructions()}\n\n${learnedRecall}`
     : baseInstructions;
@@ -527,5 +551,53 @@ export async function buildWorkflowStepAgent(
     outputGuardrails: harnessOutputGuardrails,
   });
   bindAgentMcpToolScope(agent, externalMcpScope);
+  // Explicitly locked/exact/result-only steps have no call_tool acquisition
+  // path and intentionally stay on their physical exact surface. Unbound
+  // schema-on-demand steps seal the complete post-blocklist universe, then
+  // bind revision 1 to only the active schemas plus dispatcher.
+  if (schemaOnDemand) {
+    try {
+      const budgetSettings = getHarnessBudgetSettings();
+      const universeByName = new Map<string, SealableToolLike>();
+      for (const toolRef of [
+        ...capabilityUniverseTools,
+        ...tools,
+      ] as unknown as SealableToolLike[]) {
+        const name = typeof toolRef.name === 'string' ? toolRef.name : '';
+        if (name) universeByName.set(name, toolRef); // active instances win
+      }
+      const sealed = sealAgentCapabilityUniverse({
+        sessionId: options.sessionId?.trim() || 'workflow-step-unbound',
+        universeTools: [...universeByName.values()],
+        activeToolNames: tools
+          .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+          .filter(Boolean),
+        policyHash: createHash('sha256')
+          .update(JSON.stringify(getProactivityPolicySnapshot().policy), 'utf-8')
+          .digest('hex'),
+        budget: {
+          maxUncachedTokens: budgetSettings.maxRunTokens > 0 ? budgetSettings.maxRunTokens : 10_000_000,
+          maxModelCalls: budgetSettings.maxTurns > 0 ? budgetSettings.maxTurns * 4 : 200,
+          maxToolCalls: budgetSettings.toolCallsPerTurn > 0
+            ? budgetSettings.toolCallsPerTurn * (budgetSettings.maxTurns > 0 ? budgetSettings.maxTurns : 50)
+            : 500,
+          maxElapsedMs: budgetSettings.maxConversationWallMs > 0
+            ? budgetSettings.maxConversationWallMs
+            : 3_600_000,
+        },
+      });
+      if (sealed.ok) {
+        bindAgentCapabilityEnvelope(agent, sealed.envelope);
+        bindAgentCapabilityRevision(agent, sealed.revision);
+        admitBuiltinAcquisition = (targetName) => appendAgentCapabilityBinding(agent, targetName);
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(`[workflow-step] capability universe refused to seal: ${sealed.errors.join('; ')}`);
+      }
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn('[workflow-step] capability universe sealing threw:', error instanceof Error ? error.message : error);
+    }
+  }
   return agent;
 }

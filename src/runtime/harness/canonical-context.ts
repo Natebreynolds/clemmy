@@ -27,6 +27,9 @@ export interface CanonicalContextPack {
 
 export interface BuildCanonicalContextPackOptions {
   input: string;
+  /** Exact current input used for preflight/tool authority. `input` may be a
+   * richer private retrieval query for a verified continuation. */
+  authorityInput?: string;
   memory: MemoryPrimerSummary;
   sessionId?: string;
   sessionKind?: string;
@@ -34,6 +37,13 @@ export interface BuildCanonicalContextPackOptions {
   /** True for synthetic continuation/retry inputs — the alignment beat must
    *  only ever evaluate a REAL user message. */
   suppressConfirmBeat?: boolean;
+  /** A typed decline still needs the ordinary conversational/history surface,
+   *  but not semantic recall, ranking, capability resolution, or schema warm. */
+  suppressSemanticEnrichment?: boolean;
+  /** The exact accepted turn declined its parent and supplied an independent
+   * fresh clause. This is a policy cue only; provider-visible wording stays
+   * byte-exact elsewhere. */
+  declinedParentWithNewTask?: boolean;
   includeMemoryDiagnostics?: boolean;
 }
 
@@ -59,6 +69,9 @@ export function buildCanonicalContextPack(opts: BuildCanonicalContextPackOptions
     sessionKind: opts.sessionKind,
     sourceUserSeq: opts.sourceUserSeq,
     suppressConfirmBeat: opts.suppressConfirmBeat,
+    suppressSemanticEnrichment: opts.suppressSemanticEnrichment,
+    authorityInput: opts.authorityInput,
+    declinedParentWithNewTask: opts.declinedParentWithNewTask,
   });
 
   let stableMemoryAvailable = false;

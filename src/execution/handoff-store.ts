@@ -216,11 +216,18 @@ export function listUnsettledHandoffRecords(): HandoffRecord[] {
 
 export function listHandoffRecords(): HandoffRecord[] {
   try {
-    return (db().prepare('SELECT * FROM handoffs ORDER BY updated_at ASC').all() as HandoffRow[])
-      .map(toRecord);
+    return listHandoffRecordsStrict();
   } catch {
     return [];
   }
+}
+
+/** Correctness-boundary reader for callers deciding whether work can be
+ * skipped. Unlike the dashboard-compatible list helper, unreadable ownership
+ * state is not equivalent to an empty ledger. */
+export function listHandoffRecordsStrict(): HandoffRecord[] {
+  return (db().prepare('SELECT * FROM handoffs ORDER BY updated_at ASC').all() as HandoffRow[])
+    .map(toRecord);
 }
 
 /**

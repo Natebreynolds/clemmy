@@ -83,7 +83,7 @@ function runnerForModelStream(
   let activeStop: () => void = () => {};
   let cancellationCalls = 0;
   const runner = {
-    run: async () => {
+    run: async (_agent: unknown, _items: unknown, options: { signal?: AbortSignal } = {}) => {
       const controller = new AbortController();
       let complete!: () => void;
       const completed = new Promise<void>((resolve) => { complete = resolve; });
@@ -94,22 +94,25 @@ function runnerForModelStream(
         controller.abort();
         complete();
       };
+      const abortFromRunnerSignal = () => {
+        cancellationCalls += 1;
+        activeStop();
+      };
+      if (options.signal?.aborted) abortFromRunnerSignal();
+      else options.signal?.addEventListener('abort', abortFromRunnerSignal, { once: true });
       return {
         history: [],
         lastResponseId: 'fusion-stall',
         finalOutput: { ok: true },
         rawResponses: [],
         completed,
-        cancel: () => {
-          cancellationCalls += 1;
-          activeStop();
-        },
         async *[Symbol.asyncIterator]() {
           try {
             for await (const data of stream(controller.signal)) {
               yield { type: 'raw_model_stream_event', data };
             }
           } finally {
+            options.signal?.removeEventListener('abort', abortFromRunnerSignal);
             complete();
           }
         },
@@ -151,7 +154,7 @@ async function expectFusionPreContentStall(
     if (safetyTimer) clearTimeout(safetyTimer);
     rig.forceStop();
   }
-  assert.equal(rig.cancelCalls(), 1, 'the watchdog attempted to cancel the stuck fused model stream');
+  assert.equal(rig.cancelCalls(), 1, 'the watchdog aborted the exact signal passed into runner.run');
 }
 
 test('a stream that never emits is aborted with a transient timeout error', async () => {
@@ -327,12 +330,133 @@ test('a PRE-CONTENT stall is retried and self-heals when the retry streams (Clau
   const first = makeStreamResult({ events: 0, hang: true }); // wedges pre-content
   const second = makeStreamResult({ events: 2, gapMs: 30 }); // healthy retry
   let call = 0;
-  const flakyRunner = { run: async () => (call++ === 0 ? first : second) } as unknown as Runner;
+  let firstAttemptAborts = 0;
+  const flakyRunner = {
+    run: async (_agent: unknown, _items: unknown, options: { signal?: AbortSignal } = {}) => {
+      const attempt = call++;
+      if (attempt === 0) {
+        options.signal?.addEventListener('abort', () => { firstAttemptAborts += 1; }, { once: true });
+        return first;
+      }
+      return second;
+    },
+  } as unknown as Runner;
   const started = Date.now();
   const out = await __defaultRunRunner(flakyRunner, {} as never, [], {} as never);
   assert.deepEqual(out.finalOutput, { ok: true }, 'recovered via the retry');
   assert.equal(call, 2, 'made exactly one retry');
+  assert.equal(firstAttemptAborts, 1, 'ordinary stream silence aborts the first physical request before retry');
   assert.ok(Date.now() - started < 5_000, 'recovered promptly');
+});
+
+test('a buffered BYO completion outliving first-byte stays single-request and finishes under the full-stream deadline', async () => {
+  const previousStream = process.env.CLEMMY_MODEL_STREAM_STALL_MS;
+  const previousFirstByte = process.env.CLEMMY_MODEL_FIRST_BYTE_STALL_MS;
+  process.env.CLEMMY_MODEL_STREAM_STALL_MS = '1200';
+  process.env.CLEMMY_MODEL_FIRST_BYTE_STALL_MS = '150';
+  try {
+    const { ToolCallsCounter, harnessRunContextStorage, withHarnessRunContext } = await import('./brackets.js');
+    let calls = 0;
+    const runner = {
+      run: async () => {
+        calls += 1;
+        return {
+          history: [], lastResponseId: 'byo-buffered', finalOutput: { ok: true }, rawResponses: [],
+          completed: Promise.resolve(),
+          async *[Symbol.asyncIterator]() {
+            const context = harnessRunContextStorage.getStore();
+            assert.ok(context, 'physical attempt keeps its harness context');
+            const ownership = {
+              kind: 'byo_non_streaming_completion' as const,
+              startedAt: Date.now(),
+              active: true,
+            };
+            (context.bufferedProviderRequests ??= new Set()).add(ownership);
+            await new Promise((resolve) => setTimeout(resolve, 550));
+            ownership.active = false;
+            context.privateModelActivityAt = Date.now();
+            yield { type: 'raw_model_stream_event', data: { type: 'output_text_delta', delta: 'done' } };
+          },
+        };
+      },
+    } as unknown as Runner;
+
+    const out = await withHarnessRunContext(
+      { sessionId: 'byo-buffered-single-request', counter: new ToolCallsCounter(4) },
+      () => __defaultRunRunner(runner, {} as never, [], {} as never),
+    );
+    assert.deepEqual(out.finalOutput, { ok: true });
+    assert.equal(calls, 1, 'the 150ms first-byte deadline never overlaps the owned 550ms paid request');
+  } finally {
+    if (previousStream === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_MS;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_MS = previousStream;
+    if (previousFirstByte === undefined) delete process.env.CLEMMY_MODEL_FIRST_BYTE_STALL_MS;
+    else process.env.CLEMMY_MODEL_FIRST_BYTE_STALL_MS = previousFirstByte;
+  }
+});
+
+test('a genuinely hung buffered BYO request cancels at the finite hard deadline without parallel replay', async () => {
+  const previousStream = process.env.CLEMMY_MODEL_STREAM_STALL_MS;
+  const previousFirstByte = process.env.CLEMMY_MODEL_FIRST_BYTE_STALL_MS;
+  const previousRetries = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+  process.env.CLEMMY_MODEL_STREAM_STALL_MS = '350';
+  process.env.CLEMMY_MODEL_FIRST_BYTE_STALL_MS = '100';
+  process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '3';
+  try {
+    const { ToolCallsCounter, withHarnessRunContext } = await import('./brackets.js');
+    const { wrapCompletionsCreate } = await import('./byo-model.js');
+    let runnerCalls = 0;
+    let wireCalls = 0;
+    let requestSignal: AbortSignal | undefined;
+    const original = async (_params: Record<string, unknown>, options?: unknown): Promise<unknown> => {
+      wireCalls += 1;
+      const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+      return new Promise<never>((_resolve, reject) => {
+        const aborted = () => reject(new Error('provider transport aborted'));
+        if (signal?.aborted) aborted();
+        else signal?.addEventListener('abort', aborted, { once: true });
+      });
+    };
+    const create = wrapCompletionsCreate(original);
+    const runner = {
+      run: async (_agent: unknown, _items: unknown, options: { signal?: AbortSignal } = {}) => {
+        runnerCalls += 1;
+        requestSignal = options.signal;
+        return {
+          history: [], lastResponseId: 'byo-hung', finalOutput: { ok: false }, rawResponses: [],
+          completed: Promise.resolve(),
+          async *[Symbol.asyncIterator]() {
+            const stream = await create({
+              model: 'glm-test',
+              messages: [{ role: 'user', content: 'wait forever' }],
+              stream: true,
+            }, { signal: options.signal });
+            for await (const _chunk of stream as AsyncIterable<unknown>) {
+              // The provider never settles, so no synthetic chunk can appear.
+            }
+          },
+        };
+      },
+    } as unknown as Runner;
+
+    await assert.rejects(
+      withHarnessRunContext(
+        { sessionId: 'byo-buffered-hard-deadline', counter: new ToolCallsCounter(4) },
+        () => __defaultRunRunner(runner, {} as never, [], {} as never),
+      ),
+      (error: unknown) => error instanceof Error && /timed out/.test(error.message),
+    );
+    assert.equal(runnerCalls, 1, 'an in-flight paid request is never automatically replayed');
+    assert.equal(requestSignal?.aborted, true, 'the finite full-stream deadline aborts the exact runner request signal');
+    assert.equal(wireCalls, 1, 'the aborted BYO non-streaming call never probes an orphan streaming fallback');
+  } finally {
+    if (previousStream === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_MS;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_MS = previousStream;
+    if (previousFirstByte === undefined) delete process.env.CLEMMY_MODEL_FIRST_BYTE_STALL_MS;
+    else process.env.CLEMMY_MODEL_FIRST_BYTE_STALL_MS = previousFirstByte;
+    if (previousRetries === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = previousRetries;
+  }
 });
 
 test('disablePreContentRetry (approval-resume): a pre-content stall does NOT replay — no duplicate approved write', async () => {
@@ -426,7 +550,7 @@ test('a superseded pre-content attempt cannot mutate after the recovery attempt 
   // The stream guard above protects only user-visible text. A cancelled provider
   // can still finish a late tool call after the retry has started, so the tool
   // boundary must reject work owned by the superseded attempt. This reproduces
-  // the live GLM workspace race without a network dependency: cancel() is
+  // the live GLM workspace race without a network dependency: signal abort is
   // observed, the recovery attempt saves first, then the abandoned attempt
   // reaches the real harness wrapper with a second space_save.
   const {
@@ -453,7 +577,6 @@ test('a superseded pre-content attempt cannot mutate after the recovery attempt 
   const stale = {
     history: [], lastResponseId: 'stale', finalOutput: { ok: false }, rawResponses: [],
     completed: Promise.resolve(),
-    cancel: () => { cancelCalls += 1; },
     async *[Symbol.asyncIterator]() {
       await retryStarted;
       try {
@@ -477,7 +600,16 @@ test('a superseded pre-content attempt cannot mutate after the recovery attempt 
     },
   };
   let call = 0;
-  const runner = { run: async () => (call++ === 0 ? stale : live) } as unknown as Runner;
+  const runner = {
+    run: async (_agent: unknown, _items: unknown, options: { signal?: AbortSignal } = {}) => {
+      const attempt = call++;
+      if (attempt === 0) {
+        options.signal?.addEventListener('abort', () => { cancelCalls += 1; }, { once: true });
+        return stale;
+      }
+      return live;
+    },
+  } as unknown as Runner;
   const out = await withHarnessRunContext(
     {
       sessionId: session.id,
@@ -490,7 +622,7 @@ test('a superseded pre-content attempt cannot mutate after the recovery attempt 
 
   assert.deepEqual(out.finalOutput, { ok: true }, 'the recovery attempt remains authoritative');
   assert.equal(call, 2, 'the stalled turn is retried exactly once');
-  assert.equal(cancelCalls, 1, 'the stale stream received the best-effort transport cancel');
+  assert.equal(cancelCalls, 1, 'the stale stream received the physical-attempt signal abort');
   assert.deepEqual(
     writes,
     ['recovery-attempt'],
@@ -563,10 +695,6 @@ test('a killed attempt is fenced before transport cancel can release a late muta
   const stale = {
     history: [], lastResponseId: 'killed', finalOutput: { ok: false }, rawResponses: [],
     completed: Promise.resolve(),
-    cancel: () => {
-      cancelCalls += 1;
-      releaseCancel();
-    },
     async *[Symbol.asyncIterator]() {
       signalStarted();
       let wasCancelled = false;
@@ -582,13 +710,22 @@ test('a killed attempt is fenced before transport cancel can release a late muta
       try {
         await wrapped.execute!({});
       } catch {
-        // The kill path must revoke before invoking cancel(), so this is the
+        // The kill path must revoke before aborting the request signal, so this is the
         // expected stale-generation refusal.
       } finally {
         signalSettled();
       }
     },
   };
+  const signalAwareRunner = {
+    run: async (_agent: unknown, _items: unknown, options: { signal?: AbortSignal } = {}) => {
+      options.signal?.addEventListener('abort', () => {
+        cancelCalls += 1;
+        releaseCancel();
+      }, { once: true });
+      return stale;
+    },
+  } as unknown as Runner;
   const task = withHarnessRunContext(
     {
       sessionId: session.id,
@@ -596,7 +733,7 @@ test('a killed attempt is fenced before transport cancel can release a late muta
       counter: new ToolCallsCounter(10),
     },
     () => __defaultRunRunner(
-      runnerFor(stale),
+      signalAwareRunner,
       {} as never,
       [],
       { context: { sessionId: session.id } } as never,

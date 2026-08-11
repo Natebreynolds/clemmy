@@ -1,6 +1,12 @@
 import type { PendingApproval } from '../types.js';
 import type { PendingApprovalRow } from './harness/approval-registry.js';
 import { listEvents as listHarnessEvents } from './harness/eventlog.js';
+import {
+  decodeBrokerCarrier,
+  isCallToolMultiplexerName,
+  isComposioMultiplexerName,
+  resolveToolInvocation,
+} from '../agents/tool-invocation.js';
 
 /**
  * Build a short human-readable description of what a pending approval
@@ -426,19 +432,30 @@ function previewToolCallAtDepth(toolName: string, argsRaw: unknown, depth: numbe
   const args = parseArgs(argsRaw);
   if (!args) return toolName;
   const MAX = 70;
-  switch (toolName) {
-    case 'call_tool': {
-      // call_tool is a transport carrier, not the action the user cares about.
-      // Project its canonical inner target into public progress so a Composio
-      // call reads "composio · SLUG" instead of "using call_tool". Keep the
-      // recursion bounded because nested carriers are valid input, including a
-      // malformed self-carrier that must never recurse forever.
-      const target = pickString(args, ['name']).trim();
-      if (!target || depth >= 4) return toolName;
-      const innerPreview = previewToolCallAtDepth(target, args.args_json, depth + 1);
-      if (innerPreview !== target) return innerPreview;
-      return target === toolName ? toolName : `using ${trim(target, MAX - 6)}`;
+  if (isCallToolMultiplexerName(toolName)) {
+    // External provider brokers use several real-world spellings
+    // (call_tool/call-tool/call.tool/callTool). Resolve all of them through the
+    // same semantic projection used by approval policy.
+    const resolved = resolveToolInvocation(toolName, args);
+    if (resolved.externalBroker) {
+      if (!resolved.valid || depth >= 4) return toolName;
+      const innerPreview = previewToolCallAtDepth(resolved.toolName, resolved.args, depth + 1);
+      return innerPreview !== resolved.toolName
+        ? innerPreview
+        : `using ${trim(resolved.toolName, MAX - 6)}`;
     }
+    // Clementine-local/bare call_tool retains its own dispatcher semantics.
+    const carrier = decodeBrokerCarrier(args);
+    if (!carrier.ok || depth >= 4) return toolName;
+    const innerPreview = previewToolCallAtDepth(carrier.target, carrier.args, depth + 1);
+    if (innerPreview !== carrier.target) return innerPreview;
+    return carrier.target === toolName ? toolName : `using ${trim(carrier.target, MAX - 6)}`;
+  }
+  if (isComposioMultiplexerName(toolName)) {
+    const slug = pickString(args, ['tool_slug', 'slug']);
+    return slug ? `composio · ${trim(slug, MAX - 10)}` : toolName;
+  }
+  switch (toolName) {
     case 'run_shell_command':
     case 'shell': {
       const command = pickString(args, ['command', 'cmd']);
@@ -453,10 +470,6 @@ function previewToolCallAtDepth(toolName: string, argsRaw: unknown, depth: numbe
     case 'read_file': {
       const file = pickString(args, ['file_path', 'path', 'filePath']);
       return file ? `reading ${trim(file, MAX)}` : toolName;
-    }
-    case 'composio_execute_tool': {
-      const slug = pickString(args, ['tool_slug', 'slug']);
-      return slug ? `composio · ${trim(slug, MAX - 10)}` : toolName;
     }
     case 'composio_search_tools': {
       const query = pickString(args, ['query', 'q']);

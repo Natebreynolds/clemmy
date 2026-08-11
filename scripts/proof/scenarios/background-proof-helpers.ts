@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { performance } from 'node:perf_hooks';
 
 import { openHarnessDb } from '../score.js';
 import type { Check, DaemonHandle, TurnResult } from '../types.js';
@@ -88,9 +89,67 @@ export interface DispatchedBackgroundTask {
   turn: TurnResult;
   taskId: string;
   detail: ProofBackgroundDetail;
+  settlementTimer: BackgroundSettlementTimer;
+}
+
+export const BACKGROUND_SETTLEMENT_WALL_MS_LABEL = 'request-dispatch-to-observed-settlement' as const;
+
+export interface BackgroundSettlementTiming {
+  /** Monotonic duration from immediately before chat dispatch until the proof observes settlement. */
+  observedSettlementWallMs: number;
+  /** HTTP chat turn only; retained to diagnose dispatch overhead separately. */
+  dispatchAcknowledgementWallMs: number;
+  /** Raw task status at the observation boundary; settlement is not necessarily success. */
+  terminalStatus: string;
+  /** Stable report contract for latency[].wallMs and observedSettlementWallMs. */
+  wallMsLabel: typeof BACKGROUND_SETTLEMENT_WALL_MS_LABEL;
+}
+
+export interface BackgroundSettlementTimer {
+  observe(
+    terminalStatus: string,
+    dispatchAcknowledgementWallMs: number,
+  ): BackgroundSettlementTiming;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Start a background settlement timer using a monotonic clock. dispatchBackground
+ * owns the production anchor so it can start after preflight and immediately
+ * before daemon.chat. The injectable clock keeps this contract deterministic in
+ * self-tests.
+ */
+export function startBackgroundSettlementTimer(
+  now: () => number = () => performance.now(),
+): BackgroundSettlementTimer {
+  const startedAt = now();
+  if (!Number.isFinite(startedAt)) throw new Error('background timer clock returned a non-finite start');
+
+  return {
+    observe(
+      terminalStatus: string,
+      dispatchAcknowledgementWallMs: number,
+    ): BackgroundSettlementTiming {
+      const settlementObservedAt = now();
+      if (!Number.isFinite(settlementObservedAt) || settlementObservedAt < startedAt) {
+        throw new Error('background monotonic clock moved backwards or returned a non-finite settlement time');
+      }
+      if (!Number.isFinite(dispatchAcknowledgementWallMs) || dispatchAcknowledgementWallMs < 0) {
+        throw new Error('background dispatch acknowledgement latency must be a non-negative finite number');
+      }
+      if (!terminalStatus.trim()) {
+        throw new Error('background settlement timing requires an observed terminal status');
+      }
+      return {
+        observedSettlementWallMs: settlementObservedAt - startedAt,
+        dispatchAcknowledgementWallMs,
+        terminalStatus,
+        wallMsLabel: BACKGROUND_SETTLEMENT_WALL_MS_LABEL,
+      };
+    },
+  };
+}
 
 export function proofSessionId(label: string): string {
   return `proof-${label}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -123,12 +182,14 @@ export async function dispatchBackground(
   daemon: DaemonHandle,
   originSessionId: string,
   instruction: string,
+  opts: { monotonicNow?: () => number } = {},
 ): Promise<DispatchedBackgroundTask> {
   const before = new Set(
     (await getBoardCards(daemon))
       .filter((card) => card.sourceKind === 'background')
       .map((card) => card.id),
   );
+  const settlementTimer = startBackgroundSettlementTimer(opts.monotonicNow);
   const turn = await daemon.chat(`/background ${instruction}`, originSessionId, 180_000);
   const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
@@ -139,7 +200,7 @@ export async function dispatchBackground(
     ));
     if (card) {
       const { detail } = await getBackgroundDetail(daemon, card.id);
-      return { turn, taskId: card.id, detail };
+      return { turn, taskId: card.id, detail, settlementTimer };
     }
     await sleep(250);
   }

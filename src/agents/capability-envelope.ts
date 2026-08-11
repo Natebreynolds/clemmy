@@ -9,12 +9,10 @@
  * MCP scope is bound: a module-private WeakMap, unreachable from model
  * output.
  *
- * This slice is INSTRUMENTATION WITH TEETH DEFERRED: the envelope travels
- * with the agent and is queryable at the dispatch boundary, but nothing
- * refuses on it yet. The enforcement slice — the boundary refusing a tool
- * absent from the envelope, and binding revisions for schema-on-demand
- * growth — lands against this exact artifact, which is why it must exist
- * first and why its digest must be honest now.
+ * The envelope now has teeth at the built-in schema-on-demand dispatch
+ * boundary: acquisition must append (or reuse) a binding revision before the
+ * inner tool can run. A missing authority or a name outside the universe is a
+ * typed `requires_readmission` refusal, never a warning followed by dispatch.
  *
  * Sealing failure is LOUD and non-fatal: an agent still builds (chat must
  * not die because instrumentation refused), but the warning names the exact
@@ -156,36 +154,50 @@ export function bindAgentCapabilityRevision(agent: object, revision: CapabilityB
   AGENT_REVISIONS.set(agent, revision);
 }
 
+export type AgentCapabilityBindingResult =
+  | { ok: true; revision: CapabilityBindingRevision; changed: boolean }
+  | {
+      ok: false;
+      kind: 'requires_readmission';
+      outside: string[];
+      reason: string;
+    };
+
 /**
- * Record a schema-on-demand acquisition as the next monotonic binding
- * revision. Returns null for an agent with no sealed envelope/revision
- * (unknown, never unlimited — there is nothing lawful to append to).
- * `requires_readmission` here means the dispatcher reached a name outside
- * the sealed universe: today that is surfaced to the caller to warn loudly;
- * the enforcement slice turns it into the pause the contract demands.
+ * Admit a schema-on-demand acquisition as the next monotonic binding
+ * revision. An already-bound name reuses the current revision without churn.
+ * Missing envelope/revision authority and names outside the sealed universe
+ * both fail closed as typed `requires_readmission` results; callers must not
+ * dispatch after either refusal.
  */
 export function appendAgentCapabilityBinding(
   agent: object,
   name: string,
-):
-  | { ok: true; revision: CapabilityBindingRevision }
-  | { ok: false; reason: string }
-  | null {
+): AgentCapabilityBindingResult {
   const envelope = AGENT_ENVELOPES.get(agent);
   const previous = AGENT_REVISIONS.get(agent);
-  if (!envelope || !previous) return null;
-  if (previous.bound.includes(name)) return { ok: true, revision: previous };
+  if (!envelope || !previous) {
+    return {
+      ok: false,
+      kind: 'requires_readmission',
+      outside: [name],
+      reason: 'agent has no sealed capability envelope and active binding revision',
+    };
+  }
+  if (previous.bound.includes(name)) return { ok: true, revision: previous, changed: false };
   const appended = appendBindings(envelope, previous, [name]);
   if (!appended.ok) {
     return {
       ok: false,
+      kind: 'requires_readmission',
+      outside: appended.kind === 'requires_readmission' ? appended.outside : [name],
       reason: appended.kind === 'requires_readmission'
         ? `"${appended.outside.join(', ')}" is outside the sealed capability universe`
         : appended.errors.join('; '),
     };
   }
   AGENT_REVISIONS.set(agent, appended.revision);
-  return { ok: true, revision: appended.revision };
+  return { ok: true, revision: appended.revision, changed: true };
 }
 
 /** The active binding revision, or null (unknown, never unlimited). */

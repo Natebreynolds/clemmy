@@ -435,6 +435,45 @@ test('gateway bare continue prioritizes a parked background continuation', async
   assert.ok(stored?.continueResolution, 'continue request should be queued on the background task');
 });
 
+for (const message of ['Continue.', 'keep going!']) {
+  test(`gateway ${JSON.stringify(message)} prioritizes a parked background continuation`, async () => {
+    const session = createSession({
+      kind: 'chat',
+      channel: 'mobile',
+      title: `Mobile punctuated background continue: ${message}`,
+    });
+    const task = createBackgroundTask({
+      title: 'Punctuated long report',
+      prompt: 'continue the report',
+      originSessionId: session.id,
+      channel: 'mobile',
+      source: 'mobile',
+    });
+    markBackgroundTaskAwaitingContinue(task.id, 'turn budget', 'partial work');
+
+    let respondCalled = false;
+    const gateway = new ClementineGateway({
+      respond: async (req: { sessionId: string }) => {
+        respondCalled = true;
+        return { text: 'foreground', sessionId: req.sessionId };
+      },
+    } as never);
+
+    const response = await gateway.handleMessage({
+      message,
+      sessionId: session.id,
+      channel: 'mobile',
+      source: 'mobile',
+    });
+
+    assert.equal(respondCalled, false, 'the foreground model must not win continuation precedence');
+    assert.equal(response.handledControl, true);
+    assert.equal(response.queuedTaskId, task.id);
+    assert.equal(getBackgroundTask(task.id)?.status, 'pending');
+    assert.ok(getBackgroundTask(task.id)?.continueResolution);
+  });
+}
+
 test('gateway keeps an INFERRED pipeline in the conversation, and backgrounds a named one', async () => {
   const session = createSession({ kind: 'chat', channel: 'mobile', title: 'CRM enrichment' });
   let respondCalled = false;

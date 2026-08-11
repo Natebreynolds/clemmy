@@ -22,7 +22,7 @@ import { test, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 const {
-  saveToolContract, loadToolContract, redactExample, fingerprintSchema,
+  saveToolContract, saveToolContractExample, loadToolContract, redactExample, fingerprintSchema,
   contractFileName, _clearToolContractsForTests,
 } = await import('./tool-contract-store.js');
 
@@ -76,7 +76,7 @@ test('an example records SHAPE, never content — this is a cache, not a copy of
     'no recipient, subject, body or secret may be persisted');
   assert.ok('to' in redacted!, 'the KEYS are the useful part — they are the call shape');
   assert.equal(redacted!.isDraft, true, 'booleans are shape, not content');
-  assert.equal(redacted!.importance, 2, 'numbers are shape, not content');
+  assert.equal(redacted!.importance, '<number>', 'numeric ids/timestamps/amounts are content; only their type survives');
 });
 
 test('a working example survives a schema refresh — losing it re-opens the failure it prevents', () => {
@@ -85,6 +85,42 @@ test('a working example survives a schema refresh — losing it re-opens the fai
   const loaded = loadToolContract('X_TOOL');
   assert.ok(loaded?.exampleArgs, 'a refreshed schema must not discard the known-good call shape');
   assert.equal(loaded!.exampleArgs!.isDraft, true);
+});
+
+test('business/example writes never mint or renew provider schema authority', () => {
+  const observedAt = new Date(Date.now() - 60_000).toISOString();
+  saveToolContract({
+    identifier: 'AUTHORITY_TOOL',
+    schema: SCHEMA,
+    providerObservedAt: observedAt,
+  });
+  saveToolContractExample({ identifier: 'AUTHORITY_TOOL', exampleArgs: { message_id: 'private-id' } });
+  assert.equal(
+    loadToolContract('AUTHORITY_TOOL')?.providerObservedAt,
+    observedAt,
+    'same-schema example capture must preserve the original observation time exactly',
+  );
+  assert.equal(
+    loadToolContract('AUTHORITY_TOOL')?.providerObservedFingerprint,
+    fingerprintSchema(SCHEMA),
+    'the preserved observation stays bound to the exact schema fingerprint',
+  );
+
+  saveToolContract({
+    identifier: 'AUTHORITY_TOOL',
+    schema: { ...SCHEMA, title: 'business-fallback-shape' },
+    exampleArgs: { message_id: 'private-id' },
+  });
+  assert.equal(
+    loadToolContract('AUTHORITY_TOOL')?.providerObservedAt,
+    observedAt,
+    'a schema change without provider metadata cannot replace or downgrade prior authority',
+  );
+  assert.deepEqual(
+    loadToolContract('AUTHORITY_TOOL')?.schema,
+    SCHEMA,
+    'the stale unproven schema itself is rejected, not merely its authority timestamp',
+  );
 });
 
 test('a SUCCESSFUL call teaches the shape; a failed one teaches nothing', async () => {
@@ -101,6 +137,8 @@ test('a SUCCESSFUL call teaches the shape; a failed one teaches nothing', async 
   );
   const learned = loadToolContract('OUTLOOK_CREATE_DRAFT');
   assert.ok(learned?.exampleArgs, 'a success must leave a known-good call shape behind');
+  assert.equal(learned?.providerObservedAt, undefined,
+    'a business success without provider metadata must remain validation-only');
   assert.ok('to' in learned!.exampleArgs!, 'the keys are the recipe');
   assert.doesNotMatch(JSON.stringify(learned!.exampleArgs), /christian|Q3 traffic/i,
     'and still no content, on the path that runs against real mail');

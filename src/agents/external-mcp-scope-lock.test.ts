@@ -157,6 +157,9 @@ test('typed exact lease binds one configured namespace and ambiguous generic ali
   );
   assert.deepEqual(exact, {
     reason: 'worker typed exact external MCP lease',
+    // Stated by the producer: a typed lease binds these tools and no others.
+    // Leaving this to be inferred downstream is what let bounded lanes drift.
+    authority: 'exact',
     allowedServerSlugs: ['notion-mcp'],
     allowedToolNames: ['notion-mcp__read_page'],
     maxTools: 1,

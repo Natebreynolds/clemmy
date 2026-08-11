@@ -7,7 +7,8 @@ import {
   describeCarrierRefusal,
   normalizeComposioArgsPayload,
 } from './composio-carrier.js';
-import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
@@ -22,6 +23,8 @@ import {
   getComposioCredentialStatus,
   getComposioExecutionBackend,
   getComposioRuntimeStatus,
+  searchComposioToolsViaCli,
+  composioToolSchemaObservedAt,
   listCachedToolkits,
   listComposioToolkitTools,
   listUsableConnectedToolkits,
@@ -58,15 +61,41 @@ import {
 import { harnessRunContextStorage, workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
+import { discoveryGovernor } from '../runtime/harness/discovery-governor.js';
+import {
+  settleToolAttempt,
+  ToolAttemptSettlementAuthorityError,
+} from '../runtime/harness/attempt-settlement.js';
+import {
+  authorizeResolvedLogicalCallContract,
+  currentLogicalCall,
+  withLogicalToolCall,
+  withPhysicalDispatch,
+} from '../runtime/harness/attempt-identity.js';
+import { toolOutputContextStorage } from '../runtime/harness/tool-output-context.js';
+import type { AttemptSignals } from '../runtime/harness/attempt-outcome.js';
+import { classifyDiscoveryCall } from '../runtime/harness/discovery-boundary.js';
 import { isTransientStepError } from '../execution/transient-error.js';
 import { asyncJobTimeoutCorrective } from '../runtime/harness/tool-error-corrective.js';
-import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint, findOutlookCalendarReadConstraint, renderToolkitConstraintBanner } from '../runtime/harness/constraint-guard.js';
+import {
+  checkConstraintViolation,
+  formatConstraintEscalation,
+  findEmailDraftAuthoringPreference,
+  findEmailSendConstraint,
+  findOutlookCalendarReadConstraint,
+  renderToolkitConstraintBanner,
+} from '../runtime/harness/constraint-guard.js';
 import { resolveCompliantSenderConnection, extractMailboxEmails } from '../runtime/harness/sender-verify.js';
 import { rememberAccountAlias, resolveAccountAlias, aliasLabelFor } from '../memory/account-alias-store.js';
 import { cachedIdentityEmail, identityProbeAttempted, recordIdentityProbe } from '../integrations/composio/identity-cache.js';
 import { validateComposioArgs, formatBatchValidationError, applyEmailRecipientAliases } from './composio-batch-validator.js';
-import { rememberToolSchema, getCachedToolSchema, ensureToolSchema } from './composio-schema-cache.js';
-import { saveToolContract } from './tool-contract-store.js';
+import {
+  rememberToolSchema,
+  getCachedToolSchema,
+  ensureToolSchema,
+  liveComposioSchemaFingerprint,
+} from './composio-schema-cache.js';
+import { saveToolContractExample } from './tool-contract-store.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import { composioSlugIsReadOnly } from '../integrations/composio/slug-effect.js';
@@ -77,10 +106,12 @@ import {
   suppressConnectionAfterHardAuthFailure,
   type ComposioConnectionSuppressionState,
 } from '../agents/composio-connection-suppression.js';
-import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import { classifyComposioActionConsequence, classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 import { ExternalWritePreDispatchError, ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 import { getComposioCliDefaultAccountAuthority } from '../integrations/composio/cli-default-account-authority.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+import { formatComposioCliDefaultReadAccountRoute } from '../integrations/composio/account-route.js';
+import { normalizeProcedureAccountIdentity } from '../runtime/read-path/procedure-scope.js';
 
 export { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 
@@ -112,15 +143,39 @@ export const COMPOSIO_LIST_TOOLS_PARAMS = {
 
 export const COMPOSIO_SEARCH_TOOLS_PARAMS = {
   query: z.string().min(1),
-  toolkit_slug: z.string().min(1).nullable(),
+  // Some OpenAI-compatible providers encode an omitted optional string as
+  // "". Accept it at the SDK boundary so normalizeOptionalToolkitSlug can
+  // collapse it to null; rejecting before execute burns the one discovery
+  // allowance without ever reaching a provider (observed on the GLM lane).
+  toolkit_slug: z.string().nullable(),
   limit: z.number().int().positive().max(50).nullable(),
 } satisfies z.ZodRawShape;
+
+/** Some OpenAI-compatible providers serialize an optional JSON null as the
+ * literal string "null"/"none". Those sentinel spellings are absence, not a
+ * real Composio toolkit constraint; forwarding them as `--toolkits null`
+ * turns a valid broad search into a false zero-match result. */
+function normalizeOptionalToolkitSlug(value: string | null): string | null {
+  const normalized = value?.trim() ?? '';
+  return !normalized || /^(?:null|none|undefined)$/i.test(normalized)
+    ? null
+    : normalized;
+}
 
 export const COMPOSIO_EXECUTE_TOOL_PARAMS = {
   tool_slug: z.string().min(1),
   arguments: z.string().nullable(),
   connected_account_id: z.string().nullable(),
 } satisfies z.ZodRawShape;
+
+export interface ComposioCliSearchMatch {
+  toolkit: string;
+  slug: string;
+  name: string;
+  description?: string;
+  score: number;
+  inputParameters?: unknown;
+}
 
 type SuppressedConnectedToolkit = ConnectedToolkit & { suppression: { reason?: string; suppressUntil: string } };
 
@@ -589,13 +644,38 @@ export function composioUncertainMutationOutput(
 // FIRST discovery of an intent: once remembered, the choice is injected, the
 // model stops re-searching it, and the hint goes quiet.
 const AUTO_REMEMBER_WINDOW_MS = 5 * 60 * 1000;
-const lastComposioSearchBySession = new Map<string, {
+/**
+ * Attribution belongs to the accepted TASK, not the conversation.
+ *
+ * Keyed by session alone, a search issued for one request could be credited to
+ * the execution of the next one — two tasks in the same chat shared a single
+ * slot, so the later task learned the earlier task's answer. The accepted user
+ * sequence is the task identity everything else here already uses.
+ */
+export function composioSearchAttributionKey(
+  sessionId: string,
+  sourceUserSeq?: number,
+): string {
+  const seq = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+    ? sourceUserSeq
+    : harnessRunContextStorage.getStore()?.sourceUserSeq;
+  return Number.isSafeInteger(seq) && (seq ?? 0) > 0 ? `${sessionId}#${seq}` : sessionId;
+}
+
+interface ComposioSearchRecord {
+  /** Distinguishes concurrent searches within one accepted task. */
+  searchId: string;
   query: string;
   at: number;
   slugs?: string[];
   fromMemory?: boolean;
   useIdsBySlug?: Record<string, string>;
-}>();
+}
+
+/** How many in-flight searches one accepted task may keep correlatable. */
+const MAX_TRACKED_SEARCHES_PER_TASK = 8;
+
+const lastComposioSearchBySession = new Map<string, ComposioSearchRecord[]>();
 
 // F2 — cross-call reconnect breaker. 90870d8c stops the WITHIN-call retry, but the
 // 15-call thrash was the MODEL re-calling composio_execute_tool for the same dead
@@ -739,20 +819,243 @@ export function noteComposioSearchIntent(
   if (lastComposioSearchBySession.size > 500) {
     const cutoff = Date.now() - AUTO_REMEMBER_WINDOW_MS;
     for (const [k, v] of lastComposioSearchBySession) {
-      if (v.at < cutoff) lastComposioSearchBySession.delete(k);
+      const live = v.filter((entry) => entry.at >= cutoff);
+      if (live.length > 0) lastComposioSearchBySession.set(k, live);
+      else lastComposioSearchBySession.delete(k);
     }
   }
-  const replaced = lastComposioSearchBySession.get(sessionId);
-  if (replaced?.useIdsBySlug) {
-    for (const useId of Object.values(replaced.useIdsBySlug)) cancelToolProcedureUse(useId);
-  }
-  lastComposioSearchBySession.set(sessionId, {
+  const key = composioSearchAttributionKey(sessionId);
+  // Many searches, not one slot. A long task legitimately searches more than
+  // once, and the single-slot store meant the second search silently cancelled
+  // the first — so an execute could be credited to a search that never
+  // surfaced its slug. Searches now coexist and are matched by what they found.
+  const searches = lastComposioSearchBySession.get(key) ?? [];
+  searches.push({
+    searchId: `search-${searches.length + 1}-${Date.now().toString(36)}`,
     query: query.trim(),
     at: Date.now(),
     slugs: slugs && slugs.length > 0 ? slugs.slice(0, 60) : undefined,
     fromMemory: options.fromMemory,
     useIdsBySlug: options.useIdsBySlug,
   });
+  // Bounded per task; the oldest search is the one least likely to be credited.
+  while (searches.length > MAX_TRACKED_SEARCHES_PER_TASK) {
+    const dropped = searches.shift();
+    for (const useId of Object.values(dropped?.useIdsBySlug ?? {})) cancelToolProcedureUse(useId);
+  }
+  lastComposioSearchBySession.set(key, searches);
+}
+
+/**
+ * The search that actually surfaced this slug.
+ *
+ * Correlation is by RESULT, not recency: when two searches are in flight for
+ * one task, crediting the newest would teach the wrong query for the slug. A
+ * search that named the slug wins; only when none did does the most recent
+ * stand in, and then only for a search that recorded no candidates at all.
+ */
+function composioSearchForSlug(
+  key: string,
+  toolSlug: string,
+): ComposioSearchRecord | undefined {
+  const searches = lastComposioSearchBySession.get(key) ?? [];
+  const slug = toolSlug.trim().toUpperCase();
+  const surfaced = searches.filter(
+    (candidate) => candidate.slugs?.some((entry) => entry.trim().toUpperCase() === slug),
+  );
+  // Exactly one search surfaced this slug — that search owns the execution.
+  if (surfaced.length === 1) return surfaced[0];
+  // Two outstanding searches both surfaced it: which query taught this slug is
+  // genuinely unknown, and guessing would write the wrong intent into memory
+  // for good. Decline to attribute; the call still runs, it just teaches
+  // nothing.
+  if (surfaced.length > 1) return undefined;
+  const untargeted = searches.filter((candidate) => !candidate.slugs);
+  return untargeted.length === 1 ? untargeted[0] : undefined;
+}
+
+function forgetComposioSearch(key: string, record: ComposioSearchRecord): void {
+  const searches = lastComposioSearchBySession.get(key) ?? [];
+  const remaining = searches.filter((entry) => entry.searchId !== record.searchId);
+  if (remaining.length > 0) lastComposioSearchBySession.set(key, remaining);
+  else lastComposioSearchBySession.delete(key);
+}
+
+/** Persist only the bounded, schema-backed result of discovery for the exact
+ * accepted source. A later clarification answer may reuse these identifiers
+ * after restart, but never the search query, arguments, or execution rights. */
+/**
+ * A candidate failed, so the task may search again.
+ *
+ * The trigger is an OBSERVED failed dispatch, never anything the model claims,
+ * and the governor still refuses to advance an epoch that has budget left. So
+ * this reopens discovery exactly once per dead end, which is the number of
+ * times a dead end is worth reopening it.
+ */
+/**
+ * A thrown Composio failure, settled once through the shared kernel.
+ *
+ * These exits used to return a rendered banner and nothing else — the typed
+ * reason existed for one stack frame and then became prose, so a dead candidate
+ * never gave its discovery budget back and a reconnect never became a
+ * conversational blocker.
+ */
+/**
+ * The exact callable contract, rendered for repair.
+ *
+ * Bounded on purpose — required fields, their types, and the accepted keys.
+ * Enough to correct the call, not so much that a schema dump displaces the
+ * work. Returns '' when no schema is available, so this can never make an
+ * error message worse.
+ */
+function renderCallableContract(toolSlug: string, schema: unknown): string {
+  const shape = schema && typeof schema === 'object' ? schema as Record<string, unknown> : null;
+  const properties = shape?.properties && typeof shape.properties === 'object'
+    ? shape.properties as Record<string, Record<string, unknown>>
+    : null;
+  if (!properties) return '';
+  const required = new Set(Array.isArray(shape?.required) ? shape.required as string[] : []);
+  const lines = Object.entries(properties).slice(0, 24).map(([name, spec]) => {
+    const type = typeof spec?.type === 'string' ? spec.type : 'any';
+    return `  ${name}${required.has(name) ? '*' : ''}: ${type}`;
+  });
+  if (lines.length === 0) return '';
+  return `\n\nCallable contract for ${toolSlug} (* = required):\n${lines.join('\n')}`
+    + '\nCorrect the arguments and call it again; this attempt never dispatched.';
+}
+
+/** A typed gateway refusal that never reached the provider. The reason decides
+ *  recovery structurally; provider prose is never parsed to recover it. */
+function settleComposioPreDispatchRefusal(
+  toolSlug: string,
+  reason: ComposioGatewayBlockReason,
+  args: Record<string, unknown>,
+  schema?: unknown,
+): void {
+  const run = harnessRunContextStorage.getStore();
+  const invocation = toolOutputContextStorage.getStore();
+  const reasonSignals: AttemptSignals = reason === 'invalid-args'
+    ? { argumentValidationFailed: true, schemaAvailable: Boolean(schema) }
+    : reason === 'ambiguous-account' || reason === 'identity-absent'
+      ? { needsUserInput: true }
+      : reason === 'not-connected'
+        ? { connectionMissing: true }
+        : { policyRefused: true };
+  try {
+    settleToolAttempt({
+      sessionId: run?.sessionId,
+      sourceUserSeq: run?.sourceUserSeq,
+      turn: run?.turn,
+      lane: 'composio',
+      toolName: toolSlug,
+      ...(invocation?.settlementNonce ? { callId: invocation.settlementNonce } : {}),
+      args,
+      // Nothing dispatched, so nothing is uncertain — even for a write.
+      mutating: false,
+      businessCall: classifyDiscoveryCall(toolSlug, args) === null,
+      signals: {
+        preDispatch: true,
+        ...reasonSignals,
+      },
+    });
+  } catch (error) {
+    if (error instanceof ToolAttemptSettlementAuthorityError) throw error;
+    // Classification/telemetry defects remain secondary to the typed refusal.
+  }
+}
+
+/** Settlement is runtime truth, so it lives on the synchronous dispatch path—
+ * never inside best-effort procedural learning. */
+function settleComposioReturned(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  result: unknown,
+  continuesRequirement = false,
+): void {
+  const run = harnessRunContextStorage.getStore();
+  const invocation = toolOutputContextStorage.getStore();
+  try {
+    settleToolAttempt({
+      sessionId: run?.sessionId,
+      sourceUserSeq: run?.sourceUserSeq,
+      turn: run?.turn,
+      lane: 'composio',
+      toolName: toolSlug,
+      args,
+      ...(invocation?.settlementNonce ? { callId: invocation.settlementNonce } : {}),
+      mutating: classifyComposioSlugEffect(toolSlug) !== 'read',
+      businessCall: classifyDiscoveryCall(toolSlug, args) === null,
+      result,
+      ...(continuesRequirement ? { continuesRequirement: true } : {}),
+    });
+  } catch (error) {
+    if (error instanceof ToolAttemptSettlementAuthorityError) throw error;
+    // Non-authority bookkeeping remains fail-open for the provider result.
+  }
+}
+
+function settleComposioThrown(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  thrown: unknown,
+  signals: AttemptSignals = {},
+): void {
+  const run = harnessRunContextStorage.getStore();
+  try {
+    settleToolAttempt({
+      sessionId: run?.sessionId,
+      sourceUserSeq: run?.sourceUserSeq,
+      turn: run?.turn,
+      lane: 'composio',
+      toolName: toolSlug,
+      args,
+      ...(toolOutputContextStorage.getStore()?.settlementNonce
+        ? { callId: toolOutputContextStorage.getStore()!.settlementNonce }
+        : {}),
+      mutating: classifyComposioSlugEffect(toolSlug) !== 'read',
+      businessCall: classifyDiscoveryCall(toolSlug, args) === null,
+      thrown,
+      signals,
+    });
+  } catch (error) {
+    if (error instanceof ToolAttemptSettlementAuthorityError) throw error;
+    // Non-authority bookkeeping remains fail-open for the provider error.
+  }
+}
+
+function recordDiscoveredComposioCapabilities(
+  matches: ReadonlyArray<{ slug: string }>,
+): void {
+  const run = harnessRunContextStorage.getStore();
+  if (!run?.sessionId || !Number.isSafeInteger(run.sourceUserSeq) || (run.sourceUserSeq ?? 0) <= 0) return;
+  const capabilities = matches
+    .filter((match) => match.slug && match.slug !== '__toolkit_error__')
+    .slice(0, 10)
+    .map((match) => {
+      const schemaFingerprint = liveComposioSchemaFingerprint(match.slug);
+      return {
+        kind: 'composio',
+        identifier: match.slug,
+        effectClass: classifyComposioSlugEffect(match.slug) === 'read' ? 'read' : 'write',
+        ...(schemaFingerprint ? { schemaFingerprint } : {}),
+      };
+    })
+    // A search hint without an executable schema is not continuity evidence.
+    .filter((capability) => Boolean(capability.schemaFingerprint));
+  if (capabilities.length === 0) return;
+  try {
+    appendEvent({
+      sessionId: run.sessionId,
+      turn: Number.isSafeInteger(run.turn) && (run.turn ?? 0) > 0 ? run.turn as number : 0,
+      role: 'system',
+      type: 'capability_discovered',
+      data: {
+        sourceUserSeq: run.sourceUserSeq,
+        ...(run.runAttemptId ? { attemptId: run.runAttemptId } : {}),
+        capabilities,
+      },
+    });
+  } catch { /* continuation evidence must never break discovery */ }
 }
 
 /** The honest intent behind an execute, for outcome learning: the session's
@@ -762,7 +1065,10 @@ export function noteComposioSearchIntent(
  *  must never label this slug's outcome stats. Read-only — never consumes the
  *  session entry (auto-remember owns deletion). */
 export function executionIntentForSession(sessionId: string | undefined, toolSlug: string): string {
-  const pending = sessionId ? lastComposioSearchBySession.get(sessionId) : undefined;
+  // The search that surfaced THIS slug — not merely the latest one.
+  const pending = sessionId
+    ? composioSearchForSlug(composioSearchAttributionKey(sessionId), toolSlug)
+    : undefined;
   const fresh = Boolean(pending && Date.now() - pending.at <= AUTO_REMEMBER_WINDOW_MS);
   const surfacedThisSlug = Boolean(pending?.slugs?.includes(toolSlug));
   return (fresh && surfacedThisSlug ? pending?.query.trim() : undefined)
@@ -799,27 +1105,31 @@ export function isCrossServiceToolkitMismatch(query: string, slug: string, known
 
 /**
  * The STABLE account identity behind a dispatch: the connected account's
- * email, never the rotating ca_ connection id. Only meaningful when the
- * toolkit has >1 connection (a single-account toolkit needs no
- * disambiguation, and binding it would just go stale). Zero network — the
- * connections snapshot is the SWR cache already in hand. Fail-open: identity
- * capture must never break learning or a tool call.
+ * email, never the rotating ca_ connection id. Single-account toolkits bind
+ * the same stable identity too: re-auth rotates the connection, not the
+ * mailbox. Zero extra discovery — the connections snapshot is the gateway's
+ * SWR source. Fail-open: identity capture must never break the tool call.
  */
-async function stableComposioAccountIdentity(
+export function stableComposioAccountIdentityFromSnapshot(
   toolSlug: string,
   connectionId: string | undefined,
-): Promise<string | undefined> {
+  resolvedIdentity: string | undefined,
+  connections: readonly ConnectedToolkit[],
+): string | undefined {
   if (!connectionId) return undefined;
   try {
-    const conns = await listUsableConnectedToolkits();
     const lower = toolSlug.toLowerCase();
-    const forToolkit = conns.filter((c) => {
+    const forToolkit = connections.filter((c) => {
       const s = (c.slug ?? '').toLowerCase();
       return s && (lower === s || lower.startsWith(`${s}_`));
     });
-    if (forToolkit.length <= 1) return undefined;
-    const email = forToolkit.find((c) => c.connectionId === connectionId)?.accountEmail?.trim().toLowerCase();
-    return email && email.includes('@') ? email : undefined;
+    const raw = forToolkit.find((c) => c.connectionId === connectionId)?.accountEmail;
+    const email = normalizeProcedureAccountIdentity(raw);
+    if (!email.includes('@')) return undefined;
+    const routed = resolvedIdentity === undefined
+      ? ''
+      : normalizeProcedureAccountIdentity(resolvedIdentity);
+    return routed && routed !== email ? undefined : email;
   } catch {
     return undefined;
   }
@@ -852,17 +1162,19 @@ export async function maybeAutoRememberComposioChoice(
     // only; the store redacts every value that could carry content.
     if (!failed) {
       try {
-        saveToolContract({
+        saveToolContractExample({
           identifier: toolSlug,
-          schema: getCachedToolSchema(toolSlug) ?? { type: 'object' },
           exampleArgs: args,
         });
       } catch { /* learning an example must never affect the call that succeeded */ }
     }
     const sid = sessionId;
-    const pending = sid ? lastComposioSearchBySession.get(sid) : undefined;
+    // Consume only the search this slug actually came from; a sibling search
+    // still in flight for the same task keeps its own attribution.
+    const attributionKey = sid ? composioSearchAttributionKey(sid) : '';
+    const pending = sid ? composioSearchForSlug(attributionKey, toolSlug) : undefined;
     const pendingFresh = Boolean(pending && Date.now() - pending.at <= AUTO_REMEMBER_WINDOW_MS);
-    if (sid && pending) lastComposioSearchBySession.delete(sid);
+    if (sid && pending) forgetComposioSearch(attributionKey, pending);
     const selectedUseId = pendingFresh ? pending?.useIdsBySlug?.[toolSlug] : undefined;
     if (pending?.useIdsBySlug) {
       for (const useId of Object.values(pending.useIdsBySlug)) {
@@ -1032,12 +1344,19 @@ export function normalizeInlineConnectedAccountId(
   connectedAccountId: string | undefined,
 ): { args: Record<string, unknown>; connectedAccountId: string | undefined } {
   const inline = args.connected_account_id ?? args.connectedAccountId;
-  let effectiveConnectionId = connectedAccountId;
+  const normalizeOptionalConnection = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const trimmed = value.trim();
+    return trimmed && !/^(?:null|none|undefined)$/i.test(trimmed)
+      ? trimmed
+      : undefined;
+  };
+  // OpenAI-compatible providers sometimes stringify an optional JSON null on
+  // the outer broker argument. Treat those spellings exactly like an omitted
+  // selector; they are never a real Composio connection id.
+  let effectiveConnectionId = normalizeOptionalConnection(connectedAccountId);
   if (!effectiveConnectionId && typeof inline === 'string') {
-    const trimmed = inline.trim();
-    if (trimmed && !['null', 'undefined', 'none'].includes(trimmed.toLowerCase())) {
-      effectiveConnectionId = trimmed;
-    }
+    effectiveConnectionId = normalizeOptionalConnection(inline);
   }
   delete args.connected_account_id;
   delete args.connectedAccountId;
@@ -1271,6 +1590,7 @@ function withEnrichedIdentities(conns: ConnectedToolkit[]): ConnectedToolkit[] {
 // CLI/SDK dispatch. Every block is ledgered (guardrail_tripped:composio_gateway).
 
 export type ComposioGatewayBlockReason =
+  | 'worker-compose-only' // run_worker may read/compose; only its parent commits the immutable batch
   | 'ambiguous-account'  // >1 distinct mailbox, no disambiguator → ASK
   | 'identity-absent'    // required/remembered mailbox no longer connected → ASK
   | 'constraint'         // standing-rule block (sender mismatch etc.)
@@ -1295,6 +1615,12 @@ export interface ComposioGatewayResolved {
   connectionId?: string;
   /** Normalized mailbox identity of the owner, when known. */
   identity?: string;
+  /** Immutable contract fingerprint captured at gateway validation, before
+   * provider I/O. */
+  schemaFingerprint?: string;
+  /** Final addressable owner↔stable-identity proof from the same gateway
+   * snapshot. Absent means learning must remain unbound/non-executable. */
+  accountIdentityProof?: { connectionId: string; identity: string };
   /** True when a standing sender rule verified the route (surface the sender-verify note). */
   senderVerified: boolean;
   /** Human-readable route notes to append to the tool output. */
@@ -1302,6 +1628,55 @@ export interface ComposioGatewayResolved {
 }
 
 export type ComposioGatewayResolution = ComposioGatewayResolved | ComposioGatewayBlocked;
+
+interface ClosedNoArgReadRepair {
+  args: Record<string, unknown>;
+  note: string;
+}
+
+/** A current, closed no-argument READ contract has one useful projection: {}.
+ *
+ * This is deliberately narrower than generic argument coercion. It does not
+ * touch writes, schemas with any declared property/pattern, stale validation-
+ * only contracts, or contracts whose other keywords could make the empty
+ * object invalid. In that exact lane, retaining an invented field can only buy
+ * a deterministic provider rejection and another model/tool turn; removing it
+ * preserves the requested fresh read while making the repair visible in the
+ * returned tool note. */
+function repairClosedNoArgRead(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  schema: Record<string, unknown> | null,
+): ClosedNoArgReadRepair | null {
+  if (classifyComposioSlugEffect(toolSlug) !== 'read'
+    || !schema
+    || !liveComposioSchemaFingerprint(toolSlug)
+    || schema.type !== 'object'
+    || schema.additionalProperties !== false
+    || !isRecord(schema.properties)
+    || Object.keys(schema.properties).length !== 0
+    || Object.keys(args).length === 0) return null;
+
+  const required = schema.required;
+  if (required !== undefined && (!Array.isArray(required) || required.length > 0)) return null;
+  const patterns = schema.patternProperties;
+  if (patterns !== undefined && (!isRecord(patterns) || Object.keys(patterns).length > 0)) return null;
+  const minProperties = schema.minProperties;
+  if (minProperties !== undefined && minProperties !== 0) return null;
+  // These applicators can reject {} even though the local object surface is
+  // closed. Without a full schema evaluator, abstaining is the safe choice.
+  if (['$ref', 'const', 'enum', 'not', 'allOf', 'anyOf', 'oneOf', 'if', 'then', 'else']
+    .some((key) => Object.prototype.hasOwnProperty.call(schema, key))) return null;
+
+  const removed = Object.keys(args).sort();
+  return {
+    args: {},
+    note:
+      `[argument-repair] ${toolSlug} is a read whose current provider schema accepts exactly {}. `
+      + `Removed unsupported argument field(s) before dispatch: ${removed.join(', ')}. `
+      + 'A fresh provider read was still dispatched; no earlier result was replayed.',
+  };
+}
 
 interface ComposioDispatchLaneStatus {
   executionBackend: 'auto' | 'sdk' | 'cli';
@@ -1380,6 +1755,10 @@ export interface ComposioGatewayOptions {
   userInput?: string;
   /** Caller-supplied mailbox preference (email) — wins over recall. */
   preferredIdentity?: string;
+  /** Exact-identity callers (the governed warm lane) may forbid profile-probe
+   * enrichment and sticky fallback. Absence/mismatch then returns a typed
+   * block instead of approaching a provider to discover another identity. */
+  strictPreferredIdentity?: boolean;
 }
 
 /** Exact gateway-resolved call handed to a correctness-critical dispatch
@@ -1390,6 +1769,7 @@ export interface ComposioDispatchBoundaryContext {
   args: Record<string, unknown>;
   connectionId?: string;
   identity?: string;
+  schemaFingerprint?: string;
 }
 
 export type ComposioDispatchBoundary = (
@@ -1481,18 +1861,39 @@ function stickyRunAccount(
   return { connectionId, identity: use.identity };
 }
 
+
 export async function resolveComposioDispatch(
   toolSlug: string,
   rawArgs: Record<string, unknown>,
   connectedAccountId: string | undefined,
   opts: ComposioGatewayOptions = {},
 ): Promise<ComposioGatewayResolution> {
+  const activeRun = harnessRunContextStorage.getStore();
+  const sid = opts.sessionId ?? activeRun?.sessionId;
+  // COMPOSE -> COMMIT: a run_worker child may gather provider data and reason
+  // about one item, but it never owns the external commit. Refuse a mutation at
+  // THE shared Composio gateway before connection lookup, schema hydration, or
+  // provider I/O. The explicit workerScope bit survives both the nested
+  // @openai/agents lane and Claude SDK's in-process/stdio MCP transport; it is
+  // deliberately independent of the optional thrash-guard scope and does not
+  // conflate workflow steps with workers.
+  if (activeRun?.workerScope === true && classifyComposioSlugEffect(toolSlug) !== 'read') {
+    const toolkit = registeredToolkitOfSlug(toolSlug);
+    const message = [
+      `WORKER_COMPOSE_ONLY: ${toolSlug} is a mutating Composio action, so this worker did not dispatch it.`,
+      'No provider dispatch was started. Finish any required reads/reasoning, then return the parent one exact per-item payload shaped as {"id":"<stable item id>","composioSlug":"<exact slug>","args":{...},"account_alias":"<stable email or saved alias, only when supplied>"}.',
+      'The parent must validate and aggregate the worker payloads, call run_batch action="propose" once, and execute that one immutable pending batch only after its single approval. Do not call run_batch or pending-action commit tools from the worker.',
+    ].join(' ');
+    emitComposioGatewayBlock(sid, toolSlug, 'worker-compose-only', {
+      guard: 'worker-compose-then-parent-commit',
+    });
+    return { ok: false, reason: 'worker-compose-only', message, toolkit };
+  }
   revalidateStaleSuppressionsOnce();
   const toolkit = registeredToolkitOfSlug(toolSlug);
   const normalized = normalizeInlineConnectedAccountId(rawArgs, connectedAccountId);
   let args = normalized.args;
   const pinned = normalized.connectedAccountId;
-  const sid = opts.sessionId;
   const notes: string[] = [];
   const credentials = getComposioCredentialStatus();
   const cliOnlyLane = composioExecutionUsesCliOnlyLane(credentials);
@@ -1537,6 +1938,8 @@ export async function resolveComposioDispatch(
   // Standard SDK and AUTO-with-key routing does not enter this branch.
   const recalledIdentity = recallComposioAccountIdentity(toolSlug);
   const preferredIdentity = opts.preferredIdentity?.trim();
+  const draftPreference = findEmailDraftAuthoringPreference(toolSlug);
+  const draftPreferredIdentity = draftPreference?.preferredAccount;
   const cliAccountRoute = pinned
     ? {
       description: `connected_account_id "${pinned}"`,
@@ -1552,13 +1955,18 @@ export async function resolveComposioDispatch(
           description: `preferred account identity "${preferredIdentity}"`,
           recovery: 'clear the preferred identity for this request and retry without it',
         }
-        : recalledIdentity
+        : draftPreferredIdentity
           ? {
-            description: `remembered account identity "${recalledIdentity}" from Tool Memory`,
-            recovery:
-              'remove this action route from Tool Memory (for example, use tool_choice_forget for the matching intent) and retry',
+            description: `standing Outlook draft mailbox preference "${draftPreferredIdentity}"`,
+            recovery: 'use an account-addressable SDK route or explicitly name another account for this draft',
           }
-          : undefined;
+          : recalledIdentity
+            ? {
+              description: `remembered account identity "${recalledIdentity}" from Tool Memory`,
+              recovery:
+                'remove this action route from Tool Memory (for example, use tool_choice_forget for the matching intent) and retry',
+            }
+            : undefined;
   if (cliOnlyLane && cliAccountRoute) {
     const message =
       `⚠️ NEEDS-YOUR-CHOICE: ${toolkit} was not started because this call selected ${cliAccountRoute.description}. ` +
@@ -1589,9 +1997,7 @@ export async function resolveComposioDispatch(
       `[account-route] Using the Composio CLI default "${cliDefaultAuthority.label}" under operator authority scoped specifically to ${toolkit}; the CLI cannot target a connected_account_id.`,
     );
   } else if (cliOnlyLane && !cliDefaultWrite) {
-    notes.push(
-      `[account-route] Read through the authenticated Composio CLI's provider-side ${toolkit} default; no connected_account_id was selected or claimed.`,
-    );
+    notes.push(formatComposioCliDefaultReadAccountRoute(toolkit));
   }
 
   // One SWR snapshot reused by every stage below (breaker verify + identity).
@@ -1606,7 +2012,9 @@ export async function resolveComposioDispatch(
     const t = toolSlug.toLowerCase();
     return s && (t === s || t.startsWith(`${s}_`));
   });
-  const usable = toolkitConns.filter((c) => /active|enabled|initiat/i.test(c.status ?? ''));
+  const usable = toolkitConns.filter((c) => opts.strictPreferredIdentity
+    ? /^(active|enabled)$/i.test((c.status ?? '').trim())
+    : /active|enabled|initiat/i.test(c.status ?? ''));
   let emptySnapshotRuntime: Awaited<ReturnType<typeof getComposioRuntimeStatus>> | null = null;
 
   // FIRST-CALL connection gate. A managed/BYO toolkit with no usable account is
@@ -1629,9 +2037,15 @@ export async function resolveComposioDispatch(
       emitComposioGatewayBlock(sid, toolSlug, 'not-connected');
       return { ok: false, reason: 'not-connected', message, toolkit };
     }
-    notes.push(cliDefaultWrite
-      ? `[account-route] The authenticated Composio CLI will use the operator-authorized ${toolkit} default; no targetable SDK account snapshot is configured.`
-      : `[account-route] The authenticated Composio CLI will read its ${toolkit} default; no targetable SDK account snapshot is configured.`);
+    if (cliDefaultWrite) {
+      notes.push(`[account-route] The authenticated Composio CLI will use the operator-authorized ${toolkit} default; no targetable SDK account snapshot is configured.`);
+    } else {
+      // The CLI-only read lane already emitted this exact harness-owned route
+      // above. Keep one canonical line so downstream authority parsing is
+      // identical for no-auth proof toolkits and account-bearing providers.
+      const readRoute = formatComposioCliDefaultReadAccountRoute(toolkit);
+      if (!notes.includes(readRoute)) notes.push(readRoute);
+    }
   }
 
   // Unknown/no-auth toolkits can still run through an authenticated CLI or SDK
@@ -1692,6 +2106,7 @@ export async function resolveComposioDispatch(
   // EMAIL is accepted directly as the identity hint (the model often knows the
   // address from a memory fact before a name binding exists).
   let aliasHint: string | undefined;
+  let unresolvedAlias: string | undefined;
   if (!owner && aliasArg) {
     if (aliasArg.includes('@')) {
       aliasHint = aliasArg.toLowerCase();
@@ -1703,9 +2118,34 @@ export async function resolveComposioDispatch(
         owner = alias.connectionId;
         notes.push(`[account-route] Routed to your saved "${alias.label}" ${toolkit} account.`);
       } else {
-        notes.push(`[account-memory] No saved ${toolkit} account named "${aliasArg}" — resolving normally. To save it: re-call with connected_account_id + account_alias.`);
+        unresolvedAlias = aliasArg;
       }
     }
+  }
+
+  // `account_alias` is an explicit current-turn selector. If it cannot resolve,
+  // do not silently fall through to a standing rule, sticky choice, or provider
+  // default — that would make the user's named account lose to older memory.
+  if (!owner && unresolvedAlias) {
+    const candidates = usable.map((candidate) => ({
+      email: candidate.accountEmail,
+      connectionId: candidate.connectionId,
+    }));
+    const message =
+      `⚠️ NEEDS-YOUR-CHOICE: no saved ${toolkit} account named "${unresolvedAlias}" is attached to a live connection. `
+      + 'Choose a live connected_account_id and re-call it together with this account_alias to bind the stable name. '
+      + 'No provider dispatch was started.';
+    emitComposioGatewayBlock(sid, toolSlug, 'identity-absent', {
+      candidates: candidates.map((candidate) => candidate.email ?? candidate.connectionId),
+      guard: 'explicit-account-alias-unresolved',
+    });
+    return {
+      ok: false,
+      reason: 'identity-absent',
+      message,
+      toolkit,
+      candidates,
+    };
   }
 
   if (!owner) {
@@ -1743,9 +2183,19 @@ export async function resolveComposioDispatch(
     return { ok: false, reason: 'constraint', message, toolkit };
   }
   if (!owner && !ruleOwnedSend) {
-    const hint = opts.preferredIdentity ?? aliasHint ?? recalledIdentity;
+    // Current-turn routing always wins. For reversible Outlook draft creation,
+    // the standing sender mailbox is then a stable preference ahead of generic
+    // per-slug recall; this avoids re-asking without granting send authority.
+    const hint = opts.preferredIdentity ?? aliasHint ?? draftPreferredIdentity ?? recalledIdentity;
+    const draftPreferenceOwnsHint = Boolean(
+      draftPreference
+      && draftPreferredIdentity
+      && !opts.preferredIdentity
+      && !aliasHint,
+    );
     let outcome = selectToolkitConnection(toolSlug, conns, hint);
-    if (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent') {
+    if (!opts.strictPreferredIdentity
+      && (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent')) {
       // Identity enrichment before blocking: probe unidentified candidates ONCE
       // (cached durably) — same-mailbox re-auths then merge, and a named/
       // recalled mailbox can match. Only then is a residual ambiguity real.
@@ -1759,14 +2209,26 @@ export async function resolveComposioDispatch(
       owner = outcome.connectionId;
       identity = outcome.identity;
       if (hint && outcome.identity === hint) {
-        const label = aliasLabelFor(toolkit, hint);
-        notes.push(`[account-route] Routed to your ${label ? `"${label}" (${hint})` : `remembered ${hint}`} ${toolkit} account.`);
+        if (draftPreferenceOwnsHint) {
+          notes.push(
+            `[account-route] Routed reversible Outlook draft authoring to ${hint} from standing rule #${draftPreference!.constraint.id}; sending remains separately verified.`,
+          );
+        } else {
+          const label = aliasLabelFor(toolkit, hint);
+          notes.push(`[account-route] Routed to your ${label ? `"${label}" (${hint})` : `remembered ${hint}`} ${toolkit} account.`);
+        }
       }
     } else if (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent') {
       // Ask-at-most-once: an account already chosen for this toolkit IN THIS
       // RUN answers the question — the user should never be re-interrogated
       // per call for a choice they already made.
-      const sticky = stickyRunAccount(toolkit, usable);
+      // Stickiness answers an otherwise-open account question; it must never
+      // override an exact selector. A current-turn alias and the standing
+      // Outlook draft mailbox preference both own their identity hint even
+      // when that mailbox is no longer live, so absence stays a typed block.
+      const sticky = opts.strictPreferredIdentity || aliasArg || draftPreferenceOwnsHint
+        ? undefined
+        : stickyRunAccount(toolkit, usable);
       if (sticky) {
         owner = sticky.connectionId;
         identity = sticky.identity ?? identity;
@@ -1817,6 +2279,7 @@ export async function resolveComposioDispatch(
 
   // Suppression policy (skipped when the sender rule owns the route, as before).
   if (!gate.routeConnectedAccountId) {
+    const ownerBeforeSuppression = owner;
     const route = applySuppressedComposioConnectionPolicy(
       toolSlug,
       owner,
@@ -1826,8 +2289,35 @@ export async function resolveComposioDispatch(
       emitComposioGatewayBlock(sid, toolSlug, 'suppressed');
       return { ok: false, reason: 'suppressed', message: route.block, toolkit };
     }
+    if (opts.strictPreferredIdentity && ownerBeforeSuppression
+      && route.connectedAccountId !== ownerBeforeSuppression) {
+      const message = `The exact ${toolkit} account selected for this read is suppressed and cannot be replaced by a provider default. Reconnect that account and retry.`;
+      emitComposioGatewayBlock(sid, toolSlug, 'suppressed', {
+        guard: 'strict-preferred-identity-suppressed',
+      });
+      return { ok: false, reason: 'suppressed', message, toolkit };
+    }
     owner = route.connectedAccountId;
     if (route.note) notes.push(route.note);
+  }
+
+  // The governed warm lane requires an addressable, exact account all the way
+  // through resolution. No default, sticky, unidentified, suppressed, or
+  // policy-rewritten owner may inherit the requested identity string.
+  if (opts.strictPreferredIdentity) {
+    let wanted = '';
+    try { wanted = normalizeProcedureAccountIdentity(opts.preferredIdentity); } catch { /* block below */ }
+    const selected = owner ? usable.find((connection) => connection.connectionId === owner) : undefined;
+    let selectedIdentity = '';
+    try { selectedIdentity = normalizeProcedureAccountIdentity(selected?.accountEmail); } catch { /* block below */ }
+    if (!wanted || !owner || !selected || selectedIdentity !== wanted) {
+      const message = `The exact preferred ${toolkit} account is not currently available as an active, addressable connection. No provider dispatch was started.`;
+      emitComposioGatewayBlock(sid, toolSlug, 'identity-absent', {
+        guard: 'strict-preferred-identity-unresolved',
+      });
+      return { ok: false, reason: 'identity-absent', message, toolkit };
+    }
+    identity = selectedIdentity;
   }
 
   // SEND SAFETY NET: an irreversible send must NEVER dispatch with an unresolved
@@ -1916,7 +2406,13 @@ export async function resolveComposioDispatch(
   // required fields instead of a heuristic (live 2026-08-07: two paid 400s for
   // an APIFY_RUN_ACTOR with no actorId). Fail-open — an unavailable schema
   // simply keeps the previous heuristic behavior.
-  const validation = validateComposioArgs(toolSlug, args, await ensureToolSchema(toolSlug));
+  const dispatchSchema = await ensureToolSchema(toolSlug);
+  const noArgReadRepair = repairClosedNoArgRead(toolSlug, args, dispatchSchema);
+  if (noArgReadRepair) {
+    args = noArgReadRepair.args;
+    notes.push(noArgReadRepair.note);
+  }
+  const validation = validateComposioArgs(toolSlug, args, dispatchSchema);
   if (validation.error) {
     const message = formatBatchValidationError(validation.error, toolSlug, validation.mode);
     emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
@@ -1924,7 +2420,30 @@ export async function resolveComposioDispatch(
       field: validation.error.field,
       validationReason: validation.error.reason,
     });
-    return { ok: false, reason: 'invalid-args', message, toolkit };
+    // A refusal that never dispatched is the most repairable failure there is,
+    // and the contract that would repair it is already loaded above. Handing
+    // back only a banner is what turned one wrong argument into a hunt for a
+    // different tool: the model could tell the call failed and not what to fix.
+    return {
+      ok: false,
+      reason: 'invalid-args',
+      message: `${message}${renderCallableContract(toolSlug, dispatchSchema)}`,
+      toolkit,
+    };
+  }
+
+  let accountIdentityProof: ComposioGatewayResolved['accountIdentityProof'];
+  if (owner) {
+    const finalConnection = usable.find((connection) => connection.connectionId === owner);
+    let snapshotIdentity = '';
+    let routedIdentity = '';
+    try { snapshotIdentity = normalizeProcedureAccountIdentity(finalConnection?.accountEmail); } catch { /* unbound */ }
+    try { routedIdentity = normalizeProcedureAccountIdentity(identity); } catch { /* unbound */ }
+    if (finalConnection && snapshotIdentity
+      && (!routedIdentity || routedIdentity === snapshotIdentity)) {
+      identity = snapshotIdentity;
+      accountIdentityProof = { connectionId: owner, identity: snapshotIdentity };
+    }
   }
 
   // A positively resolved account is this run's answer to the account
@@ -1934,7 +2453,20 @@ export async function resolveComposioDispatch(
     recordRunToolkitAccountUse(toolkit, owner, identity, Boolean(pinned) || Boolean(aliasArg));
   }
 
-  return { ok: true, args, connectionId: owner, identity, senderVerified, notes };
+  // No await between validation and this capture: this is the exact contract
+  // the dispatch attempt validated, not whatever happens to be live after the
+  // provider returns.
+  const schemaFingerprint = liveComposioSchemaFingerprint(toolSlug);
+  return {
+    ok: true,
+    args,
+    connectionId: owner,
+    identity,
+    ...(schemaFingerprint ? { schemaFingerprint } : {}),
+    ...(accountIdentityProof ? { accountIdentityProof } : {}),
+    senderVerified,
+    notes,
+  };
 }
 
 /**
@@ -1952,33 +2484,109 @@ export async function dispatchComposioTool(
     dispatchBoundary?: ComposioDispatchBoundary;
   } = {},
 ): Promise<{ ok: true; result: unknown; connectionId?: string; identity?: string } | ComposioGatewayBlocked> {
-  const resolved = await resolveComposioDispatch(toolSlug, args, opts.connectedAccountId, opts);
-  if (!resolved.ok) return resolved;
-  try {
-    const dispatch = (): Promise<unknown> => executeComposioTool(
+  const run = harnessRunContextStorage.getStore();
+  const dispatchOnce = async (): Promise<{
+    ok: true; result: unknown; connectionId?: string; identity?: string;
+  } | ComposioGatewayBlocked> => {
+    const admittedArgs = args;
+    // The gateway removes host-only routing keys in place. Keep the exact raw
+    // logical input immutable for a zero-crossing refusal; successful calls
+    // refine to the returned provider-ready object below.
+    const resolved = await resolveComposioDispatch(
       toolSlug,
-      resolved.args,
-      resolved.connectionId,
-      resolved.identity,
+      { ...args },
+      opts.connectedAccountId,
+      opts,
     );
-    const result = opts.dispatchBoundary
-      ? await opts.dispatchBoundary({
-        toolSlug,
-        args: resolved.args,
-        connectionId: resolved.connectionId,
-        identity: resolved.identity,
-      }, dispatch)
-      : await dispatch();
-    const failure = detectComposioFailure(result);
-    if (failure.failed) {
-      throw new Error(`Composio tool ${toolSlug} failed: ${failure.summary || 'provider reported failure'}`);
+    if (!resolved.ok) {
+      settleComposioPreDispatchRefusal(toolSlug, resolved.reason, admittedArgs);
+      return resolved;
     }
-    clearReconnectBreaker(opts.sessionId, toolSlug);
-    return { ok: true, result, connectionId: resolved.connectionId, identity: resolved.identity };
-  } catch (err) {
-    if (isComposioReconnectRequiredError(err)) recordReconnectBreaker(opts.sessionId, toolSlug);
-    throw err;
+    // Account selectors and other routing-only metadata belong to the raw
+    // audit contract, not the provider payload. Freeze the gateway's exact
+    // provider-ready args before the first paid crossing. Non-harness callers
+    // have no ambient logical call and keep their established behavior.
+    if (
+      currentLogicalCall()
+      && run?.sessionId
+      && Number.isSafeInteger(run.sourceUserSeq)
+      && (run.sourceUserSeq ?? 0) > 0
+    ) {
+      authorizeResolvedLogicalCallContract({
+        sessionId: run.sessionId,
+        sourceUserSeq: run.sourceUserSeq as number,
+        turn: run.turn,
+        tool: toolSlug,
+        effectiveArgs: resolved.args,
+      });
+    }
+    let providerOutcomeSettled = false;
+    try {
+      const providerDispatch = (): Promise<unknown> => {
+        if (run?.sessionId && Number.isSafeInteger(run.sourceUserSeq) && (run.sourceUserSeq ?? 0) > 0) {
+          return withPhysicalDispatch(
+            {
+              sessionId: run.sessionId,
+              sourceUserSeq: run.sourceUserSeq as number,
+              turn: run.turn,
+              tool: toolSlug,
+              args: resolved.args,
+            },
+            () => executeComposioTool(
+              toolSlug,
+              resolved.args,
+              resolved.connectionId,
+              resolved.identity,
+            ),
+          );
+        }
+        return executeComposioTool(
+          toolSlug,
+          resolved.args,
+          resolved.connectionId,
+          resolved.identity,
+        );
+      };
+      const result = opts.dispatchBoundary
+        ? await opts.dispatchBoundary({
+          toolSlug,
+          args: resolved.args,
+          connectionId: resolved.connectionId,
+          identity: resolved.identity,
+          schemaFingerprint: resolved.schemaFingerprint,
+        }, providerDispatch)
+        : await providerDispatch();
+      const failure = detectComposioFailure(result);
+      settleComposioReturned(toolSlug, resolved.args, result);
+      providerOutcomeSettled = true;
+      if (failure.failed) {
+        throw new Error(`Composio tool ${toolSlug} failed: ${failure.summary || 'provider reported failure'}`);
+      }
+      clearReconnectBreaker(opts.sessionId, toolSlug);
+      return { ok: true, result, connectionId: resolved.connectionId, identity: resolved.identity };
+    } catch (err) {
+      if (err instanceof ToolAttemptSettlementAuthorityError) throw err;
+      // A returned failure was already settled from its structured provider
+      // envelope. The Error below is only this adapter's outward disposition,
+      // not a second outcome for the same logical call.
+      if (!providerOutcomeSettled) settleComposioThrown(toolSlug, resolved.args, err);
+      if (isComposioReconnectRequiredError(err)) recordReconnectBreaker(opts.sessionId, toolSlug);
+      throw err;
+    }
+  };
+
+  if (run?.sessionId && Number.isSafeInteger(run.sourceUserSeq) && (run.sourceUserSeq ?? 0) > 0) {
+    return withLogicalToolCall(
+      {
+        sessionId: run.sessionId,
+        sourceUserSeq: run.sourceUserSeq as number,
+        tool: toolSlug,
+        args,
+      },
+      dispatchOnce,
+    );
   }
+  return dispatchOnce();
 }
 
 // Uniform-empty advisory (2026-07-22 Phoenix intel audit): 14 Apify calls all
@@ -2098,22 +2706,81 @@ async function runComposioExecute(
     execute?: typeof executeComposioTool;
     delay?: (ms: number) => Promise<void>;
     skipGateway?: boolean;
+    /** Narrow test authority: simulate the stable identity already resolved by
+     * the gateway while still exercising the real execute→settlement path. */
+    resolvedIdentityForTest?: string;
   } = {},
 ): Promise<string> {
   const runSid = sessionIdFromRunContext(options.context);
+  // Open the physical attempt BEFORE validation and before the gateway, so a
+  // refusal that never crossed the boundary is still correlated to something.
+  // Nested carriers inherit this rather than minting a second identity.
+  const attemptCtx = harnessRunContextStorage.getStore();
+  if (attemptCtx?.sessionId && attemptCtx.sourceUserSeq) {
+    return withLogicalToolCall(
+      {
+        sessionId: attemptCtx.sessionId,
+        sourceUserSeq: attemptCtx.sourceUserSeq,
+        tool: toolSlug,
+        args,
+      },
+      () => runComposioExecuteInner(toolSlug, args, connectedAccountId, options, hooks),
+    );
+  }
+  return runComposioExecuteInner(toolSlug, args, connectedAccountId, options, hooks);
+}
+
+async function runComposioExecuteInner(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  connectedAccountId: string | undefined,
+  options: FormatComposioToolOutputOptions,
+  hooks: {
+    execute?: typeof executeComposioTool;
+    delay?: (ms: number) => Promise<void>;
+    skipGateway?: boolean;
+    resolvedIdentityForTest?: string;
+  } = {},
+): Promise<string> {
+  const runSid = sessionIdFromRunContext(options.context);
+  const admittedArgs = args;
+  const gatewayArgs = { ...args };
   const dispatch = hooks.execute ?? executeComposioTool;
   const wait = hooks.delay ?? delayMs;
+  const testSchemaFingerprint = hooks.skipGateway
+    ? liveComposioSchemaFingerprint(toolSlug)
+    : undefined;
 
   // THE gateway: owner-first resolution + typed blocks (ledgered). Preserve a
   // nominal in-process error so the shared write boundary can prove that no
   // provider dispatch started and release the exact reservation safely.
+  const testConnectionId = hooks.resolvedIdentityForTest
+    ? (connectedAccountId ?? 'ca_test_resolved_identity')
+    : connectedAccountId;
   const resolved: ComposioGatewayResolution = hooks.skipGateway
-    ? { ok: true, args, connectionId: connectedAccountId, senderVerified: false, notes: [] }
-    : await resolveComposioDispatch(toolSlug, args, connectedAccountId, {
+    ? {
+        ok: true,
+        args: gatewayArgs,
+        connectionId: testConnectionId,
+        ...(hooks.resolvedIdentityForTest ? { identity: hooks.resolvedIdentityForTest } : {}),
+        ...(hooks.resolvedIdentityForTest && testConnectionId
+          ? {
+              accountIdentityProof: {
+                connectionId: testConnectionId,
+                identity: normalizeProcedureAccountIdentity(hooks.resolvedIdentityForTest),
+              },
+            }
+          : {}),
+        ...(testSchemaFingerprint ? { schemaFingerprint: testSchemaFingerprint } : {}),
+        senderVerified: false,
+        notes: [],
+      }
+    : await resolveComposioDispatch(toolSlug, gatewayArgs, connectedAccountId, {
       sessionId: runSid,
       userInput: latestUserInputForContext(options.context),
     });
   if (!resolved.ok) {
+    settleComposioPreDispatchRefusal(toolSlug, resolved.reason, admittedArgs);
     // RETURN the typed refusal instead of throwing (call-tool.ts precedent):
     // a throw inside execute is swallowed by the SDK's error_as_result into
     // prose BEFORE the harness bracket can classify it, so a provably
@@ -2129,6 +2796,21 @@ async function runComposioExecute(
     ) as unknown as string;
   }
   args = resolved.args;
+  const resolvedRun = harnessRunContextStorage.getStore();
+  if (
+    currentLogicalCall()
+    && resolvedRun?.sessionId
+    && Number.isSafeInteger(resolvedRun.sourceUserSeq)
+    && (resolvedRun.sourceUserSeq ?? 0) > 0
+  ) {
+    authorizeResolvedLogicalCallContract({
+      sessionId: resolvedRun.sessionId,
+      sourceUserSeq: resolvedRun.sourceUserSeq as number,
+      turn: resolvedRun.turn,
+      tool: toolSlug,
+      effectiveArgs: args,
+    });
+  }
   const effectiveConnectionId = resolved.connectionId;
   let accountRouteNote = resolved.notes.join('\n');
   const gate = { routeConnectedAccountId: resolved.senderVerified ? resolved.connectionId : undefined };
@@ -2141,6 +2823,11 @@ async function runComposioExecute(
   // Same typed-return rule as the gateway refusal above: never started ⇒
   // settle `failed`, never `orphaned`.
   if (checkpoint) {
+    // Resolution has already frozen the provider-ready contract. Settle this
+    // zero-crossing policy refusal here with those exact args so an outer SDK
+    // carrier neither re-settles the raw payload nor leaves the logical call
+    // open.
+    settleComposioPreDispatchRefusal(toolSlug, 'constraint', args);
     return new ExternalWritePreDispatchResult(
       checkpoint,
       'provider-dispatch:not-started:data-quality-checkpoint',
@@ -2159,9 +2846,26 @@ async function runComposioExecute(
   const maxDispatchAttempts = composioSlugIsReadOnly(toolSlug) ? 3 : 1;
 
   // Retry loop with exponential backoff for transient errors
+  let priorDispatchId: string | undefined;
   for (let attempt = 1; attempt <= maxDispatchAttempts; attempt++) {
     try {
-      const result = await dispatch(toolSlug, args, effectiveConnectionId);
+      // Each pass through this loop is a PAID provider crossing. One identity
+      // spanning the whole loop reported "one tool call" for up to three
+      // charges, which is precisely the cost a release comparison must see.
+      const result = await withPhysicalDispatch(
+        {
+          sessionId: runSid ?? '',
+          sourceUserSeq: harnessRunContextStorage.getStore()?.sourceUserSeq ?? 0,
+          turn: harnessRunContextStorage.getStore()?.turn,
+          tool: toolSlug,
+          args,
+          ...(priorDispatchId ? { retryOf: priorDispatchId } : {}),
+        },
+        async (crossing) => {
+          priorDispatchId = crossing.physicalDispatchId;
+          return dispatch(toolSlug, args, effectiveConnectionId);
+        },
+      );
       let output = formatComposioExecuteOutput(result, { ...options, toolSlug });
       if (gate.routeConnectedAccountId) {
         output += `\n\n[sender-verify] Routed to connection ${gate.routeConnectedAccountId} — its mailbox verified against the standing sender rule.`;
@@ -2172,7 +2876,6 @@ async function runComposioExecute(
       // Capture the intent BEFORE auto-remember consumes (deletes) the session's
       // search entry — the fresh search query is the honest intent behind this execute.
       const executionIntent = executionIntentForSession(sid, toolSlug);
-      maybeAutoRememberComposioChoice(toolSlug, args, result, sid, effectiveConnectionId);
 
       // PHASE 5: Record outcome for adaptive tool selection & learning
       const failure = detectComposioFailure(result);
@@ -2331,10 +3034,31 @@ async function runComposioExecute(
             ...(runContext?.sessionId === sid && typeof runContext.sourceUserSeq === 'number'
               ? { sourceUserSeq: runContext.sourceUserSeq }
               : {}),
-            accountIdentity: await stableComposioAccountIdentity(toolSlug, effectiveConnectionId),
+            accountIdentity: resolved.accountIdentityProof?.identity,
+            schemaFingerprint: resolved.schemaFingerprint,
+            normalizedArgs: args,
           });
         }
       } catch { /* learning never breaks a tool call */ }
+
+      // Settle after async receipt handling has determined whether this logical
+      // call produced final data or only a continuation. Runtime truth remains
+      // synchronous with dispatch; procedural learning is deliberately not on
+      // the authority path.
+      const finalSettlementResult = settledForLearning ?? result;
+      settleComposioReturned(
+        toolSlug,
+        args,
+        finalSettlementResult,
+        !failure.failed && settledForLearning == null,
+      );
+      void maybeAutoRememberComposioChoice(
+        toolSlug,
+        args,
+        finalSettlementResult,
+        sid,
+        effectiveConnectionId,
+      );
 
       // Only count/advise on SUCCESS — a failed call isn't "an item processed".
       //
@@ -2367,6 +3091,7 @@ async function runComposioExecute(
       }
       return output;
     } catch (err) {
+      if (err instanceof ToolAttemptSettlementAuthorityError) throw err;
       lastError = err;
       const errorMsg = err instanceof Error ? err.message : String(err ?? '');
       recentErrors.push(errorMsg);
@@ -2388,11 +3113,15 @@ async function runComposioExecute(
       // that can only be repaired by reconnecting the app under this user.
       if (isComposioReconnectRequiredError(err)) {
         recordReconnectBreaker(runSid, toolSlug); // F2: trip the cross-call breaker
+        // Nominal: this lane KNOWS the connection is the problem, so the shared
+        // kernel is told rather than left to infer it from the message.
+        settleComposioThrown(toolSlug, args, err, { connectionMissing: true });
         return composioThrownErrorOutput(err, { ...options, toolSlug })
           + suppressComposioConnectionAfterHardFailure(effectiveConnectionId, err);
       }
 
       if (!composioSlugIsReadOnly(toolSlug)) {
+        settleComposioThrown(toolSlug, args, err, { mutating: true, acknowledged: false });
         return composioUncertainMutationOutput(err, { ...options, toolSlug });
       }
 
@@ -2400,6 +3129,7 @@ async function runComposioExecute(
       const decision = shouldRetryToolCall(err, attempt, recentErrors);
       if (!decision.shouldRetry) {
         // Terminal error or circuit-breaker triggered: return error immediately
+        settleComposioThrown(toolSlug, args, err);
         return composioThrownErrorOutput(err, { ...options, toolSlug })
           + suppressComposioConnectionAfterHardFailure(effectiveConnectionId, err);
       }
@@ -2412,6 +3142,7 @@ async function runComposioExecute(
   }
 
   // Max retries exhausted: return last error
+  settleComposioThrown(toolSlug, args, lastError);
   return composioThrownErrorOutput(lastError, { ...options, toolSlug });
 }
 
@@ -2437,13 +3168,14 @@ export function runComposioExecuteForTestInSession(
   args: Record<string, unknown>,
   execute: typeof executeComposioTool,
   sessionId: string,
+  resolvedIdentityForTest?: string,
 ): Promise<string> {
   return runComposioExecute(
     toolSlug,
     args,
     undefined,
     { toolName: 'composio_execute_tool', toolSlug, context: { context: { sessionId } } as never },
-    { execute, delay: async () => {}, skipGateway: true },
+    { execute, delay: async () => {}, skipGateway: true, resolvedIdentityForTest },
   );
 }
 
@@ -2545,6 +3277,183 @@ function scoreComposioTool(toolkitSlug: string, toolSlug: string, name: string, 
   return score;
 }
 
+/**
+ * Normalize the published CLI's search response into the same compact match
+ * shape as the SDK catalog. CLI releases have used both arrays and nested
+ * `{items|tools|results}` envelopes, so this walks data rather than binding the
+ * runtime to one presentation wrapper. Only action-shaped slugs are admitted;
+ * toolkit/catalog rows such as `{slug:"gmail"}` are never executable matches.
+ */
+export function normalizeComposioCliSearchMatches(
+  value: unknown,
+  query: string,
+  limit = DEFAULT_SEARCH_TOTAL_LIMIT,
+): ComposioCliSearchMatch[] {
+  const queryTerms = tokenize(query);
+  const bySlug = new Map<string, ComposioCliSearchMatch>();
+  const seenObjects = new Set<object>();
+  let visited = 0;
+
+  const actionSlug = (candidate: unknown): string | undefined => {
+    if (typeof candidate !== 'string') return undefined;
+    const normalized = candidate.trim();
+    return /^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+$/.test(normalized)
+      ? normalized.toUpperCase()
+      : undefined;
+  };
+  const stringField = (record: Record<string, unknown>, ...keys: string[]): string | undefined => {
+    for (const key of keys) {
+      const candidate = record[key];
+      if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    }
+    return undefined;
+  };
+  const ingest = (record: Record<string, unknown>): void => {
+    const explicitSlug = record.tool_slug ?? record.toolSlug;
+    const carriesInlineSchema = record.inputParameters !== undefined
+      || record.input_parameters !== undefined
+      || record.parameters !== undefined
+      || record.schema !== undefined;
+    const legacySlug = carriesInlineSchema
+      && typeof record.slug === 'string'
+      && record.slug.trim() === record.slug.trim().toUpperCase()
+      ? record.slug
+      : undefined;
+    const slug = actionSlug(explicitSlug ?? legacySlug);
+    if (!slug) return;
+    const toolkitRecord = isRecord(record.toolkit) ? record.toolkit : undefined;
+    const toolkit = (
+      stringField(record, 'toolkit_slug', 'toolkitSlug')
+      ?? (toolkitRecord ? stringField(toolkitRecord, 'slug', 'name') : undefined)
+      ?? registeredToolkitOfSlug(slug)
+    ).toLowerCase();
+    const name = stringField(record, 'name', 'display_name', 'displayName') ?? slug;
+    const description = stringField(record, 'description', 'summary');
+    const inputParameters = record.inputParameters
+      ?? record.input_parameters
+      ?? record.parameters
+      ?? record.schema;
+    const providerScore = typeof record.score === 'number' && Number.isFinite(record.score)
+      ? record.score
+      : undefined;
+    const match: ComposioCliSearchMatch = {
+      toolkit,
+      slug,
+      name,
+      ...(description ? { description } : {}),
+      score: providerScore ?? Math.max(1, scoreComposioTool(toolkit, slug, name, description, queryTerms)),
+      ...(inputParameters !== undefined ? { inputParameters } : {}),
+    };
+    const prior = bySlug.get(slug);
+    if (!prior || match.score > prior.score || (prior.inputParameters === undefined && match.inputParameters !== undefined)) {
+      bySlug.set(slug, match);
+    }
+  };
+  const visit = (node: unknown, depth: number): void => {
+    if (depth > 8 || visited >= 2_000 || node === null || node === undefined) return;
+    visited += 1;
+    if (typeof node === 'string') {
+      const trimmed = node.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try { visit(JSON.parse(trimmed), depth + 1); } catch { /* plain CLI text below */ }
+      }
+      return;
+    }
+    if (typeof node !== 'object') return;
+    if (seenObjects.has(node)) return;
+    seenObjects.add(node);
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, depth + 1);
+      return;
+    }
+    const record = node as Record<string, unknown>;
+    ingest(record);
+    for (const key of ['primary_tool_slugs', 'related_tool_slugs']) {
+      const slugs = record[key];
+      if (!Array.isArray(slugs)) continue;
+      for (const slug of slugs) ingest({ tool_slug: slug });
+    }
+    for (const [key, child] of Object.entries(record)) {
+      if (key === 'primary_tool_slugs' || key === 'related_tool_slugs') continue;
+      if (child && (typeof child === 'object' || typeof child === 'string')) visit(child, depth + 1);
+    }
+  };
+
+  visit(value, 0);
+  return [...bySlug.values()]
+    .slice(0, Math.max(1, Math.min(limit, 50)));
+}
+
+/**
+ * The current published CLI returns primary slugs plus schema-file paths under
+ * `~/.composio/tool_definitions`; it does not inline `inputParameters` in the
+ * search JSON. Hydrate only paths explicitly mapped to returned slugs, and
+ * only after both the schema root and file resolve inside that root. This
+ * keeps CLI output from becoming an arbitrary local-file read primitive.
+ */
+export function hydrateComposioCliSearchSchemas(
+  value: unknown,
+  matches: readonly ComposioCliSearchMatch[],
+  homeDir = os.homedir(),
+): ComposioCliSearchMatch[] {
+  const wanted = new Set(matches.map((match) => match.slug));
+  const paths = new Map<string, string>();
+  const actionSlug = (candidate: string): string | undefined => {
+    const normalized = candidate.trim();
+    return /^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+$/.test(normalized)
+      ? normalized.toUpperCase()
+      : undefined;
+  };
+  let root = value;
+  if (typeof root === 'string') {
+    try { root = JSON.parse(root) as unknown; } catch { root = null; }
+  }
+  const toolSchemas = isRecord(root) && isRecord(root.tool_schemas) ? root.tool_schemas : undefined;
+  const primary = toolSchemas && isRecord(toolSchemas.primary) ? toolSchemas.primary : undefined;
+  for (const [key, child] of Object.entries(primary ?? {})) {
+    const slug = actionSlug(key);
+    if (slug && wanted.has(slug) && typeof child === 'string') paths.set(slug, child);
+  }
+
+  let schemaRoot: string;
+  try {
+    schemaRoot = realpathSync(path.resolve(homeDir, '.composio', 'tool_definitions'));
+  } catch {
+    return matches.map((match) => ({ ...match }));
+  }
+  const hydrated = new Map<string, unknown>();
+  for (const [slug, rawPath] of paths) {
+    const expanded = rawPath === '~'
+      ? homeDir
+      : rawPath.startsWith('~/') || rawPath.startsWith(`~${path.sep}`)
+        ? path.join(homeDir, rawPath.slice(2))
+        : rawPath;
+    if (!path.isAbsolute(expanded)) continue;
+    let file: string;
+    try {
+      file = realpathSync(path.resolve(expanded));
+      if (file !== schemaRoot && !file.startsWith(`${schemaRoot}${path.sep}`)) continue;
+      if (path.basename(file).toUpperCase() !== `${slug}.JSON`) continue;
+      const stat = statSync(file);
+      if (!stat.isFile() || stat.size <= 0 || stat.size > 1_000_000) continue;
+      const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown;
+      if (!isRecord(parsed)) continue;
+      const schema = parsed.inputSchema
+        ?? parsed.input_schema
+        ?? parsed.inputParameters
+        ?? parsed.input_parameters
+        ?? ((parsed.type === 'object' || isRecord(parsed.properties)) ? parsed : undefined);
+      if (isRecord(schema)) hydrated.set(slug, schema);
+    } catch {
+      // A missing, malformed, oversized, or escaped schema stays unavailable.
+    }
+  }
+  return matches.map((match) => {
+    const schema = hydrated.get(match.slug) ?? match.inputParameters;
+    return schema === undefined ? { ...match } : { ...match, inputParameters: schema };
+  });
+}
+
 function describeDynamicTool(toolkitSlug: string, toolSlug: string, description?: string): string {
   // Lead with Composio's own description if it exists — that's the
   // model's primary signal of "what this does". Our scaffolding goes
@@ -2609,7 +3518,11 @@ export async function getDynamicComposioRuntimeTools(options: {
 
       const toolSlug = toolkitTool.slug;
       // Deposit the real schema for schema-grounded pre-dispatch validation.
-      rememberToolSchema(toolSlug, toolkitTool.inputParameters);
+      rememberToolSchema(
+        toolSlug,
+        toolkitTool.inputParameters,
+        composioToolSchemaObservedAt(toolkitTool) ?? Number.NaN,
+      );
       out.push(tool({
         name,
         description: describeDynamicTool(toolkitSlug, toolSlug, toolkitTool.description),
@@ -2662,7 +3575,13 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       const tools = await listComposioToolkitTools(toolkit_slug, limit ?? 80);
       // Deposit real schemas — upgrades pre-dispatch validation to
       // schema-grounded for every listed action (self-healing loop).
-      for (const item of tools) rememberToolSchema(item.slug, item.inputParameters);
+      for (const item of tools) {
+        rememberToolSchema(
+          item.slug,
+          item.inputParameters,
+          composioToolSchemaObservedAt(item) ?? Number.NaN,
+        );
+      }
       const output = formatComposioToolOutput({
         toolkit: toolkit_slug,
         count: tools.length,
@@ -2689,6 +3608,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     description: 'Search Composio for the right action slug. Use this BEFORE concluding an action is unavailable — Composio exposes hundreds of actions per toolkit and Clementine intentionally does not inject every action schema into every call. Query with plain English ("outlook list unread messages today", "drive search by name", "gmail mark as read"). Returns slugs to pass to `composio_execute_tool`.',
     parameters: z.object(COMPOSIO_SEARCH_TOOLS_PARAMS),
     execute: async ({ query, toolkit_slug, limit }, context, details) => {
+      toolkit_slug = normalizeOptionalToolkitSlug(toolkit_slug);
       // Searching is exposure/uncertainty, never evidence of failure. The old
       // path auto-invalidated an exact memo simply because the model searched
       // again, creating churn and relearning loops. Only a real execute outcome
@@ -2755,10 +3675,93 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       }
 
       const credentials = getComposioCredentialStatus();
+      const cliOnlyLane = composioExecutionUsesCliOnlyLane(credentials);
+      if (cliOnlyLane) {
+        const runtime = await getComposioRuntimeStatus();
+        if (runtime.cli.installed && runtime.cli.authenticated) {
+          const maxResults = Math.max(1, Math.min(limit ?? DEFAULT_SEARCH_TOTAL_LIMIT, 50));
+          // Order authority by request start, not response completion. An older
+          // slow search must never finish last and look newer than a later one.
+          const observedAt = Date.now();
+          const raw = await searchComposioToolsViaCli(query, {
+            ...(toolkit_slug ? { toolkitSlug: toolkit_slug } : {}),
+            limit: maxResults,
+          });
+          const discoveredMatches = hydrateComposioCliSearchSchemas(
+            raw,
+            normalizeComposioCliSearchMatches(raw, query, maxResults),
+          );
+          // The published CLI guarantees local schema files for PRIMARY
+          // results only. Related slugs are useful search hints, but without a
+          // hydrated contract they are not executable authority and must not
+          // enter tool-choice memory as if the model could safely build args.
+          const matches = discoveredMatches.filter((match) => match.inputParameters !== undefined);
+          const schemaLessCandidates = discoveredMatches
+            .filter((match) => match.inputParameters === undefined)
+            .map(({ toolkit, slug, name, description, score }) => ({
+              toolkit, slug, name, ...(description ? { description } : {}), score,
+              status: 'schema_unavailable',
+            }));
+          for (const match of matches) {
+            if (match.inputParameters !== undefined) {
+              rememberToolSchema(match.slug, match.inputParameters, observedAt);
+            }
+          }
+          noteComposioSearchIntent(
+            sessionIdFromRunContext(context),
+            query,
+            matches.map((match) => match.slug),
+          );
+          recordDiscoveredComposioCapabilities(matches);
+          const output = formatComposioToolOutput({
+            configured: true,
+            discoveryBackend: 'cli',
+            accountRoute: 'provider_default',
+            query,
+            count: matches.length,
+            // CONSEQUENCE, as data. A caller who asked to change something and
+            // is offered only a way to create something new is being offered a
+            // materially different outcome; surfacing each candidate's declared
+            // consequence lets that be noticed and raised with the user rather
+            // than discovered after the fact. Derived from the action's own
+            // verb — no provider names, no slug lists.
+            matches: matches.map((match) => ({
+              ...match,
+              consequence: classifyComposioActionConsequence(match.slug),
+            })),
+            ...(schemaLessCandidates.length > 0 ? { schemaLessCandidates } : {}),
+            nextStep: matches.length > 0
+              ? 'Pick the best match, then call `composio_execute_tool` with its exact slug and arguments built from `inputParameters`.'
+              : schemaLessCandidates.length > 0
+                ? 'The CLI returned related candidates without executable schemas. Refine this one search until a primary schema-backed match appears; do not execute or memorize a schema-less slug.'
+                : 'No CLI action matched. Refine this one query or connect the required app; do not invent a slug.',
+          }, { context, details, toolName: 'composio_search_tools' });
+          const advisory = maybeDiscoveryAdvisory({
+            kind: 'search',
+            toolkit: toolkit_slug ?? matches[0]?.toolkit ?? schemaLessCandidates[0]?.toolkit ?? '*',
+            signature: query,
+            sessionId: runScopeIdFromRunContext(context) ?? sessionIdFromRunContext(context),
+          });
+          return advisory ? output + advisory : output;
+        }
+        if (credentials.executionBackend === 'cli') {
+          return formatComposioToolOutput({
+            configured: false,
+            discoveryBackend: 'cli',
+            query,
+            matches: [],
+            message: runtime.cli.installed
+              ? 'The Composio CLI is installed but not authenticated. Run `composio login`, then retry this same search.'
+              : 'The Composio CLI backend is selected but the CLI is not installed.',
+          }, { context, details, toolName: 'composio_search_tools' });
+        }
+      }
       if (!credentials.enabled) {
         return formatComposioToolOutput({
           configured: false,
-          message: 'COMPOSIO_API_KEY is not configured. Connect Composio in the dashboard first.',
+          message: cliOnlyLane
+            ? 'Neither an authenticated Composio CLI session nor COMPOSIO_API_KEY is available. Connect Composio first.'
+            : 'COMPOSIO_API_KEY is not configured. Connect Composio in the dashboard first.',
           matches: [],
         }, { context, details, toolName: 'composio_search_tools' });
       }
@@ -2825,7 +3828,11 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         for (const item of tools) {
           // Deposit real schemas — upgrades pre-dispatch validation to
           // schema-grounded for every searched action (self-healing loop).
-          rememberToolSchema(item.slug, item.inputParameters);
+          rememberToolSchema(
+            item.slug,
+            item.inputParameters,
+            composioToolSchemaObservedAt(item) ?? Number.NaN,
+          );
           const score = scoreComposioTool(slug, item.slug, item.name, item.description, queryTerms);
           if (score <= 0 && queryTerms.length > 0) continue;
           matches.push({
@@ -2849,6 +3856,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         query,
         matches.filter((m) => m.slug && m.slug !== '__toolkit_error__').map((m) => m.slug),
       );
+      recordDiscoveredComposioCapabilities(matches);
       // Empty-with-connections: the query matched nothing in the CONNECTED
       // toolkits. One bounded catalog check tells the user whether the app they
       // want is supported-but-unconnected (the common cold-start confusion)
@@ -2980,6 +3988,8 @@ export function _settleVerifiedComposioReadForTest(input: {
   result: unknown;
   sourceUserSeq?: number;
   accountIdentity?: string;
+  schemaFingerprint?: string;
+  normalizedArgs?: unknown;
 }): ReturnType<typeof settleVerifiedComposioRead> {
   return settleVerifiedComposioRead(input);
 }

@@ -149,9 +149,16 @@ export function filterMcpToolsForScope(
   let capped = ranked;
   if (hasServerCaps) {
     const counts = new Map<string, number>();
+    const capEntries = Object.entries(scope.serverMaxTools ?? {});
+    // Admission alias-matches the slug (`dataforseo` admits `DataForSEO MCP`),
+    // so the cap has to as well. An exact-key lookup let any server whose
+    // configured name carried a suffix slip its per-server budget and crowd out
+    // every other system's tools.
+    const capFor = (slug: string): number | undefined =>
+      capEntries.find(([configured]) => mcpServerAliasMatches(slug, configured))?.[1];
     capped = [];
     for (const entry of ranked) {
-      const cap = entry.serverSlug ? scope.serverMaxTools?.[entry.serverSlug] : undefined;
+      const cap = entry.serverSlug ? capFor(entry.serverSlug) : undefined;
       if (cap !== undefined) {
         const normalizedCap = Math.max(0, Math.floor(cap));
         const count = counts.get(entry.serverSlug!) ?? 0;

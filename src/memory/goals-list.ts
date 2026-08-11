@@ -5,7 +5,8 @@ import { BASE_DIR } from '../config.js';
 /**
  * The lightweight goal-list store (`goal_create` / `goal_update`, written to
  * `~/.clementine-next/goals/*.json`) — distinct from the plan-proposals GOAL
- * CONTRACT (staged/validated, injected per-turn via renderGoalContextBlock).
+ * CONTRACT (staged/validated, injected per-turn through the canonical active-
+ * task context projection).
  *
  * This is the ONE reader for that store. It used to be copy-pasted across three
  * context assemblers (harness, chat, voice); each kept its own render but read

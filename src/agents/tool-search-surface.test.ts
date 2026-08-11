@@ -269,6 +269,9 @@ test('schema-on-demand defers broad MCP fail-open but preserves concrete provide
   };
   assert.deepEqual(externalMcpAttachmentScope(broad, true), {
     reason: 'unknown app intent; external MCP connection deferred to mcp_list_tools/call_tool',
+    // Deferred, not denied: nothing is attached up front, and the servers stay
+    // reachable through call_tool — which is the entire premise of deferring.
+    authority: 'catalog',
     allowedServerSlugs: [],
     toolPatterns: [],
     maxTools: 0,

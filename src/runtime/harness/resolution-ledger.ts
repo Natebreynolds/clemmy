@@ -1,0 +1,1011 @@
+/**
+ * Durable expected-vs-observed authority for one accepted task.
+ *
+ * Expected work comes only from the exact, hash-verified TurnGraph persisted for
+ * the accepted user source. Observed work comes only from host boundaries that
+ * saw a logical business call. Neither artifact contains objective prose,
+ * provider payloads, or a catalog of tools.
+ *
+ * The normalized rows are the state-machine authority. Mirror events are
+ * inserted in the SAME IMMEDIATE transaction, then published after commit. That
+ * closes the old check-then-append race: an operation and finalization are
+ * serialized, and an operation can never appear after a finalized count.
+ */
+import { createHash } from 'node:crypto';
+import { classifyTool, type ToolKind } from '../../agents/tool-taxonomy.js';
+import type { TurnGraphIR, TurnGraphNode } from '../graph/turn-graph-ir.js';
+import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
+import {
+  getTurnGraphEventForSource,
+  insertInternalEventInTransaction,
+  openEventLog,
+  publishCommittedInternalEvent,
+  type EventRow,
+} from './eventlog.js';
+import { acceptedTaskIdFor } from './attempt-identity.js';
+import {
+  canonicalRuntimeEffectiveToolName,
+  classifyRuntimeToolEffect,
+  unwrapRuntimeEffectiveToolIdentity,
+  type RuntimeToolEffect,
+} from './tool-effect.js';
+import { loadExpectedWorkContract } from './expected-work-contract.js';
+import {
+  matchExpectedWork,
+  type ExpectedWorkMatchResult,
+} from './expected-work-matcher.js';
+import { projectObservedExpectedWorkHistory } from './expected-work-observed-projector.js';
+
+export const RESOLUTION_OPERATION_EVENT = 'resolution_operation' as const;
+export const RESOLUTION_FINALIZED_EVENT = 'resolution_finalized' as const;
+
+type WorkKind = 'conversation' | 'retrieve' | 'execute' | 'fanout';
+export type ObservedReversibility =
+  | 'read_only'
+  | 'reversible'
+  | 'irreversible'
+  | 'not_applicable'
+  | 'unknown';
+
+export interface AcceptedTaskExpectation {
+  version: 1;
+  acceptedTaskId: string;
+  identity: { sessionId: string; sourceUserSeq: number; turn: number };
+  graphEventId: string;
+  graphId: string;
+  graphHash: string;
+  compilerVersion: string;
+  route: TurnGraphIR['classification']['route'];
+  workNodeId?: string;
+  workKind: WorkKind;
+  effectCeiling: TurnGraphIR['effectCeiling'];
+  externalEffectRequested: boolean;
+  externalEffectKinds: string[];
+}
+
+export type ExpectedTaskState =
+  | { status: 'ok'; expectation: AcceptedTaskExpectation; graph: TurnGraphIR }
+  | { status: 'missing'; reason: string }
+  | { status: 'ambiguous'; reason: string };
+
+function workNodes(graph: TurnGraphIR): TurnGraphNode[] {
+  return graph.nodes.filter((node) =>
+    node.kind === 'retrieve' || node.kind === 'execute' || node.kind === 'fanout');
+}
+
+/** Load the one accepted-source graph and project only its authority fields. */
+export function expectedTaskFor(sessionId: string, sourceUserSeq: number): ExpectedTaskState {
+  let graphEvent: EventRow | null;
+  try {
+    graphEvent = getTurnGraphEventForSource(sessionId, sourceUserSeq);
+  } catch (error) {
+    return { status: 'ambiguous', reason: `turn graph store unreadable: ${String(error)}` };
+  }
+  if (!graphEvent) return { status: 'missing', reason: 'no persisted turn graph for accepted task' };
+  const graph = turnGraphFromShadowEvent(graphEvent);
+  if (!graph) return { status: 'ambiguous', reason: 'persisted turn graph failed identity or hash validation' };
+
+  const candidates = workNodes(graph);
+  if (candidates.length > 1) {
+    return { status: 'ambiguous', reason: `turn graph contains ${candidates.length} primary work nodes` };
+  }
+  if (graph.classification.route !== 'direct_reply' && candidates.length !== 1) {
+    return { status: 'ambiguous', reason: 'non-conversational graph has no unique work node' };
+  }
+  const work = candidates[0];
+  const workKind: WorkKind = work
+    ? work.kind as Exclude<WorkKind, 'conversation'>
+    : 'conversation';
+  return {
+    status: 'ok',
+    graph,
+    expectation: {
+      version: 1,
+      acceptedTaskId: acceptedTaskIdFor(sessionId, sourceUserSeq),
+      identity: { ...graph.identity },
+      graphEventId: graphEvent.id,
+      graphId: graph.graphId,
+      graphHash: graph.compiler.graphHash,
+      compilerVersion: graph.compiler.version,
+      route: graph.classification.route,
+      ...(work ? { workNodeId: work.id } : {}),
+      workKind,
+      effectCeiling: graph.effectCeiling,
+      externalEffectRequested: graph.classification.externalEffectRequested,
+      externalEffectKinds: [...graph.classification.externalEffectKinds].sort(),
+    },
+  };
+}
+
+function canonical(value: unknown, depth = 0, seen = new Set<object>()): string {
+  if (depth > 8) return '"[depth]"';
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') {
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (typeof value !== 'object') return JSON.stringify(String(value));
+  if (seen.has(value)) return '"[circular]"';
+  seen.add(value);
+  let result: string;
+  if (Array.isArray(value)) {
+    result = `[${value.slice(0, 64).map((entry) => canonical(entry, depth + 1, seen)).join(',')}]`;
+  } else {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).filter((key) => record[key] !== undefined).sort().slice(0, 64);
+    result = `{${keys.map((key) => `${JSON.stringify(key)}:${canonical(record[key], depth + 1, seen)}`).join(',')}}`;
+  }
+  seen.delete(value);
+  return result;
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function argumentShape(args: unknown): { keys: string[]; digest: string } {
+  const keys = args && typeof args === 'object' && !Array.isArray(args)
+    ? Object.keys(args as Record<string, unknown>).sort().slice(0, 64)
+    : [];
+  return { keys, digest: sha256(canonical(args)) };
+}
+
+function effectForToolKind(kind: ToolKind): RuntimeToolEffect | undefined {
+  switch (kind) {
+    case 'read': return 'read';
+    case 'execute': return 'compute';
+    case 'write': return 'local_write';
+    case 'send': return 'external_write';
+    case 'admin': return 'admin';
+    default: return undefined;
+  }
+}
+
+function reversibilityFor(
+  kind: ToolKind,
+  effect: RuntimeToolEffect,
+): ObservedReversibility {
+  switch (kind) {
+    case 'read': return 'read_only';
+    case 'write': return 'reversible';
+    case 'send':
+    case 'admin': return 'irreversible';
+    case 'execute': return 'not_applicable';
+    default:
+      if (effect === 'read') return 'read_only';
+      if (effect === 'local_write') return 'reversible';
+      if (effect === 'external_write' || effect === 'admin') return 'irreversible';
+      if (effect === 'compute') return 'not_applicable';
+      return 'unknown';
+  }
+}
+
+export interface ResolvedOperationFact {
+  nodeId: string;
+  operationId: string;
+  resolvedTool: string;
+  logicalToolCallId: string;
+  physicalDispatchId?: string;
+  effectKind: RuntimeToolEffect;
+  reversibility: ObservedReversibility;
+  effectSource: string;
+  argumentKeys: string[];
+  argumentDigest: string;
+  outcomeKind?: string;
+  dispatchState?: 'not_started' | 'dispatched';
+}
+
+export interface RecordResolvedOperationInput {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn?: number;
+  /** Must be the unique work node in the persisted graph. */
+  nodeId: string;
+  /** Stable logical operation label. Production uses logicalToolCallId. */
+  operationId: string;
+  resolvedTool: string;
+  args?: unknown;
+  logicalToolCallId: string;
+  physicalDispatchId?: string;
+  outcomeKind?: string;
+  dispatchState?: 'not_started' | 'dispatched';
+}
+
+export type RecordResolvedOperationTransactionResult =
+  | { status: 'inserted'; fact: ResolvedOperationFact; event: EventRow }
+  | { status: 'existing'; fact: ResolvedOperationFact }
+  | { status: 'not_ready' | 'conflict'; reason: string };
+
+interface ResolutionRow {
+  accepted_task_id: string;
+  graph_event_id: string;
+  graph_id: string;
+  graph_hash: string;
+  compiler_version: string;
+  route: AcceptedTaskExpectation['route'];
+  work_node_id: string | null;
+  work_kind: WorkKind;
+  effect_ceiling: string;
+  external_effect_requested: number;
+  external_effect_kinds_json: string;
+  state: 'open' | 'finalized' | 'legacy_ambiguous';
+  operation_count: number;
+  operations_digest: string | null;
+  expectations_satisfied: number | null;
+}
+
+function rowMatchesExpectation(row: ResolutionRow, expected: AcceptedTaskExpectation): boolean {
+  return row.accepted_task_id === expected.acceptedTaskId
+    && row.graph_event_id === expected.graphEventId
+    && row.graph_id === expected.graphId
+    && row.graph_hash === expected.graphHash
+    && row.compiler_version === expected.compilerVersion
+    && row.route === expected.route
+    && row.work_node_id === (expected.workNodeId ?? null)
+    && row.work_kind === expected.workKind
+    && row.effect_ceiling === expected.effectCeiling
+    && row.external_effect_requested === (expected.externalEffectRequested ? 1 : 0)
+    && row.external_effect_kinds_json === JSON.stringify(expected.externalEffectKinds);
+}
+
+function ensureOpenResolution(
+  db: ReturnType<typeof openEventLog>,
+  expected: AcceptedTaskExpectation,
+): ResolutionRow {
+  let row = db.prepare(
+    `SELECT * FROM accepted_task_resolutions WHERE session_id = ? AND source_user_seq = ?`,
+  ).get(expected.identity.sessionId, expected.identity.sourceUserSeq) as ResolutionRow | undefined;
+  if (!row) {
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO accepted_task_resolutions
+        (session_id, source_user_seq, accepted_task_id, graph_event_id, graph_id,
+         graph_hash, compiler_version, route, work_node_id, work_kind,
+         effect_ceiling, external_effect_requested, external_effect_kinds_json,
+         state, revision, operation_count, opened_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', 0, 0, ?)
+    `).run(
+      expected.identity.sessionId,
+      expected.identity.sourceUserSeq,
+      expected.acceptedTaskId,
+      expected.graphEventId,
+      expected.graphId,
+      expected.graphHash,
+      expected.compilerVersion,
+      expected.route,
+      expected.workNodeId ?? null,
+      expected.workKind,
+      expected.effectCeiling,
+      expected.externalEffectRequested ? 1 : 0,
+      JSON.stringify(expected.externalEffectKinds),
+      now,
+    );
+    row = db.prepare(
+      `SELECT * FROM accepted_task_resolutions WHERE session_id = ? AND source_user_seq = ?`,
+    ).get(expected.identity.sessionId, expected.identity.sourceUserSeq) as ResolutionRow;
+  }
+  if (!rowMatchesExpectation(row, expected)) {
+    throw new Error('accepted task resolution conflicts with its persisted graph');
+  }
+  if (row.state === 'legacy_ambiguous') throw new Error('accepted task resolution is ambiguous');
+  return row;
+}
+
+/** Same-transaction admission seam for logical calls and provider crossings. */
+export function ensureAcceptedTaskResolutionOpenInTransaction(
+  db: ReturnType<typeof openEventLog>,
+  expected: AcceptedTaskExpectation,
+): boolean {
+  return ensureOpenResolution(db, expected).state === 'open';
+}
+
+function physicalDispatchBelongs(
+  db: ReturnType<typeof openEventLog>,
+  expected: AcceptedTaskExpectation,
+  logicalToolCallId: string,
+  physicalDispatchId: string,
+  resolvedTool: string,
+): boolean {
+  const row = db.prepare(`
+    SELECT tool_name, state FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+       AND accepted_task_id = ? AND logical_tool_call_id = ?
+       AND physical_dispatch_id = ?
+     LIMIT 1
+  `).get(
+    expected.identity.sessionId,
+    expected.identity.sourceUserSeq,
+    expected.acceptedTaskId,
+    logicalToolCallId,
+    physicalDispatchId,
+  ) as { tool_name: string; state: string } | undefined;
+  return row?.tool_name === resolvedTool && row.state === 'returned';
+}
+
+/**
+ * Record one host-observed business operation.
+ *
+ * The caller names a capability and supplies its ephemeral arguments; the host
+ * derives effective tool, effect and reversibility. Raw arguments are discarded
+ * after structural keys and a content digest are computed.
+ */
+export function recordResolvedOperationInTransaction(
+  db: ReturnType<typeof openEventLog>,
+  input: RecordResolvedOperationInput,
+): RecordResolvedOperationTransactionResult {
+  const expectedState = expectedTaskFor(input.sessionId, input.sourceUserSeq);
+  if (expectedState.status !== 'ok') {
+    return {
+      status: expectedState.status === 'missing' ? 'not_ready' : 'conflict',
+      reason: expectedState.reason,
+    };
+  }
+  const expected = expectedState.expectation;
+  if (!expected.workNodeId || input.nodeId !== expected.workNodeId) {
+    return { status: 'conflict', reason: 'operation does not belong to the accepted work node' };
+  }
+  if (!input.operationId.trim() || !input.logicalToolCallId.trim() || !input.resolvedTool.trim()) {
+    return { status: 'conflict', reason: 'operation identity is incomplete' };
+  }
+
+  const effective = unwrapRuntimeEffectiveToolIdentity(input.resolvedTool, input.args);
+  const resolvedTool = canonicalRuntimeEffectiveToolName(
+    effective.toolName?.trim() || input.resolvedTool.trim(),
+  );
+  if (!resolvedTool) return { status: 'conflict', reason: 'resolved tool identity is unsafe' };
+  const runtime = classifyRuntimeToolEffect(input.resolvedTool, input.args);
+  const taxonomy = classifyTool(resolvedTool, { args: effective.args });
+  const effectKind = runtime.effect === 'unknown'
+    ? effectForToolKind(taxonomy) ?? 'unknown'
+    : runtime.effect;
+  const reversibility = reversibilityFor(taxonomy, effectKind);
+  const shape = argumentShape(effective.args);
+  const resolution = ensureOpenResolution(db, expected);
+  if (resolution.state !== 'open') {
+    return { status: 'not_ready', reason: `accepted task resolution is ${resolution.state}` };
+  }
+  if (
+    input.physicalDispatchId
+    && !physicalDispatchBelongs(
+      db,
+      expected,
+      input.logicalToolCallId,
+      input.physicalDispatchId,
+      resolvedTool,
+    )
+  ) {
+    return { status: 'conflict', reason: 'physical dispatch does not belong to this operation' };
+  }
+  if (
+    input.physicalDispatchId
+    && (
+      input.dispatchState === 'not_started'
+      || (
+        input.outcomeKind !== undefined
+        && input.outcomeKind !== 'succeeded'
+        && input.outcomeKind !== 'empty_result'
+      )
+    )
+  ) {
+    return { status: 'conflict', reason: 'operation outcome conflicts with its physical dispatch' };
+  }
+
+  const existing = db.prepare(`
+    SELECT * FROM accepted_task_operations
+     WHERE session_id = ? AND source_user_seq = ?
+       AND (operation_id = ? OR logical_tool_call_id = ?)
+     LIMIT 1
+  `).get(
+    input.sessionId,
+    input.sourceUserSeq,
+    input.operationId,
+    input.logicalToolCallId,
+  ) as OperationRow | undefined;
+  if (existing) {
+    const fact = operationFact(existing);
+    const exact = fact.nodeId === expected.workNodeId
+      && fact.operationId === input.operationId
+      && fact.logicalToolCallId === input.logicalToolCallId
+      && fact.resolvedTool === resolvedTool
+      && fact.effectKind === effectKind
+      && fact.reversibility === reversibility
+      && fact.argumentDigest === shape.digest
+      && (fact.physicalDispatchId ?? undefined) === input.physicalDispatchId;
+    return exact
+      ? { status: 'existing', fact }
+      : { status: 'conflict', reason: 'operation identity conflicts with an existing observation' };
+  }
+
+  const mirror = insertInternalEventInTransaction(db, {
+    sessionId: input.sessionId,
+    turn: expected.identity.turn,
+    role: 'system',
+    type: RESOLUTION_OPERATION_EVENT,
+    data: {
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: expected.acceptedTaskId,
+      graphId: expected.graphId,
+      graphHash: expected.graphHash,
+      nodeId: expected.workNodeId,
+      operationId: input.operationId,
+      resolvedTool,
+      logicalToolCallId: input.logicalToolCallId,
+      ...(input.physicalDispatchId ? { physicalDispatchId: input.physicalDispatchId } : {}),
+      effectKind,
+      reversibility,
+      effectSource: runtime.effect === 'unknown' ? 'taxonomy' : runtime.source,
+      argumentKeys: shape.keys,
+      argumentDigest: shape.digest,
+      ...(input.physicalDispatchId
+        ? { outcomeKind: input.outcomeKind ?? 'succeeded', dispatchState: 'dispatched' }
+        : input.outcomeKind ? { outcomeKind: input.outcomeKind } : {}),
+      ...(!input.physicalDispatchId && input.dispatchState
+        ? { dispatchState: input.dispatchState }
+        : {}),
+    },
+  });
+  db.prepare(`
+    INSERT INTO accepted_task_operations
+      (session_id, source_user_seq, operation_id, logical_tool_call_id,
+       graph_node_id, resolved_tool, effect_kind, reversibility,
+       effect_source, argument_keys_json, argument_digest,
+       physical_dispatch_id, outcome_kind, dispatch_state, recorded_at,
+       operation_event_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.sessionId,
+    input.sourceUserSeq,
+    input.operationId,
+    input.logicalToolCallId,
+    expected.workNodeId,
+    resolvedTool,
+    effectKind,
+    reversibility,
+    runtime.effect === 'unknown' ? 'taxonomy' : runtime.source,
+    JSON.stringify(shape.keys),
+    shape.digest,
+    input.physicalDispatchId ?? null,
+    input.physicalDispatchId ? input.outcomeKind ?? 'succeeded' : input.outcomeKind ?? null,
+    input.physicalDispatchId ? 'dispatched' : input.dispatchState ?? null,
+    mirror.createdAt,
+    mirror.id,
+  );
+  return {
+    status: 'inserted',
+    fact: {
+      nodeId: expected.workNodeId,
+      operationId: input.operationId,
+      resolvedTool,
+      logicalToolCallId: input.logicalToolCallId,
+      ...(input.physicalDispatchId ? { physicalDispatchId: input.physicalDispatchId } : {}),
+      effectKind,
+      reversibility,
+      effectSource: runtime.effect === 'unknown' ? 'taxonomy' : runtime.source,
+      argumentKeys: shape.keys,
+      argumentDigest: shape.digest,
+      ...(input.physicalDispatchId
+        ? { outcomeKind: input.outcomeKind ?? 'succeeded', dispatchState: 'dispatched' }
+        : input.outcomeKind ? { outcomeKind: input.outcomeKind } : {}),
+      ...(!input.physicalDispatchId && input.dispatchState
+        ? { dispatchState: input.dispatchState }
+        : {}),
+    },
+    event: mirror,
+  };
+}
+
+export function recordResolvedOperation(input: RecordResolvedOperationInput): boolean {
+  const db = openEventLog();
+  let event: EventRow | null = null;
+  try {
+    const commit = db.transaction((): RecordResolvedOperationTransactionResult => {
+      const result = recordResolvedOperationInTransaction(db, input);
+      if (result.status === 'inserted') event = result.event;
+      return result;
+    });
+    const result = commit.immediate();
+    if (result.status === 'inserted' && event) publishCommittedInternalEvent(event);
+    return result.status === 'inserted';
+  } catch {
+    return false;
+  }
+}
+
+interface OperationRow {
+  graph_node_id: string;
+  operation_id: string;
+  resolved_tool: string;
+  logical_tool_call_id: string;
+  physical_dispatch_id: string | null;
+  effect_kind: RuntimeToolEffect;
+  reversibility: ObservedReversibility;
+  effect_source: string;
+  argument_keys_json: string;
+  argument_digest: string;
+  outcome_kind: string | null;
+  dispatch_state: 'not_started' | 'dispatched' | null;
+}
+
+function operationFact(row: OperationRow): ResolvedOperationFact {
+  let argumentKeys: string[] = [];
+  try {
+    const parsed = JSON.parse(row.argument_keys_json) as unknown;
+    if (Array.isArray(parsed)) argumentKeys = parsed.filter((entry): entry is string => typeof entry === 'string');
+  } catch { /* malformed structural metadata fails to an empty projection */ }
+  return {
+    nodeId: row.graph_node_id,
+    operationId: row.operation_id,
+    resolvedTool: row.resolved_tool,
+    logicalToolCallId: row.logical_tool_call_id,
+    ...(row.physical_dispatch_id ? { physicalDispatchId: row.physical_dispatch_id } : {}),
+    effectKind: row.effect_kind,
+    reversibility: row.reversibility,
+    effectSource: row.effect_source,
+    argumentKeys,
+    argumentDigest: row.argument_digest,
+    ...(row.outcome_kind ? { outcomeKind: row.outcome_kind } : {}),
+    ...(row.dispatch_state ? { dispatchState: row.dispatch_state } : {}),
+  };
+}
+
+export function resolvedOperationsFor(sessionId: string, sourceUserSeq: number): ResolvedOperationFact[] {
+  try {
+    return (openEventLog().prepare(`
+      SELECT * FROM accepted_task_operations
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY recorded_at, operation_id
+    `).all(sessionId, sourceUserSeq) as OperationRow[]).map(operationFact);
+  } catch {
+    return [];
+  }
+}
+
+function operationsDigest(operations: ResolvedOperationFact[]): string {
+  return sha256(canonical(operations.map((operation) => ({
+    nodeId: operation.nodeId,
+    operationId: operation.operationId,
+    resolvedTool: operation.resolvedTool,
+    logicalToolCallId: operation.logicalToolCallId,
+    physicalDispatchId: operation.physicalDispatchId ?? null,
+    effectKind: operation.effectKind,
+    reversibility: operation.reversibility,
+    argumentDigest: operation.argumentDigest,
+    outcomeKind: operation.outcomeKind ?? null,
+    dispatchState: operation.dispatchState ?? null,
+  }))));
+}
+
+function expectationSatisfied(
+  expected: AcceptedTaskExpectation,
+  operations: ResolvedOperationFact[],
+): boolean {
+  if (expected.workKind === 'conversation') return true;
+  if (operations.length === 0) return false;
+  if (expected.route === 'retrieve') {
+    return operations.some((operation) => operation.effectKind === 'read');
+  }
+  if (expected.externalEffectRequested || expected.effectCeiling === 'external_write' || expected.effectCeiling === 'admin') {
+    return operations.some((operation) =>
+      operation.effectKind === 'external_write' || operation.effectKind === 'admin');
+  }
+  // An action may legitimately be a calculation, a local edit, or a read-only
+  // tool invocation whose result is the requested deliverable. Semantic branch
+  // completeness remains the independent completion judge's job until the graph
+  // compiler emits one child node per requested branch.
+  return operations.some((operation) => operation.effectKind !== 'unknown');
+}
+
+function hasUnsettledToolWorkInTransaction(
+  db: ReturnType<typeof openEventLog>,
+  expected: AcceptedTaskExpectation,
+): boolean {
+  const row = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM logical_tool_calls
+        WHERE session_id = ? AND source_user_seq = ? AND state != 'settled') AS logical_n,
+      (SELECT COUNT(*) FROM physical_dispatches
+        WHERE session_id = ? AND source_user_seq = ? AND state = 'started') AS dispatch_n
+  `).get(
+    expected.identity.sessionId,
+    expected.identity.sourceUserSeq,
+    expected.identity.sessionId,
+    expected.identity.sourceUserSeq,
+  ) as { logical_n: number; dispatch_n: number };
+  return row.logical_n > 0 || row.dispatch_n > 0;
+}
+
+export type ExpectedWorkResolutionFinalization =
+  | {
+      status: 'finalized' | 'replayed';
+      match: ExpectedWorkMatchResult;
+      resolution: FinalizedResolution;
+    }
+  | { status: 'incomplete'; match: ExpectedWorkMatchResult }
+  | { status: 'conflict'; match?: ExpectedWorkMatchResult; reason?: string }
+  | { status: 'not_ready' | 'storage_error'; reason: string };
+
+function deterministicExpectedWorkMatch(input: {
+  contract: Extract<ReturnType<typeof loadExpectedWorkContract>, { status: 'ok' }>['contract'];
+}): { status: 'ok'; match: ExpectedWorkMatchResult } | { status: 'storage_error'; reason: string } {
+  const projected = projectObservedExpectedWorkHistory({
+    contract: input.contract,
+    // Matching happens against the exact set the surrounding IMMEDIATE
+    // transaction is proposing to freeze. This flag is tentative until the
+    // resolution CAS below succeeds.
+    finalized: true,
+  });
+  if (projected.status !== 'ok') return projected;
+  return { status: 'ok', match: matchExpectedWork(input.contract, projected.history) };
+}
+
+function expectedWorkContractStillBoundInTransaction(
+  db: ReturnType<typeof openEventLog>,
+  contract: Extract<ReturnType<typeof loadExpectedWorkContract>, { status: 'ok' }>['contract'],
+): boolean {
+  return Boolean(db.prepare(`
+    SELECT 1
+      FROM accepted_task_authority a
+      JOIN accepted_task_work_contracts c
+        ON c.session_id = a.session_id
+       AND c.source_user_seq = a.source_user_seq
+       AND c.contract_id = a.work_contract_id
+     WHERE a.session_id = ? AND a.source_user_seq = ?
+       AND a.accepted_task_id = ?
+       AND a.graph_event_id = ? AND a.graph_id = ? AND a.graph_hash = ?
+       AND a.state != 'conflict'
+       AND c.accepted_task_id = ?
+       AND c.graph_event_id = ? AND c.graph_id = ? AND c.graph_hash = ?
+       AND c.contract_id = ?
+     LIMIT 1
+  `).get(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.acceptedTaskId,
+    contract.graphEventId,
+    contract.graphId,
+    contract.graphHash,
+    contract.acceptedTaskId,
+    contract.graphEventId,
+    contract.graphId,
+    contract.graphHash,
+    contract.contractId,
+  ));
+}
+
+/**
+ * Typed pre-close admission for the deterministic expected-work cutover.
+ *
+ * Incomplete/conflicting work never closes the accepted task. A later host
+ * repair can therefore add evidence under the same task. Exact replay after a
+ * restart is idempotent, but only after count, digest and contract match all
+ * recompute from durable rows. Action topology remains staged and is refused
+ * here until its production scheduler supplies the missing bindings.
+ */
+export function finalizeResolutionAgainstExpectedWork(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn?: number;
+}): ExpectedWorkResolutionFinalization {
+  const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+  if (loaded.status === 'missing') {
+    return { status: 'not_ready', reason: 'accepted task has no immutable expected-work contract' };
+  }
+  if (loaded.status === 'storage_error') {
+    return { status: 'storage_error', reason: loaded.reason };
+  }
+  if (loaded.status !== 'ok') {
+    return { status: 'conflict', reason: `expected-work contract is ${loaded.status}: ${loaded.reason}` };
+  }
+  const expectedState = expectedTaskFor(input.sessionId, input.sourceUserSeq);
+  if (expectedState.status !== 'ok') {
+    return {
+      status: expectedState.status === 'missing' ? 'not_ready' : 'conflict',
+      reason: expectedState.reason,
+    };
+  }
+  const expected = expectedState.expectation;
+  if (
+    loaded.contract.acceptedTaskId !== expected.acceptedTaskId
+    || loaded.contract.graphEventId !== expected.graphEventId
+    || loaded.contract.graphId !== expected.graphId
+    || loaded.contract.graphHash !== expected.graphHash
+  ) {
+    return { status: 'conflict', reason: 'expected-work contract does not match accepted resolution authority' };
+  }
+
+  const db = openEventLog();
+  let mirror: EventRow | null = null;
+  try {
+    const commit = db.transaction((): ExpectedWorkResolutionFinalization => {
+      if (!expectedWorkContractStillBoundInTransaction(db, loaded.contract)) {
+        return { status: 'conflict', reason: 'expected-work contract lost its exact authority binding' };
+      }
+      const resolution = ensureOpenResolution(db, expected);
+      const operations = (db.prepare(`
+        SELECT * FROM accepted_task_operations
+         WHERE session_id = ? AND source_user_seq = ?
+         ORDER BY recorded_at, operation_id
+      `).all(input.sessionId, input.sourceUserSeq) as OperationRow[]).map(operationFact);
+      const digest = operationsDigest(operations);
+      const adjudicated = deterministicExpectedWorkMatch({ contract: loaded.contract });
+      if (adjudicated.status !== 'ok') return adjudicated;
+
+      if (resolution.state === 'finalized') {
+        if (
+          resolution.operation_count !== operations.length
+          || resolution.operations_digest !== digest
+          || resolution.expectations_satisfied !== 1
+          || adjudicated.match.status !== 'complete'
+        ) {
+          return {
+            status: 'conflict',
+            match: adjudicated.match,
+            reason: 'finalized resolution does not replay against its exact contract and digest',
+          };
+        }
+        return {
+          status: 'replayed',
+          match: adjudicated.match,
+          resolution: {
+            operationCount: operations.length,
+            operationsDigest: digest,
+            expectationsSatisfied: true,
+          },
+        };
+      }
+      if (resolution.state !== 'open') {
+        return { status: 'conflict', reason: `accepted task resolution is ${resolution.state}` };
+      }
+      if (hasUnsettledToolWorkInTransaction(db, expected)) {
+        return { status: 'not_ready', reason: 'accepted task still has unsettled logical or physical work' };
+      }
+      if (adjudicated.match.status === 'incomplete') {
+        return { status: 'incomplete', match: adjudicated.match };
+      }
+      if (adjudicated.match.status === 'conflict') {
+        return { status: 'conflict', match: adjudicated.match };
+      }
+
+      mirror = insertInternalEventInTransaction(db, {
+        sessionId: input.sessionId,
+        turn: expected.identity.turn,
+        role: 'system',
+        type: RESOLUTION_FINALIZED_EVENT,
+        data: {
+          sourceUserSeq: input.sourceUserSeq,
+          acceptedTaskId: expected.acceptedTaskId,
+          graphId: expected.graphId,
+          graphHash: expected.graphHash,
+          workContractId: loaded.contract.contractId,
+          operationCount: operations.length,
+          operationsDigest: digest,
+          expectationsSatisfied: true,
+          expectedWorkMatch: 'complete',
+        },
+      });
+      const updated = db.prepare(`
+        UPDATE accepted_task_resolutions
+           SET state = 'finalized', revision = revision + 1,
+               operation_count = ?, operations_digest = ?, expectations_satisfied = 1,
+               finalized_at = ?, finalize_event_id = ?
+         WHERE session_id = ? AND source_user_seq = ? AND state = 'open'
+      `).run(
+        operations.length,
+        digest,
+        mirror.createdAt,
+        mirror.id,
+        input.sessionId,
+        input.sourceUserSeq,
+      );
+      if (updated.changes !== 1) throw new Error('expected-work resolution finalization lost its CAS');
+      return {
+        status: 'finalized',
+        match: adjudicated.match,
+        resolution: {
+          operationCount: operations.length,
+          operationsDigest: digest,
+          expectationsSatisfied: true,
+        },
+      };
+    });
+    const result = commit.immediate();
+    if (result.status === 'finalized' && mirror) publishCommittedInternalEvent(mirror);
+    return result;
+  } catch (error) {
+    return {
+      status: 'storage_error',
+      reason: String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 240),
+    };
+  }
+}
+
+/**
+ * Atomically freeze the observed set for an accepted task.
+ *
+ * This does not yet publish a user terminal. The common terminal committer will
+ * consume this state only after every lane records logical operations and the
+ * manifest-backed adjudicator replaces the legacy requirement reader.
+ */
+function finalizeResolutionLegacy(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn?: number;
+}): boolean {
+  const expectedState = expectedTaskFor(input.sessionId, input.sourceUserSeq);
+  if (expectedState.status !== 'ok') return false;
+  const expected = expectedState.expectation;
+  const db = openEventLog();
+  let mirror: EventRow | null = null;
+  try {
+    const commit = db.transaction((): boolean => {
+      const resolution = ensureOpenResolution(db, expected);
+      if (resolution.state !== 'open') return false;
+      // A zero-crossing refusal is still a logical call. Freezing while any
+      // logical call lacks its normalized settlement would let terminal truth
+      // race a pre-dispatch gate just as surely as an in-flight provider call.
+      if (hasUnsettledToolWorkInTransaction(db, expected)) return false;
+      const operations = (db.prepare(`
+        SELECT * FROM accepted_task_operations
+         WHERE session_id = ? AND source_user_seq = ?
+         ORDER BY recorded_at, operation_id
+      `).all(input.sessionId, input.sourceUserSeq) as OperationRow[]).map(operationFact);
+      const digest = operationsDigest(operations);
+      const satisfied = expectationSatisfied(expected, operations);
+      mirror = insertInternalEventInTransaction(db, {
+        sessionId: input.sessionId,
+        turn: expected.identity.turn,
+        role: 'system',
+        type: RESOLUTION_FINALIZED_EVENT,
+        data: {
+          sourceUserSeq: input.sourceUserSeq,
+          acceptedTaskId: expected.acceptedTaskId,
+          graphId: expected.graphId,
+          graphHash: expected.graphHash,
+          operationCount: operations.length,
+          operationsDigest: digest,
+          expectationsSatisfied: satisfied,
+        },
+      });
+      const updated = db.prepare(`
+        UPDATE accepted_task_resolutions
+           SET state = 'finalized', revision = revision + 1,
+               operation_count = ?, operations_digest = ?, expectations_satisfied = ?,
+               finalized_at = ?, finalize_event_id = ?
+         WHERE session_id = ? AND source_user_seq = ? AND state = 'open'
+      `).run(
+        operations.length,
+        digest,
+        satisfied ? 1 : 0,
+        mirror.createdAt,
+        mirror.id,
+        input.sessionId,
+        input.sourceUserSeq,
+      );
+      if (updated.changes !== 1) throw new Error('resolution finalization lost its CAS');
+      return true;
+    });
+    const finalized = commit.immediate();
+    if (finalized && mirror) publishCommittedInternalEvent(mirror);
+    return finalized;
+  } catch {
+    return false;
+  }
+}
+
+/** Compatibility wrapper. Contracted deterministic turns use the typed
+ * pre-close admission above; uncontracted/action turns retain the staged
+ * legacy path until action topology is cut over. Exact replay remains `false`
+ * here for callers whose historical boolean means "I performed the close". */
+export function finalizeResolution(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn?: number;
+}): boolean {
+  const contract = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+  if (contract.status === 'ok') {
+    return finalizeResolutionAgainstExpectedWork(input).status === 'finalized';
+  }
+  if (contract.status !== 'missing') return false;
+  return finalizeResolutionLegacy(input);
+}
+
+export interface FinalizedResolution {
+  operationCount: number;
+  operationsDigest: string;
+  expectationsSatisfied: boolean;
+}
+
+export type FrozenResolutionState =
+  | {
+      status: 'ok';
+      resolution: FinalizedResolution;
+      operations: ResolvedOperationFact[];
+    }
+  | { status: 'missing'; reason: string }
+  | { status: 'ambiguous'; reason: string };
+
+/**
+ * Rehydrate the frozen operation set as one integrity-checked artifact.
+ *
+ * Reading the finalization row and operations independently can manufacture a
+ * false zero-operation success if either read fails or rows are damaged after
+ * close. A frozen resolution is usable only when count, digest, and the
+ * graph-derived expectation verdict all recompute byte-for-byte.
+ */
+export function frozenResolutionFor(
+  sessionId: string,
+  sourceUserSeq: number,
+): FrozenResolutionState {
+  const expectedState = expectedTaskFor(sessionId, sourceUserSeq);
+  if (expectedState.status !== 'ok') {
+    return {
+      status: expectedState.status,
+      reason: `accepted task expectation is ${expectedState.status}: ${expectedState.reason}`,
+    };
+  }
+  try {
+    const db = openEventLog();
+    const row = db.prepare(`
+      SELECT state, operation_count, operations_digest, expectations_satisfied
+        FROM accepted_task_resolutions
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(sessionId, sourceUserSeq) as ResolutionRow | undefined;
+    if (!row || row.state !== 'finalized') {
+      return { status: 'missing', reason: 'accepted task resolution is not finalized' };
+    }
+    if (!row.operations_digest || row.expectations_satisfied === null) {
+      return { status: 'ambiguous', reason: 'finalized resolution lacks its frozen verdict' };
+    }
+    const operations = (db.prepare(`
+      SELECT * FROM accepted_task_operations
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY recorded_at, operation_id
+    `).all(sessionId, sourceUserSeq) as OperationRow[]).map(operationFact);
+    const digest = operationsDigest(operations);
+    if (operations.length !== row.operation_count || digest !== row.operations_digest) {
+      return { status: 'ambiguous', reason: 'frozen operation count or digest does not match its rows' };
+    }
+    const contract = loadExpectedWorkContract(sessionId, sourceUserSeq);
+    if (contract.status !== 'ok' && contract.status !== 'missing') {
+      return {
+        status: 'ambiguous',
+        reason: `frozen expected-work contract is ${contract.status}: ${contract.reason}`,
+      };
+    }
+    let recomputedSatisfied: boolean;
+    if (contract.status === 'ok') {
+      const adjudicated = deterministicExpectedWorkMatch({ contract: contract.contract });
+      if (adjudicated.status !== 'ok') {
+        return { status: 'ambiguous', reason: adjudicated.reason };
+      }
+      recomputedSatisfied = adjudicated.match.status === 'complete';
+    } else {
+      recomputedSatisfied = expectationSatisfied(expectedState.expectation, operations);
+    }
+    if (recomputedSatisfied !== (row.expectations_satisfied === 1)) {
+      return { status: 'ambiguous', reason: 'frozen expectation verdict does not match the accepted graph' };
+    }
+    return {
+      status: 'ok',
+      resolution: {
+        operationCount: row.operation_count,
+        operationsDigest: row.operations_digest,
+        expectationsSatisfied: recomputedSatisfied,
+      },
+      operations,
+    };
+  } catch (error) {
+    return { status: 'ambiguous', reason: `resolution store unreadable: ${String(error)}` };
+  }
+}
+
+export function finalizedResolutionFor(
+  sessionId: string,
+  sourceUserSeq: number,
+): FinalizedResolution | null {
+  const state = frozenResolutionFor(sessionId, sourceUserSeq);
+  return state.status === 'ok' ? state.resolution : null;
+}
+
+export function resolutionIsFinalized(sessionId: string, sourceUserSeq: number): boolean {
+  return finalizedResolutionFor(sessionId, sourceUserSeq) !== null;
+}

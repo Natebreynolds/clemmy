@@ -53,10 +53,15 @@ const {
   resolveTurnCapabilities,
   renderCapabilityResolutionForContext,
   recordCapabilityResolution,
+  selectWarmableContractIdentifiers,
 } = await import('./capability-resolution.js');
 const { rememberToolChoice, invalidateToolChoice } = await import('../../memory/tool-choice-store.js');
 const { __test__: composioTest, listConnectedToolkits } = await import('../../integrations/composio/client.js');
-const { createSession, listEvents, resetEventLog } = await import('./eventlog.js');
+const { appendEvent, createSession, listEvents, resetEventLog } = await import('./eventlog.js');
+const { discoveryGovernor } = await import('./discovery-governor.js');
+const { resetMemoryDb } = await import('../../memory/db.js');
+const { createFocus, patchFocusWorkstate } = await import('../../memory/focus.js');
+const { createGoalContract } = await import('../../agents/plan-proposals.js');
 
 // Teach one proven memo and one that then fails out — the live pair.
 rememberToolChoice({
@@ -106,11 +111,112 @@ test('an unrelated ask resolves nothing — zero prompt tax without history', ()
   assert.equal(renderCapabilityResolutionForContext(r), '');
 });
 
+test('a bare continuation reuses the exact-session active focus capability', () => {
+  resetMemoryDb();
+  const sessionId = 'capability-continuation-focus';
+  const focus = createFocus({
+    resourceRef: `session:${sessionId}`,
+    title: 'Outlook calendar view',
+    summary: 'List the Outlook calendar events for tomorrow.',
+    relatedSessionId: sessionId,
+  });
+  patchFocusWorkstate(focus.id, {
+    objective: 'Finish checking the Outlook calendar view for tomorrow.',
+  });
+
+  const continued = resolveTurnCapabilities('continue', { sessionId });
+  assert.ok(
+    continued.entries.some((entry) => entry.identifier === 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW'
+      && entry.status === 'proven'),
+    'the active task objective should recover the already-proven procedure',
+  );
+
+  const unrelated = resolveTurnCapabilities('continue later; tell me a story about clementines', { sessionId });
+  assert.deepEqual(
+    unrelated.entries,
+    [],
+    'a substantive new ask containing continuation language must not borrow task vocabulary',
+  );
+});
+
+test('an exact-session active goal can explain a bare continuation without a focus', () => {
+  resetMemoryDb();
+  const sessionId = 'capability-continuation-goal';
+  const goal = createGoalContract({
+    sessionId,
+    objective: 'Finish listing the Outlook calendar view for tomorrow.',
+    successCriteria: ['The calendar events are returned.'],
+  });
+  assert.ok(goal);
+
+  const continued = resolveTurnCapabilities("what's next?", { sessionId });
+  assert.ok(continued.entries.some((entry) => entry.identifier === 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW'));
+});
+
+test('continuation enrichment never reads another session or a stale focus', async () => {
+  resetMemoryDb();
+  const priorSessionId = 'capability-continuation-prior';
+  const focus = createFocus({
+    resourceRef: `session:${priorSessionId}`,
+    title: 'Outlook calendar view',
+    summary: 'List the Outlook calendar events for tomorrow.',
+    relatedSessionId: priorSessionId,
+  });
+  patchFocusWorkstate(focus.id, {
+    objective: 'Finish checking the Outlook calendar view for tomorrow.',
+  });
+  createGoalContract({
+    sessionId: priorSessionId,
+    objective: 'Finish listing the Outlook calendar view for tomorrow.',
+  });
+
+  assert.deepEqual(
+    resolveTurnCapabilities('keep going', { sessionId: 'capability-continuation-new' }).entries,
+    [],
+    'neither a cross-session focus nor another session goal may enrich the query',
+  );
+
+  resetMemoryDb();
+  process.env.CLEMMY_FOCUS_CONFIRM_MS = '1';
+  try {
+    const staleSessionId = 'capability-continuation-stale';
+    const stale = createFocus({
+      resourceRef: `session:${staleSessionId}`,
+      title: 'Outlook calendar view',
+      summary: 'List the Outlook calendar events for tomorrow.',
+      relatedSessionId: staleSessionId,
+    });
+    patchFocusWorkstate(stale.id, {
+      objective: 'Finish checking the Outlook calendar view for tomorrow.',
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(
+      resolveTurnCapabilities('continue', { sessionId: staleSessionId }).entries,
+      [],
+      'stale task prose is a pointer, not capability evidence',
+    );
+  } finally {
+    delete process.env.CLEMMY_FOCUS_CONFIRM_MS;
+  }
+});
+
+test('speculative preflight warms only the highest-ranked proven contract', () => {
+  const selected = selectWarmableContractIdentifiers([
+    { intent: 'first', kind: 'composio', identifier: 'FIRST_ACTION', status: 'proven', connection: 'active' },
+    { intent: 'second', kind: 'composio', identifier: 'SECOND_ACTION', status: 'proven', connection: 'unknown' },
+    { intent: 'failed', kind: 'composio', identifier: 'FAILED_ACTION', status: 'previously_failed', connection: 'active' },
+  ]);
+  assert.deepEqual(selected, ['FIRST_ACTION']);
+});
+
 test('the rendered block is data + floor, and names both statuses', () => {
   const r = resolveTurnCapabilities('scrape firms with apify google search research, then check my outlook calendar view');
   const block = renderCapabilityResolutionForContext(r);
   assert.match(block, /\[capability resolution/);
   assert.match(block, /✕ previously failed: apify\.google_search_scrape_public_firm_research/);
+  assert.match(block, /proven execution path: composio:OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW/);
+  assert.match(block, /intent label.*NOT callable/s);
+  assert.match(block, /call composio_execute_tool.*tool_slug.*Never pass the learned intent label/s);
   assert.match(block, /Floor: a previously-failed path must be re-verified/);
 });
 
@@ -136,13 +242,142 @@ test('with a registry snapshot, connections join: active toolkit → active; abs
 test('recordCapabilityResolution persists a typed event; empty resolutions persist nothing', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
-  recordCapabilityResolution(sess.id, resolveTurnCapabilities('scrape firms with apify google search research'), 7);
+  const knownSource = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'scrape firms with apify google search research' },
+  });
+  recordCapabilityResolution(
+    sess.id,
+    resolveTurnCapabilities('scrape firms with apify google search research'),
+    knownSource.seq,
+  );
   const rows = listEvents(sess.id, { types: ['capability_resolution'] });
   assert.equal(rows.length, 1);
   const data = rows[0].data as { entries: Array<{ status: string }>; sourceUserSeq?: number };
   assert.ok(data.entries.some((e) => e.status === 'previously_failed'));
-  assert.equal(data.sourceUserSeq, 7);
+  assert.equal(data.sourceUserSeq, knownSource.seq);
 
-  recordCapabilityResolution(sess.id, { entries: [], registryAvailable: false });
+  const novelSource = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'novel capability' },
+  });
+  recordCapabilityResolution(sess.id, { entries: [], registryAvailable: false }, novelSource.seq);
   assert.equal(listEvents(sess.id, { types: ['capability_resolution'] }).length, 1, 'empty resolution stays silent');
+  assert.equal(
+    discoveryGovernor.getTaskState({ sessionId: sess.id, sourceUserSeq: novelSource.seq })?.policy.broadDiscoveryAllowance,
+    1,
+    'an empty resolution still initializes one broad-discovery slot for the accepted task',
+  );
+});
+
+test('a resolved continuation initializes the accepted task as known', () => {
+  resetEventLog();
+  resetMemoryDb();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'continue' },
+  });
+
+  const unresolved = resolveTurnCapabilities('continue', { sessionId: sess.id });
+  assert.equal(unresolved.entries.some((entry) => entry.status === 'proven'), false);
+  recordCapabilityResolution(sess.id, unresolved, source.seq);
+  assert.equal(
+    discoveryGovernor.getTaskState({ sessionId: sess.id, sourceUserSeq: source.seq })?.policy.knownCapability,
+    false,
+  );
+
+  const focus = createFocus({
+    resourceRef: `session:${sess.id}`,
+    title: 'Outlook calendar view',
+    summary: 'List the Outlook calendar events for tomorrow.',
+    relatedSessionId: sess.id,
+  });
+  patchFocusWorkstate(focus.id, {
+    objective: 'Finish checking the Outlook calendar view for tomorrow.',
+  });
+  const resolution = resolveTurnCapabilities('continue', { sessionId: sess.id });
+  assert.ok(resolution.entries.some((entry) => entry.status === 'proven'));
+
+  recordCapabilityResolution(sess.id, resolution, source.seq);
+  const state = discoveryGovernor.getTaskState({ sessionId: sess.id, sourceUserSeq: source.seq });
+  assert.equal(state?.policy.knownCapability, true);
+  assert.equal(state?.policy.broadDiscoveryAllowance, 0);
+});
+
+test('an internal verification retry cannot tighten an unresolved continuation from an unrelated proven capability', () => {
+  resetEventLog();
+  resetMemoryDb();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Continue.' },
+  });
+
+  const initial = resolveTurnCapabilities('Continue.', { sessionId: sess.id });
+  assert.equal(initial.entries.some((entry) => entry.status === 'proven'), false);
+  recordCapabilityResolution(sess.id, initial, source.seq);
+  assert.equal(
+    discoveryGovernor.getTaskState({ sessionId: sess.id, sourceUserSeq: source.seq })?.policy.knownCapability,
+    false,
+  );
+
+  rememberToolChoice({
+    intent: 'netlify.create_disposable_site_and_prod_deploy',
+    description: 'Create a disposable Netlify site and deploy it to production',
+    choice: { kind: 'cli', identifier: 'netlify' },
+  });
+  const internalVerification = [
+    'You marked this objective complete, but an independent verification check found it is not finished.',
+    'If finishing requires a discoverable destination, create a disposable Netlify site and deploy it to production.',
+  ].join(' ');
+  const retryResolution = resolveTurnCapabilities(internalVerification, { sessionId: sess.id });
+  assert.ok(
+    retryResolution.entries.some((entry) => entry.status === 'proven' && entry.identifier === 'netlify'),
+    'the retry must reproduce the unrelated proven Netlify match from the live source-37322 shape',
+  );
+
+  recordCapabilityResolution(sess.id, retryResolution, source.seq);
+  const state = discoveryGovernor.getTaskState({ sessionId: sess.id, sourceUserSeq: source.seq });
+  assert.equal(state?.policy.knownCapability, false);
+  assert.equal(state?.policy.broadDiscoveryAllowance, 1, 'the accepted continuation remains novel');
+});
+
+test('caller-constructed resolution data cannot manufacture known-capability authority', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Continue.' },
+  });
+
+  recordCapabilityResolution(sess.id, {
+    entries: [{
+      intent: 'netlify.create_disposable_site_and_prod_deploy',
+      kind: 'cli',
+      identifier: 'netlify',
+      status: 'proven',
+      connection: 'not_applicable',
+    }],
+    registryAvailable: false,
+  }, source.seq);
+
+  const state = discoveryGovernor.getTaskState({ sessionId: sess.id, sourceUserSeq: source.seq });
+  assert.equal(state?.policy.knownCapability, false);
+  assert.equal(state?.policy.broadDiscoveryAllowance, 1);
 });

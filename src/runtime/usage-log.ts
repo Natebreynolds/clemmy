@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, appendFileSync } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { recordOperationalEvent } from './operational-telemetry.js';
@@ -73,6 +74,10 @@ export interface UsageEvent {
   /** The cached-read subset of inputTokens (prompt-cache hits). cacheHitRate =
    *  cachedInputTokens / inputTokens. Split out when the API reports it. */
   cachedInputTokens?: number;
+  /** Provider-reported prompt tokens written into cache on this call. This is
+   * observability only: adapters may already fold it into inputTokens, and the
+   * canonical debit continues to use the declared cache dialect. */
+  cacheCreationInputTokens?: number;
   outputTokens: number;
   reasoningTokens?: number;
   totalTokens: number;
@@ -382,6 +387,40 @@ export function uncachedTokensForAccrual(event: {
   return canonicalCacheAccounting(event).uncachedWorkTokens;
 }
 
+/**
+ * Canonical accepted-source join key. A session can contain many accepted
+ * user turns, so the session id alone is not a turn identity. Keep the legacy
+ * session-only shape when a lane genuinely has no accepted event; callers and
+ * readers can then distinguish exact attribution from compatibility fallback.
+ */
+export function acceptedSourceIdentity(sessionId: string, sourceUserSeq?: number): string {
+  const source = sessionId || 'unknown';
+  return source !== 'unknown' && Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq as number) > 0
+    ? `${source}:${sourceUserSeq}`
+    : source;
+}
+
+export interface ModelUsageAttributionContext {
+  sessionId: string;
+  sourceUserSeq: number;
+  attemptId?: string;
+}
+
+/**
+ * Turn-wide model-cost authority. The tool harness ALS is intentionally scoped
+ * to Runner.run; completion/watcher/delivery judges may execute after it
+ * closes. This narrower context spans the whole accepted turn without granting
+ * any tool authority, and nested worker turns naturally override their parent.
+ */
+export const modelUsageAttributionStorage = new AsyncLocalStorage<ModelUsageAttributionContext>();
+
+export function withModelUsageAttribution<T>(
+  context: ModelUsageAttributionContext,
+  work: () => T,
+): T {
+  return modelUsageAttributionStorage.run(context, work);
+}
+
 export function recordModelUsage(args: {
   sessionId: string;
   channel?: string;
@@ -391,8 +430,14 @@ export function recordModelUsage(args: {
   cacheDialect?: CacheDialectProvenance;
   /** Explicit trace identity where the lane has one (identifiers only). */
   trace?: TraceEnvelope;
+  /** Exact accepted user_input_received event that owns this model call. */
+  sourceUserSeq?: number;
+  /** Durable physical attempt, when the caller owns one. */
+  attemptId?: string;
   inputTokens: number;
   cachedInputTokens?: number;
+  /** Raw provider cache-write split when available. Does not alter debit math. */
+  cacheCreationInputTokens?: number;
   outputTokens: number;
   reasoningTokens?: number;
   totalTokens?: number;
@@ -407,7 +452,36 @@ export function recordModelUsage(args: {
   /** Spawn → first stream message (Claude SDK lane cold-start latency). */
   firstByteMs?: number;
 }): void {
-  const source = args.sessionId || 'unknown';
+  const attribution = modelUsageAttributionStorage.getStore();
+  const argsSource = args.sessionId?.trim() || 'unknown';
+  const explicitExact = argsSource !== 'unknown'
+    && Number.isSafeInteger(args.sourceUserSeq)
+    && (args.sourceUserSeq as number) > 0;
+  const inheritedExact = attribution
+    && attribution.sessionId.trim()
+    && attribution.sessionId !== 'unknown'
+    && Number.isSafeInteger(attribution.sourceUserSeq)
+    && attribution.sourceUserSeq > 0
+    ? attribution
+    : undefined;
+  // Select one whole authority tuple. Never combine a detached child's seq
+  // with an inherited parent session (or vice versa). When both tuples name
+  // the same source, the outer scope may safely fill the missing attempt id.
+  const exactAttribution = explicitExact
+    ? {
+        sessionId: argsSource,
+        sourceUserSeq: args.sourceUserSeq as number,
+        attemptId: args.attemptId ?? (
+          inheritedExact?.sessionId === argsSource
+          && inheritedExact.sourceUserSeq === args.sourceUserSeq
+            ? inheritedExact.attemptId
+            : undefined
+        ),
+      }
+    : inheritedExact;
+  const source = exactAttribution?.sessionId ?? argsSource;
+  const sourceUserSeq = exactAttribution?.sourceUserSeq;
+  const attemptId = exactAttribution?.attemptId ?? (!exactAttribution ? args.attemptId : undefined);
   // Write-time authority: the durable session row knows what this session IS,
   // so classification does not depend on every surface's id-minting habits.
   // Guarded — observability must never break the model-call path.
@@ -417,6 +491,18 @@ export function recordModelUsage(args: {
   } catch { /* classification falls back to channel/prefix evidence */ }
   const resolution = resolveUsageKind(source, { channel: args.channel, sessionRowKind });
   const canonical = canonicalCacheAccounting(args);
+  const hasExactAcceptedSource = source !== 'unknown'
+    && Number.isSafeInteger(sourceUserSeq)
+    && (sourceUserSeq as number) > 0;
+  const rawTrace = args.trace || hasExactAcceptedSource || attemptId || args.responseId
+    ? {
+        ...(args.trace ?? {}),
+        ...(hasExactAcceptedSource ? { acceptedSource: acceptedSourceIdentity(source, sourceUserSeq) } : {}),
+        ...(hasExactAcceptedSource ? { logicalTurnId: `turn:${sourceUserSeq}` } : {}),
+        ...(attemptId ? { attemptId } : {}),
+        ...(args.responseId && !args.trace?.modelCallId ? { modelCallId: args.responseId } : {}),
+      }
+    : undefined;
   const event = {
     at: new Date().toISOString(),
     source,
@@ -427,8 +513,8 @@ export function recordModelUsage(args: {
     // Sealed at persistence: an unsealable (content-shaped) envelope is
     // dropped, never appended raw.
     ...((): { trace?: TraceEnvelope } => {
-      if (!args.trace) return {};
-      const sealed = sealTraceEnvelope(args.trace);
+      if (!rawTrace) return {};
+      const sealed = sealTraceEnvelope(rawTrace);
       return sealed.ok ? { trace: sealed.envelope } : {};
     })(),
     canonical: {
@@ -440,6 +526,7 @@ export function recordModelUsage(args: {
     },
     inputTokens: args.inputTokens,
     cachedInputTokens: args.cachedInputTokens,
+    cacheCreationInputTokens: args.cacheCreationInputTokens,
     outputTokens: args.outputTokens,
     reasoningTokens: args.reasoningTokens,
     totalTokens: args.totalTokens ?? args.inputTokens + args.outputTokens,
@@ -479,6 +566,7 @@ export function recordModelUsage(args: {
       model: event.model,
       inputTokens: event.inputTokens,
       cachedInputTokens: event.cachedInputTokens,
+      cacheCreationInputTokens: event.cacheCreationInputTokens,
       outputTokens: event.outputTokens,
       reasoningTokens: event.reasoningTokens,
       totalTokens: event.totalTokens,

@@ -18,6 +18,15 @@ import {
   describeProcedureValidity,
   validateStoredProcedure,
 } from './procedure-validity.js';
+import {
+  capabilityEffectIsCompatible,
+  rememberedCapabilityEffect,
+  requestedCapabilityEffectScope,
+} from './capability-effect-scope.js';
+import {
+  parseVerifiedReadCapabilityOrigin,
+  type VerifiedReadCapabilityOrigin,
+} from './verified-read-origin.js';
 
 /**
  * Tool-choice memory store.
@@ -78,6 +87,9 @@ export interface ToolChoiceRecordChoice {
    * means "never recorded", which is legacy, not drift.
    */
   schemaFingerprint?: string;
+  /** Exact settlement that taught this capability. Private pointer only; a
+   * consumer must revalidate its durable receipt and completion lineage. */
+  verifiedReadOrigin?: VerifiedReadCapabilityOrigin;
   // ── Thread 2 — outcome-driven procedural memory ──
   // Track record of how this proven path has FARED since it was learned, so
   // retrieval can prefer procedures that actually work and retire ones that
@@ -400,6 +412,7 @@ function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
     // Absent on every record written before drift detection existed. Parsing it
     // back is what makes the fingerprint durable rather than write-only.
     schemaFingerprint: typeof r.schemaFingerprint === 'string' ? r.schemaFingerprint : undefined,
+    verifiedReadOrigin: parseVerifiedReadCapabilityOrigin(r.verifiedReadOrigin) ?? undefined,
   };
 }
 
@@ -675,6 +688,9 @@ function mergeProcedureChoice(
     ...preferred,
     invocationTemplate: preferred.invocationTemplate ?? current.invocationTemplate ?? incoming.invocationTemplate,
     accountIdentity: preferred.accountIdentity ?? current.accountIdentity ?? incoming.accountIdentity,
+    verifiedReadOrigin: preferred.verifiedReadOrigin
+      ?? current.verifiedReadOrigin
+      ?? incoming.verifiedReadOrigin,
     testEvidence: preferred.testEvidence ?? current.testEvidence ?? incoming.testEvidence,
     successCount: Math.max(current.successCount ?? 0, incoming.successCount ?? 0) || undefined,
     failureCount: Math.max(current.failureCount ?? 0, incoming.failureCount ?? 0) || undefined,
@@ -1289,6 +1305,8 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
     schemaFingerprint: input.schemaFingerprint
       ?? input.choice.schemaFingerprint
       ?? (samePath ? prev.schemaFingerprint : undefined),
+    verifiedReadOrigin: parseVerifiedReadCapabilityOrigin(input.choice.verifiedReadOrigin)
+      ?? (samePath ? prev.verifiedReadOrigin : undefined),
     ...(samePath ? {
       successCount: prev.successCount,
       failureCount: prev.failureCount,
@@ -1921,6 +1939,12 @@ export interface StepToolChoiceMatch {
   /** The stable account this capability was PROVEN against, when bound.
    *  Retrieval preserves every distinct provenance; it never picks one. */
   accountIdentity?: string;
+  /** Effect evidence carried by the remembered operation. Unknown legacy
+   *  shapes remain advisory and are never silently flattened to read/write. */
+  effectClass?: 'read' | 'write' | 'unknown';
+  /** Private, receipt-backed origin of a capability learned from a verified
+   * read. It grants no dispatch authority and is never rendered to the model. */
+  verifiedReadOrigin?: VerifiedReadCapabilityOrigin;
 }
 
 export interface MatchToolChoicesOptions {
@@ -1985,6 +2009,7 @@ export function matchToolChoicesForStep(
   const advertiseOnly = opts.purpose === 'advertise';
   const prompt = wordTokens(promptText);
   if (prompt.size === 0) return [];
+  const requestedEffect = requestedCapabilityEffectScope(promptText);
 
   let records: ToolChoiceRecord[];
   try {
@@ -2011,6 +2036,8 @@ export function matchToolChoicesForStep(
     if (!rec.choice) continue; // inactive (invalidated, not yet rediscovered)
     if (placeholderChoiceString(rec.choice.identifier)) continue;
     if (rec.choice.kind === 'mcp' && !validCallableMcpIdentifier(rec.choice.identifier)) continue;
+    const effectClass = rememberedCapabilityEffect(rec.choice);
+    if (!capabilityEffectIsCompatible(requestedEffect, effectClass)) continue;
     // A capability bound to a provider contract serves only under LIVE
     // catalog authority that matches it. A moved contract is a wrong answer
     // waiting to be argued for; NO live authority (empty or expired process
@@ -2091,6 +2118,8 @@ export function matchToolChoicesForStep(
       family: toolFamilyForChoice(rec.choice),
       command: boundCommandForChoice(rec.choice),
       ...(rec.choice.accountIdentity ? { accountIdentity: rec.choice.accountIdentity } : {}),
+      effectClass,
+      ...(rec.choice.verifiedReadOrigin ? { verifiedReadOrigin: rec.choice.verifiedReadOrigin } : {}),
     });
   }
 
@@ -2107,6 +2136,9 @@ export function matchToolChoicesForStep(
     liveSchemaFingerprintFor: opts.liveSchemaFingerprintFor ?? liveComposioSchemaFingerprint,
   });
   for (const aliasHit of aliasHits) {
+    // This index is written only from a receipt-verified successful READ.
+    // Its source phrase must never become a shortcut to a later write ask.
+    if (!capabilityEffectIsCompatible(requestedEffect, 'read')) continue;
     // One match per (identifier, account) — a phrase proven against two
     // accounts yields two provenances, and choosing between them is the
     // brain's decision, never retrieval's.
@@ -2129,6 +2161,8 @@ export function matchToolChoicesForStep(
       family: toolFamilyForChoice(rec.choice),
       command: boundCommandForChoice(rec.choice),
       ...(aliasHit.accountIdentity ? { accountIdentity: aliasHit.accountIdentity } : {}),
+      effectClass: 'read',
+      ...(rec.choice.verifiedReadOrigin ? { verifiedReadOrigin: rec.choice.verifiedReadOrigin } : {}),
     });
   }
 
@@ -2238,6 +2272,7 @@ export function recallComposioForSearch(
 ): RememberedComposioMatch[] {
   const q = wordTokens(query);
   if (q.size === 0) return [];
+  const requestedEffect = requestedCapabilityEffectScope(query);
   let records: ToolChoiceRecord[];
   try {
     records = servableChoices((opts.choices ?? listToolChoices()).filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX)));
@@ -2258,6 +2293,7 @@ export function recallComposioForSearch(
     const c = rec.choice;
     if (!c || c.kind !== 'composio') continue;
     if (placeholderChoiceString(c.identifier)) continue;
+    if (!capabilityEffectIsCompatible(requestedEffect, rememberedCapabilityEffect(c))) continue;
     // A learned procedure must resolve to ONE executable slug. Historical
     // summaries such as "TOOL_A + TOOL_B + TOOL_C" are useful evidence but can
     // never be sent to Composio and must not occupy a discovery result.
@@ -2751,7 +2787,15 @@ function contextInjectEnabled(): boolean {
 // persistent prefix on every turn (the renderFactsForInstructions discipline:
 // an explicit budget, not just a count). A long invocationTemplate is clipped,
 // not dropped — the agent still sees the intent→tool mapping.
-const TOOL_CHOICE_LINE_MAX = 160;
+// 160 could not hold a real callable shape: the live OUTLOOK_CREATE_DRAFT memo
+// renders to 263 chars, so the argument object was always cut mid-object and
+// the model never saw `body`. The budget discipline is kept — an explicit cap,
+// and the block cap below still bounds the whole section, so a longer line
+// simply means fewer lines and the highest-ranked choices win the space.
+const TOOL_CHOICE_LINE_MAX = 320;
+/** Prose absorbs clipping, but an intent clipped to nothing identifies nothing.
+ *  Below this the line keeps the shape whole and runs over budget instead. */
+const MIN_INTENT_CHARS = 24;
 const TOOL_CHOICE_BLOCK_MAX = 1400;
 
 /** Retire never-proven memos (2026-07-31 hygiene): a memo whose choice was
@@ -2797,6 +2841,15 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   }
   let activeRecords = records.filter((r) => r.choice);
   if (activeRecords.length === 0) return '';
+  const trimmedObjective = objective?.trim();
+  if (trimmedObjective) {
+    const requestedEffect = requestedCapabilityEffectScope(trimmedObjective);
+    activeRecords = activeRecords.filter((record) => record.choice
+      && capabilityEffectIsCompatible(requestedEffect, rememberedCapabilityEffect(record.choice)));
+    // Unlike outcome weighting, falling back to the unfiltered set would
+    // reintroduce the exact read/write mismatch this scope is meant to remove.
+    if (activeRecords.length === 0) return '';
+  }
 
   // Thread 2 / P3 — outcome weighting (flag-gated; off = byte-identical below).
   // Drop net-negative procedures from the ADVERTISED set (they remain on disk
@@ -2828,7 +2881,6 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   // choice. The no-objective path is unchanged.
   let ordered = byRecency;
   const relevantIntents = new Set<string>();
-  const trimmedObjective = objective?.trim();
   if (trimmedObjective) {
     try {
       const matches = matchToolChoicesForStep(trimmedObjective, {
@@ -2857,7 +2909,9 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   const header = relevantIntents.size > 0
     ? 'PAST-task tools (★ = fits your task; intent shown per line). Reuse a ★ line ONLY if its intent+resource match what you\'re doing NOW — else ignore it and rediscover. A tool from a different job (e.g. an SEO tool for an email task) is the wrong tool.'
     : 'PAST-task tools (intent shown per line; NOT filtered to your task). Reuse a line ONLY if its intent+resource match what you\'re doing NOW — else ignore it and discover fresh. A tool from a different job (e.g. an SEO tool for an email task) is the wrong tool.';
-  const clip = (s: string): string => (s.length <= TOOL_CHOICE_LINE_MAX ? s : `${s.slice(0, TOOL_CHOICE_LINE_MAX - 1)}…`);
+  const clipTo = (text: string, max: number): string => (
+    text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1))}…`
+  );
   // Accumulate lines until the block budget is hit (header counts toward it),
   // so the highest-ranked choices win the space.
   const lines: string[] = [];
@@ -2873,7 +2927,31 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
     // C6: surface WHICH account a remembered choice is bound to, so the model
     // never reuses a line against the wrong mailbox.
     const identity = c.accountIdentity ? ` @${c.accountIdentity}` : '';
-    const line = clip(`- ${star}${r.intent}: ${c.kind}:${c.identifier}${identity}${how}${track}`);
+    // SHAPE-FIRST (2026-08-09). The old render clipped the WHOLE line at 160
+    // chars with the invocation template last, so the template — the only part
+    // that says HOW to call the tool — was always what got cut. Live: the
+    // OUTLOOK_CREATE_DRAFT memo has 31 successes and states
+    // `body":"<plain string>"`, and the model was shown
+    // `arguments={"subject":"…` and nothing else. It then invented
+    // `body_content`, which failed schema validation before dispatch, twice.
+    //
+    // So the budget is spent in the order the model needs: identity of the
+    // tool, then the callable shape, and PROSE absorbs the clipping. A
+    // remembered call that cannot be reproduced from its own line is worse
+    // than no line at all — it advertises knowledge while withholding it.
+    const head = `- ${star}`;
+    const bindingTail = `: ${c.kind}:${c.identifier}${identity}${how}${track}`;
+    const intentRoom = TOOL_CHOICE_LINE_MAX - head.length - bindingTail.length;
+    // Prose absorbs the clipping so the callable shape survives; the line is
+    // still hard-capped, so the block budget stays honest.
+    // The effective cap is the smaller of the line budget and the space this
+    // block has left, so a tight budget yields a CLIPPED line rather than no
+    // line at all — rendering nothing is strictly worse than rendering less.
+    const lineCap = Math.max(MIN_INTENT_CHARS, Math.min(TOOL_CHOICE_LINE_MAX, maxChars - used - 1));
+    const line = clipTo(
+      `${head}${clipTo(r.intent, Math.max(MIN_INTENT_CHARS, intentRoom))}${bindingTail}`,
+      lineCap,
+    );
     if (used + 1 + line.length > maxChars) break;
     lines.push(line);
     used += 1 + line.length;
@@ -2893,6 +2971,7 @@ export interface InvalidatedChoiceMatch {
   /** Newest fallback's failure reason (e.g. the 3-loss auto-invalidate). */
   reason?: string;
   score: number;
+  effectClass?: 'read' | 'write' | 'unknown';
 }
 
 /**
@@ -2913,6 +2992,7 @@ export function matchInvalidatedToolChoices(
   const limit = opts.limit ?? 3;
   const prompt = wordTokens(promptText);
   if (prompt.size === 0) return [];
+  const requestedEffect = requestedCapabilityEffectScope(promptText);
   let records: ToolChoiceRecord[];
   try {
     records = (opts.choices ?? listToolChoices()).filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
@@ -2926,6 +3006,8 @@ export function matchInvalidatedToolChoices(
       .filter((f) => f.identifier && !placeholderChoiceString(f.identifier))
       .sort((a, b) => (b.failedAt ?? '').localeCompare(a.failedAt ?? ''))[0];
     if (!newest) continue;
+    const effectClass = rememberedCapabilityEffect(newest);
+    if (!capabilityEffectIsCompatible(requestedEffect, effectClass)) continue;
     const identity = new Set<string>();
     for (const t of wordTokens(newest.identifier)) {
       if (t.length < 2 || STEP_MATCH_STOPWORDS.has(t)) continue;
@@ -2950,6 +3032,7 @@ export function matchInvalidatedToolChoices(
       failedAt: newest.failedAt,
       reason: newest.reason,
       score: matchedDistinctive.length / distinctive.size,
+      effectClass,
     });
   }
   return out.sort((a, b) => b.score - a.score).slice(0, limit);

@@ -8,16 +8,50 @@
  * silently stripped composio_status + notify_user and broke
  * outlook-triage-hourly.)
  */
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// Isolate state before loading any Clementine module. call_tool dispatch records
+// hot-set hits, and a fixed test session must never write into the user's store.
+const PRIOR_CLEMENTINE_HOME = process.env.CLEMENTINE_HOME;
+const TEST_CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-workflow-step-agent-'));
+process.env.CLEMENTINE_HOME = TEST_CLEMENTINE_HOME;
+
+const {
   WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
   filterToolsForStep,
   buildWorkflowStepAgent,
   workflowStepExternalMcpScopeForLock,
   workflowStepToolUseBehavior,
-} from './workflow-step-agent.js';
-import { clearStepResult, recordStepResult } from '../tools/step-result-tool.js';
+  lockToolsForStep,
+  stepAllowedToolsLock,
+  STEP_STRUCTURAL_BASELINE_TOOLS,
+} = await import('./workflow-step-agent.js');
+const { clearStepResult, recordStepResult } = await import('../tools/step-result-tool.js');
+const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
+const {
+  bindAgentCapabilityEnvelope,
+  bindAgentCapabilityRevision,
+  boundAgentCapabilityEnvelope,
+  boundAgentCapabilityRevision,
+  sealAgentCapabilityUniverse,
+} = await import('./capability-envelope.js');
+const { _resetHotSetForTest } = await import('./tool-hotset.js');
+
+after(() => {
+  _resetHotSetForTest();
+  if (PRIOR_CLEMENTINE_HOME === undefined) delete process.env.CLEMENTINE_HOME;
+  else process.env.CLEMENTINE_HOME = PRIOR_CLEMENTINE_HOME;
+  rmSync(TEST_CLEMENTINE_HOME, { recursive: true, force: true });
+});
+
+type InvokableAgentTool = {
+  name?: string;
+  invoke?: (context: unknown, input: string, details: unknown) => Promise<unknown>;
+};
 
 // A representative slice of the orchestrator's tool pool, including the
 // work tools whose removal broke outlook-triage-hourly.
@@ -85,7 +119,6 @@ test('step surface REMOVES recursion / fan-out / authoring / planning vectors', 
 });
 
 // ── Feature A4: physically prune a bound step's tool surface ───────────────
-import { lockToolsForStep, stepAllowedToolsLock, STEP_STRUCTURAL_BASELINE_TOOLS } from './workflow-step-agent.js';
 
 const LOCK_SAMPLE = [
   { name: 'workflow_step_result' },   // structural output channel — MUST survive
@@ -278,6 +311,71 @@ test('buildWorkflowStepAgent: unbound steps defer schemas but keep every tool ca
   } finally {
     if (prior === undefined) delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
     else process.env.CLEMMY_CODEX_TOOL_SEARCH = prior;
+  }
+});
+
+test('unbound workflow call_tool advances its sealed revision once and refuses outside rebound authority before dispatch', async () => {
+  const priorSearch = process.env.CLEMMY_CODEX_TOOL_SEARCH;
+  process.env.CLEMMY_CODEX_TOOL_SEARCH = 'on';
+  let dispatches = 0;
+  _setCodeModeToolsForTests(new Map([['desktop_status', {
+    name: 'desktop_status',
+    invoke: async () => {
+      dispatches += 1;
+      return 'desktop-ok';
+    },
+  }]]));
+  try {
+    const agent = await buildWorkflowStepAgent({
+      sessionId: 'workflow-capability-revision-test',
+      userInput: 'Synthesize the supplied evidence into a compact neutral summary.',
+    });
+    const envelope = boundAgentCapabilityEnvelope(agent);
+    const before = boundAgentCapabilityRevision(agent);
+    assert.ok(envelope, 'unbound schema-on-demand step did not bind its filtered universe');
+    assert.ok(before, 'unbound schema-on-demand step did not bind active revision 1');
+    assert.ok(envelope!.capabilities.some((capability) => capability.name === 'desktop_status'));
+    assert.equal(before!.bound.includes('desktop_status'), false, 'fixture must remain deferred');
+
+    const callTool = agent.tools.find((toolRef) => toolRef.name === 'call_tool') as InvokableAgentTool | undefined;
+    assert.ok(callTool?.invoke, 'unbound schema-on-demand step omitted call_tool');
+    const invoke = () => callTool!.invoke!(
+      { context: { sessionId: 'workflow-capability-revision-test' } },
+      JSON.stringify({ name: 'desktop_status', args_json: '{}' }),
+      { toolCall: { callId: `workflow-capability-${dispatches}` } },
+    );
+
+    assert.equal(String(await invoke()), 'desktop-ok');
+    const afterFirst = boundAgentCapabilityRevision(agent)!;
+    assert.equal(afterFirst.revision, before!.revision + 1);
+    assert.deepEqual([...afterFirst.bound], [...before!.bound, 'desktop_status']);
+    assert.equal(String(await invoke()), 'desktop-ok');
+    const afterDuplicate = boundAgentCapabilityRevision(agent)!;
+    assert.equal(afterDuplicate.revision, afterFirst.revision, 'duplicate acquisition churned the revision');
+    assert.equal(afterDuplicate.revisionDigest, afterFirst.revisionDigest);
+    assert.equal(dispatches, 2);
+
+    const narrowed = sealAgentCapabilityUniverse({
+      sessionId: 'workflow-capability-narrowed-test',
+      universeTools: [{ name: 'call_tool', parameters: {} }],
+      activeToolNames: ['call_tool'],
+      policyHash: 'workflow-capability-narrowed-test',
+      budget: { maxUncachedTokens: 1_000, maxModelCalls: 2, maxToolCalls: 2, maxElapsedMs: 1_000 },
+    });
+    assert.equal(narrowed.ok, true, JSON.stringify(narrowed));
+    if (!narrowed.ok) return;
+    bindAgentCapabilityEnvelope(agent, narrowed.envelope);
+    bindAgentCapabilityRevision(agent, narrowed.revision);
+
+    const refusal = JSON.parse(String(await invoke())) as { error?: string; kind?: string; outside?: string[] };
+    assert.equal(refusal.error, 'requires_readmission');
+    assert.equal(refusal.kind, 'requires_readmission');
+    assert.deepEqual(refusal.outside, ['desktop_status']);
+    assert.equal(dispatches, 2, 'refused workflow acquisition entered the inner handler');
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (priorSearch === undefined) delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
+    else process.env.CLEMMY_CODEX_TOOL_SEARCH = priorSearch;
   }
 });
 

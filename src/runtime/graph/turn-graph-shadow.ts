@@ -11,11 +11,14 @@ import {
   type EventRow,
 } from '../harness/eventlog.js';
 import type { TurnIdentity } from '../harness/turn-outcome.js';
+import type { TaskContinuationContext } from '../../types.js';
 import {
   compileTurnGraph,
   snapshotTurnGraphPolicy,
+  validateTurnGraph,
 } from './turn-graph-compiler.js';
 import type {
+  TurnGraphIR,
   TurnGraphPolicySnapshot,
   TurnGraphSurface,
 } from './turn-graph-ir.js';
@@ -25,8 +28,36 @@ export interface RecordTurnGraphShadowInput {
   surface?: TurnGraphSurface;
   allowedToolNames?: readonly string[];
   excludedToolNames?: readonly string[];
+  /** Exact-source runtime continuation context. Only the independently parsed
+   * fresh clause of `declined_with_new_task` may override graph semantics; the
+   * accepted event remains the graph's immutable parent/identity. */
+  verifiedTaskContinuation?: TaskContinuationContext;
   /** Injection seam for callers/tests that already captured the policy. */
   policy?: TurnGraphPolicySnapshot | ProactivityPolicySnapshot;
+}
+
+/**
+ * Read the exact closed IR carried by a durable shadow event.
+ *
+ * The bridge and the provider lane can both observe one accepted source. The
+ * event is the only graph they may share; compiling again creates two subtly
+ * different contracts (approval resume used to do exactly that). This decoder
+ * verifies identity, metadata and the content address before the graph can be
+ * handed to an executor or an evidence authority.
+ */
+export function turnGraphFromShadowEvent(event: EventRow | null): TurnGraphIR | null {
+  if (!event || event.type !== 'turn_graph_compiled') return null;
+  const graph = event.data.graph as TurnGraphIR | undefined;
+  if (!graph || typeof graph !== 'object') return null;
+  if (
+    graph.identity.sessionId !== event.sessionId
+    || graph.identity.turn !== event.turn
+    || graph.identity.sourceUserSeq !== event.data.sourceUserSeq
+    || graph.graphId !== event.data.graphId
+    || graph.compiler.graphHash !== event.data.graphHash
+  ) return null;
+  const validation = validateTurnGraph(graph);
+  return validation.ok ? graph : null;
 }
 
 function acceptedSource(identity: RecordTurnGraphShadowInput['identity']): EventRow | null {
@@ -41,6 +72,23 @@ function acceptedText(event: EventRow): string {
   const displayText = typeof event.data.displayText === 'string' ? event.data.displayText.trim() : '';
   const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
   return displayText || text;
+}
+
+function graphSemanticText(
+  sourceText: string,
+  identity: RecordTurnGraphShadowInput['identity'],
+  context?: TaskContinuationContext,
+): string {
+  if (
+    context?.disposition !== 'declined_with_new_task'
+    || context.consumingSourceUserSeq !== identity.sourceUserSeq
+    || context.answer !== sourceText
+    || typeof context.activeTaskInput !== 'string'
+    || !context.activeTaskInput.trim()
+  ) return sourceText;
+  const normalizedSource = sourceText.replace(/\s+/g, ' ').trim();
+  const normalizedActive = context.activeTaskInput.replace(/\s+/g, ' ').trim();
+  return normalizedSource.includes(normalizedActive) ? normalizedActive : sourceText;
 }
 
 function isGraphPolicy(value: RecordTurnGraphShadowInput['policy']): value is TurnGraphPolicySnapshot {
@@ -73,7 +121,11 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
         : null;
     }
 
-    const text = acceptedText(source);
+    const text = graphSemanticText(
+      acceptedText(source),
+      input.identity,
+      input.verifiedTaskContinuation,
+    );
     const policy = isGraphPolicy(input.policy)
       ? input.policy
       : snapshotTurnGraphPolicy(input.policy ?? getProactivityPolicySnapshot());

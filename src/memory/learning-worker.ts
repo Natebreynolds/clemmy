@@ -19,9 +19,12 @@ import { createHash } from 'node:crypto';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
-import { eventLogReceiptResolver } from '../runtime/read-path/read-lane-adapters.js';
-import { getComposioToolBySlug } from '../integrations/composio/client.js';
-import type { DurableReceiptRecord } from './procedure-receipts.js';
+import { eventLogReceiptResolver } from '../runtime/read-path/event-log-read-receipts.js';
+import {
+  composioToolSchemaObservedAt,
+  getComposioToolBySlug,
+} from '../integrations/composio/client.js';
+import { promoteFromVerifiedReceipt, type DurableReceiptRecord } from './procedure-receipts.js';
 import {
   completePendingLearning,
   listPendingLearning,
@@ -38,6 +41,7 @@ import {
   rememberToolSchema,
 } from '../tools/composio-schema-cache.js';
 import { checkpointCapsuleForSession } from '../execution/continuation-capsule.js';
+import { canonicalProcedureScope } from '../runtime/read-path/procedure-scope.js';
 
 function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -71,7 +75,13 @@ async function acquireLiveContract(identifier: string): Promise<string | undefin
   if (cached) return cached;
   try {
     const match = await getComposioToolBySlug(identifier);
-    if (match?.inputParameters) rememberToolSchema(identifier, match.inputParameters);
+    if (match?.inputParameters) {
+      rememberToolSchema(
+        identifier,
+        match.inputParameters,
+        composioToolSchemaObservedAt(match) ?? Number.NaN,
+      );
+    }
   } catch { /* declined below; the pending row retries */ }
   return liveComposioSchemaFingerprint(identifier);
 }
@@ -86,10 +96,16 @@ function receiptAlreadyDurable(sessionId: string, receiptId: string): boolean {
 }
 
 async function materializeOne(pending: PendingLearningRecord): Promise<void> {
-  const schemaFingerprint = await acquireLiveContract(pending.identifier);
-  if (!schemaFingerprint) {
+  const liveSchemaFingerprint = await acquireLiveContract(pending.identifier);
+  if (!liveSchemaFingerprint) {
     throw new LearningWriteError('no live catalog authority for the identifier yet');
   }
+  if (pending.schemaFingerprint && pending.schemaFingerprint !== liveSchemaFingerprint) {
+    throw new LearningWriteError(
+      `dispatch schema ${pending.schemaFingerprint} no longer matches live schema ${liveSchemaFingerprint}`,
+    );
+  }
+  const schemaFingerprint = pending.schemaFingerprint || liveSchemaFingerprint;
   const receiptId = boundReceiptId({
     sessionId: pending.sessionId,
     sourceUserSeq: pending.sourceUserSeq,
@@ -99,6 +115,12 @@ async function materializeOne(pending: PendingLearningRecord): Promise<void> {
     schemaFingerprint,
     evidenceDigest: pending.evidenceDigest,
   });
+  let scope;
+  try {
+    scope = canonicalProcedureScope(pending.accountIdentity);
+  } catch (error) {
+    throw new LearningWriteError(error instanceof Error ? error.message : String(error));
+  }
   const record: DurableReceiptRecord = {
     receiptId,
     at: new Date().toISOString(),
@@ -107,8 +129,17 @@ async function materializeOne(pending: PendingLearningRecord): Promise<void> {
     effectClass: 'read',
     identifier: pending.identifier,
     schemaFingerprint,
-    scope: { tenant: getMachineId(), workspace: BASE_DIR, accountIdentity: pending.accountIdentity },
+    scope,
     dispatchOutcome: 'succeeded',
+    ...(typeof pending.sourceUserSeq === 'number'
+      ? {
+          source: {
+            sessionId: pending.sessionId,
+            sourceUserSeq: pending.sourceUserSeq,
+            ...(pending.attemptId ? { attemptId: pending.attemptId } : {}),
+          },
+        }
+      : {}),
     readEvidenceRef: `evt:${pending.evidenceDigest}`,
   };
   // Idempotent under retry: the receipt id is fully binding-derived, so a
@@ -123,18 +154,41 @@ async function materializeOne(pending: PendingLearningRecord): Promise<void> {
     });
   }
 
+  // The only automatic executable promotion is the structurally complete
+  // empty-args shape. It carries no historical constants and needs no slots or
+  // model-authored resolver: `{}` is the entire typed invocation template.
+  // Every non-empty read remains capability_only below.
+  if (pending.executableEmptyArgs && pending.kind === 'composio' && pending.accountIdentity) {
+    const promoted = await promoteFromVerifiedReceipt({
+      scope,
+      provider: record.provider,
+      operation: record.operation,
+      effectClass: 'read',
+      kind: 'composio',
+      identifier: pending.identifier,
+      templateArgs: {},
+      receiptId,
+      acquiredSchemaFingerprint: schemaFingerprint,
+    }, eventLogReceiptResolver(pending.sessionId));
+    if (!promoted.ok) {
+      throw new LearningWriteError(`empty-args structural promotion refused: ${promoted.errors.join('; ')}`);
+    }
+  }
+
   const verdict = learnVerifiedReadSettlement({
     receiptId,
     receipts: eventLogReceiptResolver(pending.sessionId),
     kind: pending.kind as ToolChoiceKind,
     sessionId: pending.sessionId,
     ...(typeof pending.sourceUserSeq === 'number' ? { sourceUserSeq: pending.sourceUserSeq } : {}),
+    ...(pending.attemptId ? { attemptId: pending.attemptId } : {}),
     expect: {
       identifier: pending.identifier,
       accountIdentity: pending.accountIdentity,
       evidenceDigest: pending.evidenceDigest,
     },
-    phrase: pending.phrase,
+    aliasDigest: pending.aliasDigest,
+    aliasTerms: pending.aliasTerms,
   });
   if (!verdict.learned && /already owned/.test(verdict.reason)) {
     // The claim was committed by an earlier (possibly crashed-and-retried)

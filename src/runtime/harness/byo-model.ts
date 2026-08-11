@@ -37,6 +37,7 @@ import { resolveModelCapability, modelParityEnabled, restoreLegacyInstructionOrd
 import { recordModelUsage } from '../usage-log.js';
 import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
+import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.byo-model' });
@@ -310,6 +311,10 @@ async function reAskForJson(
     const messages = Array.isArray(relaxed.messages) ? [...(relaxed.messages as unknown[])] : [];
     messages.push({ role: 'system', content: instruction });
     const c = (await original({ ...relaxed, stream: false, stream_options: undefined, messages }, options)) as CompatCompletion;
+    // This is a real second provider call, not a local repair. Charge it to the
+    // same accepted turn so correction cost cannot disappear from efficiency
+    // comparisons (and promote its response id into the exact trace).
+    recordByoUsage(c, relaxed.model);
     return c?.choices?.[0]?.message?.content ?? null;
   } catch {
     return null;
@@ -405,19 +410,54 @@ async function repairStructuredContent(original: CreateFn, relaxed: Record<strin
  *  stays byte-identical. No re-ask — a tool turn can't be cheaply re-elicited;
  *  this recovers the common wrapping case. Returns true if anything changed.
  *  Mutates the completion. Exported for unit tests. */
-export function repairToolCallArguments(completion: CompatCompletion): boolean {
+function functionParametersForTool(toolDefinitions: unknown, name: string): unknown {
+  if (!Array.isArray(toolDefinitions) || !name) return undefined;
+  for (const raw of toolDefinitions) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const fn = (raw as { function?: unknown }).function;
+    if (!fn || typeof fn !== 'object' || Array.isArray(fn)) continue;
+    const definition = fn as { name?: unknown; parameters?: unknown };
+    if (definition.name === name) return definition.parameters;
+  }
+  return undefined;
+}
+
+export function repairToolCallArguments(
+  completion: CompatCompletion,
+  toolDefinitions?: unknown,
+): boolean {
   const calls = completion?.choices?.[0]?.message?.tool_calls;
   if (!Array.isArray(calls) || calls.length === 0) return false;
   let changed = false;
   for (const tc of calls) {
     const fn = tc?.function;
-    const args = fn?.arguments;
-    // Skip absent / empty (no-arg call) / already-valid args.
-    if (!fn || typeof args !== 'string' || args === '' || isParseableJson(args)) continue;
-    const { text, repaired } = repairToParseableJson(args);
-    if (repaired && isParseableJson(text)) {
+    let args = fn?.arguments;
+    if (!fn || typeof args !== 'string' || args === '') continue;
+    if (!isParseableJson(args)) {
+      const { text, repaired } = repairToParseableJson(args);
+      if (!repaired || !isParseableJson(text)) continue;
       fn.arguments = text;
+      args = text;
       changed = true;
+    }
+
+    // Strict OpenAI tool schemas encode optional fields as required+nullable.
+    // Compatible providers often omit those fields naturally. Materialize only
+    // the schema-certified nullable omissions before the Agents SDK validates
+    // the call; never invent a real required value or alter an explicit one.
+    const parameters = functionParametersForTool(toolDefinitions, fn.name ?? '');
+    if (parameters) {
+      try {
+        const parsed = JSON.parse(args) as unknown;
+        const materialized = materializeStrictNullableFields(parsed, parameters);
+        if (JSON.stringify(materialized) !== JSON.stringify(parsed)) {
+          fn.arguments = JSON.stringify(materialized);
+          changed = true;
+        }
+      } catch {
+        // The parseability repair above is authoritative; malformed calls still
+        // fail through the SDK instead of receiving guessed transport fields.
+      }
     }
   }
   if (changed) logger.debug({ kind: 'tool_args' }, 'byo json repair');
@@ -516,22 +556,54 @@ async function wrappedCompletionsCreate(
     const structured = downgradedBodies.has(relaxed as object);
 
     if (relaxed.stream === true) {
-      let completion: CompatCompletion;
+      // This adapter intentionally pays for a full non-streaming completion and
+      // only then emits one synthetic SDK chunk. Tell the outer watchdog that a
+      // provider request owns this otherwise eventless interval. The marker is
+      // bounded by the loop's ordinary full-stream deadline; it is not a
+      // heartbeat and cannot keep a genuinely hung request alive forever.
+      const runContext = harnessRunContextStorage.getStore();
+      const bufferedRequest = {
+        kind: 'byo_non_streaming_completion' as const,
+        startedAt: Date.now(),
+        active: true,
+      };
+      const bufferedRequests = runContext
+        ? (runContext.bufferedProviderRequests ??= new Set())
+        : undefined;
+      bufferedRequests?.add(bufferedRequest);
       try {
-        completion = (await original({ ...relaxed, stream: false, stream_options: undefined }, options)) as CompatCompletion;
-      } catch {
-        return original(relaxed, options); // backend rejects stream:false → real (unmodified) stream
+        let completion: CompatCompletion;
+        try {
+          completion = (await original({ ...relaxed, stream: false, stream_options: undefined }, options)) as CompatCompletion;
+        } catch (error) {
+          // The outer watchdog/caller owns cancellation. Falling back to a
+          // second wire shape after its AbortSignal fired can start another
+          // paid request precisely while the cancelled non-streaming request is
+          // still settling provider-side. Only a live caller may probe the
+          // compatibility stream fallback.
+          const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+          if (signal?.aborted) throw error;
+          return original(relaxed, options); // backend rejects stream:false → real (unmodified) stream
+        }
+        liftReasoning(completion);
+        promoteReasoningFinal(completion);
+        recordByoUsage(completion, relaxed.model);
+        const msg = completion?.choices?.[0]?.message;
+        if (isToolOrEmpty(msg)) {
+          repairToolCallArguments(completion, relaxed.tools);
+          return synthFaithfulStream(completion);
+        }
+        if (structured) await repairStructuredContent(original, relaxed, options, completion, downgradedSchemas.get(relaxed as object));
+        return synthContentStream(completion);
+      } finally {
+        bufferedRequest.active = false;
+        // Bridge the tiny completion→synthetic-chunk scheduling gap without
+        // extending it indefinitely. The ordinary first-byte window resumes
+        // from this real transport settlement timestamp.
+        if (runContext && bufferedRequests?.delete(bufferedRequest)) {
+          runContext.privateModelActivityAt = Date.now();
+        }
       }
-      liftReasoning(completion);
-      promoteReasoningFinal(completion);
-      recordByoUsage(completion, relaxed.model);
-      const msg = completion?.choices?.[0]?.message;
-      if (isToolOrEmpty(msg)) {
-        repairToolCallArguments(completion);
-        return synthFaithfulStream(completion);
-      }
-      if (structured) await repairStructuredContent(original, relaxed, options, completion, downgradedSchemas.get(relaxed as object));
-      return synthContentStream(completion);
     }
 
     const completion = (await original(relaxed, options)) as CompatCompletion;
@@ -540,7 +612,7 @@ async function wrappedCompletionsCreate(
     recordByoUsage(completion, relaxed.model);
     const msg = completion?.choices?.[0]?.message;
     if (Array.isArray(msg?.tool_calls) && msg!.tool_calls!.length > 0) {
-      repairToolCallArguments(completion);
+      repairToolCallArguments(completion, relaxed.tools);
     } else if (structured && !isToolOrEmpty(msg)) {
       await repairStructuredContent(original, relaxed, options, completion, downgradedSchemas.get(relaxed as object));
     }
@@ -575,12 +647,15 @@ function recordByoUsage(completion: CompatCompletion, fallbackModel?: unknown): 
     const sessionId = harnessContext?.sessionId ?? 'unknown';
     recordModelUsage({
       sessionId,
+      sourceUserSeq: harnessContext?.sourceUserSeq,
+      attemptId: harnessContext?.runAttemptId,
       model: (completion as { model?: string })?.model || (typeof fallbackModel === 'string' ? fallbackModel : 'byo'),
       cacheDialect: 'inclusive', // OpenAI-compatible wire: prompt/input ⊇ cached
       inputTokens,
       cachedInputTokens: cached,
       outputTokens,
       totalTokens: n(u.total_tokens) || inputTokens + outputTokens,
+      responseId: typeof completion.id === 'string' ? completion.id : undefined,
       promptComponents: harnessContext?.promptComponents,
     });
     // Proven-acceptance learning: an accepted request above our believed

@@ -45,6 +45,34 @@ interface ExternalEffectRule {
 const TECHNICAL_COMMUNICATION_OBJECT_SOURCE =
   'address|api|body|column|command|endpoint|field|function|helper|method|property|schema|script|subject|template|tool|type|variable';
 
+// `send` needs a destination to be consequential. Keep programming/data-flow
+// language out of the early intent ceiling; the actual tool boundary will
+// still classify a real network write from the capability that is selected.
+const TECHNICAL_SEND_TARGET_SOURCE =
+  `${TECHNICAL_COMMUNICATION_OBJECT_SOURCE}|callback|class|database|db|host|module|object|parameter|queue|server|service`;
+
+// A callable written in a programming/tool shape is not a person. Keep this
+// narrower than arbitrary snake_case so a contact handle is still treated as
+// consequential; these shapes carry explicit callable syntax or a technical
+// terminal noun.
+const TECHNICAL_CALL_TARGET_SOURCE = [
+  String.raw`[A-Za-z][A-Za-z0-9_-]*(?:__|:)[A-Za-z0-9_.:-]+`,
+  // A bare dotted handle can name a real contact (alice.smith). Only treat
+  // dotted syntax as callable when its namespace is itself technical.
+  String.raw`(?:api|calendar|client|composio|database|db|mcp|provider|sdk|service|tool|tools)\.[A-Za-z_][A-Za-z0-9_]*`,
+  String.raw`[A-Za-z][A-Za-z0-9_.]*\s*\(`,
+  String.raw`[A-Za-z][A-Za-z0-9_]*_(?:tool|tools|function|method|handler|command)\b`,
+  String.raw`\`[^\`\r\n]+\``,
+].join('|');
+
+// Protect explicit technical invocations before clause splitting. In
+// particular, the period in `call calendar.listEvents` is otherwise treated as
+// sentence punctuation and leaves the false-positive clause `call calendar`.
+const TECHNICAL_CALL_INVOCATION_RE = new RegExp(
+  `\\bcall\\s+(?:${TECHNICAL_CALL_TARGET_SOURCE})`,
+  'gi',
+);
+
 /** Publication verbs are matched only at the start of a direct request clause. */
 function publicationRules(bodies: readonly string[]): ExternalEffectRule[] {
   return bodies.map((body) => ({
@@ -54,6 +82,16 @@ function publicationRules(bodies: readonly string[]): ExternalEffectRule[] {
 }
 
 const EXTERNAL_EFFECT_RULES: readonly ExternalEffectRule[] = [
+  {
+    kind: 'communication',
+    pattern: new RegExp(
+      `^send\\b[^.!?\\n;]{0,140}\\bto\\s+`
+      + `(?!(?:(?:my|our|the|this|that|your)\\s+)?(?:${TECHNICAL_SEND_TARGET_SOURCE})\\b)`
+      + `(?!(?:${TECHNICAL_CALL_TARGET_SOURCE}))`
+      + `(?:(?:my|our|the|this|that|your)\\s+)?\\S+`,
+      'i',
+    ),
+  },
   {
     kind: 'communication',
     pattern: new RegExp(
@@ -68,7 +106,7 @@ const EXTERNAL_EFFECT_RULES: readonly ExternalEffectRule[] = [
   {
     kind: 'communication',
     pattern: new RegExp(
-      `^call\\s+(?!(?:(?:my|our|the|this|that|your)\\s+)?(?:${TECHNICAL_COMMUNICATION_OBJECT_SOURCE})\\b)(?:(?:my|our|the|this|that|your)\\s+)?\\S+`,
+      `^call\\s+(?!(?:(?:my|our|the|this|that|your)\\s+)?(?:${TECHNICAL_COMMUNICATION_OBJECT_SOURCE})\\b)(?!(?:${TECHNICAL_CALL_TARGET_SOURCE}))(?:(?:my|our|the|this|that|your)\\s+)?\\S+`,
       'i',
     ),
   },
@@ -237,7 +275,8 @@ function stripDirectRequestPrefixes(rawClause: string): string {
  */
 export function classifyExternalEffectRequest(text: string): ExternalEffectClassification {
   const kinds = new Set<ExternalEffectKind>();
-  for (const rawClause of text.split(CLAUSE_BOUNDARY_RE)) {
+  const classificationText = text.replace(TECHNICAL_CALL_INVOCATION_RE, 'invoke technical callable');
+  for (const rawClause of classificationText.split(CLAUSE_BOUNDARY_RE)) {
     if (!rawClause.trim() || APPROVAL_DEFERRAL_RE.test(rawClause)) continue;
     const clause = stripDirectRequestPrefixes(rawClause);
     for (const rule of EXTERNAL_EFFECT_RULES) {

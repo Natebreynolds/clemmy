@@ -7,12 +7,17 @@ import {
 } from './reflection-candidates.js';
 import { recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 import { attachGroundedUserPeople } from './grounded-user-entities.js';
+import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 
 const AUTO_CAPTURE_SOURCE = 'auto_capture' as const;
 const AUTO_CAPTURE_MAX_ATTEMPTS = 8;
 const AUTO_CAPTURE_LEASE_MS = 5 * 60 * 1_000;
 const AUTO_CAPTURE_RETRY_BASE_MS = 15_000;
 const AUTO_CAPTURE_RETRY_MAX_MS = 60 * 60 * 1_000;
+const EXPLICIT_STABLE_CONTEXT_REASONS = new Set([
+  'explicit remember request',
+  'explicit durable correction',
+]);
 
 export interface DurableAutoCaptureCandidate {
   kind: ConsolidatedFactKind;
@@ -60,6 +65,7 @@ interface PendingAutoCaptureRow {
   authority: 'user' | 'derived' | 'import' | 'manual' | null;
   source_uri: string | null;
   pin: number;
+  intake_reason: string;
   attempt_count: number;
   evidence_excerpt: string | null;
   episode_source_uri: string | null;
@@ -147,7 +153,8 @@ function candidateRows(options: { ids?: number[]; limit: number; now: string }):
   return db.prepare(`
     SELECT mrc.id, mrc.episode_id, mrc.session_id, mrc.call_id,
            mrc.kind, mrc.text, mrc.importance, mrc.trust_level,
-           mrc.authority, mrc.source_uri, mrc.pin, mrc.attempt_count,
+           mrc.authority, mrc.source_uri, mrc.pin, mrc.intake_reason,
+           mrc.attempt_count,
            me.evidence_excerpt, me.source_uri AS episode_source_uri,
            me.occurred_at
     FROM memory_reflection_candidates mrc
@@ -237,6 +244,16 @@ export async function drainDurableConsolidationCandidates(options: {
         resultingFactId: outcome.factId,
         now,
       });
+      // Stable-prefix freezing deliberately defers incidental reflection churn,
+      // but these rows are explicit user memory edits. Bump only after the
+      // canonical fact transition commits, never at enqueue time where an
+      // asynchronous resolver could race and re-freeze the superseded value.
+      if (
+        outcome.action !== 'ignore'
+        && EXPLICIT_STABLE_CONTEXT_REASONS.has(row.intake_reason)
+      ) {
+        bumpStableContextGeneration();
+      }
       result.promoted += 1;
     } catch (error) {
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 500);

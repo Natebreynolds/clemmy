@@ -13,6 +13,10 @@ import Database from 'better-sqlite3';
 import path from 'node:path';
 
 import { looksLikeToolCallShape } from '../../src/runtime/harness/tool-narration-shapes.js';
+import {
+  canonicalCacheAccounting,
+  type UsageEvent,
+} from '../../src/runtime/usage-log.js';
 import type {
   BrainKind,
   Check,
@@ -63,6 +67,58 @@ export interface SessionMetrics {
    * Falls back to the legacy sdk_first_byte/process-init metric only for proof
    * homes produced before sdk_first_model_activity existed. */
   firstByteMs: number | null;
+}
+
+export type ProofUsageRole = 'brain' | 'worker' | 'workflow_step' | 'auxiliary' | 'unattributed';
+
+/** One additive usage row in a proof report. `phase`/`wave` stay null until a
+ * usage producer persists those identities explicitly. */
+export interface ProofUsageBreakdownRow {
+  role: ProofUsageRole;
+  model: string;
+  phase: string | null;
+  wave: string | null;
+  attribution: 'explicit_trace_lane' | 'unattributed';
+  callCount: number;
+  grossPromptTokens: number;
+  cacheReadInputTokens: number;
+  cacheReadRecordedCalls: number;
+  /** Null unless every contributing NDJSON row preserved this provider split. */
+  cacheCreationInputTokens: number | null;
+  cacheCreationRecordedCalls: number;
+  uncachedInputTokens: number;
+  outputTokens: number;
+  accruedTokens: number;
+  cacheHitRatio: number | null;
+  /** Defined only for explicit worker rows. */
+  zeroCacheCalls: number | null;
+  uncertifiedCallCount: number;
+  invalidCallCount: number;
+}
+
+export interface ProofUsageBreakdown {
+  usageRecordCount: number;
+  malformedUsageRecordCount: number;
+  explicitRoleUsageRecords: number;
+  unattributedUsageRecords: number;
+  zeroCacheWorkerCalls: number | null;
+  rows: ProofUsageBreakdownRow[];
+  totals: {
+    callCount: number;
+    grossPromptTokens: number;
+    cacheReadInputTokens: number;
+    cacheReadRecordedCalls: number;
+    cacheCreationInputTokens: number | null;
+    cacheCreationRecordedCalls: number;
+    uncachedInputTokens: number;
+    outputTokens: number;
+    accruedTokens: number;
+    cacheHitRatio: number | null;
+    sessionTokensUsed: number | null;
+    accrualDeltaFromSession: number | null;
+  };
+  /** Honest boundaries on what the existing ledgers can prove. */
+  limitations: string[];
 }
 
 export function openHarnessDb(home: string): Database.Database {
@@ -202,6 +258,287 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
 export function summarizeAllSessions(db: Database.Database): SessionMetrics[] {
   const rows = db.prepare(`SELECT id FROM sessions ORDER BY updated_at DESC`).all() as { id: string }[];
   return rows.map((r) => sessionMetrics(db, r.id)).filter((m): m is SessionMetrics => m !== null);
+}
+
+type ProofUsageEvent = UsageEvent & { cacheCreationInputTokens?: number };
+
+function finiteNonNegative(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function explicitProofUsageRole(event: ProofUsageEvent): ProofUsageRole {
+  switch (event.trace?.lane) {
+    case 'brain': return 'brain';
+    case 'worker': return 'worker';
+    case 'workflow_step': return 'workflow_step';
+    case 'auxiliary': return 'auxiliary';
+    default: return 'unattributed';
+  }
+}
+
+function roundedRatio(numerator: number, denominator: number): number {
+  if (denominator <= 0) return 0;
+  return Math.round((numerator / denominator) * 10_000) / 10_000;
+}
+
+function readProofUsageEvents(
+  home: string,
+  sessionId: string,
+): { events: ProofUsageEvent[]; malformed: number; directoryReadable: boolean } {
+  const usageDir = path.join(home, 'state', 'token-usage');
+  const events: ProofUsageEvent[] = [];
+  let malformed = 0;
+  try {
+    for (const file of readdirSync(usageDir).filter((name) => name.endsWith('.ndjson')).sort()) {
+      for (const line of readFileSync(path.join(usageDir, file), 'utf-8').split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line) as ProofUsageEvent;
+          if (event.source === sessionId) events.push(event);
+        } catch {
+          malformed += 1;
+        }
+      }
+    }
+    return { events, malformed, directoryReadable: true };
+  } catch {
+    return { events, malformed, directoryReadable: false };
+  }
+}
+
+function proofSessionTokensUsed(home: string, sessionId: string): number | null {
+  let db: Database.Database | null = null;
+  try {
+    db = openHarnessDb(home);
+    const row = db.prepare('SELECT tokens_used FROM sessions WHERE id = ?').get(sessionId) as {
+      tokens_used?: unknown;
+    } | undefined;
+    return typeof row?.tokens_used === 'number' && Number.isFinite(row.tokens_used)
+      ? row.tokens_used
+      : null;
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
+/**
+ * Proof-only usage attribution for one durable session.
+ *
+ * Role comes ONLY from the persisted trace lane. Model comes ONLY from the
+ * usage row. We deliberately do not infer worker/brain identity from model id,
+ * prompt size, timestamps, or event adjacency: concurrent fan-out makes those
+ * attractive but non-authoritative. The current usage envelope carries no
+ * manifest phase/wave identity, so both remain null until a producer records
+ * them explicitly.
+ */
+export function sessionUsageBreakdown(home: string, sessionId: string): ProofUsageBreakdown {
+  const read = readProofUsageEvents(home, sessionId);
+  type Accumulator = Omit<ProofUsageBreakdownRow,
+    'cacheCreationInputTokens' | 'cacheHitRatio' | 'zeroCacheCalls'> & {
+      cacheCreationInputTokensKnown: number;
+      workerUsageRecordCount: number;
+      zeroCacheDerivableCalls: number;
+      zeroCacheCallsKnown: number;
+    };
+  const groups = new Map<string, Accumulator>();
+
+  let explicitRoleUsageRecords = 0;
+  let unattributedUsageRecords = 0;
+  let zeroCacheWorkerCallsKnown = 0;
+  let workerUsageRecordCount = 0;
+  let zeroCacheDerivableWorkerCalls = 0;
+  let totalGrossPromptTokens = 0;
+  let totalCacheReadInputTokens = 0;
+  let totalCacheReadRecordedCalls = 0;
+  let totalCacheCreationInputTokensKnown = 0;
+  let totalCacheCreationRecordedCalls = 0;
+  let totalUncachedInputTokens = 0;
+  let totalOutputTokens = 0;
+  let totalAccruedTokens = 0;
+
+  for (const event of read.events) {
+    const role = explicitProofUsageRole(event);
+    const attribution = role === 'unattributed' ? 'unattributed' : 'explicit_trace_lane';
+    if (role === 'unattributed') unattributedUsageRecords += 1;
+    else explicitRoleUsageRecords += 1;
+    const model = typeof event.model === 'string' && event.model.trim()
+      ? event.model.trim()
+      : '(unknown)';
+    // Phase/wave are intentionally null: neither is present in UsageEvent's
+    // trace envelope today, and no proof result may reconstruct them by timing.
+    const phase = null;
+    const wave = null;
+    const key = JSON.stringify([role, model, phase, wave, attribution]);
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        role,
+        model,
+        phase,
+        wave,
+        attribution,
+        callCount: 0,
+        grossPromptTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheReadRecordedCalls: 0,
+        cacheCreationInputTokensKnown: 0,
+        cacheCreationRecordedCalls: 0,
+        uncachedInputTokens: 0,
+        outputTokens: 0,
+        accruedTokens: 0,
+        workerUsageRecordCount: 0,
+        zeroCacheDerivableCalls: 0,
+        zeroCacheCallsKnown: 0,
+        uncertifiedCallCount: 0,
+        invalidCallCount: 0,
+      };
+      groups.set(key, group);
+    }
+
+    const accounting = canonicalCacheAccounting(event);
+    const cacheReadRecorded = event.cacheDialect === 'none'
+      || (
+        typeof event.cachedInputTokens === 'number'
+        && Number.isFinite(event.cachedInputTokens)
+        && event.cachedInputTokens >= 0
+      );
+    const creationRecorded = typeof event.cacheCreationInputTokens === 'number'
+      && Number.isFinite(event.cacheCreationInputTokens)
+      && event.cacheCreationInputTokens >= 0;
+    group.callCount += 1;
+    group.grossPromptTokens += accounting.promptTokens;
+    group.cacheReadInputTokens += accounting.cachedReadTokens;
+    if (cacheReadRecorded) {
+      group.cacheReadRecordedCalls += 1;
+      totalCacheReadRecordedCalls += 1;
+    }
+    group.uncachedInputTokens += accounting.uncachedInputTokens;
+    group.outputTokens += finiteNonNegative(event.outputTokens);
+    group.accruedTokens += accounting.uncachedWorkTokens;
+    if (!accounting.certified) group.uncertifiedCallCount += 1;
+    if (accounting.invalid) group.invalidCallCount += 1;
+    if (creationRecorded) {
+      group.cacheCreationInputTokensKnown += event.cacheCreationInputTokens as number;
+      group.cacheCreationRecordedCalls += 1;
+      totalCacheCreationInputTokensKnown += event.cacheCreationInputTokens as number;
+      totalCacheCreationRecordedCalls += 1;
+    }
+    if (role === 'worker') {
+      group.workerUsageRecordCount += 1;
+      workerUsageRecordCount += 1;
+      if (accounting.certified && !accounting.invalid && accounting.promptTokens > 0 && cacheReadRecorded) {
+        group.zeroCacheDerivableCalls += 1;
+        zeroCacheDerivableWorkerCalls += 1;
+        if (accounting.cachedReadTokens === 0) {
+          group.zeroCacheCallsKnown += 1;
+          zeroCacheWorkerCallsKnown += 1;
+        }
+      }
+    }
+
+    totalGrossPromptTokens += accounting.promptTokens;
+    totalCacheReadInputTokens += accounting.cachedReadTokens;
+    totalUncachedInputTokens += accounting.uncachedInputTokens;
+    totalOutputTokens += finiteNonNegative(event.outputTokens);
+    totalAccruedTokens += accounting.uncachedWorkTokens;
+  }
+
+  const roleOrder: Record<ProofUsageRole, number> = {
+    brain: 0,
+    worker: 1,
+    workflow_step: 2,
+    auxiliary: 3,
+    unattributed: 4,
+  };
+  const rows: ProofUsageBreakdownRow[] = [...groups.values()]
+    .map((group) => ({
+      role: group.role,
+      model: group.model,
+      phase: group.phase,
+      wave: group.wave,
+      attribution: group.attribution,
+      callCount: group.callCount,
+      grossPromptTokens: group.grossPromptTokens,
+      cacheReadInputTokens: group.cacheReadInputTokens,
+      cacheReadRecordedCalls: group.cacheReadRecordedCalls,
+      cacheCreationInputTokens: group.cacheCreationRecordedCalls === group.callCount
+        ? group.cacheCreationInputTokensKnown
+        : null,
+      cacheCreationRecordedCalls: group.cacheCreationRecordedCalls,
+      uncachedInputTokens: group.uncachedInputTokens,
+      outputTokens: group.outputTokens,
+      accruedTokens: group.accruedTokens,
+      cacheHitRatio: group.cacheReadRecordedCalls === group.callCount
+        ? roundedRatio(group.cacheReadInputTokens, group.grossPromptTokens)
+        : null,
+      zeroCacheCalls: group.role === 'worker'
+        && group.workerUsageRecordCount > 0
+        && group.zeroCacheDerivableCalls === group.workerUsageRecordCount
+        ? group.zeroCacheCallsKnown
+        : null,
+      uncertifiedCallCount: group.uncertifiedCallCount,
+      invalidCallCount: group.invalidCallCount,
+    }))
+    .sort((a, b) => (
+      roleOrder[a.role] - roleOrder[b.role]
+      || a.model.localeCompare(b.model)
+    ));
+
+  const sessionTokensUsed = proofSessionTokensUsed(home, sessionId);
+  const limitations = [
+    'phase and wave are unavailable: usage traces do not currently record manifest identity',
+    'callCount counts durable usage records; an SDK record may aggregate provider-internal activity',
+  ];
+  if (!read.directoryReadable) limitations.push('token-usage directory was unavailable');
+  if (unattributedUsageRecords > 0) {
+    limitations.push('rows without an explicit supported trace lane remain unattributed; model/timestamp inference is forbidden');
+  }
+  if (totalCacheCreationRecordedCalls < read.events.length) {
+    limitations.push('cache-creation tokens are null where the provider split was not persisted');
+  }
+  if (totalCacheReadRecordedCalls < read.events.length) {
+    limitations.push('cache-hit ratio and zero-cache worker counts are null where cache-read presence was not explicit');
+  }
+  if (rows.some((row) => row.uncertifiedCallCount > 0)) {
+    limitations.push('one or more usage rows have uncertified cache accounting');
+  }
+  if (read.malformed > 0) limitations.push('malformed usage rows were excluded');
+
+  return {
+    usageRecordCount: read.events.length,
+    malformedUsageRecordCount: read.malformed,
+    explicitRoleUsageRecords,
+    unattributedUsageRecords,
+    zeroCacheWorkerCalls: workerUsageRecordCount > 0
+      && zeroCacheDerivableWorkerCalls === workerUsageRecordCount
+      ? zeroCacheWorkerCallsKnown
+      : null,
+    rows,
+    totals: {
+      callCount: read.events.length,
+      grossPromptTokens: totalGrossPromptTokens,
+      cacheReadInputTokens: totalCacheReadInputTokens,
+      cacheReadRecordedCalls: totalCacheReadRecordedCalls,
+      cacheCreationInputTokens: totalCacheCreationRecordedCalls === read.events.length
+        ? totalCacheCreationInputTokensKnown
+        : null,
+      cacheCreationRecordedCalls: totalCacheCreationRecordedCalls,
+      uncachedInputTokens: totalUncachedInputTokens,
+      outputTokens: totalOutputTokens,
+      accruedTokens: totalAccruedTokens,
+      cacheHitRatio: read.events.length > 0
+        && totalCacheReadRecordedCalls === read.events.length
+        ? roundedRatio(totalCacheReadInputTokens, totalGrossPromptTokens)
+        : null,
+      sessionTokensUsed,
+      accrualDeltaFromSession: sessionTokensUsed === null
+        ? null
+        : totalAccruedTokens - sessionTokensUsed,
+    },
+    limitations,
+  };
 }
 
 type ServedModelFamily = 'claude' | 'codex' | 'byo';
@@ -533,7 +870,8 @@ export function exactWorkerRouteChecks(
 }
 
 /** Whole-leg backstop: a pre-dispatch route marker is not enough. At least one
- * completed call in the scenario sessions must name the exact configured id. */
+ * completed call in the scenario sessions must name the exact configured id.
+ * The runner additionally invokes this check per exact-brain route session. */
 export function exactBrainServedChecks(
   home: string,
   sessionIds: Iterable<string>,

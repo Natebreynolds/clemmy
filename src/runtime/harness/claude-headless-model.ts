@@ -414,6 +414,8 @@ function recordClaudeHeadlessUsage(state: HeadlessRunState): void {
     const sessionId = harnessContext?.sessionId ?? state.sessionId ?? 'unknown';
     recordModelUsage({
       sessionId,
+      sourceUserSeq: harnessContext?.sourceUserSeq,
+      attemptId: harnessContext?.runAttemptId,
       model: state.model || 'claude-headless',
       // inputTokens above pre-folds cache_read/cache_creation: inclusive.
       cacheDialect: 'inclusive',

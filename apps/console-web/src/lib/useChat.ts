@@ -369,6 +369,8 @@ function looksRawError(s: string): boolean {
   return s.length > 200 || /at\s+\w+\s+\(|stack|ECONN|ETIMEDOUT|\{"/.test(s);
 }
 
+const REUSED_RESULT_LABEL = 'Reused earlier result';
+
 /** Fold one harness event into the turn's activity list. Returns the SAME array
  *  reference when nothing changed (so the caller can skip a re-render). Tools are
  *  correlated called→returned by callId when available, falling back to name for
@@ -500,13 +502,22 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     case 'tool_called': {
       if (!tool || tool === 'run_worker' || /run_worker/.test(tool)) return prev; // agents render as agents, not a tool row
       if (d.batchMode === true) return prev; // batch items render as ONE live meter row, not N tool rows
-      const detail = salientArgDetail(d.args);
-      return [...prev, { id: callId ? `t-${callId}` : `t${prev.length}-${tool}`, kind: 'tool', label: toolLabel, ...(detail ? { detail } : {}), startedAt: Date.now(), status: 'running' }];
+      const reused = d.reused === true;
+      const detail = reused ? toolLabel : salientArgDetail(d.args);
+      return [...prev, {
+        id: callId ? `t-${callId}` : `t${prev.length}-${tool}`,
+        kind: 'tool',
+        label: reused ? REUSED_RESULT_LABEL : toolLabel,
+        ...(detail ? { detail } : {}),
+        startedAt: Date.now(),
+        status: 'running',
+      }];
     }
     case 'tool_returned': {
       if (d.batchMode === true) return prev; // counted via batch_progress
       // The backend now carries data.ok — a returned tool can have failed.
       const status: ActivityItem['status'] = d.ok === false ? 'failed' : 'done';
+      const reused = d.reused === true;
       // The read-result glimpse: "12 records · name, website, phone — Acme
       // Roofing". Runtime-derived structure, so scraped data visibly ARRIVES
       // instead of disappearing into a digest.
@@ -518,11 +529,21 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
             typeof g.sample === 'string' && g.sample ? `“${g.sample}”` : '',
           ].filter(Boolean).join(' · ')
         : '';
-      const settle = (a: ActivityItem): ActivityItem => ({
-        ...a,
-        status,
-        ...(glimpseDetail ? { detail: glimpseDetail } : {}),
-      });
+      const settle = (a: ActivityItem): ActivityItem => {
+        const reusedDetail = a.label === REUSED_RESULT_LABEL
+          ? (a.detail || toolLabel)
+          : a.label;
+        return {
+          ...a,
+          status,
+          ...(reused ? { label: REUSED_RESULT_LABEL } : {}),
+          ...(glimpseDetail
+            ? { detail: glimpseDetail }
+            : reused
+              ? { detail: reusedDetail }
+              : {}),
+        };
+      };
       if (callId) {
         const id = `t-${callId}`;
         if (prev.some((a) => a.kind === 'tool' && a.id === id)) {

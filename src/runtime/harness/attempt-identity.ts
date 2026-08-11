@@ -1,0 +1,343 @@
+/**
+ * Three identities, not two.
+ *
+ *   acceptedTaskId     one accepted user task
+ *   logicalToolCallId  one model/host tool invocation — INCLUDING a refusal
+ *                      that never reached a provider
+ *   physicalDispatchId one actual provider crossing, with its parent logical
+ *                      call, an ordinal, and `retryOf` when it repeats one
+ *
+ * The middle level is the one that was missing, and its absence was hiding
+ * money. `runComposioExecute` wraps an entire validation/retry/poll loop, so a
+ * single identity spanning that loop covers one to three *paid* provider
+ * crossings while only the final result is visible. Anything measuring "tool
+ * calls" then reports one, and a comparison against a previous release cannot
+ * see that the new path paid three times to answer once.
+ *
+ * So: nested transport wrappers reuse the LOGICAL identity and settle nothing;
+ * every retry, poll, account probe and code-mode child dispatch takes a fresh
+ * PHYSICAL id. A pre-dispatch refusal has a logical call and no physical
+ * dispatch at all, which is exactly what `dispatchState: 'not_started'` means.
+ *
+ * Inheritance is scoped: an ambient identity belonging to a different accepted
+ * task is ignored rather than adopted, because attributing task A's dispatch to
+ * task B is worse than having no attribution.
+ */
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
+import {
+  admitLogicalCall,
+  beginPhysicalDispatch,
+  refineLogicalCallContract,
+  settlePhysicalDispatch,
+  type DispatchRelation,
+  type LogicalCallAdmissionResult,
+  type RefinedLogicalCall,
+} from './dispatch-ledger.js';
+import { assertExpectedWorkLogicalAdmission } from './expected-work-admission.js';
+
+export interface LogicalCallIdentity {
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+}
+
+export interface PhysicalDispatchIdentity extends LogicalCallIdentity {
+  physicalDispatchId: string;
+  /** 1-based position of this crossing within its logical call. */
+  ordinal: number;
+  relation?: DispatchRelation;
+  /** The dispatch this one repeats, when it is a retry or a poll. */
+  retryOf?: string;
+}
+
+export class PhysicalDispatchPreDispatchError extends Error {
+  override readonly name = 'PhysicalDispatchPreDispatchError';
+  constructor(readonly reason: string) {
+    super(`Provider dispatch refused before I/O: ${reason}`);
+  }
+}
+
+export class PhysicalDispatchSettlementError extends Error {
+  override readonly name = 'PhysicalDispatchSettlementError';
+  constructor(readonly reason: string) {
+    super(`Provider dispatch completed but durable settlement failed: ${reason}`);
+  }
+}
+
+export type LogicalCallAuthorityFailureStatus = Exclude<
+  LogicalCallAdmissionResult['status'],
+  'inserted' | 'replayed'
+>;
+
+/**
+ * The host could not durably bind a logical invocation to its accepted task.
+ * This is a pre-dispatch authority failure: no gate, adapter or provider body
+ * is allowed to execute after it.
+ */
+export class LogicalCallPreDispatchAuthorityError extends Error {
+  override readonly name = 'LogicalCallPreDispatchAuthorityError';
+  constructor(
+    readonly status: LogicalCallAuthorityFailureStatus,
+    readonly reason: string,
+  ) {
+    super(`Logical tool call refused before execution (${status}): ${reason}`);
+  }
+}
+
+/**
+ * Derived, not random: the same accepted turn must produce the same id in every
+ * process and after a restart, or durable evidence stops matching its owner.
+ */
+export function acceptedTaskIdFor(sessionId: string, sourceUserSeq: number): string {
+  return `task:${sessionId}#${sourceUserSeq}`;
+}
+
+interface LogicalFrame extends LogicalCallIdentity {
+  /** Crossings so far, so each physical dispatch gets a truthful ordinal. */
+  crossings: number;
+}
+
+const logicalStorage = new AsyncLocalStorage<LogicalFrame>();
+const physicalStorage = new AsyncLocalStorage<PhysicalDispatchIdentity>();
+
+export function currentLogicalCall(): LogicalCallIdentity | undefined {
+  const frame = logicalStorage.getStore();
+  if (!frame) return undefined;
+  return { acceptedTaskId: frame.acceptedTaskId, logicalToolCallId: frame.logicalToolCallId };
+}
+
+export function currentPhysicalDispatch(): PhysicalDispatchIdentity | undefined {
+  return physicalStorage.getStore();
+}
+
+/**
+ * Trusted host-resolver seam for a semantic raw -> provider-ready rewrite.
+ *
+ * Callers cannot nominate a logical id: the exact accepted-task frame is read
+ * from AsyncLocalStorage, then the durable ledger proves it still owns an open,
+ * zero-crossing call. This API is intentionally not exposed as a model tool.
+ */
+export function authorizeResolvedLogicalCallContract(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  tool: string;
+  effectiveArgs?: unknown;
+  turn?: number;
+}): RefinedLogicalCall {
+  const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
+  const frame = logicalStorage.getStore();
+  if (!frame || frame.acceptedTaskId !== acceptedTaskId) {
+    throw new LogicalCallPreDispatchAuthorityError(
+      'missing',
+      'trusted resolver has no logical call owned by this accepted task',
+    );
+  }
+  const refinement = refineLogicalCallContract({
+    identity: {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId,
+      logicalToolCallId: frame.logicalToolCallId,
+    },
+    tool: input.tool,
+    effectiveArgs: input.effectiveArgs,
+    turn: input.turn,
+  });
+  if (refinement.status !== 'refined' && refinement.status !== 'replayed') {
+    throw new LogicalCallPreDispatchAuthorityError(refinement.status, refinement.reason);
+  }
+  return refinement.identity;
+}
+
+/**
+ * Open one logical tool call.
+ *
+ * A nested transport wrapper inherits rather than opening a second call — one
+ * model invocation is one logical call however many layers wrap it. An ambient
+ * frame owned by a DIFFERENT accepted task is not inherited.
+ */
+export function withLogicalToolCall<T>(
+  input: {
+    sessionId: string;
+    sourceUserSeq: number;
+    /** Trusted host-visible tool identity at this invocation boundary. */
+    tool: string;
+    /** Complete host-visible arguments; values are digested, never persisted. */
+    args?: unknown;
+    /**
+     * The host invocation id when one already exists (SDK call id, code-mode
+     * child id, batch item id).  A nested carrier that supplies the SAME id
+     * inherits the ambient call; a genuinely different host invocation opens
+     * a new logical call even when it runs beneath a parent tool.
+     */
+    logicalToolCallId?: string;
+  },
+  work: (identity: LogicalCallIdentity) => T,
+): T {
+  const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
+  const inherited = logicalStorage.getStore();
+  const requested = typeof input.logicalToolCallId === 'string'
+    && input.logicalToolCallId.trim().length > 0
+    && input.logicalToolCallId.length <= 512
+    ? input.logicalToolCallId.trim()
+    : undefined;
+  if (
+    inherited
+    && inherited.acceptedTaskId === acceptedTaskId
+    && (requested === undefined || requested === inherited.logicalToolCallId)
+  ) {
+    const identity = {
+      acceptedTaskId: inherited.acceptedTaskId,
+      logicalToolCallId: inherited.logicalToolCallId,
+    };
+    assertExpectedWorkLogicalAdmission({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      logicalToolCallId: identity.logicalToolCallId,
+      tool: input.tool,
+      args: input.args,
+    });
+    const admission = admitLogicalCall({
+      identity: { ...identity, sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
+      tool: input.tool,
+      args: input.args,
+    });
+    if (admission.status !== 'inserted' && admission.status !== 'replayed') {
+      throw new LogicalCallPreDispatchAuthorityError(admission.status, admission.reason);
+    }
+    return work(identity);
+  }
+  const frame: LogicalFrame = {
+    acceptedTaskId,
+    logicalToolCallId: requested ?? `call:${randomUUID()}`,
+    crossings: 0,
+  };
+  assertExpectedWorkLogicalAdmission({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    logicalToolCallId: frame.logicalToolCallId,
+    tool: input.tool,
+    args: input.args,
+  });
+  const admission = admitLogicalCall({
+    identity: {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: frame.acceptedTaskId,
+      logicalToolCallId: frame.logicalToolCallId,
+    },
+    tool: input.tool,
+    args: input.args,
+  });
+  if (admission.status !== 'inserted' && admission.status !== 'replayed') {
+    throw new LogicalCallPreDispatchAuthorityError(admission.status, admission.reason);
+  }
+  return logicalStorage.run(frame, () => work({
+    acceptedTaskId: frame.acceptedTaskId,
+    logicalToolCallId: frame.logicalToolCallId,
+  }));
+}
+
+/**
+ * Open one physical provider crossing inside the current logical call.
+ *
+ * Always mints: a retry, a poll and an account probe are each a separate thing
+ * the account was charged for, and collapsing them is how paid work disappears
+ * from a comparison.
+ */
+export async function withPhysicalDispatch<T>(
+  input: {
+    sessionId: string;
+    sourceUserSeq: number;
+    tool: string;
+    args?: unknown;
+    turn?: number;
+    relation?: DispatchRelation;
+    retryOf?: string;
+  },
+  work: (identity: PhysicalDispatchIdentity) => Promise<T>,
+): Promise<T> {
+  const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
+  const frame = logicalStorage.getStore();
+  const owned = frame && frame.acceptedTaskId === acceptedTaskId ? frame : undefined;
+  if (owned) owned.crossings += 1;
+
+  const proposed: PhysicalDispatchIdentity = {
+    acceptedTaskId,
+    logicalToolCallId: owned?.logicalToolCallId ?? `call:${randomUUID()}`,
+    physicalDispatchId: `dispatch:${randomUUID()}`,
+    ordinal: owned?.crossings ?? 1,
+    ...(input.retryOf ? { retryOf: input.retryOf } : {}),
+  };
+  const proposedCrossing = {
+    ...proposed,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+  };
+
+  // This INSERT is authority, not best-effort telemetry. Only a newly inserted
+  // row permits control to leave for the provider; replaying a start must not
+  // repeat a paid call.
+  const admission = beginPhysicalDispatch({
+    identity: proposedCrossing,
+    tool: input.tool,
+    args: input.args,
+    turn: input.turn,
+    relation: input.relation,
+  });
+  if (admission.status !== 'inserted') {
+    throw new PhysicalDispatchPreDispatchError(
+      'reason' in admission ? admission.reason : `dispatch start was ${admission.status}`,
+    );
+  }
+  const identity: PhysicalDispatchIdentity = admission.identity;
+  const crossing = { ...identity, sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq };
+
+  return physicalStorage.run(identity, async () => {
+    try {
+      const result = await work(identity);
+      const settled = settlePhysicalDispatch({
+        identity: crossing, tool: input.tool, outcome: 'returned', turn: input.turn,
+      });
+      if (settled.status !== 'inserted' && settled.status !== 'replayed') {
+        throw new PhysicalDispatchSettlementError(
+          settled.reason,
+        );
+      }
+      return result;
+    } catch (error) {
+      // A settlement-persistence error thrown above already attempted to close
+      // the returned crossing. Do not contradict it with a synthetic `threw`.
+      if (error instanceof PhysicalDispatchSettlementError) throw error;
+      const settled = settlePhysicalDispatch({
+        identity: crossing, tool: input.tool, outcome: 'threw', turn: input.turn,
+      });
+      if (settled.status !== 'inserted' && settled.status !== 'replayed') {
+        throw new PhysicalDispatchSettlementError(
+          settled.reason,
+        );
+      }
+      throw error;
+    }
+  });
+}
+
+/**
+ * The identity a settlement should be attributed to, for a given task.
+ *
+ * Returns undefined when the ambient frame belongs to another accepted task —
+ * letting task A's dispatch settle against task B would corrupt both ledgers.
+ */
+export function settlementIdentityFor(
+  sessionId: string,
+  sourceUserSeq: number,
+): { acceptedTaskId: string; logicalToolCallId: string; physicalDispatchId?: string } | undefined {
+  const acceptedTaskId = acceptedTaskIdFor(sessionId, sourceUserSeq);
+  const physical = physicalStorage.getStore();
+  if (physical && physical.acceptedTaskId === acceptedTaskId) return physical;
+  const logical = logicalStorage.getStore();
+  if (logical && logical.acceptedTaskId === acceptedTaskId) {
+    return { acceptedTaskId, logicalToolCallId: logical.logicalToolCallId };
+  }
+  return undefined;
+}

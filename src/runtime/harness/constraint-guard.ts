@@ -25,6 +25,12 @@ export interface EmailSendConstraint {
   allowedAccount: string;
 }
 
+export interface EmailDraftAuthoringPreference {
+  constraint: ConsolidatedFact;
+  /** Stable mailbox identity to prefer for reversible Outlook draft creation. */
+  preferredAccount: string;
+}
+
 export interface OutlookCalendarReadConstraint {
   constraint: ConsolidatedFact;
   /** The Outlook connected account this calendar read must use. */
@@ -110,6 +116,17 @@ export function isEmailFamilySend(toolSlug: string, args: Record<string, unknown
   return EMAILISH_SLUG_RE.test(toolSlug) || argsAddressEmailRecipients(args);
 }
 
+function firstDispatchMailboxConstraint(): EmailSendConstraint | null {
+  for (const constraint of listDispatchConstraints()) {
+    const content = constraint.content.toLowerCase();
+    if (!content.includes('email') && !content.includes('mail')) continue;
+    const match = constraint.content.match(EMAIL_IN_TEXT);
+    if (!match) continue;
+    return { constraint, allowedAccount: match[0].toLowerCase() };
+  }
+  return null;
+}
+
 export function findEmailSendConstraint(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -123,15 +140,36 @@ export function findEmailSendConstraint(
     // A mailbox-identity constraint governs EMAIL sends only — out-of-family
     // sends (Slack/Discord/SMS/…) cannot violate it and are out of scope.
     if (!isEmailFamilySend(toolSlug, args)) return null;
-    for (const constraint of listDispatchConstraints()) {
-      const content = constraint.content.toLowerCase();
-      if (!content.includes('email') && !content.includes('mail')) continue;
-      const match = constraint.content.match(EMAIL_IN_TEXT);
-      if (!match) continue;
-      return { constraint, allowedAccount: match[0].toLowerCase() };
-    }
+    return firstDispatchMailboxConstraint();
   } catch (err) {
     console.error('[constraint-guard] error finding email constraint:', err);
+  }
+  return null;
+}
+
+/**
+ * Reuse the stable mailbox identity from a standing sender policy while
+ * AUTHORING a reversible Outlook draft. This is deliberately a preference,
+ * not send authority: CREATE_*_DRAFT may route with it, but SEND_DRAFT and all
+ * other irreversible sends still pass through findEmailSendConstraint and the
+ * live sender-verification gate.
+ */
+export function findEmailDraftAuthoringPreference(
+  toolSlug: string,
+): EmailDraftAuthoringPreference | null {
+  try {
+    const slug = toolSlug.trim().toUpperCase();
+    if (!slug.startsWith('OUTLOOK_')) return null;
+    if (isIrreversibleSendSlug(toolSlug)) return null;
+    if (!/(?:^|_)CREATE(?:_[A-Z0-9]+)*_DRAFT(?:_|$)/.test(slug)) return null;
+    const mailbox = firstDispatchMailboxConstraint();
+    if (!mailbox) return null;
+    return {
+      constraint: mailbox.constraint,
+      preferredAccount: mailbox.allowedAccount,
+    };
+  } catch (err) {
+    console.error('[constraint-guard] error finding email draft preference:', err);
   }
   return null;
 }

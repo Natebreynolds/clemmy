@@ -3,6 +3,7 @@
 # installed Clementine.app back. Run at the end of a build session.
 set -uo pipefail
 HOME_DIR="$HOME/.clementine-next"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="$(grep -E '^WEBHOOK_PORT=' "$HOME_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"'"'"' ' )"; PORT="${PORT:-8520}"
 
 echo "→ stopping dev daemon"
@@ -28,7 +29,7 @@ if [ -f "$POL.devbak" ]; then mv "$POL.devbak" "$POL"; echo "→ restored proact
 # Clean up smoke/test sessions this harness created (id prefixes used by the suite)
 DB="$HOME_DIR/state/harness.db"
 if [ -f "$DB" ]; then
-  sqlite3 "$DB" "DELETE FROM events WHERE session_id LIKE 'console:%smoke%' OR session_id LIKE 'devsmoke:%'; DELETE FROM sessions WHERE id LIKE 'console:%smoke%' OR id LIKE 'devsmoke:%';" 2>/dev/null \
+  sqlite3 "$DB" < "$SCRIPT_DIR/dev-clean-harness-sessions.sql" 2>/dev/null \
     && echo "→ cleaned harness test sessions"
 fi
 

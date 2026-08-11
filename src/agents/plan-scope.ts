@@ -1,23 +1,33 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
+import {
+  extractComposioSlug,
+  isCallToolMultiplexerName,
+  isComposioMultiplexerName,
+  isDestructiveToolInvocation,
+  isShellMultiplexerName,
+  resolveToolInvocation,
+} from './tool-invocation.js';
 
 /** Only IRREVERSIBLE sends (email/call/post) get the strict enumeration floor.
  *  The taxonomy's 'send' kind is broader — it tags reversible network writes
  *  (a sheet/record create) too, and those keep the lenient scope/YOLO behavior.
  *  Authoritative irreversibility comes from classifyExternalWrite. */
 function isIrreversibleSendAction(toolName: string, args: unknown, kindHint?: 'send' | 'other'): boolean {
+  const resolved = resolveToolInvocation(toolName, args);
+  if (!resolved.valid) return kindHint === 'send';
   try {
     // The authoritative classifier is the source of truth. A kindHint of 'other'
     // must NOT short-circuit it to false: native comm-object sends (create_event,
     // respond_to_event) derive kindHint='other' from the taxonomy's verb list yet
     // ARE irreversible sends, and the old short-circuit disarmed the send-lock +
     // YOLO/wildcard-scope carve-out for them (2026-07-09 re-hunt: Lanes 2/3).
-    if (classifyExternalWrite(toolName, args).irreversible) return true;
+    if (classifyExternalWrite(resolved.toolName, resolved.args).irreversible) return true;
   } catch {
     // Fail-safe: if we can't classify but the caller called it a send, treat as
     // irreversible (ask) rather than auto-approve.
@@ -84,6 +94,13 @@ export interface PlanScope {
    * exact Composio slugs.
    */
   allowedComposioSlugs?: string[];
+  /**
+   * Exact destructive semantic actions approved by the plan. Values are
+   * opaque SHA-256 authority keys produced by `destructivePlanActionKey` so
+   * plan-scope persistence does not copy sensitive payloads. A wildcard or a
+   * bare tool name can never substitute for one of these exact keys.
+   */
+  allowedDestructiveActions?: string[];
   /**
    * Goal-scoped autonomy (B1): when set, this scope's lifetime is DERIVED from
    * the goal record — it stays open while the goal is `active` and is closed by
@@ -193,6 +210,8 @@ export interface OpenPlanScopeInput {
   ttlMs?: number;
   allowedTools?: string[];
   allowedComposioSlugs?: string[];
+  /** Exact keys from `destructivePlanActionKey(toolName, args)`. */
+  allowedDestructiveActions?: string[];
   /** Open a goal-lifetime scope (no TTL) keyed to this goal id. */
   goalScoped?: { goalId: string };
   /** Sends the plan enumerated + the user blessed (goal-scoped only). */
@@ -228,6 +247,9 @@ export function openPlanScope(input: OpenPlanScopeInput): PlanScope {
     allowedComposioSlugs: input.allowedComposioSlugs && input.allowedComposioSlugs.length > 0
       ? input.allowedComposioSlugs
       : undefined,
+    allowedDestructiveActions: input.allowedDestructiveActions && input.allowedDestructiveActions.length > 0
+      ? [...new Set(input.allowedDestructiveActions)]
+      : undefined,
     goalScoped: input.goalScoped,
     allowedSends: input.allowedSends && input.allowedSends.length > 0 ? input.allowedSends : undefined,
     allowAnySend: input.allowAnySend === true ? true : undefined,
@@ -247,6 +269,7 @@ export function openPlanScope(input: OpenPlanScopeInput): PlanScope {
     expiresAt: scope.expiresAt,
     allowedTools: scope.allowedTools,
     allowedComposioSlugs: scope.allowedComposioSlugs,
+    allowedDestructiveActions: scope.allowedDestructiveActions?.length,
   }, 'plan scope opened');
 
   return scope;
@@ -281,6 +304,54 @@ export function closePlanScope(sessionId: string, reason: string = 'closed'): Pl
   return scope;
 }
 
+function canonicalScopeJson(value: unknown, seen = new WeakSet<object>()): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'bigint') return JSON.stringify(value.toString());
+    if (typeof value === 'number' && !Number.isFinite(value)) return JSON.stringify(String(value));
+    return JSON.stringify(value) ?? 'null';
+  }
+  if (seen.has(value)) return JSON.stringify('[circular]');
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return `[${value.map((entry) => canonicalScopeJson(entry, seen)).join(',')}]`;
+    }
+    const obj = value as Record<string, unknown>;
+    return `{${Object.keys(obj).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalScopeJson(obj[key], seen)}`
+    )).join(',')}}`;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+/**
+ * Exact semantic destructive authority. Broker transport/provider payloads are
+ * projected to the nested action first; the outer card remains independently
+ * byte-bound by the approval registry.
+ */
+export function destructivePlanActionKey(toolName: string, args?: unknown): string | null {
+  const resolved = resolveToolInvocation(toolName, args);
+  if (!resolved.valid) return null;
+  const digest = createHash('sha256')
+    .update(canonicalScopeJson({ toolName: resolved.toolName, args: resolved.args }))
+    .digest('hex');
+  return `destructive-action-v1:${digest}`;
+}
+
+export function isDestructiveActionApprovedByScope(
+  sessionId: string | undefined,
+  toolName: string,
+  args?: unknown,
+): boolean {
+  if (!sessionId) return false;
+  const scope = getPlanScope(sessionId);
+  if (!scope || scope.closedAt) return false;
+  const key = destructivePlanActionKey(toolName, args);
+  return Boolean(key && scope.allowedDestructiveActions?.includes(key));
+}
+
 /**
  * Pure check — does the session have an active, unexpired plan scope
  * that covers `toolName`? Does not mutate.
@@ -291,10 +362,25 @@ export function isAutoApprovedByScope(
   args?: unknown,
   kindHint?: 'send' | 'other',
 ): boolean {
+  const resolved = resolveToolInvocation(toolName, args);
+  if (!resolved.valid) return false;
+  const semanticTool = resolved.toolName;
+  const semanticArgs = resolved.args;
+  // Destructive scope is exact action+args only. This check lives here as well
+  // as in decideToolApproval because guardrail/batch callers consult plan scope
+  // directly and must not let a wildcard launder a delete.
+  if (isDestructiveToolInvocation(toolName, args)) {
+    return isDestructiveActionApprovedByScope(sessionId, toolName, args);
+  }
   // Standing grants (B2): durable, user-level, session-independent. A send is
   // never grantable (refused at write), so a grant only ever covers a safe
   // write/execute tool — but guard kindHint defensively anyway.
-  if (kindHint !== 'send' && isStandingGranted(toolName)) return true;
+  if (
+    kindHint !== 'send'
+    && !resolved.unsafeExternalMultiplexer
+    && !isUngrantableMultiplexer(semanticTool)
+    && isStandingGranted(semanticTool)
+  ) return true;
   if (!sessionId) return false;
   const scope = getPlanScope(sessionId);
   if (!scope) return false;
@@ -316,13 +402,13 @@ export function isAutoApprovedByScope(
   // it returns false → needsApproval → the run PARKS for a card.
   // THE SEND LOCK — only IRREVERSIBLE sends (email/call/post), not reversible
   // network writes (a sheet/record create still auto-approves under a scope).
-  if (isIrreversibleSendAction(toolName, args, kindHint)) {
+  if (isIrreversibleSendAction(semanticTool, semanticArgs, kindHint)) {
     // Authored-send consent: the workflow author declared this step SENDS and
     // the user saved + launched/enabled it — the only human-in-the-loop gates
     // in a workflow are steps AUTHORED `requiresApproval` (owner rule,
     // 2026-07-24). Scope is step-TTL-bound and set only by the runner.
     if (scope.allowAnySend === true) return true;
-    const slug = extractComposioSlug(args);
+    const slug = extractComposioSlug(semanticArgs);
     const sends = scope.allowedSends ?? [];
     // The SLUG is the real action for a composio send — auto-approve only when
     // the exact slug is enumerated (allowedSends or allowedComposioSlugs).
@@ -332,40 +418,38 @@ export function isAutoApprovedByScope(
     // is NOT — naming the gateway would blanket-approve every slug through it
     // (2026-07-09 Hole A: approve Gmail, model then sends Slack). Nor does a
     // wildcard '*'.
-    if (!isUngrantableMultiplexer(toolName) && (sends.includes(toolName) || scope.allowedTools.includes(toolName))) return true;
+    if (
+      !isUngrantableMultiplexer(semanticTool)
+      && (sends.includes(semanticTool) || scope.allowedTools.includes(semanticTool))
+    ) return true;
     return false; // wildcard / multiplexer / un-enumerated → human approval required
   }
+  // A foreign shell/Composio gateway is arbitrary capability. It may not ride
+  // YOLO, a wildcard, or its outer broker name. Composio remains usable when
+  // the plan names the exact nested slug.
+  if (resolved.unsafeExternalMultiplexer) {
+    const slug = isComposioMultiplexerName(semanticTool)
+      ? extractComposioSlug(semanticArgs)
+      : undefined;
+    return Boolean(slug && scope.allowedComposioSlugs?.includes(slug));
+  }
   if (scope.allowedTools.includes('*')) return true;
-  if (scope.allowedTools.includes(toolName)) {
+  if (scope.allowedTools.includes(semanticTool)) {
     if (
-      toolName === 'composio_execute_tool'
+      isComposioMultiplexerName(semanticTool)
       && scope.allowedComposioSlugs
       && scope.allowedComposioSlugs.length > 0
     ) {
-      const slug = extractComposioSlug(args);
+      const slug = extractComposioSlug(semanticArgs);
       return !!slug && scope.allowedComposioSlugs.includes(slug);
     }
     return true;
   }
   const prefixMatch = scope.allowedTools.some((allowed) => (
-    allowed.endsWith('*') && toolName.startsWith(allowed.slice(0, -1))
+    allowed.endsWith('*') && semanticTool.startsWith(allowed.slice(0, -1))
   ));
   if (!prefixMatch) return false;
   return true;
-}
-
-function extractComposioSlug(args: unknown): string | undefined {
-  if (!args) return undefined;
-  if (typeof args === 'string') {
-    try {
-      return extractComposioSlug(JSON.parse(args) as unknown);
-    } catch {
-      return undefined;
-    }
-  }
-  if (typeof args !== 'object') return undefined;
-  const slug = (args as Record<string, unknown>).tool_slug;
-  return typeof slug === 'string' && slug.length > 0 ? slug : undefined;
 }
 
 /**
@@ -395,6 +479,8 @@ export function evaluateAutoApprove(input: {
   /** 'send' applies the goal-scoped send lock; anything else is 'other'. */
   kindHint?: 'send' | 'other';
 }): AutoApproveDecision {
+  const resolved = resolveToolInvocation(input.toolName, input.args);
+  if (!resolved.valid) return { autoApproved: false, reason: 'denied' };
   if (isAutoApprovedByScope(input.sessionId, input.toolName, input.args, input.kindHint)) {
     return { autoApproved: true, reason: 'plan-scope' };
   }
@@ -404,9 +490,12 @@ export function evaluateAutoApprove(input: {
   // posture, like a standing grant — it IS the user's explicit consent, scoped;
   // revocable; the returned reason lands in the audit trail. Fail-closed inside
   // matchesSendTrust, so an unparseable or mass send falls through to the card.
-  if (isIrreversibleSendAction(input.toolName, input.args, input.kindHint)
-    && matchesSendTrust(input.toolName, input.args)) {
+  if (isIrreversibleSendAction(resolved.toolName, resolved.args, input.kindHint)
+    && matchesSendTrust(resolved.toolName, resolved.args)) {
     return { autoApproved: true, reason: 'send-trust' };
+  }
+  if (resolved.unsafeExternalMultiplexer) {
+    return { autoApproved: false, reason: 'denied' };
   }
   // YOLO / workspace blanket policies NEVER auto-approve an IRREVERSIBLE send
   // (Hole C, 2026-07-09): the batch path already carved this out (brackets
@@ -415,7 +504,7 @@ export function evaluateAutoApprove(input: {
   // irreversible sends (email/call/post) are held; reversible writes (a sheet
   // create) keep full YOLO/workspace convenience. YOLO means "don't nag me
   // about reversible work", not "email anyone silently".
-  if (!isIrreversibleSendAction(input.toolName, input.args, input.kindHint)) {
+  if (!isIrreversibleSendAction(resolved.toolName, resolved.args, input.kindHint)) {
     if (input.scope === 'yolo') {
       return { autoApproved: true, reason: 'yolo-policy' };
     }
@@ -497,7 +586,12 @@ const UNGRANTABLE_MULTIPLEXERS = new Set<string>([
   'local_cli_exec',
 ]);
 export function isUngrantableMultiplexer(name: string): boolean {
-  if (UNGRANTABLE_MULTIPLEXERS.has(name)) return true;
+  if (
+    UNGRANTABLE_MULTIPLEXERS.has(name)
+    || isCallToolMultiplexerName(name)
+    || isShellMultiplexerName(name)
+    || isComposioMultiplexerName(name)
+  ) return true;
   // Arbitrary code/command execution hosted via MCP (kernel exec_command,
   // playwright run_code_unsafe / execute_playwright_code, ide executeCode).
   return /(^|_)(exec_command|run_code_unsafe|execute_playwright_code|executecode|eval)(_|$)/i.test(

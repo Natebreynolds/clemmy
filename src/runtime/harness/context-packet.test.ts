@@ -173,6 +173,89 @@ test('context packet ranks relevant skills and workflows for the current request
   assert.match(packet.text, /Do NOT auto-run a workflow the user did not ask to run/);
 });
 
+test('private continuation text can rank context but cannot become preflight or tool authority', () => {
+  const packet = buildAgentContextPacket(
+    ['Send the client email through Outlook.', 'Should I send it?', 'No.'].join('\n'),
+    { enabled: true, hitCount: 0, source: 'unified', injected: false },
+    {
+      sessionKind: 'chat',
+      sessionId: 'context-authority-split',
+      authorityInput: 'No.',
+      suppressConfirmBeat: true,
+    },
+  );
+  assert.equal(packet.confirmBeatOffered, false);
+  assert.equal(packet.preflightPhase, 'execute');
+  assert.equal(packet.multiItem.detected, false);
+  assert.ok(!(packet.toolScope.allowedServerSlugs ?? []).includes('outlook'));
+  assert.doesNotMatch(packet.text, /\[confirm-first\]/);
+});
+
+test('typed decline keeps conversational guidance while skipping semantic enrichment', () => {
+  const packet = buildAgentContextPacket(
+    ['Send the client email through Outlook.', 'Should I send it?', 'No.'].join('\n'),
+    {
+      enabled: true,
+      hitCount: 0,
+      source: 'unified',
+      injected: false,
+      skippedReason: 'declined_continuation',
+    },
+    {
+      sessionKind: 'chat',
+      sessionId: 'context-declined-continuation',
+      sourceUserSeq: 2,
+      authorityInput: 'No.',
+      suppressConfirmBeat: true,
+      suppressSemanticEnrichment: true,
+    },
+  );
+
+  assert.deepEqual(packet.skills, []);
+  assert.deepEqual(packet.workflows, []);
+  assert.deepEqual(packet.projectCommands, []);
+  assert.deepEqual(packet.mcp, []);
+  assert.deepEqual(packet.healthWarnings, []);
+  assert.deepEqual(packet.capabilityResolution.entries, []);
+  assert.equal(packet.semanticEnrichmentSkippedReason, 'declined_continuation');
+  assert.deepEqual(packet.toolScope.allowedServerSlugs ?? [], []);
+  assert.equal(packet.preflightPhase, 'execute');
+  assert.match(packet.text, /keep the conversation natural/i);
+  assert.match(packet.text, /declined work/i);
+  assert.doesNotMatch(packet.text, /Send the client email/i);
+  assert.doesNotMatch(packet.text, /Provider access \(harness facts/i);
+  assert.doesNotMatch(packet.text, /Approval reminder/i);
+});
+
+test('compound decline scopes private context to the fresh clause without scripting the reply', () => {
+  const fullMessage = 'No—leave that email unsent. Instead, what is 15 × 9? Answer naturally without tools.';
+  const activeClause = 'what is 15 × 9? Answer naturally without tools.';
+  const packet = buildAgentContextPacket(
+    activeClause,
+    { enabled: true, hitCount: 0, source: 'unified', injected: false },
+    {
+      sessionKind: 'chat',
+      sessionId: 'context-compound-decline',
+      authorityInput: activeClause,
+      suppressConfirmBeat: true,
+      declinedParentWithNewTask: true,
+    },
+  );
+
+  assert.equal(packet.inputPreview, activeClause);
+  assert.equal(packet.confirmBeatOffered, false);
+  assert.equal(packet.multiItem.detected, false);
+  assert.ok(!(packet.toolScope.allowedServerSlugs ?? []).includes('outlook'));
+  assert.deepEqual(packet.skills, []);
+  assert.deepEqual(packet.workflows, []);
+  assert.deepEqual(packet.projectCommands, []);
+  assert.match(packet.text, /keep the full reply conversationally intact/i);
+  assert.match(packet.text, /only the fresh clause as active authority/i);
+  assert.doesNotMatch(packet.text, /Send the client email|email-report-helper/i);
+  assert.doesNotMatch(packet.text, /Understood|I won’t send|Sure —/i);
+  assert.notEqual(packet.inputPreview, fullMessage, 'the private semantic packet contains only the active clause');
+});
+
 test('context packet projects only relevant future commitments and conditionally suggests durable capture', () => {
   upsertProspectiveIntention({
     id: 'timer:orchid-launch',

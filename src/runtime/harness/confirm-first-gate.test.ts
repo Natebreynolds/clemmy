@@ -141,6 +141,10 @@ test('isConfirmFirstEnabled: defaults on with an explicit off escape hatch', () 
     assert.equal(isConfirmFirstEnabled(), false);
     process.env.CLEMMY_CONFIRM_FIRST = 'true';
     assert.equal(isConfirmFirstEnabled(), true);
+    process.env.CLEMMY_CONFIRM_FIRST = 'enabled-by-typo';
+    assert.equal(isConfirmFirstEnabled(), true, 'an unknown safety value must not disable the gate');
+    process.env.CLEMMY_CONFIRM_FIRST = '  off  ';
+    assert.equal(isConfirmFirstEnabled(), false, 'explicit off remains whitespace-tolerant');
   } finally {
     if (previous === undefined) delete process.env.CLEMMY_CONFIRM_FIRST;
     else process.env.CLEMMY_CONFIRM_FIRST = previous;

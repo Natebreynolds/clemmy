@@ -76,6 +76,14 @@ test('renderClaudeAgentWorkerSystemAppend tells Claude to use named skills and s
   assert.match(prompt, /Worker intent: design/);
 });
 
+test('agentic Claude worker guidance is compose-only for Composio mutations', () => {
+  const prompt = renderClaudeAgentWorkerSystemAppend(packet, true);
+  assert.match(prompt, /COMPOSE → PARENT COMMIT/);
+  assert.match(prompt, /never execute a mutating Composio action/i);
+  assert.match(prompt, /WORKER_COMPOSE_ONLY/);
+  assert.match(prompt, /one immutable run_batch proposal/i);
+});
+
 test('runClaudeAgentSdkWorker builds a worker packet prompt with read-only tools', async () => {
   let captured: any;
   setClaudeAgentSdkWorkerRunForTest(async (options) => {
@@ -107,6 +115,7 @@ test('runClaudeAgentSdkWorker builds a worker packet prompt with read-only tools
   // external lease must not re-interpret that local name as native MCP scope.
   assert.equal(captured.nativeMcpScopeInput, '');
   assert.equal(captured.nativeMcpScopeMode, 'resolved_tools');
+  assert.equal(captured.workerScope, true, 'worker identity reaches the SDK independently of the optional thrash guard');
 });
 
 // ── 2026-06-22 fan-out fix: SDK-lane cap visibility + intent-aware cap ─────────
@@ -206,6 +215,7 @@ test('guard OFF: byte-identical rollback — friendly text verbatim + base cap r
     assert.equal(r.text, 'I reached the turn budget. Say "continue" to keep going.', 'friendly text verbatim');
     assert.doesNotMatch(r.text, /^ERROR:/);
     assert.equal(captured.maxTurns, 12, 'no intent widening when the guard is off');
+    assert.equal(captured.workerScope, true, 'compose-only authority survives the thrash-guard rollback');
   });
 });
 

@@ -2,6 +2,7 @@ import { after, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
+import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 
 const TEST_HOME = '/tmp/clemmy-test-turn-graph-shadow';
@@ -96,6 +97,43 @@ test('accepted event text is authoritative and neither it nor tool input is pers
   assert.equal(serialized.includes('alex@example.com'), false);
   const graph = event.data.graph as { source?: { inputHash?: unknown } };
   assert.match(String(graph.source?.inputHash), /^[a-f0-9]{64}$/);
+});
+
+test('an exact-source compound decline keeps the full accepted parent while graphing only its fresh clause', () => {
+  const text = 'No—leave that note alone. Instead, what is 15 × 9?';
+  const source = acceptedTurn({ sessionId: 'shadow-compound-decline', text });
+  const event = recordTurnGraphShadow({
+    identity: {
+      sessionId: source.sessionId,
+      turn: source.turn,
+      sourceUserSeq: source.seq,
+    },
+    surface: 'home',
+    verifiedTaskContinuation: {
+      packetId: 'packet-compound',
+      parentSourceUserSeq: source.seq - 1,
+      consumingSourceUserSeq: source.seq,
+      parentInput: 'Update the note.',
+      question: 'Should I update it?',
+      options: ['Yes', 'No'],
+      answer: text,
+      disposition: 'declined_with_new_task',
+      activeTaskInput: 'what is 15 × 9?',
+      retrievalQuery: 'what is 15 × 9?',
+      capabilities: [],
+    },
+  });
+  assert.ok(event);
+  const graph = event.data.graph as { source?: { inputHash?: unknown } };
+  const activeHash = createHash('sha256').update('what is 15 × 9?', 'utf8').digest('hex');
+  const fullHash = createHash('sha256').update(text, 'utf8').digest('hex');
+  assert.equal(graph.source?.inputHash, activeHash, 'graph semantics use only the fresh clause');
+  assert.notEqual(graph.source?.inputHash, fullHash, 'the declined parent cannot shape graph topology');
+  assert.equal(
+    listEvents(source.sessionId, { types: ['user_input_received'] })[0]?.data.text,
+    text,
+    'the durable/provider-visible user message remains complete',
+  );
 });
 
 test('missing accepted text cannot be replaced by a private runtime fallback', () => {

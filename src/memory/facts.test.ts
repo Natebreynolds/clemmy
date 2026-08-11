@@ -1,21 +1,24 @@
 /**
- * Run: CLEMENTINE_HOME=/tmp/clemmy-test-facts npx tsx --test src/memory/facts.test.ts
+ * Run: npx tsx --test src/memory/facts.test.ts
  *
  * Tests use an isolated temp CLEMENTINE_HOME so they don't pollute the
  * user's real vault.
  */
-import { test, before, beforeEach } from 'node:test';
+import { test, after, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // CLEMENTINE_HOME must be set BEFORE importing config/db modules.
 // node:test runs before/beforeEach after imports, so we set the env
 // var at module-init time here.
-const TEST_HOME = '/tmp/clemmy-test-facts';
+const PRIOR_CLEMENTINE_HOME = process.env.CLEMENTINE_HOME;
+const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-test-facts-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
 // eslint-disable-next-line import/first
-const { resetMemoryDb, openMemoryDb } = await import('./db.js');
+const { closeMemoryDb, resetMemoryDb, openMemoryDb } = await import('./db.js');
 // eslint-disable-next-line import/first
 const {
   decayAndEvictFacts,
@@ -37,6 +40,7 @@ const {
   setFactPinned,
   setTurnQueryVector,
   clearTurnQueryVector,
+  withTurnQueryVectorScope,
   touchFactAccess,
   recordFactImpression,
 } = await import('./facts.js');
@@ -54,6 +58,14 @@ beforeEach(() => {
   _setEmbeddingProviderForTest(undefined);
   // Touch DB so subsequent ops succeed.
   openMemoryDb();
+});
+
+after(() => {
+  _setEmbeddingProviderForTest(undefined);
+  closeMemoryDb();
+  rmSync(TEST_HOME, { recursive: true, force: true });
+  if (PRIOR_CLEMENTINE_HOME === undefined) delete process.env.CLEMENTINE_HOME;
+  else process.env.CLEMENTINE_HOME = PRIOR_CLEMENTINE_HOME;
 });
 
 function factContentHash(id: number): string {
@@ -124,6 +136,77 @@ test('forgetFact hard delete drops the row', () => {
   assert.equal(forgetFact(fact.id, { hard: true }), true);
   assert.equal(getFact(fact.id), null);
   assert.equal(forgetFact(fact.id), false, 'second delete returns false');
+});
+
+test('hard delete restores FK enforcement and atomically removes every fact dependent', () => {
+  const fact = rememberFact({ kind: 'user', content: 'My smoke marker is MEMTOK-REGRESSION.' });
+  const superseded = rememberFact({ kind: 'user', content: 'My old smoke marker was MEMTOK-OLD.' });
+  const db = openMemoryDb();
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO memory_episodes
+      (id, kind, source_app, session_id, call_id, source_uri, occurred_at,
+       ingested_at, content_hash, evidence_excerpt, status)
+    VALUES (?, 'user_turn', 'console', ?, ?, ?, ?, ?, ?, ?, 'available')
+  `).run(
+    'episode:fk-hard-delete',
+    'console:devsmoke-memory',
+    'call:fk-hard-delete',
+    'conversation://console/devsmoke-memory',
+    now,
+    now,
+    'episode-hash-fk-hard-delete',
+    'Remember exactly: my smoke marker is MEMTOK-REGRESSION.',
+  );
+  db.prepare(`
+    INSERT INTO fact_evidence
+      (fact_id, episode_id, excerpt, source_uri, ordinal, created_at)
+    VALUES (?, 'episode:fk-hard-delete', ?, 'conversation://console/devsmoke-memory', 0, ?)
+  `).run(fact.id, 'Remember exactly: my smoke marker is MEMTOK-REGRESSION.', now);
+  db.prepare(`
+    INSERT INTO memory_reflection_candidates
+      (episode_id, session_id, call_id, candidate_hash, kind, text,
+       importance, status, reason, resulting_fact_id, created_at, resolved_at,
+       source_type)
+    VALUES ('episode:fk-hard-delete', 'console:devsmoke-memory',
+      'call:fk-hard-delete', 'candidate-hash-fk-hard-delete', 'user', ?,
+      5, 'promoted', 'consolidation:add', ?, ?, ?, 'auto_capture')
+  `).run(fact.content, fact.id, now, now);
+  db.prepare(`
+    UPDATE consolidated_facts
+    SET active = 0, valid_to = ?, superseded_by_fact_id = ?
+    WHERE id = ?
+  `).run(now, fact.id, superseded.id);
+
+  // Reproduce the violating precondition: the old path issued one plain DELETE
+  // and trusted connection-global state, leaving exactly the candidate,
+  // validity, and evidence orphans seen in the live readiness audit.
+  db.pragma('foreign_keys = OFF');
+  assert.equal(db.pragma('foreign_keys', { simple: true }), 0);
+
+  assert.equal(forgetFact(fact.id, { hard: true }), true);
+  assert.equal(db.pragma('foreign_keys', { simple: true }), 1, 'hard delete restores FK enforcement');
+  assert.equal(getFact(fact.id), null);
+  assert.equal(
+    (db.prepare('SELECT COUNT(*) AS count FROM fact_evidence WHERE fact_id = ?').get(fact.id) as { count: number }).count,
+    0,
+    'evidence CASCADEs',
+  );
+  assert.equal(
+    (db.prepare('SELECT COUNT(*) AS count FROM fact_validity_intervals WHERE fact_id = ?').get(fact.id) as { count: number }).count,
+    0,
+    'validity history CASCADEs',
+  );
+  assert.equal(
+    (db.prepare(`
+      SELECT resulting_fact_id FROM memory_reflection_candidates
+      WHERE candidate_hash = 'candidate-hash-fk-hard-delete'
+    `).get() as { resulting_fact_id: number | null }).resulting_fact_id,
+    null,
+    'promotion pointer follows ON DELETE SET NULL',
+  );
+  assert.equal(getFact(superseded.id)?.supersededByFactId, null, 'supersession pointer is detached in the transaction');
+  assert.deepEqual(db.pragma('foreign_key_check'), [], 'the delete leaves no graph orphan');
 });
 
 test('renderFactsForInstructions groups by kind in fixed order', () => {
@@ -629,6 +712,50 @@ test('listActiveFacts(stanford): a semantically-relevant fact is promoted by the
   const withSem = listActiveFacts({ ranking: 'stanford', limit: 5 });
   assert.ok(rankOf(relevant.id, withSem) < rankOf(offtopic.id, withSem), 'semantic bonus promotes the on-topic fact above the merely-recent/important one');
 
+  clearTurnQueryVector();
+  delete process.env.CLEMMY_SEMANTIC_RECALL;
+  _setEmbeddingProviderForTest(undefined);
+});
+
+test('semantic turn vectors stay isolated across concurrent async turn scopes', async () => {
+  process.env.CLEMMY_SEMANTIC_RECALL = 'on';
+  _setEmbeddingProviderForTest({
+    name: 'test',
+    model: 'test',
+    dim: 4,
+    async embed(texts) {
+      return texts.map(() => new Float32Array(4));
+    },
+  });
+  const db = openMemoryDb();
+  const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
+                            VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
+  const alpha = rememberFact({ kind: 'project', content: 'Alpha semantic scope marker.', importance: 5 });
+  const beta = rememberFact({ kind: 'project', content: 'Beta semantic scope marker.', importance: 5 });
+  embed.run(alpha.id, vectorToBuffer(Float32Array.from([1, 0, 0, 0])), factContentHash(alpha.id));
+  embed.run(beta.id, vectorToBuffer(Float32Array.from([0, 1, 0, 0])), factContentHash(beta.id));
+
+  let alphaReady!: () => void;
+  let betaReady!: () => void;
+  const alphaSet = new Promise<void>((resolve) => { alphaReady = resolve; });
+  const betaSet = new Promise<void>((resolve) => { betaReady = resolve; });
+  const [alphaTop, betaTop] = await Promise.all([
+    withTurnQueryVectorScope(async () => {
+      setTurnQueryVector('alpha', Float32Array.from([1, 0, 0, 0]));
+      alphaReady();
+      await betaSet;
+      return listActiveFacts({ ranking: 'stanford', limit: 1 })[0]?.id;
+    }),
+    withTurnQueryVectorScope(async () => {
+      setTurnQueryVector('beta', Float32Array.from([0, 1, 0, 0]));
+      betaReady();
+      await alphaSet;
+      return listActiveFacts({ ranking: 'stanford', limit: 1 })[0]?.id;
+    }),
+  ]);
+
+  assert.equal(alphaTop, alpha.id, 'alpha turn observed another turn\'s vector');
+  assert.equal(betaTop, beta.id, 'beta turn observed another turn\'s vector');
   clearTurnQueryVector();
   delete process.env.CLEMMY_SEMANTIC_RECALL;
   _setEmbeddingProviderForTest(undefined);

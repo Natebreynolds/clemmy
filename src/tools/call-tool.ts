@@ -15,6 +15,9 @@
  *  - ARG VALIDATION: args_json is Zod-validated against the target's schema BEFORE
  *    dispatch. On failure it returns {error:'arg_validation', schema, detail} with
  *    ZERO side effects — one round-trip self-correction.
+ *  - CAPABILITY ADMISSION: production supplies a sealed-universe callback. A
+ *    built-in must append/reuse its binding revision before dispatch; missing or
+ *    outside authority returns typed requires_readmission with ZERO dispatch.
  *  - GATE KEYING: dispatch goes through dispatchBatchItemTool, which wraps the REAL
  *    inner tool via wrapToolForHarness — so the write/send/approval gates key on the
  *    INNER tool name, exactly as a discrete call. call_tool itself is NEVER
@@ -33,19 +36,41 @@ import {
   ToolCallsCounter,
   ToolCallsLimitExceeded,
 } from '../runtime/harness/brackets.js';
+import {
+  authorizeResolvedLogicalCallContract,
+  currentLogicalCall,
+} from '../runtime/harness/attempt-identity.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { dispatchBatchItemTool, isMcpNamespacedTool } from './code-mode-tool.js';
 import { deriveOrchestratorDiscoveryNames } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
-import { textResult } from './shared.js';
+import { isHarnessRefusalText, textResult } from './shared.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import {
   validateIrreversibleSendPayload,
 } from '../runtime/harness/grounding-gate.js';
-import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
+import {
+  ExternalWritePreDispatchError,
+  ExternalWritePreDispatchResult,
+} from '../runtime/harness/external-write-admission.js';
+import {
+  settleResolvedCarrierRefusal,
+  type ResolvedCarrierTarget,
+} from '../runtime/harness/resolved-carrier-refusal.js';
+import type { SettleToolAttemptInput } from '../runtime/harness/attempt-settlement.js';
+import {
+  normalizeComposioCarrierInput,
+  serializeComposioCarrier,
+} from './composio-carrier.js';
+import {
+  jsonSchemaAllowsNull,
+  materializeStrictNullableFields,
+} from '../runtime/schema-normalizer.js';
+
+export { materializeStrictNullableFields } from '../runtime/schema-normalizer.js';
 
 const DESCRIPTION = [
   'Invoke a built-in tool that is in the catalog but not currently one of your first-class tools. Pass the exact tool `name` (from the catalog / tool_search) and `args_json` — a JSON object string of that tool\'s arguments (use "{}" for none).',
@@ -90,106 +115,6 @@ async function localSchemas(): Promise<{
     optionalKeys: optionalKeysCache ?? new Map(),
     descriptions: descriptionCache ?? new Map(),
   };
-}
-
-function jsonSchemaAllowsNull(value: unknown): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const schema = value as {
-    type?: unknown;
-    nullable?: unknown;
-    anyOf?: unknown;
-    oneOf?: unknown;
-  };
-  if (schema.nullable === true || schema.type === 'null') return true;
-  if (Array.isArray(schema.type) && schema.type.includes('null')) return true;
-  for (const branch of [schema.anyOf, schema.oneOf]) {
-    if (Array.isArray(branch) && branch.some(jsonSchemaAllowsNull)) return true;
-  }
-  return false;
-}
-
-function jsonSchemaTypeMatches(value: unknown, schemaValue: unknown): boolean {
-  if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return false;
-  // zod's nullish() emits a NESTED wrapper — anyOf[anyOf[T,null],null] — with
-  // no `type` on the wrapper itself. A wrapper matches when any branch does;
-  // without this recursion the branch resolver loses the array/object branch
-  // (live: space_save data_sources items were never null-materialized).
-  const wrapper = schemaValue as { type?: unknown; anyOf?: unknown; oneOf?: unknown };
-  if (wrapper.type === undefined) {
-    for (const alternatives of [wrapper.anyOf, wrapper.oneOf]) {
-      if (Array.isArray(alternatives)) {
-        return alternatives.some((candidate) => jsonSchemaTypeMatches(value, candidate));
-      }
-    }
-  }
-  const type = (schemaValue as { type?: unknown }).type;
-  const types = Array.isArray(type) ? type : [type];
-  if (value === null) return types.includes('null');
-  if (Array.isArray(value)) return types.includes('array');
-  if (typeof value === 'object') {
-    return types.includes('object') || Boolean((schemaValue as { properties?: unknown }).properties);
-  }
-  if (typeof value === 'string') return types.includes('string');
-  if (typeof value === 'boolean') return types.includes('boolean');
-  if (typeof value === 'number') {
-    return types.includes('number') || (Number.isInteger(value) && types.includes('integer'));
-  }
-  return false;
-}
-
-function schemaBranchForValue(schemaValue: unknown, value: unknown): unknown {
-  if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return schemaValue;
-  const schema = schemaValue as { anyOf?: unknown; oneOf?: unknown };
-  for (const alternatives of [schema.anyOf, schema.oneOf]) {
-    if (!Array.isArray(alternatives)) continue;
-    const exact = alternatives.find((candidate) => jsonSchemaTypeMatches(value, candidate));
-    if (exact) return schemaBranchForValue(exact, value);
-    const nonNull = alternatives.find((candidate) => !jsonSchemaAllowsNull(candidate));
-    if (nonNull) return schemaBranchForValue(nonNull, value);
-  }
-  return schemaValue;
-}
-
-/**
- * Convert an ordinary, compact args_json object into the strict provider shape
- * expected by the inner first-class tool. Missing fields are filled ONLY when
- * that exact nested property is both required and nullable. Truly required
- * values remain missing and are rejected by the normal validator.
- */
-export function materializeStrictNullableFields(value: unknown, schemaValue: unknown): unknown {
-  const schema = schemaBranchForValue(schemaValue, value);
-  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return value;
-  const record = schema as {
-    type?: unknown;
-    properties?: unknown;
-    required?: unknown;
-    items?: unknown;
-  };
-
-  if (Array.isArray(value)) {
-    return value.map((item) => materializeStrictNullableFields(item, record.items));
-  }
-  if (!value || typeof value !== 'object') return value;
-
-  const input = value as Record<string, unknown>;
-  const out: Record<string, unknown> = { ...input };
-  const properties = record.properties && typeof record.properties === 'object'
-    ? record.properties as Record<string, unknown>
-    : {};
-  const required = new Set(
-    Array.isArray(record.required)
-      ? record.required.filter((key): key is string => typeof key === 'string')
-      : [],
-  );
-
-  for (const [key, propertySchema] of Object.entries(properties)) {
-    if (!(key in out) || out[key] === undefined) {
-      if (required.has(key) && jsonSchemaAllowsNull(propertySchema)) out[key] = null;
-      continue;
-    }
-    out[key] = materializeStrictNullableFields(out[key], propertySchema);
-  }
-  return out;
 }
 
 async function strictToolParameters(): Promise<Map<string, unknown>> {
@@ -257,6 +182,55 @@ function jsonResult(value: unknown): string {
 interface CarrierValidationError {
   detail: string;
   reason?: 'arguments_missing' | 'target_missing';
+}
+
+type CallToolCarrierNormalization =
+  | { ok: true; args: unknown }
+  | {
+      ok: false;
+      detail: string;
+      violations: string[];
+      schemaHash: string;
+      contract: string;
+      repair: unknown;
+    };
+
+/**
+ * Canonicalize the Composio carrier before this dispatcher's schema and safety
+ * checks. The shared adapter deliberately accepts representation-only drift
+ * such as an object-valued `arguments`; charging a model turn to stringify an
+ * already-valid object is transport work, not discovery or reasoning.
+ *
+ * `connected_account_id` is an outer execution selector rather than part of
+ * the reusable invocation body, so preserve it separately. The canonical
+ * adapter still strips any accidentally nested connection id from `arguments`.
+ */
+function normalizeCallToolComposioCarrier(
+  target: string,
+  args: unknown,
+): CallToolCarrierNormalization {
+  if (target !== 'composio_execute_tool') return { ok: true, args };
+
+  const normalized = normalizeComposioCarrierInput(args);
+  if (!normalized.ok) {
+    return {
+      ok: false,
+      detail: normalized.error,
+      violations: normalized.violations,
+      schemaHash: normalized.schemaHash,
+      contract: normalized.contract,
+      repair: normalized.repair,
+    };
+  }
+
+  const carrier: Record<string, unknown> = {
+    ...serializeComposioCarrier(normalized.canonical),
+  };
+  const original = args as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(original, 'connected_account_id')) {
+    carrier.connected_account_id = original.connected_account_id;
+  }
+  return { ok: true, args: carrier };
 }
 
 function composioCarrierValidationError(target: string, args: unknown): CarrierValidationError | null {
@@ -330,14 +304,53 @@ export interface BuildCallToolOptions {
    * to the active HarnessRunContext (and then legacy behavior); `null` is an
    * explicit no-external-tools boundary. */
   mcpToolScope?: McpToolScope | null;
-  /** Observes each built-in name the moment it is about to dispatch — the
-   * schema-on-demand ACQUISITION event the capability revision chain records
-   * (Clem 4 Stage 4). Called after every authority gate has passed and args
-   * validated, immediately before the inner dispatch; never for MCP-namespaced
-   * targets (they carry their own scope authority). Instrumentation only: a
-   * throwing observer must never break dispatch. */
+  /** Fail-closed admission gate for a validated built-in acquisition. When
+   * supplied, the inner tool cannot dispatch unless this callback proves the
+   * name belongs to a sealed capability universe and appends/reuses its active
+   * binding revision. Omit only for legacy/custom unsealed constructions.
+   * External MCP tools do not pass through this gate; their bound MCP scope is
+   * the separate authority. */
+  admitBuiltinAcquisition?: (
+    targetName: string,
+  ) => BuiltinCapabilityAdmissionResult | Promise<BuiltinCapabilityAdmissionResult>;
+  /** Optional diagnostic observer for each admitted built-in immediately before
+   * inner dispatch. Never called for MCP-namespaced targets. This is not the
+   * authority boundary; `admitBuiltinAcquisition` owns that contract. A throwing
+   * observer must never break an already-admitted dispatch. */
   onBuiltinAcquisition?: (targetName: string) => void;
+  /** Optional carrier-owned authority wrapper around the already-resolved,
+   * schema-validated inner dispatch. `work_call` uses this seam to atomically
+   * bind semantic expected work before the inner brackets/provider run. */
+  aroundResolvedDispatch?: (
+    input: {
+      sessionId: string;
+      sourceUserSeq?: number;
+      turn?: number;
+      logicalToolCallId?: string;
+      targetName: string;
+      targetArgs: unknown;
+      /** Exact provider-ready callable schema used to normalize targetArgs.
+       * Null means this carrier could not prove a schema for the target. */
+      targetInputSchema: unknown | null;
+      /** Semantic inner payload/schema used only for evidence refinement when
+       * targetArgs is a generic transport envelope. */
+      evidenceArgs?: unknown;
+      evidenceInputSchema?: unknown;
+    },
+    dispatch: () => Promise<unknown>,
+  ) => Promise<unknown>;
+  /** Adapter attribution for a trusted refusal after inner resolution. */
+  resolvedRefusalLane?: SettleToolAttemptInput['lane'];
 }
+
+export type BuiltinCapabilityAdmissionResult =
+  | { ok: true }
+  | {
+      ok: false;
+      kind: 'requires_readmission';
+      outside: readonly string[];
+      reason?: string;
+    };
 
 export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeContextValue> {
   const defaultSurface = resolveToolSurface({
@@ -372,13 +385,17 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       runContext: unknown,
       details: { toolCall?: { callId?: string; id?: string } } | undefined,
     ): Promise<string> => {
+      let resolvedRefusalTarget: ResolvedCarrierTarget | undefined;
       // Exactly-once budget contract: the harness wrapper exempts call_tool
       // from the per-turn counter (the INNER tool's wrapper charges it on the
       // dispatch path). Every early return below therefore charges the
       // ambient counter itself — otherwise a model looping on failing
       // call_tool invocations would burn ZERO tool budget and lose the
       // deterministic runaway ceiling.
-      const refuse = (payload: Record<string, unknown>): string => {
+      const refuse = (
+        payload: Record<string, unknown>,
+        classification: 'invalid_arguments' | 'policy_denial' = 'invalid_arguments',
+      ): string => {
         const counter = harnessRunContextStorage.getStore()?.counter;
         if (counter) {
           // The ceiling is terminal for this turn. Returning another nominal
@@ -389,10 +406,19 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         // Preserve the exact JSON corrective for the model while retaining a
         // nominal, local-only proof for the surrounding effect ledger. A
         // provider-returned object or marker can never manufacture this class.
-        return new ExternalWritePreDispatchResult(
+        const refusal = new ExternalWritePreDispatchResult(
           JSON.stringify(payload),
           typeof payload.error === 'string' ? payload.error : 'call_tool_refused',
-        ) as unknown as string;
+        );
+        if (resolvedRefusalTarget) {
+          settleResolvedCarrierRefusal({
+            resolved: resolvedRefusalTarget,
+            lane: options.resolvedRefusalLane ?? 'agents_runner',
+            refusal,
+            classification,
+          });
+        }
+        return refusal as unknown as string;
       };
       const requestedTarget = (name ?? '').trim();
       if (!requestedTarget) return refuse({ error: 'bad_request', detail: 'name is required' });
@@ -457,7 +483,22 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         }
       }
 
-      // 3. Zod-validate BEFORE dispatch — zero side effects on failure.
+      // 3. Canonicalize representation drift, then Zod-validate BEFORE
+      // dispatch — zero side effects on failure. This is deliberately before
+      // the irreversible-send check so every surface reasons over the same
+      // canonical invocation.
+      const carrierNormalization = normalizeCallToolComposioCarrier(target, resolvedArgs);
+      if (!carrierNormalization.ok) {
+        return refuse({
+          error: 'arg_validation',
+          detail: carrierNormalization.detail,
+          violations: carrierNormalization.violations,
+          schemaHash: carrierNormalization.schemaHash,
+          contract: carrierNormalization.contract,
+          repair: carrierNormalization.repair,
+        });
+      }
+      resolvedArgs = carrierNormalization.args;
       const carrierValidationError = composioCarrierValidationError(target, resolvedArgs);
       if (carrierValidationError) {
         return refuse({
@@ -505,6 +546,28 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         dispatchArgs = materializeStrictNullableFields(dispatchArgs, strictParameters);
       }
 
+      let exactTargetInputSchema: unknown | null = strictParameters
+        ?? (schema ? z.toJSONSchema(schema) : null);
+      // A named external tool may be outside the advertised cap while still
+      // inside the accepted turn's authority. Resolve its real schema from the
+      // exact authorized server catalog before expected-work admission.
+      if (options.aroundResolvedDispatch && !exactTargetInputSchema && isMcpNamespacedTool(target)) {
+        const { resolveAuthorizedExternalMcpToolDefinition } = await import('../runtime/mcp-servers.js');
+        const definition = await resolveAuthorizedExternalMcpToolDefinition(target, activeMcpScope);
+        exactTargetInputSchema = definition?.inputSchema ?? null;
+      }
+
+      let evidenceArgs: unknown = dispatchArgs;
+      let evidenceInputSchema: unknown | undefined;
+      if (options.aroundResolvedDispatch && target === 'composio_execute_tool') {
+        const canonical = normalizeComposioCarrierInput(dispatchArgs);
+        if (canonical.ok) {
+          evidenceArgs = canonical.canonical.args;
+          const { ensureToolSchema } = await import('./composio-schema-cache.js');
+          evidenceInputSchema = await ensureToolSchema(canonical.canonical.toolSlug) ?? undefined;
+        }
+      }
+
       // 4. Dispatch through the gated inner path (gates key on the INNER name).
       const sessionId = sessionIdFromRunContext(runContext)
         ?? getToolOutputContext()?.sessionId
@@ -521,28 +584,105 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // invocation; the fallback only serves direct/unit invocations without a
       // harness run context.
       const activeRunContext = harnessRunContextStorage.getStore();
+      if (
+        currentLogicalCall()
+        && activeRunContext?.sessionId === sessionId
+        && Number.isSafeInteger(activeRunContext.sourceUserSeq)
+        && (activeRunContext.sourceUserSeq ?? 0) > 0
+      ) {
+        authorizeResolvedLogicalCallContract({
+          sessionId,
+          sourceUserSeq: activeRunContext.sourceUserSeq as number,
+          turn: activeRunContext.turn,
+          tool: target,
+          effectiveArgs: dispatchArgs,
+        });
+        resolvedRefusalTarget = {
+          sessionId,
+          sourceUserSeq: activeRunContext.sourceUserSeq,
+          turn: activeRunContext.turn,
+          logicalToolCallId: currentLogicalCall()?.logicalToolCallId,
+          targetName: target,
+          targetArgs: dispatchArgs,
+          targetInputSchema: exactTargetInputSchema,
+        };
+      }
       const counter = activeRunContext?.counter ?? new ToolCallsCounter(1000);
       const outerCallId = details?.toolCall?.callId ?? details?.toolCall?.id;
-      if (options.onBuiltinAcquisition && !isMcpNamespacedTool(target)) {
-        try {
-          options.onBuiltinAcquisition(target);
-        } catch {
-          // Acquisition observation is instrumentation; dispatch never dies for it.
+      if (!isMcpNamespacedTool(target)) {
+        // Capability admission is a PRE-DISPATCH authority boundary. The
+        // callback is optional solely for legacy/custom call_tool instances;
+        // when production supplies it, throwing or refusing fails closed and
+        // spends exactly the wrapper attempt through refuse().
+        if (options.admitBuiltinAcquisition) {
+          let admission: BuiltinCapabilityAdmissionResult;
+          try {
+            admission = await options.admitBuiltinAcquisition(target);
+          } catch (error) {
+            admission = {
+              ok: false,
+              kind: 'requires_readmission',
+              outside: [target],
+              reason: error instanceof Error ? error.message : String(error),
+            };
+          }
+          if (!admission.ok) {
+            return refuse({
+              error: 'requires_readmission',
+              kind: admission.kind,
+              outside: [...admission.outside],
+              detail: admission.reason
+                ?? `"${target}" is not admitted by the active sealed capability revision.`,
+            }, 'policy_denial');
+          }
+        }
+        if (options.onBuiltinAcquisition) {
+          try {
+            options.onBuiltinAcquisition(target);
+          } catch {
+            // Acquisition observation is instrumentation; dispatch never dies for it.
+          }
         }
       }
-      const out = await dispatchBatchItemTool(
-        target,
-        dispatchArgs,
-        sessionId,
-        counter,
-        // call_tool authority is turn-scoped and may not carry a batch/pending
-        // grant into another target. Approved durable calls store the validated
-        // INNER tool directly; a legacy/synthetic carrier must pass the inner
-        // send floor instead of widening outer authority.
-        undefined,
-        { accounting: 'transport_mirror', canonicalCallId: outerCallId },
-        activeMcpScope,
-      );
+      const dispatch = () => dispatchBatchItemTool(
+          target,
+          dispatchArgs,
+          sessionId,
+          counter,
+          // call_tool authority is turn-scoped and may not carry a batch/pending
+          // grant into another target. Approved durable calls store the validated
+          // INNER tool directly; a legacy/synthetic carrier must pass the inner
+          // send floor instead of widening outer authority.
+          undefined,
+          { accounting: 'transport_mirror', canonicalCallId: outerCallId },
+          activeMcpScope,
+        );
+      let out: unknown;
+      try {
+        out = options.aroundResolvedDispatch
+          ? await options.aroundResolvedDispatch({
+              sessionId,
+              sourceUserSeq: activeRunContext?.sourceUserSeq,
+              turn: activeRunContext?.turn,
+              logicalToolCallId: currentLogicalCall()?.logicalToolCallId,
+              targetName: target,
+              targetArgs: dispatchArgs,
+              targetInputSchema: exactTargetInputSchema,
+              ...(evidenceArgs !== dispatchArgs ? { evidenceArgs } : {}),
+              ...(evidenceInputSchema ? { evidenceInputSchema } : {}),
+            }, dispatch)
+          : await dispatch();
+      } catch (error) {
+        if (resolvedRefusalTarget && error instanceof ExternalWritePreDispatchError) {
+          settleResolvedCarrierRefusal({
+            resolved: resolvedRefusalTarget,
+            lane: options.resolvedRefusalLane ?? 'agents_runner',
+            refusal: error,
+            classification: 'policy_denial',
+          });
+        }
+        throw error;
+      }
 
       // 5. Promote the reached tool into the session hot-set.
       recordToolHit(sessionId, target);
@@ -586,7 +726,13 @@ export function registerCallToolMcp(
         { context: { sessionId } },
         JSON.stringify({ name, args_json }),
       );
-      return textResult(jsonResult(output));
+      // TRUTH AT THE TRANSPORT. Every deferred built-in reaches the Claude lane
+      // through here, so this is where a harness refusal stops looking like an
+      // answer. The consumer already reads `isError`; nothing ever set it, so a
+      // pre-dispatch rejection and a real result were indistinguishable and an
+      // identical payload could be sent straight back (live 2026-08-09).
+      const rendered = jsonResult(output);
+      return textResult(rendered, { isError: isHarnessRefusalText(rendered) });
     },
   );
 }

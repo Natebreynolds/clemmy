@@ -4,59 +4,21 @@ import {
 } from './eventlog.js';
 import { verifiedWorkflowRunDispatchReceipts } from './loop.js';
 import {
+  exactTerminalForAcceptedSource,
+  type AcceptedSourceTerminalOutcome,
+} from './accepted-source-terminal.js';
+import {
   publicAsyncWorkDispatchedData,
   type PublicAsyncWorkDispatchedData,
 } from './public-presentation.js';
-import {
-  presentationEventFromCompletionData,
-  type PresentationEvent,
-} from './turn-outcome.js';
 
 export type AcceptedSourceOutcome =
-  | {
-      kind: 'terminal';
-      event: EventRow;
-      presentation: PresentationEvent;
-    }
+  | AcceptedSourceTerminalOutcome
   | {
       kind: 'dispatched';
       event: EventRow;
       presentation: PublicAsyncWorkDispatchedData;
     };
-
-function exactTerminalForAcceptedSource(
-  source: EventRow,
-): Extract<AcceptedSourceOutcome, { kind: 'terminal' }> | null {
-  const terminalKey = `turn:${source.seq}`;
-  for (const event of listEvents(source.sessionId, {
-    types: ['conversation_completed'],
-    desc: true,
-  })) {
-    if (
-      event.data.terminalKey !== terminalKey
-      && event.data.sourceUserSeq !== source.seq
-      && (event.data.presentation as { identity?: { sourceUserSeq?: unknown } } | undefined)
-        ?.identity?.sourceUserSeq !== source.seq
-    ) continue;
-    try {
-      const presentation = presentationEventFromCompletionData(event.data);
-      if (
-        !presentation
-        || event.sessionId !== source.sessionId
-        || event.turn !== source.turn
-        || presentation.identity.sessionId !== source.sessionId
-        || presentation.identity.turn !== source.turn
-        || presentation.identity.sourceUserSeq !== source.seq
-      ) return null;
-      return { kind: 'terminal', event, presentation };
-    } catch {
-      // A typed row claiming this source but failing its projection is corrupt
-      // authority. Never skip past it to a weaker candidate.
-      return null;
-    }
-  }
-  return null;
-}
 
 function exactDispatchForAcceptedSource(
   source: EventRow,

@@ -109,6 +109,23 @@ export function isReadOnlyCallAction(value: string | null | undefined): boolean 
  * They count as writes only when no read verb anchors the action. */
 const AMBIGUOUS_OBJECT_TOKENS: ReadonlySet<string> = new Set(['CALL', 'POST']);
 
+const EPHEMERAL_COMPUTE_NOUNS: ReadonlySet<string> = new Set([
+  'COMPLETION', 'COMPLETIONS', 'EMBEDDING', 'EMBEDDINGS',
+  'MODERATION', 'MODERATIONS', 'TRANSCRIPTION', 'TRANSCRIPTIONS',
+  'TRANSLATION', 'TRANSLATIONS',
+]);
+
+/** A nondeterministic inference/transform action that creates no durable
+ * provider record. It is read-class for approval purposes, but it is not a
+ * snapshot read: two identical calls may intentionally produce independent
+ * samples and therefore must never enter settled-read replay. */
+export function composioActionIsEphemeralCompute(slug: string | null | undefined): boolean {
+  const tokens = actionTokens(String(slug ?? '').trim().toUpperCase());
+  const lastToken = tokens[tokens.length - 1] ?? '';
+  return EPHEMERAL_COMPUTE_NOUNS.has(lastToken)
+    && tokens.some((token) => token === 'CREATE' || token === 'GENERATE' || token === 'RUN');
+}
+
 /** Read tokens that are commonly a trailing STATE/NOUN rather than the action:
  * `GMAIL_MARK_AS_READ` mutates, `…_UPDATE_VIEW` mutates, `RUN_CHECK` acts. A
  * read token in FINAL position is only trusted when it cannot be a state noun
@@ -157,9 +174,7 @@ export function composioSlugEffectEvidence(slug: string | null | undefined): Com
   // RESPONSE, not a record. Treating it as a write dragged the execution-wrap
   // ceremony onto every inference batch through the Composio OpenAI lane.
   // Principled noun rule (like STATE_NOUN_READ_TOKENS), not a tool list.
-  const COMPUTE_NOUNS = new Set(['COMPLETION', 'COMPLETIONS', 'EMBEDDING', 'EMBEDDINGS', 'MODERATION', 'MODERATIONS', 'TRANSCRIPTION', 'TRANSCRIPTIONS', 'TRANSLATION', 'TRANSLATIONS']);
-  const lastToken = tokens[tokens.length - 1] ?? '';
-  if (COMPUTE_NOUNS.has(lastToken) && tokens.some((token) => token === 'CREATE' || token === 'GENERATE' || token === 'RUN')) {
+  if (composioActionIsEphemeralCompute(upper)) {
     return 'read';
   }
   // An unambiguous write verb anywhere is a mutation, full stop.

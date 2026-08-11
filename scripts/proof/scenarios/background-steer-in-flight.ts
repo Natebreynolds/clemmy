@@ -50,6 +50,7 @@ export const backgroundSteerInFlight: ScenarioDef = {
   name: 'background-steer-in-flight',
   summary: 'running v1 manifest → revise in place → revalidate on v2',
   routeExpectation: 'exact-brain',
+  workerRouteExpectation: true,
   async run(daemon: DaemonHandle) {
     const originSessionId = proofSessionId('steer-origin');
     const dispatched = await dispatchBackground(daemon, originSessionId, PROMPT);
@@ -76,6 +77,7 @@ export const backgroundSteerInFlight: ScenarioDef = {
     const revisedBody = revision.json as { ok?: boolean; task?: ProofTaskRevision };
     const settled = await waitForTerminal(daemon, dispatched.taskId, 35 * 60_000);
     const task = settled.detail.task;
+    const backgroundTiming = dispatched.settlementTimer.observe(task.status, dispatched.turn.wallMs);
     const manifest = manifestFor(settled.detail, MANIFEST_ID);
     const events = manifestEventCounts(daemon, task.runSessionId, MANIFEST_ID);
     const outcomes = await waitForOutcomeEvents(
@@ -196,7 +198,7 @@ export const backgroundSteerInFlight: ScenarioDef = {
     return {
       checks,
       latency: [{
-        wallMs: dispatched.turn.wallMs,
+        wallMs: backgroundTiming.observedSettlementWallMs,
         ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null,
       }],
       sessionId: task.runSessionId,
@@ -204,6 +206,10 @@ export const backgroundSteerInFlight: ScenarioDef = {
         contractVersion: task.contractVersion,
         manifest: manifest ?? null,
         manifestEvents: events,
+        observedSettlementWallMs: backgroundTiming.observedSettlementWallMs,
+        dispatchAcknowledgementWallMs: backgroundTiming.dispatchAcknowledgementWallMs,
+        terminalStatus: backgroundTiming.terminalStatus,
+        wallMsLabel: backgroundTiming.wallMsLabel,
         toolCalls: metrics?.toolCalls,
         tokensUsed: metrics?.tokensUsed,
       },

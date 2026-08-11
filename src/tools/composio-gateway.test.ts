@@ -53,6 +53,7 @@ const {
   grantComposioCliDefaultAccountAuthority,
   revokeComposioCliDefaultAccountAuthority,
 } = await import('../integrations/composio/cli-default-account-authority.js');
+const { formatComposioCliDefaultReadAccountRoute } = await import('../integrations/composio/account-route.js');
 
 type LoaderItem = Record<string, unknown>;
 function account(id: string, toolkit: string, email?: string, status = 'ACTIVE'): LoaderItem {
@@ -316,11 +317,15 @@ test('CLI-only reads remain lightweight, writes require durable default-account 
       undefined,
       {},
     );
-    for (const out of [knownRead, unknownRead]) {
+    for (const [out, toolkit] of [[knownRead, 'airtable'], [unknownRead, 'newcrm']] as const) {
       assert.equal(out.ok, true, 'an authenticated CLI default remains a usable lightweight read lane');
       if (out.ok) {
         assert.equal(out.connectionId, undefined);
-        assert.ok(out.notes.some((note) => /read through the authenticated Composio CLI/i.test(note)));
+        assert.deepEqual(
+          out.notes,
+          [formatComposioCliDefaultReadAccountRoute(toolkit)],
+          'account-bearing and no-auth CLI reads expose one canonical route line',
+        );
       }
     }
     assert.equal(unknownWrite.ok, false, 'CLI whoami alone cannot establish write authority');
@@ -909,6 +914,73 @@ test('CLI/SDK selection boundary: a pinned owner is NEVER dispatched via the CLI
 const { harnessRunContextStorage, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
 const stickyCtx = () => ({ sessionId: `sess-sticky-${Math.random().toString(36).slice(2)}`, counter: new ToolCallsCounter(50) });
 
+test('worker compose-only boundary: mutations dispatch zero, reads work, and the parent certified context still commits', async () => {
+  const previousApiKey = process.env.COMPOSIO_API_KEY;
+  process.env.COMPOSIO_API_KEY = 'worker-compose-boundary-test-key';
+  const sessionId = createSession({ kind: 'chat' }).id;
+  setAccounts([account('ca_worker_outlook', 'outlook', 'worker-owner@example.test')]);
+  let providerDispatches = 0;
+  __test__.setComposioClient({
+    tools: {
+      execute: async (slug: string) => {
+        providerDispatches += 1;
+        return slug === 'OUTLOOK_LIST_MESSAGES'
+          ? { successful: true, data: { messages: [] } }
+          : { successful: true, data: { id: 'draft-parent-1' } };
+      },
+    },
+  });
+  try {
+    await harnessRunContextStorage.run({
+      sessionId,
+      counter: new ToolCallsCounter(50),
+      workerScope: true,
+    }, async () => {
+      const blocked = await dispatchComposioTool('OUTLOOK_CREATE_DRAFT', {
+        to_email: 'recipient@example.test',
+        subject: 'Composed by worker',
+        body: 'Exact body',
+      }, { sessionId, connectedAccountId: 'ca_worker_outlook' });
+      assert.equal(blocked.ok, false);
+      if (!blocked.ok) {
+        assert.equal(blocked.reason, 'worker-compose-only');
+        assert.match(blocked.message, /WORKER_COMPOSE_ONLY/);
+        assert.match(blocked.message, /run_batch/);
+        assert.match(blocked.message, /No provider dispatch was started/);
+      }
+      assert.equal(providerDispatches, 0, 'worker mutation is refused before the provider client');
+
+      const read = await dispatchComposioTool('OUTLOOK_LIST_MESSAGES', { folder: 'inbox' }, {
+        sessionId,
+        connectedAccountId: 'ca_worker_outlook',
+      });
+      assert.equal(read.ok, true, 'worker Composio reads remain executable');
+      assert.equal(providerDispatches, 1, 'the allowed worker read dispatches exactly once');
+    });
+
+    const parent = await harnessRunContextStorage.run({
+      sessionId,
+      counter: new ToolCallsCounter(50),
+      certifiedBatch: { batchId: 'parent-certified-batch', payloadHash: 'payload-hash' },
+    }, () => dispatchComposioTool('OUTLOOK_CREATE_DRAFT', {
+      to_email: 'recipient@example.test',
+      subject: 'Committed by parent',
+      body: 'Exact body',
+    }, { sessionId, connectedAccountId: 'ca_worker_outlook' }));
+    assert.equal(parent.ok, true, 'ordinary parent/certified batch contexts are not worker-blocked');
+    assert.equal(providerDispatches, 2, 'the parent commit dispatches exactly once after the read');
+
+    const workerBlocks = listEvents(sessionId, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data?.reason === 'worker-compose-only');
+    assert.equal(workerBlocks.length, 1, 'the compose-only refusal is ledgered exactly once');
+  } finally {
+    __test__.setConnectedAccountsLoader(null);
+    resetComposioClient();
+    if (previousApiKey === undefined) delete process.env.COMPOSIO_API_KEY;
+    else process.env.COMPOSIO_API_KEY = previousApiKey;
+  }
+});
+
 test('ask-once: an explicit account pin answers the question for the REST of the run', async () => {
   setAccounts([
     account('ca_work', 'outlook', 'work@site.example'),
@@ -1003,6 +1075,153 @@ test('a disconnected sticky account falls back to the ask — never a stale rout
       assert.equal(out.reason, 'ambiguous-account');
     }
   });
+});
+
+test('an absent current-turn email alias never falls back to another account chosen in the run', async () => {
+  setAccounts([
+    account('ca_work', 'outlook', 'work@site.example'),
+    account('ca_home', 'outlook', 'home@personal.example'),
+  ]);
+  await harnessRunContextStorage.run(stickyCtx(), async () => {
+    const pinnedCall = await resolveComposioDispatch(
+      'OUTLOOK_LIST_MESSAGES',
+      {},
+      'ca_work',
+      {},
+    );
+    assert.equal(pinnedCall.ok, true);
+
+    const absentAlias = await resolveComposioDispatch(
+      'OUTLOOK_LIST_MESSAGES',
+      { account_alias: 'gone@archive.example' },
+      undefined,
+      {},
+    );
+    assert.equal(absentAlias.ok, false, 'the explicit mailbox must beat run stickiness');
+    if (!absentAlias.ok) {
+      assert.equal(absentAlias.reason, 'identity-absent');
+      assert.match(absentAlias.message, /gone@archive\.example/);
+    }
+  });
+});
+
+test('standing sender memory routes reversible Outlook drafts by stable mailbox, not stale connection id', async () => {
+  const fact = rememberFact({
+    kind: 'constraint',
+    content: 'Always send Outlook email from scorpion@corp.example unless the user explicitly chooses another mailbox.',
+  });
+  const conflictingIntent = 'create an Outlook draft from the previously remembered mailbox';
+  rememberToolChoice({
+    intent: conflictingIntent,
+    choice: {
+      kind: 'composio',
+      identifier: 'OUTLOOK_CREATE_DRAFT',
+      accountIdentity: 'other@corp.example',
+    },
+  });
+  rememberAccountAlias({
+    toolkit: 'outlook',
+    label: 'other-draft-account',
+    email: 'other@corp.example',
+    connectionId: 'ca_other',
+  });
+  try {
+    setAccounts([
+      account('ca_scorpion_old', 'outlook', 'scorpion@corp.example'),
+      account('ca_other', 'outlook', 'other@corp.example'),
+    ]);
+
+    const preferred = await resolveComposioDispatch(
+      'OUTLOOK_CREATE_DRAFT',
+      { subject: 'policy-selected draft' },
+      undefined,
+      {},
+    );
+    assert.equal(preferred.ok, true);
+    if (preferred.ok) {
+      assert.equal(preferred.connectionId, 'ca_scorpion_old');
+      assert.ok(
+        preferred.notes.some((note) => /standing rule/i.test(note) && /sending remains separately verified/i.test(note)),
+      );
+    }
+
+    const explicitlyNamed = await resolveComposioDispatch(
+      'OUTLOOK_CREATE_DRAFT',
+      { subject: 'explicit account wins', account_alias: 'other-draft-account' },
+      undefined,
+      {},
+    );
+    assert.equal(explicitlyNamed.ok, true);
+    if (explicitlyNamed.ok) assert.equal(explicitlyNamed.connectionId, 'ca_other');
+
+    const unknownExplicitAlias = await resolveComposioDispatch(
+      'OUTLOOK_CREATE_DRAFT',
+      { subject: 'must not fall back to policy', account_alias: 'missing-draft-account' },
+      undefined,
+      {},
+    );
+    assert.equal(unknownExplicitAlias.ok, false);
+    if (!unknownExplicitAlias.ok) {
+      assert.equal(unknownExplicitAlias.reason, 'identity-absent');
+      assert.match(unknownExplicitAlias.message, /missing-draft-account/);
+    }
+
+    // Re-auth rotates the opaque ca_* id. The standing policy is stable email,
+    // so a later call follows the live mailbox without rewriting memory.
+    setAccounts([
+      account('ca_scorpion_new', 'outlook', 'scorpion@corp.example'),
+      account('ca_other', 'outlook', 'other@corp.example'),
+    ]);
+    const rotated = await resolveComposioDispatch(
+      'OUTLOOK_CREATE_DRAFT',
+      { subject: 'after re-auth' },
+      undefined,
+      {},
+    );
+    assert.equal(rotated.ok, true);
+    if (rotated.ok) assert.equal(rotated.connectionId, 'ca_scorpion_new');
+
+    // The preference is intentionally narrow: ordinary mailbox reads still
+    // ask, and a missing policy mailbox fails closed instead of guessing.
+    const genericRead = await resolveComposioDispatch('OUTLOOK_LIST_MAIL_FOLDERS', {}, undefined, {});
+    assert.equal(genericRead.ok, false);
+    if (!genericRead.ok) assert.equal(genericRead.reason, 'ambiguous-account');
+
+    setAccounts([
+      account('ca_other', 'outlook', 'other@corp.example'),
+      account('ca_third', 'outlook', 'third@corp.example'),
+    ]);
+    const absent = await resolveComposioDispatch(
+      'OUTLOOK_CREATE_DRAFT',
+      { subject: 'missing policy mailbox' },
+      undefined,
+      {},
+    );
+    assert.equal(absent.ok, false);
+    if (!absent.ok) assert.equal(absent.reason, 'identity-absent');
+
+    await harnessRunContextStorage.run(stickyCtx(), async () => {
+      const pinnedOther = await resolveComposioDispatch(
+        'OUTLOOK_CREATE_DRAFT',
+        { subject: 'establish another account for this run' },
+        'ca_other',
+        {},
+      );
+      assert.equal(pinnedOther.ok, true);
+
+      const absentWithSticky = await resolveComposioDispatch(
+        'OUTLOOK_CREATE_DRAFT',
+        { subject: 'missing policy mailbox with sticky alternative' },
+        undefined,
+        {},
+      );
+      assert.equal(absentWithSticky.ok, false, 'the standing mailbox must beat run stickiness');
+      if (!absentWithSticky.ok) assert.equal(absentWithSticky.reason, 'identity-absent');
+    });
+  } finally {
+    deleteToolChoice(conflictingIntent);
+    forgetFact(fact.id, { hard: true });
+  }
 });
 
 // ── ROUTE PROHIBITION OUTRANKS PROVIDER HEALTH ────────────────────────────────

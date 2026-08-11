@@ -689,6 +689,8 @@ class RawClaudeUsageRecordingModel implements Model {
       const context = harnessRunContextStorage.getStore();
       this.usageRecorder({
         sessionId: context?.sessionId ?? 'unknown',
+        sourceUserSeq: context?.sourceUserSeq,
+        attemptId: context?.runAttemptId,
         model: this.modelId,
         // Raw Anthropic Messages wire: input_tokens EXCLUDES cache reads.
         cacheDialect: 'exclusive',

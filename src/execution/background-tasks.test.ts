@@ -2462,6 +2462,44 @@ test('markBackgroundTaskAwaitingInput parks the task with the question', () => {
   assert.match(parked?.pendingQuestion ?? '', /priority-accounts/);
 });
 
+test('markBackgroundTaskAwaitingInput recovers options from the exact newest durable question', () => {
+  const task = createBackgroundTask({
+    title: 'Choose deploy target',
+    prompt: 'deploy',
+    originSessionId: 'console:home',
+  });
+  createSession({ id: task.runSessionId, kind: 'execution', channel: 'background' });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: 'Choose the deployment target.',
+      options: ['Old staging', 'Old production'],
+      purpose: 'clarification',
+    },
+  });
+  const current = appendEvent({
+    sessionId: task.runSessionId,
+    turn: 2,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: 'Choose the deployment target.',
+      options: ['Staging', 'Production'],
+      purpose: 'clarification',
+    },
+  });
+
+  const parked = markBackgroundTaskAwaitingInput(
+    task.id,
+    current.id,
+    'Choose the deployment target.',
+  );
+  assert.deepEqual(parked?.pendingQuestionOptions, ['Staging', 'Production']);
+});
+
 test('Railway auth blocker preserves completed work, pauses resumably, and continues the same task', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const origin = createSession({ kind: 'chat', title: 'Railway build origin' });

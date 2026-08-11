@@ -360,7 +360,11 @@ test('renderToolChoicesForContext respects per-line and block budgets', () => {
     const lines = rendered.split('\n').slice(1);
     assert.ok(lines.length > 0, 'expected at least one remembered choice');
     assert.ok(lines.length < 3, 'block budget should stop before all records fit');
-    assert.ok(lines.every((line) => line.length <= 160), 'every rendered choice line should fit the line budget');
+    // The per-line budget is 320 (2026-08-09): 160 could not hold a real
+    // callable shape, so the argument object was always clipped mid-object and
+    // a remembered call could not be reproduced from its own line. The
+    // invariant — every line fits the budget — is unchanged.
+    assert.ok(lines.every((line) => line.length <= 320), 'every rendered choice line should fit the line budget');
     assert.match(lines[0], /…$/, 'long invocation templates should be clipped, not omitted');
   } finally {
     if (previous === undefined) delete process.env.TOOL_CHOICE_CONTEXT_INJECT;
@@ -1352,4 +1356,36 @@ test('JIT recall pin: a proven fingerprinted composio memo pins its carrier for 
   });
   const pins = recallPinnedBuiltinTools('hey whats on my calendar tomorrow');
   assert.ok(pins.includes('composio_execute_tool'), `carrier tool pinned (got: ${JSON.stringify(pins)})`);
+});
+
+test('a remembered call renders SHAPE-first — the callable template is never the part that gets clipped', () => {
+  const previous = process.env.TOOL_CHOICE_CONTEXT_INJECT;
+  try {
+    delete process.env.TOOL_CHOICE_CONTEXT_INJECT;
+    // The live 2026-08-09 memo, byte-for-byte: 31 successes, and it states the
+    // exact field the model got wrong. The old renderer clipped the whole line
+    // at 160 chars with the template LAST, so the model saw
+    // `arguments={"subject":"…` and invented `body_content`, which failed
+    // pre-dispatch schema validation twice.
+    const template = 'composio_execute_tool OUTLOOK_CREATE_DRAFT connected_account_id=ca_T9pDCuTalAI3 '
+      + 'arguments={"subject":"...","body":"<plain string>","to_recipients":["a@b.com"],"user_id":"nathan.reynolds@scorpion.co"}';
+    rememberToolChoice({
+      intent: 'shapefirst.outlook.create_draft',
+      choice: {
+        kind: 'composio',
+        identifier: 'OUTLOOK_CREATE_DRAFT',
+        invocationTemplate: template,
+        testedAt: '2099-03-01T00:00:00.000Z',
+      },
+    });
+    const rendered = renderToolChoicesForContext(24, 4000, 'draft an outlook email');
+    const line = rendered.split('\n').find((l) => l.includes('OUTLOOK_CREATE_DRAFT')) ?? '';
+    assert.ok(line, 'the remembered draft call was not rendered at all');
+    assert.match(line, /"body":"<plain string>"/, 'the required field was clipped out of the remembered call');
+    assert.match(line, /to_recipients/, 'the argument shape was truncated mid-object');
+    assert.ok(!line.includes('arguments={"subject":"…'), 'the template is still being cut at the old boundary');
+  } finally {
+    if (previous === undefined) delete process.env.TOOL_CHOICE_CONTEXT_INJECT;
+    else process.env.TOOL_CHOICE_CONTEXT_INJECT = previous;
+  }
 });

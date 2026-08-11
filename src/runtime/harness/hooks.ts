@@ -1,6 +1,6 @@
 import type { Runner } from '@openai/agents';
 import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
-import { scheduleReflection } from '../../memory/reflection.js';
+import { scheduleReflection, type ReflectionInput } from '../../memory/reflection.js';
 import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { autoInvalidateOnFailure } from './auto-invalidate.js';
 import { autoRememberOnSuccess } from './auto-remember.js';
@@ -11,7 +11,13 @@ import {
   type RuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
 import { harnessRunContextStorage } from './brackets.js';
+import { isDispatchLeaseCurrent, type DispatchLeaseRef } from './dispatch-lease.js';
 import { toolCallHint } from './tool-call-hint.js';
+import {
+  SETTLED_READ_REPEAT_REPLAY_KIND,
+  settledReadRepeatReplayDisposition,
+  stripSettledReadHarnessAdvisory,
+} from './settled-read-repeat.js';
 
 /**
  * RunHooks → event log writer.
@@ -49,6 +55,8 @@ export interface AttachHooksOptions {
   maxResultChars?: number;
   /** Cap on agent_end output size persisted in the event. */
   maxOutputChars?: number;
+  /** Test/integration seam for observing the exact clean reflection payload. */
+  scheduleReflection?: (input: ReflectionInput) => void;
 }
 
 interface NamedAgent {
@@ -123,14 +131,39 @@ function callIdFromDetails(details: ToolDetails | undefined): string | undefined
   return call?.callId ?? call?.id;
 }
 
-function currentSourceAttribution(): { sourceUserSeq?: number; runScopeId?: string } {
+function currentSourceAttribution(): { sourceUserSeq?: number; runScopeId?: string; attemptId?: string } {
   const ctx = harnessRunContextStorage.getStore();
   return {
     ...(Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
       ? { sourceUserSeq: ctx?.sourceUserSeq as number }
       : {}),
     ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
+    ...(ctx?.runAttemptId?.trim() ? { attemptId: ctx.runAttemptId.trim() } : {}),
   };
+}
+
+/**
+ * Runner cancellation is transport-best-effort: an abandoned stream can emit
+ * lifecycle callbacks after a newer physical generation has taken ownership.
+ * Those callbacks are useful only inside that dead transport; admitting them
+ * to the canonical ledger would make a call that was refused before provider
+ * dispatch look like request evidence. No lease remains the compatibility path
+ * for explicitly out-of-band hooks.
+ */
+function currentDispatchLease(): DispatchLeaseRef | undefined {
+  return harnessRunContextStorage.getStore()?.dispatchLease;
+}
+
+function currentPhysicalAttemptIsAuthoritative(): boolean {
+  const lease = currentDispatchLease();
+  if (!lease) return true;
+  try {
+    return isDispatchLeaseCurrent(lease);
+  } catch {
+    // Evidence admission is fail-closed. The hook itself remains best-effort
+    // and must never interrupt the provider run when the ledger is unavailable.
+    return false;
+  }
 }
 
 /** Best-effort `item` label from a run_worker call's arguments (the worker
@@ -200,6 +233,7 @@ export function attachEventLogHooks(
   const getTurn = options.getTurn ?? (() => 0);
   const maxResultChars = options.maxResultChars ?? 8000;
   const maxOutputChars = options.maxOutputChars ?? 4000;
+  const scheduleReflectionForHook = options.scheduleReflection ?? scheduleReflection;
   // SDK call ids are presentation identifiers, not globally unique invocation
   // identities. Scope correlation to the harness session and keep only the
   // currently-open occurrence. A closed id may legitimately be reused by a
@@ -216,9 +250,24 @@ export function attachEventLogHooks(
   // run_worker item label captured at tool-start (args live on the START
   // event) for the fan-out ledger's failure report; read+cleared at tool-end.
   const callIdToWorkerItem = new Map<string, string | null>();
+  // A stale start/end pair can overlap a current pair that happens to reuse the
+  // same SDK call id. Include the physical lease generation so the dead end
+  // cannot consume or close the authoritative occurrence.
+  const suppressedToolLifecycleKeys = new Set<string>();
 
   const lifecycleKey = (sessionId: string, callId: string): string =>
     `${sessionId}\u0000${callId}`;
+
+  const physicalLifecycleKey = (
+    sessionId: string,
+    callId: string,
+    lease: DispatchLeaseRef,
+  ): string => `${lifecycleKey(sessionId, callId)}\u0000${lease.scopeId}\u0000${lease.leaseId}`;
+
+  const currentLifecycleKey = (sessionId: string, callId: string): string => {
+    const lease = currentDispatchLease();
+    return lease ? physicalLifecycleKey(sessionId, callId, lease) : lifecycleKey(sessionId, callId);
+  };
 
   const notificationIdentity = (details: ToolDetails | undefined): object | null => {
     const toolCall = details?.toolCall;
@@ -230,6 +279,7 @@ export function attachEventLogHooks(
     const [runContext, agent] = args as [unknown, NamedAgent | undefined];
     const sessionId = options.getSessionId(runContext);
     if (!sessionId) return;
+    if (!currentPhysicalAttemptIsAuthoritative()) return;
     appendEvent({
       sessionId,
       turn: getTurn(runContext),
@@ -243,6 +293,7 @@ export function attachEventLogHooks(
     const [runContext, agent, output] = args as [unknown, NamedAgent | undefined, string];
     const sessionId = options.getSessionId(runContext);
     if (!sessionId) return;
+    if (!currentPhysicalAttemptIsAuthoritative()) return;
     appendEvent({
       sessionId,
       turn: getTurn(runContext),
@@ -263,6 +314,7 @@ export function attachEventLogHooks(
     ];
     const sessionId = options.getSessionId(runContext);
     if (!sessionId) return;
+    if (!currentPhysicalAttemptIsAuthoritative()) return;
     appendEvent({
       sessionId,
       turn: getTurn(runContext),
@@ -285,8 +337,16 @@ export function attachEventLogHooks(
     const sessionId = options.getSessionId(runContext);
     if (!sessionId) return;
     const callId = callIdFromDetails(details);
-    const key = callId ? lifecycleKey(sessionId, callId) : null;
+    const lease = currentDispatchLease();
+    const key = callId ? currentLifecycleKey(sessionId, callId) : null;
     const notification = notificationIdentity(details);
+    if (!currentPhysicalAttemptIsAuthoritative()) {
+      if (callId && lease) {
+        suppressedToolLifecycleKeys.add(physicalLifecycleKey(sessionId, callId, lease));
+      }
+      if (notification) seenToolStartNotifications.add(notification);
+      return;
+    }
     if (notification && seenToolStartNotifications.has(notification)) return;
     if (key && activeToolCallKeys.has(key)) {
       // Duplicate start for the open occurrence. Remember this notification as
@@ -307,6 +367,7 @@ export function attachEventLogHooks(
           tool: tool?.name ?? null,
           callId: callId ?? null,
           canonicalCallId: callId ?? null,
+          ...(lease ? { dispatchLeaseId: lease.leaseId } : {}),
           accounting: 'top_level',
           effect: accounting.effect,
           ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
@@ -341,8 +402,25 @@ export function attachEventLogHooks(
     const sessionId = options.getSessionId(runContext);
     if (!sessionId) return;
     const callId = callIdFromDetails(details);
-    const key = callId ? lifecycleKey(sessionId, callId) : null;
+    const key = callId ? currentLifecycleKey(sessionId, callId) : null;
     const notification = notificationIdentity(details);
+    const lease = currentDispatchLease();
+    const suppressedKey = callId && lease
+      ? physicalLifecycleKey(sessionId, callId, lease)
+      : null;
+    if (suppressedKey && suppressedToolLifecycleKeys.delete(suppressedKey)) {
+      if (notification) seenToolEndNotifications.add(notification);
+      return;
+    }
+    const physicalAttemptAuthoritative = currentPhysicalAttemptIsAuthoritative();
+    // A start admitted while current may cross an awaited gate before its final
+    // pre-dispatch lease check. Keep that occurrence paired for audit, but do not
+    // let its losing generation teach or invalidate memory below. When no start
+    // was ever admitted, this is merely a late callback from a dead transport.
+    if (!physicalAttemptAuthoritative && (!key || !activeToolCallKeys.has(key))) {
+      if (notification) seenToolEndNotifications.add(notification);
+      return;
+    }
     if (notification && seenToolEndNotifications.has(notification)) return;
     if (key && !activeToolCallKeys.has(key) && closedToolCallKeys.has(key)) {
       if (notification) seenToolEndNotifications.add(notification);
@@ -383,17 +461,50 @@ export function attachEventLogHooks(
                 return String(result);
               }
             })();
+    const sourceAttribution = currentSourceAttribution();
+    const settledReadReplay = physicalAttemptAuthoritative
+      && callId
+      && parentEventId
+      && tool?.name === 'composio_execute_tool'
+      && accounting.effect === 'read'
+      && typeof sourceAttribution.sourceUserSeq === 'number'
+      && typeof sourceAttribution.runScopeId === 'string'
+      && typeof accounting.toolSlug === 'string'
+      ? settledReadRepeatReplayDisposition({
+          sessionId,
+          replayCallId: callId,
+          replayCalledEventId: parentEventId,
+          toolName: tool.name,
+          effect: accounting.effect,
+          sourceUserSeq: sourceAttribution.sourceUserSeq,
+          replayBehaviorScopeId: sourceAttribution.runScopeId,
+          toolSlug: accounting.toolSlug,
+        })
+      : null;
+    // The SDK lifecycle sees the model-facing result, which can carry harness
+    // steering appended after the provider settled. Never persist or learn
+    // that control-plane prose as provider authority.
+    const authorityResultStr = resultStr === null
+      || effectiveToolTail(tool?.name ?? '') !== 'composio_execute_tool'
+      ? resultStr
+      : stripSettledReadHarnessAdvisory(resultStr);
     // Lossless write FIRST (up to TOOL_OUTPUT_MAX_BYTES, see eventlog.ts). The event
     // log copy below is intentionally clipped for readability; the
     // recall_tool_result tool reads from tool_outputs to retrieve the
     // verbatim original.
-    if (callId && resultStr !== null) {
+    // A same-source settled-read replay carries the ORIGINAL call's bounded
+    // bytes for model recovery. It is not a new provider result and therefore
+    // must never mint a second authoritative tool_outputs row or reflection.
+    if (physicalAttemptAuthoritative
+      && callId
+      && authorityResultStr !== null
+      && !settledReadReplay) {
       try {
         writeToolOutput({
           sessionId,
           callId,
           tool: tool?.name ?? null,
-          output: resultStr,
+          output: authorityResultStr,
         });
       } catch {
         // Best-effort: a tool_outputs write failure must never block
@@ -406,15 +517,15 @@ export function attachEventLogHooks(
       // `cancelled` telemetry event — that's what feeds the Brain ->
       // Evolution panel's calibration story. Scheduling is
       // microtask-deferred so the SDK's tool result is unblocked.
-      if (resultStr.length > 0) {
-        scheduleReflection({
+      if (authorityResultStr.length > 0) {
+        scheduleReflectionForHook({
           sessionId,
           callId,
           // Unwrap composio_execute_tool → its action slug so the fact's
           // provenance is specific and the source-trust classifier can see
           // the system of record.
           tool: effectiveReflectionTool(tool?.name ?? null, details),
-          output: resultStr,
+          output: authorityResultStr,
           scopeId: harnessRunContextStorage.getStore()?.behaviorScopeId,
         });
       }
@@ -423,7 +534,10 @@ export function attachEventLogHooks(
     // (ok = result does NOT start with ERROR:) so a partial batch can report
     // honestly instead of a hollow done. Covers chat + background/execution
     // (both flow through this hook). Best-effort + flag-gated.
-    if (fanoutLedgerEnabled() && tool?.name === 'run_worker' && callId) {
+    if (physicalAttemptAuthoritative
+      && fanoutLedgerEnabled()
+      && tool?.name === 'run_worker'
+      && callId) {
       try {
         const ok = !/^\s*ERROR:/i.test(resultStr ?? '');
         const item = (key ? callIdToWorkerItem.get(key) : undefined) ?? workerItemFromDetails(details);
@@ -443,7 +557,9 @@ export function attachEventLogHooks(
     // this is the only signal of "a worker hit its turn ceiling", needed to
     // recalibrate CLEMMY_WORKER_MAX_TURNS from real data. Matches both the raw
     // SDK MaxTurnsExceeded string and the FIX-1.3 normalized turn-cap envelope.
-    if (tool?.name === 'run_worker' && /MaxTurnsExceeded|hit its turn cap/i.test(resultStr ?? '')) {
+    if (physicalAttemptAuthoritative
+      && tool?.name === 'run_worker'
+      && /MaxTurnsExceeded|hit its turn cap/i.test(resultStr ?? '')) {
       try {
         appendEvent({
           sessionId,
@@ -464,14 +580,20 @@ export function attachEventLogHooks(
         role: agent?.name ?? 'agent',
         type: 'tool_returned',
         data: {
-          ...currentSourceAttribution(),
+          ...sourceAttribution,
           tool: tool?.name ?? null,
           callId: callId ?? null,
           canonicalCallId: callId ?? null,
+          ...(lease ? { dispatchLeaseId: lease.leaseId } : {}),
           accounting: 'top_level',
           effect: accounting.effect,
           ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
           ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
+          ...(settledReadReplay ? {
+            providerDispatched: false,
+            replayedFromCallId: settledReadReplay.sourceCallId,
+            replayKind: SETTLED_READ_REPEAT_REPLAY_KIND,
+          } : {}),
           result: clipToolResult(
             resultStr,
             maxResultChars,
@@ -491,18 +613,22 @@ export function attachEventLogHooks(
     // Evolving procedural memory: if this call was a HARD failure of a
     // remembered tool, self-correct (invalidate the stale memo so the next run
     // rediscovers). Best-effort; runs AFTER the tool_returned event is logged.
-    autoInvalidateOnFailure({
-      toolName: tool?.name ?? null,
-      args: (details as { toolCall?: { arguments?: unknown } } | undefined)?.toolCall?.arguments,
-      resultStr,
-    });
+    if (physicalAttemptAuthoritative && !settledReadReplay) {
+      autoInvalidateOnFailure({
+        toolName: tool?.name ?? null,
+        args: (details as { toolCall?: { arguments?: unknown } } | undefined)?.toolCall?.arguments,
+        resultStr: authorityResultStr,
+      });
+    }
     // Commit half: a CLEAN native-MCP success memorizes itself against the
     // active objective so recall can compound for the native-MCP family (the
     // Composio half already does this via the search query). Best-effort.
-    autoRememberOnSuccess({
-      toolName: tool?.name ?? null,
-      resultStr,
-    });
+    if (physicalAttemptAuthoritative && !settledReadReplay) {
+      autoRememberOnSuccess({
+        toolName: tool?.name ?? null,
+        resultStr: authorityResultStr,
+      });
+    }
   };
 
   hooks.on('agent_start', onAgentStart);

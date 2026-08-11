@@ -35,16 +35,85 @@ import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import {
   admitPendingActionCall,
+  resolveStableComposioAccountAlias,
   verifyPendingComposioExecutionAuthority,
 } from './pending-action-admission.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 import { skillBindingHold } from '../memory/skill-binding-gate.js';
 import type { ComposioCliDefaultAccountAuthority } from '../integrations/composio/cli-default-account-authority.js';
+import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+import { findEmailDraftAuthoringPreference } from '../runtime/harness/constraint-guard.js';
 
 const textResult = (text: string) => ({ content: [{ type: 'text' as const, text }] });
 
 type BatchPlanRunner = typeof runBatchPlan;
 let batchPlanRunner: BatchPlanRunner = runBatchPlan;
+
+interface MaterializedBatchBindings {
+  plan: BatchPlan;
+  repairs: string[];
+  errors: string[];
+}
+
+/**
+ * Freeze every account decision into the exact plan that certification and the
+ * approval hash see. Labels are useful conversational input, but they are not
+ * immutable authority: a user can later rebind one. The durable carrier is the
+ * stable mailbox email consumed by the existing Composio gateway.
+ *
+ * Reversible Outlook draft authoring also has a standing mailbox preference in
+ * the deterministic constraint store. Snapshot it here when the item has no
+ * explicit selector, so a later A→B policy update cannot retarget an already
+ * approved batch.
+ */
+function materializeComposioBatchBindings(plan: BatchPlan): MaterializedBatchBindings {
+  const repairs: string[] = [];
+  const errors: string[] = [];
+  if (plan.tool !== 'composio_execute_tool' || !plan.composioSlug) {
+    return { plan, repairs, errors };
+  }
+  const slug = plan.composioSlug.trim();
+  const toolkit = registeredToolkitOfSlug(slug);
+  const draftPreference = findEmailDraftAuthoringPreference(slug)?.preferredAccount;
+  const items = plan.items.map((item, index) => {
+    const args = { ...item.args };
+    const rawAlias = args.account_alias;
+    const explicitAlias = typeof rawAlias === 'string' ? rawAlias.trim() : '';
+    if (rawAlias !== undefined && rawAlias !== null && !explicitAlias) {
+      errors.push(`items[${index}] ("${item.id}"): account_alias must be a non-empty string`);
+    }
+    const connected = typeof item.connectedAccountId === 'string'
+      ? item.connectedAccountId.trim()
+      : '';
+    if (explicitAlias && connected) {
+      errors.push(
+        `items[${index}] ("${item.id}"): account_alias conflicts with connected_account_id; choose one immutable account selector`,
+      );
+      return { ...item, args };
+    }
+
+    const requestedAlias = explicitAlias || (!connected ? draftPreference : undefined);
+    if (!requestedAlias) return { ...item, args };
+    const canonicalEmail = resolveStableComposioAccountAlias(slug, requestedAlias);
+    if (!canonicalEmail) {
+      errors.push(
+        `items[${index}] ("${item.id}"): account_alias "${requestedAlias}" is not bound to a stable ${toolkit} identity; `
+        + 'name the live account once or use its mailbox email before proposing this batch',
+      );
+      return { ...item, args };
+    }
+    args.account_alias = canonicalEmail;
+    if (draftPreference && !explicitAlias) {
+      repairs.push(
+        `items[${index}] ("${item.id}"): snapshotted standing Outlook draft mailbox preference as ${canonicalEmail}`,
+      );
+    } else if (requestedAlias !== canonicalEmail) {
+      repairs.push(`items[${index}] ("${item.id}"): resolved account_alias to stable mailbox ${canonicalEmail}`);
+    }
+    return { ...item, args };
+  });
+  return { plan: { ...plan, composioSlug: slug, items }, repairs, errors };
+}
 
 function admitComposioBatchPlan(
   plan: BatchPlan,
@@ -80,6 +149,40 @@ function admitComposioBatchPlan(
   return authority;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function nestedWrapperArguments(args: Record<string, unknown>): Record<string, unknown> | null {
+  if (!Object.prototype.hasOwnProperty.call(args, 'tool_slug')
+    || !Object.prototype.hasOwnProperty.call(args, 'arguments')) return null;
+  if (isRecord(args.arguments)) return args.arguments;
+  if (typeof args.arguments !== 'string') return null;
+  try {
+    const parsed = JSON.parse(args.arguments) as unknown;
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A legacy approved plan may be shape-normalized only when that repair cannot
+ * alter account authority. Wrapper-carried aliases/ca selectors were not visible
+ * to the old claim verifier, so allowing the repair would resolve a mutable label
+ * after approval. New proposals store canonical selectors directly. */
+function storedBatchRouteNeedsRepair(plan: BatchPlan): boolean {
+  return plan.items.some((item) => {
+    if (!isRecord(item?.args)) return false;
+    const inner = nestedWrapperArguments(item.args);
+    if (!inner) return false;
+    return [item.args, inner].some((carrier) => (
+      Object.prototype.hasOwnProperty.call(carrier, 'account_alias')
+      || Object.prototype.hasOwnProperty.call(carrier, 'connected_account_id')
+      || Object.prototype.hasOwnProperty.call(carrier, 'connectedAccountId')
+    ));
+  });
+}
+
 function verifyBatchExecutionAuthority(
   record: NonNullable<ReturnType<typeof getPendingAction>>,
 ): string | null {
@@ -94,10 +197,23 @@ function verifyBatchExecutionAuthority(
   if (plan.sideEffect === 'read' && classifyComposioSlugEffect(slug) !== 'read') {
     return `${slug || 'This Composio action'} is write-shaped but the stored batch declares sideEffect:"read".`;
   }
-  const items = Array.isArray(plan.items) ? plan.items : [];
+  const prepared = prepareBatchPlanForExecution(plan as BatchPlan);
+  if (prepared.errors.length > 0) {
+    return `The stored batch cannot establish immutable account authority after normalization: ${prepared.errors.join('; ')}`;
+  }
+  const validationErrors = validateBatchPlan(prepared.plan);
+  if (validationErrors.length > 0) {
+    return `The stored batch failed claim-time validation: ${validationErrors.join('; ')}`;
+  }
+  if (storedBatchRouteNeedsRepair(plan as BatchPlan)) {
+    return 'The stored batch carries account authority inside a legacy Composio wrapper. That route needs normalization after approval, so it cannot be claimed; re-propose to freeze the stable selector before approval.';
+  }
+  const normalizedPlan = prepared.plan;
+  const items = normalizedPlan.items;
   return verifyPendingComposioExecutionAuthority({
-    toolSlug: slug,
+    toolSlug: normalizedPlan.composioSlug ?? slug,
     connectedAccountIds: items.map((item) => item?.connectedAccountId),
+    accountAliases: items.map((item) => item?.args?.account_alias),
     executionAuthority: authority,
   });
 }
@@ -176,6 +292,7 @@ function batchExecutionSkipText(id: string, status: string | undefined, claimUnc
 
 const BatchItemSchema = z.object({
   id: z.string().min(1).max(120).describe('Stable per-item id the ledger reports on (e.g. the recipient domain or record id).'),
+  account_alias: z.string().min(1).max(160).nullable().optional().describe('Optional stable account name or email for this item (for example "acme" or "alex@acme.example"). The gateway resolves it to the current live connection at dispatch; never put a raw ca_* id here.'),
   // A JSON STRING (not an open object) — the same shape composio_execute_tool
   // uses. An open z.record does not survive Codex strict-mode structured output
   // (it serializes to {}), which silently emptied every item's args and looped
@@ -222,7 +339,31 @@ export function registerBatchTools(server: McpServer): void {
             let obj: unknown;
             try { obj = JSON.parse(it.args); } catch { parseErrors.push(`item "${it.id}": args is not valid JSON`); continue; }
             if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { parseErrors.push(`item "${it.id}": args must be a JSON object`); continue; }
-            parsedItems.push({ id: it.id, args: obj as Record<string, unknown> });
+            const itemArgs = obj as Record<string, unknown>;
+            const itemAlias = typeof it.account_alias === 'string' ? it.account_alias.trim() : '';
+            if (it.account_alias != null && !itemAlias) {
+              parseErrors.push(`item "${it.id}": account_alias must be a non-empty stable account name or email`);
+              continue;
+            }
+            if (itemAlias) {
+              if (rawPlan.tool.trim() !== 'composio_execute_tool' || !rawPlan.composioSlug?.trim()) {
+                parseErrors.push(`item "${it.id}": account_alias is supported only for a concrete composio_execute_tool action`);
+                continue;
+              }
+              const nestedAlias = itemArgs.account_alias;
+              if (nestedAlias != null && (
+                typeof nestedAlias !== 'string'
+                || nestedAlias.trim().toLowerCase() !== itemAlias.toLowerCase()
+              )) {
+                parseErrors.push(`item "${it.id}": first-class account_alias conflicts with args.account_alias`);
+                continue;
+              }
+              // Put the first-class carrier alongside a repeated broker wrapper.
+              // The shared normalizer reconciles it with any alias inside the
+              // wrapper, preserves it across unwrap, and rejects disagreement.
+              itemArgs.account_alias = itemAlias;
+            }
+            parsedItems.push({ id: it.id, args: itemArgs });
           }
           if (parseErrors.length > 0) return textResult(`Plan items have malformed args — fix and re-propose:\n${parseErrors.map((e) => `- ${e}`).join('\n')}`);
           const plan: BatchPlan = {
@@ -248,7 +389,13 @@ export function registerBatchTools(server: McpServer): void {
               : '';
             return textResult(`Plan invalid after harness normalization — fix and re-propose:\n${prepared.errors.map((e) => `- ${e}`).join('\n')}${remedy}`);
           }
-          const planForExecution = prepared.plan;
+          const bindings = materializeComposioBatchBindings(prepared.plan);
+          if (bindings.errors.length > 0) {
+            return textResult(
+              `Plan account bindings are not immutable — fix and re-propose:\n${bindings.errors.map((e) => `- ${e}`).join('\n')}`,
+            );
+          }
+          const planForExecution = bindings.plan;
           const errors = validateBatchPlan(planForExecution);
           if (errors.length > 0) return textResult(`Plan invalid — DO NOT re-propose the identical plan; change what the errors name first:\n${errors.map((e) => `- ${e}`).join('\n')}`);
           let executionAuthority: ComposioCliDefaultAccountAuthority | null;
@@ -272,8 +419,9 @@ export function registerBatchTools(server: McpServer): void {
             });
             if (hold) return textResult(hold.message);
           }
-          const repairNote = prepared.repairs.length > 0
-            ? ` Harness normalized ${prepared.repairs.length} batch item shape(s) before certification.`
+          const repairCount = prepared.repairs.length + bindings.repairs.length;
+          const repairNote = repairCount > 0
+            ? ` Harness normalized ${repairCount} batch item shape/account binding(s) before certification.`
             : '';
           const cert = await certifyBatchPlan(planForExecution);
           // A REAL denial (the judge RAN and flagged the payloads) is terminal —

@@ -537,9 +537,9 @@ test('write-validation guard: tonight\'s new tools never open an ungated externa
 });
 
 // ── Consent-scope wave (2026-08-07): destructive writes need consent that names them ──
-test('a destructive external call never rides YOLO — only a scope that covers it', async () => {
+test('a destructive external call never rides YOLO — only an exact semantic action+args scope covers it', async () => {
   const { decideToolApproval, isDestructiveExternalToolCall } = await import('./tool-taxonomy.js');
-  const { openPlanScope, closePlanScope } = await import('./plan-scope.js');
+  const { destructivePlanActionKey, openPlanScope, closePlanScope } = await import('./plan-scope.js');
   setScope('yolo');
 
   // Live 2026-08-07: OUTLOOK_DELETE_MESSAGE executed with zero gate mid-run.
@@ -551,28 +551,34 @@ test('a destructive external call never rides YOLO — only a scope that covers 
   assert.equal(del.needsApproval, true, 'an unscoped delete now asks');
   assert.equal(del.reason, 'destructive-hint');
 
-  // A card-approved scope that ENUMERATES the delete slug is the consent
-  // (the orchestrator opens exactly this scope when the user approves the
-  // card, so answering once covers the run's repeats).
+  // Destructive plan consent binds the concrete action and exact semantic args.
   const sid = 'sess-destructive-scoped';
+  const deleteArgs = { tool_slug: 'OUTLOOK_DELETE_MESSAGE', arguments: '{"message_id":"m1"}' };
+  const exactDelete = destructivePlanActionKey('composio_execute_tool', deleteArgs);
+  assert.ok(exactDelete);
   openPlanScope({
     sessionId: sid,
     planProposalId: 'card:cleanup',
     approvedPlanObjective: 'delete the duplicate outlook drafts',
     allowedTools: ['composio_execute_tool'],
     allowedComposioSlugs: ['OUTLOOK_DELETE_MESSAGE'],
+    allowedDestructiveActions: [exactDelete!],
   });
   const covered = decideToolApproval({
     sessionId: sid,
     toolName: 'composio_execute_tool',
-    args: { tool_slug: 'OUTLOOK_DELETE_MESSAGE', arguments: '{"message_id":"m1"}' },
+    args: deleteArgs,
   });
-  assert.equal(covered.needsApproval, false, 'an enumerated card scope covers the delete');
+  assert.equal(covered.needsApproval, false, 'the exact semantic action+args covers the delete');
   assert.equal(covered.reason, 'plan-scope');
+  assert.equal(decideToolApproval({
+    sessionId: sid,
+    toolName: 'composio_execute_tool',
+    args: { tool_slug: 'OUTLOOK_DELETE_MESSAGE', arguments: '{"message_id":"m2"}' },
+  }).needsApproval, true, 'changing one nested argument invalidates destructive plan authority');
   closePlanScope(sid, 'test-done');
 
-  // A wildcard scope (launched cron/background/workflow grant) keeps covering
-  // deletes — those lanes were launched as autonomous on purpose.
+  // A wildcard scope cannot launder a delete.
   const wild = 'sess-destructive-wildcard';
   openPlanScope({
     sessionId: wild,
@@ -585,7 +591,7 @@ test('a destructive external call never rides YOLO — only a scope that covers 
     toolName: 'composio_execute_tool',
     args: { tool_slug: 'AIRTABLE_DELETE_RECORDS_FOR_TABLE', arguments: '{}' },
   });
-  assert.equal(cron.needsApproval, false, 'wildcard lanes keep their autonomy');
+  assert.equal(cron.needsApproval, true, 'wildcard lanes still need exact destructive authority');
   closePlanScope(wild, 'test-done');
 
   // Non-destructive writes keep today's exact behavior (no new nags).
@@ -600,5 +606,105 @@ test('a destructive external call never rides YOLO — only a scope that covers 
   assert.equal(isDestructiveExternalToolCall('composio_execute_tool', { tool_slug: 'GMAIL_REMOVE_LABEL' }), false);
   assert.equal(isDestructiveExternalToolCall('composio_execute_tool', { tool_slug: 'OUTLOOK_DELETE_EVENT' }), true);
   assert.equal(isDestructiveExternalToolCall('mcp__m365__sharepoint_delete_item', undefined), true);
+  assert.equal(isDestructiveExternalToolCall('mcp__m365__sharepoint-delete-item', undefined), true);
+  assert.equal(isDestructiveExternalToolCall('mcp__m365__sharepoint.delete.item', undefined), true);
+  assert.equal(isDestructiveExternalToolCall('mcp__m365__sharepointDeleteItem', undefined), true);
+  assert.equal(isDestructiveExternalToolCall('mcp__m365__sharepointUpdateItem', undefined), false);
+  assert.equal(isDestructiveExternalToolCall('mcp__gmail__remove-label', undefined), false);
+  assert.equal(
+    isDestructiveExternalToolCall('mcp__m365__call_tool', {
+      name: 'sharepointDeleteItem',
+      args_json: JSON.stringify({ item_id: 'nested-1' }),
+    }),
+    true,
+    'external native brokers classify their exact name/args_json target',
+  );
+  assert.equal(
+    isDestructiveExternalToolCall('mcp__m365__call_tool', {
+      name: 'removeLabel',
+      args_json: JSON.stringify({ item_id: 'nested-1' }),
+    }),
+    false,
+  );
+  assert.equal(
+    isDestructiveExternalToolCall('mcp__m365__call_tool', { args_json: '{}' }),
+    true,
+    'an external broker without an exact delegated target fails closed',
+  );
   assert.equal(isDestructiveExternalToolCall('cx_outlook_trash_thread', undefined), true);
+});
+
+test('all external call_tool spellings classify the nested action before policy', () => {
+  setScope('yolo');
+  for (const variant of ['call_tool', 'call-tool', 'call.tool', 'callTool']) {
+    const outer = `mcp__m365__${variant}`;
+    const deletion = decideToolApproval({
+      toolName: outer,
+      args: { name: 'deleteItem', args_json: JSON.stringify({ item_id: 'one' }) },
+    });
+    assert.equal(deletion.needsApproval, true, `${variant}: nested delete gates`);
+    assert.equal(deletion.reason, 'destructive-hint');
+
+    const send = decideToolApproval({
+      toolName: outer,
+      args: { name: 'sendEmail', args_json: JSON.stringify({ to: 'person@example.com' }) },
+    });
+    assert.equal(send.kind, 'send', `${variant}: nested send owns kind`);
+    assert.equal(send.needsApproval, true, `${variant}: nested send stays held under yolo`);
+
+    const read = decideToolApproval({
+      toolName: outer,
+      args: { name: 'listItems', args_json: JSON.stringify({ site_id: 'site-a' }) },
+    });
+    assert.equal(read.kind, 'read', `${variant}: safe nested read is recognized`);
+    assert.equal(read.needsApproval, false, `${variant}: safe nested read remains usable`);
+
+    const update = decideToolApproval({
+      toolName: outer,
+      args: { name: 'updateItem', args_json: JSON.stringify({ item_id: 'one', title: 'Updated' }) },
+    });
+    assert.equal(update.kind, 'write');
+    assert.equal(update.needsApproval, false, `${variant}: reversible nested work keeps yolo behavior`);
+  }
+});
+
+test('missing, unknown, malformed, ambiguous, and recursive external broker targets fail closed', () => {
+  setScope('yolo');
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['missing', { args_json: '{}' }],
+    ['unknown', { name: 'frobnicate', args_json: '{}' }],
+    ['malformed args', { name: 'update_item', args_json: '{not-json' }],
+    ['ambiguous args', { name: 'update_item', args_json: '{"item_id":"one"}', arguments: { item_id: 'two' } }],
+    ['ambiguous payload', { name: 'update_item', args_json: '{"item_id":"one"}', payload: { item_id: 'two' } }],
+    ['unexpected top-level args', { name: 'update_item', item_id: 'one' }],
+    ['recursive snake', { name: 'call_tool', args_json: '{}' }],
+    ['recursive camel', { name: 'other__callTool', args_json: '{}' }],
+  ];
+  for (const [label, args] of cases) {
+    const decision = decideToolApproval({ toolName: 'mcp__m365__call.tool', args });
+    assert.equal(decision.needsApproval, true, label);
+    assert.equal(decision.reason, 'untrusted-multiplexer', label);
+  }
+});
+
+test('foreign shell and Composio multiplexers never auto-run under yolo', () => {
+  setScope('yolo');
+  for (const [toolName, args] of [
+    ['mcp__foreign__run_shell_command', { command: 'pwd' }],
+    ['foreign__composio_execute_tool', { tool_slug: 'GOOGLESHEETS_GET_VALUES', arguments: {} }],
+    ['mcp__foreign__callTool', {
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_GET_VALUES', arguments: {} }),
+    }],
+  ] as const) {
+    const decision = decideToolApproval({ toolName, args });
+    assert.equal(decision.needsApproval, true, toolName);
+    assert.equal(decision.reason, 'untrusted-multiplexer', toolName);
+  }
+
+  const local = decideToolApproval({
+    toolName: 'mcp__clementine-local__run_shell_command',
+    args: { command: 'pwd' },
+  });
+  assert.equal(local.needsApproval, false, 'exact local shell keeps yolo semantics');
 });

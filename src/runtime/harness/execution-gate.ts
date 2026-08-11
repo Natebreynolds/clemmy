@@ -535,14 +535,13 @@ export class MissingExecutionWrapError extends Error {
 }
 
 /**
- * Read the env-flag mode. Defaults to 'on'. Set to 'off' to disable
- * the gate (debug / explicit-bypass). Anything else also disables —
- * be permissive on unrecognized values rather than risk blocking
- * legitimate work because of a typo.
+ * Read the env-flag mode. Defaults to on and disables only for an explicit
+ * false value. A typo in a safety flag must preserve the gate, not silently
+ * turn external-write protection off.
  */
 export function isGateEnabled(): boolean {
-  const raw = (process.env.CLEMMY_EXECUTION_GATE ?? 'on').toLowerCase();
-  return raw === 'on' || raw === 'strict' || raw === 'true' || raw === '1';
+  const raw = (process.env.CLEMMY_EXECUTION_GATE ?? 'on').trim().toLowerCase();
+  return !['off', 'false', '0', 'no'].includes(raw);
 }
 
 /** Convenience export for tests + brackets integration. */

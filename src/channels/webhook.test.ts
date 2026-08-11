@@ -272,6 +272,49 @@ test('environment state uses one sanitized canonical tool milestone without retu
   assert.deepEqual(detail.events, structural, 'raw tool args stay outside the compact response projection');
 });
 
+test('environment state narrates a settled replay without erasing its canonical attempt', () => {
+  const milestone = __test__.latestCanonicalToolMilestone([
+    {
+      id: 'reused-call',
+      type: 'tool_called',
+      createdAt: '2026-07-16T12:00:02.000Z',
+      data: {
+        tool: 'composio_execute_tool',
+        toolSlug: 'OUTLOOK_LIST_MESSAGES',
+        callId: 'reuse-2',
+        canonicalCallId: 'reuse-2',
+        accounting: 'top_level',
+      },
+    },
+    {
+      id: 'reused-return',
+      type: 'tool_returned',
+      createdAt: '2026-07-16T12:00:02.010Z',
+      data: {
+        tool: 'composio_execute_tool',
+        callId: 'reuse-2',
+        canonicalCallId: 'reuse-2',
+        accounting: 'top_level',
+        providerDispatched: false,
+        replayKind: 'same_source_settled_read_replay',
+        replayedFromCallId: 'fresh-1',
+      },
+    },
+  ]);
+  assert.deepEqual(milestone?.data, {
+    tool: 'OUTLOOK_LIST_MESSAGES',
+    accounting: 'top_level',
+    reused: true,
+  });
+  const detail = __test__.enrichProjectedActivityRunDetail({
+    id: 'sess-environment-reuse',
+    status: 'running',
+    updatedAt: new Date().toISOString(),
+    events: [],
+  }, [milestone!]);
+  assert.equal(detail.liveLine, 'Reused earlier result');
+});
+
 test('desktop background control is hidden for external chat origins until report-back attribution is preserved', () => {
   const session = (input: Partial<SessionRow>): SessionRow => ({
     id: 'session',

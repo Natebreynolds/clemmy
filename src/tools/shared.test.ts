@@ -10,7 +10,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR, DEFAULT_TOOL_RESULT_MAX_CHARS, resolveMemoryTarget, textResult, truncateToolText, updateEnvKey } from './shared.js';
+import { BASE_DIR, DEFAULT_TOOL_RESULT_MAX_CHARS, isHarnessRefusalText, resolveMemoryTarget, textResult, truncateToolText, updateEnvKey } from './shared.js';
 import { getRuntimeEnv } from '../config.js';
 import { VAULT_DIR } from '../memory/vault.js';
 
@@ -90,4 +90,37 @@ test('updateEnvKey: a write takes effect LIVE even when the key was already in p
     if (original !== null) writeFileSync(envPath, original, 'utf-8');
     else if (!hadFile && existsSync(envPath)) rmSync(envPath);
   }
+});
+
+test('the transport tells the truth: a harness refusal is an error, a real result is not', () => {
+  // Live 2026-08-09: a pre-dispatch schema refusal naming the exact missing
+  // field arrived as an ordinary successful result, and the identical payload
+  // was sent straight back. `claude-agent-sdk.ts` already reads
+  // `ok: !result?.isError`; nothing had ever set it, so all four transport
+  // truths collapsed into "succeeded".
+  assert.equal(isHarnessRefusalText(
+    '[provider-dispatch:not-started:invalid-args] ⚠️ Operation validation failed before dispatch',
+  ), true, 'a pre-dispatch refusal must read as an error');
+  assert.equal(isHarnessRefusalText(
+    'Tool call refused by harness: tool-call guardrail block: [harness fan-out check — REFUSED]',
+  ), true, 'a guardrail block must read as an error');
+  assert.equal(isHarnessRefusalText(
+    '{"error":"requires_readmission","outside":["desktop_status"]}',
+  ), true, 'a typed dispatcher refusal must read as an error');
+
+  // The direction that matters MORE: a genuine result must never be marked
+  // failed, however its DATA happens to read. Detection keys on the harness's
+  // own structural markers, not on words appearing anywhere in a payload.
+  assert.equal(isHarnessRefusalText(
+    '{"data":{"status":"refused","note":"the customer refused delivery"}}',
+  ), false, 'a real payload containing "refused" must stay a success');
+  assert.equal(isHarnessRefusalText(
+    '{"successful":true,"data":{"revision":1}}',
+  ), false);
+  // Invented tool, randomized name: nothing here can pass by knowing a slug.
+  const nonce = Math.random().toString(36).slice(2, 8).toUpperCase();
+  assert.equal(isHarnessRefusalText(`{"data":{"tool":"ZZ${nonce}_LIST_THINGS","ok":true}}`), false);
+  assert.equal(isHarnessRefusalText(
+    `[provider-dispatch:not-started:ambiguous-account] ZZ${nonce} needs a choice`,
+  ), true);
 });

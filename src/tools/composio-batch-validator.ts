@@ -35,6 +35,8 @@ export interface BatchValidationError {
   field: string;
   reason: string;
   examples: string[];
+  /** Machine-readable recovery direction for schema-grounded refusals. */
+  kind?: 'unsupported-fields';
 }
 
 export type ValidationMode = 'schema' | 'heuristic';
@@ -65,6 +67,36 @@ function parseJsonObject(value: unknown): { value?: Record<string, unknown>; err
   } catch {
     return { error: 'arguments is not valid JSON' };
   }
+}
+
+function optionalSelectorCarrier(
+  value: unknown,
+  carrier: string,
+  errors: string[],
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string' || !value.trim()) {
+    errors.push(`${carrier} must be a non-empty string when provided`);
+    return undefined;
+  }
+  return value.trim();
+}
+
+function selectorsAgree(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+function connectionCarrier(
+  record: Record<string, unknown>,
+  prefix: string,
+  errors: string[],
+): string | undefined {
+  const snake = optionalSelectorCarrier(record.connected_account_id, `${prefix}connected_account_id`, errors);
+  const camel = optionalSelectorCarrier(record.connectedAccountId, `${prefix}connectedAccountId`, errors);
+  if (snake && camel && snake !== camel) {
+    errors.push(`${prefix}connected_account_id conflicts with ${prefix}connectedAccountId`);
+  }
+  return snake ?? camel;
 }
 
 function schemaRequiredFields(schema?: Record<string, unknown> | null): Set<string> {
@@ -124,25 +156,83 @@ export function normalizeComposioBatchItemArgs(
   let nextArgs = { ...args };
   let connectedAccountId: string | null | undefined;
 
-  const hasComposioWrapper = 'tool_slug' in nextArgs || 'arguments' in nextArgs || 'connected_account_id' in nextArgs;
-  if (hasComposioWrapper && 'arguments' in nextArgs) {
+  // `account_alias` may arrive on the run_batch item, on an accidentally
+  // repeated composio_execute_tool wrapper, or inside that wrapper's arguments.
+  // Treat those spellings as ONE selector. The caller injects the first-class
+  // item carrier at wrapper level before this normalization, so preserving it
+  // here is what keeps the account binding from disappearing during unwrap.
+  const outerAlias = optionalSelectorCarrier(args.account_alias, 'account_alias', errors);
+  let effectiveAlias = outerAlias;
+
+  const hasToolSlug = Object.prototype.hasOwnProperty.call(nextArgs, 'tool_slug');
+  const hasArguments = Object.prototype.hasOwnProperty.call(nextArgs, 'arguments');
+  const fullComposioWrapper = hasToolSlug && hasArguments;
+  if (fullComposioWrapper) {
     const wrapperSlug = typeof nextArgs.tool_slug === 'string' ? nextArgs.tool_slug.trim() : '';
-    if (wrapperSlug && wrapperSlug !== toolSlug) {
+    if (!wrapperSlug) {
+      errors.push('wrapper tool_slug must be a non-empty string');
+    } else if (wrapperSlug !== toolSlug) {
       errors.push(`wrapper tool_slug "${wrapperSlug}" does not match plan composioSlug "${toolSlug}"`);
     }
     const parsed = parseJsonObject(nextArgs.arguments);
     if (parsed.error) {
       errors.push(`wrapper arguments ${parsed.error}`);
     } else if (parsed.value) {
-      nextArgs = { ...parsed.value };
-      const rawConnection = args.connected_account_id;
-      connectedAccountId = typeof rawConnection === 'string' && rawConnection.trim()
-        ? rawConnection.trim()
-        : rawConnection === null
-          ? null
-          : undefined;
+      const innerArgs = { ...parsed.value };
+      const innerAlias = optionalSelectorCarrier(innerArgs.account_alias, 'wrapper arguments.account_alias', errors);
+      if (outerAlias && innerAlias && !selectorsAgree(outerAlias, innerAlias)) {
+        errors.push('wrapper account_alias conflicts with arguments.account_alias');
+      }
+      effectiveAlias = outerAlias ?? innerAlias;
+
+      const outerConnection = optionalSelectorCarrier(
+        args.connected_account_id,
+        'wrapper connected_account_id',
+        errors,
+      );
+      if (Object.prototype.hasOwnProperty.call(args, 'connectedAccountId')) {
+        optionalSelectorCarrier(args.connectedAccountId, 'wrapper connectedAccountId', errors);
+        errors.push('wrapper connectedAccountId is unsupported; use outer connected_account_id');
+      }
+      const hasInnerConnection = Object.prototype.hasOwnProperty.call(innerArgs, 'connected_account_id')
+        || Object.prototype.hasOwnProperty.call(innerArgs, 'connectedAccountId');
+      if (hasInnerConnection) {
+        // Never turn a ca_* buried in provider args into transport authority.
+        // Only the outer, positively identified broker wrapper owns that field.
+        connectionCarrier(innerArgs, 'wrapper arguments.', errors);
+        errors.push(
+          'wrapper arguments.connected_account_id is not account authority; move the selector to the outer composio_execute_tool wrapper or use account_alias',
+        );
+      }
+      connectedAccountId = outerConnection
+        ?? (args.connected_account_id === null ? null : undefined);
+
+      // Transport selectors never reach the provider-specific action schema.
+      delete innerArgs.account_alias;
+      delete innerArgs.connected_account_id;
+      delete innerArgs.connectedAccountId;
+      nextArgs = innerArgs;
+      if (effectiveAlias) nextArgs.account_alias = effectiveAlias;
       repairs.push('unwrapped nested composio_execute_tool args inside run_batch item');
     }
+  } else {
+    if (hasToolSlug) {
+      errors.push('tool_slug without arguments is not a supported composio_execute_tool wrapper');
+      delete nextArgs.tool_slug;
+    }
+    const directConnection = connectionCarrier(args, '', errors);
+    delete nextArgs.connected_account_id;
+    delete nextArgs.connectedAccountId;
+    if (directConnection) {
+      errors.push(
+        'connected_account_id inside provider args is not account authority; use account_alias, or provide a supported full composio_execute_tool wrapper',
+      );
+    }
+    if (outerAlias) nextArgs.account_alias = outerAlias;
+  }
+
+  if (effectiveAlias && connectedAccountId) {
+    errors.push('account_alias conflicts with connected_account_id; choose one immutable account selector');
   }
 
   const recipient = applyEmailRecipientAliases(toolSlug, nextArgs, schema);
@@ -169,8 +259,9 @@ export function validateComposioArgs(
 
 /**
  * Schema-grounded validation: block ONLY on fields the action's real
- * JSON Schema declares `required` and that are absent from the args.
- * Presence-only — types, formats, and extra keys are Composio's job.
+ * JSON Schema declares `required` and that are absent from the args, plus
+ * fields an exact object contract explicitly rejects via
+ * `additionalProperties: false`. Types and formats remain Composio's job.
  * Fail-open on any malformed/unexpected schema shape.
  */
 export function validateArgsAgainstSchema(
@@ -194,9 +285,46 @@ export function validateArgsAgainstSchema(
       };
     }
 
+    const properties = isRecordValue(schema.properties) ? schema.properties : null;
+
+    // An explicit closed object contract is provider proof that unknown keys
+    // cannot succeed. Refuse them before dispatch instead of paying for the
+    // same deterministic provider 400 (for example, inventing
+    // `{ force_refresh: true }` for an action whose exact contract is `{}`).
+    // Keep the ordinary open-schema behavior unchanged: absent/true
+    // additionalProperties and malformed/missing properties still fail open.
+    const patternProperties = schema.patternProperties === undefined
+      ? null
+      : isRecordValue(schema.patternProperties)
+        ? schema.patternProperties
+        : undefined;
+    const hasPatternProperties = patternProperties === undefined
+      || (patternProperties !== null && Object.keys(patternProperties).length > 0);
+    if (schema.additionalProperties === false && properties && !hasPatternProperties) {
+      const unsupported = Object.keys(args)
+        .filter((key) => !Object.prototype.hasOwnProperty.call(properties, key))
+        .sort();
+      if (unsupported.length > 0) {
+        const allowed = Object.keys(properties).sort();
+        return {
+          kind: 'unsupported-fields',
+          field: unsupported.join(', '),
+          reason:
+            `Unsupported field(s) per ${toolSlug}'s exact schema: ${unsupported.join(', ')}. `
+            + (allowed.length > 0
+              ? `Allowed fields: ${allowed.join(', ')}`
+              : 'This action accepts no argument fields; use {}.'),
+          examples: [
+            allowed.length > 0
+              ? `Remove the unsupported field(s) and use only: ${allowed.join(', ')}`
+              : `Call ${toolSlug} with the empty argument object {}.`,
+          ],
+        };
+      }
+    }
+
     // Batch-item required fields: any args array whose schema property
     // declares required keys on its items.
-    const properties = isRecordValue(schema.properties) ? schema.properties : null;
     if (!properties) return null;
     for (const [key, value] of Object.entries(args)) {
       if (!Array.isArray(value)) continue;
@@ -415,7 +543,12 @@ export function formatBatchValidationError(
   mode: ValidationMode = 'heuristic',
 ): string {
   const recovery = mode === 'schema'
-    ? [
+    ? error.kind === 'unsupported-fields'
+      ? [
+          `Recovery: remove the unsupported field(s) named above and retry with arguments that match ${toolSlug}'s real schema exactly.`,
+          `The real schema is already known; do not rediscover the action or invent replacement keys.`,
+        ]
+      : [
         `Recovery: the missing field(s) come from ${toolSlug}'s real schema — add them and retry.`,
         `Do NOT rename or drop other keys; they were not the problem.`,
       ]

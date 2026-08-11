@@ -125,23 +125,33 @@ test('an acquisition appends a monotonic revision within the universe and refuse
 
   const acquired = appendAgentCapabilityBinding(agent, 'deferred_tool');
   assert.equal(acquired?.ok, true, JSON.stringify(acquired));
+  assert.equal(acquired.ok && acquired.changed, true, 'first acquisition must append a revision');
   const grown = boundAgentCapabilityRevision(agent)!;
   assert.equal(grown.revision, 2);
   assert.deepEqual([...grown.bound], ['active_tool', 'deferred_tool']);
 
   // Re-acquiring an already-bound name is idempotent — no revision churn.
-  assert.equal(appendAgentCapabilityBinding(agent, 'deferred_tool')?.ok, true);
+  const duplicate = appendAgentCapabilityBinding(agent, 'deferred_tool');
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.ok && duplicate.changed, false, 'duplicate acquisition must reuse its revision');
   assert.equal(boundAgentCapabilityRevision(agent)!.revision, 2,
     'a duplicate acquisition minted a new revision');
 
   const outside = appendAgentCapabilityBinding(agent, 'ghost_tool');
   assert.equal(outside?.ok, false, 'a name outside the sealed universe was bound');
+  assert.equal(!outside.ok && outside.kind, 'requires_readmission');
+  assert.deepEqual(!outside.ok && outside.outside, ['ghost_tool']);
   assert.match((outside as Extract<typeof outside, { ok: false }>).reason, /ghost_tool/);
   assert.equal(boundAgentCapabilityRevision(agent)!.revision, 2,
     'a refused acquisition mutated the bound revision');
 
-  assert.equal(appendAgentCapabilityBinding({}, 'anything'), null,
-    'an unsealed agent grew a revision from nothing');
+  const unsealed = appendAgentCapabilityBinding({}, 'anything');
+  assert.deepEqual(unsealed, {
+    ok: false,
+    kind: 'requires_readmission',
+    outside: ['anything'],
+    reason: 'agent has no sealed capability envelope and active binding revision',
+  }, 'missing authority must be a typed refusal, never unlimited authority');
 });
 
 test('the binding is per-agent and null means unknown, not unlimited', () => {

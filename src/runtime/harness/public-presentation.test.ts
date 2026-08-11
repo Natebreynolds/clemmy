@@ -83,6 +83,13 @@ test('public reply projection extracts the answer and question, never decision b
 test('raw model/control events and untrusted stream deltas have no public event', () => {
   assert.equal(projectHarnessEventForPublic(event('turn_ended', { output: NARRATED })), null);
   assert.equal(projectHarnessEventForPublic(event('guardrail_tripped', { prompt: 'private corrective text' })), null);
+  assert.equal(projectHarnessEventForPublic(event('claude_local_permission_admitted', {
+    providerCallId: 'private-tool-use-id',
+  })), null);
+  assert.equal(projectHarnessEventForPublic(event('claude_local_permission_claimed', {
+    providerCallId: 'private-tool-use-id',
+    calledEventId: 'private-canonical-event-id',
+  })), null);
   assert.equal(projectHarnessEventForPublic(event('stream_token', { delta: 'private draft' })), null);
   assert.equal(
     projectHarnessEventForPublic(event('async_work_dispatch_batch_closed', { runIds: ['private-run'] })),
@@ -211,6 +218,87 @@ test('transport mirrors remain in the audit ledger but never enter the public ev
     canonicalCallId: 'call-workspace-cadence',
     accounting: 'transport_mirror',
   })), null);
+});
+
+test('settled-read replay projects one safe reuse bit without replay internals', () => {
+  const projected = projectHarnessEventForPublic(event('tool_returned', {
+    tool: 'composio_execute_tool',
+    callId: 'reuse-1',
+    canonicalCallId: 'reuse-1',
+    accounting: 'top_level',
+    ok: true,
+    providerDispatched: false,
+    replayKind: 'same_source_settled_read_replay',
+    replayedFromCallId: 'private-prior-call',
+  }));
+  assert.ok(projected);
+  assert.equal(projected.data.reused, true);
+  assert.equal(projected.data.progress, 'Reused earlier result');
+  assert.equal('providerDispatched' in projected.data, false);
+  assert.equal('replayKind' in projected.data, false);
+  assert.equal('replayedFromCallId' in projected.data, false);
+
+  const untrustedClaim = projectHarnessEventForPublic(event('tool_returned', {
+    tool: 'composio_execute_tool',
+    callId: 'ordinary-1',
+    accounting: 'top_level',
+    reused: true,
+  }));
+  assert.ok(untrustedClaim);
+  assert.equal(untrustedClaim.data.reused, undefined, 'a bare producer claim is not public authority');
+});
+
+test('public replay keeps every canonical attempt while annotating only the reused one', () => {
+  const raw = [
+    { ...event('tool_called', { tool: 'composio_execute_tool', callId: 'fresh-1', accounting: 'top_level' }), seq: 1, id: 'fresh-call' },
+    { ...event('tool_returned', { tool: 'composio_execute_tool', callId: 'fresh-1', accounting: 'top_level', ok: true }), seq: 2, id: 'fresh-return' },
+    { ...event('tool_called', { tool: 'composio_execute_tool', callId: 'reuse-2', accounting: 'top_level' }), seq: 3, id: 'reuse-call' },
+    { ...event('tool_returned', {
+      tool: 'composio_execute_tool',
+      callId: 'reuse-2',
+      accounting: 'top_level',
+      ok: true,
+      providerDispatched: false,
+      replayKind: 'same_source_settled_read_replay',
+      replayedFromCallId: 'fresh-1',
+    }), seq: 4, id: 'reuse-return' },
+  ];
+  const projected = projectHarnessEventsForPublic(raw);
+  const calls = projected.filter((row) => row.type === 'tool_called');
+  assert.equal(calls.length, 2, 'reuse does not erase the model\'s canonical attempt');
+  assert.equal(calls[0].data.reused, undefined);
+  assert.equal(calls[1].data.reused, true);
+  assert.equal(calls[1].data.progress, 'Reused earlier result');
+});
+
+test('public reuse annotation follows the exact parent when an SDK call id is reused', () => {
+  const first = {
+    ...event('tool_called', { tool: 'composio_execute_tool', callId: 'sdk-reused', accounting: 'top_level' }),
+    seq: 1,
+    id: 'first-occurrence',
+  };
+  const second = {
+    ...event('tool_called', { tool: 'composio_execute_tool', callId: 'sdk-reused', accounting: 'top_level' }),
+    seq: 2,
+    id: 'second-occurrence',
+  };
+  const replay = {
+    ...event('tool_returned', {
+      tool: 'composio_execute_tool',
+      callId: 'sdk-reused',
+      accounting: 'top_level',
+      providerDispatched: false,
+      replayKind: 'same_source_settled_read_replay',
+    }),
+    seq: 3,
+    id: 'second-return',
+    parentEventId: second.id,
+  };
+  const calls = projectHarnessEventsForPublic([first, second, replay])
+    .filter((row) => row.type === 'tool_called');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].data.reused, undefined, 'the earlier same-id occurrence stays fresh');
+  assert.equal(calls[1].data.reused, true, 'only the replay parent is annotated');
 });
 
 test('public tool progress never derives identity from model-supplied carrier arguments', () => {

@@ -1,8 +1,9 @@
 import { Agent, Runner, MaxTurnsExceededError } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
+import { createHash } from 'node:crypto';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
-import { buildCallTool } from '../tools/call-tool.js';
+import { buildCallTool, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
 import { buildCompactToolCatalog } from './tool-catalog.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
@@ -30,6 +31,15 @@ import {
   workerPacketMcpToolScope,
 } from './external-mcp-scope-lock.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
+import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
+import { getProactivityPolicySnapshot } from './proactivity-policy.js';
+import {
+  appendAgentCapabilityBinding,
+  bindAgentCapabilityEnvelope,
+  bindAgentCapabilityRevision,
+  sealAgentCapabilityUniverse,
+  type SealableToolLike,
+} from './capability-envelope.js';
 
 /**
  * Sub-agents.
@@ -105,8 +115,10 @@ function wrapTools(tools: Tool<RuntimeContextValue>[]): Tool<RuntimeContextValue
 // plan-authoring/ask_user_question), PLUS `notify_user` — a parallel fan-out
 // of workers each pinging the user is collision/clutter, and a worker can't
 // meaningfully converse mid-item. Everything else (memory, files, shell,
-// git, ALL composio, recall_tool_result/tool_output_query, skills, CLIs,
-// executions, capability, browser, vault) is reachable. If the orchestrator
+// git, Composio reads/composition, recall_tool_result/tool_output_query, skills,
+// CLIs, executions, capability, browser, vault) is reachable. Batch/pending
+// commit tools remain parent-only: workers return exact mutation payloads and
+// the parent freezes them into one approval. If the orchestrator
 // tells a worker to use a native tool, the worker now HAS it.
 // Lazily computed: sub-agents ← orchestrator ← workflow-step-agent forms an
 // import cycle, so reading WORKFLOW_STEP_BLOCKED_TOOL_NAMES at module-eval time
@@ -115,7 +127,19 @@ function wrapTools(tools: Tool<RuntimeContextValue>[]): Tool<RuntimeContextValue
 let _workerBlockedToolNames: Set<string> | null = null;
 function workerBlockedToolNames(): Set<string> {
   if (!_workerBlockedToolNames) {
-    _workerBlockedToolNames = new Set<string>([...WORKFLOW_STEP_BLOCKED_TOOL_NAMES, 'notify_user']);
+    _workerBlockedToolNames = new Set<string>([
+      ...WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
+      'notify_user',
+      // A worker composes one exact mutation payload; only the conversational
+      // parent may aggregate, freeze, approve, and commit it. Keeping commit
+      // primitives off this surface makes the capability envelope agree with
+      // the central Composio gateway's workerScope refusal.
+      'run_batch',
+      'request_approval',
+      'pending_action_queue',
+      'pending_action_execute',
+      'pending_action_record_result',
+    ]);
   }
   return _workerBlockedToolNames;
 }
@@ -147,9 +171,15 @@ function workerSlimToolsEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKER_SLIM_TOOLS', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
-export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope | null; model?: string; workerInput?: WorkerToolInput } = {}): Promise<SubAgent> {
+export async function buildWorkerAgent(options: {
+  mcpToolScope?: McpToolScope | null;
+  model?: string;
+  workerInput?: WorkerToolInput;
+  sessionId?: string | null;
+} = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  let tools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
+  const capabilityUniverseTools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
+  let tools = [...capabilityUniverseTools];
   const externalMcpScope = options.mcpToolScope !== undefined
     ? options.mcpToolScope
     : (options.workerInput
@@ -157,6 +187,15 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope | 
           ? externalMcpScopeFromExactToolNames(options.workerInput.externalMcpToolNames)
           : externalMcpScopeFromResolvedTools(options.workerInput.resolvedTools)
         : null);
+  // The dispatcher is assembled before the worker Agent exists. Keep its
+  // authority cell fail-closed until the exact filtered universe and active
+  // surface have been sealed and bound to THIS worker instance.
+  let admitBuiltinAcquisition = (targetName: string): BuiltinCapabilityAdmissionResult => ({
+    ok: false,
+    kind: 'requires_readmission',
+    outside: [targetName],
+    reason: 'the worker capability universe or binding revision is not sealed',
+  });
   let workerCatalogBlock = '';
   if (workerSlimToolsEnabled()) {
     const names = tools.map((t) => (t as { name?: string }).name ?? '').filter(Boolean);
@@ -176,6 +215,7 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope | 
         reachableBuiltinNames: deferredNames,
         firstClassNames,
         mcpToolScope: externalMcpScope,
+        admitBuiltinAcquisition: (targetName) => admitBuiltinAcquisition(targetName),
       }) as Tool<RuntimeContextValue>);
       const catalog = buildCompactToolCatalog({ allowedNames: deferredNames });
       workerCatalogBlock = [
@@ -193,7 +233,8 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope | 
       'Rules:',
       '  - Do exactly the work described in the input prompt. Do not ask follow-up questions, do not deliberate, do not branch into other tasks.',
       '  - If the input contains a [WORKER JOB PACKET], treat its resolvedTools/context/instructions as authoritative. Use exact slugs/commands/schemas from resolvedTools; do NOT rediscover those same capabilities.',
-      '  - Use the smallest set of tool calls needed. Discovery → execute when the action is external and not already resolved by the parent packet.',
+      '  - Use the smallest set of tool calls needed. Reuse resolved capabilities from the parent packet. You may execute Composio READ actions for evidence; never execute a mutating Composio action from this worker.',
+      '  - COMPOSE → PARENT COMMIT for external mutations: finish the item\'s reads/reasoning, then return one exact JSON payload {"id":"<stable item id>","composioSlug":"<exact slug>","args":{...},"account_alias":"<stable email or saved alias, only when supplied>"}. The parent aggregates all worker payloads into ONE immutable run_batch proposal and one approval/commit. Do not call run_batch, request_approval, or pending_action_* from a worker. A WORKER_COMPOSE_ONLY tool result proves zero dispatch; return the payload instead of retrying it.',
       '  - If the parent named a specific skill or the item clearly needs installed skill rules, call `skill_read` for that skill. Otherwise do not spend worker context on skill discovery.',
       '  - Return a TIGHT, structured result on the last line: a single sentence, a JSON object, or a bullet list. The parent will aggregate hundreds of these — keep yours compact.',
       '  - If a tool call fails or returns a result missing the data you need, fix and retry that call ONCE: re-run discovery to get the exact slug/id, narrow the query, or adjust arguments from the error. A failing tool result is information, not a stop sign. Do NOT re-issue the SAME call with identical arguments — that is a loop and will be cut off; change something or move on.',
@@ -235,6 +276,54 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope | 
     ...(externalMcpServers.length > 0 ? { mcpServers: externalMcpServers } : {}),
   });
   bindAgentMcpToolScope(agent, externalMcpScope);
+  // Seal the worker's complete post-blocklist catalog, while revision 1 binds
+  // only the active (possibly slim) surface. Deferred acquisitions can then
+  // append monotonically inside this immutable universe; they can never widen
+  // it. MCP tools retain their separate bound scope authority.
+  try {
+    const budgetSettings = getHarnessBudgetSettings();
+    const universeByName = new Map<string, SealableToolLike>();
+    for (const toolRef of [
+      ...capabilityUniverseTools,
+      ...tools,
+    ] as unknown as SealableToolLike[]) {
+      const name = typeof toolRef.name === 'string' ? toolRef.name : '';
+      if (name) universeByName.set(name, toolRef); // active instances win
+    }
+    const sealed = sealAgentCapabilityUniverse({
+      sessionId: options.sessionId?.trim()
+        || harnessRunContextStorage.getStore()?.sessionId
+        || 'worker-unbound',
+      universeTools: [...universeByName.values()],
+      activeToolNames: tools
+        .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+        .filter(Boolean),
+      policyHash: createHash('sha256')
+        .update(JSON.stringify(getProactivityPolicySnapshot().policy), 'utf-8')
+        .digest('hex'),
+      budget: {
+        maxUncachedTokens: budgetSettings.maxRunTokens > 0 ? budgetSettings.maxRunTokens : 10_000_000,
+        maxModelCalls: budgetSettings.maxTurns > 0 ? budgetSettings.maxTurns * 4 : 200,
+        maxToolCalls: budgetSettings.toolCallsPerTurn > 0
+          ? budgetSettings.toolCallsPerTurn * (budgetSettings.maxTurns > 0 ? budgetSettings.maxTurns : 50)
+          : 500,
+        maxElapsedMs: budgetSettings.maxConversationWallMs > 0
+          ? budgetSettings.maxConversationWallMs
+          : 3_600_000,
+      },
+    });
+    if (sealed.ok) {
+      bindAgentCapabilityEnvelope(agent, sealed.envelope);
+      bindAgentCapabilityRevision(agent, sealed.revision);
+      admitBuiltinAcquisition = (targetName) => appendAgentCapabilityBinding(agent, targetName);
+    } else {
+      // eslint-disable-next-line no-console
+      console.warn(`[worker] capability universe refused to seal: ${sealed.errors.join('; ')}`);
+    }
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn('[worker] capability universe sealing threw:', error instanceof Error ? error.message : error);
+  }
   return agent;
 }
 
@@ -291,6 +380,7 @@ export async function runCrossProviderWorker(
     model: modelId,
     workerInput: input,
     mcpToolScope: effectiveMcpToolScope,
+    sessionId,
   });
   const guard = workerThrashGuardEnabled();
   // Base per-item turn budget — mirrors the orchestrator nested lane
@@ -312,6 +402,9 @@ export async function runCrossProviderWorker(
       {
         sessionId,
         counter,
+        // Explicitly marks this standalone Runner as a compose-only worker.
+        // Do not infer worker authority from the optional thrash-guard id.
+        workerScope: true,
         mcpToolScope: effectiveMcpToolScope,
         ...(guard ? { guardrailScopeId: scopeId } : {}),
         ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),

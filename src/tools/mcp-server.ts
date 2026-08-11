@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { registerMemoryTools } from './memory-tools.js';
 import { registerFocusTools } from './focus-tools.js';
 import { registerVaultTools } from './vault-tools.js';
@@ -42,7 +43,11 @@ import { registerRecallTools } from './recall-tools.js';
 import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
 import { registerToolSearchTool } from './tool-search-tool.js';
-import { registerCallToolMcp } from './call-tool.js';
+import {
+  registerCallToolMcp,
+  type BuiltinCapabilityAdmissionResult,
+} from './call-tool.js';
+import { registerClaudeActionWorkCall } from './work-call-mcp.js';
 import { registerGatedMutatingTools } from './gated-mutating-tools.js';
 import { codeModeEnabled, codeModeDescription, runCodeModeForSession } from './code-mode-tool.js';
 import { ensureToolDirectories, textResult } from './shared.js';
@@ -56,6 +61,8 @@ import {
   parseDispatchLease,
   type DispatchLeaseRef,
 } from '../runtime/harness/dispatch-lease.js';
+import type { SealableToolLike } from '../agents/capability-envelope.js';
+import type { AdmissionEnvelope, CapabilityBindingRevision } from '../runtime/graph/admission-envelope.js';
 
 // Counter cap for the ambient harness run context. Most tools wrapped here are
 // reads that never touch the counter; the gated mutating tools set their OWN
@@ -75,6 +82,12 @@ function resolvedMcpToolScope(
 export interface ClementineMcpServerOptions {
   sessionId?: string;
   runScopeId?: string;
+  /** Explicit foreground-orchestrator eligibility for one-shot read recovery.
+   * Workers/workflow steps pass false; absence remains legacy/non-SDK. */
+  directOrchestrator?: boolean;
+  /** Explicit run_worker child identity. Unlike directOrchestrator=false this
+   * does not include workflow steps or other non-foreground lanes. */
+  workerScope?: boolean;
   /** Exact accepted user event owned by this SDK attempt. The in-process and
    * stdio MCP transports must carry the same authority into nested carriers. */
   sourceUserSeq?: number;
@@ -85,6 +98,9 @@ export interface ClementineMcpServerOptions {
    * through env when this server runs as a stdio child. */
   dispatchLease?: DispatchLeaseRef;
   gatedMutations?: boolean;
+  /** Trusted transport request to expose the action-only semantic carrier.
+   * Registration still revalidates the exact persisted task as activated act. */
+  actionExpectedWork?: boolean;
   allowedTools?: string[];
   /** Tools that must remain first-class when the client supports MCP tool
    * deferral. Every unmarked registered tool remains available for native
@@ -101,6 +117,179 @@ export interface ClementineMcpServerOptions {
   /** Internal surface introspection. Called only for tools this server actually
    * registers after feature gates and allowlists have been evaluated. */
   onToolRegistered?: (name: string) => void;
+}
+
+type McpCapabilityController = {
+  authority: object;
+  initialize(): Promise<boolean>;
+  admit(name: string): Promise<BuiltinCapabilityAdmissionResult>;
+  errors(): readonly string[];
+};
+
+const MCP_CAPABILITY_CONTROLLERS = new WeakMap<McpServer, McpCapabilityController>();
+let coreCapabilityDescriptorsPromise: Promise<Map<string, SealableToolLike>> | null = null;
+
+function registrationDescriptor(args: readonly unknown[]): SealableToolLike | null {
+  const name = typeof args[0] === 'string' ? args[0].trim() : '';
+  if (!name) return null;
+  const description = typeof args[1] === 'string' ? args[1] : '';
+  const schemaInput = typeof args[1] === 'string' ? args[2] : args[1];
+  let parameters: unknown = null;
+  if (schemaInput && typeof schemaInput === 'object') {
+    try {
+      const candidate = schemaInput as z.ZodTypeAny & Record<string, unknown>;
+      parameters = ('_zod' in candidate || '_def' in candidate)
+        ? z.toJSONSchema(candidate)
+        : z.toJSONSchema(z.object(schemaInput as z.ZodRawShape));
+    } catch {
+      // Some valid MCP raw shapes (notably run_worker) contain Zod constructs
+      // that the public z.toJSONSchema converter rejects even though the MCP
+      // SDK's compatibility converter accepts and registers them. Preserve the
+      // exact source shape for fingerprinting instead of erasing the descriptor:
+      // capability-envelope already fingerprints Zod parameters in this form on
+      // the OpenAI lane. A genuinely absent/non-object schema remains null and
+      // still falls back to the core dispatcher descriptor below.
+      parameters = schemaInput;
+    }
+  }
+  return { name, description, parameters };
+}
+
+async function coreCapabilityDescriptors(): Promise<Map<string, SealableToolLike>> {
+  if (!coreCapabilityDescriptorsPromise) {
+    coreCapabilityDescriptorsPromise = import('./registry.js')
+      .then(({ getCoreTools }) => {
+        const descriptors = new Map<string, SealableToolLike>();
+        for (const tool of getCoreTools() as unknown as SealableToolLike[]) {
+          const name = typeof tool.name === 'string' ? tool.name.trim() : '';
+          if (name) descriptors.set(name, tool);
+        }
+        return descriptors;
+      });
+  }
+  return coreCapabilityDescriptorsPromise;
+}
+
+function createMcpCapabilityController(input: {
+  opts: ClementineMcpServerOptions;
+  registeredNames: ReadonlySet<string>;
+  deferredNames: ReadonlySet<string>;
+  consideredDescriptors: ReadonlyMap<string, SealableToolLike>;
+}): McpCapabilityController {
+  const authority = {};
+  let initialization: Promise<boolean> | null = null;
+  let sealErrors: string[] = [];
+
+  const initialize = (): Promise<boolean> => {
+    if (initialization) return initialization;
+    initialization = (async () => {
+      try {
+        const [core, capability, budgetModule, policyModule] = await Promise.all([
+          coreCapabilityDescriptors(),
+          import('../agents/capability-envelope.js'),
+          import('../runtime/harness/budget-settings.js'),
+          import('../agents/proactivity-policy.js'),
+        ]);
+        const universeNames = new Set([...input.registeredNames, ...input.deferredNames]);
+        const universeTools: SealableToolLike[] = [];
+        const missing: string[] = [];
+        for (const name of universeNames) {
+          // Prefer the exact descriptor this MCP server attempted to register;
+          // local-runtime-only deferred tools have no MCP adapter and fall
+          // back to the same core Tool object call_tool will dispatch.
+          const considered = input.consideredDescriptors.get(name);
+          const descriptor = considered && considered.parameters !== null ? considered : core.get(name);
+          if (descriptor) universeTools.push(descriptor);
+          else missing.push(`${name}${considered ? ' (captured without parameters)' : ' (registration not observed)'}`);
+        }
+        if (missing.length > 0) {
+          sealErrors = [`capability descriptors are missing for: ${missing.sort().join(', ')}`];
+          return false;
+        }
+        const budgetSettings = budgetModule.getHarnessBudgetSettings();
+        const dispatchLease = input.opts.dispatchLease
+          ?? parseDispatchLease(process.env.CLEMENTINE_MCP_DISPATCH_LEASE_JSON);
+        const sealed = capability.sealAgentCapabilityUniverse({
+          sessionId: dispatchLease?.scopeId
+            ?? input.opts.runScopeId
+            ?? input.opts.sessionId
+            ?? process.env.CLEMENTINE_MCP_RUN_SCOPE_ID
+            ?? process.env.CLEMENTINE_MCP_SESSION_ID
+            ?? 'unbound-mcp-run',
+          universeTools,
+          activeToolNames: [...input.registeredNames],
+          policyHash: createHash('sha256')
+            .update(JSON.stringify(policyModule.getProactivityPolicySnapshot().policy), 'utf-8')
+            .digest('hex'),
+          budget: {
+            maxUncachedTokens: budgetSettings.maxRunTokens > 0 ? budgetSettings.maxRunTokens : 10_000_000,
+            maxModelCalls: budgetSettings.maxTurns > 0 ? budgetSettings.maxTurns * 4 : 200,
+            maxToolCalls: budgetSettings.toolCallsPerTurn > 0
+              ? budgetSettings.toolCallsPerTurn * (budgetSettings.maxTurns > 0 ? budgetSettings.maxTurns : 50)
+              : 500,
+            maxElapsedMs: budgetSettings.maxConversationWallMs > 0
+              ? budgetSettings.maxConversationWallMs
+              : 3_600_000,
+          },
+        });
+        if (!sealed.ok) {
+          sealErrors = [...sealed.errors];
+          return false;
+        }
+        capability.bindAgentCapabilityEnvelope(authority, sealed.envelope);
+        capability.bindAgentCapabilityRevision(authority, sealed.revision);
+        sealErrors = [];
+        return true;
+      } catch (error) {
+        sealErrors = [error instanceof Error ? error.message : String(error)];
+        return false;
+      }
+    })();
+    return initialization;
+  };
+
+  return {
+    authority,
+    initialize,
+    async admit(name) {
+      if (!await initialize()) {
+        return {
+          ok: false,
+          kind: 'requires_readmission',
+          outside: [name],
+          reason: `the MCP capability universe could not seal: ${sealErrors.join('; ') || 'unknown refusal'}`,
+        };
+      }
+      const capability = await import('../agents/capability-envelope.js');
+      return capability.appendAgentCapabilityBinding(authority, name);
+    },
+    errors: () => sealErrors,
+  };
+}
+
+/** Initialize/query the per-physical-server capability authority. A server
+ * without a deferred acquisition door intentionally has no controller. */
+export async function initializeClementineMcpCapabilityAuthority(server: McpServer): Promise<boolean> {
+  const controller = MCP_CAPABILITY_CONTROLLERS.get(server);
+  return controller ? controller.initialize() : true;
+}
+
+export async function boundClementineMcpCapabilityEnvelope(
+  server: McpServer,
+): Promise<AdmissionEnvelope | null> {
+  const controller = MCP_CAPABILITY_CONTROLLERS.get(server);
+  if (!controller) return null;
+  const capability = await import('../agents/capability-envelope.js');
+  return capability.boundAgentCapabilityEnvelope(controller.authority);
+}
+
+export async function boundClementineMcpCapabilityRevision(
+  server: McpServer,
+): Promise<CapabilityBindingRevision | null> {
+  const controller = MCP_CAPABILITY_CONTROLLERS.get(server);
+  if (!controller) return null;
+  const capability = await import('../agents/capability-envelope.js');
+  return capability.boundAgentCapabilityRevision(controller.authority);
 }
 
 function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
@@ -120,6 +309,10 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
   const mcpToolScope = resolvedMcpToolScope(opts);
   const dispatchLease = opts.dispatchLease
     ?? parseDispatchLease(process.env.CLEMENTINE_MCP_DISPATCH_LEASE_JSON);
+  const directOrchestrator = opts.directOrchestrator
+    ?? (process.env.CLEMENTINE_MCP_DIRECT_ORCHESTRATOR ?? '').trim().toLowerCase() === 'on';
+  const workerScope = opts.workerScope
+    ?? (process.env.CLEMENTINE_MCP_WORKER_SCOPE ?? '').trim().toLowerCase() === 'on';
   const originalTool = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
@@ -152,6 +345,8 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
             {
               sessionId,
               behaviorScopeId: runScopeId,
+              directOrchestrator,
+              workerScope,
               counter: new ToolCallsCounter(AMBIENT_COUNTER_LIMIT),
               ...(sourceUserSeq ? { sourceUserSeq } : {}),
               ...(mcpToolScope !== undefined ? { mcpToolScope } : {}),
@@ -207,28 +402,42 @@ function resolvedDeferredTools(opts: ClementineMcpServerOptions = {}): string[] 
       : [];
 }
 
-function installToolAllowlistFilter(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
+function installToolAllowlistFilter(
+  server: McpServer,
+  opts: ClementineMcpServerOptions = {},
+  onConsidered?: (descriptor: SealableToolLike) => void,
+): void {
   const allowlist = resolvedToolAllowlist(opts);
-  if (allowlist.length === 0) return;
+  if (allowlist.length === 0 && !onConsidered) return;
   const allowed = new Set(allowlist);
+  const filtering = allowed.size > 0;
   // Floor: a health tool that must always exist so the surface is never empty.
   const FLOOR = new Set(['ping']);
   const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
+    if (onConsidered) {
+      const descriptor = registrationDescriptor(args);
+      if (descriptor) onConsidered(descriptor);
+    }
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
-    if (toolName && !allowed.has(toolName) && !FLOOR.has(toolName)) {
+    if (filtering && toolName && !allowed.has(toolName) && !FLOOR.has(toolName)) {
       return undefined; // not in the JIT set → don't advertise it (schema not sent)
     }
     return wrapped(...args);
   };
 }
 
-function installToolRegistrationObserver(server: McpServer, observer?: (name: string) => void): void {
+function installToolRegistrationObserver(
+  server: McpServer,
+  observer?: (name: string, descriptor: SealableToolLike | null) => void,
+): void {
   if (!observer) return;
   const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
     const result = wrapped(...args);
-    if (result !== undefined && typeof args[0] === 'string') observer(args[0]);
+    if (result !== undefined && typeof args[0] === 'string') {
+      observer(args[0], registrationDescriptor(args));
+    }
     return result;
   };
 }
@@ -256,16 +465,27 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   const server = new McpServer({ name: 'clementine-next-tools', version: '0.3.0' });
   const registeredNames = new Set<string>();
   const deferredNames = new Set(resolvedDeferredTools(opts));
+  const consideredDescriptors = new Map<string, SealableToolLike>();
 
   installAmbientToolContext(server, opts);
-  installToolRegistrationObserver(server, (name) => {
+  installToolRegistrationObserver(server, (name, descriptor) => {
     registeredNames.add(name);
+    if (descriptor) consideredDescriptors.set(name, descriptor);
     opts.onToolRegistered?.(name);
   });
   installAlwaysLoadMetadata(server, opts);
   // Install last so it is the outermost registration boundary: filtered tools
   // never reach metadata or registration observers.
-  installToolAllowlistFilter(server, opts);
+  installToolAllowlistFilter(server, opts, deferredNames.size > 0
+    ? (descriptor) => {
+        const name = typeof descriptor.name === 'string' ? descriptor.name.trim() : '';
+        if (name) consideredDescriptors.set(name, descriptor);
+      }
+    : undefined);
+  const capabilityController = deferredNames.size > 0
+    ? createMcpCapabilityController({ opts, registeredNames, deferredNames, consideredDescriptors })
+    : null;
+  if (capabilityController) MCP_CAPABILITY_CONTROLLERS.set(server, capabilityController);
 
   registerMemoryTools(server);
   registerFocusTools(server);
@@ -325,7 +545,31 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
     runScopeId: opts.runScopeId,
     sourceUserSeq: opts.sourceUserSeq,
     dispatchLease: opts.dispatchLease,
+    directOrchestrator: opts.directOrchestrator,
+    workerScope: opts.workerScope,
   });
+
+  const actionExpectedWorkRequested = opts.actionExpectedWork
+    ?? (process.env.CLEMENTINE_MCP_ACTION_EXPECTED_WORK ?? '').trim().toLowerCase() === 'on';
+  const actionWorkCallRegistered = registerClaudeActionWorkCall(server, {
+    enabled: actionExpectedWorkRequested,
+    sessionId: opts.sessionId,
+    sourceUserSeq: opts.sourceUserSeq,
+    runScopeId: opts.runScopeId,
+    directOrchestrator: opts.directOrchestrator,
+    dispatchLease: opts.dispatchLease,
+    reachableBuiltinNames: deferredNames,
+    firstClassNames: registeredNames,
+    mcpToolScope: resolvedMcpToolScope(opts),
+    ...(capabilityController ? {
+      admitBuiltinAcquisition: (name) => capabilityController.admit(name),
+    } : {}),
+  });
+  if (actionExpectedWorkRequested && !actionWorkCallRegistered) {
+    throw new Error(
+      'ACTION_EXPECTED_WORK_CARRIER_UNAVAILABLE: the exact action carrier could not be registered; refusing to construct a fallback business surface.',
+    );
+  }
 
   // Code Mode (Lane C) — expose run_tool_program on the Claude SDK lane too, so
   // BOTH brains can run a sandboxed program. Flag-gated (CLEMMY_CODE_MODE); the
@@ -352,13 +596,22 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   // registered here (so their schemas cannot be billed in the provider prompt),
   // but remain callable through the same generic dispatcher and inner-tool gate
   // chain the Codex lane uses.
-  if (deferredNames.size > 0) {
+  if (deferredNames.size > 0 && !actionWorkCallRegistered) {
     registerCallToolMcp(server, {
       reachableBuiltinNames: deferredNames,
       // This Set is intentionally live: ping/tool_search/call_tool register
       // below and become valid first-class targets without rebuilding it.
       firstClassNames: registeredNames,
       mcpToolScope: resolvedMcpToolScope(opts),
+      // A physical MCP server owns one sealed universe/revision chain. The
+      // controller initializes lazily, but every acquisition awaits that seal
+      // and fails closed before inner dispatch if authority cannot be proved.
+      admitBuiltinAcquisition: (name) => capabilityController?.admit(name) ?? {
+        ok: false,
+        kind: 'requires_readmission',
+        outside: [name],
+        reason: 'the MCP capability controller is unavailable',
+      },
     });
   }
 
@@ -394,7 +647,10 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
     : registeredNames;
   registerToolSearchTool(server, {
     allowedNames: searchableNames,
-    dispatchViaCallTool: deferredNames.size > 0,
+    dispatchViaCallTool: deferredNames.size > 0 && !actionWorkCallRegistered,
+    ...(deferredNames.size > 0 && actionWorkCallRegistered
+      ? { dispatchCarrier: 'work_call' as const }
+      : {}),
   });
   return server;
 }
@@ -466,6 +722,12 @@ async function main(): Promise<void> {
   if (plugins.length > 0) {
     console.error(`[plugins] Loaded ${plugins.length} plugin(s) with ${pluginToolCount} tool(s)`);
   }
+
+  // A stdio child is itself the physical Claude query boundary. Build its
+  // revision-1 authority after every built-in/plugin registration and before
+  // the client can invoke call_tool. A refused seal leaves the handler's
+  // typed requires_readmission gate in place; it never becomes unbounded.
+  await initializeClementineMcpCapabilityAuthority(server);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

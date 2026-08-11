@@ -1,10 +1,41 @@
 import { matchToolChoicesForStep, type StepToolChoiceMatch } from '../memory/tool-choice-store.js';
 
+/**
+ * What this turn is ALLOWED to run — deliberately not the same question as what
+ * it can afford to show the model.
+ *
+ * `catalog`    — the user's connected, authorized capabilities are the boundary.
+ *   Anything inside that catalog may execute, including a tool the turn never
+ *   advertised: the model naming an exact authorized tool is a reason to fetch
+ *   it, not a reason to refuse. This is the default for a CONVERSATION, because
+ *   the catalog is what the user actually consented to and a chat turn cannot
+ *   know in advance which of their systems the work will need.
+ * `server_set` — only `allowedServerSlugs` may execute, at any tool. A lane
+ *   handed one system (a worker, a workflow step, a delegated fan-out) was
+ *   given that system and not the user's whole account. Widening here is not
+ *   recovery, it is a bound lane escaping its binding.
+ * `exact`      — only `allowedToolNames` may execute. Typed leases and approval
+ *   resumes bind one precise capability and must not drift to a sibling.
+ * `none`       — the user said no. A decline, an explicit "don't touch my
+ *   connectors": zero external authority regardless of what is connected.
+ *
+ * `maxTools` is NOT on this axis. A cap is a context budget; spending it says
+ * nothing about permission, and it must never be the reason a call is refused.
+ */
+export type McpToolAuthority = 'catalog' | 'server_set' | 'exact' | 'none';
+
 export interface McpToolScope {
   /**
    * Human-readable reason for telemetry/debug logs.
    */
   reason: string;
+  /**
+   * Execution authority for this turn. Absent means "infer from shape" for
+   * legacy callers (see `mcpToolScopeAuthority`); every producer in this module
+   * states it outright, so an empty tool surface can no longer be mistaken for
+   * a prohibition.
+   */
+  authority?: McpToolAuthority;
   /**
    * Escape hatch for legacy/internal callers that must preserve the full
    * external MCP surface.
@@ -14,6 +45,15 @@ export interface McpToolScope {
    * Allowed namespaced server slugs, e.g. "dataforseo".
    */
   allowedServerSlugs?: string[];
+  /**
+   * Servers the user explicitly excluded for this turn.
+   *
+   * A refusal is structure, not a hint. These are resolved against the
+   * CONFIGURED catalog at scope time, so the runtime never carries a provider
+   * name of its own — and they are honoured before construction, so an excluded
+   * system is never connected, never listed, and never called.
+   */
+  deniedServerSlugs?: string[];
   /**
    * Canonical exact external tool identities (`server__tool`). When present,
    * this is an authority allowlist, not a ranking hint: descriptions and
@@ -30,7 +70,8 @@ export interface McpToolScope {
    */
   priorityKeywords?: string[];
   /**
-   * Hard cap on returned MCP tools after filtering.
+   * Hard cap on returned MCP tools after filtering. ADVERTISEMENT ONLY — this
+   * bounds what the model is shown, never what it is permitted to run.
    */
   maxTools?: number;
   /**
@@ -60,14 +101,204 @@ export interface McpToolScope {
   queryText?: string;
 }
 
+/**
+ * Names of the servers the user actually has configured.
+ *
+ * Supplied by the caller so this module stays pure and, more importantly, so
+ * the runtime never learns a provider's name: an exclusion is only ever matched
+ * against systems that exist in THIS user's catalog. Add a connector tomorrow
+ * and "don't use it" works with no code change.
+ */
 export interface ResolveMcpToolScopeOptions {
   userInput?: string | null;
+  configuredServerNames?: string[];
   /**
    * Distinguishing labels of the user's pinned-calendar rules (from
    * constraint-guard's pinnedCalendarRuleLabels). Lets a date shorthand that
    * names the org ("check <org> tomorrow") scope the Outlook tools.
    */
   pinnedCalendarLabels?: string[];
+}
+
+/**
+ * What the user said about their own systems, compiled against their catalog.
+ *
+ * `deny_all`   — no external system may run.
+ * `allow_only` — exactly these may run; everything else is refused.
+ * `deny_set`   — everything may run except these.
+ * `none`       — the turn said nothing about access.
+ */
+export type McpConstraintMode = 'none' | 'deny_all' | 'allow_only' | 'deny_set';
+
+export interface McpAccessConstraint {
+  mode: McpConstraintMode;
+  /** Configured server slugs the user permitted by name. */
+  allow: string[];
+  /** Configured server slugs the user refused by name. */
+  deny: string[];
+}
+
+/** Generic words for "an external system", with no system named. */
+const GENERIC_CONNECTOR_RE =
+  /\b(?:external\s+)?(?:connectors?|integrations?|mcp(?:\s+servers?)?|external\s+(?:tools?|services?|systems?)|third[-\s]party\s+(?:tools?|services?))\b/gi;
+/** Refusals. Order matters only for readability; all are scanned by position. */
+const NEGATIVE_MARKER_RE =
+  /\b(?:do\s+not|do\s?n[o']t|dont|never|without|avoid|excluding|no\s+longer|not|no)\b/gi;
+/** Carve-outs from a surrounding statement. */
+const EXCEPTION_MARKER_RE = /\b(?:except(?:\s+for)?|other\s+than|apart\s+from|besides|but\s+not)\b/gi;
+/** Restriction to what is named. */
+const ONLY_MARKER_RE = /\b(?:only|exclusively|solely|just)\b/gi;
+
+function markerPositions(text: string, pattern: RegExp): number[] {
+  return [...text.matchAll(new RegExp(pattern.source, pattern.flags))].map((m) => m.index ?? 0);
+}
+
+/** The nearest marker at or before `index`, or -1. */
+function nearestBefore(positions: number[], index: number): number {
+  let best = -1;
+  for (const position of positions) {
+    if (position <= index && position > best) best = position;
+  }
+  return best;
+}
+
+function slugOf(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+/**
+ * Every way a user might name one configured server, longest first.
+ *
+ * Multiword names matter: "Google Sheets" and "Google Drive" share a word, so
+ * the full phrase must win and the shared word must never decide. A single
+ * token only counts when it identifies exactly one server in THIS catalog.
+ */
+function catalogAliases(configured: string[]): Array<{ slug: string; alias: string }> {
+  const aliases: Array<{ slug: string; alias: string }> = [];
+  const tokenOwners = new Map<string, Set<string>>();
+
+  for (const name of configured) {
+    const slug = slugOf(name);
+    if (!slug) continue;
+    const spaced = name.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    for (const alias of new Set([spaced, slug.replace(/_/g, ' '), canonicalMcpServerAliasLocal(name)])) {
+      if (alias.length >= 2) aliases.push({ slug, alias });
+    }
+    for (const token of spaced.split(' ').filter((t) => t.length >= 3)) {
+      const owners = tokenOwners.get(token) ?? new Set<string>();
+      owners.add(slug);
+      tokenOwners.set(token, owners);
+    }
+  }
+  // A bare word is an alias only when it is unambiguous across the catalog.
+  for (const [token, owners] of tokenOwners) {
+    if (owners.size === 1) aliases.push({ slug: [...owners][0]!, alias: token });
+  }
+  return aliases.sort((a, b) => b.alias.length - a.alias.length);
+}
+
+/**
+ * Compile a turn's access instruction against the user's own catalog.
+ *
+ * Polarity is decided by POSITION, not by which regex happened to match: the
+ * nearest governing marker before a mention owns it, and an exception inside a
+ * refusal flips back to permission — which is why "do not use any connector
+ * except Alpha" grants Alpha instead of banning it. The previous parser read
+ * every clause independently and got that backwards.
+ */
+export function compileMcpAccessConstraint(
+  input: string,
+  configuredServerNames: string[] | undefined,
+): McpAccessConstraint {
+  const configured = (configuredServerNames ?? []).filter(Boolean);
+  const text = input.toLowerCase();
+  if (!text.trim()) return { mode: 'none', allow: [], deny: [] };
+
+  const negatives = markerPositions(text, NEGATIVE_MARKER_RE);
+  const exceptions = markerPositions(text, EXCEPTION_MARKER_RE);
+  const onlys = markerPositions(text, ONLY_MARKER_RE);
+
+  const allow = new Set<string>();
+  const deny = new Set<string>();
+  let restrictedToNamed = false;
+
+  // Which servers are mentioned, and where. Longest alias wins so a multiword
+  // name is never shadowed by one of its words.
+  const claimed: Array<{ start: number; end: number }> = [];
+  for (const { slug, alias } of catalogAliases(configured)) {
+    const pattern = new RegExp(`(?<![a-z0-9])${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '[^a-z0-9]+')}(?![a-z0-9])`, 'g');
+    for (const match of text.matchAll(pattern)) {
+      const start = match.index ?? 0;
+      const end = start + match[0].length;
+      if (claimed.some((span) => start < span.end && end > span.start)) continue;
+      claimed.push({ start, end });
+
+      const negative = nearestBefore(negatives, start);
+      const exception = nearestBefore(exceptions, start);
+      // An exception that sits inside a refusal grants; one that sits inside a
+      // permission refuses ("use anything except Beta").
+      if (exception >= 0 && exception > negative) {
+        if (negative >= 0) {
+          allow.add(slug);
+          restrictedToNamed = true;
+        } else {
+          deny.add(slug);
+        }
+        continue;
+      }
+      if (negative >= 0 && negative > exception) {
+        deny.add(slug);
+        continue;
+      }
+      allow.add(slug);
+      if (nearestBefore(onlys, start) >= 0) restrictedToNamed = true;
+    }
+  }
+
+  // A blanket refusal of "connectors" with nothing carved out denies everything.
+  const genericMentions = markerPositions(text, GENERIC_CONNECTOR_RE);
+  const blanketRefusal = genericMentions.some((position) => {
+    const negative = nearestBefore(negatives, position);
+    const exception = nearestBefore(exceptions, position);
+    return negative >= 0 && negative > exception;
+  });
+
+  if (restrictedToNamed && allow.size > 0) {
+    return { mode: 'allow_only', allow: [...allow].sort(), deny: [...deny].sort() };
+  }
+  if (blanketRefusal) {
+    if (allow.size > 0) {
+      return { mode: 'allow_only', allow: [...allow].sort(), deny: [...deny].sort() };
+    }
+    // The user carved something out, but no catalog was supplied to resolve it
+    // against. Compiling this as "deny everything" would refuse the one system
+    // they just permitted, so decline to compile and let the caller's ordinary
+    // routing decide — a constraint we cannot read is not a constraint we get
+    // to invent.
+    if (exceptions.length > 0) return { mode: 'none', allow: [], deny: [] };
+    return { mode: 'deny_all', allow: [], deny: [] };
+  }
+  if (deny.size > 0) return { mode: 'deny_set', allow: [...allow].sort(), deny: [...deny].sort() };
+  return { mode: 'none', allow: [...allow].sort(), deny: [] };
+}
+
+/** Back-compatible view: which configured servers this turn refuses outright. */
+export function deniedServerSlugsFromInput(
+  input: string,
+  configuredServerNames: string[] | undefined,
+): string[] {
+  return compileMcpAccessConstraint(input, configuredServerNames).deny;
+}
+
+/** Local copy of the dispatcher's canonical alias rule, kept here so this
+ *  module stays dependency-free and pure. */
+function canonicalMcpServerAliasLocal(value: string): string {
+  let canonical = value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  for (;;) {
+    const next = canonical.replace(/(?:mcpserver|servermcp|mcp|server)$/, '');
+    if (next === canonical) return canonical;
+    canonical = next;
+  }
 }
 
 const URL_RE = /\bhttps?:\/\/[^\s)]+/i;
@@ -257,6 +488,48 @@ function failOpenMaxTools(): number {
 }
 
 /**
+ * Turn a compiled constraint into the turn's scope, when the user actually
+ * expressed one. Returns null when they said nothing about access, leaving the
+ * ordinary relevance routing below to decide what to show.
+ */
+function constraintScope(
+  constraint: McpAccessConstraint,
+  input: string,
+): McpToolScope | null {
+  const excerpt = input.toLowerCase().slice(0, 120);
+  if (constraint.mode === 'deny_all') {
+    return {
+      reason: `user refused external connectors: ${excerpt}`,
+      authority: 'none',
+      allowedServerSlugs: [],
+      toolPatterns: [],
+      maxTools: 0,
+    };
+  }
+  if (constraint.mode === 'allow_only') {
+    return {
+      reason: `user restricted this turn to ${constraint.allow.join(', ')}: ${excerpt}`,
+      authority: 'server_set',
+      allowedServerSlugs: constraint.allow,
+      ...(constraint.deny.length > 0 ? { deniedServerSlugs: constraint.deny } : {}),
+      maxTools: Math.max(8, constraint.allow.length * 8),
+    };
+  }
+  if (constraint.mode === 'deny_set') {
+    // Everything else stays reachable; the named systems do not.
+    return {
+      reason: `user excluded ${constraint.deny.join(', ')}: ${excerpt}`,
+      authority: 'catalog',
+      deniedServerSlugs: constraint.deny,
+      failOpenCandidate: true,
+      toolPatterns: [],
+      maxTools: failOpenMaxTools(),
+    };
+  }
+  return null;
+}
+
+/**
  * Resolve the external MCP tool surface for a fresh user turn.
  *
  * Important: callers without a concrete user prompt intentionally get
@@ -264,22 +537,43 @@ function failOpenMaxTools(): number {
  * that was pending before the scoped-tool experiment existed.
  */
 export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): McpToolScope {
+  const rawInput = options.userInput?.trim();
+
+  // Consent is compiled BEFORE any kill-switch. `CLEMMY_SCOPED_MCP_TOOLS=off`
+  // disables scoped advertisement and ranking — a token-budget experiment. It
+  // was never meant to mean "ignore the user when they say don't touch my
+  // connectors", and letting a display flag revoke a refusal is not a tuning
+  // decision, it is a consent bug.
+  const constraint = rawInput
+    ? compileMcpAccessConstraint(rawInput, options.configuredServerNames)
+    : { mode: 'none' as const, allow: [], deny: [] };
+  const constrained = constraintScope(constraint, rawInput ?? '');
+  if (constrained) return constrained;
+
   if (scopingDisabled()) {
     return { reason: 'scoped MCP disabled by CLEMMY_SCOPED_MCP_TOOLS', allowAll: true };
   }
 
-  const input = options.userInput?.trim();
+  const input = rawInput;
   if (!input) {
     return { reason: 'no prompt available; preserving legacy external MCP surface', allowAll: true };
   }
 
   const lower = input.toLowerCase();
+  // Resolved once and attached to every branch below: a refusal must survive
+  // whichever route the turn takes through this resolver.
+  const deniedRaw = deniedServerSlugsFromInput(input, options.configuredServerNames);
+  const denied = deniedRaw.length > 0 ? { deniedServerSlugs: deniedRaw } : {};
   if (
     (EXPLICIT_LOCAL_ONLY_RE.test(input) || EXPLICIT_NO_EXTERNAL_TOOLS_RE.test(input))
     && !EXTERNAL_SCOPE_EXCEPTION_RE.test(input)
   ) {
+    // The user prohibited external connectors. This is the real thing an empty
+    // surface used to be confused with: a decision, not a budget.
     return {
       reason: `explicit local-only/no-external-tools instruction: ${lower.slice(0, 120)}`,
+      authority: 'none',
+      ...denied,
       allowedServerSlugs: [],
       toolPatterns: [],
       maxTools: 0,
@@ -308,8 +602,13 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
     && !hasNamedExternalSystemIntent
     && (hasNegatedFreshExternalIntent || !hasFreshExternalIntent)
   ) {
+    // Nothing here needs a connector, so advertise none — but the user never
+    // withdrew access. If the work turns out to need an authorized tool, the
+    // model may still name it and get it.
     return {
       reason: `local context/file follow-up; no fresh external MCP needed: ${lower.slice(0, 120)}`,
+      authority: 'catalog',
+      ...denied,
       allowedServerSlugs: [],
       toolPatterns: [],
       maxTools: 0,
@@ -394,6 +693,8 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
     if (LOCAL_DEPLOY_CLI_RE.test(input)) {
       return {
         reason: `local deploy CLI intent; no external MCP needed: ${lower.slice(0, 120)}`,
+        authority: 'catalog',
+        ...denied,
         allowedServerSlugs: [],
         toolPatterns: [],
         maxTools: 0,
@@ -410,6 +711,8 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
     if (!failOpenScopeEnabled()) {
       return {
         reason: `no external MCP intent detected; fail-open disabled: ${lower.slice(0, 120)}`,
+        authority: 'catalog',
+        ...denied,
         allowedServerSlugs: [],
         toolPatterns: [],
         maxTools: 0,
@@ -417,6 +720,8 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
     }
     return {
       reason: `no keyword-family intent matched — failing OPEN to the user's own connected servers (bounded): ${lower.slice(0, 120)}`,
+      authority: 'catalog',
+      ...denied,
       failOpenCandidate: true,
       toolPatterns: [],
       maxTools: failOpenMaxTools(),
@@ -437,12 +742,62 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
 
   return {
     reason: scopes.map((scope) => scope.reason).join(' + '),
+    // Keyword families choose what to SHOW first. They are a relevance guess
+    // about the user's own connected systems, never a narrowing of consent.
+    authority: 'catalog',
+    ...denied,
     allowedServerSlugs,
     toolPatterns,
     priorityKeywords,
     maxTools: maxTools > 0 ? maxTools : undefined,
     serverMaxTools: Object.keys(serverMaxTools).length > 0 ? serverMaxTools : undefined,
   };
+}
+
+/**
+ * The turn's execution authority. Explicit when the producer stated it;
+ * otherwise inferred from shape so callers that predate the field keep their
+ * exact behavior — an exact allowlist stays exact, `allowAll` stays open, and
+ * everything else falls to the catalog boundary rather than to a cap.
+ */
+export function mcpToolScopeAuthority(scope: McpToolScope): McpToolAuthority {
+  if (scope.authority) return scope.authority;
+  if (scope.allowAll) return 'catalog';
+  if (scope.allowedToolNames !== undefined) return 'exact';
+  return 'catalog';
+}
+
+/** Tightest first. Composition may only ever move DOWN this list. */
+const AUTHORITY_STRICTNESS: Record<McpToolAuthority, number> = {
+  none: 0,
+  exact: 1,
+  server_set: 2,
+  catalog: 3,
+};
+
+/**
+ * The stricter of two authorities. Composition is a narrowing operation — a
+ * parent and a child each get to say no, and neither gets to say yes on the
+ * other's behalf. Leaving this to inference is how a bounded lane ended up
+ * holding the whole catalog.
+ */
+export function strictestMcpToolAuthority(
+  ...authorities: Array<McpToolAuthority | undefined>
+): McpToolAuthority {
+  let strictest: McpToolAuthority = 'catalog';
+  for (const authority of authorities) {
+    if (!authority) continue;
+    if (AUTHORITY_STRICTNESS[authority] < AUTHORITY_STRICTNESS[strictest]) strictest = authority;
+  }
+  return strictest;
+}
+
+/** Union of two exclusion lists — a denial from either side stands. */
+export function mergeDeniedServerSlugs(
+  ...lists: Array<string[] | undefined>
+): string[] | undefined {
+  const merged = [...new Set(lists.flatMap((list) => list ?? []))].sort();
+  return merged.length > 0 ? merged : undefined;
 }
 
 /** A scope that actually exposes tools FROM A RECOGNIZED INTENT: the legacy
@@ -497,15 +852,42 @@ export function resolveMcpToolScopeWithContinuity(
     userInput?: string | null;
     priorUserInputs?: Array<string | null | undefined>;
     pinnedCalendarLabels?: string[];
+    configuredServerNames?: string[];
     /** The previous turn ended by asking this user a question. */
     awaitingAnswer?: boolean;
+    /** Exact runtime-derived meaning of the answer. A decline is an explicit
+     * zero-authority boundary and may never inherit the parent tool scope. */
+    answerDisposition?: 'affirmed' | 'declined' | 'selected' | 'provided';
   } = {},
 ): McpToolScope {
-  const direct = resolveMcpToolScope({ userInput: options.userInput, pinnedCalendarLabels: options.pinnedCalendarLabels });
+  if (options.answerDisposition === 'declined') {
+    return {
+      reason: 'continuity: user declined the prior task; external MCP authority denied for this turn',
+      authority: 'none',
+      allowedServerSlugs: [],
+      allowedToolNames: [],
+      toolPatterns: [],
+      maxTools: 0,
+    };
+  }
+  const direct = resolveMcpToolScope({
+    userInput: options.userInput,
+    pinnedCalendarLabels: options.pinnedCalendarLabels,
+    configuredServerNames: options.configuredServerNames,
+  });
+  // A turn that withdrew external access resolves to an empty surface, and an
+  // empty surface is exactly what continuity is built to fill in. Those two
+  // facts together turned "don't use my connectors" into "reuse the last
+  // connector". Authority is checked before the gap is noticed.
+  if (mcpToolScopeAuthority(direct) === 'none') return direct;
   if (scopeIsConcrete(direct)) return direct;
   if (!options.awaitingAnswer && !isToolScopeContinuation(options.userInput)) return direct;
   for (const prior of options.priorUserInputs ?? []) {
-    const inherited = resolveMcpToolScope({ userInput: prior, pinnedCalendarLabels: options.pinnedCalendarLabels });
+    const inherited = resolveMcpToolScope({
+      userInput: prior,
+      pinnedCalendarLabels: options.pinnedCalendarLabels,
+      configuredServerNames: options.configuredServerNames,
+    });
     // Only inherit a CONCRETE keyword scope (maxTools>0) — never a prior allowAll
     // (a no-prompt/internal turn) which would silently open the whole surface,
     // and never a prior FAIL-OPEN scope (that's a fallback, not a precise
@@ -591,14 +973,19 @@ export function resolveMcpToolScopeWithRecall(
     priorUserInputs?: Array<string | null | undefined>;
     learnedMatches?: StepToolChoiceMatch[];
     pinnedCalendarLabels?: string[];
+    configuredServerNames?: string[];
     /** The previous turn ended by asking this user a question. Threaded to
      *  continuity so a contentless go-ahead keeps the scope its request earned. */
     awaitingAnswer?: boolean;
+    answerDisposition?: 'affirmed' | 'declined' | 'selected' | 'provided';
   } = {},
 ): McpToolScope {
   const base = resolveMcpToolScopeWithContinuity(options);
   if (!recallScopeEnabled()) return base;
   if (base.allowAll) return base; // already the full surface
+  // A user prohibition outranks the user's own history. Everywhere else recall
+  // only reorders what was already permitted.
+  if (mcpToolScopeAuthority(base) === 'none') return base;
   // A DELIBERATE no-tool turn (maxTools:0, not fail-open) explicitly wants no
   // tools — recall must not override it.
   if ((base.maxTools ?? 0) === 0 && !base.failOpenCandidate) return base;

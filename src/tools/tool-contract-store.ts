@@ -47,6 +47,21 @@ export interface ToolContract {
   schema: Record<string, unknown>;
   /** Stable digest of the schema, so drift under a stable name is detectable. */
   fingerprint: string;
+  /**
+   * When this exact schema fingerprint was last observed from provider
+   * metadata. This is deliberately separate from savedAt: successful business
+   * calls may refresh examples/validation retention, but they must never mint
+   * or extend autonomous execution authority.
+  */
+  providerObservedAt?: string;
+  /** Fingerprint observed at providerObservedAt; binds the lease to one schema. */
+  providerObservedFingerprint?: string;
+  /**
+   * Two different schemas observed at the same provider timestamp are
+   * unordered. Keep that timestamp as a monotonic watermark, but revoke
+   * executable authority until a strictly later observation resolves it.
+   */
+  providerAuthorityConflictAt?: string;
   /** An argument payload that ACTUALLY SUCCEEDED. A schema says what is legal;
    *  this says what worked — which is what stops a repeat of the same
    *  invalid-argument failure on a tool already used before. Keys only when the
@@ -104,9 +119,13 @@ export function redactExample(args: unknown, depth = 0): Record<string, unknown>
       out[key] = value.length > 0 ? [typeof value[0] === 'object' ? redactExample(value[0], depth + 1) ?? '<object>' : `<${typeof value[0]}>`] : [];
     } else if (typeof value === 'object') {
       out[key] = redactExample(value, depth + 1) ?? '<object>';
-    } else if (typeof value === 'boolean' || typeof value === 'number') {
-      // Enum-ish and numeric values are shape, not content.
+    } else if (typeof value === 'boolean') {
+      // Booleans carry no destination, identifier, timestamp, or free text.
       out[key] = value;
+    } else if (typeof value === 'number') {
+      // Numeric ids, timestamps, amounts, and row numbers are content. Keep
+      // only their type marker; the key already captures the useful shape.
+      out[key] = '<number>';
     } else {
       out[key] = `<${typeof value}>`;
     }
@@ -118,17 +137,110 @@ export function saveToolContract(input: {
   identifier: string;
   schema: unknown;
   exampleArgs?: unknown;
-}): void {
+  /** Set only by a real provider-metadata observation. */
+  providerObservedAt?: string;
+  /** Set only when two real observations at the same timestamp disagree. */
+  providerAuthorityConflictAt?: string;
+}): ToolContract | null {
   const { identifier, schema } = input;
-  if (!identifier || !schema || typeof schema !== 'object' || Array.isArray(schema)) return;
+  if (!identifier || !schema || typeof schema !== 'object' || Array.isArray(schema)) return null;
   try {
     const dir = ensureDir();
     const file = path.join(dir, contractFileName(identifier));
-    const existing = readContractFile(file);
+    const existing = validateToolContractRecord(readContractFile(file), identifier);
+    const fingerprint = fingerprintSchema(schema);
+    const explicitProviderObservedAt = normalizeProviderObservedAt(input.providerObservedAt);
+    const explicitConflictAt = normalizeProviderObservedAt(input.providerAuthorityConflictAt);
+    const existingObservation = providerObservation(existing);
+    const existingConflictAt = normalizeProviderObservedAt(existing?.providerAuthorityConflictAt);
+    const existingConflictMs = existingConflictAt ? Date.parse(existingConflictAt) : Number.NaN;
+    const existingWatermarkMs = Math.max(
+      existingObservation?.observedMs ?? Number.NEGATIVE_INFINITY,
+      Number.isFinite(existingConflictMs) ? existingConflictMs : Number.NEGATIVE_INFINITY,
+    );
+    const explicitObservedMs = explicitProviderObservedAt
+      ? Date.parse(explicitProviderObservedAt)
+      : Number.NaN;
+
+    // A process may detect an equal-time conflict even when its earlier
+    // durable write was lost or removed. Persist that process evidence
+    // directly; a newer durable observation still wins if one raced ahead.
+    if (explicitConflictAt) {
+      const explicitConflictMs = Date.parse(explicitConflictAt);
+      if (existing && Number.isFinite(existingWatermarkMs)
+        && existingWatermarkMs > explicitConflictMs) return existing;
+      const record: ToolContract = {
+        identifier,
+        schema: existing?.schema ?? schema as Record<string, unknown>,
+        fingerprint: existing?.fingerprint ?? fingerprint,
+        providerAuthorityConflictAt: explicitConflictAt,
+        ...(existing?.exampleArgs ? { exampleArgs: existing.exampleArgs } : {}),
+        savedAt: new Date().toISOString(),
+        ...(existing?.lastUsedAt ? { lastUsedAt: existing.lastUsedAt } : {}),
+      };
+      atomicWrite(file, record);
+      pruneIfNeeded(dir);
+      return record;
+    }
+
+    // Provider observations are monotonic per identifier. A stale/unproven
+    // schema can remain useful to its caller, but it cannot roll durable state
+    // back from a later trusted observation or replace that schema outright.
+    if (existing && Number.isFinite(existingWatermarkMs)
+      && explicitProviderObservedAt && explicitObservedMs < existingWatermarkMs) {
+      return existing;
+    }
+
+    // Millisecond request-start timestamps form only a partial order. If two
+    // different schemas share one timestamp, neither may win executable
+    // authority. Persist a conflict watermark so restart or an equal-time
+    // replay cannot re-authorize either side; only a later observation can.
+    if (existing && explicitProviderObservedAt
+      && explicitObservedMs === existingWatermarkMs
+      && !(existingObservation?.observedMs === explicitObservedMs
+        && existing.fingerprint === fingerprint)) {
+      const record: ToolContract = {
+        identifier,
+        schema: existing.schema,
+        fingerprint: existing.fingerprint,
+        providerAuthorityConflictAt: explicitProviderObservedAt,
+        ...(existing.exampleArgs ? { exampleArgs: existing.exampleArgs } : {}),
+        savedAt: new Date().toISOString(),
+        ...(existing.lastUsedAt ? { lastUsedAt: existing.lastUsedAt } : {}),
+      };
+      atomicWrite(file, record);
+      pruneIfNeeded(dir);
+      return record;
+    }
+
+    if (existing && Number.isFinite(existingWatermarkMs)
+      && !explicitProviderObservedAt && existing.fingerprint !== fingerprint) {
+      return existing;
+    }
+
+    const acceptExplicitObservation = Boolean(explicitProviderObservedAt
+      && (!Number.isFinite(existingWatermarkMs)
+        || explicitObservedMs > existingWatermarkMs
+        || (existingObservation?.observedMs === explicitObservedMs
+          && existing?.fingerprint === fingerprint)));
+    const preservedProviderObservedAt = existing?.fingerprint === fingerprint
+      ? existingObservation?.observedAt
+      : undefined;
+    const providerObservedAt = acceptExplicitObservation
+      ? explicitProviderObservedAt
+      : preservedProviderObservedAt;
+    const providerAuthorityConflictAt = !acceptExplicitObservation
+      && existing?.fingerprint === fingerprint
+      ? existingConflictAt
+      : undefined;
     const record: ToolContract = {
       identifier,
       schema: schema as Record<string, unknown>,
-      fingerprint: fingerprintSchema(schema),
+      fingerprint,
+      ...(providerObservedAt
+        ? { providerObservedAt, providerObservedFingerprint: fingerprint }
+        : {}),
+      ...(providerAuthorityConflictAt ? { providerAuthorityConflictAt } : {}),
       // A previously-learned working example survives a schema refresh unless a
       // newer one arrives — losing it would re-open the failure it prevents.
       ...(redactExample(input.exampleArgs) ?? existing?.exampleArgs
@@ -139,7 +251,47 @@ export function saveToolContract(input: {
     };
     atomicWrite(file, record);
     pruneIfNeeded(dir);
-  } catch { /* a cache that cannot write must not break the call it was helping */ }
+    return record;
+  } catch {
+    // A cache that cannot write must not break the call it was helping.
+    return null;
+  }
+}
+
+/**
+ * A successful business call teaches only a redacted example. It never accepts
+ * a caller-supplied schema, so a fallback or mutated process object cannot
+ * overwrite a provider-observed contract. If discovery was unavailable, an
+ * inert validation-only object contract keeps the example without authority.
+ */
+export function saveToolContractExample(input: {
+  identifier: string;
+  exampleArgs: unknown;
+}): void {
+  if (!input.identifier) return;
+  const existing = loadToolContract(input.identifier);
+  saveToolContract({
+    identifier: input.identifier,
+    schema: existing?.schema ?? { type: 'object' },
+    exampleArgs: input.exampleArgs,
+  });
+}
+
+function normalizeProviderObservedAt(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const observedAt = Date.parse(value);
+  if (!Number.isFinite(observedAt) || observedAt < 0 || observedAt > Date.now()) return undefined;
+  return new Date(observedAt).toISOString();
+}
+
+function providerObservation(record: ToolContract | null): {
+  observedAt: string;
+  observedMs: number;
+} | null {
+  if (!record || record.providerObservedFingerprint !== record.fingerprint) return null;
+  const observedAt = normalizeProviderObservedAt(record.providerObservedAt);
+  if (!observedAt) return null;
+  return { observedAt, observedMs: Date.parse(observedAt) };
 }
 
 function readContractFile(file: string): ToolContract | null {

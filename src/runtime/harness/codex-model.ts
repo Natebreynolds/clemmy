@@ -1612,11 +1612,13 @@ export function recordCodexHarnessUsage(
     if (inputTokens + outputTokens <= 0) return;
     const cached = usage.input_tokens_details?.cached_tokens;
     const reasoning = usage.output_tokens_details?.reasoning_tokens;
+    const harnessContext = harnessRunContextStorage.getStore();
     recordModelUsage({
-      sessionId: harnessRunContextStorage.getStore()?.sessionId ?? 'unknown',
+      sessionId: harnessContext?.sessionId ?? 'unknown',
+      sourceUserSeq: harnessContext?.sourceUserSeq,
+      attemptId: harnessContext?.runAttemptId,
       model: modelId,
       trace: {
-        acceptedSource: harnessRunContextStorage.getStore()?.sessionId ?? 'unknown',
         brain: 'codex',
         ...(responseId ? { modelCallId: responseId } : {}),
       },
@@ -1627,7 +1629,7 @@ export function recordCodexHarnessUsage(
       reasoningTokens: typeof reasoning === 'number' ? reasoning : undefined,
       totalTokens: typeof usage.total_tokens === 'number' ? usage.total_tokens : inputTokens + outputTokens,
       responseId,
-      promptComponents: harnessRunContextStorage.getStore()?.promptComponents,
+      promptComponents: harnessContext?.promptComponents,
     });
   } catch { /* fail-silent */ }
 }

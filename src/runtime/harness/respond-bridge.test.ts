@@ -105,6 +105,58 @@ function fakeRun(result: Record<string, unknown>): never {
   }) as never;
 }
 
+function seedCompletedAnswerReplay(input: {
+  sessionId: string;
+  answerRequest?: string;
+  priorText?: string;
+  priorStatus?: 'done' | 'continue';
+}): {
+  prior: import('./eventlog.js').EventRow;
+  current: import('./eventlog.js').EventRow;
+  currentAttempt: ReturnType<typeof beginRunAttempt>;
+} {
+  const priorText = input.priorText ?? 'The workspace inspection is complete.';
+  const answerRequest = input.answerRequest ?? 'Repeat the last answer.';
+  createSession({ id: input.sessionId, kind: 'chat' });
+  const priorAttempt = beginRunAttempt(input.sessionId, { runId: `${input.sessionId}:prior` });
+  const prior = recordRunAttemptUserInput(priorAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Inspect the workspace and report the roots.' },
+  }, { armRunInFlight: true });
+  const priorIdentity = {
+    sessionId: input.sessionId,
+    turn: prior.turn,
+    sourceUserSeq: prior.seq,
+  } as const;
+  commitTurnOutcome(input.priorStatus === 'continue'
+    ? {
+        version: 2,
+        id: turnOutcomeId(priorIdentity),
+        identity: priorIdentity,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'continue' },
+        presentation: { kind: 'continue', text: 'The task has more work. Reply continue.' },
+      }
+    : {
+        version: 2,
+        id: turnOutcomeId(priorIdentity),
+        identity: priorIdentity,
+        status: 'done',
+        resumable: false,
+        presentation: { kind: 'answer', text: priorText },
+      });
+  finishRunAttempt(priorAttempt, 'completed');
+  const currentAttempt = beginRunAttempt(input.sessionId, { runId: `${input.sessionId}:current` });
+  const current = recordRunAttemptUserInput(currentAttempt, {
+    turn: 2,
+    role: 'user',
+    data: { text: answerRequest },
+  }, { armRunInFlight: true });
+  return { prior, current, currentAttempt };
+}
+
 function appendActiveWorkflowDispatch(source: import('./eventlog.js').EventRow, runId: string): void {
   const replyTarget = source.data.originReplyTarget as { type: 'origin_chat' };
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
@@ -215,6 +267,174 @@ test('harnessSurfaceEnabled: ALL surfaces default ON (FORK-collapse complete); k
   process.env.CLEMMY_HARNESS_DASHBOARD = 'off';
   assert.equal(harnessSurfaceEnabled('dashboard'), false, 'kill-switch disables the lane');
   delete process.env.CLEMMY_HARNESS_DASHBOARD;
+});
+
+test('explicit completed-answer replay is provider-neutral, zero-model, typed, and idempotent', async () => {
+  const providers = [
+    { label: 'claude', authMode: 'claude_oauth', claudeSdk: 'on', routingMode: 'balanced' },
+    { label: 'codex', authMode: 'codex_oauth', claudeSdk: 'off', routingMode: 'balanced' },
+    { label: 'byo', authMode: 'api_key', claudeSdk: 'off', routingMode: 'all_in' },
+  ] as const;
+
+  for (const provider of providers) {
+    process.env.AUTH_MODE = provider.authMode;
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = provider.claudeSdk;
+    process.env.MODEL_ROUTING_MODE = provider.routingMode;
+    const sessionId = `completed-answer-replay-${provider.label}`;
+    const seeded = seedCompletedAnswerReplay({
+      sessionId,
+      priorText: `${provider.label}: the exact task is complete.`,
+    });
+    let configureCalls = 0;
+    let buildCalls = 0;
+    let runCalls = 0;
+    let claudeCalls = 0;
+    let readPortCalls = 0;
+    let legacyCalls = 0;
+    _setBridgeImplsForTests({
+      configure: (async () => { configureCalls += 1; return { ok: true }; }) as never,
+      buildAgent: (async () => { buildCalls += 1; return FAKE_AGENT; }) as never,
+      runConversation: (async () => { runCalls += 1; throw new Error('model lane must not run'); }) as never,
+      claudeAgentBrain: (async () => { claudeCalls += 1; throw new Error('Claude must not run'); }) as never,
+      acceptedTurnReadPorts: (async () => { readPortCalls += 1; return null; }) as never,
+      completedAnswerReplayProtection: () => [],
+    });
+    const request = {
+      message: 'Repeat the last answer.',
+      sessionId,
+      sourceUserSeq: seeded.current.seq,
+      runId: seeded.currentAttempt.runId ?? undefined,
+    };
+    const first = await respondPreferHarness('home', request, async (req) => {
+      legacyCalls += 1;
+      return { text: 'legacy', sessionId: req.sessionId };
+    });
+    const second = await respondPreferHarness('home', request, async (req) => {
+      legacyCalls += 1;
+      return { text: 'legacy', sessionId: req.sessionId };
+    });
+
+    assert.equal(first.text, `${provider.label}: the exact task is complete.`);
+    assert.equal(second.text, first.text, `${provider.label}: transport retry replays the same winner`);
+    assert.equal(first.stoppedReason, 'success');
+    assert.equal(first.turnsUsed, 0);
+    assert.equal(first.route?.transport, 'completed_answer_replay');
+    assert.equal(first.route?.provider, undefined);
+    assert.equal(first.route?.effectiveModel, undefined);
+    assert.equal(second.route?.transport, 'completed_answer_replay');
+    assert.deepEqual(
+      { configureCalls, buildCalls, runCalls, claudeCalls, readPortCalls, legacyCalls },
+      { configureCalls: 0, buildCalls: 0, runCalls: 0, claudeCalls: 0, readPortCalls: 0, legacyCalls: 0 },
+      `${provider.label}: no runtime, brain, read-provider, or legacy work ran`,
+    );
+
+    const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
+    assert.equal(terminals.length, 2, `${provider.label}: prior + current typed terminals only`);
+    const currentTerminal = terminals.find((event) => event.data.sourceUserSeq === seeded.current.seq);
+    assert.ok(currentTerminal);
+    const presentation = currentTerminal.data.presentation as {
+      identity?: { sourceUserSeq?: number };
+      status?: string;
+      kind?: string;
+      resumable?: boolean;
+    };
+    assert.equal(presentation.identity?.sourceUserSeq, seeded.current.seq);
+    assert.equal(presentation.status, 'done');
+    assert.equal(presentation.kind, 'answer');
+    assert.equal(presentation.resumable, false);
+    assert.equal(currentTerminal.data.transport, 'completed_answer_replay');
+    assert.equal(currentTerminal.data.steps, 0);
+    assert.equal(currentTerminal.data.replayedFromSourceUserSeq, seeded.prior.seq);
+    assert.equal(typeof currentTerminal.data.replayedFromTerminalId, 'string');
+    assert.equal(typeof currentTerminal.data.replayedFromPresentationId, 'string');
+    assert.equal(listEvents(sessionId, { types: ['turn_model_routed'] }).length, 0);
+    assert.equal(listEvents(sessionId, { types: ['tool_called', 'tool_returned'] }).length, 0);
+    assert.equal(getLatestRunAttempt(sessionId)?.status, 'completed');
+    assert.equal(HarnessSession.load(sessionId)?.runInFlightSince(), null);
+  }
+});
+
+test('completed-answer replay declines unfinished, substantive, blocked, and unreadable cases', async () => {
+  const cases = [
+    { label: 'prior-needs-continue', priorStatus: 'continue' as const, answerRequest: 'Repeat the last answer.', protection: () => [] },
+    { label: 'substantive-repeat', priorStatus: 'done' as const, answerRequest: 'Repeat the last answer and refresh it.', protection: () => [] },
+    { label: 'durable-blocker', priorStatus: 'done' as const, answerRequest: 'Repeat the last answer.', protection: () => ['approval'] },
+    { label: 'unreadable', priorStatus: 'done' as const, answerRequest: 'Repeat the last answer.', protection: () => { throw new Error('ledger unreadable'); } },
+  ];
+
+  for (const item of cases) {
+    const sessionId = `completed-answer-replay-decline-${item.label}`;
+    const seeded = seedCompletedAnswerReplay({
+      sessionId,
+      answerRequest: item.answerRequest,
+      priorStatus: item.priorStatus,
+    });
+    let configureCalls = 0;
+    _setBridgeImplsForTests({
+      configure: (async () => { configureCalls += 1; return { ok: false, reason: 'test normal route' }; }) as never,
+      completedAnswerReplayProtection: item.protection,
+    });
+    const response = await respondPreferHarness('home', {
+      message: item.answerRequest,
+      sessionId,
+      sourceUserSeq: seeded.current.seq,
+      runId: seeded.currentAttempt.runId ?? undefined,
+    }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+
+    assert.equal(configureCalls, 1, `${item.label}: ordinary preflight ran`);
+    assert.notEqual(response.route?.transport, 'completed_answer_replay');
+    assert.notEqual(response.text, 'The workspace inspection is complete.');
+    const currentTerminal = listEvents(sessionId, { types: ['conversation_completed'] })
+      .find((event) => event.data.sourceUserSeq === seeded.current.seq);
+    assert.equal((currentTerminal?.data.presentation as { status?: string } | undefined)?.status, 'blocked');
+  }
+});
+
+test('Continue, Resume, and Keep going after a completed answer reach ordinary brain reasoning', async () => {
+  for (const [index, message] of ['Continue.', 'Resume!', 'Keep going!'].entries()) {
+    const sessionId = `conversational-continuation-${index}`;
+    const seeded = seedCompletedAnswerReplay({ sessionId, answerRequest: message });
+    const brainReply = `The brain handled ${message} as a new conversational turn.`;
+    let runCalls = 0;
+    let replayProtectionCalls = 0;
+    _setBridgeImplsForTests({
+      configure: okConfigure,
+      buildAgent: fakeAgentBuilder,
+      runConversation: (async (opts: { sessionId: string; buildAgent?: () => Promise<unknown> }) => {
+        runCalls += 1;
+        await opts.buildAgent?.();
+        return {
+          sessionId: opts.sessionId,
+          status: 'completed',
+          steps: 1,
+          lastTurn: 2,
+          lastDecision: {
+            summary: 'ordinary brain continuation',
+            reply: brainReply,
+            done: true,
+            nextAction: 'completed',
+          },
+        };
+      }) as never,
+      acceptedTurnReadPorts: () => null,
+      completedAnswerReplayProtection: () => {
+        replayProtectionCalls += 1;
+        return [];
+      },
+    });
+
+    const response = await respondPreferHarness('home', {
+      message,
+      sessionId,
+      sourceUserSeq: seeded.current.seq,
+      runId: seeded.currentAttempt.runId ?? undefined,
+    }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+
+    assert.equal(runCalls, 1, `${message}: ordinary brain ran once`);
+    assert.equal(replayProtectionCalls, 0, `${message}: answer-replay audit stayed off the hot path`);
+    assert.equal(response.text, brainReply, `${message}: the new brain reply was preserved`);
+    assert.equal(response.route?.transport, 'openai_agents_harness');
+  }
 });
 
 test('respondPreferHarness: dashboard rides the gated harness loop by DEFAULT (architect conversion baked in)', async () => {
@@ -590,6 +810,132 @@ test('respondPreferHarness: Claude auth + SDK brain opt-in routes chat through C
   assert.equal(res.text, 'claude sdk brain');
   assert.equal(legacyCalled, 0);
   assert.equal(runConversationCalled, 0, 'Claude SDK brain is a distinct route from the OpenAI SDK runner');
+});
+
+test('respondPreferHarness: exact compound decline reaches Claude with full text while graphing the fresh task', async () => {
+  const sessionId = 'claude-bridge-compound-decline';
+  const fullMessage = 'No—leave that note alone. Instead, what is 15 × 9? Answer that naturally without tools.';
+  const activeTaskInput = 'what is 15 × 9? Answer that naturally without tools.';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
+  const parent = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update the local note.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 7,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: 'Should I update it?',
+      options: ['Yes', 'No'],
+      purpose: 'clarification',
+      sourceUserSeq: parent.seq,
+    },
+  });
+  const parentIdentity = { sessionId, turn: parent.turn, sourceUserSeq: parent.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(parentIdentity),
+    identity: parentIdentity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: 'Should I update it?' },
+  });
+
+  const runId = 'run-claude-bridge-compound-decline';
+  const attempt = beginRunAttempt(sessionId, { runId });
+  const accepted = recordRunAttemptUserInput(attempt, {
+    turn: 2,
+    role: 'user',
+    data: { text: fullMessage, runId },
+  }, { armRunInFlight: true });
+
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  const priorJudge = process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE;
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  let claudeRequest: {
+    message: string;
+    semanticTaskInput?: string;
+    sourceUserSeq?: number;
+    taskContinuation?: {
+      answer: string;
+      disposition: string;
+      activeTaskInput?: string;
+      consumingSourceUserSeq: number;
+    };
+  } | undefined;
+  let providerPrompt = '';
+  let providerObjective = '';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    claudeAgentBrain: (async (surface, request) => {
+      claudeRequest = request;
+      return respondViaClaudeAgentSdkBrain(surface, request);
+    }) as never,
+  });
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    providerPrompt = options.prompt;
+    providerObjective = options.artifactObjective ?? '';
+    return {
+      text: '135',
+      sessionId: options.sessionId,
+      model: 'claude-sonnet-4-6',
+      toolUses: [],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+  });
+
+  try {
+    const response = await respondPreferHarness('home', {
+      message: fullMessage,
+      sessionId,
+      sourceUserSeq: accepted.seq,
+      runId,
+      channel: 'desktop',
+    }, async () => {
+      assert.fail('the exact Claude turn cannot fall through to legacy');
+    });
+
+    assert.equal(response.text, '135');
+    assert.equal(claudeRequest?.message, fullMessage, 'Claude receives the complete conversational correction');
+    assert.equal(claudeRequest?.sourceUserSeq, accepted.seq);
+    assert.equal(claudeRequest?.taskContinuation?.answer, fullMessage);
+    assert.equal(claudeRequest?.taskContinuation?.disposition, 'declined_with_new_task');
+    assert.equal(claudeRequest?.taskContinuation?.activeTaskInput, activeTaskInput);
+    assert.equal(claudeRequest?.taskContinuation?.consumingSourceUserSeq, accepted.seq);
+    assert.equal(claudeRequest?.semanticTaskInput, activeTaskInput);
+    assert.equal(providerPrompt, fullMessage, 'the provider prompt remains the user\'s full message');
+    assert.equal(providerObjective, activeTaskInput, 'Claude semantics use only the independent fresh task');
+
+    const acceptedAfter = listEvents(sessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === accepted.seq);
+    assert.equal(acceptedAfter?.id, accepted.id);
+    assert.equal(acceptedAfter?.data.text, fullMessage);
+    const graphs = listEvents(sessionId, { types: ['turn_graph_compiled'] });
+    assert.equal(graphs.length, 1, 'the exact accepted source owns one graph');
+    assert.equal(graphs[0].parentEventId, accepted.id);
+    assert.equal(graphs[0].data.sourceUserSeq, accepted.seq);
+    assert.equal(graphs[0].data.route, 'retrieve', 'the fresh what-is clause classifies as a bounded lookup');
+    const graph = graphs[0].data.graph as {
+      source?: { inputHash?: unknown };
+      classification?: { messageIntent?: unknown; route?: unknown };
+    };
+    assert.equal(graph.classification?.messageIntent, 'lookup');
+    assert.equal(graph.classification?.route, 'retrieve');
+    const activeHash = createHash('sha256').update(activeTaskInput, 'utf8').digest('hex');
+    const fullHash = createHash('sha256').update(fullMessage, 'utf8').digest('hex');
+    assert.equal(graph.source?.inputHash, activeHash, 'graph classification hashes the fresh active clause');
+    assert.notEqual(graph.source?.inputHash, fullHash, 'declined parent wording cannot shape graph semantics');
+  } finally {
+    if (priorJudge === undefined) delete process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE;
+    else process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = priorJudge;
+  }
 });
 
 test('active-Claude cron dispatches through the tool-capable SDK lane', async () => {
@@ -1984,7 +2330,8 @@ test('all_in gpt-shaped BYO route diagnostics and event telemetry report the act
 
   const routed = listEvents('route-gpt-shaped-byo', { types: ['turn_model_routed'] });
   assert.equal(routed.length, 1);
-  assert.deepEqual(routed[0].data, {
+  const { sourceUserSeq, attemptId, ...routeData } = routed[0].data;
+  assert.deepEqual(routeData, {
     model: 'gpt-4o',
     provider: 'byo',
     transport: 'openai_agents_harness',
@@ -1992,6 +2339,10 @@ test('all_in gpt-shaped BYO route diagnostics and event telemetry report the act
     routeKind: 'harness',
     surface: 'home',
   });
+  const accepted = listEvents('route-gpt-shaped-byo', { types: ['user_input_received'] });
+  assert.equal(sourceUserSeq, accepted[0]?.seq, 'route evidence owns the exact accepted source');
+  assert.equal(attemptId, getLatestRunAttempt('route-gpt-shaped-byo')?.attemptId,
+    'route evidence owns the exact physical attempt');
 });
 
 test('respondViaHarness: relays harness tool/progress events to legacy callbacks', async () => {

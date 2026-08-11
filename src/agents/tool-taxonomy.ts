@@ -29,12 +29,24 @@
  *   the scope policy take care of the rest.
  */
 
-import { evaluateAutoApprove, isAutoApprovedByScope, recordAutoApproval, summarizeToolArgs } from './plan-scope.js';
+import {
+  evaluateAutoApprove,
+  isDestructiveActionApprovedByScope,
+  recordAutoApproval,
+  summarizeToolArgs,
+} from './plan-scope.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import type { AutoApproveScope } from './proactivity-policy.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import {
+  canonicalToolToken,
+  extractComposioSlug,
+  isComposioMultiplexerName,
+  isDestructiveToolInvocation,
+  resolveToolInvocation,
+} from './tool-invocation.js';
 
 export type ToolKind =
   | 'read'      // pure lookup; never asks
@@ -422,7 +434,7 @@ function normalizeForMatch(name: string): string {
   const sep = '__';
   const idx = name.indexOf(sep);
   const local = idx > 0 ? name.slice(idx + sep.length) : name;
-  return local.toLowerCase();
+  return canonicalToolToken(local);
 }
 
 /**
@@ -465,9 +477,9 @@ export function classifyTool(name: string, options: ClassifyOptions = {}): ToolK
 
   // Composio broker: composio_execute_tool's "real kind" depends on the
   // slug it was asked to invoke. Pull it out of args when available.
-  if (name === 'composio_execute_tool' && options.args && typeof options.args === 'object') {
-    const slug = (options.args as { tool_slug?: unknown }).tool_slug;
-    if (typeof slug === 'string' && slug.trim()) {
+  if (isComposioMultiplexerName(name)) {
+    const slug = extractComposioSlug(options.args);
+    if (slug) {
       return classifyComposioSlug(slug);
     }
     // Slug missing → conservative: treat as send.
@@ -506,6 +518,18 @@ export function classifyTool(name: string, options: ClassifyOptions = {}): ToolK
   // ask, not silently run. Once a name lands in this branch in the
   // wild, add an explicit pattern (and a test).
   return 'write';
+}
+
+function hasKnownToolClassification(name: string, args: unknown): boolean {
+  if (ALWAYS_READ.has(name) || ALWAYS_ADMIN.has(name) || NEVER_GATE_LOCAL_MEMORY.has(name)) return true;
+  const rawLower = name.toLowerCase();
+  if (rawLower.startsWith('dataforseo__') || rawLower.startsWith('dataforseo-mcp-server__')) return true;
+  if (name === 'memory_self_heal' || name.endsWith('__memory_self_heal')) return true;
+  if (isComposioMultiplexerName(name)) return Boolean(extractComposioSlug(args));
+  if (name.startsWith('cx_')) return name.length > 3;
+  const norm = normalizeForMatch(name);
+  return NAME_PATTERNS.some(({ verbs }) => verbs.some((verb) => matchesVerb(norm, verb)))
+    || isIrreversibleSendSlug(name);
 }
 
 export interface ApprovalDecisionInput {
@@ -553,50 +577,38 @@ export interface ApprovalDecision {
     | 'send-trust'
     | 'strict-policy'
     | 'pending-action-owned'
+    | 'untrusted-multiplexer'
     | 'unknown';
   kind: ToolKind;
 }
 
-/** Verbs whose provider effect is destroying user data. Deliberately NARROW —
- *  REMOVE/CLEAR/CANCEL are commonly reversible bookkeeping (remove a label,
- *  clear a filter, respond to an invite) and gating them would re-create the
- *  over-prompting this wave removes. */
-const DESTRUCTIVE_SLUG_VERBS = new Set(['DELETE', 'TRASH', 'PURGE', 'DESTROY', 'WIPE', 'ERASE', 'DROP']);
-
-function destructiveSlugFromArgs(args: unknown): string | undefined {
-  if (typeof args === 'string') {
-    try { return destructiveSlugFromArgs(JSON.parse(args) as unknown); } catch { return undefined; }
-  }
-  if (!args || typeof args !== 'object') return undefined;
-  const slug = (args as Record<string, unknown>).tool_slug;
-  return typeof slug === 'string' && slug ? slug : undefined;
-}
-
 export function isDestructiveExternalToolCall(toolName: string, args?: unknown): boolean {
-  const slug = destructiveSlugFromArgs(args)
-    ?? (toolName.startsWith('cx_') ? toolName.slice(3).toUpperCase() : undefined);
-  if (slug) {
-    return slug.toUpperCase().split('_').some((token) => DESTRUCTIVE_SLUG_VERBS.has(token));
-  }
-  // Native MCP tool names (mcp__server__sharepoint_delete_item and friends).
-  if (toolName.startsWith('mcp__')) {
-    return toolName.toUpperCase().split('_').some((token) => DESTRUCTIVE_SLUG_VERBS.has(token));
-  }
-  return false;
+  return isDestructiveToolInvocation(toolName, args);
 }
 
 export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecision {
-  const kind = classifyTool(input.toolName, {
-    kindHint: input.kindHint,
-    args: input.args,
+  const resolved = resolveToolInvocation(input.toolName, input.args);
+  const semanticTool = resolved.valid ? resolved.toolName : input.toolName;
+  const semanticArgs = resolved.valid ? resolved.args : input.args;
+  const kind = classifyTool(semanticTool, {
+    // A nested action, never the outer broker hint, owns its effect class.
+    kindHint: resolved.nested ? undefined : input.kindHint,
+    args: semanticArgs,
   });
+
+  if (!resolved.valid) {
+    return { needsApproval: true, reason: 'untrusted-multiplexer', kind };
+  }
+  if (resolved.nested && !hasKnownToolClassification(semanticTool, semanticArgs)) {
+    return { needsApproval: true, reason: 'untrusted-multiplexer', kind };
+  }
 
   // Local memory bookkeeping is the cheapest possible write — no
   // network, no external mutation, no shared state. Treat as read
   // for approval purposes regardless of the kind classifier's word
   // matching (e.g. `tool_choice_remember` matches the `remember`
   // verb and would otherwise count as `write`).
-  if (NEVER_GATE_LOCAL_MEMORY.has(input.toolName)) {
+  if (NEVER_GATE_LOCAL_MEMORY.has(semanticTool)) {
     return { needsApproval: false, reason: 'read-always-auto', kind };
   }
 
@@ -608,7 +620,7 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
   // propose, a second to approve the queued plan (live 2026-07-09
   // double-approval regression: four cards for one 10-email batch). Same class as the
   // 2026-06-17 double-approval fix above.
-  if (input.toolName === 'run_batch') {
+  if (semanticTool === 'run_batch') {
     return { needsApproval: false, reason: 'pending-action-owned', kind };
   }
 
@@ -625,17 +637,41 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
   const destructiveCall = input.isDestructiveHint === true
     || isDestructiveExternalToolCall(input.toolName, input.args);
   if (destructiveCall) {
-    if (isAutoApprovedByScope(input.sessionId, input.toolName, input.args)) {
+    if (isDestructiveActionApprovedByScope(input.sessionId, input.toolName, input.args)) {
       if (input.sessionId) {
         recordAutoApproval(
           input.sessionId,
-          input.toolName,
-          `[plan-scope:destructive] kind=${kind} ${summarizeToolArgs(input.toolName, input.args)}`,
+          semanticTool,
+          `[plan-scope:destructive] kind=${kind} ${summarizeToolArgs(semanticTool, semanticArgs)}`,
         );
       }
       return { needsApproval: false, reason: 'plan-scope', kind };
     }
     return { needsApproval: true, reason: 'destructive-hint', kind };
+  }
+  // A foreign shell/Composio gateway cannot inherit Clementine's local smart
+  // semantics or ride YOLO. An exact plan-scoped Composio slug may still pass
+  // through evaluateAutoApprove below.
+  if (resolved.unsafeExternalMultiplexer) {
+    const scoped = evaluateAutoApprove({
+      sessionId: input.sessionId,
+      toolName: input.toolName,
+      args: input.args,
+      scope: 'strict',
+      insideWorkspace: false,
+      kindHint: kind === 'send' ? 'send' : 'other',
+    });
+    if (scoped.autoApproved) {
+      if (input.sessionId) {
+        recordAutoApproval(
+          input.sessionId,
+          semanticTool,
+          `[${scoped.reason}] kind=${kind} ${summarizeToolArgs(semanticTool, semanticArgs)}`,
+        );
+      }
+      return { needsApproval: false, reason: scoped.reason === 'plan-scope' ? 'plan-scope' : 'send-trust', kind };
+    }
+    return { needsApproval: true, reason: 'untrusted-multiplexer', kind };
   }
   if (kind === 'read') {
     return { needsApproval: false, reason: 'read-always-auto', kind };
@@ -646,12 +682,12 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
   // applies to write/execute on agent-managed paths (vault, state, logs,
   // meeting-capture/analysis/, etc.). For 'send' (network) there's no
   // path concept, so the hint is meaningless and ignored.
-  if (kind !== 'send' && input.insideAgentOwnedDirHint) {
+  if (kind !== 'send' && !resolved.nested && input.insideAgentOwnedDirHint) {
     if (input.sessionId) {
       recordAutoApproval(
         input.sessionId,
-        input.toolName,
-        `[agent-owned-dir] kind=${kind} ${summarizeToolArgs(input.toolName, input.args)}`,
+        semanticTool,
+        `[agent-owned-dir] kind=${kind} ${summarizeToolArgs(semanticTool, semanticArgs)}`,
       );
     }
     return { needsApproval: false, reason: 'agent-owned-dir', kind };
@@ -676,8 +712,8 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
     if (input.sessionId) {
       recordAutoApproval(
         input.sessionId,
-        input.toolName,
-        `[${decision.reason}] kind=${kind} ${summarizeToolArgs(input.toolName, input.args)}`,
+        semanticTool,
+        `[${decision.reason}] kind=${kind} ${summarizeToolArgs(semanticTool, semanticArgs)}`,
       );
     }
     const reason =
@@ -695,12 +731,12 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
   // consent by asking for a report, proposal, CSV, draft, etc. Network
   // sends, shell commands, admin ops, and destructive hints still use
   // the normal approval gates above/below.
-  if (input.toolName === 'write_file' && input.insideWorkspaceHint) {
+  if (semanticTool === 'write_file' && !resolved.nested && input.insideWorkspaceHint) {
     if (input.sessionId) {
       recordAutoApproval(
         input.sessionId,
-        input.toolName,
-        `[local-workspace-write] kind=${kind} ${summarizeToolArgs(input.toolName, input.args)}`,
+        semanticTool,
+        `[local-workspace-write] kind=${kind} ${summarizeToolArgs(semanticTool, semanticArgs)}`,
       );
     }
     return { needsApproval: false, reason: 'local-workspace-write', kind };

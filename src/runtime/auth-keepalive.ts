@@ -64,6 +64,7 @@ export async function tickAuthKeepalive(): Promise<void> {
 
     const tokens = getStoredCodexOAuthTokens();
     if (!tokens?.accessToken) return; // api_key mode or not signed in — nothing to warm
+    if (tokens.accessOnly) return; // isolated proof snapshots are intentionally non-refreshable
 
     if (accessTokenExpiresSoon(tokens.accessToken, KEEPALIVE_SKEW_MS)) {
       const result = await refreshStoredNativeOAuth();

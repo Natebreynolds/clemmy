@@ -22,6 +22,7 @@ import {
   openHarnessDb,
   sessionMetrics,
   sessionRouteEvidence,
+  sessionUsageBreakdown,
   stormCheck,
   summarizeAllSessions,
   tokenCeilingCheck,
@@ -121,6 +122,22 @@ function addUsage(home: string, source: string, model: string): void {
   );
 }
 
+function addDetailedUsage(
+  home: string,
+  fileDate: string,
+  event: Record<string, unknown>,
+): void {
+  const dir = path.join(home, 'state', 'token-usage');
+  mkdirSync(dir, { recursive: true });
+  appendFileSync(path.join(dir, `${fileDate}.ndjson`), `${JSON.stringify(event)}\n`);
+}
+
+function setSessionTokensUsed(home: string, sessionId: string, tokensUsed: number): void {
+  const db = new Database(path.join(home, 'state', 'harness.db'));
+  db.prepare('UPDATE sessions SET tokens_used = ? WHERE id = ?').run(tokensUsed, sessionId);
+  db.close();
+}
+
 function addOperationalFallover(home: string, sessionId: string): void {
   const db = new Database(path.join(home, 'state', 'operational-telemetry.db'));
   db.exec(`
@@ -199,6 +216,176 @@ test('summarizeAllSessions returns every session', () => {
     db.close();
     assert.equal(all.length, 1);
     assert.equal(all[0].sessionId, 'sess-1');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('sessionUsageBreakdown uses explicit lanes and reconciles canonical usage across files', () => {
+  const home = buildFixtureHome();
+  const base = {
+    at: '2026-07-01T23:59:59.000Z',
+    source: 'sess-1',
+    kind: 'chat',
+  };
+  try {
+    setSessionTokensUsed(home, 'sess-1', 212);
+    addDetailedUsage(home, '2026-07-01', {
+      ...base,
+      model: 'claude-sonnet-4-6',
+      cacheDialect: 'inclusive',
+      trace: { lane: 'worker' },
+      inputTokens: 100,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 20,
+      outputTokens: 10,
+      totalTokens: 110,
+    });
+    addDetailedUsage(home, '2026-07-02', {
+      ...base,
+      at: '2026-07-02T00:00:01.000Z',
+      model: 'claude-sonnet-4-6',
+      cacheDialect: 'inclusive',
+      trace: { lane: 'worker' },
+      inputTokens: 100,
+      cachedInputTokens: 80,
+      cacheCreationInputTokens: 0,
+      outputTokens: 10,
+      totalTokens: 110,
+    });
+    addDetailedUsage(home, '2026-07-02', {
+      ...base,
+      model: 'claude-sonnet-4-6',
+      cacheDialect: 'inclusive',
+      trace: { lane: 'brain' },
+      inputTokens: 50,
+      cachedInputTokens: 20,
+      outputTokens: 5,
+      totalTokens: 55,
+    });
+    addDetailedUsage(home, '2026-07-02', {
+      ...base,
+      model: 'gpt-5.4',
+      cacheDialect: 'none',
+      trace: { lane: 'auxiliary' },
+      inputTokens: 20,
+      outputTokens: 2,
+      totalTokens: 22,
+    });
+    addDetailedUsage(home, '2026-07-02', {
+      ...base,
+      model: 'gpt-5.4-mini',
+      cacheDialect: 'exclusive',
+      inputTokens: 12,
+      cachedInputTokens: 8,
+      outputTokens: 3,
+      totalTokens: 15,
+    });
+    addDetailedUsage(home, '2026-07-02', {
+      ...base,
+      source: 'sess-10',
+      model: 'must-not-match-by-prefix',
+      cacheDialect: 'none',
+      inputTokens: 999,
+      outputTokens: 1,
+      totalTokens: 1_000,
+    });
+    appendFileSync(path.join(home, 'state', 'token-usage', '2026-07-02.ndjson'), '{malformed\n');
+
+    const breakdown = sessionUsageBreakdown(home, 'sess-1');
+    assert.equal(breakdown.usageRecordCount, 5);
+    assert.equal(breakdown.malformedUsageRecordCount, 1);
+    assert.equal(breakdown.explicitRoleUsageRecords, 4);
+    assert.equal(breakdown.unattributedUsageRecords, 1);
+    assert.equal(breakdown.zeroCacheWorkerCalls, 1);
+    assert.deepEqual(breakdown.rows.map((row) => row.role), [
+      'brain', 'worker', 'auxiliary', 'unattributed',
+    ]);
+
+    const worker = breakdown.rows.find((row) => row.role === 'worker');
+    assert.ok(worker);
+    assert.equal(worker.callCount, 2);
+    assert.equal(worker.grossPromptTokens, 200);
+    assert.equal(worker.cacheReadInputTokens, 80);
+    assert.equal(worker.cacheReadRecordedCalls, 2);
+    assert.equal(worker.cacheCreationInputTokens, 20);
+    assert.equal(worker.cacheCreationRecordedCalls, 2);
+    assert.equal(worker.uncachedInputTokens, 120);
+    assert.equal(worker.outputTokens, 20);
+    assert.equal(worker.accruedTokens, 140);
+    assert.equal(worker.cacheHitRatio, 0.4);
+    assert.equal(worker.zeroCacheCalls, 1);
+    assert.equal(worker.phase, null);
+    assert.equal(worker.wave, null);
+
+    assert.deepEqual(breakdown.totals, {
+      callCount: 5,
+      grossPromptTokens: 290,
+      cacheReadInputTokens: 108,
+      cacheReadRecordedCalls: 5,
+      cacheCreationInputTokens: null,
+      cacheCreationRecordedCalls: 2,
+      uncachedInputTokens: 182,
+      outputTokens: 30,
+      accruedTokens: 212,
+      cacheHitRatio: 0.3724,
+      sessionTokensUsed: 212,
+      accrualDeltaFromSession: 0,
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('sessionUsageBreakdown leaves absent cache-read evidence and legacy roles unknown', () => {
+  const home = buildFixtureHome();
+  try {
+    addDetailedUsage(home, '2026-07-01', {
+      at: '2026-07-01T10:00:00.000Z',
+      source: 'sess-1',
+      kind: 'chat',
+      model: 'claude-sonnet-4-6',
+      cacheDialect: 'inclusive',
+      trace: { lane: 'worker' },
+      inputTokens: 10,
+      outputTokens: 1,
+      totalTokens: 11,
+    });
+    addDetailedUsage(home, '2026-07-01', {
+      at: '2026-07-01T10:00:01.000Z',
+      source: 'sess-1',
+      kind: 'chat',
+      model: 'claude-sonnet-4-6',
+      cacheDialect: 'inclusive',
+      inputTokens: 10,
+      cachedInputTokens: 0,
+      outputTokens: 1,
+      totalTokens: 11,
+    });
+
+    const breakdown = sessionUsageBreakdown(home, 'sess-1');
+    const worker = breakdown.rows.find((row) => row.role === 'worker');
+    assert.ok(worker);
+    assert.equal(worker.cacheReadRecordedCalls, 0);
+    assert.equal(worker.cacheHitRatio, null);
+    assert.equal(worker.zeroCacheCalls, null);
+    assert.equal(breakdown.zeroCacheWorkerCalls, null);
+    assert.equal(breakdown.unattributedUsageRecords, 1);
+    assert.match(breakdown.limitations.join('\n'), /cache-read presence was not explicit/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('sessionUsageBreakdown handles a missing usage directory without fabricating rows', () => {
+  const home = buildFixtureHome();
+  try {
+    const breakdown = sessionUsageBreakdown(home, 'sess-1');
+    assert.equal(breakdown.usageRecordCount, 0);
+    assert.deepEqual(breakdown.rows, []);
+    assert.equal(breakdown.zeroCacheWorkerCalls, null);
+    assert.equal(breakdown.totals.cacheHitRatio, null);
+    assert.match(breakdown.limitations.join('\n'), /token-usage directory was unavailable/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -403,6 +590,11 @@ test('worker and whole-leg usage proof are exact and session-scoped', () => {
     addUsage(home, 'sess-1', expected.modelId);
     assert.equal(exactWorkerRouteChecks(home, 'sess-1', expected).every((check) => check.pass), true);
     assert.equal(exactBrainServedChecks(home, ['sess-1'], expected).every((check) => check.pass), true);
+    assert.equal(
+      exactBrainServedChecks(home, ['cold-session'], expected)[1]?.pass,
+      false,
+      'a per-route served check cannot borrow exact-model completion evidence from a warm session',
+    );
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

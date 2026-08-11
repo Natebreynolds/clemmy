@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
-import { resolveMcpToolScope, resolveMcpToolScopeWithContinuity, resolveMcpToolScopeWithRecall, isToolScopeContinuation, type McpToolScope } from './mcp-tool-scope.js';
+import { resolveMcpToolScope, resolveMcpToolScopeWithContinuity, resolveMcpToolScopeWithRecall, isToolScopeContinuation, mcpToolScopeAuthority, type McpToolScope } from './mcp-tool-scope.js';
 import type { StepToolChoiceMatch } from '../memory/tool-choice-store.js';
 
 function mcpMatch(identifier: string, tier: 'high' | 'medium' = 'high'): StepToolChoiceMatch {
@@ -103,7 +103,9 @@ test('resolveMcpToolScope: explicit local-memory diagnostics cannot be misread a
   assert.deepEqual(scope.allowedServerSlugs, []);
   assert.equal(scope.maxTools, 0);
   assert.ok(!scope.failOpenCandidate);
-  assert.match(scope.reason, /local-only\/no-external-tools/i);
+  // The contract is the authority, not the sentence describing it: an explicit
+  // refusal must resolve to zero external authority however it is worded.
+  assert.equal(mcpToolScopeAuthority(scope), 'none');
 });
 
 test('resolveMcpToolScope: an email column in a Sheet is structured data, not Outlook intent', () => {
@@ -510,7 +512,9 @@ test('resolveMcpToolScope: without-running-any wording suppresses comma-list ext
   assert.equal(scope.allowAll, undefined);
   assert.deepEqual(scope.allowedServerSlugs, []);
   assert.equal(scope.maxTools, 0);
-  assert.match(scope.reason, /local context/i);
+  // "Without running any … external MCP lookups" is an explicit refusal, so it
+  // now resolves to zero authority rather than merely an empty surface.
+  assert.equal(mcpToolScopeAuthority(scope), 'none');
 });
 
 test('resolveMcpToolScope: fresh SEO follow-ups can still request DataForSEO', () => {
@@ -658,6 +662,19 @@ test('the structural signal covers go-aheads no word list would contain', () => 
       `"${answer}" answers a question — the scope must survive it`,
     );
   }
+});
+
+test('a typed decline never inherits the parent external MCP scope', () => {
+  const scope = resolveMcpToolScopeWithContinuity({
+    userInput: 'No.',
+    priorUserInputs: ['Send the client email through Outlook.'],
+    awaitingAnswer: false,
+    answerDisposition: 'declined',
+  });
+  assert.equal(scope.maxTools, 0);
+  assert.deepEqual(scope.allowedServerSlugs, []);
+  assert.deepEqual(scope.allowedToolNames, []);
+  assert.match(scope.reason, /declined/);
 });
 
 test('awaitingAnswer never over-inherits: a fresh topic still wins', () => {

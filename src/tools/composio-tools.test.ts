@@ -1,7 +1,7 @@
 /**
  * Run: npx tsx --test src/tools/composio-tools.test.ts
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -30,6 +30,11 @@ const {
   normalizeInlineConnectedAccountId,
   applySuppressedComposioConnectionPolicy,
   buildComposioStatusPayload,
+  stableComposioAccountIdentityFromSnapshot,
+  normalizeComposioCliSearchMatches,
+  hydrateComposioCliSearchSchemas,
+  resolveComposioDispatch,
+  dispatchComposioTool,
 } = await import('./composio-tools.js');
 const {
   closeEventLog,
@@ -91,6 +96,73 @@ test('formatComposioToolOutput falls back to a non-recallable clip without harne
 
   assert.match(output, /truncated/);
   assert.doesNotMatch(output, /recall_tool_result/);
+});
+
+test('CLI search normalization hydrates current slug-plus-schema-path responses', () => {
+  const schemaDir = path.join(TMP_HOME, '.composio', 'tool_definitions');
+  mkdirSync(schemaDir, { recursive: true });
+  writeFileSync(path.join(schemaDir, 'PROOF_LIST_TASKS.json'), JSON.stringify({
+    version: 'proof-v1',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  }), 'utf8');
+  const raw = {
+    results: [{
+      query: 'proof release queue current items',
+      primary_tool_slugs: ['PROOF_LIST_TASKS'],
+      related_tool_slugs: [],
+    }],
+    tool_schemas: {
+      primary: { PROOF_LIST_TASKS: '~/.composio/tool_definitions/PROOF_LIST_TASKS.json' },
+      related_tools_path_format: '~/.composio/tool_definitions/<TOOL_SLUG>.json',
+    },
+    connected_toolkits: ['google_calendar'],
+  };
+  const matches = hydrateComposioCliSearchSchemas(
+    raw,
+    normalizeComposioCliSearchMatches(raw, 'proof release queue current items', 5),
+    TMP_HOME,
+  );
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches.some((match: { slug: string }) => match.slug === 'GOOGLE_CALENDAR'), false);
+  assert.deepEqual(matches[0], {
+    toolkit: 'proof',
+    slug: 'PROOF_LIST_TASKS',
+    name: 'PROOF_LIST_TASKS',
+    score: matches[0]!.score,
+    inputParameters: { type: 'object', properties: {}, additionalProperties: false },
+  });
+  assert.ok(matches[0]!.score > 0);
+
+  writeFileSync(path.join(schemaDir, 'GMAIL_SEND_EMAIL.json'), JSON.stringify({
+    inputSchema: { type: 'object', required: ['to'] },
+  }), 'utf8');
+  const mismatched = {
+    ...raw,
+    tool_schemas: {
+      ...raw.tool_schemas,
+      primary: { PROOF_LIST_TASKS: '~/.composio/tool_definitions/GMAIL_SEND_EMAIL.json' },
+    },
+  };
+  const refused = hydrateComposioCliSearchSchemas(
+    mismatched,
+    normalizeComposioCliSearchMatches(mismatched, 'proof release queue current items', 5),
+    TMP_HOME,
+  );
+  assert.equal(refused[0]?.inputParameters, undefined, 'a path for another slug cannot grant schema authority');
+});
+
+test('CLI search normalization rejects toolkit rows and deduplicates action slugs', () => {
+  const matches = normalizeComposioCliSearchMatches({
+    slug: 'proof',
+    tools: [
+      { slug: 'PROOF_LIST_TASKS', name: 'List tasks', inputParameters: { type: 'object' } },
+      { tool_slug: 'PROOF_LIST_TASKS', name: 'List tasks', score: 99 },
+    ],
+  }, 'list tasks', 10);
+
+  assert.deepEqual(matches.map((match: { slug: string }) => match.slug), ['PROOF_LIST_TASKS']);
+  assert.equal(matches[0]!.score, 99);
 });
 
 test('ambiguous Composio mutation errors never replay the provider dispatch', async () => {
@@ -173,6 +245,12 @@ test('normalizeInlineConnectedAccountId lets the explicit outer connection win a
   const junk = normalizeInlineConnectedAccountId({ connected_account_id: 'null', q: 'x' }, undefined);
   assert.equal(junk.connectedAccountId, undefined);
   assert.deepEqual(junk.args, { q: 'x' });
+
+  for (const sentinel of ['null', 'NONE', ' undefined ', '']) {
+    const outerJunk = normalizeInlineConnectedAccountId({ q: 'x' }, sentinel);
+    assert.equal(outerJunk.connectedAccountId, undefined, `outer ${JSON.stringify(sentinel)} is absence`);
+    assert.deepEqual(outerJunk.args, { q: 'x' });
+  }
 });
 
 test('normalizeInlineConnectedAccountId strips Clementine artifact-slot metadata before provider validation', () => {
@@ -182,6 +260,95 @@ test('normalizeInlineConnectedAccountId strips Clementine artifact-slot metadata
     title: 'Appendix',
   }, undefined);
   assert.deepEqual(normalized.args, { title: 'Appendix' });
+});
+
+test('single connected account learning binds normalized stable identity, never its rotating connection id', () => {
+  const identity = stableComposioAccountIdentityFromSnapshot(
+    'OUTLOOK_LIST_MESSAGES',
+    'ca_rotates_on_reauth',
+    undefined,
+    [{
+      slug: 'outlook',
+      connectionId: 'ca_rotates_on_reauth',
+      status: 'ACTIVE',
+      accountEmail: ' SMTP:Person@Example.COM ',
+    }],
+  );
+  assert.equal(identity, 'person@example.com');
+  assert.notEqual(identity, 'ca_rotates_on_reauth');
+  assert.equal(stableComposioAccountIdentityFromSnapshot(
+    'OUTLOOK_LIST_MESSAGES',
+    'ca_rotates_on_reauth',
+    'someone-else@example.com',
+    [{
+      slug: 'outlook', connectionId: 'ca_rotates_on_reauth', status: 'ACTIVE', accountEmail: 'person@example.com',
+    }],
+  ), undefined, 'a rewritten final gateway identity was trusted as learning authority');
+  assert.equal(stableComposioAccountIdentityFromSnapshot(
+    'OUTLOOK_LIST_MESSAGES',
+    'ca_missing_from_snapshot',
+    'person@example.com',
+    [{
+      slug: 'outlook', connectionId: 'ca_rotates_on_reauth', status: 'ACTIVE', accountEmail: 'person@example.com',
+    }],
+  ), undefined, 'identity text without its exact final snapshot row became learning authority');
+});
+
+test('strict preferred identity selects only its exact active account and carries that pair to the dispatch boundary', async () => {
+  const { __test__: composioClientTest } = await import('../integrations/composio/client.js');
+  const schemaCache = await import('./composio-schema-cache.js');
+  const slug = 'OUTLOOK_LIST_MESSAGES';
+  schemaCache.rememberToolSchema(slug, { type: 'object', properties: {}, additionalProperties: false }, Date.now());
+  composioClientTest.setConnectedAccountsLoader(async () => [
+    {
+      id: 'ca_exact_work', toolkit: { slug: 'outlook' }, status: 'ACTIVE',
+      data: { user_info: { email: 'work@example.com' } },
+    },
+    {
+      id: 'ca_other_home', toolkit: { slug: 'outlook' }, status: 'ACTIVE',
+      data: { user_info: { email: 'home@example.com' } },
+    },
+  ]);
+  try {
+    const exact = await resolveComposioDispatch(slug, {}, undefined, {
+      preferredIdentity: ' WORK@EXAMPLE.COM ',
+      strictPreferredIdentity: true,
+    });
+    assert.equal(exact.ok, true);
+    if (!exact.ok) assert.fail(exact.message);
+    assert.equal(exact.connectionId, 'ca_exact_work');
+    assert.equal(exact.identity, 'work@example.com');
+    assert.deepEqual(exact.accountIdentityProof, {
+      connectionId: 'ca_exact_work', identity: 'work@example.com',
+    });
+
+    let boundaryContext: { connectionId?: string; identity?: string } | undefined;
+    const dispatched = await dispatchComposioTool(slug, {}, {
+      preferredIdentity: 'work@example.com',
+      strictPreferredIdentity: true,
+      dispatchBoundary: async (context) => {
+        boundaryContext = context;
+        return { successful: true, data: { items: [] } };
+      },
+    });
+    assert.equal(dispatched.ok, true);
+    assert.deepEqual(boundaryContext, {
+      toolSlug: slug,
+      args: {},
+      connectionId: 'ca_exact_work',
+      identity: 'work@example.com',
+      schemaFingerprint: schemaCache.liveComposioSchemaFingerprint(slug),
+    });
+
+    const absent = await resolveComposioDispatch(slug, {}, undefined, {
+      preferredIdentity: 'missing@example.com',
+      strictPreferredIdentity: true,
+    });
+    assert.equal(absent.ok, false);
+    if (!absent.ok) assert.equal(absent.reason, 'identity-absent');
+  } finally {
+    composioClientTest.setConnectedAccountsLoader(null);
+  }
 });
 
 test('applySuppressedComposioConnectionPolicy repairs stale pins for read-only Composio calls', () => {
@@ -1279,6 +1446,87 @@ test('a gateway refusal is a nominal pre-dispatch RETURN and performs zero provi
   assert.match(refusal.output, /provider-dispatch:not-started:not-connected/i);
   assert.match(refusal.reason, /provider-dispatch:not-started/);
   assert.equal(dispatches, 0);
+});
+
+test('a current closed no-arg read repairs invented inner args once and dispatches exactly {}', async () => {
+  const { runComposioExecuteWithGatewayForTest } = await import('./composio-tools.js');
+  const { __test__: composioClientTest } = await import('../integrations/composio/client.js');
+  const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
+  const schemaCache = await import('./composio-schema-cache.js');
+  const slug = 'PROOF_LIST_TASKS';
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  }, Date.now());
+  composioClientTest.setConnectedAccountsLoader(async () => [{
+    id: 'ca_proof_no_arg_read',
+    toolkit: { slug: 'proof' },
+    status: 'ACTIVE',
+    data: { user_info: { email: 'proof@example.test' } },
+  }]);
+
+  let dispatches = 0;
+  let dispatchedArgs: Record<string, unknown> | undefined;
+  try {
+    const out = await runComposioExecuteWithGatewayForTest(
+      slug,
+      { force_refresh: true },
+      (async (_toolSlug: string, args: Record<string, unknown>) => {
+        dispatches += 1;
+        dispatchedArgs = args;
+        return {
+          successful: true,
+          data: { sourceMarker: 'PROOF_RELEASE_QUEUE:LOCAL_ONLY', revision: 2, items: [] },
+        };
+      }) as never,
+      'sess-closed-no-arg-read-repair',
+    );
+    assert.equal(dispatches, 1, 'the local projection must not add a retry or second provider call');
+    assert.deepEqual(dispatchedArgs, {}, 'the executor receives the schema\'s sole legal payload');
+    assert.match(out, /\[argument-repair\].*force_refresh/s);
+    assert.match(out, /fresh provider read was still dispatched; no earlier result was replayed/i);
+    assert.match(out, /revision["']?:?\s*2/i);
+
+    let outOfScopeDispatches = 0;
+    const shouldNotDispatch = (async () => {
+      outOfScopeDispatches += 1;
+      return { successful: true };
+    }) as never;
+
+    const filteredSlug = 'PROOF_LIST_FILTERED_TASKS';
+    schemaCache.rememberToolSchema(filteredSlug, {
+      type: 'object',
+      properties: { status: { type: 'string' } },
+      additionalProperties: false,
+    }, Date.now());
+    const filtered = await runComposioExecuteWithGatewayForTest(
+      filteredSlug,
+      { force_refresh: true },
+      shouldNotDispatch,
+      'sess-nonempty-schema-no-repair',
+    );
+    assert.ok((filtered as unknown) instanceof ExternalWritePreDispatchResult,
+      'a nonempty schema stays a typed invalid-args refusal');
+
+    const writeSlug = 'PROOF_UPDATE_TASK';
+    schemaCache.rememberToolSchema(writeSlug, {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    }, Date.now());
+    const write = await runComposioExecuteWithGatewayForTest(
+      writeSlug,
+      { force_refresh: true },
+      shouldNotDispatch,
+      'sess-write-no-repair',
+    );
+    assert.ok((write as unknown) instanceof ExternalWritePreDispatchResult,
+      'a write stays a typed invalid-args refusal even with a closed empty schema');
+    assert.equal(outOfScopeDispatches, 0, 'the repair never broadens to nonempty schemas or writes');
+  } finally {
+    composioClientTest.setConnectedAccountsLoader(null);
+  }
 });
 
 test('connection ground truth: active-but-failing vs truly-absent are told apart in plain words', async () => {

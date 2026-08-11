@@ -172,8 +172,55 @@ test('a named scope without maxTools still creates its scoped base', () => {
   assert.deepEqual(mcpServersTestHooks.cacheState().scopedExternalBaseKeys, ['dataforseo']);
 });
 
-test('scoped callTool dispatches only an exact member of the selected list', async () => {
-  let listCalls = 0;
+test('an authorized tool the cap left out is acquired, not refused', async () => {
+  // THE REGRESSION PIN for "external MCP tool was not selected for this turn".
+  // Two authorized tools, a cap of one: the loser of the ranking race is still
+  // a tool the user connected, and naming it exactly must reach it.
+  let dispatchCalls = 0;
+  const dispatched: string[] = [];
+  const base = {
+    cacheToolsList: true,
+    name: 'fake-base',
+    async connect() {},
+    async close() {},
+    async listTools() {
+      return [
+        { name: 'dataforseo__read_serp', description: 'read' },
+        { name: 'dataforseo__delete_task', description: 'delete' },
+      ];
+    },
+    async callTool(toolName: string) {
+      dispatchCalls += 1;
+      dispatched.push(toolName);
+      return [{ type: 'text', text: 'ok' }];
+    },
+    async invalidateToolsCache() {},
+  };
+  const scoped = mcpServersTestHooks.scopedView(base as never, {
+    reason: 'read only',
+    authority: 'catalog',
+    allowedServerSlugs: ['dataforseo'],
+    toolPatterns: ['read'],
+    maxTools: 1,
+  });
+
+  // The advertised working set is exactly one tool — the budget still bounds
+  // what the model is shown.
+  assert.deepEqual(
+    (await scoped.listTools()).map((tool) => tool.name),
+    ['dataforseo__read_serp'],
+  );
+
+  await scoped.callTool('dataforseo__read_serp', {});
+  assert.equal(dispatchCalls, 1);
+
+  // ...and the one the cap dropped still dispatches when named exactly.
+  await scoped.callTool('dataforseo__delete_task', {});
+  assert.equal(dispatchCalls, 2, 'an authorized tool outside the working set still runs');
+  assert.deepEqual(dispatched, ['dataforseo__read_serp', 'dataforseo__delete_task']);
+});
+
+test('acquisition refuses a name outside the connected catalog', async () => {
   let dispatchCalls = 0;
   const base = {
     cacheToolsList: true,
@@ -181,11 +228,7 @@ test('scoped callTool dispatches only an exact member of the selected list', asy
     async connect() {},
     async close() {},
     async listTools() {
-      listCalls += 1;
-      return [
-        { name: 'dataforseo__read_serp', description: 'read' },
-        { name: 'dataforseo__delete_task', description: 'delete' },
-      ];
+      return [{ name: 'dataforseo__read_serp', description: 'read' }];
     },
     async callTool() {
       dispatchCalls += 1;
@@ -195,18 +238,46 @@ test('scoped callTool dispatches only an exact member of the selected list', asy
   };
   const scoped = mcpServersTestHooks.scopedView(base as never, {
     reason: 'read only',
+    authority: 'catalog',
     allowedServerSlugs: ['dataforseo'],
-    toolPatterns: ['read'],
-    maxTools: 1,
+    maxTools: 8,
+  });
+  // No configured server answers to this namespace, so the catalog — not a
+  // ranking heuristic — is what turns it down, and it says what IS connected.
+  await assert.rejects(
+    () => scoped.callTool('evil_dataforseo_proxy__serp_report', {}),
+    /not in your connected, authorized catalog/,
+  );
+  assert.equal(dispatchCalls, 0, 'an unauthorized namespace never reaches a transport');
+});
+
+test('a user prohibition denies even an exactly-named connected tool', async () => {
+  let dispatchCalls = 0;
+  const base = {
+    cacheToolsList: true,
+    name: 'fake-base',
+    async connect() {},
+    async close() {},
+    async listTools() {
+      return [{ name: 'dataforseo__read_serp', description: 'read' }];
+    },
+    async callTool() {
+      dispatchCalls += 1;
+      return [{ type: 'text', text: 'ok' }];
+    },
+    async invalidateToolsCache() {},
+  };
+  const scoped = mcpServersTestHooks.scopedView(base as never, {
+    reason: 'user said no external connectors',
+    authority: 'none',
+    allowedServerSlugs: [],
+    maxTools: 0,
   });
   await assert.rejects(
-    () => scoped.callTool('dataforseo__delete_task', {}),
-    /outside this turn's scope|not selected for this turn/,
+    () => scoped.callTool('dataforseo__read_serp', {}),
+    /outside this turn's scope/,
   );
-  assert.equal(dispatchCalls, 0, 'an off-pattern guessed tool never reaches the base');
-  await scoped.callTool('dataforseo__read_serp', {});
-  assert.equal(dispatchCalls, 1);
-  assert.equal(listCalls, 1, 'the exact advertised membership is cached for dispatch');
+  assert.equal(dispatchCalls, 0);
 });
 
 test('scoped callTool accepts the MCP carrier but dispatches the advertised server__tool identity', async () => {
@@ -298,8 +369,28 @@ test('empty or explicitly zero external scope stays empty and creates no base', 
     maxTools: 0,
   });
 
-  assert.equal(empty.name, 'clementine-external-empty');
-  assert.equal(zero.name, 'clementine-external-empty');
+  // Zero width still costs nothing to build — that was always the point of
+  // this test, and it is unchanged. What changed is the name: the surface is
+  // cold rather than empty, because advertising nothing never meant the user's
+  // connectors had gone away.
+  assert.equal(empty.name, 'clementine-external-acquire-only');
+  assert.equal(zero.name, 'clementine-external-acquire-only');
+  assert.deepEqual(mcpServersTestHooks.cacheState(), {
+    allExternalBaseCreated: false,
+    scopedExternalBaseKeys: [],
+    scopedExternalViewKeys: [],
+    failOpenCreated: false,
+  });
+});
+
+test('a prohibition scope is the only genuinely empty external surface', () => {
+  const denied = getOrCreateExternalMcpServers({
+    reason: 'user declined external connectors',
+    authority: 'none',
+    allowedServerSlugs: [],
+    maxTools: 0,
+  });
+  assert.equal(denied.name, 'clementine-external-empty');
   assert.deepEqual(mcpServersTestHooks.cacheState(), {
     allExternalBaseCreated: false,
     scopedExternalBaseKeys: [],

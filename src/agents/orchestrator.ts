@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { getRuntimeEnv, MODELS } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
-import type { RuntimeContextValue } from '../types.js';
+import type { RuntimeContextValue, TaskContinuationContext } from '../types.js';
 import { buildPlannerTool } from './planner.js';
 // Phase 3 (v0.5.16): single-agent mode — Clem completes the user's
 // request without delegating. The 5 specialized sub-agents (Researcher
@@ -24,7 +24,7 @@ import {
 } from './external-mcp-scope-lock.js';
 import { harnessInstructions } from './harness-context.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
-import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
+import { enabledExternalServerNames, getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
@@ -44,8 +44,10 @@ import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.j
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS_LEAN, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
 import { resolveToolSearchDecision, resolveHotSet, buildCompactToolCatalog } from './tool-catalog.js';
-import { deriveOrchestratorDiscoveryNames } from '../tools/tool-registry.js';
-import { buildCallTool } from '../tools/call-tool.js';
+import { actionTopologyRoleFor, deriveOrchestratorDiscoveryNames } from '../tools/tool-registry.js';
+import { buildCallTool, type BuildCallToolOptions, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
+import { buildWorkCall } from '../tools/work-call.js';
+import { actionExpectedWorkCarrierSelection } from '../runtime/harness/action-expected-work-boundary.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
@@ -159,8 +161,18 @@ export interface BuildOrchestratorAgentOptions {
    * turn. Delivery is the request/build-options path only — candidates widen
    * the visible surface and the advisory card; they decide nothing. */
   turnCandidates?: TurnCapabilityCandidates;
+  /** Exact bridge-derived clarification context. Raw userInput remains the
+   * current answer; parentInput participates only as verified prior context. */
+  taskContinuation?: TaskContinuationContext;
+  taskContinuationResolved?: true;
   /** Session id for best-effort tool-scope telemetry. */
   sessionId?: string | null;
+  /** Exact accepted source. When present, durable graph authority—not prompt
+   * wording—decides whether the action-only work carrier is exposed. */
+  sourceUserSeq?: number;
+  /** Host-compiled route for this exact accepted source. Non-action routes
+   * skip the action-authority read entirely, preserving their prior build cost. */
+  acceptedRoute?: 'direct_reply' | 'retrieve' | 'act';
   /** Test/advanced override. */
   mcpToolScope?: McpToolScope;
   /**
@@ -228,6 +240,10 @@ export function externalMcpAttachmentScope(
   if (!schemaOnDemandActive || !scope.failOpenCandidate) return scope;
   return {
     reason: `${scope.reason}; external MCP connection deferred to mcp_list_tools/call_tool`,
+    // Deferral, not denial — the whole point is that the model reaches these
+    // servers later through call_tool. Treating the deferred surface as zero
+    // authority is what made "connect it later" mean "you never can".
+    authority: 'catalog',
     allowedServerSlugs: [],
     toolPatterns: [],
     maxTools: 0,
@@ -356,6 +372,85 @@ type OrchestratorToolResult = {
   output?: unknown;
 };
 
+const ASK_USER_QUESTION_CANDIDATE_KIND = 'clementine.ask_user_question.candidate' as const;
+
+type AskUserQuestionCandidate = {
+  kind: typeof ASK_USER_QUESTION_CANDIDATE_KIND;
+  status: 'staged';
+  posted: false;
+  question: string;
+  options: string[] | null;
+  purpose: 'clarification' | 'approval' | null;
+};
+
+function askUserQuestionCandidate(output: unknown): AskUserQuestionCandidate | null {
+  let value = output;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value) as unknown; } catch { return null; }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Partial<AskUserQuestionCandidate>;
+  if (
+    candidate.kind !== ASK_USER_QUESTION_CANDIDATE_KIND
+    || candidate.status !== 'staged'
+    || candidate.posted !== false
+    || typeof candidate.question !== 'string'
+    || !(
+      candidate.options === null
+      || (Array.isArray(candidate.options) && candidate.options.every((option) => typeof option === 'string'))
+    )
+    || !(
+      candidate.purpose === null
+      || candidate.purpose === 'clarification'
+      || candidate.purpose === 'approval'
+    )
+  ) return null;
+  return candidate as AskUserQuestionCandidate;
+}
+
+function exactAskUserQuestionCandidateKey(candidate: AskUserQuestionCandidate): string {
+  return JSON.stringify([candidate.question, candidate.options, candidate.purpose]);
+}
+
+function renderAskUserQuestionCandidates(candidates: AskUserQuestionCandidate[]): {
+  question: string;
+  options: string[] | null;
+} {
+  const [only] = candidates;
+  if (candidates.length === 1 && only) {
+    return { question: only.question, options: only.options };
+  }
+  const countLabel = candidates.length === 2 ? 'two' : String(candidates.length);
+  const answerLabel = candidates.length === 2 ? 'both answers' : 'each answer';
+  const blocks = candidates.map((candidate, index) => {
+    const lines = [`${index + 1}. ${candidate.question.trim()}`];
+    for (const option of candidate.options ?? []) {
+      const text = option.trim();
+      if (text) lines.push(`   - ${text}`);
+    }
+    return lines.join('\n');
+  });
+  return {
+    question: [
+      `I need ${countLabel} quick details so I can get this right:`,
+      ...blocks,
+      `Reply with ${answerLabel} in your own words; the choices are just shortcuts.`,
+    ].join('\n\n'),
+    // Each candidate owns its own option set. Flattening them into the legacy
+    // top-level array would make a reply like "2" ambiguous, so the bundled
+    // question renders those choices inline and keeps the outer options empty.
+    options: null,
+  };
+}
+
+function postedQuestionReceipt(question: string): string {
+  // Keep the long-standing single-question receipt byte-for-byte. Bundles end
+  // in a complete sentence already, so do not manufacture a visible ".." in
+  // the internal turn result after the truthful public post.
+  const separator = question.includes('\n') && /[.!?]\s*$/.test(question) ? '' : '.';
+  return `Question posted: ${question}${separator} Awaiting user reply.`;
+}
+
 function stringifyToolOutput(output: unknown): string {
   if (typeof output === 'string') return output;
   try { return JSON.stringify(output); } catch { return String(output ?? ''); }
@@ -364,9 +459,93 @@ function stringifyToolOutput(output: unknown): string {
 /** End a provider turn only after a real user-choice pause. Approval-shaped
  * YOLO asks explicitly return a non-halting result and must run the model again. */
 export function userChoiceToolUseBehavior(
-  _context: unknown,
+  context: unknown,
   toolResults: OrchestratorToolResult[],
 ) {
+  // The SDK executes parallel function calls concurrently, then supplies this
+  // callback with the COMPLETE result array in provider order. Treat real asks
+  // as staged candidates until this batch boundary: it lets two independent
+  // clarifications become one natural public question instead of racing to
+  // publish one while both tool receipts falsely claim success.
+  const candidates: AskUserQuestionCandidate[] = [];
+  const seenCandidates = new Set<string>();
+  for (const result of toolResults) {
+    if (result.type !== 'function_output') continue;
+    if (bareTerminalToolName(result.tool.name ?? '') !== 'ask_user_question') continue;
+    const candidate = askUserQuestionCandidate(result.output);
+    if (!candidate) continue;
+    const key = exactAskUserQuestionCandidateKey(candidate);
+    if (seenCandidates.has(key)) continue;
+    seenCandidates.add(key);
+    candidates.push(candidate);
+  }
+  if (candidates.length > 0) {
+    const rendered = renderAskUserQuestionCandidates(candidates);
+    const sessionId = extractSessionId(context);
+    const turn = extractTurn(context);
+    const sourceUserSeq = extractSourceUserSeq(context);
+    const purposes = new Set(candidates.map((candidate) => candidate.purpose));
+    // A bundle may contain independently authored questions. Only project a
+    // typed purpose to the top level when every candidate agrees; otherwise
+    // preserve the ambiguity explicitly so downstream continuity cannot treat
+    // an approval-shaped ask as a clarification. An all-null bundle remains
+    // null for rolling-upgrade compatibility.
+    const purpose: AskUserQuestionCandidate['purpose'] | 'mixed' = purposes.size === 1
+      ? candidates[0]!.purpose
+      : 'mixed';
+    if (!sessionId) {
+      // This can only occur in direct SDK/playground use outside Clementine's
+      // harness. Return the question itself, but never claim a public post that
+      // had no session/event destination.
+      return {
+        isFinalOutput: true as const,
+        isInterrupted: undefined,
+        finalOutput: rendered.question,
+      };
+    }
+    const existing = listEvents(sessionId, { types: ['awaiting_user_input'] })
+      .find((event) => event.turn === turn);
+    if (existing) {
+      const existingQuestion = String(
+        (existing.data as { question?: unknown }).question ?? rendered.question,
+      ).trim() || rendered.question;
+      return {
+        isFinalOutput: true as const,
+        isInterrupted: undefined,
+        finalOutput: postedQuestionReceipt(existingQuestion),
+      };
+    }
+    appendEvent({
+      sessionId,
+      turn,
+      role: 'Clem',
+      type: 'awaiting_user_input',
+      data: {
+        question: rendered.question,
+        options: rendered.options,
+        purpose,
+        ...(sourceUserSeq ? { sourceUserSeq } : {}),
+        ...(candidates.length > 1
+          ? {
+              bundled: true,
+              questions: candidates.map((candidate) => ({
+                question: candidate.question,
+                options: candidate.options,
+                purpose: candidate.purpose,
+              })),
+            }
+          : {}),
+      },
+    });
+    return {
+      isFinalOutput: true as const,
+      isInterrupted: undefined,
+      finalOutput: postedQuestionReceipt(rendered.question),
+    };
+  }
+
+  // Rolling-upgrade/backward-compatible path for old string receipts. YOLO's
+  // machine-readable auto-resolution prefix remains explicitly non-halting.
   for (const result of toolResults) {
     if (result.type !== 'function_output') continue;
     const rawName = result.tool.name ?? '';
@@ -817,23 +996,21 @@ export function buildAskUserQuestionTool() {
         );
       }
       if (sessionId) {
-        const turn = extractTurn(runContext);
-        const alreadyPosted = listEvents(sessionId, { types: ['awaiting_user_input'] })
-          .some((event) => event.turn === turn);
-        if (!alreadyPosted) {
-          appendEvent({
-            sessionId,
-            turn,
-            role: 'Clem',
-            type: 'awaiting_user_input',
-            data: {
-              question: args.question,
-              options: args.options ?? null,
-            },
-          });
-        }
+        // A genuine question is only STAGED here. The SDK may execute several
+        // independent asks in parallel; userChoiceToolUseBehavior sees the full
+        // provider-ordered batch, bundles it, and owns the single durable post.
+        // Therefore every per-tool receipt remains truthful: none says "posted"
+        // before the public awaiting_user_input event actually exists.
+        return {
+          kind: ASK_USER_QUESTION_CANDIDATE_KIND,
+          status: 'staged' as const,
+          posted: false as const,
+          question: args.question,
+          options: args.options ?? null,
+          purpose: args.purpose ?? null,
+        } satisfies AskUserQuestionCandidate;
       }
-      return `Question posted: ${args.question}. Awaiting user reply.`;
+      return `Question ready for the caller: ${args.question}. No session was available to post it.`;
     },
   });
 }
@@ -1018,12 +1195,55 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // Prior-turn texts (this session + continuation lineage), newest-first. Reused by
   // BOTH the MCP scope (continuity) and the JIT ranking query, so a bare follow-up
   // ("do it", "schedule it") ranks against the work the conversation built toward.
-  const priorUserInputs = options.sessionId
-    ? recentPriorUserInputsForScope(options.sessionId, options.userInput)
+  const declinedContinuation = options.taskContinuation?.disposition === 'declined';
+  const declinedParentWithNewTask =
+    options.taskContinuation?.disposition === 'declined_with_new_task';
+  const parentAuthorityDeclined = declinedContinuation || declinedParentWithNewTask;
+  const currentUserInput = typeof options.userInput === 'string' ? options.userInput : '';
+  // A dual-clause turn remains byte-exact in the provider transcript, while
+  // semantic/tool acquisition sees only the fresh clause after the explicit
+  // parent decline.
+  const scopeUserInput = declinedParentWithNewTask
+    ? options.taskContinuation?.activeTaskInput ?? currentUserInput
+    : currentUserInput;
+  const actionWork = (() => {
+    if (options.acceptedRoute !== 'act') return false;
+    if (
+      !options.sessionId
+      || !Number.isSafeInteger(options.sourceUserSeq)
+      || (options.sourceUserSeq ?? 0) <= 0
+    ) throw new Error('An accepted action route requires its exact session/source identity before agent construction.');
+    return actionExpectedWorkCarrierSelection({
+      sessionId: options.sessionId,
+      sourceUserSeq: options.sourceUserSeq as number,
+    });
+  })();
+  // A typed decline is a complete conversational turn, not an execution turn.
+  // Keep the transcript and A/Q/B capsule for the model, but make the local
+  // allowlist explicitly empty so no structural/discovery schema reaches the
+  // provider and no acquisition path spends work preparing the cancelled task.
+  const effectiveAllowedToolNames = declinedContinuation
+    ? []
+    : actionWork && (options.allowedToolNames?.length ?? 0) > 0
+      ? [...new Set([...(options.allowedToolNames ?? []), 'work_call'])]
+      : options.allowedToolNames;
+  const historicalPriorUserInputs = options.sessionId && !parentAuthorityDeclined
+    ? recentPriorUserInputsForScope(options.sessionId, currentUserInput)
     : [];
-  const mcpToolScope = options.allowedToolNames !== undefined
+  const priorUserInputs = parentAuthorityDeclined
+    // The ordinary transcript and typed continuation still tell Clem what was
+    // declined. None of those prior turns may reopen JIT/MCP tool authority.
+    ? []
+    : [
+        options.taskContinuation?.parentInput ?? '',
+        ...historicalPriorUserInputs,
+      ].filter((value, index, all) => value.trim() && all.indexOf(value) === index);
+  const mcpToolScope: McpToolScope = effectiveAllowedToolNames !== undefined
     ? {
-        reason: 'explicit local tool allowlist; external MCP authority denied',
+        reason: declinedContinuation
+          ? 'continuity: user declined the prior task; local and external tool authority denied for this turn'
+          : 'explicit local tool allowlist; external MCP authority denied',
+        authority: 'none',
         allowedServerSlugs: [],
         toolPatterns: [],
         maxTools: 0,
@@ -1031,9 +1251,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     : options.mcpToolScope ?? (
         options.sessionId
           ? resolveMcpToolScopeWithRecall({
-              userInput: options.userInput,
+              userInput: scopeUserInput,
               priorUserInputs,
               pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+              configuredServerNames: enabledExternalServerNames(),
               // The turn's resolved candidates ride in as advisory matches so
               // the MCP scope sees exactly what the JIT surface sees.
               ...(options.turnCandidates?.matches.length
@@ -1042,15 +1263,25 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               // A contentless go-ahead ("go", "ok") is an ANSWER, and an answer
               // must not be scoped as if it were a fresh topic with no keywords.
               // Structural, so it never depends on a list of ways to say yes.
-              awaitingAnswer: priorTurnEndedAwaitingClarification(options.sessionId),
+              awaitingAnswer: Boolean(
+                options.taskContinuation
+                && options.taskContinuation.disposition !== 'declined'
+                && options.taskContinuation.disposition !== 'declined_with_new_task'
+              )
+                || (!options.taskContinuationResolved
+                  && priorTurnEndedAwaitingClarification(options.sessionId)),
+              ...(options.taskContinuation
+                && options.taskContinuation.disposition !== 'declined_with_new_task'
+                ? { answerDisposition: options.taskContinuation.disposition }
+                : {}),
             })
-          : resolveMcpToolScope({ userInput: options.userInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() })
+          : resolveMcpToolScope({ userInput: scopeUserInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() })
       );
   // T1: thread the current input so the fail-open MCP surface can rank the
   // user's connected tools by semantic relevance (run-start only; ignored by
   // keyword family scopes). Respects a caller-provided queryText.
-  if (typeof options.userInput === 'string' && options.userInput.trim() && !mcpToolScope.queryText) {
-    mcpToolScope.queryText = options.userInput;
+  if (!declinedContinuation && scopeUserInput.trim() && !mcpToolScope.queryText) {
+    mcpToolScope.queryText = scopeUserInput;
   }
   // Batch-shape directive: on a data-heavy turn (MCP data servers in scope)
   // inject the standing lane rule (run_worker per item / run_tool_program /
@@ -1059,10 +1290,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // proposal ("research these 18 firms?") answered with a bare "yes"
   // (live 2026-07-07: current-message-only detection serialized 18 firms).
   // '' (byte-identical prompt) on non-data turns or when the kill-switch is off.
-  const multiItem = typeof options.userInput === 'string'
+  const multiItem = !declinedContinuation && typeof scopeUserInput === 'string'
     ? detectMultiItemIntentFromConversation(
-        options.userInput,
-        options.sessionId ? recentConversationTextsForFanout(options.sessionId, options.userInput) : priorUserInputs,
+        scopeUserInput,
+        declinedParentWithNewTask
+          ? []
+          : options.sessionId
+            ? recentConversationTextsForFanout(options.sessionId, currentUserInput)
+            : priorUserInputs,
       )
     : undefined;
   // `draft_plan` is both an optional planning affordance and the recovery path
@@ -1196,7 +1431,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       `On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with ${toolCallHint('tool_output_query', { call_id: '<call id>' })} only where an exact figure is needed.`,
       'For durable multi-wave or multi-phase work, include workManifest. Its phases are per-item worker stages; exclude parent-only ranking, merge, final synthesis, and reporting. Declare the canonical item universe and graph on the first wave; reconcile later labels (for example sheet rows) back to those ids with aliases. The harness checkpoints logical progress and refuses accidental scope inflation before spawning workers.',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never summarize a batch as complete if any worker returned ERROR. Report exactly which items succeeded and which failed, including the worker reason, and treat the run as needs-attention rather than success.',
-      'Before fanning out N mutating workers: call `request_approval` ONCE with the batch summary ("Create 50 Salesforce tasks for these leads — review the list?") instead of letting each worker pause individually. Sticky approval then covers the fan-out.',
+      'COMPOSE → SINGLE COMMIT for external mutations: workers may execute reads and reason, but the Composio gateway mechanically refuses worker writes/sends. Require each worker to return one exact {id, composioSlug, args, account_alias?} payload. Validate and aggregate every returned payload, then call run_batch action="propose" ONCE; its immutable pending batch is the one payload the user approves and the parent executes. Never approve a summary before the workers materialize the final payloads, and never ask workers to call run_batch or pending_action tools.',
       'When NOT to use: tasks that need cross-item memory or a single coherent output stream — those stay on you.',
     ].join(' ');
   const runWorkerAsToolOptions = {
@@ -1395,6 +1630,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       {
         sessionId,
         counter,
+        // Worker identity is authority, not a loop-guard side effect. Keep it
+        // present even when CLEMMY_WORKER_THRASH_GUARD=off so the central
+        // Composio gateway can enforce compose -> parent batch commit.
+        workerScope: true,
         ...(parent?.sourceUserSeq ? { sourceUserSeq: parent.sourceUserSeq } : {}),
         ...(mcpToolScopeOverride !== undefined
           ? { mcpToolScope: mcpToolScopeOverride }
@@ -1950,7 +2189,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // tool-taxonomy decideToolApproval() path — mutating slugs still
   // pause for user consent before firing, regardless of which agent
   // invoked them.
-  const allCoreTools = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  const allCoreTools = declinedContinuation
+    ? []
+    : await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const byName = (n: string) =>
     allCoreTools.find((t) => (t as { name?: string }).name === n) as
       | Tool<RuntimeContextValue>
@@ -1986,7 +2227,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     seenDiscoveryNames.add(name);
     return true;
   });
-  const localMemoryScope = localMemoryBuiltinScope(options.userInput);
+  const localMemoryScope = declinedContinuation ? null : localMemoryBuiltinScope(scopeUserInput);
   const scopedDiscoveryTools = localMemoryScope
     ? dedupedDiscoveryTools.filter((toolRef) => localMemoryScope.has((toolRef as { name?: string }).name ?? ''))
     : dedupedDiscoveryTools;
@@ -2008,14 +2249,20 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // (measured 10.5s cold on 2026-07-08: it embedded+ranked 127 built-ins, dropped
   // 61, and the switch then rebuilt the surface its own way) and can even prune a
   // session-LRU tool the hot set wanted first-class.
-  const searchDecision = resolveToolSearchDecision({ allowLane: options.allowToolJit === true, sessionId: options.sessionId });
-  const jitDecision = resolveToolJitDecision({ allowLane: options.allowToolJit === true && !searchDecision.active, sessionId: options.sessionId });
+  const searchDecision = resolveToolSearchDecision({
+    allowLane: !declinedContinuation && options.allowToolJit === true,
+    sessionId: options.sessionId,
+  });
+  const jitDecision = resolveToolJitDecision({
+    allowLane: !declinedContinuation && options.allowToolJit === true && !searchDecision.active,
+    sessionId: options.sessionId,
+  });
   let jitDiscoveryTools = scopedDiscoveryTools;
   let jitDropped = 0;
   let jitReason = searchDecision.active ? 'jit-superseded-by-tool-search' : jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
-  if (jitDecision.active && typeof options.userInput === 'string' && options.userInput.trim()) {
+  if (jitDecision.active && scopeUserInput.trim()) {
     try {
-      const jitQuery = [options.userInput, ...priorUserInputs.slice(0, 3)]
+      const jitQuery = [scopeUserInput, ...priorUserInputs.slice(0, 3)]
         .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
         .join('\n');
       const selection = await selectToolsForTurn({
@@ -2075,9 +2322,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // per-turn re-render), not baked into a separate cacheable prefix.
   let firstClassDiscovery = jitDiscoveryTools;
   let callTool: Tool<RuntimeContextValue> | null = null;
+  let workCallOptions: BuildCallToolOptions | null = null;
   // Assigned after the capability universe seals (the agent does not exist yet
-  // when the dispatcher is built); null = unsealed, acquisitions unobserved.
-  let acquisitionSink: ((targetName: string) => void) | null = null;
+  // when the dispatcher is built). Until then it fails closed: a production
+  // dispatcher can never interpret missing authority as unlimited authority.
+  let admitBuiltinAcquisition = (targetName: string): BuiltinCapabilityAdmissionResult => ({
+    ok: false,
+    kind: 'requires_readmission',
+    outside: [targetName],
+    reason: 'the orchestrator capability universe or binding revision is not sealed',
+  });
   let catalogBlock: string | null = null;
   let searchFirstClassCount = 0;
   let searchCatalogCount = 0;
@@ -2091,8 +2345,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           .map((toolRef) => (toolRef as { name?: string }).name ?? '')
           .filter(Boolean),
       );
-      const policyAllowed = new Set([...availableNames].filter((name) => !excludes.has(name)));
-      const searchQuery = [options.userInput, ...priorUserInputs.slice(0, 3)]
+      const explicitAllowed = options.allowedToolNames
+        ? new Set(options.allowedToolNames)
+        : null;
+      const policyAllowed = new Set([...availableNames].filter((name) =>
+        !excludes.has(name) && (!actionWork || !explicitAllowed || explicitAllowed.has(name)),
+      ));
+      const searchQuery = [scopeUserInput, ...priorUserInputs.slice(0, 3)]
         .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
         .join('\n');
       const hot = resolveHotSet(options.sessionId, searchQuery, { allowedNames: policyAllowed });
@@ -2110,40 +2369,51 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       });
       const firstClassNames = new Set(surface.firstClass);
       const deferredNames = new Set(surface.deferred);
+      const actionBusinessNames = new Set([...policyAllowed]
+        .filter((name) => actionTopologyRoleFor(name) === 'business'));
+      const visibleFirstClassNames = actionWork
+        ? new Set([...policyAllowed].filter((name) => actionTopologyRoleFor(name) === 'control'))
+        : firstClassNames;
+      const discoverableNames = actionWork ? actionBusinessNames : deferredNames;
       firstClassDiscovery = scopedDiscoveryTools
-        .filter((t) => firstClassNames.has((t as { name?: string }).name ?? ''))
+        .filter((t) => visibleFirstClassNames.has((t as { name?: string }).name ?? ''))
         // The static tool_search instance searches the entire registry. On the
         // schema-on-demand lane replace it with a turn-scoped instance so every
-        // result is guaranteed to be reachable through THIS call_tool.
+        // result is guaranteed to be reachable through this turn's one carrier.
         .map((t) => (t as { name?: string }).name === 'tool_search'
-          ? buildScopedLocalToolSearch(deferredNames)
+          ? buildScopedLocalToolSearch(discoverableNames, actionWork ? 'work_call' : 'call_tool')
           : t);
       // Suppress the generic dispatcher ONLY on the local-memory-scoped turn
       // (memory tools are first-class there; a generic door invites off-scope
       // calls). Everywhere else keep call_tool even when the deferred set is
       // empty — it still carries the MCP-namespaced dispatch path and the
       // first-class-wrap fallback that avoids the not_reachable loop.
-      callTool = localMemoryScope
+      const dispatcherOptions: BuildCallToolOptions = {
+        reachableBuiltinNames: discoverableNames,
+        firstClassNames: actionWork ? new Set<string>() : firstClassNames,
+        deniedNames: excludes,
+        mcpToolScope,
+        // The dispatcher is built before the agent exists; the gate cell is
+        // assigned after sealing so each built-in acquisition must append
+        // or reuse a monotonic binding revision on THIS agent before the
+        // inner dispatch. MCP tools retain their separate scope authority.
+        admitBuiltinAcquisition: (targetName) => admitBuiltinAcquisition(targetName),
+      };
+      workCallOptions = actionWork ? dispatcherOptions : null;
+      callTool = localMemoryScope || actionWork
         ? null
-        : buildCallTool({
-            reachableBuiltinNames: deferredNames,
-            firstClassNames,
-            deniedNames: excludes,
-            mcpToolScope,
-            // The dispatcher is built before the agent exists; the sink cell is
-            // assigned after sealing so each acquisition lands as a monotonic
-            // binding revision on THIS agent's sealed universe.
-            onBuiltinAcquisition: (targetName) => acquisitionSink?.(targetName),
-          });
-      const catalogText = buildCompactToolCatalog({ allowedNames: deferredNames });
-      searchCatalogCount = deferredNames.size;
+        : buildCallTool(dispatcherOptions);
+      const catalogText = buildCompactToolCatalog({ allowedNames: discoverableNames });
+      searchCatalogCount = discoverableNames.size;
       searchCatalogTokens = Math.round(catalogText.length / 4);
       catalogBlock = [
         // Leads with an unambiguous "you HAVE access" — live 2026-07-08 a model
         // read the name-only listing as evidence it had NO tool access and
         // refused the task outright (A_zero_tools stall). The catalog must be
         // impossible to misread as a capability restriction.
-        '[tool-catalog] You HAVE FULL TOOL ACCESS this turn: first-class tools above, every deferred built-in name below, and connected external MCP/Composio tools. NEVER claim access is missing. Deferred schemas are intentionally omitted: call `tool_search(query)` for the ranked description + exact schema when unsure, then `call_tool(name, args_json)`. If you already know the exact name and arguments, call it directly through `call_tool`. External MCP names use `<server>__<tool>`. The inner tool—not call_tool—controls approval.',
+        actionWork
+          ? '[tool-catalog] You HAVE FULL TOOL ACCESS for this accepted action: direct tools above are control/discovery only; every business capability below and every authorized external MCP/Composio capability is reachable through `work_call`. Call `tool_search(query)` when the inner name/schema is unknown. On the first `work_call`, provide the complete provider-neutral semantic proposal and the first inner call together; later calls use proposal:null. Never use a second business carrier. The inner tool controls approval.'
+          : '[tool-catalog] You HAVE FULL TOOL ACCESS this turn: first-class tools above, every deferred built-in name below, and connected external MCP/Composio tools. NEVER claim access is missing. Deferred schemas are intentionally omitted: call `tool_search(query)` for the ranked description + exact schema when unsure, then `call_tool(name, args_json)`. If you already know the exact name and arguments, call it directly through `call_tool`. External MCP names use `<server>__<tool>`. The inner tool—not call_tool—controls approval.',
         catalogText,
       ].join('\n');
     } catch {
@@ -2154,20 +2424,56 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     }
   }
 
+  if (actionWork && !workCallOptions) {
+    const excludes = new Set(options.excludeToolNames ?? []);
+    const explicitAllowed = options.allowedToolNames ? new Set(options.allowedToolNames) : null;
+    const businessNames = new Set(scopedDiscoveryTools
+      .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+      .filter((name) => name
+        && !excludes.has(name)
+        && (!explicitAllowed || explicitAllowed.has(name))
+        && actionTopologyRoleFor(name) === 'business'));
+    workCallOptions = {
+      reachableBuiltinNames: businessNames,
+      firstClassNames: new Set<string>(),
+      deniedNames: excludes,
+      mcpToolScope,
+    };
+    firstClassDiscovery = scopedDiscoveryTools
+      .filter((toolRef) => {
+        const name = (toolRef as { name?: string }).name ?? '';
+        return name
+          && !excludes.has(name)
+          && (!explicitAllowed || explicitAllowed.has(name))
+          && actionTopologyRoleFor(name) === 'control';
+      })
+      .map((toolRef) => (toolRef as { name?: string }).name === 'tool_search'
+        ? buildScopedLocalToolSearch(businessNames, 'work_call')
+        : toolRef);
+    callTool = null;
+  }
+
   // Keep stable lane rules + the within-run catalog BEFORE the dynamic memory
   // tail. The previous `[rubric][fresh memory][catalog]` order broke the prompt
   // cache immediately before a ~3K-token catalog on every model cycle.
   const staticInstructions = [
     rubricChoice.instructions,
     codeModeMandate,
+    actionWork
+      ? '[action-work] This exact accepted turn requires durable action authority. Call control/discovery tools directly when needed. Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
+      : null,
     catalogBlock,
     renderCapabilityCandidateCard(options.turnCandidates),
   ].filter(Boolean).join('\n\n');
   const instructions = harnessInstructions(staticInstructions, {
     sessionId: options.sessionId ?? undefined,
-    focusInput: options.userInput ?? undefined,
+    focusInput: scopeUserInput || undefined,
   });
-  const structuralTools = localMemoryScope
+  const structuralTools = declinedContinuation
+    ? []
+    : actionWork
+    ? [buildRequestApprovalTool(), buildAskUserQuestionTool()]
+    : localMemoryScope
     ? [plannerTool, buildAskUserQuestionTool()]
     : [
         plannerTool,
@@ -2177,6 +2483,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       ];
   const assembledTools = [
     ...structuralTools,
+    ...(actionWork && workCallOptions ? [buildWorkCall(workCallOptions)] : []),
     ...(callTool ? [callTool] : []),
     ...firstClassDiscovery,
   ];
@@ -2210,10 +2517,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     surface: 'orchestrator',
     lane: options.allowToolJit === true ? 'chat' : 'execution',
     tools: assembledTools.map((toolRef) => toolRef as Tool<RuntimeContextValue>),
-    allowedToolNames: options.allowedToolNames,
+    allowedToolNames: effectiveAllowedToolNames,
     excludeToolNames: options.excludeToolNames,
     reason: 'orchestrator local harness tools',
   });
+  // An action turn advertises one business carrier. External MCP authority is
+  // retained for work_call's exact named dispatch, while its first-class list
+  // is zero-width so a second unbound business path cannot tempt the model.
+  const advertisedMcpScope: McpToolScope = actionWork
+    ? { ...mcpToolScope, maxTools: 0 }
+    : externalMcpAttachmentScope(mcpToolScope, searchDecision.active);
   if (options.sessionId) {
     try {
       appendEvent({
@@ -2221,7 +2534,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         turn: 0,
         role: 'system',
         type: 'tool_policy_resolved',
-        data: { ...toolPolicy.diagnostics },
+        data: {
+          ...toolPolicy.diagnostics,
+          ...(declinedContinuation
+            ? {
+                shortCircuitReason: 'declined_continuation',
+                semanticAcquisitionSkipped: true,
+                schemaWarmSkipped: true,
+                advertisedSchemaCount: 0,
+                catalogCount: 0,
+              }
+            : {}),
+        },
       });
     } catch {
       // Tool policy telemetry is diagnostic only.
@@ -2272,7 +2596,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // it would mistakenly tell the user "DataForSEO isn't connected"
     // when in fact the MCP server is running with 118 tools loaded.
     mcpServers: [
-      getOrCreateExternalMcpServers(externalMcpAttachmentScope(mcpToolScope, searchDecision.active)),
+      getOrCreateExternalMcpServers(advertisedMcpScope),
     ],
     // Phase 2: handoffs intentionally omitted. Sub-agents are tools
     // (run_researcher / run_writer / run_reviewer / run_executor /
@@ -2292,10 +2616,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // under their own bound scope authority and compose at enforcement. Active
   // instances win name collisions (the turn-scoped tool_search ships a
   // different schema than the static registry instance, and the fingerprint
-  // must describe what actually dispatches). Nothing refuses on this yet —
-  // the dispatch boundary gains the artifact to enforce against in the next
-  // slice. Loud and non-fatal on refusal: chat must not die because
-  // instrumentation declined, and a silent skip is how instrumentation rots.
+  // must describe what actually dispatches). The call_tool dispatch boundary
+  // refuses unless acquisition succeeds against this exact authority.
   try {
     const budgetSettings = getHarnessBudgetSettings();
     const universeByName = new Map<string, SealableToolLike>();
@@ -2326,16 +2648,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     if (sealed.ok) {
       bindAgentCapabilityEnvelope(agent, sealed.envelope);
       bindAgentCapabilityRevision(agent, sealed.revision);
-      // Every call_tool acquisition from here on is a revision within the
-      // sealed universe. An outside name is loud — that is the exact event
-      // the enforcement slice turns into a lawful pause.
-      acquisitionSink = (targetName) => {
-        const appended = appendAgentCapabilityBinding(agent, targetName);
-        if (appended && !appended.ok) {
-          // eslint-disable-next-line no-console
-          console.warn(`[orchestrator] capability acquisition refused: ${appended.reason}`);
-        }
-      };
+      // Every call_tool acquisition from here on must become a revision within
+      // the sealed universe before its inner tool can dispatch. Refusals flow
+      // back as typed requires_readmission results; warning-and-continue is
+      // forbidden at this authority boundary.
+      admitBuiltinAcquisition = (targetName) => appendAgentCapabilityBinding(agent, targetName);
     } else {
       // eslint-disable-next-line no-console
       console.warn(`[orchestrator] capability universe refused to seal: ${sealed.errors.join('; ')}`);

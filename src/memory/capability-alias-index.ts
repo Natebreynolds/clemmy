@@ -27,7 +27,7 @@
  * here blocks a turn on a model load.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { BASE_DIR } from '../config.js';
@@ -152,54 +152,27 @@ export type CapabilityAliasWrite =
 let handle: Database.Database | null = null;
 let handlePath = '';
 
-function db(): Database.Database {
-  const dir = path.join(BASE_DIR, 'memory', 'capability-aliases', getMachineId());
-  const file = path.join(dir, 'aliases.db');
-  if (handle && handlePath === file) return handle;
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  handle = new Database(file);
-  handlePath = file;
-  handle.pragma('journal_mode = WAL');
-  // One row per (phrase, scope, identifier, account): a multi-read turn keeps
-  // EVERY capability it proved, and the same phrase proven against two
-  // accounts keeps both provenances. The earlier one-row-per-phrase shape is
-  // rebuilt in place — its rows are re-learnable evidence, not user data.
-  const legacy = handle.prepare(
-    "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'aliases'",
-  ).get() as { n: number };
-  if (legacy.n > 0) {
-    const columns = (handle.prepare('PRAGMA table_info(aliases)').all() as Array<{ name: string }>)
-      .map((c) => c.name);
-    if (!columns.includes('account_identity')) handle.exec('DROP TABLE aliases');
+const PENDING_LEARNING_TERMINAL_LIMIT = 256;
+
+function hardenAliasStorePermissions(dir: string, file: string): void {
+  try { chmodSync(dir, 0o700); } catch { /* best effort on filesystems that ignore POSIX modes */ }
+  for (const member of [file, `${file}-wal`, `${file}-shm`, `${file}-journal`]) {
+    if (!existsSync(member)) continue;
+    try { chmodSync(member, 0o600); } catch { /* best effort */ }
   }
-  const legacyClaims = handle.prepare(
-    "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'alias_claims'",
-  ).get() as { n: number };
-  if (legacyClaims.n > 0) {
-    const claimColumns = (handle.prepare('PRAGMA table_info(alias_claims)').all() as Array<{ name: string }>)
-      .map((c) => c.name);
-    if (!claimColumns.includes('account_identity')) handle.exec('DROP TABLE alias_claims');
+}
+
+function checkpointAliasStore(database: Database.Database): void {
+  const rows = database.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy?: number }>;
+  if (rows.some((row) => Number(row.busy ?? 0) !== 0)) {
+    throw new Error('capability alias privacy checkpoint is busy');
   }
-  handle.exec(`
-    CREATE TABLE IF NOT EXISTS aliases (
-      alias_digest       TEXT NOT NULL,
-      scope_digest       TEXT NOT NULL,
-      intent             TEXT NOT NULL,
-      kind               TEXT NOT NULL,
-      identifier         TEXT NOT NULL,
-      account_identity   TEXT NOT NULL DEFAULT '',
-      klass              TEXT NOT NULL CHECK (klass IN ('capability_only', 'executable')),
-      terms              TEXT NOT NULL,
-      schema_fingerprint TEXT,
-      embedding          BLOB,
-      embedding_space    TEXT,
-      created_at         TEXT NOT NULL,
-      updated_at         TEXT NOT NULL,
-      row_digest         TEXT NOT NULL,
-      PRIMARY KEY (alias_digest, scope_digest, identifier, account_identity)
-    );
-    CREATE INDEX IF NOT EXISTS aliases_by_scope ON aliases (scope_digest);
-    CREATE TABLE IF NOT EXISTS pending_learning (
+}
+
+function createPendingLearningTable(database: Database.Database, name = 'pending_learning'): void {
+  if (!/^[a-z_][a-z0-9_]*$/.test(name)) throw new Error('invalid pending-learning table name');
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS ${name} (
       pending_id       TEXT PRIMARY KEY,
       session_id       TEXT NOT NULL,
       source_user_seq  INTEGER,
@@ -207,24 +180,195 @@ function db(): Database.Database {
       identifier       TEXT NOT NULL,
       kind             TEXT NOT NULL,
       account_identity TEXT NOT NULL DEFAULT '',
-      phrase           TEXT NOT NULL,
+      alias_digest     TEXT NOT NULL,
+      alias_terms      TEXT NOT NULL,
       evidence_digest  TEXT NOT NULL,
+      schema_fingerprint TEXT NOT NULL DEFAULT '',
+      executable_empty_args INTEGER NOT NULL DEFAULT 0,
       status           TEXT NOT NULL CHECK (status IN ('pending','done','dead')),
       attempts         INTEGER NOT NULL DEFAULT 0,
       last_error       TEXT,
       created_at       TEXT NOT NULL,
       updated_at       TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS alias_claims (
-      session_id       TEXT NOT NULL,
-      source_user_seq  INTEGER NOT NULL,
-      identifier       TEXT NOT NULL,
-      account_identity TEXT NOT NULL DEFAULT '',
-      claimed_at       TEXT NOT NULL,
-      PRIMARY KEY (session_id, source_user_seq, identifier, account_identity)
-    );
+    )
   `);
-  return handle;
+}
+
+function parseStoredAliasTerms(value: unknown): string[] {
+  let parsed: unknown = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value); } catch { return []; }
+  }
+  if (!Array.isArray(parsed)) return [];
+  return [...new Set(parsed
+    .filter((term): term is string => typeof term === 'string')
+    .map((term) => term.trim().toLowerCase())
+    .filter((term) => /^[a-z0-9]+$/.test(term)
+      && term.length > 2
+      && term.length <= MAX_TERM_LENGTH
+      && !ALIAS_STOPWORDS.has(term)
+      && !tokenLooksSensitive(term)))]
+    .slice(0, MAX_ALIAS_TERMS);
+}
+
+/**
+ * Upgrade the transient learning queue without ever carrying raw accepted text
+ * into the replacement table. The table swap is one transaction: a crash sees
+ * either the complete legacy table or the complete privacy-bounded table.
+ * Terminal rows stay as compact diagnostics and are bounded separately.
+ */
+function ensurePendingLearningSchema(database: Database.Database): boolean {
+  const exists = database.prepare(
+    "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'pending_learning'",
+  ).get() as { n: number };
+  if (exists.n === 0) {
+    createPendingLearningTable(database);
+    database.exec('CREATE INDEX IF NOT EXISTS pending_learning_by_status_created ON pending_learning (status, created_at)');
+    return false;
+  }
+
+  const columns = new Set(
+    (database.prepare('PRAGMA table_info(pending_learning)').all() as Array<{ name: string }>).map((row) => row.name),
+  );
+  const current = columns.has('alias_digest') && columns.has('alias_terms') && !columns.has('phrase')
+    && columns.has('schema_fingerprint') && columns.has('executable_empty_args');
+  if (current) {
+    database.exec('CREATE INDEX IF NOT EXISTS pending_learning_by_status_created ON pending_learning (status, created_at)');
+    return false;
+  }
+
+  const migrate = database.transaction(() => {
+    const legacyRows = database.prepare('SELECT * FROM pending_learning ORDER BY created_at ASC').all() as Array<Record<string, unknown>>;
+    database.exec('DROP TABLE IF EXISTS pending_learning_private_v2');
+    createPendingLearningTable(database, 'pending_learning_private_v2');
+    const insert = database.prepare(`
+      INSERT INTO pending_learning_private_v2 (
+        pending_id, session_id, source_user_seq, attempt_id, identifier, kind,
+        account_identity, alias_digest, alias_terms, evidence_digest,
+        schema_fingerprint, executable_empty_args, status, attempts, last_error,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const row of legacyRows) {
+      const phrase = typeof row.phrase === 'string' ? row.phrase : '';
+      const aliasDigest = typeof row.alias_digest === 'string' && /^[a-f0-9]{24}$/.test(row.alias_digest)
+        ? row.alias_digest
+        : acceptedPhraseDigest(phrase);
+      const existingTerms = parseStoredAliasTerms(row.alias_terms);
+      const aliasTerms = existingTerms.length > 0 ? existingTerms : boundedAliasTerms(phrase);
+      insert.run(
+        String(row.pending_id), String(row.session_id), row.source_user_seq ?? null,
+        row.attempt_id ?? null, String(row.identifier), String(row.kind),
+        String(row.account_identity ?? ''), aliasDigest, JSON.stringify(aliasTerms),
+        String(row.evidence_digest), String(row.schema_fingerprint ?? ''),
+        Number(row.executable_empty_args ?? 0) === 1 ? 1 : 0,
+        row.status, Number(row.attempts ?? 0), row.last_error ?? null,
+        String(row.created_at), String(row.updated_at),
+      );
+    }
+    database.exec('DROP TABLE pending_learning');
+    database.exec('ALTER TABLE pending_learning_private_v2 RENAME TO pending_learning');
+    database.exec('CREATE INDEX pending_learning_by_status_created ON pending_learning (status, created_at)');
+  });
+  migrate();
+  return true;
+}
+
+function pruneTerminalPendingLearning(database: Database.Database): void {
+  try {
+    database.prepare(`
+      DELETE FROM pending_learning
+       WHERE pending_id IN (
+         SELECT pending_id
+           FROM pending_learning
+          WHERE status IN ('done', 'dead')
+          ORDER BY updated_at DESC, pending_id DESC
+          LIMIT -1 OFFSET ?
+       )
+    `).run(PENDING_LEARNING_TERMINAL_LIMIT);
+  } catch { /* bounded diagnostics must never fail learning */ }
+}
+
+function db(): Database.Database {
+  const dir = path.join(BASE_DIR, 'memory', 'capability-aliases', getMachineId());
+  const file = path.join(dir, 'aliases.db');
+  if (handle && handlePath === file) return handle;
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  hardenAliasStorePermissions(dir, file);
+  const database = new Database(file);
+  try {
+    hardenAliasStorePermissions(dir, file);
+    database.pragma('journal_mode = WAL');
+    database.pragma('secure_delete = ON');
+    // One row per accepted intent identity, scope, identifier, and account: a
+    // multi-read turn keeps EVERY capability it proved without copying the
+    // accepted prompt into each row.
+    const legacy = database.prepare(
+      "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'aliases'",
+    ).get() as { n: number };
+    if (legacy.n > 0) {
+      const columns = (database.prepare('PRAGMA table_info(aliases)').all() as Array<{ name: string }>)
+        .map((c) => c.name);
+      if (!columns.includes('account_identity')) database.exec('DROP TABLE aliases');
+    }
+    const legacyClaims = database.prepare(
+      "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'alias_claims'",
+    ).get() as { n: number };
+    if (legacyClaims.n > 0) {
+      const claimColumns = (database.prepare('PRAGMA table_info(alias_claims)').all() as Array<{ name: string }>)
+        .map((c) => c.name);
+      if (!claimColumns.includes('account_identity')) database.exec('DROP TABLE alias_claims');
+    }
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS aliases (
+        alias_digest       TEXT NOT NULL,
+        scope_digest       TEXT NOT NULL,
+        intent             TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        identifier         TEXT NOT NULL,
+        account_identity   TEXT NOT NULL DEFAULT '',
+        klass              TEXT NOT NULL CHECK (klass IN ('capability_only', 'executable')),
+        terms              TEXT NOT NULL,
+        schema_fingerprint TEXT,
+        embedding          BLOB,
+        embedding_space    TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        row_digest         TEXT NOT NULL,
+        PRIMARY KEY (alias_digest, scope_digest, identifier, account_identity)
+      );
+      CREATE INDEX IF NOT EXISTS aliases_by_scope ON aliases (scope_digest);
+      CREATE TABLE IF NOT EXISTS alias_claims (
+        session_id       TEXT NOT NULL,
+        source_user_seq  INTEGER NOT NULL,
+        identifier       TEXT NOT NULL,
+        account_identity TEXT NOT NULL DEFAULT '',
+        claimed_at       TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq, identifier, account_identity)
+      );
+    `);
+    const scrubbedRawPhrases = ensurePendingLearningSchema(database);
+    pruneTerminalPendingLearning(database);
+    const privacySchemaVersion = Number(database.pragma('user_version', { simple: true }) ?? 0);
+    if (scrubbedRawPhrases || privacySchemaVersion < 2) {
+      // DROP frees pages logically; checkpoint + VACUUM removes legacy prompt
+      // bytes from the database and WAL instead of leaving recoverable remnants.
+      // user_version advances only after physical scrubbing, so a failed scrub
+      // is retried on the next open even though the table swap already committed.
+      checkpointAliasStore(database);
+      database.exec('VACUUM');
+      checkpointAliasStore(database);
+      database.pragma('user_version = 2');
+    }
+    hardenAliasStorePermissions(dir, file);
+    handle = database;
+    handlePath = file;
+    return database;
+  } catch (error) {
+    try { database.close(); } catch { /* best effort */ }
+    hardenAliasStorePermissions(dir, file);
+    throw error;
+  }
 }
 
 /** Test hook: drop the handle so a fresh CLEMENTINE_HOME opens its own file. */
@@ -673,8 +817,16 @@ export interface PendingLearningRecord {
   identifier: string;
   kind: string;
   accountIdentity: string;
-  phrase: string;
+  /** Privacy-bounded identity derived synchronously at settlement. The raw
+   * accepted phrase is never durable in this queue. */
+  aliasDigest: string;
+  aliasTerms: string[];
   evidenceDigest: string;
+  /** Exact provider contract validated on the dispatch path. */
+  schemaFingerprint: string;
+  /** Typed structural promotion is permitted only for the literal empty args
+   * shape; no historical value is stored or replayed. */
+  executableEmptyArgs: boolean;
   status: 'pending' | 'done' | 'dead';
   attempts: number;
   lastError: string | null;
@@ -689,24 +841,33 @@ export function enqueuePendingLearning(input: {
   identifier: string;
   kind: string;
   accountIdentity?: string;
-  phrase: string;
+  aliasDigest: string;
+  aliasTerms: string[];
   evidenceDigest: string;
+  schemaFingerprint?: string;
+  executableEmptyArgs?: boolean;
 }): PendingLearningRecord | null {
+  const aliasDigest = input.aliasDigest.trim().toLowerCase();
+  if (!/^[a-f0-9]{24}$/.test(aliasDigest)) return null;
+  const aliasTerms = parseStoredAliasTerms(input.aliasTerms);
   const pendingId = sha256(JSON.stringify([
     input.sessionId, input.sourceUserSeq ?? null, input.identifier,
     input.accountIdentity ?? '', input.evidenceDigest,
+    input.schemaFingerprint ?? '', input.executableEmptyArgs === true,
   ])).slice(0, 32);
   const now = new Date().toISOString();
   try {
     db().prepare(`
       INSERT OR IGNORE INTO pending_learning (
         pending_id, session_id, source_user_seq, attempt_id, identifier, kind,
-        account_identity, phrase, evidence_digest, status, attempts, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+        account_identity, alias_digest, alias_terms, evidence_digest, schema_fingerprint, executable_empty_args,
+        status, attempts, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
     `).run(
       pendingId, input.sessionId, input.sourceUserSeq ?? null, input.attemptId ?? null,
       input.identifier, input.kind, input.accountIdentity?.trim() ?? '',
-      input.phrase, input.evidenceDigest, now, now,
+      aliasDigest, JSON.stringify(aliasTerms), input.evidenceDigest, input.schemaFingerprint?.trim() ?? '',
+      input.executableEmptyArgs === true ? 1 : 0, now, now,
     );
     return loadPendingLearning(pendingId);
   } catch {
@@ -723,8 +884,11 @@ function hydratePending(raw: Record<string, unknown>): PendingLearningRecord {
     identifier: String(raw.identifier),
     kind: String(raw.kind),
     accountIdentity: String(raw.account_identity ?? ''),
-    phrase: String(raw.phrase),
+    aliasDigest: String(raw.alias_digest),
+    aliasTerms: parseStoredAliasTerms(raw.alias_terms),
     evidenceDigest: String(raw.evidence_digest),
+    schemaFingerprint: String(raw.schema_fingerprint ?? ''),
+    executableEmptyArgs: Number(raw.executable_empty_args ?? 0) === 1,
     status: raw.status as PendingLearningRecord['status'],
     attempts: Number(raw.attempts ?? 0),
     lastError: (raw.last_error as string | null) ?? null,
@@ -753,8 +917,10 @@ export function listPendingLearning(limit = 32): PendingLearningRecord[] {
 
 export function completePendingLearning(pendingId: string): void {
   try {
-    db().prepare("UPDATE pending_learning SET status = 'done', updated_at = ? WHERE pending_id = ?")
+    const database = db();
+    database.prepare("UPDATE pending_learning SET status = 'done', updated_at = ? WHERE pending_id = ?")
       .run(new Date().toISOString(), pendingId);
+    pruneTerminalPendingLearning(database);
   } catch { /* the worker retries a row it could not complete */ }
 }
 
@@ -762,12 +928,14 @@ export function completePendingLearning(pendingId: string): void {
  *  spent; then the row is DEAD and visible, never silently gone. */
 export function recordPendingLearningFailure(pendingId: string, error: string): void {
   try {
-    db().prepare(`
+    const database = db();
+    database.prepare(`
       UPDATE pending_learning
          SET attempts = attempts + 1, last_error = ?,
              status = CASE WHEN attempts + 1 >= ${PENDING_LEARNING_MAX_ATTEMPTS} THEN 'dead' ELSE 'pending' END,
              updated_at = ?
        WHERE pending_id = ?
     `).run(error.slice(0, 400), new Date().toISOString(), pendingId);
+    pruneTerminalPendingLearning(database);
   } catch { /* leave the row pending */ }
 }

@@ -28,12 +28,19 @@ import {
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { looksLikeCompactDecisionProtocol } from './presentation-hygiene.js';
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
+import {
+  isSettledReadReplayReturnData,
+  settledReadReplayCallId,
+  SETTLED_READ_REUSE_LABEL,
+} from './settled-read-replay-semantics.js';
 
 const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'turn_ended',
   'turn_preflight_decision',
   'conversation_step',
   'conversation_recovery_candidate',
+  'claude_local_permission_admitted',
+  'claude_local_permission_claimed',
   'cross_session_prefix',
   'agent_context_packet',
   'async_work_dispatch_prepared',
@@ -42,6 +49,7 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'guardrail_tripped',
   'stuck_detected',
   'learning_candidate_evaluated',
+  'durable_memory_intake_receipt',
 ]);
 
 const DECISION_KEYS = new Set(['summary', 'reply', 'done', 'nextaction', 'reason']);
@@ -559,12 +567,16 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       const innerTool = publicInnerTool(data);
       const publicSlug = publicDispatchSlug(data);
       const glimpse = publicResultGlimpse(data);
+      const reused = isSettledReadReplayReturnData(data);
       return {
         ...selected(data, ['tool', 'toolName', 'name', 'callId', 'call_id', 'ok', 'success', 'batchMode', 'accounting']),
         ...(innerTool ? { innerTool } : {}),
         ...(publicSlug ? { publicSlug } : {}),
         ...(publicToolEffect(data) ? { effect: publicToolEffect(data) } : {}),
         ...(glimpse ? { glimpse } : {}),
+        // Derived at the trust boundary from the exact replay marker plus
+        // providerDispatched:false. Replay ids and control prose stay private.
+        ...(reused ? { reused: true, progress: SETTLED_READ_REUSE_LABEL } : {}),
       };
     }
     case 'deliverable_saved': {
@@ -684,7 +696,28 @@ export function projectHarnessEventsForPublic(events: readonly EventRow[]): Even
   // replay elects the earliest valid terminal for that logical source. Compute
   // the winner by durable seq rather than trusting caller order.
   const winnerBySource = new Map<string, EventRow>();
+  const reusedToolCallIds = new Set<string>();
+  const reusedToolCallParentIds = new Set<string>();
+  const canonicalToolCallIdCounts = new Map<string, number>();
   for (const event of events) {
+    if (event.type === 'tool_called' && isCanonicalTopLevelToolEvent(event)) {
+      const callId = firstString(
+        event.data.canonicalCallId,
+        event.data.callId,
+        event.data.call_id,
+      );
+      if (callId) canonicalToolCallIdCounts.set(
+        callId,
+        (canonicalToolCallIdCounts.get(callId) ?? 0) + 1,
+      );
+    }
+    if (event.type === 'tool_returned' && isCanonicalTopLevelToolEvent(event)) {
+      const callId = settledReadReplayCallId(event.data);
+      if (callId) {
+        reusedToolCallIds.add(callId);
+        if (event.parentEventId) reusedToolCallParentIds.add(event.parentEventId);
+      }
+    }
     if (event.type !== 'conversation_completed') continue;
     // A row that advertises the typed contract but fails validation is private
     // evidence, not a legacy candidate allowed to suppress a valid owner.
@@ -710,7 +743,30 @@ export function projectHarnessEventsForPublic(events: readonly EventRow[]): Even
       if (key && winnerBySource.get(key) !== event) continue;
     }
     const row = projectHarnessEventForPublic(event);
-    if (row) projected.push(row);
+    if (!row) continue;
+    if (event.type === 'tool_called') {
+      const callId = firstString(
+        event.data.canonicalCallId,
+        event.data.callId,
+        event.data.call_id,
+      );
+      const reused = reusedToolCallParentIds.has(event.id)
+        || Boolean(
+          callId
+          && canonicalToolCallIdCounts.get(callId) === 1
+          && reusedToolCallIds.has(callId),
+        );
+      if (reused) {
+        // Keep the canonical call row (it is an honest model attempt), but
+        // narrate how that attempt settled instead of implying a fresh fetch.
+        row.data = {
+          ...row.data,
+          reused: true,
+          progress: SETTLED_READ_REUSE_LABEL,
+        };
+      }
+    }
+    projected.push(row);
   }
   return projected;
 }

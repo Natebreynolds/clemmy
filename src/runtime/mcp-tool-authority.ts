@@ -1,5 +1,5 @@
 import { parseNamespacedTool } from './mcp-namespace-shim.js';
-import type { McpToolScope } from './mcp-tool-scope.js';
+import { mcpToolScopeAuthority, type McpToolScope } from './mcp-tool-scope.js';
 
 /** Canonical alias only: punctuation/case and generic transport suffixes do not
  * change identity, but arbitrary prefixes/suffixes never count as a match. */
@@ -47,12 +47,20 @@ export function stripMcpToolCarrier(toolName: string): string {
 }
 
 /**
- * MCP scope is an authority boundary, not merely an advertisement hint.
+ * May this exact tool run on this turn?
  *
- * `undefined` intentionally preserves legacy callers that have no per-run
- * scope. `null` is an explicit deny (used by locked workflow/worker lanes).
- * Concrete scopes admit only their selected server/tool family; an explicit
- * zero cap remains a deny even when a server slug is present.
+ * The only inputs are the user's decision (`authority`) and, when that decision
+ * named specific tools, exact identity. Relevance signals are deliberately
+ * absent: `maxTools`, `serverMaxTools`, `priorityKeywords`, `toolPatterns` and
+ * the ranked selection all describe what the model was SHOWN, and a tool the
+ * user connected does not become forbidden by losing a ranking race.
+ *
+ * The catalog itself is enforced downstream, where it is actually known — the
+ * namespace shim can only route to a configured, enabled server, so an
+ * unauthorized name has nowhere to land.
+ *
+ * `undefined` preserves legacy callers with no per-run scope. `null` is an
+ * explicit deny used by locked workflow/worker lanes.
  */
 export function mcpToolAllowedByScope(
   toolName: string,
@@ -64,35 +72,31 @@ export function mcpToolAllowedByScope(
   const normalizedToolName = stripMcpToolCarrier(toolName);
   const parsed = parseNamespacedTool(normalizedToolName);
   if (!parsed) return false;
-  if (scope.maxTools === 0) return false;
-  if (scope.allowAll) return true;
-  if (scope.failOpenCandidate) return true;
 
-  const allowedSlugs = scope.allowedServerSlugs ?? [];
-  if (allowedSlugs.length === 0) return false;
-  const serverAllowed = allowedSlugs.some((raw) =>
-    mcpServerAliasMatches(parsed.serverSlug, raw));
-  if (!serverAllowed) return false;
+  // An explicit exclusion outranks every grant. "Use Sheets, not Outlook" is a
+  // decision about Outlook, and no amount of catalog authority reopens it.
+  const denied = scope.deniedServerSlugs ?? [];
+  if (denied.some((raw) => mcpServerAliasMatches(parsed.serverSlug, raw))) return false;
 
-  const exactAuthority = scope.allowedToolNames !== undefined;
+  const authority = mcpToolScopeAuthority(scope);
+  if (authority === 'none') return false;
+  if (authority === 'catalog') return true;
+
+  if (authority === 'server_set') {
+    // Bound to a set of systems, free within them. The tool name is not
+    // constrained — a worker given Firecrawl may use any Firecrawl tool — but
+    // the server is, so the lane cannot reach a system it was never handed.
+    const allowed = scope.allowedServerSlugs ?? [];
+    return allowed.some((raw) => mcpServerAliasMatches(parsed.serverSlug, raw));
+  }
+
+  // 'exact': one precise capability was bound (typed worker lease, approval
+  // resume). Alias-confusable siblings must not satisfy it.
   const exactNames = new Set((scope.allowedToolNames ?? [])
     .map(canonicalMcpToolIdentity)
     .filter((value): value is string => Boolean(value)));
-  if (exactAuthority) {
-    const identity = canonicalMcpToolIdentity(toolName);
-    if (!identity || !exactNames.has(identity)) return false;
-  }
-
-  const patterns = (scope.toolPatterns ?? []).flatMap((source) => {
-    try {
-      return [new RegExp(source, 'i')];
-    } catch {
-      return [];
-    }
-  });
-  if (patterns.length === 0) return true;
-  const haystack = `${normalizedToolName} ${parsed.serverSlug} ${parsed.toolName}`;
-  return patterns.some((pattern) => pattern.test(haystack));
+  const identity = canonicalMcpToolIdentity(toolName);
+  return Boolean(identity && exactNames.has(identity));
 }
 
 const agentScopes = new WeakMap<object, McpToolScope | null>();

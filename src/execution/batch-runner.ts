@@ -172,7 +172,31 @@ export function prepareBatchPlanForExecution(plan: BatchPlan): PreparedBatchPlan
     for (const err of normalized.errors) errors.push(`items[${index}] ("${item.id ?? ''}"): ${err}`);
     for (const repair of normalized.repairs) repairs.push(`items[${index}] ("${item.id ?? ''}"): ${repair}`);
     const next: BatchPlanItem = { ...item, args: normalized.args };
-    if (normalized.connectedAccountId !== undefined) next.connectedAccountId = normalized.connectedAccountId;
+    const storedConnection = typeof item.connectedAccountId === 'string'
+      ? (item.connectedAccountId.trim() || undefined)
+      : item.connectedAccountId === null
+        ? null
+        : undefined;
+    if (item.connectedAccountId !== undefined && storedConnection === undefined) {
+      errors.push(`items[${index}] ("${item.id ?? ''}"): connectedAccountId must be a non-empty string or null`);
+    }
+    const normalizedConnection = normalized.connectedAccountId;
+    if (
+      storedConnection
+      && normalizedConnection
+      && storedConnection !== normalizedConnection
+    ) {
+      errors.push(`items[${index}] ("${item.id ?? ''}"): stored connectedAccountId conflicts with the item args carrier`);
+    }
+    const effectiveConnection = storedConnection ?? normalizedConnection;
+    if (effectiveConnection !== undefined) next.connectedAccountId = effectiveConnection;
+    if (
+      effectiveConnection
+      && typeof next.args.account_alias === 'string'
+      && next.args.account_alias.trim()
+    ) {
+      errors.push(`items[${index}] ("${item.id ?? ''}"): account_alias conflicts with connected_account_id; choose one immutable account selector`);
+    }
 
     const validation = validateComposioArgs(slug, next.args, schema);
     if (validation.error) {

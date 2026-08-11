@@ -15,6 +15,7 @@ import {
   friendlyTimeline,
   isLive,
   liveLine,
+  progressNarration,
   runFilterCategory,
   runPreview,
   userFacingRunState,
@@ -44,6 +45,10 @@ test('eventVisibility hides internal noise and keeps milestones', () => {
 
 test('friendlyEventMessage produces plain language', () => {
   assert.equal(friendlyEventMessage({ type: 'tool_called', data: { tool: 'Gmail' } }), 'Used Gmail');
+  assert.equal(
+    friendlyEventMessage({ type: 'tool_called', data: { tool: 'Gmail', reused: true } }),
+    'Reused earlier result',
+  );
   assert.equal(friendlyEventMessage({ type: 'approval_resolved', data: { decision: 'approved' } }), 'Approval approved');
   assert.equal(friendlyEventMessage({ type: 'run_completed' }), 'Completed');
   assert.equal(
@@ -59,6 +64,25 @@ test('friendlyEventMessage produces plain language', () => {
   );
   // Unknown type falls back to a humanized label, never the raw machine name.
   assert.equal(friendlyEventMessage({ type: 'turn_started' }), 'Turn started');
+});
+
+test('live activity describes a reused settlement instead of a fresh fetch', () => {
+  const run: ActivityRunLike = {
+    status: 'running',
+    updatedAt: new Date().toISOString(),
+    events: [{
+      type: 'tool_called',
+      data: { tool: 'OUTLOOK_LIST_MESSAGES', reused: true },
+      createdAt: new Date().toISOString(),
+    }],
+  };
+  assert.equal(liveLine(run), 'Reused earlier result');
+  assert.equal(runPreview(run), 'Reused earlier result');
+  assert.deepEqual(friendlyTimeline(run.events), [{
+    type: 'tool_called',
+    message: 'Reused earlier result',
+    createdAt: run.events?.[0]?.createdAt,
+  }]);
 });
 
 test('friendlyKindLabel maps source/kind to product language', () => {
@@ -235,3 +259,56 @@ test('friendlyTimeline drops noise events', () => {
   ]);
   assert.deepEqual(timeline.map((entry) => entry.message), ['Used Gmail', 'Completed']);
 });
+
+test('progress narration says what the turn is doing, not how many tools it used', () => {
+  // The live 2026-08-09 workflow build, in order. Discord showed three
+  // identical "Still working (N tool calls so far)." lines across four minutes
+  // while this sequence was happening underneath.
+  const liveWorkflowBuild = [
+    'memory_recall_all', 'tool_search', 'COMPOSIO_SEARCH_TOOLS', 'skill_read',
+    'workflow_get', 'workflow_edit_step', 'workflow_update',
+    'workflow_enable', 'workflow_schedule', 'workflow_activate',
+  ];
+  assert.equal(progressNarration(liveWorkflowBuild), 'Still working — turning on the workflow.');
+  assert.equal(
+    progressNarration(liveWorkflowBuild.slice(0, 7)),
+    'Still working — updating the workflow.',
+    'the narration tracks the CURRENT step, not the first or the busiest',
+  );
+
+  // Acquisition is overhead, not work: a trailing lookup must not be narrated
+  // as if it were the task, and must not erase the real work behind it.
+  assert.equal(
+    progressNarration(['workflow_schedule', 'tool_search', 'recall_tool_result']),
+    'Still working — scheduling the workflow.',
+  );
+
+  // Never invent. An unknown shape stays honest rather than guessing intent.
+  assert.equal(progressNarration(['zzz_unrecognised_thing']), 'Still working.');
+  assert.equal(progressNarration([]), 'Still working.');
+
+  // MCP-namespaced tools narrate from their real trailing name.
+  assert.equal(
+    progressNarration(['mcp__clementine-local__workflow_schedule']),
+    'Still working — scheduling the workflow.',
+  );
+  // A real provider slug from a draft run.
+  assert.equal(progressNarration(['OUTLOOK_CREATE_DRAFT']), 'Still working — drafting your email.');
+})
+
+test('narration skips dispatcher wrappers and never ships a dangling verb', () => {
+  // The exact live 2026-08-09 tail that produced "Still working — running."
+  // `run_tool_program` is a dispatcher; the Slack lookup one frame behind it is
+  // the work the user was waiting on.
+  const liveTail = [
+    'run_tool_program', 'composio_execute_tool', 'run_shell_command',
+    'run_tool_program', 'SLACK_FIND_USER_BY_EMAIL_ADDRESS',
+    'run_tool_program', 'composio_execute_tool',
+  ];
+  assert.equal(progressNarration(liveTail), 'Still working — reading Slack.');
+
+  // A verb with no subject is a fragment; say less instead.
+  assert.equal(progressNarration(['run_tool_program']), 'Still working.');
+  assert.equal(progressNarration(['composio_execute_tool', 'call_tool']), 'Still working.');
+})
+

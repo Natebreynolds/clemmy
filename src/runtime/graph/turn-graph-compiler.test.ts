@@ -92,6 +92,27 @@ test('direct external effect is only an effect ceiling and never a compiler-gran
   });
 });
 
+test('destination-shaped send intent cannot be closed by a read-only observation', () => {
+  const result = compile('Send every alpha record to the beta recipients.');
+  assert.equal(result.validation.ok, true, result.validation.errors.join('\n'));
+  assert.equal(result.graph.classification.route, 'act');
+  assert.equal(result.graph.classification.externalEffectRequested, true);
+  assert.deepEqual(result.graph.classification.externalEffectKinds, ['communication']);
+  assert.equal(result.graph.effectCeiling, 'external_write');
+});
+
+test('an explicit tool invocation never inflates a read into an external communication write', () => {
+  const result = compile([
+    'Retrieve the current item feed from the connected local provider.',
+    'Call composio_search_tools exactly once, then call composio_execute_tool exactly once.',
+    'Return the source marker, revision, item id, title, and status.',
+  ].join('\n'));
+
+  assert.equal(result.graph.classification.externalEffectRequested, false);
+  assert.deepEqual(result.graph.classification.externalEffectKinds, []);
+  assert.notEqual(result.graph.effectCeiling, 'external_write');
+});
+
 test('conservative multi-item signal compiles bounded fanout, per-item execution, and reduce', () => {
   const result = compile('Research these firms.', {
     signals: {

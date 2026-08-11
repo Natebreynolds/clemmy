@@ -22,6 +22,8 @@ import {
   _peekTracker,
   _resetAllTrackersForTests,
   noteGuardrailToolResult,
+  noteGuardrailObservedCost,
+  _resetGuardrailScopeSignals,
   resetTracker,
 } from './tool-guardrail.js';
 
@@ -568,9 +570,12 @@ test('buildFanoutRecoveryMessage: composio dispatches via composio_execute_tool,
 
 test('buildFanoutRecoveryMessage: escalation prefix appears only at refusals >= 2', () => {
   const first = buildFanoutRecoveryMessage({ toolName: 'composio_execute_tool', slug: 'X_LIST', args: {}, distinct: 6, fanoutBlockAt: 6 });
-  assert.doesNotMatch(first, /ALREADY been refused/, 'first refusal (distinct == blockAt) has no escalation prefix');
+  assert.doesNotMatch(first, /already been refused/i, 'first refusal (distinct == blockAt) has no escalation prefix');
   const third = buildFanoutRecoveryMessage({ toolName: 'composio_execute_tool', slug: 'X_LIST', args: {}, distinct: 8, fanoutBlockAt: 6 });
-  assert.match(third, /ALREADY been refused 2×/, 'refusals >= 2 → hardened stop prefix');
+  // The escalation still appears only at >= 2. What it ESCALATES TO changed
+  // (2026-08-09): a repeated refusal now hands the decision to the user rather
+  // than restating a harder stop, which is what deadlocked a live turn.
+  assert.match(third, /already been refused 2×/i, 'refusals >= 2 → escalation prefix');
 });
 
 test('fanoutBlock: ON → re-polling the SAME id is never blocked (identical args = one distinct)', () => {
@@ -1096,3 +1101,98 @@ test('the id-shaped ladder is unchanged — nudge at 3, refusal at 6', () => {
   assert.equal(ids.findIndex((c) => c.nudge), 2, 'nudge on the 3rd distinct id');
   assert.equal(ids.findIndex((c) => c.block), 5, 'refusal on the 6th distinct id');
 });
+
+// ─── fan-out ladder: decide from what happened, not from a count ──────────
+//
+// Live 2026-08-09. Eight reps' Slack ids: six resolved in ~5s, one per call,
+// ~300 bytes each. The ladder refused the remaining two for being "serialized".
+// The model complied and wrote the prescribed program 28×; those programs hit
+// their own discovery-budget and invalid-JSON failures. Nine minutes, 33
+// guardrails, "I cannot honestly confirm the work went out."
+
+const SLACK = 'SLACK_FIND_USER_BY_EMAIL_ADDRESS';
+const smallResult = JSON.stringify({ data: { ok: true, user: { id: 'U07HLQ2AY6Q', name: 'bobby' } } });
+
+function serialLookups(scope: string, n: number, resultBytes: string) {
+  let last;
+  for (let i = 0; i < n; i += 1) {
+    last = evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: SLACK, arguments: { email: `rep${i}@scorpion.co` } });
+    noteGuardrailObservedCost(scope, 'composio_execute_tool', resultBytes);
+  }
+  return last;
+}
+
+test('cheap serial reads are a job, not a thrash — the fan-out block stands down', () => {
+  _resetAllTrackersForTests();
+  _resetGuardrailScopeSignals();
+  // Ten one-per-second lookups returning a few hundred bytes each. Under the
+  // old count-only rule this was refused at six, stranding the last items.
+  const decision = serialLookups('sess-cheap', 10, smallResult);
+  assert.ok(decision, 'expected a decision');
+  assert.equal(decision!.fanoutBlock, undefined, 'cheap serial reads were refused as if expensive');
+});
+
+test('expensive serial reads still get the fan-out refusal', () => {
+  _resetAllTrackersForTests();
+  _resetGuardrailScopeSignals();
+  // Page-sized payloads: piling these into context is the cost the ladder exists for.
+  const bigResult = JSON.stringify({ data: 'x'.repeat(20_000) });
+  const decision = serialLookups('sess-costly', 10, bigResult);
+  assert.ok(decision?.fanoutBlock, 'expensive serialization must still be refused');
+});
+
+test('a block may not outlive the alternative it prescribes', () => {
+  _resetAllTrackersForTests();
+  _resetGuardrailScopeSignals();
+  const scope = 'sess-redirect';
+  const big = JSON.stringify({ data: 'x'.repeat(20_000) });
+  assert.ok(serialLookups(scope, 8, big)?.fanoutBlock, 'setup: the block should be active');
+  // The prescribed program fails the way it failed live.
+  noteGuardrailObservedCost(scope, 'run_tool_program',
+    'code-mode program failed: discovery budget denied (category_budget_exhausted) on code_mode_describe');
+  noteGuardrailObservedCost(scope, 'run_tool_program',
+    'An error occurred while running the tool. Error: InvalidToolInputError: Invalid JSON input for tool');
+  const after = evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: SLACK, arguments: { email: 'last@scorpion.co' } });
+  assert.equal(after.fanoutBlock, undefined,
+    'the working path stayed refused after its prescribed replacement failed twice');
+});
+
+test('a repeated refusal releases the working path instead of ending the turn', () => {
+  _resetAllTrackersForTests();
+  _resetGuardrailScopeSignals();
+  const scope = 'sess-deadlock';
+  const big = JSON.stringify({ data: 'x'.repeat(20_000) });
+  serialLookups(scope, 8, big);
+  // Refusing a fanout-keyed READ must never kill the turn (pinned invariant).
+  const again = evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: SLACK, arguments: { email: 'a@scorpion.co' } });
+  assert.notEqual(again.action, 'escalate', 'a fanout-refused read must never end the turn');
+  // Recovery is RELEASE: once the prescribed program fails twice, the working
+  // path resumes and the remaining items can finish.
+  noteGuardrailObservedCost(scope, 'run_tool_program', 'code-mode program failed: discovery budget denied');
+  noteGuardrailObservedCost(scope, 'run_tool_program', 'Error: InvalidToolInputError: Invalid JSON input for tool');
+  const released = evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: SLACK, arguments: { email: 'b@scorpion.co' } });
+  assert.equal(released.fanoutBlock, undefined, 'the turn stayed deadlocked instead of releasing');
+});
+
+test('a repeated fan-out refusal escalates to the USER instead of restating itself', () => {
+  // "Escalation over blocking" (Oversight Has a Capacity, arXiv 2606.08919):
+  // a guard facing an ambiguous, repeatedly-unresolved case should hand the
+  // decision to the person rather than keep deciding autonomously. Live
+  // 2026-08-09 restated the same refusal for six minutes instead.
+  const first = buildFanoutRecoveryMessage({
+    toolName: 'composio_execute_tool', slug: SLACK, args: {}, distinct: 7, fanoutBlockAt: 6,
+  });
+  assert.doesNotMatch(first, /CHECK IN WITH THE USER/i, 'the FIRST refusal should still teach the batch path');
+
+  const repeated = buildFanoutRecoveryMessage({
+    toolName: 'composio_execute_tool', slug: SLACK, args: {}, distinct: 8, fanoutBlockAt: 6,
+  });
+  assert.match(repeated, /CHECK IN WITH THE USER/i, 'a repeated refusal must hand the decision back');
+  assert.match(repeated, /which items you already completed/i, 'the check-in must report partial progress');
+  assert.match(repeated, /ask whether to continue/i, 'the check-in must actually ask');
+  // The rubric names what must be true; it must not script her words, and must
+  // never leak internal machinery into a user-facing message.
+  assert.match(repeated, /in your own words/i, 'the rubric must leave the wording to her');
+  assert.match(repeated, /do not mention harnesses or guardrails/i);
+});
+

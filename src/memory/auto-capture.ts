@@ -54,6 +54,10 @@ export interface AutoCaptureResult {
   /** Durable learned-claim rows written before asynchronous consolidation. */
   queuedCandidateIds?: number[];
   episodeId?: string | null;
+  /** Stable intake call identity. This is evidence metadata only; callers may
+   * not treat its presence as completion authority without redeeming the
+   * normalized host receipt against the memory ledger. */
+  callId?: string | null;
   profilePatch?: Record<string, unknown>;
   profile?: UserProfile;
 }
@@ -215,25 +219,98 @@ function clean(value: string, maxChars = 260): string {
  * a reminder/task rather than a declarative fact, and preserving it is safer
  * than turning it into the awkward/ambiguous "to ...".
  */
-function explicitRememberContent(text: string): string {
-  const leaders = [
+const EXPLICIT_REMEMBER_LEADERS = [
     // Natural variants such as "remember this release-validation fact
     // exactly: <claim>" are still explicit store requests. Strip the
     // descriptive command wrapper before the generic "remember this" rule,
     // otherwise "release-validation fact exactly:" becomes part of memory.
     /^(?:please\s+)?remember\s+(?:this\s+)?(?:[\w-]+\s+){0,5}?fact(?:\s+exactly)?\s*:\s*/i,
+    /^(?:please\s+)?remember\s+(?:for\s+later|for\s+future\s+reference)(?:\s+that)?\s*:?\s*/i,
     /^(?:please\s+)?remember\s+(?:this|that|exactly)\s*:?\s*/i,
     /^(?:please\s+)?remember\s*:\s*/i,
+    // Keep bare "remember to ..." intact (see function comment), but clean
+    // ordinary command forms such as "remember my name is Nathan".
+    /^(?:please\s+)?remember\s+(?!to\b)/i,
     /^(?:please\s+)?note\s+that\s+/i,
+    /^(?:please\s+)?note\s*:\s*/i,
     /^(?:please\s+)?keep\s+in\s+mind(?:\s+that)?\s+/i,
     /^(?:please\s+)?don'?t\s+forget(?:\s+that)?\s+/i,
     /^(?:please\s+)?make\s+a\s+note(?:\s+that)?\s*:?\s*/i,
-  ];
-  const leader = leaders.find((candidate) => candidate.test(text));
-  if (!leader) return text;
+] as const;
 
-  const clause = text
-    .replace(leader, '')
+// A memory command may follow independent live work ("Summarize this, and
+// remember that Cedar is Cedar-17"). Find only command-shaped occurrences at a
+// clause boundary; a mid-sentence mention such as "explain what remember means"
+// grants no durable-write authority.
+const EXPLICIT_REMEMBER_COMMAND_RE = /(?:^|[.!?;]\s+|[—–]\s+|,\s*)(?:(?:and|also|then)\s+)?((?:please\s+)?(?:remember\b|note(?:\s+that\b|\s*:)|keep\s+in\s+mind\b|don'?t\s+forget\b|make\s+a\s+note\b))/i;
+
+const SECONDARY_MEMORY_REQUEST_VERB_SOURCE = [
+  'answer', 'analy[sz]e', 'assess', 'advise', 'brainstorm', 'calculate',
+  'check', 'clear', 'compare', 'create', 'delete', 'deploy', 'draft', 'edit',
+  'email', 'evaluate', 'execute', 'explain', 'fetch', 'find', 'forget', 'give',
+  'help', 'inspect', 'list', 'look\\s+up', 'manage', 'message', 'multiply',
+  'outline', 'post', 'publish', 'purge', 'read', 'recommend', 'research',
+  'restore', 'review', 'run', 'schedule', 'scrape', 'send', 'show',
+  'summari[sz]e', 'take', 'tell', 'test', 'translate', 'unpin', 'update',
+  'upload', 'verify', 'write',
+].join('|');
+const SECONDARY_MEMORY_QUESTION_SOURCE = '(?:what|when|where|who|why|how|which|do(?:es|did)?\\s+(?:you|we|i)|is|are|can|could|would|will|have|has)';
+const SECONDARY_MEMORY_TOOL_NAME_SOURCE = 'memory_(?:forget|list_facts|read|recall_all|remember|restore|search)';
+const SECONDARY_MEMORY_DELIVERABLE_SOURCE = '(?:answer|analysis|summary|report|brief|review|draft|email|message|list|outline|plan|recommendation|translation|update)';
+const SECONDARY_MEMORY_ACTION_GERUND_SOURCE = '(?:analy[sz]ing|assessing|brainstorming|calculating|checking|comparing|creating|deleting|deploying|drafting|editing|emailing|evaluating|executing|explaining|fetching|finding|forgetting|helping|inspecting|listing|managing|messaging|outlining|posting|publishing|purging|reading|recommending|researching|restoring|reviewing|running|scheduling|scraping|sending|showing|summari[sz]ing|testing|translating|unpinning|updating|uploading|verifying|writing)';
+const SECONDARY_MEMORY_MUTATION_PARTICIPLE_SOURCE = '(?:called|cleared|created|deleted|deployed|drafted|emailed|executed|forgotten|inserted|invoked|migrated|published|purged|refunded|removed|restored|reviewed|run|scheduled|sent|shared|tested|translated|unpinned|updated|uploaded|used|verified|written)';
+const SECONDARY_MEMORY_MUTATION_FORM_SOURCE = `(?:${SECONDARY_MEMORY_MUTATION_PARTICIPLE_SOURCE}|${SECONDARY_MEMORY_ACTION_GERUND_SOURCE})`;
+const SECONDARY_MEMORY_INDIRECT_REQUEST_SOURCE = [
+  '(?:i|we)\\s+(?:have|had)\\s+(?:(?:a|another|one(?:\\s+more)?)\\s+)?questions?\\b',
+  '(?:i|we)\\s+(?:wonder|wondered)\\b',
+  '(?:i|we)\\s+(?:am|are|was|were)\\s+(?:curious|wondering)\\b',
+  '(?:i|we)(?:\\s+would|[\'’]d)\\s+like\\s+to\\s+know\\b',
+  '(?:i|we)\\s+(?:need|want)\\s+to\\s+know\\b',
+  '(?:i|we)\\s+(?:have|had)\\s+something\\s+to\\s+ask\\b',
+  '(?:one\\s+more|another)\\s+question\\s+(?:is|about)\\b',
+  'there\\s+(?:is|was)\\s+(?:one\\s+more|another)\\s+question\\b',
+  `(?:i|we)\\s+(?:need|want|would\\s+like)\\s+(?:(?:an?|the|some|your)\\s+)?${SECONDARY_MEMORY_DELIVERABLE_SOURCE}\\b`,
+  `(?:i|we)\\s+(?:expect|anticipate)\\s+(?:(?:an?|the|some|your)\\s+)?(?:[\\w-]+\\s+){0,2}${SECONDARY_MEMORY_DELIVERABLE_SOURCE}\\b`,
+  `(?:i|we)\\s+(?:(?:am|are|was|were)\\s+)?hoping\\s+(?:you\\s+)?(?:(?:can|could|would|will)\\s+)?(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE})\\b`,
+  `let(?:['’]s|\\s+us)\\s+(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE})\\b`,
+  `(?:i|we)\\s+should\\s+(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE})\\b`,
+  `maybe\\s+(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE})\\b`,
+  `(?:i|we)\\s+(?:have|had)\\s+(?:(?:an?|another|one\\s+more)\\s+)?asks?\\s*:\\s*(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE})\\b`,
+  `(?:i|we)\\s+(?:need|want)\\s+you\\s+(?:${SECONDARY_MEMORY_ACTION_GERUND_SOURCE})\\b`,
+  `(?:i|we)\\s+(?:could|would)\\s+use\\s+(?:(?:an?|the|some|your)\\s+)?${SECONDARY_MEMORY_DELIVERABLE_SOURCE}\\b`,
+  `(?:the\\s+)?[\\w'’.-]+(?:\\s+[\\w'’.-]+){0,5}\\s+(?:(?:should|must)\\s+be|needs?(?:\\s+to\\s+be)?)\\s+${SECONDARY_MEMORY_MUTATION_FORM_SOURCE}\\b`,
+  `let\\s+${SECONDARY_MEMORY_TOOL_NAME_SOURCE}\\s+(?:run|execute|operate)\\b`,
+  `${SECONDARY_MEMORY_TOOL_NAME_SOURCE}\\s+is\\s+the\\s+tool\\s+to\\s+(?:run|call|invoke|use)\\b`,
+  `(?:i|we)\\s+need\\s+${SECONDARY_MEMORY_TOOL_NAME_SOURCE}\\s+(?:to\\s+)?(?:run|called|invoked|used)\\b`,
+].join('|');
+const SECONDARY_MEMORY_REQUEST_SOURCE = [
+  '(?:(?:also|and\\s+then|then|plus|so)\\s+)?',
+  '(?:(?:while|if|since|once|after|before)\\b[^.!?;]{0,64}[,:]\\s*)?',
+  '(?:(?:please|kindly)\\s+|(?:can|could|would|will)\\s+you\\s+|(?:i|we)\\s+(?:need|want)\\s+you\\s+to\\s+|our\\s+next\\s+task\\s+is\\s+to\\s+)?',
+  `(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE}|${SECONDARY_MEMORY_QUESTION_SOURCE})\\b`,
+].join('');
+const SECONDARY_MEMORY_SENTENCE_RE = new RegExp(`([.!?;])\\s+(?=${SECONDARY_MEMORY_REQUEST_SOURCE})`, 'i');
+const SECONDARY_MEMORY_INDIRECT_SENTENCE_RE = new RegExp(
+  `([.!?;])\\s+(?=(?:(?:also|and(?:\\s+then)?|then|plus|so)\\s+)?(?:${SECONDARY_MEMORY_INDIRECT_REQUEST_SOURCE}))`,
+  'i',
+);
+const SECONDARY_MEMORY_TRANSITION_RE = new RegExp(
+  `(?:\\s+[—–]\\s+|\\s+-\\s+|,\\s*|\\s+)(?=(?:also|and(?:\\s+then)?|then|plus|so)\\s+(?:(?:(?:please|kindly)\\s+|(?:can|could|would|will)\\s+you\\s+)?(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE})\\b|(?:${SECONDARY_MEMORY_INDIRECT_REQUEST_SOURCE})))`,
+  'i',
+);
+const SECONDARY_MEMORY_CONDITIONAL_RE = new RegExp(
+  `(?:,\\s*|\\s+)(?=(?:while\\s+(?:you\\s+)?(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE})\\b|if\\s+you\\s+(?:can|could|would)\\s+(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE})\\b|(?:if|since|while|when|once|after|before|provided|assuming)\\b[^.!?;]{0,64}[,:]\\s*(?:(?:please|kindly)\\s+)?(?:${SECONDARY_MEMORY_REQUEST_VERB_SOURCE})\\b))`,
+  'i',
+);
+
+function explicitRememberCommandStart(text: string): number | null {
+  const match = EXPLICIT_REMEMBER_COMMAND_RE.exec(text);
+  if (!match?.[1] || match.index === undefined) return null;
+  return match.index + match[0].lastIndexOf(match[1]);
+}
+
+function stripTerminalMemoryFraming(text: string): string {
+  return text
     .replace(
       /\s+(?:then\s+)?(?:just\s+)?confirm(?:\s+only)?\s+(?:(?:you(?:'ve| have)\s+)?(?:noted|saved|remembered)\s+it|after\s+it\s+is\s+(?:noted|saved|stored|remembered))(?:\s*[—,:;-]\s*nothing\s+else)?[.!?]*$/i,
       '',
@@ -245,13 +322,110 @@ function explicitRememberContent(text: string): string {
       '',
     )
     // A standalone final sentence is framing; "I need to confirm" is not.
-    .replace(/(?<=[.!?])\s+(?:just\s+)?confirm[.!?]*$/i, '');
-  return clause.trim() || text;
+    .replace(/(?<=[.!?])\s+(?:just\s+)?confirm[.!?]*$/i, '')
+    .replace(
+      /(?<=[.!?])\s+(?:a|an)\s+(?:(?:natural|brief|short|simple)\s+)?(?:acknowledg(?:e)?ment|confirmation|reply)\s+(?:is|will\s+be)\s+(?:enough|sufficient)[.!?]*$/i,
+      '',
+    )
+    .trim();
 }
 
-function isExplicitRememberRequest(text: string): boolean {
-  return !/^\s*(?:do|did|does|can|could|would|will)\b/i.test(text)
-    && /\b(?:remember|note|keep in mind|don'?t forget|make a note)\b/i.test(text);
+interface MemoryClauseIsolation {
+  memoryContent: string;
+  hasSecondaryWork: boolean;
+}
+
+function isolateMemoryFromSecondaryWork(text: string): MemoryClauseIsolation {
+  const matches = [
+    SECONDARY_MEMORY_SENTENCE_RE.exec(text),
+    SECONDARY_MEMORY_INDIRECT_SENTENCE_RE.exec(text),
+    SECONDARY_MEMORY_TRANSITION_RE.exec(text),
+    SECONDARY_MEMORY_CONDITIONAL_RE.exec(text),
+  ].filter((match): match is RegExpExecArray => Boolean(match?.index !== undefined));
+  if (matches.length === 0) {
+    return { memoryContent: text.trim(), hasSecondaryWork: false };
+  }
+  const boundary = matches.reduce((earliest, match) => (
+    (match.index ?? Number.POSITIVE_INFINITY) < (earliest.index ?? Number.POSITIVE_INFINITY)
+      ? match
+      : earliest
+  ));
+  const punctuationLength = boundary[1]?.length ?? 0;
+  const isolated = text.slice(0, (boundary.index ?? 0) + punctuationLength).trim();
+  return {
+    memoryContent: isolated || text.trim(),
+    hasSecondaryWork: Boolean(isolated),
+  };
+}
+
+function parseRememberInstruction(text: string): MemoryClauseIsolation | null {
+  const commandStart = explicitRememberCommandStart(text);
+  if (commandStart === null) return null;
+  const command = text.slice(commandStart);
+  const leader = EXPLICIT_REMEMBER_LEADERS.find((candidate) => candidate.test(command));
+  // Bare "remember to ..." intentionally keeps its command wording; every
+  // other recognized memory command is cleaned to the user-authored claim.
+  const content = leader ? command.replace(leader, '') : command;
+
+  const isolated = isolateMemoryFromSecondaryWork(stripTerminalMemoryFraming(content));
+  return {
+    memoryContent: isolated.memoryContent || text,
+    hasSecondaryWork: commandStart > 0 || isolated.hasSecondaryWork,
+  };
+}
+
+// A user can explicitly revise durable knowledge without repeating the word
+// "remember". Keep this deliberately narrower than the general correction
+// detector: future-reference language grants durable intent, while the
+// remainder still has to be a factual claim rather than an instruction to
+// rewrite the current reply/artifact. The complete text is retained because
+// conflict resolution needs both the correction cue and any quoted stale value.
+// Unrelated live work is isolated later; the exact full turn remains the source
+// episode, while only the correction claim is eligible for promotion.
+const FUTURE_REFERENCE_CORRECTION_LEADER_RE = /^\s*(?:(?:small\s+)?correction\s+(?:for\s+later|for\s+future\s+reference)|(?:for\s+later|for\s+future\s+reference)\s*[,:—–-]?\s*(?:small\s+)?correction)\s*[,:—–-]\s*/i;
+const CORRECTION_FACT_RELATION_RE = /\b(?:is|are|was|were|has|have|uses?|prefers?|works?|reports?|lives?|equals?|means?|belongs?|closes?|starts?|ends?|moved?)\b/i;
+const CORRECTION_IMPERATIVE_RE = /^\s*(?:please\s+)?(?:add|change|create|delete|edit|format|make|move|remove|rename|rewrite|send|shorten|update|use|write)\b/i;
+
+function isExplicitDurableCorrectionRequest(text: string): boolean {
+  const leader = FUTURE_REFERENCE_CORRECTION_LEADER_RE.exec(text);
+  if (!leader) return false;
+  const claim = text.slice(leader[0].length).trim();
+  return claim.length >= 12
+    && !CORRECTION_IMPERATIVE_RE.test(claim)
+    && CORRECTION_FACT_RELATION_RE.test(claim);
+}
+
+export type ExplicitMemoryInstructionKind = 'remember' | 'future_reference_correction';
+
+export interface ExplicitMemoryInstructionParse {
+  kind: ExplicitMemoryInstructionKind;
+  memoryContent: string;
+  hasSecondaryWork: boolean;
+}
+
+/** Parse the durable-memory portion of a compound user turn without changing
+ * the source turn itself. The returned `memoryContent` is safe to enqueue as a
+ * candidate; callers must keep the original message for transcript, provider,
+ * and episode evidence. This module-level seam lets every brain share the same
+ * memory/action boundary without importing runtime code into memory. */
+export function parseExplicitMemoryInstruction(message: string): ExplicitMemoryInstructionParse | null {
+  const text = clean(message, 900);
+  if (!text) return null;
+  if (isExplicitDurableCorrectionRequest(text)) {
+    const isolated = isolateMemoryFromSecondaryWork(stripTerminalMemoryFraming(text));
+    return {
+      kind: 'future_reference_correction',
+      memoryContent: isolated.memoryContent || text,
+      hasSecondaryWork: isolated.hasSecondaryWork,
+    };
+  }
+  const remembered = parseRememberInstruction(text);
+  if (!remembered) return null;
+  return {
+    kind: 'remember',
+    memoryContent: remembered.memoryContent,
+    hasSecondaryWork: remembered.hasSecondaryWork,
+  };
 }
 
 function explicitRememberKind(content: string): ConsolidatedFactKind {
@@ -330,7 +504,9 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   const taskRequest = looksLikeOneOffTaskRequest(text);
   const persistentScope = PERSISTENT_SCOPE_RE.test(text);
   const explicitPreference = EXPLICIT_PREFERENCE_CUES.test(text);
-  const explicitRemember = isExplicitRememberRequest(text);
+  const explicitMemoryInstruction = parseExplicitMemoryInstruction(text);
+  const explicitRemember = explicitMemoryInstruction?.kind === 'remember';
+  const explicitDurableCorrection = explicitMemoryInstruction?.kind === 'future_reference_correction';
 
   // Enforceable sender/account routing rule → kind:'constraint' so the dispatch
   // gate (constraint-guard via listConstraints) actually ENFORCES it, closing the
@@ -347,13 +523,28 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   }
   const capturedConstraint = candidates.some((c) => c.kind === 'constraint');
 
+  // "Correction for later" is the same durable authority as "remember this",
+  // but preserving the complete CORRECTION is essential: the consolidation
+  // layer uses its cue and quoted old value to retire exactly one stale fact
+  // without a model conflict-resolution call. A following live request is not
+  // part of that fact; only the source episode keeps the complete user turn.
+  if (explicitDurableCorrection && explicitMemoryInstruction && !capturedConstraint) {
+    const content = explicitMemoryInstruction.memoryContent;
+    addCandidate(candidates, {
+      kind: explicitRememberKind(content),
+      content,
+      reason: 'explicit durable correction',
+    });
+    return candidates.slice(0, maxCandidates);
+  }
+
   // An explicit store request is already the user's durable-memory decision.
   // Canonicalize it before the broader project/feedback heuristics see words
   // such as "project", "must", or "durable" in the surrounding command. Those
   // heuristics previously stored a second, truncated "Clementine requirement:
   // Remember this..." wrapper before memory_remember wrote the clean claim.
-  if (explicitRemember && !capturedConstraint) {
-    const content = explicitRememberContent(text);
+  if (explicitRemember && explicitMemoryInstruction && !capturedConstraint) {
+    const content = explicitMemoryInstruction.memoryContent;
     if (prohibition) {
       addCandidate(candidates, {
         kind: 'feedback',
@@ -427,13 +618,11 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     });
   }
 
-  // Explicit store request. Broadened from the old
-  // `remember (that|this|my|i|we)` — that dropped "remember to call the
-  // vendor", "remember: ship Friday", and "note that …" / "don't forget
-  // …". A "do you remember X?" question is NOT a store request, so we
-  // exclude leading interrogatives.
-  if (candidates.length === 0 && explicitRemember) {
-    const content = explicitRememberContent(text);
+  // Explicit store request. The shared parser recognizes command-shaped
+  // clauses (including action-first compound turns) while questions and
+  // incidental mentions of "remember" grant no durable-write authority.
+  if (candidates.length === 0 && explicitRemember && explicitMemoryInstruction) {
+    const content = explicitMemoryInstruction.memoryContent;
     addCandidate(candidates, {
       kind: explicitRememberKind(content),
       content,
@@ -565,6 +754,7 @@ export function captureInteractionSignals(input: {
   // not create duplicate facts or duplicate "learning decision" entries.
   let queuedCandidateIds: number[] = [];
   let episodeId: string | null = null;
+  let callId: string | null = null;
   if (candidates.length > 0 && input.sessionId) {
     try {
       const queued = enqueueAutoCaptureCandidates({
@@ -576,6 +766,7 @@ export function captureInteractionSignals(input: {
       });
       queuedCandidateIds = queued.candidateIds;
       episodeId = queued.episodeId;
+      callId = queued.callId;
       if (queuedCandidateIds.length > 0) {
         queueMicrotask(() => {
           void drainDurableConsolidationCandidates({ ids: queuedCandidateIds, limit: queuedCandidateIds.length })
@@ -610,6 +801,7 @@ export function captureInteractionSignals(input: {
     facts: [],
     queuedCandidateIds,
     episodeId,
+    callId,
     profilePatch,
     profile,
   };

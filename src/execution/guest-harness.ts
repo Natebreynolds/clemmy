@@ -50,6 +50,10 @@ export interface GuestRunOptions {
   allowedTools?: string[];
   timeoutMs?: number;
   sessionId?: string;
+  /** Exact origin turn/attempt. Guest work can outlive the ALS context, so
+   *  these identities travel with the job instead of being recovered later. */
+  sourceUserSeq?: number;
+  attemptId?: string;
   /** Abort = the user's kill switch. The child gets SIGTERM, then SIGKILL. */
   signal?: AbortSignal;
   onEvent?: (event: GuestRunEvent) => void;
@@ -431,6 +435,8 @@ export async function runGuestHarness(opts: GuestRunOptions): Promise<GuestRunRe
   if (usage) {
     recordModelUsage({
       sessionId: opts.sessionId || 'guest-harness',
+      sourceUserSeq: opts.sourceUserSeq,
+      attemptId: opts.attemptId,
       channel: 'guest-harness',
       model: usage.model || `${opts.harness}-guest`,
       // Claude guests emit raw Anthropic result JSON (input EXCLUDES cache

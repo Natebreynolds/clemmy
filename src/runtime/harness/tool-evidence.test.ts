@@ -10,6 +10,8 @@ import {
   objectiveMayRequireMultipleResults,
   objectiveRequiresFreshExternalWrite,
   objectiveRequiresMutatingEvidence,
+  singleSuccessfulCollectionReadCompletesObjective,
+  singleSuccessfulCollectionReadHasNoHardMultiplicity,
   freshExternalWriteEvidenceIsVerified,
   freshExternalWriteEvidenceStatus,
   toolOutputLooksSuccessful,
@@ -68,6 +70,18 @@ test('control and read tools cannot certify a mutating objective', () => {
   );
   assert.equal(
     objectiveRequiresMutatingEvidence('Do not run shell commands; write the report.'),
+    true,
+  );
+  assert.equal(
+    objectiveRequiresMutatingEvidence('Do not merely retrieve the item but send it to Slack.'),
+    true,
+  );
+  assert.equal(
+    objectiveRequiresMutatingEvidence('Do not ask me — email me the returned status.'),
+    true,
+  );
+  assert.equal(
+    objectiveRequiresMutatingEvidence('Do not ask me: email me the returned status.'),
     true,
   );
   for (const objective of [
@@ -353,6 +367,55 @@ test('multi-result objectives retain completeness verification after one success
   );
 });
 
+test('one concrete collection read certifies only an implicit plural collection objective', () => {
+  const horizonObjective = [
+    'Refresh the proof release queue current items from the same connected source.',
+    'Reuse the capability already proved on this machine. Do not discover, inspect a contract, use code mode, shell, workspace, or memory.',
+    'Return the source marker, revision, item id, title, and status.',
+  ].join('\n');
+  assert.equal(
+    singleSuccessfulCollectionReadCompletesObjective(horizonObjective, ['PROOF_LIST_TASKS']),
+    true,
+  );
+  for (const objective of [
+    'Read both reports.',
+    'Query every account and summarize it.',
+    'Research these 12 prospects.',
+    '- List open tasks.\n- Query overdue tasks.',
+    'List more than one current item.',
+    'Return a pair of current items.',
+    'Return a couple of current items.',
+    'Return one open item and one closed item.',
+    'Return one item per status group.',
+  ]) {
+    assert.equal(
+      singleSuccessfulCollectionReadCompletesObjective(objective, ['PROOF_LIST_TASKS']),
+      false,
+      objective,
+    );
+  }
+  assert.equal(
+    singleSuccessfulCollectionReadCompletesObjective('Refresh the current items.', ['composio_search_tools']),
+    false,
+    'surface discovery is not business-result evidence',
+  );
+  assert.equal(
+    singleSuccessfulCollectionReadCompletesObjective('Refresh the current items.', ['PROOF_LIST_TASKS', 'PROOF_QUERY_TASKS']),
+    false,
+    'multiple reads do not receive the singular certificate',
+  );
+  assert.equal(
+    singleSuccessfulCollectionReadCompletesObjective('Update the current items.', ['PROOF_LIST_TASKS']),
+    false,
+    'a read cannot certify a mutation',
+  );
+  assert.equal(
+    singleSuccessfulCollectionReadHasNoHardMultiplicity('Refresh the current items.', ['PROOF_LIST_TASKS']),
+    true,
+    'the intended bare-plural relaxation remains narrow and available',
+  );
+});
+
 test('fresh external-write requirement is destination-aware and ignores prohibitions/data fields', () => {
   for (const objective of [
     'Perform one Google Sheets value write, then read it back.',
@@ -376,6 +439,10 @@ test('fresh external-write requirement is destination-aware and ignores prohibit
     'Subscribe me to the newsletter.',
     'Comment on issue 123.',
     'Merge the PR.',
+    'Do not ask me a question but email me the returned status.',
+    'Do not ask me — email me the returned status.',
+    'Do not ask me: email me the returned status.',
+    'Do not merely retrieve the item but send it to Slack.',
   ]) {
     assert.equal(objectiveRequiresFreshExternalWrite(objective), true, objective);
   }

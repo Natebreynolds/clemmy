@@ -28,7 +28,12 @@
  */
 import { randomUUID } from 'node:crypto';
 import { setDefaultModelProvider } from '@openai/agents';
-import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, accessTokenExpMs } from '../auth-store.js';
+import {
+  accessTokenExpMs,
+  assertCodexAccessTokenCanCoverCall,
+  getStoredCodexOAuthTokens,
+  refreshStoredNativeOAuth,
+} from '../auth-store.js';
 import { RouterModelProvider } from './router-model.js';
 import { reviveDeadBrains } from './fallback-model.js';
 import { maybeWrapDebate } from './debate-model.js';
@@ -89,6 +94,10 @@ export async function loadFreshCodexAccessToken(): Promise<string> {
   if (!tokens?.accessToken) {
     throw new Error('codex OAuth tokens were cleared while the harness was running');
   }
+  // Proof snapshots cannot refresh. Guard every model dispatch so a long
+  // horizon may progress across many calls but never begins one whose full
+  // 10-minute call budget could cross the access token's expiry.
+  assertCodexAccessTokenCanCoverCall(tokens);
   if (shouldRefresh(tokens.accessToken, tokens.lastRefresh)) {
     const result = await refreshStoredNativeOAuth();
     if (result.ok) {

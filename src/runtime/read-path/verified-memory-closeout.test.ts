@@ -65,7 +65,7 @@ async function governedRead(
   payload: unknown,
   options: { schema?: Record<string, unknown> | null } = {},
 ): Promise<string> {
-  if (options.schema !== null) schemaCache.rememberToolSchema(slug, options.schema ?? CAL_SCHEMA_V1);
+  if (options.schema !== null) schemaCache.rememberToolSchema(slug, options.schema ?? CAL_SCHEMA_V1, Date.now());
   const exec = (async () => payload) as never;
   const output = await composio.runComposioExecuteForTestInSession(slug, { timeMin: '2026-08-06' }, exec, sessionId);
   // Materialization is the durable worker's job now; tests drive its entry
@@ -98,7 +98,7 @@ test('a thrown provider error never learns', async () => {
   const phrase = 'fetch the flaky upstream numbers';
   acceptSource(sessionId, phrase);
   const exec = (async () => { throw new Error('upstream unreachable'); }) as never;
-  schemaCache.rememberToolSchema('SCHEDULERCO_FETCH_NUMBERS', CAL_SCHEMA_V1);
+  schemaCache.rememberToolSchema('SCHEDULERCO_FETCH_NUMBERS', CAL_SCHEMA_V1, Date.now());
   await composio.runComposioExecuteForTestInSession('SCHEDULERCO_FETCH_NUMBERS', {}, exec, sessionId).catch(() => '');
   assert.equal(retrievedIdentifiers(phrase).includes('SCHEDULERCO_FETCH_NUMBERS'), false,
     'a thrown dispatch was learned as a proven capability');
@@ -164,7 +164,7 @@ test('a capability learned under one contract stops serving when the live contra
   // The provider ships a NEW contract for the same identifier.
   schemaCache.rememberToolSchema('SCHEDULERCO_LIST_PARKING', {
     type: 'object', properties: { lot: { type: 'string' }, level: { type: 'number' } },
-  });
+  }, Date.now());
   assert.equal(retrievedIdentifiers(phrase).includes('SCHEDULERCO_LIST_PARKING'), false,
     'a stale capability was served after its provider contract changed');
 });
@@ -192,7 +192,7 @@ test('the same phrase proven against two accounts keeps both, each with its own 
   acceptSource(sessionId, phrase);
   schemaCache.rememberToolSchema('MAILCO_FETCH_INVOICES', {
     type: 'object', properties: { query: { type: 'string' } },
-  });
+  }, Date.now());
   await composio._settleVerifiedComposioReadForTest({
     toolSlug: 'MAILCO_FETCH_INVOICES', sessionId,
     result: { successful: true, data: { items: [{ id: 'i-1' }] } },

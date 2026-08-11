@@ -117,9 +117,19 @@ function verifyPendingActionExecutionAuthority(record: PendingActionRecord): str
   const connectedAccountId = typeof record.payload.connected_account_id === 'string'
     ? record.payload.connected_account_id.trim()
     : '';
+  let accountAlias: unknown;
+  try {
+    const parsedArguments = typeof record.payload.arguments === 'string'
+      ? JSON.parse(record.payload.arguments) as unknown
+      : record.payload.arguments;
+    if (isPlainRecord(parsedArguments) && Object.prototype.hasOwnProperty.call(parsedArguments, 'account_alias')) {
+      accountAlias = parsedArguments.account_alias;
+    }
+  } catch { /* payload integrity/canonicalization handles malformed arguments */ }
   return verifyPendingComposioExecutionAuthority({
     toolSlug: slug,
     connectedAccountIds: [connectedAccountId || null],
+    accountAliases: [accountAlias],
     executionAuthority: authority,
   });
 }

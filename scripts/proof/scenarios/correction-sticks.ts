@@ -44,9 +44,9 @@ export function staleValueAssertedAsCurrent(text: string, staleValue: string): b
     const before = text.slice(Math.max(0, index - 72), index);
     const after = text.slice(index + staleValue.length, index + staleValue.length + 112);
     const retiredBefore =
-      /(?:stale|old|outdated|superseded|retired|deprecated|former|previous)(?:\s+(?:project\s+)?(?:access\s+)?(?:code|value|credential))?[\s:="'`—–-]*$/i.test(before);
+      /(?:stale|old|outdated|superseded|retired|deprecated|former|previous)(?:\s+(?:project\s+)?(?:access\s+)?(?:code|value|credential))?[\s:="'`*_~—–-]*$/i.test(before);
     const retiredAfter =
-      /^[\s()[\]{}:="'`—–,;-]*(?:(?:is|was|has been|=)[\s:="'`—–-]*)?(?:stale|old|outdated|superseded|retired|deprecated|no longer\s+(?:current|valid|correct)|not\s+(?:current|valid|correct)|should not be used|do not use|don't use)\b/i.test(after);
+      /^[\s()[\]{}:="'`*_~—–,;-]*(?:(?:is|was|has been|=)[\s:="'`*_~—–-]*(?:(?:the|a|an)\s+)?)?(?:stale|old|outdated|superseded|retired|deprecated|no longer\s+(?:current|valid|correct)|not\s+(?:current|valid|correct)|should not be used|do not use|don't use)\b/i.test(after);
     const reversal = /\b(?:but|however|yet)\b.{0,96}\b(?:(?:is|was|became|remains)\s+(?:now\s+)?(?:current|valid|correct)(?:\s+again)?|no longer\s+(?:stale|old|outdated|superseded|retired|deprecated)|should\s+(?:now\s+)?be\s+used|(?:do\s+)?use\s+(?:it|this|the\s+(?:code|value|credential)))\b/i.test(after);
     if (reversal || (!retiredBefore && !retiredAfter)) return true;
     cursor = index + needle.length;

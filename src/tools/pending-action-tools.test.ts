@@ -29,6 +29,10 @@ const {
   grantComposioCliDefaultAccountAuthority,
   revokeComposioCliDefaultAccountAuthority,
 } = await import('../integrations/composio/cli-default-account-authority.js');
+const {
+  rememberAccountAlias,
+  resetAccountAliasesForTest,
+} = await import('../memory/account-alias-store.js');
 
 function handlerFor(name: string): (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }> {
   const handlers = new Map<string, (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>>();
@@ -82,6 +86,8 @@ before(() => rmSync(TEST_HOME, { recursive: true, force: true }));
 beforeEach(() => {
   resetEventLog();
   rmSync(`${TEST_HOME}/pending-actions`, { recursive: true, force: true });
+  rmSync(`${TEST_HOME}/memory/account-aliases.json`, { force: true });
+  resetAccountAliasesForTest();
 });
 after(() => rmSync(TEST_HOME, { recursive: true, force: true }));
 
@@ -223,6 +229,78 @@ test('pending_action_queue canonicalizes both Composio spellings and promotes on
     'request_now',
     'request_now cannot be downgraded by a stale retry',
   );
+});
+
+test('formal pending-action admission freezes account_alias labels and rejects mutable or non-string write routes', async () => {
+  rememberAccountAlias({
+    toolkit: 'outlook',
+    label: 'Review Mailbox',
+    email: 'review-a@corp.example',
+    connectionId: 'ca_review_a',
+  });
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Stage the reviewed Outlook draft in my Review Mailbox.' },
+  });
+  const invoke = (accountAlias: unknown, callId: string) => withToolOutputContext(
+    { sessionId: session.id, runScopeId: 'stable-alias-admission', callId },
+    () => withHarnessRunContext(
+      {
+        sessionId: session.id,
+        sourceUserSeq: source.seq,
+        behaviorScopeId: 'stable-alias-admission',
+        counter: new ToolCallsCounter(10),
+      },
+      () => handlerFor('pending_action_queue')({
+        title: 'Mailbox-bound Outlook draft',
+        summary: 'Create the exact reviewed draft in the named mailbox.',
+        kind: 'external_write',
+        // Bare direct slug exercises the legacy spelling and omitted intent
+        // exercises the formal legacy bridge through the shared admission seam.
+        toolName: 'OUTLOOK_CREATE_DRAFT',
+        payloadJson: JSON.stringify({
+          subject: 'Review',
+          body: 'Body',
+          to_email: 'review@example.com',
+          account_alias: accountAlias,
+        }),
+      }),
+    ),
+  );
+
+  const queued = await invoke('Review Mailbox', 'stable-alias');
+  assert.match(queued.content[0].text, /Pending action queued/);
+  const [record] = listPendingActions({ sessionId: session.id, status: 'all' });
+  assert.ok(record);
+  const storedArgs = JSON.parse(
+    (record.payload as { arguments: string }).arguments,
+  ) as Record<string, unknown>;
+  assert.equal(storedArgs.account_alias, 'review-a@corp.example');
+  const approvedHash = record.payloadHash;
+
+  rememberAccountAlias({
+    toolkit: 'outlook',
+    label: 'Review Mailbox',
+    email: 'review-b@corp.example',
+    connectionId: 'ca_review_b',
+  });
+  const afterRebind = getPendingAction(record.id)!;
+  assert.equal(
+    (JSON.parse((afterRebind.payload as { arguments: string }).arguments) as Record<string, unknown>).account_alias,
+    'review-a@corp.example',
+    'a later alias rebind cannot retarget the queued payload',
+  );
+  assert.equal(afterRebind.payloadHash, approvedHash, 'the stable route was part of the original approval hash');
+
+  const unresolved = await invoke('Not Bound Anywhere', 'unresolved-alias');
+  assert.match(unresolved.content[0].text, /refused.*not bound to a stable outlook email identity/is);
+  const nonString = await invoke({ label: 'Review Mailbox' }, 'non-string-alias');
+  assert.match(nonString.content[0].text, /refused.*account_alias must be a non-empty string/is);
+  assert.equal(listPendingActions({ sessionId: session.id, status: 'all' }).length, 1);
 });
 
 test('pending-action canonicalization never rewrites local or custom tool identities as Composio', () => {

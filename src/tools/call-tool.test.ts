@@ -8,10 +8,11 @@
  *    write-boundary gate (keyed on the INNER name), via the _setCodeModeToolsForTests seam.
  *  - PROMOTION: a successful dispatch records the reached tool to the session hot-set.
  */
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+const PRIOR_CLEMENTINE_HOME = process.env.CLEMENTINE_HOME;
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-call-tool-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
@@ -35,20 +36,94 @@ const {
   wrapToolForHarness,
 } = await import('../runtime/harness/brackets.js');
 const { getHotSet, _resetHotSetForTest } = await import('../agents/tool-hotset.js');
-const { resetEventLog, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const {
+  appendEvent,
+  closeEventLog,
+  createSession,
+  getSession,
+  listEvents,
+  openEventLog,
+  resetEventLog,
+} = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { closeOperationalTelemetryDb } = await import('../runtime/operational-telemetry.js');
 const { getLocalToolSchemas } = await import('./local-runtime-tools.js');
 const { deriveOrchestratorDiscoveryNames } = await import('./tool-registry.js');
+const {
+  appendAgentCapabilityBinding,
+  bindAgentCapabilityEnvelope,
+  bindAgentCapabilityRevision,
+  boundAgentCapabilityRevision,
+  sealAgentCapabilityUniverse,
+} = await import('../agents/capability-envelope.js');
 
 type ToolLike = { invoke?: (ctx: unknown, input: string, details: unknown) => Promise<unknown> };
 
+/**
+ * Production no longer lets a bracketed tool mint settlement authority from a
+ * session id alone. Give each legacy component fixture the same exact accepted
+ * source + persisted graph the real turn spine establishes before dispatch.
+ * Reuse it for later calls in the same fixture session; after resetEventLog the
+ * durable marker disappears and a fresh source is created automatically.
+ */
+function acceptedSourceForCallToolFixture(sessionId: string): { sourceUserSeq: number; turn: number } {
+  if (!getSession(sessionId)) createSession({ id: sessionId, kind: 'chat' });
+  const existing = listEvents(sessionId, { types: ['user_input_received'] })
+    .find((event) => event.data.callToolAuthorityFixture === true);
+  if (existing) return { sourceUserSeq: existing.seq, turn: existing.turn };
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Hello', callToolAuthorityFixture: true },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  }));
+  return { sourceUserSeq: source.seq, turn: source.turn };
+}
+
+function invokeCallToolFixture(
+  callTool: ToolLike,
+  sessionId: string,
+  input: string,
+  callId: string,
+  counter = new ToolCallsCounter(1_000),
+): Promise<unknown> {
+  const accepted = acceptedSourceForCallToolFixture(sessionId);
+  return withHarnessRunContext(
+    { sessionId, ...accepted, counter },
+    () => withToolOutputContext(
+      { sessionId, sourceUserSeq: accepted.sourceUserSeq, callId, toolName: 'call_tool' },
+      () => callTool.invoke!(
+        { context: { sessionId, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn } },
+        input,
+        { toolCall: { callId } },
+      ) as Promise<unknown>,
+    ),
+  ) as Promise<unknown>;
+}
+
+test.after(() => {
+  _setCodeModeToolsForTests(null);
+  _setCodeModeMcpResolverForTests(null);
+  _resetHotSetForTest();
+  closeEventLog();
+  closeOperationalTelemetryDb();
+  rmSync(TMP_HOME, { recursive: true, force: true });
+  if (PRIOR_CLEMENTINE_HOME === undefined) delete process.env.CLEMENTINE_HOME;
+  else process.env.CLEMENTINE_HOME = PRIOR_CLEMENTINE_HOME;
+});
+
 function invokeCallTool(sessionId: string, name: string, argsJson: string): Promise<unknown> {
   const callTool = buildCallTool() as unknown as ToolLike;
-  return withToolOutputContext({ sessionId }, () =>
-    callTool.invoke!(
-      { context: { sessionId } },
-      JSON.stringify({ name, args_json: argsJson }),
-      { toolCall: { callId: `call-${Math.random()}` } },
-    ) as Promise<unknown>,
+  const callId = `call-${Math.random()}`;
+  return invokeCallToolFixture(
+    callTool,
+    sessionId,
+    JSON.stringify({ name, args_json: argsJson }),
+    callId,
   );
 }
 
@@ -113,6 +188,7 @@ test('an explicit local-only MCP scope rejects a guessed name before provider re
       reachableBuiltinNames: new Set(),
       mcpToolScope: {
         reason: 'explicit local-only regression',
+        authority: 'none',
         allowedServerSlugs: [],
         maxTools: 0,
       },
@@ -194,6 +270,7 @@ test('a wrapped write-shaped carrier rejection records typed no-dispatch instead
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   resetEventLog();
   const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
   let providerDispatches = 0;
   _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
@@ -208,7 +285,7 @@ test('a wrapped write-shaped carrier rejection records typed no-dispatch instead
 
   try {
     const rawOutput = await withHarnessRunContext(
-      { sessionId: session.id, counter: new ToolCallsCounter(10), sourceUserSeq: 41 },
+      { sessionId: session.id, ...accepted, counter: new ToolCallsCounter(10) },
       () => wrapped.invoke!(
         { context: { sessionId: session.id } },
         JSON.stringify({
@@ -227,12 +304,13 @@ test('a wrapped write-shaped carrier rejection records typed no-dispatch instead
     const output = String(rawOutput);
 
     assert.match(output, /arg_validation/);
-    assert.match(output, /non-empty tool_slug/);
+    assert.match(output, /slug.*not a field.*tool_slug/);
+    assert.match(output, /repair/);
     assert.equal(providerDispatches, 0, 'validation stops before the provider boundary');
     const failed = listEvents(session.id, { types: ['external_write_failed'] });
     assert.equal(failed.length, 1, 'the canonical attempt receives one retry-safe settlement');
     assert.equal(failed[0]?.data.callId, 'call-workspace-cadence-invalid-carrier');
-    assert.equal(failed[0]?.data.sourceUserSeq, 41, 'settlement remains owned by the accepted request');
+    assert.equal(failed[0]?.data.sourceUserSeq, accepted.sourceUserSeq, 'settlement remains owned by the accepted request');
     assert.equal(failed[0]?.data.dispatch, 'not_started');
     assert.equal(failed[0]?.data.effect, 'none');
     assert.equal(listEvents(session.id, { types: ['external_write'] }).length, 0, 'the carrier creates no outer reservation');
@@ -249,6 +327,7 @@ test('an exhausted write-shaped carrier hard-stops without manufacturing no-disp
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   resetEventLog();
   const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
   const counter = new ToolCallsCounter(1);
   counter.increment();
   let providerDispatches = 0;
@@ -266,7 +345,7 @@ test('an exhausted write-shaped carrier hard-stops without manufacturing no-disp
   try {
     await assert.rejects(
       () => withHarnessRunContext(
-        { sessionId: session.id, counter, sourceUserSeq: 42 },
+        { sessionId: session.id, ...accepted, counter },
         () => wrapped.invoke!(
           { context: { sessionId: session.id } },
           JSON.stringify({
@@ -308,6 +387,7 @@ test('an ambiguous reached write produces one inner orphan and no outer carrier 
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   resetEventLog();
   const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
   let providerDispatches = 0;
   _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
@@ -323,7 +403,7 @@ test('an ambiguous reached write produces one inner orphan and no outer carrier 
 
   try {
     const output = String(await withHarnessRunContext(
-      { sessionId: session.id, counter: new ToolCallsCounter(10), sourceUserSeq: 43 },
+      { sessionId: session.id, ...accepted, counter: new ToolCallsCounter(10) },
       () => wrapped.invoke!(
         { context: { sessionId: session.id } },
         JSON.stringify({
@@ -350,7 +430,11 @@ test('an ambiguous reached write produces one inner orphan and no outer carrier 
     assert.equal(attempts[0]?.data.toolName, 'composio_execute_tool');
     assert.equal(orphans[0]?.data.toolName, 'composio_execute_tool');
     assert.equal(orphans[0]?.data.callId, attempts[0]?.data.callId, 'the inner attempt settles by exact id');
-    assert.notEqual(orphans[0]?.data.callId, outerCallId, 'call_tool must not author a second lifecycle');
+    assert.equal(
+      orphans[0]?.data.callId,
+      outerCallId,
+      'the transport mirror and resolved inner attempt share one logical lifecycle',
+    );
     assert.equal(listEvents(session.id, { types: ['external_write_failed'] }).length, 0);
   } finally {
     _setCodeModeToolsForTests(null);
@@ -453,6 +537,70 @@ test('call_tool materializes omitted optional keys before invoking the real stri
   assert.ok(Array.isArray(JSON.parse(out)), 'the real inner memory tool completed with valid JSON');
 });
 
+test('call_tool freezes strict host materialization as the one effective logical contract', async () => {
+  resetEventLog();
+  _resetCallToolSchemaCacheForTest();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'List the matching memory facts.' },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
+  let received: unknown;
+  _setCodeModeToolsForTests(new Map([[
+    'memory_list_facts',
+    { name: 'memory_list_facts', invoke: async (_context: unknown, input: unknown) => {
+      received = typeof input === 'string' ? JSON.parse(input) : input;
+      return '[]';
+    } },
+  ]]));
+  const wrapped = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set(['memory_list_facts']) }) as never,
+  ) as unknown as ToolLike;
+  try {
+    const output = await withHarnessRunContext(
+      {
+        sessionId: session.id,
+        sourceUserSeq: source.seq,
+        turn: 1,
+        counter: new ToolCallsCounter(10),
+      },
+      () => wrapped.invoke!(
+        { context: { sessionId: session.id } },
+        JSON.stringify({
+          name: 'memory_list_facts',
+          args_json: JSON.stringify({ query: 'Northstar team', limit: 10 }),
+        }),
+        { toolCall: { callId: 'call-tool-strict-refinement' } },
+      ),
+    );
+    assert.equal(String(output), '[]');
+    assert.ok(received && typeof received === 'object');
+    const logical = openEventLog().prepare(`
+      SELECT argument_digest, raw_argument_digest, effective_argument_digest
+        FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(session.id, source.seq) as {
+      argument_digest: string;
+      raw_argument_digest: string;
+      effective_argument_digest: string;
+    };
+    assert.notEqual(logical.raw_argument_digest, logical.effective_argument_digest);
+    assert.equal(logical.argument_digest, logical.effective_argument_digest);
+    assert.equal(
+      listEvents(session.id, { types: ['logical_call_contract_refined'] }).length,
+      1,
+    );
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
 test('call_tool materializes omitted nullable computer-tool defaults before strict dispatch', async () => {
   _resetCallToolSchemaCacheForTest();
   const out = String(await invokeCallTool(
@@ -522,6 +670,7 @@ test('a wrapped nested irreversible send gives one pending-action recovery, neve
   process.env.CLEMMY_EXECUTION_GATE = 'on';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(sess.id);
   let dispatched = 0;
   _setCodeModeToolsForTests(
     new Map([['composio_execute_tool', {
@@ -538,7 +687,7 @@ test('a wrapped nested irreversible send gives one pending-action recovery, neve
   const counter = new ToolCallsCounter(10);
   try {
     const output = String(await withHarnessRunContext(
-      { sessionId: sess.id, counter },
+      { sessionId: sess.id, ...accepted, counter },
       () => wrapped.invoke!(
         { context: { sessionId: sess.id } },
         JSON.stringify({
@@ -562,6 +711,20 @@ test('a wrapped nested irreversible send gives one pending-action recovery, neve
     assert.doesNotMatch(output, /SEND_REQUIRES_APPROVAL/);
     assert.equal(dispatched, 0, 'the provider is untouched while the exact call waits for approval');
     assert.equal(counter.calls, 1, 'the pre-dispatch send floor still charges the refused attempt');
+    assert.deepEqual(openEventLog().prepare(`
+      SELECT l.tool_name, s.outcome_kind, s.execution_kind
+        FROM logical_tool_calls l
+        JOIN logical_call_settlements s USING (session_id, source_user_seq, logical_tool_call_id)
+       WHERE l.session_id = ? AND l.source_user_seq = ? AND l.logical_tool_call_id = ?
+    `).get(sess.id, accepted.sourceUserSeq, 'nested-send-one-recovery'), {
+      tool_name: 'gmail_send_email',
+      outcome_kind: 'policy_denial',
+      execution_kind: 'refused_pre_dispatch',
+    });
+    assert.equal((openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(sess.id, accepted.sourceUserSeq, 'nested-send-one-recovery') as { n: number }).n, 0);
   } finally {
     _setCodeModeToolsForTests(null);
     if (prev.brackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
@@ -575,6 +738,7 @@ test('carrier target policy allows account-scoped social posts but blocks target
   const prev = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
   const counter = new ToolCallsCounter(10);
   let dispatched = 0;
   _setCodeModeToolsForTests(
@@ -591,7 +755,7 @@ test('carrier target policy allows account-scoped social posts but blocks target
   ) as unknown as ToolLike;
   const invoke = (toolSlug: string, args: Record<string, unknown>, callId: string) =>
     withHarnessRunContext(
-      { sessionId: session.id, counter },
+      { sessionId: session.id, ...accepted, counter },
       () => wrapped.invoke!(
         { context: { sessionId: session.id } },
         JSON.stringify({
@@ -654,6 +818,32 @@ test('carrier target policy allows account-scoped social posts but blocks target
     }
     assert.equal(dispatched, 0);
     assert.equal(counter.calls, 7, 'two approval conversions plus five validation refusals charge once each');
+    assert.deepEqual(openEventLog().prepare(`
+      SELECT l.logical_tool_call_id, l.tool_name, s.outcome_kind, s.execution_kind
+        FROM logical_tool_calls l
+        JOIN logical_call_settlements s USING (session_id, source_user_seq, logical_tool_call_id)
+       WHERE l.session_id = ? AND l.source_user_seq = ?
+         AND l.logical_tool_call_id IN (?, ?)
+       ORDER BY l.logical_tool_call_id
+    `).all(
+      session.id,
+      accepted.sourceUserSeq,
+      'account-scoped-instagram-post',
+      'account-scoped-instagram-media-publish',
+    ), [
+      {
+        logical_tool_call_id: 'account-scoped-instagram-media-publish',
+        tool_name: 'instagram_post_ig_user_media_publish',
+        outcome_kind: 'policy_denial',
+        execution_kind: 'refused_pre_dispatch',
+      },
+      {
+        logical_tool_call_id: 'account-scoped-instagram-post',
+        tool_name: 'instagram_create_post',
+        outcome_kind: 'policy_denial',
+        execution_kind: 'refused_pre_dispatch',
+      },
+    ]);
   } finally {
     _setCodeModeToolsForTests(null);
     if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
@@ -666,6 +856,7 @@ test('unknown, denied, and malformed nested sends validate before any pending-ac
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(sess.id);
   let dispatched = 0;
   _setCodeModeToolsForTests(
     new Map([['composio_execute_tool', {
@@ -684,7 +875,7 @@ test('unknown, denied, and malformed nested sends validate before any pending-ac
   ) => {
     const wrapped = wrapToolForHarness(buildCallTool(toolOptions) as never) as unknown as ToolLike;
     return withHarnessRunContext(
-      { sessionId: sess.id, counter: new ToolCallsCounter(20) },
+      { sessionId: sess.id, ...accepted, counter: new ToolCallsCounter(20) },
       () => wrapped.invoke!(
         { context: { sessionId: sess.id } },
         JSON.stringify({ name, args_json: args }),
@@ -787,6 +978,64 @@ test('a successful dispatch records the reached tool to the session hot-set', as
   }
 });
 
+test('call_tool canonicalizes object-form Composio arguments before one inner dispatch', async () => {
+  const dispatched: Array<Record<string, unknown>> = [];
+  _setCodeModeToolsForTests(
+    new Map([['composio_execute_tool', {
+      name: 'composio_execute_tool',
+      invoke: async (_context: unknown, input: string) => {
+        dispatched.push(JSON.parse(input) as Record<string, unknown>);
+        return 'rows';
+      },
+    }]]),
+  );
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(['composio_execute_tool']),
+  }) as unknown as ToolLike;
+  const invoke = (sessionId: string, carrier: Record<string, unknown>, callId: string) =>
+    invokeCallToolFixture(
+      callTool,
+      sessionId,
+      JSON.stringify({
+        name: 'composio_execute_tool',
+        args_json: JSON.stringify(carrier),
+      }),
+      callId,
+    );
+
+  try {
+    const empty = await invoke(
+      'sess-object-carrier-empty',
+      { tool_slug: 'PROOF_LIST_TASKS', arguments: {} },
+      'object-carrier-empty',
+    );
+    assert.equal(String(empty), 'rows');
+    assert.equal(dispatched.length, 1, 'valid representation drift must dispatch exactly once');
+    assert.equal(dispatched[0].tool_slug, 'PROOF_LIST_TASKS');
+    assert.equal(dispatched[0].arguments, null);
+
+    const populated = await invoke(
+      'sess-object-carrier-populated',
+      {
+        tool_slug: 'PROOF_LIST_TASKS',
+        arguments: { z: 2, q: 'firm-a' },
+        connected_account_id: 'ca_proof_primary',
+      },
+      'object-carrier-populated',
+    );
+    assert.equal(String(populated), 'rows');
+    assert.equal(dispatched.length, 2, 'a second outer request still causes only one inner dispatch');
+    assert.equal(dispatched[1].arguments, '{"q":"firm-a","z":2}');
+    assert.equal(
+      dispatched[1].connected_account_id,
+      'ca_proof_primary',
+      'canonicalizing the inner payload must preserve an explicit outer account selector',
+    );
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
 test('a first-class built-in accidentally wrapped in call_tool dispatches instead of bouncing not_reachable', async () => {
   _setCodeModeToolsForTests(
     new Map([['memory_recall_all', { name: 'memory_recall_all', invoke: async () => 'all eight teammates' }]]),
@@ -796,10 +1045,11 @@ test('a first-class built-in accidentally wrapped in call_tool dispatches instea
       reachableBuiltinNames: new Set(),
       firstClassNames: new Set(['memory_recall_all']),
     }) as unknown as ToolLike;
-    const out = await callTool.invoke!(
-      { context: { sessionId: 'sess-first-class-wrapper' } },
+    const out = await invokeCallToolFixture(
+      callTool,
+      'sess-first-class-wrapper',
       JSON.stringify({ name: 'memory_recall_all', args_json: JSON.stringify({ objective: 'my team', limit: null }) }),
-      { toolCall: { callId: 'first-class-wrapper' } },
+      'first-class-wrapper',
     );
     assert.equal(String(out), 'all eight teammates');
   } finally {
@@ -825,13 +1075,14 @@ test('a common http_fetch guess repairs to the allowed bounded GET path without 
       reachableBuiltinNames: new Set(),
       firstClassNames: new Set(['run_shell_command']),
     }) as unknown as ToolLike;
-    const out = await callTool.invoke!(
-      { context: { sessionId: sess.id } },
+    const out = await invokeCallToolFixture(
+      callTool,
+      sess.id,
       JSON.stringify({
         name: 'http_fetch',
         args_json: JSON.stringify({ url: 'https://example.com/posts/1' }),
       }),
-      { toolCall: { callId: 'outer-http-fetch' } },
+      'outer-http-fetch',
     );
     assert.deepEqual(JSON.parse(String(out)), { id: 1 });
     assert.ok(dispatched);
@@ -873,13 +1124,14 @@ test('the common mcp_tools guess repairs to the on-demand MCP inventory tool', a
     const callTool = buildCallTool({
       reachableBuiltinNames: new Set(['mcp_list_tools']),
     }) as unknown as ToolLike;
-    const out = await callTool.invoke!(
-      { context: { sessionId: 'sess-mcp-tools-alias' } },
+    const out = await invokeCallToolFixture(
+      callTool,
+      'sess-mcp-tools-alias',
       JSON.stringify({
         name: 'mcp_tools',
         args_json: JSON.stringify({ server_name: 'dataforseo', query: 'keyword suggestions' }),
       }),
-      { toolCall: { callId: 'mcp-tools-alias' } },
+      'mcp-tools-alias',
     );
     assert.match(String(out), /dataforseo__keyword_suggestions/);
     assert.equal(dispatched?.server_name, 'dataforseo');
@@ -913,13 +1165,14 @@ test('production run context attributes the inner dispatch without a tool-output
   _resetHotSetForTest();
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(sess.id);
   _setCodeModeToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
   );
   try {
     const callTool = buildCallTool() as unknown as ToolLike;
     const out = await withHarnessRunContext(
-      { sessionId: sess.id, counter: new ToolCallsCounter(10) },
+      { sessionId: sess.id, ...accepted, counter: new ToolCallsCounter(10) },
       () => callTool.invoke!(
         { context: { sessionId: sess.id } },
         JSON.stringify({
@@ -945,6 +1198,7 @@ test('nested call_tool dispatch reuses the ambient run counter', async () => {
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
   );
   const counter = new ToolCallsCounter(1);
+  const accepted = acceptedSourceForCallToolFixture('sess-shared-counter');
   const callTool = buildCallTool({
     reachableBuiltinNames: new Set(['composio_execute_tool']),
   }) as unknown as ToolLike;
@@ -958,7 +1212,7 @@ test('nested call_tool dispatch reuses the ambient run counter', async () => {
   ) as Promise<unknown>;
   try {
     await withHarnessRunContext(
-      { sessionId: 'sess-shared-counter', counter },
+      { sessionId: 'sess-shared-counter', ...accepted, counter },
       async () => {
         assert.equal(String(await invoke()), 'rows');
         assert.equal(counter.calls, 1, 'the inner call consumes the ambient budget');
@@ -985,6 +1239,7 @@ test('an external MCP name (<server>__<tool>) passes authority and reaches MCP r
 
 test('malformed outer call_tool envelopes consume budget and hit the loop ceiling before SDK validation', async () => {
   const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
   const counter = new ToolCallsCounter(3);
   const wrapped = wrapToolForHarness(
     buildCallTool({ reachableBuiltinNames: new Set() }) as never,
@@ -995,7 +1250,7 @@ test('malformed outer call_tool envelopes consume budget and hit the loop ceilin
     JSON.stringify({ args_json: '{}' }),
   ];
   await withHarnessRunContext(
-    { sessionId: session.id, counter },
+    { sessionId: session.id, ...accepted, counter },
     async () => {
       for (let index = 0; index < malformedInputs.length; index += 1) {
         const output = String(await wrapped.invoke!(
@@ -1017,6 +1272,29 @@ test('malformed outer call_tool envelopes consume budget and hit the loop ceilin
       assert.equal(counter.calls, 3, 'the ceiling refuses without spending past its cap');
     },
   );
+  assert.deepEqual(openEventLog().prepare(`
+    SELECT l.logical_tool_call_id, l.tool_name, s.outcome_kind, s.execution_kind
+      FROM logical_tool_calls l
+      JOIN logical_call_settlements s USING (session_id, source_user_seq, logical_tool_call_id)
+     WHERE l.session_id = ? AND l.source_user_seq = ?
+       AND l.logical_tool_call_id IN (?, ?, ?)
+     ORDER BY l.logical_tool_call_id
+  `).all(
+    session.id,
+    accepted.sourceUserSeq,
+    'malformed-outer-0',
+    'malformed-outer-1',
+    'malformed-outer-2',
+  ), [0, 1, 2].map((index) => ({
+    logical_tool_call_id: `malformed-outer-${index}`,
+    tool_name: 'call_tool',
+    outcome_kind: 'invalid_arguments',
+    execution_kind: 'refused_pre_dispatch',
+  })));
+  assert.equal((openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(session.id, accepted.sourceUserSeq) as { n: number }).n, 0);
 });
 
 test('a harness-wrapped call_tool charges the ambient budget exactly ONCE per deferred action', async () => {
@@ -1028,12 +1306,13 @@ test('a harness-wrapped call_tool charges the ambient budget exactly ONCE per de
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
   );
   const counter = new ToolCallsCounter(10);
+  const accepted = acceptedSourceForCallToolFixture('sess-single-charge');
   const wrapped = wrapToolForHarness(
     buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
   ) as unknown as ToolLike;
   try {
     await withHarnessRunContext(
-      { sessionId: 'sess-single-charge', counter },
+      { sessionId: 'sess-single-charge', ...accepted, counter },
       async () => {
         const out = await wrapped.invoke!(
           { context: { sessionId: 'sess-single-charge' } },
@@ -1058,16 +1337,21 @@ test('a FAILING call_tool dispatch still charges the budget — no zero-cost ret
   // charges). Each ordinary refusal costs exactly 1, then the hard ceiling
   // terminates every later attempt instead of returning zero-cost results.
   const counter = new ToolCallsCounter(2);
+  const accepted = acceptedSourceForCallToolFixture('sess-fail-charge');
+  let invocation = 0;
   const wrapped = wrapToolForHarness(
     buildCallTool({ reachableBuiltinNames: new Set() }) as never,
   ) as unknown as ToolLike;
-  const invoke = () => wrapped.invoke!(
-    { context: { sessionId: 'sess-fail-charge' } },
-    JSON.stringify({ name: 'not_a_real_tool', args_json: '{}' }),
-    { toolCall: { callId: `fail-charge-${counter.calls}` } },
-  ) as Promise<unknown>;
+  const invoke = () => {
+    invocation += 1;
+    return wrapped.invoke!(
+      { context: { sessionId: 'sess-fail-charge' } },
+      JSON.stringify({ name: 'not_a_real_tool', args_json: '{}' }),
+      { toolCall: { callId: `fail-charge-${invocation}` } },
+    ) as Promise<unknown>;
+  };
   await withHarnessRunContext(
-    { sessionId: 'sess-fail-charge', counter },
+    { sessionId: 'sess-fail-charge', ...accepted, counter },
     async () => {
       assert.equal(JSON.parse(String(await invoke())).error, 'not_reachable');
       assert.equal(counter.calls, 1, 'a refused dispatch costs exactly one call');
@@ -1084,6 +1368,8 @@ test('a built-in dispatch is observed as an acquisition; refusals and MCP names 
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const acquired: string[] = [];
+  const previousExecutionGate = process.env.CLEMMY_EXECUTION_GATE;
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
   _setCodeModeToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'updated' }]]),
   );
@@ -1093,12 +1379,11 @@ test('a built-in dispatch is observed as an acquisition; refusals and MCP names 
       onBuiltinAcquisition: (name: string) => acquired.push(name),
     }) as unknown as ToolLike;
     const invoke = (name: string, argsJson: string) =>
-      withToolOutputContext({ sessionId: sess.id }, () =>
-        callTool.invoke!(
-          { context: { sessionId: sess.id } },
-          JSON.stringify({ name, args_json: argsJson }),
-          { toolCall: { callId: `acq-${name}` } },
-        ) as Promise<unknown>,
+      invokeCallToolFixture(
+        callTool,
+        sess.id,
+        JSON.stringify({ name, args_json: argsJson }),
+        `acq-${name}`,
       );
 
     // A refused target is NEVER an acquisition — nothing dispatched.
@@ -1115,12 +1400,196 @@ test('a built-in dispatch is observed as an acquisition; refusals and MCP names 
     assert.deepEqual(acquired, ['composio_execute_tool']);
   } finally {
     _setCodeModeToolsForTests(null);
+    if (previousExecutionGate === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
+    else process.env.CLEMMY_EXECUTION_GATE = previousExecutionGate;
+  }
+});
+
+test('a sealed built-in acquisition appends once, reuses its revision, and dispatches exactly once per call', async () => {
+  const authority = {};
+  const sealed = sealAgentCapabilityUniverse({
+    sessionId: 'sess-capability-admitted',
+    universeTools: [
+      { name: 'call_tool', parameters: {} },
+      { name: 'composio_execute_tool', parameters: {} },
+    ],
+    activeToolNames: ['call_tool'],
+    policyHash: 'policy-capability-admitted',
+    budget: { maxUncachedTokens: 100_000, maxModelCalls: 50, maxToolCalls: 200, maxElapsedMs: 600_000 },
+  });
+  assert.equal(sealed.ok, true, JSON.stringify(sealed));
+  if (!sealed.ok) return;
+  bindAgentCapabilityEnvelope(authority, sealed.envelope);
+  bindAgentCapabilityRevision(authority, sealed.revision);
+
+  let dispatches = 0;
+  let admissions = 0;
+  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      dispatches += 1;
+      return 'rows';
+    },
+  }]]));
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(['composio_execute_tool']),
+      admitBuiltinAcquisition: (targetName: string) => {
+        admissions += 1;
+        return appendAgentCapabilityBinding(authority, targetName);
+      },
+    }) as unknown as ToolLike;
+    const invoke = () => invokeCallToolFixture(
+      callTool,
+      'sess-capability-admitted',
+      JSON.stringify({
+        name: 'composio_execute_tool',
+        args_json: JSON.stringify({ tool_slug: 'APIFY_GET_DATASET_ITEMS', arguments: '{}' }),
+      }),
+      `capability-admitted-${admissions}`,
+    );
+
+    assert.equal(String(await invoke()), 'rows');
+    const afterFirst = boundAgentCapabilityRevision(authority)!;
+    assert.equal(afterFirst.revision, 2);
+    assert.deepEqual([...afterFirst.bound], ['call_tool', 'composio_execute_tool']);
+    assert.equal(String(await invoke()), 'rows');
+    const afterDuplicate = boundAgentCapabilityRevision(authority)!;
+    assert.equal(afterDuplicate.revision, 2, 'duplicate acquisition created revision churn');
+    assert.equal(afterDuplicate.revisionDigest, afterFirst.revisionDigest);
+    assert.equal(admissions, 2, 'each requested dispatch must cross admission exactly once');
+    assert.equal(dispatches, 2, 'each admitted call must dispatch its inner tool exactly once');
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
+test('outside-universe and missing capability authority return requires_readmission with zero dispatch and one budget charge', async () => {
+  const sealedAuthority = {};
+  const missingAuthority = {};
+  const sealed = sealAgentCapabilityUniverse({
+    sessionId: 'sess-capability-refused',
+    universeTools: [{ name: 'call_tool', parameters: {} }],
+    activeToolNames: ['call_tool'],
+    policyHash: 'policy-capability-refused',
+    budget: { maxUncachedTokens: 100_000, maxModelCalls: 50, maxToolCalls: 200, maxElapsedMs: 600_000 },
+  });
+  assert.equal(sealed.ok, true, JSON.stringify(sealed));
+  if (!sealed.ok) return;
+  bindAgentCapabilityEnvelope(sealedAuthority, sealed.envelope);
+  bindAgentCapabilityRevision(sealedAuthority, sealed.revision);
+  const before = boundAgentCapabilityRevision(sealedAuthority)!;
+
+  let dispatches = 0;
+  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      dispatches += 1;
+      return 'must-not-run';
+    },
+  }]]));
+  try {
+    for (const [label, authority] of [
+      ['outside-universe', sealedAuthority],
+      ['missing-authority', missingAuthority],
+    ] as const) {
+      const counter = new ToolCallsCounter(5);
+      const wrapped = wrapToolForHarness(buildCallTool({
+        reachableBuiltinNames: new Set(['composio_execute_tool']),
+        admitBuiltinAcquisition: (targetName: string) => appendAgentCapabilityBinding(authority, targetName),
+      }) as never) as unknown as ToolLike;
+      const sessionId = `sess-${label}`;
+      const accepted = acceptedSourceForCallToolFixture(sessionId);
+      const output = await withHarnessRunContext(
+        { sessionId, ...accepted, counter },
+        () => wrapped.invoke!(
+          { context: { sessionId } },
+          JSON.stringify({
+            name: 'composio_execute_tool',
+            args_json: JSON.stringify({ tool_slug: 'APIFY_GET_DATASET_ITEMS', arguments: '{}' }),
+          }),
+          { toolCall: { callId: `capability-refused-${label}` } },
+        ) as Promise<unknown>,
+      );
+      const refusal = JSON.parse(String(output));
+      assert.equal(refusal.error, 'requires_readmission');
+      assert.equal(refusal.kind, 'requires_readmission');
+      assert.deepEqual(refusal.outside, ['composio_execute_tool']);
+      assert.equal(counter.calls, 1, `${label} refusal must charge the wrapper budget exactly once`);
+      assert.deepEqual(openEventLog().prepare(`
+        SELECT l.tool_name, s.outcome_kind, s.execution_kind
+          FROM logical_tool_calls l
+          JOIN logical_call_settlements s USING (session_id, source_user_seq, logical_tool_call_id)
+         WHERE l.session_id = ? AND l.source_user_seq = ? AND l.logical_tool_call_id = ?
+      `).get(sessionId, accepted.sourceUserSeq, `capability-refused-${label}`), {
+        tool_name: 'apify_get_dataset_items',
+        outcome_kind: 'policy_denial',
+        execution_kind: 'refused_pre_dispatch',
+      });
+      assert.equal((openEventLog().prepare(`
+        SELECT COUNT(*) AS n FROM physical_dispatches
+         WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+      `).get(sessionId, accepted.sourceUserSeq, `capability-refused-${label}`) as { n: number }).n, 0);
+    }
+    assert.equal(dispatches, 0, 'capability refusals must happen before every inner dispatch');
+    const after = boundAgentCapabilityRevision(sealedAuthority)!;
+    assert.equal(after.revision, before.revision, 'outside-universe refusal mutated revision number');
+    assert.equal(after.revisionDigest, before.revisionDigest, 'outside-universe refusal mutated revision content');
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
+test('external MCP dispatch stays under MCP scope and bypasses built-in capability admission', async () => {
+  let admissions = 0;
+  let listCalls = 0;
+  let dispatches = 0;
+  _setCodeModeMcpResolverForTests(() => ({
+    listTools: async () => {
+      listCalls += 1;
+      return [{ name: 'proof__read' }];
+    },
+    callTool: async () => {
+      dispatches += 1;
+      return 'mcp-result';
+    },
+  }));
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(),
+      mcpToolScope: {
+        reason: 'external MCP capability authority regression',
+        allowedServerSlugs: ['proof'],
+        maxTools: 8,
+      },
+      admitBuiltinAcquisition: (targetName: string) => {
+        admissions += 1;
+        return {
+          ok: false,
+          kind: 'requires_readmission',
+          outside: [targetName],
+        };
+      },
+    }) as unknown as ToolLike;
+    const output = await callTool.invoke!(
+      { context: { sessionId: 'sess-mcp-separate-authority' } },
+      JSON.stringify({ name: 'proof__read', args_json: JSON.stringify({ id: 'row-1' }) }),
+      { toolCall: { callId: 'mcp-separate-authority' } },
+    );
+    assert.equal(String(output), 'mcp-result');
+    assert.equal(admissions, 0, 'external MCP tools must not cross built-in capability admission');
+    assert.equal(listCalls, 1);
+    assert.equal(dispatches, 1);
+  } finally {
+    _setCodeModeMcpResolverForTests(null);
   }
 });
 
 test('a throwing acquisition observer never breaks dispatch', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const previousExecutionGate = process.env.CLEMMY_EXECUTION_GATE;
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
   _setCodeModeToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'updated' }]]),
   );
@@ -1129,18 +1598,19 @@ test('a throwing acquisition observer never breaks dispatch', async () => {
       reachableBuiltinNames: new Set(['composio_execute_tool']),
       onBuiltinAcquisition: () => { throw new Error('observer exploded'); },
     }) as unknown as ToolLike;
-    const out = String(await withToolOutputContext({ sessionId: sess.id }, () =>
-      callTool.invoke!(
-        { context: { sessionId: sess.id } },
+    const out = String(await invokeCallToolFixture(
+      callTool,
+      sess.id,
         JSON.stringify({
           name: 'composio_execute_tool',
           args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_VALUES_UPDATE', arguments: JSON.stringify({ range: 'A1' }) }),
         }),
-        { toolCall: { callId: 'acq-throwing' } },
-      ) as Promise<unknown>,
+      'acq-throwing',
     ));
     assert.ok(out.startsWith('updated'), `instrumentation killed the dispatch: ${out}`);
   } finally {
     _setCodeModeToolsForTests(null);
+    if (previousExecutionGate === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
+    else process.env.CLEMMY_EXECUTION_GATE = previousExecutionGate;
   }
 });

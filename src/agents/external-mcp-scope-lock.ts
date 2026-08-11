@@ -1,5 +1,10 @@
 import { discoverMcpServers } from '../runtime/mcp-config.js';
-import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
+import {
+  mcpToolScopeAuthority,
+  mergeDeniedServerSlugs,
+  strictestMcpToolAuthority,
+  type McpToolScope,
+} from '../runtime/mcp-tool-scope.js';
 import {
   canonicalMcpToolIdentity,
   mcpServerAliasMatches,
@@ -143,6 +148,10 @@ export function externalMcpScopeForAllowedToolLock(args: {
   const toolPatterns = [...new Set([...matches.values()].flatMap((match) => [...match.patterns]))].sort();
   return {
     reason: `${reason}: ${allowedServerSlugs.join(', ')}`,
+    // A wildcard/server-bound worker was handed these systems and only these.
+    // Stated, never inferred: inference reads an empty tool list as "no
+    // constraint", which is the opposite of what a bound lane means.
+    authority: 'server_set',
     allowedServerSlugs,
     ...(toolPatterns.length > 0 ? { toolPatterns } : {}),
   };
@@ -186,6 +195,9 @@ export function externalMcpScopeFromResolvedTools(
   const allowedToolNames = [...new Set(resolved.map((resolution) => resolution.identity))].sort();
   return {
     ...scope,
+    // Naming exact tools binds the lane to exactly those; naming only servers
+    // leaves it bound to the server set it was given.
+    authority: allowedToolNames.length > 0 ? 'exact' : 'server_set',
     ...(allowedToolNames.length > 0
       ? { allowedServerSlugs: [...new Set(resolved.map((resolution) => resolution.serverSlug))].sort() }
       : {}),
@@ -212,6 +224,7 @@ export function externalMcpScopeFromExactToolNames(
   const allowedToolNames = [...new Set(exact.map((resolution) => resolution.identity))].sort();
   return {
     reason: 'worker typed exact external MCP lease',
+    authority: 'exact',
     allowedServerSlugs,
     allowedToolNames,
     maxTools: allowedToolNames.length,
@@ -337,6 +350,18 @@ export function intersectExternalMcpToolScopes(
   if (!parentBroad && !childBroad && parentExact.length > 0 && childExact.length > 0 && allowedToolNames.length === 0) {
     return null;
   }
+  // A surviving server set constrains the surviving TOOLS too. Without this, a
+  // child naming `alpha__x` and `beta__y` under a parent bound to alpha kept
+  // `beta__y` in the exact list — the server intersection said no and the tool
+  // list said yes, and the tool list is what dispatch reads.
+  const survivingServers = remainsBroad ? null : [...new Set(allowedServerSlugs ?? [])];
+  const scopedToolNames = survivingServers === null
+    ? allowedToolNames
+    : allowedToolNames.filter((name) => {
+        const slug = parseNamespacedTool(canonicalMcpToolIdentity(name) ?? name)?.serverSlug;
+        return Boolean(slug && survivingServers.some((allowed) => mcpServerAliasMatches(slug, allowed)));
+      });
+  if (allowedToolNames.length > 0 && scopedToolNames.length === 0) return null;
   const maxTools = optionalCapMin(parent.maxTools, child.maxTools);
   const priorityKeywords = [...new Set([
     ...(parent.priorityKeywords ?? []),
@@ -351,13 +376,29 @@ export function intersectExternalMcpToolScopes(
     if (cap !== undefined) serverMaxTools[serverSlug] = cap;
   }
 
+  // Composition narrows. Each side's authority is honoured and the tighter one
+  // wins outright — a parent cannot be widened by its child, and a child cannot
+  // be widened by a permissive parent. An exact result stays exact even when
+  // one side only named servers.
+  const composedAuthority = strictestMcpToolAuthority(
+    mcpToolScopeAuthority(parent),
+    mcpToolScopeAuthority(child),
+    scopedToolNames.length > 0 ? 'exact' : undefined,
+  );
+  const deniedServerSlugs = mergeDeniedServerSlugs(
+    parent.deniedServerSlugs,
+    child.deniedServerSlugs,
+  );
+
   return {
     reason,
+    authority: composedAuthority,
+    ...(deniedServerSlugs ? { deniedServerSlugs } : {}),
     ...(remainsBroad
       ? (parent.allowAll && child.allowAll ? { allowAll: true } : { failOpenCandidate: true })
       : { allowedServerSlugs: [...new Set(allowedServerSlugs ?? [])].sort() }),
     ...(toolPatterns && toolPatterns.length > 0 ? { toolPatterns } : {}),
-    ...(allowedToolNames.length > 0 ? { allowedToolNames: [...new Set(allowedToolNames)].sort() } : {}),
+    ...(scopedToolNames.length > 0 ? { allowedToolNames: [...new Set(scopedToolNames)].sort() } : {}),
     ...(priorityKeywords.length > 0 ? { priorityKeywords } : {}),
     ...(maxTools !== undefined ? { maxTools } : {}),
     ...(Object.keys(serverMaxTools).length > 0 ? { serverMaxTools } : {}),

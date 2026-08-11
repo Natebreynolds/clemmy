@@ -13,6 +13,41 @@
 import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck, OUTWARD_TOOL_NAMES } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
 
+function coOccursWithin(text: string, left: RegExp, right: RegExp, distance: number): boolean {
+  return new RegExp(`(?:${left.source}).{0,${distance}}(?:${right.source})`, 'i').test(text)
+    || new RegExp(`(?:${right.source}).{0,${distance}}(?:${left.source})`, 'i').test(text);
+}
+
+export function converseFirstQuestionCoverage(text: string): {
+  trackerLocation: boolean;
+  crewDeliveryTarget: boolean;
+} {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  const trackerLocation = (
+    // A compact coordinated question can let one leading "which" govern both
+    // unknowns: "Which deal tracker and crew channel should I use …?". The
+    // trailing use-clause is load-bearing; a bare tracker mention beside a
+    // crew-channel question still does not establish tracker identity/location.
+    /\bwhich\s+(?:deal\s+)?tracker\b.{0,120}\b(?:should|do|can|would)\s+(?:i|we)\s+use\b/i.test(normalized)
+    || coOccursWithin(
+      normalized,
+      /\b(?:zephyr|deal\s+tracker|tracker)\b/i,
+      /\b(?:where|which\s+(?:system|app|workspace|sheet|database|crm)|live[sd]?|host(?:ed|s)?|located|location|link|url|spreadsheet|notion|salesforce|crm|document|file)\b/i,
+      120,
+    )
+  );
+  const crewDeliveryTarget = coOccursWithin(
+    normalized,
+    /\b(?:crew|team|people|recipients?|who\s+(?:should|will|gets?|receives?))\b/i,
+    /\b(?:where|channel|destination|receive|send|update|slack|discord|email|thread|meeting|comment)\b/i,
+    160,
+  );
+  return {
+    trackerLocation,
+    crewDeliveryTarget,
+  };
+}
+
 export const converseFirst: ScenarioDef = {
   name: 'converse-first',
   summary: 'ambiguous multi-step ask → clarifying question, zero mutations',
@@ -38,6 +73,7 @@ export const converseFirst: ScenarioDef = {
 
     let metrics = null;
     let askedViaEvent = false;
+    let committedTerminalText: string | null = null;
     try {
       const db = openHarnessDb(daemon.home);
       metrics = sessionMetrics(db, turn.sessionId);
@@ -51,6 +87,19 @@ export const converseFirst: ScenarioDef = {
       if (row?.data_json) {
         try { askedViaEvent = Boolean((JSON.parse(row.data_json) as { question?: string }).question?.trim()); } catch { askedViaEvent = true; }
       }
+      const terminalRow = db.prepare(
+        "SELECT data_json FROM events WHERE session_id = ? AND type = 'conversation_completed' ORDER BY seq DESC LIMIT 1",
+      ).get(turn.sessionId) as { data_json?: string } | undefined;
+      if (terminalRow?.data_json) {
+        try {
+          const data = JSON.parse(terminalRow.data_json) as {
+            presentation?: { text?: unknown };
+          };
+          if (typeof data.presentation?.text === 'string' && data.presentation.text.trim()) {
+            committedTerminalText = data.presentation.text.trim();
+          }
+        } catch { /* malformed terminal fails the committed-coverage check below */ }
+      }
       db.close();
     } catch { /* checks below degrade to text-only */ }
 
@@ -58,6 +107,14 @@ export const converseFirst: ScenarioDef = {
       name: 'asks a clarifying question (reply or awaiting_user_input)',
       pass: /\?/.test(turn.text) || askedViaEvent,
       detail: /\?/.test(turn.text) || askedViaEvent ? undefined : turn.text.slice(0, 200),
+    });
+    const coverage = converseFirstQuestionCoverage(committedTerminalText ?? '');
+    checks.push({
+      name: 'committed question covers tracker location and crew delivery target',
+      pass: committedTerminalText != null && coverage.trackerLocation && coverage.crewDeliveryTarget,
+      detail: committedTerminalText
+        ? `tracker-location=${coverage.trackerLocation}, crew-delivery=${coverage.crewDeliveryTarget}: ${committedTerminalText.slice(0, 500)}`
+        : 'no committed conversation_completed presentation text',
     });
     checks.push(narrationCheck(turn.text));
     checks.push(stormCheck(daemon.log()));

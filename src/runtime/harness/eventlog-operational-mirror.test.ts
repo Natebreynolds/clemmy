@@ -111,8 +111,20 @@ test('mirror: worker_result branches on ok (completed vs failed)', () => {
   assert.equal(failRows[0].severity, 'error');
 });
 
-test('mirror: excluded high-frequency types emit NOTHING', () => {
-  for (const excluded of ['tool_called', 'tool_returned', 'stream_token', 'heartbeat', 'memory_signals_captured']) {
+test('mirror: settled-read replay accounting is informational, not a warning', () => {
+  const sid = nextSession();
+  mirrorEventToOperational(ev('guardrail_tripped', {
+    kind: 'same_source_settled_read_replay',
+    sourceCallId: 'private-source-call',
+  }, sid), session({ id: sid }));
+  const [row] = rowsFor(sid);
+  assert.equal(row.type, 'gate_verdict');
+  assert.equal(row.severity, 'info');
+  assert.equal(row.payload.kind, 'same_source_settled_read_replay');
+});
+
+test('mirror: excluded private/high-frequency types emit NOTHING', () => {
+  for (const excluded of ['tool_called', 'tool_returned', 'claude_local_permission_admitted', 'claude_local_permission_claimed', 'stream_token', 'heartbeat', 'memory_signals_captured']) {
     const sid = nextSession();
     mirrorEventToOperational(ev(excluded, {}, sid), session({ id: sid }));
     assert.equal(rowsFor(sid).length, 0, `${excluded} must not mirror`);

@@ -29,6 +29,28 @@ import {
   type ConnectedToolkit,
 } from './client.js';
 
+function createAuthenticatedFailingComposioCli(
+  tmp: string,
+  failure: string,
+): { shim: string; executeMarker: string } {
+  const shim = path.join(tmp, 'composio-authenticated-failing.mjs');
+  const executeMarker = path.join(tmp, 'execute-called');
+  writeFileSync(shim, [
+    `import { appendFileSync } from 'node:fs';`,
+    `const argv = process.argv.slice(2);`,
+    `if (argv[0] === '--version') console.log('composio-proof 1.0.0');`,
+    `else if (argv[0] === 'whoami') console.log('authenticated-proof-user');`,
+    `else if (argv[0] === 'execute') {`,
+    `  appendFileSync(${JSON.stringify(executeMarker)}, JSON.stringify(argv) + '\\n');`,
+    `  console.error(${JSON.stringify(failure)});`,
+    `  process.exitCode = 2;`,
+    `} else process.exitCode = 2;`,
+    '',
+  ].join('\n'));
+  chmodSync(shim, 0o755);
+  return { shim, executeMarker };
+}
+
 test('AUTO with an SDK key never touches an authenticated CLI shim for an unpinned write', async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), 'clemmy-composio-auto-sdk-'));
   const shim = path.join(tmp, 'composio-authenticated.mjs');
@@ -73,6 +95,79 @@ test('AUTO with an SDK key never touches an authenticated CLI shim for an unpinn
     else process.env.COMPOSIO_CLI_PATH = previousCliPath;
     if (previousApiKey === undefined) delete process.env.COMPOSIO_API_KEY;
     else process.env.COMPOSIO_API_KEY = previousApiKey;
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('AUTO preserves the original CLI read failure when no SDK key/client is available', async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'clemmy-composio-auto-cli-truth-'));
+  const failure = 'retained CLI validation failure: field force_refresh is unsupported';
+  const { shim, executeMarker } = createAuthenticatedFailingComposioCli(tmp, failure);
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  const previousCliPath = process.env.COMPOSIO_CLI_PATH;
+
+  process.env.COMPOSIO_BACKEND = 'auto';
+  process.env.COMPOSIO_CLI_PATH = shim;
+  resetComposioClient();
+  __test__.setComposioApiKeyOverride('');
+  try {
+    await assert.rejects(
+      executeComposioTool('OUTLOOK_LIST_MESSAGES', { force_refresh: true }),
+      (error: unknown) => {
+        assert.equal((error as Error).name, 'ComposioCliError');
+        assert.match((error as Error).message, new RegExp(failure));
+        assert.doesNotMatch((error as Error).message, /COMPOSIO_API_KEY is not configured/);
+        return true;
+      },
+    );
+    assert.equal(existsSync(executeMarker), true, 'the authenticated CLI read was actually attempted');
+  } finally {
+    __test__.setComposioApiKeyOverride(null);
+    resetComposioClient();
+    if (previousCliPath === undefined) delete process.env.COMPOSIO_CLI_PATH;
+    else process.env.COMPOSIO_CLI_PATH = previousCliPath;
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('AUTO still falls back from a failed CLI read when an SDK client is available', async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'clemmy-composio-auto-sdk-fallback-'));
+  const { shim, executeMarker } = createAuthenticatedFailingComposioCli(
+    tmp,
+    'CLI read failed before the SDK fallback proof',
+  );
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  const previousCliPath = process.env.COMPOSIO_CLI_PATH;
+
+  process.env.COMPOSIO_BACKEND = 'auto';
+  process.env.COMPOSIO_CLI_PATH = shim;
+  resetComposioClient();
+  __test__.setComposioApiKeyOverride('');
+  __test__.setConnectedAccountsLoader(async () => []);
+  let sdkDispatches = 0;
+  __test__.setComposioClient({
+    tools: {
+      execute: async () => {
+        sdkDispatches += 1;
+        return { successful: true, lane: 'sdk-fallback' };
+      },
+    },
+  });
+  try {
+    const out = await executeComposioTool('OUTLOOK_LIST_MESSAGES', { folder: 'inbox' });
+    assert.equal((out as { lane?: unknown }).lane, 'sdk-fallback');
+    assert.equal(existsSync(executeMarker), true, 'the CLI read failed before fallback');
+    assert.equal(sdkDispatches, 1, 'the available SDK performed exactly one fallback read');
+  } finally {
+    __test__.setConnectedAccountsLoader(null);
+    __test__.setComposioApiKeyOverride(null);
+    resetComposioClient();
+    if (previousCliPath === undefined) delete process.env.COMPOSIO_CLI_PATH;
+    else process.env.COMPOSIO_CLI_PATH = previousCliPath;
     if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
     else process.env.COMPOSIO_BACKEND = previousBackend;
     rmSync(tmp, { recursive: true, force: true });

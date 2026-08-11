@@ -30,6 +30,8 @@ const {
   clearCodexAuthDead,
   accessTokenExpiresSoon,
   accessTokenExpMs,
+  assertCodexAccessTokenCanCoverCall,
+  getStoredCodexOAuthTokens,
 } = await import('./auth-store.js');
 
 // Build a fake JWT (header.payload.sig) whose payload carries the given exp
@@ -43,7 +45,19 @@ function jwtWithExp(expSeconds: number): string {
 const AUTH_FILE = path.join(TMP_HOME, 'state', 'auth.json');
 const LOCK_FILE = path.join(TMP_HOME, 'state', 'codex-refresh.lock');
 const DEAD_FILE = path.join(TMP_HOME, 'state', 'codex-auth-dead.json');
+const ACCESS_ONLY_FILE = path.join(TMP_HOME, 'state', 'codex-access-only.json');
 const CLI_AUTH_FILE = path.join(TMP_HOME, '.codex', 'auth.json');
+
+function writeAccessOnly(expSecondsFromNow: number): number {
+  const expiresAt = (Math.floor(Date.now() / 1000) + expSecondsFromNow) * 1000;
+  writeFileSync(ACCESS_ONLY_FILE, JSON.stringify({
+    version: 1,
+    accessToken: jwtWithExp(expiresAt / 1000),
+    expiresAt,
+    accountId: 'proof-acct',
+  }), 'utf-8');
+  return expiresAt;
+}
 
 function writeNativeVault(refreshToken = 'RT_native'): void {
   writeFileSync(AUTH_FILE, JSON.stringify({
@@ -78,6 +92,7 @@ beforeEach(() => {
   rmSync(AUTH_FILE, { force: true });
   rmSync(CLI_AUTH_FILE, { force: true });
   rmSync(DEAD_FILE, { force: true });
+  rmSync(ACCESS_ONLY_FILE, { force: true });
   __setRefreshTokenImplForTests(null);
 });
 
@@ -274,6 +289,54 @@ test('missing refresh token → ok:false, no crash', async () => {
   writeFileSync(AUTH_FILE, JSON.stringify({ source: 'native', codexOauth: {} }), 'utf-8');
   const res = await refreshStoredNativeOAuth();
   assert.equal(res.ok, false);
+});
+
+test('access-only proof auth exposes no refresh token and never enters refresh or lock paths', async () => {
+  const expiresAt = writeAccessOnly(30 * 60);
+  let refreshCalls = 0;
+  __setRefreshTokenImplForTests(async () => {
+    refreshCalls += 1;
+    throw new Error('must not refresh an isolated access token');
+  });
+
+  const stored = getStoredCodexOAuthTokens();
+  assert.deepEqual(stored, {
+    accessToken: jwtWithExp(expiresAt / 1000),
+    accountId: 'proof-acct',
+    accessOnly: true,
+    expiresAt,
+  });
+  assert.equal(stored?.refreshToken, undefined);
+
+  const result = await refreshStoredNativeOAuth({ force: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.terminal, true);
+  assert.match(result.message, /cannot be refreshed/i);
+  assert.equal(refreshCalls, 0, 'no rotating-token network call is possible');
+  assert.equal(existsSync(LOCK_FILE), false, 'no independent proof-home refresh lock is created');
+  assert.equal(existsSync(AUTH_FILE), false, 'access-only proof auth never becomes the refresh-token vault');
+});
+
+test('access-only proof auth fails before dispatch unless it covers the full model-call budget', () => {
+  const now = Date.now();
+  const safe = {
+    accessToken: 'unused-by-this-pure-check',
+    accessOnly: true as const,
+    expiresAt: now + 12 * 60_000,
+  };
+  assert.doesNotThrow(() => assertCodexAccessTokenCanCoverCall(safe, 10 * 60_000, now));
+  assert.throws(
+    () => assertCodexAccessTokenCanCoverCall({ ...safe, expiresAt: now + 11 * 60_000 }, 10 * 60_000, now),
+    /cannot cover this model call/i,
+  );
+  assert.throws(
+    () => assertCodexAccessTokenCanCoverCall(safe, 0, now),
+    /cannot cover an unbounded model call/i,
+  );
+  assert.doesNotThrow(
+    () => assertCodexAccessTokenCanCoverCall({ accessToken: 'normal', refreshToken: 'refresh' }, 60 * 60_000, now),
+    'refreshable production grants are not constrained by proof snapshot policy',
+  );
 });
 
 test.after(() => {

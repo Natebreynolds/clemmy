@@ -7,7 +7,12 @@ import assert from 'node:assert/strict';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-mcp-surface-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
-const { createClementineMcpServer } = await import('./mcp-server.js');
+const {
+  boundClementineMcpCapabilityEnvelope,
+  boundClementineMcpCapabilityRevision,
+  createClementineMcpServer,
+  initializeClementineMcpCapabilityAuthority,
+} = await import('./mcp-server.js');
 const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
 const { getToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
@@ -73,6 +78,15 @@ test('MCP schema-on-demand omits deferred schemas but search → call_tool still
   assert.ok(registered.call_tool);
   assert.equal(registered.workspace_roots, undefined, 'deferred schema must not enter the MCP surface');
 
+  assert.equal(await initializeClementineMcpCapabilityAuthority(server), true);
+  const envelope = await boundClementineMcpCapabilityEnvelope(server);
+  const initialRevision = await boundClementineMcpCapabilityRevision(server);
+  assert.ok(envelope?.capabilities.some((capability) => capability.name === 'workspace_roots'),
+    'the deferred capability is absent from the sealed universe');
+  assert.equal(initialRevision?.revision, 1);
+  assert.equal(initialRevision?.bound.includes('workspace_roots'), false,
+    'a deferred capability started active before acquisition');
+
   const searched = await registered.tool_search.handler({ query: 'list workspace roots', limit: 20 });
   const searchBody = JSON.parse(searched.content[0].text) as {
     results: Array<{ name: string }>;
@@ -89,6 +103,95 @@ test('MCP schema-on-demand omits deferred schemas but search → call_tool still
   });
   assert.doesNotMatch(called.content[0].text, /not_reachable|arg_validation|missing_session_context/i);
   assert.match(called.content[0].text, /clementine-next|clemmy-mcp-surface/i);
+  const acquiredRevision = await boundClementineMcpCapabilityRevision(server);
+  assert.equal(acquiredRevision?.revision, 2);
+  assert.equal(acquiredRevision?.bound.includes('workspace_roots'), true);
+
+  await registered.call_tool.handler({ name: 'workspace_roots', args_json: '{}' });
+  assert.equal((await boundClementineMcpCapabilityRevision(server))?.revision, 2,
+    'duplicate acquisition churned the MCP revision');
+});
+
+test('MCP schema-on-demand fails closed when its exact universe cannot seal', async () => {
+  const session = createSession({ kind: 'chat' });
+  const server = createClementineMcpServer({
+    sessionId: session.id,
+    allowedTools: ['tool_search', 'call_tool'],
+    deferredTools: ['test_only_missing_capability_descriptor'],
+  });
+  const registered = (server as any)._registeredTools as Record<string, {
+    handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
+  }>;
+  assert.equal(await initializeClementineMcpCapabilityAuthority(server), false,
+    'a universe with no exact descriptor sealed');
+  const result = await registered.call_tool.handler({
+    name: 'test_only_missing_capability_descriptor',
+    args_json: '{}',
+  });
+  assert.match(result.content[0].text, /requires_readmission/i);
+  assert.equal(await boundClementineMcpCapabilityRevision(server), null,
+    'a refused seal still created dispatch authority');
+});
+
+test('two physical MCP servers keep capability revisions isolated', async () => {
+  const make = () => {
+    const session = createSession({ kind: 'chat' });
+    return createClementineMcpServer({
+      sessionId: session.id,
+      allowedTools: ['tool_search', 'call_tool'],
+      deferredTools: ['workspace_roots'],
+    });
+  };
+  const first = make();
+  const second = make();
+  await Promise.all([
+    initializeClementineMcpCapabilityAuthority(first),
+    initializeClementineMcpCapabilityAuthority(second),
+  ]);
+  const firstTools = (first as any)._registeredTools as Record<string, {
+    handler: (input: Record<string, unknown>) => Promise<unknown>;
+  }>;
+  await firstTools.call_tool.handler({ name: 'workspace_roots', args_json: '{}' });
+  assert.equal((await boundClementineMcpCapabilityRevision(first))?.revision, 2);
+  assert.equal((await boundClementineMcpCapabilityRevision(second))?.revision, 1,
+    'one physical query mutated another query\'s revision chain');
+  assert.equal((await boundClementineMcpCapabilityRevision(second))?.bound.includes('workspace_roots'), false);
+});
+
+test('the real default Claude full universe seals and admits a deferred built-in', async () => {
+  const { defaultClaudeAgentSdkAllowedLocalTools } = await import('../runtime/harness/claude-agent-sdk.js');
+  const { claudeAgentSdkAdvertisedToolUniverse } = await import('../runtime/harness/claude-agent-brain.js');
+  const fastAllow = defaultClaudeAgentSdkAllowedLocalTools('full');
+  const universe = claudeAgentSdkAdvertisedToolUniverse('full', fastAllow, [], false);
+  const firstClass = ['tool_search', 'call_tool'];
+  const deferred = universe.filter((name) => !firstClass.includes(name));
+  assert.ok(deferred.includes('run_worker'), 'fixture stopped matching the production full universe');
+  assert.ok(deferred.includes('view_image'), 'fixture stopped matching the production MCP surface');
+  assert.ok(deferred.includes('workspace_roots'), 'fixture needs a safe deferred dispatch probe');
+
+  const session = createSession({ kind: 'chat' });
+  const server = createClementineMcpServer({
+    sessionId: session.id,
+    gatedMutations: true,
+    allowedTools: firstClass,
+    deferredTools: deferred,
+  });
+  assert.equal(await initializeClementineMcpCapabilityAuthority(server), true,
+    'the production Claude full universe refused capability sealing');
+  const envelope = await boundClementineMcpCapabilityEnvelope(server);
+  const before = await boundClementineMcpCapabilityRevision(server);
+  assert.ok(envelope?.capabilities.some((capability) => capability.name === 'run_worker'));
+  assert.ok(envelope?.capabilities.some((capability) => capability.name === 'view_image'));
+  assert.equal(before?.bound.includes('workspace_roots'), false);
+
+  const registered = (server as any)._registeredTools as Record<string, {
+    handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
+  }>;
+  const called = await registered.call_tool.handler({ name: 'workspace_roots', args_json: '{}' });
+  assert.doesNotMatch(called.content[0].text, /requires_readmission|not_reachable/i);
+  const acquired = await boundClementineMcpCapabilityRevision(server);
+  assert.equal(acquired?.revision, (before?.revision ?? 0) + 1);
+  assert.equal(acquired?.bound.includes('workspace_roots'), true);
 });
 
 test('in-process MCP handlers inherit the exact SDK source turn', async () => {

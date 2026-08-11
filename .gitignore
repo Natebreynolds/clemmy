@@ -121,6 +121,7 @@ vendor/
 # Local Netlify folder
 .netlify
 proof-report.json
+/proof-reports/
 
 # Local demo/scratch outputs — never release content
 output/

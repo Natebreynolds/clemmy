@@ -60,7 +60,7 @@ async function teachOneVerifiedRead(): Promise<void> {
   }, { armRunInFlight: true });
   schemaCache.rememberToolSchema(CALENDAR_SLUG, {
     type: 'object', properties: { timeMin: { type: 'string' }, timeMax: { type: 'string' } },
-  });
+  }, Date.now());
   const exec = (async () => ({
     successful: true,
     data: { items: [{ id: 'evt-1', summary: 'Standup', start: '2026-08-06T09:00:00-07:00' }] },

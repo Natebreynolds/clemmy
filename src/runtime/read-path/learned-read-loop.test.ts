@@ -66,7 +66,7 @@ async function governedRead(sessionId: string, args: Record<string, unknown>): P
   // the network function.
   schemaCache.rememberToolSchema(CALENDAR_SLUG, {
     type: 'object', properties: { timeMin: { type: 'string' }, timeMax: { type: 'string' } },
-  });
+  }, Date.now());
   let dispatches = 0;
   const exec = (async () => { dispatches += 1; return calendarPayload(); }) as never;
   const output = await composio.runComposioExecuteForTestInSession(CALENDAR_SLUG, args, exec, sessionId);
@@ -91,7 +91,7 @@ function acceptSource(sessionId: string, text: string): { sourceUserSeq: number 
 
 test('A1: one verified governed read teaches memory the exact capability for this scope', async () => {
   const sessionId = 'sess-a1-home';
-  acceptSource(sessionId, COLD_PHRASE);
+  const source = acceptSource(sessionId, COLD_PHRASE);
   const { output, dispatches } = await governedRead(sessionId, { timeMin: '2026-08-06', timeMax: '2026-08-07' });
   assert.equal(dispatches, 1, 'the cold turn made exactly one governed provider dispatch');
   assert.ok(output.length > 0);
@@ -100,9 +100,20 @@ test('A1: one verified governed read teaches memory the exact capability for thi
   // capability back for a later prompt. Nothing in this assertion knows how
   // learning is implemented.
   const remembered = toolChoice.matchToolChoicesForStep(COLD_PHRASE, { limit: 5 });
+  const learned = remembered.find((match) => match.identifier === CALENDAR_SLUG);
   assert.ok(
-    remembered.some((match) => match.identifier === CALENDAR_SLUG),
+    learned,
     'a verified successful read did not become a remembered capability — nothing learned from the settled turn',
+  );
+  assert.equal(learned.verifiedReadOrigin?.sessionId, sessionId);
+  assert.equal(learned.verifiedReadOrigin?.sourceUserSeq, source.sourceUserSeq);
+  assert.ok(/^rr_[a-f0-9]{32}$/.test(learned.verifiedReadOrigin?.receiptId ?? ''),
+    'the learned capability lost its durable receipt origin');
+  assert.equal(
+    eventlog.listEvents(sessionId).some((event) => event.type === 'read_receipt'
+      && (event.data as { record?: { receiptId?: string } }).record?.receiptId === learned.verifiedReadOrigin?.receiptId),
+    true,
+    'the capability origin points at no durable learning receipt',
   );
 });
 

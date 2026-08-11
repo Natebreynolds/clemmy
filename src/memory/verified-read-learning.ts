@@ -34,8 +34,6 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
 import {
-  acceptedPhraseDigest,
-  boundedAliasTerms,
   claimAcceptedSourceForLearning,
   daemonAliasScope,
   recordCapabilityAlias,
@@ -181,6 +179,8 @@ export interface VerifiedReadLearningInput {
   sessionId: string;
   /** The EXACT accepted user event this dispatch belongs to. */
   sourceUserSeq?: number;
+  /** Exact live run attempt captured with the pending settlement. */
+  attemptId?: string;
   /** Every binding the caller expects the durable record to prove. A receipt
    *  that resolves but disagrees on ANY of these is a different settlement
    *  and must not teach under this identity. */
@@ -189,9 +189,10 @@ export interface VerifiedReadLearningInput {
     accountIdentity: string;
     evidenceDigest: string;
   };
-  /** The intent-carrying accepted phrase, captured AT settlement (the live
-   *  attempt is gone by the time the worker runs). */
-  phrase: string;
+  /** Privacy-bounded intent identity derived AT settlement. The live attempt
+   *  is gone by the time the worker runs, and raw user text is never queued. */
+  aliasDigest: string;
+  aliasTerms: string[];
 }
 
 /** Verification failures that a retry cannot fix (a binding mismatch) are
@@ -247,18 +248,39 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
     return { learned: false, reason: 'the receipt cites different evidence than this settlement produced' };
   }
 
-  const phrase = input.phrase.trim();
-  if (!phrase) return { learned: false, reason: 'no accepted source phrase was captured at settlement' };
-  const source = typeof input.sourceUserSeq === 'number'
-    ? { sourceUserSeq: input.sourceUserSeq, phrase }
-    : resolveAcceptedSource(input.sessionId, input.sourceUserSeq);
-  if (!source) return { learned: false, reason: 'no exact accepted source' };
+  const sourceUserSeq = typeof input.sourceUserSeq === 'number'
+    ? input.sourceUserSeq
+    : resolveAcceptedSource(input.sessionId, input.sourceUserSeq)?.sourceUserSeq;
+  if (typeof sourceUserSeq !== 'number') return { learned: false, reason: 'no exact accepted source' };
+  const receiptSource = receipt.source;
+  const verifiedOrigin = receiptSource
+    && receiptSource.sessionId === input.sessionId
+    && receiptSource.sourceUserSeq === sourceUserSeq
+    && typeof receiptSource.attemptId === 'string'
+    && receiptSource.attemptId.trim() === receiptSource.attemptId
+    && receiptSource.attemptId.length > 0
+    && receiptSource.attemptId === input.attemptId
+    ? {
+        version: 1 as const,
+        sessionId: input.sessionId,
+        sourceUserSeq,
+        receiptId: input.receiptId,
+        evidenceDigest: input.expect.evidenceDigest,
+      }
+    : null;
 
   const intent = canonicalIntentSlug(identifier);
   if (!intent) return { learned: false, reason: 'identifier has no canonical slug' };
-  const terms = boundedAliasTerms(phrase);
+  const aliasDigest = input.aliasDigest.trim().toLowerCase();
+  if (!/^[a-f0-9]{24}$/.test(aliasDigest)) {
+    return { learned: false, reason: 'accepted source alias digest is invalid' };
+  }
+  const terms = [...new Set(input.aliasTerms
+    .filter((term): term is string => typeof term === 'string')
+    .map((term) => term.trim().toLowerCase())
+    .filter((term) => /^[a-z0-9]{3,24}$/.test(term)))]
+    .slice(0, 12);
   if (terms.length === 0) return { learned: false, reason: 'accepted phrase has no distinctive terms' };
-  const aliasDigest = acceptedPhraseDigest(phrase);
 
 
   const accountIdentity = receipt.scope?.accountIdentity?.trim() || undefined;
@@ -266,7 +288,7 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
   // A retry or replayed frame that already lost the claim stops here — but
   // the claim itself is only CONSUMED after every write below commits.
   const alreadyClaimed = !claimAcceptedSourceForLearning({
-    sessionId: input.sessionId, sourceUserSeq: source.sourceUserSeq, identifier,
+    sessionId: input.sessionId, sourceUserSeq, identifier,
     accountIdentity: claimAccount, probe: true,
   });
   if (alreadyClaimed) {
@@ -284,6 +306,7 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
         // Deliberately NO invocationTemplate: a proven capability is
         // capability_only, so no concrete argument value can be replayed.
         ...(accountIdentity ? { accountIdentity } : {}),
+        ...(verifiedOrigin ? { verifiedReadOrigin: verifiedOrigin } : {}),
       },
       aliasSource: 'verified_read',
       schemaFingerprint: receipt.schemaFingerprint,
@@ -309,7 +332,7 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
     // is idempotent, so a crash between the writes and this line retries
     // cleanly on the next drain.
     claimAcceptedSourceForLearning({
-      sessionId: input.sessionId, sourceUserSeq: source.sourceUserSeq, identifier,
+      sessionId: input.sessionId, sourceUserSeq, identifier,
       accountIdentity: claimAccount,
     });
     // A paraphrase learned NOW must retrieve on the NEXT turn: the missing

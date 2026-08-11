@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { classifyComposioSlugEffect, composioSlugEffectEvidence } from './slug-effect.js';
+import {
+  classifyComposioActionConsequence,
+  classifyComposioSlugEffect,
+  composioActionIsEphemeralCompute,
+  composioSlugEffectEvidence,
+} from './slug-effect.js';
 
 test('provider-side research jobs remain reads', () => {
   for (const slug of [
@@ -138,8 +143,42 @@ test('CREATE + compute noun is a read; durable creations stay writes', async () 
   assert.equal(composioSlugEffectEvidence('OPENAI_CREATE_CHAT_COMPLETION'), 'read');
   assert.equal(composioSlugEffectEvidence('OPENAI_CREATE_EMBEDDING'), 'read');
   assert.equal(composioSlugEffectEvidence('OPENAI_CREATE_MODERATION'), 'read');
+  assert.equal(composioActionIsEphemeralCompute('OPENAI_CREATE_CHAT_COMPLETION'), true);
+  assert.equal(composioActionIsEphemeralCompute('OPENAI_RUN_TRANSCRIPTION'), true);
   // Durable creations are still writes, full stop.
   assert.equal(composioSlugEffectEvidence('GMAIL_CREATE_DRAFT'), 'write');
+  assert.equal(composioActionIsEphemeralCompute('GMAIL_CREATE_DRAFT'), false);
   assert.equal(composioSlugEffectEvidence('GOOGLESHEETS_CREATE_GOOGLE_SHEET1'), 'write');
   assert.equal(composioSlugEffectEvidence('OUTLOOK_CREATE_EVENT'), 'write');
+});
+
+test('consequence is derived from the action\'s own verb — invented tools, randomized names', () => {
+  // RANDOMIZED so no slug list, provider name, or incident-specific rule can
+  // pass this. The verbs are the only thing carrying meaning.
+  const nonce = Math.random().toString(36).slice(2, 8).toUpperCase();
+  const app = `ZZ${nonce}`;
+  const noun = `WIDGET${nonce}`;
+
+  assert.equal(classifyComposioActionConsequence(`${app}_CREATE_${noun}`), 'create');
+  assert.equal(classifyComposioActionConsequence(`${app}_UPDATE_${noun}`), 'update');
+  assert.equal(classifyComposioActionConsequence(`${app}_DELETE_${noun}`), 'delete');
+  assert.equal(classifyComposioActionConsequence(`${app}_SEND_${noun}`), 'send');
+  assert.equal(classifyComposioActionConsequence(`${app}_LIST_${noun}`), 'read');
+
+  // The distinction that matters: create and update are BOTH writes, and are
+  // not interchangeable outcomes. A caller offered the wrong one is being
+  // offered a materially different result.
+  assert.notEqual(
+    classifyComposioActionConsequence(`${app}_CREATE_${noun}`),
+    classifyComposioActionConsequence(`${app}_UPDATE_${noun}`),
+    'create and update must be distinguishable consequences',
+  );
+
+  // Most consequential declared verb wins when a slug names several.
+  assert.equal(classifyComposioActionConsequence(`${app}_CREATE_OR_DELETE_${noun}`), 'delete');
+
+  // An unrecognised verb is not guessed into a class.
+  assert.equal(classifyComposioActionConsequence(`${app}_FLURBLE_${noun}`), 'other');
+  assert.equal(classifyComposioActionConsequence(''), 'other');
+  assert.equal(classifyComposioActionConsequence(null), 'other');
 });

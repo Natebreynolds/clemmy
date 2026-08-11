@@ -13,10 +13,12 @@ const {
   drainDurableConsolidationCandidates,
   enqueueAutoCaptureCandidates,
 } = await import('./durable-consolidation.js');
+const { extractAutoMemoryCandidates } = await import('./auto-capture.js');
 const { getFactEvidence } = await import('./temporal-memory.js');
 const { readReflectionCandidateHealth } = await import('./reflection-candidates.js');
 const { buildMemoryNeighborhood } = await import('../dashboard/memory-graph.js');
 const { getFact, getFactAt } = await import('./facts.js');
+const { stableContextGeneration } = await import('../runtime/stable-context-generation.js');
 
 before(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
 beforeEach(() => { resetMemoryDb(); });
@@ -57,6 +59,42 @@ test('auto capture durably records the exact source and replay payload before co
   assert.equal(episode.subtype, 'auto_capture');
   assert.match(episode.source_uri, /^conversation:\/\//);
   assert.equal(readReflectionCandidateHealth().orphanedPending, 0, 'episode-backed queued work is not orphaned');
+});
+
+test('compound explicit memory queues only the isolated claim while retaining the exact source episode', async () => {
+  const message = 'Remember this: Cedar is Cedar-17. Also give me three launch ideas. Just confirm.';
+  const candidates = extractAutoMemoryCandidates(message);
+  assert.deepEqual(candidates, [{
+    kind: 'user',
+    content: 'Cedar is Cedar-17.',
+    reason: 'explicit remember request',
+  }]);
+
+  const queued = enqueueAutoCaptureCandidates({
+    message,
+    sessionId: 'chat-compound-memory-isolation',
+    sourceEventId: 'turn:compound',
+    occurredAt: '2026-08-09T01:00:00.000Z',
+    candidates,
+  });
+  const db = openMemoryDb();
+  const episode = db.prepare(`
+    SELECT evidence_excerpt FROM memory_episodes WHERE id = ?
+  `).get(queued.episodeId) as { evidence_excerpt: string };
+  const candidate = db.prepare(`
+    SELECT text FROM memory_reflection_candidates WHERE id = ?
+  `).get(queued.candidateIds[0]) as { text: string };
+  assert.equal(episode.evidence_excerpt, message, 'audit evidence keeps the complete conversational turn');
+  assert.equal(candidate.text, 'Cedar is Cedar-17.', 'only the memory clause enters the durable replay queue');
+
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: queued.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+  const fact = db.prepare(`
+    SELECT content FROM consolidated_facts WHERE active = 1
+  `).get() as { content: string };
+  assert.equal(fact.content, 'Cedar is Cedar-17.', 'secondary live work cannot reach canonical memory');
 });
 
 test('maintenance replay promotes one canonical fact with the original user-turn evidence', async () => {
@@ -128,6 +166,76 @@ test('redelivery and worker replay are idempotent at both candidate and fact lay
   assert.equal((db.prepare('SELECT COUNT(*) AS count FROM memory_reflection_candidates').get() as { count: number }).count, 1);
   assert.equal((db.prepare('SELECT COUNT(*) AS count FROM consolidated_facts').get() as { count: number }).count, 1);
   assert.equal((db.prepare('SELECT COUNT(*) AS count FROM fact_evidence').get() as { count: number }).count, 1);
+});
+
+test('explicit durable memory bumps the stable-context generation only after canonical commit', async () => {
+  const startGeneration = stableContextGeneration();
+  const implicit = enqueueAutoCaptureCandidates({
+    message: 'My preferred launch color is orange.',
+    sessionId: 'chat-stable-generation',
+    sourceEventId: 'turn:implicit',
+    candidates: [{
+      kind: 'user',
+      content: 'My preferred launch color is orange.',
+      reason: 'durable first-person declarative',
+    }],
+  });
+  assert.equal(stableContextGeneration(), startGeneration, 'durable enqueue alone never invalidates a canonical snapshot');
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: implicit.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+  assert.equal(stableContextGeneration(), startGeneration, 'incidental reflection churn remains deferred');
+
+  const remembered = enqueueAutoCaptureCandidates({
+    message: 'Remember this: Cedar is Cedar-12.',
+    sessionId: 'chat-stable-generation',
+    sourceEventId: 'turn:remember',
+    occurredAt: '2026-08-09T00:45:05.000Z',
+    candidates: [{
+      kind: 'user',
+      content: 'Cedar is Cedar-12.',
+      reason: 'explicit remember request',
+    }],
+  });
+  assert.equal(stableContextGeneration(), startGeneration, 'explicit intake still waits for canonical commit');
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: remembered.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+  assert.equal(stableContextGeneration(), startGeneration + 1, 'an explicit ADD invalidates every frozen stable prefix');
+
+  const correction = enqueueAutoCaptureCandidates({
+    message: 'Small correction for later: Cedar is Cedar-17. Cedar-12 is retired and must not be used as current.',
+    sessionId: 'chat-stable-generation',
+    sourceEventId: 'turn:correction',
+    occurredAt: '2026-08-09T00:45:40.000Z',
+    candidates: [{
+      kind: 'user',
+      content: 'Small correction for later: Cedar is Cedar-17. Cedar-12 is retired and must not be used as current.',
+      reason: 'explicit durable correction',
+    }],
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: correction.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+  assert.equal(stableContextGeneration(), startGeneration + 2, 'an explicit SUPERSEDE invalidates every frozen stable prefix');
+
+  const redelivery = enqueueAutoCaptureCandidates({
+    message: 'Small correction for later: Cedar is Cedar-17. Cedar-12 is retired and must not be used as current.',
+    sessionId: 'chat-stable-generation',
+    sourceEventId: 'turn:correction',
+    occurredAt: '2026-08-09T00:45:40.000Z',
+    candidates: [{
+      kind: 'user',
+      content: 'Small correction for later: Cedar is Cedar-17. Cedar-12 is retired and must not be used as current.',
+      reason: 'explicit durable correction',
+    }],
+  });
+  assert.deepEqual(redelivery.candidateIds, correction.candidateIds);
+  assert.equal((await drainDurableConsolidationCandidates({ ids: redelivery.candidateIds })).selected, 0);
+  assert.equal(stableContextGeneration(), startGeneration + 2, 'idempotent replay cannot churn the stable prefix');
 });
 
 test('a failed immediate resolver remains visible and succeeds on bounded replay', async () => {
@@ -297,6 +405,75 @@ test('a normal-order explicit cross-kind correction deterministically retires th
   assert.equal(staleFact.superseded_by_fact_id, correctedFact.id);
   assert.equal(correctedFact.active, 1);
   assert.equal(correctedFact.kind, 'project', 'the correction inherits the claim family it corrected');
+});
+
+test('a real future-reference correction survives admission and deterministically supersedes stale memory', async () => {
+  const sessionId = 'chat-future-reference-correction';
+  const staleMessage = "Please remember for later that Cedar's current release number is Cedar-12. A natural acknowledgement is enough.";
+  const staleCandidates = extractAutoMemoryCandidates(staleMessage);
+  assert.equal(staleCandidates.length, 1);
+  const stale = enqueueAutoCaptureCandidates({
+    message: staleMessage,
+    sessionId,
+    sourceEventId: 'turn:teach',
+    occurredAt: '2026-08-09T00:45:05.000Z',
+    candidates: staleCandidates,
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: stale.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+
+  const correctionMessage = "Small correction for later: Cedar's current release number is Cedar-17. Cedar-12 is retired and must not be used as current. A natural acknowledgement is enough.";
+  const correctionContent = "Small correction for later: Cedar's current release number is Cedar-17. Cedar-12 is retired and must not be used as current.";
+  const correctionCandidates = extractAutoMemoryCandidates(correctionMessage);
+  assert.deepEqual(correctionCandidates, [{
+    kind: 'user',
+    content: correctionContent,
+    reason: 'explicit durable correction',
+  }]);
+  const correction = enqueueAutoCaptureCandidates({
+    message: correctionMessage,
+    sessionId,
+    sourceEventId: 'turn:correct',
+    occurredAt: '2026-08-09T00:45:40.000Z',
+    candidates: correctionCandidates,
+  });
+  let resolverCalls = 0;
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: correction.candidateIds,
+    resolver: async () => {
+      resolverCalls += 1;
+      return { decision: 'ADD' as const };
+    },
+  })).promoted, 1);
+  assert.equal(resolverCalls, 0, 'one evidence-backed correction uses the deterministic transition');
+
+  const rows = openMemoryDb().prepare(`
+    SELECT id, content, active, valid_to, superseded_by_fact_id
+    FROM consolidated_facts ORDER BY id
+  `).all() as Array<{
+    id: number; content: string; active: number;
+    valid_to: string | null; superseded_by_fact_id: number | null;
+  }>;
+  const staleFact = rows.find((row) => row.content.includes('Cedar-12') && !row.content.includes('Cedar-17'));
+  const correctedFact = rows.find((row) => row.content.includes('Cedar-17'));
+  assert.ok(staleFact);
+  assert.ok(correctedFact);
+  assert.equal(staleFact.active, 0);
+  assert.equal(staleFact.valid_to, '2026-08-09T00:45:40.000Z');
+  assert.equal(staleFact.superseded_by_fact_id, correctedFact.id);
+  assert.equal(correctedFact.active, 1);
+  assert.equal(correctedFact.content, correctionContent, 'the cue and both values remain canonical evidence without reply framing');
+  assert.equal(rows.filter((row) => row.active === 1 && row.content.includes('Cedar')).length, 1);
+  const correctionEpisode = openMemoryDb().prepare(`
+    SELECT evidence_excerpt FROM memory_episodes WHERE id = ?
+  `).get(correction.episodeId) as { evidence_excerpt: string };
+  assert.equal(correctionEpisode.evidence_excerpt, correctionMessage, 'the exact correction turn remains durable source evidence');
+  assert.ok(
+    getFactEvidence(correctedFact.id).some((evidence) => evidence.episodeId === correction.episodeId),
+    'the active correction links to its exact authoritative user-turn episode',
+  );
 });
 
 test('a quoted retired identifier cannot cross conflicting claim subjects', async () => {

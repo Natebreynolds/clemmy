@@ -32,6 +32,13 @@ import {
 import { looksLikeNativeMcpSend } from './harness/execution-gate.js';
 import { isConfirmFirstEnabled } from './harness/confirm-first-gate.js';
 import { appendEvent, listEvents } from './harness/eventlog.js';
+import {
+  settleToolAttempt,
+  ToolAttemptSettlementAuthorityError,
+} from './harness/attempt-settlement.js';
+import { withLogicalToolCall, withPhysicalDispatch } from './harness/attempt-identity.js';
+import type { AttemptSignals } from './harness/attempt-outcome.js';
+import { classifyDiscoveryCall } from './harness/discovery-boundary.js';
 import { evaluateToolCall, applyMode } from './harness/tool-guardrail.js';
 import { toolCallCorrelationFingerprint } from './harness/tool-correlation.js';
 import {
@@ -376,7 +383,9 @@ function clipMcpResultForRecall(toolName: string, result: CallToolResultContent)
     // Replace the (possibly multi-block) text with one clipped block; preserve any
     // non-text blocks (images, resource refs) untouched.
     const nonText = result.filter((block) => (block as { type?: string } | null)?.type !== 'text');
-    return [{ type: 'text', text: clipped }, ...nonText] as CallToolResultContent;
+    const clippedResult = [{ type: 'text', text: clipped }, ...nonText] as CallToolResultContent;
+    copyMcpResultMetadata(result, clippedResult);
+    return clippedResult;
   } catch {
     return result; // clipping must NEVER break a tool call
   }
@@ -402,7 +411,9 @@ function annotateMcpResultFailure(toolName: string, result: CallToolResultConten
     const { failed, summary } = mcpResultFailure(result);
     if (!failed) return result;
     const corrective = toolFailureCorrective(summary, { toolName });
-    return [{ type: 'text', text: corrective }, ...result] as CallToolResultContent;
+    const annotated = [{ type: 'text', text: corrective }, ...result] as CallToolResultContent;
+    copyMcpResultMetadata(result, annotated);
+    return annotated;
   } catch {
     return result; // a corrective must NEVER break a tool call
   }
@@ -433,7 +444,9 @@ function appendMcpFanoutAdvisory(
       resultText,
     });
     if (!advisory) return result;
-    return [...result, { type: 'text', text: advisory }];
+    const appended = [...result, { type: 'text', text: advisory }] as CallToolResultContent;
+    copyMcpResultMetadata(result, appended);
+    return appended;
   } catch {
     return result; // a nudge must never break a tool call
   }
@@ -562,6 +575,115 @@ export function slugifyServerName(name: string): string {
 
 export function namespaceToolName(serverSlug: string, toolName: string): string {
   return `${serverSlug}${SEPARATOR}${toolName}`;
+}
+
+/** Typed effect for this call, from the classifier the reconciler already
+ *  trusts — never from the tool's name. */
+function nativeCallIsMutating(toolName: string, args: unknown): boolean {
+  try {
+    return classifyRuntimeToolEffect(toolName, args).effect === 'external_write';
+  } catch {
+    // Unknown effect is treated as mutating: assuming a call was harmless is
+    // the mistake that duplicates writes.
+    return true;
+  }
+}
+
+/** Native MCP's entry into the shared settlement seam. Attribution comes from
+ *  the ambient run context, the same source every other lane uses. */
+/**
+ * MCP's own metadata, read as structure.
+ *
+ * A tools/call result carries `isError` and may carry `structuredContent`. A
+ * plain success is a content ARRAY with no error flag — which parses to no
+ * signals at all, so every ordinary native success used to settle as `unknown`
+ * and credit nothing. The lane knows it succeeded; it says so nominally rather
+ * than hoping a generic envelope reader infers it.
+ */
+function nativeMcpSignals(result: unknown): AttemptSignals {
+  const envelope = result && typeof result === 'object' && !Array.isArray(result)
+    ? result as Record<string, unknown>
+    : null;
+  const isError = typeof envelope?.isError === 'boolean' ? envelope.isError : undefined;
+  if (isError === true) return { providerReportedError: true };
+
+  const content = Array.isArray(result)
+    ? result
+    : Array.isArray(envelope?.content)
+      ? envelope.content as unknown[]
+      : null;
+  const structured = envelope?.structuredContent;
+  const hasPayload = (content !== null && content.length > 0)
+    || (structured !== undefined && structured !== null);
+  return {
+    providerReportedError: false,
+    ...(hasPayload ? {} : { emptyResult: true }),
+  };
+}
+
+
+/**
+ * A refusal is still one physical attempt.
+ *
+ * It has an owner, an outcome (it did not run) and a dispatch state. Recording
+ * nothing made "we refused" indistinguishable from "we never tried", which is
+ * what let a spent budget look like an untouched one.
+ */
+function settleNativeMcpRefusal(input: {
+  toolName: string;
+  args: unknown;
+  reason: string;
+  mutating: boolean;
+}): void {
+  const ctx = harnessRunContextStorage.getStore();
+  try {
+    settleToolAttempt({
+      sessionId: ctx?.sessionId,
+      sourceUserSeq: ctx?.sourceUserSeq,
+      turn: ctx?.turn,
+      lane: 'native_mcp',
+      toolName: input.toolName,
+      args: input.args,
+      mutating: input.mutating,
+      businessCall: classifyDiscoveryCall(input.toolName, input.args) === null,
+      // Nothing dispatched, so nothing is uncertain — even for a write.
+      signals: { preDispatch: true },
+      thrown: new Error(input.reason),
+    });
+  } catch (error) {
+    if (error instanceof ToolAttemptSettlementAuthorityError) throw error;
+    // Non-authority bookkeeping remains secondary to the typed refusal.
+  }
+}
+
+function settleNativeMcpAttempt(input: {
+  toolName: string;
+  args: unknown;
+  result?: unknown;
+  thrown?: unknown;
+  mutating: boolean;
+  callId?: string;
+}): void {
+  const ctx = harnessRunContextStorage.getStore();
+  try {
+    settleToolAttempt({
+      sessionId: ctx?.sessionId,
+      sourceUserSeq: ctx?.sourceUserSeq,
+      turn: ctx?.turn,
+      lane: 'native_mcp',
+      toolName: input.toolName,
+      args: input.args,
+      ...(input.callId ? { callId: input.callId } : {}),
+      mutating: input.mutating,
+      businessCall: classifyDiscoveryCall(input.toolName, input.args) === null,
+      ...(input.result !== undefined ? { result: input.result } : {}),
+      ...(input.thrown !== undefined ? { thrown: input.thrown } : {}),
+      ...(input.result !== undefined ? { signals: nativeMcpSignals(input.result) } : {}),
+    });
+  } catch (error) {
+    if (error instanceof ToolAttemptSettlementAuthorityError) throw error;
+    // Non-authority bookkeeping remains fail-open for the provider result.
+  }
 }
 
 export function parseNamespacedTool(namespaced: string): { serverSlug: string; toolName: string } | null {
@@ -1042,6 +1164,11 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     },
 
     async callTool(toolName: string, args: Record<string, unknown> | null): Promise<CallToolResultContent> {
+      // Open the physical attempt here, before lease and routing checks, so an
+      // unknown tool or an unavailable server is still a correlated attempt
+      // rather than an event nothing can be reconciled against.
+      const attemptEntry = harnessRunContextStorage.getStore();
+      const dispatchNamespacedTool = async (): Promise<CallToolResultContent> => {
       const entryRunContext = harnessRunContextStorage.getStore();
       // A stale provider frame must not even rebuild routing or emit tool
       // bookkeeping. Native MCP calls bypass wrapToolForHarness, so this is
@@ -1058,12 +1185,18 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // or the cache is stale and the underlying tool has been
         // removed. Surface a real error so the model's next turn
         // sees what actually failed.
+        settleNativeMcpRefusal({
+          toolName, args, mutating: false, reason: `unknown tool: ${toolName}`,
+        });
         throw new Error(
           `Unknown MCP tool: "${toolName}". Available tools come from the namespaced shim with names like "<server>__<tool>".`,
         );
       }
       const parsed = parseNamespacedTool(toolName);
       if (!parsed) {
+        settleNativeMcpRefusal({
+          toolName, args, mutating: false, reason: `malformed tool name: ${toolName}`,
+        });
         throw new Error(`Malformed namespaced tool name: "${toolName}".`);
       }
       // T2.3 — if the model called the synthetic "<slug>__unavailable"
@@ -1074,6 +1207,9 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       if (parsed.toolName === 'unavailable' || serverHealth.get(server)?.state === 'unavailable') {
         const slug = parsed.serverSlug;
         const health = serverHealth.get(server);
+        settleNativeMcpRefusal({
+          toolName, args, mutating: false, reason: `server unavailable: ${slug}`,
+        });
         throw new BoundaryError({
           kind: 'mcp.server_unavailable',
           retryable: true,
@@ -1118,6 +1254,9 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // structured error, the runtime can detect the kind and
         // create an actual approval (mirroring the local-tool path)
         // so the user sees the apr-xxxx prompt and can resolve it.
+        settleNativeMcpRefusal({
+          toolName, args, mutating: true, reason: `approval blocked: ${decision.kind}`,
+        });
         throw new BoundaryError({
           kind: 'mcp.approval_blocked',
           retryable: false,
@@ -1496,7 +1635,16 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           assertDispatchLeaseCurrent(activeRunContext?.dispatchLease);
         }
         // Forward to the underlying server with the ORIGINAL tool name.
-        const rawResult = await server.callTool(parsed.toolName, args);
+        const rawResult = await withPhysicalDispatch(
+          {
+            sessionId: entryRunContext?.sessionId ?? '',
+            sourceUserSeq: entryRunContext?.sourceUserSeq ?? 0,
+            turn: entryRunContext?.turn,
+            tool: toolName,
+            args,
+          },
+          () => server.callTool(parsed.toolName, args),
+        );
         const normalized = normalizeMcpCallResult(toolName, rawResult);
         const rawText = mcpResultText(normalized.result);
         const failure = normalized.invalid
@@ -1542,6 +1690,11 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             },
           });
         }
+        // The shared settlement seam. This lane never passed through
+        // wrapToolForHarness, so it used to recover by its own rules — and a
+        // native MCP failure moved no budget at all. One call puts it on the
+        // same footing as every other lane.
+        settleNativeMcpAttempt({ toolName, args, result, mutating: nativeCallIsMutating(toolName, args), callId: externalWriteCallId });
         // Parity with shell/Composio: prepend a self-correcting header when the
         // result is a failure envelope (best-effort; success is byte-identical).
         const flagged = annotateMcpResultFailure(toolName, result);
@@ -1550,7 +1703,12 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // the run_worker advisory appended. Best-effort; no-op when not looping.
         return appendMcpFanoutAdvisory(toolName, args, flagged);
       } catch (err) {
+        if (err instanceof ToolAttemptSettlementAuthorityError) throw err;
         finish('error', err instanceof Error ? err.message : String(err));
+        // A thrown failure is settled by the same seam as a returned one. This
+        // is the path that used to render its typed kind into English and throw
+        // it away, leaving recovery to whoever regexed the message next.
+        settleNativeMcpAttempt({ toolName, args, thrown: err, mutating: nativeCallIsMutating(toolName, args), callId: externalWriteCallId });
         // Once the reservation has crossed into server.callTool, every thrown
         // error is ambiguous. Provider text cannot prove that nothing landed.
         if (preRecordedWrite && integritySessionId) {
@@ -1604,6 +1762,20 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         }
         throw err;
       }
+      };
+
+      if (attemptEntry?.sessionId && attemptEntry.sourceUserSeq) {
+        return withLogicalToolCall(
+          {
+            sessionId: attemptEntry.sessionId,
+            sourceUserSeq: attemptEntry.sourceUserSeq,
+            tool: toolName,
+            args,
+          },
+          dispatchNamespacedTool,
+        );
+      }
+      return dispatchNamespacedTool();
     },
 
     async invalidateToolsCache() {

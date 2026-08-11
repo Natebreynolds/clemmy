@@ -14,11 +14,13 @@ import assert from 'node:assert/strict';
 
 const { resetMemoryDb } = await import('../memory/db.js');
 const { createFocus, patchFocusWorkstate } = await import('../memory/focus.js');
-const { renderHarnessMemoryContext } = await import('./harness-context.js');
+const { harnessInstructions, renderHarnessMemoryContext } = await import('./harness-context.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const { rememberFact } = await import('../memory/facts.js');
 const { checkpointWorkingMemory } = await import('../memory/working-memory.js');
 const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
+const { createGoalContract } = await import('./plan-proposals.js');
+const { renderCanonicalMemoryContext } = await import('../runtime/harness/canonical-context.js');
 const { MEMORY_AUTO_SECTION_MARKER, MEMORY_FILE } = await import('../memory/vault.js');
 
 test('query-driven recall: a request-relevant fact is surfaced UP FRONT for a matching message (never knowledge-starve the brain)', () => {
@@ -219,6 +221,68 @@ test('Current Focus injects a compact shared workstate across provider contexts'
   assert.match(context, /Decisions:\n  - Black bean tacos are selected for Thursday/);
   assert.match(context, /Open loops:\n  - Pick two more dinners/);
   assert.match(context, /\[planned\] airtable: Update recipe database · external/);
+});
+
+test('active task focus + exact-session goal render once in the same volatile block for every provider path', () => {
+  resetMemoryDb();
+  const sessionId = 'provider-active-task-parity';
+  const focus = createFocus({
+    resourceRef: `session:${sessionId}`,
+    title: 'Provider parity',
+    summary: 'Running the same acceptance contract on every brain.',
+    relatedSessionId: sessionId,
+  });
+  patchFocusWorkstate(focus.id, {
+    mode: 'execute',
+    addDecisions: ['Use one canonical active-task renderer.'],
+  });
+  createGoalContract({
+    sessionId,
+    objective: 'Prove active-task context parity.',
+    successCriteria: ['Codex, Claude, and BYO receive the same active-task block.'],
+  });
+  createGoalContract({
+    sessionId: 'provider-active-task-other-session',
+    objective: 'THIS OTHER SESSION MUST NOT LEAK',
+    successCriteria: ['Never visible here.'],
+  });
+
+  const opts = {
+    sessionId,
+    focusInput: 'continue the provider parity work',
+    partition: 'volatile' as const,
+  };
+  const harnessVolatile = renderHarnessMemoryContext(opts);
+  const canonicalVolatile = renderCanonicalMemoryContext(opts);
+  const codexInstructions = harnessInstructions('CODEX ROLE', {
+    sessionId,
+    focusInput: opts.focusInput,
+  })();
+
+  assert.equal(canonicalVolatile, harnessVolatile, 'Claude/canonical and standard harness paths share one renderer');
+  assert.equal(
+    (codexInstructions.match(/\[ACTIVE GOAL/g) ?? []).length,
+    1,
+    'the standard Codex/BYO harness-instructions seam receives the goal exactly once',
+  );
+  assert.equal((harnessVolatile.match(/## Current Focus/g) ?? []).length, 1);
+  assert.equal((harnessVolatile.match(/\[ACTIVE GOAL/g) ?? []).length, 1);
+  assert.match(harnessVolatile, /Use one canonical active-task renderer/);
+  assert.match(harnessVolatile, /Prove active-task context parity/);
+  assert.doesNotMatch(harnessVolatile, /THIS OTHER SESSION MUST NOT LEAK/);
+
+  const all = renderHarnessMemoryContext({
+    sessionId,
+    focusInput: opts.focusInput,
+    partition: 'all',
+  });
+  const sectionFrom = (text: string): string => {
+    const start = text.indexOf('## Current Focus');
+    assert.ok(start >= 0);
+    const end = text.indexOf('\n\n## ', start + 1);
+    return text.slice(start, end >= 0 ? end : undefined);
+  };
+  assert.equal(sectionFrom(all), sectionFrom(harnessVolatile));
 });
 
 test('Current Focus applies one hard prompt budget to an oversized shared workstate', () => {

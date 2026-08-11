@@ -29,12 +29,14 @@ const {
   claudeAgentSdkAdvertisedToolUniverse,
   partitionClaudeAgentSdkJitSurface,
   resolveClaudeAgentBrainMaxTurns,
+  durableMemoryReceiptAllowsConversationOnly,
 } = brain;
 const {
   accrueSessionTokens,
   appendEvent,
   beginRunAttempt,
   claimHarnessChatRequest,
+  closeEventLog,
   createSession,
   getLatestRunAttempt,
   getSession,
@@ -45,6 +47,10 @@ const {
   writeToolOutput,
 } = await import('./eventlog.js');
 const { saveUserProfile } = await import('../user-profile.js');
+const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { turnOutcomeId } = await import('./turn-outcome.js');
+const { _setOpennessJudgeForTests } = await import('./turn-openness.js');
+const { readUsageEventsForDate, recordModelUsage } = await import('../usage-log.js');
 const {
   ClaudeSdkProviderOverloadError,
   ClaudeSdkContextOverflowError,
@@ -52,7 +58,10 @@ const {
 } = await import('./claude-agent-sdk.js');
 const capabilityHealth = await import('./capability-health.js');
 const artifactLedger = await import('./artifact-ledger.js');
-const { openMemoryDb } = await import('../../memory/db.js');
+const { closeMemoryDb, openMemoryDb } = await import('../../memory/db.js');
+const { rememberFact } = await import('../../memory/facts.js');
+const { clearFocus, createFocus, patchFocusWorkstate } = await import('../../memory/focus.js');
+const { createGoalContract } = await import('../../agents/plan-proposals.js');
 const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
 const {
   cancelProspectiveIntention,
@@ -126,6 +135,7 @@ beforeEach(() => {
     objective: query, hits: [], perStore: {}, answerability: 'insufficient',
     diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
   }));
+  _setOpennessJudgeForTests(null);
   _resetClaudeAgentSdkAdvertisableLocalToolsForTest();
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS;
@@ -357,6 +367,24 @@ test('completion judge targets suspicious text and skips concrete tool-backed re
     false,
     'a successful concrete send still certifies a singular objective',
   );
+  assert.equal(
+    shouldJudgeClaudeCompletion(
+      [
+        'Refresh the proof release queue current items from the same connected source.',
+        'Reuse the capability already proved on this machine. Do not discover, inspect a contract, use code mode, shell, workspace, or memory.',
+        'Return the source marker, revision, item id, title, and status.',
+      ].join('\n'),
+      'Refreshed from the connected source.',
+      ['PROOF_LIST_TASKS'],
+    ),
+    false,
+    'one concrete collection read does not pay a judge merely for a bare plural noun',
+  );
+  assert.equal(
+    shouldJudgeClaudeCompletion('Refresh both reports.', 'Refreshed the reports.', ['REPORT_LIST_CURRENT']),
+    true,
+    'explicit multiplicity retains completion verification',
+  );
 });
 
 test('JIT monotonic floor: the EMITTED allowlist string is byte-identical once converged (the actual prompt-cache precondition)', () => {
@@ -536,6 +564,667 @@ test('Claude cron uses an execution SDK session, skips the expensive judge, and 
   assert.equal(response.stoppedReason, 'awaiting-input', 'plain blocking questions still pause canonically');
 });
 
+test('durable memory receipt conversation boundary is exact and fails closed on additional work', () => {
+  const correction = {
+    message: "Small correction for later: Cedar is Cedar-17. A natural acknowledgement is enough.",
+    candidates: [{ reason: 'explicit durable correction' }],
+    queuedCandidateCount: 1,
+    episodeId: 'episode-1',
+  };
+  assert.equal(durableMemoryReceiptAllowsConversationOnly(correction), true);
+  assert.equal(
+    durableMemoryReceiptAllowsConversationOnly({ ...correction, queuedCandidateCount: 0 }),
+    false,
+    'candidate detection without a durable receipt grants no shortcut',
+  );
+  assert.equal(
+    durableMemoryReceiptAllowsConversationOnly({ ...correction, episodeId: null }),
+    false,
+    'candidate ids without their durable episode grant no shortcut',
+  );
+  assert.equal(
+    durableMemoryReceiptAllowsConversationOnly({
+      ...correction,
+      message: `${correction.message} Also create a local note.`,
+    }),
+    false,
+  );
+  assert.equal(
+    durableMemoryReceiptAllowsConversationOnly({
+      ...correction,
+      message: 'Small correction for later: Cedar is Cedar-17. Also forget memory fact #1. A natural acknowledgement is enough.',
+    }),
+    false,
+  );
+  assert.equal(
+    durableMemoryReceiptAllowsConversationOnly({
+      ...correction,
+      message: 'Small correction for later: Cedar is Cedar-17. What do you remember? A natural acknowledgement is enough.',
+    }),
+    false,
+  );
+  assert.equal(
+    durableMemoryReceiptAllowsConversationOnly({
+      ...correction,
+      candidates: [{ reason: 'durable first-person declarative' }],
+    }),
+    false,
+    'incidental fact capture never removes the ordinary agent surface',
+  );
+  for (const message of [
+    'Small correction for later: Cedar is Cedar-17. Also forget Cedar-12. A natural acknowledgement is enough.',
+    'Small correction for later: Cedar is Cedar-17. Also use memory_forget on Cedar-12. A natural acknowledgement is enough.',
+    'Small correction for later: Cedar is Cedar-17. Also manage my stored Cedar knowledge. A natural acknowledgement is enough.',
+    'Remember this: Cedar is Cedar-17. Also forget the old one. Just confirm.',
+    'Small correction for later: Cedar is Cedar-17. Also what is 8 x 7. A natural acknowledgement is enough.',
+    'Small correction for later: Cedar is Cedar-17. Then multiply 8 x 7. A natural acknowledgement is enough.',
+    'Small correction for later: Cedar is Cedar-17. Translate Cedar into French. A natural acknowledgement is enough.',
+    'Small correction for later: Cedar is Cedar-17. Also inspect fact #1. A natural acknowledgement is enough.',
+    'Small correction for later: Cedar is Cedar-17. Clear the old memory. A natural acknowledgement is enough.',
+    'Small correction for later: Cedar is Cedar-17. Purge Cedar-12. A natural acknowledgement is enough.',
+    'Remember this: Cedar is Cedar-17. Give me three launch ideas. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Outline a rollout plan. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Recommend what we should do next. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Brainstorm launch angles. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Help me decide the next step. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Review the release notes. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Test the endpoint. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Verify the deployment. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Scrape the launch page. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Take a screenshot. Just confirm.',
+    'Remember this: Cedar is Cedar-17. While you are here, summarize the plan. Just confirm.',
+    'Remember this: Cedar is Cedar-17. If you are able, summarize the plan. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Since we are here, outline the rollout. Just confirm.',
+    'Remember this: Cedar is Cedar-17 — give me three ideas. Just confirm.',
+    'Remember this: Cedar is Cedar-17, plus brainstorm some names. Just confirm.',
+    'Remember this: You are to review the checklist. Just confirm.',
+    'Remember this: Cedar is Cedar-17. I need you to summarize the plan now. Just confirm.',
+    'Remember this: Cedar is Cedar-17. I want you to review the checklist now. Just confirm.',
+    'Remember this: Cedar is Cedar-17. We are here, so outline the rollout. Just confirm.',
+    'Remember this: Cedar is Cedar-17. Our next task is to review the release notes now. Just confirm.',
+  ]) {
+    assert.equal(
+      durableMemoryReceiptAllowsConversationOnly({ ...correction, message }),
+      false,
+      `additional work retains normal authority: ${message}`,
+    );
+  }
+  for (const tail of [
+    'and I have a question: what is 8 x 7',
+    'and I wonder what else you remember',
+    'and I need a summary of the launch',
+    'and the old memory should be deleted',
+    'and memory_forget should be called for fact 1',
+    'and I want the report sent to alice@example.com',
+    'and I would like to know what 8 x 7 is',
+    'and I am curious what else you remember',
+    'and I have something to ask about the launch',
+    'and the memory_forget tool should be called',
+    'and the report should be sent to alice@example.com',
+    'and the document must be published',
+    'and I expect a launch summary',
+    "and I'd like to know what 8 x 7 is",
+    'and I’d like to know what 8 x 7 is',
+    'and I am wondering what else you remember',
+    'and I was wondering what else you remember',
+    'and I need to know what 8 x 7 is',
+    'and I want to know what else you remember',
+    'and one more question is what the launch date is',
+    'and there is one more question about the launch',
+    'and let memory_forget run for fact 1',
+    'and memory_forget is the tool to run for fact 1',
+    'and I need memory_forget run for fact 1',
+    'and the spreadsheet needs to be updated',
+    'and the deployment must be run',
+    'and the payment needs to be refunded',
+    'and the database needs to be migrated',
+    'and the row needs to be inserted',
+    'and the spreadsheet needs updated',
+    'and the payment needs refunded',
+    'and the database needs migrated',
+    'and the row needs inserted',
+    'and I was hoping you could summarize',
+    "and let's review the launch",
+    'and let us review the launch',
+    'and we should review the launch',
+    'and maybe review the launch',
+    'and I have another ask: summarize the launch',
+    'and I want you reviewing the launch',
+    'and I could use a summary',
+    'and the plan needs summarizing',
+    'and I need you summarizing the launch',
+    'and memory_forget needs running',
+  ]) {
+    const message = `Remember this: Cedar is Cedar-17 ${tail}. A natural acknowledgement is enough.`;
+    assert.equal(
+      durableMemoryReceiptAllowsConversationOnly({ ...correction, message }),
+      false,
+      `an unsplit secondary tail cannot borrow receipt authority: ${tail}`,
+    );
+  }
+  assert.equal(
+    durableMemoryReceiptAllowsConversationOnly({
+      ...correction,
+      message: 'Remember this: Cedar is Cedar-17 and Cedar-12 is retired. A natural acknowledgement is enough.',
+    }),
+    true,
+    'a second declarative fact remains a conversation-only memory payload',
+  );
+  assert.equal(
+    durableMemoryReceiptAllowsConversationOnly({
+      ...correction,
+      message: 'Remember this: Cedar is Cedar-17 and memory_forget is deprecated. A natural acknowledgement is enough.',
+    }),
+    true,
+    'a factual statement naming a tool is not mistaken for a tool request',
+  );
+});
+
+test('SDK brain gives a receipt-backed acknowledgement-only correction zero tool authority and preserves Claude voice', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'on';
+  const sessionId = 'brain-memory-receipt-conversation-only';
+  const message = "Small correction for later: Cedar's current release number is Cedar-17. Cedar-12 is retired and must not be used as current. A natural acknowledgement is enough.";
+  const providerReply = "Got it — Cedar-17 is current, Cedar-12 is retired. I'll remember that.";
+  createSession({ id: sessionId, kind: 'chat', title: 'memory receipt' });
+  const priorSource = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Keep our conversations warm and direct.' },
+  });
+  const priorIdentity = { sessionId, turn: 1, sourceUserSeq: priorSource.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(priorIdentity),
+    identity: priorIdentity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: 'Absolutely — warm, direct, and still me.' },
+  });
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  invalidateStableMemorySnapshot(sessionId);
+  rememberFact({
+    kind: 'user',
+    content: "Cedar's current release number is Cedar-12.",
+    sessionId,
+  });
+  const seededSystem = renderClaudeAgentBrainSystemAppend('home', { message: 'seed', sessionId }, 'read_only');
+  assert.match(seededSystem, /Cedar-12/, 'the frozen prefix really contains the stale value before correction');
+
+  // A session-global unfinished skill from an older turn must not reopen this
+  // unrelated acknowledgement through the deterministic skill repair gate.
+  const priorSkillCall = appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'skill_read', callId: 'old-skill', effect: 'read', args: { name: 'old-report-skill' } },
+  });
+  writeToolOutput({
+    sessionId,
+    callId: 'old-skill',
+    invocationNonce: `${sessionId}:old-skill`,
+    tool: 'skill_read',
+    output: 'Skill: old-report-skill\n---\nRun scripts/render-old-report.js before completion.',
+  });
+  appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'Clem',
+    type: 'tool_returned',
+    parentEventId: priorSkillCall.id,
+    data: { tool: 'skill_read', callId: 'old-skill', effect: 'read', ok: true },
+  });
+
+  let runCalls = 0;
+  let judgeCalls = 0;
+  let unifiedPrimerCalls = 0;
+  let capturedPrompt = '';
+  let capturedTurnContext = '';
+  let capturedSystemAppend = '';
+  let capturedPriorTurns: Array<{ who: 'user' | 'assistant'; text: string }> = [];
+  let capturedAllowedLocalTools: string[] | undefined;
+  let capturedMcpToolAllowlist: string[] | undefined;
+  let capturedLocalToolUniverse: string[] | undefined;
+  let capturedRequiredLocalTools: string[] | undefined;
+  let capturedScope: { maxTools?: number; allowedServerSlugs?: string[] } | undefined;
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => {
+    unifiedPrimerCalls += 1;
+    return {
+      objective: query,
+      hits: [],
+      perStore: {},
+      answerability: 'insufficient',
+      diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
+    };
+  });
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    runCalls += 1;
+    capturedPrompt = options.prompt;
+    capturedTurnContext = options.turnContext ?? '';
+    capturedSystemAppend = options.systemAppend ?? '';
+    capturedPriorTurns = options.priorTurns ?? [];
+    capturedAllowedLocalTools = options.allowedLocalMcpTools;
+    capturedMcpToolAllowlist = options.mcpToolAllowlist;
+    capturedLocalToolUniverse = options.localMcpToolUniverse;
+    capturedRequiredLocalTools = options.requiredLocalMcpTools;
+    capturedScope = options.nativeMcpToolScope;
+    return {
+      text: providerReply,
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: [],
+    };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judgeCalls += 1;
+    return { done: true, reason: 'the receipt already satisfies the request' };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+
+  assert.equal(response.text, providerReply);
+  assert.equal(runCalls, 1);
+  assert.equal(judgeCalls, 0, 'the generic completion judge cannot re-open receipt-backed memory work');
+  assert.equal(unifiedPrimerCalls, 0, 'a durable acknowledgement does not re-retrieve the fact it just accepted');
+  assert.equal(capturedPrompt, message, 'the provider still receives the literal user message');
+  assert.deepEqual(capturedPriorTurns, [
+    { who: 'user', text: 'Keep our conversations warm and direct.' },
+    { who: 'assistant', text: 'Absolutely — warm, direct, and still me.' },
+  ], 'the complete conversational history remains available to Claude');
+  assert.match(capturedSystemAppend, /Cedar-12/, 'the cacheable personalized prefix remains stable during asynchronous consolidation');
+  assert.match(capturedSystemAppend, /plain, warm, specific/i, 'the core conversational voice contract remains present');
+  assert.match(capturedTurnContext, /supersedes any older conflicting value/i);
+  assert.match(capturedTurnContext, /already durably queued/i);
+  assert.match(capturedTurnContext, /naturally in your own voice/i);
+  assert.deepEqual(capturedAllowedLocalTools, []);
+  assert.deepEqual(capturedMcpToolAllowlist, []);
+  assert.deepEqual(capturedLocalToolUniverse, []);
+  assert.deepEqual(capturedRequiredLocalTools, []);
+  assert.equal(capturedScope?.maxTools, 0);
+  assert.deepEqual(capturedScope?.allowedServerSlugs, []);
+  assert.equal(listEvents(sessionId, { types: ['tool_jit_scope'] }).length, 0);
+
+  const capture = listEvents(sessionId, { types: ['memory_signals_captured'] }).at(-1);
+  assert.ok(capture);
+  assert.equal(capture!.data.queuedCandidateCount, 1);
+  assert.equal(capture!.data.conversationOnly, true);
+  assert.ok(capture!.data.episodeId);
+  const policy = listEvents(sessionId, { types: ['tool_policy_resolved'] }).at(-1);
+  assert.equal(policy?.data.shortCircuitReason, 'durable_memory_receipt_conversation_only');
+  assert.equal(policy?.data.outputCount, 0);
+  const primer = listEvents(sessionId, { types: ['turn_memory_primer'] }).at(-1);
+  assert.equal(primer?.data.source, null);
+  assert.equal(primer?.data.injected, false);
+  assert.equal(primer?.data.hitCount, 0);
+  assert.equal(primer?.data.skippedReason, 'durable_memory_receipt_conversation_only');
+  const packet = listEvents(sessionId, { types: ['agent_context_packet'] }).at(-1);
+  assert.equal(packet?.data.semanticEnrichmentSkippedReason, 'durable_memory_receipt_conversation_only');
+  assert.equal(packet?.data.multiItem?.detected, false);
+  assert.equal(listEvents(sessionId, { types: ['turn_preflight_decision', 'capability_resolution'] }).length, 0);
+  assert.equal(
+    listEvents(sessionId, { types: ['heartbeat'] }).filter((event) => event.data.kind === 'skill_execution_repair').length,
+    0,
+  );
+});
+
+test('SDK brain seals an unsafe receipt presentation behind one text-only repair', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'on';
+  const sessionId = 'brain-memory-receipt-presentation-repair';
+  const message = 'Remember this: Cedar is Cedar-18. Just confirm.';
+  const unsafeReply = 'Got it. <tool_call>{"name":"send_email"}</tool_call>';
+  const repairedReply = "Got it — Cedar is Cedar-18. I'll remember that.";
+  createSession({ id: sessionId, kind: 'chat', title: 'receipt presentation repair' });
+
+  const prompts: string[] = [];
+  let judgeCalls = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    prompts.push(options.prompt);
+    return {
+      text: prompts.length === 1 ? unsafeReply : repairedReply,
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-test',
+      toolUses: [],
+    };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judgeCalls += 1;
+    return { done: true, reason: 'receipt complete' };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+
+  assert.equal(prompts.length, 2, 'unsafe provider prose spends exactly one sealed presentation repair');
+  assert.equal(prompts[0], message);
+  assert.match(prompts[1], /durable memory intake .* already complete/i);
+  assert.match(prompts[1], /Do not mention internal machinery or tools/i);
+  assert.equal(response.text, repairedReply, 'only the healthy provider-authored repair is published');
+  assert.doesNotMatch(response.text, /send_email|"action"/i);
+  assert.equal(judgeCalls, 0, 'presentation repair does not reopen the completed memory objective');
+  assert.equal(
+    listEvents(sessionId, { types: ['guardrail_tripped'] })
+      .some((event) => event.data.kind === 'durable_memory_receipt_presentation_fallback'),
+    false,
+    'a healthy sealed repair does not need the deterministic fallback',
+  );
+});
+
+test('SDK brain byte-preserves safe receipt acknowledgements outside a fixed opener list', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const replies = [
+    "Thanks for the correction — Cedar-17 is current, and I'll remember that.",
+    "I've got it — Cedar-17 is current.",
+  ];
+
+  for (const [index, reply] of replies.entries()) {
+    resetEventLog();
+    const sessionId = `brain-memory-receipt-varied-safe-voice-${index}`;
+    const message = `Small correction for later: Cedar is Cedar-17. Cedar-${index + 10} is retired. Just confirm.`;
+    createSession({ id: sessionId, kind: 'chat', title: 'varied safe receipt voice' });
+    let runCalls = 0;
+    setClaudeAgentSdkBrainRunForTest(async () => {
+      runCalls += 1;
+      return {
+        text: reply,
+        sessionId: 'sdk-session',
+        model: 'claude-sonnet-test',
+        toolUses: [],
+      };
+    });
+
+    const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+
+    assert.equal(runCalls, 1, `fixture ${index} needs no style repair`);
+    assert.equal(response.text, reply, `fixture ${index} remains byte-identical`);
+    assert.equal(
+      listEvents(sessionId, { types: ['guardrail_tripped'] })
+        .some((event) => event.data.kind === 'durable_memory_receipt_presentation_fallback'),
+      false,
+    );
+  }
+});
+
+test('SDK brain repairs a false denial after durable memory intake succeeded', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'brain-memory-receipt-false-denial-repair';
+  const message = 'Remember this: Cedar is Cedar-20. Just confirm.';
+  const repairedReply = 'Thanks — Cedar-20 is current, and I’ll remember that.';
+  createSession({ id: sessionId, kind: 'chat', title: 'receipt denial repair' });
+
+  let runCalls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    runCalls += 1;
+    return {
+      text: runCalls === 1 ? "Sorry, I can't remember or store that." : repairedReply,
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-test',
+      toolUses: [],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+
+  assert.equal(runCalls, 2);
+  assert.equal(response.text, repairedReply);
+  assert.doesNotMatch(response.text, /can(?:not|'t) remember|can't remember/i);
+});
+
+test('SDK brain repairs an unrelated completed-effect claim on a receipt-only turn', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'brain-memory-receipt-effect-claim-repair';
+  const message = 'Remember this: Cedar is Cedar-21. Just confirm.';
+  const repairedReply = "I've got it — Cedar-21 is current.";
+  createSession({ id: sessionId, kind: 'chat', title: 'receipt effect repair' });
+
+  let runCalls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    runCalls += 1;
+    return {
+      text: runCalls === 1 ? 'Got it — I updated the spreadsheet.' : repairedReply,
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-test',
+      toolUses: [],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+
+  assert.equal(runCalls, 2);
+  assert.equal(response.text, repairedReply);
+  assert.doesNotMatch(response.text, /spreadsheet/i);
+});
+
+test('SDK brain falls back safely when the sealed receipt repair is still unsafe', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'brain-memory-receipt-presentation-fallback';
+  const message = 'Remember this: Cedar is Cedar-19. Just confirm.';
+  const unsafeReply = 'Noted — the note got created, and I pushed the branch.';
+  createSession({ id: sessionId, kind: 'chat', title: 'receipt presentation fallback' });
+
+  let runCalls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    runCalls += 1;
+    return {
+      text: unsafeReply,
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-test',
+      toolUses: [],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+
+  assert.equal(runCalls, 2, 'one sealed repair is attempted before fallback');
+  assert.equal(response.text, "Got it — I'll remember that.");
+  assert.doesNotMatch(response.text, /created|pushed/i);
+  assert.equal(
+    listEvents(sessionId, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data.kind === 'durable_memory_receipt_presentation_fallback').length,
+    1,
+  );
+});
+
+test('SDK brain preserves an explicit caller tool allowlist on an acknowledgement-only memory receipt', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = 'brain-memory-receipt-explicit-tool-authority';
+  const message = 'Remember this: Cedar is Cedar-17. Just confirm.';
+  createSession({ id: sessionId, kind: 'chat', title: 'explicit receipt authority' });
+
+  let unifiedPrimerCalls = 0;
+  let capturedAllowedLocalTools: string[] | undefined;
+  let capturedMcpToolAllowlist: string[] | undefined;
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => {
+    unifiedPrimerCalls += 1;
+    return {
+      objective: query,
+      hits: [],
+      perStore: {},
+      answerability: 'insufficient',
+      diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
+    };
+  });
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    capturedAllowedLocalTools = options.allowedLocalMcpTools;
+    capturedMcpToolAllowlist = options.mcpToolAllowlist;
+    return {
+      text: 'Got it — Cedar is Cedar-17.',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-test',
+      toolUses: [],
+    };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message,
+    sessionId,
+    allowedToolNames: ['memory_recall_all'],
+  });
+
+  assert.equal(unifiedPrimerCalls, 1, 'explicit caller authority keeps the ordinary semantic context path');
+  assert.deepEqual(capturedAllowedLocalTools, ['memory_recall_all']);
+  assert.deepEqual(capturedMcpToolAllowlist, ['memory_recall_all']);
+  const capture = listEvents(sessionId, { types: ['memory_signals_captured'] }).at(-1);
+  assert.equal(capture?.data.conversationOnly, false);
+  const policy = listEvents(sessionId, { types: ['tool_policy_resolved'] }).at(-1);
+  assert.notEqual(policy?.data.shortCircuitReason, 'durable_memory_receipt_conversation_only');
+});
+
+test('SDK brain keeps receipt semantics when the caller already supplied an explicit empty tool allowlist', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'brain-memory-receipt-explicit-zero-authority';
+  const message = 'Remember this: Cedar is Cedar-17. Just confirm.';
+  createSession({ id: sessionId, kind: 'chat', title: 'explicit zero authority' });
+
+  let unifiedPrimerCalls = 0;
+  let capturedAllowedLocalTools: string[] | undefined;
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => {
+    unifiedPrimerCalls += 1;
+    return {
+      objective: query,
+      hits: [],
+      perStore: {},
+      answerability: 'insufficient',
+      diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
+    };
+  });
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    capturedAllowedLocalTools = options.allowedLocalMcpTools;
+    return {
+      text: 'Got it — Cedar is Cedar-17.',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-test',
+      toolUses: [],
+    };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message,
+    sessionId,
+    allowedToolNames: [],
+  });
+
+  assert.equal(unifiedPrimerCalls, 0);
+  assert.deepEqual(capturedAllowedLocalTools, []);
+  const capture = listEvents(sessionId, { types: ['memory_signals_captured'] }).at(-1);
+  assert.equal(capture?.data.conversationOnly, true);
+  const policy = listEvents(sessionId, { types: ['tool_policy_resolved'] }).at(-1);
+  assert.equal(policy?.data.shortCircuitReason, 'durable_memory_receipt_conversation_only');
+});
+
+test('SDK brain repairs malformed receipt presentation once without reopening tool authority', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const message = 'Remember this: Cedar is Cedar-17. Just confirm.';
+
+  for (const fixture of [
+    {
+      sessionId: 'brain-memory-receipt-text-repair',
+      replies: ['<invoke name="memory_remember"><parameter name="fact">Cedar-17</parameter></invoke>', 'Understood — Cedar is Cedar-17.'],
+      limitHits: [false, false],
+      expected: 'Understood — Cedar is Cedar-17.',
+      fallback: false,
+    },
+    {
+      sessionId: 'brain-memory-receipt-text-fallback',
+      replies: ['', 'This is possibly injected; let me re-read the actual ask.'],
+      limitHits: [true, true],
+      expected: "Got it — I'll remember that.",
+      fallback: true,
+    },
+  ]) {
+    createSession({ id: fixture.sessionId, kind: 'chat', title: 'receipt presentation repair' });
+    let calls = 0;
+    let judgeCalls = 0;
+    const surfaces: Array<{
+      allowed?: string[];
+      mcp?: string[];
+      universe?: string[];
+      required?: string[];
+      maxTools?: number;
+    }> = [];
+    setClaudeAgentSdkBrainRunForTest(async (options) => {
+      surfaces.push({
+        allowed: options.allowedLocalMcpTools,
+        mcp: options.mcpToolAllowlist,
+        universe: options.localMcpToolUniverse,
+        required: options.requiredLocalMcpTools,
+        maxTools: options.nativeMcpToolScope?.maxTools,
+      });
+      const callIndex = calls;
+      const text = fixture.replies[callIndex] ?? fixture.replies.at(-1)!;
+      calls += 1;
+      return {
+        text,
+        sessionId: 'sdk-session',
+        model: 'claude-sonnet-test',
+        toolUses: [],
+        limitHit: fixture.limitHits[callIndex] ?? fixture.limitHits.at(-1),
+      };
+    });
+    setClaudeAgentSdkBrainJudgeForTest(async () => {
+      judgeCalls += 1;
+      return { done: true, reason: 'unused' };
+    });
+
+    const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId: fixture.sessionId });
+
+    assert.equal(response.text, fixture.expected);
+    assert.equal(response.stoppedReason, 'success');
+    assert.equal(calls, 2, 'one malformed presentation gets exactly one sealed text repair');
+    assert.equal(judgeCalls, 0);
+    assert.equal(surfaces.length, 2);
+    for (const surface of surfaces) {
+      assert.deepEqual(surface.allowed, []);
+      assert.deepEqual(surface.mcp, []);
+      assert.deepEqual(surface.universe, []);
+      assert.deepEqual(surface.required, []);
+      assert.equal(surface.maxTools, 0);
+    }
+    const fallbackEvents = listEvents(fixture.sessionId, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data.kind === 'durable_memory_receipt_presentation_fallback');
+    assert.equal(fallbackEvents.length, fixture.fallback ? 1 : 0);
+    assert.equal(listEvents(fixture.sessionId, { types: ['conversation_limit_exceeded'] }).length, 0);
+  }
+});
+
+test('SDK brain reduces a receipt presentation provider failure without cross-brain replay authority', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'brain-memory-receipt-provider-failure';
+  const message = 'Remember this: Cedar is Cedar-17. Just confirm.';
+  createSession({ id: sessionId, kind: 'chat', title: 'receipt provider failure' });
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    assert.deepEqual(options.allowedLocalMcpTools, []);
+    assert.deepEqual(options.mcpToolAllowlist, []);
+    assert.equal(options.nativeMcpToolScope?.maxTools, 0);
+    throw new ClaudeSdkProviderOverloadError('API Error: 529 overloaded_error', false);
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+
+  assert.equal(calls, 1);
+  assert.equal(response.text, "Got it — I'll remember that.");
+  assert.equal(response.stoppedReason, 'success');
+  const fallback = listEvents(sessionId, { types: ['guardrail_tripped'] })
+    .filter((event) => event.data.kind === 'durable_memory_receipt_provider_failure_fallback');
+  assert.equal(fallback.length, 1);
+  assert.equal(listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+});
+
 test('SDK brain auto-captures explicit remember turns even when the model skips memory_remember', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
@@ -564,6 +1253,137 @@ test('SDK brain auto-captures explicit remember turns even when the model skips 
     events.findIndex((event) => event.type === 'memory_signals_captured') <
       events.findIndex((event) => event.type === 'conversation_completed'),
     'capture telemetry is recorded before the final saved reply',
+  );
+});
+
+test('SDK brain durably captures an exact pre-recorded source once and isolates compound-decline memory authority', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  setClaudeAgentSdkBrainRunForTest(async (options) => ({
+    text: 'Understood — I’ll keep that correction in mind.',
+    sessionId: options.sessionId,
+    model: 'claude-sonnet-test',
+    toolUses: [],
+  }));
+
+  const correctionSessionId = 'brain-autocap-pre-recorded-correction';
+  const correctionRunId = 'run-autocap-pre-recorded-correction';
+  const correction = "Small correction for later: Project Cedar's release marker is Cedar-17, not Cedar-12.";
+  createSession({ id: correctionSessionId, kind: 'chat', channel: 'desktop', title: 'correction' });
+  const correctionAttempt = beginRunAttempt(correctionSessionId, { runId: correctionRunId });
+  const correctionSource = recordRunAttemptUserInput(correctionAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: correction, displayText: correction, runId: correctionRunId },
+  });
+
+  const correctionRequest = {
+    message: correction,
+    displayMessage: correction,
+    sourceUserSeq: correctionSource.seq,
+    sessionId: correctionSessionId,
+    runId: correctionRunId,
+    channel: 'desktop',
+  } as const;
+  await respondViaClaudeAgentSdkBrain('home', correctionRequest);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const correctionCallId = `auto-capture:user-source:${correctionSource.seq}`;
+  const assertSingleCorrectionAdmission = (): void => {
+    const db = openMemoryDb();
+    const episodes = db.prepare(`
+      SELECT evidence_excerpt FROM memory_episodes
+      WHERE session_id = ? AND call_id = ?
+    `).all(correctionSessionId, correctionCallId) as Array<{ evidence_excerpt: string | null }>;
+    const candidates = db.prepare(`
+      SELECT text, intake_reason FROM memory_reflection_candidates
+      WHERE session_id = ? AND call_id = ? AND source_type = 'auto_capture'
+    `).all(correctionSessionId, correctionCallId) as Array<{ text: string; intake_reason: string | null }>;
+    assert.equal(episodes.length, 1, 'the exact accepted source owns one durable episode');
+    assert.equal(episodes[0]?.evidence_excerpt, correction);
+    assert.equal(candidates.length, 1, 'the exact accepted source owns one durable learning decision');
+    assert.equal(candidates[0]?.text, correction);
+    assert.equal(candidates[0]?.intake_reason, 'explicit durable correction');
+  };
+  assertSingleCorrectionAdmission();
+
+  // Simulate a daemon restart and re-delivery of the same accepted edge. The
+  // physical attempt rotates, but sourceUserSeq — and therefore memory intake
+  // identity — remains stable.
+  closeEventLog();
+  closeMemoryDb();
+  await respondViaClaudeAgentSdkBrain('home', correctionRequest);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assertSingleCorrectionAdmission();
+
+  const compoundSessionId = 'brain-autocap-compound-decline';
+  createSession({ id: compoundSessionId, kind: 'chat', channel: 'desktop', title: 'compound correction' });
+  const parentAttempt = beginRunAttempt(compoundSessionId);
+  const parent = recordRunAttemptUserInput(parentAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Update the local project note.' },
+  });
+  appendEvent({
+    sessionId: compoundSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: 'Should I update it?',
+      options: ['Yes', 'No'],
+      purpose: 'clarification',
+      source: 'decision_awaiting',
+      sourceUserSeq: parent.seq,
+    },
+  });
+  const parentIdentity = { sessionId: compoundSessionId, turn: 1, sourceUserSeq: parent.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(parentIdentity),
+    identity: parentIdentity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: 'Should I update it?' },
+  });
+
+  const activeTaskInput = "Small correction for later: Project Birch's release marker is Birch-29, not Birch-11.";
+  const compoundMessage = `No—leave that note alone. Instead, ${activeTaskInput}`;
+  const compoundRunId = 'run-autocap-compound-decline';
+  const compoundAttempt = beginRunAttempt(compoundSessionId, { runId: compoundRunId });
+  const compoundSource = recordRunAttemptUserInput(compoundAttempt, {
+    turn: 2,
+    role: 'user',
+    data: { text: compoundMessage, displayText: compoundMessage, runId: compoundRunId },
+  });
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: compoundMessage,
+    displayMessage: compoundMessage,
+    sourceUserSeq: compoundSource.seq,
+    sessionId: compoundSessionId,
+    runId: compoundRunId,
+    channel: 'desktop',
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const compoundCallId = `auto-capture:user-source:${compoundSource.seq}`;
+  const db = openMemoryDb();
+  const compoundEpisodes = db.prepare(`
+    SELECT evidence_excerpt FROM memory_episodes
+    WHERE session_id = ? AND call_id = ?
+  `).all(compoundSessionId, compoundCallId) as Array<{ evidence_excerpt: string | null }>;
+  const compoundCandidates = db.prepare(`
+    SELECT text FROM memory_reflection_candidates
+    WHERE session_id = ? AND call_id = ? AND source_type = 'auto_capture'
+  `).all(compoundSessionId, compoundCallId) as Array<{ text: string }>;
+  assert.deepEqual(compoundEpisodes, [{ evidence_excerpt: activeTaskInput }]);
+  assert.deepEqual(compoundCandidates, [{ text: activeTaskInput }]);
+  assert.doesNotMatch(
+    compoundEpisodes[0]!.evidence_excerpt!,
+    /leave that note alone/i,
+    'the declined parent remains conversational transcript, never durable memory authority',
   );
 });
 
@@ -820,6 +1640,45 @@ test('Claude brain keeps the installed catalog out of the stable prompt and inje
   }
 });
 
+test('Claude volatile turn receives the canonical FocusWorkstate + exact-session goal exactly once', async () => {
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  const sessionId = 'brain-active-task-parity';
+  const focus = createFocus({
+    resourceRef: `session:${sessionId}`,
+    title: 'Claude active-task parity',
+    summary: 'Using the shared provider-neutral task context.',
+    relatedSessionId: sessionId,
+  });
+  patchFocusWorkstate(focus.id, {
+    mode: 'execute',
+    addDecisions: ['Render the task contract through canonical volatile context.'],
+  });
+  createGoalContract({
+    sessionId,
+    objective: 'Prove Claude receives the shared active task.',
+    successCriteria: ['The goal appears exactly once in the turn context.'],
+  });
+  createGoalContract({
+    sessionId: 'brain-active-task-other-session',
+    objective: 'OTHER CLAUDE SESSION GOAL MUST NOT LEAK',
+    successCriteria: ['Never visible in this turn.'],
+  });
+
+  try {
+    const turn = await renderClaudeAgentBrainTurnContext({
+      message: 'continue the active task',
+      sessionId,
+    });
+    assert.equal((turn.match(/\[ACTIVE GOAL/g) ?? []).length, 1);
+    assert.match(turn, /Render the task contract through canonical volatile context/);
+    assert.match(turn, /Prove Claude receives the shared active task/);
+    assert.doesNotMatch(turn, /OTHER CLAUDE SESSION GOAL MUST NOT LEAK/);
+  } finally {
+    clearFocus(focus.id, 'completed');
+    delete process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT;
+  }
+});
+
 test('stable memory freezing is DEFAULT ON, defers churn, and honors the invalidation generation', () => {
   process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on'; // the freeze applies only on the split (cacheable-prefix) path
   delete process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT; // default path under test
@@ -922,16 +1781,44 @@ test('Claude SDK dispatch receives non-coercive convergence state on a clarifica
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.CLEMMY_TOOL_JIT = 'off';
   const sid = createSession({ kind: 'chat' }).id;
+  const originAttempt = beginRunAttempt(sid);
+  const origin = recordRunAttemptUserInput(originAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Should we build a win-back queue or diagnose losses?' },
+  });
   appendEvent({
     sessionId: sid,
     turn: 1,
     role: 'Clem',
     type: 'awaiting_user_input',
-    data: { question: 'Win-back queue or loss diagnosis?', source: 'decision_awaiting' },
+    data: {
+      question: 'Win-back queue or loss diagnosis?',
+      options: ['Win-back queue', 'Loss diagnosis'],
+      purpose: 'clarification',
+      source: 'decision_awaiting',
+      sourceUserSeq: origin.seq,
+    },
+  });
+  const originIdentity = { sessionId: sid, turn: 1, sourceUserSeq: origin.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(originIdentity),
+    identity: originIdentity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: 'Win-back queue or loss diagnosis?' },
   });
   let capturedTurnContext = '';
+  let capturedPrompt = '';
+  let capturedNativeMcpScopeInput = '';
+  let capturedArtifactObjective = '';
   setClaudeAgentSdkBrainRunForTest(async (options) => {
     capturedTurnContext = options.turnContext ?? '';
+    capturedPrompt = options.prompt;
+    capturedNativeMcpScopeInput = options.nativeMcpScopeInput ?? '';
+    capturedArtifactObjective = options.artifactObjective ?? '';
     return { text: 'Built the win-back queue.', sessionId: sid, model: 'claude-sonnet-5', toolUses: [] };
   });
 
@@ -941,9 +1828,377 @@ test('Claude SDK dispatch receives non-coercive convergence state on a clarifica
   });
 
   assert.equal(response.text, 'Built the win-back queue.');
+  assert.equal(capturedPrompt, 'Use the win-back queue.', 'Claude receives the literal answer as its user prompt');
+  assert.equal(capturedNativeMcpScopeInput, 'Use the win-back queue.', 'native MCP sees literal B as the current input');
+  assert.equal(
+    capturedArtifactObjective,
+    'Use the win-back queue.',
+    'artifact and completion policy receive only the exact accepted authority, never private A/Q/B retrieval text',
+  );
   assert.match(capturedTurnContext, /CONVERGE/);
   assert.match(capturedTurnContext, /never re-ask the resolved point/);
   assert.doesNotMatch(capturedTurnContext, /EXECUTE the work this turn/);
+});
+
+test('a literal decline cannot inherit the parent send objective or trigger corrective work', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'on';
+  process.env.CLEMMY_TOOL_JIT = 'on';
+  process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'on';
+  const sid = createSession({ kind: 'chat' }).id;
+  const originAttempt = beginRunAttempt(sid);
+  const origin = recordRunAttemptUserInput(originAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Send the client email.' },
+  });
+  // Reproduce the strongest case: A already earned a durable consequential
+  // alignment before Clem asked the follow-up. B="No" must still override it.
+  let unifiedRecallCalls = 0;
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => {
+    unifiedRecallCalls += 1;
+    return {
+      objective: query,
+      hits: [],
+      perStore: {},
+      answerability: 'insufficient',
+      diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
+    };
+  });
+  let opennessCalls = 0;
+  _setOpennessJudgeForTests(async () => {
+    opennessCalls += 1;
+    return null;
+  });
+  await renderClaudeAgentBrainTurnContext({
+    message: 'Send the client email.',
+    sessionId: sid,
+  }, { sourceUserSeq: origin.seq });
+  const recallCallsBeforeDecline = unifiedRecallCalls;
+  const opennessCallsBeforeDecline = opennessCalls;
+  const capabilityEventsBeforeDecline = listEvents(sid, { types: ['capability_resolution'] }).length;
+  assert.ok(recallCallsBeforeDecline > 0, 'the recall seam is active for the parent turn');
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: 'Should I send it?',
+      options: ['Yes', 'No'],
+      purpose: 'clarification',
+      source: 'decision_awaiting',
+      sourceUserSeq: origin.seq,
+    },
+  });
+  const identity = { sessionId: sid, turn: 1, sourceUserSeq: origin.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: 'Should I send it?' },
+  });
+
+  let runCalls = 0;
+  let judgeCalls = 0;
+  let capturedPrompt = '';
+  let capturedArtifactObjective = '';
+  let capturedTurnContext = '';
+  let capturedPriorTurns: Array<{ who: 'user' | 'assistant'; text: string }> = [];
+  let capturedAllowedLocalTools: string[] | undefined;
+  let capturedMcpToolAllowlist: string[] | undefined;
+  let capturedLocalToolUniverse: string[] | undefined;
+  let capturedRequiredLocalTools: string[] | undefined;
+  let capturedScope: { maxTools?: number; allowedServerSlugs?: string[] } | undefined;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    runCalls += 1;
+    capturedPrompt = options.prompt;
+    capturedArtifactObjective = options.artifactObjective ?? '';
+    capturedTurnContext = options.turnContext ?? '';
+    capturedPriorTurns = options.priorTurns ?? [];
+    capturedAllowedLocalTools = options.allowedLocalMcpTools;
+    capturedMcpToolAllowlist = options.mcpToolAllowlist;
+    capturedLocalToolUniverse = options.localMcpToolUniverse;
+    capturedRequiredLocalTools = options.requiredLocalMcpTools;
+    capturedScope = options.nativeMcpToolScope;
+    return {
+      text: 'Understood — I won’t send it.',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: [],
+    };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judgeCalls += 1;
+    return { done: false, reason: 'should not judge a decline' };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'No.',
+    sessionId: sid,
+  });
+
+  assert.equal(response.text, 'Understood — I won’t send it.');
+  assert.equal(response.stoppedReason, 'success');
+  assert.equal(runCalls, 1, 'no corrective execution turn may follow the decline');
+  assert.equal(judgeCalls, 0, 'the parent send objective never reaches completion judging');
+  assert.equal(capturedPrompt, 'No.', 'the provider receives literal B');
+  assert.equal(capturedArtifactObjective, 'No.', 'artifact/effect policy is literal B');
+  assert.match(capturedTurnContext, /CONVERGE/, 'the model still receives conversational continuation state');
+  assert.ok(
+    capturedPriorTurns.some((turn) => turn.who === 'user' && turn.text === 'Send the client email.'),
+    'conversation history remains available for a natural acknowledgement',
+  );
+  assert.equal(unifiedRecallCalls, recallCallsBeforeDecline, 'a typed decline performs no unified recall');
+  assert.equal(opennessCalls, opennessCallsBeforeDecline, 'a typed decline performs no openness pass');
+  assert.equal(
+    listEvents(sid, { types: ['capability_resolution'] }).length,
+    capabilityEventsBeforeDecline,
+    'a typed decline performs no capability resolution or schema warming',
+  );
+  assert.deepEqual(capturedAllowedLocalTools, [], 'a typed decline advertises no local tool authority');
+  assert.deepEqual(capturedMcpToolAllowlist, [], 'a typed decline loads no local MCP schemas');
+  assert.deepEqual(capturedLocalToolUniverse, [], 'deferred tool acquisition is unavailable on a decline');
+  assert.deepEqual(capturedRequiredLocalTools, [], 'a conversational decline requires no tool surface');
+  assert.equal(capturedScope?.maxTools, 0, 'a decline inherits no external MCP authority');
+  assert.deepEqual(capturedScope?.allowedServerSlugs, []);
+  const declineToolPolicies = listEvents(sid, { types: ['tool_policy_resolved'] })
+    .filter((event) => event.data.shortCircuitReason === 'declined_continuation');
+  assert.equal(declineToolPolicies.length, 1);
+  assert.equal(declineToolPolicies[0]!.data.outputCount, 0);
+  assert.equal(declineToolPolicies[0]!.data.semanticAcquisitionSkipped, true);
+  assert.equal(declineToolPolicies[0]!.data.schemaWarmSkipped, true);
+  assert.equal(declineToolPolicies[0]!.data.advertisedSchemaCount, 0);
+  assert.equal(declineToolPolicies[0]!.data.catalogCount, 0);
+  const declinePrimer = listEvents(sid, { types: ['turn_memory_primer'] }).at(-1);
+  assert.ok(declinePrimer);
+  assert.equal(declinePrimer.data.queryPreview, 'No.', 'retrieval telemetry is literal B, never private A/Q/B');
+  assert.equal(declinePrimer.data.skippedReason, 'declined_continuation');
+  assert.equal(declinePrimer.data.hitCount, 0);
+  assert.equal(declinePrimer.data.injected, false);
+  assert.equal(declinePrimer.data.source, null);
+  const declineContextPacket = listEvents(sid, { types: ['agent_context_packet'] }).at(-1);
+  assert.ok(declineContextPacket);
+  assert.equal(
+    declineContextPacket.data.semanticEnrichmentSkippedReason,
+    'declined_continuation',
+  );
+  assert.equal(declineContextPacket.data.multiItem?.detected, false);
+  assert.equal(
+    listEvents(sid, { types: ['tool_jit_scope'] }).length,
+    0,
+    'typed decline bypasses JIT/schema acquisition even when both are enabled',
+  );
+  assert.equal(
+    listEvents(sid, { types: ['guardrail_tripped'] })
+      .some((event) => event.data.kind === 'request_bound_external_write_missing'),
+    false,
+    'the declined parent send creates no missing-write coercion',
+  );
+});
+
+test('a compound decline keeps the full conversation provider-visible while private authority follows only the fresh clause', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'off';
+  const sid = createSession({ kind: 'chat' }).id;
+  const originAttempt = beginRunAttempt(sid);
+  const origin = recordRunAttemptUserInput(originAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Send the client email.' },
+  });
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: 'Should I send it?',
+      options: ['Yes', 'No'],
+      purpose: 'clarification',
+      source: 'decision_awaiting',
+      sourceUserSeq: origin.seq,
+    },
+  });
+  const identity = { sessionId: sid, turn: 1, sourceUserSeq: origin.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: 'Should I send it?' },
+  });
+
+  const fullMessage = 'No—leave that email unsent. Instead, what is 15 × 9? Answer naturally without tools.';
+  const activeClause = 'what is 15 × 9? Answer naturally without tools.';
+  const providerReply = 'Happy to switch gears — that comes to one hundred thirty-five.';
+  const recallQueries: string[] = [];
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => {
+    recallQueries.push(query);
+    return {
+      objective: query,
+      hits: [],
+      perStore: {},
+      answerability: 'insufficient',
+      diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
+    };
+  });
+
+  let runCalls = 0;
+  let capturedPrompt = '';
+  let capturedArtifactObjective = '';
+  let capturedNativeMcpScopeInput = '';
+  let capturedTurnContext = '';
+  let capturedPriorTurns: Array<{ who: 'user' | 'assistant'; text: string }> = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    runCalls += 1;
+    capturedPrompt = options.prompt;
+    capturedArtifactObjective = options.artifactObjective ?? '';
+    capturedNativeMcpScopeInput = options.nativeMcpScopeInput ?? '';
+    capturedTurnContext = options.turnContext ?? '';
+    capturedPriorTurns = options.priorTurns ?? [];
+    return {
+      text: providerReply,
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: [],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: fullMessage,
+    sessionId: sid,
+  });
+
+  assert.equal(response.text, providerReply, 'the runtime preserves the provider-authored conversational reply');
+  assert.equal(response.stoppedReason, 'success');
+  assert.equal(runCalls, 1, 'the compound turn is one normal provider dispatch, not a canned decline short-circuit');
+  assert.equal(capturedPrompt, fullMessage, 'the provider receives the complete literal current message');
+  assert.deepEqual(
+    capturedPriorTurns,
+    [
+      { who: 'user', text: 'Send the client email.' },
+      { who: 'assistant', text: 'Should I send it?' },
+    ],
+    'the provider also retains the complete parent conversation for a natural transition',
+  );
+  assert.equal(capturedArtifactObjective, activeClause, 'artifact and completion policy see only the fresh task');
+  assert.equal(capturedNativeMcpScopeInput, activeClause, 'native MCP authority is scoped only to the fresh task');
+  assert.deepEqual(recallQueries, [activeClause], 'discovery and memory retrieval ignore the declined parent');
+  assert.match(capturedTurnContext, /keep the full reply conversationally intact/i);
+  assert.match(capturedTurnContext, /only the fresh clause as active authority/i);
+
+  const acceptedInputs = listEvents(sid, { types: ['user_input_received'] });
+  assert.equal(acceptedInputs.at(-1)?.data.text, fullMessage, 'the durable user transcript preserves the literal reply');
+  const primer = listEvents(sid, { types: ['turn_memory_primer'] }).at(-1);
+  assert.ok(primer);
+  assert.equal(primer.data.queryPreview, activeClause);
+  const contextPacket = listEvents(sid, { types: ['agent_context_packet'] }).at(-1);
+  assert.ok(contextPacket);
+  assert.equal(contextPacket.data.inputPreview, activeClause);
+  assert.equal(contextPacket.data.semanticEnrichmentSkippedReason, null);
+  assert.equal(
+    listEvents(sid, { types: ['tool_policy_resolved'] })
+      .some((event) => event.data.shortCircuitReason === 'declined_continuation'),
+    false,
+    'separate new work stays on the semantic path instead of becoming a canned decline',
+  );
+});
+
+test('an exact affirmative still recovers the aligned send objective and keeps write verification', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS = '0';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  const sid = createSession({ kind: 'chat' }).id;
+  const originAttempt = beginRunAttempt(sid);
+  const origin = recordRunAttemptUserInput(originAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Send the client email.' },
+  });
+  await renderClaudeAgentBrainTurnContext({
+    message: 'Send the client email.',
+    sessionId: sid,
+  }, { sourceUserSeq: origin.seq });
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: 'Should I send it?',
+      options: ['Yes', 'No'],
+      purpose: 'clarification',
+      source: 'decision_awaiting',
+      sourceUserSeq: origin.seq,
+    },
+  });
+  const identity = { sessionId: sid, turn: 1, sourceUserSeq: origin.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: 'Should I send it?' },
+  });
+  let unifiedRecallCalls = 0;
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => {
+    unifiedRecallCalls += 1;
+    return {
+      objective: query,
+      hits: [],
+      perStore: {},
+      answerability: 'insufficient',
+      diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
+    };
+  });
+  let capturedArtifactObjective = '';
+  let capturedAllowedLocalTools: string[] | undefined;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    capturedArtifactObjective = options.artifactObjective ?? '';
+    capturedAllowedLocalTools = options.allowedLocalMcpTools;
+    return {
+      text: 'Sent it.',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: [],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Yes.',
+    sessionId: sid,
+  });
+
+  assert.equal(capturedArtifactObjective, 'Send the client email.');
+  assert.ok(unifiedRecallCalls > 0, 'the decline short-circuit does not disable affirmative retrieval');
+  assert.ok((capturedAllowedLocalTools?.length ?? 0) > 0, 'the affirmative twin keeps its agent tool surface');
+  const affirmativeContextPacket = listEvents(sid, { types: ['agent_context_packet'] }).at(-1);
+  assert.ok(affirmativeContextPacket);
+  assert.equal(
+    affirmativeContextPacket.data.semanticEnrichmentSkippedReason,
+    null,
+    'the typed decline boundary must not suppress semantic enrichment for an affirmative answer',
+  );
+  assert.equal(response.stoppedReason, 'awaiting-input');
+  assert.match(response.text, /no receipt of it landing after your message/i);
+  assert.ok(
+    listEvents(sid, { types: ['guardrail_tripped'] })
+      .some((event) => event.data.kind === 'request_bound_external_write_missing'),
+    'the decline fix must not disable positive write verification',
+  );
 });
 
 test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/model-role capability', () => {
@@ -1104,6 +2359,54 @@ test('Claude brain keeps unified recall enabled when context split is off', asyn
   assert.match(ctx, /\[EPISODE\].*In-person no-split review/);
   assert.match(ctx, /meeting:\/\/local\/no-split-review/);
   assert.doesNotMatch(ctx, /# Current State/, 'persistent and volatile blocks stay in the system append');
+});
+
+test('Claude brain honors request-local recall opt-out while retaining pinned policy context', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  const safetyRule = 'Never send the explicit-opt-out fixture externally without authorization.';
+  rememberFact({ kind: 'constraint', content: safetyRule });
+
+  let unifiedRecallCalls = 0;
+  let captured: any;
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => {
+    unifiedRecallCalls += 1;
+    return {
+      objective: query,
+      hits: [],
+      perStore: {},
+      answerability: 'insufficient',
+      diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
+    };
+  });
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    captured = options;
+    return {
+      text: 'Handled from the supplied request.',
+      sessionId: 'sdk-explicit-memory-opt-out',
+      model: 'claude',
+      toolUses: [],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Do not use code mode, shell, workspace, or memory. Answer only from this request.',
+    sessionId: 'brain-explicit-memory-opt-out',
+  });
+
+  assert.equal(unifiedRecallCalls, 0, 'the optional query recall does no retrieval work');
+  assert.doesNotMatch(captured.turnContext ?? '', /\[MEMORY PRIMER\]|## Relevant To Your Request/);
+  assert.match(captured.systemAppend ?? '', new RegExp(safetyRule.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+    'request-local primer opt-out must not suppress the stable pinned-policy tier');
+  const event = listEvents('brain-explicit-memory-opt-out', { types: ['turn_memory_primer'] })[0];
+  assert.ok(event);
+  assert.equal(event.data.enabled, true);
+  assert.equal(event.data.injected, false);
+  assert.equal(event.data.hitCount, 0);
+  assert.equal(event.data.source, null);
+  assert.equal(event.data.skippedReason, 'explicit_request_opt_out');
 });
 
 test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors excludes, and commits final text', async () => {
@@ -1580,6 +2883,50 @@ test('full mode: completion judge bounces a not-done turn into ONE continuation,
   assert.match(prompts[1], /continue now and FINISH it/i);
   assert.match(prompts[1], /do NOT proceed on your own/i, 'continuation permits asking before external actions');
   assert.match(res.text, /Sent all 3 emails/);
+});
+
+test('Claude turn-wide attribution owns completion-judge usage for the exact accepted source and attempt', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'brain-judge-usage-attribution';
+  const responseId = 'resp-brain-judge-usage-attribution';
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'Completed the requested release analysis.',
+    sessionId: 'sdk-provider-session',
+    model: 'claude-sonnet-test',
+    toolUses: [],
+  }));
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    // The real Claude self-judge only knows its provider session UUID. The
+    // accepted-turn wrapper must supply the owning source and attempt tuple.
+    recordModelUsage({
+      sessionId: 'provider-session-uuid',
+      model: 'claude-haiku-test',
+      cacheDialect: 'anthropic_split',
+      inputTokens: 100,
+      outputTokens: 10,
+      responseId,
+    });
+    return { done: true, reason: 'the analysis is present', selfJudge: true };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Build the release analysis.',
+    sessionId,
+  });
+
+  const source = listEvents(sessionId, { types: ['user_input_received'] })[0];
+  assert.ok(source);
+  const attempt = getLatestRunAttempt(sessionId);
+  assert.ok(attempt);
+  const usage = readUsageEventsForDate().find((event) => event.responseId === responseId);
+  assert.equal(usage?.source, sessionId);
+  assert.deepEqual(usage?.trace, {
+    acceptedSource: `${sessionId}:${source.seq}`,
+    logicalTurnId: `turn:${source.seq}`,
+    attemptId: attempt.attemptId,
+    modelCallId: responseId,
+  });
 });
 
 test('full mode: a stale execution lookup cannot certify a newly requested external write', async () => {

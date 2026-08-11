@@ -15,6 +15,7 @@
  */
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { deleteSmokeHarnessSession } from './smoke-harness-cleanup.js';
 
 process.env.CLEMENTINE_HOME = process.env.CLEMENTINE_HOME || `${process.env.HOME}/.clementine-next`;
 // Production behavior — do NOT disable brackets/gates; this is a real run.
@@ -48,11 +49,7 @@ async function cleanup() {
   } catch { /* */ }
   try { closePlanScope(sessionId, 'smoke cleanup'); } catch { /* */ }
   try {
-    const Database = (await import('better-sqlite3')).default;
-    const db = new Database(`${process.env.CLEMENTINE_HOME}/state/harness.db`);
-    db.prepare("DELETE FROM events WHERE session_id = ?").run(sessionId);
-    db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
-    db.close();
+    deleteSmokeHarnessSession(`${process.env.CLEMENTINE_HOME}/state/harness.db`, sessionId);
   } catch { /* */ }
   try { if (existsSync(file)) rmSync(file, { force: true }); } catch { /* */ }
 }

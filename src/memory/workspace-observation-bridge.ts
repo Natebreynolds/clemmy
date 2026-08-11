@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { redactSensitiveText } from '../runtime/security.js';
-import { openMemoryDb } from './db.js';
+import {
+  ensureMemoryForeignKeysEnabled,
+  hardDeleteConsolidatedFacts,
+  openMemoryDb,
+} from './db.js';
 import {
   recordMemoryEpisode,
   type MemoryEpisodeInput,
@@ -581,6 +585,7 @@ export function purgeWorkspaceObservationMemory(
   const slug = validatedWorkspaceSlug(workspaceId);
   const sessionId = `workspace:${slug}`;
   ensureWorkspaceProjectionReceiptSchema(db);
+  ensureMemoryForeignKeysEnabled(db);
   const episodeSelector = `
     SELECT id
     FROM memory_episodes
@@ -610,10 +615,14 @@ export function purgeWorkspaceObservationMemory(
     // The bridge itself does not consolidate facts, but deleting an exact
     // synthetic-session derivative closes the future-proof privacy seam if a
     // later reflection path ever promotes one.
-    const derivedFactsDeleted = db.prepare(`
-      DELETE FROM consolidated_facts
+    const derivedFactRows = db.prepare(`
+      SELECT id FROM consolidated_facts
       WHERE source_session_id = ? OR derived_from_session_id = ?
-    `).run(sessionId, sessionId).changes;
+    `).all(sessionId, sessionId) as Array<{ id: number }>;
+    const derivedFactsDeleted = hardDeleteConsolidatedFacts(
+      db,
+      derivedFactRows.map((row) => row.id),
+    );
 
     let evidenceRowsDeleted = 0;
     let evidenceReferencesCleared = 0;

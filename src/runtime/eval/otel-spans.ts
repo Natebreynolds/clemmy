@@ -8,10 +8,11 @@
  * Mapping (OTel GenAI semantic conventions, gen_ai.*):
  *   tool_called + tool_returned (paired by callId) → an `execute_tool` CLIENT
  *     span (gen_ai.tool.name / .call.id; ERROR status if the result reads as a
- *     gate block / failure).
+ *     gate block / failure). A settled-read reuse remains one logical
+ *     `execute_tool` span but is INTERNAL: no provider client was dispatched.
  *   turn_started + turn_ended (paired by turn) → an `invoke_agent` INTERNAL span.
- *   guardrail_tripped → an `INTERNAL` span with ERROR status carrying the gate
- *     kind (so a blocked write is one glance in the trace).
+ *   guardrail_tripped → an `INTERNAL` span carrying the gate kind: ERROR for
+ *     real blocks, OK for the settled-read accounting advisory.
  *   run_failed → an ERROR span.
  */
 import { listEvents, type EventRow } from '../harness/eventlog.js';
@@ -19,6 +20,10 @@ import {
   pairTransportMirrorToolCalls,
   projectCanonicalTopLevelToolEvents,
 } from '../harness/tool-effect.js';
+import {
+  isSettledReadReplayMarkerData,
+  isSettledReadReplayReturnData,
+} from '../harness/settled-read-replay-semantics.js';
 
 export interface GenAiSpan {
   name: string;
@@ -61,7 +66,22 @@ export function toGenAiSpans(events: EventRow[]): GenAiSpan[] {
   const appendToolSpan = (callId: string, called: EventRow | undefined, completions: EventRow[]): void => {
     if (completions.length === 0) return;
     const sortedCompletions = [...completions].sort((a, b) => a.seq - b.seq);
-    const failedCompletion = sortedCompletions.find((event) => {
+    const replayCompletions = sortedCompletions.filter((event) =>
+      isSettledReadReplayReturnData(event.data));
+    // Reused SDK ids can collect more than one historical completion. Scope to
+    // the exact canonical parent and require EVERY completion for that
+    // occurrence to be a replay. Legacy unparented rows qualify only when every
+    // completion is a replay, so ambiguity never under-counts physical I/O.
+    const parentedCompletions = called
+      ? sortedCompletions.filter((event) => event.parentEventId === called.id)
+      : [];
+    const hasAnyParentedCompletion = sortedCompletions.some((event) => Boolean(event.parentEventId));
+    const settledReadReplay = parentedCompletions.length > 0
+      ? parentedCompletions.every((event) => isSettledReadReplayReturnData(event.data))
+      : !hasAnyParentedCompletion
+        && replayCompletions.length > 0
+        && replayCompletions.length === sortedCompletions.length;
+    const failedCompletion = settledReadReplay ? undefined : sortedCompletions.find((event) => {
       const text = str(event.data.result || event.data.error || event.data.preview);
       return event.data.ok === false || FAILURE_RE.test(text);
     });
@@ -74,7 +94,7 @@ export function toGenAiSpans(events: EventRow[]): GenAiSpan[] {
       || 'unknown';
     spans.push({
       name: `execute_tool ${tool}`,
-      kind: 'CLIENT',
+      kind: settledReadReplay ? 'INTERNAL' : 'CLIENT',
       startTime: (called ?? sortedCompletions[0]).createdAt,
       endTime: sortedCompletions.at(-1)!.createdAt,
       attributes: {
@@ -82,6 +102,10 @@ export function toGenAiSpans(events: EventRow[]): GenAiSpan[] {
         'gen_ai.tool.name': tool,
         'gen_ai.tool.call.id': callId || 'unknown',
         'gen_ai.system': 'clementine',
+        ...(settledReadReplay ? {
+          'clem.tool.reused': true,
+          'clem.provider.dispatched': false,
+        } : {}),
       },
       ...(failedCompletion ? { status: { code: 'ERROR' as const, message: result.slice(0, 160) } } : {}),
     });
@@ -126,13 +150,24 @@ export function toGenAiSpans(events: EventRow[]): GenAiSpan[] {
   for (const e of events) {
     if (e.type === 'guardrail_tripped') {
       const kind = str(e.data.kind) || 'guardrail';
+      const settledReadReplay = isSettledReadReplayMarkerData(e.data);
       spans.push({
-        name: `guardrail ${kind}`,
+        name: `${settledReadReplay ? 'advisory' : 'guardrail'} ${kind}`,
         kind: 'INTERNAL',
         startTime: e.createdAt,
         endTime: e.createdAt,
-        attributes: { 'gen_ai.operation.name': 'guardrail', 'clem.guardrail.kind': kind, 'gen_ai.tool.name': str(e.data.toolName) },
-        status: { code: 'ERROR', message: kind },
+        attributes: {
+          'gen_ai.operation.name': 'guardrail',
+          'clem.guardrail.kind': kind,
+          'gen_ai.tool.name': str(e.data.toolName),
+          ...(settledReadReplay ? {
+            'clem.advisory': true,
+            'clem.tool.reused': true,
+          } : {}),
+        },
+        status: settledReadReplay
+          ? { code: 'OK' }
+          : { code: 'ERROR', message: kind },
       });
     } else if (e.type === 'run_failed') {
       spans.push({

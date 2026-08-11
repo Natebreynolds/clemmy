@@ -1,12 +1,18 @@
 /**
  * Run: npx tsx --test src/integrations/composio/cli.test.ts
  */
-import { mkdtempSync, chmodSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, chmodSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { composioCliSpawnSpec, findComposioCli, parseComposioCliJson } from './cli.js';
+import {
+  ComposioCliError,
+  composioCliSpawnSpec,
+  findComposioCli,
+  parseComposioCliJson,
+  searchComposioCliTools,
+} from './cli.js';
 
 test('parseComposioCliJson parses clean JSON output', () => {
   assert.deepEqual(parseComposioCliJson('{"ok":true}'), { ok: true });
@@ -36,6 +42,51 @@ test('findComposioCli honors COMPOSIO_CLI_PATH', () => {
   process.env.COMPOSIO_CLI_PATH = file;
   try {
     assert.equal(findComposioCli(), file);
+  } finally {
+    if (oldPath === undefined) delete process.env.COMPOSIO_CLI_PATH;
+    else process.env.COMPOSIO_CLI_PATH = oldPath;
+  }
+});
+
+test('searchComposioCliTools preserves argv boundaries and surfaces a typed CLI failure', async () => {
+  const oldPath = process.env.COMPOSIO_CLI_PATH;
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-composio-cli-search-'));
+  const file = path.join(dir, 'composio');
+  const argvLog = path.join(dir, 'argv.log');
+  writeFileSync(file, [
+    '#!/bin/sh',
+    `printf '%s\\n' "$@" > "${argvLog}"`,
+    `printf '%s\\n' '{"results":[{"primary_tool_slugs":["PROOF_LIST_TASKS"]}]}'`,
+    'exit 0',
+    '',
+  ].join('\n'), 'utf8');
+  chmodSync(file, 0o755);
+  process.env.COMPOSIO_CLI_PATH = file;
+  try {
+    const result = await searchComposioCliTools('proof release queue current items', {
+      toolkitSlug: 'proof',
+      limit: 7,
+    });
+    assert.deepEqual(result, {
+      results: [{ primary_tool_slugs: ['PROOF_LIST_TASKS'] }],
+    });
+    assert.deepEqual(readFileSync(argvLog, 'utf8').trim().split('\n'), [
+      'search',
+      'proof release queue current items',
+      '--toolkits',
+      'proof',
+      '--limit',
+      '7',
+    ]);
+
+    writeFileSync(file, '#!/bin/sh\nprintf "%s\\n" "provider search refused" >&2\nexit 23\n', 'utf8');
+    chmodSync(file, 0o755);
+    await assert.rejects(
+      searchComposioCliTools('proof release queue current items'),
+      (error: unknown) => error instanceof ComposioCliError
+        && error.result.exitCode === 23
+        && /provider search refused/.test(error.message),
+    );
   } finally {
     if (oldPath === undefined) delete process.env.COMPOSIO_CLI_PATH;
     else process.env.COMPOSIO_CLI_PATH = oldPath;

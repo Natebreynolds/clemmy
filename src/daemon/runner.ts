@@ -55,6 +55,7 @@ import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { withModelUsageAttribution } from '../runtime/usage-log.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import {
   reconcileActivatedWorkflowDispatchGroups,
@@ -76,7 +77,10 @@ import { sweepStaleRuns } from '../runtime/run-events.js';
 import { reportInterruptedChatRuns } from '../runtime/harness/restart-recovery.js';
 import { reconcileHandoffsForBoot } from '../execution/continuation-capsule.js';
 import { startTerminalReportBackWatcher } from '../runtime/harness/terminal-report-back.js';
-import { interruptOrphanedRunAttemptsAtBoot } from '../runtime/harness/eventlog.js';
+import {
+  getLatestRunAttemptByRunId,
+  interruptOrphanedRunAttemptsAtBoot,
+} from '../runtime/harness/eventlog.js';
 import { reconcileDormantTerminalWorkSessions } from '../runtime/harness/session-reconcile.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
@@ -589,7 +593,7 @@ async function runCronJob(
     : `cron:${job.name}`;
   const cronRunId = identity
     ? `cron-occurrence:v1:${job.name}:${Math.floor(identity.occurrenceAtMs / 60_000) * 60_000}`
-    : undefined;
+    : `cron-manual:v1:${job.name}:${startMs}`;
   const stopHeartbeat = startCronHeartbeat(job, startedAt, startMs);
   recordOperationalEvent({
     source: 'scheduler',
@@ -627,7 +631,7 @@ async function runCronJob(
     // write gates matter most. Kill-switch CLEMMY_HARNESS_CRON=off.
     const response = await respondPreferHarness('cron', {
       sessionId: cronSessionId,
-      ...(cronRunId ? { runId: cronRunId } : {}),
+      runId: cronRunId,
       channel: 'cron',
       message: prompt,
       model: job.mode === 'unleashed' ? MODELS.deep : MODELS.primary,
@@ -637,7 +641,17 @@ async function runCronJob(
     // Report-back honesty: a non-throwing respond() can still be a blocked /
     // promised / errored run. Fail-open + suspicious-only, so this only ever
     // converts a false "ok" into an honest "needs attention".
-    const verdict = await verifyDelivered(prompt, response.text, { stoppedReason: response.stoppedReason });
+    const usageAttempt = getLatestRunAttemptByRunId(cronSessionId, cronRunId);
+    const verdict = usageAttempt?.sourceUserSeq
+      ? await withModelUsageAttribution(
+          {
+            sessionId: cronSessionId,
+            sourceUserSeq: usageAttempt.sourceUserSeq,
+            attemptId: usageAttempt.attemptId,
+          },
+          () => verifyDelivered(prompt, response.text, { stoppedReason: response.stoppedReason }),
+        )
+      : await verifyDelivered(prompt, response.text, { stoppedReason: response.stoppedReason });
     const route = cronRouteMetadata(response);
 
     appendRunLog(job.name, {

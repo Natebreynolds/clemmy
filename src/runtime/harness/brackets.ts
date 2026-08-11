@@ -26,7 +26,16 @@ import {
   withExternalWriteAdmissionLock,
 } from './external-write-admission.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
-import { evaluateToolCall, applyMode, noteGuardrailToolResult } from './tool-guardrail.js';
+import { evaluateToolCall, applyMode, noteGuardrailToolResult, noteGuardrailObservedCost } from './tool-guardrail.js';
+import {
+  acceptedSourceRequestsPolling,
+  classifySettledDirectComposioRead,
+  formatSettledReadRepeatAdvisory,
+  formatSettledReadSuccessAdvisory,
+  resolveSettledReadRepeat,
+  settledReadRepeatEnabled,
+  settledReadRepeatReplayMarker,
+} from './settled-read-repeat.js';
 import { normalizeWorkerOutput } from '../../agents/worker-output.js';
 import {
   toolOutputLooksSuccessful,
@@ -135,6 +144,27 @@ import {
   StaleDispatchLeaseError,
   type DispatchLeaseRef,
 } from './dispatch-lease.js';
+import {
+  admitDiscoveryBoundary,
+  DiscoveryBudgetDeniedError,
+  settleDiscoveryBoundary,
+  type DiscoveryBoundaryLease,
+} from './discovery-boundary.js';
+import {
+  settleToolAttempt,
+  ToolAttemptSettlementAuthorityError,
+} from './attempt-settlement.js';
+import {
+  authorizeResolvedLogicalCallContract,
+  currentLogicalCall,
+  withLogicalToolCall,
+} from './attempt-identity.js';
+import { logicalCallAuthorityState } from './dispatch-ledger.js';
+import {
+  isPlainOrClementineLocalTool,
+  isTrustedComposioGateway,
+  isTrustedDynamicComposioTool,
+} from './runtime-tool-identity.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -465,9 +495,34 @@ export const DEFAULT_TIMEOUTS_MS = {
   dispatcher: 900_000,
 } as const;
 
+function isNestedDispatchCarrier(toolName: string): boolean {
+  return isPlainOrClementineLocalTool(toolName, 'call_tool')
+    || isPlainOrClementineLocalTool(toolName, 'work_call');
+}
+
+function nestedDispatchCarrierInputIsStructurallyValid(toolName: string, input: unknown): boolean {
+  const carrier = input && typeof input === 'object' && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : null;
+  return Boolean(
+    carrier
+    && typeof carrier.name === 'string'
+    && carrier.name.length > 0
+    && typeof carrier.args_json === 'string'
+    && (
+      isPlainOrClementineLocalTool(toolName, 'call_tool')
+      || (
+        typeof carrier.requirement_id === 'string'
+        && carrier.requirement_id.length > 0
+        && Object.prototype.hasOwnProperty.call(carrier, 'proposal')
+      )
+    ),
+  );
+}
+
 /** Pick a default timeout from the tool name. */
 export function timeoutForTool(toolName: string): number {
-  if (toolName === 'call_tool') return DEFAULT_TIMEOUTS_MS.dispatcher;
+  if (isNestedDispatchCarrier(toolName)) return DEFAULT_TIMEOUTS_MS.dispatcher;
   if (toolName === 'run_shell_command') return DEFAULT_TIMEOUTS_MS.shell;
   if (/^(exec|spawn|launch|run_shell|shell_)/.test(toolName)) {
     return DEFAULT_TIMEOUTS_MS.shell;
@@ -1023,6 +1078,8 @@ export class RecallBudget {
 
 export interface HarnessRunContext {
   sessionId: string;
+  /** Exact physical harness turn owning canonical tool and auxiliary evidence. */
+  turn?: number;
   counter: ToolCallsCounter;
   /** Exact physical provider/Runner generation allowed to dispatch tools.
    * Transport cancellation is best-effort; this durable lease is checked at
@@ -1046,6 +1103,14 @@ export interface HarnessRunContext {
   /** One active model/tool run; loop/discovery counters key here so a long-lived
    * chat session does not accumulate unrelated calls across user turns. */
   behaviorScopeId?: string;
+  /** Explicit Claude local-MCP lane identity. `false` excludes workers and
+   * workflow steps from parent-only settled-read steering; `undefined` keeps
+   * existing Codex/BYO top-level behavior governed by the structural guards. */
+  directOrchestrator?: boolean;
+  /** Raw provider arguments for the exact outer Claude toolUseID. The gated
+   * MCP bridge materializes omitted nullable fields before inner validation;
+   * replay identity must still compare the provider-authored raw call. */
+  settledReadCanonicalArgs?: unknown;
   /** Provider labels that already stayed silent during this Runner.run. Shared
    * across RouterModelProvider resolutions so later model iterations use the
    * proven fallback without repaying the same first-byte timeout. */
@@ -1054,6 +1119,17 @@ export interface HarnessRunContext {
    * Reasoning is buffered until text/tool output makes the attempt replay-unsafe,
    * but the outer stream watchdog still needs to know the model is alive. */
   privateModelActivityAt?: number;
+  /** A compatibility adapter is currently paying for one provider request while
+   * buffering its non-streaming completion into an SDK-compatible synthetic
+   * stream. No Runner event can exist during that interval, so the outer
+   * first-byte watchdog must not mistake the adapter boundary for provider
+   * silence and start a parallel paid retry. This is transport liveness only:
+   * it receives the finite full-stream deadline and never counts as content. */
+  bufferedProviderRequests?: Set<{
+    kind: 'byo_non_streaming_completion';
+    startedAt: number;
+    active: boolean;
+  }>;
   /** Per-turn budget for recall_tool_result calls. Optional — when
    *  absent (e.g. tests, non-harness call paths), recall is unmetered. */
   recallBudget?: RecallBudget;
@@ -1072,6 +1148,13 @@ export interface HarnessRunContext {
    *  so kill/pause/approval/recall reads still resolve to the real
    *  session. Falls back to sessionId when absent (byte-identical). */
   guardrailScopeId?: string;
+  /** Explicit compose-only worker authority. Unlike guardrailScopeId this is
+   *  present even when the worker-thrash kill-switch is off, and unlike
+   *  directOrchestrator=false it does not conflate workers with workflow
+   *  steps. Central external-provider gateways use it to permit reads while
+   *  refusing direct worker mutations; the parent must commit the workers'
+   *  materialized payloads through one immutable approved batch. */
+  workerScope?: boolean;
   /** Set ONLY by the batch runner's approved/certified execute path (never on
    *  ad-hoc dispatches). When present, the batch plan already passed ONE
    *  plan-level certification judge over these EXACT payloads, and the items are
@@ -1706,7 +1789,7 @@ function recordExternalWriteSettlement(
   // validated inner tool owns its own reservation/settlement lifecycle. The
   // only outer lifecycle we author is the nominal early-refusal result, where
   // no inner tool existed and local code can prove dispatch never started.
-  if (toolName === 'call_tool' && !(result instanceof ExternalWritePreDispatchResult)) {
+  if (isNestedDispatchCarrier(toolName) && !(result instanceof ExternalWritePreDispatchResult)) {
     return undefined;
   }
 
@@ -1895,6 +1978,60 @@ export function pendingNestedToolApprovalRequiredError(
  * legitimate record-creates must still flow, so this never blocks — it hands
  * back the fact plus the prior call id so the model can reuse what it built.
  */
+/**
+ * SELF-DESTRUCTION GUARD — she may not delete what she just made.
+ *
+ * Live 2026-08-09: a follow-up asked for HTML formatting on two drafts she had
+ * created moments earlier. `OUTLOOK_UPDATE_DRAFT` failed pre-dispatch, she hunted
+ * for another tool, tried `OUTLOOK_UPDATE_EMAIL`, and then reached for
+ * `OUTLOOK_DELETE_MESSAGE` on both drafts — escalating a FORMATTING EDIT into
+ * destroying the user's objects, which opened an approval card and parked the
+ * turn for ten minutes. The same shape appeared on 08-07, deleting a duplicate
+ * it had created itself.
+ *
+ * The rule is about EFFECTS, not methods: when an edit path fails, the safe
+ * recovery is additive — leave the object alone and create a corrected one, or
+ * ask. Destroying the original converts a recoverable mistake into an
+ * unrecoverable one, and it is never the cheapest way to fix formatting.
+ *
+ * Scoped deliberately narrow: only objects THIS run created, and only when an
+ * earlier mutation of that same object already failed. Ordinary cleanup the
+ * user asked for is untouched, and so is deleting anything she did not make.
+ */
+function selfDestructionRefusal(
+  sessionId: string | undefined,
+  toolName: string,
+  parsedInput: unknown,
+  shapeKey: string | undefined,
+): string | null {
+  if (!sessionId || !shapeKey) return null;
+  const actionKey = canonicalExternalWriteActionKey(toolName, shapeKey);
+  if (!/(?:^|[:_])(?:DELETE|REMOVE|TRASH|DESTROY)(?:[:_]|$)/i.test(actionKey)) return null;
+  try {
+    const events = listEvents(sessionId, {
+      types: ['external_write_succeeded', 'external_write_failed'],
+    });
+    // Did THIS run create something, and did a later mutation of it fail?
+    const createdHere = events.some((event) => {
+      if (event.type !== 'external_write_succeeded') return false;
+      const key = (event.data as { actionKey?: string }).actionKey ?? '';
+      return /(?:^|[:_])(?:CREATE|ADD|INSERT|NEW|DRAFT)(?:[:_]|$)/i.test(key);
+    });
+    if (!createdHere) return null;
+    const mutationFailedHere = events.some((event) => {
+      if (event.type !== 'external_write_failed') return false;
+      const key = (event.data as { actionKey?: string }).actionKey ?? '';
+      return /(?:^|[:_])(?:UPDATE|EDIT|PATCH|MODIFY|DRAFT)(?:[:_]|$)/i.test(key);
+    });
+    if (!mutationFailedHere) return null;
+    return `[additive-recovery] You created this in THIS run and an edit to it just failed — deleting it is not the recovery. `
+      + `Leave what exists alone and CREATE a corrected version instead, then tell the user which one is current. `
+      + `If replacing it truly requires removing the original, ask the user first in your own words; do not delete on your own initiative.`;
+  } catch {
+    return null;
+  }
+}
+
 function repeatedCreationAdvisory(
   sessionId: string | undefined,
   toolName: string,
@@ -2124,6 +2261,30 @@ export function _setAfterSharedWriteReservationForTests(
   afterSharedWriteReservationForTests = hook;
 }
 
+/**
+ * A nested provider adapter may have already committed the logical outcome
+ * before its outer SDK wrapper receives the rendered value. The outer wrapper
+ * is a carrier in that case: settling its prose again would either double-count
+ * or contradict the structured inner verdict. This check is provider-neutral
+ * and reads only the ambient task-owned logical row.
+ */
+function wrapperMustSettleLogicalCall(ctx: HarnessRunContext | undefined): boolean {
+  if (!ctx?.sessionId || !Number.isSafeInteger(ctx.sourceUserSeq) || (ctx.sourceUserSeq ?? 0) <= 0) {
+    return true;
+  }
+  const identity = currentLogicalCall();
+  if (!identity) return true;
+  const state = logicalCallAuthorityState({
+    sessionId: ctx.sessionId,
+    sourceUserSeq: ctx.sourceUserSeq as number,
+    acceptedTaskId: identity.acceptedTaskId,
+    logicalToolCallId: identity.logicalToolCallId,
+  });
+  if (state.status === 'open') return true;
+  if (state.status === 'settled') return false;
+  throw new ToolAttemptSettlementAuthorityError(state.status, state.reason);
+}
+
 export function wrapToolForHarness<T extends WrappableTool>(
   tool: T,
   options: WrapToolOptions = {},
@@ -2161,6 +2322,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
   type BracketOutcome = {
     advisory?: string;
     reservation?: ExternalWriteReservationRef;
+    discovery?: DiscoveryBoundaryLease;
+    /** The SDK rejected the outer carrier schema before execute/inner dispatch.
+     * This is nominal pre-dispatch evidence, not a local successful return. */
+    carrierMalformed?: true;
+    settledReadReplay?: {
+      output: string;
+      advisory: string;
+    };
   };
 
   /** Internal control flow for a durable duplicate-artifact refusal. It stays
@@ -2184,6 +2353,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     parsedInput: unknown,
     callId?: string,
     claimBeforeAccounting?: () => ArtifactAdmission,
+    deferDiscoveryAdmission = false,
   ): Promise<BracketOutcome | undefined> => {
     const ctx = harnessRunContextStorage.getStore();
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
@@ -2207,19 +2377,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // those structurally invalid envelopes here to retain a deterministic loop
     // ceiling without applying any outer effect/write gate. A valid envelope is
     // charged exactly once by either its validated inner call or execute.refuse.
-    if (tool.name === 'call_tool') {
-      const carrier = parsedInput && typeof parsedInput === 'object' && !Array.isArray(parsedInput)
-        ? parsedInput as Record<string, unknown>
-        : null;
-      const structurallyValid = Boolean(
-        carrier
-        && typeof carrier.name === 'string'
-        && carrier.name.length > 0
-        && typeof carrier.args_json === 'string',
-      );
+    if (isNestedDispatchCarrier(tool.name)) {
+      const structurallyValid = nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput);
       if (!structurallyValid) {
         if (ctx.counter.willExceed()) throw new ToolCallsLimitExceeded(ctx.counter.limit);
         ctx.counter.increment();
+        return { carrierMalformed: true };
       }
       return undefined;
     }
@@ -2240,7 +2403,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // bill every deferred action twice, halving the effective budget on the
     // schema-on-demand lane. The inner charge is the real one; loop
     // detection below still evaluates the outer call.
-    if (tool.name !== 'call_tool') {
+    if (!isNestedDispatchCarrier(tool.name)) {
       if (ctx.counter.willExceed()) {
         throw new ToolCallsLimitExceeded(ctx.counter.limit);
       }
@@ -2296,6 +2459,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // batched execution we're steering toward and must NEVER be blocked (that
       // would refuse the very program the block demands). Reads are idempotent, so
       // refusing one loses nothing.
+      // A fan-out-keyed READ is never hard-killed, even after its refusal has
+      // released: the shield is about the CALL's nature, the block is about
+      // whether we are refusing right now. Conflating them meant releasing the
+      // refusal handed the read to the exact-repeat turn-kill.
       if (decision.fanoutBlock && !ctx.codeMode && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         try {
           appendEvent({
@@ -2387,6 +2554,68 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (err instanceof ToolGuardrailEscalated) throw err;
       // eslint-disable-next-line no-console
       console.warn('[harness] tool guardrail evaluation threw (fail-open)', err instanceof Error ? err.message : err);
+    }
+    // A direct, non-poll Composio read that already returned verified data for
+    // this EXACT accepted source is settled work. Recover its authoritative
+    // bytes instead of paying the provider again. The durable source identity
+    // survives an infra retry that advances behaviorScopeId; a new user source,
+    // changed args, intervening mutation/steer, poll, worker, program, or batch
+    // all fail open to the ordinary dispatch path.
+    if (
+      settledReadRepeatEnabled()
+      && ctx.directOrchestrator !== false
+      && !ctx.codeMode
+      && !ctx.guardrailScopeId
+      && !ctx.certifiedBatch
+      && !ctx.batchItem
+      && Number.isSafeInteger(ctx.sourceUserSeq)
+      && (ctx.sourceUserSeq ?? 0) > 0
+      && typeof callId === 'string'
+      && callId.length > 0
+      && typeof ctx.behaviorScopeId === 'string'
+      && ctx.behaviorScopeId.length > 0
+    ) {
+      const replay = resolveSettledReadRepeat({
+        sessionId: ctx.sessionId,
+        sourceUserSeq: ctx.sourceUserSeq as number,
+        currentCallId: callId,
+        toolName: tool.name,
+        args: ctx.settledReadCanonicalArgs ?? parsedInput,
+        currentBehaviorScopeId: ctx.behaviorScopeId,
+      });
+      if (replay) {
+        let replayMarked = false;
+        try {
+          appendEvent({
+            sessionId: ctx.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'guardrail_tripped',
+            data: settledReadRepeatReplayMarker({
+              replayCallId: callId,
+              replayCalledEventId: replay.currentCalledEventId,
+              sourceCallId: replay.sourceCallId,
+              sourceUserSeq: ctx.sourceUserSeq as number,
+              toolSlug: replay.toolSlug,
+              sourceBehaviorScopeId: replay.sourceBehaviorScopeId,
+              replayBehaviorScopeId: ctx.behaviorScopeId,
+            }),
+          });
+          replayMarked = true;
+        } catch { /* no durable disposition means replay is not safe */ }
+        if (replayMarked) {
+          return {
+            settledReadReplay: {
+              output: replay.output,
+              advisory: formatSettledReadRepeatAdvisory({
+                toolSlug: replay.toolSlug,
+                sourceCallId: replay.sourceCallId,
+                recoveredAcrossBehaviorScope: replay.recoveredAcrossBehaviorScope,
+              }),
+            },
+          };
+        }
+      }
     }
     // 2c. Execution-wrap gate
     try {
@@ -3244,15 +3473,34 @@ export function wrapToolForHarness<T extends WrappableTool>(
         + 'Return your best result NOW as your final answer. A partial result with honest gaps beats nothing: '
         + 'include everything you gathered, and mark anything missing with an "ERROR: <what is missing>" line.';
     }
+    // Discovery is admitted at the LAST shared pre-dispatch edge: every
+    // deterministic refusal above has already run, so a refused artifact/write
+    // cannot spend the task's one discovery slot. The physical call id is the
+    // durable replay identity across wrapper retries and process restarts.
+    const discovery = deferDiscoveryAdmission
+      ? null
+      : admitDiscoveryBoundary({
+          sessionId: ctx.sessionId,
+          sourceUserSeq: ctx.sourceUserSeq,
+          turn: ctx.turn,
+          attemptId: ctx.runAttemptId,
+          toolName: tool.name,
+          input: parsedInput,
+          callId: callId ?? `harness-${randomUUID()}`,
+        });
     // Code-mode callers must always receive the native result unchanged.
     // Keep this final invariant even if a future advisory is added above and
     // forgets its local codeMode exemption.
-    if (ctx.codeMode) return reservation ? { reservation } : undefined;
+    if (ctx.codeMode) return reservation || discovery
+      ? { reservation, discovery: discovery ?? undefined }
+      : undefined;
     // All nudges ride the same advisory rail (appended to the tool result by the
     // caller). Combine so a turn that trips several still delivers each.
     const nudges = [fanoutNudge, cacheNudge, workerFinishNudge, managerNudge].filter(Boolean);
     const advisory = nudges.length > 0 ? nudges.join('\n\n') : undefined;
-    return advisory || reservation ? { advisory, reservation } : undefined;
+    return advisory || reservation || discovery
+      ? { advisory, reservation, discovery: discovery ?? undefined }
+      : undefined;
   };
 
   // Resolve the per-tool timeout once at wrap time.
@@ -3400,6 +3648,32 @@ export function wrapToolForHarness<T extends WrappableTool>(
     }
   };
 
+  const settledReadSuccessAdvisory = (
+    ctx: HarnessRunContext | undefined,
+    parsedInput: unknown,
+    result: unknown,
+  ): string => {
+    if (
+      !settledReadRepeatEnabled()
+      || !ctx
+      || ctx.directOrchestrator === false
+      || ctx.codeMode
+      || ctx.guardrailScopeId
+      || ctx.certifiedBatch
+      || ctx.batchItem
+      || !Number.isSafeInteger(ctx.sourceUserSeq)
+      || (ctx.sourceUserSeq ?? 0) <= 0
+      || typeof result !== 'string'
+    ) return '';
+    if (acceptedSourceRequestsPolling(ctx.sessionId, ctx.sourceUserSeq as number)) return '';
+    const settled = classifySettledDirectComposioRead({
+      toolName: tool.name,
+      args: parsedInput,
+      output: result,
+    });
+    return settled ? `\n\n${formatSettledReadSuccessAdvisory(settled.toolSlug)}` : '';
+  };
+
   if (hasInvoke) {
     // PRODUCTION PATH — wrap SDK invoke.
     const originalInvoke = tt.invoke!;
@@ -3418,12 +3692,21 @@ export function wrapToolForHarness<T extends WrappableTool>(
           parsedInput = input;
         }
       }
+      // A malformed carrier cannot be admitted under its arbitrary raw bytes:
+      // strings and partial envelopes are not callable contracts. Bind the one
+      // refusal to a safe host-owned OUTER identity instead. No inner tool is
+      // named or refined, and the settlement below uses these same bytes.
+      const logicalContractArgs = isNestedDispatchCarrier(tool.name)
+        && !nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput)
+        ? { carrier: tool.name, malformed: true, version: 1 }
+        : parsedInput;
       const ctx = harnessRunContextStorage.getStore();
       // SDK call_id for THIS invocation — lets the within-task fetch-memory nudge
       // correlate a future identical call back to this one's tool_outputs row.
       const invokeCall = (details as { toolCall?: { callId?: string; id?: string } } | undefined)?.toolCall;
       const invokeCallId = invokeCall?.callId ?? invokeCall?.id ?? `harness-${randomUUID()}`;
       const settlementNonce = randomUUID();
+      const invokeBody = async (): Promise<unknown> => {
       // Layer 1 — structural prevention. Bind $fromToolOutput references to REAL
       // values from the lossless store BEFORE gates + execution, so a high-stakes
       // field comes from a trusted source, never model-authored text (the class of
@@ -3441,16 +3724,50 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
         parsedInput = refResolution.resolved;
         input = typeof input === 'string' ? JSON.stringify(refResolution.resolved) : refResolution.resolved;
+        // Composio performs one later, provider-final routing refinement; do
+        // not spend the single monotonic transition on this intermediate
+        // shape. call_tool likewise owns schema/default materialization at its
+        // trusted inner resolver. Every other bracketed tool reaches execution
+        // with this exact host-bound payload.
+        if (
+          ctx?.sessionId
+          && Number.isSafeInteger(ctx.sourceUserSeq)
+          && (ctx.sourceUserSeq ?? 0) > 0
+          && !isTrustedComposioGateway(tool.name)
+          && !isTrustedDynamicComposioTool(tool.name)
+          && !isNestedDispatchCarrier(tool.name)
+        ) {
+          authorizeResolvedLogicalCallContract({
+            sessionId: ctx.sessionId,
+            sourceUserSeq: ctx.sourceUserSeq as number,
+            turn: ctx.turn,
+            tool: tool.name,
+            effectiveArgs: parsedInput,
+          });
+        }
       }
       let fanoutNudge: string | undefined;
       let artifact: ArtifactAdmission = {};
       let bracketOutcome: BracketOutcome | undefined;
+      let deferredDiscoveryAdmissionError: unknown;
       try {
-        bracketOutcome = await runBrackets(ctx?.sessionId ?? '', parsedInput, invokeCallId, () => {
-          artifact = claimArtifact(ctx, parsedInput, invokeCallId);
-          return artifact;
-        });
+        bracketOutcome = await runBrackets(
+          ctx?.sessionId ?? '',
+          parsedInput,
+          invokeCallId,
+          () => {
+            artifact = claimArtifact(ctx, parsedInput, invokeCallId);
+            return artifact;
+          },
+          true,
+        );
         fanoutNudge = bracketOutcome?.advisory;
+        if (bracketOutcome?.settledReadReplay) {
+          // A READ cannot own an artifact slot, but release defensively if a
+          // future classifier grows one before this early-return seam.
+          releaseUndispatchedArtifact(artifact.dispatch);
+          return `${bracketOutcome.settledReadReplay.output}\n\n${bracketOutcome.settledReadReplay.advisory}`;
+        }
         if (artifact.dispatch && bracketOutcome?.reservation) {
           const reservation = bracketOutcome.reservation;
           if (
@@ -3511,6 +3828,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           err,
         );
         releaseUndispatchedArtifact(artifact.dispatch);
+        settleDiscoveryBoundary(bracketOutcome?.discovery, 'failed', 'stale_dispatch_lease');
         throw err;
       }
       const invokeOnce = () => {
@@ -3528,6 +3846,23 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // the watcher, which then delivers the real result to this session.
         const mayStartProviderJob = toolCallMayStartProviderJob(tool.name, parsedInput);
         const ac = new AbortController();
+        const invokeDetails = withSdkParsedInputCallback(details, (validatedInput) => {
+          try {
+            const lease = admitDiscoveryBoundary({
+              sessionId: ctx?.sessionId,
+              sourceUserSeq: ctx?.sourceUserSeq,
+              turn: ctx?.turn,
+              attemptId: ctx?.runAttemptId,
+              toolName: tool.name,
+              input: validatedInput,
+              callId: invokeCallId,
+            });
+            if (lease) bracketOutcome = { ...bracketOutcome, discovery: lease };
+          } catch (error) {
+            deferredDiscoveryAdmissionError = error;
+            throw error;
+          }
+        });
         const start = () => Promise.resolve(withToolOutputContext({
           sessionId: ctx?.sessionId,
           sourceUserSeq: ctx?.sourceUserSeq,
@@ -3535,7 +3870,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           callId: invokeCallId,
           toolName: tool.name,
           settlementNonce,
-        }, () => originalInvoke.call(tt, runContext, input, details)));
+        }, () => originalInvoke.call(tt, runContext, input, invokeDetails)));
         const work = runWithToolAbortSignal(ac.signal, start);
         if (mayStartProviderJob) {
           // The harness stops WAITING on it; the promise keeps living so its
@@ -3561,14 +3896,34 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // exact_args_repeat/same_mut_tool_repeat aggregate that cancelled the
       // 44-attorney batch). sessionId is unchanged (kill/pause/recall intact);
       // the counter stays shared (batch budget). Behind CLEMMY_WORKER_THRASH_GUARD.
-      let invokePromise =
-        tool.name === 'run_worker' && ctx && workerThrashGuardEnabled()
-          ? (harnessRunContextStorage.run(
-              { ...ctx, guardrailScopeId: workerScopeIdFromDetails(ctx.sessionId, details) },
-              invokeOnce,
-            ) as Promise<unknown>)
-          : invokeOnce();
+      let invokePromise: Promise<unknown>;
+      try {
+        invokePromise =
+          tool.name === 'run_worker' && ctx && workerThrashGuardEnabled()
+            ? (harnessRunContextStorage.run(
+                { ...ctx, guardrailScopeId: workerScopeIdFromDetails(ctx.sessionId, details) },
+                invokeOnce,
+              ) as Promise<unknown>)
+            : invokeOnce();
+      } catch (err) {
+        settleDiscoveryBoundary(bracketOutcome?.discovery, 'failed', 'provider_start_error');
+        throw err;
+      }
       invokePromise = invokePromise.then((result) => {
+        // The SDK's default error function converts a parser-callback throw to
+        // a string result. Restore the harness's specific recoverable denial,
+        // while preserving the decisive fact that execute/provider code never
+        // began after the callback refused admission.
+        if (deferredDiscoveryAdmissionError) {
+          const soft = softToolError(deferredDiscoveryAdmissionError);
+          if (soft !== null) return soft;
+          throw deferredDiscoveryAdmissionError;
+        }
+        settleDiscoveryBoundary(
+          bracketOutcome?.discovery,
+          toolOutputLooksSuccessful(result) ? 'succeeded' : 'failed',
+          toolOutputLooksSuccessful(result) ? undefined : 'provider_returned_failure',
+        );
         const shellOutcome = tool.name === 'run_shell_command'
           ? takeShellExecutionOutcome(invokeCallId)
           : undefined;
@@ -3579,6 +3934,33 @@ export function wrapToolForHarness<T extends WrappableTool>(
           compactResult: result,
           settlementNonce,
         });
+        // Every lane ends here or in its own equivalent; this is the shared one.
+        // A business call that returned is where the task's next requirement
+        // becomes new, and where a candidate that eliminated itself gives the
+        // search back.
+        if (wrapperMustSettleLogicalCall(ctx)) {
+          settleToolAttempt({
+            sessionId: ctx?.sessionId,
+            sourceUserSeq: ctx?.sourceUserSeq,
+            turn: ctx?.turn,
+            lane: 'agents_runner',
+            toolName: tool.name,
+            callId: invokeCallId,
+            args: logicalContractArgs,
+            mutating: isMutatingExternalWrite(tool.name, parsedInput),
+            businessCall: bracketOutcome?.discovery == null,
+            result,
+            ...(bracketOutcome?.carrierMalformed
+              ? {
+                  signals: {
+                    preDispatch: true,
+                    argumentValidationFailed: true,
+                    schemaAvailable: true,
+                  },
+                }
+              : {}),
+          });
+        }
         settleArtifact(artifact.dispatch, exactEvidenceResult, shellOutcome);
         settleArtifactReadback(ctx, parsedInput, exactEvidenceResult, invokeCallId);
         recordExternalWriteSettlement(
@@ -3606,6 +3988,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // exact-args guardrail can tell a progressing status poll from a
         // genuine loop (live 2026-07-23).
         if (ctx) { try { noteGuardrailToolResult(guardrailScopeKey(ctx), tool.name, parsedInput, outwardResult); } catch { /* advisory */ } }
+        // OBSERVED COST + REDIRECT HEALTH: the fan-out ladder decides from what
+        // calls actually cost and whether the batch program it prescribes is
+        // succeeding. Both are facts only the RESULT carries, so they are
+        // recorded here alongside the existing result fingerprint.
+        if (ctx) { try { noteGuardrailObservedCost(guardrailScopeKey(ctx), tool.name, outwardResult); } catch { /* advisory */ } }
         // MID-RUN STEERING: deliver any user message that arrived while this
         // run was working, riding the next tool result (the one channel every
         // lane's model reads every few seconds). Appended AFTER settlement,
@@ -3613,6 +4000,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // steering text can never masquerade as provider output to a gate; the
         // parked exact-output bytes above are untouched.
         if (typeof outwardResult === 'string') {
+          const settledRead = settledReadSuccessAdvisory(ctx, parsedInput, outwardResult);
           const repeated = repeatedCreationAdvisory(
             ctx?.sessionId,
             tool.name,
@@ -3621,10 +4009,40 @@ export function wrapToolForHarness<T extends WrappableTool>(
             invokeCallId,
           );
           const steer = steerBlockForToolBoundary(ctx?.sessionId);
-          if (repeated || steer) return `${outwardResult}${repeated ?? ''}${steer}`;
+          if (settledRead || repeated || steer) return `${outwardResult}${settledRead}${repeated ?? ''}${steer}`;
         }
         return outwardResult;
       }, (err) => {
+        settleDiscoveryBoundary(
+          bracketOutcome?.discovery,
+          err instanceof ToolTimeout ? 'timed_out' : 'failed',
+          err instanceof ToolTimeout ? 'provider_timeout' : 'provider_error',
+        );
+        // The rejection path settles too. Only the RETURN path did, so a tool
+        // that threw left the task holding a spent budget and no reason.
+        if (wrapperMustSettleLogicalCall(ctx)) {
+          settleToolAttempt({
+            sessionId: ctx?.sessionId,
+            sourceUserSeq: ctx?.sourceUserSeq,
+            turn: ctx?.turn,
+            lane: 'agents_runner',
+            toolName: tool.name,
+            callId: invokeCallId,
+            args: logicalContractArgs,
+            mutating: isMutatingExternalWrite(tool.name, parsedInput),
+            businessCall: bracketOutcome?.discovery == null,
+            thrown: err,
+            ...(bracketOutcome?.carrierMalformed
+              ? {
+                  signals: {
+                    preDispatch: true,
+                    argumentValidationFailed: true,
+                    schemaAvailable: true,
+                  },
+                }
+              : err instanceof ToolTimeout ? { signals: { errorName: 'TimeoutError' } } : {}),
+          });
+        }
         const shellOutcome = tool.name === 'run_shell_command'
           ? takeShellExecutionOutcome(invokeCallId)
           : undefined;
@@ -3717,6 +4135,20 @@ export function wrapToolForHarness<T extends WrappableTool>(
         return typeof result === 'string' ? `${result}\n\n${fanoutNudge}` : result;
       }
       return invokePromise;
+      };
+      if (ctx?.sessionId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0) {
+        return withLogicalToolCall(
+          {
+            sessionId: ctx.sessionId,
+            sourceUserSeq: ctx.sourceUserSeq as number,
+            logicalToolCallId: invokeCallId,
+            tool: tool.name,
+            args: logicalContractArgs,
+          },
+          invokeBody,
+        );
+      }
+      return invokeBody();
     };
     return { ...tool, invoke: wrappedInvoke } as T;
   }
@@ -3727,6 +4159,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     const ctx = harnessRunContextStorage.getStore();
     const executeCallId = `harness-${randomUUID()}`;
     const settlementNonce = randomUUID();
+    const executeBody = async (): Promise<unknown> => {
     // Layer 1 — bind $fromToolOutput references to real store values before gates
     // + execution (mirror of the invoke path). No-op without the syntax.
     if (toolOutputReferenceResolutionEnabled() && hasToolOutputReference(input)) {
@@ -3739,6 +4172,22 @@ export function wrapToolForHarness<T extends WrappableTool>(
         });
       }
       input = refResolution.resolved;
+      if (
+        ctx?.sessionId
+        && Number.isSafeInteger(ctx.sourceUserSeq)
+        && (ctx.sourceUserSeq ?? 0) > 0
+        && !isTrustedComposioGateway(tool.name)
+        && !isTrustedDynamicComposioTool(tool.name)
+        && !isNestedDispatchCarrier(tool.name)
+      ) {
+        authorizeResolvedLogicalCallContract({
+          sessionId: ctx.sessionId,
+          sourceUserSeq: ctx.sourceUserSeq as number,
+          turn: ctx.turn,
+          tool: tool.name,
+          effectiveArgs: input,
+        });
+      }
     }
     let fanoutNudge: string | undefined;
     let artifact: ArtifactAdmission = {};
@@ -3749,6 +4198,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
         return artifact;
       });
       fanoutNudge = bracketOutcome?.advisory;
+      if (bracketOutcome?.settledReadReplay) {
+        releaseUndispatchedArtifact(artifact.dispatch);
+        return `${bracketOutcome.settledReadReplay.output}\n\n${bracketOutcome.settledReadReplay.advisory}`;
+      }
       if (artifact.dispatch && bracketOutcome?.reservation) {
         const reservation = bracketOutcome.reservation;
         if (
@@ -3801,6 +4254,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         err,
       );
       releaseUndispatchedArtifact(artifact.dispatch);
+      settleDiscoveryBoundary(bracketOutcome?.discovery, 'failed', 'stale_dispatch_lease');
       throw err;
     }
     let result: unknown;
@@ -3826,6 +4280,34 @@ export function wrapToolForHarness<T extends WrappableTool>(
         },
       );
     } catch (err) {
+      settleDiscoveryBoundary(
+        bracketOutcome?.discovery,
+        err instanceof ToolTimeout ? 'timed_out' : 'failed',
+        err instanceof ToolTimeout ? 'provider_timeout' : 'provider_error',
+      );
+      if (wrapperMustSettleLogicalCall(ctx)) {
+        settleToolAttempt({
+          sessionId: ctx?.sessionId,
+          sourceUserSeq: ctx?.sourceUserSeq,
+          turn: ctx?.turn,
+          lane: 'agents_runner',
+          toolName: tool.name,
+          callId: executeCallId,
+          args: input,
+          mutating: isMutatingExternalWrite(tool.name, input),
+          businessCall: bracketOutcome?.discovery == null,
+          thrown: err,
+          ...(bracketOutcome?.carrierMalformed
+            ? {
+                signals: {
+                  preDispatch: true,
+                  argumentValidationFailed: true,
+                  schemaAvailable: true,
+                },
+              }
+            : err instanceof ToolTimeout ? { signals: { errorName: 'TimeoutError' } } : {}),
+        });
+      }
       const shellOutcome = tool.name === 'run_shell_command'
         ? takeShellExecutionOutcome(executeCallId)
         : undefined;
@@ -3855,6 +4337,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (soft !== null) return soft;
       throw err;
     }
+    settleDiscoveryBoundary(
+      bracketOutcome?.discovery,
+      toolOutputLooksSuccessful(result) ? 'succeeded' : 'failed',
+      toolOutputLooksSuccessful(result) ? undefined : 'provider_returned_failure',
+    );
     const shellOutcome = tool.name === 'run_shell_command'
       ? takeShellExecutionOutcome(executeCallId)
       : undefined;
@@ -3865,6 +4352,29 @@ export function wrapToolForHarness<T extends WrappableTool>(
       compactResult: result,
       settlementNonce,
     });
+    if (wrapperMustSettleLogicalCall(ctx)) {
+      settleToolAttempt({
+        sessionId: ctx?.sessionId,
+        sourceUserSeq: ctx?.sourceUserSeq,
+        turn: ctx?.turn,
+        lane: 'agents_runner',
+        toolName: tool.name,
+        callId: executeCallId,
+        args: input,
+        mutating: isMutatingExternalWrite(tool.name, input),
+        businessCall: bracketOutcome?.discovery == null,
+        result,
+        ...(bracketOutcome?.carrierMalformed
+          ? {
+              signals: {
+                preDispatch: true,
+                argumentValidationFailed: true,
+                schemaAvailable: true,
+              },
+            }
+          : {}),
+      });
+    }
     settleArtifact(artifact.dispatch, exactEvidenceResult, shellOutcome);
     settleArtifactReadback(ctx, input, exactEvidenceResult, executeCallId);
     recordExternalWriteSettlement(
@@ -3883,6 +4393,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     creditRecallFromToolResult(ctx?.sessionId, tool.name, input, outwardResult, shellOutcome);
     // MID-RUN STEERING + already-created advisory (mirror of the invoke path):
     // both are appended AFTER settlement and credit consumed the clean value.
+    const settledRead = settledReadSuccessAdvisory(ctx, input, outwardResult);
     const steer = typeof outwardResult === 'string' ? steerBlockForToolBoundary(ctx?.sessionId) : '';
     const repeatedCreate = typeof outwardResult === 'string'
       ? (repeatedCreationAdvisory(
@@ -3893,8 +4404,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
           executeCallId,
         ) ?? '')
       : '';
-    if (fanoutNudge && typeof outwardResult === 'string') return `${outwardResult}\n\n${fanoutNudge}${repeatedCreate}${steer}`;
-    if ((steer || repeatedCreate) && typeof outwardResult === 'string') return `${outwardResult}${repeatedCreate}${steer}`;
+    if (fanoutNudge && typeof outwardResult === 'string') return `${outwardResult}${settledRead}\n\n${fanoutNudge}${repeatedCreate}${steer}`;
+    if ((settledRead || steer || repeatedCreate) && typeof outwardResult === 'string') return `${outwardResult}${settledRead}${repeatedCreate}${steer}`;
     return outwardResult;
     // NOTE: A tool-return truncator used to live here as part of
     // Primitive 6 (v0.5.18 plan). Removed 2026-05-24 because hooks.ts
@@ -3904,6 +4415,20 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // history trim. Adding a fourth layer was redundant. The
     // loop-detection half of Primitive 6 (evaluateToolCall above)
     // stays — it's novel, not duplicative.
+    };
+    if (ctx?.sessionId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0) {
+      return withLogicalToolCall(
+        {
+          sessionId: ctx.sessionId,
+          sourceUserSeq: ctx.sourceUserSeq as number,
+          logicalToolCallId: executeCallId,
+          tool: tool.name,
+          args: input,
+        },
+        executeBody,
+      );
+    }
+    return executeBody();
   };
   return { ...tool, execute: wrappedExecute };
 }
@@ -3916,6 +4441,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
 export function softToolError(err: unknown): string | null {
   if (
     err instanceof MissingExecutionWrapError ||
+    err instanceof DiscoveryBudgetDeniedError ||
     err instanceof ConfirmFirstRequiredError ||
     err instanceof ToolGuardrailBlocked ||
     err instanceof GroundingCheckFailedError ||
@@ -3932,6 +4458,40 @@ export function softToolError(err: unknown): string | null {
     return `Tool call refused by harness: ${err instanceof Error ? err.message : String(err)}`;
   }
   return null;
+}
+
+/**
+ * The Agents SDK validates Zod-backed function-tool input inside its private
+ * `invoke` closure. Its parsed-input callback is the only seam after that local
+ * validation and before `execute` begins. Wrap that callback without importing
+ * an SDK-internal, non-public symbol: the description is pinned by the focused
+ * real-SDK regression below, and every dependency update must keep that test
+ * green before discovery can dispatch.
+ */
+function withSdkParsedInputCallback(
+  details: unknown,
+  callback: (validatedInput: unknown) => void,
+): unknown {
+  const source = details && typeof details === 'object'
+    ? details as Record<PropertyKey, unknown>
+    : {};
+  const target = { ...source } as Record<PropertyKey, unknown>;
+  let admitted = false;
+  return new Proxy(target, {
+    get(current, property, receiver) {
+      const prior = Reflect.get(current, property, receiver);
+      if (
+        typeof property !== 'symbol'
+        || property.description !== 'openai.agents.functionToolParsedInputCallback'
+      ) return prior;
+      return (validatedInput: unknown) => {
+        if (typeof prior === 'function') Reflect.apply(prior, source, [validatedInput]);
+        if (admitted) return;
+        admitted = true;
+        callback(validatedInput);
+      };
+    },
+  });
 }
 
 /** Minimal shape for the SDK-built Tool with an invoke method.
