@@ -302,15 +302,59 @@ function readContractFile(file: string): ToolContract | null {
   } catch { return null; }
 }
 
+function validateToolContractRecord(
+  record: ToolContract | null,
+  expectedIdentifier: string,
+): ToolContract | null {
+  if (!record || record.identifier !== expectedIdentifier) return null;
+  const age = Date.now() - Date.parse(record.savedAt);
+  if (!Number.isFinite(age) || age < 0 || age > CONTRACT_TTL_MS) return null;
+  if (!record.schema || typeof record.schema !== 'object' || Array.isArray(record.schema)) return null;
+  if (fingerprintSchema(record.schema) !== record.fingerprint) return null;
+  return record;
+}
+
+/**
+ * The case-collision twin of a provider-slug-shaped identifier. The store
+ * keys files on the RAW identifier digest, so `composio_search_tools` and
+ * `COMPOSIO_SEARCH_TOOLS` were two files with identical schemas on disk
+ * (live 2026-08). Only the single-underscore word shape folds — external MCP
+ * names (`server__tool`) and CLI commands (spaces/dashes) are case-sensitive
+ * identities and never alias.
+ */
+function caseTwinIdentifier(identifier: string): string | null {
+  if (!/^[A-Za-z0-9_]+$/.test(identifier)) return null;
+  if (!identifier.includes('_') || identifier.includes('__')) return null;
+  const upper = identifier.toUpperCase();
+  return upper === identifier ? null : upper;
+}
+
 export function loadToolContract(identifier: string): ToolContract | null {
   if (!identifier) return null;
   try {
     const file = path.join(machineDir(), contractFileName(identifier));
-    const record = readContractFile(file);
-    if (!record) return null;
-    if (Date.now() - Date.parse(record.savedAt) > CONTRACT_TTL_MS) return null;
-    return record;
+    const exact = validateToolContractRecord(readContractFile(file), identifier);
+    if (exact) return exact;
+    const twin = caseTwinIdentifier(identifier);
+    if (!twin) return null;
+    const twinFile = path.join(machineDir(), contractFileName(twin));
+    return validateToolContractRecord(readContractFile(twinFile), twin);
   } catch { return null; }
+}
+
+/**
+ * Record that a learned contract was READ FOR DISPATCH. Deliberately not
+ * called from any save path — a write is not a use — so `lastUsedAt` stays a
+ * pure recency-of-consumption signal for recall ranking and pruning.
+ */
+export function touchToolContract(identifier: string): void {
+  if (!identifier) return;
+  try {
+    const record = loadToolContract(identifier);
+    if (!record) return;
+    const file = path.join(ensureDir(), contractFileName(record.identifier));
+    atomicWrite(file, { ...record, lastUsedAt: new Date().toISOString() });
+  } catch { /* recency is hygiene, never correctness */ }
 }
 
 function atomicWrite(file: string, record: ToolContract): void {
@@ -341,4 +385,49 @@ export function _clearToolContractsForTests(): void {
       if (f.endsWith('.json') || f.endsWith('.tmp')) unlinkSync(path.join(dir, f));
     }
   } catch { /* best effort */ }
+}
+
+/**
+ * Enumerate this machine's learned-contract files without opening them. The
+ * fileName's leading `safe` segment is a token-matchable hint of the
+ * identifier (OUTLOOK_CREATE_DRAFT.ab12….json), which lets recall rank the
+ * whole store by name overlap and then open only the winners — the read side
+ * of "a successful call teaches how to call it" (exampleArgs had zero readers
+ * before this).
+ */
+export function listToolContractFiles(): Array<{ fileName: string; identifierHint: string; modifiedMs: number }> {
+  try {
+    const dir = machineDir();
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir)
+      .filter((f) => f.endsWith('.json'))
+      .map((fileName) => {
+        // `<safe>.<12-hex>.json` — strip the digest + extension, keep the hint.
+        const identifierHint = fileName.replace(/\.[0-9a-f]{12}\.json$/, '');
+        let modifiedMs = 0;
+        try { modifiedMs = statSync(path.join(dir, fileName)).mtimeMs; } catch { /* hint only */ }
+        return { fileName, identifierHint, modifiedMs };
+      });
+  } catch {
+    return [];
+  }
+}
+
+/** Open one enumerated contract file. Validation identical to loadToolContract;
+ *  the identifier check is skipped because the caller only knows the fileName
+ *  (the safe segment is lossy) — the record's own identifier field is trusted
+ *  after structural validation. */
+export function readToolContractFile(fileName: string): ToolContract | null {
+  if (!/^[A-Za-z0-9_.-]+\.json$/.test(fileName)) return null;
+  try {
+    const file = path.join(machineDir(), fileName);
+    const record = readContractFile(file);
+    if (!record || typeof record !== 'object') return null;
+    const contract = record as ToolContract;
+    if (typeof contract.identifier !== 'string' || !contract.identifier) return null;
+    if (!contract.schema || typeof contract.schema !== 'object') return null;
+    return contract;
+  } catch {
+    return null;
+  }
 }

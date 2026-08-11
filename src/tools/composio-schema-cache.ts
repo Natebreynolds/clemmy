@@ -1,5 +1,10 @@
-import { createHash } from 'node:crypto';
-import { loadToolContract, saveToolContract } from './tool-contract-store.js';
+import {
+  fingerprintSchema,
+  loadToolContract,
+  saveToolContract,
+  touchToolContract,
+  type ToolContract,
+} from './tool-contract-store.js';
 /**
  * In-memory cache of Composio action input schemas, keyed by tool slug.
  *
@@ -174,28 +179,137 @@ export function rememberToolSchemas(
  * between learning a tool once and learning it every session. */
 export function getCachedToolSchema(toolSlug: string): Record<string, unknown> | null {
   const hit = cache.get(toolSlug);
-  if (hit && Date.now() - hit.cachedAt <= SCHEMA_TTL_MS) return hit.schema;
+  const hitAge = hit ? Date.now() - hit.cachedAt : Number.NaN;
+  if (hit && Number.isFinite(hitAge) && hitAge >= 0 && hitAge <= SCHEMA_TTL_MS) return hit.schema;
   if (hit) cache.delete(toolSlug);
   const durable = loadToolContract(toolSlug);
   if (!durable) return null;
-  // Promote back into the hot map so the rest of the session pays nothing.
-  cache.set(toolSlug, { schema: durable.schema, cachedAt: Date.now() });
+  // A dispatch-path read IS a use — stamp recency for recall ranking and
+  // pruning. (Save paths deliberately never touch; a write is not a use.)
+  touchToolContract(durable.identifier);
+  // Promote back into the validation map so the rest of the session pays
+  // nothing. Preserve the provider-observation timestamp separately: a
+  // 30-day validation contract must not become 30-minute executable authority
+  // merely because this process read it from disk.
+  // loadToolContract has already verified the schema fingerprint. Legacy
+  // contracts without this explicit field remain validation-only until one
+  // exact-slug provider metadata refresh establishes a new authority lease.
+  const providerObservedAt = durableProviderObservation(durable);
+  const providerObservedFingerprint = providerObservedAt !== undefined
+    ? durable.providerObservedFingerprint
+    : undefined;
+  cache.set(toolSlug, {
+    schema: durable.schema,
+    cachedAt: Date.now(),
+    ...(Number.isFinite(providerObservedAt) && providerObservedFingerprint
+      ? { providerObservedAt, providerObservedFingerprint }
+      : {}),
+  });
   return durable.schema;
 }
 
 /**
- * Slugs whose live schema we already tried to load this session. Prevents a
+ * Slugs whose validation schema we already tried to load this session. Prevents a
  * slug the provider cannot describe from paying a fetch on every dispatch.
  */
 const schemaLoadAttempted = new Set<string>();
+const liveSchemaNegativeUntil = new Map<string, number>();
+const LIVE_SCHEMA_NEGATIVE_TTL_MS = 60_000;
 
-type SchemaLoader = (slug: string) => Promise<{ inputParameters?: unknown } | null>;
+export interface LiveSchemaProviderRefresh {
+  outcome: 'refreshed' | 'unavailable' | 'failed';
+  durationMs: number;
+  fingerprint?: string;
+}
+
+export type LiveSchemaProviderRefreshObserver = (refresh: LiveSchemaProviderRefresh) => void;
+
+interface ProviderSchemaLoad {
+  promise: Promise<LiveSchemaProviderRefresh>;
+  /** First warm-session observer wins; one physical request emits one event. */
+  observer?: LiveSchemaProviderRefreshObserver;
+}
+
+const providerSchemaLoads = new Map<string, ProviderSchemaLoad>();
+
+interface LoadedSchema {
+  inputParameters?: unknown;
+  providerObservedAt?: number;
+}
+type SchemaLoader = (slug: string) => Promise<LoadedSchema | null>;
 let schemaLoader: SchemaLoader | null = null;
+
+async function loadSchemaFromProvider(toolSlug: string): Promise<LoadedSchema | null> {
+  const load = schemaLoader ?? (async (slug: string) => {
+    const client = await import('../integrations/composio/client.js');
+    // Ask ONLY when an SDK client already exists. Without one, the slug
+    // lookup falls back to listing the whole toolkit — a side effect no
+    // validation or warm-read admission step should cause on a keyless install.
+    if (!client.getComposio()) return null;
+    const tool = await client.getComposioToolBySlug(slug);
+    return tool
+      ? {
+        inputParameters: tool.inputParameters,
+        providerObservedAt: client.composioToolSchemaObservedAt(tool),
+      }
+      : null;
+  });
+  return load(toolSlug);
+}
+
+/** One exact-slug metadata lookup per process at a time. Validation and warm
+ * authority callers share it, so concurrent accepted turns cannot fan out. */
+function refreshSchemaFromProvider(
+  toolSlug: string,
+  observer?: LiveSchemaProviderRefreshObserver,
+): Promise<LiveSchemaProviderRefresh> {
+  const existing = providerSchemaLoads.get(toolSlug);
+  if (existing) {
+    // A validation lookup can start first with no session observer. Let the
+    // first warm joiner attach the one accounting event to that physical I/O.
+    if (!existing.observer && observer) existing.observer = observer;
+    return existing.promise;
+  }
+  const entry = {} as ProviderSchemaLoad;
+  entry.observer = observer;
+  const refresh = (async () => {
+    const startedAt = Date.now();
+    let result: LiveSchemaProviderRefresh;
+    try {
+      const tool = await loadSchemaFromProvider(toolSlug);
+      if (!tool?.inputParameters) {
+        result = { outcome: 'unavailable', durationMs: Date.now() - startedAt };
+      } else {
+        rememberToolSchema(
+          toolSlug,
+          tool.inputParameters,
+          tool.providerObservedAt ?? Number.NaN,
+        );
+        const fingerprint = liveComposioSchemaFingerprint(toolSlug);
+        result = fingerprint
+          ? { outcome: 'refreshed', durationMs: Date.now() - startedAt, fingerprint }
+          : { outcome: 'unavailable', durationMs: Date.now() - startedAt };
+      }
+    } catch {
+      result = { outcome: 'failed', durationMs: Date.now() - startedAt };
+    }
+    try { entry.observer?.(result); } catch { /* telemetry never changes authority */ }
+    return result;
+  })();
+  entry.promise = refresh;
+  providerSchemaLoads.set(toolSlug, entry);
+  void refresh.finally(() => {
+    if (providerSchemaLoads.get(toolSlug) === entry) providerSchemaLoads.delete(toolSlug);
+  });
+  return refresh;
+}
 
 /** Test seam: inject the live loader without importing the composio client. */
 export function _setToolSchemaLoaderForTests(loader: SchemaLoader | null): void {
   schemaLoader = loader;
   schemaLoadAttempted.clear();
+  liveSchemaNegativeUntil.clear();
+  providerSchemaLoads.clear();
 }
 
 /**
