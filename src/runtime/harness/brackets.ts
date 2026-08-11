@@ -160,6 +160,7 @@ import {
   withLogicalToolCall,
 } from './attempt-identity.js';
 import { logicalCallAuthorityState } from './dispatch-ledger.js';
+import { logicalCallArgumentsAreContractible } from './logical-call-contract.js';
 import {
   isPlainOrClementineLocalTool,
   isTrustedComposioGateway,
@@ -3696,8 +3697,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // strings and partial envelopes are not callable contracts. Bind the one
       // refusal to a safe host-owned OUTER identity instead. No inner tool is
       // named or refined, and the settlement below uses these same bytes.
-      const logicalContractArgs = isNestedDispatchCarrier(tool.name)
-        && !nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput)
+      // This is not carrier-only. ANY invocation can arrive with bytes the
+      // contract layer cannot read — truncated JSON, or a gateway payload whose
+      // inner `arguments` string is malformed — and both are among the most
+      // common model failures. Left raw, admission returns `conflict`, which
+      // POISONS this accepted task's resolution: one bad payload would refuse
+      // every remaining tool call of the turn instead of returning the ordinary
+      // invalid-arguments error and letting the model retype the call.
+      const logicalContractArgs = !logicalCallArgumentsAreContractible(tool.name, parsedInput)
+        || (isNestedDispatchCarrier(tool.name)
+          && !nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput))
         ? { carrier: tool.name, malformed: true, version: 1 }
         : parsedInput;
       const ctx = harnessRunContextStorage.getStore();

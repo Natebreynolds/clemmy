@@ -25,14 +25,13 @@ export function canonicalLogicalToolName(tool: string): string | null {
   return canonicalRuntimeEffectiveToolName(tool)?.toLowerCase() ?? null;
 }
 
-export function durableLogicalCallContract(
-  acceptedTaskId: string,
+function readableContract(
   tool: string,
   args: unknown,
-): DurableLogicalCallContract | null {
+): { toolName: string; contract: ReturnType<typeof normalizeCallableArguments> } | null {
   const effective = unwrapRuntimeEffectiveToolIdentity(tool, args);
   const toolName = canonicalLogicalToolName(effective.toolName ?? '');
-  if (!toolName || !acceptedTaskId.trim()) return null;
+  if (!toolName) return null;
   // Only the trusted Composio gateway owns a provider-carrier payload. Its
   // `{tool_slug, arguments}` pair is peeled to the same inner contract used at
   // the paid dispatch. Every other effective tool keeps a discriminated direct
@@ -42,10 +41,33 @@ export function durableLogicalCallContract(
     ? normalizeCallableArguments(effective.args, toolName)
     : normalizeCallableArguments({ kind: 'direct', toolName, args: effective.args });
   if (contract.error || contract.toolName !== toolName) return null;
+  return { toolName, contract };
+}
+
+/**
+ * Whether these exact bytes can become a durable contract at all.
+ *
+ * Admission REQUIRES a contract, and refusing one poisons the accepted task's
+ * resolution — so an invocation whose arguments cannot be read (truncated JSON,
+ * a carrier whose inner `arguments` payload is malformed) must be bound to a
+ * host-owned outer identity rather than take the whole turn down with it.
+ */
+export function logicalCallArgumentsAreContractible(tool: string, args: unknown): boolean {
+  return readableContract(tool, args) !== null;
+}
+
+export function durableLogicalCallContract(
+  acceptedTaskId: string,
+  tool: string,
+  args: unknown,
+): DurableLogicalCallContract | null {
+  if (!acceptedTaskId.trim()) return null;
+  const readable = readableContract(tool, args);
+  if (!readable) return null;
   return {
-    toolName,
+    toolName: readable.toolName,
     argumentDigest: createHash('sha256')
-      .update(`${acceptedTaskId}\0${callableContractIdentity(contract)}`)
+      .update(`${acceptedTaskId}\0${callableContractIdentity(readable.contract)}`)
       .digest('hex'),
   };
 }

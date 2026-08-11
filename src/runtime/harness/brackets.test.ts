@@ -20,6 +20,8 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { tool } from '@openai/agents';
+import { z } from 'zod';
 
 // Dynamic imports — see eventlog.test.ts for why.
 const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput, listEvents, openEventLog } = await import('./eventlog.js');
@@ -105,6 +107,38 @@ function setEnvForTest(
     if (previous === undefined) delete process.env[key];
     else process.env[key] = previous;
   });
+}
+
+/** Anchor a source event the test already appended (its exact text/turn carry
+ *  meaning): persist the turn graph the settlement spine requires for that
+ *  accepted task. */
+function anchorExistingSource(sessionId: string, source: { seq: number; turn: number }): void {
+  assert.ok(
+    recordTurnGraphShadow({
+      identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+    }),
+    'fixture persisted the turn graph for the accepted task',
+  );
+}
+
+/** The settlement spine refuses wrapped-tool dispatch without an accepted
+ *  source (a durable user_input_received) AND a persisted turn graph for that
+ *  accepted task. Every fixture that drives a wrapped tool anchors both — the
+ *  same shape production's turn spine establishes before dispatch. */
+function anchorAcceptedTask(
+  sessionId: string,
+  text: string,
+  turn = 1,
+): { sourceUserSeq: number; turn: number } {
+  const source = appendEvent({
+    sessionId,
+    turn,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  anchorExistingSource(sessionId, source);
+  return { sourceUserSeq: source.seq, turn: source.turn };
 }
 
 test('parallelPreWriteGatesEnabled: DEFAULT-ON with =off kill-switch', () => {
@@ -312,6 +346,7 @@ test('revoke-after-reservation compensates proven non-dispatch and permits one c
   const runCase = async (kind: 'shell' | 'generic'): Promise<void> => {
     resetEventLog();
     const session = createSession({ kind: 'chat' });
+    const anchor = anchorAcceptedTask(session.id, 'Send the hello message.');
     const scopeId = `${session.id}::${kind}:post-reservation`;
     const lease = leases.activateDispatchLease({ sessionId: session.id, scopeId });
     let invoked = 0;
@@ -335,7 +370,7 @@ test('revoke-after-reservation compensates proven non-dispatch and permits one c
       : wrapToolForHarness({ name: 'composio_execute_tool', invoke: async () => { invoked += 1; return 'sent'; } });
     const dispatch = (activeLease: typeof lease, suffix: string): Promise<unknown> => Promise.resolve(
       withHarnessRunContext(
-        { sessionId: session.id, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(10), dispatchLease: activeLease },
+        { sessionId: session.id, sourceUserSeq: anchor.sourceUserSeq, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(10), dispatchLease: activeLease },
         () => kind === 'shell'
           ? wrapped.execute!(input)
           : (wrapped as unknown as { invoke: (rc: unknown, input: string, details: unknown) => Promise<unknown> })
@@ -657,15 +692,21 @@ test('wrapToolForHarness: no-op when HARNESS_TOOL_BRACKETS is off', () => {
 test('wrapToolForHarness: forwards the execute call when flag is on', async () => {
   const prev = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(session.id, 'Echo the value.');
   try {
     let receivedInput: unknown;
     const wrapped = wrapToolForHarness({
       name: 'echo',
       execute: async (input) => { receivedInput = input; return 'ok'; },
     });
-    // Without a run-context, the wrapper should still forward (no kill
-    // check, no counter check — graceful degradation).
-    const result = await wrapped.execute!({ value: 42 });
+    // The settlement spine requires durable accepted-task identity even on
+    // the plain forwarding path, so the fixture anchors an accepted source.
+    const result = await withHarnessRunContext(
+      { sessionId: session.id, sourceUserSeq: anchor.sourceUserSeq, counter: new ToolCallsCounter(4) },
+      () => wrapped.execute!({ value: 42 }),
+    );
     assert.equal(result, 'ok');
     assert.deepEqual(receivedInput, { value: 42 });
   } finally {
@@ -685,6 +726,7 @@ test('wrapToolForHarness: invoke and execute expose the exact sourceUserSeq to t
     type: 'user_input_received',
     data: { text: 'Run my workflow.' },
   });
+  anchorExistingSource(session.id, source);
   const seen: Array<{ path: string; sessionId?: string; sourceUserSeq?: number }> = [];
   try {
     const executeTool = wrapToolForHarness({
@@ -746,6 +788,7 @@ test('artifact admission: a duplicate create neither executes nor records/counts
     type: 'user_input_received',
     data: { text: 'Create one Google Doc named Client brief.' },
   });
+  anchorExistingSource(sess.id, source);
   try {
     const counter = new ToolCallsCounter(10);
     let providerInvocations = 0;
@@ -827,10 +870,11 @@ test('artifact settlement: only a typed local spawn failure releases; provider r
   process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
-  appendEvent({
+  const source = appendEvent({
     sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'Create one new site named clementine-harness.' },
   });
+  anchorExistingSource(sess.id, source);
   const { classifyShellExecutionOutcome, recordShellExecutionOutcome } = await import('../shell-execution-outcome.js');
   const { listRunArtifacts } = await import('./artifact-ledger.js');
   const { rememberToolChoice, peekToolChoice, deleteToolChoice } = await import('../../memory/tool-choice-store.js');
@@ -880,7 +924,7 @@ test('artifact settlement: only a typed local spawn failure releases; provider r
 
   try {
     const counter = new ToolCallsCounter(20);
-    await withHarnessRunContext({ sessionId: sess.id, behaviorScopeId: 'typed-shell-artifact', counter }, async () => {
+    await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: source.seq, behaviorScopeId: 'typed-shell-artifact', counter }, async () => {
       assert.match(String(await invoke('npx-local-failure')), /EACCES/);
       assert.equal(listRunArtifacts(sess.id).length, 0, 'typed pre-spawn failure never parks an uncertain artifact');
       assert.equal(
@@ -925,13 +969,14 @@ test('artifact readback bookkeeping: an ordinary tool result does not mint artif
   process.env.CLEMMY_CONFIRM_FIRST = 'on';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
-  appendEvent({
+  const source = appendEvent({
     sessionId: sess.id,
     turn: 1,
     role: 'user',
     type: 'user_input_received',
     data: { text: 'Search memory for the client name.' },
   });
+  anchorExistingSource(sess.id, source);
   try {
     const behaviorScopeId = 'ordinary-read-no-artifact-root';
     const counter = new ToolCallsCounter(10);
@@ -940,7 +985,7 @@ test('artifact readback bookkeeping: an ordinary tool result does not mint artif
       execute: async () => 'No matching fact.',
     });
     const result = await withHarnessRunContext(
-      { sessionId: sess.id, behaviorScopeId, counter },
+      { sessionId: sess.id, sourceUserSeq: source.seq, behaviorScopeId, counter },
       () => wrapped.execute!({ query: 'client name' }),
     );
     assert.equal(result, 'No matching fact.');
@@ -978,6 +1023,7 @@ test('artifact lineage: create/readback stay on the context-bound source when a 
     type: 'user_input_received',
     data: { text: 'Create one Google Doc named Verified brief.' },
   });
+  anchorExistingSource(sess.id, sourceA);
   appendEvent({
     sessionId: sess.id,
     turn: 2,
@@ -1080,6 +1126,7 @@ test('artifact objective: a legacy go-ahead retains the aligned multi-document i
     type: 'user_input_received',
     data: { text: 'go ahead' },
   });
+  anchorExistingSource(sess.id, approval);
   try {
     const behaviorScopeId = 'confirmed-multi-doc-scope';
     const counter = new ToolCallsCounter(10);
@@ -1160,6 +1207,7 @@ test('wrapToolForHarness: kill switch is checked mid-turn (per-tool)', async () 
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Run the kill-switch check.');
   try {
     const counter = new ToolCallsCounter(10);
     const wrapped = wrapToolForHarness({
@@ -1168,7 +1216,7 @@ test('wrapToolForHarness: kill switch is checked mid-turn (per-tool)', async () 
     });
     // First call goes through fine.
     await withHarnessRunContext(
-      { sessionId: sess.id, counter },
+      { sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter },
       async () => {
         await wrapped.execute!({});
       },
@@ -1176,7 +1224,7 @@ test('wrapToolForHarness: kill switch is checked mid-turn (per-tool)', async () 
     // Now request a kill mid-turn and try another tool call.
     requestKill(sess.id, 'mid-turn kill test');
     await withHarnessRunContext(
-      { sessionId: sess.id, counter },
+      { sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter },
       async () => {
         await assert.rejects(
           () => wrapped.execute!({}),
@@ -1200,6 +1248,8 @@ test('timeoutForTool: run_tool_program outer budget exceeds the code-mode sandbo
 test('wrapToolForHarness: applies per-tool timeout via withTimeout', async () => {
   const prev = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Run the slow tool once.');
   try {
     const counter = new ToolCallsCounter(10);
     const wrapped = wrapToolForHarness(
@@ -1213,7 +1263,7 @@ test('wrapToolForHarness: applies per-tool timeout via withTimeout', async () =>
       { timeoutMs: 50 },
     );
     await withHarnessRunContext(
-      { sessionId: 'timeout-session', counter },
+      { sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter },
       async () => {
         await assert.rejects(
           () => wrapped.execute!({}),
@@ -1256,10 +1306,11 @@ async function runTscTimeout(opts: {
     const counter = new ToolCallsCounter(10);
     const slow = async () => { await tscSleep(200); return 'ran'; };
     const sessionId = createSession({ kind: 'chat' }).id;
+    const anchor = anchorAcceptedTask(sessionId, 'Run the requested tool once.');
     if (opts.path === 'invoke') {
       const wrapped = wrapToolForHarness({ name: opts.name, invoke: slow }, { timeoutMs: 50 });
       const argStr = JSON.stringify(opts.input ?? {});
-      return await withHarnessRunContext({ sessionId, counter }, async () => {
+      return await withHarnessRunContext({ sessionId, sourceUserSeq: anchor.sourceUserSeq, counter }, async () => {
         try {
           const result = await (wrapped as unknown as {
             invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown>;
@@ -1269,7 +1320,7 @@ async function runTscTimeout(opts: {
       });
     }
     const wrapped = wrapToolForHarness({ name: opts.name, execute: slow }, { timeoutMs: 50 });
-    return await withHarnessRunContext({ sessionId, counter }, async () => {
+    return await withHarnessRunContext({ sessionId, sourceUserSeq: anchor.sourceUserSeq, counter }, async () => {
       try { return { result: await wrapped.execute!(opts.input ?? {}) }; }
       catch (error) { return { error }; }
     });
@@ -1356,8 +1407,9 @@ async function runComposioTimeoutInSession(sessionId: string, input: unknown): P
   try {
     const counter = new ToolCallsCounter(10);
     const slow = async () => { await tscSleep(200); return 'ran'; };
+    const anchor = anchorAcceptedTask(sessionId, 'Run the provider call once.');
     const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', invoke: slow }, { timeoutMs: 50 });
-    return await withHarnessRunContext({ sessionId, counter }, async () =>
+    return await withHarnessRunContext({ sessionId, sourceUserSeq: anchor.sourceUserSeq, counter }, async () =>
       (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
         .invoke(null, JSON.stringify(input), { toolCall: { callId: 'c-orphan' } }));
   } finally {
@@ -1404,6 +1456,7 @@ async function withActualOrphan<T>(
   process.env.CLEMMY_GROUNDING_GATE = 'off';
   try {
     const sess = createSession({ kind: 'chat' }).id;
+    const anchor = anchorAcceptedTask(sess, 'Create the requested records.');
     const counter = new ToolCallsCounter(20);
     let dispatches = 0;
     const wrapped = wrapToolForHarness({
@@ -1417,7 +1470,7 @@ async function withActualOrphan<T>(
     const invoke = (args: unknown, callId: string) =>
       (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
         .invoke(null, JSON.stringify(args), { toolCall: { callId } });
-    return await withHarnessRunContext({ sessionId: sess, counter }, () =>
+    return await withHarnessRunContext({ sessionId: sess, sourceUserSeq: anchor.sourceUserSeq, counter }, () =>
       run({ sessionId: sess, invoke, dispatchCount: () => dispatches }));
   } finally {
     for (const [k, v] of Object.entries(saved)) {
@@ -1724,6 +1777,7 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Send the reviewed batch of emails.');
   const { ConfirmFirstRequiredError } = await import('./confirm-first-gate.js');
   const { openPlanScope, closePlanScope } = await import('../../agents/plan-scope.js');
   try {
@@ -1738,7 +1792,7 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
     });
 
     const sendNo = (n: number) =>
-      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () =>
         wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@site.example` }) }),
       ));
 
@@ -1784,6 +1838,7 @@ test('confirm-first gate: reversible mutation batches are outside the irreversib
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Create the reviewed batch of records.');
   try {
     const counter = new ToolCallsCounter(100);
     const wrapped = wrapToolForHarness({
@@ -1792,7 +1847,7 @@ test('confirm-first gate: reversible mutation batches are outside the irreversib
     });
 
     for (let n = 1; n <= 6; n += 1) {
-      const result = await withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      const result = await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () =>
         wrapped.execute!({
           tool_slug: 'AIRTABLE_CREATE_RECORD',
           arguments: JSON.stringify({ record: { name: `record-${n}` } }),
@@ -1828,6 +1883,7 @@ test('confirm-first gate: YOLO never extends to an irreversible batch — thresh
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Send the approved batch of intro emails.');
   const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
   const { listEvents } = await import('./eventlog.js');
   saveProactivityPolicy({ autoApproveScope: 'yolo' });
@@ -1839,7 +1895,7 @@ test('confirm-first gate: YOLO never extends to an irreversible batch — thresh
     });
     const sendNo = (n: number, certified = false) =>
       withHarnessRunContext(
-        { sessionId: sess.id, counter, ...(certified ? { certifiedBatch: { batchId: 'b1', payloadHash: 'h1' } } : {}) },
+        { sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter, ...(certified ? { certifiedBatch: { batchId: 'b1', payloadHash: 'h1' } } : {}) },
         () => wrapped.execute!({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@site.example` }) }),
       );
     // Under the threshold (5): YOLO standing approval still flows.
@@ -1876,6 +1932,7 @@ test('confirm-first gate: explicit off escape hatch lets batches pass', async ()
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Send the reviewed batch of emails.');
   try {
     const counter = new ToolCallsCounter(100);
     const wrapped = wrapToolForHarness({
@@ -1884,7 +1941,7 @@ test('confirm-first gate: explicit off escape hatch lets batches pass', async ()
     });
     // 8 same-shape writes, well past the threshold — all pass with flag off.
     for (let n = 1; n <= 8; n += 1) {
-      const r = await withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      const r = await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () =>
         wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `p${n}@site.example` }) }),
       );
       assert.ok(String(r).startsWith('sent'), `write #${n} should pass when confirm-first is off`);
@@ -1909,6 +1966,7 @@ test('fan-out nudge: appended to the tool RESULT on serial same-slug calls; supp
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'List the records in every view.');
   try {
     const counter = new ToolCallsCounter(100);
     const wrapped = wrapToolForHarness({
@@ -1917,7 +1975,7 @@ test('fan-out nudge: appended to the tool RESULT on serial same-slug calls; supp
     });
     const call = (n: number, scopeId?: string) =>
       withHarnessRunContext(
-        { sessionId: sess.id, counter, ...(scopeId ? { guardrailScopeId: scopeId } : {}) },
+        { sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter, ...(scopeId ? { guardrailScopeId: scopeId } : {}) },
         () => wrapped.execute!({ tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: JSON.stringify({ view: `v${n}` }) }),
       );
     assert.equal(await call(1), 'rows');
@@ -1929,6 +1987,7 @@ test('fan-out nudge: appended to the tool RESULT on serial same-slug calls; supp
     // Worker scope: same serial pattern, nudge suppressed.
     resetEventLog();
     const sess2 = createSession({ kind: 'chat' });
+    const anchor2 = anchorAcceptedTask(sess2.id, 'List the records in every view.');
     const counter2 = new ToolCallsCounter(100);
     const wrapped2 = wrapToolForHarness({
       name: 'composio_execute_tool',
@@ -1936,7 +1995,7 @@ test('fan-out nudge: appended to the tool RESULT on serial same-slug calls; supp
     });
     for (let n = 1; n <= 4; n += 1) {
       const r = await withHarnessRunContext(
-        { sessionId: sess2.id, counter: counter2, guardrailScopeId: `${sess2.id}::w:test` },
+        { sessionId: sess2.id, sourceUserSeq: anchor2.sourceUserSeq, counter: counter2, guardrailScopeId: `${sess2.id}::w:test` },
         () => wrapped2.execute!({ tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: JSON.stringify({ view: `v${n}` }) }),
       );
       assert.equal(r, 'rows', `worker-scope call #${n} must NOT carry the fan-out nudge`);
@@ -1962,13 +2021,14 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
   process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE = 'on';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Look up the priority accounts.');
   try {
     const counter = new ToolCallsCounter(100);
     const wrapped = wrapToolForHarness({ name: 'memory_search', invoke: async () => 'memory rows' });
     const args = JSON.stringify({ query: 'priority accounts' });
     const invoke = (callId: string, scopeId?: string) =>
       withHarnessRunContext(
-        { sessionId: sess.id, counter, ...(scopeId ? { guardrailScopeId: scopeId } : {}) },
+        { sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter, ...(scopeId ? { guardrailScopeId: scopeId } : {}) },
         () => (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
           .invoke(null, args, { toolCall: { callId } }),
       );
@@ -1983,12 +2043,13 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
     // Worker scope: identical repeat, nudge suppressed (tracker/tool_outputs keying diverges).
     resetEventLog();
     const sess2 = createSession({ kind: 'chat' });
+    const anchor2 = anchorAcceptedTask(sess2.id, 'Look up the queue.');
     const counter2 = new ToolCallsCounter(100);
     const wrapped2 = wrapToolForHarness({ name: 'memory_search', invoke: async () => 'rows' });
     const wargs = JSON.stringify({ query: 'q' });
     const winvoke = (callId: string) =>
       withHarnessRunContext(
-        { sessionId: sess2.id, counter: counter2, guardrailScopeId: `${sess2.id}::w:test` },
+        { sessionId: sess2.id, sourceUserSeq: anchor2.sourceUserSeq, counter: counter2, guardrailScopeId: `${sess2.id}::w:test` },
         () => (wrapped2 as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
           .invoke(null, wargs, { toolCall: { callId } }),
       );
@@ -1999,12 +2060,13 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
     // Error-shaped prior output: a retry after a transient failure must NOT be discouraged.
     resetEventLog();
     const sess3 = createSession({ kind: 'chat' });
+    const anchor3 = anchorAcceptedTask(sess3.id, 'Look up the error case.');
     const counter3 = new ToolCallsCounter(100);
     const wrapped3 = wrapToolForHarness({ name: 'memory_search', invoke: async () => 'ERROR: timed out' });
     const eargs = JSON.stringify({ query: 'e' });
     const einvoke = (callId: string) =>
       withHarnessRunContext(
-        { sessionId: sess3.id, counter: counter3 },
+        { sessionId: sess3.id, sourceUserSeq: anchor3.sourceUserSeq, counter: counter3 },
         () => (wrapped3 as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
           .invoke(null, eargs, { toolCall: { callId } }),
       );
@@ -2040,6 +2102,7 @@ test('same-source settled Composio read is recovered without a second provider d
     type: 'user_input_received',
     data: { text: 'Refresh the proof release queue once.' },
   });
+  anchorExistingSource(sess.id, source);
   const args = { tool_slug: 'PROOF_LIST_TASKS', arguments: '{}', connected_account_id: null };
   const providerResult = JSON.stringify({
     successful: true,
@@ -2172,6 +2235,7 @@ test('same-source settled Composio read is recovered without a second provider d
       type: 'user_input_received',
       data: { text: 'Refresh it again now.' },
     });
+    anchorExistingSource(sess.id, nextSource);
     const freshScope = `${sess.id}::turn:3`;
     callEvent('settled-new-source', freshScope, nextSource.seq);
     await invoke('settled-new-source', freshScope, nextSource.seq);
@@ -2205,6 +2269,7 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
   grounding._resetGroundingStateForTests();
   grounding._resetDuplicateStateForTests();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Send Casey at Oakridge Law the Denver comp search gap note.');
   // The extraction worker's CORRECT artifact for this target (Denver).
   writeAuthoritativeToolOutput({
     sessionId: sess.id,
@@ -2222,7 +2287,7 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
       execute: async (_input: unknown) => 'sent',
     });
     const send = (subject: string) =>
-      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () =>
         wrapped.execute!({
           tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
           arguments: JSON.stringify({ to_email: 'casey@oakridge-law.example', subject, body: `${subject} body` }),
@@ -2363,11 +2428,14 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
   const destination = await import('./destination-gate.js');
   destination._resetDestinationStateForTests();
   const sess = createSession({ kind: 'chat' });
+  // Anchor text stays free of any site name/id so it can never confer
+  // destination provenance on its own.
+  const anchor = anchorAcceptedTask(sess.id, 'Proceed with the plan.');
   try {
     const counter = new ToolCallsCounter(100);
     const wrapped = wrapToolForHarness({ name: 'run_shell_command', execute: async () => 'deployed' });
     const shell = (command: string) =>
-      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ command })));
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () => wrapped.execute!({ command })));
     const prodCmd = 'netlify deploy --dir "/x/site" --prod --json';
     // 1. PROD ambient publish → hard-blocked.
     await assert.rejects(() => Promise.resolve(shell(prodCmd)), (err: Error) => {
@@ -2497,6 +2565,7 @@ test('shell publish ledger records the explicit destination instead of targets=[
   process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Deploy the site to site_fixture_ledger.');
   try {
     const counter = new ToolCallsCounter(20);
     const wrapped = wrapToolForHarness({
@@ -2504,7 +2573,7 @@ test('shell publish ledger records the explicit destination instead of targets=[
       execute: async () => 'deployed',
     });
     assert.equal(
-      await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({
+      await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () => wrapped.execute!({
         command: 'netlify deploy --prod --dir /x/site --site site_fixture_ledger --json',
       })),
       'deployed',
@@ -2538,6 +2607,7 @@ test('shell-send grounding: a curl POST with a contradicting payload soft-blocks
   grounding._resetGroundingStateForTests();
   grounding._resetDuplicateStateForTests();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Post Casey at Oakridge Law the Denver comp search gap note.');
   writeAuthoritativeToolOutput({
     sessionId: sess.id, callId: 'c_extract', tool: 'run_worker',
     output: 'Oakridge Law; verified "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
@@ -2552,7 +2622,7 @@ test('shell-send grounding: a curl POST with a contradicting payload soft-blocks
       execute: async (_input: unknown) => 'posted',
     });
     const post = (city: string) =>
-      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () =>
         wrapped.execute!({
           command: `curl -X POST https://api.example.com/send -d '{"to_email":"casey@oakridge-law.example","body":"${city} comp search gap"}'`,
         })));
@@ -2572,7 +2642,7 @@ test('shell-send grounding: a curl POST with a contradicting payload soft-blocks
     // A plain read curl (GET) is NOT gated.
     const readCurl = wrapToolForHarness({ name: 'run_shell_command', execute: async () => 'ok' });
     assert.equal(
-      await withHarnessRunContext({ sessionId: sess.id, counter }, () => readCurl.execute!({ command: 'curl -s https://api.example.com/status' })),
+      await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () => readCurl.execute!({ command: 'curl -s https://api.example.com/status' })),
       'ok',
     );
   } finally {
@@ -2605,6 +2675,7 @@ test('parallel shell pre-write gates consume the prestarted output-grounding pro
   const output = await import('./output-grounding-gate.js');
   output._resetOutputGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Post the Acme campaign summary.');
   writeAuthoritativeToolOutput({
     sessionId: sess.id,
     callId: 'analytics-source',
@@ -2624,7 +2695,7 @@ test('parallel shell pre-write gates consume the prestarted output-grounding pro
     });
     const command = `curl -X POST https://api.example.com/send -d '{"body":"Acme ad spend was $2,400."}'`;
     assert.equal(
-      await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ command })),
+      await withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () => wrapped.execute!({ command })),
       'posted',
     );
     assert.equal(judgeCalls, 1, 'one shell send must not double-call the output-grounding judge');
@@ -2656,6 +2727,7 @@ test('shell-send compensation: a generic nonzero provider exit remains possible 
   grounding._resetDuplicateStateForTests();
   grounding._setGroundingJudgeForTests(async () => ({ grounded: true, reason: 'ok' }));
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Post Casey the follow-up note.');
   const cmd = `curl -X POST https://api.example.com/send -d '{"to_email":"casey@oakridge-law.example"}'`;
   try {
     const counter = new ToolCallsCounter(100);
@@ -2665,7 +2737,7 @@ test('shell-send compensation: a generic nonzero provider exit remains possible 
       name: 'run_shell_command',
       execute: async () => { attempt += 1; return attempt === 1 ? 'exit_code: 28  stderr: curl: (28) timed out' : 'exit_code: 0  stdout: sent'; },
     });
-    const post = () => withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ command: cmd }));
+    const post = () => withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () => wrapped.execute!({ command: cmd }));
     // 1. The non-zero exit is not proof the provider did nothing.
     assert.match(String(await post()), /exit_code: 28/);
     const { listEvents } = await import('./eventlog.js');
@@ -2698,6 +2770,7 @@ test('duplicate-target gate: provider failure prose remains ambiguous and blocks
   grounding._resetDuplicateStateForTests();
   grounding._setGroundingJudgeForTests(async () => ({ grounded: true, reason: 'ok' }));
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Send Alex the gate test note.');
   try {
     const counter = new ToolCallsCounter(100);
     let nextResult = '';
@@ -2706,7 +2779,7 @@ test('duplicate-target gate: provider failure prose remains ambiguous and blocks
       execute: async (_input: unknown) => nextResult,
     });
     const send = () =>
-      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter }, () =>
         wrapped.execute!({
           tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
           arguments: JSON.stringify({ to_email: 'alex@corp.example', subject: 'Gate test', body: 'b' }),
@@ -2762,6 +2835,7 @@ test('nominal local pre-dispatch errors release the exact reservation and permit
     type: 'user_input_received',
     data: { text: 'Send the approved note after I connect the provider.' },
   });
+  anchorExistingSource(session.id, source);
   const { ExternalWritePreDispatchError } = await import('./external-write-admission.js');
   let providerReady = false;
   let dispatches = 0;
@@ -2847,13 +2921,14 @@ test('external-write settlement requires a positive acknowledgement, never failu
     ] as const) {
       resetEventLog();
       const session = createSession({ kind: 'chat' });
+      const anchor = anchorAcceptedTask(session.id, 'Create the record.');
       const wrapped = wrapToolForHarness({
         name: 'composio_execute_tool',
         execute: async () => providerResult,
       });
       await withHarnessRunContext({
         sessionId: session.id,
-        sourceUserSeq: 1,
+        sourceUserSeq: anchor.sourceUserSeq,
         behaviorScopeId: `ack-${label}`,
         counter: new ToolCallsCounter(20),
       }, () => wrapped.execute!({
@@ -2874,13 +2949,14 @@ test('external-write settlement requires a positive acknowledgement, never failu
 
     resetEventLog();
     const successSession = createSession({ kind: 'chat' });
+    const successAnchor = anchorAcceptedTask(successSession.id, 'Create the record.');
     const successful = wrapToolForHarness({
       name: 'composio_execute_tool',
       execute: async () => ({ successful: true, data: { id: 'rec-clean-1' } }),
     });
     await withHarnessRunContext({
       sessionId: successSession.id,
-      sourceUserSeq: 1,
+      sourceUserSeq: successAnchor.sourceUserSeq,
       behaviorScopeId: 'ack-clean',
       counter: new ToolCallsCounter(20),
     }, () => successful.execute!({
@@ -2923,6 +2999,7 @@ test('large successful mutation settles from its exact lossless output, never th
     type: 'user_input_received',
     data: { text: 'Create the report document.' },
   });
+  anchorExistingSource(session.id, source);
   const exact = JSON.stringify({
     successful: true,
     error: null,
@@ -3011,6 +3088,7 @@ test('a reused call id cannot promote a stale side-store success for a failing i
     type: 'user_input_received',
     data: { text: 'Create the report document.' },
   });
+  anchorExistingSource(session.id, source);
   const callId = 'reused-side-store-call';
   writeToolOutput({
     sessionId: session.id,
@@ -3080,6 +3158,7 @@ test('exact artifact readback idempotently settles its original ambiguous create
     type: 'user_input_received',
     data: { text: 'Create one report document and verify it.' },
   });
+  anchorExistingSource(session.id, source);
   const documentId = 'doc-readback-settles-1';
   const wrapped = wrapToolForHarness({
     name: 'composio_execute_tool',
@@ -3194,6 +3273,7 @@ test('artifact readback does not duplicate a prior exact reconciliation settleme
     type: 'user_input_received',
     data: { text: 'Create and verify one report document.' },
   });
+  anchorExistingSource(session.id, source);
   const documentId = 'doc-prior-reconcile-1';
   const wrapped = wrapToolForHarness({
     name: 'composio_execute_tool',
@@ -3278,10 +3358,13 @@ test('reused SDK call ids cannot attach verified artifact settlement to another 
     type: 'user_input_received',
     data: { text: 'Update Airtable, then create and verify one Google Doc.' },
   });
+  anchorExistingSource(session.id, source);
   const documentId = 'doc-call-id-collision-1';
+  let providerCalls = 0;
   const wrapped = wrapToolForHarness({
     name: 'composio_execute_tool',
     invoke: async (_runContext: unknown, rawInput: unknown) => {
+      providerCalls += 1;
       const input = JSON.parse(String(rawInput)) as { tool_slug?: string };
       if (input.tool_slug === 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT') {
         return JSON.stringify({
@@ -3314,33 +3397,110 @@ test('reused SDK call ids cannot attach verified artifact settlement to another 
       tool_slug: 'AIRTABLE_UPDATE_RECORD',
       arguments: JSON.stringify({ base_id: 'base-1', table_id: 'table-1', record_id: 'rec-1', fields: { status: 'done' } }),
     }, 'airtable-collision-scope');
-    await run('duplicate-call', {
-      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
-      arguments: JSON.stringify({ title: 'Report', markdown_text: '# Report' }),
-    }, 'doc-collision-scope');
-    await run('verify-doc-collision', {
-      tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
-      arguments: JSON.stringify({ document_id: documentId }),
-    }, 'verify-collision-scope');
+    // The reused id is now refused BEFORE execution, which is strictly stronger
+    // than sorting out the settlement afterwards: the durable logical-call
+    // contract for `duplicate-call` names the Airtable update and its exact
+    // arguments, so a different call can never take that identity, never reach
+    // the provider, and never leave a reservation for a later readback to
+    // settle against.
+    await assert.rejects(
+      run('duplicate-call', {
+        tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+        arguments: JSON.stringify({ title: 'Report', markdown_text: '# Report' }),
+      }, 'doc-collision-scope'),
+      (error: unknown) => {
+        assert.equal((error as Error).name, 'LogicalCallPreDispatchAuthorityError');
+        assert.match((error as Error).message, /conflicts with its durable contract/);
+        return true;
+      },
+    );
+    assert.equal(providerCalls, 1, 'the refused reuse must not reach provider code');
 
     const reservations = listEvents(session.id, { types: ['external_write'] });
-    assert.equal(reservations.length, 2);
-    const airtable = reservations.find((event) => event.data.shapeKey === 'AIRTABLE_UPDATE_RECORD');
-    const doc = reservations.find((event) => event.data.shapeKey === 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN');
-    assert.ok(airtable);
-    assert.ok(doc);
-    const settled = listEvents(session.id, { types: ['external_write_succeeded'] });
-    assert.equal(settled.length, 1);
-    assert.equal(settled[0]?.parentEventId, doc.id);
-    assert.notEqual(settled[0]?.parentEventId, airtable.id);
-    assert.equal(settled[0]?.data.shapeKey, 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN');
-    assert.equal(settled[0]?.data.resourceId, documentId);
+    assert.equal(reservations.length, 1, 'the refused reuse reserved nothing');
+    assert.equal(reservations[0]?.data.shapeKey, 'AIRTABLE_UPDATE_RECORD');
+    assert.equal(
+      listEvents(session.id, { types: ['external_write_succeeded'] }).length,
+      0,
+      'no artifact settlement exists to attach to the Airtable reservation',
+    );
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
   }
+});
+
+test('a truncated argument payload refuses one call without poisoning the accepted task', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const accepted = anchorAcceptedTask(session.id, 'look up the current status of the alpha record');
+  let providerCalls = 0;
+  const wrapped = wrapToolForHarness(tool({
+    name: 'alpha_record_get_by_id',
+    description: 'malformed-argument admission fixture',
+    parameters: z.object({ id: z.string().min(1) }),
+    execute: async ({ id }) => {
+      providerCalls += 1;
+      return `record ${id}`;
+    },
+  }));
+  const counter = new ToolCallsCounter(10);
+  const invoke = (rawInput: string, callId: string) => withHarnessRunContext(
+    { sessionId: session.id, turn: accepted.turn, sourceUserSeq: accepted.sourceUserSeq, counter },
+    () => (wrapped as unknown as {
+      invoke: (runContext: unknown, rawInput: string, details?: unknown) => Promise<unknown>;
+    }).invoke(undefined, rawInput, { toolCall: { callId } }),
+  );
+
+  // Truncated argument bytes are one of the most common model failures. They
+  // are not a callable contract, so admission cannot digest them — and left
+  // raw they return `conflict`, which poisons this task's resolution.
+  const malformed = await invoke('{', 'truncated-payload');
+  assert.match(String(malformed), /invalid|error/i, 'the model gets an ordinary retypable error');
+  assert.equal(providerCalls, 0, 'unreadable arguments never reach provider code');
+
+  // The point of the pin: the SAME accepted task keeps dispatching. A poisoned
+  // resolution refuses this with LogicalCallPreDispatchAuthorityError instead.
+  const valid = await invoke(JSON.stringify({ id: 'alpha-1' }), 'valid-payload');
+  assert.equal(valid, 'record alpha-1');
+  assert.equal(providerCalls, 1);
+});
+
+test('a gateway payload with unreadable inner arguments refuses one call, not the task', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const accepted = anchorAcceptedTask(session.id, 'read back the outlook messages for the account');
+  let dispatches = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      dispatches += 1;
+      return JSON.stringify({ successful: true, data: { items: [] } });
+    },
+  });
+  const counter = new ToolCallsCounter(10);
+  const invoke = (input: unknown, callId: string) => withHarnessRunContext(
+    { sessionId: session.id, turn: accepted.turn, sourceUserSeq: accepted.sourceUserSeq, counter },
+    () => (wrapped as unknown as {
+      invoke: (runContext: unknown, rawInput: string, details?: unknown) => Promise<unknown>;
+    }).invoke(null, JSON.stringify(input), { toolCall: { callId } }),
+  );
+
+  // The outer envelope is a perfectly good object; the INNER arguments string
+  // is truncated, so no inner contract can be digested. The refusal binds to
+  // the host-owned outer identity.
+  await invoke(
+    { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: '{"folder":' },
+    'malformed-inner-args',
+  );
+  const good = await invoke(
+    { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: JSON.stringify({ folder: 'inbox' }) },
+    'readable-inner-args',
+  );
+  assert.match(String(good), /successful/, 'the next gateway call in the same task still dispatches');
+  assert.ok(dispatches >= 1);
 });
 
 test('a provider request echo is not artifact readback evidence', async () => {
@@ -3369,6 +3529,7 @@ test('a provider request echo is not artifact readback evidence', async () => {
     type: 'user_input_received',
     data: { text: 'Create and verify one Google Doc.' },
   });
+  anchorExistingSource(session.id, source);
   const documentId = 'doc-echo-only-1';
   let readCount = 0;
   const wrapped = wrapToolForHarness({
@@ -3442,6 +3603,7 @@ test('typed non-shell pre-dispatch errors release an artifact create claim', asy
     type: 'user_input_received',
     data: { text: 'Create one Google Doc named Client brief.' },
   });
+  anchorExistingSource(session.id, source);
   const { ExternalWritePreDispatchError } = await import('./external-write-admission.js');
   const { listRunArtifacts } = await import('./artifact-ledger.js');
   const wrapped = wrapToolForHarness({
@@ -3500,13 +3662,14 @@ async function runCertifiedSendProbe(opts: { certifiedBatch?: { batchId: string;
   try {
     const sess = createSession({ kind: 'chat' }).id;
     // A goal (re-derived from the user's ask) so the goal-fidelity judge WOULD fire.
-    appendEvent({ sessionId: sess, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Send 10 personalized intro emails to the prospect list I approved.' } });
+    const source = appendEvent({ sessionId: sess, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Send 10 personalized intro emails to the prospect list I approved.' } });
+    anchorExistingSource(sess, source);
     let invoked = 0;
     const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', invoke: async () => { invoked += 1; return 'OK sent'; } }, {});
     const args = { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'a@firm.example', subject: 's', body: 'hello there, a personalized note for you' }) };
     const counter = new ToolCallsCounter(100);
     await withHarnessRunContext(
-      { sessionId: sess, counter, ...(opts.certifiedBatch ? { certifiedBatch: opts.certifiedBatch } : {}) },
+      { sessionId: sess, sourceUserSeq: source.seq, counter, ...(opts.certifiedBatch ? { certifiedBatch: opts.certifiedBatch } : {}) },
       () => (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
         .invoke({ context: { sessionId: sess } }, JSON.stringify(args), { toolCall: { callId: 'c-probe' } }),
     );
@@ -3575,6 +3738,7 @@ async function runJudgeFailSendProbe(opts: {
   try {
     const sess = createSession({ kind: 'chat' }).id;
     const source = appendEvent({ sessionId: sess, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Send the 10 approved intro emails to the prospect list.' } });
+    anchorExistingSource(sess, source);
     if (opts.judge === 'timeout') {
       // Two prior byte-identical sends to DISTINCT targets → a burst is in flight,
       // so a judge OUTAGE fails CLOSED (the exact live scenario).
@@ -3881,6 +4045,7 @@ test('a RESOLVED typed refusal (SDK-built tool path) settles failed — the 2026
     sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'Create the outreach drafts in my name.' },
   });
+  anchorExistingSource(session.id, source);
   const { ExternalWritePreDispatchResult } = await import('./external-write-admission.js');
   let accountPinned = false;
   let dispatches = 0;
@@ -3942,6 +4107,7 @@ test('the SDK PROSE shape of a swallowed typed error still settles orphaned — 
     sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'send it' },
   });
+  anchorExistingSource(session.id, source);
   const wrapped = wrapToolForHarness({
     name: 'composio_execute_tool',
     invoke: async () =>
@@ -3971,6 +4137,7 @@ test('inside a certified batch a RESOLVED typed refusal re-surfaces as a typed p
     sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'run the approved batch' },
   });
+  anchorExistingSource(session.id, source);
   const { ExternalWritePreDispatchResult, ExternalWritePreDispatchError } = await import('./external-write-admission.js');
   const wrapped = wrapToolForHarness({
     name: 'composio_execute_tool',
@@ -4001,6 +4168,7 @@ test('inside a certified batch a RESOLVED typed refusal re-surfaces as a typed p
 test('a steer note is appended to the next tool result exactly once — settlement and parked bytes stay clean', async () => {
   const { appendSteerNote } = await import('./steer-notes.js');
   const session = createSession({ id: 'sess-steer-bracket', kind: 'chat' });
+  const anchor = anchorAcceptedTask(session.id, 'Look up the firm facts.');
   const wrapped = wrapToolForHarness({
     name: 'memory_search_facts',
     execute: async () => 'fact-a; fact-b',
@@ -4008,6 +4176,7 @@ test('a steer note is appended to the next tool result exactly once — settleme
   const run = (label: string) => withHarnessRunContext(
     {
       sessionId: session.id,
+      sourceUserSeq: anchor.sourceUserSeq,
       behaviorScopeId: `${session.id}::${label}`,
       counter: new ToolCallsCounter(10),
     },
@@ -4070,9 +4239,11 @@ test('a timed-out job-starting call is NOT cancelled, so its late result can sel
     },
   }, { timeoutMs: 60 });                      // budget expires long before the call
   const session = createSession({ id: 'sess-job-timeout', kind: 'chat' });
+  const anchor = anchorAcceptedTask(session.id, 'Start the scrape run.');
   const out = await withHarnessRunContext(
     {
       sessionId: session.id,
+      sourceUserSeq: anchor.sourceUserSeq,
       behaviorScopeId: `${session.id}::turn`,
       counter: new ToolCallsCounter(10),
     },
@@ -4091,6 +4262,7 @@ test('a timed-out job-starting call is NOT cancelled, so its late result can sel
 test('a repeated CREATE is told it already exists — informed, never blocked', async (context) => {
   setEnvForTest(context, 'CLEMMY_EXECUTION_GATE', 'off');
   const session = createSession({ id: 'sess-repeat-create', kind: 'chat' });
+  const anchor = anchorAcceptedTask(session.id, 'Build the Airtable tables.');
   let dispatches = 0;
   const wrapped = wrapToolForHarness({
     name: 'composio_execute_tool',
@@ -4101,7 +4273,7 @@ test('a repeated CREATE is told it already exists — informed, never blocked', 
   });
   let callSeq = 0;
   const create = (name: string) => withHarnessRunContext(
-    { sessionId: session.id, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(20) },
+    { sessionId: session.id, sourceUserSeq: anchor.sourceUserSeq, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(20) },
     () => wrapped.execute!(
       { tool_slug: 'AIRTABLE_CREATE_TABLE', arguments: JSON.stringify({ baseId: 'appX', name }) },
       { context: { sessionId: session.id } },
@@ -4132,10 +4304,11 @@ test('an advisory goal-alignment miss reaches the MODEL as a manager nudge, and 
   _resetGoalFidelityStateForTests();
   const session = createSession({ kind: 'chat' });
   // The pinned task the user actually stated (the judge reads it from events).
-  appendEvent({
+  const source = appendEvent({
     sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'Find verified contact emails for each firm and put them in the sheet. Do not draft outreach.' },
   });
+  anchorExistingSource(session.id, source);
   // The judge sees the drift (live shape: she started producing outreach the
   // user never asked for). Zero skills loaded → advisory mode: inform, allow.
   _setGoalFidelityJudgeForTests(async () => ({
@@ -4149,7 +4322,7 @@ test('an advisory goal-alignment miss reaches the MODEL as a manager nudge, and 
   });
   try {
     const out = await withHarnessRunContext(
-      { sessionId: session.id, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(10) },
+      { sessionId: session.id, sourceUserSeq: source.seq, behaviorScopeId: `${session.id}::turn`, counter: new ToolCallsCounter(10) },
       () => wrapped.execute!(
         {
           tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
