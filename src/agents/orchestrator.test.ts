@@ -517,6 +517,10 @@ test('run_worker requires a structured parent-planned job packet', async () => {
     'expectedOutput',
     'intent',
     'workManifest',
+    // 2026-08-11 contracted fan-out: expectedWork carries the frozen-plan
+    // requirement so workers bind instead of concluding a capability is
+    // missing (nullable; strict mode keeps it in required).
+    'expectedWork',
     'items',
   ]);
   assert.equal(runWorker.parameters?.additionalProperties, false);

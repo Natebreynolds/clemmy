@@ -119,7 +119,7 @@ test('latest schema upgrades an existing v4 approval table without losing rows',
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34, // v34: normalized durable-memory host receipt authority
+    37, // v37: expected-work universe amendments (35 host evidence, 36 split-brain repair)
   );
   resetEventLog();
 });
@@ -163,7 +163,7 @@ test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => 
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34, // v34: normalized durable-memory host receipt authority
+    37, // v37: expected-work universe amendments (35 host evidence, 36 split-brain repair)
   );
   resetEventLog();
 });
@@ -298,7 +298,7 @@ test('fresh schema creates artifact truth, discovery, and accepted-task authorit
   );
   assert.equal(
     (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34, // v34: normalized durable-memory host receipt authority
+    37, // v37: expected-work universe amendments (35 host evidence, 36 split-brain repair)
   );
   resetEventLog();
 });
@@ -365,7 +365,7 @@ test('schema v12 upgrades a lazy artifact ledger in place and preserves its earl
   assert.equal(root.root_scope_id, 'root-first');
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34, // v34: normalized durable-memory host receipt authority
+    37, // v37: expected-work universe amendments (35 host evidence, 36 split-brain repair)
   );
   resetEventLog();
 });
@@ -401,7 +401,7 @@ test('schema v19 upgrades a live-like v18 database with invocation-scoped output
   assert.ok(tables.has('tool_output_invocations'));
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34,
+    37, // migrations now end at v37
   );
   writeToolOutput({
     sessionId: 'sess-live-v18',
@@ -432,7 +432,7 @@ test('schema v21 upgrades a v20 database with durable discovery claims and casca
   const migrated = openEventLog();
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34,
+    37, // migrations now end at v37
   );
   migrated.prepare(`
     INSERT INTO discovery_governor_tasks
@@ -545,7 +545,7 @@ test('schema v22 preserves complete legacy obligation evidence without inventing
   });
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34,
+    37, // migrations now end at v37
   );
   migrated.close();
   resetEventLog();
@@ -594,7 +594,7 @@ test('schema v22 quarantines an incomplete obligation table instead of promoting
   }
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34,
+    37, // migrations now end at v37
   );
   resetEventLog();
 });
@@ -625,7 +625,7 @@ test('schema v22 keeps sparse migration rehearsals sparse while installing stand
   ]);
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34,
+    37, // migrations now end at v37
   );
   resetEventLog();
 });
@@ -814,7 +814,7 @@ test('schema v32 installs immutable action bindings and removes only rows whose 
   const raw = new Database(HARNESS_DB_PATH);
   raw.pragma('foreign_keys = OFF');
   raw.exec(`
-    DELETE FROM schema_version WHERE version IN (32, 33, 34);
+    DELETE FROM schema_version WHERE version >= 32; -- runner resumes from MAX(version): every later version must go too
     INSERT INTO run_attempts
       (attempt_id, session_id, run_id, started_at, finished_at, status,
        lease_owner, lease_expires_at, source_user_seq)
@@ -837,7 +837,7 @@ test('schema v32 installs immutable action bindings and removes only rows whose 
   const migrated = openEventLog();
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34,
+    37, // migrations now end at v37
   );
   assert.deepEqual(
     migrated.prepare('SELECT attempt_id, source_user_seq FROM run_attempts ORDER BY attempt_id').all(),
@@ -866,7 +866,7 @@ test('schema v33 installs normalized pre-dispatch write bindings and proof autho
   const db = openEventLog();
   assert.equal(
     (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    34,
+    37, // migrations now end at v37
   );
   const tables = new Set(
     (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
