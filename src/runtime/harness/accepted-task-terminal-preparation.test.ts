@@ -207,6 +207,55 @@ test('a fully settled source-bound work manifest publishes done without a frozen
   );
 });
 
+
+// A mid-run contract revision (steer) supersedes earlier checkpoints; they
+// remain in the ledger as STALE history. Completion is judged on canonical
+// current coverage — a steered task that redid all items under v2 carried 42
+// stale v1 rows and was wrongly blocked (live 2026-08-11,
+// background-steer-in-flight, goal validation had already passed).
+test('a revised manifest fully settled under the new contract publishes despite stale rows', () => {
+  const task = acceptActivatedAction('Email alex@example.com the update for every record.');
+  workManifest.declareWorkManifest({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    manifestId: 'pin-steered-manifest',
+    contractVersion: '1',
+    phases: [{ id: 'research' }],
+    items: [{ id: 'account-01' }],
+  });
+  workManifest.checkpointWorkItem({
+    sessionId: task.sessionId,
+    manifestId: 'pin-steered-manifest',
+    contractVersion: '1',
+    phase: 'research',
+    itemId: 'account-01',
+    status: 'succeeded',
+    evidence: [{ kind: 'worker_result', ref: 'worker:v1:account-01' }],
+  });
+  workManifest.reviseWorkContract({
+    sessionId: task.sessionId,
+    manifestId: 'pin-steered-manifest',
+    fromVersion: '1',
+    toVersion: '2',
+    instruction: 'Use the corrected keyword for every account.',
+    evidencePolicy: 'redo',
+  });
+  workManifest.checkpointWorkItem({
+    sessionId: task.sessionId,
+    manifestId: 'pin-steered-manifest',
+    contractVersion: '2',
+    phase: 'research',
+    itemId: 'account-01',
+    status: 'succeeded',
+    evidence: [{ kind: 'worker_result', ref: 'worker:v2:account-01' }],
+  });
+  const summary = workManifest.summarizeWorkManifest(task.sessionId, 'pin-steered-manifest');
+  assert.ok((summary?.staleCheckpoints ?? 0) > 0, 'the superseded v1 checkpoint is stale history');
+  const prepared = preparation.prepareAcceptedTaskTerminal(task);
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  assert.equal(prepared.status === 'ready' && prepared.verdict.status, 'done');
+});
+
 test('a half-settled work manifest keeps the verification gap and names the open phases', () => {
   const task = acceptActivatedAction('Email alex@example.com the update for every record.');
   workManifest.declareWorkManifest({

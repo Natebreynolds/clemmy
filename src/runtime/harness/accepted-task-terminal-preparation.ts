@@ -65,11 +65,15 @@ type SettledWorkManifestAuthority =
   | { status: 'incomplete'; reason: string };
 
 function manifestFullySettled(summary: WorkManifestSummary): boolean {
+  // staleCheckpoints intentionally NOT required to be zero: a mid-run
+  // contract revision (steer) supersedes every earlier checkpoint, and the
+  // summary already excludes them from canonical coverage — a steered task
+  // that redid all 24 items under v2 carried 42 stale v1 rows and was
+  // wrongly blocked (live 2026-08-11, background-steer-in-flight).
   return summary.total > 0
     && summary.remaining === 0
     && summary.completed === summary.total
     && summary.anomalies.length === 0
-    && summary.staleCheckpoints === 0
     && summary.untrackedCheckpoints === 0
     && summary.evidenceCount > 0
     && summary.phases.every((phase) =>
