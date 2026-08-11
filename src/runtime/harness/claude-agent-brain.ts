@@ -1783,7 +1783,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       ...(request.runId ? { runId: request.runId } : {}),
     },
   }, { existingEventSeq: preRecordedUserInput?.seq, armRunInFlight: true });
-  recordTurnGraphShadow({
+  const brainGraphEvent = recordTurnGraphShadow({
     identity: {
       sessionId,
       turn: userInputEvent.turn,
@@ -1798,10 +1798,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // this exact source's hash-validated graph has durable cutover authority.
   // Re-entry from the bridge or a brain fallover observes the existing marker;
   // it never arms an independent task.
-  // TurnGraph v1 is a chat contract. Background/cron execution sessions keep
-  // their existing durable execution authority until an execution graph is
-  // introduced; they must not be forced through a fabricated chat graph.
-  if (getSession(sessionId)?.kind === 'chat') {
+  // Arm wherever a graph exists (all lanes persist the shadow now — the
+  // dispatch ledger and the lane-neutral carrier surface both require it;
+  // see the loop.ts twin for the live incident this closes). Contract and
+  // terminal scoping stay route-owned downstream.
+  if (brainGraphEvent !== null) {
     requireAcceptedTaskAuthority({
       sessionId,
       sourceUserSeq: userInputEvent.seq,

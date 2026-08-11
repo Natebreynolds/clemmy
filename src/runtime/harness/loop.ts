@@ -3634,18 +3634,25 @@ export async function runConversation(
     verifiedTaskContinuation: options.taskContinuation,
   });
   const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
-  const acceptedCapabilityRoute = getSession(options.sessionId)?.kind === 'chat'
-    ? acceptedTurnGraph?.classification.route ?? 'direct_reply'
-    : 'direct_reply';
+  // The route comes from the graph wherever one exists — the chat-only
+  // forcing to 'direct_reply' left act-routed background sources armed but
+  // never ACTIVATED (expected_work_required stayed 0), so every fan-out
+  // worker failed 'accepted action was not durably activated before
+  // execution' (live 2026-08-11, long-horizon-manifest run 3: 12/12 workers).
+  const acceptedCapabilityRoute = acceptedTurnGraph?.classification.route ?? 'direct_reply';
   // The graph is now execution authority rather than best-effort telemetry.
   // Arm its exact accepted source before capability construction, context
   // warming, model invocation, or any tool can run. A bridge/fallover may enter
   // this seam again with the same source; exact re-admission is idempotent.
-  // TurnGraph v1 currently contracts chat sources only. Execution/workflow
-  // sessions do not yet emit this graph and therefore cannot be armed through
-  // this protocol; leave their existing, separately-owned execution authority
-  // unchanged instead of manufacturing a chat graph for them here.
-  if (getSession(options.sessionId)?.kind === 'chat') {
+  // Arm wherever a graph exists. Every lane now persists the shadow graph
+  // (the dispatch ledger demands it), and the model-facing carrier surface
+  // (actionExpectedWorkCarrierSelection in orchestrator/SDK) is lane-neutral —
+  // an act-routed background/workflow source with a graph but no activation
+  // row had its batched run_worker refused live (2026-08-11:
+  // long-horizon-manifest, 12/12 items failed 'activation row is missing').
+  // Contract compilation and terminal adjudication keep their own
+  // route/kind scoping unchanged.
+  if (graphEvent !== null) {
     requireAcceptedTaskAuthority({
       sessionId: options.sessionId,
       sourceUserSeq,
