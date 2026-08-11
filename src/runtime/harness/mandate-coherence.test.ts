@@ -33,14 +33,17 @@ test.beforeEach(() => {
   delete process.env.CLEMMY_CODE_MODE;
 });
 
-test('PHANTOM-MANDATE pin: oracle wired, tool absent → the refusal names NO tool', () => {
+test('PHANTOM-MANDATE pin: a projectable name absent from the registered surface mandates nothing', () => {
   registerLocalSchemaProvider(() => new Map([
-    // A registered surface that does NOT contain run_tool_program — the exact
-    // shape of the live incident (code-mode env said yes, environment said no).
     ['some_other_tool', { type: 'object', required: [], properties: {} }],
   ]));
-  const mandate = mandateFor('run_tool_program');
-  assert.equal(mandate, null, 'a registered oracle without the tool must refuse the mandate');
+  // The projectable class (local runtime tools): absent from the registered
+  // surface → no mandate, no phantom.
+  assert.equal(mandateFor('memory_search'), null, 'a registered oracle without the tool must refuse the mandate');
+  // Structural fan-out primitives are per-agent closures, permanently outside
+  // the projection (161 local tools, neither present — probed 2026-08-11);
+  // they keep their proven env-derived availability instead.
+  assert.ok(mandateFor('run_tool_program'), 'structural primitive keeps env-derived availability');
 
   const message = buildFanoutRecoveryMessage({
     toolName: 'composio_execute_tool',
@@ -75,9 +78,10 @@ test('oracle-proven mandate renders the contract inline — the refusal contains
   assert.match(message, /required: program/, 'schema rides the refusal so zero discovery is needed to comply');
 });
 
-test('TRANSITION pin: unwired oracle preserves the exact legacy availability semantics', () => {
-  // No provider registered — pre-wiring lanes.
-  assert.ok(mandateFor('run_tool_program'), 'code mode defaults on → legacy mandate stands');
+test('STRUCTURAL pin: fan-out primitives keep env-derived availability, wired or not', () => {
+  // Registration state is irrelevant for the structural arm — these are
+  // per-agent closures the projection can never contain.
+  assert.ok(mandateFor('run_tool_program'), 'code mode defaults on → structural mandate stands');
   assert.equal(mandateFor('run_tool_program')?.source, 'legacy_env');
   assert.ok(mandateFor('run_worker'), 'the nudge tool keeps its historical (unchecked) availability');
 

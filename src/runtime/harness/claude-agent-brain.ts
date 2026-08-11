@@ -59,6 +59,9 @@ import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { enabledExternalServerNames } from '../mcp-servers.js';
 import { appendEvent } from './eventlog.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+// Lane wiring: the callable-surface oracle serves exact local schemas on this
+// lane (guardrail mandates are constructible only from proof).
+import '../../tools/callable-surface-registration.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
 import { enrichAcceptedRequestWithTaskContinuity } from './task-continuity-runtime.js';
 import {

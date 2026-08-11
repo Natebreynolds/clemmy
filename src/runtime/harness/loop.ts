@@ -193,6 +193,9 @@ import { withModelUsageAttribution } from '../usage-log.js';
 import type { TaskContinuationContext } from '../../types.js';
 import { effectiveTurnObjective } from './turn-control.js';
 import { recordTurnGraphShadow, turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
+// Lane wiring: the callable-surface oracle serves exact local schemas on this
+// lane (guardrail mandates are constructible only from proof).
+import '../../tools/callable-surface-registration.js';
 import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { requireKnownExpectedWorkContract } from './expected-work-contract.js';
 import { requireActionExpectedWorkActivation } from './action-expected-work-boundary.js';

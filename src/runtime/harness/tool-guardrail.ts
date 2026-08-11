@@ -38,11 +38,7 @@ import {
 import { isAutoApprovedByScope } from '../../agents/plan-scope.js';
 import { getRuntimeEnv } from '../../config.js';
 import { classifyRuntimeToolEffect, type RuntimeToolEffect } from './tool-effect.js';
-import {
-  isMandatable,
-  localSchemaProviderRegistered,
-  resolveCallable,
-} from './callable-surface.js';
+import { isMandatable, resolveCallable } from './callable-surface.js';
 
 const logger = pino({ name: 'clementine.harness.tool-guardrail' });
 
@@ -360,20 +356,19 @@ export function mandateFor(
     return mandate;
   }
   if (entry.eliminatedForTask) return null;
-  // TRANSITION (until every lane registers its local schema projection): an
-  // unwired oracle must not WEAKEN the proven block/nudge, so the two names
-  // the fan-out ladder historically prescribed keep their exact legacy
-  // availability semantics — run_tool_program gated on the code-mode env
-  // (the old codeModeRecoveryAvailable), run_worker unchecked. Once a lane
-  // registers, truth replaces both. The per-lane wiring pin retires this arm.
-  if (!localSchemaProviderRegistered()) {
-    if (name === 'run_tool_program') {
-      const codeMode = (getRuntimeEnv('CLEMMY_CODE_MODE', 'on') || 'on').trim().toLowerCase() !== 'off';
-      return codeMode ? { name, schema: null, requiredFields: [], source: 'legacy_env' } : null;
-    }
-    if (name === 'run_worker') {
-      return { name, schema: null, requiredFields: [], source: 'legacy_env' };
-    }
+  // STRUCTURAL arm (not a transition): the two batching primitives the
+  // fan-out ladder prescribes are per-agent closures, permanently outside the
+  // local schema projection the oracle serves (probed 2026-08-11: 161 local
+  // tools, neither present). Their availability semantics stay exactly the
+  // proven ones — run_tool_program gated on the code-mode env, run_worker
+  // unchecked. Every OTHER name resolves through the oracle or mandates
+  // nothing.
+  if (name === 'run_tool_program') {
+    const codeMode = (getRuntimeEnv('CLEMMY_CODE_MODE', 'on') || 'on').trim().toLowerCase() !== 'off';
+    return codeMode ? { name, schema: null, requiredFields: [], source: 'legacy_env' } : null;
+  }
+  if (name === 'run_worker') {
+    return { name, schema: null, requiredFields: [], source: 'legacy_env' };
   }
   return null;
 }
@@ -390,9 +385,9 @@ export function buildFanoutRecoveryMessage(opts: {
   mandate?: MandatedAlternative | null;
 }): string {
   const { toolName, slug, args, distinct, fanoutBlockAt } = opts;
-  const mandate = opts.mandate === undefined
-    ? { name: 'run_tool_program', schema: null, requiredFields: [], source: 'legacy_env' as const }
-    : opts.mandate;
+  // An omitted mandate renders the no-tool refusal — the message must never
+  // fabricate a prescription the oracle did not prove.
+  const mandate = opts.mandate ?? null;
   const label = slug ?? toolName;
   const innerArgs = slug ? (args as { arguments?: unknown })?.arguments : args;
   let exampleArgs: string;

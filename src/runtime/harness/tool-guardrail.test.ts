@@ -557,6 +557,7 @@ test('buildFanoutRecoveryMessage: composio dispatches via composio_execute_tool,
     toolName: 'composio_execute_tool', slug: 'OUTLOOK_GET_MAIL_FOLDER',
     args: { tool_slug: 'OUTLOOK_GET_MAIL_FOLDER', arguments: JSON.stringify({ folder_id: 'inbox' }) },
     distinct: 6, fanoutBlockAt: 6,
+    mandate: { name: 'run_tool_program', schema: null, requiredFields: [], source: 'legacy_env' },
   });
   assert.match(composio, /clem\.composio_execute_tool\(\{ tool_slug: "OUTLOOK_GET_MAIL_FOLDER"/, 'composio → composio_execute_tool');
   assert.doesNotMatch(composio, /clem\["outlook_get_mail_folder"\]/, 'the broken lowercased-slug dispatch must never return');
@@ -564,7 +565,10 @@ test('buildFanoutRecoveryMessage: composio dispatches via composio_execute_tool,
   assert.match(composio, /folder_id/, 'carries the literal arg shape the model was varying');
   assert.match(composio, /run_tool_program/);
 
-  const mcp = buildFanoutRecoveryMessage({ toolName: 'dataforseo__serp', args: { keyword: 'x' }, distinct: 6, fanoutBlockAt: 6 });
+  const mcp = buildFanoutRecoveryMessage({
+    toolName: 'dataforseo__serp', args: { keyword: 'x' }, distinct: 6, fanoutBlockAt: 6,
+    mandate: { name: 'run_tool_program', schema: null, requiredFields: [], source: 'legacy_env' },
+  });
   assert.match(mcp, /clem\["dataforseo__serp"\]\(a\)/, 'native MCP dispatched by its namespaced name');
 });
 
