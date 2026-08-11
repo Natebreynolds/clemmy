@@ -1624,7 +1624,6 @@ export function listConstraints(limit?: number): ConsolidatedFact[] {
 // evicted genuine user rules; importance-first ordering means overflow sheds the
 // least-important, and the render signals any elision.
 const POLICY_RUNAWAY_CAP = 256;
-const HARD_CONSTRAINT_SUMMARY_BUDGET = 1000;
 const CORE_PROFILE_BUDGET = 1400;
 const STANDING_PREFERENCE_BUDGET = 1000;
 
@@ -1735,7 +1734,15 @@ export function renderFactsForInstructions(
     const share = (present: boolean, weight: number, cap: number): number => present && activeWeight > 0
       ? Math.min(cap, Math.floor(totalPolicyBudget * weight / activeWeight))
       : 0;
-    const dispatchBudget = share(groups.dispatch_constraint.length > 0, 28, HARD_CONSTRAINT_SUMMARY_BUDGET);
+    // Dispatch-enforced constraints render IN FULL, always. They are few
+    // (compiled policies, POLICY_RUNAWAY_CAP-bounded), and each carries the
+    // POSITIVE route alongside the prohibition — eliding one as "still
+    // enforced" leaves the model without the prescribed path: live
+    // 2026-08-11, the sf-CLI-only rule was among "3 more constraints
+    // omitted", the model never learned to run `sf data query`, wandered for
+    // 55 calls, and produced zero drafts while the negative gate dutifully
+    // guarded a dispatch that never happened.
+    const dispatchBudget = Number.MAX_SAFE_INTEGER;
     const promptOnlyBudget = share(groups.prompt_instruction.length > 0, 25, totalPolicyBudget);
     const coreBudget = share(groups.core_profile.length > 0, 25, CORE_PROFILE_BUDGET);
     const preferenceBudget = share(groups.standing_preference.length > 0, 22, STANDING_PREFERENCE_BUDGET);

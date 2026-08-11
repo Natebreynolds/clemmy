@@ -1050,3 +1050,23 @@ test('180d purge eats only never-rescued archives — a resurrected fact survive
   assert.equal(getFact(doomed.id), null, 'never-used archive weight is finally gone');
   assert.equal(getFact(rescued.id)?.active, true, 'resurrection moves a fact out of the purge domain entirely');
 });
+
+// Dispatch-enforced constraints render IN FULL, always. Eliding one as
+// "still enforced" hides the POSITIVE route it carries: live 2026-08-11 the
+// sf-CLI-only rule fell among "3 more constraints omitted", the model never
+// learned to run `sf data query`, and a background run wandered 55 calls to
+// zero drafts while the negative dispatch gate guarded nothing.
+test('dispatch-enforced constraints are never elided from the standing block', () => {
+  const filler = 'The dispatch gate verifies the connected mailbox and routes to the compliant connection automatically, regardless of which account the draft was authored under, and never falls back silently. ';
+  rememberFact({
+    kind: 'constraint',
+    content: `Email sending constraint: ALWAYS send email via the Scorpion Outlook mailbox nathan.reynolds@scorpion.co. NEVER send from any other connected mailbox unless explicitly directed in the current conversation. ${filler}${filler}${filler}`,
+  });
+  rememberFact({
+    kind: 'constraint',
+    content: 'Salesforce is accessed ONLY through the authenticated sf CLI (run_shell_command: sf data query --json ...). NEVER use Composio Salesforce tools for reads or writes, and never ask the user to reconnect Composio Salesforce.',
+  });
+  const block = renderFactsForInstructions(10, 2600);
+  assert.match(block, /NEVER use Composio Salesforce/, 'the second dispatch constraint renders in full');
+  assert.doesNotMatch(block, /omitted from this summary but still enforced/, 'no dispatch constraint is ever elided');
+});
