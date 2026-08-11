@@ -19,6 +19,8 @@ const outcomes = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const authority = await import('./accepted-task-authority.js');
 const preparation = await import('./accepted-task-terminal-preparation.js');
+const admission = await import('./expected-work-admission.js');
+const workManifest = await import('./work-manifest.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -144,6 +146,106 @@ test('an incomplete collection remains repairable and cannot freeze a manifest',
   assert.equal(loaded.status === 'ok' && loaded.authority.state, 'armed');
   assert.equal(eventlog.listEvents(task.sessionId, { types: ['resolution_finalized'] }).length, 0);
   assert.equal(eventlog.listEvents(task.sessionId, { types: ['obligation_manifest'] }).length, 0);
+});
+
+function acceptActivatedAction(text: string) {
+  const session = eventlog.createSession({ id: `terminal-preparation-${++serial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
+  const activated = admission.activateActionExpectedWork({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.ok(
+    activated.status === 'activated' || activated.status === 'replayed',
+    JSON.stringify(activated),
+  );
+  return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+
+// The fan-out lane's durable work manifest is completion authority for an
+// accepted action that never froze a work_call contract: refusing it replaced
+// a fully settled 12/12 completion with a canned blocked terminal (live
+// 2026-08-11, long-horizon-manifest run 5).
+test('a fully settled source-bound work manifest publishes done without a frozen work contract', () => {
+  const task = acceptActivatedAction('Email alex@example.com the update for every record.');
+  workManifest.declareWorkManifest({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    manifestId: 'pin-fanout-manifest',
+    contractVersion: '1',
+    phases: [{ id: 'analyze' }, { id: 'validate', dependsOn: ['analyze'] }],
+    items: [{ id: 'record-001' }, { id: 'record-002' }],
+  });
+  for (const phase of ['analyze', 'validate']) {
+    for (const itemId of ['record-001', 'record-002']) {
+      workManifest.checkpointWorkItem({
+        sessionId: task.sessionId,
+        manifestId: 'pin-fanout-manifest',
+        contractVersion: '1',
+        phase,
+        itemId,
+        status: 'succeeded',
+        evidence: [{ kind: 'worker_result', ref: `worker:${phase}:${itemId}` }],
+      });
+    }
+  }
+  const prepared = preparation.prepareAcceptedTaskTerminal(task);
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  assert.equal(prepared.status === 'ready' && prepared.verdict.status, 'done');
+  assert.match(
+    prepared.status === 'ready' ? prepared.verdict.facts.join('; ') : '',
+    /4 item-phase\(s\)/,
+  );
+});
+
+test('a half-settled work manifest keeps the verification gap and names the open phases', () => {
+  const task = acceptActivatedAction('Email alex@example.com the update for every record.');
+  workManifest.declareWorkManifest({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    manifestId: 'pin-open-manifest',
+    contractVersion: '1',
+    phases: [{ id: 'analyze' }],
+    items: [{ id: 'record-001' }, { id: 'record-002' }],
+  });
+  workManifest.checkpointWorkItem({
+    sessionId: task.sessionId,
+    manifestId: 'pin-open-manifest',
+    contractVersion: '1',
+    phase: 'analyze',
+    itemId: 'record-001',
+    status: 'succeeded',
+    evidence: [{ kind: 'worker_result', ref: 'worker:analyze:record-001' }],
+  });
+  const prepared = preparation.prepareAcceptedTaskTerminal(task);
+  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
+  assert.match(
+    prepared.status === 'needs_verification' ? prepared.reason : '',
+    /not fully settled/,
+  );
+  assert.deepEqual(
+    prepared.status === 'needs_verification' ? prepared.missing : [],
+    ['cardinality_item_missing'],
+  );
+});
+
+test('an activated action with no work manifest still requires a frozen contract', () => {
+  const task = acceptActivatedAction('Email alex@example.com the update for every record.');
+  const prepared = preparation.prepareAcceptedTaskTerminal(task);
+  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
+  assert.deepEqual(
+    prepared.status === 'needs_verification' ? prepared.missing : [],
+    ['work_contract_missing'],
+  );
 });
 
 test('an accepted action that bypassed durable activation fails closed at terminal preparation', () => {

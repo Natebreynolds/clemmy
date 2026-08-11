@@ -25,6 +25,8 @@ import {
 } from './obligation-store.js';
 import { adjudicateTerminalForTaskSync, type TerminalVerdict } from './terminal-truth.js';
 import { prepareDurableMemoryIntakeHostCompletion } from './durable-memory-intake-receipt.js';
+import { listEvents } from './eventlog.js';
+import { summarizeWorkManifest, type WorkManifestSummary } from './work-manifest.js';
 
 export type AcceptedTaskTerminalPreparation =
   | { status: 'unstaged' }
@@ -55,6 +57,81 @@ function exactSatisfactionAlreadyExists(input: {
     && entry.obligation === input.obligation
     && entry.receiptId === input.receiptId
     && entry.physicalAttemptId === input.physicalDispatchId);
+}
+
+type SettledWorkManifestAuthority =
+  | { status: 'none' }
+  | { status: 'complete'; manifestIds: string[]; itemPhases: number }
+  | { status: 'incomplete'; reason: string };
+
+function manifestFullySettled(summary: WorkManifestSummary): boolean {
+  return summary.total > 0
+    && summary.remaining === 0
+    && summary.completed === summary.total
+    && summary.anomalies.length === 0
+    && summary.staleCheckpoints === 0
+    && summary.untrackedCheckpoints === 0
+    && summary.evidenceCount > 0
+    && summary.phases.every((phase) =>
+      phase.total > 0
+      && phase.succeeded === phase.total
+      && phase.pending === 0
+      && phase.running === 0
+      && phase.failed === 0
+      && phase.needsValidation === 0
+      && phase.invalidated === 0);
+}
+
+/**
+ * Durable work-manifest authority for an accepted action that fanned out
+ * through the control primitive instead of freezing a work_call contract.
+ *
+ * The fan-out lane already writes its own durable truth: manifest declarations
+ * bound to the accepted source, and per-item-phase checkpoints that REQUIRE
+ * evidence on success. Refusing that ledger and demanding a work_call contract
+ * replaced a fully verified 12/12 completion with a canned "I haven't been
+ * able to verify" terminal (live 2026-08-11, long-horizon-manifest run 5).
+ * Fail-closed: every manifest bound to the source must be fully settled with
+ * zero anomalies; anything less keeps the verification gap.
+ */
+function settledWorkManifestAuthority(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): SettledWorkManifestAuthority {
+  let manifestIds: string[];
+  try {
+    manifestIds = [...new Set(
+      listEvents(input.sessionId, { types: ['work_manifest_declared'] })
+        .map((event) => event.data as { sourceUserSeq?: unknown; manifestId?: unknown })
+        .filter((data) => data?.sourceUserSeq === input.sourceUserSeq)
+        .map((data) => (typeof data.manifestId === 'string' ? data.manifestId : ''))
+        .filter(Boolean),
+    )];
+  } catch (error) {
+    return { status: 'incomplete', reason: `work-manifest ledger unreadable: ${boundedReason(error)}` };
+  }
+  if (manifestIds.length === 0) return { status: 'none' };
+
+  let itemPhases = 0;
+  for (const manifestId of manifestIds) {
+    const summary = summarizeWorkManifest(input.sessionId, manifestId);
+    if (!summary) {
+      return { status: 'incomplete', reason: `declared work manifest ${manifestId} has no readable state` };
+    }
+    if (!manifestFullySettled(summary)) {
+      const openPhases = summary.phases
+        .filter((phase) => phase.succeeded !== phase.total)
+        .map((phase) => `${phase.id}: ${phase.succeeded}/${phase.total}`);
+      return {
+        status: 'incomplete',
+        reason: `work manifest ${manifestId} is not fully settled`
+          + (openPhases.length > 0 ? ` (${openPhases.join('; ')})` : '')
+          + (summary.anomalies.length > 0 ? `; anomalies: ${summary.anomalies.slice(0, 3).join('; ')}` : ''),
+      };
+    }
+    itemPhases += summary.phases.reduce((sum, phase) => sum + phase.total, 0);
+  }
+  return { status: 'complete', manifestIds, itemPhases };
 }
 
 function verdictResult(
@@ -140,6 +217,31 @@ export function prepareAcceptedTaskTerminal(input: {
       }
       if (host.status === 'conflict') {
         return { status: 'conflict', reason: host.reason };
+      }
+    }
+    if (action.status === 'required' && !action.contractId) {
+      const workAuthority = settledWorkManifestAuthority(input);
+      if (workAuthority.status === 'complete') {
+        return {
+          status: 'ready',
+          manifestId: workAuthority.manifestIds[0]!,
+          verdict: {
+            status: 'done',
+            missing: [],
+            facts: [
+              `every declared work item-phase is durably settled with evidence: `
+              + `${workAuthority.itemPhases} item-phase(s) across `
+              + `${workAuthority.manifestIds.length} manifest(s) (${workAuthority.manifestIds.join(', ')})`,
+            ],
+          },
+        };
+      }
+      if (workAuthority.status === 'incomplete') {
+        return {
+          status: 'needs_verification',
+          reason: workAuthority.reason,
+          missing: ['cardinality_item_missing'],
+        };
       }
     }
     return {
