@@ -82,4 +82,10 @@ test('the count-only example in the work_call description is a VALID proposal (t
   assert.match(source, /JSON\.stringify\(WORK_CALL_COUNT_ONLY_EXAMPLE\)/, 'the example constant must be embedded in the work_call description');
   const sealed = WORK_CALL_COUNT_ONLY_EXAMPLE.universes[0];
   assert.equal(sealed.seal, 'complete_source_receipt', 'the example teaches the sealed-universe shape, not accepted_input');
+  // Live 2026-08-11 run 5: the model proposed a compute op for drafting, then
+  // composed in-model — an undischargeable requirement that blocked the writes
+  // for 800s. The description must carry the composition rule; rewording it is
+  // fine, deleting the teaching is not.
+  assert.match(source, /compute ONLY for work a tool will perform/,
+    'the description must teach that model-composed content is not a compute operation');
 });

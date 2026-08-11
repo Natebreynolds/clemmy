@@ -97,6 +97,12 @@ export const WorkCallInputSchema = z.object({
   }).strict().nullable().describe(
     'RFC 6901 pointer selecting the exact member or finite member array in normalized inner arguments.',
   ),
+  seal_amendment: z.object({
+    universe_id: IdSchema,
+    member_id_pointer: z.string().max(512),
+  }).strict().nullable().optional().describe(
+    'ONE correction to a source-derived universe\'s memberIdPointer, allowed only after a seal refusal named the record\'s actual keys and only before any member is bound. The frozen proposal itself never changes.',
+  ),
   name: z.string().min(1).describe('Exact reachable inner tool name returned by tool_search/catalog.'),
   args_json: z.string().describe('JSON object string matching the inner tool schema.'),
 }).strict();
@@ -144,6 +150,8 @@ function repairLineFor(kind: ExpectedWorkAdmissionFailureKind): string {
       return 'This requirement is already complete — its stored result is included under `result`. Use it; do NOT re-run this requirement. Continue with the next `open` entry in `plan`.';
     case 'work_dependency_pending':
       return 'Complete the dependency named in `detail` first — `plan` shows each requirement\'s state. Dispatch the blocked requirement only after its dependency reads `satisfied`.';
+    case 'work_universe_unsealed':
+      return 'The source universe is not sealed. If the detail names the record keys, the member id pointer in the proposal does not match the source: re-issue this same work_call with seal_amendment { universe_id, member_id_pointer } set to the correct pointer — allowed ONCE, before any member is bound.';
     case 'work_requirement_unknown':
     case 'work_effect_mismatch':
     case 'work_cardinality_mismatch':
@@ -227,6 +235,14 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         requirementId: frame.input.requirement_id,
         universeItemId: frame.input.universe_item_id,
         universeSelector: normalizedSelector(frame.input.universe_selector),
+        ...(frame.input.seal_amendment
+          ? {
+              sealAmendment: {
+                universeId: frame.input.seal_amendment.universe_id,
+                memberIdPointer: frame.input.seal_amendment.member_id_pointer,
+              },
+            }
+          : {}),
         tool: resolved.targetName,
         args: resolved.targetArgs,
         inputSchema: resolved.targetInputSchema ?? undefined,
@@ -285,6 +301,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       'The proposal describes only effects, dependencies, coverage, cardinality and universes—never tool names, providers, services or slugs.',
       'For later calls set proposal to null and bind the exact requirement/item from the frozen contract.',
       `Count-only fanout ("one write per record from this read") — a VALID first-call proposal: ${JSON.stringify(WORK_CALL_COUNT_ONLY_EXAMPLE)}. The sealed universe sizes itself from the settled read; memberIdPointer is an RFC 6901 pointer to each record's id (empty string when the record itself is the id).`,
+      'Content you compose yourself (drafts, summaries, messages) is NOT a compute operation — composition happens inside the consuming write\'s args. Propose compute ONLY for work a tool will perform; a compute requirement no tool call ever carries can never be proven and will block everything that depends on it.',
       'Use tool_search first when the inner name/schema is unknown. Ask the user naturally if the intended work itself is ambiguous.',
     ].join(' '),
     parameters: WorkCallInputSchema,
