@@ -19,7 +19,14 @@ import {
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { toolOutputLooksSuccessful } from '../runtime/harness/tool-evidence.js';
 import { toolCallCorrelationFingerprint } from '../runtime/harness/tool-correlation.js';
-import { textResult } from './shared.js';
+import {
+  claimClaudeLocalPermissionAdmission,
+} from '../runtime/harness/claude-local-tool-correlation.js';
+import {
+  settledReadRepeatReplayDisposition,
+} from '../runtime/harness/settled-read-repeat.js';
+import { runtimeToolAccountingMetadata } from '../runtime/harness/tool-effect.js';
+import { isHarnessRefusalText, textResult } from './shared.js';
 
 function previewArgs(input: unknown): Record<string, unknown> {
   const o = (input ?? {}) as Record<string, unknown>;
@@ -256,21 +263,71 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
             wrapped.invoke!(runContext, JSON.stringify(input ?? {}), details),
           );
           const text = typeof out === 'string' ? out : out == null ? '' : JSON.stringify(out);
+          const accounting = runtimeToolAccountingMetadata(name, rawInput);
+          const settledReadReplay = canonicalClaim
+            && sourceUserSeq
+            && runScopeId
+            && accounting.effect === 'read'
+            && accounting.toolSlug
+            ? settledReadRepeatReplayDisposition({
+                sessionId,
+                replayCallId: canonicalClaim.providerCallId,
+                replayCalledEventId: canonicalClaim.calledEventId,
+                toolName: name,
+                effect: accounting.effect,
+                sourceUserSeq,
+                replayBehaviorScopeId: runScopeId,
+                toolSlug: accounting.toolSlug,
+              })
+            : null;
           try {
             // The mirror row reports what the OUTPUT says, not "the call
             // returned" — a resolved harness refusal must never read ok:true.
-            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...(sourceUserSeq ? { sourceUserSeq } : {}), tool: name, callId, ok: toolOutputLooksSuccessful(text), preview: text.slice(0, 400), accounting: 'transport_mirror' } });
+            appendEvent({
+              sessionId,
+              turn: 0,
+              role: 'tool',
+              type: 'tool_returned',
+              data: {
+                ...(sourceUserSeq ? { sourceUserSeq } : {}),
+                ...(runScopeId ? { runScopeId } : {}),
+                tool: name,
+                callId: innerCallId,
+                ...(canonicalClaim ? {
+                  canonicalCallId: canonicalClaim.providerCallId,
+                  canonicalCalledEventId: canonicalClaim.calledEventId,
+                } : {}),
+                // A harness refusal is a FAILED call in the ledger. Before
+                // this check the mirror row stamped ok:1 on refusal text, so
+                // every health metric read a policy denial as a success
+                // (live: 36 denied discovery calls, all success-shaped on the
+                // mirror, Aug 8-10 forensics).
+                ok: !isHarnessRefusalText(text) && toolOutputLooksSuccessful(text),
+                preview: text.slice(0, 400),
+                accounting: 'transport_mirror',
+                ...(settledReadReplay ? {
+                  providerDispatched: false,
+                  replayedFromCallId: settledReadReplay.sourceCallId,
+                } : {}),
+              },
+            });
           } catch { /* best-effort */ }
           // ONE park, inside the bracket: wrapped.invoke already formatted and
           // parked the exact payload (digest + recall pointer + exact-output
           // receipt) inside the harness's tool-output context. Re-formatting
           // here ran OUTSIDE that scope, so the second writeToolOutput lost the
           // invocation nonce and clobbered the receipt-bearing row.
-          return textResult(text);
+          //
+          // isError must be set on refusals: this lane returned policy denials
+          // as ordinary text, byte-identical in shape to a real answer — the
+          // sibling surface got it right (call-tool.ts textResult isError) and
+          // renderTypedRefusalForModel sat here with zero callers while the
+          // model treated denials as answers.
+          return textResult(text, { isError: isHarnessRefusalText(text) });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           try {
-            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...(sourceUserSeq ? { sourceUserSeq } : {}), tool: name, callId, ok: false, error: message.slice(0, 400), accounting: 'transport_mirror' } });
+            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...(sourceUserSeq ? { sourceUserSeq } : {}), ...(runScopeId ? { runScopeId } : {}), tool: name, callId: innerCallId, ...(canonicalClaim ? { canonicalCallId: canonicalClaim.providerCallId, canonicalCalledEventId: canonicalClaim.calledEventId } : {}), ok: false, error: message.slice(0, 400), accounting: 'transport_mirror' } });
           } catch { /* best-effort */ }
           throw err;
         }
