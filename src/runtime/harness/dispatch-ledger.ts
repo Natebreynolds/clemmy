@@ -154,6 +154,7 @@ function poisonResolution(
   sessionId: string,
   sourceUserSeq: number,
   logicalToolCallId?: string,
+  reason?: string,
 ): void {
   db.prepare(`
     UPDATE accepted_task_resolutions
@@ -161,10 +162,21 @@ function poisonResolution(
      WHERE session_id = ? AND source_user_seq = ? AND state = 'open'
   `).run(sessionId, sourceUserSeq);
   if (logicalToolCallId) {
+    // Record the FIRST cause here too. This is the OTHER poison path, and it
+    // recorded nothing: a live workflow died on it twice a day for two days
+    // and the store could not say which check failed (platform-49).
     db.prepare(`
-      UPDATE logical_tool_calls SET state = 'conflict'
+      UPDATE logical_tool_calls
+         SET state = 'conflict',
+             conflict_reason = COALESCE(conflict_reason, ?)
        WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-    `).run(sessionId, sourceUserSeq, logicalToolCallId);
+    `).run(
+      (reason ?? 'dispatch authority poisoned without a stated cause')
+        .replace(/\s+/g, ' ').trim().slice(0, 240),
+      sessionId,
+      sourceUserSeq,
+      logicalToolCallId,
+    );
   }
 }
 
@@ -193,7 +205,7 @@ function admitLogicalCallInTransaction(
   } catch (error) {
     const reason = boundedReason(error);
     if (reason.includes('conflicts with its persisted graph') || reason.includes('is ambiguous')) {
-      poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId ?? undefined);
+      poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId ?? undefined, reason);
       return { status: 'conflict', reason };
     }
     throw error;
@@ -205,11 +217,11 @@ function admitLogicalCallInTransaction(
     || input.sourceUserSeq !== expected.identity.sourceUserSeq
     || !logicalToolCallId
   ) {
-    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId ?? undefined);
+    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId ?? undefined, 'logical call names a different accepted task or unsafe identity');
     return { status: 'conflict', reason: 'logical call names a different accepted task or unsafe identity' };
   }
   if (!contract) {
-    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId);
+    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId, 'logical call tool identity is unsafe');
     return { status: 'conflict', reason: 'logical call tool identity is unsafe' };
   }
 
@@ -255,7 +267,7 @@ function admitLogicalCallInTransaction(
     !logicalMatches(row, expected.acceptedTaskId, contract.toolName, contract.argumentDigest, phase)
     || row.state !== 'open'
   ) {
-    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId);
+    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId, 'logical call identity conflicts with its durable contract');
     return { status: 'conflict', reason: 'logical call identity conflicts with its durable contract' };
   }
   return {
@@ -357,11 +369,11 @@ export function refineLogicalCallContract(input: {
         || input.identity.sourceUserSeq !== expected.identity.sourceUserSeq
         || !logicalToolCallId
       ) {
-        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, logicalToolCallId ?? undefined);
+        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, logicalToolCallId ?? undefined, 'contract refinement names a different accepted task or unsafe identity');
         return { status: 'conflict', reason: 'contract refinement names a different accepted task or unsafe identity' };
       }
       if (!effective) {
-        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, logicalToolCallId);
+        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, logicalToolCallId, 'effective logical call contract is unsafe');
         return { status: 'conflict', reason: 'effective logical call contract is unsafe' };
       }
 
@@ -381,7 +393,7 @@ export function refineLogicalCallContract(input: {
         || row.tool_name !== effective.toolName
         || row.state === 'conflict'
       ) {
-        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, logicalToolCallId);
+        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, logicalToolCallId, 'contract refinement conflicts with its logical owner or tool');
         return { status: 'conflict', reason: 'contract refinement conflicts with its logical owner or tool' };
       }
       if (row.state !== 'open') {
@@ -433,7 +445,7 @@ export function refineLogicalCallContract(input: {
         ) {
           return { status: 'replayed', identity: identity(row.effective_argument_digest) };
         }
-        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, logicalToolCallId);
+        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, logicalToolCallId, 'logical call already has a different effective contract');
         return { status: 'conflict', reason: 'logical call already has a different effective contract' };
       }
 
@@ -625,7 +637,7 @@ export function beginPhysicalDispatch(input: {
           && prior.tool_name === tool
           && prior.argument_digest === digest;
         if (!same) {
-          poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, input.identity.logicalToolCallId);
+          poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, input.identity.logicalToolCallId, 'physical dispatch id conflicts with an existing crossing');
           return { status: 'conflict', reason: 'physical dispatch id conflicts with an existing crossing' };
         }
         return {
@@ -756,7 +768,7 @@ export function settlePhysicalDispatch(input: {
         || row.logical_tool_call_id !== input.identity.logicalToolCallId
         || row.tool_name !== tool
       ) {
-        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, input.identity.logicalToolCallId);
+        poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, input.identity.logicalToolCallId, 'physical settlement conflicts with its start');
         return { status: 'conflict', reason: 'physical settlement conflicts with its start' };
       }
       if (row.state !== 'started') {
