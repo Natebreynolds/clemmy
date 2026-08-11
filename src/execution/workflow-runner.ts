@@ -3057,6 +3057,25 @@ async function runStepViaHarness(
         attemptId: stepAttempt.attemptId,
       },
     });
+    // Persist the turn graph for this exact accepted source. Lanes that run
+    // through the harness loop arm themselves; the SDK workflow-step lane
+    // never enters the loop, and dispatch admission requires the persisted
+    // graph — without it every business call on the step was refused
+    // 'no persisted turn graph for accepted task' and the step blocked
+    // silently (live 2026-08-11, team-activity-slack-updates pull_activity:
+    // run_shell_command refused twice, run "completed" with 2 blocked steps
+    // and no notification). Same pattern as ensureWorkflowCallIdentity.
+    try {
+      const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+      recordTurnGraphShadow({
+        identity: {
+          sessionId: realSessionId,
+          turn: sourceUserEvent.turn,
+          sourceUserSeq: sourceUserEvent.seq,
+        },
+        surface: 'workflow',
+      });
+    } catch { /* admission's typed refusal remains the fail-closed backstop */ }
     // Flag-gated (WORKFLOW_STEP_AGENT): the constrained step agent emits
     // structured output via workflow_step_result and CANNOT re-trigger
     // workflows (no recursion). Default off → the full orchestrator +
