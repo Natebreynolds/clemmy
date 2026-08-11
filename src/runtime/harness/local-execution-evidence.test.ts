@@ -917,3 +917,124 @@ test('the member-id correction is allowed exactly once, and never against eviden
   // And with a member already bound, identity cannot change underneath it.
   assert.match(second.reason, /already used its one member-id correction|bound member call/);
 });
+
+test('a compute requirement no tool ever attempted names its own way out', () => {
+  // Live run 5: the model proposed a compute op for drafting, composed the
+  // drafts in-model, and every write blocked for 800s behind a requirement
+  // nothing would ever settle. The gate was right; it just could not say why.
+  const task = acceptLocalAction('compute');
+  const composedProposal = {
+    version: 1 as const,
+    operations: [
+      {
+        id: 'read_leads',
+        effect: 'read' as const,
+        coverage: 'complete_set' as const,
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'once' as const },
+      },
+      {
+        id: 'draft_per_lead',
+        effect: 'compute' as const,
+        dependsOn: ['read_leads'],
+        dataFrom: ['read_leads'],
+        cardinality: { kind: 'each' as const, universeId: 'leads' },
+      },
+      {
+        id: 'write_draft',
+        effect: 'local_write' as const,
+        dependsOn: ['read_leads', 'draft_per_lead'],
+        dataFrom: ['draft_per_lead'],
+        cardinality: { kind: 'each' as const, universeId: 'leads' },
+      },
+    ],
+    universes: [{
+      id: 'leads',
+      seal: 'complete_source_receipt' as const,
+      producedBy: 'read_leads',
+      memberIdPointer: '/id',
+    }],
+  };
+  const args = { path: 'leads.json' };
+  const sourceCall = `logical:${task.label}:source`;
+  assert.equal(dispatch.admitLogicalCall({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: sourceCall,
+    },
+    tool: SOURCE_TOOL,
+    args,
+  }).status, 'inserted');
+  assert.equal(admissionModule.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId: sourceCall,
+    proposal: composedProposal,
+    requirementId: 'read_leads',
+    tool: SOURCE_TOOL,
+    args,
+  }).status, 'bound');
+  settleLocal({
+    task, logicalToolCallId: sourceCall, tool: SOURCE_TOOL, args,
+    result: { records: [{ id: 'lead-001' }, { id: 'lead-002' }] },
+    requirementId: 'read_leads',
+  });
+
+  const refused = admissionModule.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId: openAndBindable(task, 'draft-blocked-compute', 'lead-001'),
+    proposal: null,
+    requirementId: 'write_draft',
+    universeItemId: 'lead-001',
+    universeSelector: { argumentPointer: '/lead_id', memberIdPointer: null },
+    tool: DRAFT_TOOL,
+    args: { path: 'drafts/lead-001.md', content: 'x', lead_id: 'lead-001' },
+  });
+  assert.equal(refused.status, 'refused');
+  if (refused.status !== 'refused') throw new Error('an undischargeable dependency admitted work');
+  assert.equal(refused.kind, 'work_dependency_pending');
+  assert.match(refused.reason, /dependency draft_per_lead is not durably satisfied/);
+  assert.match(
+    refused.reason,
+    /no tool call has ever attempted this compute requirement/,
+    'the refusal names the way out as data',
+  );
+  assert.match(refused.reason, /re-propose without the compute operation/);
+
+  // A NON-compute dependency gets no advisory — an unsettled read may yet
+  // settle, and it is not a composition problem.
+  const readBlocked = acceptLocalAction('compute-negative');
+  const readSource = openAndBind({
+    task: readBlocked,
+    suffix: 'source',
+    tool: SOURCE_TOOL,
+    args,
+    requirementId: 'read_leads',
+    withProposal: true,
+  });
+  assert.ok(readSource, 'the standard two-op contract froze');
+  const blocked = admissionModule.admitExpectedWorkInvocation({
+    sessionId: readBlocked.sessionId,
+    sourceUserSeq: readBlocked.sourceUserSeq,
+    logicalToolCallId: openAndBindable(readBlocked, 'draft-before-source', 'lead-001'),
+    proposal: null,
+    requirementId: 'write_draft',
+    universeItemId: 'lead-001',
+    universeSelector: { argumentPointer: '/lead_id', memberIdPointer: null },
+    tool: DRAFT_TOOL,
+    args: { path: 'drafts/lead-001.md', content: 'x', lead_id: 'lead-001' },
+  });
+  assert.equal(blocked.status, 'refused');
+  if (blocked.status !== 'refused') throw new Error('an unsettled read admitted work');
+  assert.match(blocked.reason, /dependency read_leads is not durably satisfied/);
+  assert.doesNotMatch(
+    blocked.reason,
+    /no tool call has ever attempted/,
+    'a read dependency is not a composition problem and gets no compute advisory',
+  );
+});
