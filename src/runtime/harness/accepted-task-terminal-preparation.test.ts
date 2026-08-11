@@ -371,6 +371,20 @@ test('an activated action with zero mutating settlements publishes the conversat
   );
 });
 
+
+// The classifier reads reply-directives as action intent ("ping — reply with
+// one word" scored action 0.65, identical to a real work ask). The reply
+// decides: claim-free content publishes; a claim-shaped "Done." with zero
+// evidence still holds (live 2026-08-11 dev-daemon smoke: plain ping was
+// replaced by the verification hold on the real home).
+test('a zero-evidence action terminal publishes a claim-free reply and holds a claim-shaped one', () => {
+  const task = acceptActivatedAction('ping the harness and reply with one word please');
+  const published = preparation.prepareAcceptedTaskTerminal({ ...task, proposedReply: 'pong' });
+  assert.equal(published.status, 'ready', JSON.stringify(published));
+  const held = preparation.prepareAcceptedTaskTerminal({ ...task, proposedReply: 'Done from the model.' });
+  assert.equal(held.status, 'needs_verification', JSON.stringify(held));
+});
+
 test('a zero-call done claim on an action-intent ask still fails closed', () => {
   const task = acceptActivatedAction('Email alex@example.com the update for every record.');
   const prepared = preparation.prepareAcceptedTaskTerminal(task);

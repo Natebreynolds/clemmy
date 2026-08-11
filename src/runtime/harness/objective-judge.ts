@@ -166,6 +166,21 @@ const PROMISE_PHRASE_RE =
 const ARTIFACT_EVIDENCE_RE =
   /\b(?:done|completed|finished|created|drafted|generated|saved|wrote|written|sent|posted|updated|added|attached|here'?s|here is|i'?ve (?:created|drafted|saved|sent|added|updated|built|put together)|https?:\/\/|\/[\w.-]+\/)/i;
 
+/**
+ * Does the reply CLAIM completed work (done/sent/created/saved/URL/path…)?
+ * Single-sourced on the same vocabulary the promise detector suppresses on.
+ * A zero-evidence action terminal holds only claim-shaped replies — a reply
+ * that IS the content ("pong", an answer, a question) is conversation, not an
+ * unverified work claim (live 2026-08-11: "ping — reply with one word"
+ * classified action-intent and the plain reply was replaced by the
+ * verification hold).
+ */
+export function replyClaimsCompletedWork(reply?: string | null): boolean {
+  const text = (reply ?? '').trim();
+  if (!text) return false;
+  return ARTIFACT_EVIDENCE_RE.test(text);
+}
+
 export function isPromiseShapedReply(reply?: string | null): boolean {
   const text = (reply ?? '').trim();
   if (!text) return false;

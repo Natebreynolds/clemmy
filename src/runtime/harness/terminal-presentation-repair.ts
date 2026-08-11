@@ -283,6 +283,7 @@ export async function repairActionTerminalBeforeCommit(input: {
   const preparation = prepareAcceptedTaskTerminal({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
+    proposedReply: input.proposedReply,
   });
   if (preparation.status !== 'needs_verification') {
     return { status: 'unchanged', text: input.proposedReply };

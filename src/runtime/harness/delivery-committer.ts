@@ -489,6 +489,7 @@ export function commitTurnOutcome(
     const preparation = prepareAcceptedTaskTerminal({
       sessionId: requested.identity.sessionId,
       sourceUserSeq: requested.identity.sourceUserSeq,
+      proposedReply: requested.text,
     });
     if (preparation.status !== 'ready' && preparation.status !== 'unstaged') {
       effectiveOutcome = unverifiedCompletionOutcome(outcome);

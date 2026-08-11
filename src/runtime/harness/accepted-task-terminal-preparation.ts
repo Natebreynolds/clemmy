@@ -24,6 +24,7 @@ import {
   loadManifestState,
 } from './obligation-store.js';
 import { adjudicateTerminalForTaskSync, type TerminalVerdict } from './terminal-truth.js';
+import { replyClaimsCompletedWork } from './objective-judge.js';
 import { prepareDurableMemoryIntakeHostCompletion } from './durable-memory-intake-receipt.js';
 import { listEvents, openEventLog } from './eventlog.js';
 import { summarizeWorkManifest, type WorkManifestSummary } from './work-manifest.js';
@@ -235,6 +236,10 @@ function verdictResult(
 export function prepareAcceptedTaskTerminal(input: {
   sessionId: string;
   sourceUserSeq: number;
+  /** The reply proposed for delivery, when the caller has it. Used ONLY to
+   * distinguish a claim-shaped zero-evidence action terminal (held) from a
+   * reply that IS the content (published). */
+  proposedReply?: string;
 }): AcceptedTaskTerminalPreparation {
   const contract = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
   if (contract.status === 'missing') {
@@ -342,7 +347,18 @@ export function prepareAcceptedTaskTerminal(input: {
             },
           };
         }
-        if (conversationalActClassification(input)) {
+        // Two conversational doors: the graph says the ask is conversation-
+        // shaped, OR the reply itself claims no completed work (the classifier
+        // reads reply-directives like "ping — reply with one word" as action
+        // intent; a claim-free reply IS the content, not an unverified claim —
+        // live 2026-08-11 dev-daemon smoke). A claim-shaped "Done." with zero
+        // evidence still holds.
+        if (
+          conversationalActClassification(input)
+          || (typeof input.proposedReply === 'string'
+            && input.proposedReply.trim().length > 0
+            && !replyClaimsCompletedWork(input.proposedReply))
+        ) {
           return {
             status: 'ready',
             manifestId: `conversational:${input.sessionId}:${input.sourceUserSeq}`,
