@@ -225,8 +225,13 @@ export function registerBackgroundTaskTools(server: McpServer): void {
             .find((event) => (event.data as { sourceUserSeq?: unknown })?.sourceUserSeq === beatSourceSeq);
           const data = firstDecision?.data as { phase?: unknown; consequential?: unknown } | undefined;
           if (data?.phase === 'align' && data?.consequential === true) {
+            // The typed refusal prefix keeps this NON-HALTING at the
+            // control-receipt fast path (an unmarked refusal was treated as a
+            // successful receipt, the renderer fabricated a "Started …" line,
+            // and the honesty floor then blocked the whole turn — live
+            // 2026-08-11, second acceptance run).
             return textResult([
-              'Alignment beat owed — no task was started.',
+              'Tool call refused by harness: alignment beat owed — no task was started.',
               'This request is consequential and this turn opened in the ALIGN phase: reply to the user FIRST with the plan in plain language — what you will do, the concrete steps, and the success criteria — and ask for their go-ahead.',
               'Dispatch after they confirm; their confirmation arrives as their next message.',
             ].join('\n'));

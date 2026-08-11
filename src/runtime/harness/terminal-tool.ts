@@ -90,6 +90,12 @@ export function renderTerminalToolReply(rawName: string, input: unknown, output:
     if (typeof note === 'string' && note.trim().length >= 12) return note.trim();
     const match = output.match(/Dispatched "([^"]+)" to the background \(task ([^)]+)\)/i);
     const inputObjective = (input as { objective?: unknown } | null | undefined)?.objective;
+    // Never fabricate a handoff claim: without a real dispatch receipt in the
+    // output, the honest reply is the output itself (a refusal rendered as
+    // "Started …" was blocked by the honesty floor — live 2026-08-11).
+    if (!match && !(typeof inputObjective === 'string' && inputObjective.trim())) {
+      return output.trim() || 'dispatch_background_task completed.';
+    }
     const title = match?.[1] || (typeof inputObjective === 'string' && inputObjective.trim() ? inputObjective.trim() : 'the task');
     const taskId = match?.[2];
     return `Started "${title}" in the background${taskId ? ` (${taskId})` : ''} — it reports back here when it finishes or gets stuck.`;

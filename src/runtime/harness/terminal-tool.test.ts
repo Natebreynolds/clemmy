@@ -107,3 +107,15 @@ test('the orchestrator halt hook ends the turn on a successful background contro
   ] as never);
   assert.equal(notHalted.isFinalOutput, false, 'a failed control read returns to the model loop');
 });
+
+// The alignment-beat refusal must never halt the turn as a "successful"
+// dispatch receipt: unmarked, it was rendered into a fabricated "Started …"
+// line and the honesty floor blocked the whole turn (live 2026-08-11,
+// second acceptance run).
+test('the alignment-beat refusal is a failed control receipt and fabricates nothing', async () => {
+  const { renderTerminalToolReply, terminalToolShouldHalt } = await import('./terminal-tool.js');
+  const refusal = 'Tool call refused by harness: alignment beat owed — no task was started.\nReply with the plan first.';
+  assert.equal(terminalToolShouldHalt('dispatch_background_task', refusal), false);
+  const rendered = renderTerminalToolReply('dispatch_background_task', null, 'anything without a dispatch receipt');
+  assert.doesNotMatch(rendered, /^Started "/, 'no fabricated handoff claim without a real receipt');
+});
