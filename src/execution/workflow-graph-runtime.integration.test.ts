@@ -46,6 +46,49 @@ const {
 } = await import('./workflow-graph.js');
 const { persistWorkflowGraphSnapshot } = await import('./workflow-graph-store.js');
 const { createWorkflowRunDefinitionSnapshot } = await import('./workflow-run-definition.js');
+const {
+  appendEvent,
+  createSession,
+  getSession,
+  listEvents: listHarnessEvents,
+} = await import('../runtime/harness/eventlog.js');
+const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+
+/**
+ * The real runConversation is what mints the ambient identity every wrapped
+ * tool dispatch settles against: a session row, an accepted source event, a
+ * persisted turn graph, and the run context carrying that identity. These
+ * tests replace runConversation with a mock, so a mock that drives REAL
+ * wrapped tools has to mint the same identity itself — otherwise the tool
+ * throws ToolAttemptSettlementAuthorityError('uncorrelated').
+ */
+async function withStepToolIdentity<T>(
+  sessionId: string,
+  inputText: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  if (!getSession(sessionId)) createSession({ id: sessionId, kind: 'workflow' });
+  const source = listHarnessEvents(sessionId, { types: ['user_input_received'] })[0]
+    ?? appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: inputText },
+    });
+  recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+    surface: 'workflow',
+  });
+  return await withHarnessRunContext({
+    sessionId,
+    sourceUserSeq: source.seq,
+    turn: source.turn,
+    counter: new ToolCallsCounter(1_000),
+    behaviorScopeId: `${sessionId}::graph-runtime-test`,
+  }, work) as T;
+}
 
 test.after(() => {
   _setBeforeWorkflowGraphFinalizationForTests(null);
@@ -176,10 +219,14 @@ test('creation test certifies the compiled specialist graph rather than the flat
         const queryTool = (request.agent?.tools ?? [])
           .find((toolRef) => toolRef.name === 'workspace_artifact_query');
         assert.ok(queryTool?.invoke);
-        const queried = await queryTool.invoke(
-          { context: { sessionId } },
-          JSON.stringify({ path: creationSeedPath, json_path: 'rows', offset: 0, limit: 1 }),
-          { toolCall: { callId: `creation-query-${sessionId}` } },
+        const queried = await withStepToolIdentity(
+          sessionId,
+          String(request.input ?? 'creation test step'),
+          () => queryTool.invoke!(
+            { context: { sessionId } },
+            JSON.stringify({ path: creationSeedPath, json_path: 'rows', offset: 0, limit: 1 }),
+            { toolCall: { callId: `creation-query-${sessionId}` } },
+          ),
         );
         artifactQueries.push(String(queried));
       }
@@ -662,37 +709,43 @@ test('Platform-49-derived scan pages 500 opaque records, finds a final-page delt
 
         let summary: string;
         if (isPageAudit) {
-          for (const offset of [0, 100, 200, 300, 400]) {
-            const page = String(await queryTool.invoke(
+          await withStepToolIdentity(sessionId, String(request.input ?? ''), async () => {
+            for (const offset of [0, 100, 200, 300, 400]) {
+              const page = String(await queryTool.invoke!(
+                invocationContext,
+                JSON.stringify({
+                  path: inventoryPath,
+                  json_path: 'records',
+                  fields: ['id', 'baseline', 'observed'],
+                  offset,
+                  limit: 100,
+                }),
+                { toolCall: { callId: `platform49-page-${offset}` } },
+              ));
+              assert.ok(
+                page.includes(`showing 100 record(s) [${offset}-${offset + 100}] of 500`),
+                `page ${offset / 100 + 1} must preserve exact pagination metadata`,
+              );
+              pagedOffsets.push(offset);
+            }
+          });
+          summary = 'PRIVATE-PAGE-AUDIT:500-EXACT';
+        } else {
+          const tail = await withStepToolIdentity(
+            sessionId,
+            String(request.input ?? ''),
+            async () => String(await queryTool.invoke!(
               invocationContext,
               JSON.stringify({
                 path: inventoryPath,
                 json_path: 'records',
                 fields: ['id', 'baseline', 'observed'],
-                offset,
-                limit: 100,
+                offset: 499,
+                limit: 1,
               }),
-              { toolCall: { callId: `platform49-page-${offset}` } },
-            ));
-            assert.ok(
-              page.includes(`showing 100 record(s) [${offset}-${offset + 100}] of 500`),
-              `page ${offset / 100 + 1} must preserve exact pagination metadata`,
-            );
-            pagedOffsets.push(offset);
-          }
-          summary = 'PRIVATE-PAGE-AUDIT:500-EXACT';
-        } else {
-          const tail = String(await queryTool.invoke(
-            invocationContext,
-            JSON.stringify({
-              path: inventoryPath,
-              json_path: 'records',
-              fields: ['id', 'baseline', 'observed'],
-              offset: 499,
-              limit: 1,
-            }),
-            { toolCall: { callId: 'platform49-final-page-delta' } },
-          ));
+              { toolCall: { callId: 'platform49-final-page-delta' } },
+            )),
+          );
           assert.ok(tail.includes(finalOpaqueId), 'the decimal-like ID survives as an exact opaque string');
           assert.ok(tail.includes('"baseline": "queued"'));
           assert.ok(tail.includes('"observed": "reviewed"'));
@@ -957,31 +1010,34 @@ test('processWorkflowRuns resumes from the persisted live graph and includes its
       const queryTool = (request.agent?.tools ?? [])
         .find((toolRef) => toolRef.name === 'workspace_artifact_query');
       assert.ok(queryTool?.invoke, 'graph node receives its scoped artifact query');
-      const invocationContext = { context: { sessionId: request.sessionId ?? 'graph-test' } };
-      const queried = await queryTool.invoke(
-        invocationContext,
-        JSON.stringify({
-          path: exactSeedPath,
-          json_path: 'rows',
-          offset: 420,
-          limit: 1,
-          fields: ['index', 'value'],
-        }),
-        { toolCall: { callId: 'graph-exact-row' } },
-      );
-      queryResults.push(String(queried));
-      const refused = await queryTool.invoke(
-        invocationContext,
-        JSON.stringify({ path: runFile, limit: 1 }),
-        { toolCall: { callId: 'graph-outside-run' } },
-      );
-      outsideRunResults.push(String(refused));
-      const orphanRefused = await queryTool.invoke(
-        invocationContext,
-        JSON.stringify({ path: orphanSeedPath, limit: 1 }),
-        { toolCall: { callId: 'graph-orphan-artifact' } },
-      );
-      orphanResults.push(String(orphanRefused));
+      const stepSessionId = String(request.sessionId ?? 'graph-test');
+      const invocationContext = { context: { sessionId: stepSessionId } };
+      await withStepToolIdentity(stepSessionId, String(request.input ?? ''), async () => {
+        const queried = await queryTool.invoke!(
+          invocationContext,
+          JSON.stringify({
+            path: exactSeedPath,
+            json_path: 'rows',
+            offset: 420,
+            limit: 1,
+            fields: ['index', 'value'],
+          }),
+          { toolCall: { callId: 'graph-exact-row' } },
+        );
+        queryResults.push(String(queried));
+        const refused = await queryTool.invoke!(
+          invocationContext,
+          JSON.stringify({ path: runFile, limit: 1 }),
+          { toolCall: { callId: 'graph-outside-run' } },
+        );
+        outsideRunResults.push(String(refused));
+        const orphanRefused = await queryTool.invoke!(
+          invocationContext,
+          JSON.stringify({ path: orphanSeedPath, limit: 1 }),
+          { toolCall: { callId: 'graph-orphan-artifact' } },
+        );
+        orphanResults.push(String(orphanRefused));
+      });
       return {
         sessionId: request.sessionId ?? `workflow:${runId}:restart_probe`,
         status: 'completed',
@@ -1140,14 +1196,19 @@ test('an in-process graph node pages an offloaded upstream result without wideni
       };
     }) => {
       const tools = request.agent?.tools ?? [];
-      const invocationContext = { context: { sessionId: request.sessionId ?? 'graph-test' } };
-      if (String(request.sessionId ?? '').endsWith(':seed')) {
+      const stepSessionId = String(request.sessionId ?? 'graph-test');
+      const invocationContext = { context: { sessionId: stepSessionId } };
+      if (stepSessionId.endsWith(':seed')) {
         const resultTool = tools.find((toolRef) => toolRef.name === 'workflow_step_result');
         assert.ok(resultTool?.invoke, 'the authored seed can emit its complete structural result');
-        await resultTool.invoke(
-          invocationContext,
-          JSON.stringify({ data: JSON.stringify(seedOutput) }),
-          { toolCall: { callId: 'seed-full-result' } },
+        await withStepToolIdentity(
+          stepSessionId,
+          String(request.input ?? ''),
+          () => resultTool.invoke!(
+            invocationContext,
+            JSON.stringify({ data: JSON.stringify(seedOutput) }),
+            { toolCall: { callId: 'seed-full-result' } },
+          ),
         );
         return {
           sessionId: request.sessionId,
@@ -1170,15 +1231,19 @@ test('an in-process graph node pages an offloaded upstream result without wideni
         .at(-1);
       assert.ok(seedArtifact);
       const exactPath = path.join(runWorkspaceDir(workflowSlug, runId), seedArtifact.path);
-      const queried = await queryTool.invoke(
-        invocationContext,
-        JSON.stringify({
-          path: exactPath,
-          json_path: 'rows',
-          offset: 150,
-          limit: 1,
-        }),
-        { toolCall: { callId: 'graph-in-process-exact-row' } },
+      const queried = await withStepToolIdentity(
+        stepSessionId,
+        String(request.input ?? ''),
+        () => queryTool.invoke!(
+          invocationContext,
+          JSON.stringify({
+            path: exactPath,
+            json_path: 'rows',
+            offset: 150,
+            limit: 1,
+          }),
+          { toolCall: { callId: 'graph-in-process-exact-row' } },
+        ),
       );
       graphQueries.push(String(queried));
       return {
