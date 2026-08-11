@@ -345,7 +345,13 @@ export function assertExpectedWorkLogicalAdmission(input: {
     : input.tool.includes('__')
       ? ''
       : input.tool;
-  if (!authority.work_contract_id && actionTopologyRoleFor(registryName) === 'control') return;
+  // Control-role tools (ask/status/discovery/execution bookkeeping) are exempt
+  // REGARDLESS of contract state — the wall exists for BUSINESS dispatch, and
+  // a status probe after freezing is still acquisition, not work. Gating the
+  // exemption on !work_contract_id turned the first post-freeze mcp_status
+  // into a turn-killing 500 on a plain conversational scenario (live
+  // 2026-08-11, converse-first: run_failed ExpectedWorkBindingRequiredError).
+  if (actionTopologyRoleFor(registryName) === 'control') return;
   throw new ExpectedWorkBindingRequiredError(
     authority.work_contract_id
       ? `call ${input.logicalToolCallId ?? '(unidentified)'} is not bound to the frozen contract`
