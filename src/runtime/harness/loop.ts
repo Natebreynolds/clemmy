@@ -552,11 +552,21 @@ function acceptResumeConversationInput(opts: {
 /** Narrow test seam for exact approval-response source ownership. */
 export const _acceptResumeConversationInputForTest = acceptResumeConversationInput;
 
+/** Narrow test seam for the newest-ask terminal question selection. */
+export const _terminalQuestionTextForTest = (result: RunConversationResult): string =>
+  terminalQuestionText(result);
+
 function terminalQuestionText(result: RunConversationResult): string {
   const eventQuestion = (() => {
     try {
+      // desc+limit returns the newest window in CHRONOLOGICAL order, so
+      // .find() here picked the OLDEST matching ask — a byte-identical
+      // 18-minute-old clarifying question was re-delivered as the terminal
+      // (live 2026-08-09; the user re-answered and poisoned the run). Take
+      // the newest match, same as task-continuity-runtime.
       const event = listEvents(result.sessionId, { types: ['awaiting_user_input'], desc: true, limit: 40 })
-        .find((candidate) => candidate.turn === result.lastTurn);
+        .filter((candidate) => candidate.turn === result.lastTurn)
+        .at(-1);
       return event ? publicReplyText(event.data.question, '') : '';
     } catch { return ''; }
   })();

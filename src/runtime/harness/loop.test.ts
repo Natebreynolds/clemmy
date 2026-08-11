@@ -87,7 +87,7 @@ const {
   recordRunAttemptUserInput,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText, _terminalQuestionTextForTest } = await import('./loop.js');
 const {
   isSafeDurableMemoryReceiptPresentation,
   looksLikeHealthyDurableMemoryAcknowledgement,
@@ -11362,6 +11362,29 @@ test('L1 (v2.3.0): a DONE decision with a non-completed action and no reply ALSO
 const RECOVERY_SUMMARY_REPLY =
   'I was partway through pulling the prospect list for your team and hit a wall reading the Salesforce results. ' +
   'I have the first 15 accounts identified so far. Want me to keep going with those while we sort the rest?';
+
+
+// B6 stale-replay: desc+limit listEvents returns the newest window in
+// CHRONOLOGICAL order, so a .find() over it picks the OLDEST matching ask.
+// Live 2026-08-09: a byte-identical 18-minute-old clarifying question was
+// re-delivered as the terminal; the user re-answered and poisoned the run.
+test('terminalQuestionText picks the NEWEST awaiting ask for the turn, never a stale replay', () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id, turn: 3, role: 'Clem', type: 'awaiting_user_input',
+    data: { question: 'Which keyword should I use: alpha or beta?' },
+  });
+  appendEvent({
+    sessionId: sess.id, turn: 3, role: 'Clem', type: 'awaiting_user_input',
+    data: { question: 'One more thing before I dispatch: which sheet tab?' },
+  });
+  const text = _terminalQuestionTextForTest({
+    sessionId: sess.id, status: 'awaiting_user_input', steps: 1, lastTurn: 3,
+  } as never);
+  assert.match(text, /which sheet tab/i);
+  assert.doesNotMatch(text, /alpha or beta/i);
+});
 
 test('runConversation: exhausted stall retries trigger ONE recovery-summary turn whose reply is DELIVERED', async () => {
   resetEventLog();
