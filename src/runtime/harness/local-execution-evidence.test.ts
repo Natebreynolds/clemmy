@@ -1038,3 +1038,63 @@ test('a compute requirement no tool ever attempted names its own way out', () =>
     'a read dependency is not a composition problem and gets no compute advisory',
   );
 });
+
+test('the live count-only source shape is locked end to end', () => {
+  // SHAPE FIDELITY, hand-authored rather than copied from a forensic store.
+  // This is the exact production shape the count-only proof reads: five
+  // records, Salesforce "Id" casing, pretty-printed JSON arriving as TEXT from
+  // a whole-file host read. Every wall this wave closed is on the path between
+  // those bytes and a sealed universe, so a regression in any one of them —
+  // host exhaustion, the JSON-text records path, the keys detail, the single
+  // amendment — surfaces here rather than in a live run.
+  //
+  // Unlike the other pins in this file it does NOT fail on old code by design:
+  // it locks a shape that already works, so a future change cannot quietly
+  // stop working for Nathan's actual records.
+  const task = acceptLocalAction('liveshape');
+  const args = { path: 'leads.json' };
+  const call = openAndBind({
+    task, suffix: 'source', tool: SOURCE_TOOL, args,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task, logicalToolCallId: call, tool: SOURCE_TOOL, args,
+    result: JSON.stringify([
+      { Id: 'lead-001', company: 'Harbor & Vale LLP', lastTouch: 'asked for pricing two weeks ago' },
+      { Id: 'lead-002', company: 'Cedarline Physical Therapy', lastTouch: 'went quiet after the demo' },
+      { Id: 'lead-003', company: 'Bright Anchor Dental', lastTouch: 'wanted a case study' },
+      { Id: 'lead-004', company: 'Kestrel Roofing Co', lastTouch: 'budget freeze until this month' },
+      { Id: 'lead-005', company: 'Juniper Family Law', lastTouch: 'new decision maker joined' },
+    ], null, 2),
+    requirementId: 'read_leads',
+  });
+
+  // The handle stays byte-faithful: a string payload exposes no collection and
+  // carries no completeness signal.
+  const handle = eventlog.openEventLog().prepare(`
+    SELECT record_path, record_count, completeness FROM durable_result_handles
+     WHERE logical_tool_call_id = ?
+  `).get(call) as { record_path: string | null; record_count: number; completeness: string };
+  assert.deepEqual(handle, { record_path: null, record_count: 0, completeness: 'unknown' });
+
+  // As proposed, '/id' misses and the refusal hands back the real keys.
+  const asProposed = sealFor(task);
+  assert.equal(asProposed.status, 'unsealed');
+  assert.match(
+    asProposed.status === 'unsealed' ? asProposed.reason : '',
+    /no value at member id pointer '\/id' \(record keys: \/Id, \/company, \/lastTouch\)/,
+  );
+
+  // One correction, and all five members seal from the text bytes.
+  const bound = bindMember(task, 'lead-003', 'draft-live', {
+    universeId: 'leads',
+    memberIdPointer: '/Id',
+  });
+  assert.equal(bound.status, 'bound', JSON.stringify(bound));
+  const sealed = sealFor(task);
+  assert.equal(sealed.status, 'sealed');
+  assert.deepEqual(
+    sealed.status === 'sealed' ? sealed.seal.members : [],
+    ['lead-001', 'lead-002', 'lead-003', 'lead-004', 'lead-005'],
+  );
+});
