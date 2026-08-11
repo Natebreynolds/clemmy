@@ -238,17 +238,18 @@ test('a half-settled work manifest keeps the verification gap and names the open
   );
 });
 
-test('an activated action whose turn mutated without manifest or contract keeps the gap', () => {
-  // The mutating dispatch lands in the pre-activation window (restart/bridge
-  // race) — post-activation, the dispatch-ledger backstop refuses unbound
-  // dispatch outright, so this is the exact seam the terminal branch guards.
+test('a worked turn without manifest or contract publishes on its durable work evidence', () => {
+  // The dispatch lands in the pre-activation window (restart/bridge race) —
+  // post-activation, the dispatch-ledger backstop refuses unbound dispatch
+  // outright. A turn that DID work publishes as it always has; the
+  // zero-evidence action-claim pin below is what fails closed.
   const session = eventlog.createSession({ id: `terminal-preparation-${++serial}`, kind: 'chat' });
   const source = eventlog.appendEvent({
     sessionId: session.id,
     turn: 1,
     role: 'user',
     type: 'user_input_received',
-    data: { text: 'Email alex@example.com the update for every record.' },
+    data: { text: 'what time is it in the office calendar?' },
   });
   assert.ok(shadow.recordTurnGraphShadow({
     identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
@@ -299,10 +300,10 @@ test('an activated action whose turn mutated without manifest or contract keeps 
     JSON.stringify(activated),
   );
   const prepared = preparation.prepareAcceptedTaskTerminal(task);
-  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
-  assert.deepEqual(
-    prepared.status === 'needs_verification' ? prepared.missing : [],
-    ['work_contract_missing'],
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  assert.match(
+    prepared.status === 'ready' ? prepared.verdict.facts.join('; ') : '',
+    /durable work evidence/,
   );
 });
 
@@ -311,12 +312,22 @@ test('an activated action whose turn mutated without manifest or contract keeps 
 // mutating calls and owns no manifest was answered in conversation — blocking
 // it replaced ordinary replies with a canned verification refusal.
 test('an activated action with zero mutating settlements publishes the conversational terminal', () => {
-  const task = acceptActivatedAction('Email alex@example.com the update for every record.');
+  const task = acceptActivatedAction('what time is it?');
   const prepared = preparation.prepareAcceptedTaskTerminal(task);
   assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
   assert.match(
     prepared.status === 'ready' ? prepared.verdict.facts.join('; ') : '',
-    /no mutating call settled/,
+    /conversational reply is the terminal/,
+  );
+});
+
+test('a zero-call done claim on an action-intent ask still fails closed', () => {
+  const task = acceptActivatedAction('Email alex@example.com the update for every record.');
+  const prepared = preparation.prepareAcceptedTaskTerminal(task);
+  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
+  assert.deepEqual(
+    prepared.status === 'needs_verification' ? prepared.missing : [],
+    ['work_contract_missing'],
   );
 });
 

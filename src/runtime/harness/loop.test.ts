@@ -97,6 +97,24 @@ const fixtureDispatchLedger = await import('./dispatch-ledger.js');
 const fixtureOutcomes = await import('./attempt-outcome.js');
 const fixtureSettlements = await import('./logical-call-settlement-store.js');
 const fixtureIdentities = await import('./attempt-identity.js');
+const fixtureWorkManifest = await import('./work-manifest.js');
+
+
+/** Wrap runConversation options so each model pass first settles one real
+ *  read for the accepted source (fixture policy: stub work settles what it
+ *  claims — the fail-closed action terminal refuses ZERO-evidence done
+ *  claims, validated live 2026-08-11). */
+function withSettledWork<T extends { sessionId: string; runRunner?: any }>(options: T): T {
+  const rr = options.runRunner;
+  if (!rr) return options;
+  return {
+    ...options,
+    runRunner: async (...args: unknown[]) => {
+      try { settleFixtureRead(options.sessionId); } catch { /* fixture-only */ }
+      return rr(...args);
+    },
+  };
+}
 
 let fixtureReadSerial = 0;
 const fixtureReadSettled = new Set<string>();
@@ -126,7 +144,29 @@ function settleFixtureRead(sessionId: string): void {
     tool: 'fixture_mailbox_search',
     args: { query: 'fixture' },
   });
-  if (begun.status !== 'inserted') return;
+  if (begun.status !== 'inserted') {
+    // An ACTIVATED action refuses unbound business dispatch outright
+    // (work_binding_required) — settle the act fixture through the
+    // work-manifest authority lane instead, exactly as live fan-out does.
+    fixtureWorkManifest.declareWorkManifest({
+      sessionId,
+      sourceUserSeq: source.seq,
+      manifestId: `fixture-work-${source.seq}`,
+      contractVersion: '1',
+      phases: [{ id: 'work' }],
+      items: [{ id: 'item-1' }],
+    });
+    fixtureWorkManifest.checkpointWorkItem({
+      sessionId,
+      manifestId: `fixture-work-${source.seq}`,
+      contractVersion: '1',
+      phase: 'work',
+      itemId: 'item-1',
+      status: 'succeeded',
+      evidence: [{ kind: 'artifact', ref: `artifact:fixture-work-${source.seq}` }],
+    });
+    return;
+  }
   fixtureDispatchLedger.settlePhysicalDispatch({
     identity: begun.identity,
     tool: 'fixture_mailbox_search',
@@ -668,13 +708,13 @@ test('unattended self-heal: a transient infra error auto-retries and recovers (n
     }
     return { history: items, lastResponseId: undefined, finalOutput: { summary: 'recovered', reply: 'Done after the auto-retry', done: true, nextAction: 'completed', reason: null } } as never;
   };
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'run the enrichment step',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed', 'the run self-healed and completed');
   assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 1, 'the self-heal is visible in the trace');
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'never asked an absent human');
@@ -744,7 +784,7 @@ test('infra recovery composes from one exact settled read instead of asking the 
     } as never;
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     sourceUserSeq: source.seq,
@@ -752,7 +792,7 @@ test('infra recovery composes from one exact settled read instead of asking the 
     input: objective,
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(modelTurns, 2, 'one replacement model turn composes the answer');
@@ -1688,7 +1728,7 @@ test('compound decline preserves the complete user message for the model but jud
   const filteredInputs: AgentInputItem[][] = [];
   const judgedObjectives: string[] = [];
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: fullMessage,
@@ -1735,7 +1775,7 @@ test('compound decline preserves the complete user message for the model but jud
         finalOutput: decision,
       };
     },
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(result.lastDecision?.reply, reply, 'runtime scoping must not replace the provider-authored conversation');
@@ -3836,7 +3876,7 @@ test('non-reconciliation completion correction still replaces a rejected public 
     } as never;
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Create and verify the workspace cadence report.',
@@ -3846,7 +3886,7 @@ test('non-reconciliation completion correction still replaces a rejected public 
       : { done: false, reason: 'the artifact has not been created' },
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(calls, 2);
@@ -3890,13 +3930,13 @@ test('standard lane completes green when the provider create is BOUND', async ()
       },
     };
   };
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'put 20 firm outreach drafts in a google sheet',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed', 'a bound create never parks the completion');
   const asks = listEvents(sess.id, { types: ['awaiting_user_input'] })
     .filter((e) => e.data.source === 'artifact_verification_pending');
@@ -3986,13 +4026,13 @@ test('runConversation: stops on first completed decision', async () => {
       },
     },
   ]);
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'write a README',
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 1);
   assert.equal(result.lastDecision?.done, true);
@@ -4215,10 +4255,10 @@ test('runConversation: YOLO auto-resolved ask (autonomy_note + stray nextAction:
       summary: 'sent the remaining emails', reply: 'Sent the rest of the R&R emails.',
       done: true, nextAction: 'completed', reason: null } };
   };
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(), sessionId: sess.id, input: 'send the rest',
     makeRunner: makeRunnerStub, runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed', 'must NOT strand on awaiting_user_input after a YOLO auto-proceed');
   assert.ok(call >= 2, 'the loop ran a second turn instead of halting');
   const reconciled = listEventsForConv(sess.id, { types: ['heartbeat'] })
@@ -4428,7 +4468,7 @@ test('objective judge: gates premature completion and continues (action intent)'
     { finalOutput: { summary: 'Built the report', reply: 'Done — report saved to /tmp/report.md', done: true, nextAction: 'completed', reason: null } },
   ]);
   const judgeCalls: string[] = [];
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'build me a research report on solar adoption',
@@ -4439,7 +4479,7 @@ test('objective judge: gates premature completion and continues (action intent)'
     },
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 2, 'judge forced a second step before completing');
   assert.equal(judgeCalls.length, 2);
@@ -4477,7 +4517,7 @@ test('objective judge continuation does not quarantine a draft that later succee
     { finalOutput: { summary: 'finished', reply: 'Done — report saved to /tmp/final-report.md', done: true, nextAction: 'completed', reason: null } },
   ]);
   let judgeCalls = 0;
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'build me a research report',
@@ -4490,7 +4530,7 @@ test('objective judge continuation does not quarantine a draft that later succee
     },
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   assert.equal(result.status, 'completed');
@@ -4512,7 +4552,7 @@ test('objective judge: a successful read cannot certify a claimed build', async 
     ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'build the app',
@@ -4520,7 +4560,7 @@ test('objective judge: a successful read cannot certify a claimed build', async 
     judgeFn: async () => { judgeInvoked = true; return { done: true, reason: 'verified by test' }; },
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(judgeInvoked, true);
 });
@@ -4591,7 +4631,7 @@ test('objective judge: exact-source collection receipt removes only the redundan
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     sourceUserSeq: source.seq,
@@ -4604,7 +4644,7 @@ test('objective judge: exact-source collection receipt removes only the redundan
     },
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 1);
@@ -4730,7 +4770,7 @@ test('objective judge: exact read-only discovery scaffold counts as meaningful e
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     sourceUserSeq: source.seq,
@@ -4743,7 +4783,7 @@ test('objective judge: exact read-only discovery scaffold counts as meaningful e
     },
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(judgeCalls, 0, 'literal read-carrier calls do not trigger a second completion judge');
@@ -4814,7 +4854,7 @@ test('objective judge: restart change framing without prior authority stays judg
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     sourceUserSeq: source.seq,
@@ -4827,7 +4867,7 @@ test('objective judge: restart change framing without prior authority stays judg
     },
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(result.lastDecision?.reply, reply);
@@ -5160,7 +5200,7 @@ test('objective judge: a downstream claim-grounding bounce never leaves a premat
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     sourceUserSeq: source.seq,
@@ -5170,7 +5210,7 @@ test('objective judge: a downstream claim-grounding bounce never leaves a premat
     judgeFn: async () => ({ done: true, reason: 'the corrected reply is complete' }),
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(modelTurns, 2, 'the invented pointer is corrected before terminal acceptance');
@@ -5286,7 +5326,7 @@ test('objective judge: an unexecuted script-backed skill prevents the read recei
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     sourceUserSeq: source.seq,
@@ -5299,7 +5339,7 @@ test('objective judge: an unexecuted script-backed skill prevents the read recei
     },
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(modelTurns, 2, 'the missing prescribed script forces one corrective continuation');
@@ -5375,7 +5415,7 @@ test('objective judge: schema-on-demand execution_complete preview is an accepte
     };
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Create the resource, populate all requested records, and read them back exactly.',
@@ -5386,7 +5426,7 @@ test('objective judge: schema-on-demand execution_complete preview is an accepte
     },
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(judgeCalls, 0, 'the execution controller already performed the completion judgment');
 });
@@ -5463,7 +5503,7 @@ test('objective judge: an upper-bound result count is not a quota after one mean
     ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Make one real read-only call and return up to three real suggestions. Do not retry.',
@@ -5474,7 +5514,7 @@ test('objective judge: an upper-bound result count is not a quota after one mean
     },
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 1);
   assert.equal(judgeInvoked, false, '"up to three" is a ceiling, so one verified lookup is concrete completion evidence');
@@ -5517,7 +5557,7 @@ test('objective judge: a false verdict cannot widen an exhausted one-attempt con
     ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Make exactly one read-only call and return exactly three suggestions. Do not retry.',
@@ -5528,7 +5568,7 @@ test('objective judge: a false verdict cannot widen an exhausted one-attempt con
     },
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(runs, 1, 'the verifier cannot authorize a second model/tool turn');
   assert.equal(judgeInvoked, true, 'the plural exact-count objective is still audited');
@@ -5899,7 +5939,7 @@ test('objective judge: fail-open accepted completions are tagged in conversation
   const runner = scriptedRunner([
     { finalOutput: { summary: 'done', reply: 'Done — report saved to /tmp/report.md', done: true, nextAction: 'completed', reason: null } },
   ]);
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'build me a research report on solar adoption',
@@ -5907,7 +5947,7 @@ test('objective judge: fail-open accepted completions are tagged in conversation
     judgeFn: async () => ({ done: true, reason: 'judge timed out — accepting completion', failedOpen: true }),
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
   assert.equal(completed.data.delivered, true);
@@ -6017,10 +6057,10 @@ test('honest-completion: a normal delivered reply still completes (delivered:tru
   const runner = scriptedRunner([
     { finalOutput: { summary: 'done', reply: 'Done — report saved to /tmp/report.md', done: true, nextAction: 'completed', reason: null } },
   ]);
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(), sessionId: sess.id, input: 'build the report',
     makeRunner: makeRunnerStub, runRunner: runner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, true);
 });
@@ -6444,10 +6484,10 @@ test('honest-completion: kill-switch off leaves blocked text completing (byte-id
     const runner = scriptedRunner([
       { finalOutput: { summary: 'blocked', reply: 'I cannot complete this task without approval.', done: true, nextAction: 'completed', reason: null } },
     ]);
-    const result = await runConversation({
+    const result = await runConversation(withSettledWork({
       agent: makeAgentStub(), sessionId: sess.id, input: 'send it',
       makeRunner: makeRunnerStub, runRunner: runner,
-    });
+    }));
     assert.equal(result.status, 'completed', 'disabled → prior behavior');
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_VERIFY_DELIVERED;
@@ -6461,14 +6501,14 @@ test('objective judge: off by default for non-promise answer (no judgeCompletion
     { finalOutput: { summary: 'said what I would do', reply: 'Here is what I would do.', done: true, nextAction: 'completed', reason: null } },
   ]);
   let judgeInvoked = false;
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'build me a research report on solar adoption',
     judgeFn: async () => { judgeInvoked = true; return { done: false, reason: 'x' }; },
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(judgeInvoked, false, 'plain delivered reply must not invoke the judge unless judgeCompletion is opted in');
 });
@@ -6533,13 +6573,13 @@ test('runConversation: recurses through done=false steps until done=true', async
       },
     },
   ]);
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'find 20 accounts, scrape, build a sheet',
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 3);
   assert.equal(result.lastDecision?.done, true);
@@ -6844,13 +6884,13 @@ test('runConversation: a declarative queue-only completion does not mint an appr
     } as never;
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Queue the exact send.',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(calls, 1);
@@ -7250,13 +7290,13 @@ test('runConversation: captured workflow_step_result terminates despite punt-sha
     recordStepResult(sess.id, { rows: [{ id: 1 }], total: 1 });
     return { history: items, lastResponseId: undefined, finalOutput: 'Done.' };
   };
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'run one workflow step',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 1);
   assert.equal(calls, 1, 'captured step result must not trigger a repair/retry turn');
@@ -7292,14 +7332,14 @@ test('runConversation: fake workflow_step_result transcript is materialized into
     return { history: items, lastResponseId: undefined, finalOutput: fakeCall };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'run one workflow step',
     maxSteps: 3,
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.equal(calls, 1, 'structural fake transcript is safe to materialize without another model turn');
@@ -7469,13 +7509,13 @@ test('runConversation: malformed decision AFTER real tool work RETRIES instead o
     return { history: items, lastResponseId: undefined, finalOutput: decision };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'build and deploy a website',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   // NEW CONTRACT: the inline deliverable IS a valid reply — the run completes on
   // the FIRST turn with ZERO D_decision_unparsed retries (this is the exact
@@ -7588,13 +7628,13 @@ test('runConversation: a short SUBSTANTIVE reply is NOT flagged as a stall', asy
   // in the same "agent gave up" message.
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([{ finalOutput: 'Added 5 rows to the sheet.' }]);
-  await runConversation({
+  await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'add the rows',
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
   const completedEvents = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   // NEW CONTRACT: a substantive terse reply is delivered as the completed reply,
   // not routed through the malformed 'no_structured_output' path.
@@ -8452,13 +8492,13 @@ test('runConversation: fresh stall retry keeps generic ask-user fallback', async
     };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'write a quick greeting',
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
@@ -8530,13 +8570,13 @@ test('runConversation: structured false tool-unavailable decision is retried', a
     return { history: items, lastResponseId: undefined, finalOutput: output };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'create the native-compaction proof files',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
@@ -8593,13 +8633,13 @@ test('runConversation: structured tool-unavailable after only probe tools is ret
     return { history: items, lastResponseId: undefined, finalOutput: output };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'finish the SEO audit report',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
@@ -8642,13 +8682,13 @@ test('runConversation: structured awaiting_handoff_result tool-runtime stall is 
     return { history: items, lastResponseId: undefined, finalOutput: output };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'run the Priority Account workflow',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
@@ -8754,13 +8794,13 @@ test('runConversation: discover-then-defer (only tool_choice_recall/local_cli_li
     return { history: items, lastResponseId: undefined, finalOutput: output };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'continue the pull',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
@@ -8851,13 +8891,13 @@ test('runConversation: structured abandoned tool-unavailable decision is retried
     return { history: items, lastResponseId: undefined, finalOutput: output };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'create the native-compaction proof files',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
@@ -8898,13 +8938,13 @@ test('runConversation: structured zero-tool completion claim is retried', async 
     return { history: items, lastResponseId: undefined, finalOutput: output };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'create files and search the web',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
@@ -9103,13 +9143,13 @@ test('runConversation: plain self-reported no-tool-access completion is retried'
     return { history: items, lastResponseId: undefined, finalOutput: output };
   };
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'create the SEO volume tracker sheet',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
@@ -9230,10 +9270,10 @@ test('runConversation: a substantive reply ending in a concrete question is deli
     lastResponseId: undefined,
     finalOutput: PRESENTED_DRAFT,
   });
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(), sessionId: sess.id, input: 'send the outreach batch',
     makeRunner: makeRunnerStub, runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   assert.ok(completed.some((e) => String(e.data.reply ?? e.data.summary ?? '').includes('Good to send?')));
@@ -9253,10 +9293,10 @@ test('runConversation: a zero-tool text reply to the draft-present directive is 
   // The model presents the draft (announcement-verb-laden text, zero tools)
   // every turn — exactly the live failure shape.
   const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: STALL_DRAFT });
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(), sessionId: sess.id, input: 'send the outreach batch',
     makeRunner: makeRunnerStub, runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   // 2026-07-23: "ready for your review" is awaits-user-material, so the draft
@@ -9277,10 +9317,10 @@ test('runConversation: an exact reply to a verbatim request is DELIVERED, no sta
   const sess = HarnessSession.create({ kind: 'chat' });
   // The model complies exactly — "ok", zero tools — the correct deliverable.
   const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: 'ok' });
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(), sessionId: sess.id, input: 'Reply with just the word: ok',
     makeRunner: makeRunnerStub, runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   const delivered = completed.find((e) => (e.data as { reason?: string }).reason === 'verbatim_reply_fulfilled');
@@ -9549,7 +9589,7 @@ test('runConversation: a foreign active attempt keeps the shared recovery marker
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   const foreign = beginRunAttempt(sess.id, { runId: 'foreign-concurrent-owner' });
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Complete without clearing the other run marker.',
@@ -9565,7 +9605,7 @@ test('runConversation: a foreign active attempt keeps the shared recovery marker
         reason: null,
       },
     }),
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   assert.ok(HarnessSession.load(sess.id)?.runInFlightSince(), 'foreign recovery ownership survives this terminal');
@@ -11477,11 +11517,11 @@ test('stall judge: "deliver" verdict finalizes the ambiguous reply with no stuck
   try {
     // Force the ambiguous stall shape: zero tools + announcement-ish text.
     const runner = scriptedRunner([{ finalOutput: `I’ll weave it in. ${novelReply}` }]);
-    const result = await runConversation({
+    const result = await runConversation(withSettledWork({
       agent: makeAgentStub(), sessionId: sess.id, input: 'ill send the copy over soon',
       judgeFn: async () => ({ done: true, reason: 'the conversational reply is deliverable' }),
       makeRunner: makeRunnerStub, runRunner: runner,
-    });
+    }));
     assert.equal(result.status, 'completed');
     assert.equal(judgeCalls, 1, 'judge consulted exactly once');
     const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
@@ -11534,7 +11574,7 @@ test('stall judge: unstructured delivery still passes the zero-tool objective bl
       return { history: items, lastResponseId: undefined, finalOutput: decision };
     };
 
-    const result = await runConversation({
+    const result = await runConversation(withSettledWork({
       agent: makeAgentStub(),
       sessionId: sess.id,
       input: 'Research the launch and produce a complete brief with risks and recommendations.',
@@ -11545,7 +11585,7 @@ test('stall judge: unstructured delivery still passes the zero-tool objective bl
       },
       makeRunner: makeRunnerStub,
       runRunner,
-    });
+    }));
 
     assert.equal(result.status, 'completed');
     assert.equal(runs, 2, 'judge salvage cannot turn a zero-tool action promise into an early completion');
@@ -11804,10 +11844,10 @@ test('stall judge: an instructional "show me the command" answer is judged, not 
   try {
     const instructional = 'Here’s the exact command you’d run:\n\n**run_shell_command**\n```\nsf data query --query "SELECT Id, Name FROM Account LIMIT 15"\n```\nSwap the LIMIT for your batch size.';
     const runner = scriptedRunner([{ finalOutput: instructional }]);
-    const result = await runConversation({
+    const result = await runConversation(withSettledWork({
       agent: makeAgentStub(), sessionId: sess.id, input: 'can you show me the command you would run for the salesforce pull',
       makeRunner: makeRunnerStub, runRunner: runner,
-    });
+    }));
     assert.equal(result.status, 'completed');
     assert.equal(judgeCalls, 1, 'instructional transcript goes to the judge');
     const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });

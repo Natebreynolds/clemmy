@@ -58,6 +58,7 @@ import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { enabledExternalServerNames } from '../mcp-servers.js';
 import { appendEvent } from './eventlog.js';
+import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
 import { enrichAcceptedRequestWithTaskContinuity } from './task-continuity-runtime.js';
 import {
@@ -3129,6 +3130,25 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     text = 'Some of the work ran, but a later tool call was printed instead of executed, so I cannot claim the task is finished. I did not replay the turn because that could duplicate an action. Should I continue from the recorded state?';
     result = { ...result, stoppedReason: 'awaiting-input' };
   }
+  // This lane's inner SDK tools do not cross the dispatch ledger, so a worked
+  // Claude-lane action turn would otherwise look evidence-free to the
+  // store-driven terminal adjudication (repair below + delivery committer)
+  // and fail closed. Record the business tool uses durably BEFORE either
+  // consults the stores; control/discovery uses are not work.
+  try {
+    const businessToolUses = result.toolUses
+      .map((name) => name.split('__').pop() ?? name)
+      .filter((name) => actionTopologyRoleFor(name) !== 'control');
+    if (businessToolUses.length > 0) {
+      appendEvent({
+        sessionId,
+        turn: userInputEvent.turn,
+        role: 'system',
+        type: 'sdk_tool_use_recorded',
+        data: { sourceUserSeq: userInputEvent.seq, tools: businessToolUses.slice(0, 40) },
+      });
+    }
+  } catch { /* evidence recording must never break the terminal */ }
   let terminalPresentationRepair: Exclude<
     PrecommitTerminalPresentationResult,
     { status: 'unchanged' }

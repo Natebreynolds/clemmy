@@ -144,20 +144,66 @@ function settledWorkManifestAuthority(input: {
  * without a frozen topology or manifest still fails closed, and text-level
  * effect claims stay guarded by the settlement-derived claim lanes.
  */
-function sourceHasMutatingSettlement(input: {
+/** The persisted graph says this act turn is conversation-shaped: not a
+ *  committed 'action' intent, and no external effect was requested. Absent
+ *  or unreadable classification never loosens the gate. */
+function conversationalActClassification(input: {
   sessionId: string;
   sourceUserSeq: number;
 }): boolean {
   try {
-    const row = openEventLog().prepare(`
+    const expected = expectedTaskFor(input.sessionId, input.sourceUserSeq);
+    if (expected.status !== 'ok') return false;
+    const classification = expected.graph.classification as {
+      messageIntent?: unknown;
+      externalEffectRequested?: unknown;
+    };
+    return classification.messageIntent !== 'action'
+      && classification.externalEffectRequested !== true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether durable work evidence exists for this exact accepted source:
+ * settled logical calls, admitted physical dispatches, or external-write
+ * records from this turn. Until the write-evidence issuer exists, this is
+ * what separates a real worked turn (publishes, as it always has) from a
+ * ZERO-evidence done claim (fails closed). An unreadable store never counts
+ * as evidence.
+ */
+function sourceHasWorkEvidence(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  try {
+    const db = openEventLog();
+    // A pre-dispatch refusal settles an ATTEMPT, not work — a turn whose only
+    // settlement is its own corrective refusal has no work evidence.
+    const settled = db.prepare(`
       SELECT 1 FROM logical_call_settlements
-       WHERE session_id = ? AND source_user_seq = ? AND mutating = 1
+       WHERE session_id = ? AND source_user_seq = ?
+         AND execution_kind != 'refused_pre_dispatch'
        LIMIT 1
     `).get(input.sessionId, input.sourceUserSeq);
-    return row !== undefined;
+    if (settled !== undefined) return true;
+    const dispatched = db.prepare(`
+      SELECT 1 FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+       LIMIT 1
+    `).get(input.sessionId, input.sourceUserSeq);
+    if (dispatched !== undefined) return true;
+    // Legacy external-write rows carry no source binding; scope by position
+    // (after the accepted input) the same way the salvage watermark does.
+    // sdk_tool_use_recorded is the Claude lane's durable marker — its inner
+    // SDK tools do not cross the dispatch ledger.
+    return listEvents(input.sessionId, {
+      types: ['external_write', 'external_write_succeeded', 'sdk_tool_use_recorded'],
+      sinceSeq: input.sourceUserSeq,
+    }).length > 0;
   } catch {
-    // An unreadable settlement store must never loosen the gate.
-    return true;
+    return false;
   }
 }
 
@@ -268,21 +314,43 @@ export function prepareAcceptedTaskTerminal(input: {
           missing: ['cardinality_item_missing'],
         };
       }
-      // Scoped to 'ineligible' (not a memory-instruction turn): a memory
-      // instruction that failed to record must keep its gap, never publish
-      // a conversational done over the missing receipt.
-      if (host.status === 'ineligible' && !sourceHasMutatingSettlement(input)) {
-        return {
-          status: 'ready',
-          manifestId: `conversational:${input.sessionId}:${input.sourceUserSeq}`,
-          verdict: {
-            status: 'done',
-            missing: [],
-            facts: [
-              'no mutating call settled for this accepted source; the conversational reply is the terminal',
-            ],
-          },
-        };
+      // No contract, no manifest, not a memory instruction (host 'ineligible'
+      // — one that failed to record keeps its gap). Two deterministic doors:
+      // - the turn left durable work evidence (settled calls / admitted
+      //   dispatches / external-write records): a real worked turn publishes
+      //   as it always has — positive write verification arrives with the
+      //   write-evidence issuer;
+      // - the graph classifies the ask as conversation-shaped (messageIntent
+      //   is not 'action', no external effect requested — "what time is it?"
+      //   routes act as tool_intent): the reply is the terminal.
+      // A ZERO-evidence done claim on an 'action'-intent ask fails closed.
+      if (host.status === 'ineligible') {
+        if (sourceHasWorkEvidence(input)) {
+          return {
+            status: 'ready',
+            manifestId: `worked:${input.sessionId}:${input.sourceUserSeq}`,
+            verdict: {
+              status: 'done',
+              missing: [],
+              facts: [
+                'durable work evidence (settled calls, dispatches, or external-write records) exists for this accepted source',
+              ],
+            },
+          };
+        }
+        if (conversationalActClassification(input)) {
+          return {
+            status: 'ready',
+            manifestId: `conversational:${input.sessionId}:${input.sourceUserSeq}`,
+            verdict: {
+              status: 'done',
+              missing: [],
+              facts: [
+                'no work was dispatched for this accepted source; the conversational reply is the terminal',
+              ],
+            },
+          };
+        }
       }
     }
     return {

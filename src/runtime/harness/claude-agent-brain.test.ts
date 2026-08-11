@@ -78,6 +78,66 @@ const {
 } = await import('../../execution/workflow-origin-group.js');
 const { workflowOriginReplyTargetForSource } = await import('../workflow-origin-authority.js');
 const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
+const { acceptedTaskIdFor } = await import('./attempt-identity.js');
+const { beginPhysicalDispatch, settlePhysicalDispatch } = await import('./dispatch-ledger.js');
+const { classifyAttemptOutcome } = await import('./attempt-outcome.js');
+const { commitLogicalCallSettlement } = await import('./logical-call-settlement-store.js');
+
+/**
+ * Settlement anchor for stubbed retrieve turns (authority spine, ffae7dbd).
+ *
+ * The terminal committer publishes `done` for a retrieve-classified accepted
+ * task only after the ONE business read its frozen deterministic contract
+ * admits has durably settled (dispatch ledger + logical-call settlement).
+ * `setClaudeAgentSdkBrainRunForTest` bypasses real dispatch, so fixtures that
+ * stub the run must settle that admitted read themselves — exactly once per
+ * accepted task — or truth downgrades the committed answer.
+ */
+let fixtureSettledReadSerial = 0;
+function settleAdmittedRead(input: { sessionId: string; sourceUserSeq: number }): void {
+  const task = {
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    turn: 1,
+    acceptedTaskId: acceptedTaskIdFor(input.sessionId, input.sourceUserSeq),
+  };
+  const id = `brain-fixture-read:${++fixtureSettledReadSerial}`;
+  const tool = 'alpha_records_search';
+  const args = { query: 'fixture' };
+  const begun = beginPhysicalDispatch({
+    identity: {
+      ...task,
+      logicalToolCallId: `logical:${id}`,
+      physicalDispatchId: `dispatch:${id}`,
+      ordinal: 0,
+    },
+    tool,
+    args,
+  });
+  assert.equal(begun.status, 'inserted', JSON.stringify(begun));
+  if (begun.status !== 'inserted') return;
+  assert.equal(settlePhysicalDispatch({
+    identity: begun.identity,
+    tool,
+    outcome: 'returned',
+  }).status, 'inserted');
+  const settled = commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId: `logical:${id}` },
+    contract: { toolName: tool, args },
+    execution: { kind: 'provider_execution' },
+    result: {
+      payload: {
+        successful: true,
+        data: { records: [{ id: 'r1' }, { id: 'r2' }] },
+        meta: { complete: true },
+      },
+    },
+    outcome: classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: false },
+    observer: { lane: 'composio', turn: task.turn },
+  });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
+}
 
 function installPreparedClaudeWorkflowDispatch(input: {
   sessionId: string;
@@ -2066,6 +2126,7 @@ test('a compound decline keeps the full conversation provider-visible while priv
     capturedNativeMcpScopeInput = options.nativeMcpScopeInput ?? '';
     capturedTurnContext = options.turnContext ?? '';
     capturedPriorTurns = options.priorTurns ?? [];
+    settleAdmittedRead({ sessionId: sid, sourceUserSeq: options.sourceUserSeq! });
     return {
       text: providerReply,
       sessionId: 'sdk-session',
@@ -2416,6 +2477,7 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   process.env.CLEMMY_TOOL_JIT = 'off'; // pin off: this test guards the unfiltered read-only surface
   setClaudeAgentSdkBrainRunForTest(async (options) => {
     captured = options;
+    settleAdmittedRead({ sessionId: 'brain-run', sourceUserSeq: options.sourceUserSeq! });
     return {
       text: 'Claude brain reply',
       sessionId: 'sdk-session',
@@ -2743,11 +2805,14 @@ test('the shared post-turn seam FIRES on the Claude brain lane (auto-credit runs
   }));
   // Reply echoes distinctive words from the recalled snippet ("Meridian-7",
   // "reliability", "launch") that are absent from the query → a 'content' credit.
-  setClaudeAgentSdkBrainRunForTest(async () => ({
-    text: 'The Meridian-7 launch reliability review is on track.', sessionId: 'sdk', model: 'claude', toolUses: [],
-  }));
-
   const sid = 'brain-post-turn-seam-fires';
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    settleAdmittedRead({ sessionId: sid, sourceUserSeq: options.sourceUserSeq! });
+    return {
+      text: 'The Meridian-7 launch reliability review is on track.', sessionId: 'sdk', model: 'claude', toolUses: [],
+    };
+  });
+
   await respondViaClaudeAgentSdkBrain('home', { message: 'What did we cover?', sessionId: sid });
 
   const credit = listEvents(sid, { types: ['recall_auto_credit'] });
@@ -4652,9 +4717,10 @@ test('salvage B: a parse error with NOTHING committed retries once and succeeds'
   delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE;
   createSession({ id: 'salvage-retry', kind: 'chat', title: 'salvage retry' });
   let calls = 0;
-  setClaudeAgentSdkBrainRunForTest(async () => {
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
     calls += 1;
     if (calls === 1) throw new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed).");
+    settleAdmittedRead({ sessionId: 'salvage-retry', sourceUserSeq: options.sourceUserSeq! });
     return { text: 'Here is your answer.', sessionId: 'sdk', model: 'claude-opus-4-8', toolUses: [] };
   });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));
@@ -4682,9 +4748,10 @@ test('salvage ignores writes from an older turn in the same reusable chat', asyn
     },
   });
   let calls = 0;
-  setClaudeAgentSdkBrainRunForTest(async () => {
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
     calls += 1;
     if (calls === 1) throw new Error("The model's tool call could not be parsed (retry also failed).");
+    settleAdmittedRead({ sessionId: sid, sourceUserSeq: options.sourceUserSeq! });
     return { text: 'The current read-only question recovered.', sessionId: 'sdk', model: 'claude', toolUses: [] };
   });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'recovered' }));
@@ -4741,7 +4808,9 @@ test('overflow A2: an UNCOMMITTED context overflow retries ONCE with reduced con
     calls += 1;
     seen.push({ priorTurns: opts.priorTurns, turnContext: opts.turnContext });
     if (calls === 1) throw new ClaudeSdkContextOverflowError('context length exceeded', false);
-    return { text: 'finished after reduced retry', toolUses: [] };
+    // A done claim on an action ask needs work evidence — the retried turn
+    // reports the tool use it actually made.
+    return { text: 'finished after reduced retry', toolUses: ['mcp__clementine-local__write_file'] };
   });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'finish the report', sessionId: 'overflow-uncommitted' });
@@ -4790,9 +4859,10 @@ test('overflow A2: committed overflow with ZERO external writes falls through to
   createSession({ id: 'overflow-committed-reads', kind: 'chat', title: 'read-heavy overflow' });
   // No external_write events — a read-heavy research run that overflowed mid-run.
   let calls = 0;
-  setClaudeAgentSdkBrainRunForTest(async () => {
+  setClaudeAgentSdkBrainRunForTest(async (options: any) => {
     calls += 1;
     if (calls === 1) throw new ClaudeSdkContextOverflowError('prompt is too long', true);
+    settleAdmittedRead({ sessionId: 'overflow-committed-reads', sourceUserSeq: options.sourceUserSeq! });
     return { text: 'finished after retry', toolUses: [] };
   });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));

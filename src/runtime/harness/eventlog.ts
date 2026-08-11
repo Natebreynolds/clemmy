@@ -482,6 +482,11 @@ export const EVENT_TYPES = [
   // prose — so drafted emails / reports appear in the live feed as they land
   // instead of vanishing into a folder. Carries {name, dir, bytes}.
   'deliverable_saved',
+  // Durable record of the Claude lane's inner SDK business-tool uses. That
+  // lane's tools do not cross the dispatch ledger, so without this marker a
+  // worked action turn looks evidence-free to store-driven terminal
+  // adjudication and fails closed. Carries {sourceUserSeq, tools[]}.
+  'sdk_tool_use_recorded',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);
