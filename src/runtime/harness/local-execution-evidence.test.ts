@@ -195,7 +195,7 @@ function frozenContract(task: LocalTask): contracts.AcceptedTaskWorkContractV1 {
 }
 
 /** Open one logical call for a per-item write without binding it yet. */
-function openAndBindable(task: LocalTask, suffix: string): string {
+function openAndBindable(task: LocalTask, suffix: string, member = 'lead-001'): string {
   const logicalToolCallId = `logical:${task.label}:${suffix}`;
   const opened = dispatch.admitLogicalCall({
     identity: {
@@ -206,7 +206,7 @@ function openAndBindable(task: LocalTask, suffix: string): string {
       logicalToolCallId,
     },
     tool: DRAFT_TOOL,
-    args: { path: 'drafts/lead-001.md', content: 'x', lead_id: 'lead-001' },
+    args: { path: `drafts/${member}.md`, content: 'x', lead_id: member },
   });
   assert.equal(opened.status, 'inserted', JSON.stringify(opened));
   return logicalToolCallId;
@@ -576,7 +576,10 @@ test('a store that recorded a PARTIAL earlier version is repaired, not stranded'
   assert.ok(rows > 0, 'the fixture already wrote logical calls');
   live.exec('ALTER TABLE logical_tool_calls DROP COLUMN conflict_reason');
   live.exec('ALTER TABLE physical_dispatches DROP COLUMN execution_site');
-  live.prepare('DELETE FROM schema_version WHERE version = 36').run();
+  // The runner resumes from MAX(version), so simulating "never received v36"
+  // means dropping every version at or above it — the same property this pin
+  // exists to document.
+  live.prepare('DELETE FROM schema_version WHERE version >= 36').run();
   eventlog.closeEventLog();
 
   const repaired = eventlog.openEventLog();
@@ -784,4 +787,133 @@ test('the plan card cannot claim a requirement the dependency gate refuses', () 
     'the card must never call a requirement satisfied while the gate refuses work waiting on it',
   );
   assert.equal(producerLine?.settledInstances, 0, 'a settled-but-undischarged read counts for nothing');
+});
+
+/** Stage the live shape: records keyed "Id", a contract pointing at '/id'. */
+function stageCasedSource(label: string): LocalTask {
+  const task = acceptLocalAction(label);
+  const args = { path: 'leads.json' };
+  const call = openAndBind({
+    task, suffix: 'source', tool: SOURCE_TOOL, args,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task, logicalToolCallId: call, tool: SOURCE_TOOL, args,
+    result: JSON.stringify([
+      { Id: 'lead-001', company: 'Harbor & Vale LLP' },
+      { Id: 'lead-002', company: 'Cedarline Physical Therapy' },
+    ]),
+    requirementId: 'read_leads',
+  });
+  return task;
+}
+
+function bindMember(task: LocalTask, member: string, suffix: string, amendment?: {
+  universeId: string;
+  memberIdPointer: string;
+}) {
+  return admissionModule.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId: openAndBindable(task, suffix, member),
+    proposal: null,
+    requirementId: 'write_draft',
+    universeItemId: member,
+    universeSelector: { argumentPointer: '/lead_id', memberIdPointer: null },
+    tool: DRAFT_TOOL,
+    args: { path: `drafts/${member}.md`, content: 'x', lead_id: member },
+    ...(amendment ? { sealAmendment: amendment } : {}),
+  });
+}
+
+test('a wrong member-id pointer is corrected once, in-turn, and the per-item lane opens', () => {
+  // The single-turn self-correction loop: the contract froze '/id' before the
+  // read that could prove it, the records carry "Id", and the turn used to die
+  // there with no way back.
+  const task = stageCasedSource('amend');
+
+  const refused = bindMember(task, 'lead-001', 'draft-first');
+  assert.equal(refused.status, 'refused');
+  if (refused.status !== 'refused') throw new Error('a wrong pointer admitted work');
+  assert.equal(refused.kind, 'work_universe_unsealed');
+  assert.match(refused.reason, /no value at member id pointer '\/id'/);
+  assert.match(refused.reason, /record keys: \/Id, \/company/, 'the refusal carries the correction as data');
+
+  // Same turn, one work_call, carrying the correction the refusal named.
+  const amended = bindMember(task, 'lead-001', 'draft-amended', {
+    universeId: 'leads',
+    memberIdPointer: '/Id',
+  });
+  assert.equal(amended.status, 'bound', JSON.stringify(amended));
+  if (amended.status !== 'bound') throw new Error('the corrected pointer did not bind');
+  assert.equal(amended.binding.universeItemId, 'lead-001');
+
+  // The correction is durable and auditable, and the seal now reports it.
+  const row = eventlog.openEventLog().prepare(`
+    SELECT prior_member_id_pointer, member_id_pointer, sealed_member_count
+      FROM expected_work_universe_amendments
+     WHERE session_id = ? AND source_user_seq = ? AND universe_id = 'leads'
+  `).get(task.sessionId, task.sourceUserSeq) as {
+    prior_member_id_pointer: string;
+    member_id_pointer: string;
+    sealed_member_count: number;
+  };
+  assert.deepEqual(row, {
+    prior_member_id_pointer: '/id',
+    member_id_pointer: '/Id',
+    sealed_member_count: 2,
+  });
+  assert.equal(
+    eventlog.listEvents(task.sessionId, { types: ['expected_work_universe_amended'] }).length,
+    1,
+    'the correction is one auditable event',
+  );
+  const sealed = sealFor(task);
+  assert.equal(sealed.status, 'sealed');
+  assert.deepEqual(
+    sealed.status === 'sealed' ? sealed.seal.members : [],
+    ['lead-001', 'lead-002'],
+    'every later reader re-derives through the corrected pointer',
+  );
+});
+
+test('the member-id correction is allowed exactly once, and never against evidence that fails', () => {
+  const task = stageCasedSource('amend-guards');
+
+  // A correction that does not resolve is refused with the same detail — it is
+  // evidence-gated, not a free retry.
+  const wrong = bindMember(task, 'lead-001', 'draft-wrong', {
+    universeId: 'leads',
+    memberIdPointer: '/identifier',
+  });
+  assert.equal(wrong.status, 'refused');
+  if (wrong.status !== 'refused') throw new Error('a non-resolving correction was accepted');
+  assert.match(wrong.reason, /no value at member id pointer '\/identifier'/);
+  assert.match(wrong.reason, /record keys: \/Id, \/company/);
+  assert.equal(
+    (eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM expected_work_universe_amendments
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(task.sessionId, task.sourceUserSeq) as { n: number }).n,
+    0,
+    'a refused correction records nothing',
+  );
+
+  // The real correction lands and binds.
+  assert.equal(
+    bindMember(task, 'lead-001', 'draft-ok', { universeId: 'leads', memberIdPointer: '/Id' }).status,
+    'bound',
+  );
+
+  // A SECOND correction is refused — the allowance is spent.
+  const second = bindMember(task, 'lead-002', 'draft-second', {
+    universeId: 'leads',
+    memberIdPointer: '/company',
+  });
+  assert.equal(second.status, 'refused');
+  if (second.status !== 'refused') throw new Error('a second correction was accepted');
+  assert.match(second.reason, /already used its one member-id correction/);
+
+  // And with a member already bound, identity cannot change underneath it.
+  assert.match(second.reason, /already used its one member-id correction|bound member call/);
 });

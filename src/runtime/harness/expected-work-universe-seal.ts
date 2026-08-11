@@ -14,10 +14,12 @@
  * at terminal match, or after a restart — yields the same members and digest.
  */
 import type Database from 'better-sqlite3';
+import { insertInternalEventInTransaction } from './eventlog.js';
 import {
   EXPECTED_WORK_MAX_UNIVERSE_MEMBERS,
   canonicalExpectedWorkJson,
   expectedWorkDigest,
+  isBoundedJsonPointer,
   resolveJsonPointer,
   type AcceptedTaskWorkContractV1,
   type ExpectedWorkUniverseV1,
@@ -28,6 +30,8 @@ import {
   redeemSuccessfulSettlementResultForHost,
   type SuccessfulSettlementResultEvidence,
 } from './result-handle.js';
+
+export const EXPECTED_WORK_UNIVERSE_AMENDED_EVENT = 'expected_work_universe_amended' as const;
 
 export type SourceDerivedUniverseV1 = Extract<
   ExpectedWorkUniverseV1,
@@ -141,10 +145,32 @@ function sourceRecordsFor(
 }
 
 
-function deriveSeal(
+/** The pointer in force for this universe: the contract's, unless exactly one
+ *  amendment corrected it. Read fresh every time — never cached across the
+ *  amendment that changes it, and never taken from the audit event. */
+function effectiveMemberIdPointer(
   db: Database.Database,
   contract: AcceptedTaskWorkContractV1,
   universe: SourceDerivedUniverseV1,
+): string {
+  const row = db.prepare(`
+    SELECT member_id_pointer FROM expected_work_universe_amendments
+     WHERE session_id = ? AND source_user_seq = ? AND contract_id = ? AND universe_id = ?
+  `).get(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.contractId,
+    universe.id,
+  ) as { member_id_pointer: string } | undefined;
+  return row?.member_id_pointer ?? universe.memberIdPointer;
+}
+
+
+function deriveSealWithPointer(
+  db: Database.Database,
+  contract: AcceptedTaskWorkContractV1,
+  universe: SourceDerivedUniverseV1,
+  pointer: string,
 ): ExpectedWorkUniverseSealResult {
   const producer = contract.operations.find((entry) => entry.id === universe.producedBy);
   if (
@@ -236,12 +262,12 @@ function deriveSeal(
   const members: string[] = [];
   const seen = new Set<string>();
   for (const [index, record] of records.entries()) {
-    const member = memberIdOf(record, universe.memberIdPointer, index);
+    const member = memberIdOf(record, pointer, index);
     if (!member.ok) return { status: 'unsealed', reason: member.reason };
     if (seen.has(member.id)) {
       return {
         status: 'unsealed',
-        reason: `source records repeat member id '${member.id}' at pointer '${universe.memberIdPointer}'`,
+        reason: `source records repeat member id '${member.id}' at pointer '${pointer}'`,
       };
     }
     seen.add(member.id);
@@ -276,7 +302,12 @@ export function sealSourceDerivedUniverse(input: {
   if (cached) return cached;
   let result: ExpectedWorkUniverseSealResult;
   try {
-    result = deriveSeal(input.db, input.contract, input.universe);
+    result = deriveSealWithPointer(
+      input.db,
+      input.contract,
+      input.universe,
+      effectiveMemberIdPointer(input.db, input.contract, input.universe),
+    );
   } catch (error) {
     // An unreadable store refuses; it never seals a partial universe.
     result = {
@@ -313,4 +344,114 @@ export function resolveExpectedWorkUniverseMembers(input: {
   return sealed.status === 'sealed'
     ? { status: 'resolved', members: sealed.seal.members, seal: sealed.seal }
     : sealed;
+}
+
+
+export type ExpectedWorkUniverseAmendmentResult =
+  | { status: 'amended'; seal: ExpectedWorkUniverseSeal }
+  | { status: 'refused'; reason: string };
+
+/**
+ * Correct a source universe's member-id pointer ONCE, against evidence.
+ *
+ * The contract freezes this pointer before the read that could prove it, so a
+ * wrong guess used to kill the turn outright. This is the narrow way back: the
+ * pointer alone, once, only while nothing has been bound against the old seal,
+ * and only if the corrected pointer actually resolves against the producer's
+ * settled records right now. It is not a retry — an amendment that does not
+ * seal is refused with the same detail the original refusal carried, so a
+ * second guess costs the model nothing it did not already know.
+ *
+ * The caller owns the IMMEDIATE transaction; the durable row's primary key is
+ * what makes "once" true even under concurrent admission.
+ */
+export function amendSourceUniverseMemberIdPointer(input: {
+  db: Database.Database;
+  contract: AcceptedTaskWorkContractV1;
+  universe: SourceDerivedUniverseV1;
+  memberIdPointer: string;
+  motivatingRefusal: string;
+  cache?: ExpectedWorkUniverseSealCache;
+}): ExpectedWorkUniverseAmendmentResult {
+  const { db, contract, universe } = input;
+  if (!isBoundedJsonPointer(input.memberIdPointer)) {
+    return { status: 'refused', reason: 'an amended member id pointer must be a bounded RFC 6901 pointer' };
+  }
+  const current = effectiveMemberIdPointer(db, contract, universe);
+  if (input.memberIdPointer === current) {
+    return { status: 'refused', reason: `universe ${universe.id} already identifies members at '${current}'` };
+  }
+  const existing = db.prepare(`
+    SELECT member_id_pointer FROM expected_work_universe_amendments
+     WHERE session_id = ? AND source_user_seq = ? AND contract_id = ? AND universe_id = ?
+  `).get(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.contractId,
+    universe.id,
+  ) as { member_id_pointer: string } | undefined;
+  if (existing) {
+    return {
+      status: 'refused',
+      reason: `universe ${universe.id} has already used its one member-id correction ('${existing.member_id_pointer}')`,
+    };
+  }
+  // Nothing may have been bound against the seal this correction replaces.
+  const bound = db.prepare(`
+    SELECT COUNT(*) AS count FROM expected_work_call_bindings
+     WHERE session_id = ? AND source_user_seq = ? AND contract_id = ? AND universe_id = ?
+  `).get(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.contractId,
+    universe.id,
+  ) as { count: number };
+  if (bound.count > 0) {
+    return {
+      status: 'refused',
+      reason: `universe ${universe.id} already has ${bound.count} bound member call(s); its identity cannot change underneath them`,
+    };
+  }
+  // EVIDENCE GATE: the corrected pointer must seal against the producer's
+  // settled records right now, or there is nothing to record.
+  const candidate = deriveSealWithPointer(db, contract, universe, input.memberIdPointer);
+  if (candidate.status !== 'sealed') {
+    return { status: 'refused', reason: candidate.reason };
+  }
+  const mirror = insertInternalEventInTransaction(db, {
+    sessionId: contract.identity.sessionId,
+    turn: contract.identity.turn,
+    role: 'system',
+    type: EXPECTED_WORK_UNIVERSE_AMENDED_EVENT,
+    data: {
+      sourceUserSeq: contract.identity.sourceUserSeq,
+      contractId: contract.contractId,
+      universeId: universe.id,
+      priorMemberIdPointer: current,
+      memberIdPointer: input.memberIdPointer,
+      motivatingRefusal: input.motivatingRefusal.replace(/\s+/g, ' ').trim().slice(0, 300),
+      sealedMemberCount: candidate.seal.members.length,
+    },
+  });
+  db.prepare(`
+    INSERT INTO expected_work_universe_amendments
+      (session_id, source_user_seq, contract_id, universe_id,
+       prior_member_id_pointer, member_id_pointer, motivating_refusal,
+       sealed_member_count, amended_at, amendment_event_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.contractId,
+    universe.id,
+    current,
+    input.memberIdPointer,
+    input.motivatingRefusal.replace(/\s+/g, ' ').trim().slice(0, 300),
+    candidate.seal.members.length,
+    mirror.createdAt,
+    mirror.id,
+  );
+  // The seal this universe reports has changed; no reader may serve the old one.
+  input.cache?.delete(`${contract.contractId}\0${universe.id}`);
+  return { status: 'amended', seal: candidate.seal };
 }

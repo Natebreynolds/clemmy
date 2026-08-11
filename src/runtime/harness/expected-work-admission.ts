@@ -24,6 +24,7 @@ import {
   type ExpectedWorkUniverseV1,
 } from './expected-work-contract.js';
 import {
+  amendSourceUniverseMemberIdPointer,
   createExpectedWorkUniverseSealCache,
   resolveExpectedWorkUniverseMembers,
   type ExpectedWorkUniverseSealCache,
@@ -722,6 +723,38 @@ function refusal(
   return { status: 'refused', kind, reason };
 }
 
+/**
+ * A compute requirement no tool call has ever attempted is undischargeable by
+ * construction: nothing will ever settle it, so every operation depending on it
+ * blocks forever. That is almost always model-composed content proposed as work
+ * a tool would do (live 2026-08-11 run 5: drafts composed in-model behind a
+ * compute op, 800s of blocked writes).
+ *
+ * The refusal names the way out as DATA, exactly like the record-keys detail on
+ * a seal miss. No proposal shape is refused that was not already refused; the
+ * model simply learns which of its operations can never complete.
+ */
+function undischargeableComputeAdvisory(
+  db: Database.Database,
+  contract: AcceptedTaskWorkContractV1,
+  dependency: ExpectedWorkOperationV1 | undefined,
+): string {
+  if (dependency?.effect !== 'compute') return '';
+  const attempts = db.prepare(`
+    SELECT COUNT(*) AS count FROM expected_work_call_bindings
+     WHERE session_id = ? AND source_user_seq = ? AND contract_id = ? AND requirement_id = ?
+  `).get(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.contractId,
+    dependency.id,
+  ) as { count: number };
+  return attempts.count > 0
+    ? ''
+    : '; no tool call has ever attempted this compute requirement — if this content is model-composed, it belongs inside the consuming write\'s args (re-propose without the compute operation)';
+}
+
+
 /** Compute the remaining-plan card from the frozen contract + settled
  *  bindings. Cheap (one SELECT per contract) and safe inside the admission
  *  transaction. */
@@ -841,6 +874,10 @@ export function admitExpectedWorkInvocation(input: {
   requirementId: string;
   universeItemId?: string | null;
   universeSelector?: ExpectedWorkUniverseSelectorV1 | null;
+  /** ONE correction to where member identity lives in the producer's records,
+   *  after a seal refusal named what those records actually carry. Everything
+   *  else in the frozen proposal stays fixed. */
+  sealAmendment?: { universeId: string; memberIdPointer: string } | null;
   tool: string;
   args: unknown;
   /** Exact provider-ready callable schema observed before dispatch. */
@@ -1020,7 +1057,11 @@ export function admitExpectedWorkInvocation(input: {
           dependency,
           operation,
           input.universeItemId ?? undefined,
-        )) return refusedWithPlan('work_dependency_pending', `dependency ${dependencyId} is not durably satisfied`);
+        )) return refusedWithPlan(
+          'work_dependency_pending',
+          `dependency ${dependencyId} is not durably satisfied${
+            undischargeableComputeAdvisory(db, contract, dependency)}`,
+        );
       }
 
       const universe = universeFor(contract, operation);
@@ -1048,6 +1089,34 @@ export function admitExpectedWorkInvocation(input: {
         }
         const selected = selectedMemberIds(evidenceArgs, input.universeSelector, operation.cardinality.kind);
         if (!selected.ok) return refusedWithPlan('work_cardinality_mismatch', selected.reason);
+        // A pointer frozen before the read that proves it may be corrected
+        // once, here, in the same call that binds the first member — so the
+        // model's recovery is one work_call, not a dead turn.
+        if (input.sealAmendment) {
+          if (universe.seal !== 'complete_source_receipt') {
+            return refusedWithPlan(
+              'work_universe_unsealed',
+              'only a source-derived universe has a member-id pointer to correct',
+            );
+          }
+          if (input.sealAmendment.universeId !== universe.id) {
+            return refusedWithPlan(
+              'work_universe_unsealed',
+              `the amendment names universe ${input.sealAmendment.universeId}, but this call binds ${universe.id}`,
+            );
+          }
+          const amended = amendSourceUniverseMemberIdPointer({
+            db,
+            contract,
+            universe,
+            memberIdPointer: input.sealAmendment.memberIdPointer,
+            motivatingRefusal: `binding ${operation.id}`,
+            cache: sealCache,
+          });
+          if (amended.status !== 'amended') {
+            return refusedWithPlan('work_universe_unsealed', amended.reason);
+          }
+        }
         // Accepted input is exact at freeze; a source-derived universe is
         // sealed here from its producer read's own settled complete result.
         const resolvedUniverse = resolveExpectedWorkUniverseMembers({

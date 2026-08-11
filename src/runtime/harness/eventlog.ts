@@ -319,6 +319,7 @@ export const EVENT_TYPES = [
   // evidence remains valid. These are control-plane facts, not model verdicts.
   'work_manifest_declared',
   'work_item_checkpoint',
+  'expected_work_universe_amended',
   'work_contract_revised',
   // A user changed the objective/constraints of a durable background task while
   // it was queued or running. The task record owns the revision history; this
@@ -3650,6 +3651,63 @@ const MIGRATIONS: EventLogMigration[] = [
       if (tables.has('logical_tool_calls') && !columnsOf('logical_tool_calls').has('conflict_reason')) {
         db.exec('ALTER TABLE logical_tool_calls ADD COLUMN conflict_reason TEXT');
       }
+    },
+  },
+  {
+    /**
+     * ONE bounded correction to a source universe's member-id pointer.
+     *
+     * The pointer says where member identity lives inside a producer record,
+     * and the contract freezes it BEFORE the read that would prove it. A wrong
+     * guess was therefore fatal for the turn: the seal refused, the contract
+     * was immutable, and the per-item lane died with no way back (live
+     * 2026-08-11 — records keyed "Id", a natural proposal of '/id').
+     *
+     * This is seal METADATA, deliberately not part of the contract: the
+     * contract is content-addressed, so amending it in place would change its
+     * id and orphan every binding. Operations, effects, coverage, dependencies
+     * and membership rules stay immutable and unamendable. The primary key is
+     * the "exactly once" rule — a second amendment cannot be written at all.
+     */
+    version: 37,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('accepted_task_work_contracts') || !tables.has('events')) return;
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS expected_work_universe_amendments (
+          session_id              TEXT NOT NULL,
+          source_user_seq         INTEGER NOT NULL CHECK (source_user_seq > 0),
+          contract_id             TEXT NOT NULL,
+          universe_id             TEXT NOT NULL,
+          prior_member_id_pointer TEXT NOT NULL,
+          member_id_pointer       TEXT NOT NULL
+                                  CHECK (member_id_pointer != prior_member_id_pointer),
+          motivating_refusal      TEXT NOT NULL,
+          sealed_member_count     INTEGER NOT NULL CHECK (sealed_member_count > 0),
+          amended_at              TEXT NOT NULL,
+          amendment_event_id      TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+          PRIMARY KEY (session_id, source_user_seq, contract_id, universe_id),
+          FOREIGN KEY (contract_id)
+            REFERENCES accepted_task_work_contracts(contract_id) ON DELETE RESTRICT
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_expected_work_universe_amendment_update_immutable
+        BEFORE UPDATE ON expected_work_universe_amendments
+        BEGIN
+          SELECT RAISE(ABORT, 'a universe amendment is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_expected_work_universe_amendment_delete_immutable
+        BEFORE DELETE ON expected_work_universe_amendments
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN
+          SELECT RAISE(ABORT, 'a universe amendment is immutable');
+        END;
+      `);
     },
   },
 ];
