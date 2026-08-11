@@ -66,6 +66,23 @@ export const WorkProposalSchema = z.object({
   universes: z.array(UniverseSchema).max(16),
 }).strict();
 
+/** A VALID first-call proposal for the count-only fanout shape ("do one
+ * thing per record from this read") — embedded verbatim in the tool
+ * description because a working example outperforms field prose on the
+ * first call (hints-are-schema, live-proven 2026-08-05). The pin parses
+ * this constant against WorkProposalSchema, so schema drift breaks the
+ * build, not the model. */
+export const WORK_CALL_COUNT_ONLY_EXAMPLE = {
+  version: 1,
+  operations: [
+    { id: 'read_source', effect: 'read', coverage: 'complete_set', dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
+    { id: 'write_per_record', effect: 'external_write', coverage: null, dependsOn: ['read_source'], dataFrom: ['read_source'], cardinality: { kind: 'each', universeId: 'records' } },
+  ],
+  universes: [
+    { id: 'records', seal: 'complete_source_receipt', producedBy: 'read_source', memberIdPointer: '/Id' },
+  ],
+} as const;
+
 export const WorkCallInputSchema = z.object({
   proposal: WorkProposalSchema.nullable().describe(
     'Complete provider-neutral work topology. Required on the first work_call; use null after it is frozen.',
@@ -267,6 +284,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       'On the FIRST call, provide the complete provider-neutral proposal plus the first requirement binding; this freezes and dispatches in one tool call, with no separate planner round trip.',
       'The proposal describes only effects, dependencies, coverage, cardinality and universes—never tool names, providers, services or slugs.',
       'For later calls set proposal to null and bind the exact requirement/item from the frozen contract.',
+      `Count-only fanout ("one write per record from this read") — a VALID first-call proposal: ${JSON.stringify(WORK_CALL_COUNT_ONLY_EXAMPLE)}. The sealed universe sizes itself from the settled read; memberIdPointer is an RFC 6901 pointer to each record's id (empty string when the record itself is the id).`,
       'Use tool_search first when the inner name/schema is unknown. Ask the user naturally if the intended work itself is ambiguous.',
     ].join(' '),
     parameters: WorkCallInputSchema,

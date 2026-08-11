@@ -68,3 +68,18 @@ test('semantic admission sees exact Composio action args/schema while logical id
     'evidence refinement receives the exact provider action schema, not the carrier schema');
   assert.notDeepEqual(observed!.targetInputSchema, exactActionSchema);
 });
+
+test('the count-only example in the work_call description is a VALID proposal (two-teeth pin)', async () => {
+  // Tooth 1: the example must parse against the real proposal schema — schema
+  // drift breaks this test, never the model's first call.
+  const { WORK_CALL_COUNT_ONLY_EXAMPLE, WorkProposalSchema } = await import('./work-call.js');
+  const parsed = WorkProposalSchema.safeParse(WORK_CALL_COUNT_ONLY_EXAMPLE);
+  assert.equal(parsed.success, true, JSON.stringify(('error' in parsed && parsed.error) || null));
+  // Tooth 2: the example must actually ride the tool description — a valid
+  // constant nobody renders is a silent no-op.
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./work-call.ts', import.meta.url), 'utf-8');
+  assert.match(source, /JSON\.stringify\(WORK_CALL_COUNT_ONLY_EXAMPLE\)/, 'the example constant must be embedded in the work_call description');
+  const sealed = WORK_CALL_COUNT_ONLY_EXAMPLE.universes[0];
+  assert.equal(sealed.seal, 'complete_source_receipt', 'the example teaches the sealed-universe shape, not accepted_input');
+});
