@@ -261,6 +261,23 @@ test('standard action keeps control discovery before freeze, fuses proposal with
       { toolCall: { callId: 'subsequent-bound-call' } },
     );
     assert.match(JSON.stringify(second), /successful/);
+
+    // Satisfied-replay + steering card (live 2026-08-11: an already-settled
+    // requirement returned a bare error and restarted the guess-loop; a
+    // refusal without the frozen plan sent the model into blind retries).
+    const satisfied = await workCall.invoke(
+      runContext,
+      workInput({ proposal: null, requirementId: 'read-profile', name: 'user_profile_read' }),
+      { toolCall: { callId: 'already-satisfied-replay' } },
+    );
+    const satisfiedText = JSON.stringify(satisfied);
+    assert.match(satisfiedText, /work_already_satisfied/);
+    assert.match(satisfiedText, /result/, 'the stored prior result rides the response');
+    assert.match(satisfiedText, /do NOT re-run/i, 'the repair prescribes using the result, not retrying');
+    assert.match(satisfiedText, /plan/, 'the remaining-plan card rides the response');
+    assert.match(satisfiedText, /read-roots/, 'the plan names the sibling requirements');
+    assert.doesNotMatch(satisfiedText, /\\\\"error\\\\"/, 'the envelope is never double-wrapped');
+
     return done(items, 'The two source reads are complete; the report write still needs verification.');
   };
 

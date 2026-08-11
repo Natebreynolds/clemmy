@@ -89,9 +89,38 @@ export type ExpectedWorkAdmissionFailureKind =
   | 'work_already_satisfied'
   | 'work_authority_unavailable';
 
+/** One line per contract operation: what is owed, what is settled, what
+ *  blocks it. Rendered into every refusal so the model steers off the frozen
+ *  plan instead of guessing proposal shapes (live 2026-08-11: 84 blind
+ *  refusal-retry cycles on one count-only ask). */
+export interface ExpectedWorkPlanLine {
+  requirementId: string;
+  effect: string;
+  cardinality: string;
+  dependsOn: string[];
+  settledInstances: number;
+  requiredInstances: number | 'unknown';
+  state: 'satisfied' | 'open' | 'blocked_on_dependency';
+}
+
 export type ExpectedWorkInvocationAdmission =
   | { status: 'bound' | 'replayed'; binding: ExpectedWorkCallBinding; contract: AcceptedTaskWorkContractV1 }
-  | { status: 'refused'; kind: ExpectedWorkAdmissionFailureKind; reason: string; errors?: string[] };
+  /** The requirement instance is ALREADY settled — carry the prior call so
+   *  the carrier can hand back its stored result instead of an error. */
+  | {
+      status: 'satisfied';
+      priorLogicalToolCallId: string;
+      contract: AcceptedTaskWorkContractV1;
+      plan: ExpectedWorkPlanLine[];
+    }
+  | {
+      status: 'refused';
+      kind: ExpectedWorkAdmissionFailureKind;
+      reason: string;
+      errors?: string[];
+      /** Present whenever a frozen contract exists at refusal time. */
+      plan?: ExpectedWorkPlanLine[];
+    };
 
 export class ExpectedWorkBindingRequiredError extends Error {
   override readonly name = 'ExpectedWorkBindingRequiredError';
@@ -560,9 +589,9 @@ function priorRequirementAllowsAdmission(
   operation: ExpectedWorkOperationV1,
   universeItemId: string | undefined,
   currentTool: string,
-): { ok: true } | { ok: false; reason: string } {
+): { ok: true } | { ok: false; reason: string; satisfiedByLogicalToolCallId?: string } {
   const rows = db.prepare(`
-    SELECT b.tool_name, b.universe_item_id, l.state,
+    SELECT b.tool_name, b.universe_item_id, b.logical_tool_call_id, l.state,
            s.outcome_kind, s.recovery_action, s.retry_same_candidate,
            s.eliminates_candidate, s.requires_reconciliation
       FROM expected_work_call_bindings b
@@ -584,6 +613,7 @@ function priorRequirementAllowsAdmission(
   ) as Array<{
     tool_name: string;
     universe_item_id: string | null;
+    logical_tool_call_id: string;
     state: string;
     outcome_kind: string | null;
     recovery_action: string | null;
@@ -600,7 +630,11 @@ function priorRequirementAllowsAdmission(
   }
   const latest = relevant.at(-1)!;
   if (latest.outcome_kind === 'succeeded' || latest.outcome_kind === 'empty_result') {
-    return { ok: false, reason: 'this requirement instance is already durably settled' };
+    return {
+      ok: false,
+      reason: 'this requirement instance is already durably settled',
+      satisfiedByLogicalToolCallId: latest.logical_tool_call_id,
+    };
   }
   if (latest.outcome_kind === 'uncertain_write' || latest.requires_reconciliation === 1) {
     return { ok: false, reason: 'an uncertain mutation must be reconciled before any retry' };
@@ -686,6 +720,61 @@ function refusal(
   return { status: 'refused', kind, reason };
 }
 
+/** Compute the remaining-plan card from the frozen contract + settled
+ *  bindings. Cheap (one SELECT per contract) and safe inside the admission
+ *  transaction. */
+function planLinesFor(
+  db: Database.Database,
+  contract: AcceptedTaskWorkContractV1,
+): ExpectedWorkPlanLine[] {
+  const settledRows = db.prepare(`
+    SELECT b.requirement_id, b.universe_item_id
+      FROM expected_work_call_bindings b
+      JOIN logical_call_settlements s
+        ON s.session_id = b.session_id
+       AND s.source_user_seq = b.source_user_seq
+       AND s.logical_tool_call_id = b.logical_tool_call_id
+     WHERE b.session_id = ? AND b.source_user_seq = ? AND b.contract_id = ?
+       AND s.outcome_kind IN ('succeeded', 'empty_result')
+  `).all(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.contractId,
+  ) as Array<{ requirement_id: string; universe_item_id: string | null }>;
+  const settledByRequirement = new Map<string, Set<string>>();
+  for (const row of settledRows) {
+    const set = settledByRequirement.get(row.requirement_id) ?? new Set<string>();
+    set.add(row.universe_item_id ?? '');
+    settledByRequirement.set(row.requirement_id, set);
+  }
+  const satisfied = new Set<string>();
+  const lines: ExpectedWorkPlanLine[] = [];
+  for (const operation of contract.operations) {
+    const settled = settledByRequirement.get(operation.id)?.size ?? 0;
+    let required: number | 'unknown' = 1;
+    if (operation.cardinality.kind !== 'once') {
+      const universe = contract.universes.find((entry) =>
+        entry.id === (operation.cardinality as { universeId: string }).universeId);
+      required = universe && universe.seal === 'accepted_input'
+        ? (operation.cardinality.kind === 'each' ? universe.members.length : 1)
+        : 'unknown';
+    }
+    const done = typeof required === 'number' && settled >= required;
+    if (done) satisfied.add(operation.id);
+    const blocked = !done && operation.dependsOn.some((dep) => !satisfied.has(dep));
+    lines.push({
+      requirementId: operation.id,
+      effect: operation.effect,
+      cardinality: operation.cardinality.kind,
+      dependsOn: operation.dependsOn,
+      settledInstances: settled,
+      requiredInstances: required,
+      state: done ? 'satisfied' : blocked ? 'blocked_on_dependency' : 'open',
+    });
+  }
+  return lines;
+}
+
 /** Freeze/replay the proposal and bind the exact current logical call in one
  * transaction. The call must already have been monotonically refined from the
  * outer carrier to the normalized inner tool contract. */
@@ -748,17 +837,32 @@ export function admitExpectedWorkInvocation(input: {
     );
   }
 
+  // Every refusal from here on carries the remaining-plan card: the frozen
+  // contract + settled bindings are fully computable, and a refusal without
+  // them sent the model into blind proposal-retry cycles (live 2026-08-11:
+  // 84 refusals on one count-only ask).
+  const db = openEventLog();
+  const refusedWithPlan = (
+    kind: ExpectedWorkAdmissionFailureKind,
+    reason: string,
+  ): ExpectedWorkInvocationAdmission => {
+    try {
+      return { status: 'refused', kind, reason, plan: planLinesFor(db, contract) };
+    } catch {
+      return refusal(kind, reason);
+    }
+  };
   const operation = contract.operations.find((entry) => entry.id === input.requirementId);
-  if (!operation) return refusal('work_requirement_unknown', `requirement ${input.requirementId} is not in the frozen proposal`);
+  if (!operation) return refusedWithPlan('work_requirement_unknown', `requirement ${input.requirementId} is not in the frozen proposal`);
   const runtime = classifyRuntimeToolEffect(input.tool, input.args);
   if (runtime.effect === 'unknown' || runtime.effect !== operation.effect) {
-    return refusal(
+    return refusedWithPlan(
       'work_effect_mismatch',
       `requirement ${operation.id} expects ${operation.effect}; the resolved call is ${runtime.effect}`,
     );
   }
   const logicalContract = durableLogicalCallContract(contract.acceptedTaskId, input.tool, input.args);
-  if (!logicalContract) return refusal('work_authority_unavailable', 'resolved logical call contract is unsafe');
+  if (!logicalContract) return refusedWithPlan('work_authority_unavailable', 'resolved logical call contract is unsafe');
 
   try {
     const evidenceArgs = input.evidenceArgs ?? input.args;
@@ -771,7 +875,7 @@ export function admitExpectedWorkInvocation(input: {
         || authority.expected_work_required !== 1
         || authority.accepted_task_id !== contract.acceptedTaskId
         || authority.state !== 'armed'
-      ) return refusal('work_authority_unavailable', 'action expected-work authority is not active and armed');
+      ) return refusedWithPlan('work_authority_unavailable', 'action expected-work authority is not active and armed');
 
       const logical = db.prepare(`
         SELECT accepted_task_id, tool_name, argument_digest, state
@@ -789,13 +893,13 @@ export function admitExpectedWorkInvocation(input: {
         || logical.tool_name !== logicalContract.toolName
         || logical.argument_digest !== logicalContract.argumentDigest
         || logical.state !== 'open'
-      ) return refusal('work_authority_unavailable', 'logical call is not the exact open normalized inner call');
+      ) return refusedWithPlan('work_authority_unavailable', 'logical call is not the exact open normalized inner call');
       const crossingCount = (db.prepare(`
         SELECT COUNT(*) AS count FROM physical_dispatches
          WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
       `).get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId) as { count: number }).count;
       if (crossingCount !== 0) {
-        return refusal('work_authority_unavailable', 'logical call already crossed a provider boundary');
+        return refusedWithPlan('work_authority_unavailable', 'logical call already crossed a provider boundary');
       }
 
       const existing = db.prepare(`
@@ -811,7 +915,7 @@ export function admitExpectedWorkInvocation(input: {
           && String(existing.tool_name) === logicalContract.toolName
           && String(existing.argument_digest) === logicalContract.argumentDigest
         ) return { status: 'replayed', binding, contract };
-        return refusal('work_contract_conflict', 'logical call already owns a different work binding');
+        return refusedWithPlan('work_contract_conflict', 'logical call already owns a different work binding');
       }
 
       // Accepted-input universes are authority at contract freeze, not when a
@@ -826,7 +930,7 @@ export function admitExpectedWorkInvocation(input: {
           acceptedUniverse,
           acceptedUniverse.members,
         );
-        if (!witness.ok) return refusal('work_source_witness_missing', witness.reason);
+        if (!witness.ok) return refusedWithPlan('work_source_witness_missing', witness.reason);
       }
 
       const prior = priorRequirementAllowsAdmission(
@@ -836,7 +940,21 @@ export function admitExpectedWorkInvocation(input: {
         input.universeItemId ?? undefined,
         logicalContract.toolName,
       );
-      if (!prior.ok) return refusal('work_already_satisfied', prior.reason);
+      if (!prior.ok) {
+        // A SETTLED requirement instance is not an error: hand the carrier
+        // the prior call so it can return the stored result (the model asked
+        // because it needs the data — an error here restarted the whole
+        // guess-loop; live 2026-08-11: 6 pure-waste retries in one run).
+        if (prior.satisfiedByLogicalToolCallId) {
+          return {
+            status: 'satisfied',
+            priorLogicalToolCallId: prior.satisfiedByLogicalToolCallId,
+            contract,
+            plan: planLinesFor(db, contract),
+          };
+        }
+        return refusedWithPlan('work_already_satisfied', prior.reason);
+      }
 
       for (const dependencyId of operation.dependsOn) {
         const dependency = contract.operations.find((entry) => entry.id === dependencyId);
@@ -846,7 +964,7 @@ export function admitExpectedWorkInvocation(input: {
           dependency,
           operation,
           input.universeItemId ?? undefined,
-        )) return refusal('work_dependency_pending', `dependency ${dependencyId} is not durably satisfied`);
+        )) return refusedWithPlan('work_dependency_pending', `dependency ${dependencyId} is not durably satisfied`);
       }
 
       const universe = universeFor(contract, operation);
@@ -858,25 +976,25 @@ export function admitExpectedWorkInvocation(input: {
       let inputSourceDigest: string | null = null;
       if (operation.cardinality.kind === 'once') {
         if (input.universeItemId != null || input.universeSelector != null) {
-          return refusal('work_cardinality_mismatch', 'once cardinality accepts neither an item nor universe selector');
+          return refusedWithPlan('work_cardinality_mismatch', 'once cardinality accepts neither an item nor universe selector');
         }
       } else {
-        if (!universe) return refusal('work_cardinality_mismatch', 'operation universe is missing');
+        if (!universe) return refusedWithPlan('work_cardinality_mismatch', 'operation universe is missing');
         if (!input.universeSelector) {
-          return refusal('work_cardinality_mismatch', 'each/set cardinality requires an immutable argument selector');
+          return refusedWithPlan('work_cardinality_mismatch', 'each/set cardinality requires an immutable argument selector');
         }
         if (operation.cardinality.kind === 'each' && !input.universeItemId) {
-          return refusal('work_cardinality_mismatch', 'each cardinality requires universe_item_id');
+          return refusedWithPlan('work_cardinality_mismatch', 'each cardinality requires universe_item_id');
         }
         if (operation.cardinality.kind === 'set' && input.universeItemId != null) {
-          return refusal('work_cardinality_mismatch', 'set cardinality binds the full set, not one item');
+          return refusedWithPlan('work_cardinality_mismatch', 'set cardinality binds the full set, not one item');
         }
         const selected = selectedMemberIds(evidenceArgs, input.universeSelector, operation.cardinality.kind);
-        if (!selected.ok) return refusal('work_cardinality_mismatch', selected.reason);
+        if (!selected.ok) return refusedWithPlan('work_cardinality_mismatch', selected.reason);
         const expectedMembers = universe.seal === 'accepted_input'
           ? [...universe.members].sort()
           : null;
-        if (!expectedMembers) return refusal('work_universe_unsealed', 'dynamic source universe has no redeemed host seal');
+        if (!expectedMembers) return refusedWithPlan('work_universe_unsealed', 'dynamic source universe has no redeemed host seal');
         const requiredMembers = operation.cardinality.kind === 'each'
           ? [input.universeItemId as string]
           : expectedMembers;
@@ -884,9 +1002,9 @@ export function admitExpectedWorkInvocation(input: {
           requiredMembers.length !== selected.ids.length
           || requiredMembers.some((member, index) => member !== selected.ids[index])
           || requiredMembers.some((member) => !expectedMembers.includes(member))
-        ) return refusal('work_cardinality_mismatch', 'selected argument members do not match the accepted universe instance');
+        ) return refusedWithPlan('work_cardinality_mismatch', 'selected argument members do not match the accepted universe instance');
         const witness = sourceWitness(db, contract, universe, selected.ids);
-        if (!witness.ok) return refusal('work_source_witness_missing', witness.reason);
+        if (!witness.ok) return refusedWithPlan('work_source_witness_missing', witness.reason);
         selectorJson = canonicalExpectedWorkJson(input.universeSelector);
         memberDigest = expectedWorkDigest(canonicalExpectedWorkJson(selected.ids));
         memberCount = selected.ids.length;
@@ -908,7 +1026,7 @@ export function admitExpectedWorkInvocation(input: {
           args: evidenceArgs,
         });
         if (refinement.status !== 'authoritative') {
-          return refusal(
+          return refusedWithPlan(
             'work_cardinality_mismatch',
             `read evidence shape is not structurally provable: ${refinement.reason}`,
           );
@@ -925,7 +1043,7 @@ export function admitExpectedWorkInvocation(input: {
             || canonicalExpectedWorkJson(input.universeSelector)
               !== canonicalExpectedWorkJson(derivedSelector)
           ) {
-            return refusal(
+            return refusedWithPlan(
               'work_cardinality_mismatch',
               'the proposed universe selector does not equal the unique schema-derived selector',
             );
@@ -946,7 +1064,7 @@ export function admitExpectedWorkInvocation(input: {
           })
         : { status: 'replayed' as const, contract };
       if (freeze.status !== 'fixed' && freeze.status !== 'replayed') {
-        return refusal(
+        return refusedWithPlan(
           freeze.status === 'invalid' || freeze.status === 'conflict'
             ? 'work_contract_conflict'
             : 'work_authority_unavailable',
@@ -1016,6 +1134,6 @@ export function admitExpectedWorkInvocation(input: {
     });
     return tx.immediate();
   } catch (error) {
-    return refusal('work_authority_unavailable', boundedReason(error));
+    return refusedWithPlan('work_authority_unavailable', boundedReason(error));
   }
 }

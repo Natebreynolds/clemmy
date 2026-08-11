@@ -20,6 +20,7 @@ import type { ExpectedWorkProposalV1 } from '../runtime/harness/expected-work-co
 import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 import type { SettleToolAttemptInput } from '../runtime/harness/attempt-settlement.js';
 import { settleResolvedCarrierRefusal } from '../runtime/harness/resolved-carrier-refusal.js';
+import { redeemSuccessfulSettlementResultForHost } from '../runtime/harness/result-handle.js';
 import { buildCallTool, type BuildCallToolOptions } from './call-tool.js';
 
 const IdSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9:._/-]*$/);
@@ -110,15 +111,41 @@ function normalizedSelector(input: WorkCallInput['universe_selector']): Expected
   };
 }
 
-function refusalResult(kind: ExpectedWorkAdmissionFailureKind, reason: string): ExternalWritePreDispatchResult {
+/** Per-kind actionable repair lines. A refusal that only says "retry with a
+ *  corrected proposal" produced blind guess-loops (live 2026-08-11: 84
+ *  refusals on one ask); each line now names the next concrete move and the
+ *  plan card carries the frozen state to move against. */
+function repairLineFor(kind: ExpectedWorkAdmissionFailureKind): string {
+  switch (kind) {
+    case 'work_contract_required':
+    case 'work_contract_invalid':
+      return 'Retry work_call with one corrected complete semantic proposal and the same intended inner call. The plan array (when present) lists the already-frozen requirements — reuse their ids and shapes exactly.';
+    case 'work_already_satisfied':
+      return 'This requirement is already complete — its stored result is included under `result`. Use it; do NOT re-run this requirement. Continue with the next `open` entry in `plan`.';
+    case 'work_dependency_pending':
+      return 'Complete the dependency named in `detail` first — `plan` shows each requirement\'s state. Dispatch the blocked requirement only after its dependency reads `satisfied`.';
+    case 'work_requirement_unknown':
+    case 'work_effect_mismatch':
+    case 'work_cardinality_mismatch':
+      return 'Bind an EXISTING requirement from `plan` exactly — matching id, effect, and cardinality. Do not invent new requirement ids or reshape the frozen proposal.';
+    default:
+      return 'Use the frozen requirement/cardinality exactly, or explain the blocker conversationally.';
+  }
+}
+
+function refusalResult(
+  kind: ExpectedWorkAdmissionFailureKind,
+  reason: string,
+  extras?: { plan?: unknown; result?: unknown },
+): ExternalWritePreDispatchResult {
   return new ExternalWritePreDispatchResult(
     JSON.stringify({
       error: kind,
       dispatch_state: 'not_started',
       detail: reason,
-      repair: kind === 'work_contract_required' || kind === 'work_contract_invalid'
-        ? 'Retry work_call with one corrected complete semantic proposal and the same intended inner call.'
-        : 'Use the frozen requirement/cardinality exactly, or explain the blocker conversationally.',
+      repair: repairLineFor(kind),
+      ...(extras?.plan ? { plan: extras.plan } : {}),
+      ...(extras?.result !== undefined ? { result: extras.result } : {}),
     }),
     kind,
   );
@@ -139,8 +166,9 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       const refuse = (
         kind: ExpectedWorkAdmissionFailureKind,
         reason: string,
+        extras?: { plan?: unknown; result?: unknown },
       ): ExternalWritePreDispatchResult => {
-        const refusal = refusalResult(kind, reason);
+        const refusal = refusalResult(kind, reason, extras);
         const repairableInvocationShape = kind === 'work_contract_required'
           || kind === 'work_contract_invalid'
           || kind === 'work_binding_required'
@@ -189,7 +217,35 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       });
       if (admission.status === 'refused') {
         frame.refusalKind = admission.kind;
-        return refuse(admission.kind, admission.reason);
+        return refuse(admission.kind, admission.reason, admission.plan ? { plan: admission.plan } : undefined);
+      }
+      if (admission.status === 'satisfied') {
+        // The requirement instance is already settled: hand back the STORED
+        // result instead of an error. The model asked because it needs the
+        // data — refusing restarted the whole guess-loop (live 2026-08-11).
+        frame.refusalKind = 'work_already_satisfied';
+        let redeemedResult: unknown;
+        try {
+          const redeemed = redeemSuccessfulSettlementResultForHost({
+            sessionId: resolved.sessionId,
+            sourceUserSeq: resolved.sourceUserSeq as number,
+            acceptedTaskId: admission.contract.acceptedTaskId,
+            logicalToolCallId: admission.priorLogicalToolCallId,
+          });
+          if (redeemed.status === 'ok') {
+            redeemedResult = {
+              records: redeemed.value.handle.projectedRecords,
+              recordCount: redeemed.value.handle.recordCount,
+              completeness: redeemed.value.handle.completeness,
+              tool: redeemed.value.toolName,
+            };
+          }
+        } catch { /* fall through to the plain already-satisfied refusal */ }
+        return refuse(
+          'work_already_satisfied',
+          'this requirement instance is already durably settled — its stored result is included',
+          { plan: admission.plan, ...(redeemedResult !== undefined ? { result: redeemedResult } : {}) },
+        );
       }
       return withExpectedWorkBinding(admission.binding, dispatch);
     },
@@ -230,9 +286,19 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       if (output instanceof ExternalWritePreDispatchResult) {
         return output as unknown as string;
       }
-      return frame.refusalKind
-        ? refusalResult(frame.refusalKind, rendered) as unknown as string
-        : rendered;
+      if (!frame.refusalKind) return rendered;
+      // The dispatcher may hand the pre-dispatch refusal back as an ALREADY
+      // rendered envelope string; re-wrapping it buried the whole steering
+      // card (plan/result/repair) inside an escaped `detail` field (mapped
+      // 2026-08-11 as the double-wrap hardening). Pass a rendered envelope
+      // through untouched; wrap only bare reasons.
+      try {
+        const parsed = JSON.parse(rendered) as { error?: unknown; dispatch_state?: unknown };
+        if (typeof parsed?.error === 'string' && parsed.dispatch_state === 'not_started') {
+          return rendered;
+        }
+      } catch { /* not an envelope — wrap it */ }
+      return refusalResult(frame.refusalKind, rendered) as unknown as string;
     },
   });
 }
