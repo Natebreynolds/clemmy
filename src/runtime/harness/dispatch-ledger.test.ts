@@ -370,3 +370,61 @@ test('a mismatched physical settlement cannot close a crossing', () => {
   assert.equal(ledger.physicalCrossingsFor(task.sessionId, task.sourceUserSeq)[0]?.settled, false);
   assert.equal(resolution.finalizeResolution(task), false);
 });
+
+test('a poisoned call records the FIRST cause on the dispatch path, and later readers report it', () => {
+  // The OTHER poison path. poisonResolution flipped a call to 'conflict' and
+  // recorded nothing, so every later reader — including the error that ended
+  // the run — could only say the call was poisoned, never which check failed.
+  // A live scheduled workflow died on exactly this for two days with its first
+  // cause unrecoverable from the store (platform-49, 2026-08-11).
+  const task = accept();
+  const identity = {
+    ...task,
+    acceptedTaskId: identities.acceptedTaskIdFor(task.sessionId, task.sourceUserSeq),
+    logicalToolCallId: 'logical:first-cause',
+  };
+  assert.equal(ledger.admitLogicalCall({
+    identity,
+    tool: 'alpha_records_search',
+    args: { query: 'alpha' },
+  }).status, 'inserted');
+
+  // Refining someone else's tool onto this call is the platform-49 check.
+  const refused = ledger.refineLogicalCallContract({
+    identity,
+    tool: 'beta_records_write',
+    effectiveArgs: { record: 'r1' },
+  });
+  assert.equal(refused.status, 'conflict');
+  if (refused.status !== 'conflict') throw new Error('the fixture did not conflict');
+  assert.match(refused.reason, /conflicts with its logical owner or tool/);
+
+  const db = eventlog.openEventLog();
+  const row = db.prepare(`
+    SELECT state, conflict_reason FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, identity.logicalToolCallId) as {
+    state: string;
+    conflict_reason: string | null;
+  };
+  assert.equal(row.state, 'conflict');
+  assert.equal(row.conflict_reason, refused.reason, 'the first cause is durable, not just returned');
+
+  // Every later reader names that cause instead of the poisoning.
+  const authority = ledger.logicalCallAuthorityState(identity);
+  assert.equal(authority.status, 'conflict');
+  assert.match(
+    authority.status === 'conflict' ? authority.reason : '',
+    /conflicts with its logical owner or tool/,
+  );
+
+  // A second poison must not overwrite the first cause.
+  ledger.admitLogicalCall({ identity, tool: 'alpha_records_search', args: { query: 'gamma' } });
+  const after = db.prepare(`
+    SELECT conflict_reason FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, identity.logicalToolCallId) as {
+    conflict_reason: string | null;
+  };
+  assert.equal(after.conflict_reason, row.conflict_reason, 'the FIRST cause survives later conflicts');
+});
