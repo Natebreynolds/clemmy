@@ -1070,3 +1070,55 @@ test('dispatch-enforced constraints are never elided from the standing block', (
   assert.match(block, /NEVER use Composio Salesforce/, 'the second dispatch constraint renders in full');
   assert.doesNotMatch(block, /omitted from this summary but still enforced/, 'no dispatch constraint is ever elided');
 });
+
+test('the pinned block never starves the ranked scored tail (4-of-8 roster class)', () => {
+  // Live 2026-08-11: a drafts turn rendered 8 policy facts and ZERO scored
+  // facts — the pinned section consumed the whole budget, the #1-ranked
+  // complete team-roster fact never reached the model, and it drafted from a
+  // stale 4-name partial. maxChars caps ONLY the scored tail; a fat standing
+  // block must never squeeze ranked facts to nothing.
+  // Dispatch-classified rules (outlook_sender family) render IN FULL by
+  // design — exactly the group that consumed the whole budget live.
+  const filler = 'The dispatch gate verifies the connected mailbox and routes to the compliant connection automatically, regardless of which account the draft was authored under, and never falls back silently to any other route. ';
+  for (let i = 0; i < 8; i += 1) {
+    rememberFact({
+      kind: 'constraint',
+      content: `Email rule ${i}: ALWAYS send email via the Outlook mailbox alias-${i}@example.com when sending for account ${i}. ${filler}${filler}`,
+    });
+  }
+  rememberFact({
+    kind: 'project',
+    content: 'Zephyr pod roster: the eight sellers are Ada Quill, Bo Marsh, Cy Vale, Dee Lark, Ed Moss, Fay Wren, Gus Reed, and Hal Finch (complete set).',
+  });
+  const block = renderFactsForInstructions(12, 2600, 'draft follow-ups for the Zephyr pod sellers roster');
+  assert.match(
+    block,
+    /Ada Quill, Bo Marsh, Cy Vale, Dee Lark, Ed Moss, Fay Wren, Gus Reed, and Hal Finch/,
+    'the ranked scored tail must survive a fat pinned block — an empty tail is the 4-of-8 recall bug',
+  );
+});
+
+test('objective-relevant prompt-only constraints outrank a burst of newer one-off rules (pin-hygiene)', () => {
+  // Live store 2026-08-11: five constraints from one July incident (plus other
+  // one-off rules) filled the bounded prompt-only budget by recency while the
+  // rule relevant to the running objective sat below the cut. Order must be
+  // relevance-first; junk is never deleted, it just sinks when off-topic.
+  const spin = (ms: number) => { const s = Date.now(); while (Date.now() - s < ms) { /* distinct updated_at */ } };
+  rememberFact({
+    kind: 'constraint',
+    content: 'Zephyr intake submissions must bind fields as multipart form data using the numbered field names; JSON bodies silently drop attachments.',
+  });
+  for (let i = 0; i < 10; i += 1) {
+    spin(2);
+    rememberFact({
+      kind: 'constraint',
+      content: `One-off migration note ${i}: while the archive move is pegged, avoid bulk renames in the synced folder and wait for the file provider daemon to settle before retrying anything heavy.`,
+    });
+  }
+  const block = renderFactsForInstructions(12, 2600, 'submit the Zephyr intake form with the client attachments');
+  assert.match(
+    block,
+    /multipart form data using the numbered field names/,
+    'the objective-relevant prompt-only rule must render ahead of newer one-off rules',
+  );
+});

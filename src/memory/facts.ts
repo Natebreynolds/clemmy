@@ -1718,7 +1718,16 @@ export function renderFactsForInstructions(
     const totalPolicyBudget = mode === 'pinned' ? maxChars : Math.min(maxChars, 1600);
     const groups = {
       dispatch_constraint: pinned.filter((f) => f.kind === 'constraint' && dispatchBackedFactIds.has(f.id)),
-      prompt_instruction: pinned.filter((f) => f.kind === 'constraint' && !dispatchBackedFactIds.has(f.id)),
+      // Relevance-ordered like standing preferences: this group's order used
+      // to be pure policy recency, so a burst of one-off incident rules (the
+      // live store carries five facts from a single July folder-move
+      // incident) permanently occupied the bounded prompt-only budget while
+      // an objective-relevant rule sat below the cut. Nothing is deleted —
+      // off-objective rules sink and resurface when their topic is live.
+      prompt_instruction: orderPoliciesForPrompt(
+        pinned.filter((f) => f.kind === 'constraint' && !dispatchBackedFactIds.has(f.id)),
+        objective,
+      ),
       core_profile: pinned.filter((f) => f.kind !== 'constraint' && policyTypeByFactId.get(f.id) === 'core_profile'),
       standing_preference: orderPoliciesForPrompt(
         pinned.filter((f) => f.kind !== 'constraint' && policyTypeByFactId.get(f.id) !== 'core_profile'),
@@ -1806,7 +1815,15 @@ export function renderFactsForInstructions(
 
   // Cap the scored tail only, on a fact/section boundary (never mid-fact), and
   // flag the elision so the model knows recall can widen.
-  const scoredBudget = Math.max(0, maxChars - (pinnedSection ? pinnedSection.length + 2 : 0));
+  //
+  // maxChars caps ONLY the scored tail — the pinned block is separately
+  // bounded above and must never starve the ranked facts. The old
+  // subtraction (maxChars - pinnedSection.length) drove the tail to ZERO
+  // whenever standing policy filled the budget: live 2026-08-11, the drafts
+  // turn rendered 8 policy facts and no scored facts, so the #1-ranked
+  // team-roster fact never reached the model and it drafted from a stale
+  // 4-name partial (754 of 2,345 recent renders had an empty scored tail).
+  const scoredBudget = maxChars;
   if (scoredBlock.length > scoredBudget) {
     scoredBlock = clipToLineBoundary(scoredBlock, scoredBudget);
     if (scoredBlock) scoredBlock += '\n_… more facts elided to fit; call memory_search_facts to widen._';

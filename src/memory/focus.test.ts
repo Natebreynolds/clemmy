@@ -33,6 +33,7 @@ const {
   linkFocusActionForSession,
   updateLinkedFocusAction,
   updateFocus,
+  getRecallObjective,
   checkResourceMatchesFocus,
   extractNamedResource,
 } = await import('./focus.js');
@@ -326,6 +327,19 @@ test('checkResourceMatchesFocus ignores stale focus that needs confirmation', ()
   } finally {
     delete process.env.CLEMMY_FOCUS_CONFIRM_MS;
   }
+});
+
+test('getRecallObjective strips machine markers from the message (objective-pollution pin)', () => {
+  resetMemoryDb();
+  clearFocus();
+  // Live 2026-08-11: a control-receipt terminal became the recall objective,
+  // so facts were ranked against mechanism text instead of the user's ask.
+  const objective = getRecallObjective(
+    '[clementine:control-receipt:final] Started "Create 5 grounded follow-up drafts for Tyler" in the background (bg-msoqclb3) — it reports back here.',
+  );
+  assert.ok(objective, 'a receipt-wrapped message still yields the human text');
+  assert.doesNotMatch(objective!, /clementine:control-receipt/, 'machine markers must not pollute the recall objective');
+  assert.match(objective!, /follow-up drafts for Tyler/, 'the human text survives the strip');
 });
 
 process.on('exit', () => {

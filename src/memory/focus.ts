@@ -183,7 +183,12 @@ export function getRecallObjective(message?: string): string | undefined {
   const enabled = (getRuntimeEnv('CLEMMY_SCOPED_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
   if (!enabled) return undefined;
   const focus = getActiveObjective();
-  const parts = [message?.trim(), focus].filter((p): p is string => Boolean(p));
+  // Machine markers (control receipts, typed refusal prefixes) reach this
+  // seam when a harness-authored turn is the "message" — ranking facts
+  // against mechanism text polluted the objective on a live drafts run
+  // (2026-08-11). Strip bracketed clementine markers; keep the human text.
+  const cleanedMessage = message?.replace(/\[clementine:[a-z0-9:_-]+\]/gi, ' ').replace(/\s+/g, ' ').trim();
+  const parts = [cleanedMessage, focus].filter((p): p is string => Boolean(p));
   const joined = parts.join(' ').slice(0, 600).trim();
   return joined || undefined;
 }
