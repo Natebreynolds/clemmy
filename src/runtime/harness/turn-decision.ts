@@ -479,6 +479,7 @@ export function toOrchestratorDecision(value: unknown): OrchestratorDecisionShap
       done: true,
       nextAction: 'completed',
       reason: null,
+      controlReceipt: true,
     };
   }
   const decision = typeof value === 'string'

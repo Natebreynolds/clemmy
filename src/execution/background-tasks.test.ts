@@ -3007,7 +3007,10 @@ test('formatElapsedDuration: seconds, minutes, hours', () => {
   assert.equal(formatElapsedDuration(65 * 60_000), '1h 5m');
 });
 
-test('progress heartbeat body carries elapsed time, tool count, and current activity', () => {
+test('progress heartbeat body narrates the work — no run ids, no bare tool identifiers', () => {
+  // Narrate the work, not the mechanism: the live 2026-08-11 acceptance
+  // heartbeat read "Currently: work_call / Run: run-bg-…" — a bare tool
+  // identifier and an internal id shipped to the user.
   const body = buildProgressCheckInBody({
     task: heartbeatTask(),
     elapsedMs: 12 * 60_000,
@@ -3018,10 +3021,19 @@ test('progress heartbeat body carries elapsed time, tool count, and current acti
   assert.match(body, /Still working on the quarterly SEO analysis/);
   assert.match(body, /12m in/, 'human elapsed time is present');
   assert.match(body, /23 tool calls/, 'tool-call count is present');
-  assert.match(body, /Currently: serp_organic_live_advanced/, 'latest activity is surfaced');
+  assert.doesNotMatch(body, /run-bg-hb-1/, 'run ids never reach the user');
+  assert.doesNotMatch(body, /serp_organic_live_advanced/, 'a bare tool identifier is not an activity line');
+
+  const human = buildProgressCheckInBody({
+    task: heartbeatTask(),
+    elapsedMs: 12 * 60_000,
+    toolCount: 23,
+    latestActivitySummary: 'Reading the March SERP snapshots',
+  });
+  assert.match(human, /Currently: Reading the March SERP snapshots/, 'a human-shaped activity line is surfaced');
 });
 
-test('progress heartbeat body falls back to the task label when no activity seen yet, and singularizes one call', () => {
+test('progress heartbeat body stays plain with no activity yet, and singularizes one call', () => {
   const body = buildProgressCheckInBody({
     task: heartbeatTask(),
     elapsedMs: 30_000,
@@ -3029,7 +3041,7 @@ test('progress heartbeat body falls back to the task label when no activity seen
     latestActivitySummary: '',
   });
   assert.match(body, /1 tool call\./, 'singular "call" for a single tool call');
-  assert.match(body, /Currently: the quarterly SEO analysis/, 'falls back to the label as the activity');
+  assert.doesNotMatch(body, /Currently:/, 'no fabricated activity line when nothing human-shaped exists');
 });
 
 test('decideHeartbeat: running past the interval emits a LOUD heartbeat', () => {

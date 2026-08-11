@@ -102,6 +102,18 @@ export function renderTerminalToolReply(rawName: string, input: unknown, output:
     const q = (input as { question?: unknown } | null | undefined)?.question;
     return typeof q === 'string' && q.trim() ? q.trim() : (output.trim() || 'I have a quick question before I proceed.');
   }
+  if (bare === 'background_task_revise') {
+    // The raw receipt is mechanism-speak ("Updated bg-… to contract v2 …
+    // evidence policy: revalidate") and shipped verbatim to a user (live
+    // 2026-08-11, first dev-daemon acceptance ask). Plain voice, no ids —
+    // the surrounding thread already names the task.
+    return 'Got it — I’ve folded that into the running task; it picks up the change at its next step.';
+  }
+  if (bare === 'background_task_cancel') {
+    return output.trim().startsWith('{')
+      ? 'Stopped that background task — nothing further will run.'
+      : (output.trim() || 'Stopped that background task — nothing further will run.');
+  }
   return output.trim() || `${bare} completed.`;
 }
 

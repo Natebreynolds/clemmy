@@ -2058,6 +2058,13 @@ export interface OrchestratorDecisionShape {
     | 'completed'
     | 'abandoned';
   reason?: string | null;
+  /** True when this decision IS a settled control receipt (dispatch/status/
+   * revise/cancel) rather than a model-authored completion claim. The
+   * transferred/answered request is no longer this turn's objective — the
+   * completion judge must not re-open it (live 2026-08-11: the judge bounced
+   * a dispatch handoff twice, churned the model into status+self-revision,
+   * and the LAST mechanical receipt shipped as the user's reply). */
+  controlReceipt?: boolean;
 }
 
 export type RunConversationStatus =
@@ -5661,6 +5668,13 @@ async function runConversationCore(
       // Bounded + fail-open (judge defaults to done) so it can never wedge.
       } else if (
         !durableMemoryAcknowledgementCompleted
+        // A settled control receipt (dispatch handoff, status answer) is the
+        // terminal for the request it settles — the work now belongs to the
+        // child/its own executor, so there is nothing here for the judge to
+        // re-open. Bouncing it churned the model into status + self-revision
+        // and shipped the last mechanical receipt as the reply (live
+        // 2026-08-11, first dev-daemon acceptance ask).
+        && decision.controlReceipt !== true
         && shouldRunObjectiveJudge({
           optIn: objectiveJudgeOptIn,
           actionIntent: objectiveJudgeActionIntent || freshExternalWriteRequired,

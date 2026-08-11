@@ -1140,13 +1140,17 @@ function buildProgressCheckInBody(input: {
   latestActivitySummary?: string;
   runId?: string;
 }): string {
-  const activity = (input.latestActivitySummary ?? '').trim() || input.task.title;
+  const rawActivity = (input.latestActivitySummary ?? '').trim();
+  // Narrate the work, not the mechanism: a bare tool identifier
+  // ("work_call") and run ids are internal vocabulary — the live 2026-08-11
+  // acceptance heartbeat read "Currently: work_call / Run: run-bg-…". Only a
+  // human-shaped activity line earns a "Currently:".
+  const activity = /^[a-z0-9_]+$/i.test(rawActivity) ? '' : rawActivity;
   const calls = `${input.toolCount} tool call${input.toolCount === 1 ? '' : 's'}`;
   const lines = [
     `Still working on ${input.task.title} — ${formatElapsedDuration(input.elapsedMs)} in, ${calls}.`,
   ];
   if (activity) lines.push(`Currently: ${activity}`);
-  if (input.runId) lines.push(`Run: ${input.runId}`);
   return lines.join('\n');
 }
 
@@ -1170,6 +1174,10 @@ function emitBackgroundTaskProgressUpdate(
   },
 ): BackgroundTaskRecord {
   const now = nowIso();
+  // Byte-identical repeat of the last check-in: the user already saw this
+  // exact line (live 2026-08-11: the same "Still working…" posted twice in a
+  // row). Keep the dashboard timestamp fresh, but never re-deliver it loudly.
+  const loud = input.loud && clean(input.body, 700) !== task.lastCheckInMessage;
   const updated = updateBackgroundTask(task.id, {
     lastCheckInAt: now,
     lastCheckInMessage: clean(input.body, 700),
@@ -1183,7 +1191,7 @@ function emitBackgroundTaskProgressUpdate(
     body: input.body,
     createdAt: now,
     read: false,
-    silent: !input.loud,
+    silent: !loud,
     metadata: taskNotificationMetadata(updated, {
       runId: input.runId,
       ...(input.metadata ?? {}),

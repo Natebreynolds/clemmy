@@ -12,7 +12,7 @@ import {
 } from '../execution/background-tasks.js';
 import { getActiveGoalForSession, holdTaskForLater, listHeldTasks, getHeldTask } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
-import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
+import { getSession as getHarnessSession, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { linkFocusActionForSession, updateLinkedFocusAction } from '../memory/focus.js';
 import {
@@ -209,6 +209,30 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         return textResult('I can only dispatch a background task from a live chat session (no session context here) — run the task directly instead.');
       }
       void handoff_note; // consumed by the terminal reply renderer via output marker below
+
+      // STRUCTURAL alignment beat. Preflight classifies each accepted source;
+      // when the FIRST decision for this exact source said phase=align and
+      // consequential, the user has not yet seen or confirmed the plan — the
+      // tool description's CONVERSE FIRST was prompt-level and got ignored
+      // (live 2026-08-11: a consequential ask preflighted align and the model
+      // dispatched in the same turn; the user never saw the pinned goal).
+      // Their confirmation arrives as the NEXT accepted source, which
+      // preflights on its own merits.
+      const beatSourceSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
+      if (typeof beatSourceSeq === 'number' && beatSourceSeq > 0) {
+        try {
+          const firstDecision = listHarnessEvents(sessionId, { types: ['turn_preflight_decision'] })
+            .find((event) => (event.data as { sourceUserSeq?: unknown })?.sourceUserSeq === beatSourceSeq);
+          const data = firstDecision?.data as { phase?: unknown; consequential?: unknown } | undefined;
+          if (data?.phase === 'align' && data?.consequential === true) {
+            return textResult([
+              'Alignment beat owed — no task was started.',
+              'This request is consequential and this turn opened in the ALIGN phase: reply to the user FIRST with the plan in plain language — what you will do, the concrete steps, and the success criteria — and ask for their go-ahead.',
+              'Dispatch after they confirm; their confirmation arrives as their next message.',
+            ].join('\n'));
+          }
+        } catch { /* an unreadable preflight row never blocks dispatch */ }
+      }
 
       // Typed fan-out lane: the brain's OWN plan carries the manifest — no
       // second classifier call, no phrase heuristics. Admission validates the
