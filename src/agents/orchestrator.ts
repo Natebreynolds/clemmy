@@ -2460,7 +2460,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     rubricChoice.instructions,
     codeModeMandate,
     actionWork
-      ? '[action-work] This exact accepted turn requires durable action authority. Call control/discovery tools directly when needed. Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
+      ? '[action-work] This exact accepted turn requires durable action authority. Call control/discovery tools directly when needed — including `run_worker` for multi-item fan-out (each worker settles its own business calls). Route every other business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
       : null,
     catalogBlock,
     renderCapabilityCandidateCard(options.turnCandidates),
@@ -2472,7 +2472,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const structuralTools = declinedContinuation
     ? []
     : actionWork
-    ? [buildRequestApprovalTool(), buildAskUserQuestionTool()]
+    // run_worker stays DIRECT on action turns: it is the fan-out coordination
+    // primitive (control role), not a business operation — dropping it made
+    // every act-routed multi-item task unable to fan out at all (live
+    // 2026-08-11, long-horizon-manifest run 4).
+    ? [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool]
     : localMemoryScope
     ? [plannerTool, buildAskUserQuestionTool()]
     : [

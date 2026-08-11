@@ -133,9 +133,14 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'agent_runs_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'List recent autonomy cycles (daemon-source runs).' },
   { name: 'answer_check_in', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], description: 'Resolve an open check-in with an answer.' },
   { name: 'ask_user_question', sideEffect: 'read', tier: 'core', lanes: ['sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Ask the user a question when the answer would change what you do — scope, target, format, or a boundary only they can decide.' },
-  { name: 'background_task_revise', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'read-only', loopClass: 'mutating', blockedFor: ['workflow-step', 'worker'], description: 'Version and course-correct an active durable background task on its existing session.' },
-  { name: 'background_task_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Inspect a durable background task by task id, run id, or session id.' },
-  { name: 'background_tasks_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'List recent durable background tasks with status, latest activity, approvals, and result…' },
+  // The background-task family is control-plane (task-lifecycle coordination,
+  // same family as run_worker/execution_create) — the default business role
+  // made a plain status read on an act-authority turn a turn-killing 500
+  // (live 2026-08-11, long-horizon-manifest origin: background_task_status →
+  // ExpectedWorkBindingRequiredError).
+  { name: 'background_task_revise', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'read-only', loopClass: 'mutating', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Version and course-correct an active durable background task on its existing session.' },
+  { name: 'background_task_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Inspect a durable background task by task id, run id, or session id.' },
+  { name: 'background_tasks_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List recent durable background tasks with status, latest activity, approvals, and result…' },
   { name: 'browser_harness_run', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'], description: 'Run a Browser Harness Python snippet against the user browser through the browser-harness…' },
   { name: 'browser_harness_status', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], description: 'Check Browser Harness availability and setup state.' },
   // Generic gated dispatcher for schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07,
@@ -162,7 +167,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'delete_agent', sideEffect: 'admin', tier: 'discoverable', lanes: ['cli'], blockedFor: ['workflow-step', 'worker'], description: 'Delete an agent definition.' },
   { name: 'desktop_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator'], description: 'Read-only status for the locally installed Clementine desktop app, including installed bu…' },
   { name: 'discover_work', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], loopClass: 'idempotent', description: 'Scan handoffs, plans, goals, tasks, and inbox items to find prioritized work that should…' },
-  { name: 'dispatch_background_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', description: 'Hand an AGREED, multi-step task to the reliable background runner (fire-and-forget).' },
+  { name: 'dispatch_background_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Hand an AGREED, multi-step task to the reliable background runner (fire-and-forget).' },
   { name: 'draft_plan', sideEffect: 'read', tier: 'core', lanes: [], description: 'Draft a structured plan for multi-step work before executing it.' },
   { name: 'execution_complete', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', description: 'Mark a tracked execution complete after its criteria are verified. Args: id, summary.' },
   // Creating an execution lane MINTS DURABLE MUTATION AUTHORITY: it is the
@@ -237,7 +242,13 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'run_batch', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', blockedFor: ['worker'], description: 'Deterministic batch executor for N same-shape tool calls: reason ONCE (bake every item\'s…' },
   { name: 'run_shell_command', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'write', loopClass: 'mutating', description: 'Run a shell command in an allowed workspace directory.' },
   { name: 'run_tool_program', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'workflow-step', 'cli'], description: 'Run ONE short JavaScript program (the body of an async function — use `return` for the re…' },
-  { name: 'run_worker', sideEffect: 'write', tier: 'core', lanes: ['sdk-brain'], sdkLayer: 'full-extra', blockedFor: ['workflow-step', 'worker'], description: 'Spawn a stateless Worker on ONE item using a structured parent-planned job packet.' },
+  // actionTopologyRole 'control': run_worker is the fan-out COORDINATION
+  // primitive — it spawns children whose business dispatches settle at their
+  // own boundaries (same family as execution_create). Classifying it business
+  // made act-routed fan-out structurally impossible: dropped from the direct
+  // surface, absent from the carrier universe, and walled by the work-binding
+  // gate (live 2026-08-11: '"run_worker" is not a deferred callable tool').
+  { name: 'run_worker', sideEffect: 'write', tier: 'core', lanes: ['sdk-brain'], sdkLayer: 'full-extra', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Spawn a stateless Worker on ONE item using a structured parent-planned job packet.' },
   { name: 'session_history', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Read recent conversation history for a session.' },
   { name: 'session_pause', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], description: 'Save a structured handoff for a session so work can resume cleanly after context drift, a…' },
   { name: 'session_resume', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], description: 'Summarize a session using its continuity brief and recent transcript so work can resume c…' },
