@@ -28,6 +28,7 @@ import {
   commitLogicalCallSettlement,
   type LogicalCallSettlementResult,
 } from './logical-call-settlement-store.js';
+import { beginPhysicalDispatch, settlePhysicalDispatch } from './dispatch-ledger.js';
 
 export { normalizeCallableArguments, toResultHandle };
 
@@ -346,6 +347,79 @@ function hasTaskIdentity(input: SettleToolAttemptInput): input is SettleToolAtte
  * reopens discovery, an attempt that finished real work credits progress, and
  * everything else deliberately moves nothing.
  */
+/**
+ * Record the one crossing the host made into its own process.
+ *
+ * Deliberately fail-soft: this is EVIDENCE, and the settlement it accompanies
+ * is AUTHORITY. A call the dispatch ledger declines to admit — an unbound
+ * business call under an activated contract, a session whose accepted task is
+ * unreadable — simply keeps the historical no-evidence behaviour instead of
+ * losing its settlement. The id is derived from the logical call, so a replayed
+ * settlement re-admits the same row rather than minting a second crossing.
+ */
+function recordHostExecutionCrossing(
+  identity: SettlementAuthorityIdentity,
+  call: { tool: string; args?: unknown; turn?: number },
+): void {
+  try {
+    // ANNOTATE AUTHORITY, NEVER CREATE IT. Opening a crossing also admits its
+    // logical parent, so recording one for a call that was never admitted
+    // would manufacture the very authority the settlement is about to refuse —
+    // a settlement with no admitted logical call must still fail closed.
+    const parent = openEventLog().prepare(`
+      SELECT accepted_task_id, state FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(
+      identity.sessionId,
+      identity.sourceUserSeq,
+      identity.logicalToolCallId,
+    ) as { accepted_task_id: string; state: string } | undefined;
+    if (
+      !parent
+      || parent.state !== 'open'
+      || parent.accepted_task_id !== identity.acceptedTaskId
+    ) return;
+    const admitted = beginPhysicalDispatch({
+      identity: {
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        acceptedTaskId: identity.acceptedTaskId,
+        logicalToolCallId: identity.logicalToolCallId,
+        physicalDispatchId: `dispatch:host:${identity.logicalToolCallId}`,
+        ordinal: 1,
+      },
+      tool: call.tool,
+      args: call.args,
+      ...(call.turn === undefined ? {} : { turn: call.turn }),
+      relation: 'primary',
+      executionSite: 'host',
+    });
+    if (admitted.status !== 'inserted') return;
+    // Settle against the name the ledger actually STORED. It records the
+    // normalized inner identity, which for a wrapped carrier is not the name
+    // this lane was handed — settling with the raw one reads as a crossing
+    // conflicting with its own start, which poisons the resolution and leaves
+    // the crossing in flight so the settlement behind it can never close.
+    const stored = openEventLog().prepare(`
+      SELECT tool_name FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ? AND physical_dispatch_id = ?
+    `).get(
+      identity.sessionId,
+      identity.sourceUserSeq,
+      admitted.identity.physicalDispatchId,
+    ) as { tool_name: string } | undefined;
+    if (!stored) return;
+    settlePhysicalDispatch({
+      identity: admitted.identity,
+      tool: stored.tool_name,
+      outcome: 'returned',
+      ...(call.turn === undefined ? {} : { turn: call.turn }),
+    });
+  } catch {
+    // An unrecordable crossing must never take the settlement down with it.
+  }
+}
+
 export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAttempt {
   const extracted: AttemptSignals = {
     ...signalsFromResult(input.result),
@@ -412,12 +486,49 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   const businessCall = binding ? true : input.businessCall === true;
   const continuesRequirement = input.continuesRequirement === true;
 
-  const physicalCrossingCount = durablePhysicalCrossingCount(identity);
-  const executionKind = physicalCrossingCount > 0
+  const priorCrossingCount = durablePhysicalCrossingCount(identity);
+  const executionKind = priorCrossingCount > 0
     ? 'provider_execution' as const
     : extracted.preDispatch === true
       ? 'refused_pre_dispatch' as const
       : 'local_execution' as const;
+
+  // THE HOST'S OWN EXECUTION IS EVIDENCE. Nothing left the machine, so there
+  // was no crossing to record and therefore no durable result to redeem, no
+  // observed operation to project, and no outcome the classifier could name.
+  // A contract that legitimately owns local work — a local source read, a
+  // local_write per item — was unprovable by construction (live 2026-08-11:
+  // zero dispatches, zero handles, zero operations for a whole run).
+  //
+  // The host knows strictly more about this call than any provider envelope
+  // could tell it: it invoked the tool and holds the exact bytes that came
+  // back. Record that as the crossing it is, marked as never having left the
+  // process, and let the identical downstream evidence path do the rest.
+  if (
+    executionKind === 'local_execution'
+    && businessCall
+    // Scoped to work that is BOUND to a frozen requirement. Such a call has
+    // already been normalized to its exact inner contract by admission, so the
+    // crossing, the logical call and the durable result all describe the same
+    // identity. An unbound local business call still records no crossing —
+    // its evidence has no contract to discharge, and a wrapped carrier's outer
+    // name would not match the inner identity a result handle is bound to.
+    && binding !== undefined
+    && input.thrown === undefined
+    && Object.prototype.hasOwnProperty.call(input, 'result')
+    && deriveResultHandleFactsFromRaw(input.result).success
+  ) {
+    if (outcome.kind === 'unknown') {
+      outcome = classifyAttemptOutcome({ ...extracted, hostExecuted: true });
+    }
+    if (outcome.kind === 'succeeded' || outcome.kind === 'empty_result') {
+      recordHostExecutionCrossing(identity, {
+        tool: input.toolName,
+        args: input.args,
+        ...(Number.isSafeInteger(input.turn) ? { turn: input.turn as number } : {}),
+      });
+    }
+  }
 
   const completedBusinessWork = outcome.kind === 'succeeded'
     && businessCall

@@ -3508,6 +3508,91 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     },
   },
+  {
+    // The host's own in-process execution is a crossing too.
+    //
+    // Evidence redemption, dependency discharge and terminal projection all
+    // key on a physical dispatch, so work the host ran itself produced no
+    // evidence at all and no contract naming a local read or local_write
+    // could ever be proved (live 2026-08-11: a contracted local source read
+    // settled with zero dispatches, zero handles, zero operations).
+    //
+    // Recording those crossings makes them provable, and this column keeps the
+    // table honest about which ones left the machine — a paid provider call
+    // and a filesystem write must stay distinguishable to anything that counts
+    // crossings. Deliberately an ADD COLUMN, not a widened relation CHECK:
+    // three tables carry foreign keys into physical_dispatches, so the table
+    // rebuild a CHECK change requires would put those references and a live
+    // multi-hundred-megabyte store at risk for a label. NULL means what it has
+    // always meant — a crossing that left the process.
+    version: 35,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('physical_dispatches')) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(physical_dispatches)').all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!columns.has('execution_site')) {
+        db.exec('ALTER TABLE physical_dispatches ADD COLUMN execution_site TEXT');
+      }
+      if (!tables.has('logical_call_settlements')) return;
+      // physical_crossing_count keeps its exact meaning — crossings that LEFT
+      // the machine, which is what a CHECK on that table and anything counting
+      // paid work rely on. The host's own in-process crossings are counted
+      // separately so the settlement can still bind every crossing it froze
+      // without inflating what looks like provider traffic. NULL reads as zero.
+      const settlementColumns = new Set(
+        (db.prepare('PRAGMA table_info(logical_call_settlements)').all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!settlementColumns.has('host_crossing_count')) {
+        db.exec('ALTER TABLE logical_call_settlements ADD COLUMN host_crossing_count INTEGER');
+      }
+      // Poisoning a logical call without recording WHY costs the diagnosis:
+      // every later reader sees only 'conflict', and the first cause — the one
+      // check that actually failed — is gone. A live scheduled workflow failed
+      // six times a day for two days with its first cause unrecoverable from
+      // the store (platform-49, 2026-08-11).
+      if (!tables.has('logical_tool_calls')) return;
+      const logicalColumns = new Set(
+        (db.prepare('PRAGMA table_info(logical_tool_calls)').all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!logicalColumns.has('conflict_reason')) {
+        db.exec('ALTER TABLE logical_tool_calls ADD COLUMN conflict_reason TEXT');
+      }
+      // A successful PROVIDER crossing must still carry its durable result —
+      // that requirement is unchanged. What changes is the converse: a result
+      // handle may now also belong to a successful execution the host ran
+      // itself. A refusal, or any outcome that did not succeed, still may not
+      // hold one. Local success WITHOUT a handle stays legal, because control
+      // and discovery calls record no crossing and keep none.
+      db.exec(`
+        DROP TRIGGER IF EXISTS trg_logical_settlement_result_required;
+        CREATE TRIGGER trg_logical_settlement_result_required
+        BEFORE INSERT ON logical_call_settlements
+        WHEN (
+          NEW.execution_kind = 'provider_execution'
+          AND NEW.outcome_kind IN ('succeeded','empty_result')
+          AND NEW.result_handle_id IS NULL
+        ) OR (
+          NEW.result_handle_id IS NOT NULL
+          AND NOT (
+            NEW.execution_kind IN ('provider_execution','local_execution')
+            AND NEW.outcome_kind IN ('succeeded','empty_result')
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'logical settlement result-handle binding is inconsistent');
+        END;
+      `);
+    },
+  },
 ];
 
 function runMigrations(db: Database.Database): void {

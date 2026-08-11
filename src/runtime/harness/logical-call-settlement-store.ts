@@ -117,7 +117,10 @@ export interface DurableLogicalCallSettlement {
     creditedProgress: boolean;
   };
   observer: CommitLogicalCallSettlementInput['observer'];
+  /** Crossings that LEFT the machine. */
   physicalCrossingCount: number;
+  /** Crossings the host made into its own process. */
+  hostCrossingCount: number;
   physicalCrossingsDigest: string;
   crossings: FrozenSettlementCrossing[];
   resultHandleId?: string;
@@ -153,6 +156,8 @@ interface CrossingRow {
   tool_name: string;
   argument_digest: string;
   state: 'started' | 'returned' | 'threw' | 'timed_out' | 'cancelled' | 'unknown';
+  /** 'host' when the crossing never left the process; NULL when it did. */
+  execution_site: string | null;
 }
 
 type FrozenCrossingSource = Pick<
@@ -189,6 +194,7 @@ interface SettlementRow {
   opened_discovery_epoch: number;
   credited_progress: number;
   physical_crossing_count: number;
+  host_crossing_count: number | null;
   physical_crossings_digest: string;
   observer_lane: LogicalCallSettlementLane;
   observer_call_id: string | null;
@@ -291,11 +297,23 @@ function semanticDigest(input: {
 function poison(
   db: ReturnType<typeof openEventLog>,
   identity: CommitLogicalCallSettlementInput['identity'],
+  reason: string,
 ): void {
+  // Record the FIRST cause and never overwrite it. Everything downstream sees
+  // only 'conflict' — including this store's own retry, which then reports the
+  // poisoned state rather than the check that failed — so a conflict with no
+  // recorded reason is undiagnosable after the fact.
   db.prepare(`
-    UPDATE logical_tool_calls SET state = 'conflict'
+    UPDATE logical_tool_calls
+       SET state = 'conflict',
+           conflict_reason = COALESCE(conflict_reason, ?)
      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-  `).run(identity.sessionId, identity.sourceUserSeq, identity.logicalToolCallId);
+  `).run(
+    reason.replace(/\s+/g, ' ').trim().slice(0, 240),
+    identity.sessionId,
+    identity.sourceUserSeq,
+    identity.logicalToolCallId,
+  );
   db.prepare(`
     UPDATE accepted_task_resolutions
        SET state = 'legacy_ambiguous', revision = revision + 1
@@ -308,7 +326,7 @@ function conflict(
   identity: CommitLogicalCallSettlementInput['identity'],
   reason: string,
 ): LogicalCallSettlementResult {
-  poison(db, identity);
+  poison(db, identity, reason);
   return { status: 'conflict', reason, poisoned: true };
 }
 
@@ -318,7 +336,7 @@ function readCrossings(
 ): CrossingRow[] {
   return db.prepare(`
     SELECT accepted_task_id, physical_dispatch_id, ordinal, relation, retry_of,
-           tool_name, argument_digest, state
+           tool_name, argument_digest, state, execution_site
       FROM physical_dispatches
      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
      ORDER BY ordinal
@@ -411,6 +429,7 @@ function readDurableSettlement(
       ...(row.observer_call_id !== null ? { callId: row.observer_call_id } : {}),
     },
     physicalCrossingCount: row.physical_crossing_count,
+    hostCrossingCount: row.host_crossing_count ?? 0,
     physicalCrossingsDigest: row.physical_crossings_digest,
     crossings: frozenCrossings(crossings.map((crossing) => ({
       ...crossing,
@@ -506,7 +525,8 @@ export function redeemDurableLogicalCallSettlementForHost(
       return { status: 'corrupt', reason: 'logical settlement semantic digest does not recompute' };
     }
     if (
-      settlement.crossings.length !== settlement.physicalCrossingCount
+      settlement.crossings.length
+        !== settlement.physicalCrossingCount + settlement.hostCrossingCount
       || crossingDigest(settlement.crossings) !== settlement.physicalCrossingsDigest
     ) return { status: 'corrupt', reason: 'logical settlement crossing digest does not recompute' };
 
@@ -661,11 +681,22 @@ export function commitLogicalCallSettlement(
       }
       const crossings = frozenCrossings(crossingRows);
       const crossingsDigest = crossingDigest(crossings);
-      const crossingCount = crossings.length;
+      // Every crossing is frozen and bound to this settlement, but only the
+      // ones that LEFT the machine are counted as provider traffic: the
+      // settlement's crossing count is what paid-work readers and this table's
+      // own CHECK have always meant by it.
+      const hostCrossingCount = crossingRows
+        .filter((crossing) => crossing.execution_site === 'host').length;
+      const crossingCount = crossings.length - hostCrossingCount;
 
+      // A local execution may now carry the host's own crossing — but only
+      // that. A crossing that LEFT the machine still makes this a provider
+      // execution, and a pre-dispatch refusal still executed nothing at all.
       const executionConsistent = input.execution.kind === 'provider_execution'
         ? crossingCount > 0
-        : crossingCount === 0;
+        : input.execution.kind === 'local_execution'
+          ? crossingRows.every((crossing) => crossing.execution_site === 'host')
+          : crossingCount === 0;
       const refusalOutcomeConsistent = input.execution.kind !== 'refused_pre_dispatch'
         || !['succeeded', 'empty_result', 'uncertain_write'].includes(input.outcome.kind);
       if (!executionConsistent || !refusalOutcomeConsistent) {
@@ -688,10 +719,22 @@ export function commitLogicalCallSettlement(
         return conflict(db, identity, 'progress-gated governor evidence requires a progress identity');
       }
 
+      const executedSuccessfully = input.outcome.kind === 'succeeded'
+        || input.outcome.kind === 'empty_result';
       const successfulProviderResult = input.execution.kind === 'provider_execution'
-        && (input.outcome.kind === 'succeeded' || input.outcome.kind === 'empty_result');
+        && executedSuccessfully;
+      // A local execution that recorded its own returned crossing holds exactly
+      // the same redeemable evidence — the host invoked the tool and kept the
+      // bytes it returned. Without this, work the host did itself could never
+      // discharge a dependency, seal a universe, or be projected as observed.
+      // Both conditions require a returned crossing, so neither can mint a
+      // handle for a call that never executed.
+      const successfulHostResult = input.execution.kind === 'local_execution'
+        && executedSuccessfully
+        && crossingRows.at(-1)?.state === 'returned'
+        && Boolean(input.result && Object.prototype.hasOwnProperty.call(input.result, 'payload'));
       let resultHandleId: string | undefined;
-      if (successfulProviderResult) {
+      if (successfulProviderResult || successfulHostResult) {
         const lastCrossing = crossingRows.at(-1);
         if (!lastCrossing || lastCrossing.state !== 'returned') {
           return conflict(db, identity, 'successful provider result lacks a final returned crossing');
@@ -762,6 +805,7 @@ export function commitLogicalCallSettlement(
           && prior.physicalCrossingsDigest === crossingsDigest
           && crossingDigest(prior.crossings) === prior.physicalCrossingsDigest
           && prior.physicalCrossingCount === crossingCount
+          && prior.hostCrossingCount === hostCrossingCount
           && prior.crossings.length === crossingCount;
         return exact
           ? { status: 'replayed', settlement: prior }
@@ -868,8 +912,8 @@ export function commitLogicalCallSettlement(
            settlement_event_id, settled_at, governor_evidence_kind,
            governor_evidence_detail, governor_requires_progress,
            governor_outcome, opened_discovery_epoch, credited_progress,
-           result_handle_id)
-        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           result_handle_id, host_crossing_count)
+        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         identity.sessionId,
         identity.sourceUserSeq,
@@ -904,6 +948,7 @@ export function commitLogicalCallSettlement(
         openedDiscoveryEpoch ? 1 : 0,
         creditedProgress ? 1 : 0,
         resultHandleId ?? null,
+        hostCrossingCount,
       );
       const insertCrossing = db.prepare(`
         INSERT INTO logical_call_settlement_crossings

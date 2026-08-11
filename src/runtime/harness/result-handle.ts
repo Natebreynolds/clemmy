@@ -546,6 +546,7 @@ interface SettledResultRow extends DurableResultRow {
   settlement_outcome_kind: string;
   settlement_result_handle_id: string | null;
   settlement_crossing_count: number;
+  settlement_host_crossing_count: number;
   settlement_crossings_digest: string;
   settlement_event_id: string;
   frozen_crossing_count: number;
@@ -683,9 +684,12 @@ function crossingAuthorityMatches(
   const frozenJson = crossingSetJson(frozen);
   const liveJson = crossingSetJson(live);
   const frozenDigest = sha256(frozenJson);
+  // Provider crossings and the host's own crossings are counted separately on
+  // the settlement; the frozen and live sets hold both.
+  const totalCrossings = row.settlement_crossing_count + row.settlement_host_crossing_count;
   if (
-    frozen.length !== row.settlement_crossing_count
-    || live.length !== row.settlement_crossing_count
+    frozen.length !== totalCrossings
+    || live.length !== totalCrossings
     || frozenJson !== liveJson
     || frozenDigest !== row.settlement_crossings_digest
     || sha256(liveJson) !== row.settlement_crossings_digest
@@ -747,6 +751,7 @@ export function redeemSuccessfulSettlementResultForHost(input: {
              s.outcome_kind AS settlement_outcome_kind,
              s.result_handle_id AS settlement_result_handle_id,
              s.physical_crossing_count AS settlement_crossing_count,
+             COALESCE(s.host_crossing_count, 0) AS settlement_host_crossing_count,
              s.physical_crossings_digest AS settlement_crossings_digest,
              s.settlement_event_id AS settlement_event_id,
              l.accepted_task_id AS logical_accepted_task_id,
@@ -810,7 +815,11 @@ export function redeemSuccessfulSettlementResultForHost(input: {
     }
     if (
       row.logical_state !== 'settled'
-      || row.settlement_execution_kind !== 'provider_execution'
+      // A result is redeemable when the call actually EXECUTED and returned —
+      // whether it crossed to a provider or the host ran it in-process. The
+      // crossing, tool, argument and freeze checks below are identical for
+      // both, so a local result is held to exactly the same authority.
+      || !['provider_execution', 'local_execution'].includes(row.settlement_execution_kind)
       || !['succeeded', 'empty_result'].includes(row.settlement_outcome_kind)
       || row.settlement_result_handle_id !== row.handle_id
       || row.success !== 1
@@ -822,7 +831,10 @@ export function redeemSuccessfulSettlementResultForHost(input: {
       || row.dispatch_argument_digest !== row.argument_digest
       || row.dispatch_ordinal !== row.final_dispatch_ordinal
       || row.frozen_handle_crossing_count !== 1
-      || row.frozen_crossing_count !== row.settlement_crossing_count
+      // Every crossing this settlement froze must be accounted for — the ones
+      // that left the machine and the ones the host made itself.
+      || row.frozen_crossing_count
+        !== row.settlement_crossing_count + row.settlement_host_crossing_count
     ) {
       return { status: 'corrupt', reason: 'settlement, crossing, and result-handle authority disagree' };
     }

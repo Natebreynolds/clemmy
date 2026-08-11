@@ -497,7 +497,7 @@ export function logicalCallAuthorityState(
 ): LogicalCallAuthorityStateResult {
   try {
     const row = openEventLog().prepare(`
-      SELECT l.accepted_task_id, l.state, r.state AS resolution_state
+      SELECT l.accepted_task_id, l.state, l.conflict_reason, r.state AS resolution_state
         FROM logical_tool_calls l
         JOIN accepted_task_resolutions r
           ON r.session_id = l.session_id AND r.source_user_seq = l.source_user_seq
@@ -509,11 +509,20 @@ export function logicalCallAuthorityState(
     ) as {
       accepted_task_id: string;
       state: LogicalRow['state'];
+      conflict_reason: string | null;
       resolution_state: 'open' | 'finalized' | 'legacy_ambiguous';
     } | undefined;
     if (!row) return { status: 'missing', reason: 'logical call authority is missing' };
     if (row.accepted_task_id !== identity.acceptedTaskId || row.state === 'conflict') {
-      return { status: 'conflict', reason: 'logical call authority conflicts with its accepted task' };
+      // Report the FIRST cause when one was recorded. Without it every reader
+      // of a poisoned call — including the error that ends the run — describes
+      // the poisoning rather than the check that failed.
+      return {
+        status: 'conflict',
+        reason: row.conflict_reason
+          ? `logical call authority was poisoned: ${row.conflict_reason}`
+          : 'logical call authority conflicts with its accepted task',
+      };
     }
     if (row.resolution_state === 'legacy_ambiguous') {
       return { status: 'conflict', reason: 'accepted task resolution is ambiguous' };
@@ -538,6 +547,9 @@ export function beginPhysicalDispatch(input: {
   args?: unknown;
   turn?: number;
   relation?: DispatchRelation;
+  /** 'host' when the crossing is the host invoking a tool in-process. NULL
+   *  (the default) keeps its historical meaning: it left the machine. */
+  executionSite?: 'host';
 }): DispatchAdmissionResult {
   const expectedState = expectedForAdmission(input.identity.sessionId, input.identity.sourceUserSeq);
   if (expectedState.status !== 'ok') return expectedState;
@@ -688,8 +700,8 @@ export function beginPhysicalDispatch(input: {
         INSERT INTO physical_dispatches
           (session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
            physical_dispatch_id, ordinal, relation, retry_of, tool_name,
-           argument_digest, state, started_at, start_event_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)
+           argument_digest, state, started_at, start_event_id, execution_site)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?)
       `).run(
         input.identity.sessionId,
         input.identity.sourceUserSeq,
@@ -703,6 +715,7 @@ export function beginPhysicalDispatch(input: {
         digest,
         mirror.createdAt,
         mirror.id,
+        input.executionSite ?? null,
       );
       return { status: 'inserted', identity: admittedIdentity };
     });

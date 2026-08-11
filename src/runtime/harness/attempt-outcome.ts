@@ -217,6 +217,13 @@ export interface AttemptSignals {
   providerReportedError?: boolean;
   /** The callable contract was available to hand back for repair. */
   schemaAvailable?: boolean;
+  /**
+   * The host invoked this tool in-process and it RETURNED without throwing.
+   * Unlike a provider envelope there is nothing here to distrust: the absence
+   * of a success flag on a local result is not the absence of success. Set
+   * only by the settlement seam, and only when no crossing left the machine.
+   */
+  hostExecuted?: boolean;
   /** Free text, consulted last and only able to yield `unknown`. */
   text?: string;
 }
@@ -313,6 +320,18 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
         ? outcome('uncertain_write', 'nominal', name)
         : outcome('transient', 'nominal', name);
     }
+  }
+
+  // The host ran it itself and it returned. This sits below every nominal and
+  // structured verdict — a refusal, a validation failure, an unacknowledged
+  // mutation or a contradicted envelope all still win — and above text only.
+  // It exists because 'unknown' denied an accepted task any proof of its own
+  // local work: a contracted local read could never discharge a dependency or
+  // seal a universe, so the whole per-item lane behind it was unreachable.
+  if (signals.hostExecuted === true) {
+    return signals.emptyResult
+      ? outcome('empty_result', 'nominal', 'host_execution')
+      : outcome('succeeded', 'nominal', 'host_execution');
   }
 
   // Text is last and cannot produce anything actionable — by design.
