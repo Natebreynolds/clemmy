@@ -10,6 +10,7 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-discovery-boundary-'
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
 const eventlog = await import('./eventlog.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const { discoveryGovernor } = await import('./discovery-governor.js');
 const {
   DiscoveryBudgetDeniedError,
@@ -42,6 +43,12 @@ function acceptedTask(label: string, knownCapability = false): { sessionId: stri
     type: 'user_input_received',
     data: { text: label },
   });
+  // The settlement spine refuses wrapped dispatch without an accepted source
+  // AND a persisted turn graph — anchor both for every fixture task.
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
   discoveryGovernor.initializeTask({
     sessionId: session.id,
     sourceUserSeq: source.seq,

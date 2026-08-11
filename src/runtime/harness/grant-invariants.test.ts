@@ -28,6 +28,25 @@ const { executeApprovedPendingActionCall } = await import('../../execution/pendi
 const { shouldRunObjectiveJudge } = await import('./objective-judge.js');
 const { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
 const { appendEvent, createSession, resetEventLog } = await import('./eventlog.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+
+/** The settlement spine refuses dispatch without an accepted source AND a
+ *  persisted turn graph — every fixture that drives a wrapped tool anchors
+ *  both (chat sessions only; TurnGraph v1 contracts chat sources). */
+function anchorAcceptedTask(sessionId: string, text: string): { seq: number; turn: number } {
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const shadow = recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return { seq: source.seq, turn: source.turn };
+}
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -99,6 +118,7 @@ test('EXHIBIT C replay: a certified (human-approved) batch item passes the execu
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Send the reactivation email.');
   try {
     const wrapped = wrapToolForHarness({
       name: 'composio_execute_tool',
@@ -106,7 +126,7 @@ test('EXHIBIT C replay: a certified (human-approved) batch item passes the execu
     });
     const send = (certified: boolean) =>
       withHarnessRunContext(
-        { sessionId: sess.id, counter: new ToolCallsCounter(50), ...(certified ? { certifiedBatch: { batchId: 'b1', payloadHash: 'h1' } } : {}) },
+        { sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter: new ToolCallsCounter(50), ...(certified ? { certifiedBatch: { batchId: 'b1', payloadHash: 'h1' } } : {}) },
         () => wrapped.execute!({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'x@personal.example', subject: 's', body: 'b' }) }),
       );
     // Ungranted ad-hoc send with no active execution → the gate still guards.
@@ -170,13 +190,16 @@ test('the send floor gates irreversible sends on EVERY session kind, not just ch
   saveProactivityPolicy({ autoApproveScope: 'yolo', batchConfirmThreshold: 3 });
   try {
     // A WORKFLOW session (kind 'execution') — the default-scope lane that
-    // needed no YOLO to bypass the old chat-only gate.
+    // needed no YOLO to bypass the old chat-only gate. These lanes anchor the
+    // same accepted source and turn graph as chat: every lane persists its
+    // turn graph now, so a non-chat send settles through the same spine.
     for (const kind of ['execution', 'workflow'] as const) {
       resetEventLog();
       const sess = createSession({ kind });
+      const accepted = anchorAcceptedTask(sess.id, 'work the reactivation list for the prospects');
       const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', execute: async () => 'sent' });
       const send = (n: number) => withHarnessRunContext(
-        { sessionId: sess.id, counter: new ToolCallsCounter(50) },
+        { sessionId: sess.id, turn: accepted.turn, sourceUserSeq: accepted.seq, counter: new ToolCallsCounter(50) },
         () => wrapped.execute!({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: `p${n}@site.example`, subject: 's', body: 'b' }) }),
       );
       assert.ok(String(await send(1)).startsWith('sent'), `${kind} send #1 under threshold flows`);
@@ -234,6 +257,7 @@ test('same-target Composio fan-out reserves exactly one irreversible dispatch', 
   saveProactivityPolicy({ autoApproveScope: 'balanced', batchConfirmThreshold: 20 });
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Send the one email exactly once.');
   let dispatched = 0;
   try {
     const wrapped = wrapToolForHarness({
@@ -247,6 +271,8 @@ test('same-target Composio fan-out reserves exactly one irreversible dispatch', 
     const send = () => withHarnessRunContext(
       {
         sessionId: sess.id,
+        sourceUserSeq: anchor.seq,
+        turn: anchor.turn,
         counter: new ToolCallsCounter(50),
         certifiedBatch: { batchId: 'same-target-race', payloadHash: 'one-payload' },
       },
@@ -293,14 +319,23 @@ test('same-target shell send fan-out reserves exactly one irreversible dispatch'
     destination: process.env.CLEMMY_DESTINATION_GATE,
     fidelity: process.env.CLEMMY_GOAL_FIDELITY_GATE,
     output: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    execution: process.env.CLEMMY_EXECUTION_GATE,
   };
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   process.env.CLEMMY_GROUNDING_GATE = 'on';
   process.env.CLEMMY_DESTINATION_GATE = 'off';
   process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
   process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  // Settlement-spine migration: this pin is about the shared-write reservation,
+  // not about the session lane. The spine settles wrapped dispatches only for
+  // chat sessions with an accepted source + persisted turn graph, so the
+  // fixture moved from an 'execution'-kind session to an anchored chat session.
+  // The old execution-kind fixture never faced the chat-only execution-wrap
+  // gate, so pin it off to keep the gate exposure identical.
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
   resetEventLog();
-  const sess = createSession({ kind: 'execution' });
+  const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Post the send-once payload.');
   let dispatched = 0;
   try {
     const wrapped = wrapToolForHarness({
@@ -313,7 +348,7 @@ test('same-target shell send fan-out reserves exactly one irreversible dispatch'
     });
     const command = "curl -X POST https://api.example.com/send -d 'to_email=same-shell@example.com&body=send-once'";
     const send = () => withHarnessRunContext(
-      { sessionId: sess.id, counter: new ToolCallsCounter(50) },
+      { sessionId: sess.id, sourceUserSeq: anchor.seq, turn: anchor.turn, counter: new ToolCallsCounter(50) },
       () => wrapped.execute!({ command }),
     );
 
@@ -337,6 +372,7 @@ test('same-target shell send fan-out reserves exactly one irreversible dispatch'
     restore('CLEMMY_DESTINATION_GATE', previous.destination);
     restore('CLEMMY_GOAL_FIDELITY_GATE', previous.fidelity);
     restore('CLEMMY_OUTPUT_GROUNDING_GATE', previous.output);
+    restore('CLEMMY_EXECUTION_GATE', previous.execution);
   }
 });
 
@@ -358,6 +394,9 @@ test('Composio refuses a same-recipient email already reserved through native MC
     type: 'user_input_received',
     data: { text: 'Send this email exactly once.' },
   });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: sess.id, sourceUserSeq: source.seq, turn: source.turn },
+  }), 'fixture persisted the turn graph for the accepted task');
   appendEvent({
     sessionId: sess.id,
     turn: 1,
@@ -380,6 +419,7 @@ test('Composio refuses a same-recipient email already reserved through native MC
       {
         sessionId: sess.id,
         sourceUserSeq: source.seq,
+        turn: source.turn,
         counter: new ToolCallsCounter(50),
         certifiedBatch: { batchId: 'cross-transport', payloadHash: 'one-email' },
       },

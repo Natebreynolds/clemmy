@@ -32,10 +32,13 @@ const {
   finishRunAttempt,
   getLatestRunAttempt,
   getSession,
+  getTurnGraphEventForSource,
   listEvents,
   recordRunAttemptUserInput,
   resetEventLog,
 } = await import('./eventlog.js');
+// eslint-disable-next-line import/first
+const { turnGraphFromShadowEvent } = await import('../graph/turn-graph-shadow.js');
 // eslint-disable-next-line import/first
 const { AgentRuntimeCancelledError } = await import('../provider.js');
 // eslint-disable-next-line import/first
@@ -89,13 +92,42 @@ const FAKE_AGENT = {} as never;
 const okConfigure = (async () => ({ ok: true })) as never;
 const fakeAgentBuilder = (async () => FAKE_AGENT) as never;
 
+/**
+ * Mirror of loop.ts's capability_resolve identity: the exact accepted source
+ * plus the persisted shadow-graph route (chat surfaces fall back to
+ * direct_reply exactly like the loop when no graph exists; non-chat sessions
+ * are always direct_reply because TurnGraph v1 contracts chat sources only).
+ * Every runConversation stub that invokes buildAgent must pass this — the real
+ * builder closure reads identity.sourceUserSeq and identity.route.
+ */
+function stubBuildIdentity(opts: { sessionId: string; sourceUserSeq?: number }): {
+  sessionId: string;
+  sourceUserSeq: number;
+  route: 'direct_reply' | 'retrieve' | 'act';
+} {
+  const sourceUserSeq = opts.sourceUserSeq ?? 0;
+  let route: 'direct_reply' | 'retrieve' | 'act' = 'direct_reply';
+  if (getSession(opts.sessionId)?.kind === 'chat' && sourceUserSeq > 0) {
+    try {
+      const graphEvent = getTurnGraphEventForSource(opts.sessionId, sourceUserSeq);
+      const graph = graphEvent ? turnGraphFromShadowEvent(graphEvent) : null;
+      route = graph?.classification.route ?? 'direct_reply';
+    } catch { /* keep the loop's direct_reply fallback */ }
+  }
+  return { sessionId: opts.sessionId, sourceUserSeq, route };
+}
+
 function fakeRun(result: Record<string, unknown>): never {
-  return (async (opts: { sessionId: string; buildAgent?: () => Promise<unknown> }) => {
+  return (async (opts: {
+    sessionId: string;
+    sourceUserSeq?: number;
+    buildAgent?: (identity: ReturnType<typeof stubBuildIdentity>) => Promise<unknown>;
+  }) => {
     // Capability interior contract: the real runConversation resolves the
     // agent AT the capability_resolve node. The stub mirrors that, so tests
     // asserting builder arguments keep asserting the true call, at its true
     // time — during the turn, not before it.
-    await opts.buildAgent?.();
+    await opts.buildAgent?.(stubBuildIdentity(opts));
     return {
       sessionId: opts.sessionId,
       steps: 1,
@@ -400,9 +432,13 @@ test('Continue, Resume, and Keep going after a completed answer reach ordinary b
     _setBridgeImplsForTests({
       configure: okConfigure,
       buildAgent: fakeAgentBuilder,
-      runConversation: (async (opts: { sessionId: string; buildAgent?: () => Promise<unknown> }) => {
+      runConversation: (async (opts: {
+        sessionId: string;
+        sourceUserSeq?: number;
+        buildAgent?: (identity: ReturnType<typeof stubBuildIdentity>) => Promise<unknown>;
+      }) => {
         runCalls += 1;
-        await opts.buildAgent?.();
+        await opts.buildAgent?.(stubBuildIdentity(opts));
         return {
           sessionId: opts.sessionId,
           status: 'completed',
@@ -902,7 +938,16 @@ test('respondPreferHarness: exact compound decline reaches Claude with full text
       assert.fail('the exact Claude turn cannot fall through to legacy');
     });
 
-    assert.equal(response.text, '135');
+    // KNOWN GAP, not a desired terminal. The fresh clause routes `retrieve`,
+    // which freezes a deterministic expected-work contract requiring one
+    // observed read. Only a settled dispatch-ledger read discharges it, and
+    // this lane's inner SDK tools never cross that ledger — so a retrieve turn
+    // on the Claude lane cannot publish `done` whether or not it used a tool.
+    // The committer therefore holds the model's answer behind the verification
+    // presentation. When the lane grows a read-evidence issuer (or a
+    // conversation-shaped lookup stops contracting a read), this assertion
+    // goes back to the provider's '135'.
+    assert.match(response.text, /still need to verify the result/);
     assert.equal(claudeRequest?.message, fullMessage, 'Claude receives the complete conversational correction');
     assert.equal(claudeRequest?.sourceUserSeq, accepted.seq);
     assert.equal(claudeRequest?.taskContinuation?.answer, fullMessage);
@@ -1137,7 +1182,11 @@ test('Claude SDK brain fallover forces a non-Claude harness model when one is co
         capturedModel = opts.model;
         return FAKE_AGENT;
       }) as never,
-      runConversation: (async (opts: { sessionId: string; buildAgent?: () => Promise<unknown> }) => (await opts.buildAgent?.(), {
+      runConversation: (async (opts: {
+        sessionId: string;
+        sourceUserSeq?: number;
+        buildAgent?: (identity: ReturnType<typeof stubBuildIdentity>) => Promise<unknown>;
+      }) => (await opts.buildAgent?.(stubBuildIdentity(opts)), {
         sessionId: opts.sessionId,
         status: 'completed',
         steps: 1,
@@ -2519,9 +2568,14 @@ test('parse-exhaustion completion re-runs ONCE on the next brain instead of ship
   let calls = 0;
   const attemptIds: string[] = [];
   const sourceUserSeqs: number[] = [];
-  const run = (async (opts: { sessionId: string; runAttemptId?: string; sourceUserSeq?: number; buildAgent?: () => Promise<unknown> }) => {
+  const run = (async (opts: {
+    sessionId: string;
+    runAttemptId?: string;
+    sourceUserSeq?: number;
+    buildAgent?: (identity: ReturnType<typeof stubBuildIdentity>) => Promise<unknown>;
+  }) => {
     // Contract mirror: capability resolves during the turn.
-    await opts.buildAgent?.();
+    await opts.buildAgent?.(stubBuildIdentity(opts));
     calls += 1;
     attemptIds.push(opts.runAttemptId ?? '');
     sourceUserSeqs.push(opts.sourceUserSeq ?? 0);

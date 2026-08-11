@@ -30,6 +30,8 @@ const { promoteFromVerifiedReceipt } = await import('../../memory/procedure-rece
 const { productionScope } = await import('../read-path/read-lane-chat.js');
 const eventlog = await import('./eventlog.js');
 const { closeOperationalTelemetryDb } = await import('../operational-telemetry.js');
+const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+const { harnessRunContextStorage, ToolCallsCounter } = await import('./brackets.js');
 const { listEvents } = eventlog;
 type ReceiptRecord = import('../../memory/procedure-receipts.js').DurableReceiptRecord;
 type AcceptedTurnReadPorts = import('../read-path/read-lane-chat.js').AcceptedTurnReadPorts;
@@ -237,6 +239,30 @@ function acceptedRequest(sessionId: string, message: string, runId?: string): As
     data: { text: message, attemptId: attempt.attemptId, source: 'test' },
   }, { armRunInFlight: true });
   return { sessionId, message, sourceUserSeq: source.seq, ...(runId ? { runId } : {}) };
+}
+
+/**
+ * Drive a dispatch the way a turn does: inside the accepted source's run
+ * context, with the turn graph persisted. Settlement is correlated by
+ * (session, accepted source), so a bare call from a fixture — no run context —
+ * cannot settle durably. The bridge establishes this itself; a test that calls
+ * a tool entry point directly has to establish it too.
+ */
+async function withAcceptedTurn<T>(
+  request: AssistantRequest,
+  work: () => Promise<T>,
+): Promise<T> {
+  const sessionId = request.sessionId as string;
+  const sourceUserSeq = request.sourceUserSeq as number;
+  const shadow = recordTurnGraphShadow({ identity: { sessionId, turn: 1, sourceUserSeq } });
+  assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
+  return await harnessRunContextStorage.run({
+    sessionId,
+    turn: 1,
+    sourceUserSeq,
+    runAttemptId: eventlog.getLatestRunAttempt(sessionId)?.attemptId,
+    counter: new ToolCallsCounter(50),
+  }, work);
 }
 
 /** Injected resolver fixtures: builtin/local, MCP, and connected broker. */
@@ -999,9 +1025,9 @@ test('E4 cold→warm canary: verified empty args materialize and serve the exact
   assert.ok(dispatchSchemaFingerprint);
 
   const teachingSession = 'sess-cold-empty-teaching';
-  acceptedRequest(teachingSession, phrase);
+  const teachingRequest = acceptedRequest(teachingSession, phrase);
   let coldProviderDispatches = 0;
-  await composio.runComposioExecuteForTestInSession(
+  await withAcceptedTurn(teachingRequest, () => composio.runComposioExecuteForTestInSession(
     slug,
     {},
     (async () => {
@@ -1010,7 +1036,7 @@ test('E4 cold→warm canary: verified empty args materialize and serve the exact
     }) as never,
     teachingSession,
     ' SMTP:Warm@Example.COM ',
-  );
+  ));
   assert.equal(coldProviderDispatches, 1);
   const queued = aliasIndex.listPendingLearning()
     .find((pending) => pending.sessionId === teachingSession && pending.identifier === slug);
