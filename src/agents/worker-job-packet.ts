@@ -98,6 +98,26 @@ export const WorkerToolInputSchema = z.object({
       'Bind durable work to canonical items and per-item worker phases; exclude parent-only synthesis. '
       + 'This prevents retries or changed labels from inflating progress.',
     ),
+  expectedWork: z
+    .object({
+      requirementId: z
+        .string()
+        .min(1)
+        .describe('The frozen-contract requirement each worker item discharges — copy it from your work_call plan.'),
+      universeId: z
+        .string()
+        .min(1)
+        .nullable()
+        .optional()
+        .describe('The sealed universe the items belong to, when the plan names one.'),
+    })
+    .nullable()
+    .optional()
+    .describe(
+      'When this fan-out runs under a frozen work contract, name the requirement so each worker can bind its '
+      + 'business call directly (work_call with requirement_id + its canonical item id) instead of burning a '
+      + 'refusal discovering the plan. The harness fills this automatically when it is unambiguous.',
+    ),
 });
 
 export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
@@ -316,6 +336,15 @@ export function buildWorkerJobPrompt(inputOrOptions: WorkerToolInput | WorkerToo
     '- If a listed tool call fails or returns missing data, fix and retry that call once. After one genuine retry fails, return ERROR with the specific reason.',
     '- Do not ask the user, notify the user, mutate shared task/execution state, or perform work outside this single item.',
     '- Return only the requested expectedOutput. If the item failed, the final line must start with ERROR:',
+    ...(input.expectedWork
+      ? [
+          // Live 2026-08-11: a contracted worker saw no first-class write tool,
+          // concluded the capability was unavailable, and quit with ZERO tool
+          // calls. Under a contract, business capabilities exist ONLY behind
+          // work_call — say so, and hand the worker its exact binding.
+          `- CONTRACTED ITEM: your business call is made through work_call with requirement_id "${input.expectedWork.requirementId}" and universe_item_id set to this packet's canonical item id, proposal:null (the contract is already frozen). File writes, provider actions, and every other business capability in this worker are reachable ONLY through that bound work_call — they are deliberately not first-class tools here. Never conclude a capability is unavailable without attempting the bound call; a refusal returns the frozen plan to correct against.`,
+        ]
+      : []),
     ...(remembered
       ? [
           '',

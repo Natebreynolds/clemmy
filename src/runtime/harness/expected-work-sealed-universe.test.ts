@@ -531,3 +531,36 @@ test('a per-item read is provable against sealed members and unprovable without 
   });
   assert.equal(stranger.status, 'unknown', 'a member outside the seal proves nothing');
 });
+
+test('run_worker packet binding derives from the frozen contract exactly when unambiguous', () => {
+  // Live 2026-08-11: contracted workers dispatched blind quit with zero tool
+  // calls. The dispatch site injects the binding only when it cannot be a
+  // guess — one open per-item requirement whose sealed universe covers every
+  // fanned item. Everything else stays null (advisory, never a gate).
+  const task = acceptSealedFanout('packetbind');
+  const producerCall = bindProducerRead(task);
+  const derive = (items: string[], overrides: Partial<{ sessionId: string; sourceUserSeq: number | undefined }> = {}) =>
+    admission.deriveWorkerPacketExpectedWork({
+      sessionId: overrides.sessionId ?? task.sessionId,
+      sourceUserSeq: 'sourceUserSeq' in overrides ? overrides.sourceUserSeq : task.sourceUserSeq,
+      items,
+    });
+
+  assert.equal(derive(['opp-1']), null, 'an unsealed universe must not produce a guessed binding');
+
+  settleProducerRead(task, producerCall, [
+    { id: 'opp-1', name: 'Acme expansion' },
+    { id: 'opp-2', name: 'Beta renewal' },
+  ]);
+
+  assert.deepEqual(
+    derive(['opp-1', 'opp-2']),
+    { requirementId: 'notify', universeId: 'opportunities' },
+    'sealed members covering the fan-out yield the one open per-item requirement',
+  );
+  assert.deepEqual(derive(['opp-2']), { requirementId: 'notify', universeId: 'opportunities' },
+    'a partial batch inside the sealed universe still binds');
+  assert.equal(derive(['opp-999']), null, 'an item outside the sealed universe must not bind');
+  assert.equal(derive(['opp-1'], { sessionId: 'sess-does-not-exist' }), null, 'no contract → null, never a throw');
+  assert.equal(derive(['opp-1'], { sourceUserSeq: undefined }), null, 'missing identity → null');
+});

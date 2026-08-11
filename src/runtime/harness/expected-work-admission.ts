@@ -764,6 +764,56 @@ function planLinesFor(
   return lines;
 }
 
+/**
+ * Deterministic packet binding for a fan-out under a frozen contract.
+ *
+ * Live 2026-08-11: contracted workers were dispatched blind — no requirement
+ * or item named in the packet — and a worker that saw no first-class write
+ * tool quit with zero calls ("write_file capability was not available").
+ * When the binding is UNAMBIGUOUS (exactly one non-satisfied each-cardinality
+ * requirement whose sealed universe covers every fanned item), the dispatch
+ * site injects it into the packet so instruction and surface agree. Any
+ * ambiguity or error returns null — advisory injection, never a gate.
+ */
+export function deriveWorkerPacketExpectedWork(input: {
+  sessionId: string;
+  sourceUserSeq: number | undefined;
+  items: string[];
+}): { requirementId: string; universeId: string } | null {
+  if (typeof input.sourceUserSeq !== 'number' || input.items.length === 0) return null;
+  try {
+    const state = actionExpectedWorkState({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+    });
+    if (state.status !== 'required' || !state.contractId) return null;
+    const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+    if (loaded.status !== 'ok' || loaded.contract.contractId !== state.contractId) return null;
+    const contract = loaded.contract;
+    const db = openEventLog();
+    const sealCache: ExpectedWorkUniverseSealCache = new Map();
+    const candidates: Array<{ requirementId: string; universeId: string }> = [];
+    for (const line of planLinesFor(db, contract, sealCache)) {
+      if (line.state === 'satisfied' || line.cardinality !== 'each') continue;
+      const operation = contract.operations.find((op) => op.id === line.requirementId);
+      if (!operation || operation.cardinality.kind !== 'each') continue;
+      const universeId = operation.cardinality.universeId;
+      const universe = contract.universes.find((entry) => entry.id === universeId);
+      if (!universe) continue;
+      const resolved = resolveExpectedWorkUniverseMembers({ db, contract, universe, cache: sealCache });
+      if (resolved.status !== 'resolved') continue;
+      const members = new Set(resolved.members);
+      if (!input.items.every((item) => members.has(item))) continue;
+      candidates.push({ requirementId: line.requirementId, universeId });
+    }
+    // Two open per-item requirements over these members would make the
+    // injection a guess — the worker still gets the plan card on refusal.
+    return candidates.length === 1 ? candidates[0] : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Freeze/replay the proposal and bind the exact current logical call in one
  * transaction. The call must already have been monotonically refined from the
  * outer carrier to the normalized inner tool contract. */

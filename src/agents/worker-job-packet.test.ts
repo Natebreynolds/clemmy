@@ -189,3 +189,23 @@ test('fanout uniform-failure memo refuses futile respawns and clears on success'
   clearFanoutUniformFailure('sess-uf');
   equal(fanoutUniformFailure('sess-uf'), null);
 });
+
+test('a contracted packet renders the exact bound work_call rule; an ordinary packet stays clean', async () => {
+  const { buildWorkerJobPrompt } = await import('./worker-job-packet.js');
+  const base = {
+    objective: 'Draft one follow-up for this lead',
+    item: 'lead-001',
+    resolvedTools: 'none needed',
+    context: 'Lead data is in the packet.',
+    instructions: 'Write one short draft.',
+    expectedOutput: 'lead id | drafted',
+    intent: null,
+  };
+  const contracted = buildWorkerJobPrompt({ ...base, expectedWork: { requirementId: 'write_draft', universeId: 'leads' } } as never);
+  assert.match(contracted, /CONTRACTED ITEM/, 'the binding rule must render');
+  assert.match(contracted, /requirement_id "write_draft"/, 'the exact requirement id is named');
+  assert.match(contracted, /reachable ONLY through that bound work_call/,
+    'the worker must be told business capabilities live behind the carrier — "capability not available" with zero calls was the live failure');
+  const plain = buildWorkerJobPrompt(base as never);
+  assert.doesNotMatch(plain, /CONTRACTED ITEM/, 'uncontracted packets must not carry contract-speak');
+});
