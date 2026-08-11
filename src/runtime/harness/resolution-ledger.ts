@@ -594,22 +594,60 @@ function expectationSatisfied(
   return operations.some((operation) => operation.effectKind !== 'unknown');
 }
 
+/**
+ * Is the accepted task's own work still in flight?
+ *
+ * Asked of ANY open row, this gate let one stray bookkeeping call — a discovery
+ * probe, an abandoned attempt — hold a fully discharged contract unverifiable,
+ * and the user was told their completed work could not be verified while the
+ * files provably existed (live 2026-08-11 run 6; reproduced deterministically).
+ *
+ * So when the accepted task ACTIVATED expected work, bindings are authoritative
+ * about what is contract work, and only unsettled CONTRACT-BOUND calls (and
+ * crossings beneath them) may block. A contract-bound call still in flight
+ * still blocks — nothing about the fail-closed posture on real work changes.
+ *
+ * Everywhere else — no contract, or a contract whose work is not binding-
+ * tracked (deterministic conversation/retrieve turns carry no bindings) — the
+ * original any-open-row rule stands byte for byte. Narrowing it there would
+ * loosen a gate on turns that have no other guard.
+ */
 function hasUnsettledToolWorkInTransaction(
   db: ReturnType<typeof openEventLog>,
   expected: AcceptedTaskExpectation,
 ): boolean {
-  const row = db.prepare(`
-    SELECT
-      (SELECT COUNT(*) FROM logical_tool_calls
-        WHERE session_id = ? AND source_user_seq = ? AND state != 'settled') AS logical_n,
-      (SELECT COUNT(*) FROM physical_dispatches
-        WHERE session_id = ? AND source_user_seq = ? AND state = 'started') AS dispatch_n
-  `).get(
-    expected.identity.sessionId,
-    expected.identity.sourceUserSeq,
-    expected.identity.sessionId,
-    expected.identity.sourceUserSeq,
-  ) as { logical_n: number; dispatch_n: number };
+  const identity = [expected.identity.sessionId, expected.identity.sourceUserSeq] as const;
+  const bindingTracked = Boolean(db.prepare(`
+    SELECT 1 FROM accepted_task_authority
+     WHERE session_id = ? AND source_user_seq = ?
+       AND expected_work_required = 1 AND work_contract_id IS NOT NULL
+     LIMIT 1
+  `).get(...identity));
+  const row = bindingTracked
+    ? db.prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM logical_tool_calls l
+             JOIN expected_work_call_bindings b
+               ON b.session_id = l.session_id
+              AND b.source_user_seq = l.source_user_seq
+              AND b.logical_tool_call_id = l.logical_tool_call_id
+            WHERE l.session_id = ? AND l.source_user_seq = ?
+              AND l.state != 'settled') AS logical_n,
+          (SELECT COUNT(*) FROM physical_dispatches p
+             JOIN expected_work_call_bindings b
+               ON b.session_id = p.session_id
+              AND b.source_user_seq = p.source_user_seq
+              AND b.logical_tool_call_id = p.logical_tool_call_id
+            WHERE p.session_id = ? AND p.source_user_seq = ?
+              AND p.state = 'started') AS dispatch_n
+      `).get(...identity, ...identity) as { logical_n: number; dispatch_n: number }
+    : db.prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM logical_tool_calls
+            WHERE session_id = ? AND source_user_seq = ? AND state != 'settled') AS logical_n,
+          (SELECT COUNT(*) FROM physical_dispatches
+            WHERE session_id = ? AND source_user_seq = ? AND state = 'started') AS dispatch_n
+      `).get(...identity, ...identity) as { logical_n: number; dispatch_n: number };
   return row.logical_n > 0 || row.dispatch_n > 0;
 }
 

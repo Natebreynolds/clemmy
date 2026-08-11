@@ -1098,3 +1098,128 @@ test('the live count-only source shape is locked end to end', () => {
     ['lead-001', 'lead-002', 'lead-003', 'lead-004', 'lead-005'],
   );
 });
+
+test('a discharged contract finalizes despite stray unbound bookkeeping, and still waits on its OWN work', () => {
+  // Run 6 residual: five drafts provably on disk, terminal replied "I haven't
+  // been able to verify the result yet." That sentence is FALLBACK_TEXT
+  // (terminal-presentation-repair.ts), reachable only via
+  // finalizeResolutionAgainstExpectedWork -> 'not_ready' -> needs_verification.
+  // resolution-ledger's not_ready gate is CONTRACT-BLIND: it asks whether ANY
+  // logical call is unsettled, not whether the ACCEPTED CONTRACT's work is.
+  // This probes whether one stray open bookkeeping row is enough to make a
+  // fully discharged contract unverifiable.
+  const task = acceptLocalAction('terminal-stray');
+  const sourceArgs = { path: 'leads.json' };
+  const sourceCall = openAndBind({
+    task, suffix: 'source', tool: SOURCE_TOOL, args: sourceArgs,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task, logicalToolCallId: sourceCall, tool: SOURCE_TOOL, args: sourceArgs,
+    result: { records: [{ id: 'lead-001' }, { id: 'lead-002' }] },
+    requirementId: 'read_leads',
+  });
+  for (const member of ['lead-001', 'lead-002']) {
+    const args = { path: `drafts/${member}.md`, content: `draft ${member}`, lead_id: member };
+    const call = openAndBind({
+      task, suffix: `draft-${member}`, tool: DRAFT_TOOL, args,
+      requirementId: 'write_draft', withProposal: false,
+      universeItemId: member,
+      universeSelector: { argumentPointer: '/lead_id', memberIdPointer: null },
+    });
+    settleLocal({
+      task, logicalToolCallId: call, tool: DRAFT_TOOL, args,
+      result: { path: args.path, bytes: 64 }, requirementId: 'write_draft',
+    });
+  }
+
+  // Every contracted requirement is discharged.
+  const complete = resolution.finalizeResolutionAgainstExpectedWork({
+    sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: task.turn,
+  });
+  assert.equal(complete.status, 'finalized', JSON.stringify(complete));
+
+  // Now the probe: one stray logical call, opened and never settled, owned by
+  // no requirement — the shape a discovery probe or abandoned attempt leaves.
+  const strayTask = acceptLocalAction('terminal-stray-2');
+  const strayArgs = { path: 'leads.json' };
+  const straySource = openAndBind({
+    task: strayTask, suffix: 'source', tool: SOURCE_TOOL, args: strayArgs,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task: strayTask, logicalToolCallId: straySource, tool: SOURCE_TOOL, args: strayArgs,
+    result: { records: [{ id: 'lead-001' }, { id: 'lead-002' }] },
+    requirementId: 'read_leads',
+  });
+  for (const member of ['lead-001', 'lead-002']) {
+    const args = { path: `drafts/${member}.md`, content: `draft ${member}`, lead_id: member };
+    const call = openAndBind({
+      task: strayTask, suffix: `draft-${member}`, tool: DRAFT_TOOL, args,
+      requirementId: 'write_draft', withProposal: false,
+      universeItemId: member,
+      universeSelector: { argumentPointer: '/lead_id', memberIdPointer: null },
+    });
+    settleLocal({
+      task: strayTask, logicalToolCallId: call, tool: DRAFT_TOOL, args,
+      result: { path: args.path, bytes: 64 }, requirementId: 'write_draft',
+    });
+  }
+  // The stray: opened, never settled, bound to nothing.
+  assert.equal(dispatch.admitLogicalCall({
+    identity: {
+      sessionId: strayTask.sessionId,
+      sourceUserSeq: strayTask.sourceUserSeq,
+      turn: strayTask.turn,
+      acceptedTaskId: strayTask.acceptedTaskId,
+      logicalToolCallId: `logical:${strayTask.label}:stray-probe`,
+    },
+    tool: 'list_files',
+    args: { path: 'drafts' },
+  }).status, 'inserted');
+
+  const withStray = resolution.finalizeResolutionAgainstExpectedWork({
+    sessionId: strayTask.sessionId, sourceUserSeq: strayTask.sourceUserSeq, turn: strayTask.turn,
+  });
+  assert.equal(
+    withStray.status,
+    'finalized',
+    'a stray unbound probe must not make discharged work unverifiable',
+  );
+
+  // AND THE OTHER DIRECTION: contract-bound work still in flight still blocks.
+  const inFlight = acceptLocalAction('terminal-inflight');
+  const inFlightSource = openAndBind({
+    task: inFlight, suffix: 'source', tool: SOURCE_TOOL, args: sourceArgs,
+    requirementId: 'read_leads', withProposal: true,
+  });
+  settleLocal({
+    task: inFlight, logicalToolCallId: inFlightSource, tool: SOURCE_TOOL, args: sourceArgs,
+    result: { records: [{ id: 'lead-001' }, { id: 'lead-002' }] },
+    requirementId: 'read_leads',
+  });
+  for (const member of ['lead-001', 'lead-002']) {
+    const args = { path: `drafts/${member}.md`, content: `draft ${member}`, lead_id: member };
+    const call = openAndBind({
+      task: inFlight, suffix: `draft-${member}`, tool: DRAFT_TOOL, args,
+      requirementId: 'write_draft', withProposal: false,
+      universeItemId: member,
+      universeSelector: { argumentPointer: '/lead_id', memberIdPointer: null },
+    });
+    // lead-002's write is BOUND to the contract and left unsettled.
+    if (member === 'lead-001') {
+      settleLocal({
+        task: inFlight, logicalToolCallId: call, tool: DRAFT_TOOL, args,
+        result: { path: args.path, bytes: 64 }, requirementId: 'write_draft',
+      });
+    }
+  }
+  const blocked = resolution.finalizeResolutionAgainstExpectedWork({
+    sessionId: inFlight.sessionId, sourceUserSeq: inFlight.sourceUserSeq, turn: inFlight.turn,
+  });
+  assert.equal(blocked.status, 'not_ready', 'the task still waits on its OWN unsettled work');
+  assert.match(
+    blocked.status === 'not_ready' ? blocked.reason : '',
+    /unsettled logical or physical work/,
+  );
+});
