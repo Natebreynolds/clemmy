@@ -5,6 +5,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { after, beforeEach, test } from 'node:test';
 import type { Agent, Runner, Tool } from '@openai/agents';
+import type { TerminalDeliveryJudgePort } from './terminal-delivery-judge.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-standard-action-work-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -59,6 +60,13 @@ function done(items: unknown[], text = 'Done from the model.') {
       reason: null,
     },
   } as never;
+}
+
+function unavailableTerminalDeliveryJudge(): TerminalDeliveryJudgePort {
+  return {
+    async resolveRoute() { return null; },
+    async run() { throw new Error('an unavailable terminal judge must not run'); },
+  };
 }
 
 function actionProposal() {
@@ -117,6 +125,7 @@ test('standard spine activates exact action authority before building its sole b
   const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'action activation' });
   let buildCount = 0;
   let capturedNames: string[] = [];
+  let codeModeDescription = '';
   const result = await runConversation({
     sessionId: session.id,
     input: 'Read my profile and workspace roots, then write a local report.',
@@ -131,14 +140,16 @@ test('standard spine activates exact action authority before building its sole b
         sessionId: identity.sessionId,
         sourceUserSeq: identity.sourceUserSeq,
         acceptedRoute: identity.route,
-        allowedToolNames: ['tool_search', 'user_profile_read', 'workspace_roots', 'write_file'],
+        allowedToolNames: ['tool_search', 'run_tool_program', 'user_profile_read', 'workspace_roots', 'write_file'],
         allowToolJit: true,
       });
       capturedNames = namesOf(agent);
+      codeModeDescription = String(invokable(agent, 'run_tool_program').description ?? '');
       return agent;
     },
     makeRunner: makeRunnerStub,
     runRunner: async (_runner, _agent, items) => done(items),
+    terminalDeliveryJudgePort: unavailableTerminalDeliveryJudge(),
   });
 
   assert.equal(buildCount, 1);
@@ -147,6 +158,8 @@ test('standard spine activates exact action authority before building its sole b
   assert.equal(capturedNames.includes('user_profile_read'), false, 'business tools stay behind work_call');
   assert.equal(capturedNames.includes('workspace_roots'), false, 'business tools stay behind work_call');
   assert.ok(capturedNames.includes('tool_search'), 'control discovery remains directly callable');
+  assert.match(codeModeDescription, /clem\.work/);
+  assert.match(codeModeDescription, /proposal must be null/);
   assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.publicPresentation?.kind, 'blocked', 'a zero-call action done claim must fail closed');
   const source = eventlog.listEvents(session.id, { types: ['user_input_received'] })[0]!;
@@ -165,6 +178,7 @@ test('standard direct and retrieve routes retain the legacy carrier surface', as
     const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: expectedRoute });
     let builtRoute = '';
     let surface: string[] = [];
+    let codeModeDescription = '';
     const result = await runConversation({
       sessionId: session.id,
       input,
@@ -180,6 +194,8 @@ test('standard direct and retrieve routes retain the legacy carrier surface', as
           allowToolJit: true,
         });
         surface = namesOf(agent);
+        const codeMode = (agent.tools ?? []).find((toolRef) => toolRef.name === 'run_tool_program');
+        codeModeDescription = String(codeMode?.description ?? '');
         return agent;
       },
       makeRunner: makeRunnerStub,
@@ -194,11 +210,75 @@ test('standard direct and retrieve routes retain the legacy carrier surface', as
     assert.equal(builtRoute, expectedRoute);
     assert.equal(surface.includes('work_call'), false, `${expectedRoute} must not pay the action schema cost`);
     assert.ok(surface.includes('call_tool'), `${expectedRoute} keeps its pre-existing deferred dispatcher`);
+    assert.doesNotMatch(codeModeDescription, /ACTION WORK.*clem\.work/);
     if (expectedRoute === 'direct_reply') {
       assert.equal(result.publicPresentation?.text, 'Legacy direct_reply answer.');
     }
   }
   assert.equal(repairCalls, 0, 'direct/retrieve presentation is byte-preserved without a repair model call');
+});
+
+test('shared Codex/BYO action run_tool_program carries scoped work_call through the real sandbox', async () => {
+  const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'action code work' });
+  let sourceUserSeq = 0;
+  let innerExecutions = 0;
+  _setCodeModeToolsForTests(new Map([['user_profile_read', {
+    name: 'user_profile_read',
+    invoke: async () => {
+      innerExecutions += 1;
+      return { successful: true, data: { name: 'Clem' } };
+    },
+  }]]));
+  try {
+    await runConversation({
+      sessionId: session.id,
+      input: 'Read my profile and workspace roots, then write a local report.',
+      maxSteps: 1,
+      judgeCompletion: false,
+      buildAgent: async (identity) => {
+        sourceUserSeq = identity.sourceUserSeq;
+        return buildOrchestratorAgent({
+          userInput: 'Read my profile and workspace roots, then write a local report.',
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          acceptedRoute: identity.route,
+          allowedToolNames: ['run_tool_program', 'user_profile_read', 'workspace_roots', 'write_file'],
+          allowToolJit: true,
+        });
+      },
+      makeRunner: makeRunnerStub,
+      runRunner: async (_runner, agent, items) => {
+        const program = invokable(agent, 'run_tool_program');
+        const firstWork = workInput({
+          proposal: actionProposal(),
+          requirementId: 'read-profile',
+          name: 'user_profile_read',
+        });
+        const output = await program.invoke(
+          { context: { sessionId: session.id, sourceUserSeq, turn: 1 } },
+          JSON.stringify({ program: `return await clem.work(${firstWork});` }),
+          { toolCall: { callId: 'outer-action-code-program' } },
+        );
+        assert.match(String(output), /successful/);
+        return done(items, 'The profile read is complete; the remaining accepted work is still open.');
+      },
+      terminalDeliveryJudgePort: unavailableTerminalDeliveryJudge(),
+    });
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+
+  assert.equal(innerExecutions, 1);
+  const db = eventlog.openEventLog();
+  const binding = db.prepare(`
+    SELECT requirement_id, tool_name FROM expected_work_call_bindings
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(session.id, sourceUserSeq) as { requirement_id: string; tool_name: string } | undefined;
+  assert.deepEqual(binding, { requirement_id: 'read-profile', tool_name: 'user_profile_read' });
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS n FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND state = 'OPEN'
+  `).get(session.id, sourceUserSeq) as { n: number }).n, 0);
 });
 
 test('standard action keeps control discovery before freeze, fuses proposal with call one, and binds later calls', async () => {
@@ -229,7 +309,7 @@ test('standard action keeps control discovery before freeze, fuses proposal with
 
     const searchResult = await search.invoke(
       runContext,
-      JSON.stringify({ query: 'read the user profile', limit: 1 }),
+      JSON.stringify({ query: 'read the user profile', limit: 1, role_key: null }),
       { toolCall: { callId: 'control-search' } },
     );
     assert.match(String(searchResult), /work_call/);
@@ -307,6 +387,7 @@ test('standard action keeps control discovery before freeze, fuses proposal with
         return 'I finished the two reads, but I haven\'t written or verified the report yet. I can resume from that step.';
       },
     },
+    terminalDeliveryJudgePort: unavailableTerminalDeliveryJudge(),
   });
 
   assert.equal(result.publicPresentation?.status, 'blocked');
@@ -385,6 +466,7 @@ test('malformed standard work_call settles one corrective refusal and makes zero
       assert.match(String(output), /work_contract_invalid|Invalid/);
       return done(items);
     },
+    terminalDeliveryJudgePort: unavailableTerminalDeliveryJudge(),
   });
 
   assert.equal(result.publicPresentation?.status, 'blocked');

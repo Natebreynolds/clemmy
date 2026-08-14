@@ -444,8 +444,23 @@ let localProbeInFlight: Promise<EmbeddingProvider | null> | null = null;
 // Test seam — inject a deterministic provider without any network/model load.
 let injectedProvider: EmbeddingProvider | null | undefined = undefined;
 
-/** Attempt local provider on no-key installs unless explicitly disabled. */
+/** A test seeded the local provider directly, so nothing here can reach a
+ *  model load. See localEmbeddingsAllowed(). */
+let localProviderSeededForTest = false;
+
+/** Attempt local provider on no-key installs unless explicitly disabled.
+ *
+ * A SEEDED provider outranks the env gate. That gate exists to stop unit tests
+ * warming or downloading the real ONNX model, and a test that injected its own
+ * deterministic provider has already satisfied that concern — loadLocalProvider
+ * short-circuits on an assigned `localProvider`, so no load can occur. Without
+ * this, `_setLocalProviderForTest` was a SILENT NO-OP under the suite's
+ * CLEMMY_LOCAL_EMBEDDINGS=off: the provider was assigned and then discarded one
+ * line later by activeProviderSync, semantic recall degraded to lexical, and
+ * the tests that depend on it failed only under the runner. A seam that accepts
+ * a value and never reads it is the worst kind of green. */
 function localEmbeddingsAllowed(): boolean {
+  if (localProviderSeededForTest) return true;
   return (getRuntimeEnv('CLEMMY_LOCAL_EMBEDDINGS', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
@@ -668,11 +683,13 @@ export function _setEmbeddingProviderForTest(p: EmbeddingProvider | null | undef
 export function _resetLocalProviderForTest(): void {
   localProvider = undefined;
   localProbeInFlight = null;
+  localProviderSeededForTest = false;
 }
 /** Test-only: seed the lazily-probed local provider without loading ONNX. */
 export function _setLocalProviderForTest(p: EmbeddingProvider | null | undefined): void {
   localProvider = p;
   localProbeInFlight = null;
+  localProviderSeededForTest = p !== undefined;
 }
 
 // Eager local warmup on no-key installs so isEmbeddingsEnabled() flips true
