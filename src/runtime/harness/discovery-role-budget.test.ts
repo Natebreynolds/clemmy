@@ -532,3 +532,60 @@ test('the candidate card exposes only unresolved opaque roles and the broker sch
   }) as { content?: Array<{ text?: string }> } | undefined;
   assert.match(result?.content?.[0]?.text ?? '', /"role_key":"clause-1:write"/);
 });
+
+/**
+ * The denial is correct on every door — that is pinned by the three-carrier
+ * sweep above ("alternate broad doors deny before provider I/O"). What a caller
+ * is TOLD is not the same question.
+ *
+ * Live 2026-08-14: a door with no role field was told to supply a role_key, so
+ * the caller retried the identical shape four times before abandoning it for
+ * tool_search, which was admitted immediately. Both directions are pinned here
+ * so the redirect cannot be widened into the broker's own advice, and so the
+ * broker's advice cannot be replaced by a redirect to itself.
+ */
+test('a role denial tells a role-less door to reissue through the broker, and tells the broker to name its role', () => {
+  const requirement = {
+    roleKey: 'clause-0:unknown',
+    clauseIndex: 0,
+    text: 'discover the unresolved external operation',
+    resolved: false,
+  };
+
+  const alternate = acceptedTask('advisory alternate door', [requirement]);
+  assert.throws(() => admitDiscoveryBoundary({
+    ...alternate,
+    turn: 1,
+    toolName: 'composio_search_tools',
+    input: { query: 'external operation' },
+    callId: 'advisory-alternate-door',
+  }), (error: unknown) => {
+    assert.ok(error instanceof DiscoveryBudgetDeniedError);
+    assert.equal(error.reason, 'role_required');
+    // Names the door that CAN carry the role, and says retrying is pointless.
+    assert.match(String(error.message), /reissue the search through tool_search/i);
+    assert.match(String(error.message), /cannot carry a requirement role/i);
+    assert.match(String(error.message), /do not retry this tool/i);
+    return true;
+  });
+
+  const broker = acceptedTask('advisory broker door', [requirement]);
+  assert.throws(() => admitDiscoveryBoundary({
+    ...broker,
+    turn: 1,
+    toolName: 'tool_search',
+    // No role_key: the broker CAN carry one, so the ask is followable and the
+    // original instruction must survive untouched.
+    input: { query: 'external operation' },
+    callId: 'advisory-broker-door',
+  }), (error: unknown) => {
+    assert.ok(error instanceof DiscoveryBudgetDeniedError);
+    assert.equal(error.reason, 'role_required');
+    assert.match(
+      String(error.message),
+      /Use the exact unresolved role_key shown in the current capability card; a broad search without runtime-owned requirement membership is unavailable\./,
+    );
+    assert.doesNotMatch(String(error.message), /reissue the search through tool_search/i);
+    return true;
+  });
+});

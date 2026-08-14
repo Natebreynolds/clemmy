@@ -307,9 +307,23 @@ export class DiscoveryBudgetDeniedError extends Error {
     public readonly surface: DiscoveryCallClassification['surface'],
     public readonly reason: string,
   ) {
+    // THE DENIAL IS CORRECT; THE OLD INSTRUCTION WAS NOT FOLLOWABLE HERE.
+    // `tool_search` is deliberately the ONE broker that transports a requirement
+    // role — the alternate doors deny before provider I/O so a refused search
+    // cannot simply be reissued through another carrier. But every door was
+    // told to "use the exact unresolved role_key", and a door with no role field
+    // cannot do that at all: composio_search_tools takes { query, toolkit_slug,
+    // limit } and nothing else. A caller that reads that advice retries the same
+    // shape — live 2026-08-14, four identical refusals on one turn before it
+    // gave up and reissued through tool_search, which was admitted at once.
+    // So name the door that works instead of asking for a key this one cannot
+    // carry. The gate is unchanged; only what the caller is told changes.
+    const roleBroker = surface === 'tool_search';
     const corrective = category === 'broad_discovery'
       ? reason === 'role_required'
-        ? 'Use the exact unresolved role_key shown in the current capability card; a broad search without runtime-owned requirement membership is unavailable.'
+        ? roleBroker
+          ? 'Use the exact unresolved role_key shown in the current capability card; a broad search without runtime-owned requirement membership is unavailable.'
+          : `${surface} cannot carry a requirement role, so no argument to it will satisfy this. Reissue the search through tool_search with the exact unresolved role_key shown in the current capability card; do not retry this tool.`
         : reason === 'role_resolved'
           ? 'This requirement already has a resolved capability. Execute that path; do not issue broad discovery for it.'
           : reason === 'role_not_unresolved'
