@@ -112,20 +112,33 @@ export function compareVersionLegs(baseline: VersionLeg, candidate: VersionLeg):
     if (!report.sourceClean) evidenceIssues.push(`${label}:source_dirty`);
     if (report.sourceStable === false) evidenceIssues.push(`${label}:source_unstable`);
     if (report.sourceStable === undefined) evidenceIssues.push(`${label}:source_stability_unrecorded`);
+    if (report.failures > 0) evidenceIssues.push(`${label}:report_has_failures:${report.failures}`);
+    const failingChecks = (report.reportChecks ?? []).filter((check) => !check.pass);
+    if (failingChecks.length > 0) {
+      evidenceIssues.push(`${label}:failing_report_checks:${failingChecks.length}`);
+    }
   };
   grade(baseline.report, baseline.runtimeLabel);
   grade(candidate.report, candidate.runtimeLabel);
 
-  const sameSourceFingerprint = baseline.report.sourceFingerprint === candidate.report.sourceFingerprint;
+  const baselineRuntimeFingerprint = baseline.report.runtimeFingerprint ?? baseline.report.sourceFingerprint;
+  const candidateRuntimeFingerprint = candidate.report.runtimeFingerprint ?? candidate.report.sourceFingerprint;
+  const sameSourceFingerprint = baselineRuntimeFingerprint === candidateRuntimeFingerprint;
+  const sameMeasurementStack = baseline.report.sourceFingerprint === candidate.report.sourceFingerprint;
+  if (!sameMeasurementStack) {
+    evidenceIssues.push('measurement_stack_fingerprint_mismatch');
+  }
   if (sameSourceFingerprint) {
     evidenceIssues.push('same_source_fingerprint:legs_are_one_build_not_a_version_ab');
   }
 
   const baselineWorkload = workloadKeyOf(baseline.report);
   const candidateWorkload = workloadKeyOf(candidate.report);
-  const workloadMismatch = baselineWorkload !== null
+  const workloadMismatch = !sameMeasurementStack || (
+    baselineWorkload !== null
     && candidateWorkload !== null
-    && baselineWorkload !== candidateWorkload;
+    && baselineWorkload !== candidateWorkload
+  );
 
   const baselineOutcomes = new Map<string, ScenarioOutcome>();
   for (const outcome of baseline.report.outcomes) {
@@ -166,7 +179,9 @@ export function compareVersionLegs(baseline: VersionLeg, candidate: VersionLeg):
         baselineStatus: baseOutcome.status,
         candidateStatus: candOutcome.status,
         statusDelta: 'not_comparable',
-        annotations: [`workload:${baselineWorkload}!=${candidateWorkload}`],
+        annotations: !sameMeasurementStack
+          ? ['measurement_stack_fingerprint_mismatch']
+          : [`workload:${baselineWorkload}!=${candidateWorkload}`],
       });
       continue;
     }
@@ -181,6 +196,8 @@ export function compareVersionLegs(baseline: VersionLeg, candidate: VersionLeg):
       );
     }
 
+    const failToSkip = baseOutcome.status === 'FAIL' && candOutcome.status === 'SKIP';
+    if (failToSkip) annotations.push('fail_to_skip:evidence_disappeared');
     const rankDelta = STATUS_RANK[candOutcome.status] - STATUS_RANK[baseOutcome.status];
     const cell: VersionCellComparison = {
       scenario: candOutcome.scenario,
@@ -188,7 +205,9 @@ export function compareVersionLegs(baseline: VersionLeg, candidate: VersionLeg):
       eligibility: 'comparable',
       baselineStatus: baseOutcome.status,
       candidateStatus: candOutcome.status,
-      statusDelta: rankDelta > 0 ? 'improved' : rankDelta < 0 ? 'regressed' : 'same',
+      statusDelta: failToSkip
+        ? 'not_comparable'
+        : rankDelta > 0 ? 'improved' : rankDelta < 0 ? 'regressed' : 'same',
       annotations,
       baselineFirstRun: baseExtra?.firstRun,
       candidateFirstRun: candExtra?.firstRun,
@@ -223,6 +242,9 @@ export function compareVersionLegs(baseline: VersionLeg, candidate: VersionLeg):
           ratio: ratioOf(baseExtra.canonicalToolCalls, candExtra.canonicalToolCalls),
         };
       }
+      if (!cell.tokenDelta && !cell.wallDelta && !cell.canonicalCallDelta) {
+        cell.annotations.push('cost_evidence_missing');
+      }
     }
 
     cells.push(cell);
@@ -245,8 +267,8 @@ export function compareVersionLegs(baseline: VersionLeg, candidate: VersionLeg):
   return {
     baselineLabel: baseline.runtimeLabel,
     candidateLabel: candidate.runtimeLabel,
-    baselineFingerprint: baseline.report.sourceFingerprint,
-    candidateFingerprint: candidate.report.sourceFingerprint,
+    baselineFingerprint: baselineRuntimeFingerprint,
+    candidateFingerprint: candidateRuntimeFingerprint,
     sameSourceFingerprint,
     evidenceGrade: evidenceIssues.length === 0 ? 'release' : 'development',
     evidenceIssues,

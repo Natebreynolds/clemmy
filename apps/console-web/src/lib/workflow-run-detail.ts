@@ -24,7 +24,7 @@ export interface WorkflowRunAdvisory {
   note: string;
 }
 
-export type WorkflowStepStatus = 'pending' | 'running' | 'done' | 'blocked' | 'failed' | 'skipped' | 'awaiting_approval' | 'awaiting_capability';
+export type WorkflowStepStatus = 'pending' | 'running' | 'done' | 'blocked' | 'failed' | 'skipped' | 'awaiting_approval' | 'awaiting_input' | 'awaiting_capability';
 
 export interface WorkflowRunStep {
   stepId: string;
@@ -50,7 +50,7 @@ export interface WorkflowRunSummary {
   artifacts: { counts: string[]; files: string[]; urls: string[] };
 }
 
-export type WorkflowRunStatus = 'unknown' | 'running' | 'blocked' | 'completed' | 'failed' | 'cancelled';
+export type WorkflowRunStatus = 'unknown' | 'running' | 'blocked' | 'awaiting_input' | 'completed' | 'failed' | 'cancelled';
 
 /** Run-level judge verdict (T3-B4 verdict door): the end-of-run target/goal
  *  judges record ONE canonical `verdict_recorded` event with no stepId. */
@@ -216,6 +216,10 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
       runStatus = 'blocked';
       continue;
     }
+    if (kind === 'run_paused' && str(asMeta(ev.meta).reason) === 'awaiting_user_input') {
+      runStatus = 'awaiting_input';
+      continue;
+    }
     if (kind === 'run_completed') { runFinishedAt = t; runStatus = 'completed'; continue; }
     if (kind === 'run_failed') { runFinishedAt = t; runStatus = 'failed'; continue; }
     if (kind === 'run_cancelled') { runFinishedAt = t; runStatus = 'cancelled'; continue; }
@@ -310,11 +314,16 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
         // then the stable park message for events written before the tag.
         const failMsg = str(ev.error);
         const parked = meta.reason === 'parked_on_approval' || /parked on approval/i.test(failMsg);
+        const awaitingInput = meta.reason === 'parked_on_input';
         const capability = meta.reason === 'parked_on_capability';
         if (parked) {
           s.status = 'awaiting_approval';
           s.finishedAt = t;
           s.error = 'Waiting for your approval — the run resumes automatically once you decide.';
+        } else if (awaitingInput) {
+          s.status = 'awaiting_input';
+          s.finishedAt = t;
+          s.error = failMsg || 'Waiting for your answer — completed work is preserved.';
         } else if (capability) {
           s.status = 'awaiting_capability';
           s.finishedAt = t;

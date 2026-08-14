@@ -16,7 +16,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { planBrain, provisionDaemon } from './provision.js';
-import { executeRuntimePlan, planRuntimeUnderTest } from './runtime-under-test.js';
+import {
+  executeRuntimePlan,
+  planRuntimeUnderTest,
+  runtimeProvisioningMode,
+  sha256Directory,
+  type RuntimeUnderTest,
+} from './runtime-under-test.js';
 import {
   parseProofBenchmarkFlags,
   proofBenchmarkMetadata,
@@ -269,8 +275,9 @@ async function main(): Promise<void> {
   console.log(sourceClean
     ? `\n→ building candidate ${gitHead.slice(0, 12)} …`
     : `\n→ building dirty working tree at ${gitHead.slice(0, 12)} …`);
-  let pinnedDaemonEntry: string | undefined;
-  if (runtimeRef) {
+  let pinnedRuntime: RuntimeUnderTest | undefined;
+  const provisioningMode = runtimeProvisioningMode({ runtimeRef, sourceClean });
+  if (provisioningMode === 'explicit-ref') {
     // Pinned baseline leg: the DAEMON under test comes from a worktree built
     // at its own ref; the measurement stack (scenarios, scoring, shim) always
     // runs from the current tree so ONE stack drives both versions. The
@@ -280,7 +287,22 @@ async function main(): Promise<void> {
     const runtime = executeRuntimePlan(plan, { log: (line) => console.log(line) });
     if (!runtime.built) throw new Error(`pinned runtime ${runtimeRef} did not produce ${runtime.daemonEntry}`);
     console.log(`→ pinned runtime ready: ${runtime.gitSha.slice(0, 12)} (${runtime.nodeModulesProvenance}) at ${runtime.daemonEntry}`);
-    pinnedDaemonEntry = runtime.daemonEntry;
+    pinnedRuntime = runtime;
+  } else if (provisioningMode === 'clean-candidate-worktree') {
+    // A release-grade candidate gets the same independent npm-ci + artifact
+    // attestation as a pinned baseline. Existing primary-tree node_modules are
+    // development convenience, never dependency provenance.
+    console.log(`\n→ provisioning clean candidate runtime ${gitHead.slice(0, 12)} …`);
+    const plan = planRuntimeUnderTest({
+      repoRoot: REPO_ROOT,
+      ref: gitHead,
+      label: 'candidate-clean-tree',
+    });
+    const runtime = executeRuntimePlan(plan, { log: (line) => console.log(line) });
+    if (!runtime.built || !runtime.buildAttestation) {
+      throw new Error(`clean candidate did not produce an attested runtime at ${runtime.daemonEntry}`);
+    }
+    pinnedRuntime = runtime;
   } else {
     try {
       execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'inherit' });
@@ -288,6 +310,8 @@ async function main(): Promise<void> {
       throw new Error(`Candidate build failed before live proof: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  const runtimeFingerprintStart = pinnedRuntime?.buildAttestation?.artifactSha256
+    ?? sha256Directory(path.join(REPO_ROOT, 'dist'));
 
   const outcomes: ScenarioOutcome[] = [];
   const runtimeChecks: Check[] = [];
@@ -317,7 +341,9 @@ async function main(): Promise<void> {
         keepHome: keep,
         fusionMode,
         requireWorkerProvider: scenarios.some((scenario) => scenario.workerRouteExpectation),
-        ...(pinnedDaemonEntry ? { daemonEntry: pinnedDaemonEntry } : {}),
+        ...(pinnedRuntime
+          ? { daemonEntry: pinnedRuntime.daemonEntry, expectedRuntime: pinnedRuntime }
+          : {}),
       });
     } catch (err) {
       for (const s of scenarios) {
@@ -425,6 +451,7 @@ async function main(): Promise<void> {
     } finally {
       if (anyFailed) console.log(`  (keeping ${daemon.home} for forensics)`);
       try {
+        runtimeChecks.push(...(daemon.runtimeChecks?.() ?? []));
         const stopResult = await daemon.stop({ keepHome: anyFailed || keep });
         const stopChecks = proofDaemonStopChecks(brainKind, stopResult);
         runtimeChecks.push(...stopChecks);
@@ -469,7 +496,18 @@ async function main(): Promise<void> {
     sourceCleanAtEnd,
   });
   sourceClean = sourceStability.sourceClean;
-  const reportChecks = [sourceStability.check, ...runtimeChecks];
+  let runtimeFingerprintEnd: string | undefined;
+  try {
+    runtimeFingerprintEnd = pinnedRuntime
+      ? sha256Directory(path.join(pinnedRuntime.treeRoot, 'dist'))
+      : sha256Directory(path.join(REPO_ROOT, 'dist'));
+  } catch { /* fail closed below */ }
+  const runtimeArtifactStable: Check = {
+    name: 'runtime artifact remained byte-identical through live execution',
+    pass: runtimeFingerprintEnd === runtimeFingerprintStart,
+    detail: `start=${runtimeFingerprintStart} end=${runtimeFingerprintEnd ?? '(unavailable)'}`,
+  };
+  const reportChecks = [sourceStability.check, runtimeArtifactStable, ...runtimeChecks];
   const failures = outcomes.filter((o) => o.status === 'FAIL').length
     + reportChecks.filter((check) => !check.pass).length;
   const benchmark = benchmarkRequest
@@ -492,6 +530,9 @@ async function main(): Promise<void> {
       : {}),
     sourceStable: sourceStability.sourceStable,
     sourceClean,
+    runtimeFingerprint: runtimeFingerprintStart,
+    runtimeGitSha: pinnedRuntime?.gitSha ?? gitHead,
+    runtimeLabel: pinnedRuntime?.label ?? 'working-tree',
     fusionMode,
     ...(benchmark ? { benchmark } : {}),
     reportChecks,

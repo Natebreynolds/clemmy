@@ -160,7 +160,7 @@ function eventArgs(event: RunEnvironmentEvent): Record<string, unknown> {
 
 export function isRunLive(run: Pick<RunEnvironmentDetail, 'live' | 'status' | 'runState'>): boolean {
   if (run.live === true) return true;
-  return /^(running|active|in_progress|queued|awaiting_approval|waiting_for_input|paused)$/i
+  return /^(running|active|in_progress|queued|awaiting_approval|awaiting_input|waiting_for_input|paused)$/i
     .test(firstText(run.runState, run.status));
 }
 

@@ -288,9 +288,22 @@ export interface RunSummary {
   id: string;
   sessionId: string;
   title: string;
-  status: 'received' | 'running' | 'queued' | 'awaiting_approval' | 'completed' | 'failed' | 'cancelled';
+  status: 'received' | 'running' | 'queued' | 'awaiting_approval' | 'awaiting_input' | 'completed' | 'failed' | 'cancelled';
   createdAt: string;
   updatedAt: string;
+}
+
+/** One shared mobile classification so Home and Activity cannot drift. */
+export const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
+  'running',
+  'queued',
+  'received',
+  'awaiting_approval',
+  'awaiting_input',
+]);
+
+export function isActiveRunStatus(status: string): boolean {
+  return ACTIVE_RUN_STATUSES.has(status);
 }
 
 // ─── push subscription ─

@@ -1,11 +1,8 @@
 import { useCallback, useEffect, useState } from 'preact/hooks';
-import { listRecentRuns, type RunSummary } from '../lib/api';
+import { isActiveRunStatus, listRecentRuns, type RunSummary } from '../lib/api';
 import { relativeTime } from '../components/Approvals';
 import { RunControl } from '../components/RunControl';
 import { REFRESH_EVENT } from '../lib/native-bridge';
-
-/** Runs still in flight, grouped above the finished ones. */
-const ACTIVE = new Set(['running', 'queued', 'received', 'awaiting_approval']);
 
 export function Activity() {
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -56,8 +53,8 @@ export function Activity() {
     );
   }
 
-  const live = runs.filter((run) => ACTIVE.has(run.status));
-  const done = runs.filter((run) => !ACTIVE.has(run.status));
+  const live = runs.filter((run) => isActiveRunStatus(run.status));
+  const done = runs.filter((run) => !isActiveRunStatus(run.status));
 
   return (
     <div class="home">

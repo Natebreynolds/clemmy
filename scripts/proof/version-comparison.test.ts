@@ -27,6 +27,14 @@ function report(overrides: Partial<ProofReport>): ProofReport {
   };
 }
 
+function runtimeReport(runtimeFingerprint: string, overrides: Partial<ProofReport>): ProofReport {
+  return report({
+    sourceFingerprint: 'shared-measurement-stack',
+    runtimeFingerprint,
+    ...overrides,
+  });
+}
+
 function totals(totalTokens: number, quiesceTruncated = false): LegTokenTotals {
   return {
     totalTokens,
@@ -52,14 +60,16 @@ function totals(totalTokens: number, quiesceTruncated = false): LegTokenTotals {
 
 test('different fingerprints compare cleanly; statuses pair by scenario x brain', () => {
   const baseline = report({
-    sourceFingerprint: 'fp-v3.14',
+    sourceFingerprint: 'measurement-stack',
+    runtimeFingerprint: 'runtime-v3.14',
     outcomes: [
       { scenario: 's1', brain: 'codex', status: 'FAIL', checks: [], latency: [] },
       { scenario: 's2', brain: 'codex', status: 'PASS', checks: [], latency: [] },
     ],
   });
   const candidate = report({
-    sourceFingerprint: 'fp-clem4',
+    sourceFingerprint: 'measurement-stack',
+    runtimeFingerprint: 'runtime-clem4',
     outcomes: [
       { scenario: 's1', brain: 'codex', status: 'PASS', checks: [], latency: [] },
       { scenario: 's2', brain: 'codex', status: 'PASS', checks: [], latency: [] },
@@ -93,14 +103,51 @@ test('identical fingerprints are annotated as one-build, not refused', () => {
   assert.equal(result.evidenceGrade, 'development');
 });
 
+test('cross-version identity compares the daemon runtime artifact, not the shared measurement stack', () => {
+  const baseline = report({ sourceFingerprint: 'measurement-stack' }) as ProofReport;
+  const candidate = report({ sourceFingerprint: 'measurement-stack' }) as ProofReport;
+  baseline.runtimeFingerprint = 'runtime-v314';
+  candidate.runtimeFingerprint = 'runtime-candidate';
+  const comparison = compareVersionLegs(
+    { runtimeLabel: 'v3.14', report: baseline },
+    { runtimeLabel: 'candidate', report: candidate },
+  );
+  assert.equal(comparison.sameSourceFingerprint, false);
+  assert.equal(comparison.baselineFingerprint, 'runtime-v314');
+  assert.equal(comparison.candidateFingerprint, 'runtime-candidate');
+});
+
+test('different measurement stacks make cells ineligible and downgrade evidence', () => {
+  const baseline = report({
+    sourceFingerprint: 'measurement-a',
+    runtimeFingerprint: 'runtime-a',
+    outcomes: [{ scenario: 's1', brain: 'codex', status: 'PASS', checks: [], latency: [] }],
+  });
+  const candidate = report({
+    sourceFingerprint: 'measurement-b',
+    runtimeFingerprint: 'runtime-b',
+    outcomes: [{ scenario: 's1', brain: 'codex', status: 'PASS', checks: [], latency: [] }],
+  });
+  const comparison = compareVersionLegs(
+    { runtimeLabel: 'a', report: baseline },
+    { runtimeLabel: 'b', report: candidate },
+  );
+  assert.equal(comparison.evidenceGrade, 'development');
+  assert.equal(comparison.comparableCells, 0);
+  assert.equal(comparison.cells[0]?.eligibility, 'workload_mismatch');
+  assert.ok(comparison.evidenceIssues.includes('measurement_stack_fingerprint_mismatch'));
+});
+
 test('workload-key mismatch refuses the cells', () => {
   const baseline = report({
-    sourceFingerprint: 'fp-a',
+    sourceFingerprint: 'shared-measurement-stack',
+    runtimeFingerprint: 'runtime-a',
     benchmark: { protocolVersion: 1, cohortId: 'c', sample: 'prime', workloadKey: 'wk-1' },
     outcomes: [{ scenario: 's1', brain: 'codex', status: 'PASS', checks: [], latency: [] }],
   });
   const candidate = report({
-    sourceFingerprint: 'fp-b',
+    sourceFingerprint: 'shared-measurement-stack',
+    runtimeFingerprint: 'runtime-b',
     benchmark: { protocolVersion: 1, cohortId: 'c', sample: 'measured', workloadKey: 'wk-2' },
     outcomes: [{ scenario: 's1', brain: 'codex', status: 'PASS', checks: [], latency: [] }],
   });
@@ -113,15 +160,13 @@ test('workload-key mismatch refuses the cells', () => {
 });
 
 test('missing cells surface on both sides', () => {
-  const baseline = report({
-    sourceFingerprint: 'fp-a',
+  const baseline = runtimeReport('runtime-a', {
     outcomes: [
       { scenario: 'only-base', brain: 'codex', status: 'PASS', checks: [], latency: [] },
       { scenario: 'shared', brain: 'codex', status: 'PASS', checks: [], latency: [] },
     ],
   });
-  const candidate = report({
-    sourceFingerprint: 'fp-b',
+  const candidate = runtimeReport('runtime-b', {
     outcomes: [
       { scenario: 'shared', brain: 'codex', status: 'PASS', checks: [], latency: [] },
       { scenario: 'only-cand', brain: 'codex', status: 'PASS', checks: [], latency: [] },
@@ -140,12 +185,10 @@ test('missing cells surface on both sides', () => {
 });
 
 test('model-signature drift annotates the cell and voids cost deltas, not correctness', () => {
-  const baseline = report({
-    sourceFingerprint: 'fp-a',
+  const baseline = runtimeReport('runtime-a', {
     outcomes: [{ scenario: 's1', brain: 'glm', status: 'FAIL', checks: [], latency: [] }],
   });
-  const candidate = report({
-    sourceFingerprint: 'fp-b',
+  const candidate = runtimeReport('runtime-b', {
     outcomes: [{ scenario: 's1', brain: 'glm', status: 'PASS', checks: [], latency: [] }],
   });
   const result = compareVersionLegs(
@@ -173,12 +216,10 @@ test('model-signature drift annotates the cell and voids cost deltas, not correc
 });
 
 test('stable signatures produce token/wall/call deltas with ratios', () => {
-  const baseline = report({
-    sourceFingerprint: 'fp-a',
+  const baseline = runtimeReport('runtime-a', {
     outcomes: [{ scenario: 's1', brain: 'claude', status: 'PASS', checks: [], latency: [] }],
   });
-  const candidate = report({
-    sourceFingerprint: 'fp-b',
+  const candidate = runtimeReport('runtime-b', {
     outcomes: [{ scenario: 's1', brain: 'claude', status: 'PASS', checks: [], latency: [] }],
   });
   const result = compareVersionLegs(

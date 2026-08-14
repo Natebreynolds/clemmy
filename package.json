@@ -1,6 +1,6 @@
 {
   "name": "clemmy",
-  "version": "3.15.0",
+  "version": "3.16.0",
   "description": "Local-first AI operator with persistent memory, governed tools, workflows, voice, and meetings",
   "license": "MIT",
   "homepage": "https://github.com/Natebreynolds/clemmy",
@@ -41,7 +41,7 @@
     "clean:dist": "node scripts/clean-dist.mjs",
     "check:public-hygiene": "node scripts/check-public-hygiene.mjs",
     "prebuild": "npm run clean:dist",
-    "build": "tsc --outDir dist",
+    "build": "node scripts/build-candidate.mjs",
     "build:mobile-web": "npm --prefix apps/mobile-web run build",
     "build:console-web": "npm --prefix apps/console-web run build",
     "typecheck": "tsc --noEmit",

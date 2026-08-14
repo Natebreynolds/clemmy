@@ -17,17 +17,90 @@
 # Mid-turn and boot-auth fallover are both ON for the dev daemon by default; set
 # DEV_BRAIN_FALLOVER=off and/or DEV_AUTH_FALLOVER=off to isolate a provider.
 # Re-run after every source patch (ESM cache → needs a fresh process to pick up changes).
-set -uo pipefail
+set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOME_DIR="$HOME/.clementine-next"
-PORT="$(grep -E '^WEBHOOK_PORT=' "$HOME_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"'"'"' ' )"; PORT="${PORT:-8520}"
-
+PORT="$(grep -E '^WEBHOOK_PORT=' "$HOME_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"'"'"' ' || true)"; PORT="${PORT:-8420}"
+EXPECTED_GIT_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
+if [[ ! "$EXPECTED_GIT_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "✗ could not resolve the candidate's full git SHA"; exit 2
+fi
+EXPECTED_GIT_DIRTY=false
+[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=all 2>/dev/null)" ] && EXPECTED_GIT_DIRTY=true
+EXPECTED_RUNTIME_JSON="$(cd "$ROOT" && npx tsx -e '
+  import { fingerprintRuntimeSourceFromGit } from "./src/runtime/source-fingerprint.ts";
+  import { HARNESS_SCHEMA_VERSION } from "./src/runtime/harness/schema-version.ts";
+  console.log(JSON.stringify({
+    sourceFingerprint: fingerprintRuntimeSourceFromGit({ repoRoot: process.cwd() }),
+    schemaVersion: HARNESS_SCHEMA_VERSION,
+  }));
+')"
+EXPECTED_SOURCE_FINGERPRINT="$(node -e 'console.log(JSON.parse(process.argv[1]).sourceFingerprint)' "$EXPECTED_RUNTIME_JSON")"
+EXPECTED_SCHEMA_VERSION="$(node -e 'console.log(JSON.parse(process.argv[1]).schemaVersion)' "$EXPECTED_RUNTIME_JSON")"
+if [[ ! "$EXPECTED_SOURCE_FINGERPRINT" =~ ^[a-f0-9]{64}$ ]]; then
+  echo "✗ could not fingerprint the exact candidate source"; exit 2
+fi
+if [[ ! "$EXPECTED_SCHEMA_VERSION" =~ ^[1-9][0-9]*$ ]]; then
+  echo "✗ invalid expected harness schema: $EXPECTED_SCHEMA_VERSION"; exit 2
+fi
 DEV_PRIMARY_MODEL="${DEV_PRIMARY_MODEL:-}"
 DEV_FUSION_MODE="${DEV_FUSION_MODE:-}"
 DEV_FUSION_STRATEGY="${DEV_FUSION_STRATEGY:-}"
 DEV_BRAIN_FALLOVER="${DEV_BRAIN_FALLOVER:-on}"
 DEV_AUTH_FALLOVER="${DEV_AUTH_FALLOVER:-on}"
 DAEMON_LOG="$HOME_DIR/logs/daemon.log"
+DEV_LAUNCH_VERIFIED=false
+DEV_ROLLBACK_ARMED=false
+DEV_POLICY_CREATED=false
+DEV_POLICY_PATH="$HOME_DIR/state/proactivity-policy.json"
+DEV_POLICY_CREATED_MARKER="$HOME_DIR/state/proactivity-policy.json.devcreated"
+stop_owned_daemon_and_wait() {
+  local owned_pid owned_state
+  owned_pid="$(cd "$ROOT" && CLEMENTINE_HOME="$HOME_DIR" npx tsx -e '
+    import { readDaemonPid } from "./src/daemon/process.ts";
+    console.log(readDaemonPid() ?? "");
+  ' 2>/dev/null || true)"
+  (cd "$ROOT" && CLEMENTINE_HOME="$HOME_DIR" npx tsx src/index.ts daemon stop) >/dev/null 2>&1 || true
+  if [ -n "$owned_pid" ]; then
+    for _ in $(seq 1 100); do
+      owned_state="$(ps -p "$owned_pid" -o state= 2>/dev/null | tr -d '[:space:]' || true)"
+      case "$owned_state" in ""|Z*) break ;; esac
+      sleep 0.1
+    done
+  fi
+}
+quit_installed_app_bounded() {
+  local quit_pid quit_state
+  osascript -e 'tell application "Clementine" to quit' >/dev/null 2>&1 &
+  quit_pid=$!
+  for _ in $(seq 1 30); do
+    quit_state="$(ps -p "$quit_pid" -o state= 2>/dev/null | tr -d '[:space:]' || true)"
+    case "$quit_state" in ""|Z*) wait "$quit_pid" 2>/dev/null || true; return ;; esac
+    sleep 0.1
+  done
+  # Apple Events can wedge behind an unresponsive Electron main process. The
+  # installed app is terminated immediately below, so stop waiting on the
+  # messenger instead of blocking source-launch recovery forever.
+  kill "$quit_pid" 2>/dev/null || true
+  for _ in $(seq 1 10); do
+    kill -0 "$quit_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$quit_pid" 2>/dev/null || true
+  wait "$quit_pid" 2>/dev/null || true
+}
+rollback_failed_launch() {
+  if [ "$DEV_ROLLBACK_ARMED" = "true" ] && [ "$DEV_LAUNCH_VERIFIED" != "true" ]; then
+    stop_owned_daemon_and_wait
+    if [ -f "$HOME_DIR/state/proactivity-policy.json.devbak" ]; then
+      mv "$HOME_DIR/state/proactivity-policy.json.devbak" "$HOME_DIR/state/proactivity-policy.json" 2>/dev/null || true
+    elif [ "$DEV_POLICY_CREATED" = "true" ]; then
+      rm -f "$DEV_POLICY_PATH"
+      rm -f "$DEV_POLICY_CREATED_MARKER"
+    fi
+  fi
+}
+trap rollback_failed_launch EXIT
 
 if [ -n "$DEV_PRIMARY_MODEL" ] && [[ ! "$DEV_PRIMARY_MODEL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
   echo "✗ DEV_PRIMARY_MODEL contains unsupported characters"; exit 2
@@ -38,22 +111,17 @@ case "$DEV_BRAIN_FALLOVER" in on|off) ;; *) echo "✗ DEV_BRAIN_FALLOVER must be
 case "$DEV_AUTH_FALLOVER" in on|off) ;; *) echo "✗ DEV_AUTH_FALLOVER must be on or off"; exit 2 ;; esac
 if [ -n "$DEV_FUSION_MODE" ] && [ -z "$DEV_FUSION_STRATEGY" ]; then DEV_FUSION_STRATEGY=verify; fi
 
-echo "→ quitting installed app + any prior dev daemon"
-osascript -e 'tell application "Clementine" to quit' 2>/dev/null || true
+echo "→ quitting installed app + the daemon owned by $HOME_DIR"
+DEV_ROLLBACK_ARMED=true
+quit_installed_app_bounded
 pkill -f "/Applications/Clementine.app" 2>/dev/null || true
-# Match the daemon however tsx is invoked. The real argv is
-#   node --import tsx /ABS/PATH/src/index.ts daemon --foreground
-# so the old pattern "tsx src/index.ts …" never matched (absolute path between
-# tsx and src) — the stale daemon survived, kept the port, and the bind-check
-# below false-reported "up" against the OLD code. Anchor on the stable suffix.
-pkill -f "src/index.ts daemon --foreground" 2>/dev/null || true
+stop_owned_daemon_and_wait
 for _ in $(seq 1 20); do lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1 || break; sleep 1; done
-# Belt-and-suspenders: if anything STILL holds the port, kill it by PID so we
-# never start the new daemon against a port the old one owns (EADDRINUSE).
 if lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1; then
-  STALE_PIDS="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN -n 2>/dev/null)"
-  [ -n "$STALE_PIDS" ] && echo "→ port $PORT still held by $STALE_PIDS — killing" && kill $STALE_PIDS 2>/dev/null || true
-  for _ in $(seq 1 10); do lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1 || break; sleep 1; done
+  BLOCKING_PIDS="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN -n 2>/dev/null | sort -u)"
+  echo "✗ port $PORT is owned by an unverified process (${BLOCKING_PIDS:-unknown}); refusing to kill it"
+  [ -n "$BLOCKING_PIDS" ] && ps -p "$BLOCKING_PIDS" -o pid=,command= 2>/dev/null || true
+  exit 1
 fi
 
 # Disable proactivity for the build (reversible; dev-down.sh restores it) WITHOUT
@@ -65,6 +133,8 @@ fi
 # (autoApproveScope, batchConfirmThreshold, …) and flip ONLY proactivity off.
 POL="$HOME_DIR/state/proactivity-policy.json"
 if [ -f "$POL" ] && [ ! -f "$POL.devbak" ]; then cp "$POL" "$POL.devbak"; fi
+if [ ! -f "$POL" ] && [ ! -f "$POL.devbak" ]; then DEV_POLICY_CREATED=true; fi
+if [ "$DEV_POLICY_CREATED" = "true" ]; then : > "$DEV_POLICY_CREATED_MARKER"; fi
 # Source the REAL policy from the backup when present (a prior dev-up may have
 # already minimized $POL), else from the live file.
 POL_SRC="$POL"; [ -f "$POL.devbak" ] && POL_SRC="$POL.devbak"
@@ -108,11 +178,87 @@ fi
 # rotation/history. Readiness checks below only inspect lines from THIS launch.
 ln -sf "$DAEMON_LOG" /tmp/clem-dev-daemon.log
 for _ in $(seq 1 60); do lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1 && break; sleep 1; done
-if lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1; then
-  echo "✓ dev daemon up on $PORT (source: $ROOT, home: $HOME_DIR)"
-else
+if ! lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1; then
   echo "✗ dev daemon failed to bind $PORT — see /tmp/clem-dev-daemon.log"; tail -25 /tmp/clem-dev-daemon.log; exit 1
 fi
+
+# A listener is not proof that THIS launch won the port. A stale scratch daemon
+# used to survive the kill pattern and made this script print a false success.
+# Require one owner, the exact source entry, and an authenticated build report
+# matching the candidate tree before handing the daemon to a tester.
+OWNER_PIDS="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN -n 2>/dev/null | sort -u)"
+if [ -z "$OWNER_PIDS" ] || [ "$(printf '%s\n' "$OWNER_PIDS" | wc -l | tr -d ' ')" != "1" ]; then
+  echo "✗ expected exactly one daemon owner on $PORT, found: ${OWNER_PIDS:-none}"
+  exit 1
+fi
+OWNER_COMMAND="$(ps -p "$OWNER_PIDS" -o command= 2>/dev/null)"
+if [[ "$OWNER_COMMAND" != *"$ROOT/src/index.ts daemon --foreground"* ]]; then
+  echo "✗ port $PORT belongs to the wrong process: $OWNER_COMMAND"
+  exit 1
+fi
+RECORDED_DAEMON_PID="$(cd "$ROOT" && CLEMENTINE_HOME="$HOME_DIR" npx tsx -e '
+  import { readDaemonPid } from "./src/daemon/process.ts";
+  console.log(readDaemonPid() ?? "");
+')"
+if [ "$RECORDED_DAEMON_PID" != "$OWNER_PIDS" ]; then
+  echo "✗ expected home $HOME_DIR records daemon pid ${RECORDED_DAEMON_PID:-none}, but port owner is $OWNER_PIDS"
+  exit 1
+fi
+if ! (
+  cd "$ROOT" || exit 1
+  export CLEMENTINE_HOME="$HOME_DIR"
+  export EXPECTED_CLEMENTINE_ROOT="$ROOT"
+  export EXPECTED_CLEMENTINE_SHA="$EXPECTED_GIT_SHA"
+  export EXPECTED_CLEMENTINE_DIRTY="$EXPECTED_GIT_DIRTY"
+  export EXPECTED_CLEMENTINE_SOURCE_FINGERPRINT="$EXPECTED_SOURCE_FINGERPRINT"
+  export EXPECTED_CLEMENTINE_SCHEMA_VERSION="$EXPECTED_SCHEMA_VERSION"
+  npx tsx -e '
+    import { WEBHOOK_HOST, WEBHOOK_PORT, WEBHOOK_SECRET } from "./src/config.ts";
+    import { fingerprintRuntimeSourceFromGit } from "./src/runtime/source-fingerprint.ts";
+    void (async () => {
+      if (!WEBHOOK_SECRET) throw new Error("WEBHOOK_SECRET unavailable");
+      const host = WEBHOOK_HOST === "0.0.0.0"
+        ? "127.0.0.1"
+        : WEBHOOK_HOST === "::"
+          ? "[::1]"
+          : WEBHOOK_HOST.includes(":") ? `[${WEBHOOK_HOST}]` : WEBHOOK_HOST;
+      const response = await fetch(`http://${host}:${WEBHOOK_PORT}/api/console/build-info`, {
+        headers: { authorization: `Bearer ${WEBHOOK_SECRET}` },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body = await response.json();
+      const build = body;
+      const expectedEntry = `${process.env.EXPECTED_CLEMENTINE_ROOT}/src/index.ts`;
+      const expectedDirty = process.env.EXPECTED_CLEMENTINE_DIRTY === "true";
+      const expectedFingerprint = process.env.EXPECTED_CLEMENTINE_SOURCE_FINGERPRINT;
+      const expectedSchema = Number(process.env.EXPECTED_CLEMENTINE_SCHEMA_VERSION);
+      const currentFingerprint = fingerprintRuntimeSourceFromGit({ repoRoot: process.env.EXPECTED_CLEMENTINE_ROOT });
+      const errors = [
+        response.status === 200 ? null : `HTTP ${response.status}`,
+        build?.entry === expectedEntry ? null : `entry=${String(build?.entry)}`,
+        build?.packaged === false ? null : `packaged=${String(build?.packaged)}`,
+        build?.gitSha === process.env.EXPECTED_CLEMENTINE_SHA ? null : `gitSha=${String(build?.gitSha)}`,
+        build?.gitDirty === expectedDirty ? null : `gitDirty=${String(build?.gitDirty)}`,
+        build?.sourceFingerprint === expectedFingerprint
+          ? null
+          : `sourceFingerprint=${String(build?.sourceFingerprint)}`,
+        currentFingerprint === expectedFingerprint
+          ? null
+          : `source changed during launch: current=${currentFingerprint}`,
+        build?.expectedSchemaVersion === expectedSchema
+          ? null
+          : `expectedSchemaVersion=${String(build?.expectedSchemaVersion)}`,
+        build?.schemaVersion === expectedSchema ? null : `schemaVersion=${String(build?.schemaVersion)}`,
+      ].filter(Boolean);
+      if (errors.length) throw new Error(`daemon identity mismatch: ${errors.join(", ")}`);
+      console.log(`verified ${build.entry} · ${build.gitSha}${build.gitDirty ? "-dirty" : ""} · source ${build.sourceFingerprint.slice(0, 12)} · schema ${build.schemaVersion}`);
+    })();
+  '
+); then
+  echo "✗ daemon answered on $PORT but failed exact-tree identity verification"
+  exit 1
+fi
+echo "✓ dev daemon up on $PORT (pid $OWNER_PIDS, source: $ROOT, home: $HOME_DIR)"
 
 # When Discord is on, prove the bot actually CONNECTED (login happens async after
 # the port binds). "Discord bot ready" logs the bot tag + guild count; surface it
@@ -128,6 +274,9 @@ if [ "$DEV_DISCORD" = "true" ]; then
     TAG="$(tail -n +"$LOG_START_LINE" "$DAEMON_LOG" | grep -m1 "Discord bot ready" | sed -E 's/.*"user":"([^"]+)".*/\1/')"
     printf '\r✓ Discord live as %s — DM the bot or @mention it to test           \n' "$TAG"
   else
-    printf '\r⚠ Discord did not report ready in 30s — check /tmp/clem-dev-daemon.log (token/intents?)\n'
+    printf '\r✗ Discord did not report ready in 30s — check /tmp/clem-dev-daemon.log (token/intents?)\n'
+    exit 1
   fi
 fi
+DEV_LAUNCH_VERIFIED=true
+echo "✓ exact candidate daemon is ready for local acceptance testing"

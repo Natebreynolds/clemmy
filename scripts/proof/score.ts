@@ -53,6 +53,12 @@ export interface SessionMetrics {
   /** Model-issued/canonical calls only. A call_tool wrapper and its
    * transport_mirror inner event are one physical decision, not two. */
   toolCallTotal: number;
+  /** Durable provider/transport crossings, independent of logical calls. */
+  physicalDispatches: number;
+  /** Physical crossings explicitly related to an earlier crossing as a retry. */
+  retryDispatches: number;
+  /** Canonical logical (tool,payload) signatures seen beyond their first use. */
+  repeatedIdenticalCalls: number;
   guardrailsTripped: number;
   externalWrites: number;
   autoContinues: number;
@@ -128,6 +134,78 @@ export function openHarnessDb(home: string): Database.Database {
 
 interface EventRow { type: string; data_json: string; created_at: string; turn: number }
 
+function tableExists(db: Database.Database, table: string): boolean {
+  return Boolean(db.prepare(
+    `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`,
+  ).get(table));
+}
+
+function canonicalJson(value: unknown, depth = 0): string {
+  if (depth > 16) return '"[depth-limit]"';
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'number') return Number.isFinite(value) ? JSON.stringify(value) : 'null';
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item, depth + 1)).join(',')}]`;
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson(record[key], depth + 1)}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(String(value));
+}
+
+function decodedCarrier(value: unknown): unknown {
+  let current = value;
+  for (let i = 0; i < 2 && typeof current === 'string'; i += 1) {
+    try { current = JSON.parse(current); } catch { break; }
+  }
+  return current;
+}
+
+function logicalCallSignature(data: Record<string, unknown>): string {
+  const tool = typeof data.effectiveTool === 'string' && data.effectiveTool.trim()
+    ? data.effectiveTool.trim()
+    : String(data.tool ?? 'unknown');
+  const carrier = data.arguments !== undefined
+    ? decodedCarrier(data.arguments)
+    : data.args !== undefined
+      ? decodedCarrier(data.args)
+      : null;
+  return `${tool}\u0000${canonicalJson(carrier)}`;
+}
+
+function dispatchCounts(
+  db: Database.Database,
+  sessionId: string,
+  events: readonly EventRow[],
+): { physicalDispatches: number; retryDispatches: number } {
+  if (tableExists(db, 'physical_dispatches')) {
+    const row = db.prepare(`
+      SELECT COUNT(*) AS total,
+             COALESCE(SUM(CASE WHEN relation = 'retry' THEN 1 ELSE 0 END), 0) AS retries
+        FROM physical_dispatches
+       WHERE session_id = ?
+    `).get(sessionId) as { total: number; retries: number };
+    return { physicalDispatches: row.total, retryDispatches: row.retries };
+  }
+
+  // Archived proof homes predate the normalized table. A start mirror is one
+  // crossing; settled mirrors are deliberately ignored to avoid double count.
+  let physicalDispatches = 0;
+  let retryDispatches = 0;
+  for (const event of events) {
+    if (event.type !== 'provider_dispatch_started') continue;
+    physicalDispatches += 1;
+    try {
+      const data = JSON.parse(event.data_json) as { relation?: unknown; retryOf?: unknown };
+      if (data.relation === 'retry' || typeof data.retryOf === 'string') retryDispatches += 1;
+    } catch { /* the crossing still exists; only its retry relation is unknown */ }
+  }
+  return { physicalDispatches, retryDispatches };
+}
+
 export function sessionMetrics(db: Database.Database, sessionId: string): SessionMetrics | null {
   const session = db
     .prepare(`SELECT id, kind, status, tokens_used FROM sessions WHERE id = ?`)
@@ -154,6 +232,8 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
   let openTurnStartedAt: number | null = null;
   let openTurnFirstAction: number | null = null;
   let canonicalToolCallTotal = 0;
+  let repeatedIdenticalCalls = 0;
+  const logicalSignatures = new Set<string>();
 
   for (const ev of events) {
     const ts = Date.parse(ev.created_at);
@@ -170,9 +250,14 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
         let name = 'unknown';
         let accounting = '';
         try {
-          const data = JSON.parse(ev.data_json) as { tool?: string; accounting?: string };
+          const data = JSON.parse(ev.data_json) as Record<string, unknown>;
           name = String(data.tool ?? 'unknown');
           accounting = String(data.accounting ?? '');
+          if (accounting !== 'transport_mirror') {
+            const signature = logicalCallSignature(data);
+            if (logicalSignatures.has(signature)) repeatedIdenticalCalls += 1;
+            else logicalSignatures.add(signature);
+          }
         } catch { /* keep unknown */ }
         toolCalls[name] = (toolCalls[name] ?? 0) + 1;
         if (accounting !== 'transport_mirror') {
@@ -232,6 +317,7 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
   }
 
   const turns = events.filter((e) => e.type === 'turn_started').length;
+  const dispatches = dispatchCounts(db, sessionId, events);
   return {
     sessionId,
     status: session.status,
@@ -241,6 +327,8 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
     toolCalls,
     logicalToolCalls,
     toolCallTotal: canonicalToolCallTotal,
+    ...dispatches,
+    repeatedIdenticalCalls,
     guardrailsTripped,
     externalWrites,
     autoContinues,

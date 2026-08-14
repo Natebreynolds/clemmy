@@ -19,10 +19,17 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
+import {
+  canonicalCacheAccounting,
+  type CacheDialectProvenance,
+} from '../../src/runtime/usage-log.js';
+
 export interface UsageRecordSlice {
   at: string;
   source: string;
   model: string;
+  /** Adapter-declared interpretation of inputTokens vs cachedInputTokens. */
+  cacheDialect?: CacheDialectProvenance;
   inputTokens: number;
   cachedInputTokens: number;
   cacheCreationInputTokens: number;
@@ -33,6 +40,7 @@ export interface UsageRecordSlice {
 export interface LegTokenTotals {
   /** Headline: every token billed inside this leg's home, all classes. */
   totalTokens: number;
+  /** Gross prompt tokens, normalized across inclusive/exclusive cache dialects. */
   inputTokens: number;
   outputTokens: number;
   /** The four billing classes. cacheHitRatio = cachedRead / input. */
@@ -84,6 +92,12 @@ export function parseUsageLine(line: string): UsageRecordSlice | null {
     at,
     source: typeof record.source === 'string' ? record.source : 'unknown',
     model: typeof record.model === 'string' ? record.model : '(unknown)',
+    ...(record.cacheDialect === 'inclusive'
+      || record.cacheDialect === 'exclusive'
+      || record.cacheDialect === 'none'
+      || record.cacheDialect === 'unknown'
+      ? { cacheDialect: record.cacheDialect }
+      : {}),
     inputTokens,
     cachedInputTokens: asFiniteNonNegative(record.cachedInputTokens),
     cacheCreationInputTokens: asFiniteNonNegative(record.cacheCreationInputTokens),
@@ -148,10 +162,20 @@ export function computeLegTotals(input: {
   const byModel: Record<string, number> = {};
 
   for (const record of inWindow) {
+    // Records written before cacheDialect existed used the inclusive shape in
+    // this proof stack. Preserve that archive compatibility, but let every
+    // declared modern row flow through the runtime's one canonical normalizer.
+    const accounting = canonicalCacheAccounting({
+      cacheDialect: record.cacheDialect ?? 'inclusive',
+      inputTokens: record.inputTokens,
+      cachedInputTokens: record.cachedInputTokens,
+      outputTokens: record.outputTokens,
+      totalTokens: record.totalTokens,
+    });
     totalTokens += record.totalTokens;
-    inputTokens += record.inputTokens;
+    inputTokens += accounting.promptTokens;
     outputTokens += record.outputTokens;
-    cachedReadTokens += record.cachedInputTokens;
+    cachedReadTokens += accounting.cachedReadTokens;
     cacheCreationTokens += record.cacheCreationInputTokens;
     byModel[record.model] = (byModel[record.model] ?? 0) + record.totalTokens;
     if (record.source === 'unknown') {
@@ -172,7 +196,16 @@ export function computeLegTotals(input: {
     outputTokens,
     cachedReadTokens,
     cacheCreationTokens,
-    uncachedInputTokens: Math.max(0, inputTokens - cachedReadTokens),
+    // Summing the per-record split is important: subtracting aggregate cached
+    // reads from aggregate raw input silently assumes every provider uses the
+    // inclusive dialect.
+    uncachedInputTokens: inWindow.reduce((sum, record) => sum + canonicalCacheAccounting({
+      cacheDialect: record.cacheDialect ?? 'inclusive',
+      inputTokens: record.inputTokens,
+      cachedInputTokens: record.cachedInputTokens,
+      outputTokens: record.outputTokens,
+      totalTokens: record.totalTokens,
+    }).uncachedInputTokens, 0),
     cacheHitRatio: inputTokens > 0 ? cachedReadTokens / inputTokens : 0,
     preTerminalTokens,
     quiesceTokens,

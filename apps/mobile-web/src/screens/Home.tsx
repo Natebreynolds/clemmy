@@ -19,6 +19,7 @@ import {
   type PlanProposalRow,
   type ReminderItem,
   type RunSummary,
+  isActiveRunStatus,
 } from '../lib/api';
 import { greetingName, timeGreeting } from '../lib/greeting';
 import { Decisions, relativeTime } from '../components/Approvals';
@@ -27,9 +28,6 @@ import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { RunControl } from '../components/RunControl';
 
 const POLL_MS = 5000;
-/** Runs in these states are live work, not history. */
-const ACTIVE = new Set(['running', 'queued', 'received', 'awaiting_approval']);
-
 interface Props {
   name: string;
   onAsk: (draft: string) => void;
@@ -80,7 +78,7 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
   const decisionCount = approvals.length + plans.length;
   useEffect(() => { onDecisionCount(decisionCount); }, [decisionCount, onDecisionCount]);
 
-  const working = runs.filter((run) => ACTIVE.has(run.status));
+  const working = runs.filter((run) => isActiveRunStatus(run.status));
   const recentChats = sessions.slice(0, 3);
   const greeting = timeGreeting(new Date().getHours(), greetingName(name));
 

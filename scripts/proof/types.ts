@@ -134,6 +134,8 @@ export interface DaemonHandle {
   /** Restart the real daemon against the SAME isolated home, port, and auth
    *  sandbox. Used to prove durable recovery instead of simulating it in-process. */
   restart(): Promise<void>;
+  /** Positive per-boot runtime identity checks, including restart boots. */
+  runtimeChecks?(): Check[];
   /** keepHome=true preserves the temp home for forensics (failed runs). The
    * result is report evidence: a requested retained log may never fail only as
    * a console warning. */
@@ -212,6 +214,11 @@ export interface ProofReport {
   /** False when source changed, or could not be re-fingerprinted, during proof. */
   sourceStable?: boolean;
   sourceClean: boolean;
+  /** Identity of the daemon artifact under test. For ordinary candidate runs
+   * this equals sourceFingerprint; pinned baselines use their attested dist. */
+  runtimeFingerprint?: string;
+  runtimeGitSha?: string;
+  runtimeLabel?: string;
   fusionMode: FusionProofMode;
   benchmark?: ProofBenchmarkMetadata;
   /** Report-wide evidence checks which do not belong to one brain/scenario. */

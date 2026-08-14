@@ -26,6 +26,7 @@ import Database from 'better-sqlite3';
 import type {
   BrainKind,
   BrainPlan,
+  Check,
   DaemonHandle,
   DaemonStopResult,
   FusionProofMode,
@@ -65,6 +66,13 @@ import {
   type ProofHomeIdentity,
   type ProofChildOutputTracker,
 } from './runtime-safety.js';
+import {
+  reportedBuildFromHealthResponse,
+  sha256Directory,
+  verifyDaemonBuildMatchesPinnedRuntime,
+  type ReportedDaemonBuild,
+  type RuntimeUnderTest,
+} from './runtime-under-test.js';
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
 const DAEMON_ENTRY = path.join(REPO_ROOT, 'dist', 'index.js');
@@ -445,6 +453,9 @@ export interface ProvisionOptions {
    * worktree built at its own tag, scripts/proof/runtime-under-test.ts)
    * passes its own entry so ONE measurement stack drives TWO runtimes. */
   daemonEntry?: string;
+  /** Exact pinned runtime identity expected to answer the health request.
+   * Omitted for the ordinary current-tree proof path. */
+  expectedRuntime?: RuntimeUnderTest;
 }
 
 export interface ProofProviderRequirements {
@@ -993,9 +1004,16 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
   // zero disposable credential footprint.
   (opts.runtimeSafetyPreflight ?? preflightProofRuntimeSafety)();
   const daemonEntry = opts.daemonEntry ?? DAEMON_ENTRY;
+  if (opts.daemonEntry && !opts.expectedRuntime) {
+    throw new Error('a custom daemonEntry requires expectedRuntime identity and artifact attestation');
+  }
+  if (opts.expectedRuntime && path.resolve(daemonEntry) !== path.resolve(opts.expectedRuntime.daemonEntry)) {
+    throw new Error(`daemonEntry ${daemonEntry} does not match expectedRuntime ${opts.expectedRuntime.daemonEntry}`);
+  }
   if (!existsSync(daemonEntry)) {
     throw new Error(`dist/index.js missing — run \`npm run build\` first (${daemonEntry})`);
   }
+  const artifactRoot = opts.expectedRuntime ? path.join(opts.expectedRuntime.treeRoot, 'dist') : undefined;
   const tempRoot = os.tmpdir();
   let providerLifecycle: 'never-spawned' | 'active' | 'terminated' = 'never-spawned';
   const nativeCleanupOperations = {
@@ -1175,9 +1193,46 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     throw new Error(`daemon not ready within boot timeout\n${safeRecentLog()}`);
   };
 
+  const runtimeIdentityChecks: Check[] = [];
+  let certifiedBoot = 0;
+  const certifyExpectedRuntime = async (artifactSha256BeforeSpawn: string | undefined): Promise<void> => {
+    if (!opts.expectedRuntime) return;
+    if (!artifactRoot || !artifactSha256BeforeSpawn) {
+      throw new Error('pinned runtime artifact identity was unavailable before spawn');
+    }
+    let reportedBuild: ReportedDaemonBuild | undefined;
+    const response = await fetch(`http://127.0.0.1:${port}/api/console/health`, {
+      headers: { authorization: `Bearer ${secret}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    reportedBuild = reportedBuildFromHealthResponse({
+      status: response.status,
+      bodyText: await response.text(),
+    });
+    const observedArtifactSha256 = sha256Directory(artifactRoot);
+    if (artifactSha256BeforeSpawn !== observedArtifactSha256) {
+      throw new Error(
+        `pinned daemon artifact changed during boot (before ${artifactSha256BeforeSpawn}, after ${observedArtifactSha256})`,
+      );
+    }
+    const identityCheck = verifyDaemonBuildMatchesPinnedRuntime({
+      runtime: opts.expectedRuntime,
+      reportedBuild,
+      observedArtifactSha256,
+    });
+    certifiedBoot += 1;
+    const recordedCheck = { ...identityCheck, name: `${identityCheck.name} (boot ${certifiedBoot})` };
+    runtimeIdentityChecks.push(recordedCheck);
+    if (!recordedCheck.pass) {
+      throw new Error(`${recordedCheck.name}: ${recordedCheck.detail ?? 'identity mismatch'}`);
+    }
+  };
+
   try {
+    const artifactSha256BeforeSpawn = artifactRoot ? sha256Directory(artifactRoot) : undefined;
     proc = spawnDaemon();
     await waitForReady();
+    await certifyExpectedRuntime(artifactSha256BeforeSpawn);
   } catch (error) {
     let drainError: unknown;
     try {
@@ -1281,8 +1336,10 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     await restartProofDaemonWithSanitation({
       terminate: terminateDaemon,
       start: async () => {
+        const artifactSha256BeforeSpawn = artifactRoot ? sha256Directory(artifactRoot) : undefined;
         proc = spawnDaemon();
         await waitForReady();
+        await certifyExpectedRuntime(artifactSha256BeforeSpawn);
       },
       // This also covers failure while draining the *old* daemon. The runner
       // may never regain a usable handle, so sanitize before returning.
@@ -1362,5 +1419,20 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
   // prior semantic window while the smaller forensic tail spans all restarts.
   const log = (): string => daemonLog.scenarioLog();
   const markLog = (): void => { daemonLog.markScenario(); };
-  return { home, port, secret, baseUrl, chat, acceptedChat, approve, request, log, markLog, restart, stop };
+  const runtimeChecks = (): Check[] => runtimeIdentityChecks.map((check) => ({ ...check }));
+  return {
+    home,
+    port,
+    secret,
+    baseUrl,
+    chat,
+    acceptedChat,
+    approve,
+    request,
+    log,
+    markLog,
+    restart,
+    stop,
+    runtimeChecks,
+  };
 }

@@ -17,7 +17,7 @@ function runTone(status: string): { tone: Tone; label: string } {
   if (status === 'completed') return { tone: 'success', label: 'Completed' };
   if (status === 'failed') return { tone: 'danger', label: 'Failed' };
   if (status === 'running' || status === 'queued') return { tone: 'live', label: 'Running' };
-  if (status === 'awaiting_approval') return { tone: 'warning', label: 'Needs you' };
+  if (status === 'awaiting_approval' || status === 'awaiting_input') return { tone: 'warning', label: 'Needs you' };
   return { tone: 'neutral', label: status };
 }
 

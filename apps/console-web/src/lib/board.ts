@@ -392,7 +392,7 @@ export function boardCardFromRunDetail(
 
   const rawState = String(run.runState || run.status || '').toLowerCase();
   const awaitingApproval = rawState === 'waiting_for_approval' || rawState === 'awaiting_approval';
-  const awaitingInput = rawState === 'waiting_for_input' || rawState === 'awaiting_user_input';
+  const awaitingInput = rawState === 'waiting_for_input' || rawState === 'awaiting_input' || rawState === 'awaiting_user_input';
   const queued = rawState === 'queued' || rawState === 'received';
   const running = run.live === true || ['planning', 'executing', 'running', 'active', 'in_progress'].includes(rawState);
   const column: BoardColumnId = awaitingApproval || awaitingInput

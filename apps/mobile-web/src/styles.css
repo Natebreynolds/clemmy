@@ -564,7 +564,7 @@ input, textarea { font: inherit; }
 .status-running, .status-received, .status-queued { background: var(--accent); }
 .status-completed { background: var(--accent-2); }
 .status-failed, .status-cancelled { background: var(--accent-fail); }
-.status-awaiting_approval { background: var(--accent-warn); }
+.status-awaiting_approval, .status-awaiting_input { background: var(--accent-warn); }
 
 .btn-new {
   display: inline-flex;

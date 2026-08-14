@@ -9,15 +9,10 @@ import {
 import path from 'node:path';
 
 import type { Check, ProofReport } from './types.js';
+import { RUNTIME_SOURCE_PATHS } from '../../src/runtime/source-fingerprint.js';
 
-export const PROOF_SOURCE_PATHS = [
-  'src',
-  'apps',
-  'scripts',
-  'docs',
-  'package.json',
-  'package-lock.json',
-] as const;
+/** One canonical compilation/runtime scope; proof identity cannot omit tsconfig. */
+export const PROOF_SOURCE_PATHS = RUNTIME_SOURCE_PATHS;
 
 export interface UntrackedSourceFile {
   path: string;

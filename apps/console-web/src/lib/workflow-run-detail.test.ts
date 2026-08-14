@@ -232,6 +232,29 @@ test('a parked step that resumes and completes ends done, not awaiting_approval'
   assert.equal(detail.steps[0].output, 'posted');
 });
 
+test('a conversational workflow pause renders as input, not approval or failure', () => {
+  const detail = buildWorkflowRunDetail([
+    { t: '2026-07-04T00:00:00.000Z', kind: 'run_started' },
+    { t: '2026-07-04T00:00:01.000Z', kind: 'step_started', stepId: 'choose_scope' },
+    {
+      t: '2026-07-04T00:00:02.000Z',
+      kind: 'step_failed',
+      stepId: 'choose_scope',
+      error: 'Which account scope should I use?',
+      meta: { reason: 'parked_on_input', questionId: 'workflow-input:run:choose_scope:1' },
+    },
+    {
+      t: '2026-07-04T00:00:03.000Z',
+      kind: 'run_paused',
+      error: 'Which account scope should I use?',
+      meta: { reason: 'awaiting_user_input', stepId: 'choose_scope' },
+    },
+  ]);
+  assert.equal(detail.runStatus, 'awaiting_input');
+  assert.equal(detail.steps[0].status, 'awaiting_input');
+  assert.match(detail.steps[0].error, /Which account scope/);
+});
+
 test('capability parking renders as waiting for connection and returns to running on resume', () => {
   const blocked = buildWorkflowRunDetail([
     { t: '2026-07-04T00:00:00.000Z', kind: 'run_started' },

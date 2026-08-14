@@ -30,6 +30,7 @@ const STEP_TONE: Record<WorkflowStepStatus, Tone> = {
   skipped: 'neutral',
   pending: 'neutral',
   awaiting_approval: 'warning',
+  awaiting_input: 'warning',
   awaiting_capability: 'warning',
 };
 
@@ -41,6 +42,7 @@ const STEP_ICON = {
   skipped: MinusCircle,
   pending: Circle,
   awaiting_approval: PauseCircle,
+  awaiting_input: PauseCircle,
   awaiting_capability: PauseCircle,
 } as const;
 
@@ -193,7 +195,7 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
       className={cn(
         'rounded-md border border-border border-l-2 px-3 py-2',
         step.status === 'done' && 'border-l-success',
-        (step.status === 'blocked' || step.status === 'awaiting_approval' || step.status === 'awaiting_capability') && 'border-l-warning',
+        (step.status === 'blocked' || step.status === 'awaiting_approval' || step.status === 'awaiting_input' || step.status === 'awaiting_capability') && 'border-l-warning',
         step.status === 'failed' && 'border-l-danger',
         step.status === 'running' && 'border-l-primary',
         (step.status === 'skipped' || step.status === 'pending') && 'border-l-border',
@@ -215,6 +217,8 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
         <span className="text-caption uppercase tracking-wide text-faint">
           {step.status === 'awaiting_approval'
             ? 'needs your approval'
+            : step.status === 'awaiting_input'
+              ? 'needs your answer'
             : step.status === 'awaiting_capability'
               ? 'waiting for connection'
               : step.status}
@@ -243,7 +247,7 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
         <div
           className={cn(
             'mt-1.5 whitespace-pre-wrap break-words rounded-sm border px-2 py-1.5 text-caption',
-            step.status === 'blocked' || step.status === 'awaiting_approval' || step.status === 'awaiting_capability'
+            step.status === 'blocked' || step.status === 'awaiting_approval' || step.status === 'awaiting_input' || step.status === 'awaiting_capability'
               ? 'border-warning/40 bg-warning-tint text-warning'
               : 'border-danger/40 bg-danger-tint text-danger',
           )}

@@ -148,6 +148,14 @@ export function workflowCardStatus(w: {
       aboutLastRun: true,
     };
   }
+  if (s === 'awaiting_input') {
+    return {
+      tone: 'warning',
+      label: 'Waiting for your answer',
+      detail: 'Completed work is preserved. Reply in the conversation that started this run to continue it.',
+      aboutLastRun: true,
+    };
+  }
   if ((w.lastRunFailedItemCount ?? 0) > 0) {
     const n = w.lastRunFailedItemCount ?? 0;
     return { tone: 'warning', label: `${n} failed item${n === 1 ? '' : 's'}`, aboutLastRun: true };
